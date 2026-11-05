@@ -2498,34 +2498,6 @@ const PreparationClassifierContext = struct {
     deps: *const AgentRuntimeDeps,
 };
 
-fn prepareSkillCall(deps: *const AgentRuntimeDeps, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !?skill_contract.CallPreparation {
-    const tool = deps.tool_registry.lookup(call.name) orelse return null;
-    if (tool.prepare_skill_call_fn == null) return null;
-    const prepare = deps.prepare_skill_call orelse return null;
-    return prepare(deps.ctx, arena, call, locations) catch |err| switch (err) {
-        error.OutOfMemory, error.Cancelled => return err,
-        else => .{ .failure = .{ .model_output = try arena.print("skill failed: {s}", .{@errorName(err)}) } },
-    };
-}
-
-fn skillPreparationFailure(arena: Allocator, output: skill_contract.ExecuteOutput) !ToolExecutionResult {
-    var notices: [2][]const u8 = undefined;
-    var count: usize = 0;
-    if (output.notice) |notice| {
-        notices[count] = notice;
-        count += 1;
-    }
-    if (output.diagnostic_notice) |notice| {
-        notices[count] = notice;
-        count += 1;
-    }
-    return .{
-        .status = .failure,
-        .model_output = output.model_output,
-        .context_notices = try arena.dupe([]const u8, notices[0..count]),
-    };
-}
-
 fn preparationExecutionStatus(status: runtime_tool_contracts.ToolExecutionStatus) tool_preparation.ToolStatus {
     return switch (status) {
         .success => .success,
@@ -2571,48 +2543,6 @@ fn prepareAvailabilityTerminal(
     };
 }
 
-/// Advertises live MCP tools the model called without loading them first, so
-/// those calls reach normal validation and MCP permission instead of failing
-/// as unselected. Names that do not resolve, including lookups that fail or
-/// are cancelled, keep the unsupported-tool path, where the turn's normal
-/// cancellation handling still applies.
-fn advertiseUnselectedMcpCalls(
-    deps: *const AgentRuntimeDeps,
-    arena: Allocator,
-    calls: []const ToolCall,
-    selected: *std.ArrayList(agent_stream_provider.DynamicFunctionTool),
-    advertised_tools: *[]const agent_stream_provider.DynamicFunctionTool,
-    advertised_names: *[][]const u8,
-) !void {
-    const resolve = deps.resolve_unselected_mcp_tool orelse return;
-    for (calls) |call| {
-        if (deps.tool_registry.lookup(call.name) != null) continue;
-        if (containsString(advertised_names.*, call.name)) continue;
-        const resolved = resolve(deps.ctx, arena, call.name) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                debug_trace.logf("mcp", "unselected MCP tool lookup failed tool={s} err={s}", .{ call.name, @errorName(err) });
-                continue;
-            },
-        };
-        const definition = resolved orelse continue;
-        if (!std.mem.eql(u8, definition.name, call.name) or definition.mcp_binding == null) continue;
-        try runtime_gateway_step.recordSelectedDynamicTool(arena, selected, definition);
-        const tool = for (selected.items) |item| {
-            if (std.mem.eql(u8, item.name, call.name)) break item;
-        } else unreachable;
-        const tools = try arena.alloc(agent_stream_provider.DynamicFunctionTool, advertised_tools.len + 1);
-        @memcpy(tools[0..advertised_tools.len], advertised_tools.*);
-        tools[advertised_tools.len] = tool;
-        const names = try arena.alloc([]const u8, advertised_names.len + 1);
-        @memcpy(names[0..advertised_names.len], advertised_names.*);
-        names[advertised_names.len] = tool.name;
-        advertised_tools.* = tools;
-        advertised_names.* = names;
-        debug_trace.logf("mcp", "loaded unselected MCP tool for direct call tool={s}", .{call.name});
-    }
-}
-
 /// The call a `toolbox {run}` carries, which fx prepares, admits, and runs as
 /// the agent's own direct call of it, so a run meets every check a direct
 /// call does (`tests/tla/toolbox/Toolbox.tla` RunNeedsAdmission): the call of
@@ -2637,11 +2567,7 @@ fn toolboxRunSubject(
     subject.name = run.name;
     subject.arguments_json = run.arguments_json;
     subject.carried_by = call.name;
-    if (deps.tool_registry.lookup(run.name)) |spec| {
-        // A host's own tool is called directly: a durable session reruns it
-        // by its name after a crash, under the host's rerun policy.
-        return if (spec.executor_kind == .host) null else subject;
-    }
+    if (deps.tool_registry.lookup(run.name)) |spec| return if (toolbox.runs(spec.*)) subject else null;
     for (advertised_tools.*) |tool| {
         if (std.mem.eql(u8, tool.name, run.name)) return if (tool.mcp_binding != null) subject else null;
     }
@@ -2667,6 +2593,38 @@ fn toolboxRunSubject(
     advertised_names.* = names;
     debug_trace.logf("toolbox", "run admitted for this step call={s} tool={s}", .{ call.id, run.name });
     return subject;
+}
+
+/// The call fx admits for a toolbox call: the one a run carries
+/// (`toolboxRunSubject`), or an open or search marked with what it stands
+/// for (`ToolCall.toolbox_lookup`), so the permission rules and a subagent's
+/// profile decide it as the tool it replaced. Null for any other call.
+fn toolboxSubject(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    call: ToolCall,
+    locations: ?*const skill_contract.Locations,
+    servers: []const []const u8,
+    advertised_tools: *[]const agent_stream_provider.DynamicFunctionTool,
+    advertised_names: *[][]const u8,
+) !?ToolCall {
+    if (try toolboxRunSubject(deps, arena, call, advertised_tools, advertised_names)) |subject| return subject;
+    if (call.argument_integrity != .valid) return null;
+    const lookup = (try toolbox.lookupOf(arena, call, locations, servers, deps.tool_registry)) orelse return null;
+    var marked = call;
+    marked.toolbox_lookup = lookup;
+    debug_trace.logf("toolbox", "lookup admitted as call={s} permission={s}", .{ call.id, lookup.permission });
+    return marked;
+}
+
+/// The call a subagent's live authority decides: a toolbox open or search as
+/// the tool it replaced, so a profile without `skill` reads no skill through
+/// toolbox; any other call as it is.
+fn authorityCall(call: ToolCall) ToolCall {
+    const lookup = call.toolbox_lookup orelse return call;
+    var decided = call;
+    decided.name = lookup.permission;
+    return decided;
 }
 
 fn containsString(items: []const []const u8, item: []const u8) bool {
@@ -5782,10 +5740,6 @@ fn prepareSkillCatalog(
     return section;
 }
 
-fn lessName(_: void, lhs: []const u8, rhs: []const u8) bool {
-    return std.mem.lessThan(u8, lhs, rhs);
-}
-
 /// The toolbox menu for this request: the one this conversation sent first,
 /// or, on its first request, one rendered from the visible skills, the
 /// configured MCP servers, and the built-in tools behind toolbox. Null when
@@ -5821,7 +5775,7 @@ fn toolboxMenu(
     }
     // Sorted here, so the menu never depends on the order a host lists them.
     const servers = try arena.dupe([]const u8, config.toolbox_mcp_servers);
-    sort_utils.sort([]const u8, servers, {}, lessName);
+    sort_utils.sort([]const u8, servers, {}, sort_utils.lessThanBytes);
     for (servers) |name| try entries.append(arena, .{ .kind = .mcp_server, .name = name });
     for (config.toolbox_behind) |name| {
         const tool = deps.tool_registry.lookup(name) orelse continue;
@@ -9625,17 +9579,9 @@ fn processQueuedPromptLoop(
             }
         }
 
-        // With toolbox, a direct call of an MCP tool fx didn't send fails and
-        // points the model at toolbox run: listing the tool now would change
-        // the tools every earlier request sent (`Toolbox.tla` ToolsFixed).
-        if (!toolbox.isAdvertised(config.advertised_tool_names)) try advertiseUnselectedMcpCalls(
-            deps,
-            arena,
-            completion.tool_calls,
-            &selected_dynamic_tools,
-            &advertised_dynamic_tools,
-            &advertised_dynamic_tool_names,
-        );
+        // A direct call of an MCP tool fx didn't send fails and points the
+        // model at toolbox run: listing the tool now would change the tools
+        // every earlier request sent (`Toolbox.tla` ToolsFixed).
         const prepared_tool_calls = try arena.alloc(
             PreparedToolCall,
             completion.tool_calls.len,
@@ -9737,7 +9683,7 @@ fn processQueuedPromptLoop(
         // carries; the assistant's call and its result stay toolbox.
         const toolbox_subjects = try arena.alloc(?ToolCall, prepared_tool_calls.len);
         for (prepared_tool_calls, toolbox_subjects) |prepared_call, *subject| subject.* = switch (prepared_call) {
-            .ready => try toolboxRunSubject(deps, arena, prepared_call.call(), &advertised_dynamic_tools, &advertised_dynamic_tool_names),
+            .ready => try toolboxSubject(deps, arena, prepared_call.call(), if (skills.catalog) |catalog| &catalog.locations else null, config.toolbox_mcp_servers, &advertised_dynamic_tools, &advertised_dynamic_tool_names),
             .blocked, .provider_executed => null,
         };
         const effective_tool_calls = try arena.alloc(
@@ -10080,15 +10026,6 @@ fn processQueuedPromptLoop(
             if (parallel_len > 1) {
                 const parallel_calls = effective_tool_calls[tool_call_index .. tool_call_index + parallel_len];
                 const parallel_prepared = prepared_tool_calls[tool_call_index .. tool_call_index + parallel_len];
-                const parallel_skill_preparations = try arena.alloc(?skill_contract.CallPreparation, parallel_calls.len);
-                @memset(parallel_skill_preparations, null);
-                defer {
-                    for (parallel_calls) |*call| call.resolved_skill = null;
-                    for (parallel_skill_preparations) |maybe_prepared| {
-                        if (maybe_prepared) |prepared| skill_invocation.freeCallPreparation(arena, prepared);
-                    }
-                    arena.free(parallel_skill_preparations);
-                }
                 const precomputed_results = try arena.alloc(?ToolExecutionResult, parallel_calls.len);
                 @memset(precomputed_results, null);
                 const parallel_status_started = try arena.alloc(bool, parallel_calls.len);
@@ -10169,9 +10106,8 @@ fn processQueuedPromptLoop(
                 defer mem_utils.deinitList(arena, &executable_calls);
                 var executable_classification_complete: std.ArrayList(bool) = .empty;
                 defer mem_utils.deinitList(arena, &executable_classification_complete);
-                for (parallel_calls, precomputed_results, 0..) |unbound_call, precomputed, group_index| {
+                for (parallel_calls, precomputed_results, 0..) |parallel_call, precomputed, group_index| {
                     if (precomputed != null) continue;
-                    var parallel_call = unbound_call;
                     if (config.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
@@ -10192,37 +10128,6 @@ fn processQueuedPromptLoop(
                         finish_trace.finish("interrupted");
                         return;
                     }
-                    parallel_skill_preparations[group_index] = prepareSkillCall(deps, arena, parallel_call, if (skills.catalog) |catalog| &catalog.locations else null) catch |err| {
-                        if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
-                        runtime_telemetry.traceCancelObserved(step_ctx, true);
-                        try finishPendingParallelCancelled(
-                            deps,
-                            &stream_ctx.provisional_statuses,
-                            stream_ctx.alloc,
-                            arena,
-                            config,
-                            turn_id,
-                            parallel_calls,
-                            precomputed_results,
-                            parallel_status_started,
-                            parallel_status_terminalized,
-                            advertised_dynamic_tool_names,
-                        );
-                        try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, parallel_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
-                        finish_trace.finish("interrupted");
-                        return;
-                    };
-                    if (parallel_skill_preparations[group_index]) |*prepared| switch (prepared.*) {
-                        .selected => |*skill| {
-                            parallel_call.resolved_skill = skill;
-                            parallel_calls[group_index].resolved_skill = skill;
-                        },
-                        .failure => |output| {
-                            precomputed_results[group_index] = try skillPreparationFailure(arena, output);
-                            continue;
-                        },
-                    };
                     if (!runtime_tool_admission.deferVisibleLifecycleUntilAfterPermission(parallel_call.name)) {
                         parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
                     }
@@ -10995,61 +10900,6 @@ fn processQueuedPromptLoop(
                     continue;
                 }
             }
-            var skill_preparation = prepareSkillCall(deps, arena, tool_call, if (skills.catalog) |catalog| &catalog.locations else null) catch |err| {
-                if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
-                runtime_telemetry.traceCancelObserved(step_ctx, true);
-                try finishPendingCancelledCalls(
-                    deps,
-                    &stream_ctx.provisional_statuses,
-                    stream_ctx.alloc,
-                    arena,
-                    config,
-                    turn_id,
-                    effective_tool_calls[tool_call_index..],
-                    advertised_dynamic_tool_names,
-                );
-                try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, identity_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
-                finish_trace.finish("interrupted");
-                return;
-            };
-            defer if (skill_preparation) |prepared| skill_invocation.freeCallPreparation(arena, prepared);
-            if (skill_preparation) |*skill_prepared| {
-                switch (skill_prepared.*) {
-                    .selected => |*skill| tool_call.resolved_skill = skill,
-                    .failure => |output| {
-                        const execution = try skillPreparationFailure(arena, output);
-                        const prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, tool_call, execution, null);
-                        _ = try stream_ctx.provisional_statuses.finishExecutedCall(
-                            deps,
-                            stream_ctx.alloc,
-                            arena,
-                            turn_id,
-                            tool_call,
-                            false,
-                            tool_display_target,
-                            execution,
-                            prepared.model_output,
-                            prepared.memory,
-                            null,
-                            advertised_dynamic_tool_names,
-                        );
-                        try runtime_tool_admission.recordRejectedToolCall(deps, arena, tool_call, prepared.model_output, null);
-                        for (execution.context_notices) |notice| try deps.pushContextNotice(notice);
-                        try runtime_tool_batch.appendToolResultContent(
-                            arena,
-                            &within_turn_suffix,
-                            &completed_tool_names,
-                            &step_batch,
-                            tool_call,
-                            prepared.model_output,
-                            prepared.memory,
-                            .{ .increment_error = true },
-                        );
-                        continue;
-                    },
-                }
-            }
             const is_file_mutation = file_mutation_contract.isToolName(tool_call.name) and
                 // A host tool may reuse a reserved file-mutation name; it owns
                 // its own execution and never enters the builtin contract. A
@@ -11147,10 +10997,10 @@ fn processQueuedPromptLoop(
                 const resolved = switch (try resolveLiveToolAuthority(
                     deps,
                     arena,
-                    tool_call,
+                    authorityCall(tool_call),
                     config.workspace_root,
                     advertised_dynamic_tool_names,
-                    live_authority_target,
+                    live_authority_target orelse if (tool_call.toolbox_lookup) |lookup| lookup.target else null,
                 )) {
                     .resolved => |value| value,
                     .tool_failure => |failure| {
@@ -12138,7 +11988,14 @@ fn processQueuedPromptLoop(
                 debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
                 debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
             }
-            try runtime_gateway_step.recordSelectedDynamicTools(arena, &selected_dynamic_tools, execution);
+            // With toolbox the tools fx sends stay as first sent, so a schema
+            // a call loaded, such as a run's changed definition, is shown in
+            // its result and never joins them (`Toolbox.tla` ToolsFixed).
+            if (!toolbox.isAdvertised(config.advertised_tool_names)) {
+                try runtime_gateway_step.recordSelectedDynamicTools(arena, &selected_dynamic_tools, execution);
+            } else if (execution.selected_dynamic_tools.len > 0) {
+                debug_trace.logf("toolbox", "selected tools not sent call={s} count={d}: the tools stay as first sent", .{ tool_call.id, execution.selected_dynamic_tools.len });
+            }
             try runtime_tool_batch.appendOrdinaryExecutedResult(
                 deps.tool_registry,
                 arena,

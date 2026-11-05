@@ -190,12 +190,6 @@ pub const ProviderModelSources = struct {
     }
 };
 
-/// The built-in tools behind toolbox for a run: the defaults, then the
-/// profile with this folder's entry over it, then `--tool-placement`.
-pub fn resolveToolPlacement(settings: *const Settings, command_line: []const tool_placement.Override) tool_placement.Behind {
-    return tool_placement.behindToolbox(settings.tool_placement, command_line);
-}
-
 pub fn resolveContextLimits(settings: *const Settings, command_line: []const context_limits.Override) context_limits.Values {
     var values = context_limits.Values{};
     values.apply(settings.context_limits);
@@ -263,7 +257,7 @@ pub fn writeDiagnosticMetadata(writer: *std.Io.Writer, diagnostic: ConfigDiagnos
     if (diagnostic.setting_key) |key| try writer.print("; key={s}", .{key});
     if (diagnostic.recovery_path) |path| try writer.print("; recovery={s}", .{path});
     if (diagnostic.cause == .retired_skill_match_fuzzy) {
-        try writer.writeAll("; remove skill_match_fuzzy; skills now load only through explicit invocation or the skill tool");
+        try writer.writeAll("; remove skill_match_fuzzy; skills now load only through explicit invocation or toolbox open");
     }
     if (diagnostic.cause == .invalid_context_limits) {
         try writer.writeAll("; context_limits keys must be documented limit names with a non-negative integer or \"off\" value");

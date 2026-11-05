@@ -269,7 +269,6 @@ pub const DispatchContext = struct {
     max_command_output_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     skills_dir: []const u8 = "",
     skill_locations: ?*const skill_contract.Locations = null,
-    resolved_skill: ?*const skill_contract.PreparedSkill = null,
     context_limits: context_limits.Values = .{},
     read_tracker: ?*read_tracker_mod.ReadTracker = null,
     change_tracker: ?*change_tracker.ChangeTracker = null,
@@ -422,15 +421,14 @@ pub const ExecutorKind = enum {
     web_search,
     run_command,
     terminal,
-    skill,
     install_skill,
     subagent,
-    capability_search,
-    mcp_select_tool,
     ask_user_question,
     vision,
     host,
     toolbox,
+    /// An MCP tool from a server, registered while it is sent or run.
+    mcp_tool,
 };
 
 pub const ApprovalPolicy = enum {
@@ -563,7 +561,6 @@ pub const Tool = struct {
     cancel_if_requested_after_call: bool = false,
     run_command_compatibility: ?RunCommandCompatibility = null,
     take_file_mutation_input_fn: ?TakeFileMutationInputFn = null,
-    prepare_skill_call_fn: ?*const fn (DispatchContext, []const u8) DispatchError!skill_contract.CallPreparation = null,
     reads_only_fn: ReadsOnlyFn,
     irreversible_fn: IrreversibleFn,
 };

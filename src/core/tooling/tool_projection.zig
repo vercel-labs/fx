@@ -258,43 +258,25 @@ const test_shell = blk: {
     break :blk spec;
 };
 
-const test_skill = blk: {
+const test_toolbox = blk: {
     var spec = test_read_file;
-    spec.name = "skill";
-    spec.description = "Test skill. When to use: exercise registered skill projection. When NOT to use: assert product-specific skill loading.";
-    spec.model_schema = .{
-        .name = "skill",
-        .description = spec.description,
-    };
-    spec.executor_kind = .skill;
+    spec.name = "toolbox";
+    spec.description = "Test toolbox.";
+    spec.model_schema = .{ .name = "toolbox", .description = spec.description };
+    spec.model_visible = true;
+    spec.executor_kind = .toolbox;
     spec.activity_kind = .read;
     spec.requires_approval = false;
-    spec.action_label = "Loading skill";
-    spec.completed_action_label = "Loaded skill";
+    spec.action_label = "Using";
+    spec.completed_action_label = "Used";
     spec.label_arg_kind = .name;
-    spec.label_arg_default = "skill";
+    spec.label_arg_default = "toolbox";
     spec.permission_target_kind = .none;
     break :blk spec;
 };
 
-const test_capability_search = blk: {
-    var spec = test_skill;
-    spec.name = "capability_search";
-    spec.description = "Test capability search. When to use: discover skill and MCP metadata together. When NOT to use: load or execute a match.";
-    spec.model_schema = .{
-        .name = "capability_search",
-        .description = spec.description,
-    };
-    spec.model_visible = true;
-    spec.action_label = "Searching capabilities";
-    spec.completed_action_label = "Searched capabilities";
-    spec.label_arg_kind = .query;
-    spec.label_arg_default = "capabilities";
-    break :blk spec;
-};
-
 const test_install_skill = blk: {
-    var spec = test_skill;
+    var spec = test_toolbox;
     spec.name = "install_skill";
     spec.description = "Test install skill. When to use: exercise registered write-tool projection. When NOT to use: assert product-specific installation behavior.";
     spec.model_schema = .{
@@ -311,7 +293,7 @@ const test_install_skill = blk: {
 };
 
 const test_subagent = blk: {
-    var spec = test_skill;
+    var spec = test_toolbox;
     spec.name = "subagent";
     spec.description = "Test subagent. When to use: exercise registered subagent projection. When NOT to use: assert product-specific child management.";
     spec.model_schema = .{
@@ -324,31 +306,6 @@ const test_subagent = blk: {
     spec.completed_action_label = "Managed";
     spec.label_arg_kind = .none;
     spec.label_arg_default = "subagent";
-    break :blk spec;
-};
-
-const test_mcp_select_tool = blk: {
-    var spec = test_skill;
-    spec.name = "mcp_select_tool";
-    spec.description = "Test MCP selection. When to use: exercise deferred MCP projection. When NOT to use: assert product-specific MCP guidance.";
-    spec.model_schema = .{
-        .name = "mcp_select_tool",
-        .description = spec.description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "name", .json_type = .string },
-            },
-            .required = &.{"name"},
-        },
-    };
-    spec.executor_kind = .mcp_select_tool;
-    spec.activity_kind = .read;
-    spec.requires_approval = false;
-    spec.action_label = "Selecting MCP tool";
-    spec.completed_action_label = "Selected MCP tool";
-    spec.label_arg_kind = .name;
-    spec.label_arg_default = "dynamic tool";
-    spec.permission_target_kind = .none;
     break :blk spec;
 };
 
@@ -459,11 +416,8 @@ const test_all_tools = [_]tool_dispatch.Tool{
     test_web_fetch,
     test_web_search,
     test_shell,
-    test_capability_search,
-    test_skill,
     test_install_skill,
     test_subagent,
-    test_mcp_select_tool,
     test_ask_user_question,
     test_vision,
     test_read_tool_result,
@@ -477,10 +431,7 @@ const test_order = [_][]const u8{
     "write_file",
     "shell",
     "subagent",
-    "capability_search",
-    "skill",
     "install_skill",
-    "mcp_select_tool",
     "ask_user_question",
     "web_fetch",
     "web_search",
@@ -531,17 +482,16 @@ fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, ki
     errdefer guidance_out.deinit();
 
     var first_custom_guidance = true;
-    const offers_toolbox = toolboxOffered(tool_set, kind, options);
 
     for (tool_set.order) |tool_name| {
         const tool = tool_set.registry.lookup(tool_name) orelse continue;
-        try appendBuiltinTool(alloc, &advertised_names, &advertised_functions, &guidance_out.writer, &first_custom_guidance, tool.*, kind, tool_set, options, offers_toolbox);
+        try appendBuiltinTool(alloc, &advertised_names, &advertised_functions, &guidance_out.writer, &first_custom_guidance, tool.*, kind, tool_set, options);
     }
 
     if (kind == .full) {
         for (tool_set.registry.tools) |tool| {
             if (isCanonicalToolName(tool_set, tool.name)) continue;
-            try appendBuiltinTool(alloc, &advertised_names, &advertised_functions, &guidance_out.writer, &first_custom_guidance, tool, kind, tool_set, options, offers_toolbox);
+            try appendBuiltinTool(alloc, &advertised_names, &advertised_functions, &guidance_out.writer, &first_custom_guidance, tool, kind, tool_set, options);
         }
     }
 
@@ -556,16 +506,6 @@ fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, ki
         .custom_guidance = custom_guidance,
     };
 }
-/// Whether this projection sends toolbox, so the tools it replaces and the
-/// ones behind it stay out. Without it they're the only way to reach skills
-/// and MCP tools, so they're sent as before.
-fn toolboxOffered(tool_set: tool_set_contract.ToolSet, kind: BuildKind, options: Options) bool {
-    const tool = tool_set.registry.lookup(toolbox.tool_name) orelse return false;
-    if (!tool.model_visible or !includeBuiltinForKind(tool.name, kind, tool_set)) return false;
-    if (options.permission_mode != .yolo and permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) return false;
-    return true;
-}
-
 fn appendBuiltinTool(
     alloc: Allocator,
     advertised_names: *std.ArrayList([]const u8),
@@ -576,14 +516,14 @@ fn appendBuiltinTool(
     kind: BuildKind,
     tool_set: tool_set_contract.ToolSet,
     options: Options,
-    offers_toolbox: bool,
 ) !void {
     if (!tool.model_visible) return;
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
     // toolbox opens and runs these, so they stay out of the tools list
-    // (`tests/tla/toolbox/Toolbox.tla` ToolsFixed).
-    if (offers_toolbox and (toolbox.isReplaced(tool.name) or toolNameInSet(options.behind_toolbox, tool.name))) return;
+    // (`tests/tla/toolbox/Toolbox.tla` ToolsFixed), and with toolbox denied
+    // they're denied too.
+    if (toolNameInSet(options.behind_toolbox, tool.name)) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
     if (options.permission_mode != .yolo) {
         if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
@@ -810,24 +750,7 @@ test "effective tool projection cleans up every partial allocation failure" {
     );
 }
 
-test "base tool projection includes MCP discovery and explicit selection" {
-    const alloc = std.testing.allocator;
-    var projection = try buildTestModelToolProjection(alloc, .{});
-    defer projection.deinit(alloc);
-    try expectContainsName(projection.advertised_names, "capability_search");
-    try expectContainsName(projection.advertised_names, "mcp_select_tool");
-}
-
-const test_toolbox = blk: {
-    var spec = test_skill;
-    spec.name = "toolbox";
-    spec.description = "Test toolbox.";
-    spec.model_schema = .{ .name = "toolbox", .description = spec.description };
-    spec.model_visible = true;
-    break :blk spec;
-};
-
-test "a projection that sends toolbox leaves out the tools it replaces and the ones behind it" {
+test "a projection that sends toolbox leaves out the tools behind it" {
     const alloc = std.testing.allocator;
     const tools = test_all_tools ++ [_]tool_dispatch.Tool{test_toolbox};
     const order = test_order ++ [_][]const u8{"toolbox"};
@@ -839,9 +762,26 @@ test "a projection that sends toolbox leaves out the tools it replaces and the o
     var projection = try buildModelToolProjectionForSet(alloc, set, .{});
     defer projection.deinit(alloc);
     try expectContainsName(projection.advertised_names, "toolbox");
-    for ([_][]const u8{ "capability_search", "mcp_select_tool", "skill", "install_skill" }) |name| {
-        try expectNotContainsName(projection.advertised_names, name);
-    }
+    try expectNotContainsName(projection.advertised_names, "install_skill");
+}
+
+test "with toolbox denied, the tools behind it stay out too" {
+    const alloc = std.testing.allocator;
+    const tools = test_all_tools ++ [_]tool_dispatch.Tool{test_toolbox};
+    const order = test_order ++ [_][]const u8{"toolbox"};
+    const set = tool_set_contract.ToolSet{
+        .registry = .{ .tools = &tools },
+        .order = &order,
+        .read_only_tool_names = test_read_only_names[0..],
+    };
+    var rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("toolbox"), .pattern = @constCast("*"), .action = .deny },
+    };
+    var projection = try buildModelToolProjectionForSet(alloc, set, .{ .permission_rules = .{ .rules = &rules } });
+    defer projection.deinit(alloc);
+    try expectNotContainsName(projection.advertised_names, "toolbox");
+    try expectNotContainsName(projection.advertised_names, "install_skill");
+    try expectContainsName(projection.advertised_names, "read_file");
 }
 
 test "subagent and shell selection follow host capability" {

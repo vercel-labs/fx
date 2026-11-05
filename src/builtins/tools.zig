@@ -5,7 +5,6 @@ const builtin_gateway = @import("gateway.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_projection = @import("../core/tooling/tool_projection.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
-const tool_mcp_dispatch = @import("../core/tooling/tool_mcp_dispatch.zig");
 const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const tool_specs = @import("../core/tooling/tool_specs.zig");
 const types = @import("../core/shared/types.zig");
@@ -24,8 +23,6 @@ const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
 const shell_impl = @import("../tools/shell/shell.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
-const skill_impl = @import("../tools/skills/skill.zig");
-const capability_search_impl = @import("../tools/capabilities/capability_search.zig");
 const toolbox_impl = @import("../tools/capabilities/toolbox.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
 const web_search_impl = @import("../tools/web/search.zig");
@@ -123,8 +120,6 @@ const shell_process_properties = [_]model_tool_schema.Property{
     shell_properties[11],
 };
 
-const skill_description =
-    "Load an installed skill's instructions, or one of its files. Paths a skill mentions are relative to the skill, not the workspace.";
 pub const toolbox = ToolSpec{
     .name = "toolbox",
     // Opening and searching are fx's own work; a run shows as the tool it
@@ -165,12 +160,8 @@ pub const toolbox = ToolSpec{
 };
 const toolbox_description =
     "Open, run, or search the skills, MCP servers, and tools in the toolbox list. Pass exactly one of open, run, or search.";
-const capability_search_description =
-    "Search installed skills and configured MCP tools for a capability. Matching MCP tools become callable on your next step.";
 const install_skill_description =
     "Install a skill into fx's skill storage when the user asks. Pass the source as given; fx checks it.";
-const mcp_select_tool_description =
-    "Make a configured MCP tool callable on your next step. Pass its exact name, such as mcp_server_tool.";
 const ask_user_question_description = std.fmt.comptimePrint(
     "Ask the user 1-{d} multiple-choice questions when a decision blocks you, such as a preference the workspace cannot answer.",
     .{question_answer.max_questions},
@@ -500,70 +491,6 @@ pub fn shellProcessOnlySpec() ToolSpec {
     return shell_process_only;
 }
 
-pub const capability_search = ToolSpec{
-    .name = "capability_search",
-    .internal = true,
-    .description = capability_search_description,
-    .model_schema = .{
-        .name = "capability_search",
-        .description = capability_search_description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "query", .json_type = .string, .description = "What you need to do." },
-                .{ .name = "server", .json_type = .string, .description = "Limit to one MCP server." },
-            },
-            .required = &.{"query"},
-            .additional_properties = false,
-        },
-    },
-    .executor_kind = .capability_search,
-    .activity_kind = .read,
-    .requires_approval = false,
-    .action_label = "Searching capabilities",
-    .completed_action_label = "Searched capabilities",
-    .label_arg_kind = .query,
-    .label_arg_default = "capabilities",
-    .presentation_fn = capability_search_impl.presentation,
-    .permission_target_kind = .none,
-    .decode = capability_search_impl.decode,
-    .validate = capability_search_impl.validate,
-    .call = capability_search_impl.call,
-    .reads_only_fn = capability_search_impl.readsOnly,
-    .irreversible_fn = capability_search_impl.isIrreversible,
-};
-
-pub const skill = ToolSpec{
-    .name = "skill",
-    .description = skill_description,
-    .model_schema = .{
-        .name = "skill",
-        .description = skill_description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "location", .json_type = .string, .description = "The skill's location from the skill list." },
-                .{ .name = "resource", .json_type = .string, .description = "A file inside the skill, such as template.md. Omit for SKILL.md." },
-            },
-            .required = &.{"location"},
-            .additional_properties = false,
-        },
-    },
-    .executor_kind = .skill,
-    .activity_kind = .read,
-    .requires_approval = false,
-    .action_label = "Loading skill",
-    .completed_action_label = "Loaded skill",
-    .label_arg_kind = .name,
-    .label_arg_default = "skill",
-    .presentation_fn = skill_impl.presentation,
-    .permission_target_kind = .none,
-    .decode = skill_impl.decode,
-    .prepare_skill_call_fn = skill_impl.prepare,
-    .validate = skill_impl.validate,
-    .call = skill_impl.call,
-    .reads_only_fn = skill_impl.readsOnly,
-    .irreversible_fn = skill_impl.isIrreversible,
-};
-
 pub const install_skill = ToolSpec{
     .name = "install_skill",
     .description = install_skill_description,
@@ -623,35 +550,6 @@ pub const subagent = ToolSpec{
     .runtime_provider = .subagent,
     .reads_only_fn = subagent_impl.readsOnly,
     .irreversible_fn = subagent_impl.isIrreversible,
-};
-
-pub const mcp_select_tool = ToolSpec{
-    .name = "mcp_select_tool",
-    .internal = true,
-    .description = mcp_select_tool_description,
-    .model_schema = .{
-        .name = "mcp_select_tool",
-        .description = mcp_select_tool_description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "name", .json_type = .string },
-            },
-            .required = &.{"name"},
-        },
-    },
-    .executor_kind = .mcp_select_tool,
-    .activity_kind = .read,
-    .requires_approval = false,
-    .action_label = "Selecting MCP tool",
-    .completed_action_label = "Selected MCP tool",
-    .label_arg_kind = .name,
-    .label_arg_default = "dynamic tool",
-    .permission_target_kind = .none,
-    .decode = tool_mcp_dispatch.decodeSelect,
-    .validate = tool_mcp_dispatch.validate,
-    .call = tool_mcp_dispatch.callSelect,
-    .reads_only_fn = tool_mcp_dispatch.readsOnly,
-    .irreversible_fn = tool_mcp_dispatch.isIrreversible,
 };
 
 pub const ask_user_question = ToolSpec{
@@ -779,11 +677,8 @@ pub const all = [_]tool_dispatch.Tool{
     web_fetch,
     web_search,
     shell,
-    capability_search,
-    skill,
     install_skill,
     subagent,
-    mcp_select_tool,
     ask_user_question,
     vision,
     read_tool_result,
@@ -941,9 +836,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "7819a5016d06418801e925e5982a46ea8b6db4fe4d31cdce288d25a91484de8f"
+            "82119600a092fa7631fc74c58be9e88f6a83b277631e610073aeb864abbb4300"
         else
-            "91c31d1f55bd1796fab50a19618db3727a710c76f020c61975e69086b732fc87",
+            "c7872f23462ef18ab5532669ed43b3bc804dd21a26ddeef5d37540f31d824215",
         &actual_hex,
     );
 }
@@ -1001,11 +896,8 @@ test "built-in tools register exact active local order" {
         "web_fetch",
         "web_search",
         "shell",
-        "capability_search",
-        "skill",
         "install_skill",
         "subagent",
-        "mcp_select_tool",
         "ask_user_question",
         "vision",
         "read_tool_result",
@@ -1137,7 +1029,10 @@ test "built-in tool lookup and metadata use registered defaults" {
     try std.testing.expectEqual(types.ToolActivityKind.command, toolActivityKind("shell"));
     try std.testing.expect(toolRequiresApproval("shell"));
     try std.testing.expect(toolHasPermissionContract("shell"));
-    try std.testing.expect(lookup("capability_search") != null);
+    // toolbox opens skills and searches; these aren't tools.
+    try std.testing.expect(lookup("capability_search") == null);
+    try std.testing.expect(lookup("skill") == null);
+    try std.testing.expect(lookup("mcp_select_tool") == null);
     try std.testing.expect(lookup("memory") == null);
     try std.testing.expect(lookup("skill_search") == null);
     try std.testing.expect(lookup("mcp_search_tools") == null);
@@ -1357,32 +1252,6 @@ test "built-in provider advertisements declare provider execution" {
     }
 }
 
-test "built-in skill owns product metadata schema and callbacks" {
-    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, skill);
-    defer std.testing.allocator.free(schema_json);
-
-    try std.testing.expectEqualStrings("skill", skill.name);
-    try std.testing.expect(std.mem.find(u8, skill.description, "relative to the skill, not the workspace") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"location\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"resource\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"offset\":{\"type\":\"integer\"") == null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"location\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"name\",\"location\"]") == null);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.skill, skill.executor_kind);
-    try std.testing.expectEqual(types.ToolActivityKind.read, skill.activity_kind);
-    try std.testing.expect(!skill.requires_approval);
-    try std.testing.expectEqual(tool_dispatch.LabelArgKind.name, skill.label_arg_kind);
-    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, skill.permission_target_kind);
-    try std.testing.expectEqualStrings("Loading skill", skill.action_label);
-    try std.testing.expectEqualStrings("Loaded skill", skill.completed_action_label);
-    try std.testing.expect(skill.presentation_fn == skill_impl.presentation);
-    try std.testing.expect(skill.decode == skill_impl.decode);
-    try std.testing.expect(skill.validate.? == skill_impl.validate);
-    try std.testing.expect(skill.call == skill_impl.call);
-    try std.testing.expect(skill.reads_only_fn == skill_impl.readsOnly);
-    try std.testing.expect(skill.irreversible_fn == skill_impl.isIrreversible);
-}
-
 test "built-in subagent owns product metadata schema and callbacks" {
     const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, subagent);
     defer std.testing.allocator.free(schema_json);
@@ -1493,56 +1362,6 @@ test "built-in install_skill owns product metadata and schema" {
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, install_skill.permission_target_kind);
     try std.testing.expectEqualStrings("Installing skill", install_skill.action_label);
     try std.testing.expectEqualStrings("Installed skill", install_skill.completed_action_label);
-}
-
-test "built-in capability_search owns unified bounded metadata schema and callbacks" {
-    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, capability_search);
-    defer std.testing.allocator.free(schema_json);
-
-    try std.testing.expectEqualStrings("capability_search", capability_search.name);
-    try std.testing.expect(std.mem.find(u8, capability_search.description, "configured MCP tools") != null);
-    try std.testing.expect(std.mem.find(u8, capability_search.description, "callable on your next step") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"server\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"kind\"") == null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"limit\"") == null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"cursor\"") == null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
-    try std.testing.expect(capability_search.model_visible);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.capability_search, capability_search.executor_kind);
-    try std.testing.expectEqual(types.ToolActivityKind.read, capability_search.activity_kind);
-    try std.testing.expect(!capability_search.requires_approval);
-    try std.testing.expectEqual(tool_dispatch.LabelArgKind.query, capability_search.label_arg_kind);
-    try std.testing.expect(capability_search.presentation_fn.? == capability_search_impl.presentation);
-    try std.testing.expect(capability_search.decode == capability_search_impl.decode);
-    try std.testing.expect(capability_search.call == capability_search_impl.call);
-    try std.testing.expect(capability_search.reads_only_fn == capability_search_impl.readsOnly);
-}
-
-test "built-in mcp_select_tool owns product metadata schema and callbacks" {
-    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, mcp_select_tool);
-    defer std.testing.allocator.free(schema_json);
-
-    try std.testing.expectEqualStrings("mcp_select_tool", mcp_select_tool.name);
-    try std.testing.expectEqualStrings(mcp_select_tool_description, mcp_select_tool.description);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"name\":\"mcp_select_tool\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"name\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"name\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "callable on your next step") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "mcp_search_tools") == null);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.mcp_select_tool, mcp_select_tool.executor_kind);
-    try std.testing.expectEqual(types.ToolActivityKind.read, mcp_select_tool.activity_kind);
-    try std.testing.expect(!mcp_select_tool.requires_approval);
-    try std.testing.expectEqual(tool_dispatch.LabelArgKind.name, mcp_select_tool.label_arg_kind);
-    try std.testing.expectEqualStrings("dynamic tool", mcp_select_tool.label_arg_default);
-    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, mcp_select_tool.permission_target_kind);
-    try std.testing.expectEqualStrings("Selecting MCP tool", mcp_select_tool.action_label);
-    try std.testing.expectEqualStrings("Selected MCP tool", mcp_select_tool.completed_action_label);
-    try std.testing.expect(mcp_select_tool.decode == tool_mcp_dispatch.decodeSelect);
-    try std.testing.expect(mcp_select_tool.validate.? == tool_mcp_dispatch.validate);
-    try std.testing.expect(mcp_select_tool.call == tool_mcp_dispatch.callSelect);
-    try std.testing.expect(mcp_select_tool.reads_only_fn == tool_mcp_dispatch.readsOnly);
-    try std.testing.expect(mcp_select_tool.irreversible_fn == tool_mcp_dispatch.isIrreversible);
 }
 
 test "built-in ask_user_question owns product metadata schema and callbacks" {
@@ -1800,32 +1619,6 @@ test "built-in read-only tool set matches plan inspection tools" {
     }
     try std.testing.expect(!isReadOnlyToolName("write_file"));
     try std.testing.expect(!isReadOnlyToolName("run_command"));
-}
-
-test "built-in skill registry order follows shell" {
-    var shell_pos: ?usize = null;
-    var skill_pos: ?usize = null;
-    for (all, 0..) |tool, index| {
-        if (std.mem.eql(u8, tool.name, "shell")) shell_pos = index;
-        if (std.mem.eql(u8, tool.name, "skill")) skill_pos = index;
-    }
-
-    try std.testing.expect(shell_pos != null);
-    try std.testing.expect(skill_pos != null);
-    try std.testing.expect(shell_pos.? < skill_pos.?);
-}
-
-test "built-in install_skill registry order follows skill" {
-    var skill_pos: ?usize = null;
-    var install_skill_pos: ?usize = null;
-    for (all, 0..) |tool, index| {
-        if (std.mem.eql(u8, tool.name, "skill")) skill_pos = index;
-        if (std.mem.eql(u8, tool.name, "install_skill")) install_skill_pos = index;
-    }
-
-    try std.testing.expect(skill_pos != null);
-    try std.testing.expect(install_skill_pos != null);
-    try std.testing.expect(skill_pos.? < install_skill_pos.?);
 }
 
 test "built-in subagent registry order follows install_skill" {

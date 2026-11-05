@@ -495,7 +495,6 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
         .snapshot_mcp_definition = snapshotMcpDefinition,
-        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .resolve_unselected_mcp_tool = resolveUnselectedMcpTool,
         .request_tool_permission = requestToolPermission,
@@ -844,11 +843,6 @@ fn resolveUnselectedMcpTool(raw: *anyopaque, arena: Allocator, name: []const u8)
 fn checkToolAvailability(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !?[]const u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.checkToolAvailability(context.toolContext(), arena, call);
-}
-
-fn prepareSkillCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    return tool_runtime.prepareSkillCall(context.toolContext(), arena, call, locations);
 }
 
 fn admissionContext(

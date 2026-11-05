@@ -19,6 +19,7 @@ const capability_retrieval = @import("../../core/tooling/capability_retrieval.zi
 const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
 const capability_search_impl = @import("capability_search.zig");
 const skill_impl = @import("../skills/skill.zig");
+const skill_invocation = @import("../../core/skills/skill_invocation.zig");
 const skill_search = @import("../skills/skill_search.zig");
 
 const Allocator = std.mem.Allocator;
@@ -144,7 +145,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
 /// A skill location: as the menu gives a skill whose name another shares,
 /// or the path toolbox search reports.
 fn isSkillLocation(target: []const u8) bool {
-    return std.mem.startsWith(u8, target, "skill:") or std.fs.path.isAbsolute(target);
+    return std.mem.startsWith(u8, target, "skill:") or std.Io.Dir.path.isAbsolute(target);
 }
 
 fn hasSkill(ctx: tool_dispatch.DispatchContext, name: []const u8) bool {
@@ -159,7 +160,7 @@ fn hasSkill(ctx: tool_dispatch.DispatchContext, name: []const u8) bool {
 /// A skill's instructions, an MCP server's tools, or one MCP tool's
 /// arguments, in that order of lookup.
 fn open(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    if (hasSkill(ctx, input.target)) return openSkill(ctx, input);
+    if (hasSkill(ctx, input.target)) return openSkillOrNothing(ctx, input);
     if (ctx.toolbox_run) |runner| {
         var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_state.deinit();
@@ -184,7 +185,7 @@ fn open(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.D
         const arena = arena_state.allocator();
         var cancel = std.atomic.Value(bool).init(false);
         const flag = ctx.cancel_flag orelse &cancel;
-        const listed = capability.lookup(arena, .{ .list = input.target }, flag) catch |err| return lookupError(ctx, err);
+        const listed = capability.lookup(arena, .{ .list = input.target }, flag) catch |err| return lookupError(ctx, input.target, err);
         if (listed.status == .ok) {
             return .{ .success = try ctx.allocator.print(
                 "Tools of MCP server {s}, one per line with what it does:\n{s}\n" ++
@@ -193,11 +194,18 @@ fn open(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.D
             ) };
         }
     }
-    // A skill installed since the turn started isn't in the catalog yet; the
-    // skill tool finds it.
-    const fallback = try openSkill(ctx, input);
-    if (fallback != .failure) return fallback;
-    fallback.deinit(ctx.allocator);
+    // A skill installed since the turn started isn't in the catalog yet;
+    // reading it by name finds it.
+    return openSkillOrNothing(ctx, input);
+}
+
+/// A skill's instructions. A skill fx found and couldn't read, such as a
+/// name two skills share, says why; a name or location no skill has gets the
+/// menu's next step, by the name the model gave.
+fn openSkillOrNothing(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const result = try openSkill(ctx, input);
+    if (result != .failure or !skill_invocation.isNotFound(result.failure)) return result;
+    result.deinit(ctx.allocator);
     return .{ .failure = try ctx.allocator.print(
         "Nothing named {s} is in the toolbox menu. Use toolbox search to find it.",
         .{input.target},
@@ -268,7 +276,10 @@ fn run(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.Di
     const why = runner.explain(arena_state.allocator(), input.target) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Cancelled => return error.Cancelled,
-        else => return .{ .failure = try ctx.allocator.print("{s} didn't run: {s}", .{ input.target, @errorName(err) }) },
+        else => return .{ .failure = try ctx.allocator.print(
+            "{s} didn't run ({s}). Open it with toolbox to check its name and arguments, then run it again.",
+            .{ input.target, @errorName(err) },
+        ) },
     };
     return .{ .failure = try ctx.allocator.dupe(u8, why) };
 }
@@ -343,11 +354,16 @@ fn withBuiltins(alloc: Allocator, arena: Allocator, result: []const u8, matches:
     return try out.toOwnedSlice();
 }
 
-fn lookupError(ctx: tool_dispatch.DispatchContext, err: anyerror) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+/// A failed MCP lookup of `target`, with its cause and what the model can
+/// do next.
+fn lookupError(ctx: tool_dispatch.DispatchContext, target: []const u8, err: anyerror) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Cancelled => error.Cancelled,
-        else => .{ .failure = try ctx.allocator.print("toolbox lookup failed: {s}", .{@errorName(err)}) },
+        else => .{ .failure = try ctx.allocator.print(
+            "fx couldn't look up {s} ({s}). Its MCP server may be starting, stopped, or signed out. Find it with toolbox search, or ask the user to check it with fx mcp.",
+            .{ target, @errorName(err) },
+        ) },
     };
 }
 
@@ -463,4 +479,57 @@ test "a search's result gains the built-in tools behind toolbox it found" {
     try std.testing.expect(std.mem.find(u8, merged, "\"total_matches\":{\"skills\":0,\"mcp_tools\":0,\"tools\":1}") != null);
     try std.testing.expect(std.mem.find(u8, merged, "no_match") == null);
     try std.testing.expectEqual(@as(?[]u8, null), try withBuiltins(alloc, arena_state.allocator(), "not json", &.{}));
+}
+
+test "a failed toolbox open says why and what to do next, by the name it was given" {
+    const Failing = struct {
+        fn authorize(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!mcp_call_capability.Authorization {
+            return error.TestUnexpectedCall;
+        }
+        fn call(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: @FieldType(mcp_call_capability.Authorization, "allow"), _: *std.atomic.Value(bool)) anyerror!mcp_call_capability.CallOutcome {
+            return error.TestUnexpectedCall;
+        }
+        fn lookup(_: *anyopaque, _: Allocator, _: mcp_call_capability.Lookup, _: *std.atomic.Value(bool)) anyerror!mcp_call_capability.CallOutcome {
+            return error.ServerUnavailable;
+        }
+    };
+    var context: u8 = 0;
+    const with_mcp: tool_dispatch.DispatchContext = .{
+        .allocator = std.testing.allocator,
+        .mcp_call_capability = .{ .context = &context, .authorize_fn = Failing.authorize, .call_fn = Failing.call, .lookup_fn = Failing.lookup },
+    };
+    const Case = struct { ctx: tool_dispatch.DispatchContext, args: []const u8, says: []const []const u8 };
+    const cases = [_]Case{
+        // The server's lookup fails: its cause, and where to go next.
+        .{ .ctx = with_mcp, .args = "{\"open\":\"linear\"}", .says = &.{ "linear", "ServerUnavailable", "toolbox search", "fx mcp" } },
+        // A path no skill has is named as given, not as an empty skill.
+        .{ .ctx = .{ .allocator = std.testing.allocator }, .args = "{\"open\":\"/nowhere/skill\"}", .says = &.{ "Nothing named /nowhere/skill", "toolbox search" } },
+    };
+    for (cases) |case| {
+        const decoded = try decodeForTest(case.args);
+        const input = switch (decoded) {
+            .input => |value| value,
+            .failure => |reason| {
+                std.testing.allocator.free(reason);
+                return error.TestUnexpectedFailure;
+            },
+        };
+        defer input.deinit(std.testing.allocator);
+        const result = try open(case.ctx, input.as(Input));
+        defer result.deinit(std.testing.allocator);
+        const text = switch (result) {
+            .failure => |reason| reason,
+            else => return error.TestExpectedFailure,
+        };
+        if (std.mem.find(u8, text, "Skill \"\"") != null) {
+            std.debug.print("an empty skill name in: {s}\n", .{text});
+            return error.TestExpectedEqual;
+        }
+        for (case.says) |part| {
+            if (std.mem.find(u8, text, part) == null) {
+                std.debug.print("missing {s} in: {s}\n", .{ part, text });
+                return error.TestExpectedEqual;
+            }
+        }
+    }
 }

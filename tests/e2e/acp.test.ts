@@ -8978,7 +8978,7 @@ describe("acp: model-independent", () => {
           expect(available).not.toContain("Omitted skills:");
           // The menu says once that it shortened to fit; the kept menu
           // doesn't say it again.
-          expect(JSON.stringify(result.messages).includes("skill catalog shortened to fit the toolbox menu")).toBe(index === 0);
+          expect(JSON.stringify(result.messages).includes("toolbox menu shortened to fit skill_catalog_bytes")).toBe(index === 0);
           catalogs.push(available.replace(/skill:[0-9a-f]{16}:/g, "skill:turn:"));
         }
         expect(gateway.requests).toHaveLength(2);

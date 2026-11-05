@@ -45,7 +45,7 @@ fn dynamicTool(name: []const u8) tool_dispatch.Tool {
             .name = name,
             .description = "Selected dynamic MCP tool.",
         },
-        .executor_kind = .mcp_select_tool,
+        .executor_kind = .mcp_tool,
         .activity_kind = .command,
         .decode = decode,
         .call = call,

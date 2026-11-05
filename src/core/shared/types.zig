@@ -963,6 +963,14 @@ pub const McpToolBinding = struct {
     }
 };
 
+/// A `toolbox` open or search as the tool it replaced: `skill` with the
+/// skill's name, `mcp_select_tool` with the MCP tool or server, or
+/// `capability_search` with `*`.
+pub const ToolboxLookup = struct {
+    permission: []const u8,
+    target: []const u8,
+};
+
 pub const ToolCall = struct {
     id: []const u8,
     name: []const u8,
@@ -975,8 +983,6 @@ pub const ToolCall = struct {
     provider_result: ?[]const u8 = null,
     final_identity: FinalToolIdentity = .valid,
     provenance: ToolExecutionProvenance = .fx_local,
-    /// Borrowed only for this action. Copies and durable/provider encodings omit it.
-    resolved_skill: ?*const skill_contract.PreparedSkill = null,
     /// What this action works on, resolved from earlier results, such as the
     /// command whose saved output a `read_tool_result` call reads. Borrowed
     /// only for this action. Copies and durable/provider encodings omit it.
@@ -986,6 +992,11 @@ pub const ToolCall = struct {
     /// back under that name. Borrowed only for this action. Copies and
     /// durable/provider encodings omit it.
     carried_by: ?[]const u8 = null,
+    /// What this call stands for when it is a `toolbox` open or search, set
+    /// before admission so the permission rules and a subagent's profile
+    /// decide it as the tool it replaced. Borrowed only for this action.
+    /// Copies and durable/provider encodings omit it.
+    toolbox_lookup: ?ToolboxLookup = null,
 
     /// The name the model called, which this call's result goes back under.
     pub fn calledName(self: ToolCall) []const u8 {
@@ -3462,17 +3473,16 @@ test "dupeToolCall preserves argument integrity" {
 }
 
 test "dupeToolCall drops action scoped bindings" {
-    const skill: skill_contract.PreparedSkill = .{ .skill = .{ .name = "workflow", .description = "", .path = "/skills/workflow", .source = .global_fx } };
     const source: ToolCall = .{
-        .id = "skill",
-        .name = "skill",
-        .arguments_json = "{\"location\":\"/skills/workflow\"}",
-        .resolved_skill = &skill,
+        .id = "open",
+        .name = "toolbox",
+        .arguments_json = "{\"open\":\"/skills/workflow\"}",
+        .toolbox_lookup = .{ .permission = "skill", .target = "workflow" },
         .resolved_display_target = "more output from zig build test",
     };
     const copy = try dupeToolCall(std.testing.allocator, source);
     defer freeToolCall(std.testing.allocator, copy);
-    try std.testing.expect(copy.resolved_skill == null);
+    try std.testing.expect(copy.toolbox_lookup == null);
     try std.testing.expect(copy.resolved_display_target == null);
     try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
 }

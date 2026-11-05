@@ -25,7 +25,6 @@ pub fn isReadOnlyCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
         .read_file,
         .read_tool_result,
         .grep_files,
-        .skill,
         .web_fetch,
         .web_search,
         => tool.activity_kind == .read,
@@ -740,25 +739,10 @@ test "parallel classifier admits approval-bearing web fetch read groups" {
     try std.testing.expectEqual(@as(usize, 2), parallelReadOnlyPrefixLen(registry, &calls));
 }
 
-test "parallel classifier admits installed skill reads" {
-    const builtin_tools = @import("../../../builtins/tools.zig");
-    const tools = [_]tool_dispatch.Tool{builtin_tools.skill};
-    const registry = tool_dispatch.Registry{ .tools = &tools };
-    const calls = [_]ToolCall{toolCall(
-        "skill_1",
-        "skill",
-        "{\"name\":\"demo\",\"location\":\"/tmp/demo\",\"resource\":\"SKILL.md\"}",
-    )};
-
-    try std.testing.expectEqual(@as(usize, 1), parallelReadOnlyPrefixLen(registry, &calls));
-    try std.testing.expect(isReadOnlyCall(registry, calls[0]));
-}
-
 test "parallel classifier rejects prompts approvals dynamic tools and mutations" {
     const builtin_tools = @import("../../../builtins/tools.zig");
     const tools = [_]tool_dispatch.Tool{
         builtin_tools.ask_user_question,
-        builtin_tools.mcp_select_tool,
         builtin_tools.subagent,
         builtin_tools.install_skill,
         builtin_tools.shell,
@@ -767,7 +751,6 @@ test "parallel classifier rejects prompts approvals dynamic tools and mutations"
     const registry = tool_dispatch.Registry{ .tools = &tools };
     const cases = [_]ToolCall{
         toolCall("ask_1", "ask_user_question", "{\"questions\":[]}"),
-        toolCall("mcp_1", "mcp_select_tool", "{\"name\":\"tool\"}"),
         toolCall("subagent_1", "subagent", "{\"command\":{\"inspect\":{\"id\":\"01J00000000000000000000000\",\"sections\":[\"status\"]}}}"),
         toolCall("skill_1", "install_skill", "{\"source\":\"repo\"}"),
         toolCall("browser_1", "browser_snapshot", "{}"),

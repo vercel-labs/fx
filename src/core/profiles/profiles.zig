@@ -255,6 +255,18 @@ pub fn allowsTool(profile: *const Profile, tool: []const u8) bool {
             if (listAllows(tools, name, false)) return true;
         }
     }
+    // Opening a skill, opening an MCP tool, and searching are each named for
+    // the tool they replaced; a profile that lists toolbox itself allows all
+    // three, apart from one it leaves out by name.
+    if (toolbox.isReplaced(tool)) return !listDenies(tools, tool) and listAllows(tools, toolbox.tool_name, false);
+    return false;
+}
+
+/// Whether `entries` leaves `name` out with a `!name` entry.
+fn listDenies(entries: []const []const u8, name: []const u8) bool {
+    for (entries) |entry| {
+        if (entry.len > 1 and entry[0] == '!' and std.mem.eql(u8, entry[1..], name)) return true;
+    }
     return false;
 }
 
@@ -691,6 +703,38 @@ test "a profile's * covers every tool, subagent included, and only !subagent lea
     , "");
     try testing.expect(!setsTools(&unset) and !setsMcpServers(&unset));
     try testing.expect(allowsTool(&unset, "shell"));
+}
+
+test "a profile decides toolbox's open and search as the tools they replaced" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Written for the old tools: toolbox comes with what they gave, no more.
+    const old = try testParse(arena, .home,
+        \\{"description": "Old", "tools": ["read_file", "mcp_select_tool"]}
+    , "");
+    try testing.expect(allowsTool(&old, "toolbox"));
+    try testing.expect(allowsTool(&old, "mcp_select_tool"));
+    try testing.expect(!allowsTool(&old, "skill"));
+    try testing.expect(!allowsTool(&old, "capability_search"));
+    // Listing toolbox, or every tool, allows all three.
+    for ([_][]const u8{
+        \\{"description": "Box", "tools": ["toolbox"]}
+        ,
+        \\{"description": "All", "tools": ["*"]}
+        ,
+        \\{"description": "Unset"}
+    }) |json| {
+        const profile = try testParse(arena, .home, json, "");
+        for (toolbox.replaced) |name| try testing.expect(allowsTool(&profile, name));
+    }
+    // A name left out stays out, even with toolbox allowed.
+    const no_skills = try testParse(arena, .home,
+        \\{"description": "No skills", "tools": ["*", "!skill"]}
+    , "");
+    try testing.expect(allowsTool(&no_skills, "toolbox"));
+    try testing.expect(!allowsTool(&no_skills, "skill"));
+    try testing.expect(allowsTool(&no_skills, "capability_search"));
 }
 
 test "a profile's prompt adds to fx's prompt, or replaces it when the profile says so" {

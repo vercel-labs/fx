@@ -3863,36 +3863,23 @@ pub fn Runtime(comptime App: type) type {
                 )
             else if (try tooling_presentation.subagentStatusLine(action_arena.allocator(), call, result.output)) |line|
                 line
-            else if (result.status == .success) success: {
-                var skill_name_buffer: [skill_contract.max_name_bytes]u8 = undefined;
-                const registry = app.toolAdvertisementSet(agent).registry;
-                const display_target = target: {
-                    const spec = registry.lookup(call.name) orelse break :target null;
-                    if (spec.prepare_skill_call_fn == null) break :target null;
-                    const args = tool_args.parseToolArgsObject(action_arena.allocator(), call.arguments_json) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => break :target null,
-                    };
-                    const presentation = tool_dispatch.presentationForArgs(spec.*, args);
-                    if (presentation.label_arg_kind != .name or
-                        tool_dispatch.presentationLabelValue(presentation, args) != null) break :target null;
-                    break :target skill_invocation.displayNameFromOutput(result.preview orelse result.output, &skill_name_buffer);
-                };
-                break :success try app.describeToolActionCompletedWithAdvertised(
+            else if (result.status == .success)
+                try app.describeToolActionCompletedWithAdvertised(
                     agent,
                     action_arena.allocator(),
                     call,
-                    display_target orelse action_target,
+                    action_target,
+                    &.{},
+                )
+            else
+                try app.describeToolActionDeniedWithAdvertised(
+                    agent,
+                    action_arena.allocator(),
+                    call,
+                    action_target,
+                    try tooling_presentation.subagentFailureLabel(action_arena.allocator(), call, result.output),
                     &.{},
                 );
-            } else try app.describeToolActionDeniedWithAdvertised(
-                agent,
-                action_arena.allocator(),
-                call,
-                action_target,
-                try tooling_presentation.subagentFailureLabel(action_arena.allocator(), call, result.output),
-                &.{},
-            );
             const formatted_action = if (outcome_decision) |decision|
                 if (decision.detail) |detail|
                     try action_arena.allocator().print(

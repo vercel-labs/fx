@@ -2014,9 +2014,9 @@ describe("gateway stream lifecycle", () => {
         }
         const compactScrollback = await tui.captureFullScrollback();
         expect(compact).not.toContain("project instruction file");
-        expect(compact).not.toContain("skill catalog shortened");
+        expect(compact).not.toContain("toolbox menu shortened");
         expect(compactScrollback).not.toContain("project instruction file");
-        expect(compactScrollback).not.toContain("skill catalog shortened");
+        expect(compactScrollback).not.toContain("toolbox menu shortened");
         expect(gateway.requestCount()).toBe(1);
         expect(promptText(gateway.requests[0]!.body)).toContain(
           "project_instruction_file_bytes",
@@ -2026,11 +2026,11 @@ describe("gateway stream lifecycle", () => {
         const full = await tui.waitForPane(
           (text) =>
             text.includes("project instruction file") &&
-            text.includes("skill catalog shortened"),
+            text.includes("toolbox menu shortened"),
           15_000,
         );
         expect(full.indexOf("project instruction file")).toBeLessThan(
-          full.indexOf("skill catalog shortened"),
+          full.indexOf("toolbox menu shortened"),
         );
         expect(full).toContain("! context:");
         expect(full).not.toContain("[context]");
@@ -2045,11 +2045,11 @@ describe("gateway stream lifecycle", () => {
           (text) =>
             text.includes("CONTEXT_LIMIT_FIRST_COMPLETE") &&
             !text.includes("project instruction file") &&
-            !text.includes("skill catalog shortened"),
+            !text.includes("toolbox menu shortened"),
           15_000,
         );
         expect(restored).not.toContain("project instruction file");
-        expect(restored).not.toContain("skill catalog shortened");
+        expect(restored).not.toContain("toolbox menu shortened");
 
         await tui.sendText("verify the bounded project context again");
         await tui.waitForText("CONTEXT_LIMIT_SECOND_COMPLETE", 30_000);
@@ -2059,17 +2059,17 @@ describe("gateway stream lifecycle", () => {
         const resizedCompact = await tui.capturePane();
         expect(resizedCompact).toContain("CONTEXT_LIMIT_SECOND_COMPLETE");
         expect(resizedCompact).not.toContain("project instruction file");
-        expect(resizedCompact).not.toContain("skill catalog shortened");
+        expect(resizedCompact).not.toContain("toolbox menu shortened");
 
         await tui.sendKeys("C-o");
         const finalFull = await tui.waitForPane(
           (text) =>
             text.includes("project instruction file") &&
-            text.includes("skill catalog shortened"),
+            text.includes("toolbox menu shortened"),
           15_000,
         );
         expect(finalFull.split("project instruction file").length - 1).toBe(1);
-        expect(finalFull.split("skill catalog shortened").length - 1).toBe(1);
+        expect(finalFull.split("toolbox menu shortened").length - 1).toBe(1);
         await tui.sendKeys("C-o");
 
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2092,7 +2092,7 @@ describe("gateway stream lifecycle", () => {
         const replay = replayFrames.stdout.toString();
         expect(replay).toContain("CONTEXT_LIMIT_FIRST_COMPLETE");
         expect(replay).toContain("CONTEXT_LIMIT_SECOND_COMPLETE");
-        expect(replay).toContain("skill catalog shortened");
+        expect(replay).toContain("toolbox menu shortened");
       } finally {
         if (tui) await tui.kill();
         gateway.stop();

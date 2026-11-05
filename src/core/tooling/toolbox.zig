@@ -12,6 +12,9 @@ const std = @import("std");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const mcp_call_capability = @import("mcp_call_capability.zig");
+const core_types = @import("../shared/types.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
+const tool_dispatch = @import("tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -31,15 +34,64 @@ pub const replaced = [_][]const u8{ "capability_search", "mcp_select_tool", "ski
 /// sending them, unless settings say otherwise.
 pub const default_behind = [_][]const u8{"install_skill"};
 
-/// The tool a `toolbox {run}` call runs, for reports that name what ran, or
-/// null for any other toolbox call. `buffer` holds the parse.
-pub fn runTarget(arguments_json: []const u8, buffer: []u8) ?[]const u8 {
-    var fba = std.heap.FixedBufferAllocator.init(buffer);
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), arguments_json, .{}) catch return null;
+/// What a toolbox open or search stands for, so the permission rules and a
+/// subagent's profile decide it as the tool it replaced: reading a skill is
+/// `skill` with the skill's name, opening an MCP server or tool is
+/// `mcp_select_tool` with its name, and searching is `capability_search`.
+/// Null for a run, which is admitted as the call it carries, for opening a
+/// built-in tool's definition, and for arguments that don't parse. A name
+/// that is neither a skill in `locations`, an MCP tool's, nor one of the
+/// turn's `servers` is taken as a skill's, since open reads it as a skill
+/// installed since the turn began. The result borrows `arena`.
+pub fn lookupOf(
+    arena: Allocator,
+    call: core_types.ToolCall,
+    locations: ?*const skill_contract.Locations,
+    servers: []const []const u8,
+    registry: tool_dispatch.Registry,
+) Allocator.Error!?core_types.ToolboxLookup {
+    if (!std.mem.eql(u8, call.name, tool_name)) return null;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     if (parsed != .object) return null;
-    const value = parsed.object.get("run") orelse return null;
-    if (value != .string or value.string.len == 0) return null;
-    return value.string;
+    if (parsed.object.get("search") != null) return .{ .permission = "capability_search", .target = "*" };
+    const opened = parsed.object.get("open") orelse return null;
+    if (opened != .string or opened.string.len == 0) return null;
+    const target = opened.string;
+    if (registry.lookup(target) != null) return null;
+    if (std.mem.startsWith(u8, target, "mcp_")) return .{ .permission = "mcp_select_tool", .target = target };
+    if (try skillNamed(arena, locations, target)) |skill| return .{ .permission = "skill", .target = skill };
+    for (servers) |server| {
+        if (std.mem.eql(u8, server, target)) return .{ .permission = "mcp_select_tool", .target = target };
+    }
+    return .{ .permission = "skill", .target = target };
+}
+
+/// The name of the skill `target` opens, a name or a location, or null when
+/// it names no skill. A location fx can't resolve keeps its own text, so a
+/// rule for every skill still holds.
+fn skillNamed(arena: Allocator, locations: ?*const skill_contract.Locations, target: []const u8) Allocator.Error!?[]const u8 {
+    const catalog = if (locations) |value| value.* else skill_contract.Locations{};
+    const is_location = std.mem.startsWith(u8, target, "skill:") or std.Io.Dir.path.isAbsolute(target);
+    if (!is_location) {
+        for (catalog.skills) |skill| if (std.mem.eql(u8, skill.name, target)) return skill.name;
+        return null;
+    }
+    const path = catalog.resolve(arena, target) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return target,
+    };
+    for (catalog.skills) |skill| if (std.mem.eql(u8, skill.path, path)) return skill.name;
+    return target;
+}
+
+/// Whether toolbox runs `tool` for the model. A host's own tool is called
+/// directly instead: a durable session reruns it by its name after a crash,
+/// under the host's rerun policy.
+pub fn runs(tool: tool_dispatch.Tool) bool {
+    return tool.executor_kind != .host;
 }
 
 pub const Carried = struct { name: []const u8, arguments_json: []const u8 };
@@ -61,6 +113,43 @@ pub fn carriedCall(arena: Allocator, name: []const u8, arguments_json: []const u
         std.json.Stringify.value(value, .{}, &arguments.writer) catch return error.OutOfMemory;
     } else arguments.writer.writeAll("{}") catch return error.OutOfMemory;
     return .{ .name = target.string, .arguments_json = arguments.written() };
+}
+
+test "an open or search is decided as the tool it replaced" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const registry = @import("../../builtins/tools.zig").registry;
+    // The skill's folder has another name, so a location resolves to the
+    // skill's own name, which its rules are written for.
+    const skills = [_]skill_contract.Skill{.{ .name = "workflow", .description = "", .path = "/skills/other-folder", .source = .global_fx }};
+    const locations: skill_contract.Locations = .{ .namespace = 7, .roots = &.{"/skills"}, .skills = &skills };
+    const servers = [_][]const u8{"linear"};
+    const Case = struct { arguments: []const u8, permission: ?[]const u8, target: []const u8 = "" };
+    const cases = [_]Case{
+        .{ .arguments = "{\"open\":\"workflow\"}", .permission = "skill", .target = "workflow" },
+        .{ .arguments = "{\"open\":\"/skills/other-folder\"}", .permission = "skill", .target = "workflow" },
+        .{ .arguments = "{\"open\":\"skill:0000000000000007:0/other-folder\"}", .permission = "skill", .target = "workflow" },
+        .{ .arguments = "{\"open\":\"linear\"}", .permission = "mcp_select_tool", .target = "linear" },
+        .{ .arguments = "{\"open\":\"mcp_linear_search\"}", .permission = "mcp_select_tool", .target = "mcp_linear_search" },
+        // Open reads a name it can't place as a skill installed since the
+        // turn began.
+        .{ .arguments = "{\"open\":\"installed-later\"}", .permission = "skill", .target = "installed-later" },
+        .{ .arguments = "{\"search\":\"issues\",\"server\":\"linear\"}", .permission = "capability_search", .target = "*" },
+        // A built-in tool's definition, a run, and arguments that don't
+        // parse are decided as toolbox itself or as the call a run carries.
+        .{ .arguments = "{\"open\":\"install_skill\"}", .permission = null },
+        .{ .arguments = "{\"run\":\"read_file\",\"arguments\":{}}", .permission = null },
+        .{ .arguments = "not json", .permission = null },
+    };
+    for (cases) |case| {
+        const lookup = try lookupOf(arena, .{ .id = "1", .name = tool_name, .arguments_json = case.arguments }, &locations, &servers, registry);
+        if (case.permission) |permission| {
+            try std.testing.expectEqualStrings(permission, lookup.?.permission);
+            try std.testing.expectEqualStrings(case.target, lookup.?.target);
+        } else try std.testing.expect(lookup == null);
+    }
+    try std.testing.expect(try lookupOf(arena, .{ .id = "2", .name = "read_file", .arguments_json = "{\"open\":\"workflow\"}" }, &locations, &servers, registry) == null);
 }
 
 test "a toolbox run carries the tool it names and that tool's arguments" {
@@ -123,11 +212,11 @@ pub fn renderBounded(alloc: Allocator, entries: []const Entry, limits: Limits) A
         const menu = try render(alloc, entries, current);
         if (menu.len <= bound or current.per_kind == 0) {
             const shortened = current.line_bytes != limits.line_bytes or current.per_kind != limits.per_kind;
-            if (menu.len <= max_menu_bytes) return .{ .menu = menu, .shortened = shortened };
-            // Nothing listed and still past the buffer can only be the intro;
-            // keep it within the buffer anyway.
-            alloc.free(menu);
-            return .{ .menu = try alloc.dupe(u8, intro[0..@min(intro.len, max_menu_bytes)]), .shortened = true };
+            if (menu.len <= bound) return .{ .menu = menu, .shortened = shortened };
+            // Nothing listed and still past the bound, which is then smaller
+            // than the menu's own text: keep the bound, cut on a character.
+            defer alloc.free(menu);
+            return .{ .menu = try alloc.dupe(u8, text_utils.utf8PrefixByBytes(menu, bound)), .shortened = true };
         }
         alloc.free(menu);
         if (current.line_bytes > 0) {
@@ -188,10 +277,7 @@ fn renderTo(w: *std.Io.Writer, entries: []const Entry, limits: Limits) std.Io.Wr
     }
     try w.writeAll("<toolbox>\n");
     for (sections) |section| {
-        var total: usize = 0;
-        for (entries) |entry| {
-            if (entry.kind == section.kind) total += 1;
-        }
+        const total = countOf(entries, section.kind);
         if (total == 0) continue;
         try w.print("{s}\n", .{section.title});
         var listed: usize = 0;
@@ -251,6 +337,22 @@ pub fn renderChangeNote(alloc: Allocator, entries: []const Entry) Allocator.Erro
     return out.toOwnedSlice();
 }
 
+/// How many of `entries` are of `kind`.
+fn countOf(entries: []const Entry, kind: Kind) usize {
+    var total: usize = 0;
+    for (entries) |entry| {
+        if (entry.kind == kind) total += 1;
+    }
+    return total;
+}
+
+/// The bytes `model_context_encoding.writeScalar` writes for `value`.
+fn scalarBytes(value: []const u8) std.Io.Writer.Error!usize {
+    var counter: std.Io.Writer.Discarding = .init(&.{});
+    try model_context_encoding.writeScalar(&counter.writer, value);
+    return @intCast(counter.fullCount());
+}
+
 fn renderChangeNoteTo(w: *std.Io.Writer, entries: []const Entry) std.Io.Writer.Error!void {
     if (entries.len == 0) {
         try w.writeAll("The toolbox is now empty: nothing the toolbox menu above lists can be opened or run.\n");
@@ -261,19 +363,18 @@ fn renderChangeNoteTo(w: *std.Io.Writer, entries: []const Entry) std.Io.Writer.E
     const budget = max_change_note_bytes - 512;
     var used: usize = 0;
     for (sections) |section| {
-        var total: usize = 0;
-        for (entries) |entry| {
-            if (entry.kind == section.kind) total += 1;
-        }
+        const total = countOf(entries, section.kind);
         if (total == 0) continue;
         try w.print("{s}: ", .{section.title});
         var listed: usize = 0;
         for (entries) |entry| {
             if (entry.kind != section.kind) continue;
-            if (used + entry.name.len + 2 > budget) break;
+            // A name that needs escaping takes more room than its bytes.
+            const name_bytes = try scalarBytes(entry.name);
+            if (used + name_bytes + 2 > budget) break;
             if (listed > 0) try w.writeAll(", ");
             try model_context_encoding.writeScalar(w, entry.name);
-            used += entry.name.len + 2;
+            used += name_bytes + 2;
             listed += 1;
         }
         if (total > listed) try w.print("{s}and {d} more: find them with toolbox search", .{ if (listed > 0) ", " else "", total - listed });
@@ -349,11 +450,20 @@ test "the menu lists each kind under its own title with one short line" {
     );
 }
 
-test "a run names the real tool, and nothing else does" {
-    var buffer: [4096]u8 = undefined;
-    try std.testing.expectEqualStrings("mcp_fixture_echo", runTarget("{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", &buffer).?);
-    try std.testing.expect(runTarget("{\"open\":\"fixture\"}", &buffer) == null);
-    try std.testing.expect(runTarget("not json", &buffer) == null);
+test "a run names the real tool at any size, and nothing else does" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("mcp_fixture_echo", (try carriedCall(arena, tool_name, "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}")).?.name);
+    // Arguments past any fixed buffer still name the tool that ran.
+    const padding: [64 * 1024]u8 = @splat('x');
+    const big = try arena.print("{{\"run\":\"shell\",\"arguments\":{{\"command\":\"{s}\"}}}}", .{&padding});
+    const carried = (try carriedCall(arena, tool_name, big)).?;
+    try std.testing.expectEqualStrings("shell", carried.name);
+    try std.testing.expect(carried.arguments_json.len > 64 * 1024);
+    try std.testing.expect(try carriedCall(arena, tool_name, "{\"open\":\"fixture\"}") == null);
+    try std.testing.expect(try carriedCall(arena, tool_name, "not json") == null);
+    try std.testing.expect(try carriedCall(arena, "shell", "{\"run\":\"read_file\"}") == null);
 }
 
 test "a tight budget drops descriptions before it drops a name" {
@@ -519,6 +629,15 @@ fn fuzzMenu(_: void, smith: *std.testing.Smith) anyerror!void {
     const second = try render(std.testing.allocator, entries[0..count], limits);
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
+    // The bounded menu keeps any limit, even one smaller than its own text,
+    // and the change note keeps its own, however much the names escape.
+    const max_bytes = len % 1024;
+    const bounded = try renderBounded(std.testing.allocator, entries[0..count], .{ .per_kind = limits.per_kind, .line_bytes = limits.line_bytes, .max_bytes = max_bytes });
+    defer std.testing.allocator.free(bounded.menu);
+    try std.testing.expect(bounded.menu.len <= max_bytes);
+    const note = try renderChangeNote(std.testing.allocator, entries[0..count]);
+    defer std.testing.allocator.free(note);
+    try std.testing.expect(note.len <= max_change_note_bytes);
     if (count == 0) return try std.testing.expectEqual(@as(usize, 0), first.len);
     // One opening and one closing tag, whatever the entries say.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, "<toolbox>"));
@@ -526,6 +645,31 @@ fn fuzzMenu(_: void, smith: *std.testing.Smith) anyerror!void {
     // Escaping at most multiplies each input byte by six. The fixed text is
     // the intro and, when the menu lists an MCP server, the `fx mcp call` hint.
     try std.testing.expect(first.len <= intro.len + mcp_call_hint.len + 256 + 8 * input.len);
+}
+
+test "the bounded menu keeps a limit smaller than its own text" {
+    const entries = [_]Entry{
+        .{ .kind = .skill, .name = "demo-review", .description = "Review one pull request." },
+        .{ .kind = .mcp_server, .name = "linear", .description = "" },
+    };
+    for ([_]usize{ 0, 1, 40, intro.len }) |max_bytes| {
+        const bounded = try renderBounded(std.testing.allocator, &entries, .{ .max_bytes = max_bytes });
+        defer std.testing.allocator.free(bounded.menu);
+        try std.testing.expect(bounded.menu.len <= max_bytes);
+        try std.testing.expect(bounded.shortened);
+    }
+}
+
+test "the change note keeps its limit when names need escaping" {
+    // Each control byte escapes to six bytes, so the names take six times
+    // the room their own bytes do.
+    const name: [60]u8 = @splat(0x01);
+    var entries: [40]Entry = undefined;
+    for (&entries) |*entry| entry.* = .{ .kind = .skill, .name = &name, .description = "" };
+    const note = try renderChangeNote(std.testing.allocator, &entries);
+    defer std.testing.allocator.free(note);
+    try std.testing.expect(note.len <= max_change_note_bytes);
+    try std.testing.expect(std.mem.find(u8, note, "more: find them with toolbox search") != null);
 }
 
 test "toolbox menu stays bounded and well formed on fuzzed entries" {

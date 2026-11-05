@@ -27,7 +27,6 @@
     {"name": "provider_finish_raw", "module": "fx", "test": "fuzz provider finish raw", "iterations": 5000000},
     {"name": "tool_argument_diagnostic", "module": "fx", "test": "fuzz tool argument diagnostic", "iterations": 3000000},
     {"name": "skill_file", "module": "fx", "test": "parseSkillFile keeps fuzzed borrowed slices inside the input", "iterations": 5000000},
-    {"name": "skill_display_name", "module": "fx", "test": "skill display name parsing stays bounded", "iterations": 5000000},
     {"name": "command_output_content", "module": "fx", "test": "fuzz command output content", "iterations": 160000},
     {"name": "file_index", "module": "fx", "test": "file index raw-list and Unicode query bytes remain bounded", "iterations": 620000},
     {"name": "responses_text", "module": "fx", "test": "Responses text finalization fuzzes chunking and capture boundaries", "iterations": 430000},

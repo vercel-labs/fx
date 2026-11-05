@@ -100,11 +100,6 @@ pub const Overrides = struct {
             if (value) |placement| current.* = placement;
         }
     }
-
-    pub fn isEmpty(self: Overrides) bool {
-        for (self.placements) |value| if (value != null) return false;
-        return true;
-    }
 };
 
 pub const ParseError = error{

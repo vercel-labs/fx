@@ -652,13 +652,6 @@ pub fn formatToolActionValue(alloc: Allocator, label: []const u8, value: []const
     return alloc.print("● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
 }
 
-/// Borrows the name from the prepared action without replacing resource labels.
-pub fn resolvedSkillName(call: ToolCall, presentation: tool_dispatch.CallPresentation) ?[]const u8 {
-    if (presentation.label_arg_kind != .name) return null;
-    const selected = call.resolved_skill orelse return null;
-    return selected.skill.name;
-}
-
 /// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     const call = input.call;
@@ -704,7 +697,6 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     }
     const value = input.display_target orelse
         call.resolved_display_target orelse
-        resolvedSkillName(call, presentation) orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
     return alloc.print("{s} {s}", .{ presentation.action_label, value });
@@ -911,7 +903,7 @@ fn executeTestSkillInstall(
 }
 
 const test_install_skill = blk: {
-    var tool = test_builtin_tools.skill;
+    var tool = test_builtin_tools.install_skill;
     tool.name = "install_skill";
     tool.model_schema.name = "install_skill";
     tool.executor_kind = .install_skill;
@@ -946,7 +938,6 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.edit_file,
     test_web_search,
     test_builtin_tools.shell,
-    test_builtin_tools.skill,
     test_install_skill,
     test_builtin_tools.ask_user_question,
 };
@@ -1303,37 +1294,12 @@ test "tool presentation preserves plain action fallbacks" {
         .{ .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"src/main.zig\"}" }, .expected = "Reading src/main.zig" },
         .{ .call = .{ .id = "command", .name = "run_command", .arguments_json = "{\"command\":\"zig build\"}" }, .expected = "Running zig build" },
         .{ .call = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{}" }, .expected = "Asking " },
-        .{ .call = .{ .id = "skill", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" }, .expected = "Loading skill workflow" },
-        .{ .call = .{ .id = "skill-resource", .name = "skill", .arguments_json = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}" }, .expected = "Reading skill resource references/contract-design.md" },
         .{ .call = .{ .id = "install", .name = "install_skill", .arguments_json = "{\"source\":\"vercel-labs/agent-skills\",\"skill\":\"workflow\"}" }, .expected = "Installing skill vercel-labs/agent-skills" },
         .{ .call = .{ .id = "unknown", .name = "unknown_tool", .arguments_json = "{}" }, .expected = "Working: unknown_tool" },
     };
 
     for (cases) |case| {
         const label = try formatPlainAction(alloc, .{ .tool_registry = test_tool_registry, .call = case.call });
-        defer alloc.free(label);
-        try std.testing.expectEqualStrings(case.expected, label);
-    }
-}
-
-test "tool presentation uses the resolved skill name for location calls" {
-    const alloc = std.testing.allocator;
-    const selected: @import("../skills/skill_contract.zig").PreparedSkill = .{ .skill = .{
-        .name = "workflow",
-        .description = "",
-        .path = "/skills/different-directory",
-        .source = .workspace_fx,
-    } };
-    const cases = [_]struct { args: []const u8, expected: []const u8 }{
-        .{ .args = "{\"location\":\"skill:0000000000000001:0/different-directory\"}", .expected = "Loading skill workflow" },
-        .{ .args = "{\"location\":\"/skills/different-directory\",\"resource\":\"SKILL.md\"}", .expected = "Loading skill workflow" },
-        .{ .args = "{\"location\":\"/skills/different-directory\",\"resource\":\"references/rules.md\"}", .expected = "Reading skill resource references/rules.md" },
-    };
-    for (cases) |case| {
-        const label = try formatPlainAction(alloc, .{
-            .tool_registry = test_tool_registry,
-            .call = .{ .id = "load", .name = "skill", .arguments_json = case.args, .resolved_skill = &selected },
-        });
         defer alloc.free(label);
         try std.testing.expectEqualStrings(case.expected, label);
     }

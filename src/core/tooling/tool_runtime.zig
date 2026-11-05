@@ -386,8 +386,8 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
         };
     };
     switch (spec.executor_kind) {
-        // Preserve execution-time argument failures for MCP control tool calls.
-        .mcp_select_tool => return .{ .valid = .{} },
+        // An MCP tool's server checks its arguments when it runs.
+        .mcp_tool => return .{ .valid = .{} },
         // File mutation arguments are decoded once by shared permission preflight.
         .write_file, .edit_file => return .{ .valid = .{} },
         else => {},
@@ -1108,9 +1108,7 @@ fn explainToolboxRun(raw: *anyopaque, arena: Allocator, tool: []const u8) anyerr
     const ctx = state.runtime;
     if (std.mem.eql(u8, tool, toolbox.tool_name)) return "toolbox can't run toolbox.";
     if (ctx.tool_registry.lookup(tool)) |spec| {
-        // A host's own tool is called directly: a durable session reruns it
-        // by its name after a crash, under the host's rerun policy.
-        if (spec.executor_kind == .host) return arena.print("{s} is one of this host's tools; call it directly.", .{tool});
+        if (!toolbox.runs(spec.*)) return arena.print("{s} is one of this host's tools; call it directly.", .{tool});
         return arena.print("{s} didn't run: toolbox runs a tool only as part of the agent's turn.", .{tool});
     }
     if (!std.mem.startsWith(u8, tool, "mcp_") and containsName(ctx.advertised_dynamic_tool_names, tool)) {
@@ -1292,7 +1290,7 @@ const max_bridge_list_pages = 100;
 const bridge_search_page_bytes = 256 * 1024;
 
 /// Answers `fx mcp call list`, `search`, and `help` with the tools this agent
-/// may use: the same search and schemas as its own `capability_search`, with
+/// may use: the same search and schemas as its own `toolbox` search, with
 /// the same access and permission rules.
 fn lookupBridge(
     raw: *anyopaque,
@@ -1770,16 +1768,7 @@ fn typedDispatchContextForCall(
     var dispatch = typedDispatchContext(ctx, arena);
     dispatch.tool_call_id = call.id;
     dispatch.tool_call_name = call.name;
-    dispatch.resolved_skill = call.resolved_skill;
     return dispatch;
-}
-
-pub fn prepareSkillCall(ctx: Context, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
-    const tool = ctx.tool_registry.lookup(call.name) orelse return error.UnsupportedTool;
-    const prepare = tool.prepare_skill_call_fn orelse return error.UnsupportedTool;
-    var dispatch = typedDispatchContextForCall(ctx, arena, call);
-    dispatch.skill_locations = locations;
-    return prepare(dispatch, call.arguments_json);
 }
 
 const VisionProviderState = struct {
@@ -2849,11 +2838,9 @@ const test_tool_registry = tool_dispatch.Registry{ .tools = &.{
     test_builtin_tools.web_fetch,
     test_builtin_tools.web_search,
     test_captured_shell,
-    test_builtin_tools.capability_search,
-    test_builtin_tools.skill,
     test_builtin_tools.install_skill,
     test_builtin_tools.subagent,
-    test_builtin_tools.mcp_select_tool,
+    test_builtin_tools.toolbox,
     test_builtin_tools.ask_user_question,
     test_builtin_tools.read_tool_result,
 } };
@@ -3637,36 +3624,12 @@ fn registryOwnedAskQuestionCall(
     return .{ .success = try ctx.allocator.dupe(u8, "registry-owned ask_user_question") };
 }
 
-fn registryOwnedSkillCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned skill") };
-}
-
 fn registryOwnedInstallSkillCall(
     ctx: tool_dispatch.DispatchContext,
     input: tool_dispatch.ToolInput,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     _ = input;
     return .{ .success = try ctx.allocator.dupe(u8, "registry-owned install_skill") };
-}
-
-fn registryOwnedCapabilitySearchCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned capability_search") };
-}
-
-fn registryOwnedMcpSelectCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned mcp_select_tool") };
 }
 
 const QuestionBridgeThreadState = struct {
@@ -3979,21 +3942,16 @@ test "terminal exec execution uses supplied registry entry" {
     try std.testing.expectEqualStrings("registry-owned terminal exec", result.model_output);
 }
 
-test "stateful skill tool execution uses supplied registry entries" {
+test "stateful install_skill execution uses its supplied registry entry" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var registered_skill = test_builtin_tools.skill;
-    registered_skill.call = registryOwnedSkillCall;
     var registered_install_skill = test_builtin_tools.install_skill;
     registered_install_skill.call = registryOwnedInstallSkillCall;
 
-    const tools = [_]tool_dispatch.Tool{
-        registered_skill,
-        registered_install_skill,
-    };
+    const tools = [_]tool_dispatch.Tool{registered_install_skill};
     const registry = tool_dispatch.Registry{ .tools = tools[0..] };
 
     var rt = TestRuntime{ .tool_registry = registry };
@@ -4004,77 +3962,12 @@ test "stateful skill tool execution uses supplied registry entries" {
         args: []const u8,
         expected: []const u8,
     }{
-        .{ .name = "skill", .args = "{\"name\":\"workflow\"}", .expected = "registry-owned skill" },
         .{ .name = "install_skill", .args = "{\"source\":\"/tmp/skills\",\"skill\":\"workflow\"}", .expected = "registry-owned install_skill" },
     };
 
     for (cases) |case| {
         const result = try executeToolCall(rt.context(), arena, .{
             .id = "stateful",
-            .name = case.name,
-            .arguments_json = case.args,
-        });
-        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-        try std.testing.expectEqualStrings(case.expected, result.model_output);
-    }
-}
-
-test "capability and MCP selection execution preserve argument failures" {
-    const alloc = std.testing.allocator;
-    var rt = TestRuntime{};
-    defer rt.deinit(alloc);
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const cases = [_]struct {
-        name: []const u8,
-        args: []const u8,
-        expected: []const u8,
-    }{
-        .{ .name = "capability_search", .args = "{\"query\":1}", .expected = "capability_search field \"query\" must be a string" },
-        .{ .name = "mcp_select_tool", .args = "{\"name\":1}", .expected = "mcp_select_tool requires an exact dynamic tool name." },
-    };
-
-    for (cases) |case| {
-        const result = try executeToolCall(rt.context(), arena, .{
-            .id = "mcp_validation",
-            .name = case.name,
-            .arguments_json = case.args,
-        });
-        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-        try std.testing.expectEqualStrings(case.expected, result.model_output);
-    }
-}
-
-test "capability and MCP selection execution use supplied registry entries" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var registered_search = test_builtin_tools.capability_search;
-    registered_search.call = registryOwnedCapabilitySearchCall;
-    var registered_select = test_builtin_tools.mcp_select_tool;
-    registered_select.call = registryOwnedMcpSelectCall;
-    const tools = [_]tool_dispatch.Tool{ registered_search, registered_select };
-    const registry = tool_dispatch.Registry{ .tools = tools[0..] };
-
-    var rt = TestRuntime{ .tool_registry = registry };
-    defer rt.deinit(alloc);
-
-    const cases = [_]struct {
-        name: []const u8,
-        args: []const u8,
-        expected: []const u8,
-    }{
-        .{ .name = "capability_search", .args = "{\"query\":\"read\"}", .expected = "registry-owned capability_search" },
-        .{ .name = "mcp_select_tool", .args = "{\"name\":\"mcp_fs_read\"}", .expected = "registry-owned mcp_select_tool" },
-    };
-
-    for (cases) |case| {
-        const result = try executeToolCall(rt.context(), arena, .{
-            .id = "mcp_registry",
             .name = case.name,
             .arguments_json = case.args,
         });
@@ -6927,7 +6820,6 @@ const McpFixture = struct {
 
     const PermissionContext = struct {
         search_rule_count: usize = 0,
-        schema_rule_count: usize = 0,
     };
 
     const AuthorityContext = struct {
@@ -6998,15 +6890,9 @@ const McpFixture = struct {
         ctx.search_rule_count = permission_rules.rules.len;
         return search(raw_ctx, arena, request, permission_rules, limits);
     }
-
-    fn schemaRecordingRules(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
-        const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
-        ctx.schema_rule_count = permission_rules.rules.len;
-        return schema(raw_ctx, arena, name, permission_rules, limits, access, cancel_flag);
-    }
 };
 
-test "capability search and MCP selection forward permission rules through registered execution" {
+test "toolbox search forwards permission rules to MCP search" {
     var permission_context = McpFixture.PermissionContext{};
     var rules = [_]types.PermissionRule{
         .{ .permission = @constCast("mcp_other"), .pattern = @constCast("*"), .action = .deny },
@@ -7014,7 +6900,6 @@ test "capability search and MCP selection forward permission rules through regis
     var rt = TestRuntime{
         .mcp_ctx = @ptrCast(&permission_context),
         .mcp_search_tools = McpFixture.searchRecordingRules,
-        .mcp_tool_schema = McpFixture.schemaRecordingRules,
         .permission_rules = .{ .rules = &rules },
     };
     defer rt.deinit(std.testing.allocator);
@@ -7025,33 +6910,21 @@ test "capability search and MCP selection forward permission rules through regis
 
     _ = try executeToolCall(rt.context(), arena, .{
         .id = "search",
-        .name = "capability_search",
-        .arguments_json = "{\"query\":\"read\",\"server\":\"fixture\"}",
-    });
-    _ = try executeToolCall(rt.context(), arena, .{
-        .id = "select",
-        .name = "mcp_select_tool",
-        .arguments_json = "{\"name\":\"mcp_fs_read\"}",
+        .name = "toolbox",
+        .arguments_json = "{\"search\":\"read\",\"server\":\"fixture\"}",
     });
 
     try std.testing.expectEqual(@as(usize, 1), permission_context.search_rule_count);
-    try std.testing.expectEqual(@as(usize, 1), permission_context.schema_rule_count);
 
     rt.permission_mode = .yolo;
     permission_context = .{};
     _ = try executeToolCall(rt.context(), arena, .{
         .id = "yolo-search",
-        .name = "capability_search",
-        .arguments_json = "{\"query\":\"read\",\"server\":\"fixture\"}",
-    });
-    _ = try executeToolCall(rt.context(), arena, .{
-        .id = "yolo-select",
-        .name = "mcp_select_tool",
-        .arguments_json = "{\"name\":\"mcp_fs_read\"}",
+        .name = "toolbox",
+        .arguments_json = "{\"search\":\"read\",\"server\":\"fixture\"}",
     });
 
     try std.testing.expectEqual(@as(usize, 0), permission_context.search_rule_count);
-    try std.testing.expectEqual(@as(usize, 0), permission_context.schema_rule_count);
 }
 
 test "MCP dynamic tool cannot execute before it is advertised" {
@@ -7066,40 +6939,6 @@ test "MCP dynamic tool cannot execute before it is advertised" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-
-    const result = try executeToolCall(rt.context(), arena, .{
-        .id = "dynamic",
-        .name = "mcp_fs_read",
-        .arguments_json = "{}",
-    });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "is not one of the tools in this request");
-    try std.testing.expectEqual(@as(usize, 0), counting.calls);
-}
-
-test "MCP select does not authorize same-response dynamic execution" {
-    var counting = McpFixture.CountingContext{};
-    var rt = TestRuntime{
-        .mcp_ctx = @ptrCast(&counting),
-        .mcp_has_tool = McpFixture.hasTrue,
-        .mcp_call_tool = McpFixture.callCounting,
-        .mcp_tool_schema = McpFixture.schema,
-    };
-    defer rt.deinit(std.testing.allocator);
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const selected = try executeToolCall(rt.context(), arena, .{
-        .id = "select",
-        .name = "mcp_select_tool",
-        .arguments_json = "{\"name\":\"mcp_fs_read\"}",
-    });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, selected.status);
-    try std.testing.expectEqualStrings("mcp_fs_read", selected.selected_dynamic_tools[0].name);
-    try expectContains(selected.selected_dynamic_tools[0].schema_json, "context_limit_rejection");
-    try expectContains(selected.selected_dynamic_tools[0].schema_json, "<context_limit action='literal' />");
 
     const result = try executeToolCall(rt.context(), arena, .{
         .id = "dynamic",
@@ -7336,7 +7175,7 @@ test "install_skill explicit tool installs local skill source" {
     );
 }
 
-test "skill tool preserves resource and discovery notices separately" {
+test "toolbox skill open preserves resource and discovery notices separately" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7376,25 +7215,18 @@ test "skill tool preserves resource and discovery notices separately" {
     defer arena_state.deinit();
     var ctx = rt.context();
     ctx.context_limits.skill_chunk_bytes = .{ .value = .{ .bytes = 96 }, .source = .command_line };
-    const call: ToolCall = .{ .id = "1", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" };
-    const preparation = try prepareSkillCall(ctx, arena_state.allocator(), call, null);
-    defer @import("../skills/skill_invocation.zig").freeCallPreparation(arena_state.allocator(), preparation);
-    const selected = preparation.selected;
-    for ([_]bool{ false, true }) |bound| {
-        var effective_call = call;
-        if (bound) effective_call.resolved_skill = &selected;
-        const result = try executeToolCall(ctx, arena_state.allocator(), effective_call);
-        try expectContains(result.model_output, "<skill_content name=\"workflow\" resource=\"SKILL.md\" offset=\"0\"");
-        try expectContains(result.model_output, "use the workflow skill");
-        try expectNotContains(result.model_output, "assets/data.txt");
-        try std.testing.expect(result.system_notice == null);
-        try std.testing.expectEqual(@as(usize, 2), result.context_notices.len);
-        try expectContains(result.context_notices[0], "[context] skill resource \"workflow/SKILL.md\" truncated");
-        try expectContains(result.context_notices[1], "skill discovery warning:");
-    }
+    const call: ToolCall = .{ .id = "1", .name = "toolbox", .arguments_json = "{\"open\":\"workflow\"}" };
+    const result = try executeToolCall(ctx, arena_state.allocator(), call);
+    try expectContains(result.model_output, "<skill_content name=\"workflow\" resource=\"SKILL.md\" offset=\"0\"");
+    try expectContains(result.model_output, "use the workflow skill");
+    try expectNotContains(result.model_output, "assets/data.txt");
+    try std.testing.expect(result.system_notice == null);
+    try std.testing.expectEqual(@as(usize, 2), result.context_notices.len);
+    try expectContains(result.context_notices[0], "[context] skill resource \"workflow/SKILL.md\" truncated");
+    try expectContains(result.context_notices[1], "skill discovery warning:");
 }
 
-test "skill tool loads the exact advertised duplicate and rejects ambiguous or untrusted locations" {
+test "toolbox open loads the exact advertised duplicate and rejects ambiguous or untrusted locations" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7452,39 +7284,33 @@ test "skill tool loads the exact advertised duplicate and rejects ambiguous or u
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const exact_managed_args = try arena.print("{{\"name\":\"workflow\",\"location\":\"{s}\"}}", .{managed_skill});
-    const exact = try executeToolCall(rt.context(), arena, .{ .id = "exact", .name = "skill", .arguments_json = exact_managed_args });
+    const exact_managed_args = try arena.print("{{\"open\":\"{s}\"}}", .{managed_skill});
+    const exact = try executeToolCall(rt.context(), arena, .{ .id = "exact", .name = "toolbox", .arguments_json = exact_managed_args });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, exact.status);
     try expectContains(exact.model_output, "MANAGED BODY B");
     try expectNotContains(exact.model_output, "b-only.txt");
     try expectNotContains(exact.model_output, "WORKSPACE BODY A");
     try expectNotContains(exact.model_output, "a-only.txt");
 
-    const duplicate = try executeToolCall(rt.context(), arena, .{ .id = "duplicate", .name = "skill", .arguments_json = exact_managed_args });
+    const duplicate = try executeToolCall(rt.context(), arena, .{ .id = "duplicate", .name = "toolbox", .arguments_json = exact_managed_args });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, duplicate.status);
     try expectContains(duplicate.model_output, "MANAGED BODY B");
     try expectNotContains(duplicate.model_output, "already loaded");
 
-    const ambiguous = try executeToolCall(rt.context(), arena, .{ .id = "ambiguous", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" });
+    const ambiguous = try executeToolCall(rt.context(), arena, .{ .id = "ambiguous", .name = "toolbox", .arguments_json = "{\"open\":\"workflow\"}" });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, ambiguous.status);
     try expectContains(ambiguous.model_output, "ambiguous");
     try expectContains(ambiguous.model_output, workspace_skill);
     try expectContains(ambiguous.model_output, managed_skill);
 
-    const outside_args = try arena.print("{{\"name\":\"workflow\",\"location\":\"{s}\"}}", .{outside_skill});
-    const outside = try executeToolCall(rt.context(), arena, .{ .id = "outside", .name = "skill", .arguments_json = outside_args });
+    const outside_args = try arena.print("{{\"open\":\"{s}\"}}", .{outside_skill});
+    const outside = try executeToolCall(rt.context(), arena, .{ .id = "outside", .name = "toolbox", .arguments_json = outside_args });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, outside.status);
     try expectNotContains(outside.model_output, "OUTSIDE BODY SENTINEL");
     try expectNotContains(outside.model_output, "outside-only.txt");
-
-    const mismatch_args = try arena.print("{{\"name\":\"other\",\"location\":\"{s}\"}}", .{managed_skill});
-    const mismatch = try executeToolCall(rt.context(), arena, .{ .id = "mismatch", .name = "skill", .arguments_json = mismatch_args });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, mismatch.status);
-    try expectContains(mismatch.model_output, "does not match");
-    try expectNotContains(mismatch.model_output, "MANAGED BODY B");
 }
 
-test "name-only skill call rediscovers a duplicate added after the first read" {
+test "toolbox open by name rediscovers a duplicate added after the first read" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7510,7 +7336,7 @@ test "name-only skill call rediscovers a duplicate added after the first read" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const first = try executeToolCall(rt.context(), arena, .{ .id = "first", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" });
+    const first = try executeToolCall(rt.context(), arena, .{ .id = "first", .name = "toolbox", .arguments_json = "{\"open\":\"workflow\"}" });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, first.status);
     try expectContains(first.model_output, "MANAGED BODY A");
 
@@ -7521,13 +7347,13 @@ test "name-only skill call rediscovers a duplicate added after the first read" {
         try file.writeStreamingAll(io_mod.getIo(), "---\nname: workflow\ndescription: workspace workflow\n---\n\nWORKSPACE BODY B\n");
     }
 
-    const rediscovered = try executeToolCall(rt.context(), arena, .{ .id = "rediscovered", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" });
+    const rediscovered = try executeToolCall(rt.context(), arena, .{ .id = "rediscovered", .name = "toolbox", .arguments_json = "{\"open\":\"workflow\"}" });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, rediscovered.status);
     try expectContains(rediscovered.model_output, "ambiguous");
     try expectNotContains(rediscovered.model_output, "already loaded");
 }
 
-test "supplied session grant authorizes skill in a fresh session" {
+test "a session grant for skill authorizes a toolbox open of that skill" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -7541,14 +7367,48 @@ test "supplied session grant authorizes skill in a fresh session" {
 
     const decision = (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena_state.allocator(), .{
         .id = "1",
-        .name = "skill",
-        .arguments_json = "{\"name\":\"workflow\"}",
+        .name = "toolbox",
+        .arguments_json = "{\"open\":\"workflow\"}",
+        .toolbox_lookup = .{ .permission = "skill", .target = "workflow" },
     }, .ask, &grants)).decision;
 
     try std.testing.expectEqual(ToolPermissionDecision.once, decision);
 }
 
-test "skill tool reports missing skill" {
+test "rules for the tools toolbox replaced decide its opens and searches" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("skill"), .pattern = @constCast("workflow"), .action = .deny },
+        .{ .permission = @constCast("capability_search"), .pattern = @constCast("*"), .action = .deny },
+        .{ .permission = @constCast("mcp_select_tool"), .pattern = @constCast("mcp_fs_*"), .action = .deny },
+    };
+    var rt = TestRuntime{ .permission_rules = .{ .rules = &rules } };
+    defer rt.deinit(alloc);
+
+    const Case = struct { arguments: []const u8, lookup: types.ToolboxLookup, denied: bool };
+    const cases = [_]Case{
+        .{ .arguments = "{\"open\":\"workflow\"}", .lookup = .{ .permission = "skill", .target = "workflow" }, .denied = true },
+        .{ .arguments = "{\"open\":\"other\"}", .lookup = .{ .permission = "skill", .target = "other" }, .denied = false },
+        .{ .arguments = "{\"search\":\"read\"}", .lookup = .{ .permission = "capability_search", .target = "*" }, .denied = true },
+        .{ .arguments = "{\"open\":\"mcp_fs_read\"}", .lookup = .{ .permission = "mcp_select_tool", .target = "mcp_fs_read" }, .denied = true },
+        .{ .arguments = "{\"open\":\"mcp_git_log\"}", .lookup = .{ .permission = "mcp_select_tool", .target = "mcp_git_log" }, .denied = false },
+    };
+    for (cases) |case| {
+        const decision = (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
+            .id = "1",
+            .name = "toolbox",
+            .arguments_json = case.arguments,
+            .toolbox_lookup = case.lookup,
+        }, .ask, &.{})).decision;
+        try std.testing.expectEqual(case.denied, decision == .deny or decision == .policy_denied);
+    }
+}
+
+test "toolbox open reports a missing skill with the next step" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7567,10 +7427,10 @@ test "skill tool reports missing skill" {
     defer rt.deinit(alloc);
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const result = try executeToolCall(rt.context(), arena_state.allocator(), .{ .id = "1", .name = "skill", .arguments_json = "{\"name\":\"missing\"}" });
+    const result = try executeToolCall(rt.context(), arena_state.allocator(), .{ .id = "1", .name = "toolbox", .arguments_json = "{\"open\":\"missing\"}" });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "Skill \"missing\" not found.");
-    try expectContains(result.model_output, "Refresh available skills");
+    try expectContains(result.model_output, "Nothing named missing is in the toolbox menu.");
+    try expectContains(result.model_output, "Use toolbox search to find it.");
 }
 
 const vision_test_registry_tools = [_]tool_dispatch.Tool{test_builtin_tools.vision};

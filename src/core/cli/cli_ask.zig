@@ -2124,7 +2124,6 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .validate_tool_call = validateToolCall,
         .snapshot_mcp_definition = snapshotMcpDefinition,
         .resolve_unselected_mcp_tool = resolveUnselectedMcpTool,
-        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
@@ -2343,11 +2342,6 @@ fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agen
 fn checkToolAvailability(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.checkToolAvailability(ctx.toolContext(), arena, call);
-}
-
-fn prepareSkillCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    return tool_runtime.prepareSkillCall(ctx.toolContext(), arena, call, locations);
 }
 
 fn cliAdmissionContext(
@@ -2828,23 +2822,25 @@ fn appendToolCallRecord(
     ctx.tool_call_records_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.tool_call_records_mutex.unlock(io_mod.getIo());
 
-    // A toolbox run reports the tool that ran, so a script reading the JSON
-    // sees mcp_linear_create_issue, not toolbox.
-    var run_target_buffer: [16 * 1024]u8 = undefined;
-    const reported_name = if (std.mem.eql(u8, call.name, toolbox.tool_name))
-        toolbox.runTarget(call.arguments_json, &run_target_buffer) orelse call.name
-    else
-        call.name;
-    const name = try ctx.alloc.dupe(u8, reported_name);
-    errdefer ctx.alloc.free(name);
-    const owned_status = try ctx.alloc.dupe(u8, status);
-    errdefer ctx.alloc.free(owned_status);
     var scratch_state = std.heap.ArenaAllocator.init(ctx.alloc);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
-    const is_shell = std.mem.eql(u8, call.name, "shell");
+    // A toolbox run reports the tool that ran, with that tool's arguments, so
+    // a script reading the JSON sees mcp_linear_create_issue, or shell and its
+    // command, not toolbox.
+    const ran: ToolCall = if (try toolbox.carriedCall(scratch, call.name, call.arguments_json)) |carried| ran: {
+        var effective = call;
+        effective.name = carried.name;
+        effective.arguments_json = carried.arguments_json;
+        break :ran effective;
+    } else call;
+    const name = try ctx.alloc.dupe(u8, ran.name);
+    errdefer ctx.alloc.free(name);
+    const owned_status = try ctx.alloc.dupe(u8, status);
+    errdefer ctx.alloc.free(owned_status);
+    const is_shell = std.mem.eql(u8, ran.name, "shell");
     const action = if (is_shell and error_category != null)
-        shell_action_for_call(scratch, call)
+        shell_action_for_call(scratch, ran)
     else
         null;
     const error_code = if (is_shell and error_category != null)
@@ -2867,7 +2863,7 @@ fn appendToolCallRecord(
     else
         null;
     errdefer if (command_result_json) |json| ctx.alloc.free(json);
-    const ask_question_text = try questionTextForAskCall(ctx.alloc, call);
+    const ask_question_text = try questionTextForAskCall(ctx.alloc, ran);
     errdefer if (ask_question_text) |text| ctx.alloc.free(text);
 
     try ctx.tool_call_records.append(ctx.alloc, .{
@@ -3277,8 +3273,11 @@ fn publishPendingToolProgress(ctx: *AskContext, call_id: []const u8, text: []con
         pending.visible = true;
         return;
     }
-    try ctx.writeStderr(text);
-    try ctx.writeStderr("\n");
+    // The line names what the model asked for, such as a toolbox open's
+    // target, so a control sequence in it is written as visible text.
+    const safe = try ctx.alloc.print("{f}\n", .{text_utils.terminalSafe(text)});
+    defer ctx.alloc.free(safe);
+    try ctx.writeStderr(safe);
     pending.visible = true;
 }
 
@@ -7920,6 +7919,56 @@ test "fx ask JSON records permission-denied tool calls as error status" {
         "{\"kind\":\"command\"}",
         ctx.tool_call_records.items[0].command_result_json.?,
     );
+}
+
+test "fx ask JSON names a toolbox run by the tool it ran, with that tool's fields, at any size" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    var ctx = AskContext.init(alloc, testConfig(), .{
+        .context_registry = test_no_context_registry,
+        .tool_set = builtin_tools.advertisement_set,
+    }, root);
+    defer ctx.deinit();
+    ctx.output_mode = .json;
+
+    // Bigger than any fixed parse buffer.
+    const padding: [20 * 1024]u8 = @splat('x');
+    const arguments = try alloc.print(
+        "{{\"run\":\"shell\",\"arguments\":{{\"action\":\"interact\",\"session_id\":\"shell-missing\",\"note\":\"{s}\"}}}}",
+        .{&padding},
+    );
+    defer alloc.free(arguments);
+    captureToolExecutionError(&ctx, .{
+        .call_allocator = alloc,
+        .result_allocator = alloc,
+        .call = .{ .id = "toolbox-shell", .name = "toolbox", .arguments_json = arguments },
+        .authority = .ordinary,
+        .session_grants = &.{},
+        .advertised_dynamic_tool_names = &.{},
+        .max_tool_result_bytes = 4096,
+    }, error.ExecutionNotFound);
+
+    const records = try takeToolCallRecords(&ctx, alloc);
+    const result = PromptRunResult{
+        .exit_code = 1,
+        .assistant_output = try alloc.dupe(u8, ""),
+        .tool_calls = records,
+    };
+    defer result.deinit(alloc);
+    const rendered = try renderFinalJsonResult(alloc, result);
+    defer alloc.free(rendered);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rendered, .{});
+    defer parsed.deinit();
+    const record = parsed.value.object.get("tool_calls").?.array.items[0].object;
+    try std.testing.expectEqualStrings("shell", record.get("name").?.string);
+    try std.testing.expectEqualStrings("interact", (record.get("action") orelse return error.TestExpectedEqual).string);
+    const failure = (record.get("error") orelse return error.TestExpectedEqual).object;
+    try std.testing.expectEqualStrings("ExecutionNotFound", failure.get("code").?.string);
 }
 
 test "fx ask JSON preserves shell action and runtime error identity" {

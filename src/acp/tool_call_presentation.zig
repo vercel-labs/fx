@@ -34,7 +34,6 @@ pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
     if (std.mem.eql(u8, tool_name, "shell")) return .execute;
     if (std.mem.eql(u8, tool_name, "terminal")) return .execute;
     if (std.mem.eql(u8, tool_name, "run_command")) return .execute;
-    if (std.mem.eql(u8, tool_name, "skill")) return .other;
     if (std.mem.eql(u8, tool_name, "install_skill")) return .other;
     return .other;
 }
@@ -187,10 +186,10 @@ test "describeToolCall flags internal discovery and names MCP identity" {
     const arena = arena_state.allocator();
     const registry = builtin_tools.registry;
 
-    const search = describeToolCall(registry, arena, .{ .id = "a", .name = "capability_search", .arguments_json = "{}" }, null);
+    const search = describeToolCall(registry, arena, .{ .id = "a", .name = "toolbox", .arguments_json = "{\"search\":\"echo\"}" }, null);
     try std.testing.expect(search.meta.internal);
-    const select = describeToolCall(registry, arena, .{ .id = "b", .name = "mcp_select_tool", .arguments_json = "{}" }, null);
-    try std.testing.expect(select.meta.internal);
+    const open = describeToolCall(registry, arena, .{ .id = "b", .name = "toolbox", .arguments_json = "{\"open\":\"mcp_mini_echo\"}" }, null);
+    try std.testing.expect(open.meta.internal);
     const read = describeToolCall(registry, arena, .{ .id = "c", .name = "read_file", .arguments_json = "{}" }, null);
     try std.testing.expect(!read.meta.internal);
     try std.testing.expect(read.meta.mcp == null);

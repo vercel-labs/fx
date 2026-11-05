@@ -36,8 +36,8 @@ test("signed macOS variants preserve the image flow and native resource accounti
       let childPid = 0;
       let sample: Record<string, number> | null = null;
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("image_select", "mcp_select_tool", { name: "mcp_fixture_echo" }),
-        fakeGatewayToolCall("image_call", "mcp_fixture_echo", { text: "screenshot" }),
+        fakeGatewayToolCall("image_open", "toolbox", { open: "mcp_fixture_echo" }),
+        fakeGatewayToolCall("image_call", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "screenshot" } }),
         () => {
           const measured = Bun.spawnSync([probe, String(childPid)], { stdout: "pipe", stderr: "pipe" });
           expect(measured.exitCode, measured.stderr.toString()).toBe(0);

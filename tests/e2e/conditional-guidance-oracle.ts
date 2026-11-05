@@ -19,8 +19,9 @@ export const CANONICAL_BUILTIN_NAMES = [
 ] as const;
 
 // The built-in tools fx sends by default, in order. The rest of the registry
-// is reached through toolbox: skills and install_skill from its menu, while
-// capability_search, mcp_select_tool, and skill are replaced by it.
+// is reached through toolbox: skills and install_skill from its menu. The
+// names capability_search, mcp_select_tool, and skill stay in the canonical
+// list above so fx text naming those removed tools is still caught.
 export const DEFAULT_SERIALIZED_BUILTIN_NAMES = [
   "read_file",
   "glob_files",

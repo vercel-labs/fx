@@ -291,6 +291,24 @@ describe("toolbox", () => {
     expectEveryRequestExtendsThePrevious(raws);
   }, 40_000);
 
+  test("control characters in a toolbox target reach fx ask's progress rows as visible text", async () => {
+    const root = createRoot();
+    // A window title, a bell, and a clear screen, as a model could send.
+    const active = start([
+      fakeGatewayToolCall("open_escape", "toolbox", { open: "probe\u001b]0;owned\u0007\u001b[2J" }),
+      fakeGatewayFinalText("TOOLBOX_ESCAPE_DONE"),
+    ]);
+    const result = await runFx(["ask", "--auto", "--no-save", "Open it."], {
+      cwd: root.workspace,
+      env: env(root, active),
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain("probe");
+    expect(result.stderr).not.toContain("\u001b");
+    expect(result.stderr).not.toContain("\u0007");
+  }, 40_000);
+
   test("a deny rule on the real tool stops toolbox run before the tool runs", async () => {
     const root = createRoot();
     writeFileSync(
@@ -319,6 +337,30 @@ describe("toolbox", () => {
     expect(mcp).not.toContain(MCP_RESULT);
     expect(existsSync(join(root.home, ".fx", "skills", "denied-skill"))).toBe(false);
     expect(existsSync(root.wireLogPath) ? wireCalls(root.wireLogPath) : []).toEqual([]);
+    expectEveryRequestExtendsThePrevious(raws);
+  }, 40_000);
+
+  test("rules for skill and capability_search decide toolbox open and search", async () => {
+    const root = createRoot();
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ permission: { skill: { "demo-review": "deny" }, capability_search: "deny" } }),
+    );
+    const active = start([
+      fakeGatewayToolCall("open_denied", "toolbox", { open: "demo-review" }),
+      fakeGatewayToolCall("search_denied", "toolbox", { search: "review" }),
+      fakeGatewayFinalText("TOOLBOX_RULES_DONE"),
+    ]);
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Review this change."], {
+      cwd: root.workspace,
+      env: env(root, active),
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    const raws = modelRequests(active);
+    expect(raws.length).toBe(3);
+    expect(toolResultText(body(raws[1]!), "open_denied")).not.toContain("TOOLBOX_SKILL_BODY");
+    expect(toolResultText(body(raws[2]!), "search_denied")).not.toContain("Review one pull request");
     expectEveryRequestExtendsThePrevious(raws);
   }, 40_000);
 
@@ -387,10 +429,10 @@ describe("toolbox", () => {
     expectEveryRequestExtendsThePrevious(raws);
   }, 40_000);
 
-  test("a subagent's profile limits what it runs through toolbox", async () => {
+  test("a subagent's profile limits what it runs and opens through toolbox", async () => {
     const root = createRoot();
-    // The profile lists the tools toolbox replaced, so the child gets
-    // toolbox, but not shell.
+    // The profile lists mcp_select_tool, one of the tools toolbox replaced,
+    // so the child gets toolbox, but not shell and not skill.
     const profileDir = join(root.home, ".fx", "agents", "limited");
     mkdirSync(profileDir, { recursive: true });
     writeFileSync(join(profileDir, "profile.json"), JSON.stringify({
@@ -413,6 +455,9 @@ describe("toolbox", () => {
             arguments: { action: "run", command: `touch '${marker}'` },
           });
         }
+        if (!body.includes('"toolCallId":"child_open_skill"')) {
+          return fakeGatewayToolCall("child_open_skill", "toolbox", { open: "demo-review" });
+        }
         return fakeGatewayFinalText("TOOLBOX_CHILD_DONE");
       }
       if (body.includes('"toolCallId":"parent_start"')) return fakeGatewayFinalText("TOOLBOX_PARENT_SENT");
@@ -427,7 +472,7 @@ describe("toolbox", () => {
       timeoutMs: 40_000,
     });
     expect(result.code).toBe(0);
-    expect(childBodies.length).toBeGreaterThanOrEqual(2);
+    expect(childBodies.length).toBeGreaterThanOrEqual(3);
     const childTools = toolNames(body(childBodies[0]!));
     expect(childTools).toContain("toolbox");
     expect(childTools).not.toContain("shell");
@@ -437,5 +482,9 @@ describe("toolbox", () => {
     const refused = JSON.parse(toolResultText(body(childBodies[1]!), "child_run_shell")) as { value?: string };
     expect(refused.value).toBe("Not executed");
     expect(existsSync(marker)).toBe(false);
+    // Opening a skill is decided as skill, which the profile doesn't list.
+    const opened = toolResultText(body(childBodies[2]!), "child_open_skill");
+    expect((JSON.parse(opened) as { value?: string }).value).toBe("Not executed");
+    expect(opened).not.toContain("TOOLBOX_SKILL_BODY");
   }, 60_000);
 });

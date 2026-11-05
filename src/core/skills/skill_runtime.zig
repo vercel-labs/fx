@@ -3340,7 +3340,7 @@ fn renderSkillPrompt(
 /// fit `skill_catalog_bytes`, as the skill catalog reports its own.
 pub fn writeListShortened(w: *std.Io.Writer, limits: context_limits.Values, context_window: ?u32) std.Io.Writer.Error!void {
     const budget = SkillPromptBudget.resolve(limits.skill_catalog_bytes, context_window);
-    try w.print("[context] skill catalog shortened to fit the toolbox menu: effective={d} {s} source={s}\n", .{
+    try w.print("[context] toolbox menu shortened to fit skill_catalog_bytes: effective={d} {s} source={s}\n", .{
         budget.limit, if (budget.characters) "characters" else "bytes", limits.skill_catalog_bytes.source.label(),
     });
 }

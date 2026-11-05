@@ -140,20 +140,17 @@ pub const ProvisionalToolStatuses = struct {
         var buf: [512]u8 = undefined;
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
-        const is_skill = std.mem.eql(u8, tool_name, "skill");
-        // A skill call's row changes only to read a resource. A toolbox
-        // call's row, once its arguments arrive, reads as what it opens,
-        // runs, or searches, since the first string in them may be any of
-        // those.
+        // A toolbox call's row, once its arguments arrive, reads as what it
+        // opens, runs, or searches, since the first string in them may be
+        // any of those.
         const is_toolbox = std.mem.eql(u8, tool_name, toolbox.tool_name);
-        var observed_label = if (is_skill or is_toolbox) null else label_value;
+        var observed_label = if (is_toolbox) null else label_value;
         var observed_kind = activity_kind;
-        const argument_label: ?[]const u8 = if (is_skill or is_toolbox) resource: {
+        const argument_label: ?[]const u8 = if (is_toolbox) resource: {
             const json = arguments_json orelse break :resource null;
             const args = tool_args.parseToolArgsObject(scratch.allocator(), json) catch break :resource null;
             const spec = hooks.tool_registry.lookup(tool_name) orelse break :resource null;
             const presentation = tool_dispatch.presentationForArgs(spec.*, args);
-            if (!is_toolbox and presentation.label_arg_kind != .resource) break :resource null;
             const value = tool_dispatch.presentationLabelValue(presentation, args) orelse break :resource null;
             const encoded = text_utils.encodeTerminalSafe(scratch.allocator(), value, buf.len) catch break :resource null;
             if (encoded.truncated) break :resource null;
@@ -1675,7 +1672,6 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.edit_file,
     test_builtin_tools.shell,
     test_builtin_tools.ask_user_question,
-    test_builtin_tools.skill,
     test_builtin_tools.toolbox,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
@@ -1999,55 +1995,6 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
     }
 }
 
-test "provisional skill labels select complete resource arguments and ignore opaque hints" {
-    const cases = [_]struct {
-        arguments_json: ?[]const u8,
-        hint: ?[]const u8 = "skill:opaque/location",
-        resource: ?[]const u8 = null,
-    }{
-        .{ .arguments_json = "{\"location\":\"skill:opaque/location\",\"resource\":\"references/types.md\"}", .resource = "references/types.md" },
-        .{ .arguments_json = "{\"resource\":\"references/types.md\",\"location\":\"skill:opaque/location\"}", .resource = "references/types.md" },
-        .{ .arguments_json = "{\"resource\":\"references/types.md\"}", .hint = null, .resource = "references/types.md" },
-        .{ .arguments_json = null },
-        .{ .arguments_json = "" },
-        .{ .arguments_json = "{\"resource\":\"partial" },
-        .{ .arguments_json = "[]" },
-        .{ .arguments_json = "null" },
-        .{ .arguments_json = "\"references/types.md\"" },
-        .{ .arguments_json = "{\"resource\":null}" },
-        .{ .arguments_json = "{\"resource\":42}" },
-        .{ .arguments_json = "{\"resource\":false}" },
-        .{ .arguments_json = "{\"resource\":[]}" },
-        .{ .arguments_json = "{\"resource\":{}}" },
-        .{ .arguments_json = "{\"resource\":\"\"}" },
-        .{ .arguments_json = "{\"resource\":\"SKILL.md\"}" },
-        .{ .arguments_json = "{\"resource\":\"SKILL.md\",\"offset\":1}" },
-        .{ .arguments_json = "{\"location\":\"skill:opaque/location\"}" },
-        .{ .arguments_json = "{\"name\":\"root-skill\"}" },
-        .{ .arguments_json = "{}" },
-    };
-    const alloc = std.testing.allocator;
-    for (cases) |case| {
-        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
-        defer capture.deinit();
-        const hooks = capture.hooks();
-        var statuses = ProvisionalToolStatuses{};
-        defer statuses.deinit(alloc);
-        try statuses.publish(&hooks, alloc, 7, "skill_1", "skill", .read, eligibleActionLabel("skill"), case.hint, case.arguments_json);
-        try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
-        try std.testing.expectEqual(types.ToolActivityKind.read, capture.events.items[0].provisional.activity_kind);
-        try std.testing.expectEqualStrings("skill_1", capture.events.items[1].progress.id.call_id);
-        var expected_buf: [512]u8 = undefined;
-        const expected = try formatProvisionalProgressLabel(&expected_buf, if (case.resource != null) "Reading skill resource" else "Loading skill", case.resource);
-        try std.testing.expectEqualStrings(expected, capture.events.items[1].progress.text);
-        if (case.resource) |resource| {
-            try std.testing.expectEqualStrings(resource, statuses.tracked.items[0].label_value.?);
-        } else {
-            try std.testing.expect(statuses.tracked.items[0].label_value == null);
-        }
-    }
-}
-
 test "provisional toolbox labels read as what the call opens, runs, or searches" {
     // The stream's hint is the first string in the arguments, which may name
     // what a run runs or what a search looks for, so it never labels the row.
@@ -2059,6 +2006,8 @@ test "provisional toolbox labels read as what the call opens, runs, or searches"
         .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .label = tooling_presentation.mcp_running_label, .value = "mcp_fixture_echo" },
         .{ .arguments_json = "{\"search\":\"list files\"}", .label = "Searching toolbox", .value = "list files" },
         .{ .arguments_json = "{\"open\":\"fixture\"}", .label = "Opening", .value = "fixture" },
+        // A skill's file reads as that file.
+        .{ .arguments_json = "{\"open\":\"skill:opaque/location\",\"resource\":\"references/types.md\"}", .label = "Reading skill resource", .value = "references/types.md" },
     };
     const alloc = std.testing.allocator;
     for (cases) |case| {
@@ -2080,7 +2029,7 @@ test "provisional toolbox labels read as what the call opens, runs, or searches"
     }
 }
 
-test "provisional skill labels decode escaped UTF-8 and encode terminal controls before copying" {
+test "provisional toolbox labels decode escaped UTF-8 and encode terminal controls before copying" {
     const alloc = std.testing.allocator;
     var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
     defer capture.deinit();
@@ -2088,9 +2037,9 @@ test "provisional skill labels decode escaped UTF-8 and encode terminal controls
     var statuses = ProvisionalToolStatuses{};
     defer statuses.deinit(alloc);
     {
-        const json = try alloc.dupe(u8, "{\"location\":\"skill:opaque/location\",\"resource\":\"r/\\u00e9\\u4e2d\\\"\\u001b[31m\\n\\r\\t\\u0000\\u0080.md\"}");
+        const json = try alloc.dupe(u8, "{\"open\":\"skill:opaque/location\",\"resource\":\"r/\\u00e9\\u4e2d\\\"\\u001b[31m\\n\\r\\t\\u0000\\u0080.md\"}");
         defer alloc.free(json);
-        try statuses.publish(&hooks, alloc, 7, "skill_1", "skill", .read, eligibleActionLabel("skill"), "skill:opaque/location", json);
+        try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, .read, eligibleActionLabel(toolbox.tool_name), "skill:opaque/location", json);
     }
     try std.testing.expectEqualStrings(
         "● Reading skill resource\x1b[0m \x1b[38;5;245mr/é中\"\\x1b[31m\\x0a\\x0d\\x09\\x00\\u{0080}.md\x1b[0m",
@@ -2099,7 +2048,7 @@ test "provisional skill labels decode escaped UTF-8 and encode terminal controls
     try std.testing.expectEqualStrings("r/é中\"\x1b[31m\n\r\t\x00\u{0080}.md", statuses.tracked.items[0].label_value.?);
 }
 
-test "provisional skill labels fall back when encoded resource exceeds the progress buffer" {
+test "provisional toolbox labels fall back when an encoded resource exceeds the progress buffer" {
     const alloc = std.testing.allocator;
     const max_detail = 512 - "● Reading skill resource\x1b[0m \x1b[38;5;245m\x1b[0m".len;
     for ([_]usize{ max_detail, max_detail + 1, 512, 513, 4096 }) |len| {
@@ -2111,15 +2060,15 @@ test "provisional skill labels fall back when encoded resource exceeds the progr
         const resource = try alloc.alloc(u8, len);
         defer alloc.free(resource);
         @memset(resource, 'a');
-        const json = try alloc.print("{{\"resource\":\"{s}\"}}", .{resource});
+        const json = try alloc.print("{{\"open\":\"skill:opaque/location\",\"resource\":\"{s}\"}}", .{resource});
         defer alloc.free(json);
-        try statuses.publish(&hooks, alloc, 7, "skill_1", "skill", .read, eligibleActionLabel("skill"), "skill:opaque/location", json);
+        try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, .read, eligibleActionLabel(toolbox.tool_name), "skill:opaque/location", json);
         const text = capture.events.items[1].progress.text;
         if (len == max_detail) {
             try std.testing.expectEqual(@as(usize, 512), text.len);
             try std.testing.expectEqualStrings(resource, statuses.tracked.items[0].label_value.?);
         } else {
-            try std.testing.expectEqualStrings("● Loading skill\x1b[0m", text);
+            try std.testing.expectEqualStrings("● Using\x1b[0m", text);
             try std.testing.expect(statuses.tracked.items[0].label_value == null);
         }
     }
