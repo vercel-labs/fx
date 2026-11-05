@@ -125,6 +125,7 @@ pub fn parseArgs(
 const Writable = enum {
     auto_compact_percent,
     auto_upgrade,
+    cache_warming,
     collapse_tool_calls,
     context,
     effort,
@@ -219,6 +220,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
     const enabled = parseSwitch(raw) orelse return invalid(problem, "true or false");
     switch (writable) {
         .auto_upgrade => patch.auto_upgrade = enabled,
+        .cache_warming => patch.cache_warming = enabled,
         .collapse_tool_calls => patch.collapse_tool_calls = enabled,
         .context => patch.context = enabled,
         .fast_mode => patch.fast_mode = enabled,

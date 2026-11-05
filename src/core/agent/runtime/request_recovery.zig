@@ -4,8 +4,11 @@
 //! happened to the request (`start`, `failed`, `responding`, `succeeded`,
 //! `cancel`), and each report becomes one `recovery.step` call on the boot
 //! clock. Its plan's status goes to the host, and its send tells the loop to
-//! resend. Between sends `waitForSend` delivers `tick` once a second and polls
-//! the cancel flag every 25 ms. While a send is on the wire, a ticker keeps the
+//! resend. Between sends `waitForSend` delivers `tick` every 100 ms, so a
+//! jittered wait ends within a tick of its time, and polls the cancel flag
+//! every 25 ms; in single-threaded builds each poll also gives the host its
+//! cooperative pulse, which is where the host's Esc arrives. While a send is
+//! on the wire, a ticker keeps the
 //! retrying status counting: a thread in threaded builds, or the transport's
 //! cooperative pulse in single-threaded ones.
 //!
@@ -38,8 +41,13 @@ const runtime_deps = @import("deps.zig");
 pub const Failure = recovery.Failure;
 pub const Send = recovery.Send;
 
-/// The module expects `tick` once a second from `start` until `finish`.
+/// The module expects `tick` at least once a second from `start` until
+/// `finish`; a send on the wire ticks this often.
 const tick_ms: u64 = 1_000;
+/// How often a wait ticks. The module ends a wait at the first tick past its
+/// jittered time, so a whole-second tick would round every wait up to a
+/// whole second and every client would resend together.
+const wait_tick_ms: u64 = 100;
 /// How often a wait checks for Esc.
 const cancel_poll_ms: u64 = 25;
 /// Tests run the ticker thread fast; the module still sees the virtual clock.
@@ -62,6 +70,10 @@ pub fn failureKind(cause: types.ModelRecoveryCause) ?Failure.Kind {
     };
 }
 
+/// The unreadable replies one request takes before its turn ends: a server
+/// that sends one every time is broken, not having a bad moment.
+const max_unreadable_replies = 3;
+
 pub const RequestRecovery = struct {
     deps: *const runtime_deps.AgentRuntimeDeps,
     cancel_flag: *std.atomic.Value(bool),
@@ -72,6 +84,9 @@ pub const RequestRecovery = struct {
     continue_flag: ?*std.atomic.Value(bool) = null,
     /// Off in tests unless a test exercises the thread itself.
     ticker_enabled: bool = !builtin.is_test,
+    /// Replies this request could not read. Touched only by the request's
+    /// own thread.
+    unreadable_replies: u8 = 0,
 
     mutex: std.Io.Mutex = .init,
     // Everything below is guarded by `mutex`.
@@ -218,12 +233,12 @@ pub const RequestRecovery = struct {
         return self.event(.user_continue);
     }
 
-    /// Waits for the module's next send, delivering `tick` once a second and
-    /// `user_continue` when the continue flag is set. Returns null when the
-    /// cancel flag is set; the caller then runs its cancel path, which calls
-    /// `cancel`.
+    /// Waits for the module's next send, delivering `tick` every
+    /// `wait_tick_ms` and `user_continue` when the continue flag is set.
+    /// Returns null when the cancel flag is set; the caller then runs its
+    /// cancel path, which calls `cancel`.
     pub fn waitForSend(self: *RequestRecovery) !?Send {
-        var next_tick_ms = self.nowMs() +| tick_ms;
+        var next_tick_ms = self.nowMs() +| wait_tick_ms;
         while (true) {
             if (self.cancel_flag.load(.seq_cst)) return null;
             if (self.continue_flag) |flag| if (flag.swap(false, .seq_cst)) {
@@ -234,7 +249,7 @@ pub const RequestRecovery = struct {
                 self.sleepMs(@min(cancel_poll_ms, next_tick_ms - now_ms));
                 continue;
             }
-            next_tick_ms = now_ms +| tick_ms;
+            next_tick_ms = now_ms +| wait_tick_ms;
             if (try self.event(.tick)) |send| return send;
         }
     }
@@ -317,6 +332,14 @@ pub const RequestRecovery = struct {
     }
 
     /// Sends so far, including the first.
+    /// Counts a reply this request could not read, and says whether it is
+    /// the last one: past `max_unreadable_replies` the turn ends with the
+    /// error instead of another resend.
+    pub fn unreadableReplyEndsRequest(self: *RequestRecovery) bool {
+        self.unreadable_replies +|= 1;
+        return self.unreadable_replies >= max_unreadable_replies;
+    }
+
     pub fn attempt(self: *RequestRecovery) u16 {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
@@ -512,6 +535,14 @@ pub const RequestRecovery = struct {
         if (comptime builtin.is_test) {
             _ = self.virtual_now_ms.fetchAdd(ms, .seq_cst);
             return;
+        }
+        // A single-threaded host, such as the browser SDK, delivers Esc only
+        // through the cooperative pulse, so a wait that never pulsed ended
+        // before the cancel could arrive.
+        if (comptime builtin.single_threaded) {
+            if (self.inner_pulse) |inner| inner.pulse() catch |err| {
+                debug_trace.logf("recovery", "wait pulse failed err={s}", .{@errorName(err)});
+            };
         }
         io_mod.getIo().sleep(.fromNanoseconds(@as(i96, ms) * std.time.ns_per_ms), .awake) catch {};
     }
@@ -944,4 +975,53 @@ test "a resumed start that must ask first sends nothing" {
         defer request.deinit();
         try std.testing.expectEqual(@as(?Send, null), try request.start(false, .{ .stale = true }));
     }
+}
+
+test "a resend leaves within one wait tick of its jittered deadline" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var below: usize = 0;
+    var seed: u64 = 0;
+    while (seed < 40) : (seed += 1) {
+        var cancel_flag = std.atomic.Value(bool).init(false);
+        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+        defer request.deinit();
+        request.virtual_now_ms.store(test_epoch_ms + seed * 7_919, .seq_cst);
+        _ = try request.start(false, null);
+        _ = try request.failed(.{ .kind = .server });
+        const failed_at = request.virtual_now_ms.load(.seq_cst);
+        _ = (try request.waitForSend()).?;
+        const waited = request.virtual_now_ms.load(.seq_cst) - failed_at;
+        // The first step is 1 s jittered to 80-100 %: 800 to 1000 ms, plus
+        // at most one wait tick.
+        try std.testing.expect(waited >= 800 and waited <= 1_000 + wait_tick_ms);
+        if (waited <= 950) below += 1;
+        _ = try request.cancel();
+    }
+    // A whole-second tick would put every resend at 1000 ms.
+    try std.testing.expect(below >= 10);
+}
+
+test "ten thousand failures in a row keep every wait within its cap and never stop retrying" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+    request.virtual_now_ms.store(test_epoch_ms, .seq_cst);
+    _ = try request.start(false, null);
+    var longest: u64 = 0;
+    for (0..10_000) |_| {
+        _ = try request.failed(.{ .kind = .server });
+        const failed_at = request.virtual_now_ms.load(.seq_cst);
+        _ = (try request.waitForSend()) orelse return error.TestExpectedSend;
+        const waited = request.virtual_now_ms.load(.seq_cst) - failed_at;
+        longest = @max(longest, waited);
+        // The backoff tops out at 30 s; a wait ends within one tick of its time.
+        try std.testing.expect(waited <= 30_000 + wait_tick_ms);
+    }
+    try std.testing.expect(longest >= 24_000);
+    _ = try request.cancel();
 }

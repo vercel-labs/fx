@@ -91,10 +91,7 @@ pub fn failureForHttpStatus(status: std.http.Status) Failure {
         return .{
             .category = .gateway_unavailable,
             .http_status = status,
-            .retryable = switch (status) {
-                .internal_server_error, .bad_gateway, .service_unavailable, .gateway_timeout => true,
-                else => false,
-            },
+            .retryable = types.isRetryableServerStatus(code),
         };
     }
     return .{ .category = .http_status, .http_status = status };
@@ -187,7 +184,7 @@ test "catalog capability lookup distinguishes unsupported and unknown without fe
     try std.testing.expect(provider.lookupCapabilities("known") == null);
     provider.lookup_capabilities_fn = Fixture.lookup;
     try std.testing.expectEqual(@as(?u32, 512), provider.lookupCapabilities("known").?.max_output_tokens);
-    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, provider.lookupCapabilities("unknown").?);
+    try model_capabilities.expectCapabilitiesEqualForTest(.{}, provider.lookupCapabilities("unknown").?);
     try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
 }
 
@@ -443,12 +440,12 @@ fn modelTierRank(id: []const u8) u8 {
     if (text_utils.containsIgnoreCase(id, "flash")) return 2;
     if (text_utils.containsIgnoreCase(id, "opus") or
         text_utils.containsIgnoreCase(id, "sonnet") or
-        text_utils.containsIgnoreCase(id, "gpt-5") or
+        text_utils.hasMajorVersionAtLeast(id, "gpt-", 5) or
         text_utils.containsIgnoreCase(id, "o1") or
         text_utils.containsIgnoreCase(id, "o3") or
         text_utils.containsIgnoreCase(id, "o4") or
         text_utils.containsIgnoreCase(id, "pro") or
-        text_utils.containsIgnoreCase(id, "grok-4"))
+        text_utils.hasMajorVersionAtLeast(id, "grok-", 4))
     {
         return 0;
     }
@@ -923,6 +920,34 @@ test "catalog order prefers tool use, tier, provider, then recency" {
     try std.testing.expectEqualStrings("xai/grok-flash", entries[3].id);
     try std.testing.expectEqualStrings("anthropic/claude-haiku-4.5", entries[4].id);
     try std.testing.expectEqualStrings("mistral/large-x", entries[5].id);
+}
+
+test "catalog order lists newer gpt and grok majors before older ones" {
+    // The Gateway lists models oldest first.
+    var entries = [_]ModelCatalogEntry{
+        .{ .id = @constCast("openai/gpt-4.1"), .model_type = @constCast("language"), .released = 5, .has_tool_use = true },
+        .{ .id = @constCast("openai/gpt-5.6-sol"), .model_type = @constCast("language"), .released = 10, .has_tool_use = true },
+        .{ .id = @constCast("openai/gpt-5.6-sol-fast"), .model_type = @constCast("language"), .released = 10, .has_tool_use = true },
+        .{ .id = @constCast("xai/grok-4.7"), .model_type = @constCast("language"), .released = 20, .has_tool_use = true },
+        .{ .id = @constCast("openai/gpt-6-sol"), .model_type = @constCast("language"), .released = 30, .has_tool_use = true },
+        .{ .id = @constCast("openai/gpt-6.1-sol"), .model_type = @constCast("language"), .released = 40, .has_tool_use = true },
+        .{ .id = @constCast("openai/gpt-6.1-sol-fast"), .model_type = @constCast("language"), .released = 40, .has_tool_use = true },
+        .{ .id = @constCast("xai/grok-5"), .model_type = @constCast("language"), .released = 50, .has_tool_use = true },
+    };
+
+    sort_utils.sort(ModelCatalogEntry, &entries, {}, compareModelCatalogEntries);
+
+    const expected = [_][]const u8{
+        "openai/gpt-6.1-sol",
+        "openai/gpt-6.1-sol-fast",
+        "openai/gpt-6-sol",
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-sol-fast",
+        "xai/grok-5",
+        "xai/grok-4.7",
+        "openai/gpt-4.1",
+    };
+    for (expected, entries) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
 }
 
 test "featured deepseek slot prefers the pro variant at equal recency" {

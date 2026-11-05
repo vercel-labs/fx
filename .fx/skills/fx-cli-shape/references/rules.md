@@ -81,7 +81,7 @@ Run flags and env vars never save; setter commands do (see Flags). Every effecti
 - Long flags are kebab-case. Short flags are scarce and keep one meaning: `-h` help, `-v` version, `-c` continue, `-r` resume. A short flag means the same as its long form, so `-r` is the short form of `--resume`: with no value both open the session picker, `last` opens the newest session, and an ID opens that one (`--resume=<id>` works too). Because `-c` is taken, git's `-c key=value` can't be copied.
 - `--x value` and `--x=value` both work on every command. The shared parser in `src/core/cli/cli_flags.zig` provides both.
 - A boolean pairs `--x` with `--no-x`.
-- When a flag repeats or conflicts, the last one wins, on every command. `--fast --no-fast` means Fast mode off; `--fast --ultrafast` means Ultra mode. Every command follows this.
+- When a flag repeats or conflicts, the last one wins, on every command. `--fast --no-fast` means Fast mode off; `--fast --ultrafast` means Ultrafast mode. Every command follows this.
 - An enum is one flag that takes the value: `--permission-mode <ask|auto|full-access>`. Shortcut aliases stay: `--auto`, `--full-access`, `--yolo`, plus `--ask`. Every command that runs the agent takes the whole set.
 - Flags people bring from other agents get a pointer, not an alias: `fx -p` and `fx --print` fail with exit 2 and say to use `fx ask "<prompt>"`.
 - No flag carries a value in its name. `--resume-<id>` was removed and fails with a hint naming `--resume <id>`.

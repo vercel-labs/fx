@@ -13,6 +13,7 @@ test {
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("core/cli/cli_flags.zig");
     _ = @import("core/app/app_agents_runtime.zig");
+    _ = @import("core/app/app_session_runtime.zig");
     _ = @import("core/app/host_record.zig");
     _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_data.zig");

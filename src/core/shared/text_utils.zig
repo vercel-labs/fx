@@ -4,6 +4,7 @@ const display_width = @import("display_width.zig");
 const ascii_case = @import("ascii_case.zig");
 
 pub const containsIgnoreCase = ascii_case.containsIgnoreCase;
+pub const hasMajorVersionAtLeast = ascii_case.hasMajorVersionAtLeast;
 
 /// Returns `text` repeated `count` times as a comptime string literal.
 pub inline fn repeat(comptime text: []const u8, comptime count: usize) *const [text.len * count:0]u8 {
@@ -513,8 +514,8 @@ pub fn isTerminalSafe(raw: []const u8) bool {
 }
 
 /// Returns true when `raw` draws as it is under `appendTerminalSafeText`:
-/// line breaks and tabs are its only control bytes, and the rest is valid,
-/// printable UTF-8.
+/// line breaks and tabs are its only control bytes, and the rest is valid
+/// UTF-8 with no C1 control.
 pub fn isTerminalSafeText(raw: []const u8) bool {
     var index: usize = 0;
     while (index < raw.len) {
@@ -523,7 +524,7 @@ pub fn isTerminalSafeText(raw: []const u8) bool {
             continue;
         }
         var token_buf: [12]u8 = undefined;
-        const token = terminalSafeToken(raw, index, &token_buf);
+        const token = escapedToken(raw, index, &token_buf, .controls);
         if (token.source_len != token.bytes.len) return false;
         if (!std.mem.eql(u8, raw[index .. index + token.source_len], token.bytes)) return false;
         index += token.source_len;
@@ -531,11 +532,13 @@ pub fn isTerminalSafeText(raw: []const u8) bool {
     return true;
 }
 
-/// Appends text of any number of lines ready to draw, as
-/// `appendTerminalSafeLine` does for one: line breaks and tabs stay, a
-/// carriage return before a line break is dropped, and every other control
-/// byte, C1 control, and invalid UTF-8 byte becomes the visible escape
-/// `encodeTerminalSafe` writes.
+/// Appends prose of any number of lines, such as a prompt or a model's reply,
+/// ready to draw: line breaks and tabs stay, a carriage return before a line
+/// break is dropped, and every other control byte, C1 control, and invalid
+/// UTF-8 byte becomes the visible escape `encodeTerminalSafe` writes. Unlike
+/// `appendTerminalSafeLine`, it keeps zero-width joiners, direction marks,
+/// and other invisible format characters, which emoji sequences and some
+/// scripts need.
 pub fn appendTerminalSafeText(
     alloc: std.mem.Allocator,
     out: *std.ArrayList(u8),
@@ -554,7 +557,7 @@ pub fn appendTerminalSafeText(
             continue;
         }
         var token_buf: [12]u8 = undefined;
-        const token = terminalSafeToken(raw, index, &token_buf);
+        const token = escapedToken(raw, index, &token_buf, .controls);
         try out.appendSlice(alloc, token.bytes);
         index += token.source_len;
     }
@@ -569,6 +572,13 @@ test "terminal-safe text keeps its lines and tabs and shows every other control 
     try std.testing.expect(isTerminalSafeText(out.items));
 
     try std.testing.expect(isTerminalSafeText("one\ttwo\nthree caf\xc3\xa9"));
+
+    // A joined emoji, a zero-width non-joiner, and a right-to-left mark stay.
+    const joined = "team \u{1f469}\u{200d}\u{1f4bb} \u{200c}\u{200f}";
+    try std.testing.expect(isTerminalSafeText(joined));
+    out.clearRetainingCapacity();
+    try appendTerminalSafeText(alloc, &out, joined);
+    try std.testing.expectEqualStrings(joined, out.items);
     for ([_][]const u8{ "a\x1bb", "a\xc2\x9bb", "a\r\nb", "a\x7fb", "a\xffb" }) |raw| {
         try std.testing.expect(!isTerminalSafeText(raw));
     }
@@ -727,7 +737,20 @@ const TerminalSafeToken = struct {
     bytes: []const u8,
 };
 
+/// The code points a token writes as an escape: every non-printing one, or
+/// only the C1 controls a terminal acts on.
+const EscapedCodepoints = enum { non_printing, controls };
+
 fn terminalSafeToken(raw: []const u8, index: usize, buf: *[12]u8) TerminalSafeToken {
+    return escapedToken(raw, index, buf, .non_printing);
+}
+
+fn escapedToken(
+    raw: []const u8,
+    index: usize,
+    buf: *[12]u8,
+    comptime codepoints: EscapedCodepoints,
+) TerminalSafeToken {
     const byte = raw[index];
     if (byte < 0x20 or byte == 0x7f) {
         return .{ .source_len = 1, .bytes = writeByteEscape(buf, byte) };
@@ -747,7 +770,11 @@ fn terminalSafeToken(raw: []const u8, index: usize, buf: *[12]u8) TerminalSafeTo
     const codepoint = display_width.decodeUtf8Sequence(sequence) catch {
         return .{ .source_len = 1, .bytes = writeByteEscape(buf, byte) };
     };
-    if (isNonPrintingCodepoint(codepoint)) {
+    const escape = switch (codepoints) {
+        .non_printing => isNonPrintingCodepoint(codepoint),
+        .controls => codepoint >= 0x80 and codepoint <= 0x9f,
+    };
+    if (escape) {
         return .{ .source_len = sequence_len, .bytes = writeCodepointEscape(buf, codepoint) };
     }
     return .{ .source_len = sequence_len, .bytes = sequence };

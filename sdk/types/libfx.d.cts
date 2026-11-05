@@ -46,7 +46,7 @@ export interface FxModelOptions {
   effort?: FxEffort;
   /** Enables the fast lane for models that advertise one. */
   fast?: boolean;
-  /** Requests Ultra mode, the higher-cost service tier, for models whose metadata advertises it. Disables Fast. */
+  /** Requests Ultrafast mode, the higher-cost service tier, for models whose metadata advertises it. Disables Fast. */
   ultrafast?: boolean;
 }
 
@@ -261,8 +261,8 @@ export interface FxUsage {
   reasoningTokens?: number;
 }
 
-/** Why an engine turn ended. */
-export type FxStopReason = "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled";
+/** Why an engine turn ended. `yielded`: it stopped at its `yieldAt` and stays open for `resume()`. */
+export type FxStopReason = "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled" | "yielded";
 
 // ---------------------------------------------------------------------------
 // Diagnostics
@@ -304,7 +304,8 @@ export type FxEngineEvent = FxEventBase & (
   | { type: "permission.request"; request: unknown }
   | { type: "permission.resolve"; optionId: unknown }
   | { type: "journal.open"; events: number; checkpoint: boolean; turns: unknown; resumable: boolean }
-  | { type: "journal.append"; events: number }
+  /** `barrier`: the record's `barrier`, as `Persistence.append` receives it. */
+  | { type: "journal.append"; events: number; barrier: boolean }
   | { type: "journal.error"; error: string }
   | { type: "checkpoint.save"; through: string; bytes: number }
   | { type: "checkpoint.error"; error: string; message: string }
@@ -796,8 +797,8 @@ export interface FxAccepted {
 /** How a durable turn ended. */
 export interface FxTurnResult {
   messageId: string;
-  /** `error` when the turn failed, with the reason in `error`; `unknown` when the process that ran it stopped before writing how it ended. */
-  stopReason: FxStopReason | "error" | "unknown";
+  /** `error` when the turn failed, with the reason in `error`; `unknown` when the process that ran it stopped before writing how it ended. A yielded turn continues, so it never ends `yielded`. */
+  stopReason: Exclude<FxStopReason, "yielded"> | "error" | "unknown";
   /** Absent when the result is a failure read from the session's log rather than from the turn's end. */
   usage?: FxUsage;
   error?: FxErrorSummary;
@@ -848,7 +849,7 @@ export type FxStreamLine = (
   | {
     type: "turn_end";
     messageId: string;
-    stopReason: FxStopReason | "error" | "unknown";
+    stopReason: Exclude<FxStopReason, "yielded"> | "error" | "unknown";
     usage?: FxUsage;
     error?: FxErrorSummary;
     repeated?: true;

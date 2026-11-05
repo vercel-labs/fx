@@ -423,8 +423,8 @@ Options:
   --effort <level>            Override the reasoning effort for this request
   --fast                      Enable Fast mode for this request when the model supports it
   --no-fast                   Disable Fast mode for this request
-  --ultrafast                 Request Ultra mode for this request when the model supports it
-  --no-ultrafast              Disable Ultra mode for this request
+  --ultrafast                 Request Ultrafast mode for this request when the model supports it
+  --no-ultrafast              Disable Ultrafast mode for this request
   --provider-order <a,b,...>  Prefer these gateway providers in order for this request
   --provider-strict           Restrict this request to only the providers in --provider-order
   --no-provider-strict        Clear the provider restriction for this request
@@ -1124,6 +1124,26 @@ describe("cli: status", () => {
       const relative = await runFx(["status"], { ...options, env: { ...options.env, FX_HOME: "profile" } });
       expect(relative.code).toBe(1);
       expect(relative.stderr).toBe("fx: FX_HOME must be an absolute path\n");
+
+      // A relative HOME counts as unset, so with FX_HOME unset fx has no
+      // folder of its own, and status names none.
+      const relativeHome = await runFx(["status", "--json"], {
+        ...options,
+        env: { ...options.env, HOME: "relative/home", FX_HOME: undefined },
+      });
+      expect(relativeHome.code).toBe(0);
+      expect(JSON.parse(relativeHome.stdout).fx_home).toBeUndefined();
+
+      // With FX_HOME set, a relative HOME counts as unset the same way, so
+      // FX_HOME still holds fx's files.
+      const relativeWithFxHome = { ...options, env: { ...options.env, HOME: "relative/home" } };
+      const statusWithFxHome = await runFx(["status", "--json"], relativeWithFxHome);
+      expect(statusWithFxHome.code).toBe(0);
+      expect(JSON.parse(statusWithFxHome.stdout).fx_home).toBe(fxHome);
+      const added = await runFx(["mcp", "add", "probe", "--", "/bin/echo", "hi"], relativeWithFxHome);
+      expect(added.code).toBe(0);
+      expect(added.stdout).toBe("Added probe to $FX_HOME/mcp.json.\n");
+      expect(existsSync(join(workspace, "relative"))).toBe(false);
     } finally {
       gateway.stop();
       rmSync(root, { recursive: true, force: true });
@@ -6003,6 +6023,34 @@ describe("cli: MCP profile", () => {
     }
   });
 
+  test.skipIf(platform() === "win32")("status, list, and add finish when ~/.fx/mcp.json is a fifo", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-fifo-")));
+    const home = join(root, "home");
+    const profilePath = join(home, ".fx", "mcp.json");
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    // Opening a fifo for reading waits for a writer, and nothing writes here.
+    expect(spawnSync("mkfifo", [profilePath]).status).toBe(0);
+    const env = { HOME: home, ...NO_GATEWAY_AUTH };
+    try {
+      const status = await runFx(["status", "--json"], { cwd: root, env });
+      expect(status.code).toBe(0);
+      expect(JSON.parse(status.stdout.trim()).mcp.inspection_error).toBe("DurablePathUnsafe");
+
+      const list = await runFx(["mcp", "list"], { cwd: root, env });
+      expect(list.code).toBe(1);
+      expect(list.stderr).toBe("fx mcp: an MCP config file isn't a plain file; replace it with one\n");
+
+      const add = await runFx(["mcp", "add", "probe", "--", "/bin/echo", "hi"], { cwd: root, env });
+      expect(add.code).toBe(1);
+      expect(add.stderr).toBe(
+        "Couldn't add probe to ~/.fx/mcp.json: it isn't a plain file; replace it with one.\n",
+      );
+      expect(lstatSync(profilePath).isFIFO()).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("concurrent adds of different names keep both", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-race-")));
     const home = join(root, "home");
@@ -6032,7 +6080,22 @@ describe("cli: MCP profile", () => {
       env: { HOME: undefined, ...NO_GATEWAY_AUTH },
     });
     expect(missingHome.code).toBe(1);
-    expect(missingHome.stderr).toBe("fx mcp: HOME isn't set\n");
+    expect(missingHome.stderr).toBe("fx mcp: HOME is not set to an absolute path\n");
+
+    // A relative HOME counts as unset: fx fails the same way and saves
+    // nothing under the folder it runs in.
+    const cwd = mkdtempSync(join(tmpdir(), "fx-e2e-mcp-relative-home-"));
+    try {
+      const relativeHome = await runFx(["mcp", "add", "fixture", "--", "node"], {
+        cwd,
+        env: { HOME: "relative/home", ...NO_GATEWAY_AUTH },
+      });
+      expect(relativeHome.code).toBe(1);
+      expect(relativeHome.stderr).toBe("fx mcp: HOME is not set to an absolute path\n");
+      expect(readdirSync(cwd)).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
 
     const flagged = await runFx(
       ["mcp", "add", "--transport", "sse", "fixture", "https://example.test"],

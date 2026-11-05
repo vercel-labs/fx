@@ -44,6 +44,7 @@ pub const Error = error{
     RequiredToolMissing,
     UnexpectedToolCall,
     InvalidChunk,
+    MalformedChatCompletionsChunk,
     ConflictingIdentity,
     InvalidFinishReason,
     InconsistentFinishReason,
@@ -682,7 +683,10 @@ pub const Reducer = struct {
         try check_json_depth(data);
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, data, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidChunk,
+            // Valid JSON that fx refuses ends the turn. Text that is not JSON
+            // at all was damaged on the way, so the request is resent.
+            error.DuplicateField => return error.InvalidChunk,
+            else => return error.MalformedChatCompletionsChunk,
         };
         defer parsed.deinit();
         const root = try object(parsed.value);
@@ -2239,7 +2243,7 @@ test "chat completions terminal evidence and finish reasons are strict" {
 test "chat completions rejects malformed chunks contradictory identities and extra choices" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { first: ?[]const u8 = null, chunk: []const u8, failure: Error }{
-        .{ .chunk = "not JSON", .failure = error.InvalidChunk },
+        .{ .chunk = "not JSON", .failure = error.MalformedChatCompletionsChunk },
         .{ .chunk = "{\"choices\":[],\"choices\":[]}", .failure = error.InvalidChunk },
         .{ .chunk = "{\"error\":{\"message\":\"bad request\"}}", .failure = error.ProviderError },
         .{ .chunk = "{\"choices\":[{\"index\":1,\"delta\":{}}]}", .failure = error.InvalidChunk },

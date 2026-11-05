@@ -494,6 +494,35 @@ class MinsizeFunctionTests(LlvmCase):
 
 
 @unittest.skipUnless(AVAILABLE, "pinned LLVM with libLLVM is not installed")
+class NameFunctionsTests(LlvmCase):
+    IR = (
+        "define private void @cold() { ret void }\n"
+        "define internal void @kept() { ret void }\n"
+        "define void @exported() {\n"
+        "  call void @cold()\n"
+        "  call void @kept()\n"
+        "  call void @external()\n"
+        "  ret void\n"
+        "}\n"
+        "declare void @external()\n"
+    )
+
+    def test_only_private_definitions_become_internal(self) -> None:
+        result, output = self.run_pass("name-functions", self.assemble("functions", self.IR))
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual({"pass": "name-functions", "named_functions": 1}, json.loads(result.stdout))
+        text = subprocess.run(
+            [str(LLVM_BIN / "llvm-dis"), str(output), "-o", "-"], check=True, capture_output=True, text=True
+        ).stdout
+        self.assertIn("define internal void @cold()", text)
+        self.assertIn("define internal void @kept()", text)
+        self.assertIn("define void @exported()", text)
+        self.assertIn("declare void @external()", text)
+        self.assertNotIn("private", text)
+
+
+@unittest.skipUnless(AVAILABLE, "pinned LLVM with libLLVM is not installed")
 class NoOutlineTests(LlvmCase):
     IR = (
         "define void @startup() { ret void }\n"

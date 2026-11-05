@@ -20,6 +20,9 @@ const agents_menu_presentation = @import("../../ui/footer/agents_menu_presentati
 const session_mod = @import("../session/session.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_process_runtime = @import("app_process_runtime.zig");
+const provider_runtime = @import("provider_runtime.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
+const profiles = @import("../profiles/profiles.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_authority = @import("../subagent/authority.zig");
@@ -79,6 +82,9 @@ pub const ChildAgent = struct {
     /// The name its parent gave it, such as `reviewer`, from its first run.
     /// Empty for a one-off. Owned.
     name: []u8 = &.{},
+    /// The profile it runs in, from its host's list. Empty until the list is
+    /// read. Owned.
+    profile: []u8 = &.{},
     /// Where its current approval and question come in the order its tree's
     /// prompts were asked (`App.prompt_order`), so the instance's screen
     /// shows the oldest first. Meaningful only while that prompt is active.
@@ -125,6 +131,9 @@ pub const AgentsMenu = struct {
     /// instance. Compared by address only, so it is never read after its
     /// agent closes. Meaningful while `open`.
     origin: ?*ChildAgent = null,
+    /// The subagent whose close the first x armed, until the second x
+    /// closes it or another key disarms it. Compared by address only.
+    close_armed: ?*ChildAgent = null,
     /// Backs the rows the last projection showed. Owned.
     rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
 
@@ -815,6 +824,7 @@ pub fn Runtime(comptime App: type) type {
                 for (listing) |entry| {
                     const child = findChild(app, entry.id) orelse try addChild(app, entry.id);
                     if (child.name.len == 0 and entry.name.len > 0) child.name = try app.alloc.dupe(u8, entry.name);
+                    if (child.profile.len == 0) child.profile = try app.alloc.dupe(u8, entry.profile);
                     if (child.parent_host == null) setParentHost(app, child, host);
                     try order.append(app.alloc, .{ .id = entry.id });
                 }
@@ -894,11 +904,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// The footer note for a hidden agent waiting on the user, such as
-        /// "reviewer needs approval", or the finished note, or empty. It
-        /// waits on an approval, a question, or a request only the user can
-        /// continue, such as one out of credits. The footer follows it with
-        /// the agent indicator, which names the key that opens the agent
-        /// list. fx never switches on its own. `buf` backs the returned text.
+        /// "reviewer needs approval", or else the finished note, or empty. It waits on an approval, a question, or a
+        /// request only the user can continue, such as one out of credits.
+        /// The footer follows it with the agent indicator, which names the
+        /// key that opens the agent list. fx never switches on its own.
+        /// `buf` backs the returned text.
         pub fn waitingNote(app: *App, buf: []u8) []const u8 {
             // The first waiting agent the note names, null for the first
             // instance, which `main_agent` holds.
@@ -1017,6 +1027,19 @@ pub fn Runtime(comptime App: type) type {
             return changed;
         }
 
+        /// The footer note for hidden subagents with a turn going or queued,
+        /// such as "1 subagent working", so the agent on screen shows that
+        /// work goes on elsewhere; empty when none is.
+        pub fn workingNote(app: *App, buf: []u8) []const u8 {
+            var count: usize = 0;
+            for (app.child_agents.items) |child| {
+                if (child.agent.role != .subagent or child == app.agent_on_screen) continue;
+                if (turnInFlight(&child.agent)) count += 1;
+            }
+            if (count == 0) return "";
+            return std.mem.print(buf, "{d} subagent{s} working", .{ count, if (count == 1) "" else "s" }) catch "";
+        }
+
         /// The footer note for hidden instances whose turns ended since they
         /// were last shown, such as "fx 7 finished", or empty. Only while
         /// several instances are open.
@@ -1111,6 +1134,7 @@ pub fn Runtime(comptime App: type) type {
         /// previews by switching.
         pub fn moveMenu(app: *App, delta: i32, row_budget: u16) !bool {
             if (!menuActive(app)) return false;
+            disarmClose(app);
             var order: std.ArrayList(?*ChildAgent) = .empty;
             defer order.deinit(app.alloc);
             try switchList(app, &order);
@@ -1162,17 +1186,241 @@ pub fn Runtime(comptime App: type) type {
                 const agent = targetAgent(app, target);
                 const subagent: ?*ChildAgent = if (target) |child| (if (child.agent.role == .subagent) child else null) else null;
                 if (subagent == null) number += 1;
+                const model = provider_runtime.modelOf(app, agent);
                 menu.rows.appendAssumeCapacity(.{
                     .number = if (subagent == null) number else 0,
                     .subagent_name = if (subagent) |child| child.displayName() else "",
                     .title = agent.session_title.items,
-                    .profile = agent.profile.profile.name,
+                    // A subagent's own agent never loads its profile; its
+                    // host's list says which one it runs in.
+                    .profile = if (subagent) |child| (if (child.profile.len > 0) child.profile else profiles.main_name) else agent.profile.profile.name,
                     .state = instanceState(agent, requestWaitsForUser(app, target)).label(),
                     .on_screen = target == menu.origin,
+                    .model = model,
+                    .effort = effortLabel(app, agent, model),
                 });
             }
             if (menu.selected >= menu.rows.items.len) menu.selected = menu.rows.items.len -| 1;
-            return .{ .rows = menu.rows.items, .selected = menu.selected, .window_start = menu.window_start };
+            const chosen: ?*ChildAgent = if (order.items.len > 0) order.items[@min(menu.selected, order.items.len - 1)] else null;
+            const closable = if (chosen) |child| child.agent.role == .subagent else false;
+            return .{
+                .rows = menu.rows.items,
+                .selected = menu.selected,
+                .window_start = menu.window_start,
+                .selected_closable = closable,
+                .close_armed = closable and menu.close_armed == chosen,
+            };
+        }
+
+        /// x in the agent list: the first press on a subagent's row arms its
+        /// close, and the second closes it for good (`closeSubagent`).
+        /// Instances close with /close, so x on one does nothing.
+        pub fn pressCloseKey(app: *App) !bool {
+            if (!menuActive(app)) return false;
+            var order: std.ArrayList(?*ChildAgent) = .empty;
+            defer order.deinit(app.alloc);
+            try switchList(app, &order);
+            if (order.items.len == 0) return true;
+            const menu = &app.instances.agents_menu;
+            const target = order.items[@min(menu.selected, order.items.len - 1)] orelse return true;
+            if (target.agent.role != .subagent) return true;
+            if (menu.close_armed != target) {
+                menu.close_armed = target;
+                debug_trace.eventf("host", "agents_menu_close_armed", .{}, "agent={s}", .{target.id});
+                // Its warning shows now, not at the next frame something else asks for.
+                app.shell.render_requests.request(.footer);
+                return true;
+            }
+            menu.close_armed = null;
+            try closeSubagent(app, target);
+            return true;
+        }
+
+        /// Any key but x disarms a close the first x armed, and its warning
+        /// goes at once.
+        pub fn disarmClose(app: *App) void {
+            if (comptime !@hasField(App, "instances")) return;
+            const menu = &app.instances.agents_menu;
+            if (menu.close_armed == null) return;
+            menu.close_armed = null;
+            debug_trace.eventf("host", "agents_menu_close_disarmed", .{}, "reason=key", .{});
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Closes subagent `child` for good, as the user's close from the
+        /// agent list: its host stops its work and writes the close, and its
+        /// agent, with every subagent it started, leaves the list at once.
+        fn closeSubagent(app: *App, child: *ChildAgent) !void {
+            const host = hostOf(app, child) orelse {
+                debug_trace.logf("host", "close dropped agent={s} reason=no_host", .{child.id});
+                return;
+            };
+            const id = try app.alloc.dupe(u8, child.id);
+            defer app.alloc.free(id);
+            const closed = host.closeChild(id, .user) catch |err| switch (err) {
+                // Its host keeps it listed, so its agent stays too.
+                error.CloseNotSaved => {
+                    debug_trace.logf("host", "close not saved agent={s}", .{id});
+                    return;
+                },
+                else => return err,
+            };
+            if (closed == null) {
+                debug_trace.logf("host", "close found no child agent={s}", .{id});
+                return;
+            }
+            _ = try dropClosedSubagents(app);
+        }
+
+        /// Drops the agents of the subagents their hosts closed, by their
+        /// parent's `close` or from the agent list, each with every subagent
+        /// it started (`closeBranch`). Cheap when none is. Returns whether it
+        /// dropped any.
+        pub fn dropClosedSubagents(app: *App) !bool {
+            var dropped = false;
+            // Dropping a branch can free hosts, so each pass looks afresh.
+            while (try takeAnyClosed(app)) |ids| {
+                defer {
+                    for (ids) |id| app.alloc.free(id);
+                    app.alloc.free(ids);
+                }
+                for (ids) |id| if (findChild(app, id)) |child| {
+                    try closeBranch(app, child);
+                    dropped = true;
+                };
+            }
+            return dropped;
+        }
+
+        /// The children some host closed since it was last asked, or null.
+        /// The caller owns them.
+        fn takeAnyClosed(app: *App) !?[][]u8 {
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return null;
+            if (firstOpen(app)) if (app.main_agent.session_persistence.subagent_host) |host| {
+                const ids = try host.takeClosed(app.alloc);
+                if (ids.len > 0) return ids;
+            };
+            for (app.child_agents.items) |child| if (child.agent.session_persistence.subagent_host) |host| {
+                const ids = try host.takeClosed(app.alloc);
+                if (ids.len > 0) return ids;
+            };
+            return null;
+        }
+
+        /// Whether subagent `entry` was started by `ancestor`, or by a
+        /// subagent `ancestor` started.
+        fn descendsFrom(app: *App, entry: *const ChildAgent, ancestor: *const ChildAgent) bool {
+            var current = entry;
+            while (current.agent.role == .subagent) {
+                const owner = ownerOf(app, hostOf(app, current)) orelse return false;
+                const hosted = hostedOf(app, owner) orelse return false;
+                if (hosted == ancestor) return true;
+                current = hosted;
+            }
+            return false;
+        }
+
+        fn inBranch(branch: []const *ChildAgent, value: ?*ChildAgent) bool {
+            const wanted = value orelse return false;
+            return std.mem.findScalar(*ChildAgent, branch, wanted) != null;
+        }
+
+        /// Drops subagent `child`, which its host closed, and every subagent
+        /// it started, each before the agent that started it, as `/close`
+        /// drops an instance's tree. When one of them is on screen, or the
+        /// agent list opened on one, the agent that started `child` takes
+        /// its place.
+        fn closeBranch(app: *App, child: *ChildAgent) !void {
+            var branch: std.ArrayList(*ChildAgent) = .empty;
+            defer branch.deinit(app.alloc);
+            try branch.append(app.alloc, child);
+            for (app.child_agents.items) |entry| {
+                if (entry != child and descendsFrom(app, entry, child)) try branch.append(app.alloc, entry);
+            }
+            const parent: ?*ChildAgent = if (ownerOf(app, hostOf(app, child))) |owner| hostedOf(app, owner) else null;
+            if (inBranch(branch.items, app.agent_on_screen)) try show(app, parent);
+            const menu = &app.instances.agents_menu;
+            if (inBranch(branch.items, menu.origin)) menu.origin = parent;
+            stopSet(app, branch.items, null);
+            debug_trace.eventf("host", "subagent_closed", .{}, "agent={s} subagents={d}", .{ child.id, branch.items.len - 1 });
+            dropSet(app, branch.items);
+            // The list's highlight stays on the agent shown, as it always is,
+            // not on whichever row took the closed one's place.
+            if (menuActive(app)) {
+                var order: std.ArrayList(?*ChildAgent) = .empty;
+                defer order.deinit(app.alloc);
+                try switchList(app, &order);
+                menu.selected = positionIn(order.items, app.agent_on_screen) orelse 0;
+                menu.window_start = @min(menu.window_start, menu.selected);
+                app.shell.render_requests.request(.footer);
+            }
+        }
+
+        /// Stops `set`, agents each listed after the agent that started
+        /// them, as a close does: an armed close of one and their lent prompts
+        /// go back, `first_host` and then their own hosts stop so no work the
+        /// close ends owes a report into the set, and each turn ends
+        /// cancelled. `dropSet` drops them after.
+        fn stopSet(app: *App, set: []const *ChildAgent, first_host: ?*subagent_tool_host.Runtime) void {
+            const menu = &app.instances.agents_menu;
+            if (inBranch(set, menu.close_armed)) {
+                menu.close_armed = null;
+                debug_trace.eventf("host", "agents_menu_close_disarmed", .{}, "reason=closed", .{});
+            }
+            if (inBranch(set, app.approval_lender)) _ = returnApproval(app);
+            if (inBranch(set, app.question_lender)) _ = returnQuestion(app);
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
+                if (first_host) |host| host.closeTree();
+                for (set) |entry| if (entry.agent.session_persistence.subagent_host) |host| host.closeTree();
+            }
+            for (set) |entry| {
+                entry.agent.worker.requestCancel();
+                entry.agent.worker.requestShutdown();
+                entry.agent.managed_executions.shutdown();
+            }
+            for (set) |entry| {
+                if (entry.agent.worker_thread) |thread| thread.join();
+                entry.agent.worker_thread = null;
+                if (entry.agent.child_run) |*run| {
+                    finishRun(run, .cancelled);
+                    // A turn the user started ends with the close, owing nothing.
+                    if (hostOf(app, entry)) |host| endUserWork(app.alloc, host, run, .cancelled, "");
+                }
+            }
+        }
+
+        /// Drops `set`, stopped by `stopSet`, each agent before the agent
+        /// that started it.
+        fn dropSet(app: *App, set: []const *ChildAgent) void {
+            var index = set.len;
+            while (index > 0) {
+                index -= 1;
+                dropHosted(app, set[index]);
+            }
+        }
+
+        /// `agent`'s reasoning effort as the status line shows it beside
+        /// `model`: its name when the model takes one and it is not the
+        /// default, else empty. Borrows `agent`.
+        fn effortLabel(app: *App, agent: *const AppAgent, model: []const u8) []const u8 {
+            if (agent.effort.isDefault()) return "";
+            const capabilities = model_capabilities.resolveForApp(App, app, model);
+            if (capabilities.reasoning_efforts.len == 0) return "";
+            if (!model_capabilities.reasoningEffortSupported(capabilities, agent.effort)) return "";
+            return agent.effort.displayLabel();
+        }
+
+        /// Applies every agent's finished title generation, shown or not, so
+        /// the agent list names a hidden agent by its title as soon as it
+        /// has one. Returns whether a title changed.
+        pub fn pollSessionTitles(app: *App) !bool {
+            const SessionRuntime = app_session_runtime.Runtime(App);
+            var changed = false;
+            if (firstOpen(app)) changed = try SessionRuntime.pollSessionTitleGeneration(app, &app.main_agent);
+            for (app.child_agents.items) |child| {
+                if (try SessionRuntime.pollSessionTitleGeneration(app, &child.agent)) changed = true;
+            }
+            return changed;
         }
 
         /// Whether the first instance, kept in `main_agent`, still runs.
@@ -1823,41 +2071,14 @@ pub fn Runtime(comptime App: type) type {
                 if (entry.agent.role == .subagent and rootInstance(app, entry) == root) try tree.append(app.alloc, entry);
             }
             const on_screen = app.agent_on_screen;
-            const root_on_screen = on_screen == hosted;
-            const tree_on_screen = if (on_screen) |value| std.mem.findScalar(*ChildAgent, tree.items, value) != null else false;
-            if (root_on_screen or tree_on_screen) try show(app, next);
-            if (app.approval_lender) |lender| if (std.mem.findScalar(*ChildAgent, tree.items, lender) != null) {
-                _ = returnApproval(app);
-            };
-            if (app.question_lender) |lender| if (std.mem.findScalar(*ChildAgent, tree.items, lender) != null) {
-                _ = returnQuestion(app);
-            };
-            // First, so no work the close ends owes a report into the tree.
-            if (comptime agents.hasAgentField(App, "session_persistence")) {
-                if (root.session_persistence.subagent_host) |host| host.closeTree();
-                for (tree.items) |entry| if (entry.agent.session_persistence.subagent_host) |host| host.closeTree();
-            }
-            for (tree.items) |entry| {
-                entry.agent.worker.requestCancel();
-                entry.agent.worker.requestShutdown();
-                entry.agent.managed_executions.shutdown();
-            }
-            for (tree.items) |entry| {
-                if (entry.agent.worker_thread) |thread| thread.join();
-                entry.agent.worker_thread = null;
-                if (entry.agent.child_run) |*run| {
-                    finishRun(run, .cancelled);
-                    // A turn the user started ends with the tree, owing nothing.
-                    if (hostOf(app, entry)) |host| endUserWork(app.alloc, host, run, .cancelled, "");
-                }
-            }
+            if (on_screen == hosted or inBranch(tree.items, on_screen)) try show(app, next);
+            // The instance's own host stops first, so no work the close ends
+            // owes a report into the tree.
+            const root_host: ?*subagent_tool_host.Runtime = if (comptime agents.hasAgentField(App, "session_persistence")) root.session_persistence.subagent_host else null;
+            stopSet(app, tree.items, root_host);
             root.worker.requestCancel();
             debug_trace.eventf("host", "instance_closed", .{}, "agent={s} subagents={d}", .{ label, tree.items.len });
-            var index = tree.items.len;
-            while (index > 0) {
-                index -= 1;
-                dropHosted(app, tree.items[index]);
-            }
+            dropSet(app, tree.items);
         }
 
         /// The open instance after `child` in launch order, wrapping to the
@@ -1903,6 +2124,7 @@ pub fn Runtime(comptime App: type) type {
             if (!released) return;
             child.screen.deinit(app.alloc);
             if (child.name.len > 0) app.alloc.free(child.name);
+            if (child.profile.len > 0) app.alloc.free(child.profile);
             app.alloc.free(child.id);
             app.alloc.destroy(child);
         }
@@ -2157,6 +2379,7 @@ pub fn Runtime(comptime App: type) type {
             for (app.child_agents.items) |child| {
                 child.screen.deinit(app.alloc);
                 if (child.name.len > 0) app.alloc.free(child.name);
+                if (child.profile.len > 0) app.alloc.free(child.profile);
                 app.alloc.free(child.id);
                 app.alloc.destroy(child);
             }

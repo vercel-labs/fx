@@ -69,7 +69,22 @@ pub fn subagentAction(
         else => return null,
     } else outer;
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
-    // Only a message names a subagent and carries text to preview.
+    // A close names the subagent it removes, with nothing to preview.
+    if (std.mem.eql(u8, action, "close")) {
+        const raw_closed = tool_args.optionalStringArg(args, "agent") orelse return null;
+        const closed = try text_utils.encodeTerminalSafe(scratch, raw_closed, 64);
+        const label = switch (state) {
+            .active, .pending => try alloc.print("closing {s}", .{closed.bytes}),
+            .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
+                try alloc.print("couldn't close {s}", .{closed.bytes})
+            else
+                try alloc.print("{s} {s}", .{ reason, closed.bytes }),
+            .identity, .completed, .feedback => try alloc.print("closed {s}", .{closed.bytes}),
+        };
+        errdefer alloc.free(label);
+        return .{ .label = label, .detail = try alloc.dupe(u8, "") };
+    }
+    // Otherwise only a message names a subagent and carries text to preview.
     if (!std.mem.eql(u8, action, "message")) return null;
     const raw_name = tool_args.optionalStringArg(args, "agent") orelse return null;
     const raw_preview = tool_args.optionalStringArg(args, "message") orelse return null;
@@ -189,6 +204,9 @@ test "subagent rows project request identity state and bounded safe previews" {
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Failed" }, .label = "reviewer failed", .detail = "· Check again" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Cancelled" }, .label = "reviewer interrupted", .detail = "· Check again" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Denied" }, .label = "Denied reviewer", .detail = "· Check again" },
+        .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .completed, .label = "closed tester", .detail = "" },
+        .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .active, .label = "closing tester", .detail = "" },
+        .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .{ .stopped = "Failed" }, .label = "couldn't close tester", .detail = "" },
     };
     for (cases) |case| {
         const action = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = case.args }, case.state)).?;

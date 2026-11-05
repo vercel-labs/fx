@@ -735,6 +735,7 @@ fn streamAgentCompletion(
         vercel_failure_diagnostics.collect(alloc, payload, result.err_body);
     if (result.status != .ok) return .{ .failed = .{
         .kind = gatewayFailureKind(alloc, result.status, result.err_body),
+        .http_status = result.status,
         .detail = result.err_body,
         .diagnostics = .{
             .schema = diagnostics.schema,

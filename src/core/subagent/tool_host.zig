@@ -198,6 +198,15 @@ pub const Runtime = struct {
     /// the parent's log (`beginTurnWork`): the user's, typed on the child's
     /// screen, or one its own child's report woke.
     turn_works: std.ArrayList(TurnWork) = .empty,
+    /// Children being closed for good (`closeChild`) whose work is still
+    /// ending; the close is written once nothing of theirs runs. Guarded by
+    /// `admission_mutex`.
+    closing: std.ArrayList([]u8) = .empty,
+    /// Children closed or closing whose agents the app has not yet dropped
+    /// (`takeClosed`). Guarded by `admission_mutex`.
+    closed_unseen: std.ArrayList([]u8) = .empty,
+    /// Whether `closed_unseen` holds a child, read without the lock.
+    closed_waiting: std.atomic.Value(bool) = .init(false),
     waiter_mutex: std.Io.Mutex = .init,
     /// The owner's worker while it waits in `wait`.
     waiter: ?*worker_runtime.WorkerRuntime = null,
@@ -265,6 +274,13 @@ pub const Runtime = struct {
         self.user_dropped.deinit(self.alloc);
         for (self.turn_works.items) |*work| work.deinit(self.alloc);
         self.turn_works.deinit(self.alloc);
+        for (self.closing.items) |id| {
+            debug_trace.eventf("mailbox", "close_dropped", .{}, "child={s} reason=host_closed", .{id});
+            self.alloc.free(id);
+        }
+        self.closing.deinit(self.alloc);
+        for (self.closed_unseen.items) |id| self.alloc.free(id);
+        self.closed_unseen.deinit(self.alloc);
         self.approvals.deinit();
         if (self.profile_cache) |*cache| cache.deinit();
         self.alloc.free(self.root_id);
@@ -313,33 +329,53 @@ pub const Runtime = struct {
         id: []u8,
         /// The name its parent gave it, or empty for a one-off.
         name: []u8,
+        /// The profile it runs in. One started before subagents had a
+        /// profile of their own runs as main.
+        profile: []u8,
     };
 
     /// The root's subagents in the order they started, after a restart too.
     /// Free with `freeChildListing`.
     pub fn listChildren(self: *Runtime, alloc: Allocator) ![]ChildListing {
+        // Admission before the registry, as everywhere in this host.
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
         var lock = self.managed.state_store.acquireLock();
         defer lock.release();
         var registry = try self.managed.state_store.load(alloc);
         defer registry.deinit(alloc);
-        const listing = try alloc.alloc(ChildListing, registry.children.len);
-        var filled: usize = 0;
-        errdefer freeChildListing(alloc, listing[0..filled]);
+        // One closing is gone for the list already.
+        var count: usize = 0;
         for (registry.children) |child| {
+            if (self.closingIndexLocked(child.id) == null) count += 1;
+        }
+        const listing = try alloc.alloc(ChildListing, count);
+        var filled: usize = 0;
+        errdefer {
+            for (listing[0..filled]) |entry| freeListed(alloc, entry);
+            alloc.free(listing);
+        }
+        for (registry.children) |child| {
+            if (self.closingIndexLocked(child.id) != null) continue;
             const id = try alloc.dupe(u8, child.id);
             errdefer alloc.free(id);
-            listing[filled] = .{ .id = id, .name = try alloc.dupe(u8, child.agentName() orelse "") };
+            const name = try alloc.dupe(u8, child.agentName() orelse "");
+            errdefer alloc.free(name);
+            listing[filled] = .{ .id = id, .name = name, .profile = try alloc.dupe(u8, child.profile orelse profiles.main_name) };
             filled += 1;
         }
         return listing;
     }
 
     pub fn freeChildListing(alloc: Allocator, listing: []ChildListing) void {
-        for (listing) |entry| {
-            alloc.free(entry.id);
-            alloc.free(entry.name);
-        }
+        for (listing) |entry| freeListed(alloc, entry);
         alloc.free(listing);
+    }
+
+    fn freeListed(alloc: Allocator, entry: ChildListing) void {
+        alloc.free(entry.id);
+        alloc.free(entry.name);
+        alloc.free(entry.profile);
     }
 
     /// A child's saved conversation, read without opening it. The caller
@@ -444,6 +480,10 @@ pub const Runtime = struct {
             .stop => {
                 if (!from_root) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "caller_unavailable" });
                 return self.stopChild(alloc, request.stop.agent);
+            },
+            .close => {
+                if (!from_root) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "caller_unavailable" });
+                return self.closeNamed(alloc, request.close.agent);
             },
             .message => {},
         }
@@ -761,6 +801,10 @@ pub const Runtime = struct {
     fn workEnded(raw: *anyopaque, end: managed_owner.WorkEnd) bool {
         const self: *Runtime = @ptrCast(@alignCast(raw));
         self.deliverEnd(end);
+        if (self.endClosingWork(end)) {
+            _ = self.settleClose(end.child_id);
+            return false;
+        }
         var ended = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
@@ -832,7 +876,9 @@ pub const Runtime = struct {
         try self.pending.insert(self.alloc, at, .{ .child_id = owned_child, .agent = owned_agent, .work = copy });
     }
 
-    const UserDrop = struct { child_id: []u8, count: usize };
+    /// Messages the user's stop or close of `child_id` dropped, for its
+    /// parent's next report or notice.
+    const UserDrop = struct { child_id: []u8, count: usize, closed: bool = false };
 
     /// fx is quitting: the works its quit cancels say so in their reports.
     /// Call before the quit stops any of this host's children.
@@ -853,14 +899,22 @@ pub const Runtime = struct {
         if (self.findTurnWorkLocked(child_id)) |index| self.turn_works.items[index].stopped_by = .user;
         const dropped = self.dropPendingLocked(child_id, "stopped_by_user") + from_queue;
         debug_trace.eventf("mailbox", "stop", .{}, "target={s} by=user running={} dropped={d}", .{ child_id, self.isBusyLocked(child_id), dropped });
+        self.noteUserDropLocked(child_id, dropped, false);
+    }
+
+    /// Keeps `dropped`, the messages the user's stop or close of `child_id`
+    /// dropped, for the report or notice its parent gets next. Hold the
+    /// admission mutex.
+    fn noteUserDropLocked(self: *Runtime, child_id: []const u8, dropped: usize, closed: bool) void {
         if (dropped == 0) return;
         for (self.user_dropped.items) |*drop| {
             if (!std.mem.eql(u8, drop.child_id, child_id)) continue;
             drop.count += dropped;
+            drop.closed = drop.closed or closed;
             return;
         }
         const owned = self.alloc.dupe(u8, child_id) catch return self.logLostDrop(child_id, dropped);
-        self.user_dropped.append(self.alloc, .{ .child_id = owned, .count = dropped }) catch {
+        self.user_dropped.append(self.alloc, .{ .child_id = owned, .count = dropped, .closed = closed }) catch {
             self.alloc.free(owned);
             return self.logLostDrop(child_id, dropped);
         };
@@ -870,26 +924,28 @@ pub const Runtime = struct {
         debug_trace.logf("mailbox", "stop notice lost child={s} dropped={d} reason=out_of_memory", .{ child_id, dropped });
     }
 
-    /// How many messages the user's stop of `child_id` dropped, forgotten
-    /// once read.
-    fn takeUserDropped(self: *Runtime, child_id: []const u8) usize {
+    /// What the user's stop or close of `child_id` dropped, forgotten once
+    /// read.
+    fn takeUserDropped(self: *Runtime, child_id: []const u8) Dropped {
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         for (self.user_dropped.items, 0..) |drop, index| {
             if (!std.mem.eql(u8, drop.child_id, child_id)) continue;
             _ = self.user_dropped.swapRemove(index);
             self.alloc.free(drop.child_id);
-            return drop.count;
+            return .{ .count = drop.count, .closed = drop.closed };
         }
-        return 0;
+        return .{};
     }
+
+    const Dropped = struct { count: usize = 0, closed: bool = false };
 
     fn deliverEnd(self: *Runtime, end: managed_owner.WorkEnd) void {
         debug_trace.eventf("mailbox", "child_end", .{}, "child={s} work_id={s} outcome={s} report={}", .{ end.child_id, end.work_id, @tagName(end.outcome), end.report_owed });
         const dropped = self.takeUserDropped(end.child_id);
         if (end.report_owed) return self.postReportWith(end, dropped);
         // Nothing owed, but the parent's messages were dropped: say so.
-        if (dropped > 0) return self.postReportWith(.{ .child_id = end.child_id, .work_id = "", .outcome = .cancelled, .report_owed = false }, dropped);
+        if (dropped.count > 0) return self.postReportWith(.{ .child_id = end.child_id, .work_id = "", .outcome = .cancelled, .report_owed = false }, dropped);
         self.nudgeWaiter();
     }
 
@@ -916,12 +972,12 @@ pub const Runtime = struct {
     }
 
     fn postReport(self: *Runtime, end: managed_owner.WorkEnd) void {
-        self.postReportWith(end, 0);
+        self.postReportWith(end, .{});
     }
 
     /// Posts `end`'s report, or with no `work_id` the notice that the user's
-    /// stop dropped `dropped` messages.
-    fn postReportWith(self: *Runtime, end: managed_owner.WorkEnd, dropped: usize) void {
+    /// stop or close dropped `dropped` messages.
+    fn postReportWith(self: *Runtime, end: managed_owner.WorkEnd, dropped: Dropped) void {
         const sink = self.report_sink orelse {
             // Nothing here can take it; it stays owed in the log.
             debug_trace.eventf("mailbox", "report_held", .{}, "child={s} work_id={s} reason=no_sink", .{ end.child_id, end.work_id });
@@ -932,7 +988,10 @@ pub const Runtime = struct {
         const a = arena.allocator();
         const notice = end.work_id.len == 0;
         const output = if (notice)
-            (a.print("The user stopped it, and {d} of your messages waiting for it were dropped.", .{dropped}) catch "")
+            (a.print("The user {s} it, and {d} of your messages waiting for it were dropped.", .{
+                if (dropped.closed) "closed" else "stopped",
+                dropped.count,
+            }) catch "")
         else
             self.reportOutput(a, end) catch "";
         const agent = self.childName(a, end.child_id) catch end.child_id;
@@ -943,7 +1002,7 @@ pub const Runtime = struct {
             .call_id = if (notice) "" else self.callOf(a, end.work_id),
             .outcome = end.outcome,
             .output = output,
-            .dropped = dropped,
+            .dropped = dropped.count,
             .end = end.end,
         } }) catch |err| {
             // A report stays owed in the log; a notice is lost.
@@ -951,13 +1010,13 @@ pub const Runtime = struct {
             return self.nudgeWaiter();
         };
         if (notice) {
-            debug_trace.eventf("mailbox", "notice_queued", .{}, "to={s} from={s} dropped={d}", .{ self.ownerName(), end.child_id, dropped });
+            debug_trace.eventf("mailbox", "notice_queued", .{}, "to={s} from={s} dropped={d}", .{ self.ownerName(), end.child_id, dropped.count });
         } else {
             debug_trace.eventf("mailbox", "report_queued", .{}, "to={s} from={s} work={s} dropped={d} started_by={s} cause={s}", .{
                 self.ownerName(),
                 end.child_id,
                 end.work_id,
-                dropped,
+                dropped.count,
                 @tagName(end.end.started_by),
                 if (end.end.cause) |cause| @tagName(cause) else "none",
             });
@@ -984,8 +1043,10 @@ pub const Runtime = struct {
         var lock = self.managed.state_store.acquireLock();
         defer lock.release();
         var registry = try self.managed.state_store.load(a);
-        const child = registry.findById(child_id) orelse return child_id;
-        return a.dupe(u8, child.agentName() orelse child_id);
+        if (registry.findById(child_id)) |child| return a.dupe(u8, child.agentName() orelse child_id);
+        // A closed child is gone from the registry, but its close keeps its
+        // name in the log, for a report owed from before it.
+        return (try self.managed.state_store.closedName(a, child_id)) orelse child_id;
     }
 
     /// Makes the next message waiting for `child_id` its next work, which
@@ -1079,7 +1140,7 @@ pub const Runtime = struct {
     pub fn beginUserWork(self: *Runtime, alloc: Allocator, child_id: []const u8, worker: ?*worker_runtime.WorkerRuntime) ?[]u8 {
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
-        if (self.isBusyLocked(child_id)) return null;
+        if (self.isBusyLocked(child_id) or self.closingIndexLocked(child_id) != null) return null;
         return self.openTurnWorkLocked(alloc, child_id, .user, worker, true) catch |err| {
             debug_trace.eventf("mailbox", "user_work_failed", .{}, "child={s} err={s}", .{ child_id, @errorName(err) });
             return null;
@@ -1095,7 +1156,7 @@ pub const Runtime = struct {
     pub fn beginTurnWork(self: *Runtime, alloc: Allocator, child_id: []const u8, started_by: reports.StartedBy, worker: ?*worker_runtime.WorkerRuntime) ?[]u8 {
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
-        if (self.inTurnWorkLocked(child_id)) return null;
+        if (self.inTurnWorkLocked(child_id) or self.closingIndexLocked(child_id) != null) return null;
         return self.openTurnWorkLocked(alloc, child_id, started_by, worker, !self.isBusyLocked(child_id)) catch |err| {
             debug_trace.eventf("mailbox", "turn_work_failed", .{}, "child={s} err={s}", .{ child_id, @errorName(err) });
             return null;
@@ -1199,8 +1260,10 @@ pub const Runtime = struct {
         };
         defer work.deinit(self.alloc);
         self.finishTurnWork(work, outcome, reply);
+        defer _ = self.settleClose(child_id);
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
+        if (self.closingIndexLocked(child_id) != null) return;
         if (self.startNextPendingLocked(child_id)) {
             _ = self.managed.start(child_id) catch |err| {
                 debug_trace.eventf("mailbox", "start_failed", .{}, "child={s} error={s}", .{ child_id, @errorName(err) });
@@ -1271,6 +1334,7 @@ pub const Runtime = struct {
         const registry = try self.managed.state_store.load(a);
         for (registry.children) |child| {
             const name = child.agentName() orelse continue;
+            if (self.closingIndexLocked(child.id) != null) continue;
             if (agent) |wanted| if (!std.mem.eql(u8, wanted, name)) continue;
             var waiting: usize = 0;
             for (self.pending.items) |item| {
@@ -1333,6 +1397,178 @@ pub const Runtime = struct {
         work.stopped_by = .parent;
         if (work.worker) |worker| worker.requestTurnCancel();
         return true;
+    }
+
+    /// Who closes a child: its parent's `close`, or the user from the
+    /// agent list.
+    pub const CloseBy = enum { parent, user };
+
+    /// What a close found: whether the child's work was running, and how
+    /// many of the parent's messages waiting for it were dropped.
+    pub const Closed = struct { stopped: bool, dropped: usize };
+
+    /// Closes child `child_id` for good: the parent's messages waiting for
+    /// it are dropped, its running work or turn is stopped, and once nothing
+    /// of it runs the close is written to the parent's log and it leaves
+    /// this host's children (`child_state.Store.close`). The parent's close
+    /// owes no report; the user's close of work the parent started reports
+    /// that the user closed it. The app drops the child's agent once it
+    /// takes the child from `takeClosed`. False when there is no such child.
+    pub fn closeChild(self: *Runtime, child_id: []const u8, by: CloseBy) !?Closed {
+        {
+            var lock = self.managed.state_store.acquireLock();
+            defer lock.release();
+            var registry = try self.managed.state_store.load(self.alloc);
+            defer registry.deinit(self.alloc);
+            if (registry.findById(child_id) == null) return null;
+        }
+        const result: Closed, const settle_now = blk: {
+            self.admission_mutex.lockUncancelable(io_mod.getIo());
+            defer self.admission_mutex.unlock(io_mod.getIo());
+            if (self.closingIndexLocked(child_id) != null) break :blk .{ .{ .stopped = false, .dropped = 0 }, false };
+            const owned = try self.alloc.dupe(u8, child_id);
+            errdefer self.alloc.free(owned);
+            const unseen = try self.alloc.dupe(u8, child_id);
+            errdefer self.alloc.free(unseen);
+            try self.closing.ensureUnusedCapacity(self.alloc, 1);
+            try self.closed_unseen.ensureUnusedCapacity(self.alloc, 1);
+            const dropped = self.dropPendingLocked(child_id, "closed");
+            // A user's close tells the parent what it dropped, as a stop does.
+            if (by == .user) self.noteUserDropLocked(child_id, dropped, true);
+            const stopped = switch (by) {
+                .parent => self.managed.stop(child_id),
+                .user => self.managed.closeByUser(child_id),
+            } or self.stopTurnWorkLocked(child_id);
+            self.closing.appendAssumeCapacity(owned);
+            self.closed_unseen.appendAssumeCapacity(unseen);
+            self.closed_waiting.store(true, .release);
+            debug_trace.eventf("mailbox", "close", .{}, "target={s} by={s} running={} dropped={d}", .{ child_id, @tagName(by), stopped, dropped });
+            break :blk .{ .{ .stopped = stopped, .dropped = dropped }, !self.isBusyLocked(child_id) and !self.inTurnWorkLocked(child_id) };
+        };
+        if (settle_now and !self.settleClose(child_id)) return error.CloseNotSaved;
+        return result;
+    }
+
+    /// `close`: closes the named child for good (`closeChild`).
+    fn closeNamed(self: *Runtime, alloc: Allocator, agent: []const u8) !ManagedExecutionResult {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const child_id = blk: {
+            var lock = self.managed.state_store.acquireLock();
+            defer lock.release();
+            var registry = try self.managed.state_store.load(a);
+            const child = registry.findPersistent(agent) orelse return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_unavailable" });
+            break :blk try a.dupe(u8, child.id);
+        };
+        const closed = (self.closeChild(child_id, .parent) catch |err| switch (err) {
+            error.CloseNotSaved => return self.encodeManaged(alloc, .{
+                .ok = false,
+                .error_code = "close_not_saved",
+                .result = try a.print("The close of {s} couldn't be saved, so it is still open.", .{agent}),
+            }),
+            else => return err,
+        }) orelse return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_unavailable" });
+        const dropped_text = switch (closed.dropped) {
+            0 => "",
+            1 => " The message waiting for it was dropped.",
+            else => try a.print(" The {d} messages waiting for it were dropped.", .{closed.dropped}),
+        };
+        const text = try a.print("Closed {s}{s}.{s} A later message to {s} starts a new one.", .{
+            agent,
+            if (closed.stopped) ", ending its turn" else "",
+            dropped_text,
+            agent,
+        });
+        return self.encodeManaged(alloc, .{ .ok = true, .result = text });
+    }
+
+    /// The children closed or closing since the last call, for the app to
+    /// drop their agents. The caller owns the ids. Cheap when none is.
+    pub fn takeClosed(self: *Runtime, alloc: Allocator) ![][]u8 {
+        if (!self.closed_waiting.load(.acquire)) return &.{};
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        const ids = try alloc.alloc([]u8, self.closed_unseen.items.len);
+        var moved: usize = 0;
+        errdefer {
+            for (ids[0..moved]) |id| alloc.free(id);
+            alloc.free(ids);
+        }
+        for (self.closed_unseen.items) |id| {
+            ids[moved] = try alloc.dupe(u8, id);
+            moved += 1;
+        }
+        for (self.closed_unseen.items) |id| self.alloc.free(id);
+        self.closed_unseen.clearRetainingCapacity();
+        self.closed_waiting.store(false, .release);
+        return ids;
+    }
+
+    fn closingIndexLocked(self: *const Runtime, child_id: []const u8) ?usize {
+        for (self.closing.items, 0..) |id, index| if (std.mem.eql(u8, id, child_id)) return index;
+        return null;
+    }
+
+    /// A closing child's work ended: it takes no next work, and what waits
+    /// for it is dropped. False for a child that isn't closing.
+    fn endClosingWork(self: *Runtime, end: managed_owner.WorkEnd) bool {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        if (self.closingIndexLocked(end.child_id) == null) return false;
+        self.forgetCallLocked(end.work_id);
+        _ = self.dropPendingLocked(end.child_id, "closed");
+        // A turn that began before the close, waiting for this work to end
+        // so its own could open, never reached the log: it goes with it.
+        if (self.findTurnWorkLocked(end.child_id)) |index| if (!self.turn_works.items[index].opened) {
+            var waiting = self.turn_works.swapRemove(index);
+            debug_trace.eventf("mailbox", "turn_work_dropped", .{}, "child={s} work_id={s} reason=closed", .{ end.child_id, waiting.work_id });
+            waiting.deinit(self.alloc);
+        };
+        self.clearBusyLocked(end.child_id);
+        self.managed.markEnding(end.child_id);
+        return true;
+    }
+
+    /// Writes the close of `child_id` once nothing of it runs, when it is
+    /// closing. False only when the write failed, which leaves the child
+    /// listed again, as before its close, and is traced.
+    fn settleClose(self: *Runtime, child_id: []const u8) bool {
+        const owned = blk: {
+            self.admission_mutex.lockUncancelable(io_mod.getIo());
+            defer self.admission_mutex.unlock(io_mod.getIo());
+            const index = self.closingIndexLocked(child_id) orelse return true;
+            if (self.isBusyLocked(child_id) or self.inTurnWorkLocked(child_id)) return true;
+            break :blk self.closing.swapRemove(index);
+        };
+        defer self.alloc.free(owned);
+        const work_id = self.alloc.print("fxclose:{s}", .{owned}) catch |err| return self.closeNotWritten(owned, err);
+        defer self.alloc.free(work_id);
+        // The registry's lock is released before admission's is taken.
+        const failure: ?anyerror = blk: {
+            var lock = self.managed.state_store.acquireLock();
+            defer lock.release();
+            self.managed.state_store.close(owned, work_id) catch |err| break :blk err;
+            break :blk null;
+        };
+        if (failure) |err| return self.closeNotWritten(owned, err);
+        debug_trace.eventf("mailbox", "closed", .{}, "child={s}", .{owned});
+        return true;
+    }
+
+    /// A close that couldn't be written: the child stays, so the app, if it
+    /// hasn't yet, keeps its agent too. Returns false.
+    fn closeNotWritten(self: *Runtime, child_id: []const u8, err: anyerror) bool {
+        debug_trace.logf("mailbox", "close not written child={s} err={s}", .{ child_id, @errorName(err) });
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        for (self.closed_unseen.items, 0..) |id, index| {
+            if (!std.mem.eql(u8, id, child_id)) continue;
+            self.alloc.free(self.closed_unseen.orderedRemove(index));
+            break;
+        }
+        if (self.closed_unseen.items.len == 0) self.closed_waiting.store(false, .release);
+        return false;
     }
 
     /// `message{agent: "parent"}`: a child of this host writes to the
@@ -1603,9 +1839,11 @@ pub const Runtime = struct {
         );
         defer active.deinit(alloc);
         switch (request) {
-            .wait, .status, .stop => unreachable,
+            .wait, .status, .stop, .close => unreachable,
             .message => |message| {
                 if (registry.findPersistent(message.agent)) |child| {
+                    // Closing, it takes nothing; once gone, the name starts a new one.
+                    if (self.closingIndexLocked(child.id) != null) return managedAdmissionRejected(alloc, child.id, "child_closing");
                     if (request.override().present()) {
                         debug_trace.logf(
                             "subagent",
@@ -1660,7 +1898,9 @@ pub const Runtime = struct {
                     message.instructions orelse "",
                     active,
                 );
-                if (request.override().profile) |name| try registry.setProfile(alloc, child_id, name);
+                // Without one named it runs in fx's own main, which sets
+                // nothing, so it has what its parent has.
+                try registry.setProfile(alloc, child_id, request.override().profile orelse profiles.main_name);
                 if (message.report) |rule| try registry.setReportRule(child_id, rule);
                 try self.managed.state_store.save(alloc, registry);
                 try self.ensureManagedChildSession(child_id, active.id, defaults);
@@ -2420,6 +2660,183 @@ test "stop ends a subagent's turn without a report and drops what waits for it" 
     try std.testing.expect(std.mem.find(u8, missing, "child_unavailable") != null);
 }
 
+test "the parent's close ends a working subagent's turn without a report and removes it for good" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2", null);
+    const child_id = try reviewerId(runtime, arena);
+    const closed = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, closed, "Closed reviewer, ending its turn. The message waiting for it was dropped. A later message to reviewer starts a new one.") != null);
+    // Closing, it is gone from the list already.
+    const listing = try runtime.listChildren(alloc);
+    defer Runtime.freeChildListing(alloc, listing);
+    try std.testing.expectEqual(@as(usize, 0), listing.len);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
+    {
+        var registry = try runtime.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        try std.testing.expect(registry.findById(child_id) == null);
+    }
+    const status = try callTool(runtime, arena, .{ .status = .{} }, "call-4", null);
+    try std.testing.expect(std.mem.find(u8, status, "No subagents yet.") != null);
+    // The app takes the child once, to drop its agent.
+    const taken = try runtime.takeClosed(alloc);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+    try std.testing.expectEqualStrings(child_id, taken[0]);
+    try std.testing.expectEqual(@as(usize, 0), (try runtime.takeClosed(alloc)).len);
+    const missing = try callTool(runtime, arena, .{ .close = .{ .agent = "reviewer" } }, "call-5", null);
+    try std.testing.expect(std.mem.find(u8, missing, "child_unavailable") != null);
+}
+
+test "the user's close of a working subagent reports that the user closed it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const child_id = try reviewerId(runtime, arena);
+    const closed = (try runtime.closeChild(child_id, .user)).?;
+    try std.testing.expect(closed.stopped);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try std.testing.expectEqual(child_state.EndFacts{ .cause = .user_close }, fixture.ends.items[0]);
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[0], "The user closed it before it finished.") != null);
+    try std.testing.expect(std.mem.startsWith(u8, fixture.reports.items[0], "reviewer "));
+    var registry = try runtime.managed.state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expect(registry.findById(child_id) == null);
+    // Gone from the registry, it keeps its name for a report owed from
+    // before its close, as one posted after a restart is.
+    try std.testing.expectEqualStrings("reviewer", try runtime.childName(arena, child_id));
+    const taken = try runtime.takeClosed(alloc);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+}
+
+test "the user's close tells main how many of its messages waiting for the subagent it dropped" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "waiting" } }, "call-2", null);
+    const child_id = try reviewerId(runtime, arena);
+    const closed = (try runtime.closeChild(child_id, .user)).?;
+    try std.testing.expectEqual(@as(usize, 1), closed.dropped);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    const report = fixture.reports.items[0];
+    try std.testing.expect(std.mem.find(u8, report, "The user closed it before it finished.") != null);
+    try std.testing.expect(std.mem.endsWith(u8, report, " dropped=1"));
+    try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+}
+
+test "an idle subagent closes at once, and its name then starts a new one" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    const old_id = try reviewerId(runtime, arena);
+    const closed = (try runtime.closeChild(old_id, .parent)).?;
+    try std.testing.expect(!closed.stopped);
+    try std.testing.expectEqual(@as(usize, 0), closed.dropped);
+    {
+        var registry = try runtime.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        try std.testing.expect(registry.findById(old_id) == null);
+    }
+    try std.testing.expect((try runtime.closeChild(old_id, .parent)) == null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-2", null);
+    try waitUntilQuiet(runtime);
+    const new_id = try reviewerId(runtime, arena);
+    try std.testing.expect(!std.mem.eql(u8, old_id, new_id));
+    const taken = try runtime.takeClosed(alloc);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+}
+
+test "a new subagent starts in the main profile unless its message names one, and the list says which" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "look" } }, "call-1", null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "copier", .message = "copy", .profile = "agent" } }, "call-2", null);
+    try waitUntilQuiet(runtime);
+    // A later message names no profile and changes none.
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "copier", .message = "again" } }, "call-3", null);
+    try waitUntilQuiet(runtime);
+
+    const listing = try runtime.listChildren(alloc);
+    defer Runtime.freeChildListing(alloc, listing);
+    try std.testing.expectEqual(@as(usize, 2), listing.len);
+    try std.testing.expectEqualStrings("reviewer", listing[0].name);
+    try std.testing.expectEqualStrings("main", listing[0].profile);
+    try std.testing.expectEqualStrings("copier", listing[1].name);
+    try std.testing.expectEqualStrings("agent", listing[1].profile);
+}
+
 test "wait returns at once when nothing works, and when a report arrives" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2758,6 +3175,7 @@ fn cancelledSentence(cause: ?child_state.Cause) []const u8 {
     return switch (known) {
         .user_stop => "The user stopped its turn before it finished.",
         .fx_quit => "fx quit before it finished.",
+        .user_close => "The user closed it before it finished. A later message to its name starts a new one.",
     };
 }
 

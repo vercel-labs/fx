@@ -185,13 +185,22 @@ pub fn profileShell(
 
 const captured_zsh_user_prelude = "\\builtin trap - TERM; ";
 
+/// A startup file can define a function named `builtin`, and zsh and bash run
+/// a function before a builtin of the same name, so every `\builtin` line fx
+/// adds would run the user's function instead. fx removes such a function
+/// before its own lines. The zsh test runs no command when there is no such
+/// function, so it can't fail under `errexit`; bash's `unset -f` succeeds
+/// either way.
+const zsh_unshadow_builtin = "(( ${+functions[builtin]} )) && \\unfunction builtin; ";
+const bash_unshadow_builtin = "\\unset -f builtin; ";
+
 /// zsh's `equals` option expands an unquoted word that starts with `=`, such
 /// as a `======` separator or the `==` in `[ a == b ]`, to the path of the
 /// command it names, and a word that names no command aborts the rest of the
 /// command line. Commands are written for POSIX shells, so every zsh launch
 /// turns the option off right before the command, after startup files or a
 /// snapshot replay have run.
-const zsh_command_prelude = "\\builtin unsetopt equals; ";
+const zsh_command_prelude = zsh_unshadow_builtin ++ "\\builtin unsetopt equals; ";
 
 pub fn capturedInvocation(
     alloc: Allocator,
@@ -220,7 +229,7 @@ pub fn capturedInvocation(
                 invocation.append("expand_aliases");
             }
             const effective_command = if (shellKind(path) == .zsh)
-                try std.mem.concat(alloc, u8, &.{ captured_zsh_user_prelude, zsh_command_prelude, command })
+                try std.mem.concat(alloc, u8, &.{ zsh_command_prelude, captured_zsh_user_prelude, command })
             else
                 command;
             invocation.setCommand(effective_command);
@@ -353,6 +362,7 @@ const zsh_capture_script =
 
 const bash_capture_script =
     \\{
+    \\\unset -f builtin
     \\\builtin printf 'FXSNAP:@NONCE@:ENV\0'
     \\/usr/bin/env -0
     \\\builtin printf 'FXSNAP:@NONCE@:NAMES\0'
@@ -436,7 +446,10 @@ pub fn buildBootstrap(
             "command-started",
         );
         try output.appendSlice(alloc, " || exit 125; ");
-        if (kind == .zsh) try output.appendSlice(alloc, zsh_command_prelude);
+        try output.appendSlice(alloc, switch (kind) {
+            .zsh => zsh_command_prelude,
+            .bash => bash_unshadow_builtin,
+        });
         try output.appendSlice(
             alloc,
             "builtin eval -- \"$fx_terminal_command\"; " ++
@@ -623,7 +636,7 @@ test "captured profiles use exact non-PTY argv" {
         "/bin/zsh",
         "-f",
         "-c",
-        "\\builtin unsetopt equals; printf clean",
+        "(( ${+functions[builtin]} )) && \\unfunction builtin; \\builtin unsetopt equals; printf clean",
     };
     try std.testing.expectEqual(expected_zsh_clean.len, zsh_clean.argv().len);
     for (&expected_zsh_clean, zsh_clean.argv()) |expected, actual| {
@@ -635,7 +648,7 @@ test "captured profiles use exact non-PTY argv" {
         "-l",
         "-i",
         "-c",
-        "\\builtin trap - TERM; \\builtin unsetopt equals; printf user",
+        "(( ${+functions[builtin]} )) && \\unfunction builtin; \\builtin unsetopt equals; \\builtin trap - TERM; printf user",
     };
     try std.testing.expectEqual(expected_zsh_user.len, zsh_user.argv().len);
     for (&expected_zsh_user, zsh_user.argv()) |expected, actual| {
@@ -650,7 +663,7 @@ test "captured invocation provider projection shell-quotes every argv word" {
     const invocation = try capturedInvocation(arena, .{ .clean = "/bin/zsh" }, "printf '%s' ok");
     const command = try formatInvocationCommand(arena, &invocation);
     try std.testing.expectEqualStrings(
-        "'/bin/zsh' '-f' '-c' '\\builtin unsetopt equals; printf '\"'\"'%s'\"'\"' ok'",
+        "'/bin/zsh' '-f' '-c' '(( ${+functions[builtin]} )) && \\unfunction builtin; \\builtin unsetopt equals; printf '\"'\"'%s'\"'\"' ok'",
         command,
     );
 }
@@ -660,7 +673,7 @@ test "snapshot script turns off zsh equals expansion after the replay" {
     defer std.testing.allocator.free(zsh);
     try std.testing.expectEqualStrings(
         "builtin setopt equals\n__fx_snapshot_restored=1\n" ++
-            "\\builtin unsetopt equals; \\builtin eval -- 'echo ======' </dev/null 2>&9 9>&-\n",
+            "(( ${+functions[builtin]} )) && \\unfunction builtin; \\builtin unsetopt equals; \\builtin eval -- 'echo ======' </dev/null 2>&9 9>&-\n",
         zsh,
     );
 
@@ -765,7 +778,7 @@ test "bootstrap quotes private paths and separates command completion" {
         std.mem.find(u8, command, "'command-started'") != null,
     );
     try std.testing.expect(
-        std.mem.find(u8, command, "|| exit 125; \\builtin unsetopt equals; builtin eval --") != null,
+        std.mem.find(u8, command, "|| exit 125; (( ${+functions[builtin]} )) && \\unfunction builtin; \\builtin unsetopt equals; builtin eval --") != null,
     );
     try std.testing.expect(
         std.mem.find(u8, command, "exit \"$fx_terminal_status\"") != null,
@@ -781,7 +794,7 @@ test "bootstrap quotes private paths and separates command completion" {
     );
     defer std.testing.allocator.free(bash_command);
     try std.testing.expect(
-        std.mem.find(u8, bash_command, "|| exit 125; builtin eval --") != null,
+        std.mem.find(u8, bash_command, "|| exit 125; \\unset -f builtin; builtin eval --") != null,
     );
     try std.testing.expect(std.mem.find(u8, bash_command, "unsetopt") == null);
 
