@@ -9424,10 +9424,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(result.code).toBe(0);
         expect(result.stderr).toContain(`Opening ${DYNAMIC_MCP_TOOL_NAME}\n`);
         expect(json.output).toContain("MCP argument handling complete.");
-        expect(json.tool_calls).toContainEqual({
-          name: DYNAMIC_MCP_TOOL_NAME,
-          status: "error",
-        });
+        // The open, then the run. A run whose arguments don't parse never
+        // reaches the tool, so it stays toolbox's; one the server refuses is
+        // reported as the tool it ran.
+        expect(json.tool_calls).toEqual([
+          { name: "toolbox", status: "success" },
+          { name: serialized === '{"text":7}' ? DYNAMIC_MCP_TOOL_NAME : "toolbox", status: "error" },
+        ]);
         expect(gateway.requestCount()).toBe(3);
         expect(gateway.requests[1].body).toContain(DYNAMIC_MCP_TOOL_NAME);
         if (serialized === '{"text":7}') {
