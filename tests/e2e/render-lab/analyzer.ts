@@ -663,8 +663,10 @@ function assertCommandOutputScrollback(
   let previousRow = -1;
   for (let index = 1; index <= 32; index++) {
     const marker = `ACTIVE_TOOL_LINE_${String(index).padStart(2, "0")}`;
+    // Ctrl+O shows a command's output under it at the detail indent, with
+    // no rail; the main screen's railed rows never count.
     const rows = lines.flatMap((line, row) =>
-      line.trimStart().startsWith(`│ ${marker}`) ? [row] : []
+      line.trimStart().startsWith(marker) ? [row] : []
     );
     if (rows.length !== 1) {
       push(

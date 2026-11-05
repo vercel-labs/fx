@@ -423,7 +423,7 @@ test("render-lab analyzer rejects expanded command marker corruption", () => {
   outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
   const commandLines = Array.from(
     { length: 32 },
-    (_, index) => `│ ACTIVE_TOOL_LINE_${String(index + 1).padStart(2, "0")}`,
+    (_, index) => `    ACTIVE_TOOL_LINE_${String(index + 1).padStart(2, "0")}`,
   );
   const cases = [
     {
@@ -466,7 +466,7 @@ test("render-lab analyzer rejects expanded command marker corruption", () => {
     ];
     const manifest = writeAnalyzerFixture(
       join(outDir, entry.name),
-      [...grid.slice(0, 1), "│ ACTIVE_TOOL_LINE_32", ...grid.slice(1)],
+      [...grid.slice(0, 1), "    ACTIVE_TOOL_LINE_32", ...grid.slice(1)],
       null,
       [],
       "active-tool-command-output-expanded",
