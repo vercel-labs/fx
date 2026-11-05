@@ -5286,6 +5286,7 @@ test {
     _ = @import("gateway/json_depth.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
+    _ = @import("acp/server.zig");
     _ = @import("acp/libfx_hooks.zig");
     _ = @import("acp/types.zig");
     _ = @import("core/mcp_host/model.zig");
