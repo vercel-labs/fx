@@ -574,9 +574,13 @@ fn writeStderr(deps: RunDeps, text: []const u8) void {
     deps.write_stderr(deps.stderr_ctx, text) catch {};
 }
 
+/// Reports an error that ended a command, such as `fx ask`, in plain words
+/// (`types.plainErrorText`). The raw name goes only to the trace.
 fn tryWriteErrorMessage(deps: RunDeps, err: anyerror) void {
+    debug_trace.logf("core", "command error err={s}", .{@errorName(err)});
+    var words: [128]u8 = undefined;
     writeStderr(deps, "fx: ");
-    writeStderr(deps, config_runtime.modelNotSelectedMessage(err) orelse @errorName(err));
+    writeStderr(deps, config_runtime.modelNotSelectedMessage(err) orelse types.plainErrorText(@errorName(err), &words));
     writeStderr(deps, "\n");
 }
 
@@ -682,6 +686,8 @@ fn expectEvents(expected: []const []const u8) !void {
 
 const TestCapture = struct {
     run_result: cli_surface.RunResult,
+    /// The error the command run returns in place of `run_result`.
+    cli_error: ?anyerror = null,
     cli_calls: usize = 0,
     seen_config: ?cli_surface.Config = null,
     stderr: std.Io.Writer.Allocating,
@@ -756,6 +762,7 @@ fn runIfRequestedForTest(ctx: ?*anyopaque, _: Allocator, _: []const [:0]const u8
     const capture: *TestCapture = @ptrCast(@alignCast(ctx.?));
     capture.cli_calls += 1;
     capture.seen_config = cfg;
+    if (capture.cli_error) |err| return err;
     return capture.run_result;
 }
 
@@ -1188,6 +1195,24 @@ test "app entry ignores resume handoff stdout failures" {
 fn runWithOuterCleanup(comptime App: type, alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunOutcome {
     defer appendTestEvent("outer-defer");
     return runWithDeps(App, alloc, args, cfg, deps);
+}
+
+test "a command that ends on an error reports it in plain words" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { err: anyerror, stderr: []const u8 }{
+        .{ .err = error.InvalidGatewaySseEvent, .stderr = "fx: unreadable reply\n" },
+        .{ .err = error.NoSpaceLeft, .stderr = "fx: the disk is full\n" },
+        .{ .err = error.ProviderRequestLimitReached, .stderr = "fx: provider request limit reached\n" },
+    };
+    for (cases) |case| {
+        var capture = TestCapture.init(.{ .interactive = .{} });
+        defer capture.deinit();
+        capture.cli_error = case.err;
+
+        const outcome = try runWithDeps(TestApp, alloc, &.{"ask"}, testConfig(), capture.deps());
+        try std.testing.expectEqual(RunOutcome{ .exit = 1 }, outcome);
+        try std.testing.expectEqualStrings(case.stderr, capture.stderr.written());
+    }
 }
 
 test "app entry reports unexpected init errors once and preserves identity" {

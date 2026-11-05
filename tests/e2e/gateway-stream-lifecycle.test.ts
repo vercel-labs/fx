@@ -11808,7 +11808,8 @@ describe("request recovery across statuses and garbled streams", () => {
       expect(result.code).not.toBe(0);
       expect(gateway.requestCount()).toBe(3);
       expect(result.stderr).toMatch(/^\[notice\] Unreadable reply · next try in .* · attempt 2$/m);
-      expect(result.stderr).toContain("unreadable reply");
+      expect(result.stderr).toMatch(/^fx: unreadable reply$/m);
+      expect(result.stderr).not.toContain("MalformedGatewaySseEvent");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -11847,6 +11848,9 @@ describe("request recovery across statuses and garbled streams", () => {
       });
       expect(result.code).not.toBe(0);
       expect(gateway.requestCount()).toBe(1);
+      // The error reads as words; its name stays in the trace.
+      expect(result.stderr).toBe("fx: unreadable reply\n");
+      expect(readFileSync(tracePath, "utf8")).toContain("command error err=InvalidGatewaySseEvent");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -11865,6 +11869,7 @@ describe("request recovery across statuses and garbled streams", () => {
       });
       expect(result.code).not.toBe(0);
       expect(gateway.requestCount()).toBe(1);
+      expect(result.stderr).toBe("fx: unreadable reply\n");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
