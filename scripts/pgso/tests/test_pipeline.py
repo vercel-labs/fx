@@ -36,6 +36,7 @@ from scripts.pgso.pipeline import (
     USE_FLAGS,
     ArtifactSpec,
     PipelinePaths,
+    _outline_excluding_dropped_outputs,
     _outline_without_folded_constants,
     apply_profile,
     cleanup_outlined_ir_argv,
@@ -443,7 +444,7 @@ if 'dropped-outputs' in sys.argv:
     print('{{"callers": [], "instances": [], "outlined_functions": 0}}')
     sys.exit(0)
 if 'check-outlined' in sys.argv:
-    sys.stderr.write('ir_size: IR outliner folded a nested constant into a parameter')
+    sys.stderr.write('ir_size: IR outliner miscompiled an outlined function: outlined_ir_func_3: constant expression with a parameter operand')
     sys.exit(1)
 pathlib.Path(sys.argv[-1]).write_bytes(b'BC\\xc0\\xdestaged')
 print('{{}}')""",
@@ -539,6 +540,32 @@ print('{{}}')""",
         self.assertEqual([f"caller.{number}" for number in range(IR_OUTLINER_ROUNDS - 1)], rounds["excluded"])
         self.assertEqual([], rounds["rounds"][-1]["excluded"])
         self.assertEqual(["caller.3"], rounds["rounds"][-1]["dropped_outputs"][0]["callers"])
+
+    def test_outlining_rejects_a_dropped_outputs_result_it_cannot_read(self) -> None:
+        opt = self.write_executable(
+            "unread-opt",
+            """import pathlib,sys
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'BC\\\\xc0\\\\xdeoutlined')""",
+        )
+        source = self.paths.profile_use_base_bitcode
+        source.write_bytes(b"BC\xc0\xdebase")
+        for name, printed in (
+            ("list", "[1, 2]"),
+            ("text", "not json"),
+            ("caller", '{"callers": [7], "instances": [], "outlined_functions": 1}'),
+        ):
+            with self.subTest(name):
+                ir_size = self.write_executable(
+                    f"unread-ir-size-{name}",
+                    f"""import sys
+if 'dropped-outputs' in sys.argv:
+    print({printed!r})
+    sys.exit(0)
+print('{{}}')""",
+                )
+                toolchain = dataclasses.replace(self.toolchain, opt=opt, ir_size=ir_size)
+                with self.assertRaisesRegex(PgsoError, "dropped-outputs printed no"):
+                    _outline_excluding_dropped_outputs(toolchain, self.paths, source, self.paths.outlined_bitcode, name)
 
     def test_profile_pipelines_use_the_exact_accepted_flags(self) -> None:
         self.assertEqual(
