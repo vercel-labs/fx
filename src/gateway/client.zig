@@ -11295,6 +11295,62 @@ test "the setup deadline walks away from a pooled open stuck in its lookup" {
     try waitForOpenJobs(pool);
 }
 
+/// Starts a pooled open stuck in its lookup and walks away from it at the
+/// setup deadline, so the pool has a running job and nothing else.
+fn leaveStuckOpenJob(pool: *http_pool.HttpPool, url: []const u8, stuck: *StuckLookupOpen) !void {
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 50 });
+    var reused = false;
+    const result = openGatewayRequestBounded(&pool.client, pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    try std.testing.expectError(error.ConnectionSetupTimedOut, result);
+    try std.testing.expectEqual(@as(u32, 1), pool.open_jobs.load(.acquire));
+}
+
+test "shutting the pool down waits for a connect job that finishes in time" {
+    const zio = io_mod.getIo();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(url);
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    var stuck: StuckLookupOpen = .{};
+    try leaveStuckOpenJob(&pool, url, &stuck);
+
+    const Release = struct {
+        fn run(lookup: *StuckLookupOpen) void {
+            io_mod.sleep(100 * std.time.ns_per_ms);
+            lookup.release.store(true, .seq_cst);
+        }
+    };
+    const release = try std.Thread.spawn(.{}, Release.run, .{&stuck});
+    defer release.join();
+    // The job returns its late connection to the pool and leaves before the
+    // wait runs out, so the pool frees everything; the testing allocator
+    // checks that nothing leaked.
+    try std.testing.expectEqual(http_pool.HttpPool.DestroyDisposition.destroyed, pool.deinit());
+}
+
+test "shutting the pool down leaves a connect job that is still stuck rather than freeing it" {
+    const zio = io_mod.getIo();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(url);
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    var stuck: StuckLookupOpen = .{};
+    try leaveStuckOpenJob(&pool, url, &stuck);
+
+    // The job still uses the client, so the pool gives up on it instead of
+    // freeing memory under it.
+    try std.testing.expectEqual(http_pool.HttpPool.DestroyDisposition.abandoned_open_job, pool.deinit());
+    stuck.release.store(true, .seq_cst);
+    try waitForOpenJobs(&pool);
+    // Once the job is gone the test frees what the pool left behind.
+    pool.client.deinit();
+}
+
 test "a pooled open hands over a request that carries the caller's URI and headers" {
     var fixture: PooledOpenFixture = undefined;
     try fixture.init();
