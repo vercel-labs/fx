@@ -3043,8 +3043,8 @@ pub fn buildSkillPrompt(
             continue;
         }
         // A copy with the same name and description as one already listed
-        // gives the model nothing to choose between, so only the first, from
-        // the highest-precedence root, is listed.
+        // gives the model nothing to choose between, so only the first copy
+        // in discovery order is listed.
         if (listsSameSkill(visible.items, skill)) continue;
         try visible.append(alloc, skill);
     }
@@ -4569,8 +4569,8 @@ test "skill catalog lists one entry for copies with the same name and descriptio
     var result = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
     defer result.deinit(alloc);
 
-    // The identical copy from the lower-precedence root is not listed, and
-    // its root gets no index; the copy with its own description stays.
+    // The identical copy from the later root is not listed, and its root
+    // gets no index; the copy with its own description stays.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, result.text, "\n- review: "));
     try std.testing.expect(std.mem.find(u8, result.text, "/home/.fx/skills") == null);
     try std.testing.expect(std.mem.find(u8, result.text, "Review a pull request as an exam.") != null);

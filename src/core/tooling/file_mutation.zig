@@ -198,8 +198,9 @@ pub fn prepare(
     call: types.ToolCall,
     input: file_mutation_contract.FileMutationInput,
     policy_targets: file_mutation_contract.PolicyEvaluatedFileTargets,
+    failure_detail: file_mutation_contract.EditFailureDetail,
 ) FileMutationPrepareError!file_mutation_contract.PrepareResult {
-    return prepareInternal(call_alloc, call, input, policy_targets, true);
+    return prepareInternal(call_alloc, call, input, policy_targets, true, failure_detail);
 }
 
 /// Prepares a mutation whose decoded input and canonical target proof were
@@ -210,8 +211,9 @@ pub fn prepareResolvedTarget(
     call: types.ToolCall,
     input: file_mutation_contract.FileMutationInput,
     policy_targets: file_mutation_contract.PolicyEvaluatedFileTargets,
+    failure_detail: file_mutation_contract.EditFailureDetail,
 ) FileMutationPrepareError!file_mutation_contract.PrepareResult {
-    return prepareInternal(call_alloc, call, input, policy_targets, false);
+    return prepareInternal(call_alloc, call, input, policy_targets, false, failure_detail);
 }
 
 fn prepareInternal(
@@ -220,6 +222,7 @@ fn prepareInternal(
     input: file_mutation_contract.FileMutationInput,
     policy_targets: file_mutation_contract.PolicyEvaluatedFileTargets,
     verify_target_resolution: bool,
+    failure_detail: file_mutation_contract.EditFailureDetail,
 ) FileMutationPrepareError!file_mutation_contract.PrepareResult {
     if (policyIdentityBindingMismatch(policy_targets)) {
         return .{ .semantic_failure = identity_changed_message };
@@ -237,7 +240,7 @@ fn prepareInternal(
         .semantic_failure => |message| return .{ .semantic_failure = message },
     };
 
-    const postimage_result = try derivePostimage(call_alloc, input, preimage);
+    const postimage_result = try derivePostimage(call_alloc, input, preimage, failure_detail);
     const after_content = switch (postimage_result) {
         .content => |content| content,
         .semantic_failure => |message| return .{ .semantic_failure = message },
@@ -1441,6 +1444,7 @@ fn derivePostimage(
     alloc: Allocator,
     input: file_mutation_contract.FileMutationInput,
     preimage: file_mutation_contract.Preimage,
+    failure_detail: file_mutation_contract.EditFailureDetail,
 ) error{OutOfMemory}!PostimageResult {
     return switch (input) {
         .write => |write| .{
@@ -1477,10 +1481,19 @@ fn derivePostimage(
                 }
             }
             if (occurrence_count == 0) {
-                break :blk .{ .semantic_failure = try notFoundMessage(alloc, before, old_string) };
+                break :blk .{ .semantic_failure = switch (failure_detail) {
+                    .plain => not_found_message,
+                    .file_lines => try notFoundMessage(alloc, before, old_string),
+                } };
             }
             if (occurrence_count > 1) {
-                break :blk .{ .semantic_failure = try notUniqueMessage(alloc, before, old_string, occurrence_count) };
+                break :blk .{ .semantic_failure = switch (failure_detail) {
+                    .plain => try alloc.print(
+                        "edit_file failed: old_string is not unique (found {d} occurrences), provide more context",
+                        .{occurrence_count},
+                    ),
+                    .file_lines => try notUniqueMessage(alloc, before, old_string, occurrence_count),
+                } };
             }
 
             const match_start = std.mem.find(
@@ -1928,7 +1941,7 @@ fn expectPrepared(
     policy: PolicyEvaluatedFileTargets,
 ) !PreparedFileMutation {
     const input = try decodeTestMutationInput(alloc, call);
-    return switch (try prepare(alloc, call, input, policy)) {
+    return switch (try prepare(alloc, call, input, policy, .plain)) {
         .prepared => |prepared| prepared,
         .semantic_failure => error.UnexpectedSemanticFailure,
     };
@@ -1939,8 +1952,17 @@ fn expectSemanticFailure(
     call: types.ToolCall,
     policy: PolicyEvaluatedFileTargets,
 ) ![]const u8 {
+    return expectSemanticFailureWithDetail(alloc, call, policy, .plain);
+}
+
+fn expectSemanticFailureWithDetail(
+    alloc: Allocator,
+    call: types.ToolCall,
+    policy: PolicyEvaluatedFileTargets,
+    failure_detail: file_mutation_contract.EditFailureDetail,
+) ![]const u8 {
     const input = try decodeTestMutationInput(alloc, call);
-    return switch (try prepare(alloc, call, input, policy)) {
+    return switch (try prepare(alloc, call, input, policy, failure_detail)) {
         .prepared => error.UnexpectedPreparedMutation,
         .semantic_failure => |message| message,
     };
@@ -2020,7 +2042,7 @@ test "prepare derives a missing write without creating the target" {
         .content = try arena.dupe(u8, "hello\n"),
     } };
     defer input.deinit(arena);
-    const prepared = switch (try prepare(arena, call, input, policy)) {
+    const prepared = switch (try prepare(arena, call, input, policy, .plain)) {
         .prepared => |value| value,
         .semantic_failure => return error.UnexpectedSemanticFailure,
     };
@@ -2207,8 +2229,13 @@ test "prepare preserves exact edit semantic failures" {
     };
     const duplicate_policy = try evaluatePolicy(arena, root, duplicate_call);
     try std.testing.expectEqualStrings(
-        "edit_file failed: old_string is not unique (found 2 occurrences, on line 1), provide more context\nLine 1 reads:\nsame twice same",
+        "edit_file failed: old_string is not unique (found 2 occurrences), provide more context",
         try expectSemanticFailure(arena, duplicate_call, duplicate_policy),
+    );
+    // Lines of the file appear only when the caller allows them.
+    try std.testing.expectEqualStrings(
+        "edit_file failed: old_string is not unique (found 2 occurrences, on line 1), provide more context\nLine 1 reads:\nsame twice same",
+        try expectSemanticFailureWithDetail(arena, duplicate_call, duplicate_policy, .file_lines),
     );
 }
 
@@ -2630,7 +2657,7 @@ fn prepareForApply(
     return .{
         .input = input,
         .policy = policy,
-        .prepared = switch (try prepare(alloc, call, input, policy)) {
+        .prepared = switch (try prepare(alloc, call, input, policy, .plain)) {
             .prepared => |prepared| prepared,
             .semantic_failure => return error.UnexpectedSemanticFailure,
         },
