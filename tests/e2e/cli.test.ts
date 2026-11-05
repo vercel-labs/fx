@@ -32,7 +32,7 @@ import {
   fakeGatewaySse,
   startFakeGateway,
 } from "./tmux-helpers";
-import { savedSession, sessionDir } from "./saved-sessions";
+import { onlySessionId, savedSession, savedText, sessionDir } from "./saved-sessions";
 import {
   codexBreakdownBody,
   codexProfileBody,
@@ -652,6 +652,66 @@ describe("cli: output errors", () => {
     },
     TIMEOUT,
   );
+
+  for (const [label, flags] of [["text", []], ["--json", ["--json"]]] as const) {
+    test(
+      `fx ask ${label} that can't write its answer fails and keeps the answer in the session`,
+      async () => {
+        const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-ask-closed-stdout-")));
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const tracePath = join(root, "trace.log");
+        mkdirSync(home);
+        mkdirSync(workspace);
+        const gateway = startFakeGateway([fakeGatewayFinalText("ANSWER_KEPT_IN_SESSION")]);
+        try {
+          // `>&-` closes stdout, so the answer can't be written. The fake
+          // gateway answers from this process, so fx runs asynchronously.
+          const proc = Bun.spawn(["sh", "-c", 'exec "$0" "$@" >&-', FX_BIN, "ask", ...flags, "--auto", "Say the answer."], {
+            cwd: workspace,
+            stdin: "ignore",
+            stdout: "ignore",
+            stderr: "pipe",
+            env: {
+              PATH: process.env.PATH,
+              HOME: home,
+              AI_GATEWAY_API_KEY: "closed-stdout-key",
+              FX_MODEL: FAKE_GATEWAY_MODEL,
+              FX_DISABLE_KEYCHAIN: "1",
+              FX_AUTO_UPGRADE: "0",
+              FX_SOUND: "0",
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "core",
+            },
+          });
+          const stderr = await new Response(proc.stderr).text();
+          expect(await proc.exited, stderr).toBe(1);
+          expect(stderr).toBe("fx: couldn't write the output\n");
+          const trace = readFileSync(tracePath, "utf8");
+          expect(trace).toContain("ask output write failed err=");
+          expect(trace).toContain("command error err=OutputWriteFailed");
+
+          // No file fx opened took stdout's place, such as the store's lock.
+          const lock = join(home, ".fx", "sessions", "v2", "index.lock");
+          if (existsSync(lock)) expect(readFileSync(lock, "utf8")).not.toContain("ANSWER_KEPT_IN_SESSION");
+
+          // The turn is saved, so the answer can still be read.
+          const sessionId = onlySessionId(home);
+          expect(savedText(home, sessionId)).toContain("ANSWER_KEPT_IN_SESSION");
+          const detail = await runFx(["session", "--id", sessionId, "--json"], { cwd: workspace, env: { HOME: home } });
+          expect(detail.code, detail.stderr).toBe(0);
+          expect(JSON.parse(detail.stdout).history_len).toBe(1);
+        } finally {
+          gateway.stop();
+          rmSync(root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
 });
 
 describe("cli: status", () => {
