@@ -2192,7 +2192,10 @@ test "shell request correction suggests only unambiguous repairs without executi
         .{ .input = "{\"session_id\":\"shell-3\"}", .retry = null },
         .{ .input = "{\"command\":\"true\",\"session_id\":\"shell-3\"}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":true}", .retry = null },
-        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"}}", .retry = null },
+        // A shell that is no host's login shell: the decoder drops a `shell`
+        // naming the login shell on a run without a terminal, so a common path
+        // such as /bin/bash would make this case depend on the host.
+        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/opt/example/bin/bash\"}}", .retry = null },
         .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":\"1000\",\"timeout_ms\":0}}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":4294967296}", .retry = null },
         .{ .input = "{\"action\":\"stop\",\"session_id\":\"shell-3\",\"force\":\"true\"}", .retry = null },
