@@ -6,6 +6,8 @@
 \* (src/core/mcp_host/credentials.zig) and the harness's own steps. Times are
 \* awake-clock milliseconds from the run's start.
 \*   take {p, at, started}      p took the lock and wrote its stamp, at
+\*   stamp {p, at}              p, holding it, wrote a new stamp before a
+\*                              Keychain call
 \*   release {p, at}            p let it go
 \*   giveup {p, at, started}    p gave up waiting for it
 \*   freeze {p, at}, thaw {p, at}  the harness stopped or resumed p (ctrl+z)
@@ -18,8 +20,9 @@
 \* The rules, the model's on real time with Tolerance for scheduling:
 \*   NoGiveUpOnLiveHolder  a waiter gives up only behind a frozen holder or
 \*                         one that wrote no stamp (StoreLockBudget.tla)
-\*   HoldWithinBudget      a live holder lets the lock go by its stamp plus
-\*                         Budget: the hold's Keychain calls end by then
+\*   HoldWithinBudget      a live holder writes its next stamp, or lets the
+\*                         lock go, within Budget of its last stamp: each
+\*                         Keychain call ends by then
 \*   GiveUpOnTime          a waiter gives up Budget + Slack after the later
 \*                         of the last stamp and its own start, not before
 \*                         and not long after
@@ -31,7 +34,7 @@ CONSTANTS Budget, Slack, Tolerance
 VARIABLES
     i, bad,
     owner,      \* who holds the lock, or None
-    stampAt,    \* when the current holder took it
+    stampAt,    \* the current holder's last stamp
     frozen,     \* processes the harness has stopped
     excused,    \* processes stopped at some point in their current hold
     foreign,    \* the harness holds the lock and wrote no stamp
@@ -48,8 +51,9 @@ TraceInit ==
 Broken(r) ==
     LET d == r.data IN
     (IF r.event \in {"take", "foreign"} /\ owner # None THEN {"OneOwner"} ELSE {}) \cup
-    (IF r.event = "release" /\ owner = d.p /\ ~(d.p \in excused) /\ d.at > stampAt + Budget + Tolerance
+    (IF r.event \in {"stamp", "release"} /\ owner = d.p /\ ~(d.p \in excused) /\ d.at > stampAt + Budget + Tolerance
         THEN {"HoldWithinBudget"} ELSE {}) \cup
+    (IF r.event = "stamp" /\ owner # d.p THEN {"OneOwner"} ELSE {}) \cup
     (IF r.event = "giveup" /\ ~(owner # None /\ (owner \in frozen \/ foreign))
         THEN {"NoGiveUpOnLiveHolder"} ELSE {}) \cup
     (IF r.event = "giveup" /\
@@ -61,6 +65,8 @@ Step(r) ==
     LET d == r.data IN
     CASE r.event = "take" ->
             owner' = d.p /\ stampAt' = d.at /\ lastStamp' = d.at /\ foreign' = FALSE /\ UNCHANGED <<frozen, excused>>
+      [] r.event = "stamp" ->
+            stampAt' = d.at /\ lastStamp' = d.at /\ UNCHANGED <<owner, frozen, excused, foreign>>
       [] r.event = "foreign" ->
             owner' = d.p /\ foreign' = TRUE /\ UNCHANGED <<stampAt, lastStamp, frozen, excused>>
       [] r.event \in {"release", "kill", "foreign_release"} ->

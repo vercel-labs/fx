@@ -70,5 +70,12 @@
     "stress": "StoreLockBudget.stress.cfg",
     "findings": [],
     "repair": []
+  },
+  {
+    "module": "RefreshLease",
+    "smoke": "RefreshLease.cfg",
+    "stress": "RefreshLease.stress.cfg",
+    "findings": [],
+    "repair": []
   }
 ]

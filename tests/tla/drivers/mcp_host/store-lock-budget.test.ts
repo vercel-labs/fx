@@ -1,16 +1,18 @@
 // StoreLockBudget: real fx processes take the MCP credential store's lock on
-// the macOS Keychain backend while the harness slows their Keychain reads,
-// lets a read hang past the hold budget, freezes or kills a holder, holds
-// the lock itself with no stamp as an older fx does, or writes garbage into
-// the lock file. Each process is `fx mcp list --json`, which reads the store
-// once under the lock and contacts no server. Their "MCP store lock" trace
-// lines and the harness's steps are checked by TLC against
-// StoreLockBudgetTrace.tla, the rules of StoreLockBudget.tla on the real
-// clock, and each run asserts what it must show.
+// the macOS Keychain backend while the harness slows their Keychain calls,
+// lets one hang past its budget or stop reading its stdin, freezes or kills
+// a holder, holds the lock itself with no stamp as an older fx does, or
+// writes garbage into the lock file. Most processes are `fx mcp list --json`,
+// which reads the store once under the lock and contacts no server; the
+// others are `fx mcp logout web`, which also writes it. Their "MCP store
+// lock" trace lines, a stamp when taken and before each Keychain call, and
+// the harness's steps are checked by TLC against StoreLockBudgetTrace.tla,
+// the rules of StoreLockBudget.tla on the real clock, and each run asserts
+// what it must show.
 //
 // The Keychain is the user's, through a temp HOME that links
-// ~/Library/Keychains and a throwaway USER, so no real account is read;
-// `fx mcp list` never writes the store.
+// ~/Library/Keychains and a throwaway USER, so no real account is read or
+// written; the logouts write only that account's item.
 //
 // FX_TLA_REPEAT repeats the turns schedule with fresh seeds.
 import { expect, test } from "bun:test";
@@ -94,11 +96,12 @@ function start(s: Scene, label: string, args = ["mcp", "list", "--json"]): Proc 
 /**
  * Slows each Keychain call the scene's fx processes make, each an
  * `osascript` child, by `pauseFor(n)` ms, n counting calls from 0, until
- * `stop`. `fx mcp list` makes one read per hold of the store lock; other
- * children, such as `security`'s Keychain check, go untouched. Resolves
- * `first` with the first call's pid and its fx parent.
+ * `stop`; with `only`, just the calls of that kind ("load" or "store"), the
+ * others let go at once. `fx mcp list` makes one read per hold of the store
+ * lock; other children, such as `security`'s Keychain check, go untouched.
+ * Resolves `first` with the first slowed call's pid and its fx parent.
  */
-function slowReads(s: Scene, pauseFor: (n: number) => number) {
+function slowReads(s: Scene, pauseFor: (n: number) => number, only?: "load" | "store") {
   const seen = new Set<number>();
   let calls = 0;
   let stopped = false;
@@ -114,13 +117,22 @@ function slowReads(s: Scene, pauseFor: (n: number) => number) {
           if (exe === null || exe === binary || exe.endsWith("/fx")) continue;
           seen.add(pid);
           if (exe !== "/usr/bin/osascript") continue;
+          if (only) {
+            // Stopped before it reads its stdin, then told apart by its argv.
+            try { process.kill(pid, "SIGSTOP"); } catch { continue; }
+            const argv = spawnSync("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf8" }).stdout;
+            if (!argv.includes(` ${only} `)) {
+              try { process.kill(pid, "SIGCONT"); } catch {}
+              continue;
+            }
+          }
           const n = calls++;
           const ms = pauseFor(n);
           if (ms > 0) {
-            try { process.kill(pid, "SIGSTOP"); } catch { continue; }
+            if (!only) try { process.kill(pid, "SIGSTOP"); } catch { continue; }
             s.paused.add(pid);
             s.timers.push(setTimeout(() => { try { process.kill(pid, "SIGCONT"); } catch {} s.paused.delete(pid); }, ms));
-          }
+          } else if (only) try { process.kill(pid, "SIGCONT"); } catch {}
           if (n === 0) resolveFirst({ pid, parent: p.child.pid });
         }
       }
@@ -145,6 +157,15 @@ function run(argv) {
     if (status !== 0 && status !== -25300) throw new Error("keychain status=" + status);
     return "";
   }
+  if (argv[0] === "load") {
+    query.setObjectForKey($.NSNumber.numberWithBool(true), object($.kSecReturnData));
+    query.setObjectForKey(object($.kSecMatchLimitOne), object($.kSecMatchLimit));
+    const found = Ref();
+    const status = $.SecItemCopyMatching(query, found);
+    if (status === -25300) return "";
+    if (status !== 0) throw new Error("keychain status=" + status);
+    return $.NSString.alloc.initWithDataEncoding(ObjC.castRefToObject(found[0]), $.NSUTF8StringEncoding).js;
+  }
   const secret = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
   const update = $.NSMutableDictionary.alloc.init;
   update.setObjectForKey(secret, object($.kSecValueData));
@@ -155,13 +176,25 @@ function run(argv) {
   return "";
 }`;
 
-function keychainItem(s: Scene, op: "store" | "delete", text = "") {
+/** Stores, deletes, or loads (returning its text, "" when there is none) the scene's Keychain item. */
+function keychainItem(s: Scene, op: "store" | "delete" | "load", text = ""): string {
   if (!s.account.startsWith(ACCOUNT_PREFIX)) throw new Error("refusing to touch a non-test MCP Keychain account");
   const r = spawnSync("/usr/bin/osascript", ["-l", "JavaScript", "-e", KEYCHAIN_SCRIPT, op, s.account, SERVICE], {
     input: text, encoding: "utf8", env: { ...process.env, HOME: s.f.home, USER: s.account },
   });
   if (r.status !== 0) throw new Error(`keychain ${op} failed: ${r.stderr}`);
+  return r.stdout.trim();
 }
+
+/** Saves web's login, and with `big` another server's of about 400 KB, larger than a pipe's buffer. */
+function seedLogin(s: Scene, big = false) {
+  const credential = (url: string, access = "a") => JSON.stringify({ access, refresh: "r", expires_at_ms: null, token_endpoint: `${url}/token`, revocation_endpoint: null, resource: `${url}/mcp`, client_id: "c", client_secret: null, method: "none" });
+  const servers = [{ name: "web", url: "http://127.0.0.1:9/mcp", credential: credential("http://127.0.0.1:9") }];
+  if (big) servers.push({ name: "big", url: "http://127.0.0.1:8/mcp", credential: credential("http://127.0.0.1:8", "x".repeat(400_000)) });
+  keychainItem(s, "store", JSON.stringify({ version: 1, servers }));
+  s.seeded = true;
+}
+const webSaved = (s: Scene) => keychainItem(s, "load").includes('"name":"web"');
 
 /** Holds the lock from another process with no stamp, as an older fx does, for `seconds`. */
 async function holdWithoutStamp(s: Scene, seconds: number) {
@@ -172,15 +205,17 @@ async function holdWithoutStamp(s: Scene, seconds: number) {
   return holder;
 }
 
-interface Seen { label: string; takes: { at: number; started: number }[]; releases: number[]; giveups: { at: number; started: number }[]; readFailed: boolean }
+interface Seen { label: string; takes: { at: number; started: number }[]; stamps: number[]; releases: number[]; giveups: { at: number; started: number }[]; readFailed: boolean }
 
 /** The process's lock trace lines, on the scene's clock. */
 function seen(s: Scene, p: Proc): Seen {
   const text = existsSync(p.trace) ? readFileSync(p.trace, "utf8") : "";
-  const out: Seen = { label: p.label, takes: [], releases: [], giveups: [], readFailed: /\[keychain\] load failed/.test(text) };
+  const out: Seen = { label: p.label, takes: [], stamps: [], releases: [], giveups: [], readFailed: /\[keychain\] load failed/.test(text) };
   for (const line of text.split("\n")) {
     let m = /MCP store lock taken stamp=(\d+) started=(\d+)/.exec(line);
     if (m) out.takes.push({ at: Number(m[1]) - s.t0, started: Number(m[2]) - s.t0 });
+    m = /MCP store lock stamped stamp=(\d+)/.exec(line);
+    if (m) out.stamps.push(Number(m[1]) - s.t0);
     m = /MCP store lock released stamp=\d+ at=(\d+)/.exec(line);
     if (m) out.releases.push(Number(m[1]) - s.t0);
     m = /MCP store lock given up stamp=\S+ started=(\d+) at=(\d+)/.exec(line);
@@ -201,11 +236,12 @@ async function finish(s: Scene): Promise<{ verdict: Verdict; seen: Seen[]; resul
       expect(t.at + s.t0).toBeLessThanOrEqual(results[k]!.ended + 5);
     }
     for (const t of v.takes) s.records.push({ event: "take", data: { p: p.label, at: t.at, started: t.started }, at: t.at });
+    for (const at of v.stamps) s.records.push({ event: "stamp", data: { p: p.label, at }, at });
     for (const at of v.releases) s.records.push({ event: "release", data: { p: p.label, at }, at });
     for (const g of v.giveups) s.records.push({ event: "giveup", data: { p: p.label, at: g.at, started: g.started }, at: g.at });
   }
   // Time order; at the same millisecond a release comes before a take.
-  const rank: Record<string, number> = { kill: 0, release: 0, foreign_release: 0, thaw: 1, scribble: 1, freeze: 2, giveup: 3, take: 4, foreign: 4 };
+  const rank: Record<string, number> = { kill: 0, release: 0, foreign_release: 0, thaw: 1, scribble: 1, freeze: 2, giveup: 3, take: 4, foreign: 4, stamp: 5 };
   s.records.sort((a, b) => (a.at ?? 0) - (b.at ?? 0) || (rank[a.event] ?? 5) - (rank[b.event] ?? 5));
   const verdict = await checkTrace({
     module: "StoreLockBudget", records: s.records, dir: join(s.f.base, "trace"),
@@ -230,10 +266,11 @@ const totals = (all: Seen[]) => ({
   giveups: all.reduce((n, v) => n + v.giveups.length, 0),
 });
 
-async function waitForTake(p: Proc, s: Scene, timeoutMs: number) {
+/** Waits until `p` took the store lock `n` times. */
+async function waitForTake(p: Proc, s: Scene, timeoutMs: number, n = 1) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (seen(s, p).takes.length > 0) return;
+    if (seen(s, p).takes.length >= n) return;
     await Bun.sleep(10);
   }
   throw new Error(`${p.label} never took the store lock`);
@@ -313,6 +350,20 @@ test.skipIf(!darwin)("eight waiters behind slowed reads all get the lock", async
     expect(verdict.verdict).toBe("ACCEPTED");
   } finally { cleanup(s); }
 }, 120_000);
+
+test.skipIf(!darwin)("a hundred fx reading the store at once all get the lock", async () => {
+  const s = scene("slb-hundred");
+  try {
+    // As many windows refreshing their logins together; none is slowed.
+    for (let k = 0; k < 100; k++) start(s, `p${k}`);
+    const { verdict, seen: all, results } = await finish(s);
+    expect(results.every((r) => r.code === 0)).toBe(true);
+    expect(totals(all)).toEqual({ takes: 100, releases: 100, giveups: 0 });
+    const waits = all.map((v) => (v.takes[0]?.at ?? 0) - (v.takes[0]?.started ?? 0)).sort((a, b) => a - b);
+    console.log(`longest wait ms: ${waits.at(-1)}`);
+    expect(verdict.verdict).toBe("ACCEPTED");
+  } finally { cleanup(s); }
+}, 240_000);
 
 test.skipIf(!darwin)("a frozen holder: waiters give up 12 s after they start waiting, not before", async () => {
   const s = scene("slb-frozen");
@@ -406,27 +457,75 @@ test.skipIf(!darwin)("garbage in the lock file counts as no stamp", async () => 
   } finally { cleanup(s); }
 }, 90_000);
 
-test.skipIf(!darwin)("a hold with two slow Keychain calls ends at its budget", async () => {
-  const s = scene("slb-two-calls");
+test.skipIf(!darwin)("a lone fx whose Keychain read and write take 6 s each signs out", async () => {
+  const s = scene("slb-lone");
   try {
     // web's login is saved, so signing out reads the store and writes it back.
-    const credential = JSON.stringify({ access: "a", refresh: "r", expires_at_ms: null, token_endpoint: "http://127.0.0.1:9/token", revocation_endpoint: null, resource: "http://127.0.0.1:9/mcp", client_id: "c", client_secret: null, method: "none" });
-    keychainItem(s, "store", JSON.stringify({ version: 1, servers: [{ name: "web", url: "http://127.0.0.1:9/mcp", credential }] }));
-    s.seeded = true;
-    // Every Keychain call takes 6 s: a read and a write in one hold would take 12.
+    seedLogin(s);
+    // Each call takes 6 s, inside the 10 s a call has; the hold takes 12.
     const slow = slowReads(s, () => 6_000);
     start(s, "logout", ["mcp", "logout", "web"]);
-    await slow.first;
-    start(s, "waiter");
-    const { verdict, seen: all } = await finish(s);
+    const { verdict, seen: all, results } = await finish(s);
     slow.stop();
-    for (const v of all) {
-      for (const [k, t] of v.takes.entries()) {
-        const released = v.releases[k];
-        if (released !== undefined) expect(released - t.at).toBeLessThanOrEqual(BUDGET + TOLERANCE);
-      }
-    }
+    expect(results[0]!.code).toBe(0);
+    expect(webSaved(s)).toBe(false);
+    expect(readFileSync(s.procs[0]!.trace, "utf8")).not.toMatch(/\[keychain\] store failed|MCP credential not removed/);
+    const t = totals(all);
+    expect(t.giveups).toBe(0);
+    expect(t.releases).toBe(t.takes);
+    expect(verdict.verdict).toBe("ACCEPTED");
+  } finally { cleanup(s); }
+}, 90_000);
+
+test.skipIf(!darwin)("a hold with two slow Keychain calls saves, and a waiter behind it waits", async () => {
+  const s = scene("slb-two-calls");
+  try {
+    seedLogin(s);
+    const slow = slowReads(s, () => 6_000);
+    const logout = start(s, "logout", ["mcp", "logout", "web"]);
+    // Signing out reads the store under the lock three times, then removes
+    // the login: a read and a write in one hold, 12 s together.
+    await waitForTake(logout, s, 40_000, 4);
+    start(s, "waiter");
+    const { verdict, seen: all, results } = await finish(s);
+    slow.stop();
+    expect(results.map((r) => r.code)).toEqual([0, 0]);
+    expect(webSaved(s)).toBe(false);
     expect(totals(all).giveups).toBe(0);
+    // The last hold stamped before each of its two calls and lasted longer
+    // than one call's 10 s, and the waiter waited it out.
+    const l = all[0]!;
+    const taken = l.takes.at(-1)!.at;
+    expect(l.stamps.filter((t) => t >= taken).length).toBe(2);
+    expect(l.releases.at(-1)! - taken).toBeGreaterThan(BUDGET);
+    const w = all[1]!.takes[0]!;
+    expect(w.at).toBeGreaterThanOrEqual(l.releases.at(-1)!);
+    expect(w.at - w.started).toBeGreaterThan(BUDGET);
+    expect(verdict.verdict).toBe("ACCEPTED");
+  } finally { cleanup(s); }
+}, 120_000);
+
+test.skipIf(!darwin)("a store write to an osascript that doesn't read its stdin ends 10 s after its stamp", async () => {
+  const s = scene("slb-stuck-write");
+  const stopped: number[] = [];
+  try {
+    // A document larger than the pipe's buffer: the write blocks on a reader that's stopped.
+    seedLogin(s, true);
+    const slow = slowReads(s, () => 25_000, "store");
+    const logout = start(s, "logout", ["mcp", "logout", "web"]);
+    const write = await slow.first;
+    stopped.push(write.pid);
+    start(s, "waiter");
+    const { verdict, seen: all, results } = await finish(s);
+    slow.stop();
+    expect(results[1]!.code).toBe(0);
+    expect(totals(all).giveups).toBe(0);
+    const held = all[0]!;
+    const lastStamp = Math.max(...held.takes.map((t) => t.at), ...held.stamps);
+    expect(held.releases[0]! - lastStamp).toBeLessThanOrEqual(BUDGET + TOLERANCE);
+    expect(readFileSync(logout.trace, "utf8")).toMatch(/\[keychain\] store failed/);
+    // The stopped osascript went with the write.
+    expect(stopped.filter((pid) => { try { process.kill(pid, 0); return true; } catch { return false; } })).toEqual([]);
     expect(verdict.verdict).toBe("ACCEPTED");
   } finally { cleanup(s); }
 }, 120_000);

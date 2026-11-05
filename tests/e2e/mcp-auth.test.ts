@@ -158,6 +158,8 @@ function startAuthFixture(
      * `revokeOnReplay` the newest login of the chain stops working too.
      */
     singleUseRefresh?: { graceMs: number; revokeOnReplay?: boolean };
+    /** With `singleUseRefresh`, answer each refresh this late, after retiring the token it sent. */
+    refreshDelayMs?: number;
     /** The code exchange waits for this file, after writing the other. */
     codeBarrierStartedPath?: string;
     codeBarrierReleasePath?: string;
@@ -320,6 +322,7 @@ function startAuthFixture(
               };
               Object.assign(chain, { current: answer.refresh_token, retired: sent, retiredAt: Date.now(), retiredAnswer: answer });
               validTokens.add(answer.access_token);
+              if (options.refreshDelayMs) await Bun.sleep(options.refreshDelayMs);
               return Response.json(answer);
             }
             if (sent === chain.retired && Date.now() - chain.retiredAt <= rule.graceMs) return Response.json(chain.retiredAnswer);
@@ -2068,6 +2071,72 @@ describe("MCP login", () => {
     expect(Date.now() - startedAt).toBeLessThan(5_000);
     expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-3`);
     expect(auth.replays).toBe(0);
+  }, 90_000);
+
+  // One fx refreshes a login at a time. Another that needs it meanwhile
+  // waits for as long as the refresh is still going, here a token endpoint
+  // that takes 15 s to answer, and then takes the login it saved: refreshing
+  // with the token the first already sent would be refused. Both are
+  // connected before the token runs out, as fx windows in use are.
+  test("an fx waits for another's refresh that takes 15 s, and takes the login it saved", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { singleUseRefresh: { graceMs: 0 }, refreshDelayMs: 15_000 });
+    const activeAuth = auth;
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    const until = async (what: string, done: () => boolean) => {
+      const deadline = Date.now() + 30_000;
+      while (!done()) {
+        if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+        await Bun.sleep(25);
+      }
+    };
+    const models = { models: [{ id: MODEL, type: "language" as const, tags: ["tool-use"] }] };
+    // The first fx calls once the second is connected, and finds the token
+    // withdrawn; the second calls once the first's refresh is out.
+    let second: ReturnType<typeof startFakeGateway> | null = null;
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select_first", "mcp_select_tool", { name: TOOL_NAME }),
+      async () => {
+        await until("the second fx to connect", () => (second?.requests.length ?? 0) >= 2);
+        activeAuth.validTokens.delete(ACCESS_INITIAL);
+        return fakeGatewayToolCall("first", TOOL_NAME, { text: "first" });
+      },
+      fakeGatewayFinalText("First call done."),
+    ], models);
+    const first = gateway;
+    second = startFakeGateway([
+      fakeGatewayToolCall("select_second", "mcp_select_tool", { name: TOOL_NAME }),
+      async () => {
+        await until("the first fx's refresh", () => activeAuth.refreshes >= 1);
+        return fakeGatewayToolCall("second", TOOL_NAME, { text: "second" });
+      },
+      fakeGatewayFinalText("Second call done."),
+    ], models);
+    const other = second;
+    try {
+      const ask = (g: ReturnType<typeof startFakeGateway>) => runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture."], {
+        cwd: root.workspace,
+        env: { ...env, FX_GATEWAY_BASE_URL: g.baseUrl, FX_GATEWAY_CHAT_URL: g.chatUrl },
+        timeoutMs: 60_000,
+      });
+      const [a, b] = await Promise.all([ask(first), ask(other)]);
+      // Refreshing with the token the first sent is refused, and both lose the login.
+      expect(auth.replays).toBe(0);
+      expect(auth.refreshes).toBe(1);
+      expectExit0(a);
+      expectExit0(b);
+      expect(toolResultText(first.requests.at(-1)?.body ?? "", "first")).toContain("first");
+      expect(toolResultText(other.requests.at(-1)?.body ?? "", "second")).toContain("second");
+      // Both called the tool with the one refreshed login.
+      const calls = auth.requests.filter((r) => r.body.includes("\"tools/call\"") && r.authorization === `Bearer ${ACCESS_REFRESHED}-1`);
+      expect(calls.length).toBe(2);
+      expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-1`);
+    } finally {
+      other.stop();
+    }
   }, 90_000);
 
   // A load balancer resets the token endpoint's keep-alive connection once it

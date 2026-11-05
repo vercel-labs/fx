@@ -9,14 +9,15 @@
 \* was saving is dropped (runtime.zig saveCredential): "another fx kept it
 \* busy".
 \*
-\* The design: a holder writes the awake time it took the lock into the lock
-\* file, one step after taking it; every Keychain call it makes ends by that
-\* time plus Budget, so no hold lasts longer; and the waiter gives up only
-\* once the stamp it reads, or its own start if that is later, is Budget +
-\* Slack old. flock has no queue, so other holders may take the lock between
-\* the waiter's polls; the laptop may sleep once, which stops the awake
-\* clock and moves the real one; a holder may freeze (ctrl+z) and never act
-\* again.
+\* The design: before each Keychain call it makes, a holder writes the awake
+\* time into the lock file, and the call ends within its own timeout,
+\* CallMax <= Budget, of then; the waiter gives up only once the stamp it
+\* reads, or its own start if that is later, is Budget + Slack old. A hold
+\* of several slow calls lasts as long as they take, and its stamp is never
+\* more than one call old. flock has no queue, so other holders may take the
+\* lock between the waiter's polls; the laptop may sleep once, which stops
+\* the awake clock and moves the real one; a holder may freeze (ctrl+z) and
+\* never act again.
 \*
 \* NoGiveUpOnLiveHolder: the waiter gives up only behind a frozen holder.
 EXTENDS Naturals
@@ -25,7 +26,7 @@ CONSTANTS
     Holders,   \* the other fx processes that take the lock
     CallMax,   \* one Keychain call's own timeout (s)
     MaxCalls,  \* Keychain calls one hold makes, at most
-    Budget,    \* the hold budget (s): hold_budget_ms
+    Budget,    \* how old a live holder's stamp gets (s): call_budget_ms
     Slack,     \* what a waiter allows past it (s): hold_slack_ms
     MaxSleep   \* the longest laptop sleep (s); 0 for none
 
@@ -38,15 +39,14 @@ VARIABLES
     calls,        \* holder -> calls finished
     inCall,       \* holder -> in a Keychain call
     callAt,       \* holder -> awake time its call started
-    heldAt,       \* holder -> awake time it took the lock
-    stamped,      \* holder -> it wrote its stamp into the lock file
+    stamped,      \* holder -> it wrote the stamp for its next call
     lockStamp,    \* the stamp in the lock file: the last one written
     frozen,       \* holder -> frozen
     waiter,       \* "waiting" | "got" | "gaveup"
     wStart        \* when the waiter started, on its clock
 
 vars == <<awake, real, slept, owner, state, needs, calls, inCall, callAt,
-          heldAt, stamped, lockStamp, frozen, waiter, wStart>>
+          stamped, lockStamp, frozen, waiter, wStart>>
 
 \* The clock the waiter and the stamps use: awake time.
 WClock == awake
@@ -58,8 +58,8 @@ Deadline == Max(lockStamp, wStart) + Budget + Slack
 
 Live(h) == owner = h /\ ~frozen[h]
 
-\* The holder's call has run out: its own timeout, or the hold's budget.
-CallOver(h) == inCall[h] /\ (awake - callAt[h] >= CallMax \/ awake - heldAt[h] >= Budget)
+\* The holder's call has run out its own timeout.
+CallOver(h) == inCall[h] /\ awake - callAt[h] >= CallMax
 
 TypeOK ==
     /\ owner \in Holders \cup {"none"}
@@ -75,7 +75,6 @@ Init ==
     /\ calls = [h \in Holders |-> 0]
     /\ inCall = [h \in Holders |-> FALSE]
     /\ callAt = [h \in Holders |-> 0]
-    /\ heldAt = [h \in Holders |-> 0]
     /\ stamped = [h \in Holders |-> h = owner]
     /\ lockStamp = 0
     /\ frozen = [h \in Holders |-> FALSE]
@@ -86,34 +85,34 @@ Acquire(h) ==
     /\ owner = "none" /\ state[h] = "ready" /\ waiter = "waiting"
     /\ owner' = h
     /\ state' = [state EXCEPT ![h] = "holding"]
-    /\ heldAt' = [heldAt EXCEPT ![h] = awake]
     /\ UNCHANGED <<awake, real, slept, needs, calls, inCall, callAt, stamped, lockStamp, frozen, waiter, wStart>>
 
-\* The new holder writes its stamp, the next thing it does.
+\* Before each Keychain call, the holder writes the time into the lock file.
 WriteStamp(h) ==
-    /\ Live(h) /\ ~stamped[h]
+    /\ Live(h) /\ ~stamped[h] /\ ~inCall[h] /\ calls[h] < needs[h]
     /\ stamped' = [stamped EXCEPT ![h] = TRUE]
     /\ lockStamp' = WClock
-    /\ UNCHANGED <<awake, real, slept, owner, state, needs, calls, inCall, callAt, heldAt, frozen, waiter, wStart>>
+    /\ UNCHANGED <<awake, real, slept, owner, state, needs, calls, inCall, callAt, frozen, waiter, wStart>>
 
 StartCall(h) ==
     /\ Live(h) /\ stamped[h] /\ ~inCall[h] /\ calls[h] < needs[h]
     /\ inCall' = [inCall EXCEPT ![h] = TRUE]
     /\ callAt' = [callAt EXCEPT ![h] = awake]
-    /\ UNCHANGED <<awake, real, slept, owner, state, needs, calls, heldAt, stamped, lockStamp, frozen, waiter, wStart>>
+    /\ stamped' = [stamped EXCEPT ![h] = FALSE]
+    /\ UNCHANGED <<awake, real, slept, owner, state, needs, calls, lockStamp, frozen, waiter, wStart>>
 
 \* A call may answer at any time before it runs out.
 EndCall(h) ==
     /\ Live(h) /\ inCall[h] /\ ~CallOver(h)
     /\ inCall' = [inCall EXCEPT ![h] = FALSE]
     /\ calls' = [calls EXCEPT ![h] = @ + 1]
-    /\ UNCHANGED <<awake, real, slept, owner, state, needs, callAt, heldAt, stamped, lockStamp, frozen, waiter, wStart>>
+    /\ UNCHANGED <<awake, real, slept, owner, state, needs, callAt, stamped, lockStamp, frozen, waiter, wStart>>
 
 Finish(h) ==
-    /\ Live(h) /\ stamped[h] /\ ~inCall[h] /\ calls[h] = needs[h]
+    /\ Live(h) /\ ~inCall[h] /\ calls[h] = needs[h]
     /\ owner' = "none"
     /\ state' = [state EXCEPT ![h] = "done"]
-    /\ UNCHANGED <<awake, real, slept, needs, calls, inCall, callAt, heldAt, stamped, lockStamp, frozen, waiter, wStart>>
+    /\ UNCHANGED <<awake, real, slept, needs, calls, inCall, callAt, stamped, lockStamp, frozen, waiter, wStart>>
 
 \* The call is killed; the operation fails and the lock is released.
 Cut(h) ==
@@ -121,22 +120,22 @@ Cut(h) ==
     /\ owner' = "none"
     /\ state' = [state EXCEPT ![h] = "done"]
     /\ inCall' = [inCall EXCEPT ![h] = FALSE]
-    /\ UNCHANGED <<awake, real, slept, needs, calls, callAt, heldAt, stamped, lockStamp, frozen, waiter, wStart>>
+    /\ UNCHANGED <<awake, real, slept, needs, calls, callAt, stamped, lockStamp, frozen, waiter, wStart>>
 
 Freeze(h) ==
     /\ Live(h)
     /\ frozen' = [frozen EXCEPT ![h] = TRUE]
-    /\ UNCHANGED <<awake, real, slept, owner, state, needs, calls, inCall, callAt, heldAt, stamped, lockStamp, waiter, wStart>>
+    /\ UNCHANGED <<awake, real, slept, owner, state, needs, calls, inCall, callAt, stamped, lockStamp, waiter, wStart>>
 
 Get ==
     /\ waiter = "waiting" /\ owner = "none"
     /\ waiter' = "got"
-    /\ UNCHANGED <<awake, real, slept, owner, state, needs, calls, inCall, callAt, heldAt, stamped, lockStamp, frozen, wStart>>
+    /\ UNCHANGED <<awake, real, slept, owner, state, needs, calls, inCall, callAt, stamped, lockStamp, frozen, wStart>>
 
 GiveUp ==
     /\ waiter = "waiting" /\ owner # "none" /\ WClock >= Deadline
     /\ waiter' = "gaveup"
-    /\ UNCHANGED <<awake, real, slept, owner, state, needs, calls, inCall, callAt, heldAt, stamped, lockStamp, frozen, wStart>>
+    /\ UNCHANGED <<awake, real, slept, owner, state, needs, calls, inCall, callAt, stamped, lockStamp, frozen, wStart>>
 
 \* Timeouts fire, and a holder moves on between calls, before time does; a
 \* free lock is taken within the waiter's 10 ms poll.
@@ -148,14 +147,14 @@ Due ==
 Tick ==
     /\ waiter = "waiting" /\ ~Due
     /\ awake' = awake + 1 /\ real' = real + 1
-    /\ UNCHANGED <<slept, owner, state, needs, calls, inCall, callAt, heldAt, stamped, lockStamp, frozen, waiter, wStart>>
+    /\ UNCHANGED <<slept, owner, state, needs, calls, inCall, callAt, stamped, lockStamp, frozen, waiter, wStart>>
 
 \* The laptop sleeps: nothing runs, the awake clock stops, real time passes.
 Sleep ==
     /\ waiter = "waiting" /\ MaxSleep > 0 /\ ~slept
     /\ \E d \in 1..MaxSleep : real' = real + d
     /\ slept' = TRUE
-    /\ UNCHANGED <<awake, owner, state, needs, calls, inCall, callAt, heldAt, stamped, lockStamp, frozen, waiter, wStart>>
+    /\ UNCHANGED <<awake, owner, state, needs, calls, inCall, callAt, stamped, lockStamp, frozen, waiter, wStart>>
 
 Next ==
     \/ \E h \in Holders : Acquire(h) \/ WriteStamp(h) \/ StartCall(h) \/ EndCall(h) \/ Finish(h) \/ Cut(h) \/ Freeze(h)
