@@ -361,6 +361,11 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
     }
 
     app.run() catch |err| {
+        // Before the terminal is released, which puts back SIGHUP's default
+        // action: a closed window with a turn running ends fx here.
+        if (comptime !cooperative and @hasDecl(App, "closeOnHangup")) {
+            if (err == error.TerminalInputClosed) app.closeOnHangup();
+        }
         app.releaseTerminal();
         if (err == error.TerminalInputClosed) {
             app_needs_deinit = false;
@@ -865,6 +870,10 @@ const TestApp = struct {
         return request;
     }
 
+    pub fn closeOnHangup(_: *TestApp) void {
+        appendTestEvent("hangup-close");
+    }
+
     fn releaseTerminal(self: *TestApp) void {
         if (self.terminal_released) return;
         self.terminal_released = true;
@@ -1305,6 +1314,8 @@ test "app entry treats terminal input closure as abnormal cleanup without stderr
     try std.testing.expectEqualStrings("", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 0), capture.stderr_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
+    // The hang-up close comes before the terminal is released, while
+    // SIGHUP still reaches the closer.
     try expectEvents(&.{
         "init:none",
         "rebind-after-init",
@@ -1313,6 +1324,7 @@ test "app entry treats terminal input closure as abnormal cleanup without stderr
         "worker-thread",
         "model-cache",
         "run",
+        "hangup-close",
         "terminal-release",
         "deinit",
     });

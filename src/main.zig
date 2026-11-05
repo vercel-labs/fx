@@ -1113,6 +1113,12 @@ const App = struct {
         if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
     }
 
+    /// Ends fx as a closed window while the main conversation's turn runs
+    /// (`app_lifecycle.closeOnHangup`); returns when no turn is running.
+    pub fn closeOnHangup(self: *App) void {
+        app_lifecycle.closeOnHangup(self.main_agent.worker.isProcessing());
+    }
+
     pub fn releaseTerminal(self: *App) void {
         if (!self.terminal.raw_enabled and !self.terminal.signal_handler_installed) return;
         app_lifecycle.shutdownInteractiveShell(

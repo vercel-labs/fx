@@ -1539,6 +1539,7 @@ async function launchRouteRecoveryTui(
     model?: string;
     models?: FakeGatewayOptions["models"];
     settings?: Record<string, unknown>;
+    cmd?: string;
   } = {},
 ) {
   root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
@@ -1557,6 +1558,7 @@ async function launchRouteRecoveryTui(
   gateway = queuedGateway;
 
   session = await TmuxSession.create({
+    cmd: options.cmd,
     cwd: workspace,
     width: 72,
     height: 24,
@@ -3016,6 +3018,78 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       TIMEOUT * 2,
     );
   }
+
+  // fx often sees a closed window as its terminal hanging up before SIGHUP
+  // reaches it. This fx starts with SIGHUP blocked, so the hang-up is all it
+  // sees, and the window must still close as SIGHUP closes it.
+  test.skipIf(!Bun.which("python3"))(
+    "a window that hangs up before SIGHUP reaches fx resumes its request on reopen",
+    async () => {
+      const interrupted: HoldState = { started: false, cancelled: false };
+      const resumed: HoldState = { started: false, cancelled: false };
+      const prompt = "Read before.txt, then report the result.";
+      const finalText = "Hung-up window recovered once.";
+      const blockSighup =
+        `python3 -c 'import os, signal, sys; signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGHUP}); os.execvp(sys.argv[1], sys.argv[1:])'`;
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-recovery-hangup-",
+        [
+          fakeGatewayToolCall("read_before_hangup", "read_file", { path: "before.txt" }),
+          () => heldGatewayResponse(interrupted),
+          () => heldGatewayResponse(resumed, [], [
+            { type: "text-delta", id: "answer_1", delta: finalText },
+            { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+          ]),
+        ],
+        { cmd: `${blockSighup} ${FX_BIN}` },
+      );
+      writeFileSync(join(root!, "workspace", "before.txt"), "Completed read survives the hang-up.\n");
+      await session!.sendText(prompt);
+      await waitForCondition(() => interrupted.started, "checkpointed response");
+      const firstPid = session!.processPid();
+      await session!.kill();
+      session = null;
+      await waitForCondition(() => !isProcessAlive(firstPid), "fx to exit after its window closed");
+
+      const resumedStderr = join(root!, "resumed-stderr.log");
+      session = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume last`,
+        cwd: join(root!, "workspace"),
+        width: 100,
+        height: 32,
+        stderrPath: resumedStderr,
+        env: {
+          HOME: join(root!, "home"),
+          AI_GATEWAY_API_KEY: "fake-route-recovery-key",
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "auto",
+          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+          FX_MODEL: MODEL,
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+      // The hang-up left the turn open, so reopening sends the request again
+      // on its own (`tests/tla/recovery/Resume.tla` Close and AutoResumes).
+      await waitForCondition(() => resumed.started, "resumed request after the hang-up");
+      await session.waitForText("Resuming the interrupted request", TIMEOUT);
+      resumed.release?.();
+      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForPane((pane) => hasEmptyComposer(pane), TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+
+      expect(scrollback).not.toContain("Cancelled");
+      expect(scrollback.split(`┃ ${prompt}`).length - 1).toBe(1);
+      expect(scrollback.split("└ Read before.txt").length - 1).toBe(1);
+      expect(scrollback.split(finalText).length - 1).toBe(1);
+      expect(queuedGateway.requests).toHaveLength(3);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(readFileSync(resumedStderr, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
 
   test(
     "recovering tool lifecycle admits resumed tools on the same turn",
