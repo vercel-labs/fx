@@ -893,6 +893,51 @@ describe.skipIf(SKIP_TMUX)("tui: standard terminal variables", () => {
   );
 });
 
+describe.skipIf(SKIP_TMUX)("tui: startup errors", () => {
+  test(
+    "an error that stops startup is shown in plain words, with its name only in the trace",
+    async () => {
+      // A file where the session store's folder belongs stops the resume with
+      // an error fx has no message of its own for.
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-startup-error-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      mkdirSync(join(home, ".fx", "sessions"), { recursive: true });
+      writeFileSync(join(home, ".fx", "sessions", "v2"), "not a folder\n");
+      writeFileSync(stderrPath, "");
+      const quotedFx = `'${FX_BIN.replaceAll("'", "'\\''")}'`;
+
+      try {
+        session = await TmuxSession.create({
+          cmd: `${quotedFx} --resume 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b`,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "core",
+          },
+          stderrPath,
+          remainOnExit: true,
+        });
+        await session.waitForPane(() => session!.paneStatus().dead === true, TIMEOUT);
+        expect(session.paneStatus().status).toBe(1);
+        expect(readFileSync(stderrPath, "utf8")).toBe("fx: session path unsafe\n");
+        expect(readFileSync(tracePath, "utf8")).toContain("interactive error err=SessionPathUnsafe");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
 describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
   test(
     "/setup opens the inline provider picker columns",
