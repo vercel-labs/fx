@@ -2023,7 +2023,7 @@ fn maybeStartAskTitleTask(
 /// session already carries a user-set title.
 fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) void {
     defer task.destroy();
-    task.join();
+    task.joinOrCancel(ctx.cancelFlag());
     const title = task.takeTitle() orelse return;
     defer std.heap.c_allocator.free(title);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -2237,7 +2237,7 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
     const catalog = bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model);
-    return ctx.capability_resolver.resolve(
+    return ctx.capability_resolver.resolveWithin(
         ctx.alloc,
         catalog,
         .{
@@ -2247,6 +2247,7 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
         },
         model,
         bundle.fallbackModelCapabilities(model),
+        gateway_provider.catalog_first_load_wait_ms,
     );
 }
 
@@ -2265,7 +2266,7 @@ fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []con
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx.?));
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
     const catalog_provider = bundle.model_catalog orelse return .no_catalog;
-    _ = ctx.capability_resolver.resolve(
+    _ = ctx.capability_resolver.resolveWithin(
         ctx.alloc,
         catalog_provider,
         .{
@@ -2275,6 +2276,7 @@ fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []con
         },
         raw_model,
         bundle.fallbackModelCapabilities(raw_model),
+        gateway_provider.catalog_first_load_wait_ms,
     ) catch return .no_catalog;
     const entries = ctx.capability_resolver.catalogEntries() orelse return .no_catalog;
     var ids = try model_catalog.projectModelIds(alloc, entries);

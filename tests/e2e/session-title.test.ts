@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, realpathSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
@@ -143,6 +143,46 @@ test("fx ask keeps the derived title when the title model output is unusable", a
     gateway.stop();
   }
 });
+
+test("fx ask exits promptly on SIGINT while its title request never answers", async () => {
+  const root = createFixtureRoot("interrupt");
+  let chatArrived!: () => void;
+  let titleArrived!: () => void;
+  const chatRequest = new Promise<void>((resolve) => { chatArrived = resolve; });
+  const titleRequest = new Promise<void>((resolve) => { titleArrived = resolve; });
+  // Neither request ever gets response headers.
+  const gateway = startDynamicFakeGateway(() => {
+    chatArrived();
+    return new Promise<Response>(() => {});
+  }, {
+    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
+    titleResponses: [() => {
+      titleArrived();
+      return new Promise<Response>(() => {});
+    }],
+  });
+  const child = Bun.spawn([FX_BIN, "ask", "refactor the renderer loop to fix the crash"], {
+    cwd: root.workspace,
+    env: baseEnv(root, gateway),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  try {
+    await Promise.all([chatRequest, titleRequest]);
+    const signalledAt = Date.now();
+    child.kill("SIGINT");
+    // The title call's own deadline is 15 s, so an exit that waits for it
+    // lands far past this bound.
+    const code = await Promise.race([child.exited, Bun.sleep(8_000).then(() => null)]);
+    expect(Date.now() - signalledAt).toBeLessThan(2_000);
+    expect(code).toBe(130);
+  } finally {
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await child.exited;
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 30_000);
 
 const SKIP_TMUX = !tmuxAvailable();
 

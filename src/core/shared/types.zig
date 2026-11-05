@@ -428,12 +428,15 @@ pub fn plainErrorText(raw: []const u8, buf: []u8) []const u8 {
         .{ "NetworkInterrupted", "network interrupted" },
         .{ "StreamInterrupted", "stream interrupted" },
         .{ "InvalidGatewaySseEvent", "unreadable reply" },
+        .{ "InvalidOpenAICodexSseEvent", "unreadable reply" },
+        .{ "InvalidXaiGrokSseEvent", "unreadable reply" },
         .{ "MalformedGatewaySseEvent", "unreadable reply" },
         .{ "MalformedOpenAICodexSseEvent", "unreadable reply" },
         .{ "MalformedXaiGrokSseEvent", "unreadable reply" },
         .{ "MalformedChatCompletionsChunk", "unreadable reply" },
         .{ "InvalidProviderFinishReason", "unreadable reply" },
         .{ "GatewaySseEventTooLarge", "reply too large to read" },
+        .{ "OpenAICodexSseEventTooLarge", "reply too large to read" },
         .{ "XaiGrokSseEventTooLarge", "reply too large to read" },
         // Storage faults read as fx says them on startup and in ACP.
         .{ "AccessDenied", "permission denied" },
@@ -806,6 +809,11 @@ test "model failure diagnostics read as plain words" {
         .{ .raw = "ReadFailed", .plain = "connection dropped" },
         .{ .raw = "TlsInitializationFailed", .plain = "couldn't make a secure connection" },
         .{ .raw = "NoSpaceLeft", .plain = "the disk is full" },
+        // Every provider's unreadable stream event reads the same way.
+        .{ .raw = "InvalidGatewaySseEvent", .plain = "unreadable reply" },
+        .{ .raw = "InvalidOpenAICodexSseEvent", .plain = "unreadable reply" },
+        .{ .raw = "InvalidXaiGrokSseEvent", .plain = "unreadable reply" },
+        .{ .raw = "OpenAICodexSseEventTooLarge", .plain = "reply too large to read" },
         // Any other error name is split into words.
         .{ .raw = "InvalidProviderCompletion", .plain = "invalid provider completion" },
         .{ .raw = "HTTPRequestFailed", .plain = "http request failed" },

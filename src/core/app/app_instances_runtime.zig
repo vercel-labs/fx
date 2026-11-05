@@ -253,7 +253,6 @@ pub fn Runtime(comptime App: type) type {
             app_session_runtime.Persistence.initInto(&agent.session_persistence);
             const name = profile_name orelse seed.profile_name;
             if (name) |value| try app.applyInstanceProfile(agent, value);
-            const profile_model = if (name != null) agent.profile.profile.model else null;
             try SessionRuntime.configureStartupPreferences(
                 app,
                 agent,
@@ -290,12 +289,10 @@ pub fn Runtime(comptime App: type) type {
                 try AgentsRuntime.visit(app, child, id, resumeInContext);
                 child.view_built = true;
             } else {
-                try SessionRuntime.beginFreshPersistedSession(app, agent);
+                try SessionRuntime.beginInstanceSession(app, agent);
                 SessionRuntime.enableSessionStores(app, agent);
-                // A fresh session starts from the configured model; the
-                // profile's replaces it unless `--model`, `--provider`, or
-                // `FX_MODEL` chose one for the process, which still wins.
-                if (profile_model) |model| try SessionRuntime.applyProfileModel(app, agent, model);
+                // A fresh session starts in its profile's model; `--model`,
+                // `--provider`, or `FX_MODEL` still wins for this run.
                 try SessionRuntime.applyProcessModelOverride(app, agent);
             }
             try AgentsRuntime.nameInstance(app, child, SessionRuntime.activeSessionId(agent));

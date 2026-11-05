@@ -59,6 +59,7 @@ const subagent_domain = @import("../core/subagent/domain.zig");
 const subagent_execution = @import("../core/subagent/execution.zig");
 const subagent_model_contract = @import("../core/subagent/model_contract.zig");
 const gateway_model_catalog = @import("../core/gateway/model_catalog.zig");
+const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const skill_invocation = @import("../core/skills/skill_invocation.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
@@ -1273,7 +1274,7 @@ fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessi
     const task = session.title_task orelse return;
     session.title_task = null;
     defer task.destroy();
-    task.join();
+    task.joinOrCancel(&session.cancel_flag);
     const title = task.takeTitle() orelse return;
     defer std.heap.c_allocator.free(title);
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -2200,7 +2201,7 @@ fn resolveModelCapabilities(
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return .{};
     const bundle = ctx.state.cfg.provider_set.select(session.provider);
-    return ctx.state.capability_resolver.resolve(
+    return ctx.state.capability_resolver.resolveWithin(
         ctx.state.alloc,
         bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model),
         .{
@@ -2215,6 +2216,7 @@ fn resolveModelCapabilities(
         },
         model,
         bundle.fallbackModelCapabilities(model),
+        gateway_provider.catalog_first_load_wait_ms,
     );
 }
 
@@ -2230,7 +2232,7 @@ fn resolveModelOverride(
     const session = if (ctx.state.active_session) |*active| active else return .no_catalog;
     const bundle = ctx.state.cfg.provider_set.select(session.provider);
     const catalog_provider = bundle.model_catalog orelse return .no_catalog;
-    _ = ctx.state.capability_resolver.resolve(
+    _ = ctx.state.capability_resolver.resolveWithin(
         ctx.state.alloc,
         catalog_provider,
         .{
@@ -2245,6 +2247,7 @@ fn resolveModelOverride(
         },
         raw_model,
         bundle.fallbackModelCapabilities(raw_model),
+        gateway_provider.catalog_first_load_wait_ms,
     ) catch return .no_catalog;
     const entries = ctx.state.capability_resolver.catalogEntries() orelse return .no_catalog;
     var ids = try gateway_model_catalog.projectModelIds(alloc, entries);

@@ -679,6 +679,8 @@ class Platform:
     # The architecture of LLVM's release build of the profile runtime.
     PROFILE_RUNTIME_TRIPLE: str
     SIZE_CEILING_MIB: float
+    # `llc` flags for every candidate object on this architecture.
+    CODEGEN_FLAGS: tuple[str, ...] = ()
 
     LIBLLVM_NAME: ClassVar[str] = LIBLLVM_NAME
     CONTROL_BUILD_FLAGS: ClassVar[tuple[str, ...]] = CONTROL_BUILD_FLAGS
@@ -693,13 +695,15 @@ class Platform:
     link_instrumented = staticmethod(link_instrumented)
     public_api_flags = staticmethod(public_api_flags)
     prepare_candidate_bitcode = staticmethod(prepare_candidate_bitcode)
-    candidate_object_flags = staticmethod(candidate_object_flags)
     link_candidate_binary = staticmethod(link_candidate_binary)
     inspect_candidate = staticmethod(inspect_candidate)
     candidate_evidence = staticmethod(candidate_evidence)
 
     def check_host(self) -> str:
         return check_host(self.HOST_ARCH)
+
+    def candidate_object_flags(self, paths: PipelinePaths) -> tuple[str, ...]:
+        return (*self.CODEGEN_FLAGS, *candidate_object_flags(paths))
 
     def discover_tools(
         self, zig_path: pathlib.Path, clang: pathlib.Path
@@ -724,4 +728,9 @@ X86_64 = Platform(
     # x86_64 code is larger: candidates have measured 7.654 to 8.156 MiB, and
     # the 0.250 MiB preferred headroom needs a ceiling of at least 8.406 MiB.
     SIZE_CEILING_MIB=8.750,
+    # LLVM runs the machine outliner by default only on AArch64, where it
+    # outlines the functions compiled for size. On x86_64, outline only code
+    # the profile marks cold: code without profile data counts as hot, and the
+    # startup functions are `nooutline`.
+    CODEGEN_FLAGS=("-enable-machine-outliner=conservative-pgo",),
 )

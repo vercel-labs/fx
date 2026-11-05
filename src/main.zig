@@ -1118,6 +1118,12 @@ const App = struct {
         if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
     }
 
+    /// Ends fx as a closed window while the main conversation's turn runs
+    /// (`app_lifecycle.closeOnHangup`); returns when no turn is running.
+    pub fn closeOnHangup(self: *App) void {
+        app_lifecycle.closeOnHangup(self.main_agent.worker.isProcessing());
+    }
+
     pub fn releaseTerminal(self: *App) void {
         if (!self.terminal.raw_enabled and !self.terminal.signal_handler_installed) return;
         app_lifecycle.shutdownInteractiveShell(
@@ -5292,6 +5298,7 @@ test {
     _ = @import("gateway/json_depth.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
+    _ = @import("acp/server.zig");
     _ = @import("acp/libfx_hooks.zig");
     _ = @import("acp/types.zig");
     _ = @import("core/mcp_host/model.zig");
@@ -5395,6 +5402,7 @@ test {
     _ = @import("gateway/vercel_protocol.zig");
     _ = @import("core/gateway/provider_set.zig");
     _ = @import("core/gateway/model_catalog.zig");
+    _ = @import("core/gateway/gateway_provider.zig");
     _ = @import("gateway/chat_completions.zig");
     _ = @import("core/github/git_context.zig");
     _ = @import("core/github/github_publish.zig");
@@ -5408,6 +5416,7 @@ test {
     _ = @import("core/images/image_commands.zig");
     _ = @import("core/shared/input_loop_guard.zig");
     _ = @import("core/shared/io.zig");
+    _ = @import("core/shared/leased_lock.zig");
     _ = @import("core/shared/message.zig");
     _ = @import("core/shared/token_estimate.zig");
     _ = @import("core/shell_command/command_effect.zig");
