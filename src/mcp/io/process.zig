@@ -790,6 +790,15 @@ fn expectState(p: *Process, state: core.State) !void {
     return error.TestUnexpectedResult;
 }
 
+fn expectStderr(p: *Process, line: []const u8) !void {
+    for (0..200) |_| switch (try p.next(5_000)) {
+        .stderr => |bytes| if (std.mem.eql(u8, bytes, line)) return,
+        .timeout => return error.TestTimeout,
+        else => {},
+    };
+    return error.TestUnexpectedResult;
+}
+
 test "messages arrive, and a stop that closes stdin ends the server" {
     const argv = shell("printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\\n'; exec cat >/dev/null");
     var p: Process = undefined;
@@ -841,7 +850,9 @@ test "a server that ignores closed stdin gets SIGTERM, then SIGKILL if it ignore
     // The shell runs its TERM trap only once its `sleep` returns, so the one
     // that exits on SIGTERM gets a long window: a slow machine still sees it
     // exit before SIGKILL. The one that ignores SIGTERM keeps the short one.
-    inline for (.{ .{ "trap 'exit 0' TERM; while :; do sleep 0.02; done", false, 5_000 }, .{ "trap '' TERM; while :; do sleep 0.02; done", true, test_config.term_ms } }) |case| {
+    // Each says `ready` once its trap is set, so on a slow machine the stop
+    // cannot reach the shell before the trap does.
+    inline for (.{ .{ "trap 'exit 0' TERM; echo ready >&2; while :; do sleep 0.02; done", false, 5_000 }, .{ "trap '' TERM; echo ready >&2; while :; do sleep 0.02; done", true, test_config.term_ms } }) |case| {
         const argv = shell(case[0]);
         var config = test_config;
         config.term_ms = case[2];
@@ -849,6 +860,7 @@ test "a server that ignores closed stdin gets SIGTERM, then SIGKILL if it ignore
         p.init(testing.io, testing.allocator, .{ .argv = &argv, .config = config, .poll_ms = 5, .max_line = 64 });
         defer p.deinit();
         try p.start();
+        try expectStderr(&p, "ready");
         try p.stop();
         try expectState(&p, .stopped);
         try testing.expect(p.conn.term_sent);
