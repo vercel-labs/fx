@@ -423,8 +423,8 @@ Options:
   --effort <level>            Override the reasoning effort for this request
   --fast                      Enable Fast mode for this request when the model supports it
   --no-fast                   Disable Fast mode for this request
-  --ultrafast                 Request Ultra mode for this request when the model supports it
-  --no-ultrafast              Disable Ultra mode for this request
+  --ultrafast                 Request Ultrafast mode for this request when the model supports it
+  --no-ultrafast              Disable Ultrafast mode for this request
   --provider-order <a,b,...>  Prefer these gateway providers in order for this request
   --provider-strict           Restrict this request to only the providers in --provider-order
   --no-provider-strict        Clear the provider restriction for this request
@@ -1124,6 +1124,26 @@ describe("cli: status", () => {
       const relative = await runFx(["status"], { ...options, env: { ...options.env, FX_HOME: "profile" } });
       expect(relative.code).toBe(1);
       expect(relative.stderr).toBe("fx: FX_HOME must be an absolute path\n");
+
+      // A relative HOME counts as unset, so with FX_HOME unset fx has no
+      // folder of its own, and status names none.
+      const relativeHome = await runFx(["status", "--json"], {
+        ...options,
+        env: { ...options.env, HOME: "relative/home", FX_HOME: undefined },
+      });
+      expect(relativeHome.code).toBe(0);
+      expect(JSON.parse(relativeHome.stdout).fx_home).toBeUndefined();
+
+      // With FX_HOME set, a relative HOME counts as unset the same way, so
+      // FX_HOME still holds fx's files.
+      const relativeWithFxHome = { ...options, env: { ...options.env, HOME: "relative/home" } };
+      const statusWithFxHome = await runFx(["status", "--json"], relativeWithFxHome);
+      expect(statusWithFxHome.code).toBe(0);
+      expect(JSON.parse(statusWithFxHome.stdout).fx_home).toBe(fxHome);
+      const added = await runFx(["mcp", "add", "probe", "--", "/bin/echo", "hi"], relativeWithFxHome);
+      expect(added.code).toBe(0);
+      expect(added.stdout).toBe("Added probe to $FX_HOME/mcp.json.\n");
+      expect(existsSync(join(workspace, "relative"))).toBe(false);
     } finally {
       gateway.stop();
       rmSync(root, { recursive: true, force: true });
@@ -6003,6 +6023,97 @@ describe("cli: MCP profile", () => {
     }
   });
 
+  test.skipIf(platform() === "win32")("status, list, and add finish when ~/.fx/mcp.json is a fifo", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-fifo-")));
+    const home = join(root, "home");
+    const profilePath = join(home, ".fx", "mcp.json");
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    // Opening a fifo for reading waits for a writer, and nothing writes here.
+    expect(spawnSync("mkfifo", [profilePath]).status).toBe(0);
+    const env = { HOME: home, ...NO_GATEWAY_AUTH };
+    try {
+      const status = await runFx(["status", "--json"], { cwd: root, env });
+      expect(status.code).toBe(0);
+      expect(JSON.parse(status.stdout.trim()).mcp.inspection_error).toBe("DurablePathUnsafe");
+
+      const list = await runFx(["mcp", "list"], { cwd: root, env });
+      expect(list.code).toBe(1);
+      expect(list.stderr).toBe("fx mcp: ~/.fx/mcp.json isn't a plain file; replace it with one\n");
+
+      const add = await runFx(["mcp", "add", "probe", "--", "/bin/echo", "hi"], { cwd: root, env });
+      expect(add.code).toBe(1);
+      expect(add.stderr).toBe(
+        "Couldn't add probe to ~/.fx/mcp.json: it isn't a plain file; replace it with one.\n",
+      );
+      expect(lstatSync(profilePath).isFIFO()).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(platform() === "win32")("list, add, and ask say what's wrong with an ~/.fx/mcp.json fx can't read", async () => {
+    const linkLoop = "~/.fx/mcp.json is a link that loops or passes through too many links; replace it with a plain file";
+    const tooLarge = "~/.fx/mcp.json is over 1 MB, the most fx reads; make it smaller";
+    const cases = [
+      {
+        label: "link loop",
+        make: (path: string) => symlinkSync("mcp.json", path),
+        list: `fx mcp: ${linkLoop}\n`,
+        add: "Couldn't add probe to ~/.fx/mcp.json: it is a link that loops or passes through too many links; replace it with a plain file.\n",
+        ask: `fx ask: ${linkLoop}\n`,
+      },
+      {
+        label: "over 1 MB",
+        make: (path: string) =>
+          writeFileSync(path, JSON.stringify({ mcpServers: {}, pad: "x".repeat(1024 * 1024) }), { mode: 0o600 }),
+        list: `fx mcp: ${tooLarge}\n`,
+        add: "Couldn't add probe to ~/.fx/mcp.json: it is over 1 MB, the most fx reads; make it smaller.\n",
+        ask: `fx ask: ${tooLarge}\n`,
+      },
+      {
+        label: "fifo",
+        // Opening a fifo for reading waits for a writer, and nothing writes here.
+        make: (path: string) => expect(spawnSync("mkfifo", [path]).status).toBe(0),
+        ask: "fx ask: ~/.fx/mcp.json isn't a plain file; replace it with one\n",
+      },
+    ];
+    for (const item of cases) {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-unreadable-")));
+      const home = join(root, "home");
+      const profilePath = join(home, ".fx", "mcp.json");
+      mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+      item.make(profilePath);
+      const gateway = startFakeGateway([]);
+      try {
+        const env = { HOME: home, ...NO_GATEWAY_AUTH };
+        if (item.list) {
+          const list = await runFx(["mcp", "list"], { cwd: root, env });
+          expect({ label: item.label, code: list.code, stderr: list.stderr }).toEqual({ label: item.label, code: 1, stderr: item.list });
+        }
+        if (item.add) {
+          const add = await runFx(["mcp", "add", "probe", "--", "/bin/echo", "hi"], { cwd: root, env });
+          expect({ label: item.label, code: add.code, stderr: add.stderr }).toEqual({ label: item.label, code: 1, stderr: item.add });
+        }
+        // fx ask stops in words before it sends any model request.
+        const askEnv = {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "mcp-unreadable-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        };
+        const ask = await runFx(["ask", "--no-save", "Do nothing."], { cwd: root, env: askEnv });
+        expect({ label: item.label, code: ask.code, stderr: ask.stderr }).toEqual({ label: item.label, code: 1, stderr: item.ask });
+        expect(gateway.requestCount()).toBe(0);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  }, 30_000);
+
   test("concurrent adds of different names keep both", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-race-")));
     const home = join(root, "home");
@@ -6032,7 +6143,22 @@ describe("cli: MCP profile", () => {
       env: { HOME: undefined, ...NO_GATEWAY_AUTH },
     });
     expect(missingHome.code).toBe(1);
-    expect(missingHome.stderr).toBe("fx mcp: HOME isn't set\n");
+    expect(missingHome.stderr).toBe("fx mcp: HOME is not set to an absolute path\n");
+
+    // A relative HOME counts as unset: fx fails the same way and saves
+    // nothing under the folder it runs in.
+    const cwd = mkdtempSync(join(tmpdir(), "fx-e2e-mcp-relative-home-"));
+    try {
+      const relativeHome = await runFx(["mcp", "add", "fixture", "--", "node"], {
+        cwd,
+        env: { HOME: "relative/home", ...NO_GATEWAY_AUTH },
+      });
+      expect(relativeHome.code).toBe(1);
+      expect(relativeHome.stderr).toBe("fx mcp: HOME is not set to an absolute path\n");
+      expect(readdirSync(cwd)).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
 
     const flagged = await runFx(
       ["mcp", "add", "--transport", "sse", "fixture", "https://example.test"],

@@ -65,8 +65,8 @@ Names the maintainers already settled. Reuse them; don't add another spelling. "
 | Shell completion | `fx completion bash\|zsh\|fish` |
 | Settings JSON Schema | `fx config schema [--project]`, served at `https://fx.sh/schemas/settings.json` and `https://fx.sh/schemas/fx.json` |
 | MCP servers | `fx mcp` (stays the command) |
-| Usage and spend | `fx usage`, `/usage` (`/cost`) |
-| In-session token and turn statistics | `/stats` |
+| Usage and spend | `fx usage`, `/usage` |
+| Terminal rendering counters | `/stats` |
 | Exit codes | 0 success, 1 failure, 2 usage error |
 | Start a session with a first prompt | `fx "<prompt>"`, one quoted argument; after a resume target, `fx -c "<prompt>"` or `fx -r <id\|last> "<prompt>"` |
 | Run one request and exit | `fx ask "<prompt>"`; `-p` and `--print` only point to it |

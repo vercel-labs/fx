@@ -80,7 +80,7 @@ export async function sessionsAndTurns(agent: FxAgent): Promise<void> {
   const controller = new AbortController();
   const retried = known.prompt("Refund order 42.", { messageId: "msg_refund_42", signal: controller.signal });
   const result: FxTurnResult = await retried.result;
-  assertType<Equal<typeof result.stopReason, FxStopReason | "error" | "unknown">>();
+  assertType<Equal<typeof result.stopReason, Exclude<FxStopReason, "yielded"> | "error" | "unknown">>();
   assertType<Equal<typeof result.usage, FxUsage | undefined>>();
   assertType<Equal<typeof result.repeated, true | undefined>>();
   if (result.stopReason === "error") console.log(result.error?.name, result.error?.message, result.error?.code);

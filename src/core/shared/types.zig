@@ -317,6 +317,14 @@ pub const RouteRecoveryStatusTone = enum {
     danger,
 };
 
+/// Whether a 5xx is a server failure a resend can outlive: every one, 529
+/// (overloaded) and 520-524 (Cloudflare) included, except 501 Not
+/// Implemented and 505 HTTP Version Not Supported, which say this request
+/// can never work there.
+pub fn isRetryableServerStatus(code: u16) bool {
+    return code >= 500 and code <= 599 and code != 501 and code != 505;
+}
+
 pub const ModelRecoveryCause = enum {
     network_interrupted,
     /// The network path is provably down, so nothing was sent.
@@ -420,6 +428,10 @@ pub fn plainErrorText(raw: []const u8, buf: []u8) []const u8 {
         .{ "NetworkInterrupted", "network interrupted" },
         .{ "StreamInterrupted", "stream interrupted" },
         .{ "InvalidGatewaySseEvent", "unreadable reply" },
+        .{ "MalformedGatewaySseEvent", "unreadable reply" },
+        .{ "MalformedOpenAICodexSseEvent", "unreadable reply" },
+        .{ "MalformedXaiGrokSseEvent", "unreadable reply" },
+        .{ "MalformedChatCompletionsChunk", "unreadable reply" },
         .{ "InvalidProviderFinishReason", "unreadable reply" },
         .{ "GatewaySseEventTooLarge", "reply too large to read" },
         .{ "XaiGrokSseEventTooLarge", "reply too large to read" },
@@ -2817,6 +2829,7 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .cancelled_command = cancelled_command,
                 .terminal_reason = entry.terminal_reason,
                 .cancellation_origin = entry.cancellation_origin,
+                .stopped_by_exit = entry.stopped_by_exit,
             } };
         },
     };
@@ -2946,7 +2959,7 @@ fn dupePersistedContextNotes(
     const copy = try alloc.alloc(PersistedContextNote, notes.len);
     errdefer alloc.free(copy);
     var copied: usize = 0;
-    errdefer for (copy[0..copied]) |item| alloc.free(item.text);
+    errdefer for (copy[0..copied]) |item| freePersistedContextNote(alloc, item);
     for (notes, copy) |item, *dest| {
         const text = try alloc.dupe(u8, item.text);
         errdefer alloc.free(text);
@@ -3409,6 +3422,19 @@ pub fn freeToolCall(alloc: std.mem.Allocator, call: ToolCall) void {
     alloc.free(call.arguments_json);
     if (call.provisional_id) |provisional_id| alloc.free(provisional_id);
     if (call.provider_result) |provider_result| alloc.free(provider_result);
+}
+
+test "dupeHistoryTurn keeps a turn fx stopped as stopped" {
+    const alloc = std.testing.allocator;
+    const source: HistoryTurn = .{ .interrupted = .{
+        .user = .{ .text = @constCast("go") },
+        .terminal_reason = .failed,
+        .stopped_by_exit = true,
+    } };
+    const copy = try dupeHistoryTurn(alloc, source);
+    defer freeHistoryTurn(alloc, copy);
+    try std.testing.expect(copy.interrupted.stopped_by_exit);
+    try std.testing.expectEqual(InterruptedTerminalReason.failed, copy.interrupted.terminal_reason);
 }
 
 test "dupeToolCall preserves argument integrity" {
@@ -4133,4 +4159,24 @@ test "public types remain constructible" {
     _ = decision;
     _ = action;
     _ = resolve_mode;
+}
+
+fn dupeThenFreeContextNotes(alloc: std.mem.Allocator, notes: []const PersistedContextNote) !void {
+    freePersistedContextNotes(alloc, try dupePersistedContextNotes(alloc, notes));
+}
+
+test "dupePersistedContextNotes leaves nothing behind when a later note fails to copy" {
+    var first_sources = [_]ContextNoteSource{.{ .path = "AGENTS.md", .stamp = 1 }};
+    var second_sources = [_]ContextNoteSource{.{ .path = "src/AGENTS.md", .stamp = 2 }};
+    var first_text = "first".*;
+    var second_text = "second".*;
+    const notes = [_]PersistedContextNote{
+        .{ .text = &first_text, .after_tool_step_count = 1, .sources = &first_sources },
+        .{ .text = &second_text, .after_tool_step_count = 2, .sources = &second_sources },
+    };
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        dupeThenFreeContextNotes,
+        .{@as([]const PersistedContextNote, &notes)},
+    );
 }

@@ -52,8 +52,8 @@ pub const Phase = enum { idle, running, awaiting_approval, interrupted, finished
 pub const Outcome = enum { completed, failed, cancelled, interrupted, lost };
 
 /// Why a work ended cancelled, when fx knows: the user stopped its turn,
-/// or fx quit while it ran.
-pub const Cause = enum { user_stop, fx_quit };
+/// fx quit while it ran, or the user closed the child from the agent list.
+pub const Cause = enum { user_stop, fx_quit, user_close };
 
 /// Who started a finished work and why it was cancelled. A finish that
 /// owes a report saves them, so a report posted after a restart still
@@ -509,6 +509,18 @@ pub const Store = struct {
         }
         return self.children.save(alloc, registry);
     }
+
+    /// Closes idle child `child_id` for good under work id `work_id`, as
+    /// `V2Children.close` does. Hold the lock, as for a load and its save.
+    pub fn close(self: Store, child_id: []const u8, work_id: []const u8) !void {
+        return self.children.close(child_id, work_id);
+    }
+
+    /// The name closed child `child_id` had, as `V2Children.closedName`
+    /// reads it. Hold the lock, as for a load.
+    pub fn closedName(self: Store, alloc: Allocator, child_id: []const u8) !?[]u8 {
+        return self.children.closedName(alloc, child_id);
+    }
 };
 
 /// A parent's children in its v2 log (D22). The log is the record, and this
@@ -596,6 +608,61 @@ pub const V2Children = struct {
         self.registry = copy;
     }
 
+    /// Closes idle child `child_id` for good: appends `closeLines` under
+    /// `work_id` and drops the child from this copy, so neither this process
+    /// nor a later open lists it again. Its own log stays on disk. Refused
+    /// while the child has unfinished work.
+    fn close(self: *V2Children, child_id: []const u8, work_id: []const u8) !void {
+        self.state.lockUncancelable(io_mod.getIo());
+        defer self.state.unlock(io_mod.getIo());
+        const current = try self.currentLocked();
+        const index = for (current.children, 0..) |child, i| {
+            if (std.mem.eql(u8, child.id, child_id)) break i;
+        } else return error.ChildUnavailable;
+        if (current.children[index].active != null) return error.ChildBusy;
+        // Taken before the lines are written, so a failure changes nothing.
+        const kept: []Child = if (current.children.len == 1) &.{} else try self.alloc.alloc(Child, current.children.len - 1);
+        errdefer if (kept.len > 0) self.alloc.free(kept);
+        {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const lines = try closeLines(arena.allocator(), current.children[index], work_id);
+            try self.parent.appendChildLines(&lines);
+        }
+        var next: usize = 0;
+        for (current.children, 0..) |*child, i| {
+            if (i == index) {
+                child.deinit(self.alloc);
+                continue;
+            }
+            kept[next] = child.*;
+            next += 1;
+        }
+        self.alloc.free(current.children);
+        current.children = kept;
+    }
+
+    /// The name closed child `child_id` had, from the close in the parent's
+    /// log, which writes it as a spawn does. A closed child is gone from the
+    /// registry, so a report owed from before its close is named this way.
+    /// Null when the log closed no such child or it had no name. `alloc`
+    /// owns the result.
+    fn closedName(self: *V2Children, alloc: Allocator, child_id: []const u8) !?[]u8 {
+        self.state.lockUncancelable(io_mod.getIo());
+        defer self.state.unlock(io_mod.getIo());
+        const children = try self.parent.children(alloc);
+        defer session_adapter.freeChildren(alloc, children);
+        for (children) |entry| {
+            if (!std.mem.eql(u8, entry.id, child_id)) continue;
+            if (!foldedClosed(entry)) return null;
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const spawn = json_decode.parseFromSliceLeaky(SpawnData, scratch.allocator(), entry.spawn_data orelse return null, .{ .ignore_unknown_fields = true }) catch return null;
+            return if (spawn.agent) |name| try alloc.dupe(u8, name) else null;
+        }
+        return null;
+    }
+
     fn currentLocked(self: *V2Children) !*Registry {
         if (self.registry == null) {
             const children = try self.parent.children(self.alloc);
@@ -669,7 +736,8 @@ const SpawnData = struct {
     /// A named child's name; null for a one-off.
     agent: ?[]const u8 = null,
     fingerprint: []const u8,
-    /// The agent profile the child started in; null for fx's `agent`.
+    /// The agent profile the child started in. fx writes `main` when the
+    /// parent named none; older fx wrote null there.
     profile: ?[]const u8 = null,
     /// Its report rule. This fx writes it on every spawn, which also marks
     /// the work as one whose end owes its parent a report, so a crash that
@@ -738,7 +806,37 @@ const FinishData = struct {
     report: ?bool = null,
     by: ?[]const u8 = null,
     cause: ?[]const u8 = null,
+    /// The child is closed for good (`closeLines`). Older fx ignores it.
+    closed: ?bool = null,
 };
+
+/// Pure: whether folded child `entry`'s newest line closed it for good.
+/// Data this fx can't read closes nothing.
+fn foldedClosed(entry: session_adapter.Child) bool {
+    if (entry.open) return false;
+    const bytes = entry.finish_data orelse return false;
+    var buf: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const Wire = struct { closed: ?bool = null };
+    const wire = json_decode.parseFromSliceLeaky(Wire, fba.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return false;
+    return wire.closed orelse false;
+}
+
+/// Pure: the batch that closes idle child `child` for good in its parent's
+/// log, under work id `work_id`. Its spawn reads as an ordinary one, with
+/// no report rule, so it starts no report and an older fx lists the child
+/// idle; its finish says it closed. The lines borrow `child` and `arena`.
+fn closeLines(arena: Allocator, child: Child, work_id: []const u8) ![2]session_adapter.ChildLine {
+    const fingerprint = try arena.dupe(u8, &std.fmt.bytesToHex(@as([32]u8, @splat(0)), .lower));
+    return .{
+        .{ .spawned = .{
+            .child = child.id,
+            .work_id = work_id,
+            .data = try spawnData(arena, child.agentName(), fingerprint, child.profile, null, .parent),
+        } },
+        .{ .finished = .{ .child = child.id, .work_id = work_id, .outcome = .ok, .data = "{\"closed\":true}" } },
+    };
+}
 
 /// Pure: the facts a finish line's `by` and `cause` name. A value this fx
 /// doesn't know reads as the default.
@@ -817,22 +915,28 @@ test "a spawn saves who started a work its parent didn't" {
 fn registryFromChildren(alloc: Allocator, parent_id: []const u8, folded: []const session_adapter.Child) !Registry {
     var registry = try Registry.init(alloc, parent_id);
     errdefer registry.deinit(alloc);
-    if (folded.len > max_children) return error.StateTooLarge;
-    if (folded.len == 0) return registry;
-    const children = try alloc.alloc(Child, folded.len);
+    // A closed child is gone for good: it is neither listed nor counted.
+    var open: usize = 0;
+    var generation: u64 = 0;
+    for (folded) |entry| {
+        if (!foldedClosed(entry)) open += 1;
+        generation = @max(generation, entry.seq);
+    }
+    if (open > max_children) return error.StateTooLarge;
+    registry.generation = generation;
+    if (open == 0) return registry;
+    const children = try alloc.alloc(Child, open);
     var built: usize = 0;
     errdefer {
         for (children[0..built]) |*child| child.deinit(alloc);
         alloc.free(children);
     }
-    var generation: u64 = 0;
     for (folded) |entry| {
+        if (foldedClosed(entry)) continue;
         children[built] = try childFromFolded(alloc, entry);
         built += 1;
-        generation = @max(generation, entry.seq);
     }
     registry.children = children;
-    registry.generation = generation;
     return registry;
 }
 
@@ -1760,6 +1864,113 @@ test "v2 children live in the parent's log and come back after a reopen (D22)" {
     try std.testing.expectEqualStrings("work-1", child.last_work_id.?);
     try std.testing.expectEqual(Outcome.completed, child.last_outcome.?);
     try std.testing.expectEqual(@as([32]u8, @splat(0x11)), child.last_request_fingerprint.?);
+}
+
+test "a closed v2 child is gone for good, and an older fx still reads its log" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try session_adapter.Store.open(alloc, home);
+    defer store.deinit(alloc);
+    var model = "test-model".*;
+    const seed: session_adapter.Seed = .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    };
+    const parent = try session_adapter.Session.create(alloc, &store, "/w", .ask, seed);
+    var parent_open = true;
+    defer if (parent_open) parent.close();
+    try parent.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("delegate") }, .assistant = @constCast("ok") } }, types.ConversationLanguage.default());
+    const parent_id = try alloc.dupe(u8, parent.id());
+    defer alloc.free(parent_id);
+    const reviewer = "1786460757753-rev";
+    const tester = "1786460757753-tst";
+    {
+        var children = V2Children.init(alloc, parent, "/w");
+        defer children.deinit();
+        const state_store = Store{ .children = &children, .parent_id = parent_id };
+        var lock = state_store.acquireLock();
+        defer lock.release();
+        var registry = try state_store.load(alloc);
+        defer registry.deinit(alloc);
+        var first = try testWork(alloc, "work-1", 0x11);
+        defer first.deinit(alloc);
+        try registry.appendPersistent(alloc, reviewer, "reviewer", "", first);
+        var second = try testWork(alloc, "work-2", 0x22);
+        defer second.deinit(alloc);
+        try registry.appendPersistent(alloc, tester, "tester", "", second);
+        try state_store.save(alloc, registry);
+        try registry.finish(alloc, reviewer, "work-1", .completed, null);
+        try state_store.save(alloc, registry);
+
+        // Work still open refuses a close, and so does a child that isn't there.
+        try std.testing.expectError(error.ChildBusy, state_store.close(tester, "fxclose:" ++ tester));
+        try std.testing.expectError(error.ChildUnavailable, state_store.close("1786460757753-none", "fxclose:none"));
+        try state_store.close(reviewer, "fxclose:" ++ reviewer);
+        var after = try state_store.load(alloc);
+        defer after.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), after.children.len);
+        try std.testing.expectEqualStrings("tester", after.children[0].agentName().?);
+        try std.testing.expect(after.findPersistent("reviewer") == null);
+
+        try registry.finish(alloc, tester, "work-2", .completed, null);
+        try state_store.save(alloc, registry);
+    }
+    parent.close();
+    parent_open = false;
+
+    const reopened = try session_adapter.Session.resumeSession(alloc, &store, .{ .id = parent_id }, "/w", .ask);
+    defer reopened.close();
+    var children = V2Children.init(alloc, reopened, "/w");
+    defer children.deinit();
+    const state_store = Store{ .children = &children, .parent_id = parent_id };
+    var registry = try state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), registry.children.len);
+    try std.testing.expectEqualStrings("tester", registry.children[0].agentName().?);
+
+    // An older fx folds the closed child from the same lines, as idle.
+    const folded = try reopened.children(alloc);
+    defer session_adapter.freeChildren(alloc, folded);
+    try std.testing.expectEqual(@as(usize, 2), folded.len);
+    const closed = for (folded) |entry| {
+        if (std.mem.eql(u8, entry.id, reviewer)) break entry;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(foldedClosed(closed));
+    try std.testing.expect(!spawnNamesRule(closed.spawn_data));
+    var older = try childFromFolded(alloc, closed);
+    defer older.deinit(alloc);
+    try std.testing.expectEqualStrings("reviewer", older.agentName().?);
+    try std.testing.expectEqual(Phase.idle, older.phase);
+    try std.testing.expect(!older.last_report_owed);
+}
+
+test "only open children count toward the registry's limit" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const spawn = try spawnData(arena, "reviewer", &std.fmt.bytesToHex(@as([32]u8, @splat(0)), .lower), null, null, .parent);
+    const folded = try arena.alloc(session_adapter.Child, max_children + 1);
+    for (folded, 0..) |*entry, i| entry.* = .{
+        .id = try arena.dupe(u8, try arena.print("1786460757753-{d:0>4}", .{i})),
+        .work_id = try arena.dupe(u8, "work"),
+        .open = false,
+        .outcome = .ok,
+        .spawn_data = try arena.dupe(u8, spawn),
+        // The first is closed, so the rest fit.
+        .finish_data = if (i == 0) try arena.dupe(u8, "{\"closed\":true}") else null,
+        .seq = i + 1,
+    };
+    var registry = try registryFromChildren(alloc, "1786460757753-parent", folded);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(max_children, registry.children.len);
+    try std.testing.expectEqual(@as(u64, max_children + 1), registry.generation);
+    folded[0].finish_data = null;
+    try std.testing.expectError(error.StateTooLarge, registryFromChildren(alloc, "1786460757753-parent", folded));
 }
 
 test "a v2 child keeps the profile it started in after a reopen" {

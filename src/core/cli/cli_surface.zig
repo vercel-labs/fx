@@ -443,14 +443,12 @@ const LoadStartupStatusFn = *const fn (Allocator, host.SecretStore, []const u8, 
 const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
 const LoadCatalogStartupStateWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode, ?model_provider.ProviderId, ?[]const u8) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupStatus;
-const GetenvFn = *const fn (?*anyopaque, []const u8) ?[]const u8;
 const EnvironMapFn = *const fn (?*anyopaque) ?*const std.process.Environ.Map;
 const ReadMaskedKeyFn = *const fn (?*anyopaque, Allocator, WriteFn, ?*anyopaque) anyerror![]u8;
 const SetupTerminalAvailableFn = *const fn (?*anyopaque) bool;
 const RunDeps = struct {
     stdout_ctx: ?*anyopaque = null,
     stderr_ctx: ?*anyopaque = null,
-    env_ctx: ?*anyopaque = null,
     setup_ctx: ?*anyopaque = null,
     write_stdout: WriteFn = writeRealStdout,
     write_stderr: WriteFn = writeRealStderr,
@@ -460,7 +458,6 @@ const RunDeps = struct {
     load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateWithAuthMode,
     load_catalog_startup_state_with_auth_mode: LoadCatalogStartupStateWithAuthModeFn = app_lifecycle.loadCatalogStartupStateWithAuthMode,
     load_startup_status_with_auth_mode: LoadStartupStatusWithAuthModeFn = app_lifecycle.loadStartupStatusWithAuthMode,
-    getenv: GetenvFn = getenvDefault,
     environ_map: EnvironMapFn = environMapDefault,
     read_masked_key: ReadMaskedKeyFn = readMaskedKeyDefault,
     setup_terminal_available: SetupTerminalAvailableFn = setupTerminalAvailableDefault,
@@ -1769,7 +1766,7 @@ fn runNonInteractiveWithDeps(
             snapshot.mcp = localMcpView(&mcp_inspection);
             snapshot.provider_endpoint = startup.provider_endpoint;
             snapshot.modes = statusModes(cfg.mode_registry, snapshot.permission_mode);
-            const fx_home = try profile_paths.activeRoot(alloc, io_mod.getenv("HOME"));
+            const fx_home = try profile_paths.activeRoot(alloc, io_mod.homeDir());
             defer if (fx_home) |path| alloc.free(path);
             snapshot.fx_home = fx_home;
             if (opts.format == .json) {
@@ -2112,13 +2109,10 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .usage, "usage", err, rest);
                 return usage_failure;
             };
-            // A relative $HOME counts as unset, as everywhere else in fx, and
-            // with HOME unset FX_HOME's parent serves.
-            const home = deps.getenv(deps.env_ctx, "HOME") orelse profile_paths.fxHomeParent() orelse "";
-            if (!std.Io.Dir.path.isAbsolute(home)) {
+            const home = io_mod.homeDir() orelse {
                 try writeUsageCommandFailure(alloc, deps, error.HomeNotSet, opts.format);
                 return .handled_failure;
-            }
+            };
             var startup = (if (cfg.auth_mode == .host_managed)
                 deps.load_startup_state_with_auth_mode(
                     alloc,
@@ -2711,10 +2705,6 @@ fn writeFdAll(fd: std.posix.fd_t, text: []const u8) !void {
     }
 }
 
-fn getenvDefault(_: ?*anyopaque, key: []const u8) ?[]const u8 {
-    return io_mod.getenv(key);
-}
-
 fn environMapDefault(_: ?*anyopaque) ?*const std.process.Environ.Map {
     return io_mod.environMap();
 }
@@ -2746,9 +2736,8 @@ fn runTopLevelMcp(
 
 /// `fx mcp`: the verbs `/mcp` shares.
 fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
-    // With HOME unset, FX_HOME alone names fx's files, so its parent serves.
-    const home = deps.getenv(deps.env_ctx, "HOME") orelse profile_paths.fxHomeParent() orelse {
-        try writeStderr(deps, "fx mcp: HOME isn't set\n");
+    const home = io_mod.homeDir() orelse {
+        try writeStderr(deps, "fx mcp: " ++ io_mod.no_home_dir_reason ++ "\n");
         return .handled_failure;
     };
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
@@ -2990,7 +2979,7 @@ fn writeUsageCommandFailure(
 
 fn usageFailureMessage(err: anyerror) []const u8 {
     return switch (err) {
-        error.HomeNotSet => "HOME is not set",
+        error.HomeNotSet => io_mod.no_home_dir_reason,
         error.DurablePathUnsafe,
         error.PrivateStatePermissionsUnsupported,
         => "the ~/.fx folder is unsafe",
@@ -3493,7 +3482,7 @@ fn writeLookupFailure(
         error.HomeNotSet => {
             try writeStderr(deps, "fx ");
             try writeStderr(deps, kind);
-            try writeStderr(deps, ": HOME is not set\n");
+            try writeStderr(deps, ": " ++ io_mod.no_home_dir_reason ++ "\n");
         },
         else => return err,
     }
@@ -3579,7 +3568,7 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.PrivateStatePermissionsUnsupported,
         => "durable session storage is unsafe or does not support required private permissions",
         error.SessionStoreUnavailable => "durable session store is unavailable",
-        error.HomeNotSet => "HOME is not set",
+        error.HomeNotSet => io_mod.no_home_dir_reason,
         else => null,
     };
 }
@@ -5401,6 +5390,29 @@ test "top-level MCP approve runs without interactive startup" {
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings("", capture.stdout.written());
     try std.testing.expectEqualStrings("No project server named fixture in .mcp.json.\n", capture.stderr.written());
+}
+
+test "top-level MCP and usage treat a relative HOME as unset" {
+    const alloc = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(alloc);
+    defer environ.deinit();
+    try environ.put("HOME", "relative/home");
+    try environ.put("PATH", "");
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.resetEnvironForTest();
+
+    const commands = [_][]const [:0]u8{
+        &.{ @constCast("mcp"), @constCast("add"), @constCast("probe"), @constCast("/bin/echo") },
+        &.{@constCast("usage")},
+    };
+    for (commands) |argv| {
+        var capture = CaptureOutput.init(alloc);
+        defer capture.deinit();
+        const result = try runIfRequestedWithDeps(alloc, argv, testConfig(), capture.deps());
+        try std.testing.expectEqual(RunResult.handled_failure, result);
+        try std.testing.expectEqualStrings("", capture.stdout.written());
+        try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "HOME") != null);
+    }
 }
 
 test "workspace launch modifiers preserve supported command help" {

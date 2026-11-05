@@ -714,6 +714,12 @@ const App = struct {
             }
         }
         const launch_profile = &app.main_agent.profile.profile;
+        const launch_model = app_profile_runtime.launchModel(
+            launch.modifiers.model_override,
+            launch.modifiers.provider_override != null,
+            config_runtime.modelEnvOverride(),
+            launch_profile.model,
+        );
         try BootstrapAppRuntime.bootstrap(
             &app,
             &app.main_agent,
@@ -728,8 +734,10 @@ const App = struct {
             },
             .{
                 .provider = launch.modifiers.provider_override,
-                .model = launch.modifiers.model_override orelse launch_profile.model,
+                .model = launch_model,
                 .effort = launch.modifiers.effort_override orelse launch_profile.effort,
+                .model_from_profile = launch.modifiers.model_override == null and launch_model != null,
+                .effort_from_profile = launch.modifiers.effort_override == null and launch_profile.effort != null,
                 .fast = launch.modifiers.fast_override,
                 .ultrafast = launch.modifiers.ultrafast_override,
                 .provider_order = launch.modifiers.provider_order_override,
@@ -1005,16 +1013,8 @@ const App = struct {
         return .{ .handoff = resume_handoff, .failure = shutdown_failure };
     }
 
-    pub fn resumeHandoffColumns(self: *const App) u16 {
-        return self.shell.layout.cols;
-    }
-
-    pub fn formatResumeHandoff(
-        buffer: []u8,
-        session_id: []const u8,
-        terminal_cols: u16,
-    ) ![]const u8 {
-        return ui_render.formatResumeHandoff(buffer, session_id, terminal_cols);
+    pub fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
+        return ui_render.formatResumeHandoff(buffer, session_id);
     }
 
     /// Full teardown for hosts that keep running after the shell ends, such as
@@ -1678,11 +1678,15 @@ const App = struct {
         user_prompt_already_presented: bool,
     ) !worker_runtime.QueuedPrompt {
         // A subagent's turn runs under its run's admission: its model,
-        // provider, permissions, and credential, never main's. It never names
-        // a session. An instance's turn uses its own model and provider: the
-        // app's selection for the first, a launched one's own session choice.
+        // provider, permissions, and credential, never main's. One that runs
+        // on main's credential has its first task titled as main's first
+        // prompt is; one with a credential of its own keeps the title its
+        // task gives it. An instance's turn uses its own model and provider:
+        // the app's selection for the first, a launched one's own session
+        // choice.
         const child_run = agent.child_run;
-        if (recovery_checkpoint == null and child_run == null) {
+        const titled_like_main = if (child_run) |current| current.credential == null else true;
+        if (recovery_checkpoint == null and titled_like_main) {
             SessionAppRuntime.maybeStartSessionTitleGeneration(self, agent, prompt);
         }
         const source_images = if (recovery_checkpoint) |checkpoint|
@@ -3293,9 +3297,15 @@ const App = struct {
 
         if (comptime !host_target.is_wasm) {
             try SessionAppRuntime.pollSessionPicker(self, self.screenAgent());
-            if (try SessionAppRuntime.pollSessionTitleGeneration(self, self.screenAgent())) {
+            if (try AgentsAppRuntime.pollSessionTitles(self)) {
                 RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
             }
+            // A parent's `close` leaves its subagent's agent for the loop to drop.
+            const dropped = AgentsAppRuntime.dropClosedSubagents(self) catch |err| blk: {
+                debug_trace.logf("host", "closed subagents not dropped err={s}", .{@errorName(err)});
+                break :blk false;
+            };
+            if (dropped) RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         if (self.shell.transcript_archive_request) |back| {
             // A Ctrl+O page needs an older compaction cycle from the log.
@@ -3510,6 +3520,12 @@ const App = struct {
     /// The footer note for a hidden agent waiting on the user.
     pub fn hiddenAgentWaitingNote(self: *App, buf: []u8) []const u8 {
         return AgentsAppRuntime.waitingNote(self, buf);
+    }
+
+    /// The footer note for hidden subagents working, such as
+    /// "1 subagent working".
+    pub fn hiddenAgentWorkingNote(self: *App, buf: []u8) []const u8 {
+        return AgentsAppRuntime.workingNote(self, buf);
     }
 
     /// Handles the events and paced text of the agent in context.
@@ -5536,6 +5552,7 @@ test {
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/host_stream_provider.zig");
+    _ = @import("gateway/open_job.zig");
     _ = @import("gateway/vercel_failure_diagnostics.zig");
     _ = @import("gateway/host_model_catalog.zig");
     _ = @import("gateway/host_openai_codex.zig");

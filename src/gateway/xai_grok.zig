@@ -330,6 +330,9 @@ pub fn streamPrepared(
     var response = http_request.receiveHead(&.{}) catch |err| return watch.failure(err);
     if (watch.commitHead()) |err| return err;
     if (response.head.status != .ok) {
+        // Read before the body, whose reads reuse the buffer the head's
+        // header bytes live in.
+        const retry_after = gateway_client.retryAfterSeconds(response.head);
         var transfer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer);
         const bounded_body = reader.allocRemaining(alloc, .limited(max_error_body_bytes + 1)) catch |err| switch (err) {
@@ -342,7 +345,9 @@ pub fn streamPrepared(
         } else bounded_body;
         return .{ .failed = .{
             .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body),
+            .http_status = response.head.status,
             .detail = body,
+            .retry_after_seconds = retry_after,
             .ownership = .owned,
         } };
     }
@@ -442,6 +447,7 @@ fn mapReducerError(err: anyerror) anyerror {
         error.EventTooLarge => error.XaiGrokSseEventTooLarge,
         error.StreamTooLarge => error.XaiGrokResourceLimitExceeded,
         error.InvalidEvent => error.InvalidXaiGrokSseEvent,
+        error.MalformedEvent => error.MalformedXaiGrokSseEvent,
         error.StreamIncomplete => error.XaiGrokStreamIncomplete,
         error.ToolCallLimitExceeded => error.XaiGrokToolCallLimitExceeded,
         error.ToolArgumentsTooLarge => error.XaiGrokToolArgumentsTooLarge,
@@ -1151,4 +1157,12 @@ test "xAI Grok SSE reducer cleans up bounded tool arguments and provider state" 
     const excess_state = try buildProviderStateSse(std.testing.allocator, max_provider_state_bytes + 1);
     defer std.testing.allocator.free(excess_state);
     try expectTestSseError(error.XaiGrokResourceLimitExceeded, excess_state);
+}
+
+test "an xAI event that is not JSON resends, and a duplicate key still ends the turn" {
+    const partial = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\n";
+    try expectTestSseError(error.MalformedXaiGrokSseEvent, partial ++ "data: {not-json}\n\n");
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.MalformedXaiGrokSseEvent, .possibly_sent) != null);
+    try expectTestSseError(error.InvalidXaiGrokSseEvent, partial ++ "data: {\"type\":\"a\",\"type\":\"b\"}\n\n");
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.InvalidXaiGrokSseEvent, .possibly_sent) == null);
 }

@@ -93,6 +93,7 @@ The native kernel installs host-stream and host model-catalog providers. It does
 | `coreFetchActive(runtime, fetchHandle)` | Reports whether that request may still receive host response operations. |
 | `coreFetchDisposition(runtime, fetchHandle)` | Atomically reports retired (`0`), active (`1`), or explicitly consumed (`2`) for the exact handle. Matching consumption takes precedence. This additive export is optional for version 4 addons. |
 | `startCoreFetchResponse(runtime, fetchHandle, status)` | Publishes the matching fetch response status. |
+| `startCoreFetchResponseWithRetryAfter(runtime, fetchHandle, status, retryAfterSeconds)` | Publishes the status with the response's Retry-After in whole seconds, or `-1` when it has none, so fx waits as long as the server asked before resending. This additive export is optional for version 4 addons; without it, fx waits on its own backoff. |
 | `pushCoreFetchResponse(runtime, fetchHandle, buffer)` | Appends a bounded matching response chunk. |
 | `finishCoreFetch(runtime, fetchHandle)` / `failCoreFetch(runtime, fetchHandle)` | Completes only the matching host stream successfully or with transport failure. |
 | `abortCoreFetch(runtime)` | Aborts the current fetch and wakes the Zig worker. Idle calls do not cancel a future fetch; ACP owns turn cancellation. |

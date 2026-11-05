@@ -1383,13 +1383,11 @@ pub fn Runtime(comptime App: type) type {
                                 app.shell.render_requests.request(.footer);
                             } else if (command_specs.nthSlashCompletion(app.slashRegistry(), prefix, idx)) |completion| {
                                 if (command_specs.slashCompletionHasArgs(app.slashRegistry(), completion)) {
-                                    var buf: [128]u8 = undefined;
-                                    const with_space = std.mem.print(&buf, "{s} ", .{completion}) catch completion;
-                                    try app.input_runtime.textReplacementState().replace(app.alloc, with_space);
+                                    try typeCommandAwaitingArgument(app, completion);
                                 } else {
                                     try app.input_runtime.textReplacementState().replace(app.alloc, completion);
+                                    app.shell.render_requests.request(.footer);
                                 }
-                                app.shell.render_requests.request(.footer);
                             }
                         }
                     }
@@ -1743,6 +1741,17 @@ pub fn Runtime(comptime App: type) type {
             return app_agents_runtime.Runtime(App).backMenu(app);
         }
 
+        /// x in the agent list: arms, then closes, the selected subagent.
+        fn pressAgentsMenuClose(app: *App) !bool {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
+            return app_agents_runtime.Runtime(App).pressCloseKey(app);
+        }
+
+        fn disarmAgentsMenuClose(app: *App) void {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return;
+            app_agents_runtime.Runtime(App).disarmClose(app);
+        }
+
         /// While the agent list is open it takes every key, ahead of the
         /// prompts and composer of the agent it shows, which is a preview:
         /// ↑ and ↓ move and preview, Enter keeps the agent shown, and Esc,
@@ -1754,11 +1763,18 @@ pub fn Runtime(comptime App: type) type {
         fn routeAgentsMenuInput(app: *App, event: input_action.TerminalInputEvent) !bool {
             if (!agentsMenuActive(app)) return false;
             const agent = agents.screenAgentOf(app);
+            // X too, so Caps Lock doesn't turn the close off.
+            const close_key = switch (event) {
+                .raw => |raw| raw.byte == 'x' or raw.byte == 'X',
+                else => false,
+            };
+            if (!close_key) disarmAgentsMenuClose(app);
             switch (event) {
                 // A paste closes the list before its bytes arrive.
                 .paste_byte => return false,
                 .raw => |raw| switch (raw.byte) {
                     '\r' => _ = try submitAgentsMenuSelection(app),
+                    'x', 'X' => _ = try pressAgentsMenuClose(app),
                     3, 24 => _ = try backAgentsMenu(app),
                     10 => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
                     11 => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),
@@ -2503,8 +2519,16 @@ pub fn Runtime(comptime App: type) type {
                 app.slashRegistry(),
                 items,
             ) orelse return false;
-            if (app.slashRegistry().matchExact(prefix) != null) return false;
             const count = completion_rt.visibleSlashCompletionCount(app, agent);
+            if (app.slashRegistry().matchExact(prefix)) |exact| {
+                // `/rename` typed in full waits for its title, as when it is
+                // picked from a prefix below. `/rename ` with nothing after
+                // it is sent on purpose, so it runs and says how to use it.
+                if (count == 0 or !exact.command.requires_args) return false;
+                if (std.mem.trimEnd(u8, prefix, " \t").len != prefix.len) return false;
+                try typeCommandAwaitingArgument(app, prefix);
+                return true;
+            }
             if (count == 0) return false;
             const idx = app.input_runtime.picker.slash_completion_index % count;
             if (!picker_presentation.mixedSlashCompletionIsSkill(
@@ -2520,11 +2544,27 @@ pub fn Runtime(comptime App: type) type {
                     idx,
                 ) orelse return false;
                 const spec = app.slashRegistry().matchExact(selected) orelse return false;
+                if (spec.command.requires_args) {
+                    // Only while the name is still being typed: text after it
+                    // is the argument, and Enter sends it as it is.
+                    if (std.mem.findAny(u8, prefix, " \t") != null) return false;
+                    try typeCommandAwaitingArgument(app, selected);
+                    return true;
+                }
                 if (spec.command.kind != .model) return false;
                 try openModelBrowseCatalog(app);
                 return true;
             }
             return try bindSelectedSlashSkill(app, idx);
+        }
+
+        /// Replaces the composer text with `command` and a space, so the
+        /// command waits for its argument.
+        fn typeCommandAwaitingArgument(app: *App, command: []const u8) !void {
+            var buf: [128]u8 = undefined;
+            const with_space = std.mem.print(&buf, "{s} ", .{command}) catch command;
+            try app.input_runtime.textReplacementState().replace(app.alloc, with_space);
+            app.shell.render_requests.request(.footer);
         }
 
         fn nonSlashPickerOwnsEnter(app: *App, agent: *AppAgent) bool {
@@ -2596,6 +2636,11 @@ pub fn Runtime(comptime App: type) type {
                 selected_index,
             ) orelse return false;
             const leading_ws = items.len - prefix.len;
+            debug_trace.logf(
+                "skills",
+                "slash menu replaced composer text with skill={s} dropped_bytes={d}",
+                .{ skill.name, prefix.len },
+            );
             try app.input_runtime.skillBindingState().bindSkillToken(
                 app.alloc,
                 leading_ws,
@@ -12782,6 +12827,37 @@ test "composer shortcut line delete joins at non-final line end and rejects unkn
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expectEqual(@as(?input_action.ShortcutAction, null), test_ui_input.shortcutFromControlByte('x'));
     try std.testing.expectEqualStrings("alphabeta", app.input_runtime.edit_state.input.items);
+}
+
+test "composer shortcut line delete joins at non-first line start" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "alpha\nbeta");
+    try app.input_runtime.kill_ring.text.appendSlice(alloc, "existing kill");
+    app.input_runtime.edit_state.cursor = "alpha\n".len;
+
+    _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(
+        &app,
+        .delete_to_line_start,
+        .delete_to_line_start,
+        null,
+        null,
+        false,
+        4096,
+    );
+    try std.testing.expectEqualStrings("alphabeta", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, "alpha".len), app.input_runtime.edit_state.cursor);
+    try std.testing.expectEqualStrings("\n", app.input_runtime.kill_ring.text.items);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    app.shell.render_requests.clearReason(.footer);
+    app.input_runtime.edit_state.cursor = 0;
+    try Runtime(RoutingFakeApp).handleByte(&app, 21, 4096, 100);
+    try std.testing.expectEqualStrings("alphabeta", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("\n", app.input_runtime.kill_ring.text.items);
+    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
 }
 
 test "composer shortcut yank commits fresh image ids only after insertion" {

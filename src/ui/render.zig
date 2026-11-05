@@ -204,7 +204,9 @@ pub const StatuslineItems = struct {
 /// upstream, so this only bounds pathological single-word titles.
 const max_session_title_cells: usize = 32;
 
-fn compactModelLabel(model: []const u8, out: []u8) []const u8 {
+/// A model id as the status line names it: without its provider, and
+/// a Claude model as "opus 4-7". May use `out`.
+pub fn compactModelLabel(model: []const u8, out: []u8) []const u8 {
     var start: usize = 0;
     for (model, 0..) |byte, i| {
         if (byte == '/') start = i + 1;
@@ -790,19 +792,13 @@ test "terminal title clear restores a predictable empty state" {
     try std.testing.expectEqualStrings("\x1b]2;\x07", written);
 }
 
-pub fn formatResumeHandoff(
-    buffer: []u8,
-    session_id: []const u8,
-    terminal_cols: u16,
-) ![]const u8 {
-    const label = "Continue session with:";
-    const command = "fx --resume ";
-    const single_row_width = label.len + 1 + command.len + session_id.len;
-    const separator = if (single_row_width <= terminal_cols) " " else "\n  ";
+/// The command gets a line to itself, so selecting that line copies only the
+/// command.
+pub fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
     return std.mem.print(
         buffer,
-        "{s}{s}{s}{s}{s}{s}\n",
-        .{ dim_style, label, separator, command, session_id, reset_style },
+        "{s}Resume this session with:\nfx --resume {s}{s}\n",
+        .{ dim_style, session_id, reset_style },
     );
 }
 
@@ -859,23 +855,15 @@ test "initTheme sets light mode styles" {
     try std.testing.expectEqualStrings("\x1b[1;38;5;255m", subtitle_style);
 }
 
-test "resume handoff uses one row only when the full instruction fits" {
+test "resume handoff puts the command alone on the line under its label" {
     initTheme(false, null);
     defer initTheme(false, null);
 
-    const single_row = "Continue session with: fx --resume session-123";
-    var exact_buffer: [128]u8 = undefined;
-    const exact = try formatResumeHandoff(&exact_buffer, "session-123", single_row.len);
+    var buffer: [128]u8 = undefined;
+    const message = try formatResumeHandoff(&buffer, "session-123");
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mContinue session with: fx --resume session-123\x1b[0m\n",
-        exact,
-    );
-
-    var narrow_buffer: [128]u8 = undefined;
-    const narrow = try formatResumeHandoff(&narrow_buffer, "session-123", single_row.len - 1);
-    try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mContinue session with:\n  fx --resume session-123\x1b[0m\n",
-        narrow,
+        "\x1b[38;5;245mResume this session with:\nfx --resume session-123\x1b[0m\n",
+        message,
     );
 }
 
@@ -884,9 +872,9 @@ test "resume handoff follows the active muted theme shade" {
     defer initTheme(false, null);
 
     var buffer: [128]u8 = undefined;
-    const message = try formatResumeHandoff(&buffer, "session-123", 80);
+    const message = try formatResumeHandoff(&buffer, "session-123");
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;247mContinue session with: fx --resume session-123\x1b[0m\n",
+        "\x1b[38;5;247mResume this session with:\nfx --resume session-123\x1b[0m\n",
         message,
     );
 }

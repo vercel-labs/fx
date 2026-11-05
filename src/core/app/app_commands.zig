@@ -4,6 +4,7 @@ const agents = @import("../agents/agents.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const session_display_metadata = @import("../session/session_display_metadata.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
 const io_mod = @import("../shared/io.zig");
@@ -3139,7 +3140,15 @@ fn stripAnsiEscapes(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
 fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     const App = @TypeOf(app.*);
     const SessionRuntime = app_session_runtime.Runtime(App);
-    SessionRuntime.renameActiveSession(app, agents.screenAgentOf(app), rest) catch |err| {
+    const agent = agents.screenAgentOf(app);
+    // A rename to the current title is still saved, so it pins the title;
+    // only the notice changes.
+    const previous_title: ?[]u8 = if (SessionRuntime.cachedSessionTitle(agent)) |title|
+        try app.alloc.dupe(u8, title)
+    else
+        null;
+    defer if (previous_title) |title| app.alloc.free(title);
+    SessionRuntime.renameActiveSession(app, agent, rest) catch |err| {
         if (err == error.EmptyTitle) {
             // Usage lines name the command; a topic tag would repeat it.
             try app.writeDomainNotice(
@@ -3150,7 +3159,11 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
         }
         const body: []const u8 = switch (err) {
             error.EmptyTitle => unreachable,
-            error.TitleTooLong => "title is too long",
+            error.TitleTooLong => std.fmt.comptimePrint(
+                "title is too long (at most {d} bytes)",
+                .{session_display_metadata.max_title_bytes},
+            ),
+            error.MultilineTitle => "title must be one line",
             error.InvalidTitle => "title must be printable text",
             error.NoActiveSession => "no active session to rename",
             else => {
@@ -3175,8 +3188,12 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     };
 
     app.shell.render_requests.request(.footer);
-    const title = SessionRuntime.cachedSessionTitle(agents.screenAgentOf(app)) orelse "";
-    const msg = try app.alloc.print("renamed to \"{s}\"", .{title});
+    const title = SessionRuntime.cachedSessionTitle(agent) orelse "";
+    const unchanged = if (previous_title) |previous| std.mem.eql(u8, previous, title) else false;
+    const msg = if (unchanged)
+        try app.alloc.print("already named \"{s}\"", .{title})
+    else
+        try app.alloc.print("renamed to \"{s}\"", .{title});
     defer app.alloc.free(msg);
     try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = msg }, true);
 }

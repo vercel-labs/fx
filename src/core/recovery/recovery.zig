@@ -86,6 +86,9 @@ pub const Failure = struct {
         sign_in,
         quota,
         content_filter,
+        /// The server answered with a stream fx could not read. Waits and
+        /// resends as `dropped` does, under its own name.
+        unreadable,
     };
 };
 
@@ -287,7 +290,7 @@ fn onFailed(state: *State, failure: Failure, now_ms: u64) Plan {
     if (state.phase != .sending) return .{};
     state.flowing = false;
     return switch (failure.kind) {
-        .offline, .dropped, .server, .rate_limited => waitAfter(state, failure, now_ms),
+        .offline, .dropped, .unreadable, .server, .rate_limited => waitAfter(state, failure, now_ms),
         .too_long => if (state.flags.compacted) askUser(state, .too_long, now_ms) else compactAndSend(state, now_ms),
         .rejected => askUser(state, .rejected, now_ms),
         .sign_in => askUser(state, .sign_in, now_ms),
@@ -371,7 +374,7 @@ fn waitAfter(state: *State, failure: Failure, now_ms: u64) Plan {
     state.retry_label = .after_failure;
     const delay_ms = switch (failure.kind) {
         .offline => offlineDelay(state),
-        .dropped, .server, .rate_limited => transientDelay(state, failure),
+        .dropped, .unreadable, .server, .rate_limited => transientDelay(state, failure),
         .too_long, .rejected, .sign_in, .quota, .content_filter => unreachable, // routed by onFailed
     };
     state.wait_until_ms = now_ms +| delay_ms;
@@ -437,7 +440,7 @@ fn escalate(state: *State, kind: Failure.Kind) void {
         .server => if (state.fast) {
             state.flags.no_fast = true;
         },
-        .offline, .dropped, .rate_limited, .too_long, .rejected, .sign_in, .quota, .content_filter => {},
+        .offline, .dropped, .unreadable, .rate_limited, .too_long, .rejected, .sign_in, .quota, .content_filter => {},
     }
 }
 
@@ -470,6 +473,7 @@ fn reasonText(state: *const State) []const u8 {
     return switch (cause) {
         .offline => "Offline",
         .dropped => "Connection lost",
+        .unreadable => "Unreadable reply",
         .server => "Gateway error",
         .rate_limited => "Rate limited",
         .too_long => "Conversation too long",
@@ -707,6 +711,19 @@ fn columns(text: []const u8) usize {
 
 fn startsWith(text: []const u8, prefix: []const u8) bool {
     return std.mem.startsWith(u8, text, prefix);
+}
+
+test "an unreadable reply waits and resends as a dropped connection does, under its own name" {
+    var state: State = .{};
+    _ = startNew(&state, 10_000, false);
+    const failed = fail(&state, .unreadable, 19_000);
+    try testing.expect(failed.send == null);
+    try testing.expectEqualStrings("Unreadable reply · next try in 1s · attempt 1", failed.status.?.text.slice());
+    const retry = tickUntilSend(&state, 19_000);
+    try testing.expectEqualStrings("Unreadable reply · retrying · attempt 2", retry.plan.status.?.text.slice());
+    // A relaunch reads the cause back from the record.
+    const restored = decode(encode(&state, retry.at_ms)) orelse return error.TestExpectedRecord;
+    try testing.expectEqual(@as(?Failure.Kind, .unreadable), restored.cause);
 }
 
 test "a dropped connection waits, retries, and clears at the first byte" {
@@ -1216,7 +1233,7 @@ const SimHost = struct {
         };
         if (event == .failed and was_outstanding) {
             switch (event.failed.kind) {
-                .offline, .dropped, .server, .rate_limited => {
+                .offline, .dropped, .unreadable, .server, .rate_limited => {
                     try testing.expect(plan.send == null);
                     try testing.expectEqual(Status.Kind.waiting, plan.status.?.kind);
                     host.transient_failure_ms = host.now_ms;
@@ -1300,7 +1317,7 @@ const SimHost = struct {
 
 fn randomFailure(random: std.Random) Failure {
     const kinds = [_]Failure.Kind{
-        .dropped,      .dropped,  .server,   .server,  .offline, .offline,
+        .dropped,      .dropped,  .server,   .server,  .offline, .offline,        .unreadable,
         .rate_limited, .too_long, .rejected, .sign_in, .quota,   .content_filter,
     };
     const kind = kinds[random.uintLessThan(usize, kinds.len)];

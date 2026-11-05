@@ -1355,6 +1355,37 @@ function keepRunForOfflineCheck(fixture: Fixture, name: string, traces: string[]
   if (existsSync(storeRoot(fixture.home))) cpSync(storeRoot(fixture.home), join(kept, "sessions"), { recursive: true });
 }
 
+/// The line above the command that reopens a fork's source.
+const FORK_RESUME_LABEL = "Resume the original session with:";
+
+/// The pane once the fork notice has settled at its end: the label, the
+/// command alone on the next line, and a blank row above the composer, which
+/// holds `prompt`. A long replay draws in steps, so earlier frames can lack
+/// the blank row.
+async function waitForForkNotice(session: TmuxSession, source: string, prompt: string) {
+  return session.waitForPane((pane) => {
+    const lines = pane.split("\n");
+    const label = lines.lastIndexOf(FORK_RESUME_LABEL);
+    return label >= 0 && lines[label + 1] === `fx --resume ${source}` && lines[label + 2] === "" && composerContains(pane, prompt);
+  }, TIMEOUT);
+}
+
+/// Checks that the fork notice follows the replayed turns, the newest of
+/// which holds `lastReplayed`: the notice names the fork, then the label,
+/// then the command alone on its line, so selecting that line copies it.
+function expectForkNoticeAfterReplay(lines: string[], lastReplayed: string, title: string, source: string) {
+  const replayed = lines.findLastIndex((line) => line.includes(lastReplayed));
+  const notice = lines.lastIndexOf(`* session forked: ${title}`);
+  const label = lines.lastIndexOf(FORK_RESUME_LABEL);
+  expect(replayed).toBeGreaterThanOrEqual(0);
+  expect(notice).toBeGreaterThan(replayed);
+  expect(label).toBeGreaterThan(notice);
+  expect(lines[label + 1]).toBe(`fx --resume ${source}`);
+  // A blank row keeps the command off the input box below it.
+  expect(lines[label + 2]).toBe("");
+  expect(lines.some((line) => line.includes("original session fx --resume"))).toBe(false);
+}
+
 /// The fork menu's rows below the composer, each with whether it is selected.
 async function forkMenuRows(session: TmuxSession) {
   const lines = (await session.capturePaneEscapes()).split("\n");
@@ -1402,7 +1433,8 @@ test.skipIf(!tmuxAvailable())(forkTest, async () => {
     expect((await forkMenuRows(app.session)).map((row) => row.selected)).toEqual([false, true, false]);
     await app.session.sendKeys("Enter");
 
-    expect(await scrollbackContains(app.session, `original session fx --resume ${source}`)).toContain("* session forked: Fork source (fork)");
+    await waitForForkNotice(app.session, source, "Fork prompt two.");
+    expectForkNoticeAfterReplay((await app.session.captureFullScrollback()).split("\n"), "FORK_ONE", "Fork source (fork)", source);
     await app.session.waitForPane((pane) => composerContains(pane, "Fork prompt two.") && !pane.includes("enter fork"), TIMEOUT);
     const ids = savedSessionIds(fixture.home);
     expect(ids.length).toBe(2);
@@ -1423,6 +1455,10 @@ test.skipIf(!tmuxAvailable())(forkTest, async () => {
     await app.session.sendKeys("C-u");
     await app.session.sendText("A new second prompt in the fork.");
     await app.session.waitForText("FORK_NEW_SECOND", TIMEOUT);
+    // The next prompt follows the notice with one blank row between them.
+    const continued = (await app.session.captureFullScrollback()).split("\n");
+    const label = continued.lastIndexOf(FORK_RESUME_LABEL);
+    expect(continued.slice(label, label + 4)).toEqual([FORK_RESUME_LABEL, `fx --resume ${source}`, "", "┃ A new second prompt in the fork."]);
     await quitApp(app);
     expect(readFileSync(join(storeRoot(fixture.home), fork, "log.jsonl"), "utf8")).toContain("A new second prompt in the fork.");
     expect(readFileSync(sourcePath).equals(sourceAfterFork)).toBe(true);
@@ -1431,6 +1467,43 @@ test.skipIf(!tmuxAvailable())(forkTest, async () => {
     expectNoV1Sessions(fixture);
   } finally {
     keepRunForOfflineCheck(fixture, forkTest, [trace]);
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+test.skipIf(!tmuxAvailable())("a fork of a long session ends with its notice and the source's resume command, in view", async () => {
+  const fixture = createFixture("fx-v2-app-long-fork-");
+  let longAnswer = "";
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (body.includes("Long fork prompt two.")) return fakeGatewayFinalText("LONG_FORK_TWO");
+    if (body.includes("Long fork prompt one.")) return fakeGatewayFinalText(longAnswer);
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  });
+  try {
+    const app = await startApp(fixture, gateway, []);
+    // The first answer is longer than the pane keeps in scrollback, so a
+    // notice written above the replay would scroll out of reach.
+    const lines = Array.from({ length: app.session.historyLimit() + 200 }, (_, index) => `LONG_FORK_LINE_${String(index + 1).padStart(5, "0")}`);
+    const lastLine = lines.at(-1)!;
+    longAnswer = ["```text", ...lines, "```"].join("\n");
+    await app.session.sendText("Long fork prompt one.");
+    await app.session.waitForText(lastLine, TIMEOUT);
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Long fork prompt two.");
+    await app.session.waitForText("LONG_FORK_TWO", TIMEOUT);
+    await app.session.waitForStableComposer();
+    const source = onlySessionId(fixture.home);
+
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await app.session.sendKeys("Enter");
+    // The notice and the command are on screen, not only in the scrollback.
+    await waitForForkNotice(app.session, source, "Long fork prompt two.");
+    expectForkNoticeAfterReplay((await app.session.captureFullScrollback()).split("\n"), lastLine, "Long fork prompt one. (fork)", source);
+    await app.session.sendKeys("C-u");
+    await quitApp(app);
+  } finally {
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
   }

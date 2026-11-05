@@ -19,6 +19,10 @@ pub const Transport = struct {
     close_fn: *const fn (?*anyopaque, i32) void,
     // Optional logical-completion signal, independent of HTTP EOF or close.
     consumed_fn: ?*const fn (?*anyopaque, i32) void = null,
+    // Optional: an opened response's Retry-After in whole seconds, or -1 when
+    // it has none. Read once its status is ready; a host without it leaves
+    // waits on fx's own backoff.
+    retry_after_fn: ?*const fn (?*anyopaque, i32) i32 = null,
 
     fn open(self: Transport, method: []const u8, url: []const u8, headers: []const u8, body: []const u8) !i32 {
         return self.open_fn(self.context, method, url, headers, body);
@@ -173,7 +177,9 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         const size_rejected = kind == .invalid_request and vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body);
         return .{ .failed = .{
             .kind = if (size_rejected) .request_too_large else kind,
+            .http_status = opened.status,
             .detail = try withoutCredential(alloc, body, request.credential.secret()),
+            .retry_after_seconds = opened.retry_after_seconds,
             .ownership = .owned,
         } };
     }
@@ -210,6 +216,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
 pub const OpenedPost = struct {
     handle: i32,
     status: std.http.Status,
+    retry_after_seconds: ?u64 = null,
 };
 
 /// Admits the request, sends one POST through the host and waits for its HTTP
@@ -245,7 +252,11 @@ pub fn openPost(
         try pulse(request.cooperative_pulse);
     }
     const http_status = httpStatus(status_code) orelse return error.HostStreamFailed;
-    return .{ .handle = handle, .status = http_status };
+    const retry_after: ?u64 = if (transport.retry_after_fn) |read| blk: {
+        const seconds = read(transport.context, handle);
+        break :blk if (seconds < 0) null else @intCast(seconds);
+    } else null;
+    return .{ .handle = handle, .status = http_status, .retry_after_seconds = retry_after };
 }
 
 pub const GetResponse = struct {
@@ -440,7 +451,7 @@ test "host provider signals logical consumption only after valid uncancelled com
         .{ .body = text ++ stop, .status = 1024, .expected_error = error.HostStreamFailed },
         .{ .body = text ++ stop, .status = 65535, .expected_error = error.HostStreamFailed },
         .{ .body = text, .read_error = -1, .expected_error = error.HostStreamFailed },
-        .{ .body = "data: {not-json}\n\n", .expected_error = error.InvalidGatewaySseEvent },
+        .{ .body = "data: {not-json}\n\n", .expected_error = error.MalformedGatewaySseEvent },
     };
     for (cases, 0..) |case, index| {
         var fake: FakeTransport = .{
@@ -1007,4 +1018,78 @@ test "host stream reader throttles cooperative pulses" {
     try std.testing.expectEqual(@as(usize, 1), trace.calls);
     try reader.pulseIfDueAt(awake_timestamp(200));
     try std.testing.expectEqual(@as(usize, 2), trace.calls);
+}
+
+test "a host's Retry-After and status reach the failure, and a host without one leaves the wait to fx" {
+    const FakeTransport = struct {
+        retry_after: i32,
+        admitted: usize = 0,
+        cancel_flag: std.atomic.Value(bool) = .init(false),
+
+        fn build(_: Allocator, _: stream_provider.RequestData) ![]u8 {
+            return error.UnexpectedRequest;
+        }
+        fn open(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8) !i32 {
+            return 3;
+        }
+        fn status(_: ?*anyopaque, _: i32, status_out: *u16) i32 {
+            status_out.* = 529;
+            return 1;
+        }
+        fn next(_: ?*anyopaque, _: i32, out: []u8) i32 {
+            _ = out;
+            return 0;
+        }
+        fn close(_: ?*anyopaque, _: i32) void {}
+        fn retryAfter(raw: ?*anyopaque, _: i32) i32 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.retry_after;
+        }
+        fn emit(_: *anyopaque, _: stream_provider.Event) void {}
+        fn admit(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.admitted += 1;
+        }
+    };
+    const cases = [_]struct { retry_after: i32, callback: bool, expected: ?u64 }{
+        .{ .retry_after = 7, .callback = true, .expected = 7 },
+        .{ .retry_after = 0, .callback = true, .expected = 0 },
+        .{ .retry_after = std.math.maxInt(i32), .callback = true, .expected = std.math.maxInt(i32) },
+        .{ .retry_after = -1, .callback = true, .expected = null },
+        .{ .retry_after = 7, .callback = false, .expected = null },
+    };
+    for (cases) |case| {
+        var fake: FakeTransport = .{ .retry_after = case.retry_after };
+        var context = initContext(FakeTransport.build, .{ .fixed = "https://example.invalid" }, .{
+            .context = &fake,
+            .open_fn = FakeTransport.open,
+            .status_fn = FakeTransport.status,
+            .next_fn = FakeTransport.next,
+            .close_fn = FakeTransport.close,
+            .retry_after_fn = if (case.callback) FakeTransport.retryAfter else null,
+        });
+        var delivery: stream_provider.DeliveryCertainty = .init();
+        var attempt: stream_provider.AttemptEvidence = .{};
+        var result = try stream(&context, std.testing.allocator, .{
+            .credential = .host_managed,
+            .model = "fixture-model",
+            .retry_count = 0,
+            .messages = &.{},
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .prepared_request_body = "{}",
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &attempt,
+            .events = .{ .context = &fake, .emit_fn = FakeTransport.emit },
+            .admission = .{ .context = &fake, .admit_fn = FakeTransport.admit },
+            .cancel_flag = &fake.cancel_flag,
+        });
+        defer result.deinit(std.testing.allocator);
+        const failure = result.failed;
+        try std.testing.expectEqual(stream_provider.FailureKind.server_error, failure.kind);
+        try std.testing.expectEqual(@as(?std.http.Status, @fromBackingInt(529)), failure.http_status);
+        try std.testing.expectEqual(case.expected, failure.retry_after_seconds);
+    }
 }

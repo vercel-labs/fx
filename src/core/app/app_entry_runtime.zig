@@ -29,6 +29,7 @@ const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_health = @import("../mcp/health.zig");
 const mcp_host = @import("../mcp_host/host.zig");
+const mcp_verbs = @import("../mcp_host/verbs.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const test_builtin_gateway = if (builtin.is_test)
@@ -384,12 +385,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         app.takeUpgradeRelaunchRequest()
     else
         null;
-    const resume_handoff_columns: u16 = if (comptime cooperative)
-        0
-    else if (comptime @hasDecl(App, "resumeHandoffColumns"))
-        app.resumeHandoffColumns()
-    else
-        0;
     var graceful_exit_sigint_guard = GracefulExitSigintGuard.install(
         !cooperative and relaunch_request == null,
     );
@@ -444,11 +439,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         defer handoff.deinit(alloc);
         var message_buffer: [512]u8 = undefined;
         const message = (if (comptime @hasDecl(App, "formatResumeHandoff"))
-            App.formatResumeHandoff(
-                &message_buffer,
-                handoff.session_id,
-                resume_handoff_columns,
-            )
+            App.formatResumeHandoff(&message_buffer, handoff.session_id)
         else
             formatResumeHandoff(&message_buffer, handoff.session_id)) catch return .returned;
         deps.write_stdout(deps.stdout_ctx, message) catch {};
@@ -480,7 +471,7 @@ fn writeUpgradeRelaunchFailure(
     var buffer: [768]u8 = undefined;
     const message = std.mem.print(
         &buffer,
-        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
+        "fx: upgrade installed, but relaunch failed: {s}\nResume this session with:\nfx --resume {s}\n",
         .{ @errorName(err), session_id },
     ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
     writeStderr(deps, message);
@@ -551,11 +542,14 @@ fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
 }
 
 fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
-    return std.mem.print(buffer, "Continue session with: fx --resume {s}\n", .{session_id});
+    return std.mem.print(buffer, "Resume this session with:\nfx --resume {s}\n", .{session_id});
 }
 
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
-    return std.mem.print(buffer, "fx: {s}\n", .{config_runtime.modelNotSelectedMessage(err) orelse @errorName(err)});
+    const message = config_runtime.modelNotSelectedMessage(err) orelse
+        mcp_verbs.profileConfigNotice(err) orelse
+        @errorName(err);
+    return std.mem.print(buffer, "fx: {s}\n", .{message});
 }
 
 /// A v2 session that cannot be written at startup, in one sentence; null
@@ -1033,7 +1027,7 @@ test "app entry writes exact resume handoff after interactive teardown" {
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqualStrings(
-        "Continue session with: fx --resume session-123\n",
+        "Resume this session with:\nfx --resume session-123\n",
         capture.stdout.written(),
     );
     try std.testing.expectEqual(@as(usize, 1), capture.stdout_calls);
@@ -1073,7 +1067,7 @@ test "app entry bounds graceful-exit SIGINT suppression to handoff lifetime" {
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqualStrings(
-        "Continue session with: fx --resume session-123\n",
+        "Resume this session with:\nfx --resume session-123\n",
         capture.stdout.written(),
     );
     try std.testing.expectEqual(@as(usize, 0), test_sigint_count.load(.seq_cst));
@@ -1113,7 +1107,7 @@ test "app entry relaunches only after teardown with the validated handoff" {
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "fx --resume session-123",
+        "relaunch failed: InvalidExe\nResume this session with:\nfx --resume session-123\n",
     ) != null);
     try expectEvents(&.{
         "init:none",
@@ -1207,6 +1201,20 @@ test "app entry reports unexpected init errors once and preserves identity" {
     try std.testing.expectEqualStrings("fx: TestInitFailed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try expectEvents(&.{ "init:none", "stderr-attempt" });
+}
+
+test "app entry says what's wrong with ~/.fx/mcp.json instead of naming the error" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.init_error = error.McpConfigLinkLoop;
+
+    try std.testing.expectError(error.McpConfigLinkLoop, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings(
+        profile_paths.displayText("fx: ~/.fx/mcp.json is a link that loops or passes through too many links; replace it with a plain file\n"),
+        capture.stderr.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
 }
 
 test "app entry releases terminal before reporting worker start errors" {

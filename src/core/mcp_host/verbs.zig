@@ -38,6 +38,14 @@ pub const Surface = enum {
             .shell => "/mcp",
         };
     }
+
+    /// `prog` after its article, as said aloud: "an fx mcp", "a /mcp".
+    fn progWithArticle(s: Surface) []const u8 {
+        return switch (s) {
+            .cli => "an fx mcp",
+            .shell => "a /mcp",
+        };
+    }
 };
 
 pub const Verb = enum { list, show, add, remove, login, logout, approve, reject, call };
@@ -85,9 +93,10 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         if (std.mem.eql(u8, old, "reload")) return moved(arena, "{s} reload is gone: fx loads MCP config changes at your next prompt or /mcp command.", .{p});
         if (std.mem.eql(u8, old, "resource") or std.mem.eql(u8, old, "prompt"))
             return moved(arena, "{s} {s} is gone: fx doesn't support MCP resources and prompts yet.", .{ p, old });
+        const command = surface.progWithArticle();
         if (settings_messages.closest(old, &verb_names)) |near|
-            return usage(arena, null, "'{f}' isn't a {s} command; did you mean {s}?", .{ text_utils.terminalSafe(old), p, near });
-        return usage(arena, null, "'{f}' isn't a {s} command.", .{ text_utils.terminalSafe(old), p });
+            return usage(arena, null, "'{f}' isn't {s} command; did you mean {s}?", .{ text_utils.terminalSafe(old), command, near });
+        return usage(arena, null, "'{f}' isn't {s} command.", .{ text_utils.terminalSafe(old), command });
     };
 
     // Flags come before `--`; everything after it is a stdio server's command.
@@ -441,6 +450,14 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
             return 2;
         },
     };
+    // Every verb but help and call reads or writes under `~/.fx`; call talks
+    // to the running fx over its socket. The shell passes an empty home when
+    // `io_mod.homeDir` has none, and a path built from it would land under
+    // the current folder.
+    switch (command) {
+        .help, .call => {},
+        else => if (!std.Io.Dir.path.isAbsolute(c.home)) return error.HomeNotSet,
+    }
     const old_profile = switch (command) {
         .add => |a| a.old_profile,
         .remove => |r| r.old_profile,
@@ -464,12 +481,29 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
     };
 }
 
+// How fx says an MCP file is unusable, after a subject such as "it" or
+// "~/.fx/mcp.json".
+const not_plain_words = "isn't a plain file; replace it with one";
+const link_loop_words = "is a link that loops or passes through too many links; replace it with a plain file";
+const too_large_words = std.fmt.comptimePrint("is over {d} MB, the most fx reads; make it smaller", .{config_file.max_read_bytes / (1024 * 1024)});
+
 /// Why a write to `path` failed; a link says what it points to.
 fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
+    switch (err) {
+        error.SymLinkLoop => return "it " ++ link_loop_words,
+        error.StreamTooLong => return "it " ++ too_large_words,
+        else => {},
+    }
     // The profile's replace refuses a link itself (DurablePathUnsafe).
     if (err != error.Linked and err != error.DurablePathUnsafe) return describe(err);
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const n = std.Io.Dir.readLinkAbsolute(io_mod.getIo(), path, &buffer) catch return "it has another hard link, and fx edits only a plain file; edit it by hand";
+    const n = std.Io.Dir.readLinkAbsolute(io_mod.getIo(), path, &buffer) catch {
+        // Not a link: a regular file with another hard link, or a special
+        // file such as a fifo.
+        const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch return describe(err);
+        if (stat.kind != .file) return "it " ++ not_plain_words;
+        return "it has another hard link, and fx edits only a plain file; edit it by hand";
+    };
     const target = try safe(arena, buffer[0..n]);
     return try arena.print("it's a link to {s}, and fx edits only a plain file; edit {s} by hand", .{ target, target });
 }
@@ -482,13 +516,29 @@ pub fn describe(err: anyerror) []const u8 {
         error.BothKeys => "the file has both \"mcp\" and \"mcpServers\"; merge them into one",
         error.Unreadable => "the file isn't valid JSON, or repeats a key; fix it by hand first",
         error.NotAnObject => "the file's servers aren't a JSON object; fix it by hand first",
-        error.HomeNotSet => "HOME isn't set",
+        error.HomeNotSet => io_mod.no_home_dir_reason,
         error.AccessDenied => "permission denied",
+        error.DurablePathUnsafe => "an MCP config file " ++ not_plain_words,
+        error.SymLinkLoop => "an MCP config file " ++ link_loop_words,
+        error.StreamTooLong => "an MCP config file " ++ too_large_words,
         error.Timeout, error.LockTimeout => "another fx is changing the MCP config; try again",
         error.McpConfigInvalidJson => profile_paths.displayText("~/.fx/mcp.json isn't valid JSON"),
+        error.McpConfigNotPlainFile => profile_paths.displayText("~/.fx/mcp.json " ++ not_plain_words),
+        error.McpConfigLinkLoop => profile_paths.displayText("~/.fx/mcp.json " ++ link_loop_words),
+        error.McpConfigTooLarge => profile_paths.displayText("~/.fx/mcp.json " ++ too_large_words),
         error.McpConfigInvalidHeaders, error.McpConfigAuthorizationHeader => profile_paths.displayText("a server in ~/.fx/mcp.json has headers fx won't send; put a token in bearer_token_env, or sign in with login"),
-        else => if (std.mem.startsWith(u8, @errorName(err), "McpConfig")) profile_paths.displayText("~/.fx/mcp.json has a server entry fx can't read") else "something went wrong",
+        else => if (isProfileConfigError(err)) profile_paths.displayText("~/.fx/mcp.json has a server entry fx can't read") else "something went wrong",
     };
+}
+
+/// fx's words for an error in ~/.fx/mcp.json itself, for a caller that would
+/// otherwise print the error's name; null for any other error.
+pub fn profileConfigNotice(err: anyerror) ?[]const u8 {
+    return if (isProfileConfigError(err)) describe(err) else null;
+}
+
+fn isProfileConfigError(err: anyerror) bool {
+    return std.mem.startsWith(u8, @errorName(err), "McpConfig");
 }
 
 const Paths = struct { profile: []const u8, project: []const u8 };
@@ -1196,8 +1246,8 @@ test "parse turns mistakes into usage, and old verbs into pointers" {
     const a = arena_state.allocator();
 
     const cases = [_]struct { args: []const []const u8, message: []const u8 }{
-        .{ .args = &.{"nope"}, .message = "'nope' isn't a fx mcp command." },
-        .{ .args = &.{"lsit"}, .message = "'lsit' isn't a fx mcp command; did you mean list?" },
+        .{ .args = &.{"nope"}, .message = "'nope' isn't an fx mcp command." },
+        .{ .args = &.{"lsit"}, .message = "'lsit' isn't an fx mcp command; did you mean list?" },
         .{ .args = &.{"show"}, .message = "fx mcp show needs one server NAME." },
         .{ .args = &.{ "show", "a", "b" }, .message = "fx mcp show needs one server NAME." },
         .{ .args = &.{ "add", "bad name", "https://w" }, .message = "'bad name' can't be a server name: use letters, digits, '-' and '_'." },
@@ -1220,6 +1270,7 @@ test "parse turns mistakes into usage, and old verbs into pointers" {
     try testing.expectEqualStrings("fx mcp auth is now fx mcp login NAME.", (try parseCli(a, &.{ "auth", "x" })).moved);
     try testing.expectEqualStrings("/mcp reload is gone: fx loads MCP config changes at your next prompt or /mcp command.", (try parse(a, .shell, &.{"reload"})).moved);
     try testing.expectEqualStrings("/mcp list: unknown flag --json", (try parse(a, .shell, &.{ "list", "--json" })).usage.message);
+    try testing.expectEqualStrings("'nope' isn't a /mcp command.", (try parse(a, .shell, &.{"nope"})).usage.message);
 }
 
 test "status words follow commands.md, held states first" {
@@ -1247,6 +1298,36 @@ test "status words follow commands.md, held states first" {
     try testing.expectEqualStrings("waiting for approval", try statusText(a, s));
 }
 
+test "every verb that uses ~/.fx needs an absolute home" {
+    const NoHosts = struct {
+        fn get(_: *anyopaque, _: ?runtime_mod.Notify) anyerror!?*Host {
+            return null;
+        }
+        fn release(_: *anyopaque, _: *Host) void {}
+        fn changed(_: *anyopaque) void {}
+    };
+    var unused: u8 = 0;
+    for ([_][]const u8{ "", "relative/home" }) |home| {
+        var out: Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var err: Writer.Allocating = .init(testing.allocator);
+        defer err.deinit();
+        const c: Context = .{
+            .gpa = testing.allocator,
+            .out = &out.writer,
+            .err = &err.writer,
+            .surface = .shell,
+            .home = home,
+            .workspace_root = "/Users/example/project",
+            .hosts = .{ .context = &unused, .get = NoHosts.get, .release = NoHosts.release, .changed = NoHosts.changed },
+        };
+        try testing.expectEqual(@as(u8, 1), run(c, &.{ "add", "probe", "http://127.0.0.1:9/mcp" }));
+        try testing.expectEqualStrings("/mcp: HOME is not set to an absolute path\n", err.written());
+        try testing.expectEqual(@as(u8, 0), run(c, &.{"help"}));
+        try testing.expect(out.written().len > 0);
+    }
+}
+
 test "list lines up its columns and keeps hostile names inert" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -1270,4 +1351,31 @@ test "list lines up its columns and keeps hostile names inert" {
         \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools":2}]}
         \\
     , json.written());
+}
+
+test "an MCP file fx can't read gets fx's words, and only mcp.json's own errors name it" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings(
+        profile_paths.displayText("~/.fx/mcp.json is a link that loops or passes through too many links; replace it with a plain file"),
+        profileConfigNotice(error.McpConfigLinkLoop).?,
+    );
+    try testing.expectEqualStrings(
+        profile_paths.displayText("~/.fx/mcp.json is over 1 MB, the most fx reads; make it smaller"),
+        profileConfigNotice(error.McpConfigTooLarge).?,
+    );
+    try testing.expectEqualStrings(
+        profile_paths.displayText("~/.fx/mcp.json isn't a plain file; replace it with one"),
+        profileConfigNotice(error.McpConfigNotPlainFile).?,
+    );
+    try testing.expectEqualStrings(profile_paths.displayText("~/.fx/mcp.json isn't valid JSON"), profileConfigNotice(error.McpConfigInvalidJson).?);
+    // The same failures from a file this can't name, such as the project's
+    // .mcp.json, keep their own words.
+    try testing.expect(profileConfigNotice(error.SymLinkLoop) == null);
+    try testing.expect(profileConfigNotice(error.AccessDenied) == null);
+    try testing.expectEqualStrings("an MCP config file is a link that loops or passes through too many links; replace it with a plain file", describe(error.SymLinkLoop));
+    try testing.expectEqualStrings("an MCP config file is over 1 MB, the most fx reads; make it smaller", describe(error.StreamTooLong));
+    try testing.expectEqualStrings("it is a link that loops or passes through too many links; replace it with a plain file", try whyNot(a, error.SymLinkLoop, "/example/.mcp.json"));
+    try testing.expectEqualStrings("it is over 1 MB, the most fx reads; make it smaller", try whyNot(a, error.StreamTooLong, "/example/.mcp.json"));
 }

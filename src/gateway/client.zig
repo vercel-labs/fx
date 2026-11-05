@@ -17,6 +17,7 @@ const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
 const json_depth = @import("json_depth.zig");
 const host_stream_provider = @import("host_stream_provider.zig");
+const open_job = @import("open_job.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
@@ -34,6 +35,8 @@ pub fn networkFailureEvidence(
         .stream_stalled
     else if (isConnectivityFailure(err))
         .connectivity_lost
+    else if (isUnreadableReply(err))
+        .unreadable_reply
     else if (isRetryableAgentNetworkError(err))
         .transport_interrupted
     else
@@ -42,7 +45,8 @@ pub fn networkFailureEvidence(
 }
 
 /// Errors that prove the network path itself is down: nothing reached a
-/// server, so no request was sent and no generation exists. Distinct from
+/// server, or no connection opened within the setup budget, so no request
+/// was sent and no generation exists. Distinct from
 /// connected-but-failed errors (reset mid-stream, closed connection), which
 /// carry delivery ambiguity and belong to the retry class.
 pub fn isConnectivityFailure(err: anyerror) bool {
@@ -53,6 +57,7 @@ pub fn isConnectivityFailure(err: anyerror) bool {
         err == error.AddressUnavailable or
         err == error.ConnectionRefused or
         err == error.ConnectionTimedOut or
+        err == error.ConnectionSetupTimedOut or
         err == error.HostUnreachable or
         err == error.NetworkUnreachable or
         err == error.NetworkDown;
@@ -76,6 +81,15 @@ fn isRetryableAgentNetworkError(err: anyerror) bool {
         err == error.WriteFailed or
         err == error.ReadFailed or
         isRetryableGatewayError(err);
+}
+
+/// A stream event that was not JSON at all: the server answered, so this is
+/// not a lost connection, but the reply was damaged on the way.
+fn isUnreadableReply(err: anyerror) bool {
+    return err == error.MalformedGatewaySseEvent or
+        err == error.MalformedOpenAICodexSseEvent or
+        err == error.MalformedXaiGrokSseEvent or
+        err == error.MalformedChatCompletionsChunk;
 }
 
 fn connectedIoFailure(
@@ -121,7 +135,7 @@ test "native network failure evidence covers setup send read and resume failures
     };
     const cases = [_]Cases{
         .{ .err = error.TlsInitializationFailed },
-        .{ .err = error.ConnectionSetupTimedOut },
+        .{ .err = error.ConnectionSetupTimedOut, .cause = .connectivity_lost },
         .{ .err = error.UnknownHostName, .cause = .connectivity_lost },
         .{ .err = error.NameServerFailure, .cause = .connectivity_lost },
         .{ .err = error.NoAddressReturned, .cause = .connectivity_lost },
@@ -1211,6 +1225,159 @@ const RequestOpenOperation = struct {
     }
 };
 
+/// A pooled connection open on a thread of its own, so a request can walk
+/// away from a DNS lookup or connect that hangs (`open_job.zig`). Only the
+/// pool's client outlives the request, so only pooled opens run here. The
+/// job owns a copy of the URI, which `client.request` reads while it
+/// connects. Headers are only stored in the request, so the job opens
+/// without them and the request puts its own back when it takes the result.
+const PooledOpenJob = struct {
+    gpa: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    pool: *http_pool.HttpPool,
+    operation: RequestOpenOperation,
+    handoff: open_job.Handoff = .{},
+    result: anyerror!std.http.Client.Request = error.ConnectionSetupTimedOut,
+
+    fn start(
+        client: *std.http.Client,
+        pool: *http_pool.HttpPool,
+        uri: std.Uri,
+        options: std.http.Client.RequestOptions,
+        request_open_override: ?RequestOpenOverride,
+    ) !*PooledOpenJob {
+        const gpa = pool.client.allocator;
+        const job = try gpa.create(PooledOpenJob);
+        job.* = .{ .gpa = gpa, .arena = .init(gpa), .pool = pool, .operation = undefined };
+        errdefer job.destroy();
+        var job_options = options;
+        job_options.headers = .{};
+        job_options.extra_headers = &.{};
+        job_options.privileged_headers = &.{};
+        job.operation = .{
+            .client = client,
+            .pool = pool,
+            .uri = try dupeUri(job.arena.allocator(), uri),
+            .options = job_options,
+            .request_open_override = request_open_override,
+        };
+        pool.beginOpenJob();
+        errdefer pool.endOpenJob();
+        // A detached thread, not an Io task: std.Io cannot cancel a lookup
+        // stuck in getaddrinfo or a connect, so the job has to be able to
+        // outlive the request that started it. It is not unowned: the pool
+        // counts it from here to its last touch in `run`, and
+        // `HttpPool.deinit` waits for the count before freeing the client.
+        const thread = try std.Thread.spawn(.{}, run, .{job});
+        thread.detach();
+        return job;
+    }
+
+    fn run(self: *PooledOpenJob) void {
+        const pool = self.pool;
+        self.result = self.operation.run();
+        switch (self.handoff.publish()) {
+            // The request may free the job from here on.
+            .hand_over => {},
+            .close_late => {
+                if (self.result) |request| {
+                    // Nothing was sent on it, so std returns it to the pool.
+                    var late = request;
+                    late.deinit();
+                    debug_trace.logf("gateway", "open_job late connection released", .{});
+                } else |err| {
+                    debug_trace.logf("gateway", "open_job late open failed err={s}", .{@errorName(err)});
+                }
+                self.destroy();
+            },
+        }
+        pool.endOpenJob();
+    }
+
+    /// Waits for the open, or walks away from it on Esc or at the setup
+    /// deadline. Returns the request with the caller's URI and headers.
+    fn waitForOpen(
+        self: *PooledOpenJob,
+        uri: std.Uri,
+        options: std.http.Client.RequestOptions,
+        epoch: *const ConnectionSetupEpoch,
+        cancel_flag: *std.atomic.Value(bool),
+        reused: *bool,
+    ) anyerror!std.http.Client.Request {
+        while (true) {
+            const cancelled = cancel_flag.load(.seq_cst);
+            const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+            const expired = !std.Io.Clock.Timestamp.compare(now, .lt, epoch.deadline);
+            if (!cancelled and !expired) switch (self.handoff.poll()) {
+                .wait => {
+                    io_mod.sleep(pooled_open_poll_ms * std.time.ns_per_ms);
+                    continue;
+                },
+                .take => return self.take(uri, options, reused),
+            };
+            const stopped: anyerror = if (cancelled) error.Cancelled else error.ConnectionSetupTimedOut;
+            switch (self.handoff.stop()) {
+                .walk_away => debug_trace.logf("gateway", "open_job walked away err={s}", .{@errorName(stopped)}),
+                .close_handed => {
+                    // The open finished as the request stopped, so it closes
+                    // the connection itself.
+                    if (self.take(uri, options, reused)) |request| {
+                        var handed = request;
+                        handed.deinit();
+                        debug_trace.logf("gateway", "open_job closed a handed connection err={s}", .{@errorName(stopped)});
+                    } else |err| {
+                        debug_trace.logf("gateway", "open_job handed open failed err={s} stopped={s}", .{ @errorName(err), @errorName(stopped) });
+                    }
+                },
+            }
+            return stopped;
+        }
+    }
+
+    fn take(
+        self: *PooledOpenJob,
+        uri: std.Uri,
+        options: std.http.Client.RequestOptions,
+        reused: *bool,
+    ) anyerror!std.http.Client.Request {
+        defer self.destroy();
+        var request = try self.result;
+        request.uri = uri;
+        request.headers = options.headers;
+        request.extra_headers = options.extra_headers;
+        request.privileged_headers = options.privileged_headers;
+        reused.* = self.operation.reused;
+        return request;
+    }
+
+    fn destroy(self: *PooledOpenJob) void {
+        const gpa = self.gpa;
+        self.arena.deinit();
+        gpa.destroy(self);
+    }
+};
+
+/// How often a request checks on its pooled open.
+const pooled_open_poll_ms = 2;
+
+fn dupeUri(arena: std.mem.Allocator, uri: std.Uri) !std.Uri {
+    const Dupe = struct {
+        fn component(alloc: std.mem.Allocator, value: std.Uri.Component) !std.Uri.Component {
+            return switch (value) {
+                .raw => |text| .{ .raw = try alloc.dupe(u8, text) },
+                .percent_encoded => |text| .{ .percent_encoded = try alloc.dupe(u8, text) },
+            };
+        }
+    };
+    var copy = uri;
+    copy.scheme = try arena.dupe(u8, uri.scheme);
+    copy.path = try Dupe.component(arena, uri.path);
+    inline for (.{ "user", "password", "host", "query", "fragment" }) |field| {
+        if (@field(uri, field)) |value| @field(copy, field) = try Dupe.component(arena, value);
+    }
+    return copy;
+}
+
 fn openGatewayRequestBounded(
     client: *std.http.Client,
     pool: ?*http_pool.HttpPool,
@@ -1230,6 +1397,23 @@ fn openGatewayRequestBounded(
         return error.ConnectionSetupTimedOut;
     }
 
+    if (comptime !builtin.single_threaded) if (pool) |shared| {
+        const job = try PooledOpenJob.start(client, shared, uri, options, request_open_override);
+        var request = try job.waitForOpen(uri, options, epoch, cancel_flag, reused);
+        if (cancel_flag.load(.seq_cst)) {
+            request.deinit();
+            return error.Cancelled;
+        }
+        const result_now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+        if (!std.Io.Clock.Timestamp.compare(result_now, .lt, epoch.deadline)) {
+            request.deinit();
+            return error.ConnectionSetupTimedOut;
+        }
+        return request;
+    };
+
+    // A local client is freed when its request ends, so its open cannot be
+    // left running: Esc waits for it here.
     const Event = union(enum) {
         request: anyerror!std.http.Client.Request,
         watch: anyerror!select_watch.Outcome,
@@ -2890,16 +3074,9 @@ const HeaderMatch = struct {
     value: []const u8,
 };
 
+/// 429 and the 5xx statuses `types.isRetryableServerStatus` names.
 fn isRetryableGatewayStatus(status: std.http.Status) bool {
-    return switch (status) {
-        .too_many_requests,
-        .internal_server_error,
-        .bad_gateway,
-        .service_unavailable,
-        .gateway_timeout,
-        => true,
-        else => false,
-    };
+    return status == .too_many_requests or types.isRetryableServerStatus(@backingInt(status));
 }
 
 fn retryDelayNsForResponse(head: std.http.Client.Response.Head, attempt: usize) u64 {
@@ -2918,14 +3095,28 @@ fn retryAfterDelayNs(head: std.http.Client.Response.Head) ?u64 {
     return @min(delay, gateway_retry_after_max_ns);
 }
 
-fn retryAfterSeconds(head: std.http.Client.Response.Head) ?u64 {
+/// A response's Retry-After in whole seconds. Only digits count, as RFC 9110
+/// delay-seconds are written; a sign, a fraction, or the HTTP-date form
+/// reads as none.
+pub fn retryAfterSeconds(head: std.http.Client.Response.Head) ?u64 {
     const raw = findHeaderValue(head, "retry-after") orelse return null;
+    return parseRetryAfterSeconds(raw);
+}
+
+fn parseRetryAfterSeconds(raw: []const u8) ?u64 {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return null;
-    return std.fmt.parseInt(u64, trimmed, 10) catch |err| switch (err) {
-        error.Overflow => std.math.maxInt(u64),
-        error.InvalidCharacter => null,
-    };
+    for (trimmed) |byte| if (!std.ascii.isDigit(byte)) return null;
+    return std.fmt.parseInt(u64, trimmed, 10) catch std.math.maxInt(u64);
+}
+
+test "Retry-After counts only digits" {
+    try std.testing.expectEqual(@as(?u64, 5), parseRetryAfterSeconds(" 5 "));
+    try std.testing.expectEqual(@as(?u64, 0), parseRetryAfterSeconds("0"));
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), parseRetryAfterSeconds("99999999999999999999999"));
+    for ([_][]const u8{ "", "-5", "+5", "5.0", "5s", "Wed, 21 Oct 2026 07:28:00 GMT" }) |raw| {
+        try std.testing.expectEqual(@as(?u64, null), parseRetryAfterSeconds(raw));
+    }
 }
 
 fn findHeaderValue(head: std.http.Client.Response.Head, name: []const u8) ?[]const u8 {
@@ -3779,12 +3970,13 @@ fn errorBodyNamesQuota(alloc: std.mem.Allocator, body: []const u8) bool {
     return false;
 }
 
-/// An HTTP status an event carries in place of a code: 5xx (529 included) is
-/// transient, 429 a rate limit, and any other 4xx non-retryable.
+/// An HTTP status an event carries in place of a code: a 5xx
+/// `types.isRetryableServerStatus` names is transient, 429 a rate limit, and
+/// any other 4xx or 5xx non-retryable.
 fn httpStatusClass(status: u16) ?ErrorEventClass {
     if (status == 429) return .rate_limited;
-    if (status >= 500 and status <= 599) return .transient;
-    if (status >= 400 and status <= 499) return .non_retryable;
+    if (types.isRetryableServerStatus(status)) return .transient;
+    if (status >= 400 and status <= 599) return .non_retryable;
     return null;
 }
 
@@ -4427,8 +4619,14 @@ fn consumeSseStreamTraced(
         }
         const root = std.json.parseFromSliceLeaky(std.json.Value, event_arena.allocator(), json_text, .{}) catch |err| {
             if (err == error.OutOfMemory) return err;
+            // A duplicate key is valid JSON that fx refuses, so resending
+            // would get the same event back.
+            if (err == error.DuplicateField) {
+                debug_trace.logf("sse", "event type=duplicate_key bytes={d}", .{json_text.len});
+                return error.InvalidGatewaySseEvent;
+            }
             traceMalformedSseEvent(json_text.len);
-            return error.InvalidGatewaySseEvent;
+            return error.MalformedGatewaySseEvent;
         };
         traceParsedSseEvent(alloc, root, json_text.len);
         if (root != .object) continue;
@@ -4963,7 +5161,8 @@ test "provider framing rejects malformed Gateway JSON" {
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
-    try std.testing.expectError(error.InvalidGatewaySseEvent, consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancelled));
+    // Malformed, not too deep: the caller resends it like a dropped stream.
+    try std.testing.expectError(error.MalformedGatewaySseEvent, consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancelled));
     debug_trace.shutdown();
     const trace = try readTraceFileForTest(alloc, path);
     defer alloc.free(trace);
@@ -5091,6 +5290,88 @@ fn fuzzGatewayChunkedStream(_: void, smith: *std.testing.Smith) !void {
     try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
     try deltas.expectEqual(content.text.items, reasoning.text.items);
     try stream_fuzz.expectToolCall(completion.tool_calls, with_tool, "c1", arguments.text.items);
+}
+
+/// One Gateway event's data from fuzzed bytes: raw bytes, a valid event cut
+/// short at a fuzzed point, or brackets nested to a fuzzed depth, so each
+/// way an event can end a stream comes up often.
+fn fuzzedGatewayEventData(arena: std.mem.Allocator, smith: *std.testing.Smith) ![]u8 {
+    var data: std.ArrayList(u8) = .empty;
+    switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => {
+            var raw: [96]u8 = undefined;
+            try data.appendSlice(arena, raw[0..smith.slice(&raw)]);
+        },
+        1 => {
+            const event = "{\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"part\"}";
+            try data.appendSlice(arena, event[0..smith.valueRangeAtMost(u8, 0, event.len)]);
+        },
+        else => {
+            const depth = smith.valueRangeAtMost(u8, 0, json_depth.max_depth + 8);
+            const closers = smith.valueRangeAtMost(u8, 0, depth);
+            try data.appendNTimes(arena, '[', depth);
+            try data.appendNTimes(arena, ']', closers);
+        },
+    }
+    // One data line, so one event.
+    for (data.items) |*byte| if (byte.* == '\n' or byte.* == '\r') {
+        byte.* = ' ';
+    };
+    return data.items;
+}
+
+fn gatewayEventOutcome(wire: []const u8, read_buffer: []u8) anyerror!void {
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var fixed = std.Io.Reader.fixed(wire);
+    var source = fixed.limited(.unlimited, read_buffer);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var completion = try consumeSseStream(std.testing.allocator, &source.interface, undefined, Noop.chunk, null, &cancelled);
+    deinitGatewayCompletion(std.testing.allocator, &completion);
+}
+
+fn fuzzGatewayEventClass(_: void, smith: *std.testing.Smith) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const data = try fuzzedGatewayEventData(arena, smith);
+    const json_text = std.mem.trim(u8, data, " \t");
+    // An empty data line is skipped and `[DONE]` ends the stream.
+    if (json_text.len == 0 or std.mem.eql(u8, json_text, "[DONE]")) return;
+    const wire = try std.fmt.allocPrint(arena, "data: {s}\n\ndata: {{\"type\":\"finish\",\"finishReason\":{{\"unified\":\"stop\"}}}}\n\n", .{data});
+
+    var whole: [4096]u8 = undefined;
+    const outcome = gatewayEventOutcome(wire, &whole);
+    // The class of an event never depends on how its bytes arrive.
+    const cut = gatewayEventOutcome(wire, try stream_fuzz.readBuffer(arena, smith));
+    const name = struct {
+        fn of(result: anyerror!void) []const u8 {
+            return if (result) "ok" else |err| @errorName(err);
+        }
+    }.of;
+    try std.testing.expectEqualStrings(name(outcome), name(cut));
+
+    if (json_depth.exceeds(json_text)) {
+        // Too deep to parse safely: no resend can fix it.
+        try std.testing.expectError(error.InvalidGatewaySseEvent, outcome);
+    } else if (std.json.parseFromSliceLeaky(std.json.Value, arena, json_text, .{})) |_| {
+        // Readable JSON is never taken for a damaged event.
+        if (outcome) |_| {} else |err| try std.testing.expect(err != error.MalformedGatewaySseEvent);
+    } else |err| if (err == error.DuplicateField) {
+        // Valid JSON fx refuses: resending would get the same event back.
+        try std.testing.expectError(error.InvalidGatewaySseEvent, outcome);
+    } else {
+        // Damaged on the wire: resent as an unreadable reply.
+        try std.testing.expectError(error.MalformedGatewaySseEvent, outcome);
+        try std.testing.expect(networkFailureEvidence(error.MalformedGatewaySseEvent, .possibly_sent) != null);
+    }
+}
+
+test "a Gateway event that is not JSON is resent, a too-deep or duplicate-key one ends the turn, however its bytes arrive" {
+    try std.testing.fuzz({}, fuzzGatewayEventClass, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").gateway_event_class.*),
+    });
 }
 
 test "Gateway streams give the same result however they are cut into events and reads" {
@@ -6564,6 +6845,11 @@ test "gateway retry policy covers rate limits and transient server errors" {
     try std.testing.expect(isRetryableGatewayStatus(.bad_gateway));
     try std.testing.expect(isRetryableGatewayStatus(.service_unavailable));
     try std.testing.expect(isRetryableGatewayStatus(.gateway_timeout));
+    var code: u16 = 100;
+    while (code <= 999) : (code += 1) {
+        const status: std.http.Status = @fromBackingInt(@intCast(code));
+        try std.testing.expectEqual(code == 429 or (code >= 500 and code <= 599 and code != 501 and code != 505), isRetryableGatewayStatus(status));
+    }
     try std.testing.expect(!isRetryableGatewayStatus(.bad_request));
     try std.testing.expect(!isRetryableGatewayStatus(.unauthorized));
     try std.testing.expect(!isRetryableGatewayStatus(.forbidden));
@@ -10870,4 +11156,302 @@ test "host-managed Gateway chat omits authentication-owned headers" {
     try std.testing.expect(fixture.capturedHeaderValue("authorization") == null);
     try std.testing.expect(fixture.capturedHeaderValue(vercel_ai_gateway_team_header) == null);
     try std.testing.expectEqualStrings(user_agent, fixture.capturedHeaderValue("user-agent").?);
+}
+
+test "a stream event that is not JSON is an unreadable reply, and a too-deep or duplicate-key one still ends" {
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var reader = std.Io.Reader.fixed("data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"partial\"}\n\ndata: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"\x01garb\n\n");
+    const garbled = if (consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag)) |completion| blk: {
+        var owned = completion;
+        deinitGatewayCompletion(std.testing.allocator, &owned);
+        break :blk error.TestExpectedStreamError;
+    } else |err| err;
+    const evidence = networkFailureEvidence(garbled, .possibly_sent) orelse return error.TestExpectedNetworkFailureEvidence;
+    try std.testing.expectEqual(agent_stream_provider.NetworkFailureCause.unreadable_reply, evidence.cause);
+
+    const deep = "data: " ++ text_utils.repeat("[", 300) ++ text_utils.repeat("]", 300) ++ "\n\n";
+    var deep_reader = std.Io.Reader.fixed(deep);
+    const too_deep = if (consumeSseStream(std.testing.allocator, &deep_reader, undefined, Noop.chunk, null, &cancel_flag)) |completion| blk: {
+        var owned = completion;
+        deinitGatewayCompletion(std.testing.allocator, &owned);
+        break :blk error.TestExpectedStreamError;
+    } else |err| err;
+    try std.testing.expectEqual(error.InvalidGatewaySseEvent, too_deep);
+    try std.testing.expect(networkFailureEvidence(too_deep, .possibly_sent) == null);
+
+    var duplicate_reader = std.Io.Reader.fixed("data: {\"type\":\"text-delta\",\"type\":\"finish\"}\n\n");
+    const duplicate = if (consumeSseStream(std.testing.allocator, &duplicate_reader, undefined, Noop.chunk, null, &cancel_flag)) |completion| blk: {
+        var owned = completion;
+        deinitGatewayCompletion(std.testing.allocator, &owned);
+        break :blk error.TestExpectedStreamError;
+    } else |err| err;
+    try std.testing.expectEqual(error.InvalidGatewaySseEvent, duplicate);
+    try std.testing.expect(networkFailureEvidence(duplicate, .possibly_sent) == null);
+}
+
+test "an unreadable stream event from any provider is an unreadable reply" {
+    for ([_]anyerror{
+        error.MalformedGatewaySseEvent,
+        error.MalformedOpenAICodexSseEvent,
+        error.MalformedXaiGrokSseEvent,
+        error.MalformedChatCompletionsChunk,
+    }) |err| {
+        const evidence = networkFailureEvidence(err, .possibly_sent) orelse return error.TestExpectedNetworkFailureEvidence;
+        try std.testing.expectEqual(agent_stream_provider.NetworkFailureCause.unreadable_reply, evidence.cause);
+    }
+}
+
+test "a connection that timed out before opening is offline" {
+    const evidence = networkFailureEvidence(error.ConnectionSetupTimedOut, .definitely_unsent) orelse return error.TestExpectedNetworkFailureEvidence;
+    try std.testing.expectEqual(agent_stream_provider.NetworkFailureCause.connectivity_lost, evidence.cause);
+}
+
+/// A connection open whose DNS lookup ignores cancellation, as getaddrinfo
+/// does, until the test releases it; it then connects for real.
+const StuckLookupOpen = struct {
+    entered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+
+    fn override(self: *StuckLookupOpen) RequestOpenOverride {
+        return .{ .ctx = self, .run = run };
+    }
+
+    fn run(
+        raw: *anyopaque,
+        client: *std.http.Client,
+        method: std.http.Method,
+        uri: std.Uri,
+        options: std.http.Client.RequestOptions,
+    ) anyerror!std.http.Client.Request {
+        const self: *StuckLookupOpen = @ptrCast(@alignCast(raw));
+        self.entered.store(true, .seq_cst);
+        while (!self.release.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+        return client.request(method, uri, options);
+    }
+
+    fn waitEntered(self: *StuckLookupOpen) void {
+        while (!self.entered.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+    }
+};
+
+/// A loopback listener and the pool a pooled-open test opens through. Set up
+/// in place, since the pool's client must not move.
+const PooledOpenFixture = struct {
+    server: std.Io.net.Server,
+    url: []u8,
+    pool: http_pool.HttpPool,
+
+    fn init(self: *PooledOpenFixture) !void {
+        const zio = io_mod.getIo();
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.server = try address.listen(zio, .{ .reuse_address = true });
+        errdefer self.server.deinit(zio);
+        self.url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{self.server.socket.address.getPort()});
+        self.pool = http_pool.HttpPool.init(std.testing.allocator);
+    }
+
+    fn deinit(self: *PooledOpenFixture) void {
+        _ = self.pool.deinit();
+        std.testing.allocator.free(self.url);
+        self.server.deinit(io_mod.getIo());
+    }
+};
+
+fn waitForOpenJobs(pool: *http_pool.HttpPool) !void {
+    var waited_ms: usize = 0;
+    while (pool.open_jobs.load(.acquire) != 0) : (waited_ms += 1) {
+        if (waited_ms > 5_000) return error.TestOpenJobStillRunning;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
+test "Esc walks away from a pooled open stuck in its lookup, and the late connection goes back to the pool" {
+    const zio = io_mod.getIo();
+    var fixture: PooledOpenFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const url = fixture.url;
+    const pool = &fixture.pool;
+
+    var stuck: StuckLookupOpen = .{};
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Esc = struct {
+        fn run(lookup: *StuckLookupOpen, flag: *std.atomic.Value(bool)) void {
+            lookup.waitEntered();
+            flag.store(true, .seq_cst);
+        }
+    };
+    const esc = try std.Thread.spawn(.{}, Esc.run, .{ &stuck, &cancel_flag });
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+    var reused = false;
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    const result = openGatewayRequestBounded(&pool.client, pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+    esc.join();
+
+    try std.testing.expectError(error.Cancelled, result);
+    try std.testing.expect(elapsed_ms < 500);
+    // The lookup is still stuck, and its job still owns the open.
+    try std.testing.expectEqual(@as(u32, 1), pool.open_jobs.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+
+    stuck.release.store(true, .seq_cst);
+    try waitForOpenJobs(pool);
+    // Nothing was sent on the late connection, so the job released it to the
+    // pool instead of leaking it; the testing allocator checks the job freed
+    // itself.
+    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
+}
+
+test "the setup deadline walks away from a pooled open stuck in its lookup" {
+    const zio = io_mod.getIo();
+    var fixture: PooledOpenFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const url = fixture.url;
+    const pool = &fixture.pool;
+
+    var stuck: StuckLookupOpen = .{};
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 80 });
+    var reused = false;
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    const result = openGatewayRequestBounded(&pool.client, pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+
+    try std.testing.expectError(error.ConnectionSetupTimedOut, result);
+    try std.testing.expect(elapsed_ms < 400);
+    stuck.release.store(true, .seq_cst);
+    try waitForOpenJobs(pool);
+}
+
+/// Starts a pooled open stuck in its lookup and walks away from it at the
+/// setup deadline, so the pool has a running job and nothing else.
+fn leaveStuckOpenJob(pool: *http_pool.HttpPool, url: []const u8, stuck: *StuckLookupOpen) !void {
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 50 });
+    var reused = false;
+    const result = openGatewayRequestBounded(&pool.client, pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    try std.testing.expectError(error.ConnectionSetupTimedOut, result);
+    try std.testing.expectEqual(@as(u32, 1), pool.open_jobs.load(.acquire));
+}
+
+test "shutting the pool down waits for a connect job that finishes in time" {
+    const zio = io_mod.getIo();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(url);
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    var stuck: StuckLookupOpen = .{};
+    try leaveStuckOpenJob(&pool, url, &stuck);
+
+    const Release = struct {
+        fn run(lookup: *StuckLookupOpen) void {
+            io_mod.sleep(100 * std.time.ns_per_ms);
+            lookup.release.store(true, .seq_cst);
+        }
+    };
+    const release = try std.Thread.spawn(.{}, Release.run, .{&stuck});
+    defer release.join();
+    // The job returns its late connection to the pool and leaves before the
+    // wait runs out, so the pool frees everything; the testing allocator
+    // checks that nothing leaked.
+    try std.testing.expectEqual(http_pool.HttpPool.DestroyDisposition.destroyed, pool.deinit());
+}
+
+test "shutting the pool down leaves a connect job that is still stuck rather than freeing it" {
+    const zio = io_mod.getIo();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(url);
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    var stuck: StuckLookupOpen = .{};
+    try leaveStuckOpenJob(&pool, url, &stuck);
+
+    // The job still uses the client, so the pool gives up on it instead of
+    // freeing memory under it.
+    try std.testing.expectEqual(http_pool.HttpPool.DestroyDisposition.abandoned_open_job, pool.deinit());
+    stuck.release.store(true, .seq_cst);
+    try waitForOpenJobs(&pool);
+    // Once the job is gone the test frees what the pool left behind.
+    pool.client.deinit();
+}
+
+test "a pooled open hands over a request that carries the caller's URI and headers" {
+    var fixture: PooledOpenFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const url = fixture.url;
+    const pool = &fixture.pool;
+
+    const uri = try std.Uri.parse(url);
+    const extra = [_]std.http.Header{.{ .name = "x-fx-test", .value = "kept" }};
+    const options: std.http.Client.RequestOptions = .{
+        .headers = .{ .authorization = .{ .override = "Bearer test" } },
+        .extra_headers = &extra,
+    };
+    var stuck: StuckLookupOpen = .{};
+    stuck.release.store(true, .seq_cst);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+    var reused = true;
+    var request = try openGatewayRequestBounded(&pool.client, pool, uri, options, stuck.override(), &epoch, &cancel_flag, &reused);
+    defer request.deinit();
+
+    try std.testing.expect(!reused);
+    // The job's own copies are freed with it; the request points at the
+    // caller's again.
+    const text = struct {
+        fn of(component: std.Uri.Component) []const u8 {
+            return switch (component) {
+                .raw, .percent_encoded => |value| value,
+            };
+        }
+    }.of;
+    try std.testing.expectEqual(text(uri.host.?).ptr, text(request.uri.host.?).ptr);
+    try std.testing.expectEqual(@as([*]const std.http.Header, &extra), request.extra_headers.ptr);
+    try std.testing.expectEqualStrings("Bearer test", request.headers.authorization.override);
+    try waitForOpenJobs(pool);
+}
+
+test "two hundred Esc presses during stuck lookups leave no job or connection behind" {
+    const zio = io_mod.getIo();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(url);
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    const Esc = struct {
+        fn run(lookup: *StuckLookupOpen, flag: *std.atomic.Value(bool)) void {
+            lookup.waitEntered();
+            flag.store(true, .seq_cst);
+            lookup.release.store(true, .seq_cst);
+        }
+    };
+    for (0..200) |_| {
+        var stuck: StuckLookupOpen = .{};
+        var cancel_flag = std.atomic.Value(bool).init(false);
+        const esc = try std.Thread.spawn(.{}, Esc.run, .{ &stuck, &cancel_flag });
+        var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+        var reused = false;
+        const result = openGatewayRequestBounded(&pool.client, &pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+        esc.join();
+        // Esc and the late open race: the request either walked away or
+        // closed what it was handed. Either way it ends cancelled.
+        try std.testing.expectError(error.Cancelled, result);
+        try waitForOpenJobs(&pool);
+    }
+    // Every late connection went back to the pool, which keeps a bounded
+    // number; the testing allocator checks no job leaked.
+    try std.testing.expect(pool.freeConnectionCount() <= pool.client.connection_pool.free_size);
 }

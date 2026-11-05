@@ -1304,6 +1304,7 @@ fn resumeTerminalAfterJobControl(
     try terminal.captureOriginalTermios();
     try terminal.enableRawMode();
     try enableInteractiveTerminalModes(shell, metrics);
+    debug_trace.logf("app", "event=job_control_resume_redraw dropped=terminal_screen_and_scrollback reason=resumed_after_suspend", .{});
     try shell.requestTerminalReset(metrics);
     shell.render_requests.request(.first_frame);
 }
