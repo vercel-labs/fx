@@ -1263,7 +1263,7 @@ fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessi
     const task = session.title_task orelse return;
     session.title_task = null;
     defer task.destroy();
-    task.join();
+    task.joinOrCancel(&session.cancel_flag);
     const title = task.takeTitle() orelse return;
     defer std.heap.c_allocator.free(title);
     session.session_write_mutex.lockUncancelable(io_mod.getIo());

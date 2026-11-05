@@ -1589,6 +1589,49 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP cancel on the first prompt does not wait for a title request that never answers",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-title-cancel-");
+      const chatRequest = deferred<void>();
+      const titleRequest = deferred<void>();
+      // Neither request ever gets response headers.
+      const gateway = startDynamicFakeGateway(() => {
+        chatRequest.resolve();
+        return new Promise<Response>(() => {});
+      }, {
+        titleResponses: [() => {
+          titleRequest.resolve();
+          return new Promise<Response>(() => {});
+        }],
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        sendPrompt(client, 3, "Name this conversation for me.");
+        await Promise.all([chatRequest.promise, titleRequest.promise]);
+        const cancelledAt = Date.now();
+        client.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
+        // The title call's own deadline is 15 s, so a reply that waits for
+        // it lands far past this bound.
+        const reply = await readResponse(client, 3, 8_000);
+        expect(Date.now() - cancelledAt).toBeLessThan(2_000);
+        expect(reply.result.stopReason).toBe("cancelled");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session/new advertises no unsupported slash commands",
     async () => {
       const root = createIsolatedRoot("fx-acp-available-commands-");
