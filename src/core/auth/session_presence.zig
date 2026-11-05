@@ -86,6 +86,8 @@ fn profileFileFromHome(
     defer file.close(io_mod.getIo());
 
     const stat = file.stat(io_mod.getIo()) catch return .unavailable;
+    // Deleted after it was opened, as another fx's logout does.
+    if (stat.nlink == 0) return .missing;
     if (stat.kind != .file or
         stat.nlink != 1 or
         stat.permissions.toMode() & 0o077 != 0 or

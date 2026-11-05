@@ -154,6 +154,11 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
             defer file.close(io_mod.getIo());
 
             const stat = file.stat(io_mod.getIo()) catch |err| return session_presence.storageError(spec.auth_file_name, err);
+            // Deleted after it was opened, as another fx's logout does.
+            if (stat.nlink == 0) {
+                debug_trace.logf("auth", spec.trace_label ++ " session file removed while it was read; none is saved", .{});
+                return null;
+            }
             if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
                 debug_trace.logf("auth", spec.trace_label ++ " session load failed step=permissions err=InsecureAuthFile", .{});
                 return error.InsecureAuthFile;
