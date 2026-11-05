@@ -2075,6 +2075,38 @@ describe("MCP login", () => {
     expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials-v3.json"))).toBe(false);
   }, 60_000);
 
+  // A logout that can't remove the saved login says so: every other fx, and
+  // the next one, would still sign in with it.
+  test("a logout that can't remove the saved login says so, and fx mcp logout fails", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const storePath = seedV2Credential(root, auth);
+    // Readable, but fx won't replace a file it isn't allowed to write.
+    chmodSync(storePath, 0o400);
+    const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Signed out of fixture here, but couldn't remove its saved login: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. Sign out again once that's fixed.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  test("a logout while another fx keeps the saved logins busy changes nothing and says so", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const storePath = seedV2Credential(root, auth);
+    // Private, as fx makes it.
+    writeFileSync(join(root.home, ".fx", "mcp-credentials", "credentials-v3.lock"), "", { mode: 0o600 });
+    const holder = await holdStoreLock(root, 8);
+    const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    holder.kill();
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Couldn't sign out of fixture: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: another fx kept it busy. Try again once that's fixed.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("a refreshed login that can't be saved says so in the shell, and keeps working there", async () => {
     upstream = startModernMcpHttpFixture("json");
     const options: { rejectRefresh?: boolean } = {};

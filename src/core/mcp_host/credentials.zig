@@ -74,6 +74,19 @@ pub const Store = struct {
         };
     }
 
+    /// Why the store couldn't be written, for a notice: "<place> couldn't be
+    /// written: <why>", held in `buffer`.
+    pub fn writeFailure(s: Store, buffer: []u8, err: anyerror) []const u8 {
+        const why: []const u8 = switch (err) {
+            error.CredentialStoreUnreadable => "a newer fx saved it, or it's damaged",
+            error.LockBusy => "another fx kept it busy",
+            error.AccessDenied => "fx isn't allowed to write it",
+            error.KeychainReadFailed, error.KeychainWriteFailed => "the Keychain refused it or didn't answer",
+            else => @errorName(err),
+        };
+        return std.mem.print(buffer, "{s} couldn't be written: {s}", .{ s.place(), why }) catch "the saved MCP sign-ins couldn't be written";
+    }
+
     /// The credential saved under `key`, or null, also when the store can't be
     /// read. The caller owns it and frees it with `secret.zeroAndFree`.
     pub fn get(s: Store, alloc: Allocator, key: Key) !?[]u8 {
@@ -394,6 +407,15 @@ test "one snapshot holds every server's credential" {
     // A credential is kept per name and URL.
     try testing.expectEqual(@as(?[]const u8, null), saved.get(.{ .name = "plain", .url = "https://mcp.linear.app/mcp" }));
     try testing.expectEqual(@as(?[]const u8, null), saved.get(.{ .name = "slack", .url = "https://mcp.slack.com/mcp" }));
+}
+
+test "a store that can't be written says where and why in words" {
+    var buffer: [320]u8 = undefined;
+    const file: Store = .{ .home = "/home/example", .backend = .file };
+    try testing.expectEqualStrings("~/.fx/mcp-credentials/credentials-v3.json couldn't be written: another fx kept it busy", file.writeFailure(&buffer, error.LockBusy));
+    try testing.expectEqualStrings("~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it", file.writeFailure(&buffer, error.AccessDenied));
+    const keychain: Store = .{ .home = "/home/example", .backend = .keychain };
+    try testing.expectEqualStrings("the Keychain item " ++ native_keychain.mcp_host_credentials_service_name ++ " couldn't be written: the Keychain refused it or didn't answer", keychain.writeFailure(&buffer, error.KeychainWriteFailed));
 }
 
 test "a credential is kept per server name and URL, replaced, and removed" {

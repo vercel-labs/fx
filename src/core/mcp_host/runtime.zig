@@ -221,6 +221,8 @@ const Request = struct {
     note: ?mcp_contract.Progress = null,
     /// Guarded by `Runtime.mutex`: a question waiting for the caller to ask.
     question: ?Pending = null,
+    /// Set by the owner before a logout ends: why the saved login stayed.
+    logout_kept: ?anyerror = null,
     /// Owner thread only: fx declined the server's question, so the call's
     /// cancellation is fx's answer, not the user's.
     declined: bool = false,
@@ -682,9 +684,12 @@ pub const Runtime = struct {
     }
 
     /// Signs out: the token is revoked where the server can, and forgotten.
-    pub fn logout(r: *Runtime, server: []const u8) Error!void {
+    /// Returns why the saved login couldn't be removed, if it couldn't: this
+    /// fx is signed out, but every other fx, and the next one, still has it.
+    pub fn logout(r: *Runtime, server: []const u8) Error!?anyerror {
         var req: Request = .{ .kind = .{ .logout = server }, .alloc = r.gpa };
         try r.submitOk(&req);
+        return req.logout_kept;
     }
 
     /// Every server that needs a login takes one saved since by another fx,
@@ -1034,10 +1039,13 @@ pub const Runtime = struct {
                 defer if (saved) |c| secret.zeroAndFree(r.gpa, c);
                 // The saved login goes first: a store that can't be read leaves
                 // the session signed in rather than half signed out.
-                _ = r.options.credentials.store.remove(r.gpa, s.credentialKey()) catch |err| switch (err) {
+                if (r.options.credentials.store.remove(r.gpa, s.credentialKey())) |_| {} else |err| switch (err) {
                     error.CredentialStoreUnreadable => return r.finish(req, .{ .failed = error.CredentialStoreUnreadable }),
-                    else => debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) }),
-                };
+                    else => {
+                        debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) });
+                        req.logout_kept = err;
+                    },
+                }
                 try r.engine.signOut(s.name);
                 if (saved) |c| if (!r.holds(i, c) and try r.engine.adoptCredential(s.name, c)) {
                     debug_trace.logf("mcp", "MCP logout also revokes server={s} reason=another fx saved a newer login", .{s.name});
@@ -1599,7 +1607,7 @@ pub const Runtime = struct {
                 if (r.flags[i].not_saved) return;
                 r.flags[i].not_saved = true;
                 var buf: [320]u8 = undefined;
-                r.notify(.{ .not_saved = .{ .server = s.name, .reason = notSavedReason(&buf, r.options.credentials.store, err) } });
+                r.notify(.{ .not_saved = .{ .server = s.name, .reason = r.options.credentials.store.writeFailure(&buf, err) } });
             }
         } else {
             // The tokens are gone, so this process is signed out whatever
@@ -2227,15 +2235,6 @@ fn declaredCapabilities(questions: elicitation.Capabilities) []const u8 {
 }
 
 /// Why a new login wasn't saved, in words.
-fn notSavedReason(buffer: []u8, store: credentials.Store, err: anyerror) []const u8 {
-    const why: []const u8 = switch (err) {
-        error.CredentialStoreUnreadable => "a newer fx saved it, or it's damaged",
-        error.LockBusy => "another fx kept it busy",
-        else => @errorName(err),
-    };
-    return std.mem.print(buffer, "{s} couldn't be written: {s}", .{ store.place(), why }) catch "the saved MCP sign-ins couldn't be written";
-}
-
 /// Why a sign-in failed, in words, with the authorization server's own when
 /// it gave some.
 fn signInFailure(buffer: []u8, why: mcp.auth.client.Failure, message: ?[]const u8) []const u8 {

@@ -912,6 +912,13 @@ fn unreadableLogins(c: Context, arena: Allocator, doing: []const u8, name: []con
     return 1;
 }
 
+/// A sign-out that changed nothing, since the saved sign-ins couldn't be changed.
+fn notSignedOut(c: Context, arena: Allocator, name: []const u8, store: credentials.Store, err: anyerror) !u8 {
+    var buffer: [320]u8 = undefined;
+    try c.err.print("Couldn't sign out of {s}: {s}. Try again once that's fixed.\n", .{ try safe(arena, name), store.writeFailure(&buffer, err) });
+    return 1;
+}
+
 fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
     const host = (try c.hosts.get(c.hosts.context, null)) orelse return missing(c, arena, name);
     defer c.hosts.release(c.hosts.context, host);
@@ -921,19 +928,35 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
         return 1;
     }
     const was = findStatus(try host.runtime.statuses(arena), name) orelse return missing(c, arena, name);
+    const store = credentials.Store.detect(arena, c.home);
     // There's a login to sign out of when one is saved, by this fx or
     // another, or this session holds one. A running server needn't have one.
-    const saved = try credentials.Store.detect(arena, c.home).get(arena, server.credentialKey());
+    const saved = store.get(arena, server.credentialKey()) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return notSignedOut(c, arena, name, store, err),
+    };
     defer if (saved) |v| secret.zeroAndFree(arena, v);
-    host.runtime.logout(name) catch |err| switch (err) {
+    const kept: ?anyerror = host.runtime.logout(name) catch |err| switch (err) {
         // A held server isn't in the engine; its saved login still goes.
-        error.UnknownServer => _ = credentials.Store.detect(arena, c.home).remove(arena, server.credentialKey()) catch |e| switch (e) {
-            error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
-            else => false,
+        error.UnknownServer => held: {
+            _ = store.remove(arena, server.credentialKey()) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
+                else => break :held e,
+            };
+            break :held null;
         },
         error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
         else => return err,
     };
+    if (kept) |err| {
+        if (saved == null and !was.signed_in) return notSignedOut(c, arena, name, store, err);
+        var buffer: [320]u8 = undefined;
+        try c.err.print("Signed out of {s} here, but couldn't remove its saved login: {s}. Sign out again once that's fixed.\n", .{
+            try safe(arena, name), store.writeFailure(&buffer, err),
+        });
+        return 1;
+    }
     if (saved != null or was.signed_in) {
         try c.out.print("Signed out of {s}.\n", .{try safe(arena, name)});
     } else {
