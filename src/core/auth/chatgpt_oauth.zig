@@ -410,6 +410,9 @@ fn refreshSession(
     try body.writer.writeAll(",\"grant_type\":\"refresh_token\",\"refresh_token\":");
     try std.json.Stringify.value(session.refresh_token, .{}, &body.writer);
     try body.writer.writeByte('}');
+    // The request has its whole budget from a fresh stamp, so another fx
+    // waits for this one however slowly the issuer answers.
+    mutation.restamp();
     var token = requestRefreshToken(alloc, transport, body.written()) catch |err| switch (err) {
         error.CredentialRefreshRejected,
         error.InvalidChatGptOAuthResponse,
