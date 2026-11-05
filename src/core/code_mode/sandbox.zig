@@ -83,9 +83,12 @@ const message = struct {
     const unconfined = "The sandbox could not lock its process down on this system, so fx did not run the program.";
     const refused = "The sandbox stopped the program because the engine made a system call that code mode does not allow.";
     const out_of_resources = "The program used up its CPU time or memory and was stopped.";
+    const killed = "The sandbox process was killed before it reported an outcome.";
     const crashed = "The JavaScript engine crashed while running the program.";
     const no_outcome = "The sandbox process exited without reporting an outcome.";
     const bad_outcome = "The sandbox process sent an outcome fx could not read.";
+    /// The child's outcome when the size message itself can't be formatted.
+    const return_too_large = "The return value is too large to send back. Return less, such as a summary or the first items.";
 };
 
 /// The child's outcome frame.
@@ -212,10 +215,18 @@ fn readBefore(io: std.Io, file: std.Io.File, buffer: []u8, deadline_ms: i64) Awa
 
 fn describeExit(term: std.process.Child.Term) []const u8 {
     return switch (term) {
-        .exited => |code| if (code == @backingInt(ChildExit.unconfined)) message.unconfined else message.no_outcome,
+        .exited => |code| switch (code) {
+            @backingInt(ChildExit.unconfined) => message.unconfined,
+            @backingInt(ChildExit.out_of_memory) => message.out_of_resources,
+            else => message.no_outcome,
+        },
         .signal => |signal| switch (signal) {
             .SYS => message.refused,
-            .KILL, .XCPU => message.out_of_resources,
+            // The CPU limit on macOS. On Linux it kills the process instead.
+            .XCPU => message.out_of_resources,
+            // fx itself kills a child that closed its output without an
+            // outcome, so a kill doesn't say the program ran out of anything.
+            .KILL => message.killed,
             else => message.crashed,
         },
         .stopped, .unknown => message.crashed,
@@ -299,7 +310,7 @@ fn writeOutcome(gpa: std.mem.Allocator, writer: *std.Io.Writer, outcome: engine.
     const frame: OutcomeFrame = switch (outcome) {
         .returned => |json| if (json != null and json.?.len > max_outcome_text_bytes) .{
             .outcome = .threw,
-            .text = std.mem.print(&too_large_buffer, "The return value is {d} bytes as JSON, over the {d}-byte limit. Return less, such as a summary or the first items.", .{ json.?.len, max_outcome_text_bytes }) catch unreachable,
+            .text = std.mem.print(&too_large_buffer, "The return value is {d} bytes as JSON, over the {d}-byte limit. Return less, such as a summary or the first items.", .{ json.?.len, max_outcome_text_bytes }) catch message.return_too_large,
         } else .{ .outcome = .returned, .text = json },
         .threw => |text| .{ .outcome = .threw, .text = text_utils.utf8PrefixByBytes(text, max_outcome_text_bytes) },
         .timed_out => .{ .outcome = .timed_out },
@@ -404,11 +415,12 @@ test "the parent does not wait on a child that keeps running" {
     const outcome = "{\"outcome\":\"returned\",\"text\":\"1\"}";
     var outcome_script_buffer: [128]u8 = undefined;
     const outcome_script = try std.mem.print(&outcome_script_buffer, "printf '\\{o:0>3}\\000\\000\\000%s' '{s}'; exec sleep 30", .{ outcome.len, outcome });
-    const cases = [_]struct { script: []const u8, returned: bool }{
+    const cases = [_]struct { script: []const u8, returned: bool, failure: []const u8 = "" }{
         // A frame header over the limit, then no body.
-        .{ .script = "printf '\\377\\377\\377\\177'; exec sleep 30", .returned = false },
-        // No frame at all, with stdout closed.
-        .{ .script = "exec 1>&-; exec sleep 30", .returned = false },
+        .{ .script = "printf '\\377\\377\\377\\177'; exec sleep 30", .returned = false, .failure = message.bad_outcome },
+        // No frame at all, with stdout closed. fx kills it, and says so
+        // rather than blaming the program's resources.
+        .{ .script = "exec 1>&-; exec sleep 30", .returned = false, .failure = message.killed },
         // A valid outcome, then no exit.
         .{ .script = outcome_script, .returned = true },
     };
@@ -429,8 +441,23 @@ test "the parent does not wait on a child that keeps running" {
             try std.testing.expectEqualStrings("1", result.returned.?);
         } else {
             try std.testing.expect(result == .failed);
+            try std.testing.expectEqualStrings(case.failure, result.failed);
         }
     }
+}
+
+test "a sandbox child that stops without an outcome gets a reason a model can act on" {
+    const cases = [_]struct { term: std.process.Child.Term, reason: []const u8 }{
+        .{ .term = .{ .exited = @backingInt(ChildExit.unconfined) }, .reason = message.unconfined },
+        .{ .term = .{ .exited = @backingInt(ChildExit.out_of_memory) }, .reason = message.out_of_resources },
+        .{ .term = .{ .exited = @backingInt(ChildExit.bad_frame) }, .reason = message.no_outcome },
+        .{ .term = .{ .exited = @backingInt(ChildExit.write_failed) }, .reason = message.no_outcome },
+        .{ .term = .{ .signal = .SYS }, .reason = message.refused },
+        .{ .term = .{ .signal = .XCPU }, .reason = message.out_of_resources },
+        .{ .term = .{ .signal = .KILL }, .reason = message.killed },
+        .{ .term = .{ .signal = .SEGV }, .reason = message.crashed },
+    };
+    for (cases) |case| try std.testing.expectEqualStrings(case.reason, describeExit(case.term));
 }
 
 test "the sandbox child reads its limits only from well-formed arguments" {
