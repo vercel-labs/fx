@@ -78,10 +78,15 @@ pub const Store = struct {
     /// written: <why>", held in `buffer`.
     pub fn writeFailure(s: Store, buffer: []u8, err: anyerror) []const u8 {
         const why: []const u8 = switch (err) {
-            error.CredentialStoreUnreadable => "a newer fx saved it, or it's damaged",
+            // A store over fx's size limit is one fx can't read either.
+            error.CredentialStoreUnreadable, error.StreamTooLong => "a newer fx saved it, or it's damaged",
             error.LockBusy => "another fx kept it busy",
             error.AccessDenied => "fx isn't allowed to write it",
-            error.KeychainReadFailed, error.KeychainWriteFailed => "the Keychain refused it or didn't answer",
+            error.PrivateStatePermissionsUnsupported => "its permissions let others read it, or fx can't make them private",
+            error.DurablePathUnsafe => "it isn't a plain file",
+            error.NoSpaceLeft, error.DiskQuota => "the disk is full",
+            error.ReadOnlyFileSystem => "its disk is read-only",
+            error.KeychainReadFailed, error.KeychainWriteFailed, error.KeychainDeleteFailed => "the Keychain refused it or didn't answer",
             else => @errorName(err),
         };
         return std.mem.print(buffer, "{s} couldn't be written: {s}", .{ s.place(), why }) catch "the saved MCP sign-ins couldn't be written";
@@ -414,6 +419,8 @@ test "a store that can't be written says where and why in words" {
     const file: Store = .{ .home = "/home/example", .backend = .file };
     try testing.expectEqualStrings("~/.fx/mcp-credentials/credentials-v3.json couldn't be written: another fx kept it busy", file.writeFailure(&buffer, error.LockBusy));
     try testing.expectEqualStrings("~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it", file.writeFailure(&buffer, error.AccessDenied));
+    try testing.expectEqualStrings("~/.fx/mcp-credentials/credentials-v3.json couldn't be written: a newer fx saved it, or it's damaged", file.writeFailure(&buffer, error.StreamTooLong));
+    try testing.expectEqualStrings("~/.fx/mcp-credentials/credentials-v3.json couldn't be written: the disk is full", file.writeFailure(&buffer, error.NoSpaceLeft));
     const keychain: Store = .{ .home = "/home/example", .backend = .keychain };
     try testing.expectEqualStrings("the Keychain item " ++ native_keychain.mcp_host_credentials_service_name ++ " couldn't be written: the Keychain refused it or didn't answer", keychain.writeFailure(&buffer, error.KeychainWriteFailed));
 }
