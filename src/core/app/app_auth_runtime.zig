@@ -76,12 +76,14 @@ fn hostManagesAuth(app: anytype) bool {
 
 const TeamCatalogValidation = union(enum) {
     rejected,
+    /// fx could not connect to load the team's catalog.
+    catalog_unreachable,
     accepted: ?[]u8,
 
     fn deinit(self: *TeamCatalogValidation, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .accepted => |model| if (model) |owned| alloc.free(owned),
-            .rejected => {},
+            .rejected, .catalog_unreachable => {},
         }
         self.* = undefined;
     }
@@ -1401,10 +1403,20 @@ pub fn Runtime(comptime App: type) type {
                 .catalog => |catalog| catalog,
                 .failure => |failure| {
                     debug_trace.logf("provider", "catalog rejected provider={t} category={t}", .{ target, failure.category });
+                    // A connection fx could not make is named as one.
+                    const unreachable_body = if (failure.category == .transport)
+                        try app.alloc.print("{s}fx couldn't connect to {s} to load {s}. Check your network connection or firewall. The current provider is unchanged.", .{
+                            if (intent == .post_oauth) "Subscription sign-in completed, but " else "",
+                            model_catalog.serviceName(target),
+                            if (intent == .post_oauth) "its model catalog" else "the target provider catalog",
+                        })
+                    else
+                        null;
+                    defer if (unreachable_body) |body| app.alloc.free(body);
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .@"error",
-                        .body = if (failure.category == .cancellation) "Provider switching was cancelled. The current provider is unchanged." else providerFailureMessage(intent, "The target provider catalog could not be validated. The current provider is unchanged.", "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged."),
+                        .body = unreachable_body orelse if (failure.category == .cancellation) "Provider switching was cancelled. The current provider is unchanged." else providerFailureMessage(intent, "The target provider catalog could not be validated. The current provider is unchanged.", "Subscription sign-in completed, but its model catalog could not be validated. The current provider is unchanged."),
                     }, true);
                     return false;
                 },
@@ -1696,13 +1708,16 @@ pub fn Runtime(comptime App: type) type {
             const team = selection.teams.items[index];
             const body = try app.alloc.print("Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
             defer app.alloc.free(body);
-            if (validation == .rejected) {
+            if (validation == .rejected or validation == .catalog_unreachable) {
                 cancelPromptRetryAfterAuth(app, agent);
                 app.auth.closePicker(app.alloc);
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "The selected Vercel team could not be validated for AI Gateway. The current team is unchanged.",
+                    .body = if (validation == .catalog_unreachable)
+                        "fx couldn't connect to AI Gateway to validate the selected Vercel team. Check your network connection or firewall. The current team is unchanged."
+                    else
+                        "The selected Vercel team could not be validated for AI Gateway. The current team is unchanged.",
                 }, true);
                 return false;
             }
@@ -1823,7 +1838,7 @@ pub fn Runtime(comptime App: type) type {
             return switch (fetched) {
                 .failure => |failure| result: {
                     debug_trace.logf("auth", "team catalog rejected category={t}", .{failure.category});
-                    break :result .rejected;
+                    break :result if (failure.category == .transport) .catalog_unreachable else .rejected;
                 },
                 .catalog => |catalog_value| result: {
                     const catalog = catalog_value;
