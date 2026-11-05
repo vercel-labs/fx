@@ -786,10 +786,14 @@ pub fn refreshFxSession(
 ) !void {
     try mutation.requireWritable();
     const issuer_url = session.issuer;
+    // Each request to the issuer has its whole budget from a fresh stamp, so
+    // another fx waits for this one however slowly the issuer answers.
+    mutation.restamp();
     var metadata = try oauth.discover(alloc, transport, issuer_url);
     defer metadata.deinit(alloc);
     try oauth_session.validateE2EEndpoint(issuer_url, metadata.token_endpoint);
 
+    mutation.restamp();
     var refreshed = oauth.refreshToken(
         alloc,
         transport,

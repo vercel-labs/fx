@@ -35,6 +35,8 @@ export interface AuthServer {
   refreshError?: string;
   /** The status `refreshError` comes with (default 400). At 200 the body is Slack's: `ok:false` and the error. */
   refreshStatus?: number;
+  /** Answer the first refreshes this late, one entry each in order, after retiring the token sent. */
+  refreshDelayMs?: number[];
   /** The token endpoint is plain HTTP to another host. */
   insecureEndpoint?: boolean;
   /** The token endpoint is on an internal address: 0.0.0.0, which reaches this machine, on port 1. */
@@ -90,6 +92,8 @@ export function createAuth(config: AuthConfig, base: () => string, log: Log) {
   let clients = 0;
   const access = new Map<string, Token>();
   const refresh = new Map<string, { server: number; scopes: string[] }>();
+  /** Refreshes answered so far, per authorization server. */
+  const refreshes: number[] = [];
   const codes = new Map<string, { server: number; challenge: string; redirect: string; scopes: string[]; resource: string }>();
   const prmPath = config.prm === undefined || config.prm === "path" ? "/.well-known/oauth-protected-resource/mcp" : config.prm === "root" ? "/.well-known/oauth-protected-resource" : config.prm;
   const prmUrl = () => base() + prmPath;
@@ -215,6 +219,10 @@ export function createAuth(config: AuthConfig, base: () => string, log: Log) {
             refresh.delete(body.refresh_token as string);
             delete body.refresh_token;
           } else refresh.delete(form.refresh_token);
+          const n = refreshes[i] ?? 0;
+          refreshes[i] = n + 1;
+          const delay = s.refreshDelayMs?.[n] ?? 0;
+          if (delay > 0) await Bun.sleep(delay);
           return Response.json(body);
         }
         return Response.json({ error: "unsupported_grant_type" }, { status: 400 });
