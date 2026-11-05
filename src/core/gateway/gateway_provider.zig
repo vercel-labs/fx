@@ -238,11 +238,14 @@ pub const CapabilityResolver = struct {
     /// `resolve` for a caller that must not wait out a first load that cannot
     /// reach the catalog. On a dead network the load can sit in a DNS lookup
     /// that std.Io cannot cut short until the system resolver gives up, so it
-    /// runs on a thread of its own. When it has not finished `wait_ms` after
-    /// it started, the catalog counts as failed and `fallback` answers, as
-    /// after any failed load; the load is cancelled, never adopted, and
-    /// `deinit` waits for it. A cancelled wait leaves the load running for the
-    /// next call.
+    /// runs on a thread of its own. When its request still has no connection
+    /// `wait_ms` after the load started, the catalog counts as failed and
+    /// `fallback` answers, as after any failed load; the load is cancelled,
+    /// never adopted, and `deinit` waits for it. A load whose request has
+    /// connected is waited for until it ends, within its own deadline, so a
+    /// slow link still gets the catalog. A provider that does not report its
+    /// connection loads as `resolve` does. A cancelled wait leaves the load
+    /// running for the next call.
     pub fn resolveWithin(
         self: *CapabilityResolver,
         alloc: Allocator,
@@ -264,6 +267,7 @@ pub const CapabilityResolver = struct {
         wait_ms: i64,
     ) model_capabilities.ResolveError!void {
         if (comptime builtin.single_threaded) return self.refreshIfDue(alloc, provider, input);
+        if (!provider.reports_connection) return self.refreshIfDue(alloc, provider, input);
         const load = self.first_load orelse started: {
             const started = FirstLoad.start(alloc, provider, input) catch |err| {
                 debug_trace.logf("gateway", "model catalog first load runs inline err={s}", .{@errorName(err)});
@@ -277,13 +281,13 @@ pub const CapabilityResolver = struct {
                 if (flag.load(.seq_cst)) return error.Cancelled;
             }
             const waited_ms = model_catalog.clockMs() - load.started_ms;
-            if (waited_ms >= wait_ms) {
+            if (waited_ms >= wait_ms and !load.connected.load(.acquire)) {
                 load.cancel_requested.store(true, .seq_cst);
                 self.state = .failed;
                 self.last_attempt_ms = load.started_ms;
                 self.requested_access = .init(load.input.access);
                 self.provider_id = provider.provider_id;
-                debug_trace.logf("gateway", "model catalog first load abandoned waited_ms={d}", .{waited_ms});
+                debug_trace.logf("gateway", "model catalog first load abandoned before it connected waited_ms={d}", .{waited_ms});
                 return;
             }
             io_mod.sleep(first_load_poll_ns);
@@ -380,12 +384,14 @@ const first_load_poll_ns = 2 * std.time.ns_per_ms;
 
 /// A first catalog load on a thread of its own. It owns copies of the access
 /// and endpoint, because the caller's credential can be replaced while the
-/// load runs, and its own cancel flag.
+/// load runs, and its own cancel and connection flags.
 const FirstLoad = struct {
     provider: model_catalog.Provider,
     input: model_catalog.FetchInput,
     started_ms: i64,
     cancel_requested: std.atomic.Value(bool) = .init(false),
+    /// Set by the provider once the load's request has a connection.
+    connected: std.atomic.Value(bool) = .init(false),
     finished: std.atomic.Value(bool) = .init(false),
     /// Set before `finished`; owns any loaded catalog.
     result: model_catalog.FetchResult = undefined,
@@ -405,6 +411,7 @@ const FirstLoad = struct {
                 .endpoint = endpoint,
                 .cancel_flag = &load.cancel_requested,
                 .view = input.view,
+                .connected = &load.connected,
             },
             .started_ms = model_catalog.clockMs(),
         };
@@ -799,10 +806,13 @@ test "capability resolver degrades terminal catalog failures to local capabiliti
 
 /// A catalog that answers like `FakeCatalog.ready` once released, and fails
 /// as cancelled once its fetch is cancelled, like a lookup on a dead network.
+/// It reports its connection, at once when `connects` is set.
 const GatedCatalog = struct {
+    connects: bool = false,
     /// False for a fetch that cannot be cut short, which answers only once
     /// released.
     honors_cancel: bool = true,
+    reports_connection: bool = true,
     released: std.atomic.Value(bool) = .init(false),
     calls: std.atomic.Value(usize) = .init(0),
     saw_cancel: std.atomic.Value(bool) = .init(false),
@@ -815,14 +825,15 @@ const GatedCatalog = struct {
     ) Allocator.Error!model_catalog.ProviderResult {
         const self: *GatedCatalog = @ptrCast(@alignCast(raw.?));
         _ = self.calls.fetchAdd(1, .seq_cst);
+        if (self.connects) input.connected.?.store(true, .release);
         if (std.mem.eql(u8, input.access.authorizationCredential() orelse "", "test-key")) {
             self.saw_credential.store(true, .seq_cst);
         }
         while (!self.released.load(.seq_cst)) {
-            if (self.honors_cancel and input.cancel_flag.?.load(.seq_cst)) {
+            if (self.honors_cancel) if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) {
                 self.saw_cancel.store(true, .seq_cst);
                 return .{ .failure = .{ .category = .cancellation } };
-            }
+            };
             io_mod.sleep(std.time.ns_per_ms);
         }
         var ready = FakeCatalog{ .outcome = .ready };
@@ -830,11 +841,28 @@ const GatedCatalog = struct {
     }
 
     fn provider(self: *GatedCatalog) model_catalog.Provider {
-        return .{ .context = self, .fetch_fn = fetch };
+        return .{ .context = self, .fetch_fn = fetch, .reports_connection = self.reports_connection };
+    }
+
+    /// Releases the catalog after `delay_ms` from a thread of its own.
+    fn releaseAfter(self: *GatedCatalog, delay_ms: u64) !std.Thread {
+        const Release = struct {
+            fn run(gated: *GatedCatalog, ms: u64) void {
+                io_mod.sleep(ms * std.time.ns_per_ms);
+                gated.released.store(true, .seq_cst);
+            }
+        };
+        return std.Thread.spawn(.{}, Release.run, .{ self, delay_ms });
     }
 };
 
-test "a first catalog load that outlasts its wait answers from the fallback and is never adopted" {
+fn reportingProvider(fake: *FakeCatalog) model_catalog.Provider {
+    var provider = fake.provider();
+    provider.reports_connection = true;
+    return provider;
+}
+
+test "a first catalog load that never connects answers from the fallback after its wait and is never adopted" {
     const alloc = std.testing.allocator;
     var gated: GatedCatalog = .{};
     var resolver: CapabilityResolver = .{};
@@ -843,7 +871,7 @@ test "a first catalog load that outlasts its wait answers from the fallback and 
         .endpoint = "/v1/models",
     };
 
-    // The catalog never answers, so the lookup returns the fallback.
+    // The catalog's request never connects, so the lookup returns the fallback.
     const capabilities = try resolver.resolveWithin(alloc, gated.provider(), input, "provider/model", .{ .context_window = 1_000 }, 20);
     try std.testing.expectEqual(@as(?u32, 1_000), capabilities.context_window);
     try std.testing.expectEqual(CapabilityResolverState.failed, resolver.state);
@@ -857,6 +885,37 @@ test "a first catalog load that outlasts its wait answers from the fallback and 
     try std.testing.expectEqual(@as(usize, 1), gated.calls.load(.seq_cst));
     try std.testing.expect(gated.saw_credential.load(.seq_cst));
     try std.testing.expect(gated.saw_cancel.load(.seq_cst));
+}
+
+test "a first catalog load that connected is waited for past the wait and adopted" {
+    const alloc = std.testing.allocator;
+    var gated: GatedCatalog = .{ .connects = true };
+    var resolver: CapabilityResolver = .{};
+    defer resolver.deinit(alloc);
+
+    // The request connects at once and the catalog answers well after the wait.
+    const releaser = try gated.releaseAfter(600);
+    defer releaser.join();
+    const capabilities = try resolver.resolveWithin(alloc, gated.provider(), .{ .endpoint = "/v1/models" }, "provider/model", .{ .context_window = 1_000 }, 150);
+    try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
+    try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
+    try std.testing.expect(!gated.saw_cancel.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), gated.calls.load(.seq_cst));
+}
+
+test "a first catalog load from a provider that does not report its connection is waited for" {
+    const alloc = std.testing.allocator;
+    var gated: GatedCatalog = .{ .reports_connection = false };
+    var resolver: CapabilityResolver = .{};
+    defer resolver.deinit(alloc);
+
+    const releaser = try gated.releaseAfter(200);
+    defer releaser.join();
+    const capabilities = try resolver.resolveWithin(alloc, gated.provider(), .{ .endpoint = "/v1/models" }, "provider/model", .{}, 20);
+    try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
+    try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
+    // It loads on the caller's thread, as `resolve` does.
+    try std.testing.expect(resolver.first_load == null);
 }
 
 test "a catalog that answers after its wait ended is freed, not adopted" {
@@ -884,7 +943,7 @@ test "a first catalog load that finishes within its wait is adopted" {
     var resolver: CapabilityResolver = .{};
     defer resolver.deinit(alloc);
 
-    const capabilities = try resolver.resolveWithin(alloc, fake.provider(), .{ .endpoint = "/v1/models" }, "provider/model", .{}, 60_000);
+    const capabilities = try resolver.resolveWithin(alloc, reportingProvider(&fake), .{ .endpoint = "/v1/models" }, "provider/model", .{}, 60_000);
     try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
     try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
     try std.testing.expect(resolver.first_load == null);
@@ -897,7 +956,7 @@ test "a first catalog load keeps the public retry after a rejected credential" {
     var resolver: CapabilityResolver = .{};
     defer resolver.deinit(alloc);
 
-    const capabilities = try resolver.resolveWithin(alloc, fake.provider(), .{
+    const capabilities = try resolver.resolveWithin(alloc, reportingProvider(&fake), .{
         .access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "test-key", "team_123"),
         .endpoint = "/v1/models",
     }, "provider/model", .{}, 60_000);

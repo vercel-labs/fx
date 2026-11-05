@@ -2374,6 +2374,7 @@ pub const model_catalog_provider = model_catalog.Provider{
     // An active session refetches a stale catalog so newly released models
     // appear without a restart. Only user activity starts the refetch.
     .refresh_interval_ms = 5 * std.time.ms_per_min,
+    .reports_connection = true,
 };
 
 pub const ModelCatalogEntry = model_catalog.ModelCatalogEntry;
@@ -2395,6 +2396,7 @@ fn fetchCatalogForProvider(
         input.access,
         input.endpoint,
         input.cancel_flag,
+        input.connected,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = catalogRequestFailure(err) };
@@ -2434,7 +2436,7 @@ fn fetchModelCatalogForView(
     cancel_flag: ?*std.atomic.Value(bool),
     view: ModelCatalogView,
 ) !std.ArrayList(ModelCatalogEntry) {
-    const response = try fetchModelCatalogResponse(alloc, access, path, cancel_flag);
+    const response = try fetchModelCatalogResponse(alloc, access, path, cancel_flag, null);
     const json_text = switch (response) {
         .success => |body| body,
         .http_status => |status| return model_catalog.failureForHttpStatus(status).asError(),
@@ -2449,6 +2451,7 @@ fn fetchModelCatalogResponse(
     access: credentials.CatalogAccess,
     path: []const u8,
     cancel_flag: ?*std.atomic.Value(bool),
+    connected: ?*std.atomic.Value(bool),
 ) !gateway_client.GatewayJsonResult {
     if (cancel_flag) |flag| {
         if (flag.load(.seq_cst)) return error.Cancelled;
@@ -2479,6 +2482,7 @@ fn fetchModelCatalogResponse(
         gateway_team,
         model_catalog_url,
         cancel_flag orelse &never_cancelled,
+        connected,
     );
 }
 

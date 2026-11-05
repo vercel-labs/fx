@@ -2222,10 +2222,11 @@ fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
-/// How long a request waits for the model catalog's first load. A healthy
-/// network loads it well within this. On a dead one the load would hold the
-/// first request until its DNS lookup or connect timed out, 20 to 30
-/// seconds, before the request could report Offline and start recovering.
+/// How long a request waits for the model catalog's first load to connect.
+/// A healthy network connects well within this, and a connected load is
+/// waited for until it ends. On a dead network the load would hold the first
+/// request until its DNS lookup or connect timed out, 20 to 30 seconds,
+/// before the request could report Offline and start recovering.
 const catalog_first_load_wait_ms: i64 = 2_000;
 
 fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {

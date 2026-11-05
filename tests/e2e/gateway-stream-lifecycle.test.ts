@@ -11703,78 +11703,52 @@ describe("request recovery across statuses and garbled streams", () => {
     }
   }, 30_000);
 
-  test("fx ask goes Offline without waiting out a model catalog that never answers, then recovers", async () => {
-    const root = createFixtureRoot("catalog-never-answers");
-    const tracePath = join(root.root, "trace.log");
-    // The catalog takes its request and never answers, as behind a dead network.
-    let catalogRequests = 0;
-    const catalog = startDynamicFakeGateway(() => new Response("unexpected request", { status: 500 }), {
-      models: () => {
-        catalogRequests++;
-        return new Promise<Response>(() => {});
-      },
-    });
-    // Nothing listens on the chat port until the network returns, so the
-    // first request is refused as it is offline.
-    const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("reserved") });
-    const port = reserved.port;
-    reserved.stop(true);
-    const chatUrl = `http://127.0.0.1:${port}/v4/ai/language-model`;
-    let chat: ReturnType<typeof Bun.serve> | undefined;
-    const proc = Bun.spawn([FX_BIN, "ask", "--json", "--auto", "--no-save", "Answer once the network returns."], {
-      cwd: root.workspace,
-      env: {
-        ...fixtureEnv(root, catalog, tracePath),
-        FX_GATEWAY_CHAT_URL: chatUrl,
-        FX_TEST_GATEWAY_CHAT_URL: chatUrl,
-        FX_SOUND: "0",
-      },
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const kill = setTimeout(() => proc.kill("SIGKILL"), 50_000);
-    try {
-      const started = performance.now();
-      let offlineAfterMs: number | undefined;
-      let stderr = "";
-      const decoder = new TextDecoder();
-      const readStderr = (async () => {
-        for await (const chunk of proc.stderr) {
-          stderr += decoder.decode(chunk, { stream: true });
-          if (offlineAfterMs === undefined && /^\[notice\] Offline · next try in \d+s$/m.test(stderr)) {
-            offlineAfterMs = performance.now() - started;
-            // The network returns.
-            chat = Bun.serve({
-              hostname: "127.0.0.1",
-              port,
-              idleTimeout: 0,
-              fetch: () => fakeGatewayFinalText("Answered once the network returned."),
-            });
-          }
-        }
-      })();
-      const stdout = await new Response(proc.stdout).text();
-      const code = await proc.exited;
-      await readStderr;
-
-      expect(code, stderr).toBe(0);
-      // Without a bound the first request waited out the catalog's 30 second
-      // deadline before it could find the network down.
-      expect(offlineAfterMs).toBeDefined();
-      expect(offlineAfterMs!).toBeLessThan(15_000);
-      const json = parseAskJson(stdout);
-      expect(json.output).toBe("Answered once the network returned.");
-      expect(json.recovery?.state).toBe("recovered");
-      expect(catalogRequests).toBe(1);
-    } finally {
-      clearTimeout(kill);
-      if (proc.exitCode === null) proc.kill("SIGKILL");
-      chat?.stop(true);
-      catalog.stop();
-      rmSync(root.root, { recursive: true, force: true });
-    }
-  }, 60_000);
+  // A catalog whose request has connected is waited for, however slowly its
+  // body arrives; only a request that cannot connect is given up on
+  // (`src/core/gateway/gateway_provider.zig` resolveWithin).
+  for (const [label, bodyDelayMs] of [["at once", 0], ["slowly after it connects", 3_000]] as const) {
+    test(`fx ask uses the model catalog's limits when the catalog answers ${label}`, async () => {
+      const root = createFixtureRoot("catalog-limits");
+      const tracePath = join(root.root, "trace.log");
+      const catalogBody = JSON.stringify({
+        data: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 123_456, max_tokens: 7_000 }],
+      });
+      const encoder = new TextEncoder();
+      const timers: Array<ReturnType<typeof setTimeout>> = [];
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("Answered with the catalog's limits."), {
+        models: () => new Response(new ReadableStream({
+          start(controller) {
+            timers.push(setTimeout(() => {
+              controller.enqueue(encoder.encode(catalogBody));
+              controller.close();
+            }, bodyDelayMs));
+          },
+        }), { headers: { "content-type": "application/json" } }),
+      });
+      try {
+        const started = performance.now();
+        const result = await runFx(["ask", "--json", "--auto", "--no-save", "Answer with the catalog's limits."], {
+          cwd: root.workspace,
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,core,gateway,stream,context_compaction" },
+          timeoutMs: 30_000,
+        });
+        const elapsedMs = performance.now() - started;
+        expect(result.code, result.stderr).toBe(0);
+        expect(parseAskJson(result.stdout).output).toBe("Answered with the catalog's limits.");
+        expect(gateway.modelRequests).toHaveLength(1);
+        const trace = readFileSync(tracePath, "utf8");
+        expect(trace).toContain(`model catalog lookup outcome=ready_hit model=${MODEL}`);
+        expect(trace).not.toContain("model catalog first load abandoned");
+        // The request was sized with the catalog's output limit.
+        expect(trace).toMatch(/\[context_compaction\] event=decision .* max_output_tokens=7000\b/);
+        expect(elapsedMs).toBeGreaterThanOrEqual(bodyDelayMs);
+      } finally {
+        for (const timer of timers) clearTimeout(timer);
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 40_000);
+  }
 
   test("fx ask names the status of a failure it does not retry", async () => {
     const root = createFixtureRoot("named-status");

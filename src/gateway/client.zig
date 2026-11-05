@@ -507,17 +507,20 @@ const GatewayGetOperation = struct {
     }
 };
 
+/// Sets `connected`, when given, once the request has a connection: the DNS
+/// lookup, connect, and any TLS handshake are done.
 pub fn fetchGatewayJsonCancellable(
     alloc: std.mem.Allocator,
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    connected: ?*std.atomic.Value(bool),
 ) !GatewayJsonResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     const request_url = try resolveE2eGatewayUrl(e2e_gateway_models_url_env, url);
-    return fetchGatewayJsonAtUrlCancellable(alloc, api_key, gateway_team, request_url, cancel_flag, gateway_json_fetch_timeout_ms);
+    return fetchGatewayJsonAtUrlCancellable(alloc, api_key, gateway_team, request_url, cancel_flag, gateway_json_fetch_timeout_ms, connected);
 }
 
 /// A stalled catalog request fails with `error.Timeout` after this long, so a
@@ -531,6 +534,7 @@ fn fetchGatewayJsonAtUrlCancellable(
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
     timeout_ms: i64,
+    connected: ?*std.atomic.Value(bool),
 ) !GatewayJsonResult {
     var operation = GatewayJsonFetchOperation{
         .alloc = alloc,
@@ -538,6 +542,7 @@ fn fetchGatewayJsonAtUrlCancellable(
         .gateway_team = gateway_team,
         .url = url,
         .cancel_flag = cancel_flag,
+        .connected = connected,
     };
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
@@ -552,6 +557,7 @@ const GatewayJsonFetchOperation = struct {
     gateway_team: ?[]const u8,
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    connected: ?*std.atomic.Value(bool),
 
     fn run(self: *@This()) !GatewayJsonResult {
         return fetchGatewayJsonAtUrlCore(
@@ -560,6 +566,7 @@ const GatewayJsonFetchOperation = struct {
             self.gateway_team,
             self.url,
             self.cancel_flag,
+            self.connected,
         );
     }
 };
@@ -570,6 +577,7 @@ fn fetchGatewayJsonAtUrlCore(
     gateway_team: ?[]const u8,
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    connected: ?*std.atomic.Value(bool),
 ) !GatewayJsonResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
@@ -600,6 +608,8 @@ fn fetchGatewayJsonAtUrlCore(
         return err;
     };
     defer req.deinit();
+    // `client.request` returns once the connection is open, TLS included.
+    if (connected) |flag| flag.store(true, .release);
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     var cancel_watch_done = std.atomic.Value(bool).init(false);
@@ -10140,9 +10150,9 @@ fn expectCancellableGatewayJsonCancellation(
 
     const started = std.Io.Clock.Timestamp.now(zio, .awake);
     const result = if (use_tls)
-        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, api_key, null, models_url, &cancel_flag, gateway_json_fetch_timeout_ms)
+        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, api_key, null, models_url, &cancel_flag, gateway_json_fetch_timeout_ms, null)
     else
-        fetchGatewayJsonCancellable(std.testing.allocator, api_key, null, "https://ai-gateway.vercel.sh/v1/models", &cancel_flag);
+        fetchGatewayJsonCancellable(std.testing.allocator, api_key, null, "https://ai-gateway.vercel.sh/v1/models", &cancel_flag, null);
     const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
 
     try std.testing.expectError(error.Cancelled, result);
@@ -10168,10 +10178,63 @@ test "cancellable gateway JSON request times out a held response head" {
     const started = std.Io.Clock.Timestamp.now(zio, .awake);
     try std.testing.expectError(
         error.Timeout,
-        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, "test-key", null, models_url, &cancel_flag, 100),
+        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, "test-key", null, models_url, &cancel_flag, 100, null),
     );
     const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
     try std.testing.expect(elapsed_ms < 1500);
+    if (fixture.failure) |err| return err;
+}
+
+test "a gateway JSON request reports no connection while its TLS handshake stalls" {
+    var fixture = try LoopbackGatewayFixture.init(.tls_handshake_stall, 5000);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+    const models_url = try std.testing.allocator.print("https://127.0.0.1:{d}/v1/models", .{fixture.port()});
+    defer std.testing.allocator.free(models_url);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var connected = std.atomic.Value(bool).init(false);
+    var request_done = std.atomic.Value(bool).init(false);
+    // The server has taken the TCP connection and never answers the TLS
+    // handshake; the request is cancelled while it waits.
+    const Cancel = struct {
+        fn run(server: *LoopbackGatewayFixture, flag: *std.atomic.Value(bool), done: *std.atomic.Value(bool)) void {
+            if (!server.waitForStageOrDone(done)) return;
+            LoopbackGatewayFixture.sleepBlocking(100);
+            flag.store(true, .seq_cst);
+        }
+    };
+    const cancel_thread = try std.Thread.spawn(.{}, Cancel.run, .{ &fixture, &cancel_flag, &request_done });
+    defer {
+        request_done.store(true, .seq_cst);
+        cancel_thread.join();
+    }
+
+    try std.testing.expectError(
+        error.Cancelled,
+        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, "test-key", null, models_url, &cancel_flag, gateway_json_fetch_timeout_ms, &connected),
+    );
+    try std.testing.expect(fixture.reached_stage.load(.seq_cst));
+    try std.testing.expect(!connected.load(.acquire));
+    if (fixture.failure) |err| return err;
+}
+
+test "a gateway JSON request reports its connection before any response arrives" {
+    var fixture = try LoopbackGatewayFixture.init(.response_head_stall, 5000);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+    const models_url = try std.testing.allocator.print("http://127.0.0.1:{d}/v1/models", .{fixture.port()});
+    defer std.testing.allocator.free(models_url);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var connected = std.atomic.Value(bool).init(false);
+    try std.testing.expectError(
+        error.Timeout,
+        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, "test-key", null, models_url, &cancel_flag, 1000, &connected),
+    );
+    try std.testing.expect(connected.load(.acquire));
     if (fixture.failure) |err| return err;
 }
 
