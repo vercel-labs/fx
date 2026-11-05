@@ -515,6 +515,12 @@ pub const Store = struct {
     pub fn close(self: Store, child_id: []const u8, work_id: []const u8) !void {
         return self.children.close(child_id, work_id);
     }
+
+    /// The name closed child `child_id` had, as `V2Children.closedName`
+    /// reads it. Hold the lock, as for a load.
+    pub fn closedName(self: Store, alloc: Allocator, child_id: []const u8) !?[]u8 {
+        return self.children.closedName(alloc, child_id);
+    }
 };
 
 /// A parent's children in its v2 log (D22). The log is the record, and this
@@ -636,6 +642,27 @@ pub const V2Children = struct {
         current.children = kept;
     }
 
+    /// The name closed child `child_id` had, from the close in the parent's
+    /// log, which writes it as a spawn does. A closed child is gone from the
+    /// registry, so a report owed from before its close is named this way.
+    /// Null when the log closed no such child or it had no name. `alloc`
+    /// owns the result.
+    fn closedName(self: *V2Children, alloc: Allocator, child_id: []const u8) !?[]u8 {
+        self.state.lockUncancelable(io_mod.getIo());
+        defer self.state.unlock(io_mod.getIo());
+        const children = try self.parent.children(alloc);
+        defer session_adapter.freeChildren(alloc, children);
+        for (children) |entry| {
+            if (!std.mem.eql(u8, entry.id, child_id)) continue;
+            if (!foldedClosed(entry)) return null;
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const spawn = json_decode.parseFromSliceLeaky(SpawnData, scratch.allocator(), entry.spawn_data orelse return null, .{ .ignore_unknown_fields = true }) catch return null;
+            return if (spawn.agent) |name| try alloc.dupe(u8, name) else null;
+        }
+        return null;
+    }
+
     fn currentLocked(self: *V2Children) !*Registry {
         if (self.registry == null) {
             const children = try self.parent.children(self.alloc);
@@ -709,7 +736,8 @@ const SpawnData = struct {
     /// A named child's name; null for a one-off.
     agent: ?[]const u8 = null,
     fingerprint: []const u8,
-    /// The agent profile the child started in; null for fx's `agent`.
+    /// The agent profile the child started in. fx writes `main` when the
+    /// parent named none; older fx wrote null there.
     profile: ?[]const u8 = null,
     /// Its report rule. This fx writes it on every spawn, which also marks
     /// the work as one whose end owes its parent a report, so a crash that

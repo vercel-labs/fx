@@ -460,8 +460,11 @@ pub const RenderContext = struct {
     agent_label: []const u8 = "",
     /// A hidden agent waiting on an answer, shown on the right.
     waiting_note: []const u8 = "",
-    /// What MCP has to say, after everything else on the right.
+    /// What MCP has to say, after the notes above on the right.
     mcp_status: []const u8 = "",
+    /// Hidden subagents working, such as "1 subagent working", shown on the
+    /// right only when nothing else is.
+    working_note: []const u8 = "",
     danger_status: []const u8 = "",
     danger_status_compact: []const u8 = "",
     esc_clear_armed: bool = false,

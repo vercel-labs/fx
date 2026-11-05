@@ -86,7 +86,7 @@ pub fn composeAgentsMenuRow(
     return row;
 }
 
-pub const hint_variants = [_][]const u8{
+const hint_variants = [_][]const u8{
     "↑↓ preview     enter switch     esc back",
     "↑↓ preview  enter switch  esc back",
     "↑↓ preview  enter  esc",

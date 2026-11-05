@@ -3522,6 +3522,12 @@ const App = struct {
         return AgentsAppRuntime.waitingNote(self, buf);
     }
 
+    /// The footer note for hidden subagents working, such as
+    /// "1 subagent working".
+    pub fn hiddenAgentWorkingNote(self: *App, buf: []u8) []const u8 {
+        return AgentsAppRuntime.workingNote(self, buf);
+    }
+
     /// Handles the events and paced text of the agent in context.
     fn tickAgentInContext(_: void, self: *App, agent: *agents.Agent) anyerror!void {
         // An agent's session can start while another's transcript is on

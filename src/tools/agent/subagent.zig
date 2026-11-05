@@ -377,7 +377,7 @@ test "call executes a validated managed request through the provider" {
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
 
-test "decode accepts the four actions and nothing else" {
+test "decode accepts the five actions and nothing else" {
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"instructions\":\"Review strictly.\",\"message\":\"next\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"model\":\"gpt-5.6-sol-fast\"}}", .message);

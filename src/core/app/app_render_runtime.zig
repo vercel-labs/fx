@@ -728,6 +728,15 @@ pub fn Runtime(comptime App: type) type {
             else
                 false;
 
+            const waiting_note: []const u8 = if (comptime @hasDecl(App, "hiddenAgentWaitingNote"))
+                app.hiddenAgentWaitingNote(waiting_note_buf)
+            else
+                "";
+            // Shares the buffer: the footer shows it only without a waiting note.
+            const working_note: []const u8 = if (comptime @hasDecl(App, "hiddenAgentWorkingNote"))
+                (if (waiting_note.len == 0) app.hiddenAgentWorkingNote(waiting_note_buf) else "")
+            else
+                "";
             return .{
                 .slash_registry = app.slashRegistry(),
                 .stream = visible_stream,
@@ -856,10 +865,8 @@ pub fn Runtime(comptime App: type) type {
                     .{},
                 .upgrade_status = upgrade_label,
                 .agent_label = if (comptime @hasDecl(App, "footerAgentLabel")) app.footerAgentLabel() else "",
-                .waiting_note = if (comptime @hasDecl(App, "hiddenAgentWaitingNote"))
-                    app.hiddenAgentWaitingNote(waiting_note_buf)
-                else
-                    "",
+                .waiting_note = waiting_note,
+                .working_note = working_note,
                 .mcp_status = if (comptime @hasField(App, "mcp")) app.mcp.hostStatusText() else "",
                 .danger_status = if (yolo_warning_active)
                     app_permission_runtime.yolo_warning_text

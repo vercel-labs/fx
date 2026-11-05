@@ -8,6 +8,7 @@ import {
   fakeGatewaySse,
   startDynamicFakeGateway,
   fakeGatewayFinalText,
+  composerContains,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -1396,6 +1397,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     async () => {
       const reviewer = held();
       let childCalls = 0;
+      // The trace lives in the test's home, set before fx starts.
+      const env: Record<string, string> = {};
+      let tracePath = "";
       await withFx(async (body) => {
         if (!isMainRequest(body)) {
           childCalls += 1;
@@ -1413,14 +1417,16 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await until("the reviewer's turn", () => childCalls >= 1);
         await session.sendKeys("Down");
         await session.waitForText("esc back", 10_000);
-        // On main's row, x does nothing: an instance closes with /close.
+        // On main's row, x does nothing: an instance closes with /close. The
+        // next key is handled once the hint changes, so by then the trace
+        // shows whether x armed anything.
         await session.sendKeys("x");
-        await Bun.sleep(300);
-        expect(await session.capturePane()).not.toContain("x again to close");
         await session.sendKeys("Down");
         await session.waitForText("enter switch     x close     esc back", 10_000);
+        expect(readFileSync(tracePath, "utf8")).not.toContain("agents_menu_close_armed");
         await session.sendKeys("x");
         await session.waitForText("x again to close it for good", 10_000);
+        expect(readFileSync(tracePath, "utf8")).toContain("agents_menu_close_armed");
         // Any other key keeps it.
         await session.sendKeys("Up");
         await session.waitForPane((pane) => !pane.includes("x again to close"), 10_000);
@@ -1445,11 +1451,61 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(parents.length).toBe(1);
         const resumed = await launch(`--resume ${parents[0]}`);
         await resumed.waitForText("CLOSE_MAIN_TOLD", 30_000);
-        // Main alone: no agent indicator, and ↓ opens no list.
+        // Main alone: no agent indicator, and ↓ opens no list, which would
+        // take the next key; the composer shows it instead.
         expect(await resumed.capturePane()).not.toContain("main \u2193");
         await resumed.sendKeys("Down");
-        await Bun.sleep(500);
-        expect(await resumed.capturePane()).not.toContain("esc back");
+        await resumed.sendLiteral("z");
+        const typed = await resumed.waitForPane((pane) => composerContains(pane, "z"), 10_000);
+        expect(typed).not.toContain("esc back");
+      }, (home) => {
+        tracePath = join(home, "fx-trace.log");
+        env.FX_TRACE_LOG = tracePath;
+      }, false, env);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "closing the middle row of the agent list keeps the highlight on the agent shown, and the first x warns at once",
+    async () => {
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) return text("child_done", "MIDDLE_CHILD_DONE");
+        if (!body.includes('"main_r"')) {
+          return toolCall("main_r", "subagent", { request: { action: "message", agent: "reviewer", message: "MIDDLE_REVIEW" } });
+        }
+        if (!body.includes('"main_t"')) {
+          return toolCall("main_t", "subagent", { request: { action: "message", agent: "tester", message: "MIDDLE_TEST" } });
+        }
+        return text("main_done", "MIDDLE_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER start them");
+        await session.waitForText("MIDDLE_MAIN_DONE", 30_000);
+        await session.waitForPane((pane) => !pane.includes("subagent working"), 30_000);
+        // Rows: fx 1, reviewer, tester. Both subagents are idle, so nothing
+        // on screen animates.
+        await session.sendKeys("Down");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendKeys("Down");
+        await session.waitForText("enter switch     x close     esc back", 10_000);
+        await session.sendKeys("x");
+        await session.waitForText("x again to close it for good", 10_000);
+        // Any other key keeps it, and its warning goes at once.
+        await session.sendKeys("a");
+        await session.waitForText("enter switch     x close     esc back", 10_000);
+        // X closes too, so Caps Lock doesn't get in the way.
+        await session.sendKeys("X");
+        await session.waitForText("x again to close it for good", 10_000);
+        await session.sendKeys("x");
+        // Main is shown, and the highlight is on its row, not on tester's.
+        const closed = await session.waitForPane((pane) => !/^ {4}reviewer \u00b7 /m.test(pane) && pane.includes("esc back"), 15_000);
+        expect(closed).toMatch(/^ {4}tester \u00b7 /m);
+        expect(closed).toContain("\u2191\u2193 preview     enter switch     esc back");
+        expect(closed).not.toContain("x close");
+        await session.sendKeys("Enter");
+        const kept = await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+        expect(kept).toContain("MIDDLE_MAIN_DONE");
+        expect(kept).toContain("main \u2193");
       });
     },
     TIMEOUT,
@@ -1470,11 +1526,13 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER run them");
         const pane = await session.waitForText("MAIN_CLOSE_DONE", 60_000);
         expect(pane).toContain("\u2514 closed tester");
-        // Main alone again: no agent indicator, and ↓ opens no list.
+        // Main alone again: no agent indicator, and ↓ opens no list, which
+        // would take the next key; the composer shows it instead.
         await session.waitForPane((value) => !value.includes("main \u2193"), 10_000);
         await session.sendKeys("Down");
-        await Bun.sleep(500);
-        expect(await session.capturePane()).not.toContain("esc back");
+        await session.sendLiteral("z");
+        const typed = await session.waitForPane((pane) => composerContains(pane, "z"), 10_000);
+        expect(typed).not.toContain("esc back");
       });
     },
     TIMEOUT,

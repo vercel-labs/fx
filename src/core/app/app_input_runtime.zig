@@ -1765,8 +1765,9 @@ pub fn Runtime(comptime App: type) type {
         fn routeAgentsMenuInput(app: *App, event: input_action.TerminalInputEvent) !bool {
             if (!agentsMenuActive(app)) return false;
             const agent = agents.screenAgentOf(app);
+            // X too, so Caps Lock doesn't turn the close off.
             const close_key = switch (event) {
-                .raw => |raw| raw.byte == 'x',
+                .raw => |raw| raw.byte == 'x' or raw.byte == 'X',
                 else => false,
             };
             if (!close_key) disarmAgentsMenuClose(app);
@@ -1775,7 +1776,7 @@ pub fn Runtime(comptime App: type) type {
                 .paste_byte => return false,
                 .raw => |raw| switch (raw.byte) {
                     '\r' => _ = try submitAgentsMenuSelection(app),
-                    'x' => _ = try pressAgentsMenuClose(app),
+                    'x', 'X' => _ = try pressAgentsMenuClose(app),
                     3, 24 => _ = try backAgentsMenu(app),
                     10 => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
                     11 => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),
