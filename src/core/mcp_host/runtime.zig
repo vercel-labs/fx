@@ -2234,7 +2234,6 @@ fn declaredCapabilities(questions: elicitation.Capabilities) []const u8 {
     return "{}";
 }
 
-/// Why a new login wasn't saved, in words.
 /// Why a sign-in failed, in words, with the authorization server's own when
 /// it gave some.
 fn signInFailure(buffer: []u8, why: mcp.auth.client.Failure, message: ?[]const u8) []const u8 {

@@ -937,12 +937,13 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
     };
     defer if (saved) |v| secret.zeroAndFree(arena, v);
     const kept: ?anyerror = host.runtime.logout(name) catch |err| switch (err) {
-        // A held server isn't in the engine; its saved login still goes.
+        // A held server isn't in the engine; its saved login still goes, and
+        // when it can't, nothing changed.
         error.UnknownServer => held: {
             _ = store.remove(arena, server.credentialKey()) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
-                else => break :held e,
+                else => return notSignedOut(c, arena, name, store, e),
             };
             break :held null;
         },
