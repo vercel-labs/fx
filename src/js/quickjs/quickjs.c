@@ -43083,6 +43083,8 @@ static int JS_CopySubArray(JSContext *ctx,
     }
 
     for (i = 0; i < count; ) {
+        if (js_poll_interrupts(ctx))
+            goto exception;
         if (dir < 0) {
             from = from_pos + count - i - 1;
             to = to_pos + count - i - 1;
@@ -43506,6 +43508,8 @@ static JSValue js_array_concat(JSContext *ctx, JSValueConst this_val,
                 goto exception;
             }
             for (k = 0; k < len; k++, n++) {
+                if (js_poll_interrupts(ctx))
+                    goto exception;
                 res = JS_TryGetPropertyInt64(ctx, e, k, &val);
                 if (res < 0)
                     goto exception;
@@ -44153,6 +44157,8 @@ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
     string_buffer_init(ctx, b, 0);
 
     for(i = 0; i < n; i++) {
+        if (js_poll_interrupts(ctx))
+            goto fail;
         if (i > 0) {
             if (c >= 0) {
                 string_buffer_putc8(b, c);
@@ -44331,6 +44337,8 @@ static JSValue js_array_reverse(JSContext *ctx, JSValueConst this_val,
     }
 
     for (l = 0, h = len - 1; l < h; l++, h--) {
+        if (js_poll_interrupts(ctx))
+            goto exception;
         l_present = JS_TryGetPropertyInt64(ctx, obj, l, &lval);
         if (l_present < 0)
             goto exception;
@@ -44485,6 +44493,8 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
     }
     /* Copy the remaining elements if any (handle case of inherited properties) */
     for (; k < final; k++, n++) {
+        if (js_poll_interrupts(ctx))
+            goto exception;
         kPresent = JS_TryGetPropertyInt64(ctx, obj, k, &val);
         if (kPresent < 0)
             goto exception;
@@ -44654,6 +44664,8 @@ static int64_t JS_FlattenIntoArray(JSContext *ctx, JSValueConst target,
     }
 
     for (sourceIndex = 0; sourceIndex < sourceLen; sourceIndex++) {
+        if (js_poll_interrupts(ctx))
+            return -1;
         present = JS_TryGetPropertyInt64(ctx, source, sourceIndex, &element);
         if (present < 0)
             return -1;
@@ -44837,6 +44849,8 @@ static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
 
     /* XXX: should special case fast arrays */
     for (i = 0; i < len; i++) {
+        if (js_poll_interrupts(ctx))
+            goto exception;
         if (pos >= array_size) {
             size_t new_size;
             ValueSlot *new_array;
@@ -44884,6 +44898,8 @@ static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
             goto fail;
     }
     for (; i < len; i++) {
+        if (js_poll_interrupts(ctx))
+            goto fail;
         if (JS_DeletePropertyInt64(ctx, obj, i, JS_PROP_THROW) < 0)
             goto fail;
     }
@@ -47115,6 +47131,8 @@ static JSValue js_string_raw(JSContext *ctx, JSValueConst this_val,
         goto exception;
 
     for (i = 0; i < n; i++) {
+        if (js_poll_interrupts(ctx))
+            goto exception;
         val = JS_ToStringFree(ctx, JS_GetPropertyInt64(ctx, raw, i));
         if (JS_IsException(val))
             goto exception;
@@ -51679,6 +51697,8 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                 goto exception;
             string_buffer_putc8(jsc->b, '[');
             for(i = 0; i < len; i++) {
+                if (js_poll_interrupts(ctx))
+                    goto exception;
                 if (i > 0)
                     string_buffer_putc8(jsc->b, ',');
                 string_buffer_concat_value(jsc->b, sep);
@@ -51836,6 +51856,8 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
                 goto exception;
             for (i = j = 0; i < n; i++) {
                 JSValue present;
+                if (js_poll_interrupts(ctx))
+                    goto exception;
                 v = JS_GetPropertyInt64(ctx, replacer, i);
                 if (JS_IsException(v))
                     goto exception;

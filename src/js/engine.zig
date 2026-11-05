@@ -311,6 +311,25 @@ test "the deadline stops loops, runaway regular expressions, and endless jobs" {
     try expectOutcome(.timed_out, "for (;;) await null;", quick);
 }
 
+test "the deadline stops built-ins that loop over a huge length" {
+    // Each loop neither allocates nor calls back into JavaScript, so only
+    // the deadline ends it. Without it, each runs for seconds.
+    const quick: Limits = .{ .time_ms = 100 };
+    const programs = [_][]const u8{
+        "return Array.prototype.join.call({ length: 2 ** 27 }, '');",
+        "return Array.prototype.reverse.call({ length: 2 ** 27 });",
+        "return Array.prototype.shift.call({ length: 2 ** 27 });",
+        "return Array.prototype.slice.call({ length: 2 ** 27 }).length;",
+        "return [].concat({ length: 2 ** 27, [Symbol.isConcatSpreadable]: true }).length;",
+        "return Array.prototype.flat.call({ length: 2 ** 27 }).length;",
+        "return Array.prototype.sort.call({ length: 2 ** 27 }).length;",
+        "const a = []; a.length = 2 ** 27; return JSON.stringify(a).length;",
+        "const r = []; r.length = 2 ** 27; return JSON.stringify({ a: 1 }, r);",
+        "return String.raw({ raw: { length: 2 ** 27 } }).length;",
+    };
+    for (programs) |source| try expectOutcome(.timed_out, source, quick);
+}
+
 test "the heap limit stops the program, and the program cannot catch it" {
     const small: Limits = .{ .heap_bytes = 16 * 1024 * 1024 };
     try expectThrew("InternalError: out of memory",
