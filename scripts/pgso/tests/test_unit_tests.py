@@ -123,6 +123,19 @@ class TransformedUnitTestsTests(unittest.TestCase):
         with self.assertRaisesRegex(PgsoError, "compact-error-names skipped the unit tests: no error name table"):
             unit_tests.require_pass_applied(self.paths, "compact-error-names")
 
+    def test_a_size_pass_log_that_cannot_be_read_fails_the_step(self) -> None:
+        logs = {
+            "not-json-stdout": json.dumps({"stdout": "not json"}),
+            "not-json-log": "{broken",
+            "no-stdout": json.dumps({"stderr": ""}),
+            "list-summary": json.dumps({"stdout": "[1, 2]"}),
+        }
+        for name, text in logs.items():
+            (self.paths.logs / f"{name}.json").write_text(text, encoding="utf-8")
+        for name in (*logs, "missing"):
+            with self.subTest(name), self.assertRaisesRegex(PgsoError, f"^{name} (left no summary|printed a summary)"):
+                unit_tests.require_pass_applied(self.paths, name)
+
     def test_tests_run_from_the_repository_root_with_an_open_stdin(self) -> None:
         repo = self.root / "repo"
         repo.mkdir()
@@ -203,9 +216,10 @@ class TransformedUnitTestsTests(unittest.TestCase):
         with self.assertRaisesRegex(PgsoError, "did not all pass"):
             unit_tests.run_tests(failed, self.root, self.paths.logs / "failed.json")
         crashed = self.write_executable("crashed", "import os\nos.abort()")
-        with self.assertRaisesRegex(PgsoError, "failed twice: command failed with exit code -6"):
+        with self.assertRaisesRegex(PgsoError, "failed twice: command failed with exit code -6") as raised:
             unit_tests.run_tests(crashed, self.root, self.paths.logs / "crashed.json")
         self.assertTrue((self.paths.logs / "crashed-retry.json").is_file())
+        self.assertIn(f"logs: {self.paths.logs / 'crashed.json'} and {self.paths.logs / 'crashed-retry.json'}", str(raised.exception))
 
     def test_the_step_refuses_a_target_that_is_not_linux(self) -> None:
         toolchain = types.SimpleNamespace(target="aarch64-macos", platform=macos)

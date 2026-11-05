@@ -122,8 +122,13 @@ def failed_tests(output: str) -> list[str]:
 
 def require_pass_applied(paths: PipelinePaths, name: str) -> dict[str, object]:
     """The summary `ir_size.py` printed for `name`, which must not have skipped."""
-    log = json.loads((paths.logs / f"{name}.json").read_text(encoding="utf-8"))
-    summary = json.loads(log["stdout"])
+    log_path = paths.logs / f"{name}.json"
+    try:
+        summary = json.loads(json.loads(log_path.read_text(encoding="utf-8"))["stdout"])
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise PgsoError(f"{name} left no summary in {log_path}: {error}") from error
+    if not isinstance(summary, dict):
+        raise PgsoError(f"{name} printed a summary that is not a JSON object in {log_path}")
     if "skipped" in summary:
         raise PgsoError(f"{name} skipped the unit tests: {summary['skipped']}")
     return summary
@@ -220,7 +225,8 @@ def run_tests(binary: pathlib.Path, repo_root: pathlib.Path, log_path: pathlib.P
     except PgsoError as error:
         raise PgsoError(
             f"unit tests failed twice: {first['error']}, failed {first['failed_tests']}; "
-            f"retry: {error}, failed {failed_tests(_logged_stderr(retry_log))}"
+            f"retry: {error}, failed {failed_tests(_logged_stderr(retry_log))}; "
+            f"logs: {log_path} and {retry_log}"
         ) from error
     print(f"::warning title=Unit tests passed only on retry::{', '.join(first['failed_tests']) or first['error']}")
     return {**summary, "retried": True, "first_attempt": first}
