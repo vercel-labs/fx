@@ -59,14 +59,15 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         }
     } else if (is(op.op, "worker_poll")) {
         if (lab.worker != .waiting) result.@"error" = "the request is not waiting";
-        switch (lab.handoff.poll(lab.cancelled)) {
-            .wait => {},
-            .take => lab.worker = .using,
+        if (lab.cancelled) switch (lab.handoff.stop()) {
             .walk_away => lab.worker = .returned,
             .close_handed => {
                 lab.conn = .closed;
                 lab.worker = .returned;
             },
+        } else switch (lab.handoff.poll()) {
+            .wait => {},
+            .take => lab.worker = .using,
         }
     } else {
         result.@"error" = "unknown op";

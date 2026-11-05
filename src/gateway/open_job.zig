@@ -22,12 +22,17 @@ pub const JobAfterOpen = enum {
     close_late,
 };
 
-/// What the waiting request does on each check.
-pub const WorkerMove = enum {
-    /// The open is still running and the request still wants it.
+/// What the request does on each check while it still wants the open.
+pub const WaitMove = enum {
+    /// The open is still running.
     wait,
-    /// The open was handed over and the request still wants it.
+    /// The open was handed over.
     take,
+};
+
+/// What the request does when it stops waiting, on Esc or at the setup
+/// deadline.
+pub const StopMove = enum {
     /// The request stopped first: it returns at once and never touches the
     /// job again, which then closes its own late connection.
     walk_away,
@@ -49,10 +54,13 @@ pub const Handoff = struct {
             .close_late;
     }
 
-    /// The request's side, checked while it waits (OpenCancel.tla WorkerTake
-    /// and WorkerAbandonAtomic). `stop` is Esc or the setup deadline.
-    pub fn poll(self: *Handoff, stop: bool) WorkerMove {
-        if (!stop) return if (self.state.load(.acquire) == .handed) .take else .wait;
+    /// The request's check while it waits (OpenCancel.tla WorkerTake).
+    pub fn poll(self: *Handoff) WaitMove {
+        return if (self.state.load(.acquire) == .handed) .take else .wait;
+    }
+
+    /// The request stops waiting (OpenCancel.tla WorkerAbandonAtomic).
+    pub fn stop(self: *Handoff) StopMove {
         return if (self.state.cmpxchgStrong(.running, .abandoned, .acq_rel, .acquire) == null)
             .walk_away
         else
@@ -62,17 +70,17 @@ pub const Handoff = struct {
 
 test "an open that returns first is handed over, and a stop after it closes it" {
     var handoff: Handoff = .{};
-    try std.testing.expectEqual(WorkerMove.wait, handoff.poll(false));
+    try std.testing.expectEqual(WaitMove.wait, handoff.poll());
     try std.testing.expectEqual(JobAfterOpen.hand_over, handoff.publish());
-    try std.testing.expectEqual(WorkerMove.take, handoff.poll(false));
+    try std.testing.expectEqual(WaitMove.take, handoff.poll());
     var stopped: Handoff = .{};
     try std.testing.expectEqual(JobAfterOpen.hand_over, stopped.publish());
-    try std.testing.expectEqual(WorkerMove.close_handed, stopped.poll(true));
+    try std.testing.expectEqual(StopMove.close_handed, stopped.stop());
 }
 
 test "a request that stops first walks away, and the late open is closed by its job" {
     var handoff: Handoff = .{};
-    try std.testing.expectEqual(WorkerMove.walk_away, handoff.poll(true));
+    try std.testing.expectEqual(StopMove.walk_away, handoff.stop());
     try std.testing.expectEqual(JobAfterOpen.close_late, handoff.publish());
 }
 
@@ -80,14 +88,14 @@ test "racing threads leave exactly one owner of every open" {
     const Race = struct {
         handoff: Handoff = .{},
         job: JobAfterOpen = undefined,
-        worker: WorkerMove = undefined,
+        worker: StopMove = undefined,
 
         fn runJob(self: *@This()) void {
             self.job = self.handoff.publish();
         }
 
         fn runWorker(self: *@This()) void {
-            self.worker = self.handoff.poll(true);
+            self.worker = self.handoff.stop();
         }
     };
     var hand_overs: usize = 0;
@@ -102,11 +110,11 @@ test "racing threads leave exactly one owner of every open" {
         // handed over, the job when the request walked away first.
         switch (race.job) {
             .hand_over => {
-                try std.testing.expectEqual(WorkerMove.close_handed, race.worker);
+                try std.testing.expectEqual(StopMove.close_handed, race.worker);
                 hand_overs += 1;
             },
             .close_late => {
-                try std.testing.expectEqual(WorkerMove.walk_away, race.worker);
+                try std.testing.expectEqual(StopMove.walk_away, race.worker);
                 walk_aways += 1;
             },
         }

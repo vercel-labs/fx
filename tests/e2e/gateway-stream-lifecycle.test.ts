@@ -11741,12 +11741,51 @@ describe("request recovery across statuses and garbled streams", () => {
       expect(result.code).toBe(0);
       expect(gateway.requestCount()).toBe(2);
       expect(result.stdout).toContain("Recovered after a garbled event.");
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Unreadable reply · next try in 1s · attempt 1$/m);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
   });
+
+  test("a server that never sends a readable stream gets three requests, then the turn ends", async () => {
+    const root = createFixtureRoot("never-readable");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => sse('data: {"type":"text-delta","id":"t1","delta":"\u0001broken\n\n'));
+    try {
+      const result = await runFx(["ask", "--auto", "Read an unreadable stream."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).not.toBe(0);
+      expect(gateway.requestCount()).toBe(3);
+      expect(result.stderr).toMatch(/^\[notice\] Unreadable reply · next try in .* · attempt 2$/m);
+      expect(result.stderr).toContain("unreadable reply");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("fx ask does not retry a 501", async () => {
+    const root = createFixtureRoot("not-implemented");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => statusResponse(501, JSON.stringify({ error: { message: "not implemented" } })));
+    try {
+      const result = await runFx(["ask", "--auto", "Reach an unimplemented route."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 20_000,
+      });
+      expect(result.code).not.toBe(0);
+      expect(gateway.requestCount()).toBe(1);
+      expect(result.stderr).toContain("HTTP 501");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   test("a stream event nested past the depth limit still ends the turn", async () => {
     const root = createFixtureRoot("too-deep-event");

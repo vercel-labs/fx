@@ -70,6 +70,10 @@ pub fn failureKind(cause: types.ModelRecoveryCause) ?Failure.Kind {
     };
 }
 
+/// The unreadable replies one request takes before its turn ends: a server
+/// that sends one every time is broken, not having a bad moment.
+const max_unreadable_replies = 3;
+
 pub const RequestRecovery = struct {
     deps: *const runtime_deps.AgentRuntimeDeps,
     cancel_flag: *std.atomic.Value(bool),
@@ -80,6 +84,9 @@ pub const RequestRecovery = struct {
     continue_flag: ?*std.atomic.Value(bool) = null,
     /// Off in tests unless a test exercises the thread itself.
     ticker_enabled: bool = !builtin.is_test,
+    /// Replies this request could not read. Touched only by the request's
+    /// own thread.
+    unreadable_replies: u8 = 0,
 
     mutex: std.Io.Mutex = .init,
     // Everything below is guarded by `mutex`.
@@ -325,6 +332,14 @@ pub const RequestRecovery = struct {
     }
 
     /// Sends so far, including the first.
+    /// Counts a reply this request could not read, and says whether it is
+    /// the last one: past `max_unreadable_replies` the turn ends with the
+    /// error instead of another resend.
+    pub fn unreadableReplyEndsRequest(self: *RequestRecovery) bool {
+        self.unreadable_replies +|= 1;
+        return self.unreadable_replies >= max_unreadable_replies;
+    }
+
     pub fn attempt(self: *RequestRecovery) u16 {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);

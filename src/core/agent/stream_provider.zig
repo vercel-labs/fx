@@ -126,6 +126,10 @@ pub const NetworkFailureCause = enum {
     /// The stream produced no bytes past the stall threshold. Positive
     /// evidence that this exchange is dead; restarting it is the recovery.
     stream_stalled,
+    /// The server answered, but an event in its stream was not JSON, as if
+    /// damaged on the way. Resent a few times; a server that keeps sending
+    /// one ends the turn.
+    unreadable_reply,
 };
 
 /// Stable native transport evidence consumed by model recovery policy.
@@ -490,9 +494,7 @@ pub const FailureKind = enum {
             .bad_gateway => .bad_gateway,
             .service_unavailable => .unavailable,
             .gateway_timeout => .gateway_timeout,
-            // 529 (overloaded), 520-524 (Cloudflare) and every other 5xx are
-            // server failures a resend can outlive.
-            else => if (@backingInt(status) >= 500 and @backingInt(status) <= 599) .server_error else .provider_error,
+            else => if (types.isRetryableServerStatus(@backingInt(status))) .server_error else .provider_error,
         };
     }
 };
@@ -814,6 +816,8 @@ test "provider HTTP statuses classify into failure kinds" {
         .{ @as(std.http.Status, @fromBackingInt(520)), .server_error },
         .{ @as(std.http.Status, @fromBackingInt(524)), .server_error },
         .{ @as(std.http.Status, @fromBackingInt(529)), .server_error },
+        .{ .not_implemented, .provider_error },
+        .{ .http_version_not_supported, .provider_error },
         .{ .not_found, .provider_error },
         .{ .conflict, .provider_error },
         .{ .ok, .provider_error },

@@ -272,7 +272,7 @@ if (options.selfCheck) {
     {
       name: "walks away without the swap, leaving a handed connection open",
       target: "self.state.cmpxchgStrong(.running, .abandoned, .acq_rel, .acquire) == null",
-      planted: "true",
+      planted: "self.state.load(.acquire) != .abandoned",
     },
     {
       name: "hands a late connection to a request that walked away",
@@ -281,8 +281,8 @@ if (options.selfCheck) {
     },
     {
       name: "takes the open before it is handed over",
-      target: "if (!stop) return if (self.state.load(.acquire) == .handed) .take else .wait;",
-      planted: "if (!stop) return .take;",
+      target: "return if (self.state.load(.acquire) == .handed) .take else .wait;",
+      planted: "return if (self.state.load(.acquire) != .abandoned) .take else .wait;",
     },
   ];
   let mutantsCaught = true;
