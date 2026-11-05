@@ -189,6 +189,8 @@ pub fn build(b: *std.Build) void {
     fuzz_root.addImport("build_options", build_options.createModule());
     fuzz_root.addImport("fuzz_corpus", fuzz_corpus);
     fuzz_root.addImport("fuzz_seed", fuzz_seed);
+    // The sandbox's frame target lives in a file that also runs the engine.
+    fuzz_root.addImport("js_engine", jsEngineModule(b, target, optimize, fuzz_corpora));
     fuzz_root.addImport("session_manager", session_manager);
     fuzz_root.addImport("test_paths", test_paths_module);
     addFuzzStep(b, fuzz_step, fuzz_corpora, fuzz_target, .{
