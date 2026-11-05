@@ -24,7 +24,7 @@ type Edge = { to: string; label: string };
 type Graph = { states: Map<string, Model>; next: Map<string, Edge[]>; init: string };
 type Op = { op: string };
 type Result = {
-  state: { worker: string; job: string; conn: string; state: string; cancelled: boolean };
+  state: { worker: string; job: string; conn: string; client: string; state: string; cancelled: boolean };
   error: string | null;
 };
 type Hop = { from: string; to: string; label: string };
@@ -81,7 +81,7 @@ function buildLab(moduleSource: string, out: string, name: string): string {
 async function loadGraph(out: string): Promise<Graph> {
   const dir = join(out, "graph");
   const cfg = ["INIT Init", "NEXT Next", "CONSTANTS", "    Abandon = TRUE", "    CloseLate = TRUE",
-    "    AtomicSwap = TRUE", "CHECK_DEADLOCK FALSE", ""].join("\n");
+    "    AtomicSwap = TRUE", "    StopConnect = TRUE", "    FreeOnReturn = FALSE", "CHECK_DEADLOCK FALSE", ""].join("\n");
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "Driver.cfg"), cfg);
   const run = await runTlc(dir, "OpenCancel", "Driver.cfg", ["OpenCancel.tla"], join(TLA_ROOT, "gateway_open"),
@@ -122,19 +122,30 @@ function opFor(label: string): Op {
   switch (label) {
     case "Cancel": return { op: "cancel" };
     case "LookupReturns": return { op: "lookup_returns" };
+    case "ConnectReturns": return { op: "connect_returns" };
+    case "JobStopConnect": return { op: "job_watch" };
     case "JobPublishAtomic": return { op: "job_publish" };
     case "WorkerAbandonAtomic": case "WorkerTake": return { op: "worker_poll" };
+    case "WorkerDone": return { op: "worker_done" };
     default: throw new Error(`no mapping for model action ${label}`);
   }
 }
 
-// The real request polls every few milliseconds while it waits, which the
-// model leaves out as stuttering. A poll in a state where the request still
-// wants a running open must change nothing, so the driver adds one there.
+// The real request polls every few milliseconds while it waits, and the
+// job's watch while its open runs, which the model leaves out as
+// stuttering. A poll in a state where the request still wants a running
+// open, or where the job's open cannot be stopped yet, must change nothing,
+// so the driver adds one there.
 const pollsWhileWaiting = (t: Model) => t.worker === "waiting" && !t.cancelled && t.state === "running";
+const watchesWhileOpening = (t: Model) => t.job === "lookup" || (t.job === "connect" && t.state !== "abandoned");
 
-const opsFor = (hop: Hop, graph: Graph): Op[] =>
-  pollsWhileWaiting(graph.states.get(hop.to)!) ? [opFor(hop.label), { op: "worker_poll" }] : [opFor(hop.label)];
+function opsFor(hop: Hop, graph: Graph): Op[] {
+  const t = graph.states.get(hop.to)!;
+  const ops = [opFor(hop.label)];
+  if (pollsWhileWaiting(t)) ops.push({ op: "worker_poll" });
+  if (watchesWhileOpening(t)) ops.push({ op: "job_watch" });
+  return ops;
+}
 
 // One walk per edge: the shortest path from the initial state to the edge's
 // source, then the edge.
@@ -229,6 +240,7 @@ function check(walks: Walk[], graph: Graph, results: Result[], tamper: boolean) 
         expect("job", t.job, result.state.job);
         const conn = tamper && hop.label === "JobPublishAtomic" && t.conn === "closed" ? "open" : t.conn;
         expect("conn", conn, result.state.conn);
+        expect("client", t.client, result.state.client);
         expect("state", t.state, result.state.state);
         expect("cancelled", t.cancelled, result.state.cancelled);
       }
@@ -258,7 +270,7 @@ const outcome = check(walks, graph, results, false);
 let ok = report("module", walks, outcome);
 const coverage = [...outcome.seen.entries()].sort((a, b) => b[1] - a[1]).map(([label, count]) => `${label} ${count}`).join(", ");
 console.log(`steps per action: ${coverage}`);
-for (const label of ["Cancel", "LookupReturns", "JobPublishAtomic", "WorkerAbandonAtomic", "WorkerTake"]) {
+for (const label of ["Cancel", "LookupReturns", "ConnectReturns", "JobStopConnect", "JobPublishAtomic", "WorkerAbandonAtomic", "WorkerTake", "WorkerDone"]) {
   if (!outcome.seen.has(label)) {
     console.log(`action ${label} was never walked`);
     ok = false;
@@ -283,6 +295,11 @@ if (options.selfCheck) {
       name: "takes the open before it is handed over",
       target: "return if (self.state.load(.acquire) == .handed) .take else .wait;",
       planted: "return if (self.state.load(.acquire) != .abandoned) .take else .wait;",
+    },
+    {
+      name: "never stops an open the request walked away from",
+      target: "return self.state.load(.acquire) == .abandoned;",
+      planted: "_ = self;\n        return false;",
     },
   ];
   let mutantsCaught = true;
