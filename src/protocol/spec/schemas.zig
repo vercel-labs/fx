@@ -290,6 +290,90 @@ test "every JSON example in sh-fx.md parses as a JSON object" {
     try std.testing.expect(examples > 0);
 }
 
+/// Returns the text of the `## ` section of `doc` titled `title`, up to the next `## ` heading.
+fn section(doc: []const u8, comptime title: []const u8) ?[]const u8 {
+    const heading = "\n## " ++ title ++ "\n";
+    const start = (std.mem.find(u8, doc, heading) orelse return null) + heading.len;
+    const end = if (std.mem.find(u8, doc[start..], "\n## ")) |offset| start + offset else doc.len;
+    return doc[start..end];
+}
+
+/// Returns the text inside one pair of backticks that wraps all of `cell`, or null.
+fn codeCell(cell: []const u8) ?[]const u8 {
+    if (cell.len < 3 or cell[0] != '`' or cell[cell.len - 1] != '`') return null;
+    const inner = cell[1 .. cell.len - 1];
+    return if (std.mem.findScalar(u8, inner, '`') == null) inner else null;
+}
+
+test "the table of names in use today gives each name one valid new name" {
+    const table = section(fx_spec.bytes, "Names in use today") orelse {
+        std.debug.print("sh-fx.md has no \"Names in use today\" section\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    const meta = try parseSpecFile(acp_meta);
+    defer meta.deinit();
+    const agent_methods = field(meta.value, "agentMethods") orelse return error.TestUnexpectedResult;
+    const client_methods = field(meta.value, "clientMethods") orelse return error.TestUnexpectedResult;
+
+    var olds: [64][]const u8 = undefined;
+    var news: [64][]const u8 = undefined;
+    var rows: usize = 0;
+    var lines = std.mem.splitScalar(u8, table, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "|")) continue;
+        if (std.mem.startsWith(u8, line, "| Today |") or std.mem.startsWith(u8, line, "| --- |")) continue;
+        var cells: [6][]const u8 = undefined;
+        var count: usize = 0;
+        var parts = std.mem.splitScalar(u8, line, '|');
+        while (parts.next()) |part| : (count += 1) {
+            if (count == cells.len) break;
+            cells[count] = std.mem.trim(u8, part, " ");
+        }
+        const old = if (count == cells.len) codeCell(cells[1]) else null;
+        const new = if (count == cells.len) codeCell(cells[3]) else null;
+        if (old == null or new == null or rows == olds.len) {
+            std.debug.print("sh-fx.md has a malformed row in its names table: {s}\n", .{line});
+            return error.TestUnexpectedResult;
+        }
+        try checkNameRow(old.?, new.?, cells[2], agent_methods, client_methods, olds[0..rows], news[0..rows]);
+        olds[rows] = old.?;
+        news[rows] = new.?;
+        rows += 1;
+    }
+    try std.testing.expect(rows > 0);
+}
+
+/// Checks one row of the names table: a known direction, an old name that is not already an sh.fx
+/// name, a new name that is an sh.fx method or a standard ACP method sent the same way, and names
+/// that no earlier row used.
+fn checkNameRow(
+    old: []const u8,
+    new: []const u8,
+    direction: []const u8,
+    agent_methods: std.json.Value,
+    client_methods: std.json.Value,
+    seen_olds: []const []const u8,
+    seen_news: []const []const u8,
+) !void {
+    const to_fx = std.mem.cutPrefix(u8, direction, "client to fx, ");
+    const kind = to_fx orelse std.mem.cutPrefix(u8, direction, "fx to client, ") orelse "";
+    if (!std.mem.eql(u8, kind, "request") and !std.mem.eql(u8, kind, "notification")) {
+        std.debug.print("{s} has the unknown direction \"{s}\"\n", .{ old, direction });
+        return error.TestUnexpectedResult;
+    }
+    const standard = hasStringValue(if (to_fx != null) agent_methods else client_methods, new);
+    if (isMethodName(old) or !(isMethodName(new) or standard)) {
+        std.debug.print("{s} maps to {s}, which is not a valid new name\n", .{ old, new });
+        return error.TestUnexpectedResult;
+    }
+    for (seen_olds, seen_news) |seen_old, seen_new| {
+        if (std.mem.eql(u8, seen_old, old) or std.mem.eql(u8, seen_new, new)) {
+            std.debug.print("{s} or {s} appears twice in the names table\n", .{ old, new });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 test "every sh.fx name in sh-fx.md follows the naming rules" {
     var names: usize = 0;
     var spans = std.mem.splitScalar(u8, fx_spec.bytes, '`');
