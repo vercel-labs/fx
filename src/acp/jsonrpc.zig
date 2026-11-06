@@ -45,8 +45,9 @@ fn writeOneLine(w: *std.Io.Writer, json: []const u8) !void {
     try w.writeAll(rest);
 }
 
+/// The error codes fx sends. ACP v1 gives codes from -32000 to -32099 its own meanings, such as
+/// -32000 for "Authentication required", so fx uses one of them only with ACP's meaning.
 pub const ErrorCode = struct {
-    pub const request_frame_too_large: i64 = -32000;
     pub const parse_error: i64 = -32700;
     pub const invalid_request: i64 = -32600;
     pub const method_not_found: i64 = -32601;

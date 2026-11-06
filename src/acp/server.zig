@@ -1022,7 +1022,7 @@ pub fn runWithTransport(
         const line = switch (line_result.?) {
             .overflow => {
                 state.writer.writeError(alloc, null, .{
-                    .code = ErrorCode.request_frame_too_large,
+                    .code = ErrorCode.invalid_request,
                     .message = "Request frame too large",
                 }) catch break;
                 continue;
