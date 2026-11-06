@@ -1997,6 +1997,43 @@ describe("gateway stream lifecycle", () => {
     }
   }, 60_000);
 
+  test("a skill copied into two workspace skill folders is listed once and the trace names the copy left out", async () => {
+    const root = createFixtureRoot("skill-identical-copies");
+    const tracePath = join(root.root, "trace.log");
+    const copies = [
+      join(root.workspace, ".codex", "skills", "release-notes"),
+      join(root.workspace, ".agents", "skills", "release-notes"),
+    ];
+    for (const directory of copies) {
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(
+        join(directory, "SKILL.md"),
+        "---\nname: release-notes\ndescription: Draft release notes from merged pull requests.\n---\n\nRELEASE_NOTES_BODY\n",
+      );
+    }
+    const gateway = startGateway(() => fakeGatewayFinalText("COPIES_COMPLETE"));
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Say done."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "skills" },
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      const body = gateway.requests[0]!.body;
+      const locations = advertisedSkillLocations(body, "release-notes");
+      expect(locations).toHaveLength(1);
+      const listed = advertisedSkillPath(body, locations[0]!);
+      expect(copies).toContain(listed);
+      const omitted = copies.find((directory) => directory !== listed)!;
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        `catalog omitted identical copy name="release-notes" path="${omitted}`,
+      );
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("skill_symlink_authorities setting admits external skill links", async () => {
     const root = createFixtureRoot("skill-symlink-authorities");
     const tracePath = join(root.root, "trace.log");
@@ -9205,7 +9242,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const root = createFixtureRoot("subagent-persistent-resume");
     const resumedWorkspace = join(root.root, "resumed-workspace");
     const smallModel = "fixture/small-context";
-    const skillNames = ["alpha-check", "beta-check", "gamma-check", "delta-check"];
+    // Enough skills that the small model's catalog budget binds even with
+    // each description at the catalog's default length.
+    const skillNames = ["alpha-check", "beta-check", "gamma-check", "delta-check", "epsilon-check", "zeta-check", "eta-check", "theta-check"];
     for (const name of skillNames) {
       const directory = join(resumedWorkspace, ".agents", "skills", name);
       mkdirSync(directory, { recursive: true });

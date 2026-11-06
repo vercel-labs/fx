@@ -5370,8 +5370,10 @@ test "processQueuedPrompt skill catalog is invariant under harmless request expa
 test "processQueuedPrompt prepares each origin skill catalog with its supplied model and workspace" {
     const alloc = std.testing.allocator;
     const Skill = @import("../../../skills/skill_runtime.zig").Skill;
-    const description = text_utils.repeat("Instruction detail. ", 50);
-    const names = [_][]const u8{ "alpha", "beta", "gamma", "delta" };
+    // Short enough for the catalog to show it whole, and enough skills that
+    // only the smaller window's budget has to shorten them.
+    const description = text_utils.repeat("Instruction detail. ", 9);
+    const names = [_][]const u8{ "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta" };
     const cases = [_]struct { model: []const u8, workspace: []const u8, context_window: u32, child: bool }{
         .{ .model = "fixture/parent-model", .workspace = "/tmp/parent-workspace", .context_window = 64_000, .child = false },
         .{ .model = "fixture/child-model", .workspace = "/tmp/child-workspace", .context_window = 16_000, .child = true },
