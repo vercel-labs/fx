@@ -891,6 +891,12 @@ const App = struct {
         return AgentsAppRuntime.busiest(self);
     }
 
+    /// An agent other than the one on screen that an upgrade's restart
+    /// would stop. Its name may use `buf`.
+    pub fn busyAgentElsewhere(self: *App, buf: []u8) ?app_agents_runtime.BusyAgent {
+        return AgentsAppRuntime.busyAgentElsewhere(self, buf);
+    }
+
     /// `agent`'s turn needs the user: an approval or a question.
     pub fn dispatchAttentionRequired(
         self: *App,
@@ -5573,6 +5579,47 @@ test "the busiest agent wins herdr's state: an approval over work, work over idl
     app.instances.first_open = false;
     try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
     app.main_agent.worker.worker_processing = false;
+}
+
+test "an upgrade sees the agents its restart would stop, but not the one on screen" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const Busiest = app_agents_runtime.Busiest;
+    var buf: [32]u8 = undefined;
+    const reviewer = try addTestChildAgent(&app, "reviewer");
+    try std.testing.expect(runtime.busyAgentElsewhere(&app, &buf) == null);
+
+    // Main is on screen, so the upgrade's own checks cover its turn.
+    app.main_agent.worker.worker_processing = true;
+    try std.testing.expect(runtime.busyAgentElsewhere(&app, &buf) == null);
+    app.main_agent.worker.worker_processing = false;
+
+    reviewer.agent.worker.worker_processing = true;
+    const working = runtime.busyAgentElsewhere(&app, &buf).?;
+    try std.testing.expectEqualStrings("reviewer", working.name);
+    try std.testing.expectEqual(Busiest.working, working.doing);
+    reviewer.agent.worker.worker_processing = false;
+
+    try std.testing.expect(try reviewer.agent.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
+    try std.testing.expectEqual(Busiest.needs_approval, runtime.busyAgentElsewhere(&app, &buf).?.doing);
+    reviewer.agent.approval_prompt.clear(alloc);
+
+    // On the reviewer's screen, main's turn counts and the reviewer's own
+    // does not.
+    app.agent_on_screen = reviewer;
+    defer app.agent_on_screen = null;
+    reviewer.agent.worker.worker_processing = true;
+    try std.testing.expect(runtime.busyAgentElsewhere(&app, &buf) == null);
+    app.main_agent.worker.worker_processing = true;
+    try std.testing.expectEqualStrings("main", runtime.busyAgentElsewhere(&app, &buf).?.name);
+    app.main_agent.worker.worker_processing = false;
+    reviewer.agent.worker.worker_processing = false;
 }
 
 fn addTestChildAgent(app: *App, id: []const u8) !*app_agents_runtime.ChildAgent {
