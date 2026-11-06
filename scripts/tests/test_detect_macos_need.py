@@ -137,6 +137,14 @@ class DetectMacosNeedTests(unittest.TestCase):
                 self.assertIn(path, self.assert_needed())
                 self.base = self.git("rev-parse", "HEAD")
 
+    def test_javascript_engine_c_changes_need_macos(self) -> None:
+        for path in ("src/js/quickjs/quickjs.c", "src/js/quickjs/cutils.h"):
+            with self.subTest(path=path):
+                self.write(path, f"/* {path} */\n")
+                self.commit(path)
+                self.assertIn(path, self.assert_needed())
+                self.base = self.git("rev-parse", "HEAD")
+
     def test_native_sdk_changes_also_check_the_addon(self) -> None:
         for path in ("src/napi_core_main.zig", "sdk/node.js", "sdk/tests/test-node-napi.mjs"):
             with self.subTest(path=path):
