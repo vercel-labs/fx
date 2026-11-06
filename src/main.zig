@@ -743,6 +743,7 @@ const App = struct {
                 .provider_order = launch.modifiers.provider_order_override,
                 .provider_strict = launch.modifiers.provider_strict_override,
                 .permission_mode = launch.modifiers.permission_override,
+                .upgrade_relaunch = launch.upgrade_relaunch != null,
             },
         );
         errdefer app.deinit();

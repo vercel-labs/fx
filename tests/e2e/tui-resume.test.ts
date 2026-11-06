@@ -6191,6 +6191,254 @@ test.skipIf(!tmuxAvailable())(
   UPGRADE_TIMEOUT * 2,
 );
 
+/// The screen the pane bytes draw, rebuilt on fx's own terminal engine
+/// through `fx replay`, one row per string with trailing blanks removed.
+function replayPaneBytes(
+  root: string,
+  home: string,
+  name: string,
+  size: { cols: number; rows: number },
+  bytes: Buffer,
+): string[] {
+  // A tape header (src/core/workspace/record_tape.zig buildHeader) and one
+  // stdout frame holding every byte.
+  const header = Buffer.alloc(18);
+  header.write("FXTP\x01", 0, "binary");
+  header.writeUInt16LE(size.cols, 5);
+  header.writeUInt16LE(size.rows, 7);
+  header.writeBigInt64LE(0n, 9);
+  header.writeUInt8(0, 17);
+  const frame = Buffer.alloc(9);
+  frame.writeInt32LE(0, 0);
+  frame.writeUInt8(1, 4);
+  frame.writeUInt32LE(bytes.length, 5);
+  const tapePath = join(root, `${name}.fxtape`);
+  const gridPath = join(root, `${name}.grid.txt`);
+  writeFileSync(tapePath, Buffer.concat([header, frame, bytes]));
+  const replay = Bun.spawnSync([FX_BIN, "replay", tapePath, "--golden", gridPath], {
+    env: { ...process.env, HOME: home, FX_AUTO_UPGRADE: "0", FX_SOUND: "0" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (replay.exitCode !== 0) {
+    throw new Error(`fx replay ${name} failed: ${replay.stderr.toString()}`);
+  }
+  const rows = readFileSync(gridPath, "utf8").split("\n")
+    .filter((line) => line.startsWith("|") && line.endsWith("|"))
+    .map((line) => line.slice(1, -1).trimEnd());
+  expect(rows.length).toBe(size.rows);
+  return rows;
+}
+
+/// The capture file's length once fx has stopped writing to the pane.
+async function settledCaptureLength(path: string, stableMs = 300): Promise<number> {
+  const deadline = Date.now() + TIMEOUT;
+  let length = -1;
+  let stableSince = Date.now();
+  while (Date.now() < deadline) {
+    const current = existsSync(path) ? statSync(path).size : 0;
+    if (current !== length) {
+      length = current;
+      stableSince = Date.now();
+    } else if (Date.now() - stableSince >= stableMs) {
+      return length;
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error(`pane output in ${path} did not settle`);
+}
+
+type CtrlGScreens = {
+  /// The screen just before ctrl+g.
+  before: string[];
+  /// The screen after the old build exits and the new build starts, just
+  /// before the new build's first frame clears the terminal.
+  gap: string[];
+  /// The scrollback once the new build has drawn the conversation again.
+  redrawn: string;
+};
+
+/// Presses ctrl+g on a ready update and returns the screens around the
+/// relaunch. Every byte the pane receives, from the first one the old build
+/// writes, is captured, so the gap screen is rebuilt exactly as the terminal
+/// showed it.
+async function captureCtrlGRelaunch(options: {
+  label: string;
+  reply: string | null;
+  startupScrollback?: boolean;
+  cols?: number;
+  rows?: number;
+}): Promise<CtrlGScreens> {
+  const size = { cols: options.cols ?? 110, rows: options.rows ?? 32 };
+  const root = realpathSync(mkdtempSync(join(tmpdir(), `fx-tui-upgrade-ctrl-g-${options.label}-`)));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const installDir = join(root, "install");
+  const stderrPath = join(root, "stderr.log");
+  const argvLogPath = join(root, "upgrade-argv.log");
+  const capturePath = join(root, "pane-output.bin");
+  const launchGate = join(root, "launch-gate");
+  mkdirSync(home);
+  mkdirSync(workspace);
+  mkdirSync(installDir);
+  if (options.startupScrollback !== undefined) {
+    mkdirSync(join(home, ".fx"), { mode: 0o700 });
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ startup_scrollback: options.startupScrollback }) + "\n",
+      { mode: 0o600 },
+    );
+  }
+  const workspaceRoot = realpathSync(workspace);
+  const installedFx = join(installDir, "fx");
+  copyFileSync(FX_BIN, installedFx);
+  chmodSync(installedFx, 0o755);
+
+  const prompt = `Fill the screen before the ${options.label} relaunch.`;
+  const gateway = startFakeGateway(options.reply === null ? [] : [fakeGatewayFinalText(options.reply)]);
+  const release = startUpgradeServer(root, argvLogPath);
+  let active: TmuxSession | null = null;
+  try {
+    writeFileSync(stderrPath, "");
+    // fx waits for the gate, so the capture holds every byte it writes.
+    const gatedLaunch = `while [ ! -e ${shellQuote(launchGate)} ]; do sleep 0.02; done; exec ${shellQuote(installedFx)}`;
+    active = await TmuxSession.create({
+      cmd: `/bin/sh -c ${shellQuote(gatedLaunch)}`,
+      cwd: workspaceRoot,
+      env: {
+        ...gatewayEnv(home, gateway),
+        FX_AUTO_UPGRADE: "1",
+        FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+      },
+      stderrPath,
+      width: size.cols,
+      height: size.rows,
+      startupWaitMs: 0,
+    });
+    active.startPaneOutputCapture(capturePath);
+    writeFileSync(launchGate, "");
+    await active.waitForComposer(TIMEOUT);
+    if (options.reply !== null) {
+      await active.sendText(prompt);
+      await active.waitForText(options.reply.split("\n").at(-1)!, TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+    }
+    await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+    await active.waitForStableComposer(TIMEOUT, 250);
+    const beforeLength = await settledCaptureLength(capturePath);
+
+    const version = (await runFx(["--version"])).stdout.trim();
+    const updatedNotice = `✓ fx has been updated to v${version} (notes)`;
+    await active.sendHexBytes(["07"]);
+    await waitForScrollback(active, updatedNotice);
+    await active.waitForComposer(TIMEOUT);
+    const redrawn = await active.waitForStableScrollback(
+      (scrollback) => scrollback.includes(updatedNotice),
+      TIMEOUT,
+      250,
+    );
+    await settledCaptureLength(capturePath);
+    expect(
+      readFileSync(argvLogPath, "utf8").trim().split("\n")
+        .some((line) => line.startsWith(`${installedFx}\tresume\t`) && line.includes("\t--upgrade-relaunch")),
+    ).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).not.toContain("relaunch failed");
+
+    const bytes = readFileSync(capturePath);
+    // The new build's first frame starts by clearing the screen and its
+    // scrollback, or with RIS where the terminal needs it; the old build's
+    // exit sends neither.
+    const relaunchBytes = bytes.subarray(beforeLength);
+    const resets = [Buffer.from("\x1b[2J"), Buffer.from("\x1bc")]
+      .map((sequence) => relaunchBytes.indexOf(sequence))
+      .filter((index) => index >= 0);
+    expect(resets.length).toBeGreaterThan(0);
+    const gapLength = beforeLength + Math.min(...resets);
+
+    const screens: CtrlGScreens = {
+      before: replayPaneBytes(root, home, "before", size, bytes.subarray(0, beforeLength)),
+      gap: replayPaneBytes(root, home, "gap", size, bytes.subarray(0, gapLength)),
+      redrawn,
+    };
+
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd()).toBe(true);
+    await active.kill();
+    active = null;
+    return screens;
+  } finally {
+    if (active) {
+      try {
+        await active.sendText("/quit");
+      } catch {}
+      await active.kill();
+    }
+    release.stop();
+    gateway.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/// The old build erases its footer as it exits. Every other row stays where
+/// it was until the new build's first frame clears the terminal, so the
+/// conversation does not jump before it is drawn again.
+function expectGapKeepsScreen(screens: CtrlGScreens, marker: string): void {
+  const markerRow = screens.before.findIndex((row) => row.includes(marker));
+  expect(markerRow).toBeGreaterThanOrEqual(0);
+  const moved = screens.gap.flatMap((row, index) =>
+    row.trim() !== "" && row !== screens.before[index]
+      ? [`row ${index + 1}: ${JSON.stringify(row)}, was ${JSON.stringify(screens.before[index])}`]
+      : []
+  );
+  expect(moved).toEqual([]);
+  expect(screens.gap[markerRow]).toBe(screens.before[markerRow]);
+}
+
+const CTRL_G_SCREEN_REPLY = [
+  "CTRL_G_SCREEN_FIRST_LINE",
+  ...Array.from({ length: 24 }, (_, index) => `screen filler paragraph ${index + 1}`),
+  "CTRL_G_SCREEN_LAST_LINE",
+].join("\n\n");
+
+for (const startupScrollback of [undefined, false] as const) {
+  const setting = startupScrollback === undefined ? "startup_scrollback on by default" : "startup_scrollback off";
+  test.skipIf(!tmuxAvailable())(
+    `upgrade ctrl-g keeps the old screen in place until the new build redraws it (${setting})`,
+    async () => {
+      const screens = await captureCtrlGRelaunch({
+        label: startupScrollback === undefined ? "default" : "no-scrollback",
+        reply: CTRL_G_SCREEN_REPLY,
+        startupScrollback,
+      });
+      expectGapKeepsScreen(screens, "CTRL_G_SCREEN_LAST_LINE");
+      expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_FIRST_LINE")).toBe(1);
+      expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_LAST_LINE")).toBe(1);
+    },
+    UPGRADE_TIMEOUT * 2,
+  );
+}
+
+for (const startupScrollback of [undefined, false] as const) {
+  const setting = startupScrollback === undefined ? "startup_scrollback on by default" : "startup_scrollback off";
+  test.skipIf(!tmuxAvailable())(
+    `upgrade ctrl-g without a saved turn keeps the old screen in place until the new build redraws it (${setting})`,
+    async () => {
+      // The session saved nothing, so the new build starts twice: once for
+      // the session it cannot find and once for a fresh one (D81). With
+      // startup scrollback off, the short screen leaves the cursor above the
+      // rows a launch keeps free, so no launch moves it.
+      const screens = await captureCtrlGRelaunch({
+        label: startupScrollback === undefined ? "fresh-default" : "fresh-no-scrollback",
+        reply: null,
+        startupScrollback,
+      });
+      expectGapKeepsScreen(screens, "Run /help for commands");
+      expect(countOccurrences(screens.redrawn, "Run /help for commands")).toBe(1);
+    },
+    UPGRADE_TIMEOUT * 2,
+  );
+}
+
 test.skipIf(!tmuxAvailable())(
   "control sequences in a model reply show as text, live and after resume",
   async () => {

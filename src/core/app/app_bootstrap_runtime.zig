@@ -178,6 +178,9 @@ pub fn Runtime(comptime App: type) type {
             provider_strict: ?bool = null,
             /// `--permission-mode` for this launch; the saved mode is untouched.
             permission_mode: ?types.PermissionMode = null,
+            /// This launch replaces an older build after an update
+            /// (`--upgrade-relaunch`), so it takes over that build's screen.
+            upgrade_relaunch: bool = false,
         };
 
         pub fn bootstrap(
@@ -425,6 +428,7 @@ pub fn Runtime(comptime App: type) type {
                 .terminal_title = deps.terminal_title,
                 .footer_rows = footer_rows,
                 .startup_min_body_rows = ui_render.welcome_message_reserved_rows,
+                .takes_over_screen = launch_overrides.upgrade_relaunch,
                 .default_model = default_model,
                 .default_agent_step_limit = default_agent_step_limit,
                 .secret_store = if (comptime @hasDecl(App, "secretStore"))
