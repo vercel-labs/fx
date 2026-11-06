@@ -374,6 +374,68 @@ fn checkNameRow(
     }
 }
 
+const KeyKind = enum { meta_key, capability, removed };
+
+fn keyKind(cell: []const u8) ?KeyKind {
+    if (std.mem.eql(u8, cell, "`_meta` key")) return .meta_key;
+    if (std.mem.eql(u8, cell, "capability")) return .capability;
+    if (std.mem.eql(u8, cell, "removed")) return .removed;
+    return null;
+}
+
+test "the table of keys in use today gives each key one valid new name" {
+    const table = section(fx_spec.bytes, "Keys in use today") orelse {
+        std.debug.print("sh-fx.md has no \"Keys in use today\" section\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    const Row = struct { today: []const u8, where: []const u8, new: []const u8, kind: KeyKind };
+    var rows: [64]Row = undefined;
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, table, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "|")) continue;
+        if (std.mem.startsWith(u8, line, "| Today |") or std.mem.startsWith(u8, line, "| --- |")) continue;
+        var cells: [7][]const u8 = undefined;
+        var cell_count: usize = 0;
+        var parts = std.mem.splitScalar(u8, line, '|');
+        while (parts.next()) |part| : (cell_count += 1) {
+            if (cell_count == cells.len) break;
+            cells[cell_count] = std.mem.trim(u8, part, " ");
+        }
+        const today = if (cell_count == cells.len) codeCell(cells[1]) else null;
+        const kind = if (cell_count == cells.len) keyKind(cells[4]) else null;
+        if (today == null or kind == null or count == rows.len) {
+            std.debug.print("sh-fx.md has a malformed row in its keys table: {s}\n", .{line});
+            return error.TestUnexpectedResult;
+        }
+        const new: []const u8 = switch (kind.?) {
+            .removed => if (std.mem.eql(u8, cells[3], "-")) "-" else {
+                std.debug.print("{s} is removed but still names \"{s}\"\n", .{ today.?, cells[3] });
+                return error.TestUnexpectedResult;
+            },
+            .meta_key, .capability => name: {
+                const name = codeCell(cells[3]) orelse "";
+                if (!isKeyName(name)) {
+                    std.debug.print("{s} maps to \"{s}\", which is not an sh.fx key\n", .{ today.?, cells[3] });
+                    return error.TestUnexpectedResult;
+                }
+                break :name name;
+            },
+        };
+        for (rows[0..count]) |seen| {
+            const same_place = std.mem.eql(u8, seen.today, today.?) and std.mem.eql(u8, seen.where, cells[2]);
+            const same_name = kind.? != .removed and seen.kind == kind.? and std.mem.eql(u8, seen.new, new);
+            if (same_place or same_name) {
+                std.debug.print("{s} ({s}) repeats a row of the keys table\n", .{ today.?, cells[2] });
+                return error.TestUnexpectedResult;
+            }
+        }
+        rows[count] = .{ .today = today.?, .where = cells[2], .new = new, .kind = kind.? };
+        count += 1;
+    }
+    try std.testing.expect(count > 0);
+}
+
 test "every sh.fx name in sh-fx.md follows the naming rules" {
     var names: usize = 0;
     var spans = std.mem.splitScalar(u8, fx_spec.bytes, '`');
