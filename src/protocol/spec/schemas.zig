@@ -1,8 +1,9 @@
-//! Tests for the schema files of the `sh.fx` specification in this folder. The copy of ACP's
-//! version 1 schema in `acp/v1/` must match agent-client-protocol commit `7ec5185c18ca` byte for
-//! byte, every schema file must parse as a JSON object, and `sh-fx.schema.json` must use the JSON
-//! Schema draft of ACP's schema. `README.md` in this folder says how to move the copy to a newer
-//! commit.
+//! Tests for the files of the `sh.fx` specification in this folder. The copy of ACP's version 1
+//! schema in `acp/v1/` must match agent-client-protocol commit `7ec5185c18ca` byte for byte, and
+//! every schema file must parse as a JSON object. `sh-fx.schema.json` must use the JSON Schema
+//! draft of ACP's schema and state the naming rules of `sh-fx.md`, and the names and JSON
+//! examples in `sh-fx.md` must follow those rules and parse. `README.md` in this folder says how
+//! to move the ACP copy to a newer commit.
 
 const std = @import("std");
 
@@ -21,6 +22,7 @@ const acp_meta_unstable = specFile("acp/v1/meta.unstable.json");
 const acp_schema = specFile("acp/v1/schema.json");
 const acp_schema_unstable = specFile("acp/v1/schema.unstable.json");
 const fx_schema = specFile("sh-fx.schema.json");
+const fx_spec = specFile("sh-fx.md");
 
 const PinnedFile = struct {
     file: SpecFile,
@@ -72,6 +74,36 @@ fn hasStringValue(values: std.json.Value, want: []const u8) bool {
         if (value == .string and std.mem.eql(u8, value.string, want)) return true;
     }
     return false;
+}
+
+/// The regular expressions that `sh-fx.schema.json` gives for sh.fx names. Zig has no regular
+/// expression engine, so `isMethodName` and `isKeyName` check the same forms by hand.
+const method_name_pattern = "^_sh\\.fx/[a-z][a-z0-9_]*(/[a-z][a-z0-9_]*)+$";
+const key_name_pattern = "^sh\\.fx/[a-z][A-Za-z0-9]*$";
+
+/// Reports whether `name` is `_sh.fx/` followed by two or more snake_case segments.
+fn isMethodName(name: []const u8) bool {
+    const rest = std.mem.cutPrefix(u8, name, "_sh.fx/") orelse return false;
+    var segments = std.mem.splitScalar(u8, rest, '/');
+    var count: usize = 0;
+    while (segments.next()) |segment| : (count += 1) {
+        if (segment.len == 0 or !std.ascii.isLower(segment[0])) return false;
+        for (segment[1..]) |c| {
+            if (!std.ascii.isLower(c) and !std.ascii.isDigit(c) and c != '_') return false;
+        }
+    }
+    return count >= 2;
+}
+
+/// Reports whether `name` is `sh.fx/` followed by one camelCase segment, the form of capability
+/// names and `_meta` keys.
+fn isKeyName(name: []const u8) bool {
+    const rest = std.mem.cutPrefix(u8, name, "sh.fx/") orelse return false;
+    if (rest.len == 0 or !std.ascii.isLower(rest[0])) return false;
+    for (rest[1..]) |c| {
+        if (!std.ascii.isAlphanumeric(c)) return false;
+    }
+    return true;
 }
 
 fn parseSpecFile(file: SpecFile) !std.json.Parsed(std.json.Value) {
@@ -161,4 +193,122 @@ test "sh-fx.schema.json uses the JSON Schema draft of ACP's schema" {
 
     const fx_defs = field(fx.value, "$defs") orelse return error.TestUnexpectedResult;
     try std.testing.expect(fx_defs == .object);
+}
+
+test "the sh.fx name checks accept the documented forms and reject others" {
+    for ([_][]const u8{
+        "_sh.fx/session/steer",
+        "_sh.fx/session/follow_up",
+        "_sh.fx/session/steer2",
+        "_sh.fx/journal/append",
+    }) |name| try std.testing.expect(isMethodName(name));
+    for ([_][]const u8{
+        "_sh.fx/steer",
+        "sh.fx/session/steer",
+        "_sh.fx/Session/steer",
+        "_sh.fx/session/followUp",
+        "_sh.fx/session/",
+        "_sh.fx//steer",
+        "_sh.fx/session/steer/",
+        "_sh.fx/session/2steer",
+    }) |name| try std.testing.expect(!isMethodName(name));
+
+    for ([_][]const u8{ "sh.fx/steering", "sh.fx/journalSeq", "sh.fx/steering2" }) |name| {
+        try std.testing.expect(isKeyName(name));
+    }
+    for ([_][]const u8{
+        "sh.fx/journal_seq",
+        "sh.fx/JournalSeq",
+        "_sh.fx/steering",
+        "sh.fx/",
+        "sh.fx/a/b",
+        "fx/steering",
+        "sh.fx/2steering",
+    }) |name| try std.testing.expect(!isKeyName(name));
+}
+
+test "sh-fx.schema.json gives the name patterns that the name checks implement" {
+    const parsed = try parseSpecFile(fx_schema);
+    defer parsed.deinit();
+    const defs = field(parsed.value, "$defs") orelse return error.TestUnexpectedResult;
+
+    for ([_]struct { type_name: []const u8, pattern: []const u8 }{
+        .{ .type_name = "MethodName", .pattern = method_name_pattern },
+        .{ .type_name = "CapabilityName", .pattern = key_name_pattern },
+        .{ .type_name = "MetaKey", .pattern = key_name_pattern },
+    }) |expected| {
+        const def = field(defs, expected.type_name) orelse {
+            std.debug.print("sh-fx.schema.json has no {s} type\n", .{expected.type_name});
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqualStrings("string", stringField(def, "type") orelse "");
+        try std.testing.expectEqualStrings(expected.pattern, stringField(def, "pattern") orelse "");
+    }
+}
+
+test "every capability in sh-fx.schema.json has an sh.fx name and an object value" {
+    const parsed = try parseSpecFile(fx_schema);
+    defer parsed.deinit();
+    const defs = field(parsed.value, "$defs") orelse return error.TestUnexpectedResult;
+
+    for ([_][]const u8{ "AgentCapabilitiesMeta", "ClientCapabilitiesMeta" }) |type_name| {
+        const def = field(defs, type_name) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("object", stringField(def, "type") orelse "");
+        const properties = field(def, "properties") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(properties == .object);
+        for (properties.object.keys(), properties.object.values()) |name, value| {
+            if (!isKeyName(name)) {
+                std.debug.print("{s} lists {s}, which is not an sh.fx capability name\n", .{ type_name, name });
+                return error.TestUnexpectedResult;
+            }
+            try std.testing.expectEqualStrings("#/$defs/Capability", stringField(value, "$ref") orelse "");
+        }
+    }
+    const capability = field(defs, "Capability") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("object", stringField(capability, "type") orelse "");
+}
+
+test "every JSON example in sh-fx.md parses as a JSON object" {
+    const fence = "```json\n";
+    var examples: usize = 0;
+    var rest = fx_spec.bytes;
+    while (std.mem.find(u8, rest, fence)) |start| {
+        const body = rest[start + fence.len ..];
+        const end = std.mem.find(u8, body, "\n```") orelse {
+            std.debug.print("sh-fx.md has a JSON example that never closes\n", .{});
+            return error.TestUnexpectedResult;
+        };
+        examples += 1;
+        const parsed = std.json.parseFromSlice(std.json.Value, std.testing.allocator, body[0..end], .{}) catch |err| {
+            std.debug.print("JSON example {d} in sh-fx.md does not parse\n", .{examples});
+            return err;
+        };
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        rest = body[end..];
+    }
+    try std.testing.expect(examples > 0);
+}
+
+test "every sh.fx name in sh-fx.md follows the naming rules" {
+    var names: usize = 0;
+    var spans = std.mem.splitScalar(u8, fx_spec.bytes, '`');
+    var inside = false;
+    while (spans.next()) |span| : (inside = !inside) {
+        if (!inside) continue;
+        // Skip the bare prefixes and placeholder forms such as `sh.fx/<name>`.
+        if (std.mem.endsWith(u8, span, "/") or std.mem.findScalar(u8, span, '<') != null) continue;
+        const ok = if (std.mem.startsWith(u8, span, "_sh.fx/"))
+            isMethodName(span)
+        else if (std.mem.startsWith(u8, span, "sh.fx/"))
+            isKeyName(span)
+        else
+            continue;
+        names += 1;
+        if (!ok) {
+            std.debug.print("sh-fx.md names {s}, which breaks the naming rules\n", .{span});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expect(names > 0);
 }
