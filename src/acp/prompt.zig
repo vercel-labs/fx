@@ -265,6 +265,9 @@ const AcpContext = struct {
     /// never opened steering cancels nothing this way.
     saw_host_steering_open: bool = false,
     closed_host_steering: bool = false,
+    /// Inputs a resumed turn gives the model that no boundary takes, until
+    /// the progress that places them. Borrowed from the prompt's caller.
+    resumed_inputs: []const journal_events.PendingInput = &.{},
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
@@ -995,6 +998,8 @@ pub fn handlePrompt(
 
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
     defer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
+    var resumed_inputs: []journal_events.PendingInput = &.{};
+    defer journal_events.freePendingInputs(state.alloc, resumed_inputs);
     if (session.journal) |*journal| {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -1011,8 +1016,9 @@ pub fn handlePrompt(
         };
         // Inputs the crashed turn accepted and never placed go to the model
         // with the resume, and its first progress places them.
-        const inputs = journal.takePendingInputs();
-        defer journal_events.freePendingInputs(state.alloc, inputs);
+        resumed_inputs = journal.takePendingInputs();
+        const inputs = resumed_inputs;
+        ctx.resumed_inputs = inputs;
         recovery_checkpoint = try libfx_journal.resumeCheckpoint(alloc, pending, inputs, journal.pending_resume_yielded);
         const answered_step = journal.pending_resume_answered;
         {
@@ -2129,6 +2135,18 @@ fn acceptHostSteering(ctx: *AcpContext, taken: []const js_host_steering.Taken) !
     }
 }
 
+/// A resume gives the model the inputs its turn accepted and never placed,
+/// and no boundary takes them, so they show here, once the progress that
+/// places them is written. A resume that ends before its first request shows
+/// none. A steer a boundary showed shows again here, under the same input id,
+/// when a crash lost the progress that placed it. A durable session drops
+/// that repeat, and an engine's host sees it.
+fn publishResumedInputs(ctx: *AcpContext) !void {
+    const inputs = ctx.resumed_inputs;
+    ctx.resumed_inputs = &.{};
+    for (inputs) |input| try publishSteeringReplay(ctx, input.text, null, input.id);
+}
+
 fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrpc.RequestId, input_id: ?[]const u8) !void {
     var message_id_storage: acp_types.MessageIdBuffer = undefined;
     const message_id = acp_types.generateMessageId(&message_id_storage);
@@ -3228,6 +3246,7 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
         if (err == error.Cancelled) try keepCancelledProgress(ctx.state.alloc, session, checkpoint);
         return err;
     };
+    try publishResumedInputs(ctx);
     if (!yields) return;
     {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());

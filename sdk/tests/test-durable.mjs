@@ -477,6 +477,24 @@ if (childMode && process.argv[6] === "steer") {
   console.log(JSON.stringify({ sessionId: session.id, executionId: runs.find(([name]) => name === "lookup")?.[1] }));
   await new Promise(() => {});
 }
+// With `waiting-steer`, a steer waits for the running tool when the child
+// dies. It reports whether the log recorded the turn taking the steer: from
+// then on no worker sends it to the turn again, so only the resume can show it.
+if (childMode && process.argv[6] === "waiting-steer") {
+  gate("lookup");
+  const agent = createFxAgent(agentOptions(await durabilityAt(process.argv[5])));
+  const session = agent.session();
+  void session.prompt("use lookup", { messageId: "crash-turn" }).result.catch(() => {});
+  await gates.get("lookup").started;
+  await session.steer("a waiting steer", { messageId: "crash-waiting" });
+  const internals = agent[Symbol.for("libfx.durableInternals")];
+  const log = await internals.openLog(session.id);
+  const held = async () => (await log.read()).some(({ entry }) => entry?.marks?.some((mark) => mark.accepted === "crash-waiting"));
+  const accepted = await until(held, "the turn to take the steer", 2000).then(() => true, () => false);
+  await internals.settled(session.id);
+  console.log(JSON.stringify({ sessionId: session.id, accepted }));
+  await new Promise(() => {});
+}
 if (childMode) {
   const dir = process.argv[5];
   const tool = process.argv[6];
@@ -1355,6 +1373,35 @@ for (const tool of ["lookup", "send"]) {
   });
 }
 
+test("a steer waiting for a tool when the deadline cuts it off shows where the next delivery's turn takes it", async () => {
+  const deadlines = [];
+  const agent = createFxAgent(agentOptions(await durabilityFor({ maxDurationMs: 1500 * timeScale, reserveMs: 1000 * timeScale }), {
+    onEvent: (event) => { if (event.type === "session.deadline") deadlines.push(event); },
+  }));
+  const held = gate("lookup");
+  const turn = agent.prompt("use lookup");
+  await held.started;
+  // The call never returns on its own; a rerun goes through at once.
+  gates.delete("lookup");
+  await agent.session(agent.sessionId).steer("a steer at the deadline", { messageId: "deadline-waiting" });
+  const { result } = await collect(turn);
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(deadlines.length, 1, "the worker stopped itself once, before its deadline");
+  const lines = await readLines(agent.session(agent.sessionId).stream(0), 32);
+  const note = `stream: ${lines.map((line) => line.type).filter((type) => !type.endsWith("_delta")).join(" ")}`;
+  assert.equal(userTexts(requests.at(-1)).filter((text) => text.includes("a steer at the deadline")).length, 1, `the steer reached the model once; ${note}`);
+  assert.deepEqual(lines.filter((line) => line.type === "user_message").map(({ text, id }) => ({ text, id })), [{ text: "a steer at the deadline", id: "deadline-waiting" }], `the steer shows once; ${note}`);
+  assertShownAfterTool(lines, note);
+  await agent.close();
+});
+
+// A steer that waited for a tool reaches the model after the tool's result,
+// so it shows there too.
+function assertShownAfterTool(lines, note) {
+  const types = lines.map((line) => line.type);
+  assert.ok(types.lastIndexOf("tool_end") < types.indexOf("user_message"), `the steer shows after the tool's result; ${note}`);
+}
+
 // A call the resume answers as possibly run ends on the session stream, once,
 // with what the model heard, so a viewer never shows it running for good.
 function assertEndedAsPossiblyRun(lines, id) {
@@ -1644,6 +1691,42 @@ if (durabilityKind === "local") {
 }
 
 if (durabilityKind !== "memory") {
+  for (const alreadyShown of [false, true]) test(`a steer waiting for a tool when a crash ends its worker ${alreadyShown ? "shows once when its line reached the stream first" : "shows where the resumed turn takes it"}`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-durable-waiting-steer-"));
+    dirs.push(dir);
+    const child = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url), durabilityKind, engineBackend, "--child", dir, "waiting-steer"], {
+      stdio: ["ignore", "pipe", "inherit"], env: { ...process.env },
+    });
+    const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    try {
+      await until(() => output.includes("\n"), "the child to hold the steer", testTimeoutMs / 2);
+    } finally {
+      child.kill("SIGKILL");
+      await exited;
+    }
+    const { sessionId, accepted } = JSON.parse(output.trim().split("\n")[0]);
+    const agent = createFxAgent(agentOptions(await durabilityAt(dir)));
+    const session = agent.session(sessionId);
+    // The stream as a crash leaves it after the worker showed the steer and
+    // before the log heard the steer was placed. Only a core that takes a
+    // steer during a tool can reach this.
+    if (alreadyShown && !accepted) return agent.close();
+    if (alreadyShown) {
+      const [first] = await readLines(session.stream(0), 1);
+      const log = await agent[Symbol.for("libfx.durableInternals")].openLog(sessionId);
+      await log.ui.write([JSON.stringify({ type: "user_message", text: "a waiting steer", id: "crash-waiting", messageId: "crash-turn", epoch: first.epoch })]);
+    }
+    assert.equal((await session.resume().result).stopReason, "end_turn");
+    const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "crash-turn", "the resumed turn");
+    const note = `the turn took it before the crash: ${accepted}; stream: ${lines.map((line) => line.type).filter((type) => !type.endsWith("_delta")).join(" ")}`;
+    assert.equal(userTexts(requests.at(-1)).filter((text) => text.includes("a waiting steer")).length, 1, `the steer reached the model once; ${note}`);
+    assert.deepEqual(lines.filter((line) => line.type === "user_message").map(({ text, id }) => ({ text, id })), [{ text: "a waiting steer", id: "crash-waiting" }], `the steer shows once; ${note}`);
+    if (!alreadyShown) assertShownAfterTool(lines, note);
+    await agent.close();
+  });
+
   test("a prompt accepted just before a crash still runs", async () => {
     const dir = await mkdtemp(join(tmpdir(), "libfx-durable-accepted-"));
     dirs.push(dir);
