@@ -6872,6 +6872,63 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
+  test(
+    "session/close of a session that isn't open succeeds and leaves the open session open",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-idempotent-close-");
+      const gateway = startFakeGateway([]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const none = await client.request("session/close", { sessionId: "missing-session" }, 2) as any;
+        expect(none).toMatchObject({ id: 2, result: {} });
+
+        const first = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [] },
+          3,
+        ) as any;
+        await client.readLine();
+        const second = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [] },
+          4,
+        ) as any;
+        await client.readLine();
+        const staleSessionId = first.result.sessionId as string;
+        const activeSessionId = second.result.sessionId as string;
+
+        for (const [id, sessionId] of [[5, staleSessionId], [6, "missing-session"]] as const) {
+          const closed = await client.request("session/close", { sessionId }, id) as any;
+          expect(closed).toMatchObject({ id, result: {} });
+        }
+        const stillOpen = await client.request(
+          "session/set_mode",
+          { sessionId: activeSessionId, modeId: "auto" },
+          7,
+        ) as any;
+        expect(stillOpen.error).toBeUndefined();
+
+        const missing = await client.request("session/close", {}, 8) as any;
+        expect(missing.error).toMatchObject({ code: -32602, message: "Missing sessionId" });
+
+        for (const id of [9, 10]) {
+          const closed = await client.request("session/close", { sessionId: activeSessionId }, id) as any;
+          expect(closed).toMatchObject({ id, result: {} });
+        }
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test("ACP keeps a failed turn's image through reload and a new image prompt goes on", async () => {
     const root = createIsolatedRoot("fx-acp-checkpoint-image-");
     const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlXYX0AAAAASUVORK5CYII=";

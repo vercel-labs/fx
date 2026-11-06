@@ -3537,16 +3537,10 @@ fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messa
             .code = ErrorCode.invalid_params,
             .message = "Missing sessionId",
         });
-    const active = if (state.active_session) |*session| session else return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_params,
-        .message = "Session is not active",
-    });
-    if (!std.mem.eql(u8, active.session_id, session_id)) {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Session is not active",
-        });
-    }
+    // Closing is idempotent in ACP v1: a session that isn't open, or doesn't exist, closes with the
+    // same empty result, and the open session stays open.
+    const active = if (state.active_session) |*session| session else return state.writer.writeResponse(alloc, msg.id, "{}");
+    if (!std.mem.eql(u8, active.session_id, session_id)) return state.writer.writeResponse(alloc, msg.id, "{}");
 
     cancelAndReapActivePrompt(state);
     closeActiveSession(state) catch |err| {
