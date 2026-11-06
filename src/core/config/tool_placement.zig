@@ -226,3 +226,64 @@ test "overrides and settings name a movable tool and a placement" {
     defer wrong.deinit();
     try std.testing.expectError(error.InvalidToolPlacementValue, parseJsonObject(wrong.value));
 }
+
+const fuzz_names = [_][]const u8{ "shell", "install_skill", "read_tool_result", " web_search\t", "Shell", "toolbox", "skill", "vision", "mcp_x", "" };
+const fuzz_values = [_][]const u8{ "toolbox", "direct", "DIRECT", " Toolbox\n", "toolboxx", "", "\"direct\"", "true" };
+
+/// Byte triples pick a tool name, a separator, and a value, built into one
+/// `--tool-placement` value and a settings object; a first byte of 0xff
+/// takes the rest as both texts.
+fn fuzzParse(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buffer: [48]u8 = undefined;
+    const bytes = buffer[0..@intCast(smith.slice(&buffer))];
+    var flag: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer flag.deinit();
+    var object: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer object.deinit();
+    if (bytes.len > 0 and bytes[0] == 0xff) {
+        try flag.writer.writeAll(bytes[1..]);
+        try object.writer.writeAll(bytes[1..]);
+    } else {
+        try object.writer.writeByte('{');
+        var index: usize = 0;
+        while (index + 2 < bytes.len) : (index += 3) {
+            const name = fuzz_names[bytes[index] % fuzz_names.len];
+            const value = fuzz_values[bytes[index + 2] % fuzz_values.len];
+            if (index == 0) try flag.writer.print("{s}{s}{s}", .{ name, ([_][]const u8{ "=", " = ", "==", "" })[bytes[index + 1] % 4], value });
+            if (index > 0) try object.writer.writeByte(',');
+            try std.json.Stringify.value(name, .{}, &object.writer);
+            try object.writer.writeByte(':');
+            if (bytes[index + 1] % 2 == 0) try std.json.Stringify.value(value, .{}, &object.writer) else try object.writer.writeAll(value);
+        }
+        try object.writer.writeByte('}');
+    }
+
+    // A flag value reads as a tool and placement only when both parts name
+    // one, and what it reads writes back to the same override.
+    if (parseOverride(flag.written())) |override| {
+        var text: [64]u8 = undefined;
+        const again = try std.fmt.bufPrint(&text, "{s}={s}", .{ @tagName(override.tool), @tagName(override.placement) });
+        try std.testing.expectEqual(override, try parseOverride(again));
+    } else |_| {}
+
+    // A settings object reads only when every entry names a movable tool and
+    // a placement, and then each tool's placement is its entry's.
+    const parsed = std.json.parseFromSlice(std.json.Value, std.testing.allocator, object.written(), .{}) catch return;
+    defer parsed.deinit();
+    const overrides = parseJsonObject(parsed.value) catch return;
+    var entries = parsed.value.object.iterator();
+    while (entries.next()) |entry| {
+        const tool = Tool.parse(entry.key_ptr.*) orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(Placement.parse(entry.value_ptr.string), overrides.get(tool));
+    }
+}
+
+test "tool placement parsing reads a placement or an error from any text" {
+    try std.testing.fuzz({}, fuzzParse, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "\x00\x00\x00",
+            "\x01\x01\x01\x02\x00\x03",
+            "\xff{\"shell\":\"toolbox\",\"shell\":\"direct\"}",
+        }) ++ @import("fuzz_corpus").tool_placement_parse.*),
+    });
+}
