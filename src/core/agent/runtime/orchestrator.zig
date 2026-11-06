@@ -12185,8 +12185,9 @@ fn processQueuedPromptLoop(
                 debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
             }
             // With toolbox the tools fx sends stay as first sent, so a schema
-            // a call loaded, such as a run's changed definition, is shown in
-            // its result and never joins them (`Toolbox.tla` ToolsFixed).
+            // a call loaded, such as a run's changed definition, never joins
+            // them (`Toolbox.tla` ToolsFixed); the run's result says to open
+            // it again (`refreshChangedMcpTool`).
             if (!toolbox.isAdvertised(config.advertised_tool_names)) {
                 try runtime_gateway_step.recordSelectedDynamicTools(arena, &selected_dynamic_tools, execution);
             } else if (execution.selected_dynamic_tools.len > 0) {

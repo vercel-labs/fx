@@ -947,7 +947,7 @@ fn executeRegisteredTool(
     }
     if (mcp_execution_error) |err| {
         dispatched.deinit(arena);
-        if (err == error.McpAdvertisedToolChanged) return refreshChangedMcpTool(ctx, arena, call.name);
+        if (err == error.McpAdvertisedToolChanged) return refreshChangedMcpTool(ctx, arena, call.name, call.carried_by != null);
         return err;
     }
 
@@ -1550,8 +1550,17 @@ fn lookupToolboxMcpTool(ctx: Context, arena: Allocator, name: []const u8) !Toolb
     };
 }
 
-fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !ToolExecutionResult {
-    var unavailable_output: []const u8 = "MCP tool definition changed before execution and is no longer available. Search for current tools.";
+/// The result of an MCP call refused because the tool's definition changed
+/// between admission and execution. A sent tool gets its current schema in
+/// the next request; a toolbox run's schema never joins the tools, so its
+/// result says how to see the current arguments instead. The name is the model's,
+/// so a run's result writes it as visible text.
+fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8, toolbox_run: bool) !ToolExecutionResult {
+    const shown = model_context_encoding.scalar(name);
+    var unavailable_output: []const u8 = if (toolbox_run)
+        try arena.print("{f}'s definition changed before it ran, and it is no longer available. Use toolbox search to find current tools.", .{shown})
+    else
+        "MCP tool definition changed before execution and is no longer available. Search for current tools.";
     var notice: ?[]const u8 = null;
     if (ctx.mcp_ctx) |runtime_context| if (ctx.mcp_tool_schema) |schema_fn| {
         const current = schema_fn(runtime_context, arena, name, ctx.permission_rules, ctx.context_limits, ctx.mcp_access, runtimeCancelFlag(ctx)) catch |err| switch (err) {
@@ -1564,7 +1573,10 @@ fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !Tool
                 selected[0] = .{ .name = name, .schema_json = payload.model_output, .mcp_binding = payload.mcp_binding };
                 return .{
                     .status = .failure,
-                    .model_output = "MCP tool definition changed before execution. Its current schema is loaded; review it before issuing a new call.",
+                    .model_output = if (toolbox_run)
+                        try arena.print("{f}'s definition changed before it ran, so it didn't run. Open it with toolbox to see its current arguments, then call toolbox with run: \"{f}\" and those arguments.", .{ shown, shown })
+                    else
+                        "MCP tool definition changed before execution. Its current schema is loaded; review it before issuing a new call.",
                     .selected_dynamic_tools = selected,
                     .context_notices = if (payload.notice) |value| notices: {
                         const values = try arena.alloc([]const u8, 1);
@@ -1591,6 +1603,39 @@ fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !Tool
             break :notices values;
         } else &.{},
     };
+}
+
+fn changedMcpSchema(_: *anyopaque, arena: Allocator, _: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\"}") } };
+}
+
+fn goneMcpSchema(_: *anyopaque, _: Allocator, _: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    return null;
+}
+
+test "a toolbox run whose MCP definition changed before it ran says to open it again" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var host: u8 = 0;
+    var rt = TestRuntime{ .mcp_ctx = &host, .mcp_tool_schema = changedMcpSchema };
+    defer rt.deinit(std.testing.allocator);
+
+    // A run's schema never joins the tools, so its result can't say it is loaded.
+    const run = try refreshChangedMcpTool(rt.context(), arena, "mcp_fixture\x07echo", true);
+    try std.testing.expect(run.status == .failure);
+    try std.testing.expectEqualStrings(
+        "mcp_fixture&#x07;echo's definition changed before it ran, so it didn't run. Open it with toolbox to see its current arguments, then call toolbox with run: \"mcp_fixture&#x07;echo\" and those arguments.",
+        run.model_output,
+    );
+    // A sent tool's call keeps its message: the next request sends the current schema.
+    const sent = try refreshChangedMcpTool(rt.context(), arena, "mcp_fixture_echo", false);
+    try std.testing.expectEqualStrings("MCP tool definition changed before execution. Its current schema is loaded; review it before issuing a new call.", sent.model_output);
+    try std.testing.expectEqual(@as(usize, 1), sent.selected_dynamic_tools.len);
+
+    rt.mcp_tool_schema = goneMcpSchema;
+    const gone = try refreshChangedMcpTool(rt.context(), arena, "mcp_fixture_echo", true);
+    try std.testing.expectEqualStrings("mcp_fixture_echo's definition changed before it ran, and it is no longer available. Use toolbox search to find current tools.", gone.model_output);
 }
 
 const ContextNoticeSinkState = struct {
