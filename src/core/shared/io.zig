@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
+const net_connect = @import("net_connect.zig");
 const profile_paths = @import("profile_paths.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
@@ -21,7 +22,12 @@ var global_raw_environ: ?RawEnviron = null;
 var global_libc_environ: bool = false;
 
 pub fn setIo(zio: std.Io) void {
-    real_io = process_io_for(builtin.target.os.tag, zio);
+    real_io = processIo(zio);
+}
+
+/// `zio` with fx's process spawn on Darwin and fx's TCP connect.
+fn processIo(zio: std.Io) std.Io {
+    return net_connect.wrap(process_io_for(builtin.target.os.tag, zio));
 }
 
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
@@ -37,8 +43,8 @@ pub noinline fn getIo() std.Io {
 }
 
 noinline fn fallbackIo() std.Io {
-    if (comptime builtin.is_test) return process_io_for(builtin.target.os.tag, std.testing.io);
-    return process_io_for(builtin.target.os.tag, fallback_threaded.io());
+    if (comptime builtin.is_test) return processIo(std.testing.io);
+    return processIo(fallback_threaded.io());
 }
 
 /// Opens an absolute directory path without following any path component.
@@ -123,6 +129,23 @@ test "getIo Darwin test fallback runs a child through the selected backend" {
     }
     try std.testing.expectEqualStrings("get-io-spawn-ok", result.stdout);
     try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "process I/O connects TCP through net_connect and keeps every other entry" {
+    const original = std.testing.io;
+    const selected = processIo(original);
+    const spawn_selected = process_io_for(builtin.target.os.tag, original);
+
+    try std.testing.expect(selected.userdata == original.userdata);
+    try std.testing.expect(selected.vtable == processIo(original).vtable);
+    inline for (@typeInfo(std.Io.VTable).@"struct".field_names) |field_name| {
+        if (comptime std.mem.eql(u8, field_name, "netConnectIp")) {
+            const replaced = builtin.target.os.tag == .macos or builtin.target.os.tag == .linux;
+            try std.testing.expectEqual(replaced, @field(selected.vtable, field_name) != @field(original.vtable, field_name));
+        } else {
+            try std.testing.expectEqual(@field(spawn_selected.vtable, field_name), @field(selected.vtable, field_name));
+        }
+    }
 }
 
 test "non-Darwin process I/O keeps the original vtable" {

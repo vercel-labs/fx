@@ -76,6 +76,7 @@ VERIFICATION_E2E_TESTS = (
     "tui-input-line-delete.test.ts",
     "tui-input-navigation.test.ts",
     "tui-host-switch.test.ts",
+    "tui-mcp-http-many-servers.test.ts",
     "tui-render-replay.test.ts",
     "tui-resume.test.ts",
     "tui-slash-commands.test.ts",
