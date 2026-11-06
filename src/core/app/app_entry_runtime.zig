@@ -166,10 +166,7 @@ fn runWithDeps(comptime App: type, alloc: Allocator, args: []const [:0]const u8,
 pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !BeforeInteractiveResult {
     const run_result = cli_surface.runIfRequested(alloc, args, cliSurfaceConfig(cfg)) catch |err| switch (err) {
         error.UnknownCliCommand => return .{ .exit = output_contracts.usage_exit_code },
-        else => {
-            tryWriteErrorMessage(.{}, err);
-            return .{ .exit = 1 };
-        },
+        else => return commandFailure(.{}, err),
     };
 
     return beforeInteractiveResultFromRunResult(alloc, run_result, benchEnabled());
@@ -178,10 +175,7 @@ pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: C
 fn runBeforeInteractiveWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !BeforeInteractiveResult {
     const run_result = deps.run_if_requested(deps.cli_ctx, alloc, args, cliSurfaceConfig(cfg)) catch |err| switch (err) {
         error.UnknownCliCommand => return .{ .exit = output_contracts.usage_exit_code },
-        else => {
-            tryWriteErrorMessage(deps, err);
-            return .{ .exit = 1 };
-        },
+        else => return commandFailure(deps, err),
     };
 
     return beforeInteractiveResultFromRunResult(alloc, run_result, deps.getenv(deps.env_ctx, "FX_BENCH") != null);
@@ -584,6 +578,21 @@ fn reportUnexpectedInteractiveError(deps: RunDeps, err: anyerror) void {
 
 fn writeStderr(deps: RunDeps, text: []const u8) void {
     deps.write_stderr(deps.stderr_ctx, text) catch {};
+}
+
+/// The status a shell reports for a process SIGPIPE ended: 128 + 13.
+const output_reader_gone_exit_code: u8 = 141;
+
+/// How a command that ended on `err` exits. One whose output reader went
+/// away, as `head` does, ends quietly with SIGPIPE's status, as the commands
+/// that finish before fx's I/O starts do when SIGPIPE ends them.
+fn commandFailure(deps: RunDeps, err: anyerror) BeforeInteractiveResult {
+    if (err == error.OutputReaderGone) {
+        debug_trace.logf("core", "command ended after its output reader went away", .{});
+        return .{ .exit = output_reader_gone_exit_code };
+    }
+    tryWriteErrorMessage(deps, err);
+    return .{ .exit = 1 };
 }
 
 /// Reports an error that ended a command, such as `fx ask`, in plain words
@@ -1230,6 +1239,17 @@ test "a command that ends on an error reports it in plain words" {
         try std.testing.expectEqual(RunOutcome{ .exit = 1 }, outcome);
         try std.testing.expectEqualStrings(case.stderr, capture.stderr.written());
     }
+}
+
+test "a command whose output reader went away ends quietly with SIGPIPE's status" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.cli_error = error.OutputReaderGone;
+
+    const outcome = try runWithDeps(TestApp, alloc, &.{"ask"}, testConfig(), capture.deps());
+    try std.testing.expectEqual(RunOutcome{ .exit = 141 }, outcome);
+    try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
 test "app entry reports unexpected init errors once and preserves identity" {

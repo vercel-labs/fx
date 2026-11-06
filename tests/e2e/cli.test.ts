@@ -714,6 +714,84 @@ describe("cli: output errors", () => {
   }
 });
 
+describe("cli: closed output pipe", () => {
+  // The reader exits at once, and the short sleep lets it go before fx
+  // writes, as `| head` leaves a pipe once it has read enough.
+  async function runWithReaderGone(args: string[], env: Record<string, string | undefined>, cwd?: string) {
+    const statusPath = join(env.HOME!, "fx.status");
+    const proc = Bun.spawn(["sh", "-c", '(sleep 0.2; "$0" "$@"; echo $? > "$FX_STATUS_PATH") | true', FX_BIN, ...args], {
+      cwd,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+      env: { ...env, FX_STATUS_PATH: statusPath },
+    });
+    const stderr = await new Response(proc.stderr).text();
+    await proc.exited;
+    return { status: Number(readFileSync(statusPath, "utf8").trim()), stderr };
+  }
+
+  test(
+    "a command whose output reader went away ends quietly with SIGPIPE's status",
+    async () => {
+      const home = createIsolatedTestHome();
+      try {
+        const env = { PATH: process.env.PATH, HOME: home, FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1" };
+        // `fx --version` ends before fx's I/O starts, so SIGPIPE ends it;
+        // `fx status` gets the closed pipe as a failed write.
+        for (const args of [["--version"], ["status"]]) {
+          const result = await runWithReaderGone(args, env);
+          expect(result.status, args.join(" ")).toBe(141);
+          expect(result.stderr, args.join(" ")).toBe("");
+        }
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  for (const [label, flags] of [["text", []], ["--json", ["--json"]]] as const) {
+    test(
+      `fx ask ${label} whose reader went away ends quietly and still saves the answer`,
+      async () => {
+        const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-ask-reader-gone-")));
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(home);
+        mkdirSync(workspace);
+        const gateway = startFakeGateway([fakeGatewayFinalText("ANSWER_SAVED_AFTER_READER_LEFT")]);
+        try {
+          const result = await runWithReaderGone(["ask", ...flags, "--auto", "Say the answer."], {
+            PATH: process.env.PATH,
+            HOME: home,
+            AI_GATEWAY_API_KEY: "reader-gone-key",
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_SOUND: "0",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          }, workspace);
+          expect(result.status, result.stderr).toBe(141);
+          expect(result.stderr).toBe("");
+          // The turn finished and was saved, so a resume sees it whole.
+          const sessionId = onlySessionId(home);
+          expect(savedText(home, sessionId)).toContain("ANSWER_SAVED_AFTER_READER_LEFT");
+          const detail = await runFx(["session", "--id", sessionId, "--json"], { cwd: workspace, env: { HOME: home } });
+          expect(detail.code, detail.stderr).toBe(0);
+          expect(JSON.parse(detail.stdout).history_len).toBe(1);
+        } finally {
+          gateway.stop();
+          rmSync(root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
+});
+
 describe("cli: status", () => {
   test(
     "status and doctor expose the MCP profile error that blocks ask startup",
