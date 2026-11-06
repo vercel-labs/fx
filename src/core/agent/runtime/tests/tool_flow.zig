@@ -6529,6 +6529,33 @@ test "processQueuedPrompt persists interrupted active tool verbatim before histo
     try expectBodyContains(&follow_gateway, 0, persisted_call.id);
 }
 
+test "a toolbox run cut off while it runs is saved as the toolbox call the model made" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_box", "toolbox", "{\"run\":\"read_file\",\"arguments\":{\"path\":\"README.md\"}}")};
+    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var deps = FakeAgentRuntimeDeps.init(alloc);
+    defer deps.deinit();
+    var fixture = PromptFixture{};
+    deps.exec_plans = &.{.{ .err = error.Cancelled }};
+    deps.cancel_on_execute = &fixture.cancel_flag;
+    var config = fixture.config();
+    config.advertised_tool_names = &.{ "read_file", "toolbox" };
+    config.advertised_functions = &.{ builtin_tools.read_file.model_schema, builtin_tools.toolbox.model_schema };
+
+    try runFakePrompt(&gateway, &deps, config, fixture.job());
+
+    // It ran as the tool it carries,
+    try std.testing.expectEqual(@as(usize, 1), deps.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", deps.executed_names.items[0]);
+    // and is saved as the call the model made, so a resumed conversation
+    // replays the toolbox call its tools still have.
+    const persisted = deps.history_turns.items[0].interrupted.tool_call.?;
+    try std.testing.expectEqualStrings("toolbox", persisted.name);
+    try std.testing.expect(std.mem.find(u8, persisted.arguments_json, "\"run\":\"read_file\"") != null);
+}
+
 test "processQueuedPrompt finish_turn notice preserves execution without final assistant text" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};

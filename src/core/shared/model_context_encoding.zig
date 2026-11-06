@@ -101,6 +101,27 @@ test "writeScalar propagates writer failure" {
     try std.testing.expectError(error.WriteFailed, writeScalar(&writer, "<"));
 }
 
+/// `value` as a `{f}` format argument, written as `writeScalar` writes it,
+/// without allocating. A message that quotes a name the model gave uses it,
+/// so a control character in the name stays visible text in the message.
+pub fn scalar(value: []const u8) Scalar {
+    return .{ .value = value };
+}
+
+pub const Scalar = struct {
+    value: []const u8,
+
+    pub fn format(self: Scalar, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writeScalar(writer, self.value);
+    }
+};
+
+test "a scalar format argument writes the name as writeScalar does" {
+    var buffer: [64]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buffer, "No tool named {f}.", .{scalar("a\x00b\nc")});
+    try std.testing.expectEqualStrings("No tool named a&#x00;b&#x0a;c.", text);
+}
+
 pub fn scalarAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();

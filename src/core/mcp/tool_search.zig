@@ -196,21 +196,11 @@ pub fn rank(
             shown -= 1;
         }
         // With fewer rows, the first ones may have room for their arguments
-        // again, in order, up to the first that doesn't fit.
+        // again.
         if (arguments) |rows| {
             const cursor = try page.cursorAfter(alloc, shown);
             defer if (cursor) |value| alloc.free(value);
-            for (0..shown) |index| {
-                if (!rows.restore(index)) continue;
-                const candidate = try renderSearchResult(alloc, matches, shown, page.total_matches, cursor, limits.mcp_description_bytes, limits.mcp_search_result_bytes, &loads, arguments, observed_bytes, true);
-                if (candidate.len > effective_bytes) {
-                    alloc.free(candidate);
-                    rows.shown[index] = false;
-                    break;
-                }
-                alloc.free(output);
-                output = candidate;
-            }
+            output = try restoreArguments(alloc, rows, output, matches, shown, page.total_matches, cursor, limits, &loads, observed_bytes, effective_bytes);
         }
     }
     errdefer alloc.free(output);
@@ -219,6 +209,39 @@ pub fn rank(
     try loads.appendNotices(alloc, shown, &notice);
     const selected = try loads.take(alloc, shown);
     return tool_mcp_runtime.SearchResult{ .model_output = output, .notice = notice, .selected_tools = selected };
+}
+
+/// Gives the first `shown` rows of a page their arguments back, in order,
+/// while the page stays within `effective_bytes`, up to the first row that
+/// doesn't fit. Takes `output`, the page without them, and returns the page
+/// with the most rows' arguments; the caller owns it.
+fn restoreArguments(
+    alloc: Allocator,
+    rows: *ArgumentRows,
+    output: []u8,
+    matches: []const Candidate,
+    shown: usize,
+    total_matches: usize,
+    cursor: ?[]const u8,
+    limits: context_limits.Values,
+    loads: *const SchemaLoads,
+    observed_bytes: usize,
+    effective_bytes: usize,
+) ![]u8 {
+    var best = output;
+    errdefer alloc.free(best);
+    for (0..shown) |index| {
+        if (!rows.restore(index)) continue;
+        const candidate = try renderSearchResult(alloc, matches, shown, total_matches, cursor, limits.mcp_description_bytes, limits.mcp_search_result_bytes, loads, rows, observed_bytes, true);
+        if (candidate.len > effective_bytes) {
+            alloc.free(candidate);
+            rows.shown[index] = false;
+            break;
+        }
+        alloc.free(best);
+        best = candidate;
+    }
+    return best;
 }
 
 fn appendSearchNotice(alloc: Allocator, notice: *?[]u8, message: []const u8) !void {

@@ -25,6 +25,7 @@
     {"name": "display_width", "module": "fx", "test": "fuzz display unit boundaries", "iterations": 620000},
     {"name": "fuzzy_match", "module": "fx", "test": "fuzzy match keeps the model's laws on arbitrary bytes", "iterations": 300000},
     {"name": "toolbox_menu", "module": "fx", "test": "toolbox menu stays bounded and well formed on fuzzed entries", "iterations": 500000},
+    {"name": "toolbox_run_shape", "module": "fx", "test": "a toolbox call is carried as a run exactly when its decode reads a run", "iterations": 30000},
     {"name": "provider_finish_raw", "module": "fx", "test": "fuzz provider finish raw", "iterations": 5000000},
     {"name": "tool_argument_diagnostic", "module": "fx", "test": "fuzz tool argument diagnostic", "iterations": 3000000},
     {"name": "skill_file", "module": "fx", "test": "parseSkillFile keeps fuzzed borrowed slices inside the input", "iterations": 5000000},

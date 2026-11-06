@@ -22,7 +22,7 @@ pub const AlwaysLoadedTools = struct {
 
 /// Always-loaded tools share one `mcp_selected_schema_bytes` budget, in the
 /// order they are added. Once one doesn't fit, it and every later one are
-/// only counted, and stay reachable through capability_search.
+/// only counted, and stay reachable through toolbox.
 pub const AlwaysLoaded = struct {
     selected: std.ArrayList(tool_mcp_runtime.SelectedTool) = .empty,
     remaining: usize,

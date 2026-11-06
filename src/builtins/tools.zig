@@ -139,7 +139,7 @@ pub const toolbox = ToolSpec{
                 .{ .name = "arguments", .json_type = .object, .description = "The tool's arguments, for run." },
                 .{ .name = "search", .json_type = .string, .description = "What you need, to find skills and tools, with each tool's arguments. With server, leave it empty to list that server's tools." },
                 .{ .name = "server", .json_type = .string, .description = "With search, an MCP server from the list to search alone." },
-                .{ .name = "limit", .json_type = .integer, .description = "With search, how many matches to return, 1 to 20. The default is 5." },
+                .{ .name = "limit", .json_type = .integer, .description = std.fmt.comptimePrint("With search, how many matches to return, 1 to {d}. The default is {d}.", .{ capability_retrieval.max_limit, capability_retrieval.default_limit }) },
                 .{ .name = "cursor", .json_type = .string, .description = "With search and server, an earlier result's next_cursor, for its next page." },
             },
             .additional_properties = false,

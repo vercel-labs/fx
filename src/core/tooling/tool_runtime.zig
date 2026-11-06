@@ -23,6 +23,7 @@ const diff_mod = @import("../output/diff.zig");
 const file_mutation = @import("file_mutation.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
+const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const glob_pattern = @import("../workspace/glob_pattern.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
@@ -867,7 +868,6 @@ fn executeRegisteredTool(
     authorized_image_catalog: []const types.ImageAttachment,
     registry: tool_dispatch.Registry,
 ) !ToolExecutionResult {
-    var selected_dynamic_tool_sink = SelectedDynamicToolSinkState{ .allocator = arena };
     var context_notice_sink = ContextNoticeSinkState{ .allocator = arena };
     var command_backend = RunCommandBackendState{ .runtime = ctx };
     var vision_provider = VisionProviderState{
@@ -931,7 +931,6 @@ fn executeRegisteredTool(
         },
     }
     dispatch_ctx.mcp_execution_error_sink = &mcp_execution_error;
-    attachSelectedDynamicToolSink(&dispatch_ctx, &selected_dynamic_tool_sink);
     attachContextNoticeSink(&dispatch_ctx, &context_notice_sink);
     const dispatched = try tool_dispatch.dispatchAuthorizedToolCall(
         dispatch_ctx,
@@ -963,7 +962,6 @@ fn executeRegisteredTool(
         execution.finish_turn = true;
         execution.status_detail = "McpInputRequired";
     }
-    execution.selected_dynamic_tools = selected_dynamic_tool_sink.tools.items;
     execution.context_notices = context_notice_sink.notices.items;
     execution.result_commit = result_commit_token;
     if (dispatch_ctx.cancel_flag) |cancel_flag| {
@@ -1111,16 +1109,16 @@ fn explainToolboxRun(raw: *anyopaque, arena: Allocator, tool: []const u8) anyerr
     const ctx = state.runtime;
     if (std.mem.eql(u8, tool, toolbox.tool_name)) return "toolbox can't run toolbox.";
     if (ctx.tool_registry.lookup(tool)) |spec| {
-        if (!toolbox.runs(spec.*)) return arena.print("{s} is one of this host's tools; call it directly.", .{tool});
-        return arena.print("{s} didn't run: toolbox runs a tool only as part of the agent's turn.", .{tool});
+        if (!toolbox.runs(spec.*)) return arena.print("{f} is one of this host's tools; call it directly.", .{model_context_encoding.scalar(tool)});
+        return arena.print("{f} didn't run: toolbox runs a tool only as part of the agent's turn.", .{model_context_encoding.scalar(tool)});
     }
-    if (!std.mem.startsWith(u8, tool, "mcp_") and containsName(ctx.advertised_dynamic_tool_names, tool)) {
-        return arena.print("{s} is one of this host's tools; call it directly.", .{tool});
+    if (!types.isMcpToolName(tool) and containsName(ctx.advertised_dynamic_tool_names, tool)) {
+        return arena.print("{f} is one of this host's tools; call it directly.", .{model_context_encoding.scalar(tool)});
     }
     return switch (try lookupToolboxMcpTool(ctx, arena, tool)) {
         .rejected => |why| why,
-        .found => arena.print("{s} is available now; run it again with toolbox.", .{tool}),
-        .missing => arena.print("No tool named {s} is in the toolbox. Use toolbox search to find it.", .{tool}),
+        .found => arena.print("{f} is available now; run it again with toolbox.", .{model_context_encoding.scalar(tool)}),
+        .missing => arena.print("No tool named {f} is in the toolbox. Use toolbox search to find it.", .{model_context_encoding.scalar(tool)}),
     };
 }
 
@@ -1595,11 +1593,6 @@ fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !Tool
     };
 }
 
-const SelectedDynamicToolSinkState = struct {
-    allocator: Allocator,
-    tools: std.ArrayList(tool_mcp_runtime.SelectedTool) = .empty,
-};
-
 const ContextNoticeSinkState = struct {
     allocator: Allocator,
     notices: std.ArrayList([]const u8) = .empty,
@@ -1616,29 +1609,6 @@ fn recordContextNoticeForDispatch(raw_ctx: ?*anyopaque, notice: []const u8) erro
     const duplicate = try state.allocator.dupe(u8, notice);
     errdefer state.allocator.free(duplicate);
     try state.notices.append(state.allocator, duplicate);
-}
-
-fn attachSelectedDynamicToolSink(
-    dispatch_ctx: *tool_dispatch.DispatchContext,
-    state: *SelectedDynamicToolSinkState,
-) void {
-    dispatch_ctx.selected_dynamic_tool_ctx = state;
-    dispatch_ctx.on_selected_dynamic_tool = recordSelectedDynamicToolForDispatch;
-}
-
-fn recordSelectedDynamicToolForDispatch(
-    raw_ctx: ?*anyopaque,
-    name: []const u8,
-    schema_json: []const u8,
-    binding: ?tool_mcp_runtime.Binding,
-) error{OutOfMemory}!void {
-    const state_ptr = raw_ctx orelse return;
-    const state: *SelectedDynamicToolSinkState = @ptrCast(@alignCast(state_ptr));
-    const owned_name = try state.allocator.dupe(u8, name);
-    errdefer state.allocator.free(owned_name);
-    const owned_schema_json = try state.allocator.dupe(u8, schema_json);
-    errdefer state.allocator.free(owned_schema_json);
-    try state.tools.append(state.allocator, .{ .name = owned_name, .schema_json = owned_schema_json, .mcp_binding = binding });
 }
 
 fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchContext {

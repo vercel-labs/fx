@@ -4943,11 +4943,13 @@ test "the settings list gives the types, values, and bounds the settings parser 
         // A project file that sets a profile key is ignored, not refused.
         if (key.where == .profile) try expectSettingForTest(.project, key.name, wrong, true);
 
-        for (key.values) |value| {
+        // A map's values are checked by its own tests; a plain string key
+        // takes each listed value as its whole value.
+        if (key.kind == .string) for (key.values) |value| {
             const json = try alloc.print("\"{s}\"", .{value});
             defer alloc.free(json);
             try expectSettingForTest(layer, key.name, json, true);
-        }
+        };
         if (key.minimum) |minimum| {
             const at = try alloc.print("{d}", .{minimum});
             defer alloc.free(at);
@@ -4997,4 +4999,6 @@ test "the settings list names every value the settings enums accept" {
     for (std.meta.tags(types.CredentialSource)) |source| {
         if (types.parseCredentialSource(@tagName(source)) != null) try std.testing.expect(listed.has("credential_source", @tagName(source)));
     }
+    for (std.meta.tags(tool_placement.Placement)) |placement| try std.testing.expect(listed.has("tool_placement", @tagName(placement)));
+    try std.testing.expectEqual(std.meta.tags(tool_placement.Placement).len, settings_keys.find("tool_placement").?.values.len);
 }

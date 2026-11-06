@@ -1486,7 +1486,7 @@ fn failureStatusDetail(
 
     // An MCP call shows why it failed, made directly or through toolbox.
     const mcp_call = containsName(advertised_dynamic_tool_names, call.name) or
-        if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| std.mem.startsWith(u8, run.name, "mcp_") else false;
+        if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| types.isMcpToolName(run.name) else false;
     if (safe_result.len == 0 or !mcp_call) return null;
     const detail = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
     const masked_detail = try text_utils.maskSecrets(arena, detail);

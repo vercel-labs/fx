@@ -73,7 +73,7 @@ pub fn lookupOf(
     };
     if (try skillNamed(arena, locations, target)) |skill| return .{ .permission = "skill", .target = skill };
     if (registry.lookup(target) != null) return null;
-    if (std.mem.startsWith(u8, target, "mcp_")) return .{ .permission = "mcp_select_tool", .target = target };
+    if (core_types.isMcpToolName(target)) return .{ .permission = "mcp_select_tool", .target = target };
     for (servers) |server| {
         if (std.mem.eql(u8, server, target)) return .{ .permission = "mcp_select_tool", .target = target };
     }
@@ -107,9 +107,14 @@ pub fn runs(tool: tool_dispatch.Tool) bool {
 
 pub const Carried = struct { name: []const u8, arguments_json: []const u8 };
 
+/// The keys toolbox reads for open and search. The tool's decode
+/// (`src/tools/capabilities/toolbox.zig`) refuses a run that has any of them.
+const not_run_keys = [_][]const u8{ "open", "search", "resource", "server", "offset", "kind", "limit", "cursor" };
+
 /// The call a `toolbox {run}` call carries: the tool it names and its
 /// arguments as JSON, "{}" when it gives none. Null for any other call and
-/// for arguments that don't read as a run.
+/// for arguments the tool's decode doesn't read as a run, such as a run that
+/// also opens or searches, so that call reaches decode and gets its reason.
 pub fn carriedCall(arena: Allocator, name: []const u8, arguments_json: []const u8) Allocator.Error!?Carried {
     if (!std.mem.eql(u8, name, tool_name)) return null;
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments_json, .{}) catch |err| switch (err) {
@@ -117,13 +122,35 @@ pub fn carriedCall(arena: Allocator, name: []const u8, arguments_json: []const u
         else => return null,
     };
     if (parsed != .object) return null;
+    for (not_run_keys) |key| if (parsed.object.get(key) != null) return null;
     const target = parsed.object.get("run") orelse return null;
-    if (target != .string or target.string.len == 0) return null;
+    if (target != .string or std.mem.trim(u8, target.string, " \t\r\n").len == 0) return null;
     var arguments: std.Io.Writer.Allocating = .init(arena);
     if (parsed.object.get("arguments")) |value| {
+        if (value != .object) return null;
         std.json.Stringify.value(value, .{}, &arguments.writer) catch return error.OutOfMemory;
     } else arguments.writer.writeAll("{}") catch return error.OutOfMemory;
     return .{ .name = target.string, .arguments_json = arguments.written() };
+}
+
+test "only a call that is just a run is carried, so any other reaches the tool's decode" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const refused = [_][]const u8{
+        "{\"open\":\"mcp_fixture_echo\",\"run\":\"mcp_fixture_echo\"}",
+        "{\"run\":\"mcp_fixture_echo\",\"search\":\"echo\"}",
+        "{\"run\":\"mcp_fixture_echo\",\"kind\":\"tool\"}",
+        "{\"run\":\"mcp_fixture_echo\",\"arguments\":\"text\"}",
+        "{\"run\":\"mcp_fixture_echo\",\"arguments\":[1]}",
+        "{\"run\":\"  \"}",
+        "{\"run\":3}",
+    };
+    for (refused) |arguments| try std.testing.expect(try carriedCall(arena, tool_name, arguments) == null);
+    const carried = (try carriedCall(arena, tool_name, "{\"run\":\"mcp_fixture_echo\",\"arguments\":{\"text\":\"hi\"},\"note\":1}")).?;
+    try std.testing.expectEqualStrings("mcp_fixture_echo", carried.name);
+    try std.testing.expectEqualStrings("{\"text\":\"hi\"}", carried.arguments_json);
+    try std.testing.expectEqualStrings("{}", (try carriedCall(arena, tool_name, "{\"run\":\"mcp_fixture_echo\"}")).?.arguments_json);
 }
 
 test "an open of a skill named like a tool or server is decided as the skill, unless kind says otherwise" {

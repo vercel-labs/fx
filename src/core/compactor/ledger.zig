@@ -18,6 +18,7 @@ const std = @import("std");
 const checkpoint = @import("checkpoint.zig");
 const trace = @import("trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -835,13 +836,13 @@ const Found = struct { kind: checkpoint.Used.Kind, name: []const u8 };
 fn usedBy(arena: Allocator, call: Call) Allocator.Error!?Found {
     if (std.mem.eql(u8, call.name, "toolbox")) {
         if (try stringArgument(arena, call.arguments, "run")) |tool| {
-            return if (std.mem.startsWith(u8, tool, "mcp_")) .{ .kind = .mcp, .name = tool } else null;
+            return if (types.isMcpToolName(tool)) .{ .kind = .mcp, .name = tool } else null;
         }
         const opened = try stringArgument(arena, call.arguments, "open") orelse return null;
         // An MCP tool's definition isn't a use of it. Any other open is
         // counted as the skill it most often is; a server's name can't be
         // told apart from a skill's here.
-        if (std.mem.startsWith(u8, opened, "mcp_")) return null;
+        if (types.isMcpToolName(opened)) return null;
         const resource = try stringArgument(arena, call.arguments, "resource") orelse "";
         const name = if (resource.len == 0) opened else try arena.print("{s} {s}", .{ opened, resource });
         return .{ .kind = .skill, .name = name };
@@ -857,7 +858,7 @@ fn usedBy(arena: Allocator, call: Call) Allocator.Error!?Found {
         const action = try stringArgument(arena, call.arguments, "action") orelse "";
         return .{ .kind = .mcp, .name = try arena.print("mcp_features {s} {s}", .{ server, action }) };
     }
-    if (std.mem.startsWith(u8, call.name, "mcp_") and !std.mem.eql(u8, call.name, "mcp_select_tool")) {
+    if (types.isMcpToolName(call.name) and !std.mem.eql(u8, call.name, "mcp_select_tool")) {
         return .{ .kind = .mcp, .name = try arena.dupe(u8, call.name) };
     }
     return null;

@@ -116,13 +116,6 @@ pub const VisionProvider = struct {
     }
 };
 
-pub const SelectedDynamicToolSinkFn = *const fn (
-    ?*anyopaque,
-    []const u8,
-    []const u8,
-    ?tool_mcp_runtime.Binding,
-) error{OutOfMemory}!void;
-
 pub const ContextNoticeSinkFn = *const fn (?*anyopaque, []const u8) error{OutOfMemory}!void;
 
 /// Erased, owned typed input decoded by a concrete tool.
@@ -329,8 +322,6 @@ pub const DispatchContext = struct {
     /// The built-in tools the toolbox menu lists, by name.
     toolbox_behind: []const []const u8 = &.{},
     mcp_permission_rules: core_types.PermissionRuleSet = .{},
-    selected_dynamic_tool_ctx: ?*anyopaque = null,
-    on_selected_dynamic_tool: ?SelectedDynamicToolSinkFn = null,
     context_notice_ctx: ?*anyopaque = null,
     on_context_notice: ?ContextNoticeSinkFn = null,
     inner_usage_sink: ?*?core_types.ToolUsage = null,
@@ -637,7 +628,7 @@ pub fn toolActivityKind(registry: Registry, tool_name: []const u8) core_types.To
 /// A name the registry does not hold is an MCP server's tool when it has the
 /// `mcp_` prefix every MCP tool name gets, and is otherwise treated as a command.
 fn unregisteredActivityKind(tool_name: []const u8) core_types.ToolActivityKind {
-    return if (std.mem.startsWith(u8, tool_name, "mcp_")) .mcp else .command;
+    return if (core_types.isMcpToolName(tool_name)) .mcp else .command;
 }
 
 pub fn staticPresentation(tool: Tool) CallPresentation {
@@ -1051,16 +1042,6 @@ pub fn reportCommandResultJson(ctx: DispatchContext, json: []const u8) void {
 pub fn reportResultCommit(ctx: DispatchContext, token: result_commit.Token) void {
     const sink = ctx.result_commit_sink orelse return;
     sink.* = token;
-}
-
-pub fn reportSelectedDynamicTool(
-    ctx: DispatchContext,
-    name: []const u8,
-    schema_json: []const u8,
-    binding: ?tool_mcp_runtime.Binding,
-) error{OutOfMemory}!void {
-    const sink = ctx.on_selected_dynamic_tool orelse return;
-    try sink(ctx.selected_dynamic_tool_ctx, name, schema_json, binding);
 }
 
 pub fn reportContextNotice(ctx: DispatchContext, notice: []const u8) error{OutOfMemory}!void {

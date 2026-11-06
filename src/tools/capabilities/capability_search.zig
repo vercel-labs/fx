@@ -50,8 +50,6 @@ pub fn search(
         error.OutOfMemory => return error.OutOfMemory,
         else => return executionFailure(ctx.allocator, "combined", err),
     };
-    errdefer ctx.allocator.free(combined);
-    for (mcp_result.selected_tools) |selected| try tool_dispatch.reportSelectedDynamicTool(ctx, selected.name, selected.schema_json, selected.mcp_binding);
     return .{ .success = combined };
 }
 

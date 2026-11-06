@@ -22,6 +22,7 @@ const skill_impl = @import("../skills/skill.zig");
 const skill_invocation = @import("../../core/skills/skill_invocation.zig");
 const skill_search = @import("../skills/skill_search.zig");
 const toolbox_core = @import("../../core/tooling/toolbox.zig");
+const model_context_encoding = @import("../../core/shared/model_context_encoding.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -121,7 +122,7 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     if (args.get("limit")) |value| {
         if (chosen != .search) return failure(ctx.allocator, "toolbox limit goes with search");
         if (value != .integer or value.integer < 1 or value.integer > capability_retrieval.max_limit) {
-            return failure(ctx.allocator, "toolbox limit must be a whole number from 1 to 20");
+            return failure(ctx.allocator, std.fmt.comptimePrint("toolbox limit must be a whole number from 1 to {d}", .{capability_retrieval.max_limit}));
         }
         limit = @intCast(value.integer);
     }
@@ -218,8 +219,8 @@ fn open(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.D
     };
     if (hasSkill(ctx, input.target)) {
         if (alsoListedAs(ctx, input.target)) |other| return .{ .failure = try ctx.allocator.print(
-            "{s} is in the toolbox menu as a skill and as {s}. Open it again with kind \"skill\" or kind \"{s}\".",
-            .{ input.target, if (other == .mcp_server) "an MCP server" else "a tool", @tagName(other) },
+            "{f} is in the toolbox menu as a skill and as {s}. Open it again with kind \"skill\" or kind \"{s}\".",
+            .{ model_context_encoding.scalar(input.target), if (other == .mcp_server) "an MCP server" else "a tool", @tagName(other) },
         ) };
         return openSkillOrNothing(ctx, input);
     }
@@ -241,8 +242,8 @@ fn alsoListedAs(ctx: tool_dispatch.DispatchContext, name: []const u8) ?toolbox_c
 
 fn nothingNamed(ctx: tool_dispatch.DispatchContext, noun: []const u8, name: []const u8) Allocator.Error!tool_dispatch.ToolResult {
     return .{ .failure = try ctx.allocator.print(
-        "No {s} named {s} is in the toolbox menu. Use toolbox search to find it.",
-        .{ noun, name },
+        "No {s} named {f} is in the toolbox menu. Use toolbox search to find it.",
+        .{ noun, model_context_encoding.scalar(name) },
     ) };
 }
 
@@ -360,8 +361,8 @@ fn openSkillOrNothing(ctx: tool_dispatch.DispatchContext, input: *const Input) t
     if (result != .failure or !skill_invocation.isNotFound(result.failure)) return result;
     result.deinit(ctx.allocator);
     return .{ .failure = try ctx.allocator.print(
-        "Nothing named {s} is in the toolbox menu. Use toolbox search to find it.",
-        .{input.target},
+        "Nothing named {f} is in the toolbox menu. Use toolbox search to find it.",
+        .{model_context_encoding.scalar(input.target)},
     ) };
 }
 
@@ -421,8 +422,8 @@ fn writeSkillArgs(w: *std.Io.Writer, input: *const Input, location: ?[]const u8)
 /// RunNeedsAdmission), so a run that gets here didn't run: this says why.
 fn run(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runner = ctx.toolbox_run orelse return .{ .failure = try ctx.allocator.print(
-        "{s} can't run here: this host runs no tools through toolbox.",
-        .{input.target},
+        "{f} can't run here: this host runs no tools through toolbox.",
+        .{model_context_encoding.scalar(input.target)},
     ) };
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
@@ -430,8 +431,8 @@ fn run(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.Di
         error.OutOfMemory => return error.OutOfMemory,
         error.Cancelled => return error.Cancelled,
         else => return .{ .failure = try ctx.allocator.print(
-            "{s} didn't run ({s}). Open it with toolbox to check its name and arguments, then run it again.",
-            .{ input.target, @errorName(err) },
+            "{f} didn't run ({s}). Open it with toolbox to check its name and arguments, then run it again.",
+            .{ model_context_encoding.scalar(input.target), @errorName(err) },
         ) },
     };
     return .{ .failure = try ctx.allocator.dupe(u8, why) };
@@ -535,8 +536,8 @@ fn lookupError(ctx: tool_dispatch.DispatchContext, target: []const u8, err: anye
         error.OutOfMemory => error.OutOfMemory,
         error.Cancelled => error.Cancelled,
         else => .{ .failure = try ctx.allocator.print(
-            "fx couldn't look up {s} ({s}). Its MCP server may be starting, stopped, or signed out. Find it with toolbox search, or ask the user to check it with fx mcp.",
-            .{ target, @errorName(err) },
+            "fx couldn't look up {f} ({s}). Its MCP server may be starting, stopped, or signed out. Find it with toolbox search, or ask the user to check it with fx mcp.",
+            .{ model_context_encoding.scalar(target), @errorName(err) },
         ) },
     };
 }
@@ -548,7 +549,7 @@ pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
     }
     if (args.get("run")) |value| if (value == .string) {
         // An MCP tool's row reads as a direct call of it does.
-        const mcp = std.mem.startsWith(u8, value.string, "mcp_");
+        const mcp = core_types.isMcpToolName(value.string);
         return .{
             .activity_kind = if (mcp) .mcp else .write,
             .action_label = if (mcp) tool_presentation.mcp_running_label else "Running",
@@ -646,6 +647,56 @@ test "toolbox keeps a run's arguments as JSON and defaults them to an empty obje
     try std.testing.expectEqualStrings("{}", open_input.as(Input).arguments_json);
 }
 
+const fuzz_keys = [_][]const u8{ "open", "run", "search", "resource", "server", "offset", "kind", "limit", "cursor", "arguments", "note" };
+const fuzz_values = [_][]const u8{ "\"mcp_fixture_echo\"", "\"\"", "\"  \"", "3", "-1", "{}", "{\"text\":\"hi\"}", "[1]", "null", "true", "\"tool\"", "\"a\\u0000b\"" };
+
+/// Byte pairs pick an arguments object's keys and values; a first byte of
+/// 0xff takes the rest as the arguments' text.
+fn fuzzRunShape(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buffer: [64]u8 = undefined;
+    const bytes = buffer[0..@intCast(smith.slice(&buffer))];
+    var json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json.deinit();
+    if (bytes.len > 0 and bytes[0] == 0xff) try json.writer.writeAll(bytes[1..]) else {
+        try json.writer.writeByte('{');
+        var index: usize = 0;
+        while (index + 1 < bytes.len) : (index += 2) {
+            if (index > 0) try json.writer.writeByte(',');
+            try json.writer.print("\"{s}\":{s}", .{ fuzz_keys[bytes[index] % fuzz_keys.len], fuzz_values[bytes[index + 1] % fuzz_values.len] });
+        }
+        try json.writer.writeByte('}');
+    }
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const carried = try toolbox_core.carriedCall(arena_state.allocator(), toolbox_core.tool_name, json.written());
+    switch (try decodeForTest(json.written())) {
+        .failure => |reason| {
+            std.testing.allocator.free(reason);
+            try std.testing.expect(carried == null);
+        },
+        .input => |input| {
+            defer input.deinit(std.testing.allocator);
+            const typed = input.as(Input);
+            if (typed.action != .run) return std.testing.expect(carried == null);
+            // The agent loop runs what carriedCall gives as that tool, so it
+            // must be decode's run, target and arguments alike.
+            const run_call = carried orelse return error.TestExpectedEqual;
+            try std.testing.expectEqualStrings(typed.target, run_call.name);
+            try std.testing.expectEqualStrings(typed.arguments_json, run_call.arguments_json);
+        },
+    }
+}
+
+test "a toolbox call is carried as a run exactly when its decode reads a run" {
+    try std.testing.fuzz({}, fuzzRunShape, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "\x00\x00\x01\x00",
+            "\x01\x00\x09\x06\x0a\x03",
+            "\xff{\"run\":\"mcp_fixture_echo\",\"arguments\":\"text\"}",
+        }) ++ @import("fuzz_corpus").toolbox_run_shape.*),
+    });
+}
+
 /// A runner that describes `glob_files` only, for the search tests.
 const DescribingRunner = struct {
     fn explainNothing(_: *anyopaque, _: Allocator, _: []const u8) anyerror![]const u8 {
@@ -704,6 +755,10 @@ test "a failed toolbox open says why and what to do next, by the name it was giv
         .{ .ctx = with_mcp, .args = "{\"open\":\"linear\"}", .says = &.{ "linear", "ServerUnavailable", "toolbox search", "fx mcp" } },
         // A path no skill has is named as given, not as an empty skill.
         .{ .ctx = .{ .allocator = std.testing.allocator }, .args = "{\"open\":\"/nowhere/skill\"}", .says = &.{ "Nothing named /nowhere/skill", "toolbox search" } },
+        // A name with control characters stays visible text, so the result
+        // is still text the model can read.
+        .{ .ctx = .{ .allocator = std.testing.allocator }, .args = "{\"open\":\"bad\\u0000name\\u001b[2J\",\"kind\":\"tool\"}", .says = &.{"No tool named bad&#x00;name&#x1b;[2J"} },
+        .{ .ctx = with_mcp, .args = "{\"open\":\"lin\\u0007ear\"}", .says = &.{"fx couldn't look up lin&#x07;ear"} },
     };
     for (cases) |case| {
         const decoded = try decodeForTest(case.args);
@@ -720,6 +775,10 @@ test "a failed toolbox open says why and what to do next, by the name it was giv
         const text = switch (result) {
             .failure => |reason| reason,
             else => return error.TestExpectedFailure,
+        };
+        for (text) |byte| if (byte < 0x20) {
+            std.debug.print("a control byte in: {s}\n", .{text});
+            return error.TestExpectedEqual;
         };
         if (std.mem.find(u8, text, "Skill \"\"") != null) {
             std.debug.print("an empty skill name in: {s}\n", .{text});

@@ -5754,10 +5754,18 @@ fn toolboxMenu(
     turn_notes: *std.ArrayList(ChatMessage),
 ) !?[]const u8 {
     if (!toolbox.isAdvertised(config.advertised_tool_names)) return null;
+    // Once the conversation keeps its menu, each entry's kind and name are
+    // all a request needs: the change hash and the change note read only
+    // those, so the descriptions and the shared-name scan are skipped.
+    const kept = agent.toolbox_menu.get() != null;
     var entries: std.ArrayList(toolbox.Entry) = .empty;
     const skills = if (skill_section) |section| section.locations.skills else &.{};
     var descriptions_limited: usize = 0;
     for (skills) |skill| {
+        if (kept) {
+            try entries.append(arena, .{ .kind = .skill, .name = skill.name });
+            continue;
+        }
         // A name two skills share opens by location, as the catalog has it.
         const shared = for (skills) |other| {
             if (other.path.ptr != skill.path.ptr and std.mem.eql(u8, other.name, skill.name)) break true;
@@ -5779,10 +5787,10 @@ fn toolboxMenu(
     for (servers) |name| try entries.append(arena, .{ .kind = .mcp_server, .name = name });
     for (config.toolbox_behind) |name| {
         const tool = deps.tool_registry.lookup(name) orelse continue;
-        try entries.append(arena, .{ .kind = .tool, .name = name, .description = tool.description });
+        try entries.append(arena, .{ .kind = .tool, .name = name, .description = if (kept) "" else tool.description });
     }
     // A skipped skill is told where the skills are listed, as the catalog did.
-    const lead = (try skill_runtime.discoveryWarningMarker(arena, config.skill_catalog.diagnostics)) orelse "";
+    const lead = if (kept) "" else (try skill_runtime.discoveryWarningMarker(arena, config.skill_catalog.diagnostics)) orelse "";
     const decided = try keptToolboxMenu(arena, &agent.toolbox_menu, entries.items, lead, .{
         .max_bytes = skill_runtime.skillListBudget(config.context_limits, context_window),
     });

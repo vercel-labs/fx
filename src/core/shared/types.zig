@@ -1019,6 +1019,15 @@ pub const ToolCall = struct {
     }
 };
 
+/// The prefix of every MCP tool name fx gives the model, which
+/// `src/core/mcp/tool_names.zig` builds.
+pub const mcp_tool_prefix = "mcp_";
+
+/// Whether `name` has the shape of an MCP tool name fx gives the model.
+pub fn isMcpToolName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, mcp_tool_prefix);
+}
+
 pub const WebSearchProgress = union(enum) {
     query_started: []const u8,
     results_received: struct {
