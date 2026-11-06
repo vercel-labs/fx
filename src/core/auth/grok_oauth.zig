@@ -588,10 +588,12 @@ fn refreshReplacement(
     if (!std.mem.eql(u8, account_id, current.account_id)) {
         return error.GrokAccountChanged;
     }
-    const refresh_token = if (token.refresh_token) |rotated|
-        rotated
-    else
-        try alloc.dupe(u8, current.refresh_token);
+    // Taking the rotated token out of the reply leaves the errdefer below its
+    // only owner, so a failed check frees it once.
+    const refresh_token = if (token.refresh_token) |rotated| blk: {
+        token.refresh_token = null;
+        break :blk rotated;
+    } else try alloc.dupe(u8, current.refresh_token);
     errdefer secret.zeroAndFree(alloc, refresh_token);
     const expires_in = token.expires_in orelse return error.InvalidGrokOAuthResponse;
     const duration_ms = std.math.mul(i64, expires_in, std.time.ms_per_s) catch
@@ -605,7 +607,6 @@ fn refreshReplacement(
         .account_id = account_id,
     };
     token.access_token = &.{};
-    if (token.refresh_token != null) token.refresh_token = null;
     return replacement;
 }
 
@@ -952,6 +953,53 @@ test "Grok refresh uses form encoding and accepts omitted token rotation" {
     try std.testing.expect(std.mem.find(u8, state.payload[0..state.payload_len], "grant_type=refresh_token") != null);
     try std.testing.expect(response.refresh_token == null);
     try std.testing.expectEqual(@as(?i64, 3600), response.expires_in);
+}
+
+test "Grok refresh frees each token once when the reply's lifetime is unusable" {
+    const UserInfo = struct {
+        fn execute(_: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+            return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{\"sub\":\"acct_grok\"}") };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var current = grok_session.Session{
+        .access_token = try alloc.dupe(u8, "old-access"),
+        .refresh_token = try alloc.dupe(u8, "old-refresh"),
+        .expires_at_ms = 0,
+        .account_id = try alloc.dupe(u8, "acct_grok"),
+    };
+    defer current.deinit(alloc);
+
+    // A missing lifetime, one whose milliseconds overflow, and one that
+    // overflows when added to now, with and without a rotated refresh token.
+    const lifetimes = [_]?i64{ null, std.math.maxInt(i64), @divTrunc(std.math.maxInt(i64), std.time.ms_per_s) };
+    for (lifetimes) |expires_in| {
+        for ([_]bool{ true, false }) |rotated| {
+            var token = RefreshTokenResponse{
+                .access_token = try alloc.dupe(u8, "new-access"),
+                .refresh_token = if (rotated) try alloc.dupe(u8, "rotated-refresh") else null,
+                .expires_in = expires_in,
+            };
+            // refreshSession releases the reply the same way after a failure.
+            defer token.deinit(alloc);
+            try std.testing.expectError(
+                error.InvalidGrokOAuthResponse,
+                refreshReplacement(alloc, .{ .execute_fn = UserInfo.execute }, &token, current),
+            );
+        }
+    }
+
+    // A usable lifetime moves the rotated token into the new session.
+    var token = RefreshTokenResponse{
+        .access_token = try alloc.dupe(u8, "new-access"),
+        .refresh_token = try alloc.dupe(u8, "rotated-refresh"),
+        .expires_in = 3600,
+    };
+    defer token.deinit(alloc);
+    var replacement = try refreshReplacement(alloc, .{ .execute_fn = UserInfo.execute }, &token, current);
+    defer replacement.deinit(alloc);
+    try std.testing.expectEqualStrings("rotated-refresh", replacement.refresh_token);
+    try std.testing.expect(token.refresh_token == null);
 }
 
 test "Grok browser authorization URL uses PKCE without device authentication" {

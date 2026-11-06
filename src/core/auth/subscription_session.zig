@@ -39,7 +39,7 @@ pub const DeleteOutcome = enum {
 };
 
 pub fn refreshDeadlineMs(expires_at_ms: i64) i64 {
-    return @max(expires_at_ms - expiry_skew_ms, 0);
+    return @max(expires_at_ms -| expiry_skew_ms, 0);
 }
 
 /// `invalid_session` and `unavailable` are error literals such as
@@ -318,6 +318,24 @@ test "subscription auth session round trips without exposing token fields to str
 test "subscription session refresh deadline keeps a one minute safety margin" {
     try std.testing.expectEqual(@as(i64, 40_000), refreshDeadlineMs(100_000));
     try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(10_000));
+    try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(0));
+    try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(-1));
+    try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(std.math.minInt(i64) + expiry_skew_ms));
+    try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(std.math.minInt(i64) + expiry_skew_ms - 1));
+    try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(std.math.minInt(i64)));
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64) - expiry_skew_ms), refreshDeadlineMs(std.math.maxInt(i64)));
+}
+
+test "subscription session reads an out-of-range stored expiry as expired" {
+    // The auth file's expiry is any JSON integer, so the smallest i64 has to
+    // read as expired rather than overflow when the margin is subtracted.
+    const alloc = std.testing.allocator;
+    var session = try TestStore.parse(alloc,
+        \\{"version":1,"access_token":"access","refresh_token":"refresh","expires_at_ms":-9223372036854775808,"account_id":"acct"}
+    );
+    defer session.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), session.expires_at_ms);
+    try std.testing.expect(session.expired(0));
 }
 
 test "subscription session refuses to save an account ID it could not load" {
