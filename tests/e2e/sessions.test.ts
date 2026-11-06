@@ -1634,7 +1634,7 @@ test("ACP keeps a session once prompted, lists it, and loads every turn after a 
 
     client = await AcpRpc.start(fixture, gateway);
     const missing = await client.request("session/load", { sessionId: unused, cwd: fixture.workspace, mcpServers: [] });
-    expect(missing.error?.message).toBe("Session not found");
+    expect(missing.error).toEqual({ code: -32002, message: "Session not found", data: { sessionId: unused } });
     await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
     expect(client.texts("user_message_chunk")).toEqual(["First ACP question.", "Second ACP question."]);
     expect(client.texts("agent_message_chunk")).toEqual(["ACP_ONE", "ACP_TWO"]);

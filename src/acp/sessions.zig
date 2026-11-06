@@ -633,7 +633,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
 
     var loaded = (js_host_session_store.load(alloc, session_id) catch
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Session could not be loaded" })) orelse
-        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Session not found" });
+        return state.writer.writeError(alloc, msg.id, jsonrpc.sessionNotFound("Session not found", session_id));
     var loaded_owned = true;
     defer if (loaded_owned) loaded.deinit(alloc);
     const sid_copy = try alloc.dupe(u8, loaded.state.id);
@@ -889,9 +889,9 @@ fn handleRestoreSession(
         v2_store.notice = .{ .context = &notice, .emit = ConversionNotice.emit };
         defer v2_store.notice = null;
         v2 = session_adapter.Session.resumeSession(alloc, v2_store, .{ .id = session_id }, workspace_root, .acp) catch |err|
-            return handleLoadFailure(state, alloc, msg, err);
+            return handleLoadFailure(state, alloc, msg, session_id, err);
         v2_resumed = v2.?.durableState(alloc, workspace_root) catch |err|
-            return handleLoadFailure(state, alloc, msg, err);
+            return handleLoadFailure(state, alloc, msg, session_id, err);
     }
     const durable: *const session_codec.DurableSessionState = &v2_resumed.?.state;
 
@@ -1322,6 +1322,7 @@ fn handleLoadFailure(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
+    session_id: []const u8,
     err: anyerror,
 ) !void {
     debug_trace.logf(
@@ -1380,10 +1381,7 @@ fn handleLoadFailure(
             .message = "Session could not be loaded",
         });
     }
-    return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_params,
-        .message = "Session not found",
-    });
+    return state.writer.writeError(alloc, msg.id, jsonrpc.sessionNotFound("Session not found", session_id));
 }
 
 pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -2820,6 +2818,7 @@ test "ACP load maps one-off child denial to invalid params" {
             &state,
             arena,
             &msg,
+            "child-session",
             error.OneOffSessionNotResumable,
         );
         try std.testing.expect(state.active_session == null);

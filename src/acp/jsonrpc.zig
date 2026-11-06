@@ -53,6 +53,9 @@ pub const ErrorCode = struct {
     pub const method_not_found: i64 = -32601;
     pub const invalid_params: i64 = -32602;
     pub const internal_error: i64 = -32603;
+    /// ACP's "Resource not found", such as a request that names a session that doesn't exist or
+    /// isn't open on the connection.
+    pub const resource_not_found: i64 = -32002;
 };
 
 pub const RequestId = union(enum) {
@@ -77,12 +80,31 @@ pub const Message = struct {
 pub const RpcError = struct {
     code: i64,
     message: []const u8,
-    data: ?struct {
-        code: []const u8,
-        model: []const u8,
-        capability: []const u8,
-    } = null,
+    data: ?Data = null,
+
+    /// The `data` object of an error. Each kind writes its own fields.
+    pub const Data = union(enum) {
+        /// The selected model doesn't support a capability the request asked for.
+        model_capability: struct {
+            code: []const u8,
+            model: []const u8,
+            capability: []const u8,
+        },
+        /// `{"sessionId": ...}`: the session a request named, for ACP's unknown-session answer.
+        session: struct { session_id: []const u8 },
+    };
 };
+
+/// ACP's answer to a session-scoped request that names a session that doesn't exist or isn't open
+/// on the connection: `-32002` with `data.sessionId` set to the id the request named. The error
+/// borrows `session_id`, so the caller writes it before that memory is freed.
+pub fn sessionNotFound(message: []const u8, session_id: []const u8) RpcError {
+    return .{
+        .code = ErrorCode.resource_not_found,
+        .message = message,
+        .data = .{ .session = .{ .session_id = session_id } },
+    };
+}
 
 pub fn parseMessage(alloc: Allocator, line: []const u8) !Message {
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch
@@ -196,15 +218,22 @@ pub const Writer = struct {
                     try w.print("{d}", .{response.err.code});
                     try w.writeAll(",\"message\":");
                     try writeJsonStr(response.err.message, w);
-                    if (response.err.data) |data| {
-                        try w.writeAll(",\"data\":{\"code\":");
-                        try writeJsonStr(data.code, w);
-                        try w.writeAll(",\"model\":");
-                        try writeJsonStr(data.model, w);
-                        try w.writeAll(",\"capability\":");
-                        try writeJsonStr(data.capability, w);
-                        try w.writeByte('}');
-                    }
+                    if (response.err.data) |data| switch (data) {
+                        .model_capability => |model| {
+                            try w.writeAll(",\"data\":{\"code\":");
+                            try writeJsonStr(model.code, w);
+                            try w.writeAll(",\"model\":");
+                            try writeJsonStr(model.model, w);
+                            try w.writeAll(",\"capability\":");
+                            try writeJsonStr(model.capability, w);
+                            try w.writeByte('}');
+                        },
+                        .session => |session| {
+                            try w.writeAll(",\"data\":{\"sessionId\":");
+                            try writeJsonStr(session.session_id, w);
+                            try w.writeByte('}');
+                        },
+                    };
                     try w.writeAll("}}\n");
                 },
                 .notification => |notification| {
@@ -597,15 +626,28 @@ test "Writer Frame formats protocol lines" {
             .err = .{
                 .code = ErrorCode.invalid_params,
                 .message = "Unsupported fast mode",
-                .data = .{
+                .data = .{ .model_capability = .{
                     .code = "LIBFX_MODEL_UNSUPPORTED_FAST",
                     .model = "provider/quoted\"model",
                     .capability = "fast",
-                },
+                } },
             },
         } }).write(&out.writer);
         try std.testing.expectEqualStrings(
             "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32602,\"message\":\"Unsupported fast mode\",\"data\":{\"code\":\"LIBFX_MODEL_UNSUPPORTED_FAST\",\"model\":\"provider/quoted\\\"model\",\"capability\":\"fast\"}}}\n",
+            out.writer.buffered(),
+        );
+    }
+
+    {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try (Writer.Frame{ .error_response = .{
+            .id = .{ .integer = 8 },
+            .err = sessionNotFound("Session not found", "sess\"quoted"),
+        } }).write(&out.writer);
+        try std.testing.expectEqualStrings(
+            "{\"jsonrpc\":\"2.0\",\"id\":8,\"error\":{\"code\":-32002,\"message\":\"Session not found\",\"data\":{\"sessionId\":\"sess\\\"quoted\"}}}\n",
             out.writer.buffered(),
         );
     }

@@ -6787,8 +6787,9 @@ describe("acp: model-independent", () => {
           jsonrpc: "2.0",
           id: 2,
           error: {
-            code: -32602,
+            code: -32002,
             message: "No active session",
+            data: { sessionId: "missing-session" },
           },
         });
         expect(client.stderr).toBe("");
@@ -6837,9 +6838,10 @@ describe("acp: model-independent", () => {
           [6, "session/cancel", { sessionId: staleSessionId }],
         ] as const) {
           const response = await client.request(method, params, id) as any;
-          expect(response.error).toMatchObject({
-            code: -32602,
+          expect(response.error).toEqual({
+            code: -32002,
             message: "Session is not active",
+            data: { sessionId: staleSessionId },
           });
         }
 
@@ -6854,9 +6856,10 @@ describe("acp: model-independent", () => {
           },
         });
         const promptResponse = await readResponse(client, promptId);
-        expect(promptResponse.error).toMatchObject({
-          code: -32602,
+        expect(promptResponse.error).toEqual({
+          code: -32002,
           message: "Session is not active",
+          data: { sessionId: staleSessionId },
         });
         expect(gateway.requests).toHaveLength(0);
         expect(client.stderr).toBe("");
@@ -8467,8 +8470,9 @@ describe("acp: model-independent", () => {
           5,
         ) as any;
         expect(missingLoad.error).toEqual({
-          code: -32602,
+          code: -32002,
           message: "Session not found",
+          data: { sessionId: "missing-session" },
         });
 
         owner.endStdin();
