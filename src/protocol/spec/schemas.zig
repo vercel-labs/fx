@@ -246,6 +246,12 @@ test "sh-fx.schema.json gives the name patterns that the name checks implement" 
     }
 }
 
+/// Returns the type in `defs` that a local reference such as `#/$defs/Capability` names, or null.
+fn localDef(defs: std.json.Value, ref: []const u8) ?std.json.Value {
+    const name = std.mem.cutPrefix(u8, ref, "#/$defs/") orelse return null;
+    return field(defs, name);
+}
+
 test "every capability in sh-fx.schema.json has an sh.fx name and an object value" {
     const parsed = try parseSpecFile(fx_schema);
     defer parsed.deinit();
@@ -261,11 +267,58 @@ test "every capability in sh-fx.schema.json has an sh.fx name and an object valu
                 std.debug.print("{s} lists {s}, which is not an sh.fx capability name\n", .{ type_name, name });
                 return error.TestUnexpectedResult;
             }
-            try std.testing.expectEqualStrings("#/$defs/Capability", stringField(value, "$ref") orelse "");
+            const ref = stringField(value, "$ref") orelse "";
+            const target = localDef(defs, ref) orelse {
+                std.debug.print("{s} gives {s} the unknown type \"{s}\"\n", .{ type_name, name, ref });
+                return error.TestUnexpectedResult;
+            };
+            try std.testing.expectEqualStrings("object", stringField(target, "type") orelse "");
         }
     }
     const capability = field(defs, "Capability") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("object", stringField(capability, "type") orelse "");
+}
+
+/// Checks that each `$ref` under `value` names a type of sh-fx.schema.json or of ACP's schema, and
+/// counts the references in `refs`.
+fn checkRefs(
+    value: std.json.Value,
+    fx_defs: std.json.Value,
+    acp_defs: std.json.Value,
+    refs: *usize,
+) error{TestUnexpectedResult}!void {
+    switch (value) {
+        .object => |object| for (object.keys(), object.values()) |key, child| {
+            if (!std.mem.eql(u8, key, "$ref")) {
+                try checkRefs(child, fx_defs, acp_defs, refs);
+                continue;
+            }
+            const ref = if (child == .string) child.string else "";
+            const found = if (std.mem.cutPrefix(u8, ref, "acp/v1/schema.json#/$defs/")) |name|
+                field(acp_defs, name)
+            else
+                localDef(fx_defs, ref);
+            if (found == null) {
+                std.debug.print("sh-fx.schema.json refers to \"{s}\", which names no type\n", .{ref});
+                return error.TestUnexpectedResult;
+            }
+            refs.* += 1;
+        },
+        .array => |array| for (array.items) |child| try checkRefs(child, fx_defs, acp_defs, refs),
+        else => {},
+    }
+}
+
+test "every $ref in sh-fx.schema.json names a type that exists" {
+    const fx = try parseSpecFile(fx_schema);
+    defer fx.deinit();
+    const acp = try parseSpecFile(acp_schema);
+    defer acp.deinit();
+    const fx_defs = field(fx.value, "$defs") orelse return error.TestUnexpectedResult;
+    const acp_defs = field(acp.value, "$defs") orelse return error.TestUnexpectedResult;
+    var refs: usize = 0;
+    try checkRefs(fx.value, fx_defs, acp_defs, &refs);
+    try std.testing.expect(refs > 0);
 }
 
 test "every JSON example in sh-fx.md parses as a JSON object" {
@@ -457,4 +510,91 @@ test "every sh.fx name in sh-fx.md follows the naming rules" {
         }
     }
     try std.testing.expect(names > 0);
+}
+
+test "the Schema section lists each type of sh-fx.schema.json once" {
+    const table = section(fx_spec.bytes, "Schema") orelse {
+        std.debug.print("sh-fx.md has no \"Schema\" section\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    const parsed = try parseSpecFile(fx_schema);
+    defer parsed.deinit();
+    const defs = field(parsed.value, "$defs") orelse return error.TestUnexpectedResult;
+
+    var listed: [64][]const u8 = undefined;
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, table, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "| `")) continue;
+        var parts = std.mem.splitScalar(u8, line, '|');
+        _ = parts.next();
+        const name = codeCell(std.mem.trim(u8, parts.next() orelse "", " ")) orelse "";
+        if (field(defs, name) == null or count == listed.len) {
+            std.debug.print("the Schema section lists \"{s}\", which sh-fx.schema.json doesn't define\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+        for (listed[0..count]) |seen| {
+            if (std.mem.eql(u8, seen, name)) {
+                std.debug.print("the Schema section lists {s} twice\n", .{name});
+                return error.TestUnexpectedResult;
+            }
+        }
+        listed[count] = name;
+        count += 1;
+    }
+    if (count != defs.object.count()) {
+        std.debug.print("the Schema section lists {d} of the {d} types in sh-fx.schema.json\n", .{ count, defs.object.count() });
+        return error.TestUnexpectedResult;
+    }
+}
+
+/// Returns the quoted values in the first column of the table in `doc` whose header row starts
+/// with `header`, without their backticks and quotes.
+fn tableValues(doc: []const u8, comptime header: []const u8, out: [][]const u8) ![]const []const u8 {
+    const start = std.mem.find(u8, doc, "\n" ++ header) orelse {
+        std.debug.print("sh-fx.md has no table that starts with {s}\n", .{header});
+        return error.TestUnexpectedResult;
+    };
+    var lines = std.mem.splitScalar(u8, doc[start + 1 ..], '\n');
+    _ = lines.next(); // The header row.
+    _ = lines.next(); // The `| --- |` row.
+    var count: usize = 0;
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "|")) break;
+        var parts = std.mem.splitScalar(u8, line, '|');
+        _ = parts.next();
+        const cell = codeCell(std.mem.trim(u8, parts.next() orelse "", " ")) orelse "";
+        if (cell.len < 3 or cell[0] != '"' or cell[cell.len - 1] != '"' or count == out.len) {
+            std.debug.print("the table under {s} has a malformed row: {s}\n", .{ header, line });
+            return error.TestUnexpectedResult;
+        }
+        out[count] = cell[1 .. cell.len - 1];
+        count += 1;
+    }
+    return out[0..count];
+}
+
+test "the steering tables give the values of the schema's delivery types" {
+    const parsed = try parseSpecFile(fx_schema);
+    defer parsed.deinit();
+    const defs = field(parsed.value, "$defs") orelse return error.TestUnexpectedResult;
+    const tables = .{
+        .{ "| `sh.fx/delivery` |", "PromptDelivery" },
+        .{ "| `sh.fx/steeringDelivery` |", "SteeringDelivery" },
+    };
+    inline for (tables) |table| {
+        var buffer: [16][]const u8 = undefined;
+        const values = try tableValues(fx_spec.bytes, table[0], &buffer);
+        const def = field(defs, table[1]) orelse return error.TestUnexpectedResult;
+        const want = field(def, "enum") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(want == .array);
+        if (want.array.items.len != values.len) {
+            std.debug.print("the table under {s} gives {d} values, and {s} has {d}\n", .{ table[0], values.len, table[1], want.array.items.len });
+            return error.TestUnexpectedResult;
+        }
+        for (want.array.items, values) |value, got| {
+            try std.testing.expect(value == .string);
+            try std.testing.expectEqualStrings(value.string, got);
+        }
+    }
 }

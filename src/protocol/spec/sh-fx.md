@@ -28,7 +28,7 @@ Extra data on a standard ACP message goes in that message's `_meta` object under
 
 fx and its clients ignore fields they don't know. An extension can therefore gain optional fields in its messages and in its capability object and keep its names.
 
-A change that would break a peer that knows the older shape gets a new capability name, made by adding a version number to the old one, such as `sh.fx/steering2`. Each method or notification whose shape changes is renamed the same way, such as `_sh.fx/session/steer2`. While clients move, fx can advertise and serve the old and the new names together.
+A change that would break a peer that knows the older shape gets a new capability name, made by adding a version number to the old one, such as `sh.fx/promptDelivery2`. Each method or notification whose shape changes is renamed the same way, such as `_sh.fx/session/steer2`. While clients move, fx can advertise and serve the old and the new names together.
 
 ## Capabilities
 
@@ -70,7 +70,7 @@ After `initialize`, these rules apply to the connection:
 - A client calls an extension's methods only when fx's list names the extension. fx answers a method it doesn't support with the JSON-RPC error `-32601`, "Method not found".
 - Each side ignores the names it doesn't know in the other side's list.
 
-Each extension's section adds its capability here, and to `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json`. No capability is defined yet. The table in "Keys in use today" names three that replace fields fx uses today: `sh.fx/steering`, `sh.fx/hooks`, and `sh.fx/hostTools`.
+Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`. The table in "Keys in use today" names two more that replace fields fx uses today, `sh.fx/hooks` and `sh.fx/hostTools`, which later sections define.
 
 ## Extensions
 
@@ -78,13 +78,96 @@ Each extension gets its own section here when it is written.
 
 | Extension | What it adds | ACP proposal it follows |
 | --- | --- | --- |
-| Steering and queued prompts | Input to a running turn, and prompts that wait for the running turn to end | None: the [ACP v2 prompt proposal](https://agentclientprotocol.com/rfds/v2/prompt) leaves steering and queueing to a later proposal |
+| Steering and queued prompts | Input to a running turn, and prompts that wait for the running turn to end | [Prompt delivery](https://github.com/agentclientprotocol/agent-client-protocol/pull/1261), a draft for ACP v2 |
 | Following a session | Several clients on one live session, and whether each session is running | [Multi-Client Session Attach](https://github.com/agentclientprotocol/agent-client-protocol/pull/533) and [`session/status`](https://agentclientprotocol.com/rfds/session-status) |
 | Session list changes | A notification when the list of sessions changes | None |
 | Journal position | The position of each update in the session's log, so a client that reconnects continues without a gap | `replayFrom` in the [session resume replay proposal](https://agentclientprotocol.com/rfds/v2/session-resume-replay) for ACP v2 |
 | Subagents | The child sessions that a turn starts | [Subagent Sessions](https://agentclientprotocol.com/rfds/subagents) |
 | Fork and rewind | A new session copied from a point in another, and the removal of the latest turns | [`session/fork`](https://agentclientprotocol.com/rfds/session-fork) for fork, and none for rewind |
 | Turn diff | The combined file changes of one turn | None |
+
+### Steering and queued prompts
+
+This extension follows ACP's [prompt delivery proposal](https://github.com/agentclientprotocol/agent-client-protocol/pull/1261), a draft for ACP v2. The proposal adds a `delivery` field to `session/prompt`, which tells the Agent what to do with a prompt that arrives while a turn runs. ACP v1 has no such field, so fx reads the value from `sh.fx/delivery` in the prompt's `_meta`. When ACP adopts the proposal, clients move the value to the standard field.
+
+fx lists the `sh.fx/promptDelivery` capability with the deliveries it supports:
+
+```json
+{ "sh.fx/promptDelivery": { "steer": {}, "queue": {} } }
+```
+
+A client lists `sh.fx/promptDelivery` to receive the `sh.fx/steerInput` and `sh.fx/steeringDelivery` keys that this section describes.
+
+#### Deliveries
+
+| `sh.fx/delivery` | What fx does with the prompt |
+| --- | --- |
+| `"steer"` | Adds the prompt's text to the running turn |
+| `"queue"` | Holds the prompt and runs it as a turn of its own after the running turn |
+
+For example, this prompt steers the running turn:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "session/prompt",
+  "params": {
+    "sessionId": "sess_abc123",
+    "prompt": [{ "type": "text", "text": "Use the staging database instead." }],
+    "_meta": { "sh.fx/delivery": "steer" }
+  }
+}
+```
+
+These rules apply to both deliveries:
+
+- A prompt that arrives while no turn runs starts a turn right away, whatever its delivery.
+- A prompt without `sh.fx/delivery` that arrives while a turn runs fails with `-32600`, "Prompt already in progress".
+- fx keeps one order for each session across all of its clients.
+
+#### Steers
+
+- A steer holds only text content blocks. fx joins their text, which must be 1 byte to 64 KiB long. A steer with any other block fails with `-32602`, and the client can send the same prompt with `"queue"`.
+- A session holds at most 64 steers and 1 MiB of steer text that no turn has taken yet. A steer past either limit fails with `-32600`, "Steering queue is full".
+- If the model is writing a reply when a steer arrives, fx stops the reply. The turn takes the steer at its next safe point, before its next model request.
+- When a turn takes a steer, fx sends a `user_message_chunk` update with the steer's text. Its `_meta` holds `sh.fx/steerInput`, whose `requestId` is the steer's request id.
+
+When a turn ends, the steers it didn't take run together as the next turn, before any queued prompt. This also applies to a steer that arrives after the turn has stopped taking input, and to a turn that the client stopped.
+
+The response to a steer arrives when the turn that took it ends. It carries that turn's `stopReason`, and its `_meta` holds `sh.fx/steeringDelivery`:
+
+| `sh.fx/steeringDelivery` | Meaning |
+| --- | --- |
+| `"absorbed"` | The turn that was running took the steer |
+| `"next_turn"` | The turn that was running ended first, so the steer ran in the next turn |
+
+#### Queued prompts
+
+- A queued prompt may hold any content that `session/prompt` accepts.
+- A session holds at most 64 queued prompts. A prompt past the limit fails with `-32600`, "Prompt queue is full".
+- fx starts each queued prompt as a turn of its own when the turn before it ends, in the order it received them. The response to a queued prompt is the response of its own turn.
+
+#### Stopping and withdrawing
+
+- `session/cancel` stops only the running turn. The steers that the turn didn't take and the queued prompts still run after it.
+- A client withdraws a steer or a queued prompt that hasn't run yet with `$/cancel_request` and the prompt's request id. fx answers the prompt with `-32800`, "Request cancelled". A steer that a turn has taken can't be withdrawn.
+- `session/close` answers each steer and queued prompt that hasn't run with `-32800`.
+
+ACP v2's rule for [prompts during active work](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle) differs on one point: there, `session/cancel` also answers the prompts that haven't run with `-32800`. ACP v1 has no such rule. fx revisits this point when it moves to ACP v2.
+
+#### Host steering
+
+A host that keeps the session's journal itself, such as fx's SDK, steers through methods of its own, because each of its steers carries an input id for the journal. fx lists the `sh.fx/hostSteering` capability for these methods, and a host calls them only when fx lists it:
+
+| Method | Params | What it does | Result |
+| --- | --- | --- | --- |
+| `_sh.fx/session/steer` | `sessionId`, `text`, and an optional input `id` | Adds the text to the running turn. The text limits of a steer apply | `null` |
+| `_sh.fx/session/withdraw_steer` | `sessionId` and the input `id` | Takes back a steer that no turn has taken | `{ "result": "withdrawn" }`, or `{ "result": "already_placed" }` when a turn has taken it |
+| `_sh.fx/session/end_turn_for_steer` | `sessionId` | Ends the running turn at its next safe point, so that a steer that can't join it, such as one with images, runs next | `null` |
+| `_sh.fx/session/follow_up` | `sessionId`, the input `id`, and 1 byte to 64 KiB of `text` | Records in the journal a prompt that the host queued behind the running turn. The host runs the prompt itself | `null` |
+
+A `user_message_chunk` update for a host steer carries a `requestId` of `null` in `sh.fx/steerInput`, and the steer's input id as `inputId`.
 
 ## Names in use today
 
@@ -116,10 +199,10 @@ fx's ACP server puts its extra data under `_meta.fx.<key>` today, and it reads t
 
 | Today | Where | New | Kind | What it carries |
 | --- | --- | --- | --- | --- |
-| `_meta.fx.steering` | `agentCapabilities` in the `initialize` response | `sh.fx/steering` | capability | fx accepts steering. Its value becomes `{}` in place of `true` |
-| `_meta.fx.steering` | the `session/prompt` response to a steer | `sh.fx/steeringDelivery` | `_meta` key | How the steer fared in the turn that received it: `absorbed` or `dropped` |
+| `_meta.fx.steering` | `agentCapabilities` in the `initialize` response | `sh.fx/promptDelivery` | capability | fx accepts steering. Its value lists the deliveries fx supports, in place of `true` |
+| `_meta.fx.steering` | the `session/prompt` response to a steer | `sh.fx/steeringDelivery` | `_meta` key | How the steer ran: `absorbed` or `next_turn`. Today's `dropped` goes away, because a steer that a turn doesn't take runs in the next turn |
 | `_meta.fx.steering` | a `user_message_chunk` update that shows a steer | `sh.fx/steerInput` | `_meta` key | The steer's request id and input id |
-| `_meta.fx.steer` | `session/prompt` params | `sh.fx/steer` | `_meta` key | Makes a prompt sent during a running turn a steer. The steering section decides whether it stays |
+| `_meta.fx.steer` | `session/prompt` params | `sh.fx/delivery` | `_meta` key | What fx does with a prompt sent during a running turn: `steer` or `queue`. Today's `true` means `steer` |
 | `_meta.fx.hooksVersion` | the `session/new` and `session/load` responses | `sh.fx/hooks` | capability | That fx supports hooks, now listed in `agentCapabilities` |
 | `_meta.fx.hooks` | `session/new` params | `sh.fx/hooks` | `_meta` key | The client's hook settings, such as `captureContent` |
 | `_meta.fx.permissionMode` | each value of the `mode` config option | `sh.fx/permissionMode` | `_meta` key | The permission mode that the session mode applies, with fx's original names, such as `yolo` for full access |
@@ -156,3 +239,7 @@ The keys and capabilities move with the method names, under the same rules: for 
 | `Capability` | The value of an `sh.fx` capability entry |
 | `AgentCapabilitiesMeta` | The `sh.fx` entries in `agentCapabilities._meta` |
 | `ClientCapabilitiesMeta` | The `sh.fx` entries in `clientCapabilities._meta` |
+| `PromptDeliveryCapability` | The value of the `sh.fx/promptDelivery` capability that fx lists |
+| `PromptDelivery` | The value of `sh.fx/delivery`: `steer` or `queue` |
+| `SteeringDelivery` | The value of `sh.fx/steeringDelivery`: `absorbed` or `next_turn` |
+| `SteerInput` | The value of `sh.fx/steerInput` |
