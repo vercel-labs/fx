@@ -27,7 +27,8 @@
       "type": "object",
       "properties": {
         "sh.fx/promptDelivery": { "$ref": "#/$defs/PromptDeliveryCapability" },
-        "sh.fx/hostSteering": { "$ref": "#/$defs/Capability" }
+        "sh.fx/hostSteering": { "$ref": "#/$defs/Capability" },
+        "sh.fx/logPosition": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -37,7 +38,8 @@
       "description": "The sh.fx entries that a client lists in `clientCapabilities._meta` of its `initialize` request.",
       "type": "object",
       "properties": {
-        "sh.fx/promptDelivery": { "$ref": "#/$defs/Capability" }
+        "sh.fx/promptDelivery": { "$ref": "#/$defs/Capability" },
+        "sh.fx/logPosition": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -75,6 +77,24 @@
         }
       },
       "required": ["requestId"]
+    },
+    "LogPosition": {
+      "description": "A position in a session's log, which names the last turn saved. Opaque: a client stores it and sends it back unchanged.",
+      "type": "string",
+      "minLength": 1
+    },
+    "ReplayFrom": {
+      "description": "The value of sh.fx/replayFrom in the `_meta` of a `session/load` request: replay only the turns saved after this position.",
+      "type": "object",
+      "properties": {
+        "position": { "$ref": "#/$defs/LogPosition" }
+      },
+      "required": ["position"]
+    },
+    "Replay": {
+      "description": "The value of sh.fx/replay in the `_meta` of a `session/load` response: whether fx replayed the turns after the position, or the whole session because it didn't know the position.",
+      "type": "string",
+      "enum": ["after_position", "full"]
     }
   }
 }
