@@ -245,7 +245,11 @@ export type FxAgentTools = readonly FxAgentTool[] | { readonly [name: string]: F
 export type FxTurnEvent =
   | { type: "text_delta"; delta: string }
   | { type: "reasoning_delta"; delta: string }
-  /** Steering entering the turn as its model request carries it; `id` is the steer's id. */
+  /**
+   * Steering entering the turn as its model request carries it; `id` is the steer's id. When an engine resumes a turn
+   * after a crash, this event can repeat with the same `id`, so a host that stores events should key them by `id`. A
+   * session shows it once.
+   */
   | { type: "user_message"; text: string; id?: string }
   | { type: "tool_start"; id: string; name: string; input?: JsonValue; inputTruncated?: undefined; inputPreview?: undefined }
   /** A tool input over 64 KiB of JSON arrives as a prefix. The tool still receives complete arguments. */

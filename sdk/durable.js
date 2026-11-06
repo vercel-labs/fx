@@ -2188,6 +2188,7 @@ class SessionWorker {
         let turn = null;
         let messageId = null;
         let fresh = false;
+        let shown = new Set();
         let spent = false;
         if (open?.id) {
           // A call left running reruns only when running it twice is safe.
@@ -2198,6 +2199,8 @@ class SessionWorker {
           // It lands before the turn goes on, so any line the replaced
           // worker writes after it ranks below it and stays hidden.
           await ui.settle();
+          // A repeat of a line is better than a turn that can't resume.
+          shown = await shownSteers(log, state.heldIds).catch(() => new Set());
           // A step the deadline cut off maxCutoffs times in a row would be
           // cut off forever. A cut-off call is not run again, so the model
           // hears it may have partly run; a model request ends the turn,
@@ -2267,7 +2270,7 @@ class SessionWorker {
         else if (spent && !(open.calls?.length > 0)) turn.cancel();
         // A new turn takes the steers sent while it waited to start.
         const joining = fresh ? { ...state, steers: state.pending[0]?.joiners ?? [], endOpen: state.pending[0]?.ends === true } : state;
-        const outcome = await this.drive(log, harness, turn, messageId, joining, ui);
+        const outcome = await this.drive(log, harness, turn, messageId, joining, ui, shown);
         turnNow = null;
         if (outcome === "fenced") return "fenced";
         if (outcome === "yielded") {
@@ -2357,7 +2360,7 @@ class SessionWorker {
   // cancels the log receives while it runs. Returns "fenced", "yielded",
   // `{ stopped }` when its harness stopped under it, or `{ result }` for a
   // turn that ended, whose end the caller writes.
-  async drive(log, harness, turn, messageId, state, ui) {
+  async drive(log, harness, turn, messageId, state, ui, shown) {
     // The inputs `state` was folded from are placed already: the fold gave
     // each a turn, joined it to one, or spent it. The poll applies only the
     // inputs stored after them. After an early start, that includes this
@@ -2416,7 +2419,10 @@ class SessionWorker {
     void apply();
     let result;
     try {
-      for await (const event of turn) ui.push({ ...event, messageId });
+      for await (const event of turn) {
+        if (event.type === "user_message" && shown.has(event.id)) continue;
+        ui.push({ ...event, messageId });
+      }
       result = await turn.result;
     } catch (error) {
       if (isFenced(error)) return "fenced";
@@ -2467,7 +2473,8 @@ function uiRanker(high = 0) {
 }
 
 // The ranker as it stands after the first `count` lines of the stream.
-async function uiRankerAt(log, count) {
+// `onShown` gets each line a reader shows.
+async function uiRankerAt(log, count, onShown) {
   const shows = uiRanker();
   if (count === 0) return shows;
   const reader = log.ui.read(0).getReader();
@@ -2482,13 +2489,30 @@ async function uiRankerAt(log, count) {
         const line = buffered.slice(0, index);
         buffered = buffered.slice(index + 1);
         seen += 1;
-        try { shows(JSON.parse(line)); } catch {}
+        try {
+          const event = JSON.parse(line);
+          if (shows(event)) onShown?.(event);
+        } catch {}
       }
     }
   } finally {
     void reader.cancel().catch(() => {});
   }
   return shows;
+}
+
+// Which of the steers `held` a reader already sees. A turn shows a steer when
+// it takes it, ahead of the progress that places it. A crash between the two
+// leaves the steer held, so the resume places it and shows it again. Read
+// after `turn_resume` lands, this is exact: a line of the replaced worker's
+// that lands later stays hidden, and the resume's own line shows instead.
+async function shownSteers(log, held) {
+  const shown = new Set();
+  if (held.length === 0) return shown;
+  await uiRankerAt(log, await log.ui.length(), (event) => {
+    if (event.type === "user_message" && held.includes(event.id)) shown.add(event.id);
+  });
+  return shown;
 }
 
 // What a retried `messageId` finds in its session: its turn still waiting or

@@ -480,6 +480,7 @@ An engine differs from a session:
 - On AI Gateway, it needs an `apiKey`.
 - One prompt runs at a time, and breaking out of a turn's events cancels the turn.
 - The turn itself has `cancel()` and `steer()`. Like a session's steer, it cuts a streaming reply short and waits for a running tool, and it takes text only.
+- When an engine resumes a turn after a crash, a steer's `user_message` event can repeat with the same `id`, because the engine can't tell what your code already received. If you store these events, key them by `id`. A session shows each one once.
 
 To have the engine record the conversation as it runs, pass a `persistence` store instead of a checkpoint. A new engine on the same store can then `resume()` a turn the last process left open. A store needs two methods and can add a third, and the bytes are opaque, so it never has to understand them:
 
