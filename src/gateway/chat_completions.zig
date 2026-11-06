@@ -61,7 +61,7 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .cache_control = definition.cache_control, .provider = &identity });
 }
 
 pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {

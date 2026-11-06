@@ -26,6 +26,7 @@ pub const ParseError = Allocator.Error || error{
     InvalidAuth,
     InvalidEnvironmentName,
     InvalidToolChoiceMode,
+    InvalidCacheControl,
     InvalidModelId,
     InvalidModelMetadata,
 };
@@ -38,6 +39,14 @@ pub const ToolChoiceMode = enum { omit, send };
 pub const Auth = union(enum) {
     none,
     bearer: []const u8,
+};
+
+pub const CacheControl = struct {
+    type: Type = .ephemeral,
+    ttl: ?Ttl = null,
+
+    pub const Type = enum { ephemeral };
+    pub const Ttl = enum { @"1h" };
 };
 
 pub const ModelMetadata = struct {
@@ -56,6 +65,7 @@ pub const Definition = struct {
     base_url: []const u8,
     auth: Auth,
     tool_choice_mode: ToolChoiceMode = .omit,
+    cache_control: ?CacheControl = null,
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
 
@@ -165,7 +175,7 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "cache_control", "reviewer_model", "model_metadata" });
     const protocol = try required(value, "protocol");
     if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
     const url = try required(value, "base_url");
@@ -177,6 +187,8 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         if (choice != .string) return error.InvalidToolChoiceMode;
         mode = if (std.mem.eql(u8, choice.string, "omit")) .omit else if (std.mem.eql(u8, choice.string, "send")) .send else return error.InvalidToolChoiceMode;
     }
+    var cache: ?CacheControl = null;
+    if (value.object.get("cache_control")) |cache_value| cache = try parse_cache_control(cache_value);
     var reviewer: ?[]const u8 = null;
     if (value.object.get("reviewer_model")) |model_value| {
         if (model_value != .string) return error.InvalidModelId;
@@ -204,9 +216,23 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .base_url = owned_url,
         .auth = owned_auth,
         .tool_choice_mode = mode,
+        .cache_control = cache,
         .reviewer_model = owned_reviewer,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
     };
+}
+
+fn parse_cache_control(value: std.json.Value) ParseError!CacheControl {
+    if (value != .object) return error.InvalidCacheControl;
+    try check_fields(value, &.{ "type", "ttl" });
+    const kind = try required(value, "type");
+    if (kind != .string or !std.mem.eql(u8, kind.string, "ephemeral")) return error.InvalidCacheControl;
+    var control: CacheControl = .{};
+    if (value.object.get("ttl")) |ttl| {
+        if (ttl != .string) return error.InvalidCacheControl;
+        control.ttl = if (std.mem.eql(u8, ttl.string, "1h")) .@"1h" else return error.InvalidCacheControl;
+    }
+    return control;
 }
 
 fn parse_auth(value: std.json.Value) ParseError!Auth {
@@ -371,7 +397,7 @@ fn hash_part(hash: *std.crypto.hash.sha2.Sha256, part: []const u8) void {
 
 const test_json =
     \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1/","auth":{"type":"none"}},
-    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
+    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","cache_control":{"type":"ephemeral","ttl":"1h"},"reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
 ;
 
 test "configured provider owns definitions and preserves unknown metadata" {
@@ -392,6 +418,7 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", router.auth.bearer);
     try std.testing.expectEqualStrings("openai/review", router.reviewer_model.?);
     try std.testing.expectEqual(ToolChoiceMode.send, router.tool_choice_mode);
+    try std.testing.expectEqual(CacheControl.Ttl.@"1h", router.cache_control.?.ttl);
     const metadata = router.model("openai/gpt-4.1").?;
     try std.testing.expectEqual(@as(?u32, 8192), metadata.context_window);
     try std.testing.expectEqual(@as(?u32, 1024), metadata.max_output_tokens);
@@ -498,6 +525,12 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"secret\":\"not-allowed\"}}", .err = error.UnknownField },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_choice_mode\":\"auto\"}}", .err = error.InvalidToolChoiceMode },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_choice_mode\":null}}", .err = error.InvalidToolChoiceMode },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"cache_control\":\"ephemeral\"}}", .err = error.InvalidCacheControl },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"cache_control\":{}}}", .err = error.MissingField },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"cache_control\":{\"type\":\"persistent\"}}}", .err = error.InvalidCacheControl },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"2h\"}}}", .err = error.InvalidCacheControl },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":null}}}", .err = error.InvalidCacheControl },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"cache_control\":{\"type\":\"ephemeral\",\"mode\":\"block\"}}}", .err = error.UnknownField },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":null}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"\"}}", .err = error.InvalidModelId },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"bad\\nmodel\"}}", .err = error.InvalidModelId },
