@@ -600,20 +600,33 @@ fn jsEngineModule(
     module.addCSourceFiles(.{
         .root = b.path("src/js/quickjs"),
         .files = &.{ "quickjs.c", "libregexp.c", "libunicode.c", "dtoa.c" },
-        // Upstream's own build settings; the warnings are upstream's to fix.
-        // Zig's sanitizer runtime has no handler for the check that an
-        // indirect call matches the function's type, so Debug's full checks
-        // would leave it out; trapping on it keeps it in every mode. A fuzz
-        // build adds coverage instrumentation to the C that Zig 0.17's fuzzer
-        // can't use: it reads counter locations only from the table Zig's own
-        // code emits, and it has no hooks for comparison tracing. So the C is
-        // left uninstrumented, and the fuzzer follows the Zig code's coverage.
-        // Outside a fuzz build, this flag has no effect.
-        .flags = &.{ "-std=gnu11", "-funsigned-char", "-DQUICKJS_NG_BUILD", "-D_GNU_SOURCE", "-w", "-fsanitize=function", "-fsanitize-trap=function", "-fno-sanitize-coverage=inline-8bit-counters,trace-cmp" },
+        // A release build optimizes the C for size, which makes the engine
+        // noticeably smaller for a few percent of speed.
+        .flags = if (optimize == .debug) &quickjs_flags else &(quickjs_flags ++ [_][]const u8{"-Os"}),
     });
     module.addImport("build_options", options.createModule());
     return module;
 }
+
+/// Upstream's own build settings; the warnings are upstream's to fix.
+/// Zig's sanitizer runtime has no handler for the check that an indirect call
+/// matches the function's type, so Debug's full checks would leave it out;
+/// trapping on it keeps it in every mode. A fuzz build adds coverage
+/// instrumentation to the C that Zig 0.17's fuzzer can't use: it reads
+/// counter locations only from the table Zig's own code emits, and it has no
+/// hooks for comparison tracing. So the C is left uninstrumented, and the
+/// fuzzer follows the Zig code's coverage. Outside a fuzz build, that flag has
+/// no effect.
+const quickjs_flags = [_][]const u8{
+    "-std=gnu11",
+    "-funsigned-char",
+    "-DQUICKJS_NG_BUILD",
+    "-D_GNU_SOURCE",
+    "-w",
+    "-fsanitize=function",
+    "-fsanitize-trap=function",
+    "-fno-sanitize-coverage=inline-8bit-counters,trace-cmp",
+};
 
 fn readAppVersion(b: *std.Build) []const u8 {
     b.dependOnFileContents(b.path("src/main.zig"));
