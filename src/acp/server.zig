@@ -350,6 +350,8 @@ pub const ServerState = struct {
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
     session_titles: bool = true,
+    /// Resolved `experimental.code_mode` preference: offer the `execute` tool.
+    code_mode_enabled: bool = false,
     cache_warming: bool = true,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
@@ -3011,6 +3013,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
     state.session_titles = startup.session_title_generation;
+    state.code_mode_enabled = startup.code_mode_enabled;
     state.cache_warming = startup.cache_warming;
 
     if (comptime !host_target.is_wasm) {

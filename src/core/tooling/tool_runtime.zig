@@ -160,6 +160,11 @@ pub const Context = struct {
     root_user_messages: []const []const u8 = &.{},
     root_user_evidence_complete: bool = false,
     current_turn_messages: []const ChatMessage = &.{},
+    /// The review context the agent loop built for the call being executed,
+    /// from which an `execute` program's tool calls derive their own.
+    code_mode_review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
+    /// The turn's review holds and budget, lent for the call being executed.
+    review_ledger: ?tool_contracts.ReviewLedger = null,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
     gateway_models_path: []const u8 = "/v1/models",
@@ -232,6 +237,16 @@ pub const Context = struct {
     nested_tool_lifecycle: ?ToolLifecyclePublisher = null,
     subagent_status_renderer: ?types.SubagentStatusRenderer = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
+    /// The built-in tools a live tool authority, such as a child agent's
+    /// profile, allows. Its integrations are the advertised dynamic tool
+    /// names. Null when no authority narrows the registry. Each call an
+    /// `execute` program makes is checked against it, as a direct call is.
+    live_tool_names: ?[]const []const u8 = null,
+    /// Whether `execute` may run: `experimental.code_mode` is on, the setting
+    /// that also decides whether the tool is offered. A call while it is off
+    /// gets the tool's "not available" answer, so naming an unoffered tool
+    /// doesn't reach the sandbox.
+    code_mode_enabled: bool = false,
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
@@ -436,6 +451,7 @@ pub fn executeToolCallAuthorized(
         execution_ctx.session_grants = authority.grants;
         execution_ctx.permission_rules = authority.rules;
         execution_ctx.advertised_dynamic_tool_names = authority.integrations;
+        execution_ctx.live_tool_names = authority.tools;
         execution_ctx.mcp_access = rebindMcpAuthorityGeneration(
             execution_ctx.mcp_access,
             authority.generation,
@@ -449,6 +465,8 @@ pub fn executeToolCallAuthorized(
     execution_ctx.expected_mcp_runtime_generation = request.expected_mcp_runtime_generation;
     execution_ctx.expected_mcp_binding = request.expected_mcp_binding;
     execution_ctx.current_turn_messages = request.current_turn_messages;
+    execution_ctx.code_mode_review_turn = request.review_turn;
+    execution_ctx.review_ledger = request.review_ledger;
     execution_ctx.output_chunk_lifecycle_id = request.lifecycle_id;
     execution_ctx.output_chunk_presentation_group_id = request.presentation_group_id;
     execution_ctx.command_timeout_started_ms = request.command_timeout_started_ms;
@@ -866,6 +884,7 @@ fn executeRegisteredTool(
         .runtime = ctx,
         .authorized_image_catalog = authorized_image_catalog,
     };
+    var code_mode_provider = CodeModeProviderState{ .runtime = ctx, .call = call, .arena = arena };
     var mcp_progress_bridge = McpProgressBridge{ .ctx = ctx };
     var mcp_call_status: ?tool_mcp_runtime.CallStatus = null;
     var mcp_execution_error: ?anyerror = null;
@@ -918,6 +937,13 @@ fn executeRegisteredTool(
         .subagent => dispatch_ctx.subagent_provider = .{
             .context = &subagent_provider,
             .execute_fn = executeSubagentProvider,
+        },
+        .code_mode => if (ctx.code_mode_enabled) {
+            dispatch_ctx.code_mode_provider = .{
+                .ctx = &code_mode_provider,
+                .call_fn = executeNestedToolCall,
+                .cancelled_fn = codeModeCancelled,
+            };
         },
     }
     dispatch_ctx.mcp_execution_error_sink = &mcp_execution_error;
@@ -1643,6 +1669,229 @@ pub fn prepareSkillCall(ctx: Context, arena: Allocator, call: ToolCall, location
     var dispatch = typedDispatchContextForCall(ctx, arena, call);
     dispatch.skill_locations = locations;
     return prepare(dispatch, call.arguments_json);
+}
+
+/// Tools a program can't call: `execute` itself, `ask_user_question`, which
+/// would stop the program to wait for the user, and `subagent`, which starts
+/// a whole agent.
+const code_mode_excluded_tools = [_][]const u8{ "execute", "ask_user_question", "subagent" };
+
+/// One `execute` call's program, as its tool calls arrive.
+const CodeModeProviderState = struct {
+    runtime: Context,
+    call: ToolCall,
+    /// The `execute` call's arena. Everything a later call refers back to
+    /// lives here, since the sandbox frees its own per-call memory.
+    arena: Allocator,
+    nested_count: usize = 0,
+    /// Unselected MCP tools this program called by name, loaded the way the
+    /// orchestrator loads one for a direct call.
+    resolved_mcp: std.ArrayList(tool_mcp_runtime.SelectedTool) = .empty,
+    /// Each earlier call and its result, so a review sees what the program
+    /// read before it acted.
+    evidence: std.ArrayList(ChatMessage) = .empty,
+};
+
+/// The definition of an unselected MCP tool a program calls by name, or null
+/// for built-in and already advertised tools. Loading one extends this
+/// program's advertised names, so validation and admission treat it like a
+/// tool the model selected.
+fn nestedMcpDefinition(state: *CodeModeProviderState, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+    for (state.resolved_mcp.items) |definition| {
+        if (std.mem.eql(u8, definition.name, name)) return definition;
+    }
+    if (registeredToolSpec(state.runtime, name) != null) return null;
+    if (containsName(state.runtime.advertised_dynamic_tool_names, name)) return null;
+    const definition = (try resolveUnselectedMcpTool(state.runtime, state.arena, name)) orelse return null;
+    if (definition.mcp_binding == null) return null;
+    const owned: tool_mcp_runtime.SelectedTool = .{
+        .name = try state.arena.dupe(u8, name),
+        .schema_json = definition.schema_json,
+        .mcp_binding = definition.mcp_binding,
+    };
+    try state.resolved_mcp.append(state.arena, owned);
+    const previous = state.runtime.advertised_dynamic_tool_names;
+    const names = try state.arena.alloc([]const u8, previous.len + 1);
+    @memcpy(names[0..previous.len], previous);
+    names[previous.len] = owned.name;
+    state.runtime.advertised_dynamic_tool_names = names;
+    debug_trace.logf("mcp", "code mode loaded unselected MCP tool tool={s}", .{name});
+    return owned;
+}
+
+fn codeModeCancelled(raw: *anyopaque) bool {
+    const state: *CodeModeProviderState = @ptrCast(@alignCast(raw));
+    const flag = state.runtime.cancel_flag orelse return false;
+    return flag.load(.acquire);
+}
+
+/// Runs one call from an `execute` program through the same validation,
+/// availability check, permission admission, and authorized execution as a
+/// direct model call. The call gets its own id, `<execute id>.<n>`, so its
+/// review and any MCP correlation see the call rather than the program.
+fn executeNestedToolCall(
+    raw: *anyopaque,
+    call_arena: Allocator,
+    name: []const u8,
+    args_json: []const u8,
+) anyerror!tool_dispatch.NestedToolResult {
+    const state: *CodeModeProviderState = @ptrCast(@alignCast(raw));
+    for (code_mode_excluded_tools) |excluded| {
+        if (std.mem.eql(u8, name, excluded)) return .{
+            .text = try call_arena.print("{s} can't be called from a program. Call it directly instead.", .{name}),
+            .status = .failed,
+        };
+    }
+    if (state.runtime.live_tool_names) |tools| {
+        if (!containsName(tools, name) and !containsName(state.runtime.advertised_dynamic_tool_names, name)) return .{
+            .text = try call_arena.print("{s} isn't available to this agent.", .{name}),
+            .status = .failed,
+        };
+    }
+    if (codeModeCancelled(raw)) return error.Cancelled;
+    const resolved_mcp = try nestedMcpDefinition(state, name);
+    var ctx = state.runtime;
+    if (resolved_mcp) |definition| ctx.mcp_review_schema_json = definition.schema_json;
+    state.nested_count += 1;
+    const call: ToolCall = .{
+        .id = try state.arena.print("{s}.{d}", .{ state.call.id, state.nested_count }),
+        .name = try state.arena.dupe(u8, name),
+        .arguments_json = try nestedArguments(state, name, args_json),
+    };
+    const mcp_generation: ?u64 = switch (try validateToolCall(ctx, call_arena, call)) {
+        .valid => |witness| witness.mcp_runtime_generation,
+        .failure => |reason| return .{ .text = reason, .status = .failed },
+        .not_registered => return .{
+            .text = try call_arena.print("Unknown tool: {s}. Call a tool from your tool list by its exact name.", .{name}),
+            .status = .failed,
+        },
+    };
+    if (try checkToolAvailability(ctx, call_arena, call)) |failure| return .{ .text = failure, .status = .failed };
+
+    const outcome = try nestedPermissionOutcome(state, &ctx, call_arena, call);
+    if (outcome.tool_failure) |failure| return .{ .text = failure, .status = .failed };
+    const authority = outcome.execution_authority orelse
+        return .{ .text = try nestedDenialText(call_arena, name, outcome), .status = .held };
+
+    const result = try executeToolCallAuthorized(ctx, .{
+        .call_allocator = call_arena,
+        .result_allocator = state.arena,
+        .call = call,
+        .authority = authority,
+        .session_grants = ctx.session_grants,
+        .advertised_dynamic_tool_names = ctx.advertised_dynamic_tool_names,
+        .max_tool_result_bytes = ctx.max_tool_result_bytes,
+        .expected_mcp_runtime_generation = mcp_generation,
+        .expected_mcp_binding = if (resolved_mcp) |definition| definition.mcp_binding else ctx.expected_mcp_binding,
+        .lifecycle_id = ctx.output_chunk_lifecycle_id,
+    });
+    if (result.result_commit) |token| {
+        token.commit() catch |err| {
+            debug_trace.logf("tool", "code mode nested result commit failed tool={s} err={s}", .{ name, @errorName(err) });
+        };
+    }
+    if (result.cancelled) return error.Cancelled;
+    const text = if (registeredToolSpec(ctx, name) == null)
+        mcpTextContent(state.arena, result.model_output) orelse result.model_output
+    else
+        result.model_output;
+    try state.evidence.appendSlice(state.arena, &.{
+        .{ .role = .assistant, .tool_calls = try state.arena.dupe(ToolCall, &.{call}) },
+        .{ .role = .tool, .tool_call_id = call.id, .tool_name = call.name, .content = text },
+    });
+    return .{ .text = text, .status = if (result.status == .failure) .failed else .ok };
+}
+
+/// A program's arguments as the agent loop stores a model's call: a shell
+/// call's exact {"request":{...}} unwrapped and a missing action filled in,
+/// so `tools.shell({ command })` runs like the same direct call. The bytes
+/// live in the `execute` call's arena.
+fn nestedArguments(state: *CodeModeProviderState, name: []const u8, args_json: []const u8) ![]const u8 {
+    if (registeredToolSpec(state.runtime, name)) |tool| if (tool.executor_kind == .terminal) {
+        if (try tool_args.normalizedTerminalRequestArguments(state.arena, args_json, tool.infer_action_fn)) |normalized| return normalized;
+    };
+    return state.arena.dupe(u8, args_json);
+}
+
+/// The permission outcome for one call from a program. In `auto` mode the
+/// call reuses a hold this turn already decided for the same action, and
+/// otherwise gets its own review: the `execute` call's context, with this
+/// call as the pending action and the program's earlier results as
+/// evidence. It spends the turn's review budget like a direct call.
+fn nestedPermissionOutcome(
+    state: *CodeModeProviderState,
+    ctx: *Context,
+    arena: Allocator,
+    call: ToolCall,
+) !command_admission.PermissionOutcome {
+    const auto_mode = ctx.permission_mode == .auto;
+    if (auto_mode) if (ctx.review_ledger) |ledger| if (ledger.cached(call)) |held| return held;
+    if (ctx.code_mode_review_turn) |base| {
+        const pending: ChatMessage = .{ .role = .assistant, .tool_calls = try state.arena.dupe(ToolCall, &.{call}) };
+        var turn = base;
+        turn.origin = .code_mode;
+        turn.target_call_id = call.id;
+        turn.pending_assistant = pending;
+        turn.current_turn_untrusted_messages = try std.mem.concat(state.arena, ChatMessage, &.{
+            base.current_turn_untrusted_messages,
+            state.evidence.items,
+            &.{pending},
+        });
+        turn.review_attempt_available = !auto_mode or
+            if (ctx.review_ledger) |ledger| ledger.attemptAvailable(call) else base.review_attempt_available;
+        ctx.permission_review_turn = turn;
+    }
+    const outcome = try tool_admission.requestPermissionOutcome(ctx.admissionInput(), arena, call, ctx.permission_mode, ctx.session_grants);
+    if (auto_mode) if (ctx.review_ledger) |ledger| try ledger.remember(call, outcome);
+    return outcome;
+}
+
+/// The same text a held or denied direct call gives the model.
+fn nestedDenialText(arena: Allocator, name: []const u8, outcome: command_admission.PermissionOutcome) ![]u8 {
+    const reason = outcome.denial_reason orelse .policy_denied;
+    return switch (reason) {
+        .review_caution, .review_evidence_incomplete, .review_unavailable => tool_result_errors.toolReviewHeldJson(
+            arena,
+            name,
+            reason,
+            if (outcome.auto_review_result) |result| result.rationale else null,
+            outcome.auto_review_failure,
+        ),
+        .user_denied, .auto_denied, .policy_denied, .permission_required => tool_result_errors.toolPermissionDeniedJson(arena, name, reason),
+    };
+}
+
+/// The model reads an MCP result inside `{server, tool, result: {content}}`.
+/// A program gets only the text content, joined by newlines, or null when the
+/// output is not that shape, such as a non-text item.
+fn mcpTextContent(arena: Allocator, output: []const u8) ?[]const u8 {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, output, .{}) catch return null;
+    const envelope = switch (root) {
+        .object => |object| object,
+        else => return null,
+    };
+    const result = switch (envelope.get("result") orelse return null) {
+        .object => |object| object,
+        else => return null,
+    };
+    const content = switch (result.get("content") orelse return null) {
+        .array => |array| array,
+        else => return null,
+    };
+    var out: std.Io.Writer.Allocating = .init(arena);
+    for (content.items, 0..) |item, index| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => return null,
+        };
+        const text = switch (object.get("text") orelse return null) {
+            .string => |value| value,
+            else => return null,
+        };
+        if (index > 0) out.writer.writeByte('\n') catch return null;
+        out.writer.writeAll(text) catch return null;
+    }
+    return out.written();
 }
 
 const VisionProviderState = struct {
@@ -7013,6 +7262,137 @@ test "MCP dynamic tool executes after its schema was advertised" {
 
     try expectToolOutput(rt.context(), "mcp_fs_read", "{}", "mcp ok");
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
+}
+
+test "a program's tool calls stay inside a live tool authority" {
+    const sandbox = @import("../code_mode/sandbox.zig");
+    if (!sandbox.available) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "secret.txt", .data = "top secret" });
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var rt = TestRuntime{
+        .workspace_root = root,
+        .tool_registry = .{ .tools = &.{ test_builtin_tools.read_file, test_builtin_tools.execute } },
+    };
+    defer rt.deinit(alloc);
+    const program =
+        \\{"code":"try { return 'read: ' + await tools.read_file({ path: 'secret.txt' }); } catch (e) { return 'refused: ' + e.message; }"}
+    ;
+    const cases = [_]struct { tools: []const []const u8, reads: bool }{
+        .{ .tools = &.{"execute"}, .reads = false },
+        // The control: with read_file allowed, the same program reads it.
+        .{ .tools = &.{ "execute", "read_file" }, .reads = true },
+    };
+    var ctx = rt.context();
+    ctx.code_mode_enabled = true;
+    for (cases) |case| {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const result = try executeToolCallAuthorized(ctx, .{
+            .call_allocator = arena_state.allocator(),
+            .result_allocator = arena_state.allocator(),
+            .call = .{ .id = "program", .name = "execute", .arguments_json = program },
+            .authority = .ordinary,
+            .session_grants = &.{},
+            .live_authority = .{
+                .generation = 1,
+                .root_id = "root",
+                .tools = case.tools,
+                .integrations = &.{},
+                .rules = .{},
+                .grants = &.{},
+                .permission_mode = .yolo,
+            },
+            .advertised_dynamic_tool_names = &.{},
+            .max_tool_result_bytes = rt.max_tool_result_bytes,
+        });
+        if (case.reads) {
+            try expectContains(result.model_output, "top secret");
+        } else {
+            try expectContains(result.model_output, "refused: read_file isn't available to this agent.");
+            try expectNotContains(result.model_output, "top secret");
+        }
+    }
+}
+
+test "a program's shell call takes the arguments the same direct call does" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var rt = TestRuntime{
+        .workspace_root = "/workspace",
+        .tool_registry = .{ .tools = &.{ test_builtin_tools.shell, test_builtin_tools.read_file } },
+    };
+    defer rt.deinit(std.testing.allocator);
+    var state: CodeModeProviderState = .{
+        .runtime = rt.context(),
+        .call = .{ .id = "program", .name = "execute", .arguments_json = "{}" },
+        .arena = arena_state.allocator(),
+    };
+    const cases = [_]struct { name: []const u8, sent: []const u8, run: []const u8 }{
+        .{ .name = "shell", .sent = "{\"command\":\"pwd\"}", .run = "{\"action\":\"run\",\"command\":\"pwd\"}" },
+        .{ .name = "shell", .sent = "{\"request\":{\"action\":\"run\",\"command\":\"pwd\"}}", .run = "{\"action\":\"run\",\"command\":\"pwd\"}" },
+        .{ .name = "shell", .sent = "{\"action\":\"stop\",\"session_id\":\"s\"}", .run = "{\"action\":\"stop\",\"session_id\":\"s\"}" },
+        // The control: a tool without the agent loop's normalization keeps its arguments.
+        .{ .name = "read_file", .sent = "{\"request\":{\"path\":\"a\"}}", .run = "{\"request\":{\"path\":\"a\"}}" },
+    };
+    for (cases) |case| try std.testing.expectEqualStrings(case.run, try nestedArguments(&state, case.name, case.sent));
+}
+
+test "an execute call runs its program only while code mode is on" {
+    const sandbox = @import("../code_mode/sandbox.zig");
+    if (!sandbox.available) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "secret.txt", .data = "top secret" });
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var rt = TestRuntime{
+        .workspace_root = root,
+        .tool_registry = .{ .tools = &.{ test_builtin_tools.read_file, test_builtin_tools.execute } },
+    };
+    defer rt.deinit(alloc);
+    const program =
+        \\{"code":"return await tools.read_file({ path: 'secret.txt' });"}
+    ;
+    // The model can name `execute` while it isn't offered; the control turns
+    // code mode on and reads the file.
+    for ([_]bool{ false, true }) |enabled| {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        var ctx = rt.context();
+        ctx.code_mode_enabled = enabled;
+        const result = try executeToolCallAuthorized(ctx, .{
+            .call_allocator = arena_state.allocator(),
+            .result_allocator = arena_state.allocator(),
+            .call = .{ .id = "program", .name = "execute", .arguments_json = program },
+            .authority = .ordinary,
+            .session_grants = &.{},
+            .live_authority = .{
+                .generation = 1,
+                .root_id = "root",
+                .tools = &.{ "execute", "read_file" },
+                .integrations = &.{},
+                .rules = .{},
+                .grants = &.{},
+                .permission_mode = .yolo,
+            },
+            .advertised_dynamic_tool_names = &.{},
+            .max_tool_result_bytes = rt.max_tool_result_bytes,
+        });
+        if (enabled) {
+            try expectContains(result.model_output, "top secret");
+        } else {
+            try std.testing.expectEqual(.failure, result.status);
+            try expectContains(result.model_output, "Code mode isn't available here.");
+            try expectNotContains(result.model_output, "top secret");
+        }
+    }
 }
 
 test "MCP execution binds the last live action generation before transport" {

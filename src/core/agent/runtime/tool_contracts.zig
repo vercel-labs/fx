@@ -9,6 +9,7 @@ const session_permission_state = @import("../../permissions/session_permission_s
 const command_replay_store = @import("../../session/command_replay_store.zig");
 const result_commit = @import("../../tooling/result_commit.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
+const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 
 pub const vision = @import("vision_contracts.zig");
 
@@ -169,6 +170,12 @@ pub const ToolExecutionRequest = struct {
     /// Borrowed execution evidence retained by the owning agent loop until
     /// the current turn is committed.
     current_turn_messages: []const ChatMessage = &.{},
+    /// The review context the owning loop built for this call. `execute`
+    /// derives one from it for each tool call its program makes.
+    review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
+    /// The turn's review holds and budget, lent for this call so a program's
+    /// tool calls share them with the turn's direct calls.
+    review_ledger: ?ReviewLedger = null,
     session_grants: []const PermissionGrant,
     live_authority: ?LiveToolAuthority = null,
     expected_mcp_runtime_generation: ?u64 = null,
@@ -188,6 +195,30 @@ pub const ToolExecutionRequest = struct {
     lifecycle_id: ?types.ToolLifecycleId = null,
     /// The row group of that status row, for rows the call adds beside it.
     presentation_group_id: ?types.ToolPresentationGroupId = null,
+};
+
+/// A turn's record of review holds and of the reviewer attempts it has spent.
+pub const ReviewLedger = struct {
+    context: *anyopaque,
+    /// Owns what `remember` keeps, for the rest of the turn.
+    allocator: Allocator,
+    /// The hold this turn already decided for the same action, if any.
+    cached_fn: *const fn (context: *anyopaque, call: ToolCall) ?command_admission.PermissionOutcome,
+    /// Whether this action may still spend a reviewer attempt this turn.
+    attempt_available_fn: *const fn (context: *anyopaque, call: ToolCall) bool,
+    remember_fn: *const fn (context: *anyopaque, allocator: Allocator, call: ToolCall, outcome: command_admission.PermissionOutcome) Allocator.Error!void,
+
+    pub fn cached(ledger: ReviewLedger, call: ToolCall) ?command_admission.PermissionOutcome {
+        return ledger.cached_fn(ledger.context, call);
+    }
+
+    pub fn attemptAvailable(ledger: ReviewLedger, call: ToolCall) bool {
+        return ledger.attempt_available_fn(ledger.context, call);
+    }
+
+    pub fn remember(ledger: ReviewLedger, call: ToolCall, outcome: command_admission.PermissionOutcome) Allocator.Error!void {
+        return ledger.remember_fn(ledger.context, ledger.allocator, call, outcome);
+    }
 };
 
 pub const DiffEntryPayload = diff.DiffEntryPayload;
