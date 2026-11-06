@@ -1309,6 +1309,80 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
+    "/new in a launched profile instance keeps the profile's model and effort, and its session resumes in them",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-new-launched-")));
+      try {
+        writeProfile(home, "chooser", { description: "Chooses a model", model: "profile/model", effort: "high" });
+        const before: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: before, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await session.sendText("/launch chooser");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "LAUNCHED_TURN");
+          await session.sendText("/new");
+          await session.waitForPane((pane) => !pane.includes("DONE_LAUNCHED_TURN") && pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "NEW_TURN");
+          await quitWith(session, "/exit");
+        });
+        expect(preferencesOf(before, "LAUNCHED_TURN")).toMatchObject({ model: "profile/model", reasoning: "high" });
+        expect(preferencesOf(before, "NEW_TURN")).toMatchObject({ model: "profile/model", reasoning: "high" });
+        const id = sessionHolding(home, "DONE_NEW_TURN")!;
+        const after: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: `--resume ${id}`, env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: after, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("DONE_NEW_TURN"), 30_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "RESUMED_TURN");
+        });
+        expect(preferencesOf(after, "RESUMED_TURN")).toMatchObject({ model: "profile/model", reasoning: "high" });
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "/new in a launched instance keeps FX_MODEL for the run without saving it",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-new-env-model-")));
+      try {
+        const before: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { env: { FX_MODEL: "other/model" }, models: PREFERENCE_MODELS, requests: before, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await session.sendText("/launch");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "LAUNCHED_TURN");
+          await session.sendText("/new");
+          await session.waitForPane((pane) => !pane.includes("DONE_LAUNCHED_TURN") && pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "NEW_TURN");
+          await quitWith(session, "/exit");
+        });
+        expect(preferencesOf(before, "LAUNCHED_TURN")?.model).toBe("other/model");
+        expect(preferencesOf(before, "NEW_TURN")?.model).toBe("other/model");
+        const id = sessionHolding(home, "DONE_NEW_TURN")!;
+        const after: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: `--resume ${id}`, env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: after, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("DONE_NEW_TURN"), 30_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "RESUMED_TURN");
+        });
+        // FX_MODEL shaped only the run that set it.
+        expect(preferencesOf(after, "RESUMED_TURN")?.model).not.toBe("other/model");
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "fx --profile <name> uses the profile's model unless the process chose one",
     async () => {
       for (const [args, fxModel, expected] of [
