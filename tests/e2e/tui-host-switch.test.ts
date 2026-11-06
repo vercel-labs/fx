@@ -115,6 +115,18 @@ async function until(what: string, done: () => boolean, ms = 30_000) {
   }
 }
 
+// Whether the trace log at `path` holds `text` yet.
+function traceHas(path: string, text: string): boolean {
+  return existsSync(path) && readFileSync(path, "utf8").includes(text);
+}
+
+// Every frame of the tape at `path`, as text.
+function tapeFrames(path: string): string {
+  const replay = Bun.spawnSync([FX_BIN, "replay", path, "--frames"], { stdout: "pipe", stderr: "pipe" });
+  expect(replay.exitCode).toBe(0);
+  return new TextDecoder().decode(replay.stdout);
+}
+
 // A provider outage fx waits out and then sends the request again.
 function unavailable(): Response {
   return new Response(JSON.stringify({ error: { message: "provider temporarily unavailable" } }), {
@@ -1534,6 +1546,119 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         const typed = await session.waitForPane((pane) => composerContains(pane, "z"), 10_000);
         expect(typed).not.toContain("esc back");
       });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent's report that waits for main's running turn never shows as a message the user queued",
+    async () => {
+      const env: Record<string, string> = {};
+      let tapePath = "";
+      let tracePath = "";
+      let mainWaiting = () => {};
+      const mainWaits = new Promise<void>((resolve) => { mainWaiting = resolve; });
+      let releaseMain = () => {};
+      const mainReleased = new Promise<void>((resolve) => { releaseMain = resolve; });
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          // The report reaches main only while main waits on the model.
+          await mainWaits;
+          return text("solo_reply", "SOLO_DONE");
+        }
+        if (latestUserText(body).includes('"child_id"')) return text("main_report", "MAIN_SAW_REPORT");
+        if (!body.includes('"main_solo"')) {
+          return toolCall("main_solo", "subagent", { request: { action: "message", agent: "solo", message: "SOLO_TASK answer at once" } });
+        }
+        mainWaiting();
+        await mainReleased;
+        return text("main_done", "MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER go");
+        // The report joins main's turn as steering while main's model call
+        // is still out.
+        await until("the report to reach main", () => traceHas(tracePath, "event=child_delivery_posted"), 30_000);
+        // Give the screen time to draw what main's queue holds.
+        await Bun.sleep(1_000);
+        releaseMain();
+        await session.waitForText("MAIN_SAW_REPORT", 60_000);
+        await session.waitForComposer(30_000);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+        // No frame drew the report's raw text as the user's message.
+        const frames = tapeFrames(tapePath);
+        expect(frames).toContain("MAIN_SAW_REPORT");
+        expect(frames).not.toContain("untrusted agent output");
+      }, (home) => {
+        tapePath = join(home, "report.fxtape");
+        tracePath = join(home, "fx-trace.log");
+        env.FX_RECORD = tapePath;
+        env.FX_TRACE_LOG = tracePath;
+      }, false, env);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "\u2191 takes back the user's own queued message, never a subagent's report waiting behind a tool",
+    async () => {
+      // Full access runs main's waiting command without a review.
+      const env: Record<string, string> = { FX_PERMISSION_MODE: "full-access" };
+      let tapePath = "";
+      let tracePath = "";
+      let started = "";
+      let gate = "";
+      let releaseSolo = () => {};
+      const soloReleased = new Promise<void>((resolve) => { releaseSolo = resolve; });
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          await soloReleased;
+          return text("solo_reply", "SOLO_DONE");
+        }
+        if (latestUserText(body).includes('"child_id"')) return text("main_report", "MAIN_SAW_REPORT");
+        if (!body.includes('"main_solo"')) {
+          // A step's tools run in order: the message, then a command that
+          // runs until the test opens its gate, which the report waits for.
+          const command = `touch ${started}; i=0; while [ ! -f ${gate} ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done; echo MAIN_WAITED`;
+          return fakeGatewaySse([
+            { type: "tool-call", toolCallId: "main_solo", toolName: "subagent", input: { request: { action: "message", agent: "solo", message: "SOLO_TASK answer at once" } } },
+            { type: "tool-call", toolCallId: "main_wait", toolName: "shell", input: { action: "run", command } },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]);
+        }
+        return text("main_done", "MAIN_DONE");
+      }, async (session, { workspace }) => {
+        started = join(workspace, "command-started");
+        gate = join(workspace, "command-gate");
+        await session.sendText("SWITCH_USER go");
+        await until("main's command to start", () => existsSync(started), 30_000);
+        // The user's own message waits for main's command, in the footer.
+        await session.sendText("MY_STEER");
+        await session.waitForPane((pane) => pane.includes("\u250b MY_STEER"), 10_000);
+        releaseSolo();
+        await until("the report to reach main", () => traceHas(tracePath, "event=child_delivery_posted"), 30_000);
+        // The report is now the newest steering, but ↑ brings back the
+        // user's: MY_STEER's 8 bytes, not the report's.
+        await session.sendKeys("Up");
+        await until("\u2191 to take a message back", () => traceHas(tracePath, "event=queued_steer_restored"), 10_000);
+        expect(readFileSync(tracePath, "utf8")).toMatch(/event=queued_steer_restored bytes=8\b/);
+        const restored = await session.waitForPane((pane) => composerContains(pane, "MY_STEER"), 10_000);
+        expect(restored).not.toContain("Subagent report");
+        await session.sendKeys("C-u");
+        // Main still gets the report once its command ends.
+        writeFileSync(gate, "");
+        await session.waitForText("MAIN_SAW_REPORT", 60_000);
+        await session.waitForComposer(30_000);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+        // Neither the footer nor a card drew the report's raw text.
+        expect(tapeFrames(tapePath)).not.toContain("untrusted agent output");
+      }, (home) => {
+        tapePath = join(home, "steer.fxtape");
+        tracePath = join(home, "fx-trace.log");
+        env.FX_RECORD = tapePath;
+        env.FX_TRACE_LOG = tracePath;
+      }, false, env);
     },
     TIMEOUT,
   );
