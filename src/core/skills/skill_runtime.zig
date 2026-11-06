@@ -2636,6 +2636,23 @@ pub const Runtime = struct {
     }
 };
 
+/// The line that tells the model skill discovery skipped something, which
+/// leads whatever lists the skills: the skill catalog or the toolbox menu.
+/// Null when nothing was skipped. The caller owns the result.
+pub fn discoveryWarningMarker(alloc: Allocator, diagnostics: []const SkillDiagnostic) Allocator.Error!?[]u8 {
+    if (diagnostics.len == 0) return null;
+    var candidate_count: usize = 0;
+    var root_count: usize = 0;
+    for (diagnostics) |diagnostic| switch (diagnostic.scope) {
+        .candidate => candidate_count += 1,
+        .root => root_count += 1,
+    };
+    return try alloc.print(
+        "<skill_discovery_warning skipped_candidate_count=\"{d}\" incomplete_root_count=\"{d}\" missing_from_incomplete_roots=\"{s}\" />\n",
+        .{ candidate_count, root_count, if (root_count > 0) "unknown" else "0" },
+    );
+}
+
 fn attachCatalogDiagnostics(
     alloc: Allocator,
     section: BoundedPromptSection,
@@ -2643,18 +2660,7 @@ fn attachCatalogDiagnostics(
 ) !BoundedPromptSection {
     var result = section;
     errdefer result.deinit(alloc);
-    if (diagnostics.len == 0) return result;
-
-    var candidate_count: usize = 0;
-    var root_count: usize = 0;
-    for (diagnostics) |diagnostic| switch (diagnostic.scope) {
-        .candidate => candidate_count += 1,
-        .root => root_count += 1,
-    };
-    const marker = try alloc.print(
-        "<skill_discovery_warning skipped_candidate_count=\"{d}\" incomplete_root_count=\"{d}\" missing_from_incomplete_roots=\"{s}\" />\n",
-        .{ candidate_count, root_count, if (root_count > 0) "unknown" else "0" },
-    );
+    const marker = (try discoveryWarningMarker(alloc, diagnostics)) orelse return result;
     defer alloc.free(marker);
     const marked_text = try std.mem.concat(alloc, u8, &.{ marker, result.text });
     alloc.free(result.text);
@@ -3054,6 +3060,13 @@ pub fn buildSkillPrompt(
     };
 }
 
+/// How much the skill list may take, in bytes (characters when the window is
+/// unknown, which counts no more): the skill catalog's budget, which the
+/// toolbox menu honors too.
+pub fn skillListBudget(limits: context_limits.Values, context_window: ?u32) usize {
+    return SkillPromptBudget.resolve(limits.skill_catalog_bytes, context_window).limit;
+}
+
 const SkillPromptBudget = struct {
     limit: usize,
     characters: bool = false,
@@ -3296,9 +3309,7 @@ fn renderSkillPrompt(
     errdefer alloc.free(owned_roots);
     var notices: std.Io.Writer.Allocating = .init(alloc);
     defer notices.deinit();
-    if (description_shortened > 0) {
-        try notices.writer.print("[context] skill descriptions shortened: {d}; source={s}\n", .{ description_shortened, limits.skill_description_bytes.source.label() });
-    }
+    if (description_shortened > 0) try writeDescriptionsShortened(&notices.writer, description_shortened, limits);
     if (catalog_shortened > 0) {
         try notices.writer.print("[context] skill catalog shortened {d} descriptions: effective={d} {s} source={s}\n", .{
             catalog_shortened, budget.limit, if (budget.characters) "characters" else "bytes", limits.skill_catalog_bytes.source.label(),
@@ -3323,6 +3334,71 @@ fn renderSkillPrompt(
         .notice = notice,
         .locations = .{ .namespace = namespace, .roots = owned_roots, .skills = skills },
     };
+}
+
+/// The notice that the toolbox menu, which lists the skills, was shortened to
+/// fit `skill_catalog_bytes`, as the skill catalog reports its own.
+pub fn writeListShortened(w: *std.Io.Writer, limits: context_limits.Values, context_window: ?u32) std.Io.Writer.Error!void {
+    const budget = SkillPromptBudget.resolve(limits.skill_catalog_bytes, context_window);
+    try w.print("[context] toolbox menu shortened to fit skill_catalog_bytes: effective={d} {s} source={s}\n", .{
+        budget.limit, if (budget.characters) "characters" else "bytes", limits.skill_catalog_bytes.source.label(),
+    });
+}
+
+/// The notice that `count` skill descriptions were cut to
+/// `skill_description_bytes`, for the skill catalog and the toolbox menu.
+pub fn writeDescriptionsShortened(w: *std.Io.Writer, count: usize, limits: context_limits.Values) std.Io.Writer.Error!void {
+    try w.print("[context] skill descriptions shortened: {d}; source={s}\n", .{ count, limits.skill_description_bytes.source.label() });
+}
+
+pub const LimitedDescription = struct {
+    /// Owned by the caller.
+    text: []u8,
+    /// True when the limit cut the description.
+    limited: bool,
+};
+
+/// A skill's description for a list that encodes it for the model itself,
+/// such as the toolbox menu: sanitized and cut as the skill catalog cuts it,
+/// to the compiled default's 1024 characters or to `skill_description_bytes`
+/// counted in encoded bytes, so its encoding is the catalog's.
+pub fn limitedSkillDescription(alloc: Allocator, description: []const u8, limits: context_limits.Values) !LimitedDescription {
+    const safe = try tool_result_limits.prepareSanitizedOutput(alloc, description);
+    defer alloc.free(safe);
+    if (limits.skill_description_bytes.source == .compiled_default) {
+        const end = skillDescriptionPrefix(safe, 1024);
+        return .{ .text = try alloc.dupe(u8, safe[0..end]), .limited = end < safe.len };
+    }
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    const observed = try writeBoundedEncodedScalar(alloc, &encoded.writer, safe, limits.skill_description_bytes.effectiveBytes());
+    return .{
+        .text = try model_context_encoding.decodeScalarAlloc(alloc, encoded.written()),
+        .limited = observed > encoded.written().len,
+    };
+}
+
+test "a limited skill description encodes to the catalog's cut" {
+    const alloc = std.testing.allocator;
+    var limits: context_limits.Values = .{};
+    limits.skill_description_bytes = .{ .value = .{ .bytes = 16 }, .source = .user_workspace };
+    const cut = try limitedSkillDescription(alloc, "Use <this> skill \x1b[31mfor reviews of every kind.", limits);
+    defer alloc.free(cut.text);
+    try std.testing.expect(cut.limited);
+    var catalog: std.Io.Writer.Allocating = .init(alloc);
+    defer catalog.deinit();
+    const safe = try tool_result_limits.prepareSanitizedOutput(alloc, "Use <this> skill \x1b[31mfor reviews of every kind.");
+    defer alloc.free(safe);
+    _ = try writeBoundedEncodedScalar(alloc, &catalog.writer, safe, 16);
+    const menu = try model_context_encoding.scalarAlloc(alloc, cut.text);
+    defer alloc.free(menu);
+    try std.testing.expectEqualStrings(catalog.written(), menu);
+    try std.testing.expect(std.mem.findScalar(u8, cut.text, 0x1b) == null);
+
+    const whole = try limitedSkillDescription(alloc, "Short.", .{});
+    defer alloc.free(whole.text);
+    try std.testing.expect(!whole.limited);
+    try std.testing.expectEqualStrings("Short.", whole.text);
 }
 
 fn skillDescriptionPrefix(text: []const u8, max_characters: usize) usize {

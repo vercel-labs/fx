@@ -227,6 +227,9 @@ pub const StartupState = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
+    /// Where built-in tools are offered, from the settings files; a host
+    /// applies `--tool-placement` over it.
+    tool_placement: config_runtime.tool_placement.Overrides = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
@@ -893,6 +896,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.auto_compact_percent = compactor.resolvePercent(settings.auto_compact_percent, io_mod.getenv("FX_AUTO_COMPACT_PERCENT"));
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
+    state.tool_placement = settings.tool_placement;
     state.context_enabled = settings.context orelse true;
     const fast_mode = resolveStartupFastMode(
         state.model_source,
