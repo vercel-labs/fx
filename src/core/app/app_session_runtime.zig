@@ -4470,6 +4470,11 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             agent.session_persistence.v2_children = children;
+            // A child whose profile lists a tool kept behind toolbox keeps
+            // toolbox.
+            if (comptime @hasField(App, "toolbox_behind")) {
+                agent.session_persistence.subagent_host.?.authority_resolver.toolbox_behind = &app.toolbox_behind;
+            }
             // Its children report to this agent, through the main loop.
             if (comptime @hasDecl(App, "postSubagentReport")) {
                 const host = agent.session_persistence.subagent_host.?;

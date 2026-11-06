@@ -1,8 +1,7 @@
 ------------------------------ MODULE Toolbox ------------------------------
 (***************************************************************************)
 (* The toolbox (src/core/tooling/toolbox.zig, with the request building in *)
-(* src/core/agent/runtime/orchestrator.zig). This models code that has not *)
-(* landed yet.                                                             *)
+(* src/core/agent/runtime/orchestrator.zig).                               *)
 (*                                                                         *)
 (* fx sends its built-in tools and one `toolbox` tool, and a menu of the   *)
 (* skills, MCP servers, custom tools, and tools moved behind toolbox that  *)
@@ -12,6 +11,8 @@
 (* fx checks permission on the real tool first. The MCP catalog changes    *)
 (* underneath, fx compacts the conversation, crashes in the middle of a   *)
 (* run, and resumes in a new process.                                      *)
+(* A search, whose result carries each tool's arguments, is an open here:  *)
+(* what it finds arrives at the end of the conversation too.               *)
 (*                                                                         *)
 (* Each request is recorded as fx sends it, so the rules can say that no   *)
 (* request ever changes what an earlier one sent: the cache never breaks.  *)

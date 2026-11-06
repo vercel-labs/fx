@@ -39,10 +39,12 @@ pub const default_behind = [_][]const u8{"install_skill"};
 /// `skill` with the skill's name, opening an MCP server or tool is
 /// `mcp_select_tool` with its name, and searching is `capability_search`.
 /// Null for a run, which is admitted as the call it carries, for opening a
-/// built-in tool's definition, and for arguments that don't parse. A name
-/// that is neither a skill in `locations`, an MCP tool's, nor one of the
-/// turn's `servers` is taken as a skill's, since open reads it as a skill
-/// installed since the turn began. The result borrows `arena`.
+/// built-in tool's definition, and for arguments that don't parse. An open
+/// with `kind` is decided as that kind. Without one it is decided in the
+/// order open reads: a skill in `locations` first, whatever other tool or
+/// server shares its name, then a built-in, an MCP tool, and one of the
+/// turn's `servers`. Any other name is taken as a skill's, since open reads
+/// it as a skill installed since the turn began. The result borrows `arena`.
 pub fn lookupOf(
     arena: Allocator,
     call: core_types.ToolCall,
@@ -60,9 +62,18 @@ pub fn lookupOf(
     const opened = parsed.object.get("open") orelse return null;
     if (opened != .string or opened.string.len == 0) return null;
     const target = opened.string;
+    const kind: ?Kind = if (parsed.object.get("kind")) |value|
+        if (value == .string) std.meta.stringToEnum(Kind, value.string) else null
+    else
+        null;
+    if (kind) |chosen| return switch (chosen) {
+        .skill => .{ .permission = "skill", .target = (try skillNamed(arena, locations, target)) orelse target },
+        .mcp_server => .{ .permission = "mcp_select_tool", .target = target },
+        .tool => if (registry.lookup(target) != null) null else .{ .permission = "mcp_select_tool", .target = target },
+    };
+    if (try skillNamed(arena, locations, target)) |skill| return .{ .permission = "skill", .target = skill };
     if (registry.lookup(target) != null) return null;
     if (std.mem.startsWith(u8, target, "mcp_")) return .{ .permission = "mcp_select_tool", .target = target };
-    if (try skillNamed(arena, locations, target)) |skill| return .{ .permission = "skill", .target = skill };
     for (servers) |server| {
         if (std.mem.eql(u8, server, target)) return .{ .permission = "mcp_select_tool", .target = target };
     }
@@ -113,6 +124,43 @@ pub fn carriedCall(arena: Allocator, name: []const u8, arguments_json: []const u
         std.json.Stringify.value(value, .{}, &arguments.writer) catch return error.OutOfMemory;
     } else arguments.writer.writeAll("{}") catch return error.OutOfMemory;
     return .{ .name = target.string, .arguments_json = arguments.written() };
+}
+
+test "an open of a skill named like a tool or server is decided as the skill, unless kind says otherwise" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const registry = @import("../../builtins/tools.zig").registry;
+    // A skill's name is any text without a slash, so it can be a built-in's,
+    // an MCP tool's, or a server's. Open reads the skill first, so its rules
+    // must decide it.
+    const skills = [_]skill_contract.Skill{
+        .{ .name = "read_file", .description = "", .path = "/skills/read_file", .source = .global_fx },
+        .{ .name = "mcp_notes", .description = "", .path = "/skills/mcp_notes", .source = .global_fx },
+        .{ .name = "linear", .description = "", .path = "/skills/linear", .source = .global_fx },
+    };
+    const locations: skill_contract.Locations = .{ .namespace = 7, .roots = &.{"/skills"}, .skills = &skills };
+    const servers = [_][]const u8{"linear"};
+    const Case = struct { arguments: []const u8, permission: ?[]const u8, target: []const u8 = "" };
+    const cases = [_]Case{
+        .{ .arguments = "{\"open\":\"read_file\"}", .permission = "skill", .target = "read_file" },
+        .{ .arguments = "{\"open\":\"mcp_notes\"}", .permission = "skill", .target = "mcp_notes" },
+        // Open names both and opens nothing; the skill's rules still decide it.
+        .{ .arguments = "{\"open\":\"linear\"}", .permission = "skill", .target = "linear" },
+        .{ .arguments = "{\"open\":\"linear\",\"kind\":\"skill\"}", .permission = "skill", .target = "linear" },
+        .{ .arguments = "{\"open\":\"linear\",\"kind\":\"mcp_server\"}", .permission = "mcp_select_tool", .target = "linear" },
+        .{ .arguments = "{\"open\":\"mcp_notes\",\"kind\":\"tool\"}", .permission = "mcp_select_tool", .target = "mcp_notes" },
+        .{ .arguments = "{\"open\":\"read_file\",\"kind\":\"tool\"}", .permission = null },
+        // A kind open can't place stays with the name the model gave.
+        .{ .arguments = "{\"open\":\"elsewhere\",\"kind\":\"skill\"}", .permission = "skill", .target = "elsewhere" },
+    };
+    for (cases) |case| {
+        const lookup = try lookupOf(arena, .{ .id = "1", .name = tool_name, .arguments_json = case.arguments }, &locations, &servers, registry);
+        if (case.permission) |permission| {
+            try std.testing.expectEqualStrings(permission, lookup.?.permission);
+            try std.testing.expectEqualStrings(case.target, lookup.?.target);
+        } else try std.testing.expect(lookup == null);
+    }
 }
 
 test "an open or search is decided as the tool it replaced" {
@@ -239,7 +287,7 @@ pub const Limits = struct {
 /// The menu's opening, the same in every workspace.
 pub const intro =
     "Skills, MCP servers, and tools you can use through the toolbox tool are listed below; they are not in your tool list.\n" ++
-    "Use toolbox with open to read a skill's instructions, list an MCP server's tools, or see a tool's arguments; with run to run a tool by its name with its arguments; with search to find something not listed.\n" ++
+    "Use toolbox with open to read a skill's instructions, see a tool's arguments, or list an MCP server's tools; with search to find skills and tools by what you need, each tool with its arguments, and with server to search one MCP server, the way into a server with many tools; with run to run a tool by its name with its arguments. To open a name listed under two headings, add kind.\n" ++
     "Use named skills and clearly matching skills before substantive work, and read a selected skill completely, including its required references. A listed server is not a reason to use MCP.\n";
 
 const sections = [_]struct { kind: Kind, title: []const u8, noun: []const u8 }{

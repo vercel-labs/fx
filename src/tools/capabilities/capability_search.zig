@@ -120,6 +120,9 @@ fn combineProjected(
         mcp_parsed.value.object.get("error"),
         mcp_parsed.value.object.get("context_limit"),
         mcp_parsed.value.object.get("unavailable"),
+        // Skills and MCP tools page apart, so only a search of MCP alone
+        // offers its next page.
+        if (skill_result == null) mcp_parsed.value.object.get("next_cursor") else null,
     ) catch |err| switch (err) {
         error.WriteFailed => return error.OutOfMemory,
         else => return err,
@@ -142,6 +145,8 @@ fn renderCombined(
     mcp_context_limit: ?std.json.Value,
     /// Servers a search that matched no tool couldn't look in, and why.
     mcp_unavailable: ?std.json.Value,
+    /// The MCP page's next_cursor, for a search of MCP alone.
+    mcp_next_cursor: ?std.json.Value,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -189,6 +194,10 @@ fn renderCombined(
         try out.writer.writeAll(",\"mcp_unavailable\":");
         try std.json.Stringify.value(value, .{}, &out.writer);
     }
+    if (mcp_next_cursor) |value| if (value == .string) {
+        try out.writer.writeAll(",\"next_cursor\":");
+        try std.json.Stringify.value(value, .{}, &out.writer);
+    };
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }

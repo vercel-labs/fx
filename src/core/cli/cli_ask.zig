@@ -1042,6 +1042,8 @@ const AskContext = struct {
             self.alloc.destroy(children);
             return;
         };
+        // A child whose profile lists a tool kept behind toolbox keeps toolbox.
+        self.subagent_host.?.authority_resolver.toolbox_behind = &self.toolbox_behind;
         self.v2_children = children;
         self.subagent_host.?.report_sink = .{ .context = self, .post_fn = postAskReport };
         // What a restart left owed runs as this run's next turns.

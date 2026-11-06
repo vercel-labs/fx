@@ -1013,6 +1013,39 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
 
 
   test(
+    "a subagent whose profile lists a tool placed behind toolbox keeps toolbox to reach it",
+    async () => {
+      let childAsked = false;
+      const bodies = await withHost((body) => {
+        const texts = userTexts(body).join("\n");
+        if (texts.includes("TREE_FINDER_TASK")) {
+          childAsked = true;
+          return text("finder_done", "TREE_FINDER_DONE");
+        }
+        const last = userTexts(body).at(-1) ?? "";
+        if (last.includes("TREE_USER_FINDER")) {
+          if (answered(body)) return text("finder_final", "TREE_FINDER_FINAL");
+          return call("finder_sub", "subagent", { request: { action: "message", agent: "finder", profile: "finder", message: "TREE_FINDER_TASK" } });
+        }
+        return answerByLetter(body);
+      }, { args: "--tool-placement glob_files=toolbox", env: { FX_PERMISSION_MODE: "full-access" } }, async ({ home, session }) => {
+        writeProfile(home, "finder", { description: "Finds files", tools: ["glob_files"] });
+        await session.sendText("TREE_USER_FINDER start a finder");
+        await session.waitForText("TREE_FINDER_FINAL", 45_000);
+        const deadline = Date.now() + 15_000;
+        while (!childAsked && Date.now() < deadline) await Bun.sleep(25);
+      });
+      // The child is shown what its run was admitted with: glob_files sits
+      // behind toolbox for this run, so it keeps toolbox to run it.
+      const child = bodies.filter((body) => userTexts(body).join("\n").includes("TREE_FINDER_TASK"));
+      expect(child.length).toBeGreaterThan(0);
+      expect(toolNames(child[0]!)).toContain("toolbox");
+      expect(toolNames(child[0]!)).not.toContain("glob_files");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a launched instance's subagent asks on that instance's screen, not the first's",
     async () => {
       await withHost((body) => {
@@ -1103,6 +1136,35 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     TIMEOUT * 4,
   );
 
+
+  test(
+    "fx --profile whose tools list one placed behind toolbox starts with toolbox to reach it",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-placed-")));
+      try {
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        writeProfile(home, "finder", { description: "Finds files", tools: ["glob_files"] });
+        // The profile is read before the flag places glob_files behind
+        // toolbox, so main's tools must be decided again once it is.
+        const bodies = await withHost(() => text("answer_placed", "HOST_PLACED_DONE"), {
+          args: "--profile finder --tool-placement glob_files=toolbox",
+          reuse: { home, workspace },
+        }, async ({ session }) => {
+          await session.sendText("HOST_PLACED_USER list the files");
+          await session.waitForText("HOST_PLACED_DONE", 45_000);
+        });
+        const first = bodies.find((body) => toolNames(body).length > 0);
+        expect(first).toBeDefined();
+        expect(toolNames(first!)).toContain("toolbox");
+        expect(toolNames(first!)).not.toContain("glob_files");
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 
   test(
     "a launched instance's model and speed changes reach its own turns and no other's",

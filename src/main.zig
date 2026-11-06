@@ -771,6 +771,14 @@ const App = struct {
         }
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
         app.toolbox_behind = config_runtime.tool_placement.behindToolbox(app.tool_placement, launch.modifiers.tool_placement_overrides);
+        // The launch profile narrowed main's tools before the tools behind
+        // toolbox were placed; a tool it lists that now sits there needs
+        // toolbox.
+        if (launch.modifiers.profile_name != null) {
+            if (comptime host_profile.tools) {
+                try ProfileAppRuntime.narrowProfileTools(&app, &app.main_agent, builtin_tools.advertisement_set);
+            }
+        }
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
             if (app.requested_resume != null) {
                 const picks = app.requested_resume.? == .pick;

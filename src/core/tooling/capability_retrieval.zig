@@ -50,6 +50,11 @@ pub const Request = struct {
     /// what it finds is opened and run through toolbox, and the tools fx
     /// sends never change.
     load_schemas: bool = true,
+    /// Whether each MCP tool found carries its input schema as `arguments`
+    /// in the result itself, so the model can run it next without opening
+    /// it. The page's byte budget still holds: the last rows give up their
+    /// arguments before any row is left out.
+    schemas_in_result: bool = false,
 
     pub fn validate(self: Request) ValidationError!void {
         if (self.limit == 0 or self.limit > max_limit) return error.InvalidLimit;

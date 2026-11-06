@@ -132,12 +132,15 @@ pub const toolbox = ToolSpec{
         .input_schema = .{
             .properties = &.{
                 .{ .name = "open", .json_type = .string, .description = "A skill, MCP server, or tool from the toolbox list, to read its instructions, tools, or arguments." },
+                .{ .name = "kind", .json_type = .string, .shape = &.{ .enum_values = &.{ "skill", "mcp_server", "tool" } }, .description = "With open, for a name listed under more than one heading: which one to open." },
                 .{ .name = "resource", .json_type = .string, .description = "A file inside the skill you open, such as template.md." },
                 .{ .name = "offset", .json_type = .integer, .description = "Where to continue a skill file whose last result gave next_offset." },
                 .{ .name = "run", .json_type = .string, .description = "A tool's exact name, to run it." },
                 .{ .name = "arguments", .json_type = .object, .description = "The tool's arguments, for run." },
-                .{ .name = "search", .json_type = .string, .description = "What you need, to find a skill or tool the list doesn't show." },
+                .{ .name = "search", .json_type = .string, .description = "What you need, to find skills and tools, with each tool's arguments." },
                 .{ .name = "server", .json_type = .string, .description = "With search, an MCP server from the list to search alone." },
+                .{ .name = "limit", .json_type = .integer, .description = "With search, how many matches to return, 1 to 20. The default is 5." },
+                .{ .name = "cursor", .json_type = .string, .description = "With search and server, an earlier result's next_cursor, for its next page." },
             },
             .additional_properties = false,
         },
@@ -836,9 +839,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "82119600a092fa7631fc74c58be9e88f6a83b277631e610073aeb864abbb4300"
+            "acfc097382a5f368b25972704187e445727d2ae93db9753ce0912ac2dbc403bb"
         else
-            "c7872f23462ef18ab5532669ed43b3bc804dd21a26ddeef5d37540f31d824215",
+            "8008c3cd1b75cb33ba3525ab0e7e5ff2e761bc854734e2ecdb5e9c85a008b285",
         &actual_hex,
     );
 }

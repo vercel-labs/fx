@@ -324,6 +324,10 @@ pub const DispatchContext = struct {
     /// What `toolbox {run}` runs through: the permission check and execution
     /// a direct call of the named tool gets. Valid while this call runs.
     toolbox_run: ?ToolboxRun = null,
+    /// The MCP servers the toolbox menu lists, by name.
+    toolbox_mcp_servers: []const []const u8 = &.{},
+    /// The built-in tools the toolbox menu lists, by name.
+    toolbox_behind: []const []const u8 = &.{},
     mcp_permission_rules: core_types.PermissionRuleSet = .{},
     selected_dynamic_tool_ctx: ?*anyopaque = null,
     on_selected_dynamic_tool: ?SelectedDynamicToolSinkFn = null,

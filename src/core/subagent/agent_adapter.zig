@@ -267,13 +267,13 @@ pub fn run(
         arena,
         config.advertised_tool_names,
         config.tool_context.tool_registry,
-        .{ .profile = profile },
+        .{ .profile = .{ .value = profile, .behind = config.toolbox_behind } },
     );
     const child_functions = try childFunctions(
         arena,
         config.advertised_functions,
         config.tool_context.tool_registry,
-        .{ .profile = profile },
+        .{ .profile = .{ .value = profile, .behind = config.toolbox_behind } },
     );
     // This engine never gives a child subagents of its own, so main
     // started every child it runs.
@@ -427,8 +427,9 @@ pub fn childSystemPrompt(
 /// integrations instead.
 pub const Shown = union(enum) {
     /// The old engine's: the ones its profile allows, never `subagent`,
-    /// because it has no host for a child's own subagents.
-    profile: ?*const profiles.Profile,
+    /// because it has no host for a child's own subagents. `behind` names
+    /// the built-in tools the run offers through toolbox.
+    profile: struct { value: ?*const profiles.Profile, behind: []const []const u8 },
     /// The interactive app's: the ones its run was admitted with, its
     /// parent's narrowed by its profile, so it is never shown a tool its
     /// parent lacks. `subagent` is among them
@@ -441,9 +442,9 @@ fn childSees(registry: tool_dispatch.Registry, shown: Shown, name: []const u8) b
     switch (shown) {
         .profile => |profile| {
             if (subagent) return false;
-            const value = profile orelse return true;
+            const value = profile.value orelse return true;
             if (registry.lookup(name) == null) return true;
-            return profiles.allowsTool(value, name);
+            return profiles.allowsTool(value, name, profile.behind);
         },
         .admitted => |admitted| {
             if (subagent and !admitted.starts_subagents) return false;

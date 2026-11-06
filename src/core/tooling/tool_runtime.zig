@@ -236,6 +236,8 @@ pub const Context = struct {
     advertised_dynamic_tool_names: []const []const u8 = &.{},
     /// The built-in tools this agent offers through toolbox.
     toolbox_behind: []const []const u8 = &.{},
+    /// The MCP servers the toolbox menu lists.
+    toolbox_mcp_servers: []const []const u8 = &.{},
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
@@ -424,6 +426,7 @@ pub fn executeToolCallAuthorized(
     var execution_ctx = ctx;
     execution_ctx.observer = request.observer orelse ctx.observer;
     execution_ctx.toolbox_behind = request.toolbox_behind;
+    execution_ctx.toolbox_mcp_servers = request.toolbox_mcp_servers;
     execution_ctx.skill_locations = request.skill_locations orelse ctx.skill_locations;
     if (request.permission_mode) |permission_mode| {
         execution_ctx.permission_mode = permission_mode;
@@ -1653,6 +1656,8 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .change_tracker = ctx.tracker,
         .skills_dir = ctx.skills_dir,
         .skill_locations = ctx.skill_locations,
+        .toolbox_mcp_servers = ctx.toolbox_mcp_servers,
+        .toolbox_behind = ctx.toolbox_behind,
         .context_limits = ctx.context_limits,
         .ignored_list_entries = ctx.ignored_list_entries,
         .max_list_entries = ctx.max_list_entries,

@@ -123,6 +123,7 @@ pub const ParallelHookExecContext = struct {
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
     toolbox_behind: []const []const u8 = &.{},
+    toolbox_mcp_servers: []const []const u8 = &.{},
     classification_complete: []const bool = &.{},
     presentation_group_id: ?types.ToolPresentationGroupId = null,
 };
@@ -369,6 +370,7 @@ pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, in
         .advertised_dynamic_tool_names = exec_ctx.advertised_dynamic_tool_names,
         .max_tool_result_bytes = exec_ctx.max_tool_result_bytes,
         .toolbox_behind = exec_ctx.toolbox_behind,
+        .toolbox_mcp_servers = exec_ctx.toolbox_mcp_servers,
         .classification_complete = index < exec_ctx.classification_complete.len and
             exec_ctx.classification_complete[index],
         .lifecycle_id = .{ .turn_id = exec_ctx.turn_id, .call_id = call.id },

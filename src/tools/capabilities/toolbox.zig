@@ -21,6 +21,7 @@ const capability_search_impl = @import("capability_search.zig");
 const skill_impl = @import("../skills/skill.zig");
 const skill_invocation = @import("../../core/skills/skill_invocation.zig");
 const skill_search = @import("../skills/skill_search.zig");
+const toolbox_core = @import("../../core/tooling/toolbox.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -36,6 +37,13 @@ const Input = struct {
     offset: ?u64 = null,
     /// The MCP server to search, for search.
     server: ?[]u8 = null,
+    /// Which menu heading the name to open is under, for a name under more
+    /// than one.
+    kind: ?toolbox_core.Kind = null,
+    /// How many matches a search returns.
+    limit: usize = capability_retrieval.default_limit,
+    /// An earlier search's next_cursor, for its next page.
+    cursor: ?[]u8 = null,
     /// The run's arguments as a JSON object.
     arguments_json: []u8,
 
@@ -43,6 +51,7 @@ const Input = struct {
         alloc.free(self.target);
         if (self.resource) |value| alloc.free(value);
         if (self.server) |value| alloc.free(value);
+        if (self.cursor) |value| alloc.free(value);
         alloc.free(self.arguments_json);
         self.* = undefined;
     }
@@ -99,6 +108,28 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         if (chosen != .run) return failure(ctx.allocator, "toolbox arguments go with run");
         if (value != .object) return failure(ctx.allocator, "toolbox arguments must be an object");
     }
+    var kind: ?toolbox_core.Kind = null;
+    if (args.get("kind")) |value| {
+        if (chosen != .open) return failure(ctx.allocator, "toolbox kind goes with open");
+        if (value != .string) return failure(ctx.allocator, "toolbox kind must be skill, mcp_server, or tool");
+        kind = std.meta.stringToEnum(toolbox_core.Kind, value.string) orelse
+            return failure(ctx.allocator, "toolbox kind must be skill, mcp_server, or tool");
+    }
+    var limit: usize = capability_retrieval.default_limit;
+    if (args.get("limit")) |value| {
+        if (chosen != .search) return failure(ctx.allocator, "toolbox limit goes with search");
+        if (value != .integer or value.integer < 1 or value.integer > capability_retrieval.max_limit) {
+            return failure(ctx.allocator, "toolbox limit must be a whole number from 1 to 20");
+        }
+        limit = @intCast(value.integer);
+    }
+    const cursor_value = args.get("cursor");
+    if (cursor_value) |value| {
+        if (chosen != .search) return failure(ctx.allocator, "toolbox cursor goes with search");
+        if (value != .string or value.string.len == 0) return failure(ctx.allocator, "toolbox cursor must be an earlier search's next_cursor");
+        // Skills and MCP tools page apart, so a cursor pages one server's.
+        if (server_value == null) return failure(ctx.allocator, "toolbox cursor goes with a search of one server: pass the same server again");
+    }
     if (chosen == .search) {
         _ = lexical_relevance.prepare(target) catch return failure(ctx.allocator, "toolbox search is too long");
     }
@@ -109,6 +140,8 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     errdefer if (resource) |value| ctx.allocator.free(value);
     const server = if (server_value) |value| try ctx.allocator.dupe(u8, value.string) else null;
     errdefer if (server) |value| ctx.allocator.free(value);
+    const cursor = if (cursor_value) |value| try ctx.allocator.dupe(u8, value.string) else null;
+    errdefer if (cursor) |value| ctx.allocator.free(value);
     const arguments_json = if (arguments_value) |value| arguments: {
         var out: std.Io.Writer.Allocating = .init(ctx.allocator);
         defer out.deinit();
@@ -124,6 +157,9 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         .resource = resource,
         .offset = if (offset_value) |value| @intCast(value.integer) else null,
         .server = server,
+        .kind = kind,
+        .limit = limit,
+        .cursor = cursor,
         .arguments_json = arguments_json,
     };
     return .{ .input = .{ .ptr = input, .deinit_fn = inputDeinit } };
@@ -157,46 +193,157 @@ fn hasSkill(ctx: tool_dispatch.DispatchContext, name: []const u8) bool {
     return false;
 }
 
-/// A skill's instructions, an MCP server's tools, or one MCP tool's
-/// arguments, in that order of lookup.
+/// A server with at most this many tools opens with all of them and their
+/// arguments; a bigger one opens with its list, to search for what is needed.
+const small_server_tools: usize = 10;
+/// The most the tools of a server that opens whole may take, arguments and all.
+const small_server_bytes: usize = 8 * 1024;
+
+/// A skill's instructions, a tool's arguments, or an MCP server's tools.
+/// `kind` picks one. Without it, a name is opened as what the menu lists it
+/// under, looked up as a skill, a tool, then a server; a skill's name the
+/// menu also lists as a server or tool opens nothing and names both, since
+/// either could be meant (`toolbox.lookupOf` decides it in the same order).
 fn open(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    if (hasSkill(ctx, input.target)) return openSkillOrNothing(ctx, input);
-    if (ctx.toolbox_run) |runner| {
-        var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-        defer arena_state.deinit();
-        const described = runner.describe(arena_state.allocator(), input.target) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
-        };
-        if (described) |description| switch (description) {
-            .definition => |definition| {
-                if (definition.notice) |notice| try tool_dispatch.reportContextNotice(ctx, notice);
-                return .{ .success = try ctx.allocator.print(
-                    "{s}\nRun it with toolbox run: \"{s}\" and arguments matching this schema.",
-                    .{ definition.json, input.target },
-                ) };
-            },
-            .unavailable => |why| return .{ .failure = try ctx.allocator.dupe(u8, why) },
-        };
+    if (input.kind) |kind| return switch (kind) {
+        .skill => openSkillOrNothing(ctx, input),
+        .tool => (try openTool(ctx, input)) orelse nothingNamed(ctx, "tool", input.target),
+        .mcp_server => (try openServer(ctx, input)) orelse nothingNamed(ctx, "MCP server", input.target),
+    };
+    if (hasSkill(ctx, input.target)) {
+        if (alsoListedAs(ctx, input.target)) |other| return .{ .failure = try ctx.allocator.print(
+            "{s} is in the toolbox menu as a skill and as {s}. Open it again with kind \"skill\" or kind \"{s}\".",
+            .{ input.target, if (other == .mcp_server) "an MCP server" else "a tool", @tagName(other) },
+        ) };
+        return openSkillOrNothing(ctx, input);
     }
-    if (ctx.mcp_call_capability) |capability| {
-        var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        var cancel = std.atomic.Value(bool).init(false);
-        const flag = ctx.cancel_flag orelse &cancel;
-        const listed = capability.lookup(arena, .{ .list = input.target }, flag) catch |err| return lookupError(ctx, input.target, err);
-        if (listed.status == .ok) {
-            return .{ .success = try ctx.allocator.print(
-                "Tools of MCP server {s}, one per line with what it does:\n{s}\n" ++
-                    "Open a tool by its name to see its arguments, then run it with toolbox run and its arguments.",
-                .{ input.target, std.mem.trimEnd(u8, listed.bytes, "\n") },
-            ) };
-        }
-    }
+    if (try openTool(ctx, input)) |result| return result;
+    if (try openServer(ctx, input)) |result| return result;
     // A skill installed since the turn started isn't in the catalog yet;
     // reading it by name finds it.
     return openSkillOrNothing(ctx, input);
+}
+
+/// The other heading the menu lists skill `name` under, if any. A location
+/// names one skill only.
+fn alsoListedAs(ctx: tool_dispatch.DispatchContext, name: []const u8) ?toolbox_core.Kind {
+    if (isSkillLocation(name)) return null;
+    for (ctx.toolbox_mcp_servers) |server| if (std.mem.eql(u8, server, name)) return .mcp_server;
+    for (ctx.toolbox_behind) |tool| if (std.mem.eql(u8, tool, name)) return .tool;
+    return null;
+}
+
+fn nothingNamed(ctx: tool_dispatch.DispatchContext, noun: []const u8, name: []const u8) Allocator.Error!tool_dispatch.ToolResult {
+    return .{ .failure = try ctx.allocator.print(
+        "No {s} named {s} is in the toolbox menu. Use toolbox search to find it.",
+        .{ noun, name },
+    ) };
+}
+
+/// A built-in or MCP tool's definition, or null when no tool has `name`.
+fn openTool(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.DispatchError!?tool_dispatch.ToolResult {
+    const runner = ctx.toolbox_run orelse return null;
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const described = runner.describe(arena_state.allocator(), input.target) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+    const description = described orelse return null;
+    switch (description) {
+        .definition => |definition| {
+            if (definition.notice) |notice| try tool_dispatch.reportContextNotice(ctx, notice);
+            return .{ .success = try ctx.allocator.print(
+                "{s}\nRun it with toolbox run: \"{s}\" and arguments matching this schema.",
+                .{ definition.json, input.target },
+            ) };
+        },
+        .unavailable => |why| return .{ .failure = try ctx.allocator.dupe(u8, why) },
+    }
+}
+
+/// An MCP server's tools, or null when no server has `name`. A small server
+/// gives every tool with its arguments, so the model can run one next; a
+/// bigger one gives its list, and the model searches it for the tools it
+/// needs rather than loading every schema.
+fn openServer(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.DispatchError!?tool_dispatch.ToolResult {
+    const capability = ctx.mcp_call_capability orelse return null;
+    if (try smallServerTools(ctx, input.target)) |page| {
+        defer ctx.allocator.free(page);
+        return .{ .success = try ctx.allocator.print(
+            "Tools of MCP server {s}, each with its arguments:\n{s}\n" ++
+                "Run one with toolbox run: its name and arguments matching its schema.",
+            .{ input.target, page },
+        ) };
+    }
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    const flag = ctx.cancel_flag orelse &cancel;
+    const listed = capability.lookup(arena, .{ .list = input.target }, flag) catch |err| return try lookupError(ctx, input.target, err);
+    if (listed.status != .ok) return null;
+    return .{ .success = try ctx.allocator.print(
+        "Tools of MCP server {s}, one per line with what it does:\n{s}\n" ++
+            "Search this server for the tools you need, with toolbox search and server \"{s}\", which gives their arguments. " ++
+            "Then run one with toolbox run. Or open one tool by its name.",
+        .{ input.target, std.mem.trimEnd(u8, listed.bytes, "\n"), input.target },
+    ) };
+}
+
+/// The search page of every tool of menu server `server`, each with its
+/// arguments, or null when the server isn't in the menu, has more than
+/// `small_server_tools` tools, or they and their arguments don't fit in
+/// `small_server_bytes`. The caller owns the page.
+fn smallServerTools(ctx: tool_dispatch.DispatchContext, server: []const u8) tool_dispatch.DispatchError!?[]u8 {
+    const listed = for (ctx.toolbox_mcp_servers) |name| {
+        if (std.mem.eql(u8, name, server)) break true;
+    } else false;
+    if (!listed) return null;
+    const runtime_context = ctx.mcp_ctx orelse return null;
+    const search_tools = ctx.mcp_search_tools orelse return null;
+    const everything = lexical_relevance.prepare("") catch return null;
+    var limits = ctx.context_limits;
+    limits.mcp_search_result_bytes.value = .{ .bytes = @min(small_server_bytes, limits.mcp_search_result_bytes.effectiveBytes()) };
+    var result = search_tools(runtime_context, ctx.allocator, .{
+        .query = &everything,
+        .kind = .mcp,
+        .server = server,
+        // One past the most, to tell a small server from a bigger one.
+        .limit = small_server_tools + 1,
+        .load_schemas = false,
+        .schemas_in_result = true,
+    }, ctx.mcp_permission_rules, limits, ctx.mcp_access, ctx.cancel_flag) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Cancelled => return error.Cancelled,
+        else => return null,
+    };
+    defer result.deinit(ctx.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    if (!try wholeWithArguments(arena_state.allocator(), result.model_output)) return null;
+    if (result.notice) |notice| try tool_dispatch.reportContextNotice(ctx, notice);
+    return try ctx.allocator.dupe(u8, result.model_output);
+}
+
+/// Whether search page `page` holds every tool it found, no more than
+/// `small_server_tools`, each with its arguments.
+fn wholeWithArguments(arena: Allocator, page: []const u8) Allocator.Error!bool {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, page, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    if (parsed != .object) return false;
+    if (parsed.object.get("state") != null or parsed.object.get("context_limit") != null) return false;
+    const tools = parsed.object.get("tools") orelse return false;
+    const total = parsed.object.get("total_matches") orelse return false;
+    if (tools != .array or total != .integer) return false;
+    if (tools.array.items.len == 0 or tools.array.items.len > small_server_tools) return false;
+    if (total.integer != @as(i64, @intCast(tools.array.items.len))) return false;
+    for (tools.array.items) |tool| {
+        if (tool != .object or tool.object.get("arguments") == null) return false;
+    }
+    return true;
 }
 
 /// A skill's instructions. A skill fx found and couldn't read, such as a
@@ -285,10 +432,9 @@ fn run(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.Di
 }
 
 /// Skills and MCP tools that match the query, with no side effect: nothing
-/// found becomes callable or joins the tools list.
-/// Searches skills and MCP tools as capability_search does, server states
-/// and sign-in hints included, but loads no schemas: what it finds is opened
-/// and run through toolbox.
+/// found becomes callable or joins the tools list. Each tool found carries
+/// its arguments, so the model can run it next; a row with no room for them
+/// says to open it. Server states and sign-in hints are included.
 fn search(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const prepared = lexical_relevance.prepare(input.target) catch
         return .{ .failure = try ctx.allocator.dupe(u8, "toolbox search is too long") };
@@ -297,9 +443,11 @@ fn search(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch
         // A server's search wakes that server only.
         .kind = if (input.server == null) .all else .mcp,
         .server = input.server,
-        .limit = capability_retrieval.default_limit,
+        .limit = input.limit,
+        .cursor = input.cursor,
         .relevance_policy = .intent,
         .load_schemas = false,
+        .schemas_in_result = true,
     });
     // The built-in tools behind toolbox are found too, except by a search of
     // one server.
@@ -317,15 +465,16 @@ fn search(ctx: tool_dispatch.DispatchContext, input: *const Input) tool_dispatch
         else => return found,
     };
     if (matches.len == 0) return found;
-    const merged = (try withBuiltins(ctx.allocator, arena, text, matches)) orelse return found;
+    const merged = (try withBuiltins(ctx.allocator, arena, text, matches, runner)) orelse return found;
     ctx.allocator.free(text);
     return .{ .success = merged };
 }
 
-/// `result`, a search's JSON, with `matches` as its `tools`, their count in
-/// `counts` and `total_matches`, and no `no_match` state. Null when `result`
-/// isn't the JSON object a search returns. The caller owns the result.
-fn withBuiltins(alloc: Allocator, arena: Allocator, result: []const u8, matches: []const tool_dispatch.ToolboxMatch) Allocator.Error!?[]u8 {
+/// `result`, a search's JSON, with `matches` as its `tools`, each with its
+/// arguments as `runner` describes them, their count in `counts` and
+/// `total_matches`, and no `no_match` state. Null when `result` isn't the
+/// JSON object a search returns. The caller owns the result.
+fn withBuiltins(alloc: Allocator, arena: Allocator, result: []const u8, matches: []const tool_dispatch.ToolboxMatch, runner: tool_dispatch.ToolboxRun) Allocator.Error!?[]u8 {
     var parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, result, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -336,6 +485,7 @@ fn withBuiltins(alloc: Allocator, arena: Allocator, result: []const u8, matches:
         var entry: std.json.ObjectMap = .empty;
         try entry.put(arena, "name", .{ .string = match.name });
         try entry.put(arena, "description", .{ .string = match.description });
+        if (try builtinArguments(arena, runner, match.name)) |arguments| try entry.put(arena, "arguments", arguments);
         try tools.append(.{ .object = entry });
     }
     try parsed.object.put(arena, "tools", .{ .array = tools });
@@ -352,6 +502,24 @@ fn withBuiltins(alloc: Allocator, arena: Allocator, result: []const u8, matches:
     errdefer out.deinit();
     std.json.Stringify.value(parsed, .{}, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
+}
+
+/// The input schema of built-in `name`, or null when `runner` gives none.
+fn builtinArguments(arena: Allocator, runner: tool_dispatch.ToolboxRun, name: []const u8) Allocator.Error!?std.json.Value {
+    const described = runner.describe(arena, name) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const definition = switch (described orelse return null) {
+        .definition => |value| value,
+        .unavailable => return null,
+    };
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, definition.json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    if (parsed != .object) return null;
+    return parsed.object.get("inputSchema");
 }
 
 /// A failed MCP lookup of `target`, with its cause and what the model can
@@ -467,18 +635,39 @@ test "toolbox keeps a run's arguments as JSON and defaults them to an empty obje
     try std.testing.expectEqualStrings("{}", open_input.as(Input).arguments_json);
 }
 
-test "a search's result gains the built-in tools behind toolbox it found" {
+/// A runner that describes `glob_files` only, for the search tests.
+const DescribingRunner = struct {
+    fn explainNothing(_: *anyopaque, _: Allocator, _: []const u8) anyerror![]const u8 {
+        return "";
+    }
+    fn describeGlob(_: *anyopaque, _: Allocator, tool: []const u8) anyerror!?tool_dispatch.ToolboxDescription {
+        if (!std.mem.eql(u8, tool, "glob_files")) return null;
+        return .{ .definition = .{ .json = "{\"type\":\"function\",\"name\":\"glob_files\",\"description\":\"Find files.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"}}}}" } };
+    }
+    fn searchNothing(_: *anyopaque, _: Allocator, _: *const lexical_relevance.PreparedQuery) anyerror![]const tool_dispatch.ToolboxMatch {
+        return &.{};
+    }
+    var unused: u8 = 0;
+    const runner: tool_dispatch.ToolboxRun = .{ .context = &unused, .explain_fn = explainNothing, .describe_fn = describeGlob, .search_fn = searchNothing };
+};
+
+test "a search's result gains the built-in tools behind toolbox it found, with their arguments" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const result = "{\"skills\":[],\"mcp_tools\":[],\"counts\":{\"skills\":0,\"mcp_tools\":0},\"total_matches\":{\"skills\":0,\"mcp_tools\":0},\"state\":\"no_match\"}";
-    const merged = (try withBuiltins(alloc, arena_state.allocator(), result, &.{.{ .name = "glob_files", .description = "Find files." }})).?;
+    const merged = (try withBuiltins(alloc, arena_state.allocator(), result, &.{
+        .{ .name = "glob_files", .description = "Find files." },
+        .{ .name = "missing", .description = "Not described." },
+    }, DescribingRunner.runner)).?;
     defer alloc.free(merged);
-    try std.testing.expect(std.mem.find(u8, merged, "\"tools\":[{\"name\":\"glob_files\",\"description\":\"Find files.\"}]") != null);
-    try std.testing.expect(std.mem.find(u8, merged, "\"counts\":{\"skills\":0,\"mcp_tools\":0,\"tools\":1}") != null);
-    try std.testing.expect(std.mem.find(u8, merged, "\"total_matches\":{\"skills\":0,\"mcp_tools\":0,\"tools\":1}") != null);
+    // The arguments are the definition's input schema, so the model can run
+    // the tool next; a tool the runner can't describe keeps its row.
+    try std.testing.expect(std.mem.find(u8, merged, "\"tools\":[{\"name\":\"glob_files\",\"description\":\"Find files.\",\"arguments\":{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"}}}},{\"name\":\"missing\",\"description\":\"Not described.\"}]") != null);
+    try std.testing.expect(std.mem.find(u8, merged, "\"counts\":{\"skills\":0,\"mcp_tools\":0,\"tools\":2}") != null);
+    try std.testing.expect(std.mem.find(u8, merged, "\"total_matches\":{\"skills\":0,\"mcp_tools\":0,\"tools\":2}") != null);
     try std.testing.expect(std.mem.find(u8, merged, "no_match") == null);
-    try std.testing.expectEqual(@as(?[]u8, null), try withBuiltins(alloc, arena_state.allocator(), "not json", &.{}));
+    try std.testing.expectEqual(@as(?[]u8, null), try withBuiltins(alloc, arena_state.allocator(), "not json", &.{}, DescribingRunner.runner));
 }
 
 test "a failed toolbox open says why and what to do next, by the name it was given" {
@@ -532,4 +721,98 @@ test "a failed toolbox open says why and what to do next, by the name it was giv
             }
         }
     }
+}
+
+test "toolbox checks kind, limit, and cursor where each goes" {
+    const Bad = struct { args: []const u8, says: []const u8 };
+    const bad = [_]Bad{
+        .{ .args = "{\"open\":\"x\",\"kind\":\"server\"}", .says = "kind must be skill, mcp_server, or tool" },
+        .{ .args = "{\"search\":\"x\",\"kind\":\"skill\"}", .says = "kind goes with open" },
+        .{ .args = "{\"search\":\"x\",\"limit\":0}", .says = "limit must be a whole number from 1 to 20" },
+        .{ .args = "{\"search\":\"x\",\"limit\":21}", .says = "limit must be a whole number from 1 to 20" },
+        .{ .args = "{\"search\":\"x\",\"limit\":\"5\"}", .says = "limit must be a whole number from 1 to 20" },
+        .{ .args = "{\"open\":\"x\",\"limit\":5}", .says = "limit goes with search" },
+        // Skills and MCP tools page apart, so a cursor pages one server's.
+        .{ .args = "{\"search\":\"x\",\"cursor\":\"c1\"}", .says = "cursor goes with a search of one server" },
+        .{ .args = "{\"open\":\"x\",\"cursor\":\"c1\"}", .says = "cursor goes with search" },
+    };
+    for (bad) |case| switch (try decodeForTest(case.args)) {
+        .input => |input| {
+            input.deinit(std.testing.allocator);
+            return error.TestExpectedFailure;
+        },
+        .failure => |reason| {
+            defer std.testing.allocator.free(reason);
+            try std.testing.expect(std.mem.find(u8, reason, case.says) != null);
+        },
+    };
+    const paged = (try decodeForTest("{\"search\":\"issues\",\"server\":\"linear\",\"limit\":20,\"cursor\":\"c1\"}")).input;
+    defer paged.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 20), paged.as(Input).limit);
+    try std.testing.expectEqualStrings("c1", paged.as(Input).cursor.?);
+    const plain = (try decodeForTest("{\"search\":\"issues\"}")).input;
+    defer plain.deinit(std.testing.allocator);
+    try std.testing.expectEqual(capability_retrieval.default_limit, plain.as(Input).limit);
+    const kinded = (try decodeForTest("{\"open\":\"linear\",\"kind\":\"mcp_server\"}")).input;
+    defer kinded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(toolbox_core.Kind.mcp_server, kinded.as(Input).kind.?);
+}
+
+test "a skill's name the menu also lists as a server or tool opens nothing and names both" {
+    const skill_contract = @import("../../core/skills/skill_contract.zig");
+    const skills = [_]skill_contract.Skill{
+        .{ .name = "linear", .description = "", .path = "/skills/linear", .source = .global_fx },
+        .{ .name = "install_skill", .description = "", .path = "/skills/install_skill", .source = .global_fx },
+    };
+    const locations: skill_contract.Locations = .{ .namespace = 7, .roots = &.{"/skills"}, .skills = &skills };
+    const ctx: tool_dispatch.DispatchContext = .{
+        .allocator = std.testing.allocator,
+        .skill_locations = &locations,
+        .toolbox_mcp_servers = &.{"linear"},
+        .toolbox_behind = &.{"install_skill"},
+    };
+    const Case = struct { args: []const u8, says: []const []const u8 };
+    const cases = [_]Case{
+        .{ .args = "{\"open\":\"linear\"}", .says = &.{ "linear is in the toolbox menu as a skill and as an MCP server", "kind \"skill\"", "kind \"mcp_server\"" } },
+        .{ .args = "{\"open\":\"install_skill\"}", .says = &.{ "as a skill and as a tool", "kind \"tool\"" } },
+        // A kind with nothing of that kind says which kind is missing.
+        .{ .args = "{\"open\":\"linear\",\"kind\":\"mcp_server\"}", .says = &.{"No MCP server named linear"} },
+        .{ .args = "{\"open\":\"linear\",\"kind\":\"tool\"}", .says = &.{"No tool named linear"} },
+    };
+    for (cases) |case| {
+        const input = (try decodeForTest(case.args)).input;
+        defer input.deinit(std.testing.allocator);
+        const result = try open(ctx, input.as(Input));
+        defer result.deinit(std.testing.allocator);
+        const text = switch (result) {
+            .failure => |reason| reason,
+            else => return error.TestExpectedFailure,
+        };
+        for (case.says) |part| {
+            if (std.mem.find(u8, text, part) == null) {
+                std.debug.print("missing \"{s}\" in: {s}\n", .{ part, text });
+                return error.TestExpectedEqual;
+            }
+        }
+    }
+}
+
+test "a server opens whole only when every tool it has came back with its arguments" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const with = "{\"name\":\"mcp_s_a\",\"arguments\":{\"type\":\"object\"}}";
+    const without = "{\"name\":\"mcp_s_b\",\"open_for_arguments\":true}";
+    try std.testing.expect(try wholeWithArguments(arena, "{\"tools\":[" ++ with ++ "," ++ with ++ "],\"count\":2,\"total_matches\":2}"));
+    // A row with no room for its arguments, a server with tools past the
+    // page, one with more than the small limit, a page a limit cut, a state,
+    // or no tools all open as a list instead.
+    try std.testing.expect(!try wholeWithArguments(arena, "{\"tools\":[" ++ with ++ "," ++ without ++ "],\"count\":2,\"total_matches\":2}"));
+    try std.testing.expect(!try wholeWithArguments(arena, "{\"tools\":[" ++ with ++ "],\"count\":1,\"total_matches\":11}"));
+    const eleven = "{\"tools\":[" ++ @import("../../core/shared/text_utils.zig").repeat(with ++ ",", 10) ++ with ++ "],\"count\":11,\"total_matches\":11}";
+    try std.testing.expect(!try wholeWithArguments(arena, eleven));
+    try std.testing.expect(!try wholeWithArguments(arena, "{\"tools\":[" ++ with ++ "],\"count\":1,\"total_matches\":1,\"context_limit\":{}}"));
+    try std.testing.expect(!try wholeWithArguments(arena, "{\"tools\":[],\"count\":0,\"total_matches\":0,\"state\":\"server_not_found\"}"));
+    try std.testing.expect(!try wholeWithArguments(arena, "{\"tools\":[],\"count\":0,\"total_matches\":0}"));
+    try std.testing.expect(!try wholeWithArguments(arena, "not json"));
 }

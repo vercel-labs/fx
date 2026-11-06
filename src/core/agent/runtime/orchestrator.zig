@@ -10339,6 +10339,7 @@ fn processQueuedPromptLoop(
                         .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                         .max_tool_result_bytes = config.max_tool_result_bytes,
                         .toolbox_behind = config.toolbox_behind,
+                        .toolbox_mcp_servers = config.toolbox_mcp_servers,
                         .classification_complete = executable_classification_complete.items,
                         .presentation_group_id = stream_ctx.provisional_statuses.presentation_group_id,
                     };
@@ -11639,6 +11640,7 @@ fn processQueuedPromptLoop(
                 .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                 .max_tool_result_bytes = config.max_tool_result_bytes,
                 .toolbox_behind = config.toolbox_behind,
+                .toolbox_mcp_servers = config.toolbox_mcp_servers,
                 .expected_mcp_runtime_generation = expected_mcp_runtime_generation,
                 .expected_mcp_binding = for (advertised_dynamic_tools) |tool| {
                     if (std.mem.eql(u8, tool.name, execution_call.name)) break tool.mcp_binding;

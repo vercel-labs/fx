@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, runFx } from "../evals/eval-helpers";
 import { contentText } from "./conditional-guidance-oracle";
 import { fakeGatewayFinalText, fakeGatewayToolCall, startDynamicFakeGateway, startFakeGateway } from "./tmux-helpers";
+import { manyMcpServerName, startManyMcpHttpServers } from "./fixtures/mcp-many";
 
 // The toolbox: fx sends its built-in tools as they are, plus one `toolbox`
 // tool, and lists skills, MCP servers, and custom tools in a short menu
@@ -175,6 +176,16 @@ function toolResultText(request: Body, callId: string): string {
   }
   return "";
 }
+
+// The text a tool result carries, as the model reads it.
+function resultValue(request: Body, callId: string): string {
+  const raw = toolResultText(request, callId);
+  if (!raw) return "";
+  const wrapped = JSON.parse(raw) as { value?: unknown };
+  return typeof wrapped.value === "string" ? wrapped.value : JSON.stringify(wrapped.value ?? "");
+}
+
+type SearchRow = { name: string; arguments?: { properties?: Record<string, unknown>; required?: string[] }; open_for_arguments?: boolean };
 
 function wireCalls(path: string): Array<Record<string, any>> {
   if (!existsSync(path)) return [];
@@ -486,5 +497,166 @@ describe("toolbox", () => {
     const opened = toolResultText(body(childBodies[2]!), "child_open_skill");
     expect((JSON.parse(opened) as { value?: string }).value).toBe("Not executed");
     expect(opened).not.toContain("TOOLBOX_SKILL_BODY");
+  }, 60_000);
+
+  test("toolbox search gives each tool it finds with its arguments, so one search and one run use an MCP tool", async () => {
+    const root = createRoot();
+    const active = start([
+      fakeGatewayToolCall("find_echo", "toolbox", { search: "echo text", server: "fixture" }),
+      fakeGatewayToolCall("run_echo", "toolbox", { run: MCP_TOOL, arguments: { text: "hi" } }),
+      fakeGatewayFinalText("TOOLBOX_SEARCH_RUN_DONE"),
+    ]);
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Echo hi with the fixture."], {
+      cwd: root.workspace,
+      env: env(root, active),
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("TOOLBOX_SEARCH_RUN_DONE");
+    // Search, run, answer: no open in between.
+    const raws = modelRequests(active);
+    expect(raws.length).toBe(3);
+    const found = JSON.parse(resultValue(body(raws[1]!), "find_echo")) as { mcp_tools?: SearchRow[] };
+    const echo = (found.mcp_tools ?? []).find((tool) => tool.name === MCP_TOOL);
+    expect(echo?.arguments?.properties).toHaveProperty("text");
+    expect(echo?.arguments?.required).toEqual(["text"]);
+    expect(resultValue(body(raws[2]!), "run_echo")).toContain(MCP_RESULT);
+    expect(wireCalls(root.wireLogPath)).toHaveLength(1);
+    // The schemas came back as a result: the tools fx sends never changed.
+    expectEveryRequestExtendsThePrevious(raws);
+  }, 40_000);
+
+  test("a small MCP server opens with its tools' arguments, and a big one opens with its list and pages through search", async () => {
+    const root = createRoot();
+    const many = startManyMcpHttpServers({ servers: 1, toolsPerServer: 30 });
+    try {
+      const big = manyMcpServerName(0);
+      const config = JSON.parse(readFileSync(join(root.home, ".fx", "mcp.json"), "utf8")) as { mcp: Record<string, unknown> };
+      config.mcp[big] = { type: "http", url: many.url(0) };
+      writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify(config));
+      const pageOf = (raw: string, id: string) =>
+        JSON.parse(resultValue(body(raw), id) || "{}") as { mcp_tools?: SearchRow[]; next_cursor?: string };
+      gateway = startDynamicFakeGateway((raw) => {
+        if (!raw.includes('"toolCallId":"open_small"')) return fakeGatewayToolCall("open_small", "toolbox", { open: "fixture" });
+        if (!raw.includes('"toolCallId":"open_big"')) return fakeGatewayToolCall("open_big", "toolbox", { open: big });
+        if (!raw.includes('"toolCallId":"page_one"')) return fakeGatewayToolCall("page_one", "toolbox", { search: "echoes text", server: big, limit: 20 });
+        if (!raw.includes('"toolCallId":"page_two"')) {
+          const cursor = pageOf(raw, "page_one").next_cursor ?? "missing";
+          return fakeGatewayToolCall("page_two", "toolbox", { search: "echoes text", server: big, limit: 20, cursor });
+        }
+        return fakeGatewayFinalText("TOOLBOX_PAGES_DONE");
+      }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Look through the MCP servers."], {
+        cwd: root.workspace,
+        env: env(root, gateway),
+        timeoutMs: 40_000,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("TOOLBOX_PAGES_DONE");
+      const raws = modelRequests(gateway);
+      const last = raws.at(-1)!;
+
+      // One tool: it opens whole, with its arguments, ready to run.
+      const small = resultValue(body(last), "open_small");
+      expect(small).toContain("Tools of MCP server fixture, each with its arguments");
+      const smallPage = JSON.parse(small.slice(small.indexOf("{"), small.lastIndexOf("}") + 1)) as { tools: SearchRow[] };
+      expect(smallPage.tools.map((tool) => tool.name)).toEqual([MCP_TOOL]);
+      expect(smallPage.tools[0]!.arguments?.required).toEqual(["text"]);
+
+      // Thirty tools: their list, and the way to the ones needed.
+      const opened = resultValue(body(last), "open_big");
+      expect(opened).toContain(`Tools of MCP server ${big}, one per line`);
+      expect(opened).toContain(`server "${big}"`);
+      expect(opened).not.toContain("inputSchema");
+
+      // A search gives twenty at most, each with its arguments, then the rest.
+      const one = pageOf(last, "page_one");
+      const two = pageOf(last, "page_two");
+      expect(one.mcp_tools).toHaveLength(20);
+      expect(typeof one.next_cursor).toBe("string");
+      expect(two.mcp_tools).toHaveLength(10);
+      expect(two.next_cursor).toBeUndefined();
+      const names = [...one.mcp_tools!, ...two.mcp_tools!].map((tool) => tool.name);
+      expect(new Set(names).size).toBe(30);
+      for (const tool of [...one.mcp_tools!, ...two.mcp_tools!]) {
+        expect(tool.arguments?.required ?? (tool.open_for_arguments ? ["open"] : [])).not.toEqual([]);
+      }
+      expect(one.mcp_tools![0]!.arguments?.required).toEqual(["text"]);
+      expect(many.stats.toolsCall).toEqual([]);
+      expectEveryRequestExtendsThePrevious(raws);
+    } finally {
+      many.stop();
+    }
+  }, 60_000);
+
+  test("a skill named like a tool or server is opened and decided as the skill, and kind picks the other", async () => {
+    const root = createRoot();
+    // A skill's name can be a built-in's or a server's. The skill's rules
+    // decide an open of that name, since open reads the skill.
+    writeSkill(root.home, "read_file", "A skill that shares a built-in's name.", "TOOLBOX_NAMED_LIKE_A_TOOL");
+    writeSkill(root.home, "fixture", "A skill that shares the MCP server's name.", "TOOLBOX_NAMED_LIKE_A_SERVER");
+    writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ permission: { skill: { read_file: "deny" } } }));
+    const active = start([
+      fakeGatewayToolCall("open_denied", "toolbox", { open: "read_file" }),
+      fakeGatewayToolCall("open_both", "toolbox", { open: "fixture" }),
+      fakeGatewayToolCall("open_server", "toolbox", { open: "fixture", kind: "mcp_server" }),
+      fakeGatewayToolCall("open_skill", "toolbox", { open: "fixture", kind: "skill" }),
+      fakeGatewayFinalText("TOOLBOX_KIND_DONE"),
+    ]);
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Open the fixture."], {
+      cwd: root.workspace,
+      env: env(root, active),
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    const raws = modelRequests(active);
+    expect(raws.length).toBe(5);
+    const last = body(raws.at(-1)!);
+    expect(resultValue(last, "open_denied")).not.toContain("TOOLBOX_NAMED_LIKE_A_TOOL");
+    const both = resultValue(last, "open_both");
+    expect(both).toContain("as a skill and as an MCP server");
+    expect(both).not.toContain("TOOLBOX_NAMED_LIKE_A_SERVER");
+    expect(resultValue(last, "open_server")).toContain(MCP_TOOL);
+    expect(resultValue(last, "open_skill")).toContain("TOOLBOX_NAMED_LIKE_A_SERVER");
+    expectEveryRequestExtendsThePrevious(raws);
+  }, 40_000);
+
+  test("a subagent whose profile lists a tool placed behind toolbox keeps toolbox and runs it there", async () => {
+    const root = createRoot();
+    const profileDir = join(root.home, ".fx", "agents", "finder");
+    mkdirSync(profileDir, { recursive: true });
+    writeFileSync(join(profileDir, "profile.json"), JSON.stringify({ description: "Finds files", tools: ["glob_files"] }));
+    writeFileSync(join(root.workspace, "FINDER_NOTES.md"), "notes\n");
+    const childTask = "TOOLBOX_FINDER_TASK";
+    const childBodies: string[] = [];
+    const latestUser = (raw: string) =>
+      JSON.stringify((JSON.parse(raw) as Body).prompt.filter((message) => message.role === "user").at(-1) ?? "");
+    gateway = startDynamicFakeGateway((raw) => {
+      if (latestUser(raw).includes("Subagent report")) return fakeGatewayFinalText("TOOLBOX_FINDER_PARENT_DONE");
+      if (raw.includes(childTask) && !raw.includes('"toolCallId":"parent_start"')) {
+        childBodies.push(raw);
+        if (!raw.includes('"toolCallId":"child_glob"')) {
+          return fakeGatewayToolCall("child_glob", "toolbox", { run: "glob_files", arguments: { pattern: "*.md" } });
+        }
+        return fakeGatewayFinalText("TOOLBOX_FINDER_CHILD_DONE");
+      }
+      if (raw.includes('"toolCallId":"parent_start"')) return fakeGatewayFinalText("TOOLBOX_FINDER_SENT");
+      return fakeGatewayToolCall("parent_start", "subagent", {
+        request: { action: "message", agent: "finder-child", profile: "finder", message: childTask },
+      });
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await runFx(["--tool-placement", "glob_files=toolbox", "ask", "--json", "--auto", "Start the finder."], {
+      cwd: root.workspace,
+      env: env(root, gateway),
+      timeoutMs: 40_000,
+    });
+    expect(result.code).toBe(0);
+    expect(childBodies.length).toBeGreaterThanOrEqual(2);
+    // glob_files sits behind toolbox for this run, so toolbox is the child's
+    // way to the one tool its profile lists.
+    const childTools = toolNames(body(childBodies[0]!));
+    expect(childTools).toContain("toolbox");
+    expect(childTools).not.toContain("glob_files");
+    expect(resultValue(body(childBodies[1]!), "child_glob")).toContain("FINDER_NOTES.md");
   }, 60_000);
 });
