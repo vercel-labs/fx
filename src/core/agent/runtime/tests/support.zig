@@ -18,6 +18,7 @@ const command_replay_store = @import("../../../session/command_replay_store.zig"
 const session_child_store = @import("../../../session/session_child_store.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
+const model_catalog = @import("../../../gateway/model_catalog.zig");
 const provider_set = @import("../../../gateway/provider_set.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
 const file_mutation_contract = @import("../../../tooling/file_mutation_contract.zig");
@@ -519,7 +520,7 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_waiting: ?*std.atomic.Value(bool) = null,
     permission_release: ?*std.atomic.Value(bool) = null,
     tool_execution_override: ?ToolExecutionOverride = null,
-    catalog_unavailable: bool = false,
+    catalog_failure: ?model_catalog.FailureCategory = null,
     permission_failure_names: []const []const u8 = &.{},
     permission_index: usize = 0,
     exec_plans: []const FakeExecPlan = &.{},
@@ -796,7 +797,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .save_recovery_record = if (self.enable_recovery_record) saveRecoveryRecord else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
-            .model_catalog_unavailable = catalogUnavailable,
+            .model_catalog_failure = catalogFailure,
             .take_steering_boundary = if (self.steering_worker != null)
                 takeWorkerSteeringBoundary
             else if (self.steering_messages.len > 0 or
@@ -862,9 +863,9 @@ pub const FakeAgentRuntimeDeps = struct {
         return self.root_permission_mode.?;
     }
 
-    fn catalogUnavailable(raw: *anyopaque) bool {
+    fn catalogFailure(raw: *anyopaque) ?model_catalog.FailureCategory {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        return self.catalog_unavailable;
+        return self.catalog_failure;
     }
 
     fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {

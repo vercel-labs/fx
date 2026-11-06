@@ -12,6 +12,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const composer_stash = @import("../input/composer_stash.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
@@ -376,7 +377,7 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .available_model_capabilities = agentAvailableModelCapabilities,
                 .resolve_model_capabilities = agentResolveModelCapabilities,
-                .model_catalog_unavailable = agentModelCatalogUnavailable,
+                .model_catalog_failure = agentModelCatalogFailure,
                 .format_tool_execution_error = agentFormatToolExecutionError,
                 .record_tool_call_rejected = agentRecordToolCallRejected,
                 .record_tool_call_failed = agentRecordToolCallFailed,
@@ -851,13 +852,13 @@ pub fn Bindings(comptime App: type) type {
             }
         }
 
-        fn agentModelCatalogUnavailable(ctx: *anyopaque) bool {
+        fn agentModelCatalogFailure(ctx: *anyopaque) ?model_catalog.FailureCategory {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            if (comptime @hasDecl(App, "isModelCacheFailed")) {
-                return app.isModelCacheFailed();
+            if (comptime @hasDecl(App, "modelCacheFailure")) {
+                return app.modelCacheFailure();
             }
-            return false;
+            return null;
         }
 
         fn resolveSubagentModelOverride(ctx: ?*anyopaque, alloc: Allocator, raw_model: []const u8) Allocator.Error!subagent_model_contract.ModelCatalogMatch {

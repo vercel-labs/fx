@@ -72,6 +72,12 @@ pub const Failure = struct {
     }
 };
 
+/// Who serves `provider`'s model catalog, as a message about a connection fx
+/// could not make names it.
+pub fn serviceName(provider: model_provider.ProviderId) []const u8 {
+    return if (provider == .gateway) "AI Gateway" else "the model provider";
+}
+
 /// Milliseconds on the clock that times catalog refreshes. Natively it keeps
 /// counting while the machine sleeps, so a catalog goes stale overnight, and
 /// ignores wall-clock changes. The libfx wasm host backs it with wall time, so
