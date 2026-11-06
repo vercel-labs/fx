@@ -161,13 +161,21 @@ pub const CapabilityResolver = struct {
     last_attempt_ms: i64 = 0,
     requested_access: ?model_catalog.AccessMetadata = null,
     provider_id: ?model_provider.ProviderId = null,
-    /// The first load `resolveWithin` started: until it is adopted, or until
-    /// `deinit` when the wait for it ended first.
-    first_load: ?*FirstLoad = null,
+    /// A load `resolveWithin` or `refreshWithin` started whose wait was
+    /// cancelled, kept for the next call to wait on.
+    pending_load: ?*CatalogLoad = null,
+    /// Loads given up on before they connected. Each runs until its own
+    /// deadline; a later load frees the ones that ended, and `deinit` waits
+    /// for the rest.
+    abandoned_loads: ?*CatalogLoad = null,
 
     pub fn deinit(self: *CapabilityResolver, alloc: Allocator) void {
-        if (self.first_load) |load| load.discard(alloc);
-        self.first_load = null;
+        if (self.pending_load) |load| load.discard(alloc);
+        self.pending_load = null;
+        while (self.abandoned_loads) |load| {
+            self.abandoned_loads = load.next;
+            load.discard(alloc);
+        }
         model_catalog.freeModelCatalog(alloc, &self.catalog);
     }
 
@@ -181,13 +189,24 @@ pub const CapabilityResolver = struct {
     ) model_capabilities.ResolveError!void {
         const now = model_catalog.clockMs();
         const requested = model_catalog.AccessMetadata.init(input.access);
+        if (!self.loadDue(provider, requested, now)) return;
+
+        try self.adopt(alloc, provider, requested, now, model_catalog.fetchWithPublicFallback(provider, alloc, input));
+    }
+
+    /// Whether the catalog needs a load for `requested` access at `now`: it
+    /// never loaded, its access changed, or its refresh interval passed.
+    fn loadDue(
+        self: *const CapabilityResolver,
+        provider: model_catalog.Provider,
+        requested: model_catalog.AccessMetadata,
+        now: i64,
+    ) bool {
         const expired = if (provider.refresh_interval_ms) |interval|
             now < self.last_attempt_ms or now - self.last_attempt_ms >= interval
         else
             false;
-        if (self.state != .idle and !self.accessChanged(provider, requested) and !expired) return;
-
-        try self.adopt(alloc, provider, requested, now, model_catalog.fetchWithPublicFallback(provider, alloc, input));
+        return self.state == .idle or self.accessChanged(provider, requested) or expired;
     }
 
     fn accessChanged(
@@ -236,16 +255,9 @@ pub const CapabilityResolver = struct {
     }
 
     /// `resolve` for a caller that must not wait out a first load that cannot
-    /// reach the catalog. On a dead network the load can sit in a DNS lookup
-    /// that std.Io cannot cut short until the system resolver gives up, so it
-    /// runs on a thread of its own. When its request still has no connection
-    /// `wait_ms` after the load started, the catalog counts as failed and
-    /// `fallback` answers, as after any failed load; the load is cancelled,
-    /// never adopted, and `deinit` waits for it. A load whose request has
-    /// connected is waited for until it ends, within its own deadline, so a
-    /// slow link still gets the catalog. A provider that does not report its
-    /// connection loads as `resolve` does. A cancelled wait leaves the load
-    /// running for the next call.
+    /// reach the catalog. The load runs as `loadWithin` describes; when it is
+    /// given up on, the catalog counts as failed and `fallback` answers, as
+    /// after any failed load.
     pub fn resolveWithin(
         self: *CapabilityResolver,
         alloc: Allocator,
@@ -255,11 +267,37 @@ pub const CapabilityResolver = struct {
         fallback: model_capabilities.Capabilities,
         wait_ms: i64,
     ) model_capabilities.ResolveError!model_capabilities.Capabilities {
-        if (self.state == .idle) try self.loadFirstWithin(alloc, provider, input, wait_ms);
+        if (self.state == .idle) try self.loadWithin(alloc, provider, input, wait_ms);
         return self.resolve(alloc, provider, input, model, fallback);
     }
 
-    fn loadFirstWithin(
+    /// `refreshIfDue` for a caller that must not wait out a refresh that
+    /// cannot reach the catalog. A due load runs as `loadWithin` describes;
+    /// one given up on fails as any failed refresh does, so the catalog
+    /// already loaded for the same access stays in use until the next
+    /// refresh is due.
+    pub fn refreshWithin(
+        self: *CapabilityResolver,
+        alloc: Allocator,
+        provider: model_catalog.Provider,
+        input: model_catalog.FetchInput,
+        wait_ms: i64,
+    ) model_capabilities.ResolveError!void {
+        if (!self.loadDue(provider, .init(input.access), model_catalog.clockMs())) return;
+        try self.loadWithin(alloc, provider, input, wait_ms);
+    }
+
+    /// Loads the catalog on a thread of its own, because on a dead network
+    /// the load can sit in a DNS lookup that std.Io cannot cut short until
+    /// the system resolver gives up. When its request still has no
+    /// connection `wait_ms` after the load started, the load counts as a
+    /// transport failure; it is cancelled, never adopted, and freed once it
+    /// ends. A load whose request has connected is waited for until it ends,
+    /// within its own deadline, so a slow link still gets the catalog. A
+    /// provider that does not report its connection loads inline, as
+    /// `refreshIfDue` does. A cancelled wait leaves the load running for the
+    /// next call.
+    fn loadWithin(
         self: *CapabilityResolver,
         alloc: Allocator,
         provider: model_catalog.Provider,
@@ -268,12 +306,14 @@ pub const CapabilityResolver = struct {
     ) model_capabilities.ResolveError!void {
         if (comptime builtin.single_threaded) return self.refreshIfDue(alloc, provider, input);
         if (!provider.reports_connection) return self.refreshIfDue(alloc, provider, input);
-        const load = self.first_load orelse started: {
-            const started = FirstLoad.start(alloc, provider, input) catch |err| {
-                debug_trace.logf("gateway", "model catalog first load runs inline err={s}", .{@errorName(err)});
+        self.freeEndedAbandonedLoads(alloc);
+        const kind: []const u8 = if (self.state == .idle) "first load" else "refresh";
+        const load = self.pending_load orelse started: {
+            const started = CatalogLoad.start(alloc, provider, input) catch |err| {
+                debug_trace.logf("gateway", "model catalog {s} runs inline err={s}", .{ kind, @errorName(err) });
                 return self.refreshIfDue(alloc, provider, input);
             };
-            self.first_load = started;
+            self.pending_load = started;
             break :started started;
         };
         while (!load.finished.load(.acquire)) {
@@ -283,19 +323,35 @@ pub const CapabilityResolver = struct {
             const waited_ms = model_catalog.clockMs() - load.started_ms;
             if (waited_ms >= wait_ms and !load.connected.load(.acquire)) {
                 load.cancel_requested.store(true, .seq_cst);
-                self.state = .failed;
-                self.last_attempt_ms = load.started_ms;
-                self.requested_access = .init(load.input.access);
-                self.provider_id = provider.provider_id;
-                debug_trace.logf("gateway", "model catalog first load abandoned before it connected waited_ms={d}", .{waited_ms});
-                return;
+                self.pending_load = null;
+                load.next = self.abandoned_loads;
+                self.abandoned_loads = load;
+                debug_trace.logf("gateway", "model catalog {s} abandoned before it connected waited_ms={d}", .{ kind, waited_ms });
+                const requested = model_catalog.AccessMetadata.init(load.input.access);
+                return self.adopt(alloc, provider, requested, load.started_ms, .{ .failed = .{
+                    .access = requested,
+                    .anonymous_fallback_used = false,
+                    .failure = .{ .category = .transport },
+                } });
             }
-            io_mod.sleep(first_load_poll_ns);
+            io_mod.sleep(load_poll_ns);
         }
-        self.first_load = null;
+        self.pending_load = null;
         const requested = model_catalog.AccessMetadata.init(load.input.access);
         const started_ms = load.started_ms;
         try self.adopt(alloc, provider, requested, started_ms, load.finish(alloc));
+    }
+
+    fn freeEndedAbandonedLoads(self: *CapabilityResolver, alloc: Allocator) void {
+        var link = &self.abandoned_loads;
+        while (link.*) |load| {
+            if (load.finished.load(.acquire)) {
+                link.* = load.next;
+                load.discard(alloc);
+            } else {
+                link = &load.next;
+            }
+        }
     }
 
     pub fn resolve(
@@ -379,21 +435,21 @@ pub const CapabilityResolver = struct {
     }
 };
 
-/// How long a request waits for the model catalog's first load to connect,
-/// for `CapabilityResolver.resolveWithin`. A healthy network connects well
-/// within this, and a connected load is waited for until it ends. On a dead
-/// network the load would hold the request until its DNS lookup or connect
-/// timed out, 20 to 30 seconds, before the request could report Offline and
-/// start recovering.
-pub const catalog_first_load_wait_ms: i64 = 2_000;
+/// How long a request waits for a model catalog load to connect, for
+/// `CapabilityResolver.resolveWithin` and `refreshWithin`. A healthy network
+/// connects well within this, and a connected load is waited for until it
+/// ends. On a dead network the load would hold the request until its DNS
+/// lookup or connect timed out, 20 to 30 seconds, before the request could
+/// go on.
+pub const catalog_connect_wait_ms: i64 = 2_000;
 
-/// How often `CapabilityResolver.resolveWithin` checks on a first load.
-const first_load_poll_ns = 2 * std.time.ns_per_ms;
+/// How often `CapabilityResolver.loadWithin` checks on a load.
+const load_poll_ns = 2 * std.time.ns_per_ms;
 
-/// A first catalog load on a thread of its own. It owns copies of the access
-/// and endpoint, because the caller's credential can be replaced while the
-/// load runs, and its own cancel and connection flags.
-const FirstLoad = struct {
+/// A catalog load on a thread of its own. It owns copies of the access and
+/// endpoint, because the caller's credential can be replaced while the load
+/// runs, and its own cancel and connection flags.
+const CatalogLoad = struct {
     provider: model_catalog.Provider,
     input: model_catalog.FetchInput,
     started_ms: i64,
@@ -404,9 +460,11 @@ const FirstLoad = struct {
     /// Set before `finished`; owns any loaded catalog.
     result: model_catalog.FetchResult = undefined,
     thread: std.Thread = undefined,
+    /// The next load in `CapabilityResolver.abandoned_loads`.
+    next: ?*CatalogLoad = null,
 
-    fn start(alloc: Allocator, provider: model_catalog.Provider, input: model_catalog.FetchInput) !*FirstLoad {
-        const load = try alloc.create(FirstLoad);
+    fn start(alloc: Allocator, provider: model_catalog.Provider, input: model_catalog.FetchInput) !*CatalogLoad {
+        const load = try alloc.create(CatalogLoad);
         errdefer alloc.destroy(load);
         const endpoint = try alloc.dupe(u8, input.endpoint);
         errdefer alloc.free(endpoint);
@@ -427,13 +485,13 @@ const FirstLoad = struct {
         return load;
     }
 
-    fn run(self: *FirstLoad, alloc: Allocator) void {
+    fn run(self: *CatalogLoad, alloc: Allocator) void {
         self.result = model_catalog.fetchWithPublicFallback(self.provider, alloc, self.input);
         self.finished.store(true, .release);
     }
 
     /// Joins a finished load, frees it, and returns its result.
-    fn finish(self: *FirstLoad, alloc: Allocator) model_catalog.FetchResult {
+    fn finish(self: *CatalogLoad, alloc: Allocator) model_catalog.FetchResult {
         self.thread.join();
         const result = self.result;
         self.destroy(alloc);
@@ -441,13 +499,13 @@ const FirstLoad = struct {
     }
 
     /// Cancels the load, waits for it, and frees it with anything it loaded.
-    fn discard(self: *FirstLoad, alloc: Allocator) void {
+    fn discard(self: *CatalogLoad, alloc: Allocator) void {
         self.cancel_requested.store(true, .seq_cst);
         self.thread.join();
         switch (self.result) {
             .loaded => |loaded| {
                 var catalog = loaded.catalog;
-                debug_trace.logf("gateway", "model catalog first load discarded entries={d}", .{catalog.items.len});
+                debug_trace.logf("gateway", "model catalog load discarded entries={d}", .{catalog.items.len});
                 model_catalog.freeModelCatalog(alloc, &catalog);
             },
             .failed => {},
@@ -455,7 +513,7 @@ const FirstLoad = struct {
         self.destroy(alloc);
     }
 
-    fn destroy(self: *FirstLoad, alloc: Allocator) void {
+    fn destroy(self: *CatalogLoad, alloc: Allocator) void {
         freeCatalogAccess(alloc, self.input.access);
         alloc.free(self.input.endpoint);
         alloc.destroy(self);
@@ -923,7 +981,7 @@ test "a first catalog load from a provider that does not report its connection i
     try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
     try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
     // It loads on the caller's thread, as `resolve` does.
-    try std.testing.expect(resolver.first_load == null);
+    try std.testing.expect(resolver.pending_load == null);
 }
 
 test "a catalog that answers after its wait ended is freed, not adopted" {
@@ -935,7 +993,7 @@ test "a catalog that answers after its wait ended is freed, not adopted" {
     _ = try resolver.resolveWithin(alloc, gated.provider(), input, "provider/model", .{}, 20);
     try std.testing.expectEqual(CapabilityResolverState.failed, resolver.state);
     gated.released.store(true, .seq_cst);
-    while (!resolver.first_load.?.finished.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+    while (!resolver.abandoned_loads.?.finished.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
 
     const later = try resolver.resolveWithin(alloc, gated.provider(), input, "provider/model", .{}, 60_000);
     try std.testing.expectEqual(@as(?u32, null), later.context_window);
@@ -954,7 +1012,7 @@ test "a first catalog load that finishes within its wait is adopted" {
     const capabilities = try resolver.resolveWithin(alloc, reportingProvider(&fake), .{ .endpoint = "/v1/models" }, "provider/model", .{}, 60_000);
     try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
     try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
-    try std.testing.expect(resolver.first_load == null);
+    try std.testing.expect(resolver.pending_load == null);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
@@ -991,4 +1049,78 @@ test "a cancelled wait for a first catalog load leaves the load for the next loo
     try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
     try std.testing.expectEqual(@as(usize, 1), gated.calls.load(.seq_cst));
     try std.testing.expect(!gated.saw_cancel.load(.seq_cst));
+}
+
+/// Loads `gated`'s catalog once through a provider with a refresh interval,
+/// then lets the interval pass, so the next `refreshWithin` is due.
+fn loadRefreshableCatalogForTest(
+    alloc: Allocator,
+    resolver: *CapabilityResolver,
+    gated: *GatedCatalog,
+) !model_catalog.Provider {
+    var provider = gated.provider();
+    provider.refresh_interval_ms = 60_000;
+    gated.connects = true;
+    gated.released.store(true, .seq_cst);
+    try resolver.refreshWithin(alloc, provider, .{ .endpoint = "/v1/models" }, 60_000);
+    try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
+    gated.released.store(false, .seq_cst);
+    resolver.last_attempt_ms -= 60_000;
+    return provider;
+}
+
+test "a due catalog refresh that never connects keeps the catalog after its wait" {
+    const alloc = std.testing.allocator;
+    var gated: GatedCatalog = .{};
+    var resolver: CapabilityResolver = .{};
+    const provider = try loadRefreshableCatalogForTest(alloc, &resolver, &gated);
+    gated.connects = false;
+
+    try resolver.refreshWithin(alloc, provider, .{ .endpoint = "/v1/models" }, 20);
+    try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
+    try std.testing.expectEqualStrings("provider/model", resolver.catalogEntries().?[0].id);
+
+    // The refresh given up on counts as this interval's attempt.
+    try resolver.refreshWithin(alloc, provider, .{ .endpoint = "/v1/models" }, 60_000);
+    resolver.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), gated.calls.load(.seq_cst));
+    try std.testing.expect(gated.saw_cancel.load(.seq_cst));
+}
+
+test "a due catalog refresh that connected is waited for past the wait and adopted" {
+    const alloc = std.testing.allocator;
+    var gated: GatedCatalog = .{};
+    var resolver: CapabilityResolver = .{};
+    defer resolver.deinit(alloc);
+    const provider = try loadRefreshableCatalogForTest(alloc, &resolver, &gated);
+    const due_since_ms = resolver.last_attempt_ms;
+
+    // The request connects at once and the catalog answers well after the wait.
+    const releaser = try gated.releaseAfter(300);
+    defer releaser.join();
+    try resolver.refreshWithin(alloc, provider, .{ .endpoint = "/v1/models" }, 50);
+    try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
+    try std.testing.expect(resolver.last_attempt_ms > due_since_ms);
+    try std.testing.expect(!gated.saw_cancel.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), gated.calls.load(.seq_cst));
+}
+
+test "a catalog refresh after one given up on starts its own load and frees the one that ended" {
+    const alloc = std.testing.allocator;
+    var gated: GatedCatalog = .{};
+    var resolver: CapabilityResolver = .{};
+    defer resolver.deinit(alloc);
+    const provider = try loadRefreshableCatalogForTest(alloc, &resolver, &gated);
+    gated.connects = false;
+
+    try resolver.refreshWithin(alloc, provider, .{ .endpoint = "/v1/models" }, 20);
+    while (!resolver.abandoned_loads.?.finished.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+
+    resolver.last_attempt_ms -= 60_000;
+    try resolver.refreshWithin(alloc, provider, .{ .endpoint = "/v1/models" }, 20);
+    // Only the second load is left; the testing allocator fails the test if
+    // the first leaks.
+    try std.testing.expect(resolver.abandoned_loads.?.next == null);
+    try std.testing.expectEqual(@as(usize, 3), gated.calls.load(.seq_cst));
+    try std.testing.expectEqualStrings("provider/model", resolver.catalogEntries().?[0].id);
 }

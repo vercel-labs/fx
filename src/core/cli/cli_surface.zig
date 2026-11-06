@@ -1052,8 +1052,41 @@ fn topLevelHelpRequest(command_catalog: CommandCatalog, args: []const [:0]const 
     return null;
 }
 
+/// Runs the command `args` name. A command that ends because fx couldn't
+/// write its own output, stdout or stderr, returns `error.OutputWriteFailed`
+/// in place of the `error.WriteFailed` a failed write gives, which on its own
+/// reads as a dropped connection.
 pub fn runIfRequested(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !RunResult {
-    return runIfRequestedWithDeps(alloc, args, cfg, .{});
+    var output: OwnOutput = .{};
+    return runIfRequestedWithDeps(alloc, args, cfg, .{ .stdout_ctx = &output, .stderr_ctx = &output }) catch |err| {
+        return output.commandError(err);
+    };
+}
+
+/// Whether a write to fx's own stdout or stderr failed during a command.
+const OwnOutput = struct {
+    failed: std.atomic.Value(bool) = .init(false),
+
+    fn noteFailure(ctx: ?*anyopaque) void {
+        const self: *OwnOutput = @ptrCast(@alignCast(ctx orelse return));
+        self.failed.store(true, .release);
+    }
+
+    /// The error the command reports for `err`.
+    fn commandError(self: *const OwnOutput, err: anyerror) anyerror {
+        if (err != error.WriteFailed or !self.failed.load(.acquire)) return err;
+        debug_trace.logf("core", "command output write failed err={s}", .{@errorName(err)});
+        return error.OutputWriteFailed;
+    }
+};
+
+test "a command that ends because fx couldn't write its output reports that write" {
+    var output: OwnOutput = .{};
+    // A failed write elsewhere, such as to the network, keeps its name.
+    try std.testing.expectEqual(@as(anyerror, error.WriteFailed), output.commandError(error.WriteFailed));
+    OwnOutput.noteFailure(&output);
+    try std.testing.expectEqual(@as(anyerror, error.OutputWriteFailed), output.commandError(error.WriteFailed));
+    try std.testing.expectEqual(@as(anyerror, error.NoSpaceLeft), output.commandError(error.NoSpaceLeft));
 }
 
 fn runNoConfigIfRequestedWithDeps(
@@ -2692,14 +2725,16 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
     };
 }
 
-fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
+fn writeRealStdout(ctx: ?*anyopaque, text: []const u8) !void {
+    errdefer OwnOutput.noteFailure(ctx);
     if (comptime builtin.target.os.tag != .windows) {
         return writeFdAll(std.posix.STDOUT_FILENO, text);
     }
     try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
 }
 
-fn writeRealStderr(_: ?*anyopaque, text: []const u8) !void {
+fn writeRealStderr(ctx: ?*anyopaque, text: []const u8) !void {
+    errdefer OwnOutput.noteFailure(ctx);
     if (comptime builtin.target.os.tag != .windows) {
         return writeFdAll(std.posix.STDERR_FILENO, text);
     }

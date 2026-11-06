@@ -59,6 +59,43 @@ pub fn requireWritableInDir(dir: std.Io.Dir, file_name: []const u8) error{Creden
     return true;
 }
 
+/// A login file as it is at its name now, with its metadata.
+pub const CurrentFile = struct {
+    file: std.Io.File,
+    stat: std.Io.File.Stat,
+};
+
+const max_opens = 3;
+
+/// Opens login file `name` in `dir` for reading, without following a link or
+/// waiting for a writer when it's a fifo. Null when there's none. Another fx
+/// that saves the login replaces the file, and one that signs out deletes it,
+/// so a file opened just before has no links left; the name then holds the
+/// new file, or none, and is opened again. The caller closes the file.
+pub fn openCurrent(dir: std.Io.Dir, name: []const u8) !?CurrentFile {
+    return openCurrentWith(dir, name, null);
+}
+
+/// `openCurrent`, with `between` run after each open and before its check,
+/// as another fx's save or logout can.
+fn openCurrentWith(dir: std.Io.Dir, name: []const u8, between: ?*const fn (std.Io.Dir, []const u8) void) !?CurrentFile {
+    for (0..max_opens) |_| {
+        var file = io_mod.openExistingReadOnlyRegularFile(dir, name, .no_follow) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        if (between) |run| run(dir, name);
+        const stat = file.stat(io_mod.getIo()) catch |err| {
+            file.close(io_mod.getIo());
+            return err;
+        };
+        if (stat.nlink != 0) return .{ .file = file, .stat = stat };
+        file.close(io_mod.getIo());
+        debug_trace.logf("auth", "login file replaced or deleted after it was opened name={s}; opening it again", .{name});
+    }
+    return error.LoginFileKeptChanging;
+}
+
 fn profileFileFromHome(
     home_value: ?[]const u8,
     file_name: []const u8,
@@ -79,13 +116,10 @@ fn profileFileFromHome(
     ) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
     defer profile_dir.close(io_mod.getIo());
 
-    // A path that isn't a regular file, such as a fifo, is unavailable
-    // without waiting for a writer.
-    var file = io_mod.openExistingReadOnlyRegularFile(profile_dir, file_name, .no_follow) catch |err|
-        return if (err == error.FileNotFound) .missing else .unavailable;
-    defer file.close(io_mod.getIo());
+    var current = (openCurrent(profile_dir, file_name) catch return .unavailable) orelse return .missing;
+    defer current.file.close(io_mod.getIo());
 
-    const stat = file.stat(io_mod.getIo()) catch return .unavailable;
+    const stat = current.stat;
     if (stat.kind != .file or
         stat.nlink != 1 or
         stat.permissions.toMode() & 0o077 != 0 or
@@ -95,6 +129,56 @@ fn profileFileFromHome(
         return .unavailable;
     }
     return .present;
+}
+
+test "a login file another fx replaces after this one opened it is opened again" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "auth.json", .data = "old", .flags = .{ .permissions = .fromMode(0o600) } });
+    // Another fx saves a new login over it, by rename, once.
+    const Save = struct {
+        var done = false;
+        var failed: ?anyerror = null;
+        fn run(dir: std.Io.Dir, name: []const u8) void {
+            if (done) return;
+            done = true;
+            dir.writeFile(std.testing.io, .{ .sub_path = "auth.json.new", .data = "new", .flags = .{ .permissions = .fromMode(0o600) } }) catch |err| {
+                failed = err;
+                return;
+            };
+            dir.rename("auth.json.new", dir, name, std.testing.io) catch |err| {
+                failed = err;
+            };
+        }
+    };
+
+    var current = (try openCurrentWith(tmp.dir, "auth.json", Save.run)).?;
+    defer current.file.close(std.testing.io);
+    try std.testing.expectEqual(@as(?anyerror, null), Save.failed);
+    try std.testing.expect(Save.done);
+    const bytes = try io_mod.readFileToEnd(std.testing.allocator, &current.file, 64);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("new", bytes);
+}
+
+test "a login file another fx deletes after this one opened it is none" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "auth.json", .data = "old", .flags = .{ .permissions = .fromMode(0o600) } });
+    // Another fx signs out.
+    const Logout = struct {
+        var failed: ?anyerror = null;
+        fn run(dir: std.Io.Dir, name: []const u8) void {
+            dir.deleteFile(std.testing.io, name) catch |err| {
+                failed = err;
+            };
+        }
+    };
+
+    try std.testing.expectEqual(@as(?CurrentFile, null), try openCurrentWith(tmp.dir, "auth.json", Logout.run));
+    try std.testing.expectEqual(@as(?anyerror, null), Logout.failed);
 }
 
 test "missing native profile root is unavailable" {

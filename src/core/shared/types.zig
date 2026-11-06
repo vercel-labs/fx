@@ -444,6 +444,9 @@ pub fn plainErrorText(raw: []const u8, buf: []u8) []const u8 {
         .{ "NoSpaceLeft", "the disk is full" },
         .{ "FileTooBig", "a file-size limit was reached" },
         .{ "InputOutput", "a disk read or write failed" },
+        // A write to fx's own stdout or stderr, which a command reports in
+        // place of `WriteFailed` (`cli_surface.runIfRequested`).
+        .{ "OutputWriteFailed", "couldn't write the output" },
     };
     inline for (pairs) |pair| {
         if (std.mem.eql(u8, raw, pair[0])) return pair[1];
@@ -809,6 +812,10 @@ test "model failure diagnostics read as plain words" {
         .{ .raw = "ReadFailed", .plain = "connection dropped" },
         .{ .raw = "TlsInitializationFailed", .plain = "couldn't make a secure connection" },
         .{ .raw = "NoSpaceLeft", .plain = "the disk is full" },
+        // A failed write reads as a dropped connection unless fx knows the
+        // write was to its own output.
+        .{ .raw = "WriteFailed", .plain = "connection dropped" },
+        .{ .raw = "OutputWriteFailed", .plain = "couldn't write the output" },
         // Every provider's unreadable stream event reads the same way.
         .{ .raw = "InvalidGatewaySseEvent", .plain = "unreadable reply" },
         .{ .raw = "InvalidOpenAICodexSseEvent", .plain = "unreadable reply" },

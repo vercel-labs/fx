@@ -379,10 +379,15 @@ test(
       releaseRefresh();
 
       const [askResult, logoutResult] = await Promise.all([ask, logout]);
-      expect(
-        askResult.code,
-        `stdout: ${askResult.stdout}\nstderr: ${askResult.stderr}`,
-      ).toBe(0);
+      // The ask reads the login again for its turn. It either reads it before
+      // the logout deletes it, or after, and then it's signed out: never a
+      // store it can't read.
+      if (askResult.code !== 0) {
+        expect(
+          JSON.parse(askResult.stdout).error,
+          `stdout: ${askResult.stdout}\nstderr: ${askResult.stderr}`,
+        ).toBe("MissingCredentials");
+      }
       expect(
         logoutResult.code,
         `stdout: ${logoutResult.stdout}\nstderr: ${logoutResult.stderr}`,
