@@ -59,6 +59,7 @@ const session_store = @import("session_store.zig");
 const session_summary_codec = @import("session_summary_codec.zig");
 const v1_conversion = @import("v1_conversion.zig");
 const child_state = @import("../subagent/child_state.zig");
+const subagent_domain = @import("../subagent/domain.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -465,6 +466,25 @@ pub fn readSession(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
     };
     defer peeked.deinit(alloc);
     if (peeked.role != .root) return error.SessionNotFound;
+    return detailOf(store, alloc, id, peeked);
+}
+
+/// A subagent's session, by its own id, as `readSession` reads a root's:
+/// without its lock (D37). `resolveAgent` finds the id from the names its
+/// parents gave it. Anything but a v2 child is `error.SessionNotFound`.
+/// Caller owns the result.
+pub fn readChild(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
+    var peeked = store.manager.peek(alloc, id) catch |err| return switch (err) {
+        error.NotFound, error.InvalidArgument => error.SessionNotFound,
+        else => err,
+    };
+    defer peeked.deinit(alloc);
+    if (peeked.role != .child) return error.SessionNotFound;
+    return detailOf(store, alloc, id, peeked);
+}
+
+/// Every turn and setting of peeked session `id`, as `fx session` shows it.
+fn detailOf(store: *Store, alloc: Allocator, id: []const u8, peeked: sm.Peeked) !Resumed {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     var restored = try settingsFrom(alloc, scratch.allocator(), peeked.state);
@@ -602,6 +622,273 @@ fn countBefore(sorted: []const session_store.SessionSummary, summary: session_st
     var count: usize = 0;
     while (count < sorted.len and session_summary_codec.summaryFollowsContinuation(summary, .{ .updated_at_ms = sorted[count].updated_at_ms, .id = sorted[count].id })) count += 1;
     return count;
+}
+
+// ---------------------------------------------------------------------------
+// Live sessions, and subagents by name
+
+/// How deep a live listing and an agent address follow subagents: fx nests
+/// two levels below a root, and this leaves room. A log that names a deeper
+/// chain, or a loop, stops here.
+const max_agent_depth = 4;
+
+/// Index rows read per page while scanning for live sessions. Each page
+/// loads the whole index again, so one page covers any common profile.
+const live_scan_page = 4096;
+
+/// Every root session in `workspace`, or in every workspace when it is null,
+/// that an fx process has open right now, newest first, each with its
+/// subagents (`tests/tla/session/LiveSessions.tla`). A session is live while
+/// a process holds its writer lock, which the kernel frees however the
+/// process ends. The scan tries each lock without waiting and lets a free
+/// one go at once (`isBusy`), then reads the live session's log without the
+/// lock (D37). It writes nothing. A session whose lock can't be tried is not
+/// live, and one whose log can't be read is listed as `unknown`; both are
+/// traced. The caller frees the list with `deinit`.
+pub fn listLive(store: *Store, alloc: Allocator, workspace: ?[]const u8) !session_store.LiveSessionList {
+    var list: session_store.LiveSessionList = .{ .arena = .init(alloc), .sessions = &.{} };
+    errdefer list.arena.deinit();
+    const arena = list.arena.allocator();
+    var sessions: std.ArrayList(session_store.LiveSession) = .empty;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const filter: sm.Filter = if (workspace) |root| .{ .workspace = root } else .all;
+    var cursor: ?sm.ListCursor = null;
+    while (true) {
+        var page = try store.manager.list(alloc, filter, cursor, live_scan_page);
+        defer page.deinit();
+        for (page.items) |item| {
+            if (item.role != .root) continue;
+            const live = store.manager.isBusy(item.id) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    debug_trace.logf("session", "event=live_probe_failed session={s} err={s}", .{ item.id, @errorName(err) });
+                    continue;
+                },
+            };
+            if (!live) continue;
+            _ = scratch.reset(.retain_capacity);
+            try sessions.append(arena, try liveSession(store, arena, scratch.allocator(), item));
+        }
+        cursor = page.next orelse break;
+    }
+    list.sessions = sessions.items;
+    return list;
+}
+
+/// Live root session `item`, read from its log into `arena`.
+fn liveSession(store: *Store, arena: Allocator, scratch: Allocator, item: sm.Summary) !session_store.LiveSession {
+    const summary = try summaryOf(arena, scratch, item);
+    const peeked = store.manager.peek(scratch, item.id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=live_peek_failed session={s} err={s}", .{ item.id, @errorName(err) });
+            return .{ .summary = summary, .model = null, .state = .unknown, .agents = &.{} };
+        },
+    };
+    return .{
+        .summary = summary,
+        .model = savedModel(arena, peeked.state.prefs),
+        .state = if (peeked.state.open_turn != null) .working else .idle,
+        .agents = try liveAgents(store, arena, scratch, item.id, peeked.state.children.items, 1),
+    };
+}
+
+/// The model a session's `prefs` saved, copied into `arena`, or null when
+/// it can't be read.
+fn savedModel(arena: Allocator, prefs: ?[]const u8) ?[]const u8 {
+    const raw = prefs orelse return null;
+    const Saved = struct { model: ?[]const u8 = null };
+    const saved = json_decode.parseFromSliceLeaky(Saved, arena, raw, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
+    return saved.model;
+}
+
+/// A folded child as the subagent code reads it, borrowing `child`.
+fn foldedChild(child: sm.Child) Child {
+    return .{
+        .id = child.id,
+        .work_id = child.work_id,
+        .open = child.open,
+        .outcome = child.outcome,
+        .spawn_data = child.spawn_data,
+        .finish_data = child.finish_data,
+        .seq = child.seq,
+    };
+}
+
+/// The child in `children` that `name` reaches: the newest spawn of that
+/// name, closed for good or not when `closed` is true, and otherwise only
+/// among the ones still open. Null when none goes by it.
+fn namedChild(scratch: Allocator, children: []const sm.Child, name: []const u8, closed: bool) ?sm.Child {
+    var best: ?sm.Child = null;
+    for (children) |child| {
+        const entry = foldedChild(child);
+        if (!closed and child_state.foldedClosed(entry)) continue;
+        const own = child_state.foldedName(scratch, entry) orelse continue;
+        if (!std.mem.eql(u8, own, name)) continue;
+        if (best == null or child.seq > best.?.seq) best = child;
+    }
+    return best;
+}
+
+/// The subagents a live listing shows of one parent, whose folded children
+/// are `children`: each named one not closed for good, the newest spawn of
+/// each name, with its own below it down to `max_agent_depth`. Their
+/// addresses start with `parent`.
+fn liveAgents(store: *Store, arena: Allocator, scratch: Allocator, parent: []const u8, children: []const sm.Child, depth: usize) ![]const session_store.LiveAgent {
+    var agents: std.ArrayList(session_store.LiveAgent) = .empty;
+    for (children) |child| {
+        const entry = foldedChild(child);
+        if (child_state.foldedClosed(entry)) continue;
+        const name = child_state.foldedName(scratch, entry) orelse continue;
+        const newest = namedChild(scratch, children, name, false) orelse continue;
+        if (newest.seq != child.seq) continue;
+        const address = try std.mem.concat(arena, u8, &.{ parent, "/", name });
+        var nested: []const session_store.LiveAgent = &.{};
+        if (depth < max_agent_depth) {
+            if (store.manager.peek(scratch, child.id)) |peeked| {
+                nested = try liveAgents(store, arena, scratch, address, peeked.state.children.items, depth + 1);
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => debug_trace.logf("session", "event=live_agent_peek_failed session={s} err={s}", .{ child.id, @errorName(err) }),
+            }
+        }
+        try agents.append(arena, .{
+            .name = try arena.dupe(u8, name),
+            .address = address,
+            .id = try arena.dupe(u8, child.id),
+            .state = if (child.open) .working else .idle,
+            .agents = nested,
+        });
+    }
+    return agents.items;
+}
+
+/// `<session-id>/<name>[/<name>...]`: a subagent by the names its parents
+/// gave it, below a root session. Borrows the text it was parsed from.
+pub const AgentAddress = struct {
+    root: []const u8,
+    names_buffer: [max_agent_depth][]const u8 = undefined,
+    depth: usize = 0,
+
+    fn names(address: *const AgentAddress) []const []const u8 {
+        return address.names_buffer[0..address.depth];
+    }
+};
+
+/// Pure: `text` as an agent address, or null when it names a session alone.
+/// `error.InvalidSessionId` when a part is empty, the root is not a session
+/// id, a name is not one fx gives a subagent, or it is deeper than
+/// `max_agent_depth`.
+pub fn parseAgentAddress(text: []const u8) error{InvalidSessionId}!?AgentAddress {
+    const slash = std.mem.findScalar(u8, text, '/') orelse return null;
+    var address: AgentAddress = .{ .root = text[0..slash] };
+    session_store.validateSessionId(address.root) catch return error.InvalidSessionId;
+    var parts = std.mem.splitScalar(u8, text[slash + 1 ..], '/');
+    while (parts.next()) |name| {
+        if (address.depth == max_agent_depth or !subagent_domain.validAgentName(name)) return error.InvalidSessionId;
+        address.names_buffer[address.depth] = name;
+        address.depth += 1;
+    }
+    return address;
+}
+
+/// What an agent address names: the subagent's own session, or the first
+/// name no subagent of `parent` goes by, with the names its subagents do.
+/// Strings are borrowed from the arena `resolveAgent` was given.
+pub const AgentLookup = union(enum) {
+    found: []const u8,
+    missing: struct { parent: []const u8, name: []const u8, names: []const []const u8 },
+};
+
+/// Follows `address` from its root session down the names each parent gave
+/// its subagent, through each parent's log read without its lock (D37). A
+/// name two children took reaches the newer, closed for good or not, so a
+/// closed subagent's turns stay readable. A missing root, or one that is a
+/// child itself, is `error.SessionNotFound`.
+pub fn resolveAgent(store: *Store, arena: Allocator, address: AgentAddress) !AgentLookup {
+    // Only `parseAgentAddress` makes one, and it names at least one subagent.
+    std.debug.assert(address.depth >= 1);
+    var peeked = store.manager.peek(arena, address.root) catch |err| return switch (err) {
+        error.NotFound, error.InvalidArgument => error.SessionNotFound,
+        else => err,
+    };
+    if (peeked.role != .root) return error.SessionNotFound;
+    var parent: []const u8 = address.root;
+    for (address.names(), 0..) |name, index| {
+        const children = peeked.state.children.items;
+        const child = namedChild(arena, children, name, true) orelse
+            return .{ .missing = .{ .parent = parent, .name = name, .names = try agentNames(arena, children) } };
+        if (index + 1 == address.depth) return .{ .found = child.id };
+        parent = try std.mem.concat(arena, u8, &.{ parent, "/", name });
+        peeked = store.manager.peek(arena, child.id) catch |err| return switch (err) {
+            error.NotFound, error.InvalidArgument => error.SessionNotFound,
+            else => err,
+        };
+    }
+    unreachable;
+}
+
+/// The names of the subagents in `children` that are not closed for good,
+/// each once, in the order they were first started.
+fn agentNames(arena: Allocator, children: []const sm.Child) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (children) |child| {
+        const entry = foldedChild(child);
+        if (child_state.foldedClosed(entry)) continue;
+        const name = child_state.foldedName(arena, entry) orelse continue;
+        for (out.items) |known| {
+            if (std.mem.eql(u8, known, name)) break;
+        } else try out.append(arena, name);
+    }
+    return out.items;
+}
+
+test "an agent address splits into its root and the names below it" {
+    const address = (try parseAgentAddress("abc123/reviewer/helper-2")).?;
+    try std.testing.expectEqualStrings("abc123", address.root);
+    try std.testing.expectEqual(@as(usize, 2), address.names().len);
+    try std.testing.expectEqualStrings("reviewer", address.names()[0]);
+    try std.testing.expectEqualStrings("helper-2", address.names()[1]);
+    try std.testing.expectEqual(@as(?AgentAddress, null), try parseAgentAddress("abc123"));
+    for ([_][]const u8{ "abc123/", "/reviewer", "abc123//reviewer", "abc123/Reviewer", "abc123/a b", "../x/reviewer", "abc123/a/b/c/d/e" }) |text| {
+        try std.testing.expectError(error.InvalidSessionId, parseAgentAddress(text));
+    }
+    // The deepest address it takes.
+    try std.testing.expectEqual(@as(usize, max_agent_depth), (try parseAgentAddress("abc123/a/b/c/d")).?.depth);
+}
+
+test "an agent address parses or is refused on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzAgentAddress, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "abc123/reviewer",
+            "abc123/lead/helper",
+            "abc123",
+            "abc123//x",
+            "\xff/\x00",
+        }) ++ @import("fuzz_corpus").session_address.*),
+    });
+}
+
+fn fuzzAgentAddress(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buffer: [512]u8 = undefined;
+    const bytes = buffer[0..@intCast(smith.slice(&buffer))];
+    const address = (parseAgentAddress(bytes) catch return) orelse {
+        try std.testing.expect(std.mem.findScalar(u8, bytes, '/') == null);
+        return;
+    };
+    // What parses is a valid root and valid names, and joins back to the text.
+    try session_store.validateSessionId(address.root);
+    try std.testing.expect(address.depth >= 1 and address.depth <= max_agent_depth);
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    try joined.appendSlice(std.testing.allocator, address.root);
+    for (address.names()) |name| {
+        try std.testing.expect(subagent_domain.validAgentName(name));
+        try joined.append(std.testing.allocator, '/');
+        try joined.appendSlice(std.testing.allocator, name);
+    }
+    try std.testing.expectEqualStrings(bytes, joined.items);
 }
 
 pub const Recovered = struct {
