@@ -3275,11 +3275,8 @@ fn publishPendingToolProgress(ctx: *AskContext, call_id: []const u8, text: []con
         pending.visible = true;
         return;
     }
-    // The line names what the model asked for, such as a toolbox open's
-    // target, so a control sequence in it is written as visible text.
-    const safe = try ctx.alloc.print("{f}\n", .{text_utils.terminalSafe(text)});
-    defer ctx.alloc.free(safe);
-    try ctx.writeStderr(safe);
+    try ctx.writeStderr(text);
+    try ctx.writeStderr("\n");
     pending.visible = true;
 }
 

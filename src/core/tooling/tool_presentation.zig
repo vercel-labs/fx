@@ -660,17 +660,17 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     }
     if (file_mutation_contract.isToolName(call.name)) {
         const spec = input.tool_registry.lookup(call.name) orelse
-            return alloc.print("Working: {s}", .{call.name});
+            return alloc.print("Working: {f}", .{text_utils.terminalSafe(call.name)});
         return alloc.print(
-            "{s} {s}",
-            .{ spec.action_label, input.display_target orelse spec.label_arg_default },
+            "{s} {f}",
+            .{ spec.action_label, text_utils.terminalSafe(input.display_target orelse spec.label_arg_default) },
         );
     }
 
     if (try formatRunCommandActivity(alloc, input.tool_registry, input.workspace_root, call)) |activity| {
         defer alloc.free(activity.detail);
         const action_label = if (activity.compatibility_tool) |tool| tool.action_label else "Running";
-        return alloc.print("{s} {s}", .{ action_label, activity.detail });
+        return alloc.print("{s} {f}", .{ action_label, text_utils.terminalSafe(activity.detail) });
     }
 
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
@@ -682,24 +682,26 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
             const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
                 return alloc.print("Searching web", .{});
             };
-            return alloc.print("Searching {s}", .{try formatWebSearchActionDetail(scratch, args)});
+            return alloc.print("Searching {f}", .{text_utils.terminalSafe(try formatWebSearchActionDetail(scratch, args))});
         }
-        if (input.is_available_dynamic_mcp_tool) return alloc.print("MCP: {s}", .{call.name});
-        return alloc.print("Working: {s}", .{call.name});
+        if (input.is_available_dynamic_mcp_tool) return alloc.print("MCP: {f}", .{text_utils.terminalSafe(call.name)});
+        return alloc.print("Working: {f}", .{text_utils.terminalSafe(call.name)});
     };
     const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
-        return alloc.print("Working: {s}", .{call.name});
+        return alloc.print("Working: {f}", .{text_utils.terminalSafe(call.name)});
     };
 
     const presentation = tool_dispatch.presentationForArgs(spec.*, args);
     if (spec.executor_kind == .web_search) {
-        return alloc.print("{s} {s}", .{ presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
+        return alloc.print("{s} {f}", .{ presentation.action_label, text_utils.terminalSafe(try formatWebSearchActionDetail(scratch, args)) });
     }
     const value = input.display_target orelse
         call.resolved_display_target orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
-    return alloc.print("{s} {s}", .{ presentation.action_label, value });
+    // The value is what the model asked for, such as a toolbox open's target,
+    // so a control sequence in it is written as visible text.
+    return alloc.print("{s} {f}", .{ presentation.action_label, text_utils.terminalSafe(value) });
 }
 
 /// Names an earlier call in the row of a later call that reads its saved
