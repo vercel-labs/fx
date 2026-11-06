@@ -11,6 +11,7 @@
   { "file": "config-persistence.test.ts", "weight": 64 },
   { "file": "configured-providers.test.ts", "weight": 3 },
   { "file": "context-limits-live.test.ts", "weight": 1 },
+  { "file": "doctor.test.ts", "weight": 4 },
   { "file": "file-tool-paths.test.ts", "weight": 6 },
   { "file": "poisoned-repository.test.ts", "weight": 5 },
   { "file": "file-tool-permissions.test.ts", "weight": 2 },

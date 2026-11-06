@@ -39,6 +39,13 @@ const NO_AUTH = {
 };
 
 const serialTest = test.serial;
+
+/** The names of the checks `fx doctor --json` failed, in order. */
+function failedDoctorChecks(stdout: string): string[] {
+  return JSON.parse(stdout).checks
+    .filter((check: { status: string }) => check.status === "fail")
+    .map((check: { name: string }) => check.name);
+}
 const SELECTED_COMPLETION_SGR = "\x1b[1m\x1b[38;5;255m";
 
 function selectedModelStageRow(paneEscapes: string, label: string): string | null {
@@ -1754,11 +1761,13 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
       });
       expect(inertStatus.code).toBe(0);
       expect(inertStatus.stderr).not.toContain("legacy_workspace_preferences");
+      // No credential here, so doctor's auth check fails and nothing else does.
       const inertDoctor = await runFx(["doctor", "--json"], {
         cwd: workspaceRoot,
-        env: { HOME: home },
+        env: { ...NO_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" },
       });
-      expect(inertDoctor.code).toBe(0);
+      expect(inertDoctor.code).toBe(1);
+      expect(failedDoctorChecks(inertDoctor.stdout)).toEqual(["auth"]);
       expect(inertDoctor.stdout).not.toContain("legacy_workspace_preferences");
 
       session = await TmuxSession.create({
@@ -1778,9 +1787,10 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
       writeFileSync(settingsPath, oversized, { mode: 0o600 });
       const oversizedDoctor = await runFx(["doctor", "--json"], {
         cwd: workspaceRoot,
-        env: { HOME: home },
+        env: { ...NO_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" },
       });
-      expect(oversizedDoctor.code).toBe(0);
+      expect(oversizedDoctor.code).toBe(1);
+      expect(failedDoctorChecks(oversizedDoctor.stdout)).toEqual(["config", "auth"]);
       expect(oversizedDoctor.stdout).toContain("settings_too_large");
       expect(readFileSync(settingsPath, "utf8")).toBe(oversized);
 

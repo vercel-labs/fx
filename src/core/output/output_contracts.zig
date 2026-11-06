@@ -781,9 +781,11 @@ pub const McpLocalSnapshot = struct {
     servers: []const mcp_health.ConfiguredServerSnapshot = &.{},
     configuration_issues: []const mcp_health.ConfigurationIssue = &.{},
     inspection_error: ?[]const u8 = null,
+    /// `checked` once doctor has asked each server for its tools.
+    connection_check: enum { not_checked, checked } = .not_checked,
 
     fn writeText(self: McpLocalSnapshot, writer: *std.Io.Writer, alloc: Allocator, prefix: []const u8) !void {
-        try writer.print("[{s}] mcp_connection_check=not_checked\n", .{prefix});
+        try writer.print("[{s}] mcp_connection_check={s}\n", .{ prefix, @tagName(self.connection_check) });
         try writer.print(
             "[{s}] mcp_servers={d} mcp_configuration_issues={d}\n",
             .{ prefix, self.servers.len, self.configuration_issues.len },
@@ -812,7 +814,7 @@ pub const McpLocalSnapshot = struct {
     }
 
     fn writeJson(self: McpLocalSnapshot, writer: *std.Io.Writer) !void {
-        try writer.writeAll("{\"connection_check\":\"not_checked\",\"servers\":[");
+        try writer.print("{{\"connection_check\":\"{s}\",\"servers\":[", .{@tagName(self.connection_check)});
         for (self.servers, 0..) |server, index| {
             if (index > 0) try writer.writeByte(',');
             try std.json.Stringify.value(.{
@@ -1937,6 +1939,8 @@ test "fx sessions convert names each subagent it keeps as it is, in text and JSO
 }
 
 pub const DoctorSnapshot = struct {
+    /// The fx version that ran the checks.
+    version: []const u8 = "",
     workspace_root: []const u8,
     model: []const u8,
     provider: model_provider.ProviderId = .gateway,
@@ -1962,6 +1966,7 @@ pub const DoctorSnapshot = struct {
             "[doctor] ok={d} warn={d} fail={d}\n",
             .{ counts.ok, counts.warn, counts.fail },
         );
+        if (self.version.len > 0) try out.writer.print("[doctor] version={s}\n", .{self.version});
         try out.writer.print("[doctor] workspace={s}\n", .{self.workspace_root});
         try out.writer.print("[doctor] model={s}\n", .{self.model});
         if (self.provider != .gateway) {
@@ -1983,6 +1988,11 @@ pub const DoctorSnapshot = struct {
             try out.writer.writeAll(": ");
             try writeTerminalSafe(&out.writer, alloc, entry.detail);
             try out.writer.writeByte('\n');
+            if (entry.fix) |fix| {
+                try out.writer.writeAll("  fix: ");
+                try writeTerminalSafe(&out.writer, alloc, fix);
+                try out.writer.writeByte('\n');
+            }
         }
 
         return try out.toOwnedSlice();
@@ -2002,6 +2012,10 @@ pub const DoctorSnapshot = struct {
             "{{\"kind\":\"doctor\",\"ok_count\":{d},\"warn_count\":{d},\"fail_count\":{d}",
             .{ counts.ok, counts.warn, counts.fail },
         );
+        if (self.version.len > 0) {
+            try writer.writeAll(",\"version\":");
+            try std.json.Stringify.value(self.version, .{}, writer);
+        }
         try writer.writeAll(",\"workspace\":");
         try std.json.Stringify.value(self.workspace_root, .{}, writer);
         try writer.writeAll(",\"model\":");
@@ -2030,6 +2044,10 @@ pub const DoctorSnapshot = struct {
             try std.json.Stringify.value(checkStatusLabel(entry.status), .{}, writer);
             try writer.writeAll(",\"detail\":");
             try std.json.Stringify.value(entry.detail, .{}, writer);
+            if (entry.fix) |fix| {
+                try writer.writeAll(",\"fix\":");
+                try std.json.Stringify.value(fix, .{}, writer);
+            }
             try writer.writeByte('}');
         }
 
@@ -3470,9 +3488,10 @@ test "core session recovery snapshot text and json stay stable" {
 test "core doctor snapshot text and json stay stable" {
     const checks = [_]doctor_runtime.Check{
         .{ .name = @constCast("auth"), .status = .ok, .detail = @constCast("AI_GATEWAY_API_KEY is configured") },
-        .{ .name = @constCast("gh"), .status = .warn, .detail = @constCast("GitHub CLI not found in PATH") },
+        .{ .name = @constCast("gh"), .status = .warn, .detail = @constCast("GitHub CLI not found in PATH"), .fix = "install gh from https://cli.github.com" },
     };
     const snapshot = DoctorSnapshot{
+        .version = "0.0.16",
         .workspace_root = "/tmp/fx",
         .model = "alpha",
         .auth = .{ .active_source = .ai_gateway_api_key },
@@ -3484,14 +3503,14 @@ test "core doctor snapshot text and json stay stable" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[doctor] ok=1 warn=1 fail=0\n[doctor] workspace=/tmp/fx\n[doctor] model=alpha\n[doctor] auth=AI_GATEWAY_API_KEY\n[doctor] auth_refreshable=false\n[doctor] permission_mode=ask\n[doctor] agent_step_limit=24\n[ok] auth: AI_GATEWAY_API_KEY is configured\n[warn] gh: GitHub CLI not found in PATH\n",
+        "[doctor] ok=1 warn=1 fail=0\n[doctor] version=0.0.16\n[doctor] workspace=/tmp/fx\n[doctor] model=alpha\n[doctor] auth=AI_GATEWAY_API_KEY\n[doctor] auth_refreshable=false\n[doctor] permission_mode=ask\n[doctor] agent_step_limit=24\n[ok] auth: AI_GATEWAY_API_KEY is configured\n[warn] gh: GitHub CLI not found in PATH\n  fix: install gh from https://cli.github.com\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/fx\",\"model\":\"alpha\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"ask\",\"agent_step_limit\":24,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}",
+        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"version\":\"0.0.16\",\"workspace\":\"/tmp/fx\",\"model\":\"alpha\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"ask\",\"agent_step_limit\":24,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\",\"fix\":\"install gh from https://cli.github.com\"}]}",
         json,
     );
 }
