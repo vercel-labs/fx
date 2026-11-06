@@ -3779,6 +3779,86 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    `ACP load and resume refuse, keep, or apply a client system prompt`,
+    async () => {
+      const root = createIsolatedRoot("fx-acp-system-prompt-load-");
+      const gateway = startFakeGateway([
+        finalText("First prompt applied."),
+        finalText("Second prompt applied."),
+        finalText("Second prompt kept."),
+      ]);
+      const systemText = (body: string) => acpGatewayRequest(body).prompt
+        .filter((message) => message.role === "system")
+        .map((message) => acpContentText(message.content))
+        .join("\n");
+      const prompt = (text: string) => ({ mode: "append", content: [{ type: "text", text }] });
+      let sessionId = "";
+      const restore = async (method: string, id: number, extra: object) => await client.request(method, {
+        sessionId,
+        cwd: root.workspace,
+        mcpServers: [],
+        ...extra,
+      }, id) as any;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", {
+          cwd: root.workspace,
+          mcpServers: [],
+          systemPrompt: prompt("FIRST_SYSTEM_PROMPT"),
+        }, 2) as any;
+        sessionId = created.result.sessionId as string;
+        await client.readLine();
+        expect((await runPrompt(client, "One?", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+        expect(systemText(gateway.requests[0]!.body)).toContain("FIRST_SYSTEM_PROMPT");
+        await client.close();
+
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        // A prompt the session can't apply fails the load, which then doesn't happen.
+        const refused = await restore("session/load", 11, {
+          systemPrompt: { mode: "override", content: [{ type: "text", text: "x" }] },
+        });
+        expect(refused.error).toMatchObject({ code: -32602, message: 'systemPrompt.mode supports only "append"' });
+        const notLoaded = await client.request("session/set_mode", { sessionId, modeId: "auto" }, 12) as any;
+        expect(notLoaded.error).toMatchObject({ code: -32002, message: "No active session" });
+
+        // The same prompt again loads the session and writes nothing new.
+        expect((await restore("session/load", 13, { systemPrompt: prompt("FIRST_SYSTEM_PROMPT") })).error).toBeUndefined();
+        // A different one, sent while the session is active, applies from the next turn.
+        expect((await restore("session/load", 14, { systemPrompt: prompt("SECOND_SYSTEM_PROMPT") })).error).toBeUndefined();
+        expect((await runPrompt(client, "Two?", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+        const second = systemText(gateway.requests[1]!.body);
+        expect(second).toContain("SECOND_SYSTEM_PROMPT");
+        expect(second).not.toContain("FIRST_SYSTEM_PROMPT");
+        await client.close();
+
+        // A resume that omits the prompt keeps the one stored last.
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 20);
+        expect((await restore("session/resume", 21, {})).error).toBeUndefined();
+        expect((await runPrompt(client, "Three?", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+        expect(systemText(gateway.requests[2]!.body)).toContain("SECOND_SYSTEM_PROMPT");
+        expect(client.stderr).toBe("");
+        await client.close();
+
+        const log = readFileSync(join(root.home, ".fx", "sessions", "v2", sessionId, "log.jsonl"), "utf8");
+        const stored = log.trimEnd().split("\n").map((line) => JSON.parse(line))
+          .filter((line) => line.kind === "set" && line.key === "client_prompt")
+          .map((line) => JSON.stringify(line.value));
+        expect(stored).toHaveLength(2);
+        expect(stored[0]).toContain("FIRST_SYSTEM_PROMPT");
+        expect(stored[1]).toContain("SECOND_SYSTEM_PROMPT");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
     `ACP session/new cwd selects the session workspace`,
     async () => {
       const root = createIsolatedRoot("fx-acp-session-cwd-");

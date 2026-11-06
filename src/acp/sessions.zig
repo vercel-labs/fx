@@ -762,6 +762,16 @@ fn handleRestoreSession(
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
     };
+    // ACP v1: a prompt the session cannot apply fails the request before any
+    // restore side effect. One that differs from the stored prompt replaces it.
+    var requested_system_prompt = client_instructions.parse(state.alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = client_instructions.parseErrorMessage(err),
+        }),
+    };
+    defer if (requested_system_prompt) |text| state.alloc.free(text);
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
         .message = "Missing params",
@@ -846,6 +856,19 @@ fn handleRestoreSession(
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
             server.cancelAndReapActivePrompt(state);
+            // With the prompt worker reaped, nothing reads the old text.
+            if (requested_system_prompt) |text| if (!std.mem.eql(u8, text, active.client_system_prompt)) {
+                if (active.v2) |session| session.setClientPrompt(text) catch |err| {
+                    debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.internal_error,
+                        .message = "Failed to save the client system prompt",
+                    });
+                };
+                if (active.client_system_prompt.len > 0) state.alloc.free(active.client_system_prompt);
+                active.client_system_prompt = text;
+                requested_system_prompt = null;
+            };
             server.disableSubagentHost(state);
             state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
             const previous_host = active.mcp_host;
@@ -939,12 +962,26 @@ fn handleRestoreSession(
     // same-session `cwd` rebind has already released it above.
     var client_system_prompt: ?[]u8 = restoredClientSystemPrompt(state.alloc, v2.?) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.ClientSystemPromptUnreadable => return state.writer.writeError(alloc, msg.id, .{
+        // A supplied prompt replaces one that can't be read.
+        error.ClientSystemPromptUnreadable => if (requested_system_prompt == null) return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
             .message = "Session client system prompt could not be restored",
-        }),
+        }) else null,
     };
     defer if (client_system_prompt) |text| state.alloc.free(text);
+    if (requested_system_prompt) |text| {
+        // The session writes nothing for the prompt it already holds.
+        v2.?.setClientPrompt(text) catch |err| {
+            debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Failed to save the client system prompt",
+            });
+        };
+        if (client_system_prompt) |old| state.alloc.free(old);
+        client_system_prompt = text;
+        requested_system_prompt = null;
+    }
     // The session's downloads are its blobs (D44).
     session_rt.configureWebFetchArtifactBlobs(alloc, try v2.?.childCapability(), v2.?.id());
     server.cancelAndReapActivePrompt(state);
