@@ -71,9 +71,9 @@ Run flags and env vars never save; setter commands do (see Flags). Every effecti
 - Group nouns are singular. Plural forms that already exist stay as aliases (`fx sessions`). The target adds `fx session list` as the full form.
 - A command that only shows things never changes anything. A setter command, whose whole job is to change a setting, may save: `fx provider codex`, `fx teams`.
 - Existing aliases stay: `credits`/`balance`, `/credits`/`/balance`, `/usage`/`/cost`, `/quit`/`/exit`, `/image`/`/img`, `fx sessions`.
-- User aliases are planned as `alias.<name>` settings that work as `fx <name>` and `/<name>`. An alias never shadows a built-in command. Today `/alias` only reports that aliases aren't configurable.
+- User aliases are planned as `alias.<name>` settings that work as `fx <name>` and `/<name>`. An alias never shadows a built-in command. Until they exist there is no `/alias` command: the placeholder that only said aliases weren't configurable was removed.
 - `fx foo` never runs an `fx-foo` program from `PATH`. Skills and MCP are the extension points.
-- A hidden command is either internal, and labeled so in its spec, or deprecated. `fx replay` is hidden and labeled as a developer tool in its spec.
+- A hidden command is either internal, and labeled so in its spec, or deprecated. `fx replay` is hidden and labeled as a developer tool in its spec. A command that does nothing yet is removed rather than hidden, and a removed slash command keeps a line in the router's `parse rejects removed slash commands` test.
 - A new top-level command needs a maintainer's explicit approval.
 
 ## Flags

@@ -48,7 +48,7 @@ Names the maintainers already settled. Reuse them; don't add another spelling. "
 | Test hooks | `FX_TEST_*` |
 | Release channel | `update_channel`; `fx upgrade --channel <name>` saves it, the way a setter command does |
 | Save a default model | `/model` in a session saves it to the profile. `fx config set` refuses the model keys and points there |
-| User aliases | `alias.<name>` (planned) |
+| User aliases | `alias.<name>` (planned); there is no `/alias` command until then |
 
 ## Accounts
 
