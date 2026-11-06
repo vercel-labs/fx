@@ -2556,7 +2556,7 @@ describe("gateway stream lifecycle", () => {
       expect(initialRequest.tools.find((tool) => tool.name === "capability_search")).toBeUndefined();
       expect(toolboxSchema?.inputSchema.type).toBe("object");
       expect(Object.keys(toolboxSchema?.inputSchema.properties ?? {}).sort()).toEqual(
-        ["arguments", "offset", "open", "resource", "run", "search", "server"],
+        ["arguments", "cursor", "kind", "limit", "offset", "open", "resource", "run", "search", "server"],
       );
 
       const available = taggedBlock(gateway.requests[0]!.body, "toolbox");
@@ -8010,10 +8010,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(gateway.requests[0]!.body).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
       expect(gateway.requests[0]!.body).not.toContain("EXACT_SCHEMA_QUERY_SENTINEL");
       expect(existsSync(mcp.readyPath)).toBe(true);
+      // The search returns the tool with its arguments, as its result, not
+      // as a tool; the server's instructions come only with an open.
       const searchOutput = toolResultOutput(gateway.requests[1]!.body, searchCallId);
       expect(searchOutput).toContain(DYNAMIC_MCP_TOOL_NAME);
+      expect(searchOutput).toContain("EXACT_SCHEMA_QUERY_SENTINEL");
       expect(searchOutput).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
-      expect(searchOutput).not.toContain("EXACT_SCHEMA_QUERY_SENTINEL");
       const opened = toolResultOutput(gateway.requests[2]!.body, openCallId);
       expect(opened).toContain("EXACT_SCHEMA_QUERY_SENTINEL");
       expect(opened).toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");

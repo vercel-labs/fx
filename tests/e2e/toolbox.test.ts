@@ -458,7 +458,8 @@ describe("toolbox", () => {
       JSON.stringify((JSON.parse(body) as Body).prompt.filter((message) => message.role === "user").at(-1) ?? "");
     gateway = startDynamicFakeGateway((body) => {
       if (latestUser(body).includes("Subagent report")) return fakeGatewayFinalText("TOOLBOX_PARENT_DONE");
-      if (body.includes(childTask) && !body.includes('"toolCallId":"parent_start"')) {
+      // A model request of the child's: fx's side requests carry no tools.
+      if (body.includes(childTask) && !body.includes('"toolCallId":"parent_start"') && toolNames(JSON.parse(body) as Body).length > 0) {
         childBodies.push(body);
         if (!body.includes('"toolCallId":"child_run_shell"')) {
           return fakeGatewayToolCall("child_run_shell", "toolbox", {
@@ -638,7 +639,8 @@ describe("toolbox", () => {
       JSON.stringify((JSON.parse(raw) as Body).prompt.filter((message) => message.role === "user").at(-1) ?? "");
     gateway = startDynamicFakeGateway((raw) => {
       if (latestUser(raw).includes("Subagent report")) return fakeGatewayFinalText("TOOLBOX_FINDER_PARENT_DONE");
-      if (raw.includes(childTask) && !raw.includes('"toolCallId":"parent_start"')) {
+      // A model request of the child's: fx's side requests carry no tools.
+      if (raw.includes(childTask) && !raw.includes('"toolCallId":"parent_start"') && toolNames(JSON.parse(raw) as Body).length > 0) {
         childBodies.push(raw);
         if (!raw.includes('"toolCallId":"child_glob"')) {
           return fakeGatewayToolCall("child_glob", "toolbox", { run: "glob_files", arguments: { pattern: "*.md" } });

@@ -1019,7 +1019,9 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       const bodies = await withHost((body) => {
         const texts = userTexts(body).join("\n");
         if (texts.includes("TREE_FINDER_TASK")) {
-          childAsked = true;
+          // The child's title request carries its task too, before or after
+          // its model request; only a request with tools is the child's turn.
+          if (toolNames(body).length > 0) childAsked = true;
           return text("finder_done", "TREE_FINDER_DONE");
         }
         const last = userTexts(body).at(-1) ?? "";
@@ -1036,8 +1038,9 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         while (!childAsked && Date.now() < deadline) await Bun.sleep(25);
       });
       // The child is shown what its run was admitted with: glob_files sits
-      // behind toolbox for this run, so it keeps toolbox to run it.
-      const child = bodies.filter((body) => userTexts(body).join("\n").includes("TREE_FINDER_TASK"));
+      // behind toolbox for this run, so it keeps toolbox to run it. Its
+      // title request carries the task too, but no tools.
+      const child = bodies.filter((body) => userTexts(body).join("\n").includes("TREE_FINDER_TASK") && toolNames(body).length > 0);
       expect(child.length).toBeGreaterThan(0);
       expect(toolNames(child[0]!)).toContain("toolbox");
       expect(toolNames(child[0]!)).not.toContain("glob_files");

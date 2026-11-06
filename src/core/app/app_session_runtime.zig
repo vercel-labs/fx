@@ -2598,6 +2598,14 @@ pub fn Runtime(comptime App: type) type {
             }
             const host = agent.session_persistence.subagent_host orelse return;
             host.rebindHost(app, subagentAuthorityResolver(app));
+            bindToolboxBehind(app, host);
+        }
+
+        /// Points `host`'s children at the app's tools behind toolbox, so a
+        /// child whose profile lists one keeps toolbox to reach it. Bound
+        /// again after the app moves, as the host's callbacks are.
+        fn bindToolboxBehind(app: *App, host: *subagent_tool_host.Runtime) void {
+            if (comptime @hasField(App, "toolbox_behind")) host.authority_resolver.toolbox_behind = &app.toolbox_behind;
         }
 
         /// Stops the subagent host, joining its child threads, before the
@@ -4470,11 +4478,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             agent.session_persistence.v2_children = children;
-            // A child whose profile lists a tool kept behind toolbox keeps
-            // toolbox.
-            if (comptime @hasField(App, "toolbox_behind")) {
-                agent.session_persistence.subagent_host.?.authority_resolver.toolbox_behind = &app.toolbox_behind;
-            }
+            bindToolboxBehind(app, agent.session_persistence.subagent_host.?);
             // Its children report to this agent, through the main loop.
             if (comptime @hasDecl(App, "postSubagentReport")) {
                 const host = agent.session_persistence.subagent_host.?;
