@@ -2530,6 +2530,7 @@ fn restoredSteeringChatMessage(text: []const u8) core_types.ChatMessage {
 test "a restored subagent frame is never the user's text" {
     const report = agent_frame.report_header ++ "{\"child_id\":\"c1\",\"work_id\":\"w1\"}\n";
     try std.testing.expect(restoredSteeringChatMessage(report).context_origin == .ordinary);
+    try std.testing.expect(restoredSteeringChatMessage(agent_frame.agent_header ++ "{\"text\":\"skip the tests\"}\n").context_origin == .ordinary);
     try std.testing.expect(restoredSteeringChatMessage("focus on rendering").context_origin == .user_turn);
 }
 

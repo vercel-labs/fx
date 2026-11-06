@@ -1595,6 +1595,7 @@ function messageEntries(state, message) {
       ...named,
       ...(message.input === undefined ? {} : { input: message.input }),
       ...(typeof message.target === "string" ? { target: message.target } : {}),
+      ...(message.type === "steer" && message.author === "agent" ? { author: message.author } : {}),
       ...((message.type === "prompt" || message.type === "steer") && message.context !== undefined ? { context: message.context } : {}),
       ...((message.type === "prompt" || message.type === "steer") && message.settings !== undefined ? { settings: message.settings } : {}),
     });
@@ -2254,12 +2255,12 @@ class SessionWorker {
             continue;
           }
           try {
-            turn = harness.prompt(withImages.input ?? "", { turnId: messageId, yieldAt });
+            turn = harness.prompt(withImages.input ?? "", { turnId: messageId, yieldAt, ...(next.author ? { author: next.author } : {}) });
           } catch (error) {
             await log.append({ k: "stopped", messageId });
             return unusable(error);
           }
-          ui.push({ type: "turn_start", messageId, sessionId: this.sessionId, ...(typeof next.input === "string" ? { input: next.input } : {}) });
+          ui.push({ type: "turn_start", messageId, sessionId: this.sessionId, ...(typeof next.input === "string" ? { input: next.input } : {}), ...(next.author ? { author: next.author } : {}) });
           fresh = true;
         }
         turnNow = turn;
@@ -2381,7 +2382,7 @@ class SessionWorker {
       // opener or one that reused the id, which the log never runs.
       if (steer.messageId === messageId) return;
       if (!joinable(steer.input)) endTurn();
-      else if (!ending) void turn.steer(steer.input, steer.messageId).catch(() => {});
+      else if (!ending) void turn.steer(steer.input, steer.messageId, steer.author ? { author: steer.author } : undefined).catch(() => {});
     };
     const apply = async () => {
       if (stopped) return;
@@ -2721,7 +2722,7 @@ function turnView({ messageId, resumeRequest = null, start }) {
  *   a prompt input the harness would refuse. A session's `prompt()` calls it
  *   before it stores anything, so a prompt it refuses is never stored.
  *
- * A harness session has `prompt(input, { turnId, yieldAt })` and
+ * A harness session has `prompt(input, { turnId, yieldAt, author })` and
  * `resume({ yieldAt, rerun })`, each returning a turn, where `rerun: false`
  * runs no call left running again; `openTurn`, the turn its records left
  * open as `{ id, calls? }`, with the calls it left running, or null;
@@ -2729,13 +2730,16 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * every record it started is stored; `saveCheckpoint()`;
  * `exportCheckpoint()`, the conversation as bytes; and `close()`. A turn is
  * an async iterable of the events its viewers see, with `result` resolving
- * `{ stopReason, usage? }`, `steer(text, id)`, and `cancel(options)`, where
+ * `{ stopReason, usage? }`, `steer(text, id, { author })`, and
+ * `cancel(options)`, where
  * `{ reason: "handoff" }` stops it at once and stores nothing more, so the
  * next worker continues it. A turn may have `endForSteer()`, which ends it
  * at its next safe point, at once while its model streams a reply, for a
  * steer that cannot join it; without it, such a steer waits for the turn to
  * end. Either way the steer runs as the next turn. A turn stops before a
  * model request once `yieldAt` has passed, with the stop reason `yielded`.
+ * `author` is `"agent"` for a steer another agent wrote, and absent otherwise;
+ * the model must not read that text as the user's.
  *
  * An input the harness refuses only once a turn runs it is a turn that ends
  * with an error.
@@ -3246,7 +3250,9 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
          * one id names one input of the session, prompt or steer: reusing a
          * prompt's id throws `FX_MESSAGE_ID_IN_USE`, or, where the queue
          * outlives the process and the sender reads no log, the worker drops
-         * the steer and emits a `session.error` with that code. Resolves once
+         * the steer and emits a `session.error` with that code. With `author:
+         * "agent"`, the text is another agent's: the model never reads it as
+         * the user's, whether it joins a turn or starts one. Resolves once
          * the steer is stored, with its id, which the stream's events for it
          * carry.
          */
@@ -3258,6 +3264,8 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
             throw new TypeError("a durable steer carries image data as a base64 string");
           }
           if (steerOptions === null || typeof steerOptions !== "object") throw new TypeError("steer options must be an object");
+          const { author } = steerOptions;
+          if (author !== undefined && author !== "user" && author !== "agent") throw new TypeError('author must be "user" or "agent"');
           const messageId = steerOptions.messageId ?? newId("str");
           if (!validId(messageId)) throw new TypeError(`messageId must be ${idRule}`);
           admit(input);
@@ -3270,7 +3278,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
             named = await storePromptImages((await created.session(sessionId)).images, input);
             if (closed) throw new Error(`${label} is closed`);
           }
-          await send({ type: "steer", messageId, input: named });
+          await send({ type: "steer", messageId, input: named, ...(author === "agent" ? { author } : {}) });
           return { messageId };
         },
         /** Cancels the running turn; dropping a turn's view does not. */

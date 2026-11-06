@@ -6,6 +6,7 @@ const session = @import("session.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const types = @import("../shared/types.zig");
+const agent_frame = @import("../shared/agent_frame.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
@@ -2395,6 +2396,14 @@ fn writeExecutionFileEvidence(
     try writer.writeByte('}');
 }
 
+/// Who wrote a saved turn's opening text. A turn another agent opened holds
+/// that agent's frame, which names it without a new field, so a libfx
+/// checkpoint or journal stays readable by older fx. Text a user typed to
+/// look like the frame counts only as less of the user's own.
+fn savedAuthor(text: []const u8) types.MessageAuthor {
+    return if (agent_frame.isAgentMessage(text)) .agent else .user;
+}
+
 fn parseUserTurn(alloc: Allocator, value: std.json.Value, sources: ImageSources) !session.UserTurn {
     const source = try requireObject(value);
     const object = if (source.count() == 2)
@@ -2411,7 +2420,7 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, sources: ImageSources)
     if (work_id) |id| session.validateWorkId(id) catch return error.InvalidSessionFormat;
     const images_value = object.get("images") orelse return error.InvalidSessionFormat;
     if (images_value != .array) return error.InvalidSessionFormat;
-    if (images_value.array.items.len == 0) return .{ .text = text, .work_id = work_id };
+    if (images_value.array.items.len == 0) return .{ .text = text, .work_id = work_id, .author = savedAuthor(text) };
 
     const images = try alloc.alloc(session.ImageAttachment, images_value.array.items.len);
     errdefer mem_utils.free(alloc, images);
@@ -2478,7 +2487,7 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, sources: ImageSources)
         };
         parsed_count += 1;
     }
-    return .{ .text = text, .images = images, .work_id = work_id };
+    return .{ .text = text, .images = images, .work_id = work_id, .author = savedAuthor(text) };
 }
 
 /// An image's bytes as a parse found them, and its name when the object

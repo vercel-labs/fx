@@ -20,6 +20,15 @@ pub const protocol_version: u32 = 1;
 
 /// Returns the borrowed value at `_meta.fx.<key>` on an ACP params object.
 /// fx reads and writes its protocol extensions under that one namespace.
+/// The author a libfx host named, or null for one it may not name. A host
+/// speaks for the user or for another agent, never for a parent or a child.
+pub fn hostAuthor(value: std.json.Value) ?core_types.MessageAuthor {
+    if (value != .string) return null;
+    if (std.mem.eql(u8, value.string, "user")) return .user;
+    if (std.mem.eql(u8, value.string, "agent")) return .agent;
+    return null;
+}
+
 pub fn fxMetaField(object: std.json.ObjectMap, key: []const u8) ?std.json.Value {
     const meta = object.get("_meta") orelse return null;
     if (meta != .object) return null;
@@ -329,6 +338,7 @@ pub fn writeSteeringUserMessageChunk(
     text: []const u8,
     request_id: ?jsonrpc.RequestId,
     input_id: ?[]const u8,
+    author: core_types.MessageAuthor,
 ) !void {
     try w.writeAll("{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":");
     try writeJsonStr(message_id, w);
@@ -340,23 +350,41 @@ pub fn writeSteeringUserMessageChunk(
         try w.writeAll(",\"inputId\":");
         try writeJsonStr(id, w);
     }
+    if (author != .user) {
+        try w.writeAll(",\"author\":");
+        try writeJsonStr(@tagName(author), w);
+    }
     try w.writeAll("}}}}");
 }
 
 test "steering replay carries a libfx input id only when it has one" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeSteeringUserMessageChunk(&out.writer, "m1", "use tabs", .{ .integer = 4 }, null);
+    try writeSteeringUserMessageChunk(&out.writer, "m1", "use tabs", .{ .integer = 4 }, null, .user);
     try std.testing.expectEqualStrings(
         "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m1\",\"content\":{\"type\":\"text\",\"text\":\"use tabs\"},\"_meta\":{\"fx\":{\"steering\":{\"requestId\":4}}}}",
         out.written(),
     );
     out.clearRetainingCapacity();
-    try writeSteeringUserMessageChunk(&out.writer, "m2", "be brief", null, "s1");
+    try writeSteeringUserMessageChunk(&out.writer, "m2", "be brief", null, "s1", .user);
     try std.testing.expectEqualStrings(
         "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m2\",\"content\":{\"type\":\"text\",\"text\":\"be brief\"},\"_meta\":{\"fx\":{\"steering\":{\"requestId\":null,\"inputId\":\"s1\"}}}}",
         out.written(),
     );
+    out.clearRetainingCapacity();
+    try writeSteeringUserMessageChunk(&out.writer, "m3", "skip tests", null, "s2", .agent);
+    try std.testing.expectEqualStrings(
+        "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m3\",\"content\":{\"type\":\"text\",\"text\":\"skip tests\"},\"_meta\":{\"fx\":{\"steering\":{\"requestId\":null,\"inputId\":\"s2\",\"author\":\"agent\"}}}}",
+        out.written(),
+    );
+}
+
+test "a libfx host names the user or another agent, and no one else" {
+    try std.testing.expectEqual(@as(?core_types.MessageAuthor, .user), hostAuthor(.{ .string = "user" }));
+    try std.testing.expectEqual(@as(?core_types.MessageAuthor, .agent), hostAuthor(.{ .string = "agent" }));
+    try std.testing.expectEqual(@as(?core_types.MessageAuthor, null), hostAuthor(.{ .string = "parent" }));
+    try std.testing.expectEqual(@as(?core_types.MessageAuthor, null), hostAuthor(.{ .string = "child" }));
+    try std.testing.expectEqual(@as(?core_types.MessageAuthor, null), hostAuthor(.{ .integer = 1 }));
 }
 
 pub fn writePromptResponseWithUsage(

@@ -1,9 +1,11 @@
 const std = @import("std");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 const max_message_bytes: usize = 64 * 1024;
 const max_messages: usize = 64;
 const max_id_bytes: usize = 128;
+const agent_author = "agent";
 
 extern "fx" fn fx_steering_take(output_ptr: [*]u8, output_cap: usize) i32;
 extern "fx" fn fx_steering_close() void;
@@ -35,12 +37,14 @@ pub fn state() State {
 pub const Taken = struct {
     id: ?[]u8,
     text: []u8,
+    author: types.MessageAuthor = .user,
 };
 
 /// Drains host-owned libfx steering into allocator-owned entries. The host
-/// writes each as its id, a newline, then the text; an empty id means none.
+/// writes each as its id, a newline, its author, a newline, then the text.
+/// An empty id means none, and an empty author means the user.
 pub fn takeAll(alloc: Allocator) ![]Taken {
-    const scratch = try alloc.alloc(u8, max_id_bytes + 1 + max_message_bytes);
+    const scratch = try alloc.alloc(u8, max_id_bytes + 1 + agent_author.len + 1 + max_message_bytes);
     defer alloc.free(scratch);
     var taken: std.ArrayList(Taken) = .empty;
     errdefer {
@@ -59,11 +63,20 @@ pub fn takeAll(alloc: Allocator) ![]Taken {
         if (len > scratch.len) return error.HostSteeringFailed;
         const framed = scratch[0..len];
         const split = std.mem.findScalar(u8, framed, '\n') orelse return error.HostSteeringFailed;
-        if (split > max_id_bytes or framed.len - split - 1 > max_message_bytes) return error.HostSteeringFailed;
+        const after_id = framed[split + 1 ..];
+        const author_end = std.mem.findScalar(u8, after_id, '\n') orelse return error.HostSteeringFailed;
+        const text = after_id[author_end + 1 ..];
+        if (split > max_id_bytes or text.len > max_message_bytes) return error.HostSteeringFailed;
+        const author: types.MessageAuthor = if (author_end == 0)
+            .user
+        else if (std.mem.eql(u8, after_id[0..author_end], agent_author))
+            .agent
+        else
+            return error.HostSteeringFailed;
         try taken.ensureUnusedCapacity(alloc, 1);
         const id = if (split == 0) null else try alloc.dupe(u8, framed[0..split]);
         errdefer if (id) |value| alloc.free(value);
-        taken.appendAssumeCapacity(.{ .id = id, .text = try alloc.dupe(u8, framed[split + 1 ..]) });
+        taken.appendAssumeCapacity(.{ .id = id, .text = try alloc.dupe(u8, text), .author = author });
     }
     if (taken.items.len == 0) {
         taken.deinit(alloc);

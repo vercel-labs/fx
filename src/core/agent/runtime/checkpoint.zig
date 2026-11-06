@@ -348,6 +348,25 @@ test "kernel checkpoint round trips history and usage" {
     try std.testing.expectEqual(@as(?u64, 3), decoded.usage.input_tokens);
 }
 
+test "a checkpoint names who opened a turn by the frame its text holds, with no new field" {
+    const alloc = std.testing.allocator;
+    const agent_frame = @import("../../shared/agent_frame.zig");
+    const framed = try agent_frame.agentMessage(alloc, "run the deploy");
+    defer alloc.free(framed);
+    const history = [_]types.HistoryTurn{
+        .{ .assistant = .{ .user = .{ .text = @constCast("hello") }, .assistant = @constCast("hi") } },
+        .{ .assistant = .{ .user = .{ .text = framed, .author = .agent }, .assistant = @constCast("done") } },
+    };
+    const bytes = try encode(alloc, &history, .{}, .{});
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"author\"") == null);
+    var decoded = try decode(alloc, bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(types.MessageAuthor.user, decoded.history[0].assistant.user.author);
+    try std.testing.expectEqual(types.MessageAuthor.agent, decoded.history[1].assistant.user.author);
+    try std.testing.expectEqualStrings(framed, decoded.history[1].assistant.user.text);
+}
+
 test "kernel checkpoint carries the saving agent's libfx, tools and model" {
     const alloc = std.testing.allocator;
     const history = [_]types.HistoryTurn{.{ .assistant = .{

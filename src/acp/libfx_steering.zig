@@ -6,6 +6,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
+const types = @import("../core/shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 const RequestId = jsonrpc.RequestId;
@@ -33,6 +34,7 @@ const Entry = struct {
     request_id: ?RequestId = null,
     /// The libfx input id a journaled session records the text under.
     input_id: ?[]u8 = null,
+    author: types.MessageAuthor = .user,
 };
 
 /// Steering drained at one boundary, allocated in the caller's allocator.
@@ -40,6 +42,7 @@ pub const Drained = struct {
     texts: [][]u8,
     request_ids: []?RequestId,
     input_ids: []?[]u8 = &.{},
+    authors: []types.MessageAuthor = &.{},
 };
 
 /// A libfx input id: 1 to 128 letters, digits, `.`, `_`, or `-`.
@@ -313,8 +316,13 @@ pub const Runtime = struct {
 
     /// Queues a libfx input under `input_id`, which no queued entry may share.
     pub fn enqueueInput(self: *Runtime, alloc: Allocator, text: []const u8, input_id: []const u8) InputError!void {
-        if (!validInputId(input_id)) return error.InvalidInputId;
-        return self.enqueueEntry(alloc, text, null, input_id);
+        return self.enqueueFrom(alloc, text, input_id, .user);
+    }
+
+    /// Queues a libfx input `author` wrote, under `input_id` when it has one.
+    pub fn enqueueFrom(self: *Runtime, alloc: Allocator, text: []const u8, input_id: ?[]const u8, author: types.MessageAuthor) InputError!void {
+        if (input_id) |id| if (!validInputId(id)) return error.InvalidInputId;
+        return self.enqueueEntry(alloc, text, null, input_id, author);
     }
 
     /// Removes the queued input `input_id`. False when it is not queued: the
@@ -341,7 +349,7 @@ pub const Runtime = struct {
         text: []const u8,
         request_id: ?RequestId,
     ) EnqueueError!void {
-        return self.enqueueEntry(alloc, text, request_id, null) catch |err| switch (err) {
+        return self.enqueueEntry(alloc, text, request_id, null, .user) catch |err| switch (err) {
             // Only an input id can be invalid, and none is given here.
             error.InvalidInputId => unreachable,
             else => |other| other,
@@ -354,6 +362,7 @@ pub const Runtime = struct {
         text: []const u8,
         request_id: ?RequestId,
         input_id: ?[]const u8,
+        author: types.MessageAuthor,
     ) InputError!void {
         if (text.len == 0) return error.EmptySteeringMessage;
         if (text.len > max_message_bytes) return error.SteeringMessageTooLarge;
@@ -378,7 +387,7 @@ pub const Runtime = struct {
         const owned_input = if (input_id) |id| try alloc.dupe(u8, id) else null;
         errdefer if (owned_input) |id| alloc.free(id);
         const owned_id = if (request_id) |id| try dupeRequestId(alloc, id) else null;
-        self.messages.appendAssumeCapacity(.{ .text = owned, .request_id = owned_id, .input_id = owned_input });
+        self.messages.appendAssumeCapacity(.{ .text = owned, .request_id = owned_id, .input_id = owned_input, .author = author });
         self.queued_bytes += owned.len;
     }
 
@@ -410,6 +419,8 @@ pub const Runtime = struct {
         errdefer result_alloc.free(request_ids);
         const input_ids = try result_alloc.alloc(?[]u8, count);
         errdefer result_alloc.free(input_ids);
+        const authors = try result_alloc.alloc(types.MessageAuthor, count);
+        errdefer result_alloc.free(authors);
         var copied: usize = 0;
         errdefer for (0..copied) |index| {
             result_alloc.free(texts[index]);
@@ -422,6 +433,7 @@ pub const Runtime = struct {
             input_ids[index] = if (entry.input_id) |id| try result_alloc.dupe(u8, id) else null;
             errdefer if (input_ids[index]) |id| result_alloc.free(id);
             request_ids[index] = if (entry.request_id) |id| try dupeRequestId(result_alloc, id) else null;
+            authors[index] = entry.author;
             copied += 1;
         }
         // Capacity for every queued request was reserved at enqueue.
@@ -432,7 +444,7 @@ pub const Runtime = struct {
         }
         self.messages.clearRetainingCapacity();
         self.queued_bytes = 0;
-        return .{ .texts = texts, .request_ids = request_ids, .input_ids = input_ids };
+        return .{ .texts = texts, .request_ids = request_ids, .input_ids = input_ids, .authors = authors };
     }
 
     /// Stops accepting steering for the finished turn and reports which
@@ -517,6 +529,7 @@ pub fn freeDrained(alloc: Allocator, drained: Drained) void {
     if (drained.request_ids.len > 0) alloc.free(drained.request_ids);
     for (drained.input_ids) |maybe_id| if (maybe_id) |id| alloc.free(id);
     if (drained.input_ids.len > 0) alloc.free(drained.input_ids);
+    if (drained.authors.len > 0) alloc.free(drained.authors);
 }
 
 fn freeEntry(alloc: Allocator, entry: Entry) void {
@@ -565,6 +578,20 @@ test "libfx steering runtime preserves order and releases drained storage" {
     try std.testing.expect(drained.request_ids[0] == null);
     try std.testing.expectEqual(@as(usize, 0), runtime.messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.queued_bytes);
+}
+
+test "libfx steering runtime keeps each input's author" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.open(alloc);
+
+    try runtime.enqueueInput(alloc, "from the user", "in_1");
+    try runtime.enqueueFrom(alloc, "from a peer", "in_2", .agent);
+    try runtime.enqueueFrom(alloc, "from a peer with no id", null, .agent);
+    const drained = try runtime.takeAll(alloc, alloc, false);
+    defer freeDrained(alloc, drained);
+    try std.testing.expectEqualSlices(types.MessageAuthor, &.{ .user, .agent, .agent }, drained.authors);
 }
 
 test "libfx steering runtime bounds each message and total queue" {

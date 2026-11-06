@@ -117,6 +117,9 @@ export async function sessionsAndTurns(agent: FxAgent): Promise<void> {
   await known.steer("Keep the public API backward compatible.");
   const steered = await known.steer("Prefer small diffs.", { messageId: "m12" });
   assertType<Equal<typeof steered.messageId, string>>();
+  await known.steer("Check the other bot's work.", { messageId: "m13", author: "agent" });
+  // @ts-expect-error a steer's author is the user or another agent
+  known.steer("Check the other bot's work.", { author: "parent" });
   await known.steer([
     { type: "text", text: "Match this screenshot." },
     { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
