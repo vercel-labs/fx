@@ -287,7 +287,7 @@ pub const Limits = struct {
 /// The menu's opening, the same in every workspace.
 pub const intro =
     "Skills, MCP servers, and tools you can use through the toolbox tool are listed below; they are not in your tool list.\n" ++
-    "Use toolbox with open to read a skill's instructions, see a tool's arguments, or list an MCP server's tools; with search to find skills and tools by what you need, each tool with its arguments, and with server to search one MCP server, the way into a server with many tools; with run to run a tool by its name with its arguments. To open a name listed under two headings, add kind.\n" ++
+    "Use toolbox with open to read a skill's instructions, see a tool's arguments, or list an MCP server's tools; with search to find skills and tools by what you need, each tool with its arguments; with run to run a tool by its name with its arguments. To use an MCP server, search it with its name as server, then run what you find. To open a name listed under two headings, add kind.\n" ++
     "Use named skills and clearly matching skills before substantive work, and read a selected skill completely, including its required references. A listed server is not a reason to use MCP.\n";
 
 const sections = [_]struct { kind: Kind, title: []const u8, noun: []const u8 }{

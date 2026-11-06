@@ -544,6 +544,8 @@ describe("toolbox", () => {
           const cursor = pageOf(raw, "page_one").next_cursor ?? "missing";
           return fakeGatewayToolCall("page_two", "toolbox", { search: "echoes text", server: big, limit: 20, cursor });
         }
+        // Nothing to look for: the server's tools, a page at a time.
+        if (!raw.includes('"toolCallId":"list_big"')) return fakeGatewayToolCall("list_big", "toolbox", { search: "", server: big, limit: 3 });
         return fakeGatewayFinalText("TOOLBOX_PAGES_DONE");
       }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
       const result = await runFx(["ask", "--json", "--auto", "--no-save", "Look through the MCP servers."], {
@@ -582,6 +584,9 @@ describe("toolbox", () => {
         expect(tool.arguments?.required ?? (tool.open_for_arguments ? ["open"] : [])).not.toEqual([]);
       }
       expect(one.mcp_tools![0]!.arguments?.required).toEqual(["text"]);
+      const listed = pageOf(last, "list_big");
+      expect(listed.mcp_tools?.map((tool) => tool.arguments?.required)).toEqual([["text"], ["text"], ["text"]]);
+      expect(typeof listed.next_cursor).toBe("string");
       expect(many.stats.toolsCall).toEqual([]);
       expectEveryRequestExtendsThePrevious(raws);
     } finally {

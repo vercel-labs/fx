@@ -137,7 +137,7 @@ pub const toolbox = ToolSpec{
                 .{ .name = "offset", .json_type = .integer, .description = "Where to continue a skill file whose last result gave next_offset." },
                 .{ .name = "run", .json_type = .string, .description = "A tool's exact name, to run it." },
                 .{ .name = "arguments", .json_type = .object, .description = "The tool's arguments, for run." },
-                .{ .name = "search", .json_type = .string, .description = "What you need, to find skills and tools, with each tool's arguments." },
+                .{ .name = "search", .json_type = .string, .description = "What you need, to find skills and tools, with each tool's arguments. With server, leave it empty to list that server's tools." },
                 .{ .name = "server", .json_type = .string, .description = "With search, an MCP server from the list to search alone." },
                 .{ .name = "limit", .json_type = .integer, .description = "With search, how many matches to return, 1 to 20. The default is 5." },
                 .{ .name = "cursor", .json_type = .string, .description = "With search and server, an earlier result's next_cursor, for its next page." },
@@ -839,9 +839,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "acfc097382a5f368b25972704187e445727d2ae93db9753ce0912ac2dbc403bb"
+            "2e1a238caf28e4e7cbf4f8efd8bfbebd57a9f47bc9f681331d18bcae0eee8865"
         else
-            "8008c3cd1b75cb33ba3525ab0e7e5ff2e761bc854734e2ecdb5e9c85a008b285",
+            "dd45e787118891ee9de1881df6e718c3de57a89f0423b16c00e2b18f6090265d",
         &actual_hex,
     );
 }

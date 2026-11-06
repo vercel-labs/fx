@@ -81,7 +81,9 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     for ([_]Action{ .open, .run, .search }) |candidate| {
         const value = args.get(@tagName(candidate)) orelse continue;
         if (value != .string) return failure(ctx.allocator, "toolbox open, run, and search take a string");
-        if (std.mem.trim(u8, value.string, " \t\r\n").len == 0) return failure(ctx.allocator, "toolbox open, run, and search must not be empty");
+        // An empty search of one server lists its tools; that is checked
+        // once server is read.
+        if (candidate != .search and std.mem.trim(u8, value.string, " \t\r\n").len == 0) return failure(ctx.allocator, "toolbox open and run must not be empty");
         if (action != null) return failure(ctx.allocator, "toolbox takes exactly one of open, run, or search");
         action = candidate;
         target = value.string;
@@ -131,6 +133,10 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         if (server_value == null) return failure(ctx.allocator, "toolbox cursor goes with a search of one server: pass the same server again");
     }
     if (chosen == .search) {
+        if (std.mem.trim(u8, target, " \t\r\n").len == 0) {
+            if (server_value == null) return failure(ctx.allocator, "toolbox search needs what you are looking for. To list one MCP server's tools, give its name as server and leave search empty.");
+            target = "";
+        }
         _ = lexical_relevance.prepare(target) catch return failure(ctx.allocator, "toolbox search is too long");
     }
 
@@ -551,12 +557,17 @@ pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
             .label_arg_default = "tool",
         };
     };
-    if (args.get("search")) |value| if (value == .string) return .{
-        .activity_kind = .read,
-        .action_label = "Searching toolbox",
-        .completed_action_label = "Searched toolbox",
-        .label_arg_kind = .search,
-        .label_arg_default = "toolbox",
+    if (args.get("search")) |value| if (value == .string) {
+        // An empty search of one server lists that server's tools, so its
+        // row names the server.
+        const lists = std.mem.trim(u8, value.string, " \t\r\n").len == 0 and args.get("server") != null;
+        return .{
+            .activity_kind = .read,
+            .action_label = "Searching toolbox",
+            .completed_action_label = "Searched toolbox",
+            .label_arg_kind = if (lists) .server else .search,
+            .label_arg_default = "toolbox",
+        };
     };
     if (args.get("open")) |value| if (value == .string) return .{
         .activity_kind = .read,
@@ -585,7 +596,7 @@ test "toolbox takes exactly one of open, run, or search" {
     const cases = [_]struct { args: []const u8, reason: []const u8 }{
         .{ .args = "{}", .reason = "toolbox needs one of open, run, or search" },
         .{ .args = "{\"open\":\"a\",\"run\":\"b\"}", .reason = "toolbox takes exactly one of open, run, or search" },
-        .{ .args = "{\"open\":\"  \"}", .reason = "toolbox open, run, and search must not be empty" },
+        .{ .args = "{\"open\":\"  \"}", .reason = "toolbox open and run must not be empty" },
         .{ .args = "{\"run\":3}", .reason = "toolbox open, run, and search take a string" },
         .{ .args = "{\"open\":\"a\",\"arguments\":{}}", .reason = "toolbox arguments go with run" },
         .{ .args = "{\"run\":\"a\",\"arguments\":[]}", .reason = "toolbox arguments must be an object" },
@@ -735,6 +746,10 @@ test "toolbox checks kind, limit, and cursor where each goes" {
         // Skills and MCP tools page apart, so a cursor pages one server's.
         .{ .args = "{\"search\":\"x\",\"cursor\":\"c1\"}", .says = "cursor goes with a search of one server" },
         .{ .args = "{\"open\":\"x\",\"cursor\":\"c1\"}", .says = "cursor goes with search" },
+        // An empty search lists one server's tools, and says so when it has none.
+        .{ .args = "{\"search\":\"\"}", .says = "To list one MCP server's tools, give its name as server" },
+        .{ .args = "{\"search\":\" \",\"limit\":20}", .says = "To list one MCP server's tools, give its name as server" },
+        .{ .args = "{\"open\":\" \"}", .says = "toolbox open and run must not be empty" },
     };
     for (bad) |case| switch (try decodeForTest(case.args)) {
         .input => |input| {
@@ -753,6 +768,10 @@ test "toolbox checks kind, limit, and cursor where each goes" {
     const plain = (try decodeForTest("{\"search\":\"issues\"}")).input;
     defer plain.deinit(std.testing.allocator);
     try std.testing.expectEqual(capability_retrieval.default_limit, plain.as(Input).limit);
+    const listing = (try decodeForTest("{\"search\":\"  \",\"server\":\"linear\",\"limit\":20}")).input;
+    defer listing.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", listing.as(Input).target);
+    try std.testing.expectEqualStrings("linear", listing.as(Input).server.?);
     const kinded = (try decodeForTest("{\"open\":\"linear\",\"kind\":\"mcp_server\"}")).input;
     defer kinded.deinit(std.testing.allocator);
     try std.testing.expectEqual(toolbox_core.Kind.mcp_server, kinded.as(Input).kind.?);
