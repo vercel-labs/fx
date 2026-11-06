@@ -1892,8 +1892,8 @@ describe("gateway stream lifecycle", () => {
     const root = createFixtureRoot("skill-identical-copies");
     const tracePath = join(root.root, "trace.log");
     const copies = [
+      join(root.workspace, ".codex", "skills", "release-notes"),
       join(root.workspace, ".agents", "skills", "release-notes"),
-      join(root.workspace, ".claude", "skills", "release-notes"),
     ];
     for (const directory of copies) {
       mkdirSync(directory, { recursive: true });
