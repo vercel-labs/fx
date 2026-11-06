@@ -5638,10 +5638,12 @@ test "processQueuedPrompt stops repeated distinct terminal corrections after the
         try std.testing.expectEqual(@as(usize, 2), step.tool_calls.len);
         try std.testing.expectEqual(@as(usize, 2), step.tool_results.len);
     }
-    try std.testing.expectEqual(@as(usize, 1), deps.system_notices.items.len);
-    try std.testing.expect(
-        std.mem.find(u8, deps.system_notices.items[0], "no shell effect") != null,
-    );
+    // The turn fails with the notice as its text, as the other loop stops
+    // do, so a parent agent's report says why it ended.
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, deps.finalized_outcome.?);
+    try std.testing.expect(textContains(&deps, "no shell effect"));
+    try std.testing.expect(std.mem.find(u8, deps.history_assistant_text.?, "no shell effect") != null);
+    try std.testing.expectEqual(@as(usize, 0), deps.system_notices.items.len);
 }
 
 test "processQueuedPrompt retains a terminal correction across valid neighboring calls" {
