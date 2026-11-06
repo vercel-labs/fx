@@ -143,6 +143,118 @@ pub const ArgsDecoder = struct {
     }
 };
 
+/// Names the action a model call without one means, or null when it is not
+/// exactly one. See `tool_dispatch.Tool.infer_action_fn`.
+pub const InferActionFn = *const fn (std.json.ObjectMap) ?[]const u8;
+
+/// Returns the arguments a shell call is stored, admitted, and run with: an
+/// exact {"request":{...}} unwrapped, and a missing action filled in when
+/// `infer_action` names exactly one. Null keeps the call as it was sent. The
+/// agent loop applies it to the model's calls and code mode to a program's,
+/// so both take the same arguments. The caller owns the returned bytes.
+pub fn normalizedTerminalRequestArguments(
+    alloc: std.mem.Allocator,
+    arguments_json: []const u8,
+    infer_action: ?InferActionFn,
+) std.mem.Allocator.Error!?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const arena = parsed.arena.allocator();
+    var args = parsed.value;
+    var changed = false;
+    if (args.object.count() == 1) {
+        if (args.object.get("request")) |request| {
+            if (request != .object) return null;
+            args = request;
+            _ = try normalizeTerminalModelInput(arena, &args.object);
+            changed = true;
+        }
+    }
+    if (infer_action) |infer| {
+        if (infer(args.object)) |action| {
+            var with_action = std.json.Value{ .object = .empty };
+            try with_action.object.put(arena, "action", .{ .string = action });
+            var fields = args.object.iterator();
+            while (fields.next()) |entry| {
+                try with_action.object.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+            }
+            args = with_action;
+            changed = true;
+        }
+    }
+    if (!changed) return null;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(args, .{}, &out.writer) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+fn terminalActionIs(object: std.json.ObjectMap, action_name: []const u8) bool {
+    const action = object.get("action") orelse return false;
+    return action == .string and std.mem.eql(u8, action.string, action_name);
+}
+
+fn terminalLeaseIsAbsent(value: std.json.Value) bool {
+    return switch (value) {
+        .null => true,
+        .string => |text| isNullPlaceholderText(text),
+        else => false,
+    };
+}
+
+fn elideTerminalNullLease(object: *std.json.ObjectMap) void {
+    const lease = object.get("lease") orelse return;
+    if (!terminalLeaseIsAbsent(lease)) return;
+    _ = object.orderedRemove("lease");
+}
+
+const TerminalModelPayloadMapping = struct {
+    kind: []const u8,
+    model_field: []const u8,
+    internal_field: []const u8,
+};
+
+const terminal_model_payload_mappings = [_]TerminalModelPayloadMapping{
+    .{ .kind = "text", .model_field = "text", .internal_field = "text" },
+    .{ .kind = "keys", .model_field = "keys", .internal_field = "keys" },
+    .{ .kind = "controls", .model_field = "controls", .internal_field = "controls" },
+    .{ .kind = "paste", .model_field = "paste", .internal_field = "text" },
+};
+
+fn terminalPayloadMapping(model_field: []const u8) ?TerminalModelPayloadMapping {
+    for (terminal_model_payload_mappings) |mapping| {
+        if (std.mem.eql(u8, mapping.model_field, model_field)) return mapping;
+    }
+    return null;
+}
+
+fn normalizeTerminalModelInput(
+    arena: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+) std.mem.Allocator.Error!bool {
+    if (!terminalActionIs(object.*, "write")) return false;
+    elideTerminalNullLease(object);
+    if (object.get("write") != null or object.get("lease") != null) {
+        return false;
+    }
+    const input = object.get("input") orelse return false;
+    if (input != .object or input.object.count() != 1) return false;
+    const input_key = input.object.keys()[0];
+    const input_value = input.object.values()[0];
+    const mapping = terminalPayloadMapping(input_key) orelse return false;
+    var write = std.json.Value{ .object = .empty };
+    try write.object.put(arena, "kind", .{ .string = mapping.kind });
+    try write.object.put(arena, mapping.internal_field, input_value);
+    try object.put(arena, "write", write);
+    _ = object.orderedRemove("input");
+    return true;
+}
+
 test "parseToolArgsObject parses object roots" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
