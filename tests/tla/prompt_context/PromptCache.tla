@@ -146,7 +146,7 @@ Block(k, v) == [k |-> k, v |-> v]
 (*   skills   skill catalog: lists each root by absolute path              *)
 (*   project  AGENTS.md project context, tagged with the file's path       *)
 (*   mcp      MCP catalog                                                  *)
-(*   ctx      <fx-turn-context>: worktree path, date, branch               *)
+(*   ctx      <fx-turn-context>: worktree path, date, model, branch        *)
 (*   rt       permission, verification and response-language notes         *)
 (*   scoped   rules from a subfolder AGENTS.md, delivered at tool time     *)
 (*   skill    a named skill's text for its turn                            *)

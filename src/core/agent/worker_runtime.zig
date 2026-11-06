@@ -650,6 +650,9 @@ pub const WorkerRuntime = struct {
     agent_turn_settings: AgentTurnSettings = .{},
     active_agent_turn_settings: ?AgentTurnSettings = null,
     active_context_snapshot: ?*const context_contract.GatheredContextSnapshot = null,
+    /// Borrows the running prompt's model for its runtime context; set and
+    /// cleared alongside `active_context_snapshot`.
+    active_model: ?[]const u8 = null,
     active_prompt_snapshot_ownership: ?*ActivePromptSnapshotOwnership = null,
     preserve_prompt_snapshot_turn_id: ?u64 = null,
 
