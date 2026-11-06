@@ -113,7 +113,7 @@ fn closerMain() void {
     }
     const sig: std.posix.SIG = @fromBackingInt(@intCast(close_signal.load(.seq_cst)));
     const saved = request_recovery.RequestRecovery.closeActive();
-    debug_trace.logf("app", "event=closing signal={d} record_saved={}", .{ close_signal.load(.seq_cst), saved });
+    debug_trace.logf("app", "event=closing signal={d} records_saved={d}", .{ close_signal.load(.seq_cst), saved });
     if (closer_tmux) {
         abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, sig);
     } else {
@@ -131,7 +131,7 @@ fn closerMain() void {
 pub fn closeOnHangup(turn_running: bool) void {
     if (!turn_running) return;
     const saved = request_recovery.RequestRecovery.closeActive();
-    debug_trace.logf("app", "event=closing cause=hangup record_saved={} turn=left_open", .{saved});
+    debug_trace.logf("app", "event=closing cause=hangup records_saved={d} turn=left_open", .{saved});
     if (io_mod.getenv("TMUX") != null) {
         abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, std.posix.SIG.HUP);
     } else {
