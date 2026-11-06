@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const observation = @import("observation.zig");
+const model_call_record = @import("model_call_record.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
 const compactor = @import("../../compactor/compactor.zig");
@@ -13,6 +14,7 @@ const model_provider = @import("../../config/model_provider.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const types = @import("../../shared/types.zig");
+const io_mod = @import("../../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -39,6 +41,8 @@ pub const Request = struct {
     conversation: ?agent_stream_provider.RequestData = null,
     /// Receives what the provider reported the request used.
     usage_out: ?*types.Usage = null,
+    /// Takes the request's record once it settles, for Ctrl+O.
+    model_calls: ?model_call_record.Sink = null,
 };
 
 pub const Reason = enum {
@@ -64,6 +68,12 @@ pub const Outcome = union(enum) {
 
 pub const Error = error{ Cancelled, OutOfMemory };
 
+/// What a request was for, as its call record names it. Only the
+/// compactor reports its requests (`CompactorCaller`).
+fn callPurpose(purpose: observation.ModelPurpose) types.ModelCallPurpose {
+    return if (purpose == .compaction) .compaction else .turn;
+}
+
 /// Sends `request` and waits for the whole reply.
 pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -82,6 +92,7 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
     defer capture.deinit();
     var delivery = runtime_gateway_step.DeliveryCertainty.init();
     var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
+    const started_ms = io_mod.milliTimestamp();
     var streamed = runtime_gateway_step.streamModelCompletion(
         request.stream_provider,
         alloc,
@@ -110,12 +121,32 @@ pub fn complete(alloc: Allocator, request: Request) Error!Outcome {
             .trace_ctx = request.trace_ctx,
             .cooperative_pulse = request.cooperative_pulse,
         },
-    ) catch |err| switch (err) {
-        error.Cancelled => return error.Cancelled,
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return failed(alloc, .transport, "err={s}", .{@errorName(err)}),
+    ) catch |err| {
+        if (request.model_calls) |sink| sink.record(model_call_record.ofError(
+            sink.provider,
+            request.model,
+            callPurpose(request.purpose),
+            started_ms,
+            io_mod.milliTimestamp(),
+            err == error.Cancelled,
+            err,
+        ));
+        return switch (err) {
+            error.Cancelled => error.Cancelled,
+            error.OutOfMemory => error.OutOfMemory,
+            else => failed(alloc, .transport, "err={s}", .{@errorName(err)}),
+        };
     };
     defer streamed.deinit(alloc);
+    if (request.model_calls) |sink| sink.record(model_call_record.ofResult(
+        sink.provider,
+        request.model,
+        callPurpose(request.purpose),
+        started_ms,
+        io_mod.milliTimestamp(),
+        &streamed,
+        request.cancel_flag.load(.seq_cst),
+    ));
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const completion = switch (streamed) {
         .failed => |failure| {
@@ -204,6 +235,8 @@ pub const CompactorCaller = struct {
     /// The request the agent was about to send. A request after the
     /// conversation repeats it unchanged before its own message. Borrowed.
     conversation: ?agent_stream_provider.RequestData = null,
+    /// Takes each request's record once it settles, for Ctrl+O.
+    model_calls: ?model_call_record.Sink = null,
 
     /// Borrows `self`, which must outlive the compaction.
     pub fn caller(self: *CompactorCaller) compactor.ModelCaller {
@@ -267,6 +300,7 @@ pub const CompactorCaller = struct {
             .user = call.user,
             .conversation = conversation,
             .usage_out = &usage,
+            .model_calls = self.model_calls,
         });
         compactor.traceLog(false, "compaction model call model={s} after_conversation={} input_tokens={any} cache_read_tokens={any} cache_write_tokens={any} output_tokens={any}", .{
             call.model,               call.after_conversation, usage.input_tokens, usage.cache_read_tokens,

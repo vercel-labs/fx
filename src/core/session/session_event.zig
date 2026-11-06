@@ -207,6 +207,10 @@ pub const ConversationEvent = union(enum) {
     /// user message. Only a v2 session saves one, as its `runtime_context`
     /// item (D94).
     runtime_context: ConversationRuntimeContext,
+    /// A settled model call, for Ctrl+O and never for the model. Only a v2
+    /// session saves one, as its `model_call` item, which an older fx leaves
+    /// out (D17).
+    model_call: types.ModelCallRecord,
 };
 
 pub const ConversationEnvelope = struct {
@@ -289,6 +293,7 @@ pub fn validateConversationTransition(
         // context; only a v2 session saves them (D93, D94).
         .context_note => return rejectInvalidConversationEvent("context-note-v1"),
         .runtime_context => return rejectInvalidConversationEvent("runtime-context-v1"),
+        .model_call => return rejectInvalidConversationEvent("model-call-v1"),
     }
 }
 
@@ -298,6 +303,24 @@ pub fn validateConversationTransition(
 fn rejectInvalidConversationEvent(comptime rule: []const u8) ConversationTransitionError {
     debug_trace.logf("session", "conversation event rejected rule={s}", .{rule});
     return error.InvalidConversationEvent;
+}
+
+/// The most steps a turn's call record may name, far past any real turn.
+const max_model_call_step: usize = 1 << 20;
+
+/// A call record read from a log fx does not control: every string short,
+/// valid UTF-8 and free of control characters, and its numbers in range.
+fn validateModelCallRecord(record: types.ModelCallRecord) ConversationTransitionError!void {
+    if (record.at_ms < 0) return rejectInvalidConversationEvent("model-call-time");
+    if (record.after_tool_step_count > max_model_call_step or record.after_steering_count > max_model_call_step) {
+        return rejectInvalidConversationEvent("model-call-step");
+    }
+    if (!types.validModelCallText(record.provider) or !types.validModelCallText(record.model)) {
+        return rejectInvalidConversationEvent("model-call-identity");
+    }
+    inline for (.{ record.served_by, record.generation_id, record.finish, record.failure }) |text| {
+        if (text) |value| if (!types.validModelCallText(value)) return rejectInvalidConversationEvent("model-call-text");
+    }
 }
 
 pub fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) ConversationTransitionError!void {
@@ -338,6 +361,7 @@ pub fn validateConversationEventShape(event: ConversationEvent, schema_version: 
             if (value.messages.len == 0) return rejectInvalidConversationEvent("runtime-context-empty");
             for (value.messages) |text| try validateConversationText(text);
         },
+        .model_call => |value| try validateModelCallRecord(value),
         .tool_call => |call| {
             try validateConversationIdentity(call.call_id);
             try validateConversationIdentity(call.tool_name);
@@ -533,7 +557,7 @@ pub fn decodeConversationFrameLeaky(
         return error.InvalidConversationFrame;
     // Every caller reads a v1 log, which never holds a context note or
     // runtime context; only a v2 session saves them (D93, D94).
-    if (value.event == .context_note or value.event == .runtime_context) return error.InvalidConversationFrame;
+    if (value.event == .context_note or value.event == .runtime_context or value.event == .model_call) return error.InvalidConversationFrame;
     return value;
 }
 
@@ -640,13 +664,12 @@ pub fn appendExecutionConversationEvents(
     var note_index: usize = 0;
     try appendContextNoteConversationEvents(alloc, events, execution.context_notes, &note_index, 0);
     var steering_index: usize = 0;
-    while (steering_index < execution.steering.len and
-        execution.steering[steering_index].after_tool_step_count == 0)
-    {
-        try appendSteeringConversationEvents(alloc, events, execution.steering[steering_index]);
-        steering_index += 1;
-    }
+    var call_index: usize = 0;
+    try appendBoundarySteering(alloc, events, execution, &steering_index, &call_index, 0);
     for (execution.tool_steps, 0..) |step, step_index| {
+        // A step's calls come before its pieces: each settles before its
+        // step is saved, so every write only adds to the end.
+        try appendModelCallConversationEvents(alloc, events, execution.model_calls, &call_index, step_index, std.math.maxInt(usize));
         const assistant: []const u8 = step.assistant orelse "";
         const follows_standalone = step_index > 0 and execution.tool_steps[step_index - 1].tool_calls.len == 0;
         if (assistant.len > 0 or step.provider_replay != null or follows_standalone) {
@@ -702,18 +725,56 @@ pub fn appendExecutionConversationEvents(
         }
         const completed_steps = step_index + 1;
         try appendContextNoteConversationEvents(alloc, events, execution.context_notes, &note_index, completed_steps);
-        while (steering_index < execution.steering.len and
-            execution.steering[steering_index].after_tool_step_count == completed_steps)
-        {
-            try appendSteeringConversationEvents(alloc, events, execution.steering[steering_index]);
-            steering_index += 1;
-        }
+        try appendBoundarySteering(alloc, events, execution, &steering_index, &call_index, completed_steps);
     }
+    // The calls of the step still running, or of the turn's last answer. A
+    // record only shows in Ctrl+O, so one naming a step past the turn goes
+    // here too rather than fail the save.
+    try appendModelCallConversationEvents(alloc, events, execution.model_calls, &call_index, std.math.maxInt(usize), std.math.maxInt(usize));
     if (steering_index != execution.steering.len) {
         return rejectInvalidConversationEvent("steering-boundary");
     }
     if (note_index != execution.context_notes.len) {
         return rejectInvalidConversationEvent("context-note-boundary");
+    }
+}
+
+/// The steering at the boundary after `completed_steps` steps. A call of
+/// that boundary saved before a message was delivered goes ahead of it, so
+/// a later save, holding the message, only adds to the end (D96).
+fn appendBoundarySteering(
+    alloc: Allocator,
+    events: *std.ArrayList(ConversationEvent),
+    execution: types.ExecutionMemory,
+    steering_index: *usize,
+    call_index: *usize,
+    completed_steps: usize,
+) !void {
+    while (steering_index.* < execution.steering.len and
+        execution.steering[steering_index.*].after_tool_step_count == completed_steps)
+    {
+        try appendModelCallConversationEvents(alloc, events, execution.model_calls, call_index, completed_steps, steering_index.*);
+        try appendSteeringConversationEvents(alloc, events, execution.steering[steering_index.*]);
+        steering_index.* += 1;
+    }
+}
+
+/// The call records up to step `step` that came before the turn's first
+/// `steering` messages, in the order they settled. Advances `index` past
+/// them.
+fn appendModelCallConversationEvents(
+    alloc: Allocator,
+    events: *std.ArrayList(ConversationEvent),
+    records: []const types.ModelCallRecord,
+    index: *usize,
+    step: usize,
+    steering: usize,
+) !void {
+    while (index.* < records.len and
+        records[index.*].after_tool_step_count <= step and
+        records[index.*].after_steering_count <= steering) : (index.* += 1)
+    {
+        try events.append(alloc, .{ .model_call = records[index.*] });
     }
 }
 

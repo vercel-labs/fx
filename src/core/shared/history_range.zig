@@ -52,6 +52,7 @@ pub fn contextHistoryRange(
         execution.tool_steps = execution.tool_steps[first_step..last_step];
         execution.steering = execution.steering[first_steering..last_steering];
         execution.context_notes = try rebasedContextNotes(arena, execution.context_notes[first_note..last_note], first_step);
+        execution.model_calls = try rebasedModelCalls(arena, execution.model_calls, first_step, first_steering, last_step);
         if (first_step > 0 and execution.steering.len > 0) {
             execution.steering = try arena.dupe(types.PersistedSteering, execution.steering);
             for (execution.steering) |*item| {
@@ -116,6 +117,80 @@ pub fn rebasedContextNotes(
         note.after_tool_step_count -= first_step;
     }
     return rebased;
+}
+
+/// The call records of the steps from `first_step` to `last_step`, counted
+/// from the first as its steering is (D96): a call of a step out of range is
+/// left out with it. `records` are in step order. Borrowed when nothing
+/// moves, otherwise an arena copy; the strings stay borrowed.
+pub fn rebasedModelCalls(
+    arena: Allocator,
+    records: []types.ModelCallRecord,
+    first_step: usize,
+    first_steering: usize,
+    last_step: usize,
+) error{OutOfMemory}![]types.ModelCallRecord {
+    var first: usize = 0;
+    while (first < records.len and records[first].after_tool_step_count < first_step) first += 1;
+    var end = first;
+    while (end < records.len and records[end].after_tool_step_count <= last_step) end += 1;
+    const kept = records[first..end];
+    if (first_step == 0 and first_steering == 0) return kept;
+    const rebased = try arena.dupe(types.ModelCallRecord, kept);
+    for (rebased) |*record| {
+        record.after_tool_step_count -= first_step;
+        record.after_steering_count -|= first_steering;
+    }
+    return rebased;
+}
+
+test "a cut leaves out the calls of the steps it covers and counts the rest from it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var records = [_]types.ModelCallRecord{
+        .{ .at_ms = 1, .provider = "gateway", .model = "m", .after_tool_step_count = 0 },
+        .{ .at_ms = 2, .provider = "gateway", .model = "m", .after_tool_step_count = 1, .after_steering_count = 1 },
+        .{ .at_ms = 3, .provider = "gateway", .model = "m", .after_tool_step_count = 2, .after_steering_count = 3 },
+        .{ .at_ms = 4, .provider = "gateway", .model = "m", .after_tool_step_count = 3, .after_steering_count = 3 },
+    };
+    const kept = try rebasedModelCalls(arena_state.allocator(), &records, 1, 2, 2);
+    try std.testing.expectEqual(@as(usize, 2), kept.len);
+    try std.testing.expectEqual(@as(i64, 2), kept[0].at_ms);
+    try std.testing.expectEqual(@as(usize, 0), kept[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 0), kept[0].after_steering_count);
+    try std.testing.expectEqual(@as(usize, 1), kept[1].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 1), kept[1].after_steering_count);
+    // The saved records stay as they were.
+    try std.testing.expectEqual(@as(usize, 1), records[1].after_tool_step_count);
+    // With nothing cut the records are borrowed whole.
+    try std.testing.expectEqual(records[0..].ptr, (try rebasedModelCalls(arena_state.allocator(), &records, 0, 0, std.math.maxInt(usize))).ptr);
+}
+
+test "a history view inside a turn keeps that turn's calls at its own steps" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var steps = [_]types.ToolExecutionStep{ .{}, .{}, .{} };
+    var steering = [_]types.PersistedSteering{.{ .text = @constCast("update"), .after_tool_step_count = 1 }};
+    var records = [_]types.ModelCallRecord{
+        .{ .at_ms = 1, .provider = "gateway", .model = "m", .after_tool_step_count = 0 },
+        .{ .at_ms = 2, .provider = "gateway", .model = "m", .after_tool_step_count = 1 },
+        .{ .at_ms = 3, .provider = "gateway", .model = "m", .after_tool_step_count = 2, .after_steering_count = 1 },
+        .{ .at_ms = 4, .provider = "gateway", .model = "m", .after_tool_step_count = 3, .after_steering_count = 1 },
+    };
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("go") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = &steps, .steering = &steering, .model_calls = &records },
+    } }};
+    // A compaction inside the turn covered its first two steps and the
+    // steering after the first.
+    const view = try contextHistoryRange(arena_state.allocator(), &history, .{ .turns = 0, .tool_steps = 2, .steering = 1 }, null);
+    const kept = view[0].assistant.execution.model_calls;
+    try std.testing.expectEqual(@as(usize, 2), kept.len);
+    try std.testing.expectEqual(@as(i64, 3), kept[0].at_ms);
+    try std.testing.expectEqual(@as(usize, 0), kept[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 0), kept[0].after_steering_count);
+    try std.testing.expectEqual(@as(usize, 1), kept[1].after_tool_step_count);
 }
 
 test "a cut covers the notes before its boundary and keeps the rest" {

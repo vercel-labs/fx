@@ -990,7 +990,8 @@ describe("gateway stream lifecycle", () => {
       await tui.sendKeys("C-o");
       await tui.waitForText("Could not load status-duplicate", 5_000);
       const details = await tui.waitForText("duplicate-a", 5_000);
-      expect(details).toContain("duplicate-b");
+      // At 48 columns a long path wraps inside itself under the indent.
+      expect(details.replace(/\n {4}/g, "")).toContain("duplicate-b");
       await tui.sendKeys("C-o");
       await tui.waitForComposer(5_000);
       expect(gateway.requests).toHaveLength(2);
@@ -2137,11 +2138,12 @@ describe("gateway stream lifecycle", () => {
         expect(full.indexOf("project instruction file")).toBeLessThan(
           full.indexOf("skill catalog shortened"),
         );
-        expect(full).toContain("! context:");
+        // A notice line leads with its time, then its topic.
+        expect(full).toMatch(/\d{2}:\d{2}:\d{2} · context:/);
         expect(full).not.toContain("[context]");
         const fullGrid = await tui.capturePaneGrid();
         const fullNavigationRow = fullGrid.findIndex((row) =>
-          row.includes("┃ full detail · ctrl+o close")
+          row.includes("esc close · pgup/pgdn scroll")
         );
         expect(fullNavigationRow).toBeGreaterThan(0);
         expect(fullGrid[fullNavigationRow - 1]!.trim()).toBe("");
@@ -2386,7 +2388,8 @@ describe("gateway stream lifecycle", () => {
         expect(full.indexOf("skill resource")).toBeLessThan(
           full.indexOf("MCP schema"),
         );
-        expect(full).toContain("! context:");
+        // A notice line leads with its time, then its topic.
+        expect(full).toMatch(/\d{2}:\d{2}:\d{2} · context:/);
         expect(full).not.toContain("[context]");
         await tui.sendKeys("C-o");
         await tui.waitForPane(

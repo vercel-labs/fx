@@ -2932,12 +2932,24 @@ const App = struct {
         return result;
     }
 
+    /// Writes a call's Ctrl+O line that the pacer held until its text was
+    /// shown.
+    pub fn pacerModelCall(ctx: *anyopaque, record: types.ModelCallRecord) anyerror!void {
+        try app_worker_runtime.writeModelCallNotice(ctx, App.pacerNotice, record);
+    }
+
+    fn pacerNotice(ctx: *anyopaque, notice: types.SemanticNotice) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        try self.writeDomainNotice(notice, true);
+    }
+
     pub fn pacerCallbacks(self: *App) assistant_pacer.TickCallbacks {
         return .{
             .emit_ctx = self,
             .emit_fn = App.pacerEmit,
             .finish_ctx = self,
             .finish_fn = App.pacerFinish,
+            .model_call_fn = App.pacerModelCall,
         };
     }
 
@@ -5346,6 +5358,7 @@ test {
     _ = @import("ui/transcript/transcript_window_shell.zig");
     _ = @import("ui/transcript/transcript_window_runtime_tests.zig");
     _ = @import("ui/transcript/frozen_prefix.zig");
+    _ = @import("ui/assistant/pacer.zig");
     _ = @import("ui/render_engine/assistant_wrap.zig");
     _ = @import("ui/render_engine/transcript_blocks.zig");
     _ = @import("ui/render_engine/transcript_measure.zig");
@@ -5371,8 +5384,10 @@ test {
     _ = @import("builtins/gateway.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
+    _ = @import("core/output/full_transcript_metadata.zig");
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/shared/gateway_error_format.zig");
+    _ = @import("core/shared/history_range.zig");
     _ = @import("core/cli/doctor_runtime.zig");
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/chatgpt_oauth.zig");

@@ -10623,18 +10623,20 @@ test "app_input_runtime full transcript page wheel and alternate-scroll keys scr
     try std.testing.expect(!app.shell.full_transcript.follow_tail);
     try std.testing.expect(app.shell.render_requests.hasReason(.modal));
 
+    // A page is the screen less Ctrl+O's key row and the blank row over it:
+    // 22 of 24 rows.
     try feedRoutingBytes(&app, "\x1b[6~");
-    try std.testing.expectEqual(@as(u32, 20), app.shell.full_transcript.scroll_rows);
+    try std.testing.expectEqual(@as(u32, 22), app.shell.full_transcript.scroll_rows);
 
     try feedRoutingBytes(&app, "\x1b[<64;1;1M");
-    try std.testing.expectEqual(@as(u32, 17), app.shell.full_transcript.scroll_rows);
+    try std.testing.expectEqual(@as(u32, 19), app.shell.full_transcript.scroll_rows);
     try feedRoutingBytes(&app, "\x1b[<65;1;1M");
-    try std.testing.expectEqual(@as(u32, 20), app.shell.full_transcript.scroll_rows);
+    try std.testing.expectEqual(@as(u32, 22), app.shell.full_transcript.scroll_rows);
 
     try feedRoutingBytes(&app, "\x1b[A");
-    try std.testing.expectEqual(@as(u32, 17), app.shell.full_transcript.scroll_rows);
+    try std.testing.expectEqual(@as(u32, 19), app.shell.full_transcript.scroll_rows);
     try feedRoutingBytes(&app, "\x1b[B");
-    try std.testing.expectEqual(@as(u32, 20), app.shell.full_transcript.scroll_rows);
+    try std.testing.expectEqual(@as(u32, 22), app.shell.full_transcript.scroll_rows);
 
     try std.testing.expect(app.terminal.fullTranscriptScreenActive());
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);

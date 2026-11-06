@@ -71,6 +71,7 @@ const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
 const observation = @import("observation.zig");
+const model_call_record = @import("model_call_record.zig");
 const resend_strategy = @import("resend_strategy.zig");
 const runtime_request_recovery = @import("request_recovery.zig");
 const response_language = @import("response_language.zig");
@@ -3831,7 +3832,7 @@ fn checkpointToolState(
 /// the message that issued them, the newest one (D51).
 fn appendRunningToolCalls(
     deps: *const AgentRuntimeDeps,
-    finalization: *const TurnFinalizationGuard,
+    finalization: *TurnFinalizationGuard,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
     calls: []const types.ToolCall,
@@ -3936,7 +3937,7 @@ fn streamMainCompletion(
 
 fn persistRecoveryCheckpoint(
     deps: *const AgentRuntimeDeps,
-    finalization: *const TurnFinalizationGuard,
+    finalization: *TurnFinalizationGuard,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
     assistant_source: []const u8,
@@ -3976,7 +3977,7 @@ fn persistRecoveryCheckpoint(
 /// such as a finished final reply that recovery must deliver as saved.
 fn persistRecoveryCheckpointWithAction(
     deps: *const AgentRuntimeDeps,
-    finalization: *const TurnFinalizationGuard,
+    finalization: *TurnFinalizationGuard,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
     assistant_source: []const u8,
@@ -4056,7 +4057,7 @@ fn persistRecoveryCheckpointWithAction(
 /// passed, and no steer, subagent, or stop hook continues it.
 fn persistFinalReplyCheckpoint(
     deps: *const AgentRuntimeDeps,
-    finalization: *const TurnFinalizationGuard,
+    finalization: *TurnFinalizationGuard,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
     reply: []const u8,
@@ -4102,7 +4103,7 @@ fn deliversSavedResponse(checkpoint: session_codec.RecoveryCheckpoint) bool {
 /// so a crash during compaction can recover it.
 const CompactionSource = struct {
     deps: *const AgentRuntimeDeps,
-    finalization: *const TurnFinalizationGuard,
+    finalization: *TurnFinalizationGuard,
     arena: Allocator,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
@@ -4273,95 +4274,82 @@ test "running tool calls reach append_turn_piece before they run" {
     try std.testing.expectEqual(@as(usize, 1), sink.appends);
 }
 
-/// Pure formatter for the full-only network record: provider, model, latency,
-/// and the settled outcome. Only enum labels and provider-assigned ids are
-/// rendered; provider-controlled detail text is deliberately excluded.
-fn writeNetworkRecordBody(
-    writer: *std.Io.Writer,
-    provider: []const u8,
-    model: []const u8,
-    elapsed_ms: u64,
-    result: *const runtime_gateway_step.StreamResult,
-) !void {
-    try writer.print("provider: {s} · model: {s} · {d}ms\n", .{ provider, model, elapsed_ms });
-    switch (result.*) {
-        .completed => |*completed| {
-            try writer.writeAll("finish: ");
-            if (completed.completion.finish_reason) |reason| {
-                try writer.writeAll(@tagName(reason));
-            } else {
-                try writer.writeAll("unknown");
-            }
-            if (completed.completion.generation_id) |generation_id| {
-                try writer.print(" · generation: {s}", .{generation_id});
-            }
-            if (completed.completion.resolved_provider) |resolved| {
-                try writer.print(" · served-by: {s}", .{resolved});
-            }
-            try writeUsageTokens(writer, completed.completion.usage);
-        },
-        .failed => |*failure| {
-            try writer.print("failed: {s}", .{@tagName(failure.kind)});
-            if (failure.retry_after_seconds) |seconds| {
-                try writer.print(" · retry after: {d}s", .{seconds});
-            }
-        },
-    }
-}
-
-/// Appends the token-usage line when the completion reports any token counts.
-/// Reported values render exactly, including zero; absent fields are omitted.
-fn writeUsageTokens(writer: *std.Io.Writer, usage: types.Usage) !void {
-    const fields = .{
-        .{ "in", usage.input_tokens },
-        .{ "out", usage.output_tokens },
-        .{ "cache-read", usage.cache_read_tokens },
-        .{ "cache-write", usage.cache_write_tokens },
-        .{ "reasoning", usage.reasoning_tokens },
-    };
-    var wrote_any = false;
-    inline for (fields) |field| {
-        if (field[1]) |count| {
-            try writer.writeAll(if (wrote_any) " · " else "\ntokens: ");
-            wrote_any = true;
-            try writer.print("{d} {s}", .{ count, field[0] });
-        }
-    }
-}
-
-/// Publishes one full-detail record per settled provider request so the
-/// ctrl+o full transcript carries network call outcomes that the footer only
-/// shows transiently. Publication failure never fails the turn.
-fn pushNetworkRecord(
+/// Shows a settled call in Ctrl+O as it happens and keeps it with the turn,
+/// so every later save of the turn carries it. Neither may fail the turn: a
+/// record that can't be shown or kept is traced and dropped.
+fn noteModelCall(
     deps: *const AgentRuntimeDeps,
-    provider: model_provider.ProviderId,
+    finalization: *TurnFinalizationGuard,
+    record: types.ModelCallRecord,
+) void {
+    finalization.recordModelCall(record);
+    publishModelCall(deps, record);
+}
+
+/// `noteModelCall` for a turn request that settled. One whose attempt showed
+/// text waits in `held` until the step accepts the attempt or retries it: a
+/// retry gives that text back only while the attempt added nothing after it
+/// (`discardAssistantAttempt`), so the line shows once that is done.
+fn noteSettledCall(
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    held: *?types.ModelCallRecord,
+    attempt_showed_text: bool,
+    record: types.ModelCallRecord,
+) void {
+    finalization.recordModelCall(record);
+    if (!attempt_showed_text) return publishModelCall(deps, record);
+    if (held.*) |earlier| publishHeldModelCall(deps, earlier);
+    held.* = types.dupeModelCallRecord(std.heap.c_allocator, record) catch |err| {
+        debug_trace.logf("agent", "model call record dropped err={s} dropped=live_call_record", .{@errorName(err)});
+        held.* = null;
+        return;
+    };
+}
+
+fn publishModelCall(deps: *const AgentRuntimeDeps, record: types.ModelCallRecord) void {
+    const owned = types.dupeModelCallRecord(std.heap.c_allocator, record) catch |err| {
+        debug_trace.logf("agent", "model call record dropped err={s} dropped=live_call_record", .{@errorName(err)});
+        return;
+    };
+    publishHeldModelCall(deps, owned);
+}
+
+/// Shows an owned call record in Ctrl+O, giving it to the event queue.
+fn publishHeldModelCall(deps: *const AgentRuntimeDeps, owned: types.ModelCallRecord) void {
+    deps.push_event(deps.ctx, .{ .model_call = owned }) catch |err| {
+        types.freeModelCallRecordStrings(std.heap.c_allocator, owned);
+        debug_trace.logf("agent", "model call record publication failed err={s} dropped=live_call_record", .{@errorName(err)});
+    };
+}
+
+/// The record of a turn request that returned a result, cancelled when a
+/// stop was asked for while it streamed.
+fn settledCallRecord(
+    provider: []const u8,
     model: []const u8,
     started_ms: i64,
     result: *const runtime_gateway_step.StreamResult,
-) void {
-    const elapsed_ms: u64 = @intCast(@max(io_mod.milliTimestamp() - started_ms, 0));
-    var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
-    defer body.deinit();
-    writeNetworkRecordBody(&body.writer, provider.label(), model, elapsed_ms, result) catch |err| {
-        debug_trace.logf("agent", "network record format failed err={s}", .{@errorName(err)});
-        return;
-    };
-    // The event channel owns its payload: dupe before transfer, free on
-    // publication failure.
-    const owned = types.dupeSemanticNotice(std.heap.c_allocator, .{
-        .topic = "network",
-        .tone = if (streamSucceeded(result.*)) .neutral else .warning,
-        .body = body.written(),
-        .visibility = .full_only,
-    }) catch |err| {
-        debug_trace.logf("agent", "network record allocation failed err={s}", .{@errorName(err)});
-        return;
-    };
-    deps.push_event(deps.ctx, .{ .full_detail_record = owned }) catch |err| {
-        types.freeSemanticNotice(std.heap.c_allocator, owned);
-        debug_trace.logf("agent", "network record publication failed err={s}", .{@errorName(err)});
-    };
+    cancel_flag: *const std.atomic.Value(bool),
+) types.ModelCallRecord {
+    return model_call_record.ofResult(provider, model, .turn, started_ms, io_mod.milliTimestamp(), result, cancel_flag.load(.seq_cst));
 }
+
+/// The turn's model call sink for requests made outside the step loop, such
+/// as compaction (`model_call_record.Sink`).
+const TurnModelCalls = struct {
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+
+    fn sink(self: *TurnModelCalls, provider: []const u8) model_call_record.Sink {
+        return .{ .context = self, .record_fn = record, .provider = provider };
+    }
+
+    fn record(context: *anyopaque, value: types.ModelCallRecord) void {
+        const self: *TurnModelCalls = @ptrCast(@alignCast(context));
+        noteModelCall(self.deps, self.finalization, value);
+    }
+};
 
 fn streamFailure(result: runtime_gateway_step.StreamResult) ?agent_stream_provider.Failure {
     return switch (result) {
@@ -7458,6 +7446,10 @@ fn processQueuedPromptLoop(
         var successful_vision_route: runtime_vision_contracts.VisionRoute = .native_images;
         var successful_vision_mode: runtime_gateway_step.VisionToolMode = .unavailable;
         var reset_stream_for_next_attempt = false;
+        // A call whose attempt showed text, shown once the step accepts the
+        // attempt or a retry has given that text back (`noteSettledCall`).
+        var held_live_call: ?types.ModelCallRecord = null;
+        defer if (held_live_call) |held| publishHeldModelCall(deps, held);
         // The current failure's HTTP error notice is already on screen.
         var http_failure_notice_shown = false;
         // The next send reads the stored credential again, after a sign-in.
@@ -7523,6 +7515,8 @@ fn processQueuedPromptLoop(
             if (reset_stream_for_next_attempt) {
                 try stream_ctx.beginRecoveryAttempt();
                 reset_stream_for_next_attempt = false;
+                if (held_live_call) |held| publishHeldModelCall(deps, held);
+                held_live_call = null;
             }
 
             gateway_model = job.model;
@@ -7927,8 +7921,10 @@ fn processQueuedPromptLoop(
                         .tool_evidence = preserved_tool_evidence,
                         .trace_ctx = step_ctx,
                     };
+                    var turn_model_calls: TurnModelCalls = .{ .deps = deps, .finalization = finalization };
                     var summary_model: runtime_text_completion.CompactorCaller = .{
                         .observer = deps.observer,
+                        .model_calls = turn_model_calls.sink(job.provider.label()),
                         .stream_provider = deps.agent_stream_provider,
                         .cooperative_transport_pulse = deps.cooperative_transport_pulse,
                         .provider = job.provider,
@@ -8133,6 +8129,9 @@ fn processQueuedPromptLoop(
                     debug_trace.logf("agent", "token progress publication failed source=gateway_error err={s}", .{@errorName(progress_err)});
                 };
                 const cancel_requested = config.cancel_flag.load(.seq_cst);
+                // A stopped call is noted once its text is out (below).
+                const thrown_at_ms = io_mod.milliTimestamp();
+                if (!cancel_requested) noteSettledCall(deps, finalization, &held_live_call, stream_ctx.raw_text.items.len > 0, model_call_record.ofError(job.provider.label(), gateway_model, .turn, gateway_wait_started_ms, thrown_at_ms, false, err));
                 const consumed_attempts = (request_recovery.attempt() - 1) +
                     @as(usize, @intFromBool(gateway_attempt_evidence.provider_admitted));
                 const network_failure = if (gateway_attempt_evidence.network_failure) |evidence| blk: {
@@ -8239,6 +8238,8 @@ fn processQueuedPromptLoop(
                     );
                     const interruption_source = stream_ctx.interruption_source_or("");
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+                    // The stopped call's line goes after what text it wrote.
+                    if (cancel_requested) noteModelCall(deps, finalization, model_call_record.ofError(job.provider.label(), gateway_model, .turn, gateway_wait_started_ms, thrown_at_ms, true, err));
                     if (try append_immediate_steering_after_cancel(
                         deps,
                         arena,
@@ -8330,7 +8331,7 @@ fn processQueuedPromptLoop(
                 return err;
             };
             stream_result_set = true;
-            pushNetworkRecord(deps, job.provider, gateway_model, gateway_wait_started_ms, &stream_result);
+            noteSettledCall(deps, finalization, &held_live_call, stream_ctx.raw_text.items.len > 0, settledCallRecord(job.provider.label(), gateway_model, gateway_wait_started_ms, &stream_result, config.cancel_flag));
             const first_failure = streamFailure(stream_result);
             const auth_replay = auth_transition.decideAuthReplay(.{
                 .authentication_rejected = first_failure != null and first_failure.?.kind == .unauthorized,
@@ -8359,7 +8360,7 @@ fn processQueuedPromptLoop(
                     const replay_wait_started_ms = io_mod.milliTimestamp();
                     request_started_ms = replay_wait_started_ms;
                     stream_result = try streamMainCompletion(deps, arena, model_request);
-                    pushNetworkRecord(deps, job.provider, gateway_model, replay_wait_started_ms, &stream_result);
+                    noteSettledCall(deps, finalization, &held_live_call, stream_ctx.raw_text.items.len > 0, settledCallRecord(job.provider.label(), gateway_model, replay_wait_started_ms, &stream_result, config.cancel_flag));
                     debug_trace.eventf(
                         "auth",
                         "authenticated_request_replayed",
@@ -8991,6 +8992,9 @@ fn processQueuedPromptLoop(
             break;
         }
         defer if (stream_result_set) stream_result.deinit(arena);
+        // The accepted call's line, after its text and before its tools.
+        if (held_live_call) |held| publishHeldModelCall(deps, held);
+        held_live_call = null;
 
         var completion = streamCompletion(stream_result);
         const provider_replay: ?types.ProviderReplay = if (completion.provider_state_json) |parts| replay: {
@@ -12653,49 +12657,4 @@ test "malformed duplicate unauthorized and path Vision calls settle no image ids
         &catalog,
     ));
     try std.testing.expectEqual(@as(usize, 0), settled_ids.items.len);
-}
-
-test "writeNetworkRecordBody renders completed and failed outcomes" {
-    const alloc = std.testing.allocator;
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-
-    var completed: runtime_gateway_step.StreamResult = .{ .completed = .{ .completion = .{
-        .finish_reason = .stop,
-        .generation_id = "gen_test_123",
-        .usage = .{
-            .input_tokens = 1240,
-            .output_tokens = 56,
-            .cache_read_tokens = 900,
-        },
-    } } };
-    try writeNetworkRecordBody(&body.writer, "gateway", "kimi-k3", 812, &completed);
-    try std.testing.expectEqualStrings(
-        "provider: gateway · model: kimi-k3 · 812ms\nfinish: stop · generation: gen_test_123\ntokens: 1240 in · 56 out · 900 cache-read",
-        body.written(),
-    );
-
-    body.clearRetainingCapacity();
-    var failed: runtime_gateway_step.StreamResult = .{ .failed = .{
-        .kind = .rate_limited,
-        .retry_after_seconds = 4,
-    } };
-    try writeNetworkRecordBody(&body.writer, "codex", "gpt-5.2", 1503, &failed);
-    try std.testing.expectEqualStrings(
-        "provider: codex · model: gpt-5.2 · 1503ms\nfailed: rate_limited · retry after: 4s",
-        body.written(),
-    );
-}
-
-test "writeNetworkRecordBody omits absent finish reason and generation" {
-    const alloc = std.testing.allocator;
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-
-    var completed: runtime_gateway_step.StreamResult = .{ .completed = .{} };
-    try writeNetworkRecordBody(&body.writer, "gateway", "m", 0, &completed);
-    try std.testing.expectEqualStrings(
-        "provider: gateway · model: m · 0ms\nfinish: unknown",
-        body.written(),
-    );
 }

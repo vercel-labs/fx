@@ -546,7 +546,7 @@ pub const FakeAgentRuntimeDeps = struct {
     last_execute_grant_count: usize = 0,
     command_complete_count: usize = 0,
     route_recovery_clear_count: usize = 0,
-    full_detail_records: std.ArrayList(types.SemanticNotice) = .empty,
+    model_calls: std.ArrayList(types.ModelCallRecord) = .empty,
     finish_event_count: usize = 0,
     finish_event_attempt_count: usize = 0,
     finish_event_error: ?anyerror = null,
@@ -685,8 +685,8 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.restored_prompts);
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
-        for (self.full_detail_records.items) |notice| types.freeSemanticNotice(self.alloc, notice);
-        self.full_detail_records.deinit(self.alloc);
+        for (self.model_calls.items) |call| types.freeModelCallRecordStrings(self.alloc, call);
+        self.model_calls.deinit(self.alloc);
         freeStringList(self.alloc, &self.context_notices);
         self.route_recovery_statuses.deinit(self.alloc);
         freeStringList(self.alloc, &self.permission_names);
@@ -1657,11 +1657,11 @@ pub const FakeAgentRuntimeDeps = struct {
         defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
         if (self.steering_worker) |worker| try worker.pushEvent(self.alloc, event);
         switch (event) {
-            .full_detail_record => |notice| {
-                const owned = try types.dupeSemanticNotice(self.alloc, notice);
-                errdefer types.freeSemanticNotice(self.alloc, owned);
-                try self.full_detail_records.append(self.alloc, owned);
-                try self.record("full_detail_record:{s}:{s}", .{ notice.topic, notice.body });
+            .model_call => |call| {
+                const owned = try types.dupeModelCallRecord(self.alloc, call);
+                errdefer types.freeModelCallRecordStrings(self.alloc, owned);
+                try self.model_calls.append(self.alloc, owned);
+                try self.record("model_call:{s}:{s}", .{ @tagName(call.outcome), call.model });
             },
             .open_model_picker => try self.record("event:open_model_picker", .{}),
             .clear_route_recovery_status => {

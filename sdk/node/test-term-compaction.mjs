@@ -108,6 +108,10 @@ async function runScenario(name) {
   const seedReply = (turn) => `${turn === 1 ? head : `HOST_HISTORY_MIDDLE_${turn}`}\n${"history alpha beta gamma delta sample line\n".repeat(automatic ? 18_000 : 1_800)}HOST_SEED_DONE_${turn}${turn === seedTurns ? `\n${tail}` : ""}`;
   const activity = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
   const forbidden = /Compacting|compaction|Context compacted|No context to compact|HOST_INTERNAL_HANDOFF_268a/i;
+  // Ctrl+O gives each compaction's model call its own line, as for every call;
+  // nothing else there may speak of compaction.
+  const compactionCallLine = /^  (?:[A-Z][a-z]{2} \d{1,2} )?\d{2}:\d{2}:\d{2} · [^\n]* \(compaction\)$/gm;
+  const withoutCompactionCallLines = (text) => text.replace(compactionCallLine, "");
   const emptyComposer = (text) => text.split("\n").some((line) => /^[ \t]*(?:┃|❯|>)[ \t]*$/.test(line));
   const records = new Map();
   const requests = [];
@@ -221,8 +225,8 @@ async function runScenario(name) {
   async function silentTranscript() {
     assert(!forbidden.test(grid(active.terminal)), "compaction output leaked into inline scrollback");
     active.runtime.write("\x0f");
-    await waitFor(() => active.terminal.buffer.active.type === "alternate" && grid(active.terminal).includes("full detail"), "full transcript");
-    assert(!forbidden.test(grid(active.terminal)), "compaction output leaked into Ctrl+O");
+    await waitFor(() => active.terminal.buffer.active.type === "alternate" && grid(active.terminal).includes("esc close · pgup/pgdn scroll"), "full transcript");
+    assert(!forbidden.test(withoutCompactionCallLines(grid(active.terminal))), "compaction output leaked into Ctrl+O");
     active.runtime.write("\x0f");
     await waitFor(() => active.terminal.buffer.active.type === "normal" && emptyComposer(grid(active.terminal)), "inline restoration");
   }
@@ -289,10 +293,10 @@ async function runScenario(name) {
       phase = "reopen";
       await start(["--resume", sessionId]);
       active.runtime.write("\x0f");
-      await waitFor(() => active.terminal.buffer.active.type === "alternate" && grid(active.terminal).includes("full detail"), "reopened full transcript");
+      await waitFor(() => active.terminal.buffer.active.type === "alternate" && grid(active.terminal).includes("esc close · pgup/pgdn scroll"), "reopened full transcript");
       active.runtime.write("\x1b[F");
       await waitFor(() => grid(active.terminal).includes(cancelledPrompt), "replayed interrupted prompt");
-      assert(!/cancelled|compaction|HOST_INTERNAL_HANDOFF_268a/i.test(grid(active.terminal)), "compaction cancellation must replay silently");
+      assert(!/cancelled|compaction|HOST_INTERNAL_HANDOFF_268a/i.test(withoutCompactionCallLines(grid(active.terminal))), "compaction cancellation must replay silently");
       active.runtime.write("\x0f");
       await waitFor(() => active.terminal.buffer.active.type === "normal" && emptyComposer(grid(active.terminal)), "reopened inline restoration");
       await stop();
