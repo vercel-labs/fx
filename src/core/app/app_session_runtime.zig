@@ -538,9 +538,10 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Gives an instance launched after the first the model the launch
-        /// chose with `--model`, `--provider`, or `FX_MODEL`, which the first
-        /// instance takes through the app's selection at startup. An instance's
+        /// Gives an instance launched after the first, at launch and after each
+        /// `/new`, the model the launch chose with `--model`, `--provider`, or
+        /// `FX_MODEL`, which the first instance takes through the app's
+        /// selection at startup. An instance's
         /// model is its own session preference, and its fresh session still
         /// saves the one it started with, its profile's or the configured one,
         /// as the first instance's does.
@@ -614,21 +615,23 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn beginFreshPersistedSession(app: *App, agent: *AppAgent) !void {
-            return beginFresh(app, agent, .later);
+            return beginFresh(app, agent, .later, null);
         }
 
         /// Starts the session an instance opens with. In a profile, it starts
         /// with and saves the profile's model and effort, so resuming it
         /// brings them back; `--model`, `--effort`, and `FX_MODEL` shape only
-        /// the run that passed them. A fresh session started later, such as
-        /// `/new`'s, keeps the instance's settings as they are by then.
+        /// the run that passed them. A session `/new` starts later begins
+        /// with what the one it replaces had saved (`installFreshLiveSession`).
         pub fn beginInstanceSession(app: *App, agent: *AppAgent) !void {
-            return beginFresh(app, agent, .instance_start);
+            return beginFresh(app, agent, .instance_start, null);
         }
 
         const FreshStart = enum { instance_start, later };
 
-        fn beginFresh(app: *App, agent: *AppAgent, start: FreshStart) !void {
+        /// `carried`, when given, is what the new session starts with in
+        /// place of the workspace's preferences. The caller keeps it.
+        fn beginFresh(app: *App, agent: *AppAgent, start: FreshStart, carried: ?session_codec.DurableSessionPreferences) !void {
             closeWritableSession(app, agent);
             // A fresh session starts with no usage, whether or not it persists.
             agent.total_input_tokens = 0;
@@ -640,7 +643,20 @@ pub fn Runtime(comptime App: type) type {
             defer syncTranscriptWindowSaveMode(app, agent);
             defer syncTranscriptArchiveAvailable(app, agent);
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            if (agent.session_persistence.v2_store) |v2_store| try beginFreshV2Session(app, agent, v2_store, start);
+            if (agent.session_persistence.v2_store) |v2_store| try beginFreshV2Session(app, agent, v2_store, start, carried);
+        }
+
+        /// The preferences `agent`'s open session has saved, or null when it
+        /// has no session or they can't be read. Caller owns.
+        fn savedPreferences(app: *App, agent: *AppAgent) ?session_codec.DurableSessionPreferences {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return null;
+            agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = agent.session_persistence.v2 orelse return null;
+            return v2.currentPreferences(app.alloc) catch |err| {
+                debug_trace.logf("session", "saved preferences unavailable session={s} err={s}; the new session starts from the workspace's", .{ v2.id(), @errorName(err) });
+                return null;
+            };
         }
 
         /// The transcript window drops entries only once the session log holds
@@ -668,10 +684,16 @@ pub fn Runtime(comptime App: type) type {
 
         /// A v2 session starts in memory; its folder appears with the first
         /// turn (D2), so a launch that never prompts leaves nothing behind.
-        fn beginFreshV2Session(app: *App, agent: *AppAgent, v2_store: *session_adapter.Store, start: FreshStart) !void {
-            const workspace_preferences = agent.session_persistence.workspace_preferences orelse
+        fn beginFreshV2Session(
+            app: *App,
+            agent: *AppAgent,
+            v2_store: *session_adapter.Store,
+            start: FreshStart,
+            carried: ?session_codec.DurableSessionPreferences,
+        ) !void {
+            const seed = carried orelse agent.session_persistence.workspace_preferences orelse
                 return error.SessionPreferencesUnavailable;
-            var preferences = try workspace_preferences.dupe(app.alloc);
+            var preferences = try seed.dupe(app.alloc);
             defer preferences.deinit(app.alloc);
             if (comptime agents.hasAgentField(App, "profile")) {
                 if (start == .instance_start) {
@@ -920,9 +942,31 @@ pub fn Runtime(comptime App: type) type {
                 agent.session_persistence.pending_live_session_wait = null;
                 releaseLiveSessionTransitionHold(app, agent);
             }
-            try beginFreshPersistedSession(app, agent);
+            // The new session keeps what the one it replaces had saved: its
+            // profile's model and effort, or a /model or /effort choice, never
+            // a run flag.
+            var carried = agent.session_persistence.next_session_preferences;
+            agent.session_persistence.next_session_preferences = null;
+            defer if (carried) |*value| value.deinit(app.alloc);
+            const keeps_process_model = runsProcessModel(app, agent);
+            try beginFresh(app, agent, .later, carried);
             enableSessionStores(app, agent);
+            // An instance launched after the first runs its session's model,
+            // so the --model or FX_MODEL it ran is laid over it again; the
+            // first keeps the app's selection across sessions.
+            if (keeps_process_model) try applyProcessModelOverride(app, agent);
             try finishLiveSessionTransition(app);
+        }
+
+        /// Whether `agent`, an instance launched after the first, runs the
+        /// model `--model` or `FX_MODEL` chose, not one picked since with
+        /// `/model`.
+        fn runsProcessModel(app: *App, agent: *AppAgent) bool {
+            if (comptime !agents.hasAgentField(App, "role")) return false;
+            if (agent == &app.main_agent or agent.role != .instance) return false;
+            const model = agent.session_persistence.process_model_override orelse return false;
+            const preferences = agent.session_persistence.session_preferences orelse return false;
+            return std.mem.eql(u8, preferences.model, model);
         }
 
         fn releaseLiveSessionTransitionHold(app: *App, agent: *AppAgent) void {
@@ -1018,6 +1062,11 @@ pub fn Runtime(comptime App: type) type {
                 app.subagents.clearProjection(app.alloc);
             }
 
+            // What the session saved, read before it closes, for a fresh
+            // session `installFreshLiveSession` starts next; a resume leaves
+            // it to the next transition, which reads it again.
+            if (agent.session_persistence.next_session_preferences) |*previous| previous.deinit(app.alloc);
+            agent.session_persistence.next_session_preferences = savedPreferences(app, agent);
             closeWritableSession(app, agent);
             app.stopStream(agent);
             app.shell.clearTranscript(app.alloc);
