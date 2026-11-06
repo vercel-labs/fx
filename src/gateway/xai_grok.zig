@@ -5,6 +5,7 @@ const grok_session = @import("../core/auth/grok_session.zig");
 const secret = @import("../core/auth/secret.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
+const testing_listener = @import("../core/shared/testing_listener.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const responses_protocol = @import("responses_protocol.zig");
@@ -711,14 +712,11 @@ const TestResponseFixture = struct {
     fn deinit(self: *@This()) void {
         if (!self.server_open) return;
         self.stopping.store(true, .seq_cst);
-        const zio = self.io();
         if (self.thread) |thread| {
-            const listener = std.Io.net.Stream{ .socket = self.server.socket };
-            listener.shutdown(zio, .both) catch {};
             thread.join();
             self.thread = null;
         }
-        self.server.deinit(zio);
+        self.server.deinit(self.io());
         self.server_open = false;
     }
 
@@ -733,7 +731,7 @@ const TestResponseFixture = struct {
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
             if (self.stopping.load(.seq_cst) and
-                (err == error.SocketNotListening or err == error.BrokenPipe or err == error.ConnectionResetByPeer))
+                (err == error.BrokenPipe or err == error.ConnectionResetByPeer))
             {
                 return;
             }
@@ -743,7 +741,7 @@ const TestResponseFixture = struct {
 
     fn runFallible(self: *@This()) !void {
         const zio = self.io();
-        var stream = try self.server.accept(zio);
+        var stream = (try testing_listener.acceptUnlessStopping(&self.server, zio, &self.stopping)) orelse return;
         defer stream.close(zio);
         try readTestRequest(zio, stream);
         switch (self.mode) {
@@ -774,6 +772,15 @@ const TestResponseFixture = struct {
         }
     }
 };
+
+test "Grok response fixture cleanup joins without a client" {
+    var fixture = try TestResponseFixture.init(.slow_head);
+    defer fixture.deinit();
+    try fixture.start();
+    fixture.deinit();
+    try std.testing.expect(fixture.thread == null);
+    try std.testing.expect(fixture.failure == null);
+}
 
 fn readTestRequest(zio: std.Io, stream: std.Io.net.Stream) !void {
     var socket_buffer: [4096]u8 = undefined;
