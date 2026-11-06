@@ -2736,31 +2736,25 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
 }
 
 fn writeRealStdout(ctx: ?*anyopaque, text: []const u8) !void {
-    writeRealStream(.stdout, text) catch |err| {
+    const written = if (comptime builtin.target.os.tag != .windows)
+        writeFdAll(std.posix.STDOUT_FILENO, text)
+    else
+        std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+    written catch |err| {
         OwnOutput.noteFailure(ctx, err);
         return err;
     };
 }
 
 fn writeRealStderr(ctx: ?*anyopaque, text: []const u8) !void {
-    writeRealStream(.stderr, text) catch |err| {
+    const written = if (comptime builtin.target.os.tag != .windows)
+        writeFdAll(std.posix.STDERR_FILENO, text)
+    else
+        std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
+    written catch |err| {
         OwnOutput.noteFailure(ctx, err);
         return err;
     };
-}
-
-fn writeRealStream(stream: enum { stdout, stderr }, text: []const u8) !void {
-    if (comptime builtin.target.os.tag != .windows) {
-        return writeFdAll(switch (stream) {
-            .stdout => std.posix.STDOUT_FILENO,
-            .stderr => std.posix.STDERR_FILENO,
-        }, text);
-    }
-    const file = switch (stream) {
-        .stdout => std.Io.File.stdout(),
-        .stderr => std.Io.File.stderr(),
-    };
-    try file.writeStreamingAll(io_mod.getIo(), text);
 }
 
 fn writeFdAll(fd: std.posix.fd_t, text: []const u8) !void {
