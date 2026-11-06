@@ -1300,7 +1300,10 @@ pub fn Runtime(comptime App: type) type {
             presentation_shell.normalizeFrameInvalidations(&attempt_invalidations);
             var frame_redraw = snapshot.reasons.count() > 0 or !attempt_invalidations.isEmpty();
 
-            const body_rows: usize = presentation_shell.layout.content_bottom;
+            const body_rows: usize = if (presentation_shell.fullTranscriptActive())
+                presentation_shell.fullTranscriptPageBottom()
+            else
+                presentation_shell.layout.content_bottom;
 
             var prepared_transcript: ?transcript_painter.PreparedTranscriptSurfacePaint = null;
             defer if (prepared_transcript) |*prepared| prepared.deinit(app.alloc);

@@ -7857,7 +7857,7 @@ pub const TranscriptRuntime = struct {
             .up => .up,
             .down => .down,
         }, rows);
-        const local_visible_rows = @max(@as(u32, 1), self.layout.rows -| 4);
+        const local_visible_rows = @max(@as(u32, 1), self.fullTranscriptPageBottom());
         const local_total_rows = if (self.full_transcript_installed_page) |*page|
             self.installedPageMeasurement(page).total_rows
         else
@@ -7906,10 +7906,18 @@ pub const TranscriptRuntime = struct {
 
     fn fullTranscriptPageRows(self: *const TranscriptRuntime) u32 {
         const first_row = if (self.owned_top_row == 0) 1 else self.owned_top_row;
-        if (self.layout.content_bottom >= first_row) {
-            return @max(@as(u32, 1), @as(u32, self.layout.content_bottom - first_row + 1));
+        const bottom = self.fullTranscriptPageBottom();
+        if (bottom >= first_row) {
+            return @max(@as(u32, 1), @as(u32, bottom - first_row + 1));
         }
         return 1;
+    }
+
+    /// The last row Ctrl+O's page fills: above its one-row key footer and
+    /// the blank row over it, whatever the composer would take.
+    pub fn fullTranscriptPageBottom(self: *const TranscriptRuntime) u16 {
+        const footer_layout = render_engine.footer_layout;
+        return self.layout.rows -| (footer_layout.transcript_viewer_rows + footer_layout.transcript_viewer_gap_rows);
     }
 
     pub fn initViewport(self: *TranscriptRuntime, metrics: *Metrics, requested_start_row: u16) !void {

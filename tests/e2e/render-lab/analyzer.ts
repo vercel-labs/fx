@@ -1088,17 +1088,13 @@ function isFooterHintRow(line: string): boolean {
   return text.length > 0 && !isDividerRow(line) && !isInputRow(text);
 }
 
+// Ctrl+O's footer is its keys alone, on the bottom row, under one blank row.
 function hasTranscriptViewerFooter(grid: string[]): boolean {
-  for (let row = 0; row + 2 < grid.length; row += 1) {
-    const navigation = semanticText(grid[row] ?? "").trim();
-    if (navigation !== "esc close · pgup/pgdn scroll") {
-      continue;
-    }
-    if (isSemanticBlank(grid[row + 1] ?? "") && isFooterHintRow(grid[row + 2] ?? "")) {
-      return true;
-    }
-  }
-  return false;
+  let row = grid.length - 1;
+  while (row > 0 && isSemanticBlank(grid[row] ?? "")) row -= 1;
+  return row > 0 &&
+    semanticText(grid[row] ?? "").trim() === "esc close · pgup/pgdn scroll" &&
+    isSemanticBlank(grid[row - 1] ?? "");
 }
 
 function isDividerRow(line: string): boolean {
