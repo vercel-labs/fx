@@ -140,6 +140,7 @@ const FooterSurfaceProjection = struct {
     prepared_slash_menu: picker_presentation.PreparedSlashMenu,
     picker_start_col: u16,
     file_approval_active: bool,
+    transcript_viewer_active: bool,
     allocated_rows: ?u16,
 
     fn deinit(self: *FooterSurfaceProjection, alloc: Allocator) void {
@@ -680,7 +681,9 @@ fn buildFooterSurfaceProjection(
         0;
     const allocated_rows: ?u16 = switch (mode) {
         .measurement => null,
-        .reservation, .frame => if (file_request) |request|
+        .reservation, .frame => if (viewer_active)
+            footer_layout.transcript_viewer_rows
+        else if (file_request) |request|
             approval_ui.fileApprovalDesiredRows(request.preview) +| banner_rows
         else
             null,
@@ -697,7 +700,7 @@ fn buildFooterSurfaceProjection(
         .input_visible = input_visible,
         .composer_top_chrome_rows = composer_top_chrome_rows,
         .picker_rows = picker_rows,
-        .top_gap_rows = if (viewer_active or modal_active) 1 else 0,
+        .top_gap_rows = if (viewer_active) footer_layout.transcript_viewer_gap_rows else if (modal_active) 1 else 0,
         .footer_gap_active = !viewer_active and (modal_active or ctx.steering_messages.len > 0),
         .banner_active = banner_active,
         .banner_rows = banner_rows,
@@ -717,6 +720,7 @@ fn buildFooterSurfaceProjection(
         .prepared_slash_menu = prepared_slash_menu,
         .picker_start_col = geometry.picker_start_col,
         .file_approval_active = file_request != null,
+        .transcript_viewer_active = viewer_active,
         .allocated_rows = allocated_rows,
     };
 }
@@ -915,6 +919,7 @@ pub const SurfaceFooterMeasurement = struct {
     prepared_slash_menu: picker_presentation.PreparedSlashMenu = .{},
     picker_start_col: u16 = 1,
     file_approval_active: bool = false,
+    transcript_viewer_active: bool = false,
 
     pub fn deinit(self: *SurfaceFooterMeasurement, alloc: Allocator) void {
         self.active_label.deinit(alloc);
@@ -954,7 +959,7 @@ pub const SurfaceFooterMeasurement = struct {
     }
 
     pub noinline fn footerReservedBaseRows(self: *const SurfaceFooterMeasurement) u16 {
-        return footer_layout.reservedBaseRows(self.input_visible, self.composer_top_chrome_rows);
+        return footer_layout.surfaceBaseRows(self.transcript_viewer_active, self.input_visible, self.composer_top_chrome_rows);
     }
 
     pub noinline fn frameLayoutMeasurement(self: *const SurfaceFooterMeasurement) render_engine.frame_layout.FooterMeasurement {
@@ -965,7 +970,9 @@ pub const SurfaceFooterMeasurement = struct {
             self.picker_rows +| 1
         else
             0;
-        const input_rows: u16 = if (self.input_visible)
+        const input_rows: u16 = if (self.transcript_viewer_active)
+            footer_layout.transcript_viewer_rows
+        else if (self.input_visible)
             self.footerReservedBaseRows() +| 1 +| self.input_extra
         else
             3;
@@ -999,7 +1006,7 @@ pub const SurfaceFooterMeasurement = struct {
             .picker_rows = self.picker_rows,
             .banner_active = self.banner_active,
             .banner_rows = banner_rows,
-            .allocated_rows = if (self.file_approval_active)
+            .allocated_rows = if (self.file_approval_active or self.transcript_viewer_active)
                 @min(natural_rows, available_rows)
             else
                 null,
@@ -1031,7 +1038,7 @@ pub const SurfaceFooterMeasurement = struct {
             .banner_active = banner_active,
             .banner_rows = banner_rows,
             .footer_extra_rows = self.footer_extra,
-            .allocated_rows = if (self.file_approval_active)
+            .allocated_rows = if (self.file_approval_active or self.transcript_viewer_active)
                 self.frameLayoutMeasurement().natural_rows
             else
                 null,
@@ -1182,6 +1189,7 @@ pub noinline fn measureSurfaceFooter(
     measurement.picker_kind = projection.picker_kind;
     measurement.picker_start_col = projection.picker_start_col;
     measurement.file_approval_active = projection.file_approval_active;
+    measurement.transcript_viewer_active = projection.transcript_viewer_active;
     measurement.picker_rows = projection.picker_rows;
     measurement.top_gap_rows = projection.top_gap_rows;
     measurement.footer_gap_active = projection.footer_gap_active;
@@ -1335,7 +1343,7 @@ pub noinline fn resolveSurfaceFooterReservation(
     defer projection.deinit(alloc);
     if (try surface_invalidation.applyReservationFooterExtraUpdate(shell, force_redraw, .{
         .footer_extra = projection.footer_extra,
-        .footer_reserved_base_rows = footer_layout.reservedBaseRows(projection.input_visible, projection.composer_top_chrome_rows),
+        .footer_reserved_base_rows = footer_layout.surfaceBaseRows(projection.transcript_viewer_active, projection.input_visible, projection.composer_top_chrome_rows),
         .input_extra = projection.input_extra,
         .banner_active = projection.banner_active,
         .picker_rows = projection.picker_rows,
@@ -1438,7 +1446,7 @@ fn prepareSurfaceFooterFrameInternal(
     defer projection.deinit(alloc);
     const footer_extra_update: surface_invalidation.FooterExtraUpdate = .{
         .footer_extra = projection.footer_extra,
-        .footer_reserved_base_rows = footer_layout.reservedBaseRows(projection.input_visible, projection.composer_top_chrome_rows),
+        .footer_reserved_base_rows = footer_layout.surfaceBaseRows(projection.transcript_viewer_active, projection.input_visible, projection.composer_top_chrome_rows),
         .input_extra = projection.input_extra,
         .banner_active = projection.footer_gap_active,
         .picker_rows = projection.picker_rows,

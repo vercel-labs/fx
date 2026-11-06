@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createServer, type Socket } from "node:net";
+import { createServer, type AddressInfo, type Socket } from "node:net";
 import {
   chmodSync,
   copyFileSync,
@@ -62,6 +62,10 @@ function latestUserIsReport(raw: string): boolean {
   return latest.includes(REPORT_HEADER);
 }
 const DEFAULT_MODEL = "spacexai/grok-4.7";
+/** What fx says when it cannot connect to the model catalog and drops fast
+ * mode (`catalogDownNotice` in `src/core/agent/runtime/orchestrator.zig`). */
+const CATALOG_CONNECT_FAST_NOTICE =
+  "fx couldn't connect to AI Gateway to load the model catalog, so fast mode is off until it loads. Check your network connection or firewall.";
 const DELAY_MS = 32_500;
 // What the shell description tells the model to run for a service that
 // outlives fx; macOS has no setsid command (src/builtins/tools.zig).
@@ -457,6 +461,16 @@ function unavailableResponse(retryAfter = "0"): Response {
       },
     },
   );
+}
+
+/** A loopback URL whose port refuses connections: a server takes a free port
+ * and closes it again. */
+async function refusedLoopbackUrl(path: string): Promise<string> {
+  const server = createServer();
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  return `http://127.0.0.1:${port}${path}`;
 }
 
 function fixtureEnv(
@@ -979,7 +993,8 @@ describe("gateway stream lifecycle", () => {
       await tui.sendKeys("C-o");
       await tui.waitForText("Could not load status-duplicate", 5_000);
       const details = await tui.waitForText("duplicate-a", 5_000);
-      expect(details).toContain("duplicate-b");
+      // At 48 columns a long path wraps inside itself under the indent.
+      expect(details.replace(/\n {4}/g, "")).toContain("duplicate-b");
       await tui.sendKeys("C-o");
       await tui.waitForComposer(5_000);
       expect(gateway.requests).toHaveLength(2);
@@ -1633,6 +1648,8 @@ describe("gateway stream lifecycle", () => {
       expect(
         result.stderr.match(/Fast mode is unavailable/g),
       ).toHaveLength(1);
+      // The catalog answered, so nothing blames the connection.
+      expect(result.stderr).not.toContain("couldn't connect");
       expect(gateway.requests).toHaveLength(1);
       const request = JSON.parse(gateway.requests[0]!.body);
       expect(request).not.toHaveProperty("providerOptions.gateway.speed");
@@ -1641,6 +1658,91 @@ describe("gateway stream lifecycle", () => {
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("ask with fast mode names the connection failure once when the model catalog cannot connect", async () => {
+    const root = createFixtureRoot("fast-catalog-refused");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ fast_mode: true }),
+    );
+    const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("STANDARD_SPEED_COMPLETE"));
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Run without the catalog."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+            FX_TEST_GATEWAY_MODELS_URL: await refusedLoopbackUrl("/coding-agent/v1/models"),
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("STANDARD_SPEED_COMPLETE");
+      expect(result.stderr.split(CATALOG_CONNECT_FAST_NOTICE)).toHaveLength(2);
+      expect(result.stderr).not.toContain("Fast mode is unavailable");
+      expect(gateway.requests).toHaveLength(1);
+      const request = JSON.parse(gateway.requests[0]!.body);
+      expect(request).not.toHaveProperty("providerOptions.gateway.speed");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a 100-round tool turn names the catalog connection failure once when the model catalog cannot connect", async () => {
+    const rounds = 100;
+    const root = createFixtureRoot("fast-catalog-refused-rounds");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(
+      join(root.home, ".fx", "settings.json"),
+      JSON.stringify({ fast_mode: true }),
+    );
+    writeFileSync(
+      join(root.workspace, "rounds.txt"),
+      Array.from({ length: rounds }, (_, index) => `round ${index + 1}`).join("\n") + "\n",
+    );
+    let requests = 0;
+    const gateway = startDynamicFakeGateway(() => {
+      requests += 1;
+      if (requests > rounds) return fakeGatewayFinalText("ROUNDS_COMPLETE");
+      return fakeGatewayToolCall(`round_${requests}`, "read_file", {
+        path: "rounds.txt",
+        start_line: requests,
+        line_count: 1,
+      });
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Read every round."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+            FX_TEST_GATEWAY_MODELS_URL: await refusedLoopbackUrl("/coding-agent/v1/models"),
+          },
+          timeoutMs: 120_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("ROUNDS_COMPLETE");
+      expect(gateway.requests).toHaveLength(rounds + 1);
+      // One notice for the turn, not one for each of its requests.
+      expect(result.stderr.split(CATALOG_CONNECT_FAST_NOTICE)).toHaveLength(2);
+      expect(result.stderr).not.toContain("Fast mode is unavailable");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 150_000);
 
   test("fx ask projects explicit permission mode on initial and continuing requests", async () => {
     for (const mode of ["ask", "auto"] as const) {
@@ -2039,11 +2141,12 @@ describe("gateway stream lifecycle", () => {
         expect(full.indexOf("project instruction file")).toBeLessThan(
           full.indexOf("toolbox menu shortened"),
         );
-        expect(full).toContain("! context:");
+        // A notice line leads with its time, then its topic.
+        expect(full).toMatch(/\d{2}:\d{2}:\d{2} · context:/);
         expect(full).not.toContain("[context]");
         const fullGrid = await tui.capturePaneGrid();
         const fullNavigationRow = fullGrid.findIndex((row) =>
-          row.includes("┃ full detail · ctrl+o close")
+          row.includes("esc close · pgup/pgdn scroll")
         );
         expect(fullNavigationRow).toBeGreaterThan(0);
         expect(fullGrid[fullNavigationRow - 1]!.trim()).toBe("");
@@ -2286,7 +2389,8 @@ describe("gateway stream lifecycle", () => {
         expect(full.indexOf("skill resource")).toBeLessThan(
           full.indexOf("MCP schema"),
         );
-        expect(full).toContain("! context:");
+        // A notice line leads with its time, then its topic.
+        expect(full).toMatch(/\d{2}:\d{2}:\d{2} · context:/);
         expect(full).not.toContain("[context]");
         await tui.sendKeys("C-o");
         await tui.waitForPane(

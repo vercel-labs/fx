@@ -4649,11 +4649,25 @@ noinline fn replay(
                     // reader, so strings may point into the page.
                     if (kind == .user) {
                         try builder.begin(try src.withMovedImages(pa, try src.decodeUser(pa, data)));
+                        // Its line says when it was sent, for Ctrl+O.
+                        builder.user.?.sent_at_ms = std.math.cast(i64, entry.ts_ms) orelse 0;
+                        continue;
+                    }
+                    // A call record only shows in Ctrl+O, so one fx can't
+                    // read costs that record, never the session.
+                    if (kind == .model_call) {
+                        if (decodeModelCall(pa, data)) |record| {
+                            try builder.appendModelCall(record);
+                        } else {
+                            debug_trace.logf("session", "event=sessions_v2_model_call_unreadable session={s} dropped=call_record", .{src.id});
+                        }
                         continue;
                     }
                     switch (try decodePiece(pa, kind, data, .alloc_if_needed)) {
                         // Read above, with its images' blobs.
                         .user => unreachable,
+                        // Read above, leaving out one that fails its checks.
+                        .model_call => unreachable,
                         .assistant => |value| {
                             running_text = null;
                             try builder.appendAssistant(value);
@@ -5212,6 +5226,7 @@ fn itemType(kind: PieceKind) ?[]const u8 {
         // An older fx leaves out an item type it does not know (D17, D93, D94).
         .context_note => "context_note",
         .runtime_context => "runtime_context",
+        .model_call => "model_call",
     };
 }
 
@@ -5279,6 +5294,17 @@ fn encodePiece(alloc: Allocator, event: Event) ![]u8 {
     return out.toOwnedSlice();
 }
 
+/// A call record from the log, or null when it can't be parsed or fails its
+/// checks. A newer fx's extra fields are ignored. Strings are in `arena`.
+fn decodeModelCall(arena: Allocator, data: []const u8) ?types.ModelCallRecord {
+    const record = json_decode.parseFromSliceLeaky(types.ModelCallRecord, arena, data, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    session_event.validateConversationEventShape(.{ .model_call = record }, session_event.conversation_schema_version) catch return null;
+    return record;
+}
+
 /// Payload slices point into `arena` or `data`.
 /// With `.alloc_if_needed`, strings may point into `data`.
 fn decodePiece(arena: Allocator, kind: PieceKind, data: []const u8, allocate: std.json.AllocWhen) !Event {
@@ -5306,6 +5332,12 @@ test "v2 conversation pieces stay bounded under fuzzed bytes" {
             "{\"text\":\"n\",\"sources\":[{\"path\":\"\",\"stamp\":0}]}",
             "{\"messages\":[\"<fx-turn-context>\\ngit_branch: main\\n</fx-turn-context>\",\"Runtime context: permission mode is auto.\"]}",
             "{\"messages\":[]}",
+            // Model call records: as fx writes one, one with a newer fx's
+            // extra field, and ones whose provider text must be refused.
+            "{\"at_ms\":1762300000000,\"elapsed_ms\":2140,\"purpose\":\"turn\",\"outcome\":\"completed\",\"provider\":\"gateway\",\"model\":\"anthropic/claude-opus-4.8\",\"served_by\":null,\"generation_id\":\"gen_01JC7P5XQ2M8VZ000000000001\",\"finish\":\"stop\",\"failure\":null,\"retry_after_s\":null,\"input_tokens\":1204,\"output_tokens\":188,\"after_tool_step_count\":0}",
+            "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"cost_usd\":0.01}",
+            "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"generation_id\":\"gen_\\u001b[2J\"}",
+            "{\"at_ms\":-5,\"provider\":\"\",\"model\":\"m\",\"outcome\":\"exploded\"}",
         }) ++ @import("fuzz_corpus").session_conversation_piece.*),
     });
 }
@@ -5318,6 +5350,16 @@ fn fuzzConversationPiece(_: void, smith: *std.testing.Smith) !void {
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena_state.deinit();
         _ = decodePiece(arena_state.allocator(), @field(PieceKind, name), buffer[0..len], .alloc_always) catch {};
+    }
+    // Replay reads a model call record this way instead, and keeps one only
+    // when every string is one Ctrl+O may show.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    if (decodeModelCall(arena_state.allocator(), buffer[0..len])) |record| {
+        try std.testing.expect(types.validModelCallText(record.provider) and types.validModelCallText(record.model));
+        inline for (.{ record.served_by, record.generation_id, record.finish, record.failure }) |text| {
+            if (text) |value| try std.testing.expect(types.validModelCallText(value));
+        }
     }
 }
 
@@ -7343,6 +7385,123 @@ test "a turn's runtime context comes back on resume, saved once right after its 
     for (captured, execution.runtime_context.?) |want, got| try testing.expectEqualStrings(want, got);
     // A later turn that used the saved copy saves none.
     try testing.expect(restored.history[1].assistant.execution.runtime_context == null);
+}
+
+test "a turn's model call records come back on resume at their steps, each saved once" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    var calls = [_]types.ModelCallRecord{
+        .{ .at_ms = 1_000, .outcome = .failed, .provider = "gateway", .model = "m", .failure = "rate_limited", .retry_after_s = 4 },
+        .{ .at_ms = 2_000, .provider = "gateway", .model = "m", .generation_id = "gen_01JC7P5XQ2M8VZ000000000001", .input_tokens = 10 },
+        .{ .at_ms = 3_000, .provider = "gateway", .model = "m", .generation_id = "gen_01JC7P5XQ2M8VZ000000000002", .after_tool_step_count = 1 },
+        .{ .at_ms = 4_000, .provider = "gateway", .model = "m", .generation_id = "gen_01JC7P5XQ2M8VZ000000000003", .after_tool_step_count = 2 },
+    };
+    const user: types.UserTurn = .{ .text = @constCast("two steps") };
+    // The write before the second step's send holds the calls so far, the
+    // one for the step it's about to send last; the commit adds the rest.
+    try s.appendProgress(user, .{ .tool_steps = fixture.steps[0..1], .model_calls = calls[0..3] }, .{});
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = fixture.steps[0..2], .model_calls = &calls },
+    } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    // Every write only added to the turn, so none was superseded, and each
+    // record is on one line.
+    try testing.expect(std.mem.find(u8, bytes, superseded_type) == null);
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, bytes, "\"model_call\""));
+    for (calls[1..]) |call| try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, call.generation_id.?));
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const saved = restored.history[0].assistant.execution.model_calls;
+    try testing.expectEqual(calls.len, saved.len);
+    for (calls, saved) |want, got| {
+        try testing.expectEqual(want.at_ms, got.at_ms);
+        try testing.expectEqual(want.outcome, got.outcome);
+        try testing.expectEqual(want.after_tool_step_count, got.after_tool_step_count);
+        if (want.generation_id) |gen| try testing.expectEqualStrings(gen, got.generation_id.?);
+    }
+    try testing.expectEqualStrings("rate_limited", saved[0].failure.?);
+    try testing.expectEqual(@as(?u32, 4), saved[0].retry_after_s);
+}
+
+test "steering delivered after a saved call at the same step goes after it, so the turn is never rewritten" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    // An empty reply's call is saved, then a report arrives as steering at
+    // the same boundary, then the next call answers.
+    var first = [_]types.ModelCallRecord{
+        .{ .at_ms = 1_000, .provider = "gateway", .model = "m", .generation_id = "gen_01JC7P5XQ2M8VZ000000000001" },
+    };
+    var both = [_]types.ModelCallRecord{
+        first[0],
+        .{ .at_ms = 2_000, .provider = "gateway", .model = "m", .generation_id = "gen_01JC7P5XQ2M8VZ000000000002", .after_steering_count = 1 },
+    };
+    var steering = [_]types.PersistedSteering{.{ .text = @constCast("CHILD_REPORT_TEXT"), .after_tool_step_count = 0 }};
+    const user: types.UserTurn = .{ .text = @constCast("wait for the report") };
+    try s.appendProgress(user, .{ .model_calls = &first }, .{});
+    try s.appendProgress(user, .{ .steering = &steering, .model_calls = &both }, .{});
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .steering = &steering, .model_calls = &both },
+    } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.find(u8, bytes, superseded_type) == null);
+    // In the order they happened, each once.
+    const call_one = std.mem.find(u8, bytes, first[0].generation_id.?).?;
+    const report = std.mem.find(u8, bytes, "CHILD_REPORT_TEXT").?;
+    const call_two = std.mem.find(u8, bytes, both[1].generation_id.?).?;
+    try testing.expect(call_one < report and report < call_two);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\"model_call\""));
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const saved = restored.history[0].assistant.execution.model_calls;
+    try testing.expectEqual(@as(usize, 2), saved.len);
+    try testing.expectEqual(@as(usize, 0), saved[0].after_steering_count);
+    try testing.expectEqual(@as(usize, 1), saved[1].after_steering_count);
+}
+
+test "replay keeps a model call record a newer fx wrote and leaves out one it can't show" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const newer = decodeModelCall(a, "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"cost_usd\":0.01}").?;
+    try testing.expectEqualStrings("gateway", newer.provider);
+    // Escape bytes from a provider, an outcome this fx doesn't know, a
+    // negative time, and bytes that aren't JSON.
+    try testing.expect(decodeModelCall(a, "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"generation_id\":\"gen_\\u001b[2J\"}") == null);
+    try testing.expect(decodeModelCall(a, "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"outcome\":\"exploded\"}") == null);
+    try testing.expect(decodeModelCall(a, "{\"at_ms\":-1,\"provider\":\"gateway\",\"model\":\"m\"}") == null);
+    try testing.expect(decodeModelCall(a, "not json") == null);
 }
 
 test "a compaction inside a turn drops the context notes it covers and keeps the later ones on resume (D93)" {

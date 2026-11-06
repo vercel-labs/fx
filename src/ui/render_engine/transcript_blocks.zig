@@ -108,6 +108,10 @@ pub const FullPresentationSink = struct {
     append_override: *const fn (context: *anyopaque, entry: TranscriptEntry, out: *std.Io.Writer.Allocating) anyerror!bool,
     before_entry: *const fn (context: *anyopaque, entry_id: u32, out: *std.Io.Writer.Allocating) anyerror!void,
     append_detail: *const fn (context: *anyopaque, entry_id: u32, out: *std.Io.Writer.Allocating) anyerror!FullDetailAppend,
+    /// Whether an overridden entry starts on the row under the block before
+    /// it, with no blank row between: a model call's line under the text
+    /// the call wrote.
+    attaches_below: *const fn (context: *anyopaque, entry: TranscriptEntry, previous: TranscriptBlockKind) bool,
 };
 
 pub const AssistantTurnSegments = struct {
@@ -2090,7 +2094,8 @@ pub fn renderEntriesForFullPresentationInterruptible(
         }
 
         if (sink.override_kind(sink.context, entry)) |kind| {
-            try out.writer.splatByteAll('\n', sequence.separatorNewlineCountBefore(kind));
+            const attached = if (sequence.previous_kind) |previous| sink.attaches_below(sink.context, entry, previous) else false;
+            try out.writer.splatByteAll('\n', if (attached) sequence.attachedNewlineCountBefore() else sequence.separatorNewlineCountBefore(kind));
             try sink.before_entry(sink.context, entry_id, out);
             const override_ends_with_newline = try sink.append_override(sink.context, entry, out);
             const detail = try sink.append_detail(sink.context, entry_id, out);
@@ -2195,6 +2200,10 @@ test "full presentation composition keeps normal block gaps around detail" {
             try out.writer.writeAll("\n  input\n  FULL_DETAIL\n");
             return .{ .attached = true, .ends_with_newline = true };
         }
+
+        fn attaches_below(_: *anyopaque, _: TranscriptEntry, _: TranscriptBlockKind) bool {
+            return false;
+        }
     };
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -2207,6 +2216,7 @@ test "full presentation composition keeps normal block gaps around detail" {
         .append_override = Context.append_override,
         .before_entry = Context.before,
         .append_detail = Context.append_detail,
+        .attaches_below = Context.attaches_below,
     };
     try renderEntriesForFullPresentationInterruptible(
         alloc,
@@ -2304,6 +2314,12 @@ const BlockSequenceState = struct {
     fn separatorNewlineCountBefore(self: BlockSequenceState, next_kind: TranscriptBlockKind) u16 {
         if (!self.emitted_any) return 0;
         return blockSeparatorNewlineCount(self.previous_kind.?, next_kind) -| @intFromBool(self.previous_ends_with_newline);
+    }
+
+    /// The newlines that start a block on the row under the last one.
+    fn attachedNewlineCountBefore(self: BlockSequenceState) u16 {
+        if (!self.emitted_any) return 0;
+        return 1 -| @intFromBool(self.previous_ends_with_newline);
     }
 
     fn observe(

@@ -1241,7 +1241,7 @@ describe("effect-aware command permissions", () => {
       expectNoOutputRows(completed);
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await activeSession.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await activeSession.waitForText("FXC110_FAILED_STDERR", TIMEOUT);
       const full = await activeSession.capturePane();
       expect(full).toContain("FXC110_FAST_STDOUT");
@@ -1251,7 +1251,7 @@ describe("effect-aware command permissions", () => {
 
       await activeSession.sendKeys("C-o");
       await activeSession.waitForPane(
-        pane => pane.includes("3 tool calls") && !pane.includes("full detail · ctrl+o close"),
+        pane => pane.includes("3 tool calls") && !pane.includes("esc close · pgup/pgdn scroll"),
         TIMEOUT,
       );
       expectNoOutputRows(await activeSession.captureFullScrollback());
@@ -1275,7 +1275,7 @@ describe("effect-aware command permissions", () => {
       expectNoOutputRows(await activeSession.captureFullScrollback());
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await activeSession.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await activeSession.waitForText("FXC110_FAILED_STDERR", TIMEOUT);
       let resumedFull = await activeSession.capturePane();
       await activeSession.sendHexBytes(["1b", "5b", "35", "7e"]);
@@ -1387,6 +1387,10 @@ describe("effect-aware command permissions", () => {
       writeFileSync(resumedStderrPath, "");
       const commandOutputText = (text: string): string =>
         text.split("\n").filter((line) => line.trimStart().startsWith("│ ")).join("\n");
+      // Ctrl+O shows output rows at the detail indent, without the rail;
+      // a row keeps any spaces of its own after that indent.
+      const fullOutputText = (text: string): string =>
+        text.split("\n").filter((line) => line.startsWith("    ")).map((line) => line.slice(4)).join("\n");
       const toolResultValue = (body: string, toolCallId: string): string => {
         const request = JSON.parse(body) as {
           prompt?: Array<{ content?: Array<Record<string, any>> }>;
@@ -1429,14 +1433,14 @@ describe("effect-aware command permissions", () => {
       const losslessGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await activeSession.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await activeSession.waitForText(losslessRows[6]!, TIMEOUT);
       const losslessFull = await activeSession.capturePane();
-      const losslessFullOutput = commandOutputText(losslessFull);
-      for (const row of losslessRows) expect(losslessFullOutput).toContain(`│ ${row}`);
-      expect(losslessFullOutput).not.toContain("<stdout>");
-      expect(losslessFullOutput).not.toContain("</stdout>");
-      expect(losslessFullOutput).not.toContain("lines more (ctrl+o");
+      const losslessFullOutput = fullOutputText(losslessFull);
+      for (const row of losslessRows) expect(losslessFullOutput).toContain(row);
+      expect(losslessFull).not.toContain("<stdout>");
+      expect(losslessFull).not.toContain("</stdout>");
+      expect(losslessFull).not.toContain("lines more (ctrl+o");
       await activeSession.sendKeys("C-o");
       await activeSession.waitForText("DIRECT_LOSSLESS_DONE", TIMEOUT);
       expect(normalizeVolatileStatusRows(await activeSession.capturePaneGrid())).toEqual(
@@ -1458,13 +1462,13 @@ describe("effect-aware command permissions", () => {
       const lossyGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await activeSession.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await activeSession.sendHexBytes(["1b", "5b", "36", "7e"]);
       await activeSession.waitForText(lossyRows[7]!, TIMEOUT);
       const lossyFull = await activeSession.capturePane();
-      const lossyFullOutput = commandOutputText(lossyFull);
+      const lossyFullOutput = fullOutputText(lossyFull);
       for (const row of lossyRows) expect(lossyFullOutput).toContain(row);
-      expect(lossyFullOutput.match(/^│ DIRECT_LITERAL_<\/stdout>$/gm)).toHaveLength(1);
+      expect(lossyFullOutput.match(/^DIRECT_LITERAL_<\/stdout>$/gm)).toHaveLength(1);
       expect(lossyFullOutput).not.toContain("<stdout>");
       expect(lossyFullOutput).not.toContain("exit_code=0");
       await activeSession.sendKeys("C-o");
@@ -1528,13 +1532,13 @@ describe("effect-aware command permissions", () => {
       expect(resumedCompactOutput).toBe("");
       for (const row of lossyRows) expect(resumedCompact).not.toContain(`│ ${row}`);
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await activeSession.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await activeSession.sendHexBytes(["1b", "5b", "36", "7e"]);
       await activeSession.waitForText(lossyRows[7]!, TIMEOUT);
       const resumedFull = await activeSession.capturePane();
-      const resumedFullOutput = commandOutputText(resumedFull);
+      const resumedFullOutput = fullOutputText(resumedFull);
       for (const row of lossyRows) expect(resumedFullOutput).toContain(row);
-      expect(resumedFullOutput.match(/^│ DIRECT_LITERAL_<\/stdout>$/gm)).toHaveLength(1);
+      expect(resumedFullOutput.match(/^DIRECT_LITERAL_<\/stdout>$/gm)).toHaveLength(1);
       expect(resumedFullOutput).not.toContain("<stdout>");
       expect(resumedGateway.requests).toHaveLength(0);
       expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
@@ -1595,10 +1599,10 @@ describe("effect-aware command permissions", () => {
       for (const row of commandRows) expect(compact).not.toContain(`│ ${row}`);
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await activeSession.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await activeSession.waitForText(commandRows.at(-1)!, TIMEOUT);
       const full = await activeSession.capturePane();
-      for (const row of commandRows) expect(full).toContain(`│ ${row}`);
+      for (const row of commandRows) expect(full).toMatch(new RegExp(`^ {4}${row}$`, "m"));
       await activeSession.sendKeys("C-o");
       await activeSession.waitForText(responseRows.at(-1)!, TIMEOUT);
 
@@ -2025,10 +2029,10 @@ describe("effect-aware command permissions", () => {
       const compactGrid = await activeSession.capturePaneGrid();
 
       await activeSession.sendKeys("C-o");
-      await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await activeSession.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       const fullTranscript = await activeSession.capturePane();
       expect(fullTranscript).not.toContain("Auto agent approved this request");
-      expect(fullTranscript.indexOf("└ Ran")).toBeGreaterThanOrEqual(0);
+      expect(fullTranscript).toMatch(/^● Ran /m);
       await activeSession.sendKeys("C-o");
       await activeSession.waitForText("classifier approved complete", TIMEOUT);
       expect(normalizeVolatileStatusRows(await activeSession.capturePaneGrid())).toEqual(
@@ -2327,7 +2331,7 @@ describe("effect-aware command permissions", () => {
         expect(scrollback).not.toContain("FX_FOREGROUND_EXEC_FAILED");
 
         await activeSession.sendKeys("C-o");
-        await activeSession.waitForText("full detail · ctrl+o close", TIMEOUT);
+        await activeSession.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
         await activeSession.waitForText("TTY_SESSION_STDERR", TIMEOUT);
         const full = await activeSession.capturePane();
         expect(full).toContain("TTY_SESSION_STDOUT_BEGIN");

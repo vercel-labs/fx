@@ -833,6 +833,9 @@ pub const Persistence = struct {
     v2_children: ?*subagent_child_state.V2Children = null,
     workspace_preferences: ?session_codec.DurableSessionPreferences = null,
     session_preferences: ?session_codec.DurableSessionPreferences = null,
+    /// What the session `/new` replaces had saved, read just before that
+    /// session closes; the new session starts with it.
+    next_session_preferences: ?session_codec.DurableSessionPreferences = null,
     fast_mode_model_bound: bool = false,
     js_host_store: JsHostSessionStore = .{},
     js_host_session: ?JsHostSessionOwner = null,
@@ -871,7 +874,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 30) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 31) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -881,6 +884,7 @@ pub const Persistence = struct {
         storage.v2_children = null;
         storage.workspace_preferences = null;
         storage.session_preferences = null;
+        storage.next_session_preferences = null;
         storage.fast_mode_model_bound = false;
         storage.js_host_store = .{};
         storage.js_host_session = null;
@@ -942,6 +946,7 @@ pub const Persistence = struct {
         if (self.v2) |v2| v2.close();
         if (self.workspace_preferences) |*preferences| preferences.deinit(alloc);
         if (self.session_preferences) |*preferences| preferences.deinit(alloc);
+        if (self.next_session_preferences) |*preferences| preferences.deinit(alloc);
         if (self.js_host_session) |*owner| owner.deinit(alloc);
         if (self.process_model_override) |model| alloc.free(model);
         self.session_picker.deinit(alloc);

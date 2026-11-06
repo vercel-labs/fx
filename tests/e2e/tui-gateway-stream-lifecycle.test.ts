@@ -14,6 +14,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
@@ -52,6 +53,10 @@ import { expectPermissionModeContext } from "./permission-mode-context";
 import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
 
 const MODEL = "openai/gpt-5.5";
+/** What fx says when it cannot connect to the model catalog and drops fast
+ * mode (`catalogDownNotice` in `src/core/agent/runtime/orchestrator.zig`). */
+const CATALOG_CONNECT_FAST_NOTICE =
+  "fx couldn't connect to AI Gateway to load the model catalog, so fast mode is off until it loads. Check your network connection or firewall.";
 
 // A message to a working subagent joins its turn as its parent's words; one
 // to an idle subagent starts its next turn. Each work's end reports to the
@@ -1894,6 +1899,58 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     } finally {
       for (const release of releaseHungCatalogs) release();
     }
+  }, TIMEOUT * 2);
+
+  test("the transcript names the connection failure once when the model catalog cannot connect", async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-catalog-refused-")));
+    const home = join(root, "home");
+    const workspacePath = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspacePath, { recursive: true });
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ fast_mode: true }));
+    const workspace = realpathSync(workspacePath);
+
+    // A free port, closed again, so every catalog request is refused.
+    const probe = createServer();
+    await new Promise<void>(resolve => probe.listen(0, "127.0.0.1", resolve));
+    const refusedPort = (probe.address() as AddressInfo).port;
+    await new Promise<void>(resolve => probe.close(() => resolve()));
+    gateway = startFakeGateway([fakeGatewayFinalText("REFUSED_CATALOG_PROMPT_OK")]);
+
+    session = await TmuxSession.create({
+      cwd: workspace,
+      stderrPath,
+      width: 160,
+      height: 40,
+      env: {
+        HOME: home,
+        TMPDIR: root,
+        AI_GATEWAY_API_KEY: "fake-catalog-refused-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `http://127.0.0.1:${refusedPort}/coding-agent/v1/models`,
+        FX_MODEL: MODEL,
+      },
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Run without the catalog.");
+    await session.waitForText("REFUSED_CATALOG_PROMPT_OK", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback.split(CATALOG_CONNECT_FAST_NOTICE)).toHaveLength(2);
+    expect(scrollback).not.toContain("Fast mode is unavailable");
+    expect(scrollback).not.toContain("aren't reaching the model right now");
+
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT * 2);
 
   test("file edits keep earlier instruction bytes stable", async () => {
@@ -6510,12 +6567,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(resized).toContain(`Ran ${supportedCommand}`);
 
       await session.sendKeys("C-o");
+      // Ctrl+O gives each call its own line with its mark, without the tree marks.
       const full = await session.waitForText(
-        `├ Failed ${unsupportedToolName}`,
+        `● Failed ${unsupportedToolName}`,
         TIMEOUT,
       );
-      expect(full).toContain(`├ Failed ${unsupportedToolName}`);
-      expect(full).toContain(`└ Ran ${supportedCommand}`);
+      expect(full).toContain(`● Failed ${unsupportedToolName}`);
+      expect(full).toContain(`● Ran ${supportedCommand}`);
       expect(countOccurrences(full, `Failed ${unsupportedToolName}`)).toBe(1);
       expect(countOccurrences(full, `Ran ${supportedCommand}`)).toBe(1);
       await session.sendKeys("C-o");
@@ -6967,7 +7025,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(narrow).toContain("sent to checker · Check replay again");
         await session.resizeWindow(110, 35);
         await session.sendKeys("C-o");
-        await session.waitForText("full detail", TIMEOUT);
+        await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
         let details = await session.capturePane();
         for (let page = 0; page < 12 && !(details.includes("CHILD_ROW_REPLY_0") && details.includes("Check one-off cleanup")); page += 1) {
           await session.sendKeys("PPage");
@@ -7212,28 +7270,28 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const fullAtTail = await session.waitForText(finalText, TIMEOUT);
       let fullAtNested = fullAtTail;
       for (let page = 0; page < 10 && !fullAtNested.includes(
-        "├ Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
+        "● Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
       ); page += 1) {
         await session.sendKeys("PPage");
         fullAtNested = await session.capturePane();
       }
       expect(fullAtNested).toContain(
-        "├ Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
+        "● Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
       );
-      expect(fullAtTail).toContain(`└ Ran ${thirdCommand}`);
+      expect(fullAtTail).toContain(`● Ran ${thirdCommand}`);
       expect(withoutWorkspaceStatusline(fullAtTail)).not.toContain(workspace);
 
       let fullAtFirst = await session.capturePane();
       for (
         let page = 0;
-        page < 20 && !fullAtFirst.includes(`├ Ran ${firstDisplayCommand}`);
+        page < 20 && !fullAtFirst.includes(`● Ran ${firstDisplayCommand}`);
         page += 1
       ) {
         await session.sendKeys("PPage");
         await Bun.sleep(50);
         fullAtFirst = await session.capturePane();
       }
-      expect(fullAtFirst).toContain(`├ Ran ${firstDisplayCommand}`);
+      expect(fullAtFirst).toContain(`● Ran ${firstDisplayCommand}`);
       expect(fullAtFirst).not.toContain(`Ran ${firstCommand}`);
       expect(withoutWorkspaceStatusline(fullAtFirst)).not.toContain(workspace);
 

@@ -168,6 +168,8 @@ pub const CapabilityResolver = struct {
     /// deadline; a later load frees the ones that ended, and `deinit` waits
     /// for the rest.
     abandoned_loads: ?*CatalogLoad = null,
+    /// Why the last refresh failed, until one loads.
+    last_failure: ?model_catalog.FailureCategory = null,
 
     pub fn deinit(self: *CapabilityResolver, alloc: Allocator) void {
         if (self.pending_load) |load| load.discard(alloc);
@@ -177,6 +179,13 @@ pub const CapabilityResolver = struct {
             load.discard(alloc);
         }
         model_catalog.freeModelCatalog(alloc, &self.catalog);
+    }
+
+    /// Why the catalog is down, or null while it has entries or has not been
+    /// asked yet.
+    pub fn downFailure(self: *const CapabilityResolver) ?model_catalog.FailureCategory {
+        if (self.state != .failed) return null;
+        return self.last_failure orelse .runtime;
     }
 
     /// The owner must exclude capability readers during refresh. Borrowed
@@ -236,6 +245,7 @@ pub const CapabilityResolver = struct {
                 self.last_attempt_ms = attempt_ms;
                 self.requested_access = requested;
                 self.provider_id = provider.provider_id;
+                self.last_failure = failed.failure.category;
                 if (access_changed) {
                     if (self.catalog.items.len > 0) debug_trace.logf("gateway", "dropping model catalog after access changed entries={d}", .{self.catalog.items.len});
                     model_catalog.freeModelCatalog(alloc, &self.catalog);
@@ -252,6 +262,7 @@ pub const CapabilityResolver = struct {
         self.last_attempt_ms = attempt_ms;
         self.requested_access = requested;
         self.provider_id = provider.provider_id;
+        self.last_failure = null;
     }
 
     /// `resolve` for a caller that must not wait out a first load that cannot
@@ -637,8 +648,10 @@ test "capability resolver refreshes expired snapshots at the owner boundary and 
     var resolver: CapabilityResolver = .{};
     defer resolver.deinit(alloc);
     const input = model_catalog.FetchInput{ .endpoint = "https://example.invalid" };
+    try std.testing.expect(resolver.downFailure() == null);
     try resolver.refreshIfDue(alloc, provider, input);
     try std.testing.expect(resolver.catalogEntries() == null);
+    try std.testing.expectEqual(model_catalog.FailureCategory.transport, resolver.downFailure().?);
     fake.outcome = .ready;
     try resolver.refreshIfDue(alloc, provider, input);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
@@ -649,11 +662,14 @@ test "capability resolver refreshes expired snapshots at the owner boundary and 
     try resolver.refreshIfDue(alloc, provider, input);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), resolver.catalogEntries().?.len);
+    try std.testing.expect(resolver.downFailure() == null);
     fake.outcome = .unavailable;
     resolver.last_attempt_ms -= 60_000;
     try resolver.refreshIfDue(alloc, provider, input);
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
     try std.testing.expectEqualStrings("provider/model", resolver.catalogEntries().?[0].id);
+    // A failed refresh that keeps the earlier catalog leaves it up.
+    try std.testing.expect(resolver.downFailure() == null);
 }
 
 test "capability refresh does not retain a catalog for changed access" {
@@ -941,6 +957,9 @@ test "a first catalog load that never connects answers from the fallback after i
     const capabilities = try resolver.resolveWithin(alloc, gated.provider(), input, "provider/model", .{ .context_window = 1_000 }, 20);
     try std.testing.expectEqual(@as(?u32, 1_000), capabilities.context_window);
     try std.testing.expectEqual(CapabilityResolverState.failed, resolver.state);
+    // A load given up on before it connected is down for a connection fx
+    // could not make.
+    try std.testing.expectEqual(model_catalog.FailureCategory.transport, resolver.downFailure().?);
 
     // A later lookup neither waits nor fetches again.
     const later = try resolver.resolveWithin(alloc, gated.provider(), input, "provider/model", .{}, 60_000);
@@ -1079,6 +1098,7 @@ test "a due catalog refresh that never connects keeps the catalog after its wait
     try resolver.refreshWithin(alloc, provider, .{ .endpoint = "/v1/models" }, 20);
     try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
     try std.testing.expectEqualStrings("provider/model", resolver.catalogEntries().?[0].id);
+    try std.testing.expect(resolver.downFailure() == null);
 
     // The refresh given up on counts as this interval's attempt.
     try resolver.refreshWithin(alloc, provider, .{ .endpoint = "/v1/models" }, 60_000);

@@ -273,7 +273,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(countOccurrences(readTrace(tracePath), "event=worker_begin")).toBe(2);
 
       await session.sendKeys("C-o");
-      await session.waitForText("full detail", TIMEOUT);
+      await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await session.sendKeys("C-o");
       await session.waitForText("Thinking", TIMEOUT);
       await session.sendKeys("C-c");

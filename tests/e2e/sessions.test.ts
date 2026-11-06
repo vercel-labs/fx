@@ -294,12 +294,14 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
     const id: string = first.session_id;
     expect(id.length).toBeGreaterThan(0);
     // The first turn saves the runtime context it captured right after its
-    // user message (D94).
+    // user message (D94), then the model call that answered it, at the
+    // start of its only step (D96).
     expect(shape(logLines(fixture.home, id))).toEqual([
       "session_created",
       "turn_started",
       "item:user",
       "item:runtime_context",
+      "item:model_call",
       "item:assistant",
       "item:turn_end",
       "turn_committed",
