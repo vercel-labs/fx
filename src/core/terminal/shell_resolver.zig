@@ -333,6 +333,15 @@ pub const snapshot_marker_prefix = "FXSNAP:";
 // as Debian's and Ubuntu's global zshrc does, would otherwise make the
 // replayed `run-help () {` a parse error that stops the whole replay. The
 // captured `alias -L` lines then restore exactly the user's aliases.
+//
+// Completion functions start with `_`, a setup often has a thousand of them,
+// and a command never uses them, so the replay leaves them out. zsh autoloads
+// each one from a file of the same name, as compinit does for every
+// `#compdef` file, so a `_` function is left out only when
+// `functions_source` names no file or a file with the function's name. A `_`
+// helper that a startup file defines, such as the one a `pnpm` wrapper
+// calls, is replayed. zsh before 5.4 has no `functions_source`, so it leaves
+// out every `_` function.
 const zsh_capture_script =
     \\{
     \\\builtin zmodload zsh/parameter 2>/dev/null
@@ -344,7 +353,11 @@ const zsh_capture_script =
     \\\builtin print -r -- '\builtin unalias -a; \builtin unalias -as'
     \\\builtin typeset -p fpath
     \\for __fx_snapshot_name in ${(ko)functions}; do
-    \\  case $__fx_snapshot_name in (_*|prompt_*|__fx_snapshot_*) continue;; esac
+    \\  case $__fx_snapshot_name in (prompt_*|__fx_snapshot_*) continue;; esac
+    \\  if [[ $__fx_snapshot_name == _* ]]; then
+    \\    __fx_snapshot_file=${functions_source[$__fx_snapshot_name]-}
+    \\    if [[ -z $__fx_snapshot_file || ${__fx_snapshot_file:t} == "$__fx_snapshot_name" ]]; then continue; fi
+    \\  fi
     \\  \builtin functions -- $__fx_snapshot_name
     \\done
     \\\builtin alias -L
@@ -360,6 +373,12 @@ const zsh_capture_script =
     \\} 2>/dev/null
 ;
 
+// bash has no autoload. bash-completion and git's completion script define
+// their `_` functions in files whose path contains `completion`, so the
+// replay leaves out a `_` function only when `declare -F`, with `extdebug`
+// on, reports such a file; the name alone does not decide. Under `extdebug`
+// a DEBUG trap that fails skips the next command, so the trap is cleared
+// first.
 const bash_capture_script =
     \\{
     \\\unset -f builtin
@@ -368,10 +387,15 @@ const bash_capture_script =
     \\\builtin printf 'FXSNAP:@NONCE@:NAMES\0'
     \\\builtin printf '%s\0' $(\builtin compgen -a) $(\builtin compgen -A function)
     \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
-    \\for __fx_snapshot_name in $(\builtin compgen -A function); do
-    \\  case $__fx_snapshot_name in _*|__fx_snapshot_*) continue;; esac
+    \\\builtin trap - DEBUG
+    \\\builtin shopt -s extdebug
+    \\__fx_snapshot_sources=$(\builtin declare -F $(\builtin compgen -A function))
+    \\\builtin shopt -u extdebug
+    \\while \builtin read -r __fx_snapshot_name __fx_snapshot_line __fx_snapshot_file; do
+    \\  case $__fx_snapshot_name in __fx_snapshot_*|'') continue;; esac
+    \\  case $__fx_snapshot_name in _*) case $__fx_snapshot_file in *completion*) continue;; esac;; esac
     \\  \builtin declare -f -- "$__fx_snapshot_name"
-    \\done
+    \\done <<< "$__fx_snapshot_sources"
     \\\builtin alias -p
     \\for __fx_snapshot_name in extglob nullglob dotglob globstar nocaseglob failglob nocasematch globasciiranges; do
     \\  \builtin shopt -p "$__fx_snapshot_name" 2>/dev/null

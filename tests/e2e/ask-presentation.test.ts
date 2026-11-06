@@ -1053,6 +1053,35 @@ describe("fx ask shell startup files", () => {
     expect(result.stderr).not.toContain("shell snapshot unavailable");
   }, TIMEOUT);
 
+  // Wrappers such as Socket Firewall's `pnpm` call a helper whose name starts
+  // with `_`, which completion functions share.
+  test("a startup-file wrapper that calls an underscore helper runs through the snapshot", async () => {
+    const root = createRoot();
+    writeStartupFiles(
+      root.home,
+      "printf 'loaded\\n' >> \"$HOME/rc.log\"\n" +
+        "_fx_wrap_helper() { printf 'FX_WRAPPED_HELPER_OK %s\\n' \"$*\"; }\n" +
+        "fxwrapped() { _fx_wrap_helper fxwrapped \"$@\"; }\n",
+    );
+    const gateway = startFakeGateway([
+      userShellRun("wrapped", "fxwrapped install"),
+      fakeGatewayFinalText("Wrapper checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "Run the wrapped command."],
+      { cwd: root.workspace, env: { ...gatewayEnv(root.home, gateway), FX_SOUND: "0" }, timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(gateway.requests[1]!.body).toContain("FX_WRAPPED_HELPER_OK fxwrapped install");
+    expect(gateway.requests[1]!.body).not.toContain("command not found");
+    // The capture is the only full startup, so the command ran from the snapshot.
+    expect(startupLoads(root.home)).toBe(1);
+    expect(result.stderr).not.toContain("shell snapshot unavailable");
+  }, TIMEOUT);
+
   test("a user-profile command with a quoting error carries rewrite guidance", async () => {
     const root = createRoot();
     const gateway = startFakeGateway([
