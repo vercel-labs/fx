@@ -1681,10 +1681,7 @@ fn handleKernelWithdraw(
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const id = parsed.value.object.get("id") orelse
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
@@ -1717,10 +1714,7 @@ fn handleKernelHandoff(
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     if (active.steering.requestHandoff(&active.cancel_flag)) {
         debug_trace.logf("acp", "libfx handoff interrupts the streaming reply", .{});
     }
@@ -1839,10 +1833,7 @@ fn handleKernelCheckpoint(
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const unavailable: jsonrpc.RpcError = .{
         .code = ErrorCode.invalid_request,
         .message = "libfx checkpoint is unavailable",
@@ -1873,10 +1864,7 @@ fn handleKernelRestore(
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const reference = parsed.value.object.get("checkpointAttachment") orelse
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
@@ -1937,10 +1925,7 @@ fn handleKernelJournalOpen(
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const invalid: jsonrpc.RpcError = .{
         .code = ErrorCode.invalid_params,
         .message = "Invalid libfx journal",
@@ -2178,10 +2163,7 @@ fn handleKernelJournalImages(
     var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, invalid);
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, invalid);
     const list = parsed.value.object.get("images") orelse return state.writer.writeError(alloc, msg.id, invalid);
     if (list != .array or list.array.items.len == 0) return state.writer.writeError(alloc, msg.id, invalid);
@@ -2241,10 +2223,7 @@ fn handleKernelSnapshot(
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_request,
         .message = "libfx snapshot is unavailable",
@@ -2329,10 +2308,7 @@ fn handleKernelFollowUp(
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const id = parsed.value.object.get("id");
     const text = parsed.value.object.get("text");
     const valid_id = if (id) |value| value == .string and libfx_steering.validInputId(value.string) else false;
@@ -2364,10 +2340,7 @@ fn handleKernelSteer(
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const text = parsed.value.object.get("text") orelse
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
@@ -2443,22 +2416,65 @@ fn parsedSessionTargetDecision(state: *const ServerState, root: std.json.Value) 
     return decideSessionTarget(active_id, supplied);
 }
 
+/// Answers a request whose `sessionId` is not the open session. A missing or malformed id is
+/// invalid params; an id that names no open session gets ACP's `-32002` with `data.sessionId`.
 fn writeSessionTargetError(
     state: *ServerState,
     alloc: Allocator,
     id: ?jsonrpc.RequestId,
     decision: SessionTargetDecision,
+    root: std.json.Value,
 ) !void {
     const message: []const u8 = switch (decision) {
         .exact => return,
+        .missing => return state.writer.writeError(alloc, id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Missing sessionId",
+        }),
         .inactive => "No active session",
-        .missing => "Missing sessionId",
         .mismatch => "Session is not active",
     };
-    try state.writer.writeError(alloc, id, .{
+    // With no open session, `decideSessionTarget` answers `.inactive` before it looks at the id.
+    const requested = requestedSessionId(root) orelse return state.writer.writeError(alloc, id, .{
         .code = ErrorCode.invalid_params,
         .message = message,
     });
+    try state.writer.writeError(alloc, id, jsonrpc.sessionNotFound(message, requested));
+}
+
+/// Returns the non-empty string `sessionId` of request params, or null.
+fn requestedSessionId(root: std.json.Value) ?[]const u8 {
+    if (root != .object) return null;
+    const value = root.object.get("sessionId") orelse return null;
+    return if (value == .string and value.string.len > 0) value.string else null;
+}
+
+/// The answer to a libfx request whose session is not the open one: ACP's `-32002` with
+/// `data.sessionId` when the request names an id, and invalid params when it names none.
+fn unknownLibfxSession(params: std.json.Value) jsonrpc.RpcError {
+    const requested = requestedSessionId(params) orelse return .{
+        .code = ErrorCode.invalid_params,
+        .message = "Unknown libfx session",
+    };
+    return jsonrpc.sessionNotFound("Unknown libfx session", requested);
+}
+
+test "a libfx request for a session that isn't open names it, and one without an id is invalid" {
+    const alloc = std.testing.allocator;
+    const named = try std.json.parseFromSlice(std.json.Value, alloc, "{\"sessionId\":\"s1\"}", .{});
+    defer named.deinit();
+    const not_found = unknownLibfxSession(named.value);
+    try std.testing.expectEqual(ErrorCode.resource_not_found, not_found.code);
+    try std.testing.expectEqualStrings("s1", not_found.data.?.session.session_id);
+
+    for ([_][]const u8{ "{}", "{\"sessionId\":\"\"}", "{\"sessionId\":3}", "[]" }) |params| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, params, .{});
+        defer parsed.deinit();
+        const invalid = unknownLibfxSession(parsed.value);
+        try std.testing.expectEqual(ErrorCode.invalid_params, invalid.code);
+        try std.testing.expectEqualStrings("Unknown libfx session", invalid.message);
+        try std.testing.expect(invalid.data == null);
+    }
 }
 
 fn requireParsedActiveSessionTarget(
@@ -2469,7 +2485,7 @@ fn requireParsedActiveSessionTarget(
 ) !bool {
     const decision = parsedSessionTargetDecision(state, root);
     if (decision == .exact) return true;
-    try writeSessionTargetError(state, alloc, id, decision);
+    try writeSessionTargetError(state, alloc, id, decision, root);
     return false;
 }
 
@@ -3223,11 +3239,11 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
         try state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = message,
-            .data = .{
+            .data = .{ .model_capability = .{
                 .code = "LIBFX_MODEL_UNSUPPORTED_EFFORT",
                 .model = state.selected_model,
                 .capability = "effort",
-            },
+            } },
         });
         return false;
     }
@@ -3329,11 +3345,11 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
         try state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = message,
-            .data = .{
+            .data = .{ .model_capability = .{
                 .code = "LIBFX_MODEL_UNSUPPORTED_FAST",
                 .model = state.selected_model,
                 .capability = "fast",
-            },
+            } },
         });
         return false;
     }
@@ -3396,11 +3412,11 @@ fn writeUltrafastOverrideFailure(state: *ServerState, alloc: Allocator, msg: *js
     try state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
         .message = message,
-        .data = .{
+        .data = .{ .model_capability = .{
             .code = "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST",
             .model = state.selected_model,
             .capability = "ultrafast",
-        },
+        } },
     });
     return false;
 }
@@ -4092,11 +4108,11 @@ fn applyActiveSessionUltrafast(
             try state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_params,
                 .message = message,
-                .data = .{
+                .data = .{ .model_capability = .{
                     .code = "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST",
                     .model = session.model,
                     .capability = "ultrafast",
-                },
+                } },
             });
             return false;
         }
@@ -4146,11 +4162,11 @@ fn applyActiveSessionFast(
             try state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_params,
                 .message = message,
-                .data = .{
+                .data = .{ .model_capability = .{
                     .code = "LIBFX_MODEL_UNSUPPORTED_FAST",
                     .model = session.model,
                     .capability = "fast",
-                },
+                } },
             });
             return false;
         }
