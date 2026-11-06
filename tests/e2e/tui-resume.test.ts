@@ -5124,7 +5124,7 @@ test.skipIf(!tmuxAvailable())(
       expect(detail).not.toContain("command not run");
       expect(detail).not.toContain("1 deferred");
       // Ctrl+O has no group summary; the failed command's own line says so.
-      expect(detail).toMatch(/^  Exited 7 /m);
+      expect(detail).toMatch(/^● Exited 7 /m);
       expect(readFileSync(resumeStderrPath, "utf8")).toBe("");
 
       await active.sendKeys("Escape");

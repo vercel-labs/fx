@@ -131,7 +131,7 @@ async function ask(session: Session, prompt: string, answer: string) {
   await session.waitForComposer(TIMEOUT);
 }
 
-/// Opens Ctrl+O and returns its rows, without the hint and status rows.
+/// Opens Ctrl+O and returns its rows; the hint is the last one.
 async function fullDetail(session: Session): Promise<string[]> {
   await session.sendHexBytes(["0f"]);
   await session.waitForText("esc close", TIMEOUT);
@@ -157,12 +157,15 @@ function expectInOrder(rows: string[], steps: string[][]) {
   }
 }
 
-/// No block headers, rails, tree marks or group lines anywhere.
+/// No block headers, rails, tree marks or group lines anywhere. A mark opens
+/// only a tool's own line, at the left edge.
 function expectNoClutter(rows: string[]) {
   const text = rows.join("\n");
   for (const row of rows) {
     expect(row).not.toMatch(/· (Prompt|Response|Tool|Usage|Notice|Task|Issue)$/);
-    expect(row.trimStart()).not.toMatch(/^[│├└●]/);
+    expect(row.trimStart()).not.toMatch(/^[│├└]/);
+    expect(row).not.toMatch(/^\s*● \d+ tool calls?\b/);
+    if (row.trimStart().startsWith("●")) expect(row).toMatch(/^● \S/);
   }
   expect(text).toContain(HINT);
   expect(text).not.toContain("full detail · ctrl+o close");
@@ -403,7 +406,7 @@ describe("Ctrl+O full detail", () => {
         "  Checking the folder.",
         `  <time> · gpt-5 · <secs> · in 120 · out 18 · ${genId(1)}`,
         "",
-        "  Ran printf 'alpha\\nbeta\\n'",
+        "● Ran printf 'alpha\\nbeta\\n'",
         "    action: run",
         "    yield_time_ms: 30000",
         "    <time>",

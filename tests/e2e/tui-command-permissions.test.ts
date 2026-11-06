@@ -2032,7 +2032,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       const fullTranscript = await activeSession.capturePane();
       expect(fullTranscript).not.toContain("Auto agent approved this request");
-      expect(fullTranscript).toMatch(/^  Ran /m);
+      expect(fullTranscript).toMatch(/^● Ran /m);
       await activeSession.sendKeys("C-o");
       await activeSession.waitForText("classifier approved complete", TIMEOUT);
       expect(normalizeVolatileStatusRows(await activeSession.capturePaneGrid())).toEqual(

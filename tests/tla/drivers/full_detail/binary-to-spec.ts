@@ -81,7 +81,7 @@ export function itemsOf(rows: string[]): Item[] {
     else if (/^\s+Error · /.test(row)) items.push({ k: step, t: "fail", a: ++fails });
     else if (row.includes(`· ${MODEL} ·`) && row.includes("gen_")) items.push({ k: step, t: "rec", a: 0 });
     else if (TEXT[step] && row.includes(TEXT[step]!)) items.push({ k: step, t: "text", a: 0 });
-    else if (/^ {2}Ran /.test(row)) {
+    else if (/^● Ran /.test(row)) {
       items.push({ k: step, t: "tool", a: 0 });
       step += 1;
       fails = 0;

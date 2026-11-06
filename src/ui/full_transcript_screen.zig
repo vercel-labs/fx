@@ -989,7 +989,7 @@ test "full projection wraps a long tool status instead of clipping it" {
     const painted = try paintProjectionRowsForTest(alloc, &projection, 24);
     defer alloc.free(painted);
 
-    try std.testing.expect(std.mem.find(u8, painted, "  Searched a") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "● Searched a") != null);
     try std.testing.expect(std.mem.find(u8, painted, "\n    ") != null);
     try std.testing.expect(std.mem.find(u8, painted, "FULL_STATUS_TAIL") != null);
     try std.testing.expect(std.mem.find(u8, painted, "…") == null);
@@ -1036,7 +1036,7 @@ test "full projection shows a terminal session launch command in full" {
     const expected = try compactPaintedTextForTest(alloc, "Observed " ++ launch);
     defer alloc.free(expected);
 
-    try std.testing.expect(std.mem.find(u8, painted, "  Observed cd . && python3") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "● Observed cd . && python3") != null);
     try std.testing.expect(std.mem.find(u8, compact, expected) != null);
     try std.testing.expect(std.mem.find(u8, painted, "…") == null);
     try std.testing.expect(std.mem.find(u8, painted, "...") == null);

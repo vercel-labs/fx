@@ -761,13 +761,14 @@ test.skipIf(!tmuxAvailable())(
 
     // `interact` carries no command argument, so the Observed heading is the
     // only place Ctrl-O can show the launch command. It must wrap instead of
-    // trailing. The heading ends at a blank row, an argument row
-    // ("    key: value") or the tool's time ("    12:00:00").
+    // trailing. The heading opens with the tool's mark and ends at a blank
+    // row, an argument row ("    key: value") or the tool's time
+    // ("    12:00:00").
     const fullObservedHeading = (grid: string[]) => {
       const rows = grid.map((line) => line.trimEnd());
-      const start = rows.findIndex((line) => line.startsWith("  Observed "));
+      const start = rows.findIndex((line) => line.startsWith("● Observed "));
       if (start < 0) return null;
-      const parts = [rows[start]!.trim()];
+      const parts = [rows[start]!.slice("● ".length).trim()];
       for (const line of rows.slice(start + 1)) {
         if (line.trim() === "" || /^ {4}[a-z_]+: /.test(line) || /^ {4}\d{2}:\d{2}:\d{2}\b/.test(line)) break;
         parts.push(line.trim());
