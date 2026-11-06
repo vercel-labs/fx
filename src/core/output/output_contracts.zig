@@ -1639,6 +1639,16 @@ fn writeSessionDisplayJsonFields(writer: *std.Io.Writer, summary: session_store.
 
 pub const SessionDetailSnapshot = struct {
     state: session_codec.DurableSessionState,
+    /// `--tail`: only the last this many turns, each under its own number.
+    tail: ?usize = null,
+    /// The `<id>/<agent>` a subagent was read by.
+    address: ?[]const u8 = null,
+
+    /// Index of the first turn shown: the last `tail` of them, or all.
+    fn firstShown(self: SessionDetailSnapshot) usize {
+        const count = self.tail orelse return 0;
+        return self.state.history.len - @min(count, self.state.history.len);
+    }
 
     pub fn render(self: SessionDetailSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -1652,18 +1662,21 @@ pub const SessionDetailSnapshot = struct {
         defer out.deinit();
 
         const state = self.state;
+        const first = self.firstShown();
         try out.writer.print("[session] {s}\n", .{state.id});
+        if (self.address) |address| try out.writer.print("address: {s}\n", .{address});
         try out.writer.print("created_at_ms: {d}\n", .{state.created_at_ms});
         try out.writer.print("updated_at_ms: {d}\n", .{state.updated_at_ms});
         try out.writer.print("language: {s}\n", .{state.conversation_language.view()});
         try out.writer.print("history_len: {d}\n", .{state.history.len});
+        if (self.tail != null) try out.writer.print("first_turn: {d}\n", .{first + 1});
 
         if (state.history.len == 0) {
             try out.writer.writeAll("\n(no history yet)\n");
             return try out.toOwnedSlice();
         }
 
-        for (state.history, 0..) |turn, i| {
+        for (state.history[first..], first..) |turn, i| {
             try out.writer.print("\n[turn {d}]\n", .{i + 1});
             try writeSessionHistoryTurnText(&out.writer, turn);
         }
@@ -1676,14 +1689,20 @@ pub const SessionDetailSnapshot = struct {
         defer out.deinit();
 
         const state = self.state;
+        const first = self.firstShown();
         try out.writer.writeAll("{\"kind\":\"session_detail\",\"id\":");
         try std.json.Stringify.value(state.id, .{}, &out.writer);
+        if (self.address) |address| {
+            try out.writer.writeAll(",\"address\":");
+            try std.json.Stringify.value(address, .{}, &out.writer);
+        }
         try out.writer.print(",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"history_len\":{d}", .{ state.created_at_ms, state.updated_at_ms, state.history.len });
+        if (self.tail != null) try out.writer.print(",\"first_turn\":{d}", .{first + 1});
         try out.writer.writeAll(",\"conversation_language\":");
         try std.json.Stringify.value(state.conversation_language.view(), .{}, &out.writer);
         try out.writer.writeAll(",\"history\":[");
 
-        for (state.history, 0..) |turn, i| {
+        for (state.history[first..], 0..) |turn, i| {
             if (i > 0) try out.writer.writeByte(',');
             try writeSessionHistoryTurnJson(&out.writer, turn);
         }
@@ -1692,6 +1711,165 @@ pub const SessionDetailSnapshot = struct {
         return try out.toOwnedSlice();
     }
 };
+
+test "--tail keeps the last turns under their own numbers for every length and count" {
+    // Seeded, so a failure names its case and replays.
+    var prng = std.Random.DefaultPrng.init(0x7a11);
+    const random = prng.random();
+    var summary_text = "summary".*;
+    var history: [40]types.HistoryTurn = undefined;
+    for (&history, 0..) |*turn, i| turn.* = .{ .compacted_summary = .{ .summary = &summary_text, .removed_turn_count = i, .compaction_count = i } };
+    var model = "m".*;
+    for (0..2000) |_| {
+        const len = random.uintAtMost(usize, history.len);
+        const tail: ?usize = if (random.boolean()) null else 1 + random.uintAtMost(usize, 1000 - 1);
+        const state: session_codec.DurableSessionState = .{
+            .id = @constCast("abc"),
+            .origin_workspace_root = @constCast("/Users/example/w"),
+            .workspace_root = @constCast("/Users/example/w"),
+            .created_at_ms = 1,
+            .updated_at_ms = 2,
+            .conversation_language = types.ConversationLanguage.default(),
+            .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+            .history = history[0..len],
+            .total_input_tokens = 0,
+            .total_output_tokens = 0,
+        };
+        const snapshot: SessionDetailSnapshot = .{ .state = state, .tail = tail };
+        const first = snapshot.firstShown();
+        const shown = len - first;
+        if (tail) |count| {
+            try std.testing.expectEqual(@min(count, len), shown);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), first);
+        }
+        const text = try snapshot.renderText(std.testing.allocator);
+        defer std.testing.allocator.free(text);
+        try std.testing.expectEqual(shown, std.mem.count(u8, text, "\n[turn "));
+        if (shown > 0) {
+            var buf: [32]u8 = undefined;
+            try std.testing.expect(std.mem.find(u8, text, try std.mem.print(&buf, "\n[turn {d}]\n", .{first + 1})) != null);
+            try std.testing.expect(std.mem.find(u8, text, try std.mem.print(&buf, "\n[turn {d}]\n", .{len})) != null);
+        }
+        const json = try snapshot.renderJson(std.testing.allocator);
+        defer std.testing.allocator.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(len)), parsed.value.object.get("history_len").?.integer);
+        try std.testing.expectEqual(shown, parsed.value.object.get("history").?.array.items.len);
+        try std.testing.expectEqual(tail != null, parsed.value.object.get("first_turn") != null);
+    }
+}
+
+/// `fx sessions --live`: each session an fx process has open now, with its
+/// subagents, nested under the subagent that started them.
+pub const LiveSessionListSnapshot = struct {
+    sessions: []const session_store.LiveSession,
+    all_workspaces: bool = false,
+
+    pub fn render(self: LiveSessionListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    pub fn renderText(self: LiveSessionListSnapshot, alloc: Allocator) ![]u8 {
+        if (self.sessions.len == 0) return alloc.dupe(u8, "[sessions] no live sessions\n");
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.print("[sessions] {d} live\n", .{self.sessions.len});
+        for (self.sessions) |entry| {
+            try out.writer.writeAll(" - ");
+            try writeTerminalSafe(&out.writer, alloc, entry.summary.title orelse session_display_metadata.fallback_title);
+            try out.writer.print("\n   id={s} | {s} | ", .{ entry.summary.id, @tagName(entry.state) });
+            try writeTerminalSafe(&out.writer, alloc, entry.model orelse "unknown model");
+            try out.writer.writeAll(" | updated ");
+            try writeLocalTimestamp(&out.writer, entry.summary.updated_at_ms);
+            try out.writer.writeByte('\n');
+            if (self.all_workspaces) if (entry.summary.workspace_root) |root| {
+                try out.writer.writeAll("   workspace=");
+                try writeTerminalSafe(&out.writer, alloc, root);
+                try out.writer.writeByte('\n');
+            };
+            try writeLiveAgentsText(&out.writer, entry.agents, 3);
+        }
+        return try out.toOwnedSlice();
+    }
+
+    pub fn renderJson(self: LiveSessionListSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.print("{{\"kind\":\"live_sessions\",\"count\":{d},\"sessions\":[", .{self.sessions.len});
+        for (self.sessions, 0..) |entry, i| {
+            if (i > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"id\":");
+            try std.json.Stringify.value(entry.summary.id, .{}, &out.writer);
+            try out.writer.writeAll(",\"title\":");
+            try std.json.Stringify.value(entry.summary.title orelse session_display_metadata.fallback_title, .{}, &out.writer);
+            try out.writer.writeAll(",\"workspace_root\":");
+            try std.json.Stringify.value(entry.summary.workspace_root, .{}, &out.writer);
+            try out.writer.writeAll(",\"model\":");
+            try std.json.Stringify.value(entry.model, .{}, &out.writer);
+            try out.writer.print(",\"state\":\"{s}\",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"agents\":", .{ @tagName(entry.state), entry.summary.created_at_ms, entry.summary.updated_at_ms });
+            try writeLiveAgentsJson(&out.writer, entry.agents);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("]}");
+        return try out.toOwnedSlice();
+    }
+};
+
+/// One line per subagent, `<indent>- <name> | <state> | <address>`, with
+/// its own subagents two spaces further in. Names and addresses are agent
+/// names and session ids, which never hold terminal control bytes.
+fn writeLiveAgentsText(writer: *std.Io.Writer, agents: []const session_store.LiveAgent, indent: usize) !void {
+    for (agents) |agent| {
+        try writer.splatByteAll(' ', indent);
+        try writer.print("- {s} | {s} | {s}\n", .{ agent.name, @tagName(agent.state), agent.address });
+        try writeLiveAgentsText(writer, agent.agents, indent + 2);
+    }
+}
+
+fn writeLiveAgentsJson(writer: *std.Io.Writer, agents: []const session_store.LiveAgent) !void {
+    try writer.writeByte('[');
+    for (agents, 0..) |agent, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"name\":");
+        try std.json.Stringify.value(agent.name, .{}, writer);
+        try writer.writeAll(",\"address\":");
+        try std.json.Stringify.value(agent.address, .{}, writer);
+        try writer.writeAll(",\"id\":");
+        try std.json.Stringify.value(agent.id, .{}, writer);
+        try writer.print(",\"state\":\"{s}\",\"agents\":", .{@tagName(agent.state)});
+        try writeLiveAgentsJson(writer, agent.agents);
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+test "a live listing prints each subagent under the one that started it, and escapes titles" {
+    const helper: session_store.LiveAgent = .{ .name = "helper", .address = "abc/lead/helper", .id = "h1", .state = .working, .agents = &.{} };
+    const lead: session_store.LiveAgent = .{ .name = "lead", .address = "abc/lead", .id = "l1", .state = .idle, .agents = &.{helper} };
+    const sessions = [_]session_store.LiveSession{.{
+        .summary = .{ .id = @constCast("abc"), .title = @constCast("Fix \x1b[31mred"), .workspace_root = @constCast("/Users/example/w"), .created_at_ms = 1, .updated_at_ms = 2, .conversation_language = types.ConversationLanguage.default(), .history_len = 0 },
+        .model = "openai/gpt-5",
+        .state = .working,
+        .agents = &.{lead},
+    }};
+    const text = try (LiveSessionListSnapshot{ .sessions = &sessions, .all_workspaces = true }).renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "[sessions] 1 live\n - Fix "));
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, text, "   id=abc | working | openai/gpt-5 | updated ") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "   workspace=/Users/example/w\n   - lead | idle | abc/lead\n     - helper | working | abc/lead/helper\n"));
+    const json = try (LiveSessionListSnapshot{ .sessions = &sessions }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"agents\":[{\"name\":\"lead\",\"address\":\"abc/lead\",\"id\":\"l1\",\"state\":\"idle\",\"agents\":[{\"name\":\"helper\"") != null);
+    const empty = try (LiveSessionListSnapshot{ .sessions = &.{} }).render(std.testing.allocator, .json);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqualStrings("{\"kind\":\"live_sessions\",\"count\":0,\"sessions\":[]}", empty);
+}
 
 pub const SessionRecoverySnapshot = struct {
     result: session_store.SessionRecoveryResult,

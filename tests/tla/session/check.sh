@@ -19,6 +19,14 @@
 # stream-witness-*.cfg must be violated. stream-simulate*.cfg run random
 # behaviors with more calls and rebuilds.
 #
+# LiveSessions models `fx sessions --live`: a scan that tries each session's
+# writer lock without waiting while other fx processes open, hold, crash,
+# and close sessions, and that lists each live session's subagents from its
+# log. live-holds.cfg checks one session exhaustively and must pass;
+# live-simulate.cfg runs random behaviors with two sessions, three processes,
+# and two subagents. Each live-witness-*.cfg must be violated, and each
+# live-mutant-*.cfg plants one bug that its property must catch.
+#
 # Run the real binary along the models and have TLC check every run:
 #   bun test ../drivers/session/
 #
@@ -62,4 +70,14 @@ TurnStream stream-witness-recovery NeverCommittedAfterRecovery
 TurnStream stream-witness-missed-path MissedPathsNeverParse
 TurnStream stream-simulate simulate $sim
 TurnStream stream-simulate-before simulate $sim
+LiveSessions live-holds -
+LiveSessions live-witness-stale NoStaleListing
+LiveSessions live-witness-idle-parent NoWorkingChildOfIdle
+LiveSessions live-witness-open-fails-on-scan NoOpenFailsOnScan
+LiveSessions live-mutant-inverted-probe ProbeSound
+LiveSessions live-mutant-probe-keeps-lock ScanHoldsOneTry
+LiveSessions live-mutant-closed-child AgentsAsLogged
+LiveSessions live-mutant-parent-state AgentsAsLogged
+LiveSessions live-mutant-recent-is-live ProbeSound
+LiveSessions live-simulate simulate -simulate num=${SIM_RUNS:-20000} -depth 60 -seed 1
 EOF

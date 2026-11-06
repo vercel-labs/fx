@@ -342,6 +342,10 @@ const SessionListOptions = struct {
     scope: session_store.SessionListScope = .current_workspace,
     limit: usize = session_store.session_list_default_limit,
     continuation: ?session_store.ResumableSessionContinuation = null,
+    /// `--live`: only the sessions an fx process has open now.
+    live: bool = false,
+    /// The first paging flag given, which `--live` refuses.
+    paging_flag: ?[]const u8 = null,
 };
 
 const UsageOptions = struct {
@@ -370,6 +374,8 @@ const SessionDetailTarget = union(enum) {
 const SessionDetailOptions = struct {
     format: output_contracts.OutputFormat = .text,
     target: ?SessionDetailTarget = null,
+    /// `--tail`: only the last this many turns.
+    tail: ?usize = null,
 
     fn deinit(self: *SessionDetailOptions, alloc: Allocator) void {
         if (self.target) |*target| target.deinit(alloc);
@@ -2036,7 +2042,7 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .session, "session", error.InvalidSessionDetailArgs, rest);
                 return usage_failure;
             };
-            return runSessionDetail(alloc, deps, target, opts.format);
+            return runSessionDetail(alloc, deps, target, opts.format, opts.tail);
         },
         .sessions => |rest| {
             if (rest.len > 0 and std.mem.eql(u8, rest[0], "convert")) {
@@ -2050,6 +2056,13 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
                 return usage_failure;
             };
+            if (opts.live) {
+                if (opts.paging_flag) |flag| {
+                    try writeLivePagingError(alloc, cfg.command_catalog, deps, flag, opts.format);
+                    return usage_failure;
+                }
+                return runLiveSessionList(alloc, deps, opts);
+            }
             return runSessionList(alloc, deps, opts);
         },
         .workspace => |rest| {
@@ -3303,8 +3316,10 @@ fn writeSessionDetail(
     deps: RunDeps,
     state: session_codec.DurableSessionState,
     format: output_contracts.OutputFormat,
+    tail: ?usize,
+    address: ?[]const u8,
 ) !RunResult {
-    const text = try (output_contracts.SessionDetailSnapshot{ .state = state }).render(alloc, format);
+    const text = try (output_contracts.SessionDetailSnapshot{ .state = state, .tail = tail, .address = address }).render(alloc, format);
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, format);
     return .handled_success;
@@ -3341,6 +3356,51 @@ fn runSessionList(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !Ru
     };
     defer page.deinit(alloc);
     return writeSessionList(alloc, deps, page, opts);
+}
+
+/// `fx sessions --live`: the sessions an fx process has open now, with
+/// their subagents (`session_adapter.listLive`). Reads every session in the
+/// scope and writes none.
+fn runLiveSessionList(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !RunResult {
+    var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
+        try writeLookupFailure(alloc, deps, "sessions", session_adapter.commandError(err), opts.format);
+        return .handled_failure;
+    };
+    defer store.deinit(alloc);
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    const scope: ?[]const u8 = switch (opts.scope) {
+        .current_workspace => workspace_root,
+        .all_workspaces => null,
+    };
+    var list = session_adapter.listLive(&store, alloc, scope) catch |err| {
+        try writeLookupFailure(alloc, deps, "sessions", session_adapter.commandError(err), opts.format);
+        return .handled_failure;
+    };
+    defer list.deinit();
+    const text = try (output_contracts.LiveSessionListSnapshot{
+        .sessions = list.sessions,
+        .all_workspaces = opts.scope == .all_workspaces,
+    }).render(alloc, opts.format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, opts.format);
+    return .handled_success;
+}
+
+/// `--live` with `--limit` or `--cursor`: it lists every live session at
+/// once, so it has no pages.
+fn writeLivePagingError(
+    alloc: Allocator,
+    command_catalog: CommandCatalog,
+    deps: RunDeps,
+    flag: []const u8,
+    format: output_contracts.OutputFormat,
+) !void {
+    const message = try alloc.print("--live lists every live session, so it takes no {s}", .{flag});
+    defer alloc.free(message);
+    if (format == .json) return writeJsonCommandFailure(alloc, deps, "sessions", error.InvalidLocalSurfaceArgs, message);
+    try writeStderrLine(alloc, deps, "fx sessions: {s}\n", message);
+    try writeTopLevelUsage(command_catalog, deps, .sessions);
 }
 
 const SessionConvertFlag = enum { json };
@@ -3416,12 +3476,15 @@ fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.O
     return if (skipped.len == 0) .handled_success else .handled_failure;
 }
 
-/// `fx session last|{id}` on v2, read without the session's lock (D37).
+/// `fx session last|{id}|{id}/{agent}` on v2, read without the session's
+/// lock (D37). `last` alone is a summary; with `--tail` it is the newest
+/// session's last turns.
 fn runSessionDetail(
     alloc: Allocator,
     deps: RunDeps,
     target: SessionDetailTarget,
     format: output_contracts.OutputFormat,
+    tail: ?usize,
 ) !RunResult {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), format);
@@ -3441,17 +3504,90 @@ fn runSessionDetail(
                 try writeLookupFailure(alloc, deps, "session", session_adapter.noLatestError(&store, alloc), format);
                 return .handled_failure;
             }
-            return writeSessionSummary(alloc, deps, page.summaries.items[0], format);
+            if (tail == null) return writeSessionSummary(alloc, deps, page.summaries.items[0], format);
+            return writeRootDetail(alloc, deps, &store, page.summaries.items[0].id, format, tail);
         },
         .id => |id| {
-            var resumed = session_adapter.readSession(&store, alloc, id) catch |err| {
-                try writeSessionDetailFailure(alloc, deps, id, session_adapter.commandError(err), store.problem.text(), format);
+            const address = session_adapter.parseAgentAddress(id) catch |err| {
+                try writeLookupFailure(alloc, deps, "session", err, format);
                 return .handled_failure;
-            };
-            defer resumed.deinit(alloc);
-            return writeSessionDetail(alloc, deps, resumed.state, format);
+            } orelse return writeRootDetail(alloc, deps, &store, id, format, tail);
+            return writeAgentDetail(alloc, deps, &store, id, address, format, tail);
         },
     }
+}
+
+fn writeRootDetail(
+    alloc: Allocator,
+    deps: RunDeps,
+    store: *session_adapter.Store,
+    id: []const u8,
+    format: output_contracts.OutputFormat,
+    tail: ?usize,
+) !RunResult {
+    var resumed = session_adapter.readSession(store, alloc, id) catch |err| {
+        try writeSessionDetailFailure(alloc, deps, id, session_adapter.commandError(err), store.problem.text(), format);
+        return .handled_failure;
+    };
+    defer resumed.deinit(alloc);
+    return writeSessionDetail(alloc, deps, resumed.state, format, tail, null);
+}
+
+/// `fx session {id}/{agent}`: a subagent by the names its parents gave it.
+fn writeAgentDetail(
+    alloc: Allocator,
+    deps: RunDeps,
+    store: *session_adapter.Store,
+    target: []const u8,
+    address: session_adapter.AgentAddress,
+    format: output_contracts.OutputFormat,
+    tail: ?usize,
+) !RunResult {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const lookup = session_adapter.resolveAgent(store, arena.allocator(), address) catch |err| {
+        try writeSessionDetailFailure(alloc, deps, target, session_adapter.commandError(err), store.problem.text(), format);
+        return .handled_failure;
+    };
+    const child_id = switch (lookup) {
+        .found => |id| id,
+        .missing => |missing| {
+            try writeAgentMissing(alloc, deps, missing.parent, missing.name, missing.names, format);
+            return .handled_failure;
+        },
+    };
+    var resumed = session_adapter.readChild(store, alloc, child_id) catch |err| {
+        try writeSessionDetailFailure(alloc, deps, target, session_adapter.commandError(err), store.problem.text(), format);
+        return .handled_failure;
+    };
+    defer resumed.deinit(alloc);
+    return writeSessionDetail(alloc, deps, resumed.state, format, tail, target);
+}
+
+/// No subagent of `parent` goes by `name`: says so, with the names its
+/// subagents do go by.
+fn writeAgentMissing(
+    alloc: Allocator,
+    deps: RunDeps,
+    parent: []const u8,
+    name: []const u8,
+    names: []const []const u8,
+    format: output_contracts.OutputFormat,
+) !void {
+    var message: std.Io.Writer.Allocating = .init(alloc);
+    defer message.deinit();
+    try message.writer.print("session {s} has no agent named {s}; ", .{ parent, name });
+    if (names.len == 0) {
+        try message.writer.writeAll("it has no agents");
+    } else {
+        try message.writer.writeAll("its agents: ");
+        for (names, 0..) |known, i| {
+            if (i > 0) try message.writer.writeAll(", ");
+            try message.writer.writeAll(known);
+        }
+    }
+    if (format == .json) return writeJsonCommandFailureCode(alloc, deps, "session", "AgentNotFound", message.written());
+    try writeStderrLine(alloc, deps, "fx session: {s}\n", message.written());
 }
 
 /// `fx session recover` on v2 (D15): a copy up to the last good turn.
@@ -4131,7 +4267,7 @@ fn channelSavedLine(
     };
 }
 
-const SessionListFlag = enum { all, limit, cursor, json };
+const SessionListFlag = enum { live, all, limit, cursor, json };
 const session_list_flag_ids = cli_flags.idTable(SessionListFlag, &builtin_commands.sessions_options);
 
 fn parseSessionListArgs(args: []const [:0]const u8) !SessionListOptions {
@@ -4140,18 +4276,35 @@ fn parseSessionListArgs(args: []const [:0]const u8) !SessionListOptions {
     while (parser.next() catch return error.InvalidLocalSurfaceArgs) |item| switch (item) {
         .positional => return error.InvalidLocalSurfaceArgs,
         .option => |match| switch (session_list_flag_ids[match.index].?) {
+            .live => options.live = true,
             .all => options.scope = .all_workspaces,
             .limit => {
                 options.limit = std.fmt.parseUnsigned(usize, match.value.?, 10) catch
                     return error.InvalidLocalSurfaceArgs;
                 if (options.limit == 0 or options.limit > session_store.session_list_max_limit)
                     return error.InvalidLocalSurfaceArgs;
+                if (options.paging_flag == null) options.paging_flag = "--limit";
             },
-            .cursor => options.continuation = try parseSessionListCursor(match.value.?),
+            .cursor => {
+                options.continuation = try parseSessionListCursor(match.value.?);
+                if (options.paging_flag == null) options.paging_flag = "--cursor";
+            },
             .json => options.format = .json,
         },
     };
     return options;
+}
+
+test "fx sessions --live reads through the shared parser and names the paging flag it refuses" {
+    const live = try parseSessionListArgs(&.{ "--live", "--all", "--json" });
+    try std.testing.expect(live.live);
+    try std.testing.expectEqual(session_store.SessionListScope.all_workspaces, live.scope);
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, live.format);
+    try std.testing.expectEqual(@as(?[]const u8, null), live.paging_flag);
+    try std.testing.expectEqualStrings("--cursor", (try parseSessionListArgs(&.{ "--cursor", "v1:1:abc", "--live", "--limit", "5" })).paging_flag.?);
+    try std.testing.expectEqualStrings("--limit", (try parseSessionListArgs(&.{ "--live", "--limit=5" })).paging_flag.?);
+    try std.testing.expect(!(try parseSessionListArgs(&.{})).live);
+    try std.testing.expectError(error.InvalidLocalSurfaceArgs, parseSessionListArgs(&.{"--liv"}));
 }
 
 const UsageFlag = enum { period, json };
@@ -4250,8 +4403,11 @@ fn parseWorkspaceArgs(args: []const [:0]const u8) !WorkspaceOptions {
     return error.InvalidWorkspaceArgs;
 }
 
-const SessionFlag = enum { id, json };
+const SessionFlag = enum { id, tail, json };
 const session_flag_ids = cli_flags.idTable(SessionFlag, &builtin_commands.session_options);
+
+/// The most turns `fx session --tail` takes, as its placeholder says.
+const session_tail_max = 1000;
 
 /// The flags and the one target shared by `fx session` and
 /// `fx session recover`. A repeated `--id` keeps its last value; two
@@ -4262,6 +4418,8 @@ const SessionTargetArgs = struct {
     target: ?[]const u8 = null,
     /// The target came from `--id`, so `last` is a literal ID.
     exact_id: bool = false,
+    /// `--tail`, from 1 to `session_tail_max`; only `fx session` takes it.
+    tail: ?usize = null,
 };
 
 fn parseSessionTargetArgs(args: []const [:0]const u8) error{InvalidSessionArgs}!SessionTargetArgs {
@@ -4276,6 +4434,11 @@ fn parseSessionTargetArgs(args: []const [:0]const u8) error{InvalidSessionArgs}!
         },
         .option => |match| switch (session_flag_ids[match.index].?) {
             .id => id_flag = match.value.?,
+            .tail => {
+                const count = std.fmt.parseUnsigned(usize, match.value.?, 10) catch return error.InvalidSessionArgs;
+                if (count == 0 or count > session_tail_max) return error.InvalidSessionArgs;
+                parsed.tail = count;
+            },
             .json => parsed.format = .json,
         },
     };
@@ -4293,7 +4456,7 @@ fn parseSessionDetailArgs(
     args: []const [:0]const u8,
 ) !SessionDetailOptions {
     const parsed = parseSessionTargetArgs(args) catch return error.InvalidSessionDetailArgs;
-    var options = SessionDetailOptions{ .format = parsed.format };
+    var options = SessionDetailOptions{ .format = parsed.format, .tail = parsed.tail };
     const target = parsed.target orelse return options;
     options.target = if (!parsed.exact_id and std.mem.eql(u8, target, "last"))
         .last
@@ -4307,6 +4470,8 @@ fn parseSessionRecoveryArgs(
     args: []const [:0]const u8,
 ) !SessionRecoveryOptions {
     const parsed = parseSessionTargetArgs(args) catch return error.InvalidSessionRecoveryArgs;
+    // A recovery copies the whole session; it shows no turns to tail.
+    if (parsed.tail != null) return error.InvalidSessionRecoveryArgs;
     const target = parsed.target orelse return error.InvalidSessionRecoveryArgs;
     return .{
         .format = parsed.format,
