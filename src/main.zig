@@ -5319,6 +5319,7 @@ test {
     _ = @import("acp/server.zig");
     _ = @import("acp/libfx_hooks.zig");
     _ = @import("acp/types.zig");
+    _ = @import("protocol/spec/schemas.zig");
     _ = @import("core/mcp_host/model.zig");
     _ = @import("core/output/activity_status.zig");
     _ = @import("core/agent/agent_runtime.zig");
