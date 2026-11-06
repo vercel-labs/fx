@@ -9,6 +9,7 @@ const std = @import("std");
 
 pub const Runtime = opaque {};
 pub const Context = opaque {};
+pub const ModuleDef = opaque {};
 
 /// `JSValue` without NaN boxing, the layout quickjs.h uses on 64-bit targets.
 pub const Value = extern struct {
@@ -66,6 +67,14 @@ pub const MallocFunctions = extern struct {
 /// error it cannot catch.
 pub const InterruptHandler = fn (ctx: ?*Context, @"opaque": ?*anyopaque) callconv(.c) c_int;
 
+/// `JSModuleNormalizeFunc`: returns the resolved name, allocated with
+/// `js_malloc`, or null with an exception pending.
+pub const ModuleNormalizeFunc = fn (ctx: ?*Context, module_base_name: [*:0]const u8, module_name: [*:0]const u8, @"opaque": ?*anyopaque) callconv(.c) ?[*:0]u8;
+
+/// `JSModuleLoaderFunc`: returns the loaded module, or null with an
+/// exception pending.
+pub const ModuleLoaderFunc = fn (ctx: ?*Context, module_name: [*:0]const u8, @"opaque": ?*anyopaque) callconv(.c) ?*ModuleDef;
+
 /// `JSPromiseStateEnum`.
 pub const PromiseState = enum(c_int) {
     not_a_promise = -1,
@@ -84,7 +93,23 @@ pub extern fn JS_SetMemoryLimit(rt: *Runtime, limit: usize) void;
 pub extern fn JS_SetMaxStackSize(rt: *Runtime, stack_size: usize) void;
 pub extern fn JS_UpdateStackTop(rt: *Runtime) void;
 pub extern fn JS_SetInterruptHandler(rt: *Runtime, cb: ?*const InterruptHandler, @"opaque": ?*anyopaque) void;
-pub extern fn JS_NewContext(rt: *Runtime) ?*Context;
+/// A null `module_normalize` keeps QuickJS's own name resolution.
+pub extern fn JS_SetModuleLoaderFunc(rt: *Runtime, module_normalize: ?*const ModuleNormalizeFunc, module_loader: ?*const ModuleLoaderFunc, @"opaque": ?*anyopaque) void;
+/// `fmt` is a printf format. Returns `JS_EXCEPTION`, which holds no reference.
+pub extern fn JS_ThrowTypeError(ctx: *Context, fmt: [*:0]const u8, ...) Value;
+/// A context with only the basic objects; the `JS_AddIntrinsic*` and
+/// `JS_AddPerformance` calls each add a group of built-ins and return 0, or
+/// -1 when out of memory.
+pub extern fn JS_NewContextRaw(rt: *Runtime) ?*Context;
+pub extern fn JS_AddIntrinsicBaseObjects(ctx: *Context) c_int;
+pub extern fn JS_AddIntrinsicDate(ctx: *Context) c_int;
+pub extern fn JS_AddIntrinsicEval(ctx: *Context) c_int;
+pub extern fn JS_AddIntrinsicRegExp(ctx: *Context) c_int;
+pub extern fn JS_AddIntrinsicJSON(ctx: *Context) c_int;
+pub extern fn JS_AddIntrinsicMapSet(ctx: *Context) c_int;
+pub extern fn JS_AddIntrinsicPromise(ctx: *Context) c_int;
+pub extern fn JS_AddIntrinsicAToB(ctx: *Context) c_int;
+pub extern fn JS_AddPerformance(ctx: *Context) c_int;
 pub extern fn JS_FreeContext(ctx: *Context) void;
 /// `input[input_len]` must be 0.
 pub extern fn JS_Eval(ctx: *Context, input: [*:0]const u8, input_len: usize, filename: [*:0]const u8, eval_flags: c_int) Value;
