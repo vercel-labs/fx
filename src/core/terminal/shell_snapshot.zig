@@ -1208,7 +1208,12 @@ fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
     const home = try io_mod.dirRealpathAlloc(scratch, tmp.dir, ".");
-    try writeTestFile(tmp.dir, file_name, contents);
+    try writeTestFile(tmp.dir, file_name, try std.mem.concat(scratch, u8, &.{
+        contents,
+        "_fx_snapshot_helper() { printf 'helper-ok\\n'; }\n" ++
+            "__fx_snapshot_private() { :; }\n" ++
+            "_fx_snapshot_literal() { printf 'builtin autoload -XU\\n'; }\n",
+    }));
     if (std.mem.eql(u8, file_name, ".bashrc")) {
         try writeTestFile(tmp.dir, ".bash_profile", ". \"$HOME/.bashrc\"\n");
     }
@@ -1237,6 +1242,14 @@ fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []
     try testing.expect(std.mem.find(u8, generation.replay, "fx_snapshot_function") != null);
     try testing.expect(std.mem.find(u8, generation.replay, "fxll") != null);
     try testing.expect(std.mem.find(u8, generation.replay, "startup chatter") == null);
+    try testing.expect(std.mem.find(u8, generation.replay, "_fx_snapshot_helper") != null);
+    try testing.expect(std.mem.find(u8, generation.replay, "_fx_snapshot_literal") != null);
+    try testing.expect(std.mem.find(u8, generation.replay, "__fx_snapshot_private") == null);
+    if (std.mem.eql(u8, file_name, ".zshrc")) {
+        try testing.expect(generation.defines("_fx_unloaded"));
+        try testing.expect(std.mem.find(u8, generation.replay, "_fx_unloaded") == null);
+        try testing.expect(std.mem.find(u8, generation.replay, "fx_public_unloaded") != null);
+    }
 }
 
 test "snapshot capture reads a real zsh login shell" {
@@ -1248,7 +1261,7 @@ test "snapshot capture reads a real zsh login shell" {
             "export PATH=\"/opt/fx-snapshot-marker/bin:$PATH\"\n" ++
             "alias fxll='print -r -- alias-ok'\n" ++
             "fx_snapshot_function() { print -r -- function-ok; }\n" ++
-            "_fx_completion_helper() { :; }\n",
+            "autoload -Uz _fx_unloaded fx_public_unloaded\n",
     );
 }
 
