@@ -1756,7 +1756,7 @@ fn executeNestedToolCall(
     const call: ToolCall = .{
         .id = try state.arena.print("{s}.{d}", .{ state.call.id, state.nested_count }),
         .name = try state.arena.dupe(u8, name),
-        .arguments_json = try state.arena.dupe(u8, args_json),
+        .arguments_json = try nestedArguments(state, name, args_json),
     };
     const mcp_generation: ?u64 = switch (try validateToolCall(ctx, call_arena, call)) {
         .valid => |witness| witness.mcp_runtime_generation,
@@ -1800,6 +1800,17 @@ fn executeNestedToolCall(
         .{ .role = .tool, .tool_call_id = call.id, .tool_name = call.name, .content = text },
     });
     return .{ .text = text, .status = if (result.status == .failure) .failed else .ok };
+}
+
+/// A program's arguments as the agent loop stores a model's call: a shell
+/// call's exact {"request":{...}} unwrapped and a missing action filled in,
+/// so `tools.shell({ command })` runs like the same direct call. The bytes
+/// live in the `execute` call's arena.
+fn nestedArguments(state: *CodeModeProviderState, name: []const u8, args_json: []const u8) ![]const u8 {
+    if (registeredToolSpec(state.runtime, name)) |tool| if (tool.executor_kind == .terminal) {
+        if (try tool_args.normalizedTerminalRequestArguments(state.arena, args_json, tool.infer_action_fn)) |normalized| return normalized;
+    };
+    return state.arena.dupe(u8, args_json);
 }
 
 /// The permission outcome for one call from a program. In `auto` mode the
@@ -7306,6 +7317,29 @@ test "a program's tool calls stay inside a live tool authority" {
             try expectNotContains(result.model_output, "top secret");
         }
     }
+}
+
+test "a program's shell call takes the arguments the same direct call does" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var rt = TestRuntime{
+        .workspace_root = "/workspace",
+        .tool_registry = .{ .tools = &.{ test_builtin_tools.shell, test_builtin_tools.read_file } },
+    };
+    defer rt.deinit(std.testing.allocator);
+    var state: CodeModeProviderState = .{
+        .runtime = rt.context(),
+        .call = .{ .id = "program", .name = "execute", .arguments_json = "{}" },
+        .arena = arena_state.allocator(),
+    };
+    const cases = [_]struct { name: []const u8, sent: []const u8, run: []const u8 }{
+        .{ .name = "shell", .sent = "{\"command\":\"pwd\"}", .run = "{\"action\":\"run\",\"command\":\"pwd\"}" },
+        .{ .name = "shell", .sent = "{\"request\":{\"action\":\"run\",\"command\":\"pwd\"}}", .run = "{\"action\":\"run\",\"command\":\"pwd\"}" },
+        .{ .name = "shell", .sent = "{\"action\":\"stop\",\"session_id\":\"s\"}", .run = "{\"action\":\"stop\",\"session_id\":\"s\"}" },
+        // The control: a tool without the agent loop's normalization keeps its arguments.
+        .{ .name = "read_file", .sent = "{\"request\":{\"path\":\"a\"}}", .run = "{\"request\":{\"path\":\"a\"}}" },
+    };
+    for (cases) |case| try std.testing.expectEqualStrings(case.run, try nestedArguments(&state, case.name, case.sent));
 }
 
 test "an execute call runs its program only while code mode is on" {

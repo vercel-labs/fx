@@ -363,67 +363,6 @@ fn request_unwrap_eligible(vision_mode: runtime_gateway_step.VisionToolMode) boo
     return vision_mode != .required;
 }
 
-fn terminal_action_is(object: std.json.ObjectMap, action_name: []const u8) bool {
-    const action = object.get("action") orelse return false;
-    return action == .string and std.mem.eql(u8, action.string, action_name);
-}
-
-fn terminal_lease_is_absent(value: std.json.Value) bool {
-    return switch (value) {
-        .null => true,
-        .string => |text| tool_args.isNullPlaceholderText(text),
-        else => false,
-    };
-}
-
-fn elide_terminal_null_lease(object: *std.json.ObjectMap) void {
-    const lease = object.get("lease") orelse return;
-    if (!terminal_lease_is_absent(lease)) return;
-    _ = object.orderedRemove("lease");
-}
-
-const TerminalModelPayloadMapping = struct {
-    kind: []const u8,
-    model_field: []const u8,
-    internal_field: []const u8,
-};
-
-const terminal_model_payload_mappings = [_]TerminalModelPayloadMapping{
-    .{ .kind = "text", .model_field = "text", .internal_field = "text" },
-    .{ .kind = "keys", .model_field = "keys", .internal_field = "keys" },
-    .{ .kind = "controls", .model_field = "controls", .internal_field = "controls" },
-    .{ .kind = "paste", .model_field = "paste", .internal_field = "text" },
-};
-
-fn terminal_payload_mapping(model_field: []const u8) ?TerminalModelPayloadMapping {
-    for (terminal_model_payload_mappings) |mapping| {
-        if (std.mem.eql(u8, mapping.model_field, model_field)) return mapping;
-    }
-    return null;
-}
-
-fn normalize_terminal_model_input(
-    arena: Allocator,
-    object: *std.json.ObjectMap,
-) Allocator.Error!bool {
-    if (!terminal_action_is(object.*, "write")) return false;
-    elide_terminal_null_lease(object);
-    if (object.get("write") != null or object.get("lease") != null) {
-        return false;
-    }
-    const input = object.get("input") orelse return false;
-    if (input != .object or input.object.count() != 1) return false;
-    const input_key = input.object.keys()[0];
-    const input_value = input.object.values()[0];
-    const mapping = terminal_payload_mapping(input_key) orelse return false;
-    var write = std.json.Value{ .object = .empty };
-    try write.object.put(arena, "kind", .{ .string = mapping.kind });
-    try write.object.put(arena, mapping.internal_field, input_value);
-    try object.put(arena, "write", write);
-    _ = object.orderedRemove("input");
-    return true;
-}
-
 /// Returns the top-level arguments of an exact {"request":{...}}
 /// read_tool_result call, or null to replay the call as it was sent.
 fn projected_read_tool_result_arguments(
@@ -1297,51 +1236,6 @@ fn project_read_tool_result_request_messages(
     return projected orelse source;
 }
 
-/// Returns the arguments a shell call is stored and admitted with: an exact
-/// {"request":{...}} unwrapped, and a missing action filled in when
-/// `infer_action` names exactly one. Null keeps the call as it was sent.
-fn normalized_terminal_request_arguments(
-    alloc: Allocator,
-    arguments_json: []const u8,
-    infer_action: ?tool_dispatch.InferActionFn,
-) Allocator.Error!?[]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const arena = parsed.arena.allocator();
-    var args = parsed.value;
-    var changed = false;
-    if (args.object.count() == 1) {
-        if (args.object.get("request")) |request| {
-            if (request != .object) return null;
-            args = request;
-            _ = try normalize_terminal_model_input(arena, &args.object);
-            changed = true;
-        }
-    }
-    if (infer_action) |infer| {
-        if (infer(args.object)) |action| {
-            var with_action = std.json.Value{ .object = .empty };
-            try with_action.object.put(arena, "action", .{ .string = action });
-            var fields = args.object.iterator();
-            while (fields.next()) |entry| {
-                try with_action.object.put(arena, entry.key_ptr.*, entry.value_ptr.*);
-            }
-            args = with_action;
-            changed = true;
-        }
-    }
-    if (!changed) return null;
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    std.json.Stringify.value(args, .{}, &out.writer) catch return error.OutOfMemory;
-    return try out.toOwnedSlice();
-}
-
 fn managed_subagent_action(action: []const u8) ?[]const u8 {
     for ([_][]const u8{ "run", "message" }) |known| {
         if (std.mem.eql(u8, action, known)) return known;
@@ -1455,7 +1349,7 @@ fn normalize_terminal_request_tool_calls(
         if (call.argument_integrity != .valid) continue;
         const tool = registry.lookup(call.name) orelse continue;
         if (tool.executor_kind != .terminal) continue;
-        const arguments_json = try normalized_terminal_request_arguments(
+        const arguments_json = try tool_args.normalizedTerminalRequestArguments(
             alloc,
             call.arguments_json,
             tool.infer_action_fn,
@@ -1589,7 +1483,7 @@ test "terminal model write input normalizes every atomic payload" {
         },
     };
     for (cases) |case| {
-        const normalized = (try normalized_terminal_request_arguments(
+        const normalized = (try tool_args.normalizedTerminalRequestArguments(
             alloc,
             case.model,
             null,

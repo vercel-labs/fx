@@ -474,9 +474,7 @@ pub const RuntimeProviderKind = enum {
 };
 
 pub const CapturedCommandFn = *const fn (ToolInput) bool;
-/// Names the action a model call without one means, or null when it is not
-/// exactly one. See `Tool.infer_action_fn`.
-pub const InferActionFn = *const fn (std.json.ObjectMap) ?[]const u8;
+pub const InferActionFn = tool_args.InferActionFn;
 pub const ProcessLocalFn = *const fn (ToolInput) bool;
 
 pub const CallPresentation = struct {
