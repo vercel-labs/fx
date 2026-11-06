@@ -638,7 +638,7 @@ pub fn Runtime(comptime App: type) type {
             agent.total_output_tokens = 0;
             agent.total_web_search_requests = 0;
             if (comptime runtime_profile.allows(App, .js_host_sessions)) {
-                try beginFreshJsHostSession(app, agent);
+                try beginFreshJsHostSession(app, agent, carried);
             }
             defer syncTranscriptWindowSaveMode(app, agent);
             defer syncTranscriptArchiveAvailable(app, agent);
@@ -649,6 +649,9 @@ pub fn Runtime(comptime App: type) type {
         /// The preferences `agent`'s open session has saved, or null when it
         /// has no session or they can't be read. Caller owns.
         fn savedPreferences(app: *App, agent: *AppAgent) ?session_codec.DurableSessionPreferences {
+            if (comptime runtime_profile.allows(App, .js_host_sessions)) {
+                if (jsHostSavedPreferences(app, agent)) |preferences| return preferences;
+            }
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return null;
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
@@ -724,8 +727,20 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.degraded_warning_emitted = false;
         }
 
-        fn beginFreshJsHostSession(app: *App, agent: *AppAgent) !void {
-            const preferences = agent.session_persistence.workspace_preferences orelse
+        /// The preferences `agent`'s JS-host session has saved, or null when
+        /// it has none or they can't be copied. Caller owns.
+        fn jsHostSavedPreferences(app: *App, agent: *AppAgent) ?session_codec.DurableSessionPreferences {
+            const owner = if (agent.session_persistence.js_host_session) |*value| value else return null;
+            return owner.state.preferences.dupe(app.alloc) catch |err| {
+                debug_trace.logf("session", "saved preferences unavailable session={s} err={s}; the new session starts from the workspace's", .{ owner.state.id, @errorName(err) });
+                return null;
+            };
+        }
+
+        /// `carried`, when given, is what the new session starts with in
+        /// place of the workspace's preferences, as in `beginFresh`.
+        fn beginFreshJsHostSession(app: *App, agent: *AppAgent, carried: ?session_codec.DurableSessionPreferences) !void {
+            const preferences = carried orelse agent.session_persistence.workspace_preferences orelse
                 return error.SessionPreferencesUnavailable;
             try replacePreferences(
                 app.alloc,
@@ -1324,7 +1339,7 @@ pub fn Runtime(comptime App: type) type {
             agent.session.reset(app.alloc);
             app.shell.clearTranscript(app.alloc);
             clearCachedSessionTitle(app, agent);
-            try beginFreshJsHostSession(app, agent);
+            try beginFreshJsHostSession(app, agent, null);
             try finishLiveSessionTransition(app);
         }
 
@@ -6033,7 +6048,7 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         null,
     );
     app.agent().session_persistence.js_host_store = fake.store();
-    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), null);
 
     const first_turn = try session_runtime.makeAssistantTurn(alloc, "first prompt", "first reply");
     defer session_runtime.freeHistoryTurn(alloc, first_turn);
@@ -6065,7 +6080,7 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
     const previous_id = try alloc.dupe(u8, app.agent().session_persistence.js_host_session.?.state.id);
     defer alloc.free(previous_id);
     app.agent().session.reset(alloc);
-    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), null);
     try std.testing.expect(!std.mem.eql(
         u8,
         previous_id,
@@ -6073,6 +6088,54 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
     ));
     try std.testing.expect(app.agent().session_persistence.js_host_session.?.revision == null);
     try std.testing.expectEqual(@as(usize, 0), app.agent().session_persistence.js_host_session.?.state.history.len);
+}
+
+test "js-host /new starts with what the closing session saved, not the workspace's preferences" {
+    const alloc = std.testing.allocator;
+    var fake = FakeJsHostSessionStore{};
+    defer fake.deinit(alloc);
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    try Runtime(TestApp).configureStartupPreferences(
+        &app,
+        (&app).agent(),
+        .gateway,
+        "fresh/model",
+        .user_global,
+        "fresh/model",
+        .auto,
+        false,
+        true,
+        false,
+        null,
+        null,
+        null,
+        null,
+    );
+    app.agent().session_persistence.js_host_store = fake.store();
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), null);
+
+    // As a resumed session would, this one saved a model and effort of its own.
+    const owner = &app.agent().session_persistence.js_host_session.?;
+    alloc.free(owner.state.preferences.model);
+    owner.state.preferences.model = try alloc.dupe(u8, "resumed/model");
+    owner.state.preferences.effort = types.ReasoningEffort.literal("high");
+    const previous_id = try alloc.dupe(u8, owner.state.id);
+    defer alloc.free(previous_id);
+
+    // `beginFresh` takes these on a JS host; this native test app calls the
+    // JS-host steps directly, as the tests above do.
+    var carried = Runtime(TestApp).jsHostSavedPreferences(&app, (&app).agent());
+    defer if (carried) |*value| value.deinit(alloc);
+    try std.testing.expectEqualStrings("resumed/model", carried.?.model);
+    app.agent().session.reset(alloc);
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), carried);
+
+    const fresh = &app.agent().session_persistence.js_host_session.?.state;
+    try std.testing.expect(!std.mem.eql(u8, previous_id, fresh.id));
+    try std.testing.expectEqualStrings("resumed/model", fresh.preferences.model);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), fresh.preferences.effort);
+    try std.testing.expectEqualStrings("resumed/model", app.agent().session_persistence.session_preferences.?.model);
 }
 
 test "js-host preference changes snapshot the updated session preferences" {
@@ -6107,7 +6170,7 @@ test "js-host preference changes snapshot the updated session preferences" {
         null,
     );
     app.agent().session_persistence.js_host_store = fake.store();
-    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), null);
 
     var result = Runtime(TestApp).commitRuntimePreferences(&app, (&app).agent(), .{
         .model = "browser/model",
