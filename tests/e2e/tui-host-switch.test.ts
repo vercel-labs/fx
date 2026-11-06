@@ -120,6 +120,28 @@ function traceHas(path: string, text: string): boolean {
   return existsSync(path) && readFileSync(path, "utf8").includes(text);
 }
 
+// The newest saved request-recovery record of the main session and of its
+// subagent in `home`: its phase (1 is a send in flight) and whether it is
+// marked as a clean close.
+function lastRecoveryRecords(home: string) {
+  const sessions = join(home, ".fx", "sessions", "v2");
+  const found: { rootId: string; root: object | null; child: object | null } = { rootId: "", root: null, child: null };
+  for (const id of readdirSync(sessions)) {
+    const log = join(sessions, id, "log.jsonl");
+    if (!existsSync(log)) continue;
+    const lines = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const saved = lines.filter((line) => line.kind === "item" && line.type === "recovery" && line.data?.record).at(-1);
+    const record = saved ? { phase: Number.parseInt(saved.data.record.slice(2, 4), 16), clean: (Number.parseInt(saved.data.record.slice(4, 6), 16) & 1) === 1 } : null;
+    if (lines[0].role === "root") {
+      found.rootId = id;
+      found.root = record;
+    } else {
+      found.child = record;
+    }
+  }
+  return found;
+}
+
 // Every frame of the tape at `path`, as text.
 function tapeFrames(path: string): string {
   const replay = Bun.spawnSync([FX_BIN, "replay", path, "--frames"], { stdout: "pipe", stderr: "pipe" });
@@ -1658,6 +1680,60 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         tracePath = join(home, "fx-trace.log");
         env.FX_RECORD = tapePath;
         env.FX_TRACE_LOG = tracePath;
+      }, false, env);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "closing the window while main and a subagent wait on the model resumes main without a crash question",
+    async () => {
+      // Full access runs the subagent's command without a review.
+      const env: Record<string, string> = { FX_PERMISSION_MODE: "full-access" };
+      let home = "";
+      let mainSends = 0;
+      let subagentSends = 0;
+      const never = new Promise<Response>(() => {});
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          // A short command first, so the subagent's next request starts
+          // after main's.
+          if (!body.includes('"solo_sleep"')) return toolCall("solo_sleep", "shell", { action: "run", command: "sleep 1" });
+          subagentSends += 1;
+          return never;
+        }
+        if (!body.includes('"main_solo"')) {
+          return toolCall("main_solo", "subagent", { request: { action: "message", agent: "solo", message: "SOLO_TASK" } });
+        }
+        mainSends += 1;
+        return never;
+      }, async (session, context) => {
+        await session.sendText("SWITCH_USER go");
+        await until("main's request", () => mainSends === 1, 30_000);
+        await until("the subagent's later request", () => subagentSends === 1, 30_000);
+        process.kill(session.processPid(), "SIGHUP");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+        // Both requests in flight are saved as a clean close.
+        const records = lastRecoveryRecords(home);
+        expect(records.root).toEqual({ phase: 1, clean: true });
+        expect(records.child).toEqual({ phase: 1, clean: true });
+
+        // The window closes the same way again, while main's resumed request
+        // and a new subagent request wait.
+        const second = await context.launch(`--resume ${records.rootId}`);
+        await until("main's resumed request", () => mainSends === 2, 30_000);
+        await moveAgent(second, 1);
+        await second.sendText("SOLO_AGAIN");
+        await until("the subagent's request after main's", () => subagentSends === 2, 30_000);
+        process.kill(second.processPid(), "SIGHUP");
+        expect(await second.waitForSessionEnd(15_000)).toBe(true);
+
+        // fx never crashed, so main's request goes out again without asking.
+        const third = await context.launch(`--resume ${records.rootId}`);
+        await until("main's request to resume again", () => mainSends === 3, 30_000);
+        expect(await third.capturePane()).not.toContain("crashed fx twice");
+      }, (dir) => {
+        home = dir;
       }, false, env);
     },
     TIMEOUT,
