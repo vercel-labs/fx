@@ -574,13 +574,14 @@ fn tableValues(doc: []const u8, comptime header: []const u8, out: [][]const u8) 
     return out[0..count];
 }
 
-test "the steering tables give the values of the schema's delivery types" {
+test "the value tables in sh-fx.md give the values of the schema's enums" {
     const parsed = try parseSpecFile(fx_schema);
     defer parsed.deinit();
     const defs = field(parsed.value, "$defs") orelse return error.TestUnexpectedResult;
     const tables = .{
         .{ "| `sh.fx/delivery` |", "PromptDelivery" },
         .{ "| `sh.fx/steeringDelivery` |", "SteeringDelivery" },
+        .{ "| `sh.fx/replay` |", "Replay" },
     };
     inline for (tables) |table| {
         var buffer: [16][]const u8 = undefined;
