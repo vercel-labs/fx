@@ -34,6 +34,7 @@ pub const login_options = [_]command_specs.OptionDoc{
 };
 
 pub const sessions_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--live", .description = "List only the sessions an fx process has open now, with their subagents" },
     .{ .flag = "--all", .description = "List saved sessions across every workspace in this profile" },
     .{ .flag = "--limit <1-100>", .description = "Set the maximum sessions returned per page" },
     .{ .flag = "--cursor <cursor>", .description = "Continue from a prior sessions result" },
@@ -91,6 +92,7 @@ const session_subcommands = [_]command_specs.SubcommandDoc{
 
 pub const session_options = [_]command_specs.OptionDoc{
     .{ .flag = "--id <id>", .description = "Inspect a saved session by exact id" },
+    .{ .flag = "--tail <1-1000>", .description = "Show only the last turns, each under its own number" },
     json_option,
 };
 
@@ -352,18 +354,25 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .session,
         .token = "session",
-        .usage = "session <last|id>|--id <id> [--json] | session resume [last|<id>] | session recover <id>|--id <id> [--json]",
+        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session resume [last|<id>] | session recover <id>|--id <id> [--json]",
         .summary = "Inspect, resume, or recover saved sessions",
         .subcommands = &session_subcommands,
         .options = &session_options,
+        .details = &.{
+            "<id>/<agent> reads a subagent by the name its parent gave it, and <id>/<agent>/<agent> that subagent's own; fx sessions --live lists them.",
+            "Reading takes no lock, so it works while another fx has the session open. --tail shows finished turns; the one in progress is not saved yet.",
+        },
     },
     .{
         .kind = .sessions,
         .token = "sessions",
-        .usage = "sessions [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions convert [--json]",
+        .usage = "sessions [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions --live [--all] [--json] | sessions convert [--json]",
         .summary = "List saved sessions for the current workspace",
         .subcommands = &.{.{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options }},
         .options = &sessions_options,
+        .details = &.{
+            "--live shows each session's state (working or idle), the model saved with it, and its subagents with the <id>/<agent> address fx session reads them by.",
+        },
     },
     .{
         .kind = .@"resume",
