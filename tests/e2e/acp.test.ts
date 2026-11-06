@@ -3691,14 +3691,16 @@ describe("acp: model-independent", () => {
         expect(init.result.agentCapabilities.sessionCapabilities.systemPrompt).toEqual({});
 
         for (const [id, params, message] of [
-          [20, { systemPrompt: [] }, "systemPrompt must contain at least one content block"],
-          [21, { systemPromptMode: "append" }, "systemPromptMode requires systemPrompt"],
-          [22, {
-            systemPrompt: [{ type: "text", text: "x" }],
-            systemPromptMode: "override",
-          }, 'systemPromptMode supports only "append"'],
-          [23, { systemPrompt: [{ type: "image", data: "AA==", mimeType: "image/png" }] },
+          [20, { systemPrompt: { mode: "append", content: [] } },
+            "systemPrompt.content must contain at least one content block"],
+          // The older RFD shape, a bare array of blocks, is refused.
+          [21, { systemPrompt: [{ type: "text", text: "x" }] },
+            "systemPrompt must be an object with a mode and a content array"],
+          [22, { systemPrompt: { mode: "override", content: [{ type: "text", text: "x" }] } },
+            'systemPrompt.mode supports only "append"'],
+          [23, { systemPrompt: { mode: "append", content: [{ type: "image", data: "AA==", mimeType: "image/png" }] } },
             "systemPrompt supports text content blocks only"],
+          [24, { systemPrompt: { content: [{ type: "text", text: "x" }] } }, "systemPrompt.mode is required"],
         ] as const) {
           const rejected = await client.request("session/new", {
             cwd: root.workspace,
@@ -3715,11 +3717,13 @@ describe("acp: model-independent", () => {
         const created = await client.request("session/new", {
           cwd: root.workspace,
           mcpServers: [],
-          systemPrompt: [
-            { type: "text", text: `You are the assistant inside Mini, a macOS browser. ${marker}` },
-            { type: "text", text: "Use the browser tools for navigation." },
-          ],
-          systemPromptMode: "append",
+          systemPrompt: {
+            mode: "append",
+            content: [
+              { type: "text", text: `You are the assistant inside Mini, a macOS browser. ${marker}` },
+              { type: "text", text: "Use the browser tools for navigation." },
+            ],
+          },
         }, 2) as any;
         expect(created.error).toBeUndefined();
         const sessionId = created.result.sessionId as string;
