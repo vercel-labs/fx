@@ -7162,7 +7162,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           await tui.waitForPane((text) => hasEmptyComposer(text) && text.includes("CANCEL_RESTART_COMPLETE"), 15000);
           // One more for the report turn the restart owed.
           expect(gateway.requests).toHaveLength(8);
-          const history = (await savedSession(root.home, sessionId)).history;
+          // The reply shows before its turn is saved, so wait for the save.
+          const saveDeadline = Date.now() + 15_000;
+          let history = (await savedSession(root.home, sessionId)).history;
+          while (!history.some((turn) => turn.assistant === "CANCEL_RESTART_COMPLETE") && Date.now() < saveDeadline) {
+            await Bun.sleep(100);
+            history = (await savedSession(root.home, sessionId)).history;
+          }
           const calls = savedToolCallIds(history);
           expect(calls.filter((id) => id === "cancelled-history-child")).toHaveLength(1);
           expect(calls.filter((id) => id === "cancel-follow-up-read")).toHaveLength(1);

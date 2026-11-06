@@ -10360,12 +10360,18 @@ test "a v1 side file larger than one v2 blob is left out and named, its v1 folde
     }
     var told: std.ArrayList(u8) = .empty;
     defer told.deinit(alloc);
-    t.store.notice = .{ .context = &told, .emit = struct {
-        fn emit(context: ?*anyopaque, text: []const u8) void {
-            const out: *std.ArrayList(u8) = @ptrCast(@alignCast(context.?));
-            out.appendSlice(testing.allocator, text) catch {};
-        }
-    }.emit };
+    t.store.notice = .{
+        .context = &told,
+        .emit = struct {
+            fn emit(context: ?*anyopaque, text: []const u8) void {
+                // On a busy machine the conversion can pass its slow mark and
+                // say so too; this test is about the other notice.
+                if (std.mem.eql(u8, text, slow_conversion_text)) return;
+                const out: *std.ArrayList(u8) = @ptrCast(@alignCast(context.?));
+                out.appendSlice(testing.allocator, text) catch {};
+            }
+        }.emit,
+    };
 
     // Opened: the host is told what was left out.
     const s = try openConverted(&t, roots[0]);
