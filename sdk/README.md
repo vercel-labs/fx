@@ -214,6 +214,8 @@ When the turn continues, a call to an `idempotent: true` tool runs again. A call
 
 Each call's `executionId` stays the same when it runs again. Pass it to the service your tool calls as an idempotency key, and a service that honors idempotency keys won't refund twice. That makes the tool safe to mark `idempotent: true` with `writes: true`.
 
+A step that stops three times in a row with no progress between isn't run again. Both kinds of stop count: a process that dies partway, and the function's time limit. The call is then answered as possibly run, even for an `idempotent: true` tool, and a model request ends the turn, cancelled. So a call that crashes its process each time it runs stops after the third crash. Without this, it would take down that process and every session sharing it until the queue gave up on the message, which can take a day. A session that shares the process loses its worker in each of those crashes too, and they count toward its own three.
+
 A tool marked `idempotent: true` without `writes: true` starts as soon as the model asks for it, while libfx stores the call. If the process dies before the call is stored, the model asks again and the call gets a new `executionId`, which is harmless for a lookup. Every other tool starts only once its call is stored, so its `executionId` never changes.
 
 ### Your own store

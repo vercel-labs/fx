@@ -477,6 +477,18 @@ if (childMode && process.argv[6] === "steer") {
   console.log(JSON.stringify({ sessionId: session.id, executionId: runs.find(([name]) => name === "lookup")?.[1] }));
   await new Promise(() => {});
 }
+// With `resume`, it resumes session `process.argv[7]`, whose lookup never
+// finishes when it runs again, and prints once it does.
+if (childMode && process.argv[6] === "resume") {
+  gate("lookup");
+  const agent = createFxAgent(agentOptions(await durabilityAt(process.argv[5])));
+  const session = agent.session(process.argv[7]);
+  void session.resume().result.catch(() => {});
+  await gates.get("lookup").started;
+  await agent[Symbol.for("libfx.durableInternals")].settled(session.id);
+  console.log(JSON.stringify({ sessionId: session.id, executionId: runs.find(([name]) => name === "lookup")?.[1] }));
+  await new Promise(() => {});
+}
 if (childMode) {
   const dir = process.argv[5];
   const tool = process.argv[6];
@@ -1496,6 +1508,50 @@ if (durabilityKind !== "memory") {
       await agent.close();
     });
   }
+
+  test("an idempotent call that stops its worker each time it runs is not run again once it has been cut off three times", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-durable-poison-"));
+    dirs.push(dir);
+    // The first child starts the turn and each later one resumes it. Each is
+    // killed while the lookup runs, as a call that crashes its process
+    // would stop it.
+    let sessionId = null;
+    const executionIds = [];
+    for (let crash = 0; crash < 3; crash += 1) {
+      const child = spawn(process.execPath, [
+        ...process.execArgv,
+        fileURLToPath(import.meta.url),
+        durabilityKind,
+        engineBackend,
+        "--child",
+        dir,
+        ...(sessionId ? ["resume", sessionId] : ["lookup"]),
+      ], { stdio: ["ignore", "pipe", "inherit"], env: { ...process.env } });
+      const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
+      let output = "";
+      child.stdout.on("data", (chunk) => { output += chunk; });
+      try {
+        await until(() => output.includes("\n"), `child ${crash + 1} to run the lookup`, testTimeoutMs / 4);
+      } finally {
+        child.kill("SIGKILL");
+        await exited;
+      }
+      const printed = JSON.parse(output.trim().split("\n")[0]);
+      sessionId = printed.sessionId;
+      executionIds.push(printed.executionId);
+    }
+    assert.equal(new Set(executionIds).size, 1, "each rerun ran under the call's execution id");
+    // The first child ran the call, and each later one found the worker
+    // before it had stopped partway: two cut-offs. This takeover is the
+    // third, so the call is not run a fourth time.
+    const runsBefore = runs.filter(([name]) => name === "lookup").length;
+    const agent = createFxAgent(agentOptions(await durabilityAt(dir)));
+    const resumed = await agent.session(sessionId).resume().result;
+    assert.equal(resumed.stopReason, "end_turn");
+    assert.equal(runs.filter(([name]) => name === "lookup").length - runsBefore, 0, "the call was not run again");
+    assert.ok(JSON.stringify(requests.at(-1)).includes("may have partly run"), "the model hears the call may have partly run");
+    await agent.close();
+  });
 
   // Another worker takes the turn over as a queue that outlives the process
   // would, delivering the steer again, or for a resume.
