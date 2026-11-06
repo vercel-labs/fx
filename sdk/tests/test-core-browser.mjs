@@ -307,6 +307,146 @@ try {
     }
   }
 
+  // Image sessions in a real browser: a durable session holds more images than
+  // a 4 MiB checkpoint, an engine's store reopens with its images, and a
+  // request the provider refuses as too large goes again with fewer images.
+  {
+    const { targetId } = await command("Target.createTarget", { url: "about:blank" });
+    try {
+      const { sessionId } = await command("Target.attachToTarget", { targetId, flatten: true });
+      await command("Runtime.enable", {}, sessionId);
+      await command("Page.enable", {}, sessionId);
+      await command("Page.navigate", { url: `http://127.0.0.1:${port}/sdk/index.html?force-unsupported=1` }, sessionId);
+      await waitFor("window.__fxCoreTest?.state === 'unsupported'", sessionId);
+      const evaluated = await withTimeout(command("Runtime.evaluate", {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const expect = ${expect.toString()};
+          const { createFxAgent, createFxEngine, createMemoryPersistence, memory } = await import('/sdk/browser.js');
+          const response = await fetch('/zig-out/bin/fx-core.wasm', { cache: 'no-store' });
+          expect(response.ok, 'local core WASM fetch failed: ' + response.status);
+          const wasm = await response.arrayBuffer();
+          const apiKey = 'browser-image-test-key';
+          const model = 'sdk/chrome-vision';
+          const newline = String.fromCharCode(10);
+          // A 1x1 PNG, followed by bytes the salt makes unique, size bytes in all.
+          const head = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII='), (c) => c.charCodeAt(0));
+          const png = (size, salt) => {
+            const bytes = new Uint8Array(size);
+            bytes.set(head);
+            let x = (salt * 2654435761) >>> 0 || 1;
+            for (let i = head.length; i < size; i += 1) {
+              x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0;
+              bytes[i] = x & 255;
+            }
+            return bytes;
+          };
+          const base64 = (bytes) => {
+            let text = '';
+            for (let i = 0; i < bytes.length; i += 32768) text += String.fromCharCode(...bytes.subarray(i, i + 32768));
+            return btoa(text);
+          };
+          const requests = [];
+          let refuseOver = Infinity;
+          const fakeFetch = async (_url, init = {}) => {
+            const method = String(init.method ?? 'GET').toUpperCase();
+            if (method === 'GET') {
+              return Response.json({ object: 'list', data: [{ id: model, type: 'language', owned_by: 'sdk', tags: ['vision', 'file-input'] }] });
+            }
+            const body = new TextDecoder().decode(init.body);
+            requests.push(body);
+            if (body.length > refuseOver) {
+              return Response.json({ error: { message: 'request entity too large', type: 'invalid_request_error' } }, { status: 413 });
+            }
+            const frames = [
+              { type: 'text-delta', delta: 'seen' },
+              { type: 'finish', finishReason: { unified: 'stop', raw: 'stop' }, usage: { inputTokens: { total: 3 }, outputTokens: { total: 1 } } },
+            ];
+            return new Response(frames.map((frame) => 'data: ' + JSON.stringify(frame) + newline + newline).join('') + 'data: [DONE]' + newline + newline,
+              { headers: { 'content-type': 'text/event-stream' } });
+          };
+          const fileParts = (body) => body.split('"type":"file"').length - 1;
+          const finish = async (turn) => {
+            for await (const _ of turn) {}
+            return turn.result;
+          };
+          const passed = [];
+
+          // Three turns with two 2 MiB images each: 12 MiB, three times a checkpoint's 4 MiB.
+          const agent = createFxAgent({ wasm, apiKey, model, fetch: fakeFetch, durability: memory() });
+          try {
+            const session = agent.session();
+            for (let turn = 0; turn < 3; turn += 1) {
+              const { stopReason, error } = await finish(session.prompt([
+                { type: 'text', text: 'look ' + turn },
+                { type: 'image', mimeType: 'image/png', data: base64(png(2 * 1024 * 1024, 2 * turn + 1)) },
+                { type: 'image', mimeType: 'image/png', data: base64(png(2 * 1024 * 1024, 2 * turn + 2)) },
+              ]));
+              expect(stopReason === 'end_turn', 'durable image turn ' + turn + ' ended ' + stopReason + ': ' + (error?.message ?? ''));
+            }
+            expect(fileParts(requests.at(-1)) === 6, 'the last durable request carried ' + fileParts(requests.at(-1)) + ' images, not 6');
+            passed.push('durable session past 4 MiB of images');
+          } finally {
+            await agent.close();
+          }
+
+          // An engine that records to a store, then a new engine on that store.
+          const persistence = createMemoryPersistence();
+          const first = await createFxEngine({ wasm, apiKey, model, fetch: fakeFetch, persistence });
+          try {
+            const { stopReason } = await finish(first.prompt([
+              { type: 'text', text: 'remember this' },
+              { type: 'image', data: new Blob([png(64 * 1024, 7)], { type: 'image/png' }) },
+            ]));
+            expect(stopReason === 'end_turn', 'engine image turn ended ' + stopReason);
+          } finally {
+            await first.close();
+          }
+          const reopened = await createFxEngine({ wasm, apiKey, model, fetch: fakeFetch, persistence });
+          try {
+            const before = requests.length;
+            const { stopReason } = await finish(reopened.prompt('what did I send?'));
+            expect(stopReason === 'end_turn', 'reopened engine turn ended ' + stopReason);
+            expect(requests.length === before + 1 && fileParts(requests.at(-1)) === 1, 'the reopened engine did not send the earlier image');
+            passed.push('engine store reopens with its image');
+          } finally {
+            await reopened.close();
+          }
+
+          // A second image turn whose request the provider refuses until it
+          // leaves the first turn's image out.
+          const engine = await createFxEngine({ wasm, apiKey, model, fetch: fakeFetch });
+          try {
+            const look = (text, salt) => finish(engine.prompt([
+              { type: 'text', text },
+              { type: 'image', data: new Blob([png(512 * 1024, salt)], { type: 'image/png' }) },
+            ]));
+            expect((await look('first', 11)).stopReason === 'end_turn', 'first image turn did not end');
+            refuseOver = requests.at(-1).length * 1.5;
+            const before = requests.length;
+            const { stopReason } = await look('second', 12);
+            refuseOver = Infinity;
+            const sent = requests.slice(before).map(fileParts);
+            expect(stopReason === 'end_turn', 'the refused turn ended ' + stopReason);
+            expect(JSON.stringify(sent) === '[2,1]', 'expected a refused request with 2 images, then one with 1; got ' + JSON.stringify(sent));
+            passed.push('a refused request goes again with fewer images');
+          } finally {
+            await engine.close();
+          }
+          return passed;
+        })()`,
+      }, sessionId), "browser image session case timed out", 90000);
+      expect(!evaluated.exceptionDetails, evaluated.result?.description || evaluated.exceptionDetails?.text || "browser image session exception");
+      expect(JSON.stringify(evaluated.result.value) === JSON.stringify([
+        "durable session past 4 MiB of images", "engine store reopens with its image", "a refused request goes again with fewer images",
+      ]), `unexpected browser image cases ${JSON.stringify(evaluated.result.value)}`);
+      console.log("browser core image sessions passed");
+    } finally {
+      await command("Target.closeTarget", { targetId });
+    }
+  }
+
   const { targetId } = await command("Target.createTarget", { url: "about:blank" });
   const { sessionId } = await command("Target.attachToTarget", { targetId, flatten: true });
   try {
