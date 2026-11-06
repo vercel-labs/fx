@@ -8119,12 +8119,12 @@ describe("acp: model-independent", () => {
         jsonrpc: "2.0",
         id: null,
         error: {
-          code: -32000,
+          code: -32600,
           message: "Request frame too large",
         },
       });
       expect(client.rawLines[1]).toBe(
-        '{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Request frame too large"}}',
+        '{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Request frame too large"}}',
       );
 
       const next = await client.request("session/new", {}, 7) as any;
