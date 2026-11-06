@@ -1084,6 +1084,7 @@ pub fn Runtime(comptime App: type) type {
                 .access_scope = workspace.access_scope,
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
+                .model = agent.worker.active_model,
             }, arena, messages);
         }
 
@@ -1153,6 +1154,8 @@ pub fn Runtime(comptime App: type) type {
             defer agent.worker.endActivePromptSnapshots(&snapshot_ownership);
             agent.worker.active_context_snapshot = &job.context_snapshot;
             defer agent.worker.active_context_snapshot = null;
+            agent.worker.active_model = job.model;
+            defer agent.worker.active_model = null;
             agent.worker.setActiveAgentTurnSettings(job.agent_settings);
             defer agent.worker.clearActiveAgentTurnSettings();
             var preflight_context_notices: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
