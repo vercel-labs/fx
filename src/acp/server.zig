@@ -1006,6 +1006,7 @@ pub fn runWithTransport(
         const line_result = reader.readLine(alloc) catch break;
         if (line_result == null) break;
         const line = switch (line_result.?) {
+            // `tests/tla/acp/AcpSessionTarget.tla` OversizeIs32600 and NeverAuthCode.
             .overflow => {
                 state.writer.writeError(alloc, null, .{
                     .code = ErrorCode.invalid_request,
@@ -3514,6 +3515,9 @@ pub fn cancelAndReapActivePrompt(state: *ServerState) void {
     reapActivePrompt(state, true);
 }
 
+/// Handles `session/close`. Closing the open session closes it, and closing a session that isn't
+/// open succeeds with `{}` and changes nothing (`tests/tla/acp/AcpSessionTarget.tla`
+/// CloseClosesOpen and CloseIdempotent).
 fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,

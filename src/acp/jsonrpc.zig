@@ -96,8 +96,9 @@ pub const RpcError = struct {
 };
 
 /// ACP's answer to a session-scoped request that names a session that doesn't exist or isn't open
-/// on the connection: `-32002` with `data.sessionId` set to the id the request named. The error
-/// borrows `session_id`, so the caller writes it before that memory is freed.
+/// on the connection: `-32002` with `data.sessionId` set to the id the request named
+/// (`tests/tla/acp/AcpSessionTarget.tla` UnknownSessionAnswer). The error borrows `session_id`, so
+/// the caller writes it before that memory is freed.
 pub fn sessionNotFound(message: []const u8, session_id: []const u8) RpcError {
     return .{
         .code = ErrorCode.resource_not_found,
