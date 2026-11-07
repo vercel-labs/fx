@@ -4330,6 +4330,40 @@ test "processQueuedPrompt auto parallel availability failure does not suppress v
     try expectBodyContains(&gateway, 1, tool_dispatch.web_search_unavailable_message);
 }
 
+test "every ordinary tool call runs on its own call allocator" {
+    // A call that shares the turn's arena keeps its scratch for the rest of
+    // the turn, so each one gets its own and only the result moves to the turn.
+    const alloc = std.testing.allocator;
+    const single = [_]ToolCall{toolCall("call_one", "read_file", "{\"path\":\"README.md\"}")};
+    const batch = [_]ToolCall{
+        toolCall("call_two", "read_file", "{\"path\":\"a.txt\"}"),
+        toolCall("call_three", "glob_files", "{\"pattern\":\"*.zig\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &single },
+        .{ .tool_calls = &batch },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    try std.testing.expectEqual(@as(usize, 2), runtime_parallel_execution.parallelReadOnlyPrefixLen(hooks.tool_registry, &batch));
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    const seen = hooks.execution_allocators.items;
+    try std.testing.expectEqual(@as(usize, 3), seen.len);
+    // The lone call returns its result to the turn's arena but runs on its
+    // own; each call of the parallel batch runs on its own slot's arena.
+    const turn = seen[0].result;
+    for (seen) |call| try std.testing.expect(call.call != turn);
+    try std.testing.expect(seen[1].call != seen[2].call);
+}
+
 test "parallel invalid web_search with valid read_file starts only read_file" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{

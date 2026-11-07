@@ -489,6 +489,8 @@ pub const FakeAgentRuntimeDeps = struct {
     inner_usages: std.ArrayList(types.ToolUsage) = .empty,
     validated_names: std.ArrayList([]u8) = .empty,
     availability_checked_names: std.ArrayList([]u8) = .empty,
+    /// Per executed call, the addresses of its call and result allocators.
+    execution_allocators: std.ArrayList(struct { call: usize, result: usize }) = .empty,
     execution_classification_complete: std.ArrayList(bool) = .empty,
     execution_mcp_runtime_generations: std.ArrayList(?u64) = .empty,
     last_validated_arguments: ?[]u8 = null,
@@ -706,6 +708,7 @@ pub const FakeAgentRuntimeDeps = struct {
         self.inner_usages.deinit(self.alloc);
         freeStringList(self.alloc, &self.validated_names);
         freeStringList(self.alloc, &self.availability_checked_names);
+        self.execution_allocators.deinit(self.alloc);
         self.execution_classification_complete.deinit(self.alloc);
         self.execution_mcp_runtime_generations.deinit(self.alloc);
         if (self.last_validated_arguments) |value| self.alloc.free(value);
@@ -1426,6 +1429,10 @@ pub const FakeAgentRuntimeDeps = struct {
 
             try self.executed_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
             try self.executed_call_ids.append(self.alloc, try self.alloc.dupe(u8, call.id));
+            try self.execution_allocators.append(self.alloc, .{
+                .call = @intFromPtr(request.call_allocator.ptr),
+                .result = @intFromPtr(request.result_allocator.ptr),
+            });
             try self.execution_classification_complete.append(
                 self.alloc,
                 request.classification_complete,

@@ -11202,10 +11202,18 @@ fn processQueuedPromptLoop(
                 resolved.authority.grants
             else
                 local_grants.items;
+            // Every call runs on its own arena, freed when the call ends on
+            // any path, and the executor copies its result to the turn's
+            // arena. Shared, the turn's arena would keep every call's scratch
+            // until the turn ends (`tests/tla/agent_runtime/ToolArena.tla`
+            // TurnKeepsOnlyResults).
+            var call_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer mem_utils.deinit_arena(call_arena_state);
+            const call_allocator = call_arena_state.allocator();
             var status_started = false;
             const defer_auto_command_lifecycle = try runtime_tool_admission.deferCapturedCommandLifecycleForAutoPermissionNotice(
                 deps.tool_registry,
-                arena,
+                call_allocator,
                 tool_call,
                 action_permission_mode,
                 lifecycle.scope.kind == .interactive,
@@ -11213,18 +11221,8 @@ fn processQueuedPromptLoop(
             if (!runtime_tool_admission.deferVisibleLifecycleUntilAfterPermission(tool_call.name) and
                 !defer_auto_command_lifecycle)
             {
-                status_started = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, tool_call, tool_display_target, advertised_dynamic_tool_names);
+                status_started = try runtime_tool_presentation.startToolVisibleLifecycle(deps, call_allocator, turn_id, stream_ctx.provisional_statuses.presentation_group_id, tool_call, tool_display_target, advertised_dynamic_tool_names);
             }
-
-            var file_call_arena_state: std.heap.ArenaAllocator = undefined;
-            if (is_file_mutation) {
-                file_call_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-            }
-            defer if (is_file_mutation) mem_utils.deinit_arena(file_call_arena_state);
-            const call_allocator = if (is_file_mutation)
-                file_call_arena_state.allocator()
-            else
-                arena;
             const execution_call = if (is_file_mutation)
                 try types.dupeToolCall(call_allocator, tool_call)
             else
@@ -11757,7 +11755,7 @@ fn processQueuedPromptLoop(
                 };
             }
             const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
-            const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
+            const execution_is_command = runtime_tool_presentation.activityKindForCall(call_allocator, deps.tool_registry, tool_call) == .command;
             var execution_error: ?anyerror = null;
             var execution = deps.executeToolCall(.{
                 .skill_locations = if (skills.catalog) |catalog| &catalog.locations else null,

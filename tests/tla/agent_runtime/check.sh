@@ -31,7 +31,33 @@ cd "$(dirname "$0")"
 # shellcheck source=../lib/tlc.sh
 . ../lib/tlc.sh
 
+# ToolArena.tla is where a turn keeps its tool calls' memory: each call runs
+# on its own arena, and only its result moves to the turn
+# (src/core/agent/runtime/orchestrator.zig, src/core/tooling/tool_runtime.zig
+# executeRegisteredTool). tool-arena.cfg is the design and must pass.
+# tool-arena-today.cfg is fx before it, which ran every call but a file
+# mutation on the turn's arena (TurnKeepsOnlyResults). Each
+# tool-arena-mutation-*.cfg plants one defect, and the rule it names must
+# catch it:
+#
+#   shallow-copy         tool_result_memory stays on the call's arena     NoDanglingHistory
+#   dupe-error-code      McpInputRequired is duped onto the turn          ErrorCodeOutlivesTurn
+#   backend-call-arena   shell and vision complete on the call's arena    NoDanglingHistory
+#   error-on-call-arena  a tool's error is formatted on the call's arena  NoDanglingHistory
+#   free-before-copy     the arena goes before the result is copied out   NoReadAfterFree
+#   leak-on-return       a turn-ending call keeps its arena               CallArenaFreed
+#
+# ToolArenaTrace.tla checks turns of the built fx binary against the model;
+# tests/tla/drivers/agent_runtime/tool_arena.ts runs it.
 tlc_verdicts "$@" <<'VERDICTS'
+ToolArena tool-arena -
+ToolArena tool-arena-today TurnKeepsOnlyResults
+ToolArena tool-arena-mutation-shallow-copy NoDanglingHistory
+ToolArena tool-arena-mutation-dupe-error-code ErrorCodeOutlivesTurn
+ToolArena tool-arena-mutation-backend-call-arena NoDanglingHistory
+ToolArena tool-arena-mutation-error-on-call-arena NoDanglingHistory
+ToolArena tool-arena-mutation-free-before-copy NoReadAfterFree
+ToolArena tool-arena-mutation-leak-on-return CallArenaFreed
 EmptyReply empty-reply -
 EmptyReply empty-reply-deep -
 EmptyReply empty-reply-today EverySeparateEmptyNudged

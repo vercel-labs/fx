@@ -486,6 +486,7 @@ pub fn executeToolCallAuthorized(
     else
         executeToolCallInner(
             execution_ctx,
+            request.call_allocator,
             request.result_allocator,
             request.call,
             request.authority,
@@ -699,7 +700,8 @@ const ToolDispatchPrelude = union(enum) {
 
 fn executeToolCallInner(
     ctx: Context,
-    arena: Allocator,
+    call_allocator: Allocator,
+    result_allocator: Allocator,
     call: ToolCall,
     authority: command_admission.ToolExecutionAuthority,
     classification_complete: bool,
@@ -707,14 +709,15 @@ fn executeToolCallInner(
 ) !ToolExecutionResult {
     return switch (try resolveToolDispatchPrelude(
         ctx,
-        arena,
+        result_allocator,
         call,
         classification_complete,
     )) {
         .completed => |result| return result,
         .registered_static => try executeRegisteredTool(
             ctx,
-            arena,
+            call_allocator,
+            result_allocator,
             call,
             authority,
             authorized_image_catalog,
@@ -724,7 +727,8 @@ fn executeToolCallInner(
             const tools = [_]tool_dispatch.Tool{dynamic_tool};
             break :blk try executeRegisteredTool(
                 ctx,
-                arena,
+                call_allocator,
+                result_allocator,
                 call,
                 authority,
                 authorized_image_catalog,
@@ -851,16 +855,29 @@ fn emitMcpProgress(raw_context: *anyopaque, progress: tool_mcp_runtime.Progress)
     };
 }
 
+/// Runs a registered tool on `call_allocator`, which the caller frees when
+/// the call ends, and returns a result owned by `result_allocator`. Shell and
+/// vision run on `result_allocator`: their backend builds the completion the
+/// caller adopts, its command replay capture included.
 fn executeRegisteredTool(
     ctx: Context,
-    arena: Allocator,
+    call_allocator: Allocator,
+    result_allocator: Allocator,
     call: ToolCall,
     authority: command_admission.ToolExecutionAuthority,
     authorized_image_catalog: []const types.ImageAttachment,
     registry: tool_dispatch.Registry,
 ) !ToolExecutionResult {
-    var selected_dynamic_tool_sink = SelectedDynamicToolSinkState{ .allocator = arena };
-    var context_notice_sink = ContextNoticeSinkState{ .allocator = arena };
+    const runtime_provider = if (registry.lookup(call.name)) |tool|
+        tool.runtime_provider
+    else
+        .none;
+    const dispatch_allocator = switch (runtime_provider) {
+        .run_command, .vision => result_allocator,
+        .none, .subagent => call_allocator,
+    };
+    var selected_dynamic_tool_sink = SelectedDynamicToolSinkState{ .allocator = result_allocator };
+    var context_notice_sink = ContextNoticeSinkState{ .allocator = result_allocator };
     var command_backend = RunCommandBackendState{ .runtime = ctx };
     var vision_provider = VisionProviderState{
         .runtime = ctx,
@@ -876,7 +893,7 @@ fn executeRegisteredTool(
         .completion_sink = &dispatch_metadata.subagent_completion,
     };
     var mcp_call_bridge = McpCallBridgeState{ .runtime = ctx };
-    var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
+    var dispatch_ctx = typedDispatchContextForCall(ctx, dispatch_allocator, call);
     dispatch_metadata.attach(&dispatch_ctx);
     var result_commit_token: ?result_commit.Token = null;
     dispatch_ctx.result_commit_sink = &result_commit_token;
@@ -898,10 +915,6 @@ fn executeRegisteredTool(
     if (ctx.mcp_ctx != null and ctx.mcp_call_tool != null) {
         dispatch_ctx.mcp_call_capability = mcp_call_bridge.capability();
     }
-    const runtime_provider = if (registry.lookup(call.name)) |tool|
-        tool.runtime_provider
-    else
-        .none;
     if (registry.lookup(call.name)) |tool| {
         dispatch_ctx.captured_command_host = tool.captured_command_host;
     }
@@ -929,16 +942,16 @@ fn executeRegisteredTool(
         call,
     );
     if (command_backend.execution_error) |err| {
-        dispatched.deinit(arena);
+        dispatched.deinit(dispatch_allocator);
         return err;
     }
     if (vision_provider.execution_error) |err| {
-        dispatched.deinit(arena);
+        dispatched.deinit(dispatch_allocator);
         return err;
     }
     if (mcp_execution_error) |err| {
-        dispatched.deinit(arena);
-        if (err == error.McpAdvertisedToolChanged) return refreshChangedMcpTool(ctx, arena, call.name);
+        dispatched.deinit(dispatch_allocator);
+        if (err == error.McpAdvertisedToolChanged) return refreshChangedMcpTool(ctx, result_allocator, call.name);
         return err;
     }
 
@@ -949,6 +962,11 @@ fn executeRegisteredTool(
     else
         toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
+    // The tool's scratch dies with the call; only its result moves on
+    // (`tests/tla/agent_runtime/ToolArena.tla` TurnKeepsOnlyResults).
+    if (dispatch_allocator.ptr != result_allocator.ptr or dispatch_allocator.vtable != result_allocator.vtable) {
+        try copyDispatchedResult(result_allocator, &execution);
+    }
     if (mcp_call_status == .input_required) {
         execution.finish_turn = true;
         execution.status_detail = "McpInputRequired";
@@ -1378,6 +1396,28 @@ fn toolExecutionResultFromDispatch(
             .command_result_json = metadata.command_result_json,
         },
     };
+}
+
+/// Copies to `alloc` the fields of a dispatched result that point into the
+/// call's allocator: the body and what `toolExecutionResultFromDispatch`
+/// takes from `DispatchMetadata`. Sinks already copy into the result
+/// allocator, and `status_detail` stays as it is: the one a dispatched call
+/// gets is the static `McpInputRequired`, which `fx ask` keeps after the
+/// turn (`tests/tla/agent_runtime/ToolArena.tla` ErrorCodeOutlivesTurn).
+fn copyDispatchedResult(alloc: Allocator, execution: *ToolExecutionResult) Allocator.Error!void {
+    // A new DispatchMetadata field needs a decision here first.
+    comptime std.debug.assert(@typeInfo(DispatchMetadata).@"struct".field_names.len == 7);
+    execution.model_output = try alloc.dupe(u8, execution.model_output);
+    if (execution.tool_result_memory) |memory| {
+        execution.tool_result_memory = try types.dupeToolResultMemory(alloc, memory);
+    }
+    if (execution.command_result_json) |json| {
+        execution.command_result_json = try alloc.dupe(u8, json);
+    }
+    if (execution.subagent_completion) |*status| {
+        status.model = try alloc.dupe(u8, status.model);
+        if (status.session_title) |title| status.session_title = try alloc.dupe(u8, title);
+    }
 }
 
 pub fn snapshotMcpDefinition(ctx: Context, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
@@ -5470,6 +5510,105 @@ test "executeToolCall returns friendly failure for missing read_file path" {
     try expectToolErrorDetailString(result.model_output, "error", "FileNotFound");
     try expectContains(result.model_output, "glob_files");
     try expectNotContains(result.model_output, "Tool read_file failed: FileNotFound");
+}
+
+test "an ordinary tool call keeps only its result in the result allocator" {
+    // fx passes the turn's arena as the result allocator, so scratch a tool
+    // leaves there stays until the turn ends and every call adds more.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const line = try alloc.alloc(u8, 512 * 1024);
+    defer alloc.free(line);
+    @memset(line, 'x');
+    try writeTestFile(tmp.dir, "workspace/big.txt", line);
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    var rt = TestRuntime{ .workspace_root = root };
+    defer rt.deinit(alloc);
+    var turn_state = std.heap.ArenaAllocator.init(alloc);
+    defer turn_state.deinit();
+    for (0..2) |_| {
+        const before = turn_state.queryCapacity();
+        var call_state = std.heap.ArenaAllocator.init(alloc);
+        const result = blk: {
+            defer call_state.deinit();
+            break :blk try executeToolCallAuthorized(rt.context(), .{
+                .call_allocator = call_state.allocator(),
+                .result_allocator = turn_state.allocator(),
+                .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"big.txt\"}" },
+                .authority = .ordinary,
+                .session_grants = &.{},
+                .advertised_dynamic_tool_names = &.{},
+                .max_tool_result_bytes = rt.max_tool_result_bytes,
+            });
+        };
+        // The call's arena is gone; the result still reads back.
+        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
+        try expectContains(result.model_output, "<path>big.txt</path>");
+        // Reading the 512 KiB file takes far more than this; its result does not.
+        try std.testing.expect(turn_state.queryCapacity() - before < 64 * 1024);
+    }
+}
+
+test "a dispatched result reads back after the call's arena is gone" {
+    const alloc = std.testing.allocator;
+    var turn_state = std.heap.ArenaAllocator.init(alloc);
+    defer turn_state.deinit();
+    var call_state = std.heap.ArenaAllocator.init(alloc);
+    var call_state_live = true;
+    defer if (call_state_live) call_state.deinit();
+    const call_arena = call_state.allocator();
+    const input_required: []const u8 = "McpInputRequired";
+    const images = try call_arena.alloc(types.ToolImage, 1);
+    images[0] = .{
+        .data = try call_arena.dupe(u8, "aW1hZ2U="),
+        .mime_type = try call_arena.dupe(u8, "image/png"),
+    };
+    var execution: ToolExecutionResult = .{
+        .model_output = try call_arena.dupe(u8, "the body"),
+        .status_detail = input_required,
+        .command_result_json = try call_arena.dupe(u8, "{\"exit_code\":0}"),
+        .tool_result_memory = .{
+            .tool_images = images,
+            .output_handle = try call_arena.dupe(u8, "result-1"),
+            .preview = try call_arena.dupe(u8, "the preview"),
+        },
+        .subagent_completion = .{
+            .session_title = try call_arena.dupe(u8, "the title"),
+            .model = try call_arena.dupe(u8, "the model"),
+            .effort = .auto,
+            .input_tokens = 1,
+            .context_window = null,
+        },
+    };
+
+    try copyDispatchedResult(turn_state.allocator(), &execution);
+    // The testing allocator scribbles what it frees, so a field still on the
+    // call's arena reads garbage below.
+    call_state.deinit();
+    call_state_live = false;
+
+    try std.testing.expectEqualStrings("the body", execution.model_output);
+    try std.testing.expectEqualStrings("{\"exit_code\":0}", execution.command_result_json.?);
+    const memory = execution.tool_result_memory.?;
+    try std.testing.expectEqualStrings("result-1", memory.output_handle.?);
+    try std.testing.expectEqualStrings("the preview", memory.preview.?);
+    try std.testing.expectEqualStrings("aW1hZ2U=", memory.tool_images[0].data);
+    try std.testing.expectEqualStrings("image/png", memory.tool_images[0].mime_type);
+    try std.testing.expectEqualStrings("the model", execution.subagent_completion.?.model);
+    try std.testing.expectEqualStrings("the title", execution.subagent_completion.?.session_title.?);
+    // fx ask keeps this after the turn's arena is gone, so it stays static.
+    try std.testing.expect(execution.status_detail.?.ptr == input_required.ptr);
+
+    // An empty body with nothing else copies as an empty body with nothing else.
+    var empty: ToolExecutionResult = .{ .model_output = "" };
+    try copyDispatchedResult(turn_state.allocator(), &empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.model_output.len);
+    try std.testing.expect(empty.tool_result_memory == null);
+    try std.testing.expect(empty.command_result_json == null);
+    try std.testing.expect(empty.subagent_completion == null);
 }
 
 test "executeToolCall preserves explicit ignored directory grep roots" {

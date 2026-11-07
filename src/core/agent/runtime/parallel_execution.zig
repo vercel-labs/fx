@@ -178,10 +178,14 @@ pub fn runSequentialCalls(
             if (first_cancelled_index == null) first_cancelled_index = index;
             break :cancelled .cancelled;
         } else completed: {
-            const execution = options.execute(options.exec_ctx, alloc, call, index) catch |err| blk: {
-                const output = options.format_error(options.format_ctx, alloc, call.name, err) catch
-                    try alloc.print("Tool execution failed: {s}", .{@errorName(err)});
-                defer alloc.free(output);
+            // Each call runs on its own arena, as a parallel slot does, and
+            // only its result is copied to `alloc`.
+            var call_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer call_arena_state.deinit();
+            const call_alloc = call_arena_state.allocator();
+            const execution = options.execute(options.exec_ctx, call_alloc, call, index) catch |err| blk: {
+                const output = options.format_error(options.format_ctx, call_alloc, call.name, err) catch
+                    try call_alloc.print("Tool execution failed: {s}", .{@errorName(err)});
                 break :blk ToolExecutionResult{
                     .status = .failure,
                     .model_output = output,
@@ -809,6 +813,37 @@ test "parallel read-only execution preserves order and failure fan-in" {
     try std.testing.expectEqualStrings("third output", run.attempts[2].completed.execution.model_output);
     try std.testing.expect(run.first_cancelled_index == null);
     try std.testing.expect(fixture.max_in_flight.load(.seq_cst) > 1);
+}
+
+test "sequential calls run on their own arenas and keep only their results" {
+    // The path for hosts without threads. What a call allocates dies with
+    // its arena, so the caller's allocator holds only the copied results.
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("first", "read_file", "{\"path\":\"a\"}"),
+        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
+    };
+    const plans = [_]ParallelTestPlan{
+        .{ .output = "first output" },
+        .{ .err = error.TestExpectedEqual },
+    };
+    var fixture = ParallelTestFixture{ .plans = &plans };
+
+    var run = try runSequentialCalls(alloc, &calls, .{
+        .exec_ctx = &fixture,
+        .execute = parallelTestExecute,
+        .format_ctx = &fixture,
+        .format_error = parallelTestFormatError,
+        .cancel_flag = &fixture.cancel_flag,
+    });
+    defer run.deinit(alloc);
+
+    try std.testing.expectEqualStrings("first output", run.attempts[0].completed.execution.model_output);
+    try std.testing.expectEqual(.failure, run.attempts[1].completed.execution.status);
+    try std.testing.expectEqualStrings(
+        "grep_files failed with TestExpectedEqual",
+        run.attempts[1].completed.execution.model_output,
+    );
 }
 
 test "parallel completion observer runs before slower siblings finish while results stay ordered" {
