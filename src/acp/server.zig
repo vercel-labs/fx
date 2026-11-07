@@ -199,6 +199,8 @@ pub const OutboundResponse = struct {
 const PendingOutbound = struct {
     kind: OutboundKind,
     response: ?OutboundResponse = null,
+    /// A subagent's permission request, which closing the prompt cancels.
+    subagent: bool = false,
 };
 
 const max_pending_outbound = 32;
@@ -381,6 +383,11 @@ pub const ServerState = struct {
     host_instructions: []u8 = &.{},
     outbound_mutex: std.Io.Mutex = .init,
     outbound_cond: std.Io.Condition = .init,
+    /// Whether a subagent's permission request may be sent: only while a
+    /// prompt is open. Guarded by `outbound_mutex`, the lock its requests
+    /// are inserted under (`tests/tla/acp/AcpChildApproval.tla`
+    /// NoStrandedRequest).
+    subagent_asks_open: bool = false,
     next_outbound_request_id: u64 = 1,
     pending_outbound: std.AutoHashMapUnmanaged(u64, PendingOutbound) = .empty,
     legacy_url_mutex: std.Io.Mutex = .init,
@@ -1184,6 +1191,8 @@ fn cancelPendingOutbound(state: *ServerState, notify_client: bool) void {
     var cancelled_ids: [max_pending_outbound]u64 = undefined;
     var cancelled_count: usize = 0;
     state.outbound_mutex.lockUncancelable(io_mod.getIo());
+    // A cancelled prompt takes no more subagent requests.
+    state.subagent_asks_open = false;
     var pending = state.pending_outbound.iterator();
     while (pending.next()) |entry| {
         if (entry.value_ptr.response != null) continue;
@@ -1444,17 +1453,116 @@ pub fn beginPermissionRequest(state: *ServerState) ?u64 {
 }
 
 pub fn awaitPermissionDecision(state: *ServerState, id: u64) types.ToolPermissionDecision {
-    var response = awaitOutboundResponse(state, id, .permission) orelse return .deny;
-    defer response.deinit(state.alloc);
+    const response = awaitOutboundResponse(state, id, .permission) orelse return .deny;
+    return takePermissionDecision(state.alloc, response);
+}
+
+/// The decision a client's answer to a permission request carries, and frees
+/// the answer. Only an exact allow option allows; a cancelled, error,
+/// malformed, or unknown answer denies.
+fn takePermissionDecision(alloc: Allocator, owned: OutboundResponse) types.ToolPermissionDecision {
+    var response = owned;
+    defer response.deinit(alloc);
     if (response.cancelled or response.error_json != null) return .deny;
     const raw = response.result_json orelse return .deny;
-    const parsed = std.json.parseFromSlice(std.json.Value, state.alloc, raw, .{}) catch return .deny;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return .deny;
     defer parsed.deinit();
     return parsePermissionDecision(parsed.value) orelse .deny;
 }
 
 pub fn cancelPermissionRequest(state: *ServerState, id: u64) void {
     cancelOutboundRequest(state, id);
+}
+
+/// Begins a subagent's permission request. It fails when no prompt is open
+/// or the registry is full, and the caller then denies at once. The check and
+/// the insert hold one lock, so closing the prompt cannot fall between them
+/// (`tests/tla/acp/AcpChildApproval.tla` NoStrandedRequest).
+pub fn beginSubagentPermissionRequest(state: *ServerState) error{ PromptClosed, RequestsFull, OutOfMemory }!u64 {
+    state.outbound_mutex.lockUncancelable(io_mod.getIo());
+    defer state.outbound_mutex.unlock(io_mod.getIo());
+    if (!state.subagent_asks_open) return error.PromptClosed;
+    if (state.pending_outbound.count() >= max_pending_outbound or
+        state.next_outbound_request_id > @as(u64, @intCast(std.math.maxInt(i64))))
+    {
+        return error.RequestsFull;
+    }
+    const id = state.next_outbound_request_id;
+    try state.pending_outbound.put(state.alloc, id, .{ .kind = .permission, .subagent = true });
+    state.next_outbound_request_id += 1;
+    return id;
+}
+
+/// How often a subagent's wait for its answer looks at its stop flag.
+const subagent_stop_poll_ms = 50;
+
+/// Like `awaitPermissionDecision`, but also ends when `stop` is set: the
+/// request is then withdrawn and denied (`tests/tla/acp/AcpChildApproval.tla`
+/// StopEndsWait).
+pub fn awaitPermissionDecisionOrStop(
+    state: *ServerState,
+    id: u64,
+    stop: *const std.atomic.Value(bool),
+) types.ToolPermissionDecision {
+    const poll: std.Io.Timeout = .{ .duration = .{
+        .raw = .fromMilliseconds(subagent_stop_poll_ms),
+        .clock = .awake,
+    } };
+    var withdrew = false;
+    const response: ?OutboundResponse = blk: {
+        state.outbound_mutex.lockUncancelable(io_mod.getIo());
+        defer state.outbound_mutex.unlock(io_mod.getIo());
+        while (true) {
+            const pending = state.pending_outbound.getPtr(id) orelse break :blk null;
+            if (pending.response) |settled| {
+                _ = state.pending_outbound.remove(id);
+                break :blk settled;
+            }
+            if (stop.load(.seq_cst)) {
+                withdrew = cancelOutboundRequestLocked(state, id);
+                continue;
+            }
+            state.outbound_cond.waitTimeout(io_mod.getIo(), &state.outbound_mutex, poll) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => withdrew = cancelOutboundRequestLocked(state, id),
+            };
+        }
+    };
+    if (withdrew) {
+        debug_trace.logf("acp", "subagent permission request withdrawn id={d} reason=stopped", .{id});
+        publishRequestCancellation(state, id);
+    }
+    return takePermissionDecision(state.alloc, response orelse return .deny);
+}
+
+/// Opens the gate for subagents' permission requests as a prompt starts.
+fn openSubagentAsks(state: *ServerState) void {
+    state.outbound_mutex.lockUncancelable(io_mod.getIo());
+    defer state.outbound_mutex.unlock(io_mod.getIo());
+    state.subagent_asks_open = true;
+}
+
+/// Shuts the gate as a prompt ends and cancels every subagent request still
+/// open in the same hold of the lock, so the client is never left showing one
+/// with no prompt to answer it in.
+fn closeSubagentAsks(state: *ServerState, notify_client: bool) void {
+    var cancelled_ids: [max_pending_outbound]u64 = undefined;
+    var cancelled_count: usize = 0;
+    state.outbound_mutex.lockUncancelable(io_mod.getIo());
+    state.subagent_asks_open = false;
+    var pending = state.pending_outbound.iterator();
+    while (pending.next()) |entry| {
+        if (!entry.value_ptr.subagent or entry.value_ptr.response != null) continue;
+        entry.value_ptr.response = .{ .cancelled = true };
+        cancelled_ids[cancelled_count] = entry.key_ptr.*;
+        cancelled_count += 1;
+    }
+    state.outbound_cond.broadcast(io_mod.getIo());
+    state.outbound_mutex.unlock(io_mod.getIo());
+    for (cancelled_ids[0..cancelled_count]) |id| {
+        debug_trace.logf("acp", "subagent permission request cancelled id={d} reason=prompt_closed", .{id});
+        if (notify_client) publishRequestCancellation(state, id);
+    }
 }
 
 fn dispatchNotification(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -2412,6 +2520,7 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
 
     session.cancel_flag.store(false, .seq_cst);
     session.steering.open(state.alloc);
+    openSubagentAsks(state);
     if (comptime host_target.is_wasm) {
         promptWorkerMain(active);
         jsonrpc.freeMessage(active.alloc, &active.msg);
@@ -2523,6 +2632,7 @@ fn promptWorkerMain(active: *ActivePrompt) void {
         null;
     defer if (finished_steering) |finished| finished.deinit(active.alloc);
     active.reapable.store(true, .seq_cst);
+    closeSubagentAsks(active.state, true);
     publishPromptOutcome(active, outcome) catch {};
     if (finished_steering) |finished| publishSteeringOutcomes(active, outcome, finished) catch {};
     prompt_test_controls.pauseAfterTerminalWrite();
@@ -4529,6 +4639,64 @@ test "ACP permission responses map canonical option ids" {
         defer parsed.deinit();
         try std.testing.expect(parsePermissionDecision(parsed.value) == null);
     }
+}
+
+test "a permission answer allows only when it selects an allow option, on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzPermissionAnswer, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "r{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_once\"}}",
+            "r{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_always\"}}",
+            "r{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"reject_once\"}}",
+            "r{\"outcome\":{\"outcome\":\"cancelled\"}}",
+            "r{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_everything\"},\"extra\":[1,2]}",
+            "r{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_once\",\"optionId\":\"reject_once\"}}",
+            "r{\"outcome\":{\"outcome\":\"selected\",\"optionId\":[\"allow_once\"]}}",
+            "r\"allow_once\"",
+            "r{\"outcome\":",
+            "e{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_once\"}}",
+            "c{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_always\"}}",
+            "x",
+        }) ++ @import("fuzz_corpus").acp_permission_answer.*),
+    });
+}
+
+/// The first byte says how the answer arrived: `r` a plain result, `e` a
+/// result together with a JSON-RPC error, `c` a result for a request already
+/// cancelled, and anything else an error alone. The rest is the result. Only
+/// a plain result that selects `allow_once` or `allow_always` allows (SEC-81).
+fn fuzzPermissionAnswer(_: void, smith: *std.testing.Smith) anyerror!void {
+    const alloc = std.testing.allocator;
+    var buffer: [512]u8 = undefined;
+    const input = buffer[0..@intCast(smith.slice(&buffer))];
+    if (input.len == 0) return;
+    const how = input[0];
+    const bytes = input[1..];
+    var answer: OutboundResponse = .{ .cancelled = how == 'c' };
+    if (how == 'r' or how == 'e' or how == 'c') answer.result_json = try alloc.dupe(u8, bytes);
+    if (how != 'r' and how != 'c') {
+        answer.error_json = alloc.dupe(u8, "{\"code\":-32601,\"message\":\"Method not found\"}") catch |err| {
+            answer.deinit(alloc);
+            return err;
+        };
+    }
+    const decision = takePermissionDecision(alloc, answer);
+    if (decision == .deny) return;
+    try std.testing.expect(how == 'r');
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    const outcome = if (parsed.value == .object) parsed.value.object.get("outcome") else null;
+    const fields = if (outcome) |value| if (value == .object) value.object else null else null;
+    const kind = (fields orelse return error.TestUnexpectedResult).get("outcome") orelse return error.TestUnexpectedResult;
+    const option = fields.?.get("optionId") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(kind == .string and std.mem.eql(u8, kind.string, "selected"));
+    try std.testing.expect(option == .string);
+    const expected: types.ToolPermissionDecision = if (std.mem.eql(u8, option.string, "allow_once"))
+        .once
+    else if (std.mem.eql(u8, option.string, "allow_always"))
+        .always
+    else
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(expected, decision);
 }
 
 test "ACP outbound waiters resolve to deny on cancellation" {

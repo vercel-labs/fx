@@ -215,6 +215,10 @@ pub fn run(
         .subagent_id = trace_context.subagent_id,
     };
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
+    // A turn no screen shows asks through the prompter its host passed in,
+    // which lives only as long as this run.
+    if (turn.hosted_worker == null) turn.host_prompter = routed_config.tool_context.permission_prompter;
+    defer turn.host_prompter = null;
     turn.beginTurn() catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         turn.setFailureDiagnostic("turn_open_failed", @errorName(err));

@@ -1630,13 +1630,25 @@ pub fn revalidateLiveActionPermissionOutcome(
             }
             break :blk outcome;
         },
-        .file_mutation => try requestPermissionOutcome(
-            input,
-            arena,
-            call,
-            permission_mode,
-            revalidation_grants,
-        ),
+        .file_mutation => |expected| blk: {
+            var outcome = try requestPermissionOutcome(
+                input,
+                arena,
+                call,
+                permission_mode,
+                revalidation_grants,
+            );
+            // An exact approval outlives every later revalidation: an outcome
+            // its grants settled keeps the approved offer, so the next
+            // revalidation is settled the same way instead of asking again.
+            if (human_approval != .none) if (outcome.execution_authority) |*actual| switch (actual.*) {
+                .file_mutation => |*authorization| if (authorization.grant_offer == null) {
+                    authorization.grant_offer = expected.grant_offer;
+                },
+                .ordinary, .run_command, .vision_paths => {},
+            };
+            break :blk outcome;
+        },
         .vision_paths => |expected| blk: {
             const canonical_call = try canonicalVisionPathCall(arena, call, expected);
             const refreshed = try requestPermissionOutcome(
@@ -4097,6 +4109,63 @@ test "interactive file admission passes its canonical grant offer to the prompte
             observed_grant.target_path,
         );
     }
+}
+
+test "an approved file write survives two live authority revalidations without asking again" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    const call: ToolCall = .{
+        .id = "write",
+        .name = "write_file",
+        .arguments_json = try arena.print(
+            "{{\"path\":\"{s}/note.txt\",\"content\":\"hello\\n\"}}",
+            .{workspace},
+        ),
+    };
+
+    const approved = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    // The live authority changes twice before the write, as when another
+    // subagent moves through its phases: each revalidation starts from the
+    // outcome the one before it returned.
+    const first = try revalidateLiveActionPermissionOutcome(
+        input,
+        arena,
+        call,
+        .ask,
+        &.{},
+        approved.execution_authority.?,
+        .once,
+    );
+    const second = try revalidateLiveActionPermissionOutcome(
+        input,
+        arena,
+        call,
+        .ask,
+        &.{},
+        first.execution_authority.?,
+        .once,
+    );
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, second.decision);
+    try std.testing.expect(second.execution_authority.? == .file_mutation);
 }
 
 test "automatic non-allow is recoverable regardless tool approval policy" {
