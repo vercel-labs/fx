@@ -437,6 +437,8 @@ After a rewind:
 
 While a turn runs in the session, `session/fork` and `_sh.fx/session/rewind` both get `-32600`, and the client stops the turn first.
 
+`tests/tla/acp/AcpForkRewind.tla` models these rules, and TLC checks that a fork holds exactly the source's turns before the prompt and leaves the source as it was, that a rewind leaves exactly those turns in place, and that a client of the session holds a history that was replaced only while the notice is on its way. Its `Today` configs show where fx breaks them now.
+
 ## Names in use today
 
 fx's ACP server names its additions today with a `libfx/` prefix, which doesn't follow ACP's extension rules, and its wasm build accepts `session/remove`, which ACP calls `session/delete`. Each one gets the new name in this table:
