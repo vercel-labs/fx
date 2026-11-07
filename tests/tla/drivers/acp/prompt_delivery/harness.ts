@@ -17,6 +17,8 @@ export class Acp {
   private readonly waiters = new Map<number, (message: any) => void>();
   private closed = false;
   stderr = "";
+  /// Every notification fx sent, in order.
+  readonly notifications: Array<{ method: string; params: any }> = [];
   readonly exited: Promise<number>;
 
   constructor(readonly proc: ReturnType<typeof Bun.spawn>, private readonly log: (entry: object) => void) {
@@ -46,6 +48,11 @@ export class Acp {
     if ("method" in message && "id" in message) {
       this.log({ dir: "in-request", method: message.method });
       this.write({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not found" } });
+      return;
+    }
+    if ("method" in message && !("id" in message)) {
+      this.log({ dir: "in-notification", method: message.method });
+      this.notifications.push({ method: message.method, params: message.params });
       return;
     }
     if ("id" in message && typeof message.id === "number") {
@@ -189,7 +196,7 @@ export class Fixture {
     return readFileSync(this.traceLog, "utf8").split("\n").filter((line) => line.includes("queued steering prompt")).length;
   }
 
-  async start(): Promise<Acp> {
+  async start(init: Record<string, unknown> = { protocolVersion: 1 }): Promise<Acp> {
     const env = testEnvironment({
       NO_COLOR: "1",
       HOME: this.home,
@@ -206,8 +213,8 @@ export class Fixture {
       Bun.spawn([this.fxBin, "acp"], { cwd: this.workspace, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" }),
       (entry) => this.acpLog.push(entry),
     );
-    const init = await this.acp.request("initialize", { protocolVersion: 1 });
-    if (init.error) throw new Error(`initialize failed: ${JSON.stringify(init.error)}`);
+    const initialized = await this.acp.request("initialize", init);
+    if (initialized.error) throw new Error(`initialize failed: ${JSON.stringify(initialized.error)}`);
     return this.acp;
   }
 
