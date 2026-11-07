@@ -170,7 +170,18 @@ pub const TextEmission = union(enum) {
     assistant_source: []const u8,
     assistant_rendered: []const u8,
     assistant_restarted: []const u8,
+    /// fx's own text about the turn, such as a notice that it resends.
     operational: []const u8,
+    /// Operational text that says why the turn failed, sent as the turn
+    /// ends. A host shows it as `operational` text; ACP keeps it an agent
+    /// message even for a client that shows notices, since a client may
+    /// ignore notices (`tests/tla/acp/AcpNotices.tla` FailureReportIsMessage).
+    turn_failure: []const u8,
+    /// Operational text fx saves as the assistant's reply, such as "Done."
+    /// for a reply with no text. A host shows it as `operational` text; ACP
+    /// keeps it an agent message so the turn matches what session/load
+    /// replays (`tests/tla/acp/AcpNotices.tla` ConversationStaysMessages).
+    saved_reply: []const u8,
 };
 
 /// Accent colors for diff add/remove markers. Named fields so the two styles

@@ -108,3 +108,7 @@ bun test ./tests/tla/drivers/session/stream.test.ts     # fx ask turns along Tur
 ```
 
 A `check.sh` that uses `lib/tlc.sh` takes config names to run only those, for example `tests/tla/usage/check.sh LeanUsage`. `Fork`, `V1Conversion`, and the full `LeanUsage` config can run for many minutes. `session_manager/README.md` describes each session spec, the planted bugs, and the trace checkers.
+
+## ACP notices
+
+`acp/AcpNotices.tla` models what `fx acp` sends for each kind of text the agent runtime emits about a turn (`src/acp/prompt.zig`), to a client that advertises ACP v1 Session Notices and to one that does not. The text that says why a turn failed, the HTTP failure that ends a request, the text fx saves as the reply (such as "Done."), the reply itself, and diff previews stay agent messages for every client. The empty-reply nudge, the length resend, restarts, other operational text, and system notices reach a notices client as one notice per message, and a plain client as the agent messages it always got. `MCAcpNoticesBefore` is fx before that rule, and five planted bugs must each be caught by their named rule. `bun tests/tla/drivers/acp/notices/driver.ts` runs the built `zig-out/bin/fx acp` for both clients against a local gateway, has TLC check each turn through `AcpNoticesTrace.tla`, and checks that a notices client's agent messages match what `session/load` replays; `--stress N` adds one turn with N stalls.

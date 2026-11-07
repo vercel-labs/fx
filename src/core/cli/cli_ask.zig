@@ -3172,7 +3172,7 @@ fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
             .terminal, .terminal_no_color => try ctx.presenter.?.pushText(text),
             .quiet, .json, .raw => {},
         },
-        .operational => |text| switch (ctx.output_mode) {
+        .operational, .turn_failure, .saved_reply => |text| switch (ctx.output_mode) {
             .terminal, .terminal_no_color => try ctx.presenter.?.pushText(text),
             .quiet, .json, .raw => try ctx.writeStderr(text),
         },
