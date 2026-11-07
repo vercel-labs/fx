@@ -122,6 +122,8 @@ const Listing = struct {
     ignore_file: ?[]const u8 = null,
     files: []const []const u8 = &.{},
     children: []const Child = &.{},
+    /// Entries left out by name, as root-relative paths.
+    skipped: []const []const u8 = &.{},
 };
 
 const Worker = struct {
@@ -290,6 +292,19 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
     for (rules.sources.items, stamps) |request, *stamp| stamp.* = tree_mod.sourceStamp(try arena.dupe(u8, request.path), request.identity_only, request.follow_symlinks, scan_started_ns);
     const skipped_names = try arena.alloc([]const u8, options.skipped_names.len);
     for (options.skipped_names, skipped_names) |name, *copy| copy.* = try arena.dupe(u8, name);
+    // Each worker kept the skips of the folders it read; sorting makes the
+    // list independent of which worker read which folder.
+    var skipped_count: usize = 0;
+    for (listings) |listing| skipped_count += listing.skipped.len;
+    const skipped = try arena.alloc([]const u8, skipped_count);
+    var skipped_at: usize = 0;
+    for (listings) |listing| {
+        for (listing.skipped) |path| {
+            skipped[skipped_at] = try arena.dupe(u8, path);
+            skipped_at += 1;
+        }
+    }
+    std.mem.sortUnstable([]const u8, skipped, {}, pathLessThan);
 
     // Every allocation comes before `result_arena` is copied into the result:
     // a block the arena adds after the copy would be missing from it and leak.
@@ -305,6 +320,7 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
             .cap_reached = cap_reached,
             .skipped_overlong = shared.overlong.load(.acquire),
             .skipped_names = skipped_names,
+            .skipped = skipped,
             .entries = entries.items,
             .folders = folders.items,
             .sources = stamps,
@@ -482,6 +498,7 @@ fn listDirectory(shared: *Shared, worker: *Worker, job: Job, children: *std.Arra
     const shares_rule_path = !rules.repository or std.mem.eql(u8, job.rule_path, job.rel);
     var files: std.ArrayList([]const u8) = .empty;
     var child_entries: std.ArrayList(Child) = .empty;
+    var skipped: std.ArrayList([]const u8) = .empty;
     var saw_dot_git = false;
     var iterator = dir.iterate();
     while (true) {
@@ -496,7 +513,18 @@ fn listDirectory(shared: *Shared, worker: *Worker, job: Job, children: *std.Arra
             continue;
         }
         listing.has_entries = true;
-        if (!rules.repository and rules.skipped(entry.name)) continue;
+        if (!rules.repository and rules.skipped(entry.name)) {
+            // Kept so a listing can name what it left out
+            // (`tests/tla/indexer/SkipNote.tla` NoteHonest). A path over the
+            // limit can't be named, so it counts as overlong instead.
+            const skipped_rel = try joinPath(arena, job.rel, entry.name);
+            if (skipped_rel.len > rules.max_path_bytes) {
+                _ = shared.overlong.fetchAdd(1, .acq_rel);
+            } else {
+                try skipped.append(arena, skipped_rel);
+            }
+            continue;
+        }
 
         const rel = try joinPath(arena, job.rel, entry.name);
         const rule_path = if (shares_rule_path) rel else try joinPath(arena, job.rule_path, entry.name);
@@ -551,6 +579,7 @@ fn listDirectory(shared: *Shared, worker: *Worker, job: Job, children: *std.Arra
     }
     listing.files = files.items;
     listing.children = child_entries.items;
+    listing.skipped = skipped.items;
     const total = shared.collected.fetchAdd(files.items.len + child_entries.items.len, .acq_rel) + files.items.len + child_entries.items.len;
     if (total > shared.collect_limit) {
         if (!shared.limit_reached.swap(true, .acq_rel)) {
@@ -623,6 +652,10 @@ fn childShown(child: Child, by_path: *const std.StringHashMapUnmanaged(usize), v
         .boundary => true,
         .entered => if (by_path.get(child.rel)) |child_index| visible[child_index] else true,
     };
+}
+
+fn pathLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
 }
 
 fn entryLessThan(_: void, a: Entry, b: Entry) bool {
@@ -800,9 +833,13 @@ test "plain scan applies .gitignore files and the skipped names, also below an i
         .{ .path = "sub", .kind = .directory },
         .{ .path = "tracked.txt", .kind = .file },
     });
+    // What the names left out, a file named like a skipped folder included,
+    // so a listing can say so.
+    try expectSkipped(result, &.{ "build", "node_modules", "sub/dist" });
 
     var custom = try scan(std.testing.allocator, try std.Io.Dir.path.join(arena, &.{ tree.root, "repo/plain" }), .{ .skipped_names = &.{"src"} }, null);
     defer custom.deinit();
+    try expectSkipped(custom, &.{"src"});
     try expectEntries(custom, &.{
         .{ .path = ".gitignore", .kind = .file },
         .{ .path = "build", .kind = .directory },
@@ -814,6 +851,58 @@ test "plain scan applies .gitignore files and the skipped names, also below an i
         .{ .path = "sub/dist", .kind = .file },
         .{ .path = "tracked.txt", .kind = .file },
     });
+}
+
+fn expectSkipped(result: Result, expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, result.tree.skipped.len);
+    for (expected, result.tree.skipped) |want, have| try std.testing.expectEqualStrings(want, have);
+}
+
+test "a plain scan records each entry it skipped by name, the same with one worker or many" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The temporary folder sits below an ignored path, so plain rules apply.
+    var tree = try TestTree.init(arena);
+    defer tree.tmp.cleanup();
+    for (0..200) |i| {
+        try tree.file(try arena.print("w/p{d:0>3}/src/a.js", .{i}), "x");
+        try tree.file(try arena.print("w/p{d:0>3}/dist/b.js", .{i}), "x");
+        // Inside a skipped folder, so never read.
+        try tree.file(try arena.print("w/p{d:0>3}/dist/build/c.js", .{i}), "x");
+        try tree.file(try arena.print("w/p{d:0>3}/node_modules/m/d.js", .{i}), "x");
+    }
+    const root = try std.Io.Dir.path.join(arena, &.{ tree.root, "w" });
+
+    var serial = try scan(std.testing.allocator, root, .{ .max_workers = 1 }, null);
+    defer serial.deinit();
+    try std.testing.expect(!serial.tree.repository);
+    try std.testing.expectEqual(@as(usize, 400), serial.tree.skipped.len);
+    try std.testing.expectEqualStrings("p000/dist", serial.tree.skipped[0]);
+    try std.testing.expectEqualStrings("p000/node_modules", serial.tree.skipped[1]);
+    try std.testing.expectEqualStrings("p199/node_modules", serial.tree.skipped[399]);
+    // Workers take the folders in any order; the list never changes.
+    for (0..20) |_| {
+        var parallel = try scan(std.testing.allocator, root, .{ .max_workers = 8 }, null);
+        defer parallel.deinit();
+        try std.testing.expectEqual(serial.tree.skipped.len, parallel.tree.skipped.len);
+        for (serial.tree.skipped, parallel.tree.skipped) |a, b| try std.testing.expectEqualStrings(a, b);
+    }
+
+    // A skipped entry whose path is over the limit can't be named, so it
+    // counts as overlong: `p000/node_modules` here, and each `src/a.js`.
+    var short = try scan(std.testing.allocator, root, .{ .max_path_bytes = 10 }, null);
+    defer short.deinit();
+    try std.testing.expectEqual(@as(usize, 200), short.tree.skipped.len);
+    for (short.tree.skipped) |path| try std.testing.expect(std.mem.endsWith(u8, path, "/dist"));
+    try std.testing.expectEqual(@as(usize, 400), short.tree.skipped_overlong);
+
+    // Inside a repository git's rules decide and nothing is skipped by name.
+    try tree.repo(arena, "w", &.{});
+    var repository = try scan(std.testing.allocator, root, .{}, null);
+    defer repository.deinit();
+    try std.testing.expect(repository.tree.repository);
+    try std.testing.expectEqual(@as(usize, 0), repository.tree.skipped.len);
 }
 
 test "scan caps, skips overlong paths, cancels and is the same with one worker or many" {
