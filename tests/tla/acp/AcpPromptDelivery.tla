@@ -20,9 +20,11 @@
 (*    arrives between requests waits, and the turn takes it at its next   *)
 (*    request: after the running tool, or, when the reply has ended, by   *)
 (*    going on instead of ending (X22).                                   *)
-(*  - A steer that arrives after the turn has stopped taking input, and   *)
-(*    every waiting steer when the client stops the turn, run together   *)
-(*    as the next turn, before any queued prompt (X19, Q39, Q40).         *)
+(*  - A steer that arrives after the turn's last check for steers, while  *)
+(*    it finishes, waits until the turn stops taking input; it then runs  *)
+(*    as the next turn (X19). Steers that arrive after that, and every    *)
+(*    waiting steer when the client stops the turn, run together as the   *)
+(*    next turn, before any queued prompt (Q39, Q40).                     *)
 (*  - A queued prompt waits and runs as a turn of its own, in the order   *)
 (*    fx received them.                                                   *)
 (*  - $/cancel_request withdraws a steer or queued prompt that hasn't run *)
@@ -30,16 +32,19 @@
 (*  - Each prompt gets exactly one answer: a turn's stopReason, and for a *)
 (*    steer the delivery: absorbed into the running turn, or next_turn.   *)
 (*                                                                         *)
-(* Today (Rules = FALSE): a steer never cuts a reply short; a steer still *)
-(* waiting when the reply ends fails with -32600; a stop answers waiting  *)
-(* steers as cancelled and dropped; a late steer runs as its own next     *)
-(* turn; a queued prompt is a prompt during a turn, which fails with      *)
+(* Today (Rules = FALSE): a steer never cuts a reply short; a steer that  *)
+(* waits when the reply ends goes on in the same turn, as under the rules *)
+(* (tests/tla/drivers/acp/prompt_delivery/driver.ts shows it); one that   *)
+(* arrives while the turn finishes fails with -32600; a stop answers       *)
+(* waiting steers as cancelled and dropped; a late steer runs as its own  *)
+(* next turn; a queued prompt is a prompt during a turn, which fails with *)
 (* -32600; and $/cancel_request ignores a steer.                          *)
 (*                                                                         *)
 (* The phases of the running turn: "gen" while the model streams a reply, *)
 (* "decide" once the reply has streamed and before the turn's next        *)
-(* request, "tool" while a tool runs, and "closing" once the turn has     *)
-(* stopped taking input.                                                   *)
+(* request, "tool" while a tool runs, "finishing" once the turn has found *)
+(* no steer waiting at the reply's end but still takes input, and         *)
+(* "closing" once it has stopped taking input.                             *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets
 
@@ -197,20 +202,30 @@ ToolEnd ==
     /\ UNCHANGED <<sent, running, late, queue, answers, started, tools, cancels, closed>>
 
 \* The reply asks for nothing more. With steers waiting, the turn goes on and
-\* takes them (X22); today it ends, and they fail with -32600 (X19).
+\* takes them (X22), today too. Otherwise the turn finishes.
 ReplyEnd ==
     /\ running /\ phase = "decide"
-    /\ IF waiting # <<>> /\ Rules
+    /\ IF waiting # <<>>
        THEN /\ phase' = "gen"
             /\ cur' = [cur EXCEPT !.ctx = @ \cup Range(waiting)]
             /\ placed' = Place(Range(waiting))
             /\ waiting' = <<>>
+       ELSE /\ phase' = "finishing"
+            /\ UNCHANGED <<cur, placed, waiting>>
+    /\ UNCHANGED <<sent, running, late, queue, answers, started, tools, cancels, closed>>
+
+\* The finishing turn stops taking input. A steer that arrived while it
+\* finished runs as the next turn (X19); today it fails with -32600.
+StopInput ==
+    /\ running /\ phase = "finishing"
+    /\ phase' = "closing"
+    /\ waiting' = <<>>
+    /\ IF Rules
+       THEN /\ late' = late \o waiting
             /\ UNCHANGED answers
-       ELSE /\ phase' = "closing"
-            /\ answers' = [m \in Msgs |-> IF m \in Range(waiting) THEN Err(-32600) ELSE answers[m]]
-            /\ waiting' = <<>>
-            /\ UNCHANGED <<cur, placed>>
-    /\ UNCHANGED <<sent, running, late, queue, started, tools, cancels, closed>>
+       ELSE /\ answers' = [m \in Msgs |-> IF m \in Range(waiting) THEN Err(-32600) ELSE answers[m]]
+            /\ UNCHANGED late
+    /\ UNCHANGED <<sent, running, cur, queue, placed, started, tools, cancels, closed>>
 
 \* The turn that stopped taking input answers, and the next one starts.
 Finish ==
@@ -283,7 +298,7 @@ Close ==
 
 Next ==
     \/ \E m \in Msgs : Send(m) \/ Withdraw(m)
-    \/ StreamEnd \/ ToolCall \/ ToolEnd \/ ReplyEnd \/ Finish \/ Cancel \/ Close
+    \/ StreamEnd \/ ToolCall \/ ToolEnd \/ ReplyEnd \/ StopInput \/ Finish \/ Cancel \/ Close
 
 Spec == Init /\ [][Next]_vars
 
@@ -292,7 +307,7 @@ Spec == Init /\ [][Next]_vars
 
 TypeOK ==
     /\ running \in BOOLEAN
-    /\ phase \in {"gen", "decide", "tool", "closing"}
+    /\ phase \in {"gen", "decide", "tool", "finishing", "closing"}
     /\ Range(waiting) \cup Range(late) \cup Range(queue) \subseteq Range(sent)
     /\ \A m \in Msgs : answers[m].kind \in {"none", "ok", "err"}
 
@@ -305,8 +320,8 @@ AnsweredOnce == [][\A m \in Msgs : answers[m].kind # "none" => answers'[m] = ans
 \* While the model streams a reply, no steer waits: it cut the reply short (X20).
 NoSteerWaitsOnReply == (running /\ phase = "gen") => waiting = <<>>
 
-\* A turn never stops taking input while steers wait (X22).
-ReplyEndContinues == [][(running /\ phase = "decide" /\ phase' = "closing") => waiting = <<>>]_vars
+\* A reply never ends a turn while steers wait (X22).
+ReplyEndContinues == [][(running /\ phase = "decide" /\ phase' = "finishing") => waiting = <<>>]_vars
 
 \* When nothing is pending, every prompt fx received has its answer, and no
 \* steer or queued prompt failed except by being withdrawn or closed.

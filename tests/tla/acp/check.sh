@@ -16,6 +16,7 @@
 #   bun ../drivers/acp/speed/check-spec.ts
 #   bun ../drivers/acp/speed/driver.ts
 #   bun ../drivers/acp/prompt_delivery/check-spec.ts
+#   bun ../drivers/acp/prompt_delivery/driver.ts   # today's fx acp; --model rules fails until the rules land
 #
 # With --ci it also runs every ../drivers/acp/*/driver.ts against
 # zig-out/bin/fx, as CI does; the planted bugs stay local, since they measure
@@ -42,7 +43,6 @@ MCAcpSpeed MCAcpSpeed -
 MCAcpPromptDelivery MCAcpPromptDelivery -
 MCAcpPromptDelivery MCAcpPromptDeliveryRefusals -
 MCAcpPromptDelivery AcpPromptDeliveryToday-interrupt NoSteerWaitsOnReply
-MCAcpPromptDelivery AcpPromptDeliveryToday-reply-end ReplyEndContinues
 MCAcpPromptDelivery AcpPromptDeliveryToday-lost NothingLost
 MCAcpPromptDelivery AcpPromptDeliveryToday-dropped DeliveryValues
 MCAcpPromptDelivery AcpPromptDeliveryToday-late LateRunTogether

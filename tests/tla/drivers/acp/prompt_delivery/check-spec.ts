@@ -23,9 +23,16 @@ const MUTANTS: Mutant[] = [
   {
     id: "reply-end-ends",
     note: "a reply that ends while steers wait ends the turn instead of going on (X22)",
-    from: `    /\\ IF waiting # <<>> /\\ Rules`,
-    to: `    /\\ IF FALSE`,
+    from: `    /\\ IF waiting # <<>>\n       THEN /\\ phase' = "gen"`,
+    to: `    /\\ IF FALSE\n       THEN /\\ phase' = "gen"`,
     expect: "ReplyEndContinues",
+  },
+  {
+    id: "finishing-steer-fails",
+    note: "a steer that arrives while the turn finishes fails with -32600, as today (X19)",
+    from: `       THEN /\\ late' = late \\o waiting\n            /\\ UNCHANGED answers`,
+    to: `       THEN /\\ answers' = [m \\in Msgs |-> IF m \\in Range(waiting) THEN Err(-32600) ELSE answers[m]]\n            /\\ UNCHANGED late`,
+    expect: "NothingLost",
   },
   {
     id: "stop-forgets-waiting",
