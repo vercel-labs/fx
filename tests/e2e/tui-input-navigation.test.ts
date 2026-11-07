@@ -292,6 +292,29 @@ async function waitForExactComposerRow(
   );
 }
 
+/// The pane grid and cursor once neither has changed for `steadyMs`.
+async function waitForSettledPane(
+  active: TmuxSession,
+  steadyMs = 300,
+): Promise<{ grid: string[]; cursor: { row: number; col: number } }> {
+  const started = Date.now();
+  let lastKey = "";
+  let steadySince = Date.now();
+  while (Date.now() - started < READY_TIMEOUT) {
+    const grid = await active.capturePaneGrid();
+    const cursor = active.cursorPosition();
+    const key = `${cursor.row}:${cursor.col}\n${grid.join("\n")}`;
+    if (key !== lastKey) {
+      lastKey = key;
+      steadySince = Date.now();
+    } else if (Date.now() - steadySince >= steadyMs) {
+      return { grid, cursor };
+    }
+    await delay(25);
+  }
+  throw new Error(`Timed out waiting for the pane to settle; last=${lastKey}`);
+}
+
 async function typeTwoRowDraft(active: TmuxSession): Promise<void> {
   await typeLiteral(active, "draft");
   await active.sendKeys("M-Enter");
@@ -530,6 +553,139 @@ tmuxTest(
     expect(active.isAlive()).toBe(true);
   },
   TIMEOUT,
+);
+
+// กั้ง: ก with MAI HAN-AKAT and MAI THO, then ง. ที่นี่: two bases, each with
+// SARA II and MAI EK. A terminal draws every nonspacing mark on the cell
+// before it, so each cluster takes one cell.
+const THAI_KANG = "\u0E01\u0E31\u0E49\u0E07";
+const THAI_KAN = "\u0E01\u0E31\u0E49";
+const THAI_THI = "\u0E17\u0E35\u0E48";
+const THAI_NI = "\u0E19\u0E35\u0E48";
+const THAI_MAI_THO = "\u0E49";
+
+tmuxTest(
+  "Thai nonspacing marks keep the composer cursor and repaint on the terminal's columns",
+  async () => {
+    const active = await startFx(60, 24);
+
+    await typeLiteral(active, `${THAI_KANG}abc`);
+    await waitForExactComposerRow(active, `┃ ${THAI_KANG}abc`);
+    const start = await active.waitForCursor((position) => position.col === 7, READY_TIMEOUT);
+
+    // Text typed after the marks lands right after them, with no gap.
+    await typeLiteral(active, `${THAI_THI}${THAI_NI}ok`);
+    await waitForExactComposerRow(active, `┃ ${THAI_KANG}abc${THAI_THI}${THAI_NI}ok`);
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 11,
+      READY_TIMEOUT,
+    );
+
+    // Left steps over a base and its marks at once.
+    await active.sendKeys("Left Left Left");
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 8,
+      READY_TIMEOUT,
+    );
+    await active.sendKeys("Left");
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 7,
+      READY_TIMEOUT,
+    );
+
+    // Backspace removes a base together with its marks.
+    await active.sendKeys("End BSpace BSpace BSpace");
+    await waitForExactComposerRow(active, `┃ ${THAI_KANG}abc${THAI_THI}`);
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 8,
+      READY_TIMEOUT,
+    );
+
+    // A mark with no base takes no cell.
+    await active.sendKeys("C-u");
+    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
+    await typeLiteral(active, `${THAI_MAI_THO}a`);
+    await waitForExactComposerRow(active, `┃ ${THAI_MAI_THO}a`);
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 3,
+      READY_TIMEOUT,
+    );
+
+    // Twenty-one marks stacked on one base, 63 bytes after it, still take
+    // one cell.
+    await active.sendKeys("C-u");
+    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
+    await typeLiteral(active, `\u0E01${THAI_MAI_THO.repeat(21)}b`);
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 4,
+      READY_TIMEOUT,
+    );
+    const stacked = (await active.capturePaneGrid())[start.row]!.trimEnd();
+    expect(stacked.startsWith("┃ \u0E01")).toBe(true);
+    expect(stacked.endsWith(`${THAI_MAI_THO}b`)).toBe(true);
+
+    // A cluster in the last cell of a row wraps the character after it, not
+    // the cluster: "┃ " leaves 58 cells, 57 of them "a".
+    await active.sendKeys("C-u");
+    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
+    const fill = "a".repeat(57);
+    await typeLiteral(active, `${fill}${THAI_KANG}`);
+    const footer = await waitForActiveFooter(
+      active,
+      (text) => text.split("\n").some((line) => line.trimEnd() === "┃ \u0E07"),
+    );
+    const rows = footer.split("\n").map((line) => line.trimEnd());
+    const full = rows.indexOf(`┃ ${fill}${THAI_KAN}`);
+    expect(full).toBeGreaterThanOrEqual(0);
+    expect(rows[full + 1]).toBe("┃ \u0E07");
+    const wrapped = await active.waitForCursor((position) => position.col === 3, READY_TIMEOUT);
+    const grid = await active.capturePaneGrid();
+    expect(grid[wrapped.row]!.trimEnd()).toBe("┃ \u0E07");
+
+    // A Latin accent in the last cell stays on its letter too.
+    await active.sendKeys("C-u");
+    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
+    await typeLiteral(active, `${fill}e\u0301b`);
+    const latin = await waitForActiveFooter(
+      active,
+      (text) => text.split("\n").some((line) => line.trimEnd() === "┃ b"),
+    );
+    const latinRows = latin.split("\n").map((line) => line.trimEnd());
+    const accented = latinRows.indexOf(`┃ ${fill}e\u0301`);
+    expect(accented).toBeGreaterThanOrEqual(0);
+    expect(latinRows[accented + 1]).toBe("┃ b");
+
+    expectCleanStderr();
+    expect(active.isAlive()).toBe(true);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "a 2,000-cluster Thai draft wraps by cell and keeps the cursor on the terminal's column",
+  async () => {
+    // 2,000 clusters of three code points each, typed 100 clusters at a
+    // time, so the composer stays below the large-paste threshold and the
+    // text stays inline. Each row holds 58 clusters after "┃ ".
+    const active = await startFx(60, 24);
+    let typed = 0;
+    while (typed < 2_000) {
+      await typeLiteral(active, THAI_KAN.repeat(100));
+      typed += 100;
+      const tail = typed % 58;
+      await waitForExactComposerRow(active, `┃ ${THAI_KAN.repeat(tail)}`);
+      // The same row also shows up while earlier keys are still drawing, so
+      // check it only once the pane and the cursor have stopped changing.
+      const { grid, cursor } = await waitForSettledPane(active);
+      expect(cursor.col).toBe(2 + tail);
+      expect(grid[cursor.row]!.trimEnd()).toBe(`┃ ${THAI_KAN.repeat(tail)}`);
+      expect(grid[cursor.row - 1]!.trimEnd()).toBe(`┃ ${THAI_KAN.repeat(58)}`);
+    }
+
+    expectCleanStderr();
+    expect(active.isAlive()).toBe(true);
+  },
+  120_000,
 );
 
 tmuxTest(
