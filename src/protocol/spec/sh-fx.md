@@ -88,7 +88,29 @@ Each extension gets its own section here when it is written.
 
 ## Names in use today
 
-The `libfx/*` methods and `_meta.fx` keys that fx's ACP server uses today, and the `sh.fx` name that replaces each one. The old names will keep working for some releases after the new names ship.
+fx's ACP server names its additions today with a `libfx/` prefix, which doesn't follow ACP's extension rules, and its wasm build accepts `session/remove`, which ACP calls `session/delete`. Each one gets the new name in this table:
+
+| Today | Direction | New name | What it does |
+| --- | --- | --- | --- |
+| `libfx/steer` | client to fx, request | `_sh.fx/session/steer` | Adds text to the running turn |
+| `libfx/withdraw` | client to fx, request | `_sh.fx/session/withdraw_steer` | Takes back a steer that the running turn hasn't given to the model yet |
+| `libfx/handoff` | client to fx, request | `_sh.fx/session/end_turn_for_steer` | Ends the running turn at its next safe point, so that a steer that can't join the turn, such as one with images, runs next |
+| `libfx/follow_up` | client to fx, request | `_sh.fx/session/follow_up` | Records a prompt queued behind the running turn, so that the journal keeps it across a crash |
+| `libfx/checkpoint` | client to fx, request | `_sh.fx/session/checkpoint` | Saves the state of a session that has no running turn as bytes in a binary attachment |
+| `libfx/restore` | client to fx, request | `_sh.fx/session/restore` | Loads the state of a session from a checkpoint attachment |
+| `libfx/new` | client to fx, request | `_sh.fx/session/new` | Creates a session with an optional id that the client chooses and optional hooks. ACP's `session/new` requires a folder and MCP servers and lets the agent choose the id |
+| `libfx/snapshot` | client to fx, request | `_sh.fx/journal/snapshot` | Returns a snapshot of the session for its journal to store, when no turn is open and no follow-up waits, or at a turn that yielded with nothing waiting for it |
+| `libfx/journal_open` | client to fx, request | `_sh.fx/journal/open` | Opens a new session's journal from the events that its host stored |
+| `libfx/journal_images` | client to fx, request | `_sh.fx/journal/stage_images` | Stages images from the host's store for the journal that the session opens next |
+| `libfx/journal_append` | fx to client, notification | `_sh.fx/journal/append` | Sends a journal event for the host to store, and says whether fx waits until the host has stored it |
+| `libfx/journal_flush` | fx to client, request | `_sh.fx/journal/flush` | Waits until the host holds every journal event sent so far |
+| `libfx/hook` | fx to client, notification | `_sh.fx/hooks/event` | Reports an observer event, such as the end of a turn, to the client's hooks |
+| `libfx/tool_call` | fx to client, request | `_sh.fx/tools/call` | Asks the client to run a tool that the client listed at `initialize` |
+| `session/remove` | client to fx, request | `session/delete` | Deletes a session. The new name is ACP's standard method |
+
+For some releases after fx moves to the new names, fx also accepts the `libfx/*` names, and it sends a client the old names unless the client lists the extension's capability. `session/remove` moves to `session/delete` with no such period.
+
+The table of `_meta.fx` keys and their `sh.fx/` names is not written yet.
 
 ## Schema
 
