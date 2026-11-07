@@ -70,7 +70,7 @@ After `initialize`, these rules apply to the connection:
 - A client calls an extension's methods only when fx's list names the extension. fx answers a method it doesn't support with the JSON-RPC error `-32601`, "Method not found".
 - Each side ignores the names it doesn't know in the other side's list.
 
-Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition` and `sh.fx/sessionClients`, the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`, the subagents section defines `sh.fx/subagentPrompts`, and the fork section defines `sh.fx/fork` and `sh.fx/rewind`. The table in "Keys in use today" names two more that replace fields fx uses today, `sh.fx/hooks` and `sh.fx/hostTools`, which later sections define.
+Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition` and `sh.fx/sessionClients`, the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`, the subagents section defines `sh.fx/subagentPrompts`, the fork section defines `sh.fx/fork` and `sh.fx/rewind`, and the turn diff section defines `sh.fx/turnDiff`. The table in "Keys in use today" names two more that replace fields fx uses today, `sh.fx/hooks` and `sh.fx/hostTools`, which later sections define.
 
 ## Extensions
 
@@ -439,6 +439,52 @@ While a turn runs in the session, `session/fork` and `_sh.fx/session/rewind` bot
 
 `tests/tla/acp/AcpForkRewind.tla` models these rules, and TLC checks that a fork holds exactly the source's turns before the prompt and leaves the source as it was, that a rewind leaves exactly those turns in place, and that a client of the session holds a history that was replaced only while the notice is on its way. Its `Today` configs show where fx breaks them now.
 
+### Turn diff
+
+A client that lists `sh.fx/turnDiff` asks for the combined file changes of one turn with `_sh.fx/session/turn_diff`. It names the turn by its prompt, as a fork does. fx answers with the changes that its own tools made in that turn, file by file: each file as it was before the turn's first change to it, and after the turn's last. It answers for a saved turn, and for the running turn with what it has changed so far and `running` set. A prompt that names no turn of the session gets `-32602`.
+
+The answer carries what fx's terminal shows, so a client shows a turn's changes the same way:
+
+- For each file, `path`, `additions` and `deletions` count the added and removed lines, and `preview` holds up to 6 changed lines, as the terminal's inline diff does. A preview line holds up to 4 KiB and a preview up to 24 KiB in all, and `truncated` says when fx cut some.
+- With `full` set in the request, each file also gets `review`: its changed lines with 5 lines of context around them, as fx's full transcript shows.
+- `untracked` is set when the turn ran a shell command, because fx doesn't track the changes a command makes to files.
+
+Each line of `preview` and `review` gives its `op`, which is `context`, `add`, or `remove`, the `oldLine` and `newLine` numbers that apply to it, and its `text`.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "_sh.fx/session/turn_diff",
+  "params": { "sessionId": "sess_abc123", "turn": { "messageId": "msg_7" } }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "running": false,
+    "untracked": false,
+    "files": [
+      {
+        "path": "/home/user/project/src/main.zig",
+        "additions": 1,
+        "deletions": 1,
+        "truncated": false,
+        "preview": [
+          { "op": "remove", "oldLine": 12, "text": "    const limit = 8;" },
+          { "op": "add", "newLine": 12, "text": "    const limit = 16;" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+This extension sets no rule on order or timing, so it has no TLA+ model. The tests of its code check how fx combines a turn's changes.
+
 ## Names in use today
 
 fx's ACP server names its additions today with a `libfx/` prefix, which doesn't follow ACP's extension rules, and its wasm build accepts `session/remove`, which ACP calls `session/delete`. Each one gets the new name in this table:
@@ -523,6 +569,10 @@ The keys and capabilities move with the method names, under the same rules: for 
 | `PromptRef` | A prompt of a session, by its `messageId`: the value of `sh.fx/forkBefore`, and the `before` of a rewind |
 | `RewindParams` | The params of `_sh.fx/session/rewind` |
 | `HistoryReplacedParams` | The params of `_sh.fx/session/history_replaced` |
+| `TurnDiffParams` | The params of `_sh.fx/session/turn_diff` |
+| `TurnDiffResult` | The result of `_sh.fx/session/turn_diff` |
+| `FileChange` | The combined changes of one file in a turn |
+| `DiffLine` | One line of a file change's `preview` or `review` |
 | `SessionState` | The value of `sh.fx/state`: `running`, `requires_action`, or `idle` |
 | `SessionStateUpdate` | The `update` of `_sh.fx/session/state_update`, a part of ACP's `StateUpdate` |
 | `SessionStateUpdateParams` | The params of `_sh.fx/session/state_update` |
