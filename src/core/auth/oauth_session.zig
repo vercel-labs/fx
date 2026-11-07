@@ -315,7 +315,8 @@ fn observeAuthFile(alloc: Allocator, fx_dir: *std.Io.Dir) !FileObservation {
         return .unusable;
     }
 
-    const bytes = io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes) catch |err| switch (err) {
+    var wiping: secret.Wiping = .init(alloc);
+    const bytes = io_mod.readFileToEnd(wiping.allocator(), &file, max_auth_file_bytes) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             debug_trace.logf("auth", "session load failed source=file step=read err={s}", .{@errorName(err)});
@@ -725,7 +726,8 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) !?Session {
         return error.InsecureAuthFile;
     }
 
-    const bytes = io_mod.readFileToEnd(alloc, &current.file, max_auth_file_bytes) catch |err| return session_presence.storageError(auth_file_name, err);
+    var wiping: secret.Wiping = .init(alloc);
+    const bytes = io_mod.readFileToEnd(wiping.allocator(), &current.file, max_auth_file_bytes) catch |err| return session_presence.storageError(auth_file_name, err);
     defer secret.zeroAndFree(alloc, bytes);
     return try parseStoredSession(alloc, bytes);
 }
@@ -891,7 +893,8 @@ fn deleteAuthFile(fx_dir: *std.Io.Dir, ops: io_mod.DurableOps) !DeleteOutcome {
 }
 
 pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    var wiping: secret.Wiping = .init(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, wiping.allocator(), bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidAuthSession;
     const object = parsed.value.object;
@@ -934,7 +937,8 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
 }
 
 pub fn stringify(alloc: Allocator, session: Session) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
+    var wiping: secret.Wiping = .init(alloc);
+    var out: std.Io.Writer.Allocating = .init(wiping.allocator());
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeAll("{\"version\":1");
@@ -1663,4 +1667,74 @@ test "oauth E2E issuer override accepts loopback HTTP only" {
         error.InvalidE2EOAuthEndpoint,
         validateE2EEndpoint("http://127.0.0.1:43123", "https://example.com/oauth/token"),
     );
+}
+
+test "saving and loading an auth session gives back no block that still holds its tokens" {
+    // A short token, and one long enough to outgrow a buffer that grows.
+    var long: [1200]u8 = @splat('x');
+    @memcpy(long[0.."SECRET_MARK".len], "SECRET_MARK");
+    for ([_][]const u8{ "SECRET_MARK", &long }) |token| {
+        const session: Session = .{
+            .issuer = @constCast(issuer),
+            .client_id = @constCast("cl_test"),
+            .access_token = @constCast(token),
+            .refresh_token = @constCast(token),
+            .expires_at_ms = 1234,
+            .scope = @constCast("openid offline_access"),
+            .token_type = @constCast("Bearer"),
+        };
+        {
+            var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+            const alloc = scan.allocator();
+            const text = try stringify(alloc, session);
+            var loaded = try parse(alloc, text);
+            secret.zeroAndFree(alloc, text);
+            loaded.deinit(alloc);
+            try scan.expectWiped();
+        }
+        {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const text = try stringify(std.testing.allocator, session);
+            defer secret.zeroAndFree(std.testing.allocator, text);
+            try writeTestAuthFile(tmp.dir, text);
+            var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+            const alloc = scan.allocator();
+            var observation = try observeAuthFile(alloc, &tmp.dir);
+            try std.testing.expect(observation == .valid);
+            observation.deinit(alloc);
+            try scan.expectWiped();
+        }
+    }
+}
+
+test "a saved auth session that fails midway gives back no block that still holds its tokens" {
+    var long: [1200]u8 = @splat('x');
+    @memcpy(long[0.."SECRET_MARK".len], "SECRET_MARK");
+    const session: Session = .{
+        .issuer = @constCast(issuer),
+        .client_id = @constCast("cl_test"),
+        .access_token = &long,
+        .refresh_token = &long,
+        .expires_at_ms = 1234,
+        .scope = @constCast("openid offline_access"),
+        .token_type = @constCast("Bearer"),
+    };
+    // Fail each allocation in turn, until one run needs no failed allocation.
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+        var failing = std.testing.FailingAllocator.init(scan.allocator(), .{ .fail_index = fail_index });
+        const alloc = failing.allocator();
+        const text = stringify(alloc, session) catch |err| {
+            // The writer reports a failed allocation as a failed write.
+            if (err != error.OutOfMemory and err != error.WriteFailed) return err;
+            try std.testing.expectEqual(@as(usize, 0), scan.holding);
+            continue;
+        };
+        secret.zeroAndFree(alloc, text);
+        try scan.expectWiped();
+        break;
+    }
+    try std.testing.expect(fail_index > 1);
 }

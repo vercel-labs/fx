@@ -8,6 +8,7 @@ const stream_provider = @import("core/agent/stream_provider.zig");
 const agent_steps = @import("core/config/agent_steps.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const host = @import("core/hosts/host.zig");
+const secret = @import("core/auth/secret.zig");
 const host_attachments = @import("core/hosts/host_attachments.zig");
 const agent_checkpoint = @import("core/agent/runtime/checkpoint.zig");
 const io_mod = @import("core/shared/io.zig");
@@ -808,7 +809,7 @@ const Runtime = struct {
         self.attachments.deinit();
         self.input.deinit(self.alloc);
         self.output.deinit(self.alloc);
-        if (self.credential) |value| self.alloc.free(value);
+        if (self.credential) |value| secret.zeroAndFree(self.alloc, value);
         if (self.custom_context) |*context| context.deinit(self.alloc);
         if (self.configured_providers) |json| self.alloc.free(json);
         if (self.model) |model| self.alloc.free(model);
@@ -1023,7 +1024,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidApiKey,
     };
-    errdefer if (api_key) |value| alloc.free(value);
+    errdefer if (api_key) |value| secret.zeroAndFree(alloc, value);
     // The host authorizes every provider but Gateway, which needs its API key.
     const host_authorized = if (provider) |value| value != .gateway else false;
     if (api_key == null and !host_authorized) return error.InvalidApiKey;
