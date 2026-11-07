@@ -99,8 +99,8 @@ Init ==
     /\ turns = 0
     /\ changes = 0
 
-\* session/new, session/load, or session/resume. fx sends the current state
-\* after its response.
+\* session/new, session/load, or session/resume. fx sends the current state:
+\* before the response to a load or resume, after the response to a new.
 Open(c, s) ==
     /\ s \notin open[c] /\ ~deleted[s]
     /\ exists[s] => (saved[s] \/ Held(s))
