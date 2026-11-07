@@ -25,7 +25,10 @@
     "AgentCapabilitiesMeta": {
       "description": "The sh.fx entries that fx lists in `agentCapabilities._meta` of its `initialize` response.",
       "type": "object",
-      "properties": {},
+      "properties": {
+        "sh.fx/promptDelivery": { "$ref": "#/$defs/PromptDeliveryCapability" },
+        "sh.fx/hostSteering": { "$ref": "#/$defs/Capability" }
+      },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
       }
@@ -33,10 +36,45 @@
     "ClientCapabilitiesMeta": {
       "description": "The sh.fx entries that a client lists in `clientCapabilities._meta` of its `initialize` request.",
       "type": "object",
-      "properties": {},
+      "properties": {
+        "sh.fx/promptDelivery": { "$ref": "#/$defs/Capability" }
+      },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
       }
+    },
+    "PromptDeliveryCapability": {
+      "description": "The value of the sh.fx/promptDelivery capability that fx lists: one entry for each delivery that fx supports.",
+      "type": "object",
+      "properties": {
+        "steer": { "$ref": "#/$defs/Capability" },
+        "queue": { "$ref": "#/$defs/Capability" }
+      }
+    },
+    "PromptDelivery": {
+      "description": "The value of sh.fx/delivery in the `_meta` of a `session/prompt` request: what fx does with a prompt that arrives while a turn runs.",
+      "type": "string",
+      "enum": ["steer", "queue"]
+    },
+    "SteeringDelivery": {
+      "description": "The value of sh.fx/steeringDelivery in the `_meta` of the response to a steer: whether the running turn took the steer, or the steer ran in the next turn.",
+      "type": "string",
+      "enum": ["absorbed", "next_turn"]
+    },
+    "SteerInput": {
+      "description": "The value of sh.fx/steerInput in the `_meta` of a `user_message_chunk` update that shows a steer.",
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "description": "The request id of the `session/prompt` that sent the steer, or null for a host steer.",
+          "$ref": "acp/v1/schema.json#/$defs/RequestId"
+        },
+        "inputId": {
+          "description": "The input id of a host steer.",
+          "type": "string"
+        }
+      },
+      "required": ["requestId"]
     }
   }
 }
