@@ -392,6 +392,8 @@ As in fx today, the child's report goes to the parent, where it joins the parent
 }
 ```
 
+`tests/tla/acp/AcpSubagents.tla` models these rules, and TLC checks that a client reads a child's announcement before any of its work, that stopping a child leaves the parent's turn running, that a child's permission request ends with the child, and that no message to a child and no child's report is lost. Its `Today` configs show where fx breaks them now.
+
 ## Names in use today
 
 fx's ACP server names its additions today with a `libfx/` prefix, which doesn't follow ACP's extension rules, and its wasm build accepts `session/remove`, which ACP calls `session/delete`. Each one gets the new name in this table:
