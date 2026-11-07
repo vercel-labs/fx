@@ -2,5 +2,41 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "sh.fx extensions to the Agent Client Protocol, version 1",
   "description": "Draft. The types that sh-fx.md defines. The standard ACP types are in acp/v1/schema.json.",
-  "$defs": {}
+  "$defs": {
+    "MethodName": {
+      "description": "The name of an sh.fx method or notification: `_sh.fx/` followed by `<area>/<action>` in snake_case.",
+      "type": "string",
+      "pattern": "^_sh\\.fx/[a-z][a-z0-9_]*(/[a-z][a-z0-9_]*)+$"
+    },
+    "CapabilityName": {
+      "description": "The name of an sh.fx capability: `sh.fx/` followed by a camelCase name.",
+      "type": "string",
+      "pattern": "^sh\\.fx/[a-z][A-Za-z0-9]*$"
+    },
+    "MetaKey": {
+      "description": "An sh.fx key in a `_meta` object: `sh.fx/` followed by a camelCase name.",
+      "type": "string",
+      "pattern": "^sh\\.fx/[a-z][A-Za-z0-9]*$"
+    },
+    "Capability": {
+      "description": "The value of an sh.fx capability entry. It stays empty unless the extension defines options. Peers ignore fields they don't know.",
+      "type": "object"
+    },
+    "AgentCapabilitiesMeta": {
+      "description": "The sh.fx entries that fx lists in `agentCapabilities._meta` of its `initialize` response.",
+      "type": "object",
+      "properties": {},
+      "patternProperties": {
+        "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
+      }
+    },
+    "ClientCapabilitiesMeta": {
+      "description": "The sh.fx entries that a client lists in `clientCapabilities._meta` of its `initialize` request.",
+      "type": "object",
+      "properties": {},
+      "patternProperties": {
+        "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
+      }
+    }
+  }
 }
