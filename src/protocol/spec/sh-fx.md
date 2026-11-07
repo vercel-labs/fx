@@ -134,7 +134,7 @@ These rules apply to both deliveries:
 - A steer that arrives between two model requests waits for the turn's next one: after the running tool, or, when the model's reply has ended, the turn goes on with the steer instead of ending.
 - When a turn takes a steer, fx sends a `user_message_chunk` update with the steer's text. Its `_meta` holds `sh.fx/steerInput`, whose `requestId` is the steer's request id.
 
-A steer that arrives after the turn has stopped taking input, and every steer still waiting when the client stops the turn, run together as the next turn, before any queued prompt.
+A steer that arrives while the turn finishes, after its last check for steers, and one that arrives after the turn has stopped taking input, run as the next turn. So does every steer still waiting when the client stops the turn. They run together, before any queued prompt.
 
 The response to a steer arrives when the turn that took it ends. It carries that turn's `stopReason`, and its `_meta` holds `sh.fx/steeringDelivery`:
 
@@ -157,7 +157,7 @@ The response to a steer arrives when the turn that took it ends. It carries that
 
 ACP v2's rule for [prompts during active work](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle) differs on one point: there, `session/cancel` also answers the prompts that haven't run with `-32800`. ACP v1 has no such rule. fx revisits this point when it moves to ACP v2.
 
-`tests/tla/acp/AcpPromptDelivery.tla` models these rules, and TLC checks them in every order of steers, queued prompts, stops, withdrawals, and closing. Its `Today` configs show where fx's ACP path breaks them now.
+`tests/tla/acp/AcpPromptDelivery.tla` models these rules, and TLC checks them in every order of steers, queued prompts, stops, withdrawals, and closing. Its `Today` configs show where fx's ACP path breaks them now, and `tests/tla/drivers/acp/prompt_delivery/driver.ts` runs `fx acp` along the model.
 
 #### Host steering
 
