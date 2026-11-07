@@ -1,8 +1,8 @@
 #!/bin/sh
 # Model-checks DurableSession.tla, PromptIntake.tla, ImageStore.tla,
-# DurableSteer.tla and AgentRouting.tla with TLC, confirms each witness is
-# violated, and writes the state graphs the drivers in ../drivers/ walk
-# against the code.
+# DurableSteer.tla, AgentRouting.tla and UiStreamOrder.tla with TLC, confirms
+# each witness is violated, and writes the state graphs the drivers in
+# ../drivers/ walk against the code.
 #
 # Needs Java 11+ and tla2tools.jar:
 #   brew install openjdk
@@ -20,6 +20,7 @@
 #   bun ../drivers/drive-agents.mjs   # AgentRouting
 #   bun ../drivers/drive-steer.mjs ideal && bun ../drivers/drive-steer.mjs faults   # DurableSteer
 #   bun ../drivers/drive-tenants.mjs   # TenantIsolation
+#   bun ../drivers/sdk/ui-order.ts   # UiStreamOrder, with TLC checking each run
 set -eu
 cd "$(dirname "$0")"
 
@@ -73,6 +74,9 @@ for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoAct
         echo "== witness $witness NOT reached" >&2; status=1
     fi
 done
+# UiStreamOrder.tla: the order a viewer sees a session's UI lines in, which
+# check-ui-order.sh checks with its planted mutations.
+./check-ui-order.sh || status=1
 # DurableSteer.tla: where each message a user sends ends up. The ideal graph
 # has no faults, and the faults graph adds cancels, deadline handoffs and
 # client retries.

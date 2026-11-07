@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDurableAgentFactory, extendLogView, foldSessionLog, handoffEntries, memory, wakeHandler } from "../durable.js";
 import { world } from "../durable/world.mjs";
+import { burstHarness, burstWord, slowChunkWrites, watchStreamWrites } from "./ui-order-fixtures.mjs";
 
 const durabilityKind = process.argv[2] || "memory";
 const { local } = durabilityKind === "local" ? await import("../durable/local.mjs") : {};
@@ -1682,6 +1683,75 @@ if (durabilityKind !== "memory") {
     assert.equal(text, "alpha-0 alpha-1 alpha-2", "a reader that comes later sees the whole turn");
     assert.ok(counts.reads > 0, "reading the view read the stream");
     await agent.close();
+  });
+}
+
+// Runs one burst turn on `durability`, with the chunk write of each word in
+// `slowWords` taking `delayMs` more, and returns what a reader open from the
+// start, the turn's own events, a reader that came after, and a reconnect
+// from the middle of the stream saw, and each write libfx made to the World.
+async function runBurst({ durability, waves, gapMs = 0, slowWords = [], delayMs = 400 }) {
+  const markers = slowWords.map((index) => `"delta":"${burstWord(index)} "`);
+  const slow = slowChunkWrites((text) => (markers.some((marker) => text.includes(marker)) ? delayMs : 0));
+  const writes = [];
+  const createBurstAgent = createDurableAgentFactory({ harness: burstHarness({ waves, gapMs }), defaultDurability: async () => memory(), name: "createBurstAgent" });
+  const agent = createBurstAgent({ durability: watchStreamWrites(durability, (event) => writes.push(event)) });
+  try {
+    const session = agent.session();
+    const turn = session.prompt("go", { messageId: "turn-burst" });
+    const count = waves.reduce((sum, words) => sum + words, 0) + 2;
+    const live = readLines(session.stream(0), count, 3000);
+    const events = [];
+    for await (const event of turn) if (event.type === "text_delta") events.push(event.delta);
+    await turn.result;
+    const liveLines = await live;
+    slow.restore();
+    const replay = await readLines(session.stream(0), count, 3000);
+    const cursor = replay[Math.floor(replay.length / 2)].cursor;
+    const reconnect = await readLines(session.stream(cursor), count, 1000);
+    return { events, liveLines, replay, cursor, reconnect, writes, delayed: slow.delayed };
+  } finally {
+    slow.restore();
+    await agent.close();
+  }
+}
+
+const deltasOf = (lines) => lines.filter((line) => line.type === "text_delta").map((line) => line.delta);
+const burstWords = (count) => Array.from({ length: count }, (_, index) => `${burstWord(index)} `);
+
+if (durabilityKind === "local") {
+  // world-local 5.1.1 writes a batch's chunk files in parallel, and a live
+  // reader shows any chunk file it finds, so a chunk that lands late shows
+  // after the ones behind it. local() writes its UI lines one at a time.
+  for (const [name, plan] of [
+    ["the first chunk of a batch lands late", { waves: [12], slowWords: [1] }],
+    ["a chunk in the middle of a batch lands late", { waves: [12], slowWords: [6] }],
+    ["the last chunk of a batch lands late", { waves: [12], slowWords: [11] }],
+    ["the first and a middle chunk of a batch land late", { waves: [12], slowWords: [1, 6] }],
+    ["a batch of two lands with its first chunk late", { waves: [3], slowWords: [1] }],
+    ["the one line of a turn lands late", { waves: [1], slowWords: [0] }],
+    ["the first batch is slow and a second wave of lines comes while it is written", { waves: [4, 4], gapMs: 100, slowWords: [1] }],
+  ]) {
+    test(`local() shows a turn's lines in order when ${name}`, async () => {
+      const ran = await runBurst({ durability: await durabilityFor(), ...plan });
+      const words = burstWords(plan.waves.reduce((sum, count) => sum + count, 0));
+      assert.equal(ran.delayed.length, plan.slowWords.length, "every slow write was applied once");
+      assert.deepEqual(deltasOf(ran.liveLines), words, "a reader that was open from the start shows the words in order");
+      assert.deepEqual(ran.events, words, "the turn's own events show the words in order");
+      assert.deepEqual(deltasOf(ran.replay), words, "a reader that came after shows them in order");
+      assert.deepEqual(ran.reconnect, ran.replay.filter((line) => line.cursor > ran.cursor), "a reconnect from the middle shows the lines after its cursor");
+      assert.deepEqual(ran.liveLines.map((line) => line.type), ran.replay.map((line) => line.type), "the live reader and the later one see the same lines");
+      assert.ok(ran.writes.filter((write) => write.op === "issue").every((write) => write.chunks.length === 1), "libfx gives local() one chunk per call");
+    });
+  }
+}
+
+if (durabilityKind === "world" || durabilityKind === "queue") {
+  test("a World that is not local() gets a batch of lines in one writeMulti call", async () => {
+    const ran = await runBurst({ durability: await durabilityFor(), waves: [12] });
+    assert.deepEqual([...deltasOf(ran.replay)].sort(), burstWords(12), "every word is in the stream");
+    const batches = ran.writes.filter((write) => write.op === "issue" && write.call === "writeMulti");
+    assert.ok(batches.length > 0 && batches.every((write) => write.chunks.length > 1), JSON.stringify(ran.writes));
   });
 }
 
@@ -3868,8 +3938,11 @@ if (durabilityKind === "queue") {
   });
 }
 
+// LIBFX_TEST_ONLY runs only the tests whose names contain it.
+const only = process.env.LIBFX_TEST_ONLY;
+const selected = only ? tests.filter(([name]) => name.includes(only)) : tests;
 let failed = 0;
-for (const [name, fn] of tests) {
+for (const [name, fn] of selected) {
   const started = performance.now();
   try {
     let timer;
@@ -3883,5 +3956,5 @@ for (const [name, fn] of tests) {
 await closeAppWorlds?.();
 await closeQueueWorlds?.();
 for (const dir of dirs) await rm(dir, { recursive: true, force: true }).catch(() => {});
-console.log(`${tests.length - failed}/${tests.length} core tests passed (${durabilityKind})`);
+console.log(`${selected.length - failed}/${selected.length} core tests passed (${durabilityKind})`);
 process.exit(failed ? 1 : 0);
