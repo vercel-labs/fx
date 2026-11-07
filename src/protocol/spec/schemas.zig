@@ -582,6 +582,7 @@ test "the value tables in sh-fx.md give the values of the schema's enums" {
         .{ "| `sh.fx/delivery` |", "PromptDelivery" },
         .{ "| `sh.fx/steeringDelivery` |", "SteeringDelivery" },
         .{ "| `sh.fx/replay` |", "Replay" },
+        .{ "| `sh.fx/state` |", "SessionState" },
     };
     inline for (tables) |table| {
         var buffer: [16][]const u8 = undefined;
