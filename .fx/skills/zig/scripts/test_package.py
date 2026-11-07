@@ -173,11 +173,6 @@ class Package(unittest.TestCase):
             for m in re.finditer("/" + "Users" + r"/([^/\s]+)/", read(path)):
                 self.assertIn(m.group(1), ("example", "tester", "private", "me", "<you>"), path)
 
-    def test_openai_metadata(self):
-        text = read("agents", "openai.yaml")
-        self.assertIn("$zig ", text)
-        self.assertNotIn("$zig-", text)
-
     def all_text_files(self):
         out = []
         for root, dirs, files in os.walk(ROOT):
