@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const display_width = @import("../shared/display_width.zig");
 const contracts = @import("contracts.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -354,6 +355,11 @@ pub const Grid = struct {
     /// `Cell.combining_suffix_id`. IDs are grid-local.
     combining_suffix_pool: std.ArrayList([]u8) = .empty,
     combining_pool_bytes: usize = 0,
+    /// Zero-width units the current feed dropped because the cell they belong
+    /// to already held `contracts.max_cell_text_bytes`, and their bytes. A feed
+    /// resets them and logs them once. Checkpoints do not save them.
+    suffix_dropped_units: u32 = 0,
+    suffix_dropped_bytes: usize = 0,
     /// Exact OSC 8 parameter bytes for the currently active hyperlink.
     /// Cell resources retain their own copy after the active link closes.
     active_hyperlink_params: []const u8 = &.{},
@@ -580,6 +586,9 @@ pub const Grid = struct {
     }
 
     fn feedBytes(self: *Grid, bytes: []const u8) !void {
+        self.suffix_dropped_units = 0;
+        self.suffix_dropped_bytes = 0;
+        defer self.logDroppedSuffix();
         var remaining: []const u8 = bytes;
         while (remaining.len > 0) {
             if (!self.defer_sync_updates or !self.sync_active) {
@@ -615,6 +624,17 @@ pub const Grid = struct {
                 if (consumed != buffered.len) return error.InvalidParserState;
             }
         }
+    }
+
+    /// Logs what this feed dropped from full cells, once however many units
+    /// that was: a long run is repainted every frame.
+    fn logDroppedSuffix(self: *const Grid) void {
+        if (self.suffix_dropped_units == 0) return;
+        debug_trace.logf(
+            "terminal",
+            "dropped {d} zero-width units ({d} bytes) that would take a cell over {d} bytes of text",
+            .{ self.suffix_dropped_units, self.suffix_dropped_bytes, contracts.max_cell_text_bytes },
+        );
     }
 
     pub fn feedWithStats(self: *Grid, bytes: []const u8, stats: *FeedStats) !void {
@@ -1050,10 +1070,24 @@ pub const Grid = struct {
         return self.combining_suffix_pool.items[id - 1];
     }
 
+    /// Adds the display unit `bytes` to the suffix of the cell at `cell_idx`.
+    /// A cell holds at most `contracts.max_cell_text_bytes` of text, its base
+    /// codepoint and its suffix together, the size a render snapshot accepts.
+    /// A unit that would pass it is dropped whole, and the units before it stay,
+    /// so the cell is the same however the bytes are split across reads. Only
+    /// zero-width units can reach the cap: a unit that widens a cell is one
+    /// emoji sequence, far under it. So a dropped unit leaves the cell's width
+    /// and the cursor as they were (`tests/tla/terminal_cell/TerminalCell.tla`
+    /// `CursorAligned`).
     fn appendCombiningSuffix(self: *Grid, cell_idx: usize, bytes: []const u8) !void {
         const existing = self.combiningSuffix(self.cells[cell_idx].combining_suffix_id) orelse &.{};
-        const combined_len = std.math.add(usize, existing.len, bytes.len) catch
-            return error.CombiningPoolCapacityExceeded;
+        const base_len = std.unicode.utf8CodepointSequenceLength(self.cells[cell_idx].codepoint) catch 4;
+        if (bytes.len > contracts.max_cell_text_bytes -| (base_len + existing.len)) {
+            self.suffix_dropped_units +|= 1;
+            self.suffix_dropped_bytes +|= bytes.len;
+            return;
+        }
+        const combined_len = existing.len + bytes.len;
         for (self.combining_suffix_pool.items, 0..) |candidate, idx| {
             if (candidate.len == combined_len and
                 std.mem.startsWith(u8, candidate, existing) and
@@ -1063,8 +1097,7 @@ pub const Grid = struct {
                 return;
             }
         }
-        if (combined_len > contracts.max_cell_text_bytes or
-            self.combining_suffix_pool.items.len >= max_pool_entries or
+        if (self.combining_suffix_pool.items.len >= max_pool_entries or
             self.combining_pool_bytes > max_combining_pool_bytes - combined_len)
         {
             return error.CombiningPoolCapacityExceeded;
@@ -5304,13 +5337,22 @@ const fuzz_terminal_pieces = [_][]const u8{
     "\x1b[38;2;10;20;30m", "\x1b[48;5;236m",     "\x1b",
 };
 
+/// Zero-width pieces that pile onto one cell past the most text it can hold.
+const fuzz_zero_width_pieces = [_][]const u8{
+    "\u{301}",
+    text_utils.repeat("\u{301}", 20),
+    text_utils.repeat("\u{200b}", 12),
+};
+
+const fuzz_all_pieces = fuzz_terminal_pieces ++ fuzz_zero_width_pieces;
+
 /// CSI final bytes the grid fuzz test pairs with generated parameters.
 const fuzz_csi_finals = "ABCDEFGHJKSTXdfmr@LMPhlnsu";
 
 fn appendFuzzTerminalBytes(alloc: Allocator, smith: *std.testing.Smith, out: *std.ArrayList(u8)) !void {
     for (0..smith.valueRangeAtMost(u8, 0, 48)) |_| {
         switch (smith.valueRangeAtMost(u8, 0, 9)) {
-            0...5 => try out.appendSlice(alloc, fuzz_terminal_pieces[smith.index(fuzz_terminal_pieces.len)]),
+            0...5 => try out.appendSlice(alloc, fuzz_all_pieces[smith.index(fuzz_all_pieces.len)]),
             6...8 => {
                 try out.appendSlice(alloc, "\x1b[");
                 if (smith.boolWeighted(1, 5)) try out.append(alloc, '?');
@@ -5435,7 +5477,11 @@ fn fuzzGridFeed(_: void, smith: *std.testing.Smith) !void {
     var pieces = try Grid.init(alloc, cols, rows);
     defer pieces.deinit();
     const pieces_fed = feedFuzzFragments(&pieces, bytes.items, smith);
-    whole.feed(bytes.items) catch |err| return testing.expectError(err, pieces_fed);
+    whole.feed(bytes.items) catch |err| {
+        // A cell over its cap drops the extra marks and never fails the feed.
+        try testing.expect(err != error.CombiningPoolCapacityExceeded);
+        return testing.expectError(err, pieces_fed);
+    };
     try pieces_fed;
     const state = whole.checkpointPayload(alloc) catch |err| return testing.expectError(err, pieces.checkpointPayload(alloc));
     defer alloc.free(state);
@@ -5499,4 +5545,312 @@ test "bounded deterministic corrupt checkpoint fuzz" {
         ) catch continue;
         restored.deinit();
     }
+}
+
+// A cell holds at most `contracts.max_cell_text_bytes` of text: its base
+// codepoint and its suffix together, the size `renderSnapshot` accepts. A
+// zero-width unit that would pass it is dropped whole and the cell stays.
+
+/// `base`, then `count` copies of `mark`, then `tail`. The caller frees it.
+fn markRun(base: []const u8, mark: []const u8, count: usize, tail: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    try out.appendSlice(testing.allocator, base);
+    for (0..count) |_| try out.appendSlice(testing.allocator, mark);
+    try out.appendSlice(testing.allocator, tail);
+    return out.toOwnedSlice(testing.allocator);
+}
+
+/// The suffix of the cell at (`row`, `col`), empty when it has none.
+fn cellSuffix(grid: Grid, row: u16, col: u16) []const u8 {
+    const cell = grid.cellAt(row, col).?;
+    return grid.combiningSuffix(cell.combining_suffix_id) orelse "";
+}
+
+/// The cell at (1, 1) is `base` with exactly `kept` copies of `mark`, within
+/// the cap, and `tail` sits in the next cell with the cursor after it.
+fn expectCappedCell(grid: Grid, base: u21, width: u8, mark: []const u8, kept: usize, tail: u21) !void {
+    const lead = grid.cellAt(1, 1).?;
+    try testing.expectEqual(base, lead.codepoint);
+    try testing.expectEqual(width, lead.width);
+    const expected = try markRun("", mark, kept, "");
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, cellSuffix(grid, 1, 1));
+    var encoded: [4]u8 = undefined;
+    const base_bytes = try std.unicode.utf8Encode(base, &encoded);
+    try testing.expect(base_bytes + expected.len <= contracts.max_cell_text_bytes);
+    try testing.expectEqual(tail, grid.cellAt(1, 1 + width).?.codepoint);
+    try testing.expectEqual(@as(u16, width) + 2, grid.cursor_col);
+}
+
+test "a cell keeps at most 64 bytes of text and drops the extra marks" {
+    // `e` takes one byte and U+0301 two, so 31 marks fill 63 of the 64 bytes
+    // and a 32nd would make 65.
+    for ([_]usize{ 1, 30, 31, 32, 33, 40, 200 }) |count| {
+        var grid = try Grid.init(testing.allocator, 80, 2);
+        defer grid.deinit();
+        const run = try markRun("e", "\u{301}", count, "b");
+        defer testing.allocator.free(run);
+        try grid.feed(run);
+        try expectCappedCell(grid, 'e', 1, "\u{301}", @min(count, 31), 'b');
+    }
+}
+
+test "a cell stops at the cap for every zero-width character" {
+    const marks = [_][]const u8{
+        "\u{200b}", "\u{200d}", "\u{fe0f}", "\u{e0061}", "\u{202e}", "\u{feff}", "\u{20e3}",
+    };
+    for (marks) |mark| {
+        var grid = try Grid.init(testing.allocator, 80, 2);
+        defer grid.deinit();
+        // 63 bytes are left after `e`: 21 marks of three bytes fill 64 exactly,
+        // and 15 tag characters of four bytes fill 61.
+        const run = try markRun("e", mark, 200, "b");
+        defer testing.allocator.free(run);
+        try grid.feed(run);
+        try expectCappedCell(grid, 'e', 1, mark, (contracts.max_cell_text_bytes - 1) / mark.len, 'b');
+    }
+}
+
+test "the room for marks is the cap minus the bytes of the base" {
+    const Case = struct { base: []const u8, codepoint: u21, width: u8 };
+    const cases = [_]Case{
+        .{ .base = "e", .codepoint = 'e', .width = 1 },
+        .{ .base = "\u{754c}", .codepoint = 0x754c, .width = 2 },
+        .{ .base = "\u{1f600}", .codepoint = 0x1f600, .width = 2 },
+    };
+    for (cases) |case| {
+        var grid = try Grid.init(testing.allocator, 80, 2);
+        defer grid.deinit();
+        const run = try markRun(case.base, "\u{301}", 200, "b");
+        defer testing.allocator.free(run);
+        try grid.feed(run);
+        const kept = (contracts.max_cell_text_bytes - case.base.len) / "\u{301}".len;
+        try expectCappedCell(grid, case.codepoint, case.width, "\u{301}", kept, 'b');
+    }
+}
+
+test "a unit too big for the room left is dropped and a smaller one that fits stays" {
+    var grid = try Grid.init(testing.allocator, 20, 1);
+    defer grid.deinit();
+    // `e` and 20 three-byte marks take 61 bytes: the four-byte tag character
+    // does not fit in the 3 left, the first U+0301 does, the second does not.
+    try grid.feed("e" ++ text_utils.repeat("\u{200b}", 20) ++ "\u{e0061}\u{301}\u{301}b");
+    try testing.expectEqualStrings(
+        text_utils.repeat("\u{200b}", 20) ++ "\u{301}",
+        cellSuffix(grid, 1, 1),
+    );
+    try testing.expectEqual(@as(u21, 'b'), grid.cellAt(1, 2).?.codepoint);
+}
+
+test "a full cell is the same however the bytes are split across reads" {
+    const streams = [_][]const u8{
+        "e" ++ text_utils.repeat("\u{301}", 40) ++ "b",
+        "e" ++ text_utils.repeat("\u{200b}", 20) ++ "\u{e0061}\u{301}\u{301}b",
+        "\u{754c}" ++ text_utils.repeat("\u{301}\u{200d}", 20) ++ "b",
+    };
+    for (streams) |stream| {
+        var whole = try Grid.init(testing.allocator, 20, 2);
+        defer whole.deinit();
+        try whole.feed(stream);
+
+        var bytewise = try Grid.init(testing.allocator, 20, 2);
+        defer bytewise.deinit();
+        for (stream) |byte| try bytewise.feed(&.{byte});
+        try expectSameScreen(whole, bytewise);
+
+        for (0..stream.len + 1) |cut| {
+            var split = try Grid.init(testing.allocator, 20, 2);
+            defer split.deinit();
+            try split.feed(stream[0..cut]);
+            try split.feed(stream[cut..]);
+            try expectSameScreen(whole, split);
+        }
+    }
+}
+
+test "marks with no base to sit on are ignored" {
+    var grid = try Grid.init(testing.allocator, 20, 2);
+    defer grid.deinit();
+    const marks = text_utils.repeat("\u{301}", 100);
+    try grid.feed(marks);
+    try expectRow(grid, 1, "");
+    try grid.feed("a\n" ++ marks);
+    try expectRow(grid, 2, "");
+    try grid.feed("\x1b[2J\x1b[Ha\x1b[1;5H" ++ marks);
+    try testing.expectEqualStrings("", cellSuffix(grid, 1, 1));
+    try expectRow(grid, 1, "a");
+}
+
+test "a selector after a full cell is a dropped mark and does not widen the cell" {
+    var grid = try Grid.init(testing.allocator, 20, 1);
+    defer grid.deinit();
+    // The base and 30 marks take 63 bytes, so the three-byte selector is
+    // dropped. It never joined the base, so the cell stays one cell wide.
+    try grid.feed("\u{2600}" ++ text_utils.repeat("\u{301}", 30) ++ "\u{fe0f}b");
+    try testing.expectEqual(@as(u8, 1), grid.cellAt(1, 1).?.width);
+    try testing.expectEqualStrings(text_utils.repeat("\u{301}", 30), cellSuffix(grid, 1, 1));
+    try testing.expectEqual(@as(u21, 'b'), grid.cellAt(1, 2).?.codepoint);
+    try testing.expectEqual(@as(u16, 3), grid.cursor_col);
+}
+
+test "a full cell in the last column repaints with only the marks it kept" {
+    for ([_]bool{ true, false }) |autowrap| {
+        var live = try Grid.init(testing.allocator, 6, 2);
+        defer live.deinit();
+        live.autowrap = autowrap;
+        try live.feed("\x1b[1;6He" ++ text_utils.repeat("\u{301}", 40) ++ "\x1b[2;1HZ");
+        var screen = try Grid.init(testing.allocator, 6, 2);
+        defer screen.deinit();
+        try expectFuzzRepaint(&screen, live);
+        try testing.expectEqualStrings(text_utils.repeat("\u{301}", 31), cellSuffix(screen, 1, 6));
+    }
+}
+
+test "a full cell survives a checkpoint and a render snapshot" {
+    var grid = try Grid.init(testing.allocator, 20, 2);
+    defer grid.deinit();
+    const run = try markRun("e", "\u{301}", 200, "b");
+    defer testing.allocator.free(run);
+    try grid.feed(run);
+
+    const payload = try grid.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+    var restored = try Grid.restoreCheckpoint(testing.allocator, payload);
+    defer restored.deinit();
+    const again = try restored.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(again);
+    try testing.expectEqualSlices(u8, payload, again);
+
+    var snapshot = try grid.renderSnapshot(testing.allocator);
+    defer snapshot.deinit(testing.allocator);
+    const text = snapshot.view().cells[0].text;
+    try testing.expect(text.len <= contracts.max_cell_text_bytes);
+    try testing.expectEqualStrings("e" ++ text_utils.repeat("\u{301}", 31), text);
+}
+
+test "marks fed onto a cell that already holds more than the cap are dropped" {
+    var grid = try Grid.init(testing.allocator, 20, 1);
+    defer grid.deinit();
+    try grid.feed("e");
+    // An older fx capped the suffix alone at 64 bytes, so a checkpoint it saved
+    // can hold `e` and 32 marks: 65 bytes, one over the cap.
+    const long = try testing.allocator.dupe(u8, text_utils.repeat("\u{301}", 32));
+    grid.combining_suffix_pool.append(testing.allocator, long) catch |err| {
+        testing.allocator.free(long);
+        return err;
+    };
+    grid.combining_pool_bytes += long.len;
+    grid.cells[0].combining_suffix_id = @intCast(grid.combining_suffix_pool.items.len);
+
+    try grid.feed("\u{301}\u{200b}b");
+    try testing.expectEqualStrings(long, cellSuffix(grid, 1, 1));
+    try testing.expectEqual(@as(u21, 'b'), grid.cellAt(1, 2).?.codepoint);
+}
+
+test "stress: a million marks on one cell and 200 marks on each cell of a full grid" {
+    var one = try Grid.init(testing.allocator, 80, 2);
+    defer one.deinit();
+    try one.feed("e");
+    const block = text_utils.repeat("\u{301}", 10_000);
+    for (0..100) |_| try one.feed(block);
+    try one.feed("b");
+    try expectCappedCell(one, 'e', 1, "\u{301}", 31, 'b');
+
+    // 10,000 cells, each with 200 marks, fill a 200 by 50 grid without scrolling.
+    var wide = try Grid.init(testing.allocator, 200, 50);
+    defer wide.deinit();
+    const cell = "x" ++ text_utils.repeat("\u{301}", 200);
+    for (0..50 * 200) |_| try wide.feed(cell);
+    var row: u16 = 1;
+    while (row <= wide.rows) : (row += 1) {
+        var col: u16 = 1;
+        while (col <= wide.cols) : (col += 1) {
+            try testing.expectEqual(@as(u21, 'x'), wide.cellAt(row, col).?.codepoint);
+            try testing.expectEqualStrings(text_utils.repeat("\u{301}", 31), cellSuffix(wide, row, col));
+        }
+    }
+    const payload = try wide.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+    var restored = try Grid.restoreCheckpoint(testing.allocator, payload);
+    defer restored.deinit();
+    var snapshot = try restored.renderSnapshot(testing.allocator);
+    defer snapshot.deinit(testing.allocator);
+}
+
+test "a feed counts the units it drops from full cells and the next feed starts over" {
+    var grid = try Grid.init(testing.allocator, 20, 2);
+    defer grid.deinit();
+    // `e` and 31 U+0301 take 63 bytes, so the other 9 marks of two bytes go.
+    try grid.feed("e" ++ text_utils.repeat("\u{301}", 40));
+    try testing.expectEqual(@as(u32, 9), grid.suffix_dropped_units);
+    try testing.expectEqual(@as(usize, 18), grid.suffix_dropped_bytes);
+
+    // A second feed counts its own drops only: a two-byte and a three-byte mark.
+    try grid.feed("\u{301}\u{200b}");
+    try testing.expectEqual(@as(u32, 2), grid.suffix_dropped_units);
+    try testing.expectEqual(@as(usize, 5), grid.suffix_dropped_bytes);
+
+    try grid.feed("x");
+    try testing.expectEqual(@as(u32, 0), grid.suffix_dropped_units);
+    try testing.expectEqual(@as(usize, 0), grid.suffix_dropped_bytes);
+
+    // A clone starts at zero, and a checkpoint does not save the counters.
+    try grid.feed("\x1b[2;1He" ++ text_utils.repeat("\u{301}", 40));
+    try testing.expectEqual(@as(u32, 9), grid.suffix_dropped_units);
+    var cloned = try grid.clone(testing.allocator);
+    defer cloned.deinit();
+    try testing.expectEqual(@as(u32, 0), cloned.suffix_dropped_units);
+    const payload = try grid.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+    var restored = try Grid.restoreCheckpoint(testing.allocator, payload);
+    defer restored.deinit();
+    try testing.expectEqual(@as(u32, 0), restored.suffix_dropped_units);
+    try testing.expectEqual(@as(usize, 0), restored.suffix_dropped_bytes);
+
+    // A cell that dropped marks saves what a cell that never got them saves.
+    var kept_only = try Grid.init(testing.allocator, 20, 2);
+    defer kept_only.deinit();
+    var dropped = try Grid.init(testing.allocator, 20, 2);
+    defer dropped.deinit();
+    try kept_only.feed("e" ++ text_utils.repeat("\u{301}", 31));
+    try dropped.feed("e" ++ text_utils.repeat("\u{301}", 200));
+    const kept_payload = try kept_only.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(kept_payload);
+    const dropped_payload = try dropped.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(dropped_payload);
+    try testing.expectEqualSlices(u8, kept_payload, dropped_payload);
+}
+
+test "a feed that drops units from full cells logs one line with their counts" {
+    const alloc = testing.allocator;
+    const io_mod = @import("../shared/io.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "cell-text.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "terminal");
+
+    var grid = try Grid.init(alloc, 20, 2);
+    defer grid.deinit();
+    try grid.feed("e" ++ text_utils.repeat("\u{301}", 40));
+    // A feed that drops nothing logs nothing.
+    try grid.feed("abc");
+
+    debug_trace.shutdown();
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 8192);
+    defer alloc.free(trace);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "dropped "));
+    try testing.expect(std.mem.find(
+        u8,
+        trace,
+        "dropped 9 zero-width units (18 bytes) that would take a cell over 64 bytes of text",
+    ) != null);
 }
