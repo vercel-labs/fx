@@ -19,6 +19,13 @@
 # stream-witness-*.cfg must be violated. stream-simulate*.cfg run random
 # behaviors with more calls and rebuilds.
 #
+# PromptHistory models when an append compacts the input history file.
+# history-holds.cfg must pass with every fault on. history-before.cfg is fx
+# before the trigger was split from the target, and must violate
+# NoCompactAfterCompact. Each history-mutant-*.cfg plants one bug that its
+# property must catch, each history-witness-*.cfg must be violated, and
+# history-simulate.cfg runs random behaviors with larger limits.
+#
 # Run the real binary along the models and have TLC check every run:
 #   bun test ../drivers/session/
 #
@@ -62,4 +69,14 @@ TurnStream stream-witness-recovery NeverCommittedAfterRecovery
 TurnStream stream-witness-missed-path MissedPathsNeverParse
 TurnStream stream-simulate simulate $sim
 TurnStream stream-simulate-before simulate $sim
+PromptHistory history-holds -
+PromptHistory history-before NoCompactAfterCompact
+PromptHistory history-mutant-thin-headroom NoCompactAfterCompact
+PromptHistory history-mutant-compare-target NoCompactAfterCompact
+PromptHistory history-mutant-keep-to-trigger CompactedFitsTarget
+PromptHistory history-witness-second-compaction NeverCompactedTwice
+PromptHistory history-witness-count-bound NeverCountBound
+PromptHistory history-witness-retried NeverRetried
+PromptHistory history-witness-repaired NeverRepaired
+PromptHistory history-simulate simulate $sim
 EOF

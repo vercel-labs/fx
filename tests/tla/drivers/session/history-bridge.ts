@@ -1,0 +1,203 @@
+// Connects runs of the real fx binary to TLC for the input history file. The
+// observations of one run become PromptHistoryObserved.tla, and
+// tests/tla/session/PromptHistoryTrace.tla replays them through
+// PromptHistory's own actions with the limits the run is checked against.
+// ACCEPTED needs TLC's exit 12 on the NotAllMatched sentinel with every
+// observation matched. A finished search is REJECTED; then the longest prefix
+// the model can produce names the first observation it cannot. Strict
+// verdicts: missing or unreadable evidence is never accepted.
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { runTlc, sha256File, sha256Text, TLA_ROOT, writeJson } from "../lib/tlc";
+
+export type HistoryOp = "seed" | "append" | "duplicate" | "torn" | "restart";
+
+/// One step of a run and what the history file held after it. `size` is the
+/// appended record's bytes, newline included, or the torn bytes; 0 otherwise.
+export interface HistoryObservation {
+  op: HistoryOp;
+  size: number;
+  /// The file's length in bytes.
+  len: number;
+  /// The sizes of the newest valid records, oldest first, at most the limit.
+  tail: number[];
+  /// Bytes after the last newline.
+  torn: number;
+}
+
+/// The store's limits (src/core/session/prompt_history_store.zig), and
+/// whether the run injected a fault into a compaction's rename.
+export interface Limits {
+  trigger: number;
+  target: number;
+  recordLimit: number;
+  maxRecord: number;
+  faults: boolean;
+}
+
+const MiB = 1024 * 1024;
+
+/// The limits this change ships: compact past 2 MiB, back to 1 MiB.
+export const FIXED: Limits = { trigger: 2 * MiB, target: MiB, recordLimit: 1000, maxRecord: 256 * 1024, faults: false };
+
+/// fx before the change: the trigger was the target.
+export const BEFORE: Limits = { ...FIXED, trigger: MiB };
+
+export type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
+
+export interface TraceResult {
+  verdict: Verdict;
+  length: number;
+  matched: number;
+  detail: string;
+  firstMismatch?: { step: number; observation: HistoryObservation };
+  hashes: Record<string, string>;
+}
+
+const SPEC_DIR = join(TLA_ROOT, "session");
+const SPECS = ["PromptHistory.tla", "PromptHistoryTrace.tla"];
+
+/// A record line exactly as `serializeRecord` writes it, for text and paths
+/// that JSON escapes the same way in Zig and here.
+export function recordLine(timestampMs: number, workspaceRoot: string, text: string): string {
+  return `{"schema_version":1,"timestamp_ms":${timestampMs},"workspace_root":${JSON.stringify(workspaceRoot)},"text":${JSON.stringify(text)}}\n`;
+}
+
+export interface HistoryRecord {
+  timestampMs: number;
+  workspaceRoot: string;
+  text: string;
+  size: number;
+}
+
+/// Reads a history file the way the store does: whole lines only, a valid
+/// record has exactly the four fields, and a line too long or malformed only
+/// adds to the length. Every valid record must be in the form fx writes, so
+/// its size is the size a compaction keeps.
+export function readHistory(bytes: Uint8Array, limits: Limits): { observation: Omit<HistoryObservation, "op" | "size">; records: HistoryRecord[] } {
+  const buffer = Buffer.from(bytes);
+  const end = buffer.lastIndexOf(0x0a) + 1;
+  const records: HistoryRecord[] = [];
+  let start = 0;
+  while (start < end) {
+    const newline = buffer.indexOf(0x0a, start);
+    const line = buffer.subarray(start, newline).toString("utf8");
+    const size = newline + 1 - start;
+    start = newline + 1;
+    if (size > limits.maxRecord) continue;
+    let value: any;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (value === null || typeof value !== "object" || Object.keys(value).length !== 4) continue;
+    const { schema_version, timestamp_ms, workspace_root, text } = value;
+    if (schema_version !== 1 || !Number.isInteger(timestamp_ms) || typeof workspace_root !== "string" ||
+      !workspace_root.startsWith("/") || typeof text !== "string") continue;
+    if (recordLine(timestamp_ms, workspace_root, text) !== `${line}\n`) {
+      throw new Error(`a valid record is not in the form fx writes: ${line.slice(0, 120)}`);
+    }
+    records.push({ timestampMs: timestamp_ms, workspaceRoot: workspace_root, text, size });
+  }
+  return {
+    observation: {
+      len: buffer.length,
+      tail: records.slice(-limits.recordLimit).map((record) => record.size),
+      torn: buffer.length - end,
+    },
+    records,
+  };
+}
+
+export function readHistoryFile(path: string, limits: Limits) {
+  return readHistory(readFileSync(path), limits);
+}
+
+function observationValue(o: HistoryObservation): string {
+  return `[op |-> ${JSON.stringify(o.op)}, size |-> ${o.size}, len |-> ${o.len}, ` +
+    `tail |-> <<${o.tail.join(", ")}>>, torn |-> ${o.torn}]`;
+}
+
+export function observedModule(observations: HistoryObservation[], limits: Limits): string {
+  return [
+    "---------------------------- MODULE PromptHistoryObserved ----------------------------",
+    "(* Generated by tests/tla/drivers/session/history-bridge.ts from one run. Do not edit. *)",
+    "EXTENDS Naturals, Sequences",
+    `TTrigger == ${limits.trigger}`,
+    `TTarget == ${limits.target}`,
+    `TRecordLimit == ${limits.recordLimit}`,
+    `TMaxRecord == ${limits.maxRecord}`,
+    `TFaults == ${limits.faults ? "TRUE" : "FALSE"}`,
+    `Observed == << ${observations.map(observationValue).join(",\n  ")} >>`,
+    "=============================================================================",
+    "",
+  ].join("\n");
+}
+
+const TRACE_CFG = [
+  "CONSTANTS",
+  "  Trigger <- TTrigger",
+  "  Target <- TTarget",
+  "  RecordLimit <- TRecordLimit",
+  "  MaxRecord <- TMaxRecord",
+  "  Faults <- TFaults",
+  "  Sizes = {1}",
+  "  TornSizes = {1}",
+  "  MaxLen = 0",
+  '  Mutant = "none"',
+  "INIT TraceInit",
+  "NEXT TraceNext",
+  "INVARIANT NotAllMatched",
+  "CHECK_DEADLOCK FALSE",
+  "",
+].join("\n");
+
+async function replay(observations: HistoryObservation[], limits: Limits, dir: string): Promise<Verdict> {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "PromptHistoryObserved.tla"), observedModule(observations, limits));
+  writeFileSync(join(dir, "trace.cfg"), TRACE_CFG);
+  const run = await runTlc(dir, "PromptHistoryTrace.tla", "trace.cfg", SPECS, SPEC_DIR);
+  const matched = [...run.output.matchAll(/\/\\ k = (\d+)/g)].map((match) => Number(match[1])).at(-1);
+  if (run.exitCode === 12 && run.violated === "NotAllMatched" && matched === observations.length) return "ACCEPTED";
+  if (run.exitCode === 0 && run.output.includes("Model checking completed. No error has been found.")) return "REJECTED";
+  return "TOOL_ERROR";
+}
+
+/// Replays `observations` through the model under `limits`. `dir` receives
+/// every TLC run.
+export async function checkTrace(observations: HistoryObservation[], limits: Limits, dir: string): Promise<TraceResult> {
+  const hashes = {
+    ...Object.fromEntries(SPECS.map((name) => [name, sha256File(join(SPEC_DIR, name))])),
+    observations: sha256Text(JSON.stringify(observations)),
+  };
+  const result = await (async (): Promise<TraceResult> => {
+    const length = observations.length;
+    if (length === 0) return { verdict: "TOOL_ERROR", length, matched: 0, detail: "no observations", hashes };
+    if (observations[0]!.op !== "seed") return { verdict: "TOOL_ERROR", length, matched: 0, detail: "no seed", hashes };
+    if (length === 1) return { verdict: "TOOL_ERROR", length, matched: 0, detail: "a seed and no step", hashes };
+    const whole = await replay(observations, limits, join(dir, "whole"));
+    if (whole !== "REJECTED") {
+      return { verdict: whole, length, matched: whole === "ACCEPTED" ? length : 0, detail: `TLC work in ${dir}`, hashes };
+    }
+    // A prefix of a behavior is a behavior, so the longest one accepted is
+    // found by bisection. The seed alone is always one.
+    let good = 1, bad = length;
+    while (bad - good > 1) {
+      const mid = Math.floor((good + bad) / 2);
+      const verdict = await replay(observations.slice(0, mid), limits, join(dir, `prefix-${mid}`));
+      if (verdict === "TOOL_ERROR") return { verdict, length, matched: 0, detail: `TLC failed on a prefix of ${mid}; see ${dir}`, hashes };
+      if (verdict === "ACCEPTED") good = mid;
+      else bad = mid;
+    }
+    const step = observations[good]!;
+    return {
+      verdict: "REJECTED", length, matched: good, hashes,
+      firstMismatch: { step: good + 1, observation: step },
+      detail: `the model cannot produce step ${good + 1}: ${step.op} of ${step.size} bytes left len ${step.len}, ` +
+        `${step.tail.length} records, ${step.torn} torn, after len ${observations[good - 1]!.len}`,
+    };
+  })();
+  writeJson(join(dir, "verdict.json"), result);
+  return result;
+}

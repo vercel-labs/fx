@@ -11,9 +11,19 @@ const history_lock_file = "history.lock";
 const lock_deadline_ms: u64 = 2000;
 const default_scan_block_bytes: usize = 1024 * 1024;
 const max_record_bytes: usize = 256 * 1024;
-const compaction_threshold_bytes: u64 = 1024 * 1024;
+/// An append that leaves the file longer than this compacts it.
+const compaction_threshold_bytes: u64 = 2 * 1024 * 1024;
+/// A compaction keeps the newest records within both limits.
 const compaction_record_limit: usize = 1000;
 const compaction_byte_limit: usize = 1024 * 1024;
+// A compaction leaves room for the largest record, so the append right after
+// it never compacts again (`tests/tla/session/PromptHistory.tla`
+// NoCompactAfterCompact).
+comptime {
+    if (compaction_byte_limit + max_record_bytes > compaction_threshold_bytes) {
+        @compileError("prompt history compaction must leave room for the largest record");
+    }
+}
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
@@ -1176,9 +1186,12 @@ test "compaction retains newest one thousand valid records within one mebibyte" 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
 
+    // More than one thousand records, and past the threshold, so the append
+    // compacts.
     var fixture: std.ArrayList(u8) = .empty;
     defer fixture.deinit(alloc);
-    for (0..1005) |index| {
+    var index: usize = 0;
+    while (index < 1005 or fixture.items.len <= compaction_threshold_bytes) : (index += 1) {
         const text = try alloc.print(
             "{d:0>4}-{s}",
             .{ index, text_utils.repeat("x", 1024) },
@@ -1213,9 +1226,11 @@ test "compaction failure after append reports stale while keeping appended recor
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
 
+    // Records of 220 KiB past the threshold, so the append compacts.
     var fixture: std.ArrayList(u8) = .empty;
     defer fixture.deinit(alloc);
-    for (0..5) |index| {
+    var index: usize = 0;
+    while (fixture.items.len <= compaction_threshold_bytes) : (index += 1) {
         const line = try fixtureLine(
             alloc,
             @intCast(index),
@@ -1237,6 +1252,173 @@ test "compaction failure after append reports stale while keeping appended recor
     const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace", 100);
     defer freeLoadedEntries(alloc, entries);
     try expectTexts(entries, &.{"committed"});
+}
+
+/// Appends `text` and expects the file to grow by exactly its line, which
+/// means the append did not compact.
+fn expectAppendOnly(
+    alloc: Allocator,
+    store: *Store,
+    length: *u64,
+    timestamp_ms: i64,
+    text: []const u8,
+) !void {
+    const line = try serializeRecord(alloc, timestamp_ms, "/tmp/workspace", text);
+    defer alloc.free(line);
+    try std.testing.expectEqual(
+        AppendOutcome.appended,
+        try store.append(alloc, timestamp_ms, "/tmp/workspace", text),
+    );
+    const next = try store.historyLengthForTest();
+    try std.testing.expectEqual(length.* + line.len, next);
+    length.* = next;
+}
+
+test "an append right after a compaction does not compact again" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    // Records of about 1.1 KiB past the threshold, so the byte limit, not
+    // the record limit, binds when the first append compacts.
+    var fixture: std.ArrayList(u8) = .empty;
+    defer fixture.deinit(alloc);
+    var index: usize = 0;
+    while (fixture.items.len <= compaction_threshold_bytes) : (index += 1) {
+        const text = try alloc.print(
+            "{d:0>4}-{s}",
+            .{ index, text_utils.repeat("x", 1024) },
+        );
+        defer alloc.free(text);
+        const line = try fixtureLine(alloc, @intCast(index), "/tmp/workspace", text);
+        defer alloc.free(line);
+        try fixture.appendSlice(alloc, line);
+    }
+    try writeFixture(home, fixture.items);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    try std.testing.expectEqual(
+        AppendOutcome.appended,
+        try store.append(alloc, 5000, "/tmp/workspace", "compacts"),
+    );
+    var length = try store.historyLengthForTest();
+    try std.testing.expect(length <= compaction_byte_limit);
+
+    // The largest record the store takes, right after the compaction, and
+    // then records of the same 1.1 KiB: each only adds its line.
+    const largest = try alloc.alloc(u8, max_record_bytes - 1024);
+    defer alloc.free(largest);
+    @memset(largest, 'y');
+    try expectAppendOnly(alloc, &store, &length, 5001, largest);
+    for (0..20) |step| {
+        const text = try alloc.print(
+            "{d:0>4}-{s}",
+            .{ step, text_utils.repeat("z", 1024) },
+        );
+        defer alloc.free(text);
+        try expectAppendOnly(alloc, &store, &length, @intCast(5002 + step), text);
+    }
+
+    const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace", 22);
+    defer freeLoadedEntries(alloc, entries);
+    try std.testing.expectEqualStrings("compacts", entries[0].text);
+    try std.testing.expectEqualStrings(largest, entries[1].text);
+}
+
+test "compaction starts only past the threshold, not at it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    // Fill the file so that the next record ends exactly at the threshold.
+    const at_threshold = try serializeRecord(alloc, 9000, "/tmp/workspace", "at the threshold");
+    defer alloc.free(at_threshold);
+    const fill: usize = @intCast(compaction_threshold_bytes - at_threshold.len);
+    var fixture: std.ArrayList(u8) = .empty;
+    defer fixture.deinit(alloc);
+    var index: usize = 0;
+    while (fixture.items.len < fill) : (index += 1) {
+        const empty = try fixtureLine(alloc, @intCast(index), "/tmp/workspace", "");
+        defer alloc.free(empty);
+        const left = fill - fixture.items.len;
+        // The last record takes exactly what is left.
+        const text_len = if (left >= 2 * (empty.len + 1024)) 1024 else left - empty.len;
+        const text = try alloc.alloc(u8, text_len);
+        defer alloc.free(text);
+        @memset(text, 'x');
+        const line = try fixtureLine(alloc, @intCast(index), "/tmp/workspace", text);
+        defer alloc.free(line);
+        try fixture.appendSlice(alloc, line);
+    }
+    try std.testing.expectEqual(fill, fixture.items.len);
+    try writeFixture(home, fixture.items);
+
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+    try std.testing.expectEqual(
+        AppendOutcome.appended,
+        try store.append(alloc, 9000, "/tmp/workspace", "at the threshold"),
+    );
+    try std.testing.expectEqual(compaction_threshold_bytes, try store.historyLengthForTest());
+
+    try std.testing.expectEqual(
+        AppendOutcome.appended,
+        try store.append(alloc, 9001, "/tmp/workspace", "past the threshold"),
+    );
+    try std.testing.expect((try store.historyLengthForTest()) <= compaction_byte_limit);
+    const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace", 2);
+    defer freeLoadedEntries(alloc, entries);
+    try expectTexts(entries, &.{ "at the threshold", "past the threshold" });
+}
+
+test "a compaction that failed is retried by the next append" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    var fixture: std.ArrayList(u8) = .empty;
+    defer fixture.deinit(alloc);
+    var index: usize = 0;
+    while (fixture.items.len <= compaction_threshold_bytes) : (index += 1) {
+        const line = try fixtureLine(
+            alloc,
+            @intCast(index),
+            "/tmp/other",
+            text_utils.repeat("x", 220 * 1024),
+        );
+        defer alloc.free(line);
+        try fixture.appendSlice(alloc, line);
+    }
+    try writeFixture(home, fixture.items);
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+
+    store.failCompactionBeforeRenameForTest();
+    try std.testing.expectEqual(
+        AppendOutcome.compaction_stale,
+        try store.append(alloc, 100, "/tmp/workspace", "kept"),
+    );
+    try std.testing.expect((try store.historyLengthForTest()) > compaction_threshold_bytes);
+
+    store.clearFailureControlsForTest();
+    try std.testing.expectEqual(
+        AppendOutcome.appended,
+        try store.append(alloc, 101, "/tmp/workspace", "retried"),
+    );
+    var length = try store.historyLengthForTest();
+    try std.testing.expect(length <= compaction_byte_limit);
+    try expectAppendOnly(alloc, &store, &length, 102, "after the retry");
+
+    const entries = try store.loadRecentForWorkspace(alloc, "/tmp/workspace", 100);
+    defer freeLoadedEntries(alloc, entries);
+    try expectTexts(entries, &.{ "kept", "retried", "after the retry" });
 }
 
 test "workspace clear preserves other workspaces and chronological order" {
