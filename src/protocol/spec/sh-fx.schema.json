@@ -34,7 +34,8 @@
         "sh.fx/sessionClients": { "$ref": "#/$defs/Capability" },
         "sh.fx/subagentPrompts": { "$ref": "#/$defs/Capability" },
         "sh.fx/fork": { "$ref": "#/$defs/Capability" },
-        "sh.fx/rewind": { "$ref": "#/$defs/Capability" }
+        "sh.fx/rewind": { "$ref": "#/$defs/Capability" },
+        "sh.fx/turnDiff": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -51,7 +52,8 @@
         "sh.fx/sessionClients": { "$ref": "#/$defs/Capability" },
         "sh.fx/subagentPrompts": { "$ref": "#/$defs/Capability" },
         "sh.fx/fork": { "$ref": "#/$defs/Capability" },
-        "sh.fx/rewind": { "$ref": "#/$defs/Capability" }
+        "sh.fx/rewind": { "$ref": "#/$defs/Capability" },
+        "sh.fx/turnDiff": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -170,6 +172,54 @@
         "sessionId": { "type": "string", "minLength": 1 }
       },
       "required": ["sessionId"]
+    },
+    "TurnDiffParams": {
+      "description": "The params of `_sh.fx/session/turn_diff`: the turn, by its prompt, and whether to add each file's full review.",
+      "type": "object",
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "turn": { "$ref": "#/$defs/PromptRef" },
+        "full": { "type": "boolean" }
+      },
+      "required": ["sessionId", "turn"]
+    },
+    "TurnDiffResult": {
+      "description": "The result of `_sh.fx/session/turn_diff`: the changes fx's own tools made in the turn, file by file.",
+      "type": "object",
+      "properties": {
+        "running": { "description": "The turn still runs, and the changes are those so far.", "type": "boolean" },
+        "untracked": { "description": "The turn ran a shell command, whose changes to files fx doesn't track.", "type": "boolean" },
+        "files": { "type": "array", "items": { "$ref": "#/$defs/FileChange" } }
+      },
+      "required": ["running", "untracked", "files"]
+    },
+    "FileChange": {
+      "description": "The combined changes of one file in a turn: as it was before the turn's first change to it, and after the last. The preview follows fx's terminal: up to 6 changed lines, each up to 4 KiB, 24 KiB in all.",
+      "type": "object",
+      "properties": {
+        "path": { "description": "The file's absolute path.", "type": "string", "minLength": 1 },
+        "additions": { "type": "integer", "minimum": 0 },
+        "deletions": { "type": "integer", "minimum": 0 },
+        "truncated": { "description": "fx cut the preview to its limits.", "type": "boolean" },
+        "preview": { "type": "array", "items": { "$ref": "#/$defs/DiffLine" } },
+        "review": {
+          "description": "With `full` in the request: the changed lines with 5 lines of context, as fx's full transcript shows.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/DiffLine" }
+        }
+      },
+      "required": ["path", "additions", "deletions", "truncated", "preview"]
+    },
+    "DiffLine": {
+      "description": "One line of a file change's preview or review.",
+      "type": "object",
+      "properties": {
+        "op": { "type": "string", "enum": ["context", "add", "remove"] },
+        "oldLine": { "type": "integer", "minimum": 1 },
+        "newLine": { "type": "integer", "minimum": 1 },
+        "text": { "type": "string" }
+      },
+      "required": ["op", "text"]
     },
     "SessionState": {
       "description": "The value of sh.fx/state in the `_meta` of a `session/status` response and of a `session/list` row, and the `state` of a session state update: what the session is doing.",
