@@ -23,6 +23,9 @@ export function local({ dir, maxDurationMs, reserveMs } = {}) {
     livenessKnown: true,
     // world-local keeps its queue in memory, so a message dies with the process.
     queueDurable: false,
+    // Its chunk files land in any order, and its reader shows any that is on
+    // disk: libfx writes the session's lines one chunk at a time.
+    [Symbol.for("libfx.durability.writeUiInOrder")]: true,
     pollMs: 250,
     maxDurationMs,
     reserveMs,
