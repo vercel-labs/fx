@@ -42,6 +42,7 @@
     {"name": "url_policy", "module": "fx", "test": "url policy admits only URLs it reads back the same way", "iterations": 2400000},
     {"name": "http_response", "module": "fx", "test": "web_fetch response parser reads a response the same however it is split", "iterations": 1500000},
     {"name": "acp_jsonrpc", "module": "fx", "test": "ACP frames stay one parseable line and read the same however they are split", "iterations": 400000},
+    {"name": "acp_command_output_utf8", "module": "fx", "test": "command output text is valid UTF-8 and matches the whole output however it is split", "iterations": 20000},
     {"name": "mcp_wire", "module": "fx", "test": "MCP wire decoding returns only whole JSON values from valid input", "iterations": 900000},
     {"name": "shell_parity", "module": "fx", "test": "shell parity holds for generated commands", "iterations": 600},
     {"name": "command_lex", "module": "fx", "test": "lexing generated commands is consistent and round-trips through quoting", "iterations": 2700000},

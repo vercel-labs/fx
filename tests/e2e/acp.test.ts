@@ -626,9 +626,12 @@ class AcpReadTimeoutError extends Error {
 class AcpClient {
   private proc: ChildProcess;
   private buffer: string = "";
+  // A read can end inside a multi-byte character; the decoder keeps it.
+  private decoder = new TextDecoder();
   private lines: string[] = [];
   private waiters: Array<(line: string) => void> = [];
   private _closed = false;
+  private _stdoutChunks: Buffer[] = [];
   private _stderrChunks: Buffer[] = [];
   private activeSessionId: string | null = null;
   private pendingSessionTargets = new Map<number | string, string>();
@@ -645,7 +648,8 @@ class AcpClient {
   constructor(proc: ChildProcess) {
     this.proc = proc;
     proc.stdout!.on("data", (chunk: Buffer) => {
-      this.buffer += chunk.toString();
+      this._stdoutChunks.push(chunk);
+      this.buffer += this.decoder.decode(chunk, { stream: true });
       const parts = this.buffer.split("\n");
       this.buffer = parts.pop() ?? "";
       for (const line of parts) {
@@ -693,6 +697,26 @@ class AcpClient {
 
   get stderr(): string {
     return Buffer.concat(this._stderrChunks).toString();
+  }
+
+  /// The lines fx wrote to stdout that are not valid UTF-8.
+  get invalidUtf8Lines(): Buffer[] {
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    const bytes = Buffer.concat(this._stdoutChunks);
+    const invalid: Buffer[] = [];
+    let start = 0;
+    while (start < bytes.length) {
+      const newline = bytes.indexOf(0x0a, start);
+      const end = newline === -1 ? bytes.length : newline;
+      const line = bytes.subarray(start, end);
+      try {
+        decoder.decode(line);
+      } catch {
+        invalid.push(line);
+      }
+      start = end + 1;
+    }
+    return invalid;
   }
 
   get hookEvents(): any[] {
@@ -930,6 +954,9 @@ test.each(["empty", "unrelated"])("configured provider ACP preserves explicit mo
     if (created.error) throw new Error(JSON.stringify(created));
     const provider = created.result.configOptions.find((option: any) => option.id === "provider");
     expect(provider.currentValue).toBe("local");
+    // ACP clients take the first `model` option as the model picker.
+    expect(provider.category).toBe("model_config");
+    expect(created.result.configOptions.find((option: any) => option.category === "model").id).toBe("model");
     expect(provider.options.map((option: any) => option.value)).toContain("remote");
     const switched = await client.request("session/set_config_option", { configId: "provider", value: "remote" }) as any;
     if (switched.error) throw new Error(JSON.stringify(switched));
@@ -945,6 +972,7 @@ test.each(["empty", "unrelated"])("configured provider ACP preserves explicit mo
     if (loaded.error) throw new Error(JSON.stringify(loaded));
     const current = loaded.result.configOptions.find((option: any) => option.id === "provider").currentValue;
     expect(current).toBe("remote");
+    expect(loaded.result.configOptions.find((option: any) => option.category === "model").id).toBe("model");
     const roundTrip = await client.request("session/set_config_option", { configId: "provider", value: current }) as any;
     expect(roundTrip.error).toBeUndefined();
     expect(fixture.requests).toHaveLength(1);
@@ -1133,6 +1161,88 @@ test("ACP shell completed and replayed updates show the command output", async (
   }
 }, 45000);
 
+async function runShellProgress(command: string, callId: string) {
+  const fixture = createConfiguredProviderFixture(body => body.messages.some((message: any) => message.role === "tool")
+    ? configuredCompletion(body.model, "done")
+    : configuredToolCompletion(body.model, "shell", { request: { action: "run", command } }, callId));
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+  try {
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    await client.request("session/set_mode", { modeId: "full-access" }, 3);
+    const prompt = await runPrompt(client, "Run the command.", TIMEOUT);
+    const updates = prompt.messages
+      .map((message: any) => message.params?.update)
+      .filter((update: any) => update?.toolCallId === callId);
+    const progress = updates
+      .filter((update: any) => update.status === "in_progress")
+      .flatMap((update: any) => update.content ?? [])
+      .map((item: any) => item.content?.text ?? "")
+      .join("");
+    const invalid = client.invalidUtf8Lines;
+    client.endStdin();
+    const exitCode = await client.waitForExit();
+    return {
+      stopReason: prompt.promptResult.result.stopReason,
+      progress,
+      statuses: updates.map((update: any) => update.status),
+      invalid,
+      exitCode,
+      stderr: client.stderr,
+    };
+  } finally {
+    await client.close();
+    fixture.close();
+  }
+}
+
+test("ACP shell progress frames stay valid UTF-8 for long multi-byte output", async () => {
+  // Shell output reaches ACP in chunks of a few KiB cut at raw byte counts,
+  // so 2-, 3- and 4-byte characters land on every chunk boundary.
+  const command = "awk 'BEGIN{printf \"x\"; for(i=0;i<50000;i++) printf \"\u044f\u20ac\u{1f600}\"}'";
+  const result = await runShellProgress(command, "call_utf8_long");
+  expect(result.invalid.map(line => line.subarray(0, 120).toString("latin1"))).toEqual([]);
+  expect(result.progress).toBe("x" + "\u044f\u20ac\u{1f600}".repeat(50000));
+  expect(result.statuses.at(-1)).toBe("completed");
+  expect(result.stopReason).toBe("end_turn");
+  expect(result.stderr).toBe("");
+  expect(result.exitCode).toBe(0);
+}, 45000);
+
+test("ACP shell progress joins characters split across chunks per stream and escapes invalid bytes", async () => {
+  // The runner sends a line once it ends or reaches 4096 bytes. Each padded
+  // printf fills 4096 bytes that end inside a character, and the pause makes
+  // the rest arrive as the next chunk. stdout and stderr each hold a split
+  // character at the same time; a stray byte and a tail left unfinished at
+  // exit come out escaped.
+  const command = [
+    "printf '%4095s\\320' ' '",
+    "sleep 0.3",
+    "printf '%4094s\\360\\237' ' ' >&2",
+    "sleep 0.3",
+    "printf '\\257\\n'",
+    "sleep 0.3",
+    "printf '\\230\\200\\n' >&2",
+    "sleep 0.3",
+    "printf '%4095s\\360' ' '",
+    "sleep 0.3",
+    "printf '\\237\\230\\200\\n'",
+    "printf 'bad\\377byte\\n'",
+    "printf 'tail\\342\\202'",
+  ].join("; ");
+  const result = await runShellProgress(command, "call_utf8_split");
+  expect(result.invalid.map(line => line.subarray(0, 120).toString("latin1"))).toEqual([]);
+  expect(result.progress).toBe(
+    " ".repeat(4095) + " ".repeat(4094) + "\u042f\n" + "\u{1f600}\n"
+      + " ".repeat(4095) + "\u{1f600}\n" + "bad\\xffbyte\n" + "tail" + "\\xe2\\x82",
+  );
+  expect(result.statuses.at(-1)).toBe("completed");
+  expect(result.stopReason).toBe("end_turn");
+  expect(result.stderr).toBe("");
+  expect(result.exitCode).toBe(0);
+}, 45000);
+
 test("ACP finishes tool calls that a cancel stopped before they ran", async () => {
   const root = createIsolatedRoot("fx-acp-cancel-cards-");
   const gateway = startFakeGateway([
@@ -1193,7 +1303,7 @@ test("ACP finishes a provider search the turn ended before it finished", async (
     if (created.error) throw new Error(JSON.stringify(created));
     sendPrompt(client, 3, "Search the web.");
     const { responses } = await readUntilResponses(client, [3]);
-    expect(responses.get(3)!.result.stopReason).toBe("refused");
+    expect(responses.get(3)!.result.stopReason).toBe("refusal");
     const search = client.rawLines
       .map(line => JSON.parse(line))
       .filter((message: any) => message.method === "session/update" && message.params?.update?.toolCallId === "search_open")
@@ -7812,7 +7922,7 @@ describe("acp: model-independent", () => {
         }
 
         expect(response.error).toBeUndefined();
-        expect(response.result.stopReason).toBe("refused");
+        expect(response.result.stopReason).toBe("refusal");
         const authUpdate = messages.find((message) =>
           message.method === "session/update" &&
           message.params?.update?.sessionUpdate === "agent_message_chunk"
@@ -8909,6 +9019,57 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP uses max_tokens for the original and absorbed steering responses",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-steer-length-");
+      const firstRequest = deferred<void>();
+      const releaseFirst = deferred<void>();
+      const gateway = startFakeGateway([
+        async () => {
+          firstRequest.resolve();
+          await releaseFirst.promise;
+          return finalText("First answer.");
+        },
+        // Text before the length finish, so the empty-reply retry stays out.
+        fakeGatewaySse([
+          { type: "text-delta", id: "answer_2", delta: "Second answer, cut short" },
+          { type: "finish", finishReason: { unified: "length", raw: "length" } },
+        ]),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startAutoSession(client);
+        sendPrompt(client, 100, "Answer the first question.");
+        await firstRequest.promise;
+        sendSteeringPrompt(client, 101, "Answer the second question too.");
+        sendPrompt(client, 102, "Unopted second prompt.");
+        expect((await readResponse(client, 102)).error.code).toBe(-32600);
+        releaseFirst.resolve();
+
+        const { responses } = await readUntilResponses(client, [100, 101]);
+        expect(responses.get(100)!.result.stopReason).toBe("max_tokens");
+        expect(responses.get(100)!.result.usage).toBeDefined();
+        expect(responses.get(101)!.result.stopReason).toBe("max_tokens");
+        expect(responses.get(101)!.result._meta.fx.steering).toBe("absorbed");
+        expect(responses.get(101)!.result.usage).toBeUndefined();
+        expect(gateway.requests).toHaveLength(2);
+        client.endStdin();
+        expect(await client.waitForExit()).toBe(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        releaseFirst.resolve();
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "provider length with tool calls returns max output tokens without execution",
     async () => {
       const root = createIsolatedRoot("fx-acp-length-tool-");
@@ -8928,7 +9089,7 @@ describe("acp: model-independent", () => {
           TIMEOUT,
         );
 
-        expect(result.promptResult.result.stopReason).toBe("max_output_tokens");
+        expect(result.promptResult.result.stopReason).toBe("max_tokens");
         expect(JSON.stringify(result.messages)).toContain("ACP partial output");
         expect(JSON.stringify(result.messages)).toContain("did not run them");
         expect(existsSync(sentinelPath)).toBe(false);
@@ -8968,7 +9129,7 @@ describe("acp: model-independent", () => {
           TIMEOUT,
         );
 
-        expect(result.promptResult.result.stopReason).toBe("max_output_tokens");
+        expect(result.promptResult.result.stopReason).toBe("max_tokens");
         // The empty reply's one retry sends the same request with an output
         // limit; neither request asks for a summary.
         expect(gateway.requests).toHaveLength(4);
@@ -10262,6 +10423,11 @@ describe("acp: model catalog authentication", () => {
           .toBe("codex");
         expect(changed.result.configOptions.find((option: any) => option.id === "model").currentValue)
           .toBe("gpt-5.6-sol");
+        // Only the model picker uses the `model` category; the model's fast
+        // lane is a model setting.
+        expect(changed.result.configOptions.filter((option: any) => option.category === "model").map((option: any) => option.id))
+          .toEqual(["model"]);
+        expect(changed.result.configOptions.find((option: any) => option.id === "fast")?.category).toBe("model_config");
 
         const prompt = await runPrompt(client, "Answer directly.", TIMEOUT);
         expect(prompt.promptResult.result.stopReason).toBe("end_turn");
