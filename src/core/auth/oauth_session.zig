@@ -805,30 +805,59 @@ fn beginMutation() !Mutation {
     return lockMutation(fx_dir);
 }
 
+/// Takes the login's lock for the profile `open_fx_dir`. The Keychain login
+/// is one for the user, whatever the profile, so with `FX_HOME` set the lock
+/// is `~/.fx/auth.lock`: the one the default profile takes, older fx builds
+/// included. Otherwise it stays in the profile
+/// (`tests/tla/oauth_session/KeychainLock.tla` OneRefresher).
 fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
+    const backend = storageBackend();
+    var shared: ?io_mod.VerifiedDir = if (sharedLockParent(backend, profile_paths.fxHomeActive(), io_mod.getenv("HOME"))) |parent|
+        openSharedLockDir(parent)
+    else
+        null;
+    defer if (shared) |*dir| dir.close();
+
     var probe = MutationLockProbe{ .fx_dir = open_fx_dir.dir };
-    return lockMutationWithOps(open_fx_dir, mutation_lock_wait_ms, .{
+    return lockMutationWithBackend(open_fx_dir, if (shared) |*dir| dir else null, mutation_lock_wait_ms, .{
         .ctx = &probe,
         .try_lock = MutationLockProbe.tryLock,
-    });
+    }, backend, native_keychain_backend);
 }
 
-fn lockMutationWithOps(
-    open_fx_dir: io_mod.VerifiedDir,
-    wait_ms: i64,
-    ops: io_mod.LockOps,
-) !Mutation {
-    return lockMutationWithBackend(
-        open_fx_dir,
-        wait_ms,
-        ops,
-        storageBackend(),
-        native_keychain_backend,
-    );
+/// The folder whose `.fx` holds the login's lock for every profile, or null
+/// to keep it in the profile: the profile-file backend saves a login per
+/// profile, without `FX_HOME` the profile is `~/.fx` already, and a `HOME`
+/// that isn't absolute names no `~/.fx`.
+fn sharedLockParent(backend: StorageBackend, fx_home_active: bool, home: ?[]const u8) ?[]const u8 {
+    if (backend != .macos_keychain or !fx_home_active) return null;
+    const path = home orelse return null;
+    if (!std.Io.Dir.path.isAbsolute(path)) return null;
+    return path;
 }
 
+/// `parent`'s `.fx`, made private if it is missing, or null when it can't be
+/// opened: the lock then stays in the profile, as before `FX_HOME` profiles
+/// shared it (`tests/tla/oauth_session/KeychainLock.tla`, keychain-lock-fallback.cfg).
+fn openSharedLockDir(parent: []const u8) ?io_mod.VerifiedDir {
+    var parent_dir = io_mod.VerifiedDir{
+        .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent, .{ .iterate = true }) catch |err| {
+            debug_trace.logf("auth", "fx login lock kept in the profile step=open_home err={s}", .{@errorName(err)});
+            return null;
+        },
+    };
+    defer parent_dir.close();
+    return io_mod.openOrCreateVerifiedPrivateDir(&parent_dir, profile_paths.root_dir_name) catch |err| {
+        debug_trace.logf("auth", "fx login lock kept in the profile step=open_shared err={s}", .{@errorName(err)});
+        return null;
+    };
+}
+
+/// Locks `auth.lock` in `lock_dir`, or in the profile `open_fx_dir` when it
+/// is null. The mutation keeps the profile for its `auth.json`.
 fn lockMutationWithBackend(
     open_fx_dir: io_mod.VerifiedDir,
+    lock_dir: ?*io_mod.VerifiedDir,
     wait_ms: i64,
     ops: io_mod.LockOps,
     backend: StorageBackend,
@@ -838,7 +867,7 @@ fn lockMutationWithBackend(
     errdefer fx_dir.close();
 
     const taken = leased_lock.acquire(
-        &fx_dir,
+        lock_dir orelse &fx_dir,
         mutation_lock_file_name,
         io_mod.awakeMilliTimestamp(),
         wait_ms,
@@ -1186,6 +1215,7 @@ fn writeTestAuthFile(dir: std.Io.Dir, contents: []const u8) !void {
 fn testKeychainMutation(dir: std.Io.Dir, keychain: KeychainBackend) !Mutation {
     return lockMutationWithBackend(
         .{ .dir = try dir.openDir(std.testing.io, ".", .{ .iterate = true }) },
+        null,
         0,
         .{},
         .macos_keychain,
@@ -1621,20 +1651,199 @@ test "OAuth session mutation lock serializes independent handles" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var first = try lockMutationWithOps(
+    var first = try lockMutationWithBackend(
         .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) },
+        null,
         0,
         .{},
+        storageBackend(),
+        native_keychain_backend,
     );
     defer first.deinit();
 
     try std.testing.expectError(
         error.LockBusy,
-        lockMutationWithOps(
+        lockMutationWithBackend(
             .{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true }) },
+            null,
             0,
             .{},
+            storageBackend(),
+            native_keychain_backend,
         ),
+    );
+}
+
+/// An issuer whose refresh tokens work once: a refresh returns the next one
+/// and retires the one sent, and a retired one sent again is refused with
+/// invalid_grant. Its first token is `test_session_json`'s.
+const RotatingIssuer = struct {
+    issued: usize = 0,
+    refreshes: usize = 0,
+    reused: usize = 0,
+
+    const discovery = "{\"issuer\":\"https://vercel.com\",\"device_authorization_endpoint\":\"https://vercel.com/oauth/device\",\"token_endpoint\":\"https://vercel.com/oauth/token\"}";
+
+    fn provider(self: *RotatingIssuer) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+        const self: *RotatingIssuer = @ptrCast(@alignCast(raw.?));
+        if (request.method == .get) return .{ .disposition = .accepted, .body = try alloc.dupe(u8, discovery) };
+        const form = request.payload orelse return error.UnexpectedOAuthRequest;
+        const key = "refresh_token=";
+        const at = std.mem.find(u8, form, key) orelse return error.UnexpectedOAuthRequest;
+        const rest = form[at + key.len ..];
+        const sent = rest[0 .. std.mem.findScalar(u8, rest, '&') orelse rest.len];
+        self.refreshes += 1;
+
+        var buf: [32]u8 = undefined;
+        const current = if (self.issued == 0) "refresh" else try std.mem.print(&buf, "refresh-{d}", .{self.issued});
+        if (!std.mem.eql(u8, sent, current)) {
+            self.reused += 1;
+            return .{ .disposition = .rejected, .body = try alloc.dupe(u8, "{\"error\":\"invalid_grant\"}") };
+        }
+        self.issued += 1;
+        return .{
+            .disposition = .accepted,
+            .body = try alloc.print(
+                "{{\"access_token\":\"access-{d}\",\"refresh_token\":\"refresh-{d}\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}}",
+                .{ self.issued, self.issued },
+            ),
+        };
+    }
+};
+
+/// A folder `FX_HOME` names, under `tmp`, opened for a mutation.
+fn testProfileDir(tmp: std.testing.TmpDir, name: []const u8) !io_mod.VerifiedDir {
+    try tmp.dir.createDirPath(std.testing.io, name);
+    return .{ .dir = try tmp.dir.openDir(std.testing.io, name, .{ .iterate = true }) };
+}
+
+test "fx login lock across profiles: two FX_HOME profiles take turns and send each refresh token once" {
+    const alloc = std.testing.allocator;
+    const credentials = @import("credentials.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // ~/.fx, whose lock every profile takes while the login is in the
+    // Keychain, and two profiles FX_HOME moved.
+    var shared = try testProfileDir(tmp, "home/.fx");
+    defer shared.close();
+    var keychain = FakeOAuthKeychain{ .alloc = alloc, .value = try alloc.dupe(u8, test_session_json) };
+    defer keychain.deinit();
+    var issuer_fake: RotatingIssuer = .{};
+
+    // Profile A takes the login's lock and loads the expired login.
+    var first = try lockMutationWithBackend(try testProfileDir(tmp, "profile-a"), &shared, 0, .{}, .macos_keychain, keychain.backend());
+    var first_held = true;
+    defer if (first_held) first.deinit();
+    var first_session = (try first.load(alloc)).?;
+    defer first_session.deinit(alloc);
+    try std.testing.expect(first_session.expired(io_mod.milliTimestamp()));
+
+    // Profile B can't take it while A refreshes.
+    try std.testing.expectError(
+        error.LockBusy,
+        lockMutationWithBackend(try testProfileDir(tmp, "profile-b"), &shared, 0, .{}, .macos_keychain, keychain.backend()),
+    );
+    try credentials.refreshFxSession(alloc, issuer_fake.provider(), &first, &first_session);
+    first.deinit();
+    first_held = false;
+
+    // Once it can, B loads the login A saved, which needs no refresh, and a
+    // refresh it forces anyway (a 401) sends the rotated token.
+    var second = try lockMutationWithBackend(try testProfileDir(tmp, "profile-b"), &shared, 0, .{}, .macos_keychain, keychain.backend());
+    defer second.deinit();
+    var second_session = (try second.load(alloc)).?;
+    defer second_session.deinit(alloc);
+    try std.testing.expectEqualStrings("refresh-1", second_session.refresh_token);
+    try std.testing.expect(!second_session.expired(io_mod.milliTimestamp()));
+    try credentials.refreshFxSession(alloc, issuer_fake.provider(), &second, &second_session);
+
+    try std.testing.expectEqual(@as(usize, 2), issuer_fake.refreshes);
+    try std.testing.expectEqual(@as(usize, 0), issuer_fake.reused);
+    try std.testing.expectEqual(@as(usize, 0), keychain.delete_calls);
+    var saved = try parse(alloc, keychain.value.?);
+    defer saved.deinit(alloc);
+    try std.testing.expectEqualStrings("refresh-2", saved.refresh_token);
+    // The lock is ~/.fx/auth.lock, in neither profile.
+    _ = try tmp.dir.statFile(std.testing.io, "home/.fx/" ++ mutation_lock_file_name, .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "profile-a/" ++ mutation_lock_file_name, .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "profile-b/" ++ mutation_lock_file_name, .{}));
+}
+
+test "fx login lock across profiles: a waiter in another profile times the lease from the holder's stamp" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var shared = try testProfileDir(tmp, "home/.fx");
+    defer shared.close();
+    var keychain = FakeOAuthKeychain{ .alloc = alloc };
+    defer keychain.deinit();
+
+    var holder = try lockMutationWithBackend(try testProfileDir(tmp, "profile-a"), &shared, 0, .{}, .macos_keychain, keychain.backend());
+    defer holder.deinit();
+    // A waiter in profile B reads the stamp profile A wrote, so it waits out
+    // A's whole lease from that stamp, not from its own start.
+    const stamp = leased_lock.readStamp(&shared, mutation_lock_file_name);
+    try std.testing.expectEqual(@as(?i64, holder.stamp_ms), stamp);
+    const started = holder.stamp_ms - 1;
+    try std.testing.expect(!leased_lock.expired(stamp, started, holder.stamp_ms + mutation_lock_wait_ms - 1, mutation_lock_wait_ms));
+    try std.testing.expect(leased_lock.expired(stamp, started, holder.stamp_ms + mutation_lock_wait_ms, mutation_lock_wait_ms));
+    // Each restamp before a Keychain call or a request to the issuer starts it again.
+    holder.restamp();
+    try std.testing.expectEqual(@as(?i64, holder.stamp_ms), leased_lock.readStamp(&shared, mutation_lock_file_name));
+}
+
+test "fx login lock across profiles: only the Keychain login under FX_HOME with an absolute HOME moves the lock" {
+    try std.testing.expectEqualStrings("/Users/example", sharedLockParent(.macos_keychain, true, "/Users/example").?);
+    // No FX_HOME: the profile is ~/.fx already.
+    try std.testing.expect(sharedLockParent(.macos_keychain, false, "/Users/example") == null);
+    // The profile-file backend saves a login per profile, so it locks there.
+    try std.testing.expect(sharedLockParent(.profile_file, true, "/Users/example") == null);
+    // A HOME fx can't build ~/.fx from keeps the lock in the profile.
+    try std.testing.expect(sharedLockParent(.macos_keychain, true, null) == null);
+    try std.testing.expect(sharedLockParent(.macos_keychain, true, "") == null);
+    try std.testing.expect(sharedLockParent(.macos_keychain, true, "relative/home") == null);
+}
+
+test "fx login lock across profiles: a ~/.fx that can't hold the lock leaves it in the profile" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "");
+    defer std.testing.allocator.free(home);
+
+    // Missing: made private, then used.
+    var made = openSharedLockDir(home) orelse return error.TestExpectedSharedLockDir;
+    made.close();
+    const stat = try tmp.dir.statFile(std.testing.io, profile_paths.root_dir_name, .{});
+    try std.testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+
+    // A file where the folder should be: none, so the caller locks the profile.
+    try tmp.dir.deleteDir(std.testing.io, profile_paths.root_dir_name);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = profile_paths.root_dir_name, .data = "" });
+    try std.testing.expect(openSharedLockDir(home) == null);
+    // A home folder that isn't there.
+    try std.testing.expect(openSharedLockDir("/nonexistent-fx-home-for-test") == null);
+}
+
+test "fx login lock across profiles: FX_HOME naming ~/.fx itself takes one lock once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var shared = try testProfileDir(tmp, "home/.fx");
+    defer shared.close();
+    var keychain = FakeOAuthKeychain{ .alloc = alloc };
+    defer keychain.deinit();
+
+    // The profile and the shared folder are one folder: taking the lock
+    // must not lock its file twice, which would wait on itself.
+    var only = try lockMutationWithBackend(try testProfileDir(tmp, "home/.fx"), &shared, 0, .{}, .macos_keychain, keychain.backend());
+    defer only.deinit();
+    try std.testing.expectError(
+        error.LockBusy,
+        lockMutationWithBackend(try testProfileDir(tmp, "home/.fx"), &shared, 0, .{}, .macos_keychain, keychain.backend()),
     );
 }
 
