@@ -340,8 +340,10 @@ fn localInspectionFromConfigs(
     };
 }
 
-pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(McpServerConfig) {
-    return readProfile(alloc, path, null);
+/// With `skipped`, an entry fx can't read is noted there and left out;
+/// without it, that entry fails the whole file.
+pub fn loadConfigFromPath(alloc: Allocator, path: []const u8, skipped: ?*std.ArrayList(project_config.WorkspaceDiagnostic)) !std.ArrayList(McpServerConfig) {
+    return readProfile(alloc, path, skipped);
 }
 
 /// With `skipped`, see `project_config.parseProfileServers`.
@@ -882,7 +884,7 @@ test "a profile config fx can't read fails with an error named for the file" {
     try tmp.dir.symLink(io_mod.getIo(), "loop.json", "loop.json", .{ .is_directory = false });
     const loop = try std.Io.Dir.path.join(alloc, &.{ root, "loop.json" });
     defer alloc.free(loop);
-    try std.testing.expectError(error.McpConfigLinkLoop, loadConfigFromPath(alloc, loop));
+    try std.testing.expectError(error.McpConfigLinkLoop, loadConfigFromPath(alloc, loop, null));
 
     const big = try alloc.alloc(u8, 1024 * 1024 + 1);
     defer alloc.free(big);
@@ -890,7 +892,7 @@ test "a profile config fx can't read fails with an error named for the file" {
     try writeTempFile(&tmp, "big.json", big);
     const big_path = try std.Io.Dir.path.join(alloc, &.{ root, "big.json" });
     defer alloc.free(big_path);
-    try std.testing.expectError(error.McpConfigTooLarge, loadConfigFromPath(alloc, big_path));
+    try std.testing.expectError(error.McpConfigTooLarge, loadConfigFromPath(alloc, big_path, null));
 }
 
 test "loadConfigFromJson parses canonical local config with command array" {
@@ -1177,7 +1179,7 @@ test "save and reload preserves mixed stdio and sse configs" {
 
     try saveConfigsToPath(alloc, path, configs.items);
 
-    var reloaded = try loadConfigFromPath(alloc, path);
+    var reloaded = try loadConfigFromPath(alloc, path, null);
     defer freeConfigs(alloc, &reloaded);
 
     try std.testing.expectEqual(@as(usize, 2), reloaded.items.len);
@@ -1211,7 +1213,7 @@ test "save and reload preserves HTTP identity and headers" {
     try std.testing.expect(std.mem.find(u8, rendered, "\"type\":\"sse\"") == null);
     try std.testing.expect(std.mem.find(u8, rendered, "\"X-Workspace\":\"one\"") != null);
 
-    var reloaded = try loadConfigFromPath(alloc, path);
+    var reloaded = try loadConfigFromPath(alloc, path, null);
     defer freeConfigs(alloc, &reloaded);
     try std.testing.expectEqual(@as(usize, 2), reloaded.items.len);
     try std.testing.expectEqual(McpTransport.http, reloaded.items[1].transport);

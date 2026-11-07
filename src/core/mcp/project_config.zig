@@ -1051,7 +1051,7 @@ fn parseServerEntry(
     if (transport != .stdio) {
         const url_value = object.get("url") orelse return failServerConfig(error.McpConfigMissingUrl);
         if (url_value != .string) return failServerConfig(error.McpConfigInvalidUrl);
-        http_config.validateEndpoint(url_value.string) catch return failServerConfig(error.McpConfigInvalidUrl);
+        http_config.validateServerUrl(url_value.string) catch return failServerConfig(error.McpConfigInvalidUrl);
         const timeouts = try parseTimeouts(object);
         const env = try parseSelectedEnvironment(alloc, object);
         errdefer freeEnvVars(alloc, env);
@@ -2074,6 +2074,45 @@ test "a profile entry fx can't read is skipped with a note naming it, and the re
     }
     // Without a list the file still fails, as rewriting it needs.
     try std.testing.expectError(error.McpConfigUrlWithoutType, parseProfileJson(alloc, json));
+}
+
+test "a profile HTTP server on loopback loads with or without a port, and plain HTTP elsewhere is skipped" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"mcp":{
+        \\"port":{"type":"http","url":"http://localhost:4321/mcp"},
+        \\"bare":{"type":"http","url":"http://localhost/mcp"},
+        \\"ipv4":{"type":"http","url":"http://127.0.0.1/mcp"},
+        \\"ipv6":{"type":"http","url":"http://[::1]/mcp"},
+        \\"caps":{"type":"http","url":"HTTP://LOCALHOST/mcp"},
+        \\"resource":{"type":"http","url":"http://localhost/mcp","oauth":{"resource":"http://localhost/mcp"}},
+        \\"far":{"type":"http","url":"http://example.com/mcp"},
+        \\"farport":{"type":"http","url":"http://example.com:8080/mcp"},
+        \\"lookalike":{"type":"http","url":"http://localhost.example.com/mcp"},
+        \\"emptyport":{"type":"http","url":"http://localhost:/mcp"}
+        \\}}
+    ;
+    var skipped: std.ArrayList(WorkspaceDiagnostic) = .empty;
+    defer {
+        for (skipped.items) |*note| note.deinit(alloc);
+        skipped.deinit(alloc);
+    }
+    var configs = try parseProfileServers(alloc, json, &skipped);
+    defer deinitConfigs(alloc, &configs);
+    const loaded = [_][]const u8{ "port", "bare", "ipv4", "ipv6", "caps", "resource" };
+    try std.testing.expectEqual(loaded.len, configs.items.len);
+    for (configs.items, loaded) |config, name| try std.testing.expectEqualStrings(name, config.name);
+    try std.testing.expectEqualStrings("http://localhost/mcp", try configs.items[1].remoteUrl());
+
+    const refused = [_][]const u8{ "far", "farport", "lookalike", "emptyport" };
+    try std.testing.expectEqual(refused.len, skipped.items.len);
+    for (skipped.items, refused) |note, name| {
+        const said = try renderWorkspaceDiagnostic(alloc, note);
+        defer alloc.free(said);
+        const words = try alloc.print("~/.fx/mcp.json server '{s}' was skipped: its \"url\" isn't valid.", .{name});
+        defer alloc.free(words);
+        try std.testing.expectEqualStrings(words, said);
+    }
 }
 
 test "a project entry fx can't read says why in words" {
