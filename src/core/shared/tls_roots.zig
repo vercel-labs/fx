@@ -431,19 +431,47 @@ const FuzzBundle = struct {
     files: *Files,
 };
 
+/// What a fuzzed public bundle is built from. A block holds a whole test root
+/// or starts with bytes base64 rejects, and is never empty: std's DER parser
+/// reads past the end of an empty or cut certificate (std/crypto/Certificate.zig
+/// `der.Element.parse`), so arbitrary base64 would test std, not this loader.
+const fuzz_pieces = [_][]const u8{
+    test_root_a,
+    test_root_b,
+    // Opens a block whose content base64 rejects.
+    "-----BEGIN CERTIFICATE-----\n!!",
+    "-----END CERTIFICATE-----\n",
+    "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+    "# not a certificate\n",
+    "\n",
+    "\x00\xff\xfe",
+};
+
 fn fuzzPublicBundle(context: FuzzBundle, smith: *testing.Smith) anyerror!void {
-    var buffer: [4096]u8 = undefined;
-    const len: usize = @intCast(smith.slice(&buffer));
-    const path = try context.files.add("fuzzed.pem", buffer[0..len]);
+    var picks: [32]u8 = undefined;
+    const count: usize = @intCast(smith.slice(&picks));
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    var has: [fuzz_pieces.len]bool = @splat(false);
+    for (picks[0..count]) |pick| {
+        const piece = pick % fuzz_pieces.len;
+        has[piece] = true;
+        try text.appendSlice(testing.allocator, fuzz_pieces[piece]);
+    }
+    const path = try context.files.add("fuzzed.pem", text.items);
     defer testing.allocator.free(path);
     var bundle: Bundle = .empty;
     defer bundle.deinit(testing.allocator);
-    if (testLoad(&bundle, .{ .os = .macos, .scan = &FakeScan.deniedAfterPart, .fallback_path = path })) |_| {
-        // Loaded: never an empty bundle.
-        try testing.expect(bundle.map.count() > 0);
-    } else |err| {
-        try testing.expectEqual(error.CertificateBundleLoadFailure, err);
+    const result = testLoad(&bundle, .{ .os = .macos, .scan = &FakeScan.deniedAfterPart, .fallback_path = path });
+    // A broken block fails the whole file; otherwise the roots it holds load,
+    // and a file with none fails closed.
+    const roots = @as(u32, @intFromBool(has[0])) + @intFromBool(has[1]);
+    if (has[2] or has[4] or roots == 0) {
+        try testing.expectError(error.CertificateBundleLoadFailure, result);
         try testing.expectEqual(@as(u32, 0), bundle.map.count());
+    } else {
+        try result;
+        try testing.expectEqual(roots, bundle.map.count());
     }
 }
 
@@ -452,12 +480,13 @@ test "the trust loader fails closed or loads roots on fuzzed public bundle bytes
     defer files.deinit();
     try testing.fuzz(FuzzBundle{ .files = &files }, fuzzPublicBundle, .{
         .corpus = &(@import("fuzz_seed").slices(.{
-            test_root_a,
-            test_root_a ++ test_root_b,
+            "\x00",
+            "\x00\x01\x00",
             "",
-            "-----BEGIN CERTIFICATE-----\n",
-            "-----BEGIN CERTIFICATE-----\n====\n-----END CERTIFICATE-----\n",
-            test_root_a[0 .. test_root_a.len / 2],
+            "\x02",
+            "\x02\x03\x00",
+            "\x04\x01",
+            "\x05\x06\x07\x01\x03",
         }) ++ @import("fuzz_corpus").tls_roots_public_bundle.*),
     });
 }
