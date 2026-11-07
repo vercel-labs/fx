@@ -7,6 +7,7 @@ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const local_address = @import("../core/shared/local_address.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
+const tls_roots = @import("../core/shared/tls_roots.zig");
 const input_loop_guard = @import("../core/shared/input_loop_guard.zig");
 const io_mod = @import("../core/shared/io.zig");
 const select_watch = @import("../core/shared/select_watch.zig");
@@ -418,7 +419,7 @@ const UsageGetOperation = struct {
         const auth_header = try self.alloc.print("Bearer {s}", .{self.bearer});
         defer secret.zeroAndFree(self.alloc, auth_header);
         var extra_headers_buf: [4]std.http.Header = undefined;
-        var req = try client.request(.GET, uri, .{
+        var req = try tls_roots.request(&client, .GET, uri, .{
             .headers = .{
                 .accept_encoding = .omit,
                 .user_agent = .{ .override = user_agent },
@@ -466,7 +467,7 @@ pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, pat
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    const result = try client.fetch(.{
+    const result = try tls_roots.fetch(&client, .{
         .location = .{ .url = url },
         .method = .GET,
         .headers = headers,
@@ -599,7 +600,7 @@ fn fetchGatewayJsonAtUrlCore(
     var extra_headers_buf: [1]std.http.Header = undefined;
     const extra_headers = gatewayModelCatalogExtraHeaders(&extra_headers_buf, gateway_team);
 
-    var req = client.request(.GET, uri, .{
+    var req = tls_roots.request(&client, .GET, uri, .{
         .headers = headers,
         .extra_headers = extra_headers,
         .redirect_behavior = .unhandled,
@@ -744,7 +745,7 @@ pub fn postGatewayCompletion(
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        const result = client.fetch(.{
+        const result = tls_roots.fetch(&client, .{
             .location = .{ .url = request_url },
             .method = .POST,
             .payload = payload,
@@ -1231,7 +1232,7 @@ const RequestOpenOperation = struct {
             self.reused = opened.reused;
             return opened.request;
         }
-        return self.client.request(.POST, self.uri, self.options);
+        return tls_roots.request(self.client, .POST, self.uri, self.options);
     }
 };
 

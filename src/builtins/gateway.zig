@@ -17,6 +17,7 @@ const gateway_client = @import("../gateway/client.zig");
 const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
 const vercel_protocol = @import("../gateway/vercel_protocol.zig");
 const io_mod = @import("../core/shared/io.zig");
+const tls_roots = @import("../core/shared/tls_roots.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
@@ -922,7 +923,7 @@ const OAuthHttpOperation = struct {
         defer secret.zeroAndFree(self.alloc, response_buffer);
         var response_writer = std.Io.Writer.fixed(response_buffer);
 
-        const result = client.fetch(.{
+        const result = tls_roots.fetch(&client, .{
             .location = .{ .url = self.request.url },
             .method = switch (self.request.method) {
                 .get => .GET,

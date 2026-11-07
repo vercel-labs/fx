@@ -13,6 +13,7 @@ const permission_auto_classifier = @import("../../core/permissions/auto_classifi
 const types = @import("../../core/shared/types.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const tls_roots = @import("../../core/shared/tls_roots.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -364,7 +365,7 @@ fn sendReview(
     defer out.deinit();
 
     debug_trace.logf("permission", "event=auto_review_typesafe_transport_start payload_bytes={d} via_gateway={}", .{ payload.len, config.via_gateway });
-    const result = client.fetch(.{
+    const result = tls_roots.fetch(&client, .{
         .location = .{ .url = config.endpoint },
         .method = .POST,
         .payload = payload,

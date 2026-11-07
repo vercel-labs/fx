@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const tls_roots = @import("../shared/tls_roots.zig");
 const update_target = @import("update_target.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -229,7 +230,7 @@ fn fetchTextBounded(
     if (controlCancelled(control)) return error.Cancelled;
     const uri = std.Uri.parse(url) catch return error.FetchFailed;
 
-    var req = client.request(.GET, uri, .{}) catch return error.FetchFailed;
+    var req = tls_roots.request(client, .GET, uri, .{}) catch return error.FetchFailed;
     defer req.deinit();
 
     if (req.connection) |conn| setRecvTimeout(conn);
@@ -279,7 +280,7 @@ pub fn downloadFileStreamingWithProgress(client: *std.http.Client, url: []const 
     var file_writer: std.Io.File.Writer = .initStreaming(file, io_mod.getIo(), &write_buf);
 
     const uri = std.Uri.parse(url) catch return error.DownloadFailed;
-    var req = client.request(.GET, uri, .{}) catch return error.DownloadFailed;
+    var req = tls_roots.request(client, .GET, uri, .{}) catch return error.DownloadFailed;
     defer req.deinit();
 
     if (req.connection) |conn| setRecvTimeout(conn);

@@ -5,6 +5,7 @@
   "mcp-auth.test.ts",
   "oauth-keychain-migration.test.ts",
   "sessions.test.ts",
+  "tls-roots-sandbox.test.ts",
   "tui-auth-source-selection.test.ts",
   "tui-command-permissions.test.ts",
   "tui-full-transcript-brutal.test.ts",

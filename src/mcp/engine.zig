@@ -541,7 +541,7 @@ pub const Engine = struct {
         errdefer e.gpa.destroy(s);
         try s.init(e.io, e.gpa, .{
             .link = switch (slot.config.transport) {
-                .http => |h| .{ .http = .{ .url = h.url, .headers = h.headers, .bell = &e.bell } },
+                .http => |h| .{ .http = .{ .url = h.url, .headers = h.headers, .bell = &e.bell, .trust = e.host.trust } },
                 .stdio => |p| .{ .stdio = .{
                     .argv = p.argv,
                     .environ_map = p.environ_map,

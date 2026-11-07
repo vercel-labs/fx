@@ -2,6 +2,7 @@ const std = @import("std");
 const versions = @import("../core/gateway/provider_versions.zig");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const tls_roots = @import("../core/shared/tls_roots.zig");
 const gateway_client = @import("client.zig");
 const json_decode = @import("../core/shared/json_decode.zig");
 
@@ -81,7 +82,7 @@ const LookupOperation = struct {
         const buffer = try self.alloc.alloc(u8, max_response_bytes + 1);
         defer self.alloc.free(buffer);
         var writer = std.Io.Writer.fixed(buffer);
-        const result = try client.fetch(.{
+        const result = try tls_roots.fetch(&client, .{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = .{
