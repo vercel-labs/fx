@@ -1,4 +1,0 @@
-interface:
-  display_name: "Zig"
-  short_description: "Write, review, and upgrade Zig 0.17 code safely, without deprecated APIs"
-  default_prompt: "Use $zig to write, review, or migrate this Zig change for Zig 0.17: ownership, errors, I/O, concurrency, tests, build modes, and no removed or deprecated APIs or silent behavior changes."
