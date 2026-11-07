@@ -63,7 +63,7 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           use-cache: false
 
       - name: Test size reporter

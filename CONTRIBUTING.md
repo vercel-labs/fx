@@ -14,7 +14,7 @@ Report security vulnerabilities through the [contact page](https://fx.sh/contact
 
 You need:
 
-- [Zig 0.17.0](https://ziglang.org/download/), the version CI builds with. Check `zig version` before you build, because an older Zig fails inside `build.zig` with errors such as `no field or member function named 'poisonCache'` that don't mention the version.
+- [Zig 0.17.1](https://ziglang.org/download/), the version CI builds with. Check `zig version` before you build, because an older Zig fails inside `build.zig` with errors such as `no field or member function named 'poisonCache'` that don't mention the version.
 - [Bun](https://bun.sh) and [tmux](https://github.com/tmux/tmux) for the end-to-end tests.
 - [hyperfine](https://github.com/sharkdp/hyperfine), if you want to run the startup benchmark locally.
 

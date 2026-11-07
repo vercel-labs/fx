@@ -10,7 +10,7 @@ The driver requires:
 
 - macOS on an arm64 host
 - generic `aarch64-macos` output
-- Zig `0.17.0`
+- Zig `0.17.1`
 - LLVM `22.1.8` tools, profile runtime, and C library (`lib/libLLVM.dylib`) from one configured LLVM root
 - the selected Xcode macOS SDK and native Apple linker with arm64 support
 - Bun `1.3.14`
