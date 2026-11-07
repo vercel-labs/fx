@@ -13,14 +13,37 @@
 #   bun ../drivers/acp/speed/check-spec.ts
 #   bun ../drivers/acp/speed/driver.ts
 #
-# Needs Java 11+ and tla2tools.jar, as ../README.md describes.
+# With --ci it also runs every ../drivers/acp/*/driver.ts against
+# zig-out/bin/fx, as CI does; the planted bugs stay local, since they measure
+# the checks, not the code. Name configs to check only those.
+#
+# Needs Java 11+ and tla2tools.jar, as ../README.md describes, and Bun and a
+# built fx for --ci.
 set -eu
 
+ci=false
+if [ "${1:-}" = "--ci" ]; then
+    ci=true
+    shift
+fi
+
 cd "$(dirname "$0")"
-# shellcheck source=../lib/tlc.sh
+# shellcheck source-path=SCRIPTDIR source=../lib/tlc.sh
 . ../lib/tlc.sh
 
-tlc_verdicts "$@" <<'EOF'
+status=0
+tlc_verdicts "$@" <<'EOF' || status=1
 MCAcpPermissionModes MCAcpPermissionModes -
 MCAcpSpeed MCAcpSpeed -
 EOF
+
+if [ "$ci" = true ]; then
+    for driver in ../drivers/acp/*/driver.ts; do
+        echo "driver ${driver#../drivers/acp/}"
+        if ! bun "$driver"; then
+            echo "FAIL  ${driver#../drivers/acp/}"
+            status=1
+        fi
+    done
+fi
+exit "$status"
