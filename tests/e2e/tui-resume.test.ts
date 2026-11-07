@@ -38,6 +38,8 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
+import { PtySession, revokeAvailable, revokeTerminal } from "./pty-session";
+import { inForeground, JOB_SHELL, JOB_SHELL_ENV, launchLine, stopped, waitForFxState } from "./job-control";
 import { commandReplays, logLines, onlySessionId, savedSessionIds, savedText, sessionDir, storeRoot } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
@@ -765,6 +767,191 @@ test("Linux tmux fallbacks preserve exact ASCII and replay alignment", () => {
     "linux",
   )).toBe(false);
 });
+
+// revoke(2) takes fx's terminal away, as a logout can. A revoke that lands
+// while fx waits in poll wakes that poll as a hang-up; one that lands between
+// two polls leaves every later poll reporting POLLNVAL alone, at once, which
+// fx missed and so spun at full CPU (`tests/tla/shell_runtime/TerminalRevoke.tla`
+// NoBusyLoop). The cleanup then restores a terminal that is gone, which must
+// stay quiet (GoneQuietly).
+function revokedTerminalEnv(
+  home: string,
+  gateway: ReturnType<typeof startFakeGateway>,
+): Record<string, string> {
+  return {
+    HOME: home,
+    PATH: "/usr/bin:/bin",
+    TERM: "xterm-256color",
+    FX_HOME: join(home, ".fx"),
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_SOUND: "0",
+    FX_AUTO_UPGRADE: "0",
+    FX_TEST_SKIP_ONBOARDING: "1",
+    FX_TEST_INPUT_LOOP_NETWORK_GUARD: "1",
+    AI_GATEWAY_API_KEY: "fake-revoked-terminal-key",
+    FX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_MODEL: FAKE_GATEWAY_MODEL,
+  };
+}
+
+/// fx asks the gateway for its models once at startup. Revoking before that
+/// request lands the revoke in startup rather than in the input loop these
+/// tests cover; a revoke there still ends fx, but with status 1.
+async function waitForStartupModels(gateway: ReturnType<typeof startFakeGateway>): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  while (gateway.modelRequests.length < 1) {
+    if (Date.now() > deadline) throw new Error("fx never asked the fake gateway for its models");
+    await Bun.sleep(10);
+  }
+}
+
+/// fx on a PTY whose other side stays open and that is not fx's controlling
+/// terminal, so no SIGHUP reaches it: the terminal is all fx sees.
+async function withRevocablePty(
+  prefix: string,
+  body: (pty: PtySession, gateway: ReturnType<typeof startFakeGateway>) => Promise<void>,
+): Promise<void> {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  for (const dir of ["home", "workspace", "pty"]) mkdirSync(join(root, dir));
+  const gateway = startFakeGateway([]);
+  const pty = await PtySession.launch({
+    bin: FX_BIN,
+    cwd: join(root, "workspace"),
+    dir: join(root, "pty"),
+    env: revokedTerminalEnv(join(root, "home"), gateway),
+  });
+  try {
+    expect(await pty.waitForOutput((text) => text.includes("┃"), TIMEOUT)).toBe(true);
+    await waitForStartupModels(gateway);
+    expect(await pty.waitForQuietOutput(300, TIMEOUT)).toBe(true);
+    await body(pty, gateway);
+    expect(gateway.modelRequests).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(0);
+  } finally {
+    await pty.dispose();
+    gateway.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test.skipIf(!revokeAvailable())("fx exits cleanly when its terminal is revoked between polls", async () => {
+  await withRevocablePty("fx-revoked-pty-", async (pty) => {
+    await pty.revokeBetweenPolls();
+    const exit = await pty.waitForExit(5_000);
+    expect({ exit, stderr: pty.stderr() }).toEqual({ exit: { code: 0, signal: null }, stderr: "" });
+  });
+}, TIMEOUT * 2);
+
+test.skipIf(!revokeAvailable())("fx exits cleanly when its terminal is revoked during a paste", async () => {
+  await withRevocablePty("fx-revoked-paste-", async (pty) => {
+    // fx is reading and drawing when the terminal goes: the frame for what it
+    // read meets the revoked terminal.
+    const chunk = "x".repeat(4096);
+    for (let sent = 0; sent < 256 * 1024; sent += chunk.length) {
+      if (sent === 64 * 1024) pty.revoke();
+      try {
+        pty.write(chunk);
+      } catch {
+        break;
+      }
+    }
+    const exit = await pty.waitForExit(5_000);
+    expect({ exit, stderr: pty.stderr() }).toEqual({ exit: { code: 0, signal: null }, stderr: "" });
+  });
+}, TIMEOUT * 2);
+
+test.skipIf(!revokeAvailable() || !tmuxAvailable())("a revoked tmux pane ends fx with a clean exit", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-revoked-tmux-")));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const stderrPath = join(root, "stderr.log");
+  mkdirSync(home);
+  mkdirSync(workspace);
+  const gateway = startFakeGateway([]);
+  let session: TmuxSession | null = null;
+  try {
+    session = await TmuxSession.create({
+      cwd: workspace,
+      isolated: true,
+      remainOnExit: true,
+      stderrPath,
+      width: 100,
+      height: 30,
+      env: { ...revokedTerminalEnv(home, gateway), VERCEL_OIDC_TOKEN: undefined },
+    });
+    // Revoke while fx waits in its input loop: after its startup request and
+    // once the screen has settled.
+    await session.waitForComposer(TIMEOUT);
+    await waitForStartupModels(gateway);
+    await session.waitForStableComposer(TIMEOUT, 500);
+    const tty = execFileSync("ps", ["-o", "tty=", "-p", String(session.processPid())], {
+      encoding: "utf8",
+    }).trim();
+    revokeTerminal(`/dev/${tty}`);
+    await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+    expect({ status: session.paneStatus().status, stderr: readFileSync(stderrPath, "utf8") })
+      .toEqual({ status: 0, stderr: "" });
+    expect(gateway.modelRequests).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(0);
+  } finally {
+    await session?.kill();
+    gateway.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test.skipIf(!tmuxAvailable())("Ctrl+Z, bg, and fg keep fx alive", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-job-control-")));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const stderrPath = join(root, "stderr.log");
+  mkdirSync(home);
+  mkdirSync(workspace);
+  const gateway = startFakeGateway([]);
+  let session: TmuxSession | null = null;
+  try {
+    session = await TmuxSession.create({
+      cmd: JOB_SHELL,
+      cwd: workspace,
+      isolated: true,
+      width: 100,
+      height: 30,
+      env: { ...revokedTerminalEnv(home, gateway), ...JOB_SHELL_ENV, VERCEL_OIDC_TOKEN: undefined },
+    });
+    await session.waitForText(/^\$/m, TIMEOUT);
+    await session.sendText(launchLine(FX_BIN, stderrPath));
+    await session.waitForComposer(TIMEOUT);
+    await waitForStartupModels(gateway);
+    await session.waitForStableComposer(TIMEOUT, 500);
+
+    await session.sendKeys("C-z");
+    await session.waitForText("Stopped", TIMEOUT);
+    await waitForFxState(session, FX_BIN, stopped, TIMEOUT);
+
+    // In the background, fx's resume sets raw mode again, and SIGTTOU stops
+    // it there: it waits for fg instead of reading a terminal it can't use.
+    await session.sendText("bg");
+    await session.waitForText(/ &$/m, TIMEOUT);
+    await waitForFxState(session, FX_BIN, stopped, TIMEOUT, 500);
+
+    await session.sendText("fg; echo fx-exit=$?");
+    await waitForFxState(session, FX_BIN, inForeground, TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT, 500);
+    await session.sendText("/quit");
+    const pane = await session.waitForText(/fx-exit=\d+/, TIMEOUT);
+    expect({ exit: pane.match(/fx-exit=(\d+)/)?.[1], stderr: readFileSync(stderrPath, "utf8") })
+      .toEqual({ exit: "0", stderr: "" });
+    expect(gateway.modelRequests).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(0);
+  } finally {
+    await session?.kill();
+    gateway.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
 
 test("wrapped semantic rows join descriptions across full-transcript pages", () => {
   const vs15 = SEMANTIC_TABLE_ROWS.find((row) => row.type === "VS15")!;
