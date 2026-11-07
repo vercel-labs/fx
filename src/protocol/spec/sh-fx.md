@@ -70,7 +70,7 @@ After `initialize`, these rules apply to the connection:
 - A client calls an extension's methods only when fx's list names the extension. fx answers a method it doesn't support with the JSON-RPC error `-32601`, "Method not found".
 - Each side ignores the names it doesn't know in the other side's list.
 
-Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition` and `sh.fx/sessionClients`, the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`, and the subagents section defines `sh.fx/subagentPrompts`. The table in "Keys in use today" names two more that replace fields fx uses today, `sh.fx/hooks` and `sh.fx/hostTools`, which later sections define.
+Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition` and `sh.fx/sessionClients`, the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`, the subagents section defines `sh.fx/subagentPrompts`, and the fork section defines `sh.fx/fork` and `sh.fx/rewind`. The table in "Keys in use today" names two more that replace fields fx uses today, `sh.fx/hooks` and `sh.fx/hostTools`, which later sections define.
 
 ## Extensions
 
@@ -82,7 +82,7 @@ Each extension gets its own section here when it is written.
 | Following a session | Several clients on one live session, and catching up after a reconnect | ACP v2's [session setup](https://agentclientprotocol.com/protocol/v2/session-setup), which lets a session be active on several connections, and [Multi-Client Session Attach](https://github.com/agentclientprotocol/agent-client-protocol/pull/533) for the events between clients |
 | Session status and list changes | Whether each session is open and running, and a notification when the list of sessions changes | [`session/status`](https://agentclientprotocol.com/rfds/session-status), in ACP's unstable schema, and [session list extensions](https://github.com/agentclientprotocol/agent-client-protocol/pull/2323) |
 | Subagents | The child sessions that a turn starts | [Subagent Sessions](https://agentclientprotocol.com/rfds/subagents) |
-| Fork and rewind | A new session copied from a point in another, and the removal of the latest turns | [`session/fork`](https://agentclientprotocol.com/rfds/session-fork) for fork, and none for rewind |
+| Fork and rewind | A new session copied from another, whole or up to a prompt, and the removal of the turns from a prompt on | [`session/fork`](https://agentclientprotocol.com/rfds/session-fork) for fork, and none for rewind |
 | Turn diff | The combined file changes of one turn | None |
 
 ### Steering and queued prompts
@@ -394,6 +394,49 @@ As in fx today, the child's report goes to the parent, where it joins the parent
 
 `tests/tla/acp/AcpSubagents.tla` models these rules, and TLC checks that a client reads a child's announcement before any of its work, that stopping a child leaves the parent's turn running, that a child's permission request ends with the child, and that no message to a child and no child's report is lost. Its `Today` configs show where fx breaks them now.
 
+### Fork and rewind
+
+fx supports ACP's unstable [`session/fork`](https://agentclientprotocol.com/rfds/session-fork), and lists `sessionCapabilities.fork` in its `initialize` response. As ACP says, the request takes the options of `session/load`, its response gives the new session's id, and the new session is open on the calling connection. A fork copies the saved turns of the source session, and the source doesn't change. Neither a fork nor a rewind changes any file.
+
+#### Fork before a prompt
+
+fx's `/fork` copies a session up to just before a prompt, and ACP's proposal leaves forking at a message for later. A client that lists `sh.fx/fork` sends `sh.fx/forkBefore` in the `_meta` of `session/fork`, with the `messageId` of a prompt, which the session's updates give and which stays the same on every load, as fix F6 makes it. The fork then holds only the turns before that prompt's turn. A `messageId` that names no prompt of the session gets `-32602`.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "method": "session/fork",
+  "params": {
+    "sessionId": "sess_abc123",
+    "cwd": "/home/user/project",
+    "mcpServers": [],
+    "_meta": { "sh.fx/forkBefore": { "messageId": "msg_7" } }
+  }
+}
+```
+
+#### Rewind
+
+A rewind is the same operation as a fork before a prompt, applied to the session itself. A client that lists `sh.fx/rewind` sends `_sh.fx/session/rewind` with the `sessionId` and the same `before`. fx removes that prompt's turn and every turn after it, and the session keeps its id. The response gives the session's new position as `sh.fx/position`, for a client that lists `sh.fx/logPosition`.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 6,
+  "method": "_sh.fx/session/rewind",
+  "params": { "sessionId": "sess_abc123", "before": { "messageId": "msg_7" } }
+}
+```
+
+After a rewind:
+
+- fx sends `_sh.fx/session/history_replaced` with the `sessionId` to every other client that has the session open and lists `sh.fx/rewind`. The client loads the session again to get its history.
+- A position from before the rewind no longer names a turn, so a catch-up from it replays the whole session, as after a compaction.
+- The session's list changes, so fx sends the hint that "List changes" defines.
+
+While a turn runs in the session, `session/fork` and `_sh.fx/session/rewind` both get `-32600`, and the client stops the turn first.
+
 ## Names in use today
 
 fx's ACP server names its additions today with a `libfx/` prefix, which doesn't follow ACP's extension rules, and its wasm build accepts `session/remove`, which ACP calls `session/delete`. Each one gets the new name in this table:
@@ -475,6 +518,9 @@ The keys and capabilities move with the method names, under the same rules: for 
 | `SessionClient` | One entry of the list of clients that have a session open |
 | `ClientsUpdateParams` | The params of `_sh.fx/session/clients_update` |
 | `SubagentPrompt` | The value of `sh.fx/prompt` in a child's `capabilities._meta`: the deliveries the child accepts |
+| `PromptRef` | A prompt of a session, by its `messageId`: the value of `sh.fx/forkBefore`, and the `before` of a rewind |
+| `RewindParams` | The params of `_sh.fx/session/rewind` |
+| `HistoryReplacedParams` | The params of `_sh.fx/session/history_replaced` |
 | `SessionState` | The value of `sh.fx/state`: `running`, `requires_action`, or `idle` |
 | `SessionStateUpdate` | The `update` of `_sh.fx/session/state_update`, a part of ACP's `StateUpdate` |
 | `SessionStateUpdateParams` | The params of `_sh.fx/session/state_update` |
