@@ -780,9 +780,12 @@ pub fn open(
 }
 
 /// An owned copy of `pending` ready to continue: unless the turn yielded,
-/// the model is told the session was interrupted; then it sees the inputs
-/// the turn accepted and never placed, and the attempt budget starts over,
-/// so repeated crashes never turn into a refusal to resume.
+/// the model is told the session was interrupted, once per turn. A turn
+/// resumed again keeps the notice where the model first saw it, so its
+/// requests keep their cached prefix (`tests/tla/durable/Resumption.tla`
+/// AtMostOneNotice and SavedOnlyGrows). Then it sees the inputs the turn
+/// accepted and never placed, and the attempt budget starts over, so repeated
+/// crashes never turn into a refusal to resume.
 pub fn resumeCheckpoint(
     alloc: Allocator,
     pending: session_codec.RecoveryCheckpoint,
@@ -793,11 +796,12 @@ pub fn resumeCheckpoint(
     defer scratch.deinit();
     var view = pending;
     const old = view.execution.steering;
-    const notices: usize = if (yielded) 0 else 1;
+    const notices: usize = if (yielded or holdsResumeNotice(old)) 0 else 1;
+    if (!yielded and notices == 0) debug_trace.logf("session", "event=libfx_resume_notice_kept steering={d}", .{old.len});
     const steering = try scratch.allocator().alloc(types.PersistedSteering, old.len + notices + inputs.len);
     @memcpy(steering[0..old.len], old);
     const after = view.execution.tool_steps.len;
-    if (!yielded) steering[old.len] = .{ .text = @constCast(resume_notice), .after_tool_step_count = after };
+    if (notices > 0) steering[old.len] = .{ .text = @constCast(resume_notice), .after_tool_step_count = after };
     for (inputs, steering[old.len + notices ..]) |input, *entry| {
         entry.* = .{ .text = input.text, .after_tool_step_count = after };
     }
@@ -805,6 +809,16 @@ pub fn resumeCheckpoint(
     view.consumed_provider_attempts = 0;
     view.outstanding_reservation = false;
     return view.dupe(alloc);
+}
+
+/// Whether an earlier resume of the turn already told the model it was
+/// interrupted. A request shows the notice by the same text
+/// (`execution_memory.rewrapRestoredSteering`).
+fn holdsResumeNotice(steering: []const types.PersistedSteering) bool {
+    for (steering) |entry| {
+        if (std.mem.eql(u8, entry.text, resume_notice)) return true;
+    }
+    return false;
 }
 
 /// Forgets a response whose calls never reached the journal. After a
@@ -1063,6 +1077,51 @@ test "a response whose calls never reached the journal is asked for again" {
     forgetUnrecordedCalls(&partial, 0);
     try std.testing.expectEqual(session_codec.RecoveryToolState.none, partial.tool_state);
     try std.testing.expectEqualStrings("The answer is", partial.assistant_source);
+}
+
+test "a turn resumed again keeps its one resume notice where it was" {
+    const alloc = std.testing.allocator;
+    var progress = try testProgress(alloc);
+    defer progress.deinit(alloc);
+
+    // A turn cut off during its first request is resumed, and the model is told.
+    var first = try resumeCheckpoint(alloc, progress, &.{}, false);
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), first.execution.steering.len);
+    try std.testing.expectEqualStrings(resume_notice, first.execution.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 0), first.execution.steering[0].after_tool_step_count);
+
+    // It runs a step after the notice and is cut off again. The next resume
+    // keeps that notice, the turn's only one, before the step, and places the
+    // input the crashed turn accepted after the step.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    var calls = [_]types.ToolCall{.{ .id = "call-1", .name = "read", .arguments_json = "{}" }};
+    var stepped = first;
+    try answerRunning(scratch.allocator(), &stepped, &calls, &.{});
+    var input_id = "steer-1".*;
+    var input_text = "and the tests".*;
+    const inputs = [_]journal.PendingInput{.{ .id = &input_id, .text = &input_text }};
+    var second = try resumeCheckpoint(alloc, stepped, &inputs, false);
+    defer second.deinit(alloc);
+    const steering = second.execution.steering;
+    try std.testing.expectEqual(@as(usize, 2), steering.len);
+    try std.testing.expectEqualStrings(resume_notice, steering[0].text);
+    try std.testing.expectEqual(@as(usize, 0), steering[0].after_tool_step_count);
+    try std.testing.expectEqualStrings("and the tests", steering[1].text);
+    try std.testing.expectEqual(@as(usize, 1), steering[1].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 0), second.consumed_provider_attempts);
+
+    // A turn that yielded continues without a notice, and keeps one it already
+    // has where it was.
+    var quiet = try resumeCheckpoint(alloc, progress, &.{}, true);
+    defer quiet.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), quiet.execution.steering.len);
+    var yielded = try resumeCheckpoint(alloc, second, &.{}, true);
+    defer yielded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), yielded.execution.steering.len);
+    try std.testing.expectEqualStrings(resume_notice, yielded.execution.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 0), yielded.execution.steering[0].after_tool_step_count);
 }
 
 /// Runs again the calls in `ids`, except `stop_at`, which it reports as cancelled.
