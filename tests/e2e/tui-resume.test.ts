@@ -796,6 +796,17 @@ function revokedTerminalEnv(
   };
 }
 
+/// fx asks the gateway for its models once at startup. Revoking before that
+/// request lands the revoke in startup rather than in the input loop these
+/// tests cover; a revoke there still ends fx, but with status 1.
+async function waitForStartupModels(gateway: ReturnType<typeof startFakeGateway>): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  while (gateway.modelRequests.length < 1) {
+    if (Date.now() > deadline) throw new Error("fx never asked the fake gateway for its models");
+    await Bun.sleep(10);
+  }
+}
+
 /// fx on a PTY whose other side stays open and that is not fx's controlling
 /// terminal, so no SIGHUP reaches it: the terminal is all fx sees.
 async function withRevocablePty(
@@ -813,8 +824,9 @@ async function withRevocablePty(
   });
   try {
     expect(await pty.waitForOutput((text) => text.includes("┃"), TIMEOUT)).toBe(true);
+    await waitForStartupModels(gateway);
+    expect(await pty.waitForQuietOutput(300, TIMEOUT)).toBe(true);
     await body(pty, gateway);
-    expect(pty.stderr()).toBe("");
     expect(gateway.modelRequests).toHaveLength(1);
     expect(gateway.requests).toHaveLength(0);
   } finally {
@@ -827,7 +839,8 @@ async function withRevocablePty(
 test.skipIf(!revokeAvailable())("fx exits cleanly when its terminal is revoked between polls", async () => {
   await withRevocablePty("fx-revoked-pty-", async (pty) => {
     await pty.revokeBetweenPolls();
-    expect(await pty.waitForExit(5_000)).toEqual({ code: 0, signal: null });
+    const exit = await pty.waitForExit(5_000);
+    expect({ exit, stderr: pty.stderr() }).toEqual({ exit: { code: 0, signal: null }, stderr: "" });
   });
 }, TIMEOUT * 2);
 
@@ -844,7 +857,8 @@ test.skipIf(!revokeAvailable())("fx exits cleanly when its terminal is revoked d
         break;
       }
     }
-    expect(await pty.waitForExit(5_000)).toEqual({ code: 0, signal: null });
+    const exit = await pty.waitForExit(5_000);
+    expect({ exit, stderr: pty.stderr() }).toEqual({ exit: { code: 0, signal: null }, stderr: "" });
   });
 }, TIMEOUT * 2);
 
@@ -867,14 +881,18 @@ test.skipIf(!revokeAvailable() || !tmuxAvailable())("a revoked tmux pane ends fx
       height: 30,
       env: { ...revokedTerminalEnv(home, gateway), VERCEL_OIDC_TOKEN: undefined },
     });
+    // Revoke while fx waits in its input loop: after its startup request and
+    // once the screen has settled.
     await session.waitForComposer(TIMEOUT);
+    await waitForStartupModels(gateway);
+    await session.waitForStableComposer(TIMEOUT, 500);
     const tty = execFileSync("ps", ["-o", "tty=", "-p", String(session.processPid())], {
       encoding: "utf8",
     }).trim();
     revokeTerminal(`/dev/${tty}`);
     await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
-    expect(session.paneStatus().status).toBe(0);
-    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    expect({ status: session.paneStatus().status, stderr: readFileSync(stderrPath, "utf8") })
+      .toEqual({ status: 0, stderr: "" });
     expect(gateway.modelRequests).toHaveLength(1);
     expect(gateway.requests).toHaveLength(0);
   } finally {

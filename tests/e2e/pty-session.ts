@@ -47,6 +47,7 @@ export class PtySession {
   private readonly proc: Bun.Subprocess;
   private readonly ttyPath: string;
   private text = "";
+  private lastOutputAt = Date.now();
   private exit: PtyExit | null = null;
   private masterOpen = true;
 
@@ -87,8 +88,10 @@ export class PtySession {
       rows: opts.rows ?? 30,
       data(_terminal, chunk) {
         const text = typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
-        if (session) session.text += text;
-        else pending.push(text);
+        if (session) {
+          session.text += text;
+          session.lastOutputAt = Date.now();
+        } else pending.push(text);
       },
     });
     const flagsBefore = flagsOf(terminal);
@@ -126,6 +129,18 @@ export class PtySession {
       await Bun.sleep(10);
     }
     return ready(this.text);
+  }
+
+  /// Waits until fx has written nothing for `quietMs`, so it is idle in its
+  /// input loop. Returns false on timeout or exit.
+  async waitForQuietOutput(quietMs: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.exit) return false;
+      if (Date.now() - this.lastOutputAt >= quietMs) return true;
+      await Bun.sleep(10);
+    }
+    return false;
   }
 
   write(text: string): void {
