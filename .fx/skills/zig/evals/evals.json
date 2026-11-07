@@ -1,0 +1,186 @@
+{
+  "skill": "zig",
+  "harness": "Paired `fx ask --auto --json --no-save` runs with the same model and prompt and an isolated HOME per variant. Baseline: the skills being replaced, in HOME/.agents/skills. Candidate: only this skill, in HOME/.agents/skills/zig. Keep both variants' skills outside the agent's workspace: with the candidate in the workspace's .fx/skills, its searches found evals.json, which describes the case it was running, and that run cost twice the input tokens. Put the pinned Zig first on PATH inside the agent's login shell: on macOS /etc/zprofile runs path_helper and moves /opt/homebrew/bin to the front, so write the PATH export into HOME/.zprofile and confirm `zig version` in the run's first command. Do not edit the runner script while a run is reading it; zsh reads scripts as it goes, so a running case executes the edited bytes. Fixtures, hidden tests, and the grader live outside the skill and outside the agent's workspace. Run each case under a filesystem sandbox that denies the grader, the answer keys, and the other variants' workspaces, because unsandboxed agents found and read them. The sandbox must still let fx open every ancestor directory of the workspace and of HOME: when it can only stat them, fx's edit_file and write_file fail with access_denied and skill discovery reports the skill roots unreadable, so the candidate never sees the skill in its catalog. Before trusting a run, set FX_TRACE_LOG and confirm the trace shows the skill tool call and no skills discovery_diagnostic with cause=unreadable. Cases merge-ported-main, select-cancel-finish, and toolchain-side-by-side instead put an older Zig first on PATH, with the pinned release at a separate path, which is the situation they test; their grader also checks that the run's zig build test used the pinned compiler.",
+  "invocation": "A plain-language mention such as 'Use the zig skill' does not preload a skill in fx; only the explicit $zig token does. entry-point-allocator, c4-memmove, and the first sentence of c1-new-code measure description-based loading, with the skill unnamed.",
+  "budget": "At most 600000 input tokens per case",
+  "cases": [
+    {
+      "id": "c1-new-code",
+      "kind": "application",
+      "prompt": "Use the zig skill if it's available. Using Zig 0.17, create ./kv.zig with formatPair, splitPair, lastSlash, a 40-character rule constant, and isLinux, with a test for each, using only non-deprecated Zig 0.17 APIs.",
+      "assertions": [
+        "zig test kv.zig passes on the pinned 0.17 release",
+        "check_deprecated.py reports no removed or deprecated API",
+        "within the input-token budget"
+      ]
+    },
+    {
+      "id": "c2-migrate",
+      "kind": "migration with silent behavior changes",
+      "prompt": "Use the zig skill if it's available. Upgrade ./legacy.zig from Zig 0.16 to 0.17 in place, preserve every public function's 0.16 behavior, and remove deprecated APIs.",
+      "assertions": [
+        "hidden behavior tests pass, including @hasDecl on a private declaration and containsAtLeastScalar argument order",
+        "no removed or deprecated API",
+        "within the input-token budget"
+      ]
+    },
+    {
+      "id": "c3-build",
+      "kind": "build system",
+      "prompt": "Use the zig skill if it's available. List every change a 0.16 build.zig needs for Zig 0.17, with replacement code, without running commands.",
+      "assertions": [
+        "names addPassthruArgs, b.root, the translate-c package, addArtifactArg2, b.pathList, and .safe",
+        "within the input-token budget"
+      ]
+    },
+    {
+      "id": "c4-memmove",
+      "kind": "judgment, skill not named",
+      "prompt": "Is @memmove(list.items[start..], list.items[end..]) a safe drop-in for std.mem.copyForwards(u8, list.items[start..], list.items[end..]) in Zig 0.17? Give the exact replacement.",
+      "assertions": [
+        "says it is not a drop-in because the lengths differ",
+        "gives a destination trimmed to the source length",
+        "within the input-token budget"
+      ]
+    },
+    {
+      "id": "c5-control",
+      "kind": "control",
+      "prompt": "Use the zig skill if it's available. Show a minimal Zig 0.17 function that allocates two buffers and frees the first if the second allocation fails, plus one test.",
+      "assertions": [
+        "uses errdefer without a capture",
+        "the code compiles and its test passes on the pinned 0.17 release"
+      ]
+    },
+    {
+      "id": "c6-migrate-pressure",
+      "kind": "pressure: no research allowed",
+      "prompt": "Same as c2-migrate, but the user forbids web search and reading the Zig standard library or compiler sources.",
+      "assertions": [
+        "hidden behavior tests pass",
+        "no removed or deprecated API"
+      ]
+    },
+    {
+      "id": "merge-ported-main",
+      "kind": "application",
+      "prompt": "$zig `main` has been upgraded to Zig 0.17, and this branch (`feature/report`) was written for Zig 0.16. Merge `main` into it, get `zig build test` passing with Zig 0.17, and commit the merge.",
+      "fixture": "A git repository: a 0.16 base, a main commit ported to 0.17 that also zero-pads label(), and a 0.16 feature branch that brackets label() and adds report.zig using **, errdefer |err|, std.fmt.allocPrint, mem.lastIndexOfScalar, builtin.mode, and ArrayListUnmanaged.",
+      "assertions": [
+        "the merge is committed on feature/report with main as an ancestor",
+        "zig build test passes on the pinned 0.17 release",
+        "check_deprecated.py reports no removed or deprecated API",
+        "hidden tests pass: label() keeps both sides ([a]#007), the report helpers behave as before, and collect frees on every allocation failure",
+        "the agent ran its tests with a 0.17 compiler"
+      ]
+    },
+    {
+      "id": "select-cancel-finish",
+      "kind": "regression",
+      "prompt": "$zig We do not allow `catch unreachable`. Replace the one in watch.zig with real error handling without changing what the code does, and keep `zig build test` passing.",
+      "fixture": "watch.zig: fetch() runs a request and a cancellation watch in one std.Io.Select; Watch.finish stops the watch, takes its event with getOneUncancelable(...) catch unreachable, then cancels the select.",
+      "assertions": [
+        "no catch unreachable remains",
+        "finish takes the watch's event before any Select.cancel",
+        "zig build test passes",
+        "a probe calling fetch from 4 threads x 500 times sees no SIGIO",
+        "the agent ran its tests with a 0.17 compiler"
+      ]
+    },
+    {
+      "id": "toolchain-side-by-side",
+      "kind": "application",
+      "prompt": "$zig This Mac (Apple silicon) has Zig 0.17.0 from Homebrew on PATH, and several other agents are building branches that still target Zig 0.17.0 with it. This checkout's build.zig.zon now requires Zig 0.17.1. Write ./setup.md with the exact shell commands to get Zig 0.17.1 for this checkout without breaking the other agents' builds. Do not run any download or install commands yourself.",
+      "assertions": [
+        "setup.md downloads from ziglang.org and verifies a SHA-256 or minisign signature",
+        "any literal SHA-256 is the official one",
+        "it uses zig-aarch64-macos-0.17.1.tar.xz",
+        "it installs into a versioned directory and selects 0.17 only for this checkout",
+        "it never upgrades, relinks, or replaces the shared zig or edits a shell startup file",
+        "it verifies with zig version"
+      ]
+    },
+    {
+      "id": "entry-point-allocator",
+      "kind": "application, skill not named",
+      "prompt": "Zig 0.17.1 is on PATH. Create ./leakcheck.zig with `pub fn joinWords(gpa: std.mem.Allocator, words: []const []const u8) ![]u8`, which joins the words with single spaces (the caller owns the result), and a `pub fn main` that runs it on a few words and prints the result. In Debug and ReleaseSafe builds main must use a general-purpose allocator that reports leaks when the program exits; in other builds it uses std.heap.smp_allocator. Add tests. `zig test leakcheck.zig` must pass.",
+      "assertions": [
+        "zig test leakcheck.zig passes on 0.17.1",
+        "zig build-exe -fno-emit-bin passes in Debug, ReleaseSafe, and ReleaseFast",
+        "check_deprecated.py reports no removed or deprecated API",
+        "no std.heap.DebugAllocator",
+        "within the input-token budget"
+      ]
+    },
+    {
+      "id": "patch-release-status",
+      "kind": "version knowledge under pressure: no web search, no std or compiler source",
+      "prompt": "$zig We pin Zig 0.17.1. Do not use web search, and do not read the Zig standard library or compiler sources. Write ./answer.md that answers: (1) Our Linux code reads terminal settings through std.os.linux.tcgetattr instead of std.posix.tcgetattr, because with Zig 0.17.0 std.posix.tcgetattr overran the caller stack. Is that workaround still required with Zig 0.17.1? (2) Which known Zig 0.17.0 regressions are fixed in 0.17.1, and which still apply? (3) Can we use std.heap.SafeAllocator in tests on macOS arm64 with 0.17.1? Say how sure you are for each answer.",
+      "assertions": [
+        "keeps the termios workaround because std.c.termios is still the kernel layout (only NCCS changed)",
+        "#37006 and #37050 fixed, #36444 not fixed, #36986 only partly fixed",
+        "SafeAllocator is fine for tests on macOS arm64, and 0.17.1 fixed its stack-capture deadlock (#37310)",
+        "does not say every 0.17.0 regression still applies",
+        "within the input-token budget"
+      ]
+    },
+    {
+      "id": "migrate-silent-changes",
+      "kind": "control: migration with silent behavior changes",
+      "prompt": "$zig Upgrade ./legacy.zig from Zig 0.16 to Zig 0.17 in place. Keep the 0.16 behavior of every public function and remove deprecated APIs. Zig 0.17.1 is on PATH; `zig test legacy.zig` must pass.",
+      "fixture": "legacy.zig: a private describe() probed with @hasDecl, containsAtLeastScalar(u8, text, 3, 'a') in the 0.16 order, std.fmt.allocPrint, and builtin.mode == .Debug.",
+      "assertions": [
+        "hidden tests pass: describeOf finds the private describe, hasThreeA keeps its 0.16 meaning, label, and modeName",
+        "check_deprecated.py reports no removed or deprecated API",
+        "within the input-token budget"
+      ]
+    },
+    {
+      "id": "entry-point-init",
+      "kind": "application, skill not named",
+      "prompt": "Zig 0.17.1 is on PATH. Create ./wordcount.zig with `pub fn countWords(text: []const u8) usize`, `pub fn upperCopy(gpa: std.mem.Allocator, text: []const u8) ![]u8` (the caller owns the result), and a short `pub fn main` that prints the upper-case copy of a fixed sentence and its word count to stdout. Debug builds must report leaked memory when the program exits. Keep main as simple as the language allows. Add tests; `zig test wordcount.zig` must pass.",
+      "assertions": [
+        "zig test wordcount.zig passes on 0.17.1",
+        "the program builds and prints in Debug and ReleaseFast",
+        "check_deprecated.py reports no removed or deprecated API",
+        "main takes std.process.Init and uses init.gpa and init.io instead of building its own allocator or std.Io.Threaded",
+        "within the input-token budget"
+      ]
+    }
+  ],
+  "results": {
+    "date": "2026-11-07",
+    "model": "spacexai/grok-4.7",
+    "compiler": "Zig 0.17.1 (aarch64-macos)",
+    "runs_per_variant": "1, and 2 where marked",
+    "baseline": "the two skills this one replaced, one for Zig 0.17 version facts and one for Zig practice, as they were before the merge",
+    "cases": [
+      {
+        "id": "entry-point-allocator",
+        "class": "control",
+        "baseline": "pass; 1,479,144 input tokens; 23 std reads",
+        "candidate": "pass; 1,295,563 input tokens; 14 std reads",
+        "note": "The prompt requires smp_allocator outside Debug and ReleaseSafe, but init.gpa is c_allocator when linking libc, so both arms correctly built their own allocator switch."
+      },
+      {
+        "id": "patch-release-status",
+        "class": "discriminating",
+        "baseline": "fail: reported all four listed 0.17.0 regressions as still open; 354,481 input tokens",
+        "candidate": "pass (2 runs): correct 0.17.1 status for #37006, #37050, #36444, #36986, #37228, and #37310; 78,542 and 82,392 input tokens"
+      },
+      {
+        "id": "migrate-silent-changes",
+        "class": "control",
+        "baseline": "pass (2 runs): 172,975 and 356,588 input tokens",
+        "candidate": "pass (2 runs): 381,285 input tokens, then 244,825 after the core again said to read std source only for an API the skill lacks",
+        "note": "Both arms pass the hidden tests, and each arm's cost varies about twofold between runs, so the runs show no cost difference."
+      },
+      {
+        "id": "entry-point-init",
+        "class": "discriminating on cost",
+        "baseline": "pass; uses init.gpa; 1,342,458 input tokens; 16 std reads",
+        "candidate": "pass; uses init.gpa; 573,437 input tokens; 6 std reads"
+      }
+    ]
+  }
+}

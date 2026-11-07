@@ -181,6 +181,8 @@ Do not bypass the permission system for new tools.
 
 ## Zig-Specific Patterns
 
+Use the `zig` skill (`.fx/skills/zig/SKILL.md`) when you write, review, or upgrade Zig code. It covers what Zig 0.17.x removed, deprecated, or changed without a compile error, including the 0.17.0 to 0.17.1 changes, and Zig ownership, error, I/O, concurrency, and testing practice. Where the skill and this file differ, this file takes precedence.
+
 ### Memory and Errors
 
 * Allocators are passed explicitly. Never use a global allocator.
