@@ -30,6 +30,7 @@
     {"name": "skill_display_name", "module": "fx", "test": "skill display name parsing stays bounded", "iterations": 5000000},
     {"name": "command_output_content", "module": "fx", "test": "fuzz command output content", "iterations": 160000},
     {"name": "file_index", "module": "fx", "test": "file index raw-list and Unicode query bytes remain bounded", "iterations": 620000},
+    {"name": "grok_access_token", "module": "fx", "test": "a Grok access token gives its Team, none, or a refusal on fuzzed bytes", "iterations": 70000},
     {"name": "responses_text", "module": "fx", "test": "Responses text finalization fuzzes chunking and capture boundaries", "iterations": 430000},
     {"name": "sse_framing", "module": "fx", "test": "provider framing fuzzes chunk-invariant event data", "iterations": 1300000},
     {"name": "responses_stream", "module": "fx", "test": "Responses streams give the same result however they are cut into events and reads", "iterations": 190000},
