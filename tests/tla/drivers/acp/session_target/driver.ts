@@ -7,6 +7,10 @@
 //   bun tests/tla/drivers/acp/session_target/driver.ts              # after zig build
 //   bun tests/tla/drivers/acp/session_target/driver.ts --model before
 //
+// Kernel plans run the libfx/* methods through libfx's minimal kernel in the
+// native addon (kernel.ts), which needs `zig build libfx-napi
+// -Dnapi-surface=core`; --no-kernel leaves them out.
+//
 // --model fixed (the default) checks ACP v1's error rules. --model before
 // checks the model of fx before them; a build of origin/main at 15dab7bb4,
 // chosen with FX_WORKTREE or FX_BIN, matches it and fails --model fixed.
@@ -16,7 +20,10 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { binary, worktree } from "../../lib/context";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { Fixture, type Observation, observe } from "./harness";
+import { Kernel, addonPath } from "./kernel";
 import { outDir, sha256File, sha256Text, tlcToolchain, writeJson } from "./tlc";
 import { validate } from "./trace";
 
@@ -24,12 +31,15 @@ import { validate } from "./trace";
 
 const TARGET_OPS = ["prompt", "mode", "config", "cancel"] as const;
 const NAMING_OPS = [...TARGET_OPS, "close", "load", "resume"] as const;
-type NamingOp = (typeof NAMING_OPS)[number];
+const LIBFX_OPS = ["snapshot", "checkpoint", "handoff", "withdraw", "followup", "steer", "restore"] as const;
+const KERNEL_OPS = [...LIBFX_OPS, "close"] as const;
+type NamingOp = (typeof NAMING_OPS)[number] | (typeof LIBFX_OPS)[number];
 type Target = "A" | "B" | "X" | "none" | "bad";
 const TARGETS: Target[] = ["A", "B", "X", "none", "bad"];
 
 type Step = { op: "new" } | { op: "restart" } | { op: "oversize" } | { op: NamingOp; arg: Target };
-type Plan = { name: string; steps: Step[] };
+/// An "acp" plan runs `fx acp`; a "kernel" plan runs libfx's minimal kernel.
+type Plan = { name: string; kind: "acp" | "kernel"; steps: Step[] };
 
 const N: Step = { op: "new" };
 const R: Step = { op: "restart" };
@@ -37,33 +47,49 @@ const O: Step = { op: "oversize" };
 const s = (op: NamingOp, arg: Target): Step => ({ op, arg });
 
 const DIRECTED: Plan[] = [
-  { name: "d1-open-and-unknown", steps: [
+  { name: "d1-open-and-unknown", kind: "acp", steps: [
     N, s("prompt", "A"), s("mode", "A"), s("config", "A"), s("cancel", "A"),
     s("prompt", "X"), s("mode", "X"), s("config", "X"), s("cancel", "X"), s("close", "X"),
     s("prompt", "A"), s("close", "A"), s("prompt", "A"), s("close", "A"),
     s("load", "A"), s("prompt", "A"), s("resume", "A"),
   ] },
-  { name: "d2-missing-ids", steps: [
+  { name: "d2-missing-ids", kind: "acp", steps: [
     N, s("prompt", "none"), s("prompt", "bad"), s("mode", "none"), s("config", "bad"), s("cancel", "none"),
     s("close", "none"), s("close", "bad"), s("load", "none"), s("resume", "bad"), s("prompt", "A"),
   ] },
-  { name: "d3-two-sessions", steps: [
+  { name: "d3-two-sessions", kind: "acp", steps: [
     N, s("prompt", "A"), N, s("prompt", "A"), s("close", "A"), s("prompt", "B"), s("load", "A"),
     s("prompt", "B"), s("close", "B"), s("prompt", "A"), R, s("prompt", "A"), s("resume", "A"),
     s("prompt", "A"), s("load", "B"),
   ] },
-  { name: "d4-unsaved", steps: [
+  { name: "d4-unsaved", kind: "acp", steps: [
     N, s("close", "A"), s("load", "A"), s("resume", "A"), N, R, s("load", "B"), s("resume", "X"), s("load", "X"),
   ] },
-  { name: "d5-oversize", steps: [
+  { name: "d5-oversize", kind: "acp", steps: [
     N, O, s("prompt", "A"), O, s("close", "A"), O, s("prompt", "A"),
   ] },
-  { name: "d6-reload-open", steps: [
+  { name: "d6-reload-open", kind: "acp", steps: [
     N, s("load", "A"), s("prompt", "A"), s("load", "A"), s("resume", "A"), s("prompt", "A"),
   ] },
-  { name: "d7-after-restart", steps: [
+  { name: "d7-after-restart", kind: "acp", steps: [
     N, s("prompt", "A"), R, s("mode", "A"), s("config", "A"), s("cancel", "A"), s("close", "A"),
     s("load", "A"), s("mode", "A"), s("cancel", "A"),
+  ] },
+];
+
+const KERNEL_DIRECTED: Plan[] = [
+  { name: "k1-open-and-unknown", kind: "kernel", steps: [
+    N, s("snapshot", "A"), s("checkpoint", "A"), s("handoff", "A"), s("withdraw", "A"), s("followup", "A"),
+    s("steer", "A"), s("restore", "A"),
+    s("snapshot", "X"), s("checkpoint", "X"), s("handoff", "X"), s("withdraw", "X"), s("followup", "X"),
+    s("steer", "X"), s("restore", "X"), s("close", "A"), s("snapshot", "A"), s("close", "A"),
+  ] },
+  { name: "k2-missing-ids", kind: "kernel", steps: [
+    N, s("snapshot", "none"), s("checkpoint", "bad"), s("handoff", "none"), s("withdraw", "bad"),
+    s("followup", "none"), s("steer", "bad"), s("restore", "none"), s("snapshot", "A"),
+  ] },
+  { name: "k3-two-sessions", kind: "kernel", steps: [
+    N, N, s("snapshot", "A"), s("handoff", "B"), s("close", "A"), s("checkpoint", "B"), s("close", "B"), s("withdraw", "B"),
   ] },
 ];
 
@@ -79,8 +105,10 @@ function mulberry32(seed: number) {
 }
 
 /// Seeded plans. Each starts with a session, creates at most two, and sends
-/// at most one oversized frame, which takes fx a moment to read.
-function randomPlans(count: number, steps: number, seed: number): Plan[] {
+/// at most one oversized frame, which takes fx a moment to read. Kernel plans
+/// use the libfx/* methods and session/close, and never restart.
+function randomPlans(count: number, steps: number, seed: number, kind: "acp" | "kernel" = "acp"): Plan[] {
+  const ops: readonly NamingOp[] = kind === "kernel" ? KERNEL_OPS : NAMING_OPS;
   const rand = mulberry32(seed);
   const pick = <T>(items: readonly T[]): T => items[Math.floor(rand() * items.length)]!;
   const plans: Plan[] = [];
@@ -93,18 +121,18 @@ function randomPlans(count: number, steps: number, seed: number): Plan[] {
       if (roll < 0.08 && created < 2) {
         plan.push(N);
         created += 1;
-      } else if (roll < 0.14) {
+      } else if (roll < 0.14 && kind === "acp") {
         plan.push(R);
-      } else if (roll < 0.16 && !oversized) {
+      } else if (roll < 0.16 && !oversized && kind === "acp") {
         plan.push(O);
         oversized = true;
       } else {
         // Favor the sessions a client really has.
         const arg = rand() < 0.7 ? pick(["A", "B"] as const) : pick(TARGETS);
-        plan.push(s(pick(NAMING_OPS), arg));
+        plan.push(s(pick(ops), arg));
       }
     }
-    plans.push({ name: `r${String(n + 1).padStart(2, "0")}-seed${seed}`, steps: plan });
+    plans.push({ name: `${kind === "kernel" ? "kr" : "r"}${String(n + 1).padStart(2, "0")}-seed${seed}`, kind, steps: plan });
   }
   return plans;
 }
@@ -114,9 +142,19 @@ function randomPlans(count: number, steps: number, seed: number): Plan[] {
 /// A session id that fx never created, in the shape of a real one.
 const UNKNOWN_ID = "1700000000000-1700000000000000000-00000000deadbeef";
 
+let followUps = 0;
+
 function params(op: NamingOp, sessionId: unknown, workspace: string): [string, Record<string, unknown>] {
   const target = sessionId === undefined ? {} : { sessionId };
   switch (op) {
+    case "snapshot": return ["libfx/snapshot", target];
+    case "checkpoint": return ["libfx/checkpoint", target];
+    case "handoff": return ["libfx/handoff", target];
+    case "withdraw": return ["libfx/withdraw", { ...target, id: "w1" }];
+    case "followup": return ["libfx/follow_up", { ...target, id: `f${(followUps += 1)}`, text: "later" }];
+    case "steer": return ["libfx/steer", { ...target, text: "now" }];
+    // An empty checkpoint, which fx refuses for the open session.
+    case "restore": return ["libfx/restore", { ...target, checkpoint: "" }];
     case "prompt": return ["session/prompt", { ...target, prompt: [{ type: "text", text: "hello" }] }];
     case "mode": return ["session/set_mode", { ...target, modeId: "auto" }];
     case "config": return ["session/set_config_option", { ...target, configId: "mode", value: "auto" }];
@@ -127,12 +165,9 @@ function params(op: NamingOp, sessionId: unknown, workspace: string): [string, R
   }
 }
 
-async function runPlan(plan: Plan, dir: string) {
-  mkdirSync(dir, { recursive: true });
-  const fixture = new Fixture(binary);
-  const observations: Observation[] = [];
+/// Sends plan steps that name sessions, through `call`, and records each answer.
+function sessionIds() {
   const ids: Record<string, string> = {};
-  let error: string | null = null;
   const sessionIdFor = (target: Target): unknown => {
     if (target === "none") return undefined;
     if (target === "bad") return 42;
@@ -140,6 +175,62 @@ async function runPlan(plan: Plan, dir: string) {
     // A label the plan has not created yet names a session that doesn't exist.
     return ids[target] ?? `${UNKNOWN_ID.slice(0, -1)}${target === "A" ? "1" : "2"}`;
   };
+  return { ids, sessionIdFor };
+}
+
+async function runKernelPlan(plan: Plan, dir: string) {
+  mkdirSync(dir, { recursive: true });
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-acp-kernel-target-")));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  mkdirSync(workspace, { recursive: true, mode: 0o700 });
+  const log: object[] = [];
+  const observations: Observation[] = [];
+  const { ids, sessionIdFor } = sessionIds();
+  const processes: Array<{ exit: number; stderr: string }> = [];
+  let error: string | null = null;
+  let kernel: Kernel | null = null;
+  try {
+    kernel = Kernel.start(home, workspace, (entry) => log.push(entry));
+    observations.push({ ...observe("restart", "none", await kernel.call("initialize", { protocolVersion: 1 }), undefined), result: "none" });
+    for (const step of plan.steps) {
+      if (step.op === "new") {
+        const label = ids.A === undefined ? "A" : "B";
+        const response = await kernel.call("libfx/new", {});
+        if (typeof response.result?.sessionId === "string") ids[label] = response.result.sessionId;
+        observations.push(observe("new", label, response, undefined));
+      } else if (step.op === "restart" || step.op === "oversize") {
+        throw new Error(`kernel plans don't ${step.op}`);
+      } else {
+        const sessionId = sessionIdFor(step.arg);
+        const [method, body] = step.op === "close" ? ["session/close", sessionId === undefined ? {} : { sessionId }] : params(step.op, sessionId, workspace);
+        observations.push(observe(step.op, step.arg, await kernel.call(method, body), sessionId));
+      }
+    }
+  } catch (caught) {
+    error = caught instanceof Error ? caught.message : String(caught);
+  } finally {
+    if (kernel) {
+      const closed = await kernel.close();
+      processes.push({ exit: closed.exit, stderr: closed.error ?? "" });
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+  writeJson(join(dir, "observations.json"), observations);
+  writeJson(join(dir, "sessions.json"), ids);
+  writeFileSync(join(dir, "kernel.jsonl"), log.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  writeJson(join(dir, "processes.json"), processes);
+  return { observations, processes, error };
+}
+
+async function runPlan(plan: Plan, dir: string) {
+  if (plan.kind === "kernel") return runKernelPlan(plan, dir);
+  mkdirSync(dir, { recursive: true });
+  const fixture = new Fixture(binary);
+  const observations: Observation[] = [];
+  const { ids, sessionIdFor } = sessionIds();
+  let error: string | null = null;
   try {
     await fixture.init();
     const started = await fixture.start();
@@ -238,17 +329,25 @@ async function main() {
   const randomCount = Number(argValue("--random") ?? "12");
   const steps = Number(argValue("--steps") ?? "14");
   const only = argValue("--only");
+  const kernelRandom = Number(argValue("--kernel-random") ?? "4");
+  const withKernel = !process.argv.includes("--no-kernel");
+  if (withKernel && !existsSync(addonPath)) {
+    throw new Error(`missing ${addonPath}; run zig build libfx-napi -Dnapi-surface=core, or pass --no-kernel`);
+  }
 
   const reportDir = outDir(`acp-session-target-${model}`);
   const status = git("status", "--porcelain");
   const manifest = {
     model, worktree, binary, head: git("rev-parse", "HEAD"), dirty: status.length > 0,
     diff_sha256: status ? sha256Text(git("diff", "HEAD")) : null, fx_binary_sha256: sha256File(binary),
+    addon_sha256: withKernel ? sha256File(addonPath) : null,
     toolchain: tlcToolchain(), bun: Bun.version, seed, randomCount, steps, argv: process.argv.slice(1),
   };
   writeJson(join(reportDir, "manifest.json"), manifest);
 
-  const plans = [...DIRECTED, ...randomPlans(randomCount, steps, seed)].filter((plan) => !only || new RegExp(only).test(plan.name));
+  const kernelPlans = withKernel ? [...KERNEL_DIRECTED, ...randomPlans(kernelRandom, steps, seed, "kernel")] : [];
+  const plans = [...DIRECTED, ...randomPlans(randomCount, steps, seed), ...kernelPlans]
+    .filter((plan) => !only || new RegExp(only).test(plan.name));
   const results = [];
   for (const plan of plans) {
     const dir = join(reportDir, "traces", plan.name);
