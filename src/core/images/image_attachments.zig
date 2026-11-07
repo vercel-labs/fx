@@ -1985,8 +1985,18 @@ pub const ClipboardImageAttachment = struct {
     }
 };
 
-pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
-    if (builtin.target.os.tag != .macos) return error.Unsupported;
+/// Whether fx can read an image from the system clipboard: macOS only,
+/// through osascript.
+pub const clipboard_image_supported = builtin.target.os.tag == .macos;
+
+/// Exports the clipboard image with osascript into a temp folder and loads
+/// it. osascript can take seconds on a large image, so this runs off the
+/// input loop (`clipboard_read.zig`), and `budget` stops it: a set cancel
+/// flag or a passed deadline kills osascript within one poll and returns
+/// `error.Cancelled` or `error.TimedOut`.
+pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator, budget: CaptureBudget) !ClipboardImageAttachment {
+    if (comptime !clipboard_image_supported) return error.Unsupported;
+    try budget.check();
 
     const source_dir = try createTempSnapshotDir(alloc);
     errdefer {
@@ -2008,26 +2018,60 @@ pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAtt
     defer alloc.free(write_script);
 
     const argv = [_][]const u8{ "osascript", "-e", write_script };
-    const result = try std.process.run(alloc, io_mod.getIo(), .{
-        .argv = &argv,
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(4096),
-    });
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            const attachment = try loadImageAttachment(alloc, temp_path);
-            return .{
-                .attachment = attachment,
-                .source_dir = source_dir,
-            };
-        },
-        else => {},
+    if (try runBoundedChild(&argv, budget)) {
+        const attachment = try loadImageAttachment(alloc, temp_path);
+        return .{
+            .attachment = attachment,
+            .source_dir = source_dir,
+        };
     }
 
     return error.NoClipboardImage;
+}
+
+const bounded_child_poll_ns: u64 = 10 * std.time.ns_per_ms;
+
+/// Runs `argv` with no standard streams and returns whether it exited 0.
+/// It polls the child rather than blocking in wait, so `budget` is checked
+/// every `bounded_child_poll_ns`: a set cancel flag or a passed deadline kills
+/// the child with SIGKILL, reaps it, then returns `error.Cancelled` or
+/// `error.TimedOut`.
+fn runBoundedChild(argv: []const []const u8, budget: CaptureBudget) !bool {
+    const zio = io_mod.getIo();
+    var child = try std.process.spawn(zio, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    // Kills and reaps the child unless the loop below already reaped it.
+    defer child.kill(zio);
+    const pid = child.id orelse return error.ProcessNotFound;
+    while (true) {
+        var status: c_int = 0;
+        const reaped = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+        if (reaped == pid) {
+            // Reaped here, so the pid may be reused: kill must not touch it.
+            child.id = null;
+            const code: u32 = @bitCast(status);
+            return std.c.W.IFEXITED(code) and std.c.W.EXITSTATUS(code) == 0;
+        }
+        if (reaped == -1 and std.posix.errno(-1) != .INTR) {
+            child.id = null;
+            return error.ProcessNotFound;
+        }
+        budget.check() catch |err| {
+            debug_trace.logf("images", "event=clipboard_export_stopped reason={s}", .{@errorName(err)});
+            // `child.kill` sends SIGTERM and waits, which a child that ignores
+            // SIGTERM would turn into a wait for its own exit. SIGKILL first, so
+            // the deferred kill only reaps it. Unreaped, the pid is still ours.
+            std.posix.kill(pid, .KILL) catch |kill_err| {
+                debug_trace.logf("images", "event=clipboard_export_kill_failed err={s}", .{@errorName(kill_err)});
+            };
+            return err;
+        };
+        io_mod.sleep(bounded_child_poll_ns);
+    }
 }
 
 fn readImageHeaderBytes(path: []const u8, out: []u8) ![]const u8 {
@@ -4781,4 +4825,133 @@ test "an image saved as a blob is only its handle, and readers load the blob, ev
     // A damaged blob fails its digest wherever it is read.
     try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = &hex, .data = "damaged" });
     try std.testing.expectError(error.ImageSnapshotCorrupt, loadVerifiedSnapshot(alloc, handle, .{}));
+}
+
+/// A clock for the bounded child tests: each budget check once the child has
+/// written its pid is one tick, so a slow machine cannot stop the child
+/// before it runs. The deadline passes at `deadline_tick`, or the cancel flag
+/// is set at `cancel_tick`, and the check one tick before records whether the
+/// child still ran.
+const ChildClock = struct {
+    ticks: u32 = 0,
+    deadline_tick: u32 = std.math.maxInt(u32),
+    cancel_tick: u32 = std.math.maxInt(u32),
+    cancel: ?*std.atomic.Value(bool) = null,
+    pid_path: []const u8,
+    alive_before_stop: ?bool = null,
+
+    fn check(ctx: *anyopaque) anyerror!void {
+        const self: *ChildClock = @ptrCast(@alignCast(ctx));
+        if (childPid(self.pid_path) == null) return;
+        self.ticks += 1;
+        if (self.ticks + 1 == @min(self.deadline_tick, self.cancel_tick)) {
+            self.alive_before_stop = if (childPid(self.pid_path)) |pid| processAlive(pid) else false;
+        }
+        if (self.ticks >= self.cancel_tick) self.cancel.?.store(true, .seq_cst);
+        if (self.ticks >= self.deadline_tick) return error.TimedOut;
+    }
+
+    fn budget(self: *ChildClock) CaptureBudget {
+        return .{ .cancel_flag = self.cancel, .test_hook = .{ .ctx = self, .check = check } };
+    }
+};
+
+fn childPid(pid_path: []const u8) ?std.posix.pid_t {
+    var buf: [32]u8 = undefined;
+    const text = std.Io.Dir.cwd().readFile(std.testing.io, pid_path, &buf) catch return null;
+    return std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, text, " \n"), 10) catch null;
+}
+
+fn processAlive(pid: std.posix.pid_t) bool {
+    // A zombie still answers, so this also checks the child was reaped.
+    std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch return false;
+    return true;
+}
+
+/// A child that records its pid, then sleeps far past any test's deadline.
+fn sleeperArgv(script: *[256]u8, pid_path: []const u8) ![3][]const u8 {
+    return .{ "/bin/sh", "-c", try std.mem.print(script, "echo $$ > '{s}'; exec sleep 30", .{pid_path}) };
+}
+
+test "a bounded child reports whether it exited 0" {
+    try std.testing.expect(try runBoundedChild(&.{ "/bin/sh", "-c", "exit 0" }, .{}));
+    try std.testing.expect(!try runBoundedChild(&.{ "/bin/sh", "-c", "exit 3" }, .{}));
+    try std.testing.expect(!try runBoundedChild(&.{ "/bin/sh", "-c", "kill -9 $$" }, .{}));
+}
+
+test "a bounded child runs until its deadline tick and is killed and reaped at it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(root);
+    const pid_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, "pid" });
+    defer std.testing.allocator.free(pid_path);
+    var script: [256]u8 = undefined;
+    const argv = try sleeperArgv(&script, pid_path);
+
+    var clock: ChildClock = .{ .deadline_tick = 20, .pid_path = pid_path };
+    try std.testing.expectError(error.TimedOut, runBoundedChild(&argv, clock.budget()));
+    try std.testing.expectEqual(@as(u32, 20), clock.ticks);
+    try std.testing.expectEqual(@as(?bool, true), clock.alive_before_stop);
+    try std.testing.expect(!processAlive(childPid(pid_path).?));
+}
+
+test "a bounded child is killed and reaped when the cancel flag is set" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(root);
+    const pid_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, "pid" });
+    defer std.testing.allocator.free(pid_path);
+    var script: [256]u8 = undefined;
+    const argv = try sleeperArgv(&script, pid_path);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var clock: ChildClock = .{ .cancel_tick = 15, .cancel = &cancel, .pid_path = pid_path };
+    try std.testing.expectError(error.Cancelled, runBoundedChild(&argv, clock.budget()));
+    try std.testing.expectEqual(@as(u32, 15), clock.ticks);
+    try std.testing.expectEqual(@as(?bool, true), clock.alive_before_stop);
+    try std.testing.expect(!processAlive(childPid(pid_path).?));
+}
+
+test "a bounded child that ignores SIGTERM is still killed at its deadline" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(root);
+    const pid_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, "pid" });
+    defer std.testing.allocator.free(pid_path);
+    var script: [256]u8 = undefined;
+    const argv = [_][]const u8{ "/bin/sh", "-c", try std.mem.print(&script, "trap '' TERM; echo $$ > '{s}'; exec sleep 30", .{pid_path}) };
+
+    var clock: ChildClock = .{ .deadline_tick = 20, .pid_path = pid_path };
+    const started = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    try std.testing.expectError(error.TimedOut, runBoundedChild(&argv, clock.budget()));
+    const elapsed = started.durationTo(std.Io.Clock.Timestamp.now(std.testing.io, .awake));
+    // Twenty 10 ms polls, not the child's 30 s sleep.
+    try std.testing.expect(elapsed.raw.toMilliseconds() < 5_000);
+    try std.testing.expectEqual(@as(?bool, true), clock.alive_before_stop);
+    try std.testing.expect(!processAlive(childPid(pid_path).?));
+}
+
+test "200 bounded children stopped early leave no process behind" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(root);
+    var stopped: usize = 0;
+    for (0..200) |index| {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.mem.print(&name_buf, "pid-{d}", .{index});
+        const pid_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, name });
+        defer std.testing.allocator.free(pid_path);
+        var script: [256]u8 = undefined;
+        const argv = try sleeperArgv(&script, pid_path);
+        var cancel = std.atomic.Value(bool).init(false);
+        var clock: ChildClock = .{ .cancel_tick = 1, .cancel = &cancel, .pid_path = pid_path };
+        try std.testing.expectError(error.Cancelled, runBoundedChild(&argv, clock.budget()));
+        try std.testing.expect(!processAlive(childPid(pid_path).?));
+        stopped += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 200), stopped);
 }

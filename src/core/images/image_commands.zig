@@ -1,12 +1,20 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const clipboard_read = @import("clipboard_read.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const image_attachments = @import("image_attachments.zig");
 const types = @import("../shared/types.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const render_request = @import("../../ui/render_request.zig");
+const composer_insertion = @import("../input/composer_insertion.zig");
+const composer_stash = @import("../input/composer_stash.zig");
 const edit_contract = @import("../input/editor_state.zig");
+const edit_history = @import("../input/edit_history.zig");
+const input_limit_rejection = @import("../input/input_limit_rejection.zig");
+const picker_state = @import("../input/picker_state.zig");
 const registered_entities = @import("../input/registered_entities.zig");
+const vertical_navigation = @import("../input/vertical_navigation.zig");
 
 const InsertImageResult = enum { inserted, rejected, input_full };
 const ImageSourceLifetime = enum { retained, temporary };
@@ -86,28 +94,81 @@ pub fn Commands(comptime App: type) type {
             }, true);
         }
 
+        /// `/paste` and Ctrl+V: starts reading the clipboard image and
+        /// returns at once. `finishClipboard` attaches the image when the
+        /// loop collects the read. Silent where fx cannot read clipboard
+        /// images.
         pub fn attachClipboard(app: *App) !void {
-            var loaded = image_attachments.loadClipboardImageAttachment(app.alloc) catch |err| {
-                if (err == error.NoClipboardImage) {
-                    try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "no image found on clipboard" }, true);
-                } else if (err != error.Unsupported) {
+            if (comptime !@hasField(App, "clipboard_read")) return;
+            const started = app.clipboard_read.start(app.alloc, agents.screenAgentOf(app)) catch |err| {
+                const line = try app.alloc.print("failed to paste clipboard image: {s}", .{@errorName(err)});
+                defer app.alloc.free(line);
+                try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
+                return;
+            };
+            switch (started) {
+                .started => try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "reading clipboard" }, true),
+                .busy => try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "already reading clipboard" }, true),
+                .unsupported => {},
+            }
+        }
+
+        /// Shows how a clipboard read ended, for the agent in context, which
+        /// is the agent that asked. `draft` is that agent's stashed draft
+        /// while it is hidden, or null when it is on screen and owns the
+        /// composer. Takes the image out of `outcome`.
+        pub fn finishClipboard(app: *App, outcome: *clipboard_read.Outcome, draft: ?*composer_stash.State) !void {
+            switch (outcome.*) {
+                .image => |*loaded| {
+                    const result = if (draft) |stash| inserted: {
+                        var composer: DraftComposer = .init(stash);
+                        defer composer.deinit(app.alloc);
+                        break :inserted try insertImageInto(App, app, &composer, loaded.takeAttachment(), .temporary);
+                    } else try insertImageAtCursor(App, app, loaded.takeAttachment(), .temporary);
+                    switch (result) {
+                        .inserted => app.shell.render_requests.request(.footer),
+                        .rejected => {},
+                        .input_full => try writeInputFullNotice(app),
+                    }
+                },
+                .no_image => try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "no image found on clipboard" }, true),
+                .timed_out => try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = "clipboard read timed out" }, true),
+                .failed => |err| {
                     const line = try app.alloc.print("failed to paste clipboard image: {s}", .{@errorName(err)});
                     defer app.alloc.free(line);
                     try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
-                }
-                return;
-            };
-            defer loaded.deinit(app.alloc);
-            switch (try insertImageAtCursor(App, app, loaded.takeAttachment(), .temporary)) {
-                .inserted => app.shell.render_requests.request(.footer),
-                .rejected => {},
-                .input_full => try writeInputFullNotice(app),
+                },
             }
+        }
+
+        /// A clipboard read whose agent has closed: its image has nowhere to
+        /// go, so it is dropped with a notice and a trace line.
+        pub fn dropClipboard(app: *App, outcome: *const clipboard_read.Outcome) !void {
+            debug_trace.logf("images", "event=clipboard_read_dropped reason=agent_closed outcome={s}", .{@tagName(outcome.*)});
+            if (outcome.* != .image) return;
+            try app.writeDomainNotice(.{
+                .topic = "images",
+                .tone = .neutral,
+                .body = "clipboard image not attached: the agent that asked has closed",
+            }, true);
         }
 
         fn insertImageAtCursor(
             comptime A: type,
             app: *A,
+            image: types.ImageAttachment,
+            source_lifetime: ImageSourceLifetime,
+        ) !InsertImageResult {
+            return insertImageInto(A, app, &app.input_runtime, image, source_lifetime);
+        }
+
+        /// Inserts `image`'s placeholder at `composer`'s cursor and attaches
+        /// it to the agent in context: the live composer, or a hidden
+        /// agent's `DraftComposer`.
+        fn insertImageInto(
+            comptime A: type,
+            app: *A,
+            composer: anytype,
             image: types.ImageAttachment,
             source_lifetime: ImageSourceLifetime,
         ) !InsertImageResult {
@@ -127,17 +188,17 @@ pub fn Commands(comptime App: type) type {
                 A.input_byte_limit
             else
                 std.math.maxInt(usize);
-            if (!app.input_runtime.insertionState().canInsert(placeholder.len, max_input_len)) {
+            if (!composer.insertionState().canInsert(placeholder.len, max_input_len)) {
                 return .input_full;
             }
 
-            try app.input_runtime.edit_state.input.ensureUnusedCapacity(
+            try composer.edit_state.input.ensureUnusedCapacity(
                 app.alloc,
                 placeholder.len,
             );
             try agents.screenAgentOf(app).pending_images.ensureUnusedCapacity(app.alloc, 1);
-            if (comptime @hasField(@TypeOf(app.input_runtime), "entities")) {
-                try app.input_runtime.entities.image_tokens.ensureUnusedCapacity(app.alloc, 1);
+            if (comptime @hasField(@TypeOf(composer.*), "entities")) {
+                try composer.entities.image_tokens.ensureUnusedCapacity(app.alloc, 1);
             }
             switch (try image_attachments.captureImageAttachmentForAdmission(A, app, &attached)) {
                 .captured => {},
@@ -150,14 +211,14 @@ pub fn Commands(comptime App: type) type {
                 attached.path = display_path;
             }
 
-            const raw_start = app.input_runtime.edit_state.cursor;
-            app.input_runtime.vertical_navigation.reset();
-            app.input_runtime.insertionState().insertSliceAssumeCapacity(
+            const raw_start = composer.edit_state.cursor;
+            composer.vertical_navigation.reset();
+            composer.insertionState().insertSliceAssumeCapacity(
                 app.alloc,
                 placeholder,
             );
-            if (comptime @hasField(@TypeOf(app.input_runtime), "entities")) {
-                app.input_runtime.entities.registerImageTokenAssumeCapacity(.{
+            if (comptime @hasField(@TypeOf(composer.*), "entities")) {
+                composer.entities.registerImageTokenAssumeCapacity(.{
                     .id = id,
                     .span = .{
                         .raw_start = raw_start,
@@ -171,14 +232,54 @@ pub fn Commands(comptime App: type) type {
             agents.screenAgentOf(app).pending_images.appendAssumeCapacity(attached);
             const committed_id = app.nextImageId(agents.screenAgentOf(app));
             std.debug.assert(committed_id == id);
-            if (comptime @hasDecl(@TypeOf(app.input_runtime), "historyBoundary")) {
-                app.input_runtime.historyBoundary(app.alloc);
+            if (comptime @hasDecl(@TypeOf(composer.*), "historyBoundary")) {
+                composer.historyBoundary(app.alloc);
             }
             owns_attached = false;
             return .inserted;
         }
     };
 }
+
+/// A hidden agent's stashed draft, as a composer to insert into. The live
+/// composer's picker belongs to the agent on screen, so insertion here
+/// reconciles a scratch picker and leaves the visible one alone.
+const DraftComposer = struct {
+    edit_state: *edit_contract.State,
+    entities: *registered_entities.State,
+    edit_history: *edit_history.State,
+    vertical_navigation: *vertical_navigation.State,
+    picker: picker_state.State = .{},
+    input_limit_rejection: input_limit_rejection.State = .{},
+
+    fn init(draft: *composer_stash.State) DraftComposer {
+        return .{
+            .edit_state = &draft.edit,
+            .entities = &draft.entities,
+            .edit_history = &draft.edit_history,
+            .vertical_navigation = &draft.vertical_navigation,
+        };
+    }
+
+    fn deinit(self: *DraftComposer, alloc: std.mem.Allocator) void {
+        self.picker.deinit(alloc);
+    }
+
+    fn insertionState(self: *DraftComposer) composer_insertion.State {
+        return .{
+            .edit = self.edit_state,
+            .history = self.edit_history,
+            .picker = &self.picker,
+            .entities = self.entities,
+            .vertical_navigation = self.vertical_navigation,
+            .input_limit_rejection = &self.input_limit_rejection,
+        };
+    }
+
+    pub fn historyBoundary(self: *DraftComposer, alloc: std.mem.Allocator) void {
+        self.edit_history.reset(alloc);
+    }
+};
 
 const FakeApp = struct {
     pub const input_byte_limit: usize = 4096;
@@ -198,8 +299,10 @@ const FakeApp = struct {
     notice_count: usize = 0,
     capture_error: ?anyerror = null,
     snapshot_dir: ?[]const u8 = null,
+    clipboard_read: clipboard_read.Runtime = .{},
 
     fn deinit(self: *FakeApp) void {
+        self.clipboard_read.deinit(self.alloc);
         self.clearPendingImages(&self.main_agent);
         self.agent().pending_images.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
@@ -993,4 +1096,193 @@ test "attachClipboard is silent on unsupported platforms" {
 
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+}
+
+/// Stands in for osascript in the clipboard tests: blocks until released,
+/// then hands back a PNG in a temp folder. No test reads the real clipboard.
+const HeldClipboard = struct {
+    release: std.atomic.Value(bool) = .init(false),
+    calls: std.atomic.Value(u32) = .init(0),
+
+    fn loader(self: *HeldClipboard) clipboard_read.Loader {
+        return .{ .ctx = self, .load = load };
+    }
+
+    fn load(ctx: ?*anyopaque, alloc: std.mem.Allocator, budget: image_attachments.CaptureBudget) anyerror!image_attachments.ClipboardImageAttachment {
+        const self: *HeldClipboard = @ptrCast(@alignCast(ctx.?));
+        _ = self.calls.fetchAdd(1, .seq_cst);
+        var waited_ms: usize = 0;
+        while (!self.release.load(.seq_cst)) : (waited_ms += 1) {
+            try budget.check();
+            if (waited_ms > 10_000) return error.TestClipboardNotReleased;
+            @import("../shared/io.zig").sleep(std.time.ns_per_ms);
+        }
+        const dir = try image_attachments.createTempSnapshotDir(alloc);
+        errdefer {
+            image_attachments.cleanupSnapshotDir(dir);
+            alloc.free(dir);
+        }
+        const path = try std.Io.Dir.path.join(alloc, &.{ dir, "clipboard.png" });
+        errdefer alloc.free(path);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "\x89PNG\r\n\x1a\nheld clipboard" });
+        return .{
+            .attachment = .{ .path = path, .media_type = try alloc.dupe(u8, "image/png") },
+            .source_dir = dir,
+        };
+    }
+};
+
+fn takeClipboardRead(app: *FakeApp) !clipboard_read.Finished {
+    var waited_ms: usize = 0;
+    while (true) : (waited_ms += 1) {
+        if (app.clipboard_read.take()) |finished| return finished;
+        if (waited_ms > 10_000) return error.TestTimedOut;
+        @import("../shared/io.zig").sleep(std.time.ns_per_ms);
+    }
+}
+
+test "attachClipboard returns while the clipboard export blocks and refuses a second read with a notice" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try realTmpPath(alloc, &tmp, ".");
+    defer alloc.free(root);
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
+    defer alloc.free(snapshot_dir);
+
+    var held: HeldClipboard = .{};
+    var app = FakeApp{ .alloc = alloc, .snapshot_dir = snapshot_dir, .clipboard_read = .{ .loader = held.loader() } };
+    defer app.deinit();
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "typed ");
+    app.input_runtime.edit_state.cursor = "typed ".len;
+
+    try Commands(FakeApp).attachClipboard(&app);
+    try std.testing.expectEqualStrings("reading clipboard\n", app.text());
+    try std.testing.expect(app.clipboard_read.take() == null);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().pending_images.items.len);
+
+    try Commands(FakeApp).attachClipboard(&app);
+    try std.testing.expectEqualStrings("reading clipboard\nalready reading clipboard\n", app.text());
+
+    held.release.store(true, .seq_cst);
+    var finished = try takeClipboardRead(&app);
+    defer finished.outcome.deinit(alloc);
+    try std.testing.expectEqual(@as(?*const anyopaque, app.agent()), finished.requester);
+    try Commands(FakeApp).finishClipboard(&app, &finished.outcome, null);
+
+    try std.testing.expectEqualStrings("typed [Image #1]", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().pending_images.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.image_tokens.items.len);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expectEqual(@as(u32, 1), held.calls.load(.seq_cst));
+}
+
+test "attachClipboard reports a worker that failed to start" {
+    const alloc = std.testing.allocator;
+    var held: HeldClipboard = .{};
+    var app = FakeApp{ .alloc = alloc, .clipboard_read = .{ .loader = held.loader(), .test_spawn_error = error.SystemResources } };
+    defer app.deinit();
+
+    try Commands(FakeApp).attachClipboard(&app);
+    try std.testing.expectEqualStrings("failed to paste clipboard image: SystemResources\n", app.text());
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+    try std.testing.expectEqual(@as(u32, 0), held.calls.load(.seq_cst));
+}
+
+test "finishClipboard puts the image into a hidden agent's stashed draft and leaves the composer alone" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try realTmpPath(alloc, &tmp, ".");
+    defer alloc.free(root);
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
+    defer alloc.free(snapshot_dir);
+
+    var app = FakeApp{ .alloc = alloc, .snapshot_dir = snapshot_dir };
+    defer app.deinit();
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "visible draft");
+    app.input_runtime.edit_state.cursor = 7;
+
+    var stash: composer_stash.State = .{};
+    defer stash.deinit(alloc);
+    try stash.edit.input.appendSlice(alloc, "hidden draft");
+    stash.edit.cursor = "hidden".len;
+
+    var outcome: clipboard_read.Outcome = .{ .image = try testClipboardImage(alloc, &tmp, "clipboard-hidden") };
+    defer outcome.deinit(alloc);
+    try Commands(FakeApp).finishClipboard(&app, &outcome, &stash);
+
+    try std.testing.expectEqualStrings("hidden[Image #1] draft", stash.edit.input.items);
+    try std.testing.expectEqual(@as(usize, "hidden[Image #1]".len), stash.edit.cursor);
+    try std.testing.expectEqual(@as(usize, 1), stash.entities.image_tokens.items.len);
+    try std.testing.expectEqual(@as(usize, "hidden".len), stash.entities.image_tokens.items[0].span.raw_start);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().pending_images.items.len);
+    // The composer belongs to the agent on screen and is untouched.
+    try std.testing.expectEqualStrings("visible draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 7), app.input_runtime.edit_state.cursor);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.image_tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.history_boundary_count);
+}
+
+test "finishClipboard reports a full composer and removes the clipboard's temp file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+    try app.input_runtime.edit_state.input.appendNTimes(alloc, 'x', FakeApp.input_byte_limit);
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    var outcome: clipboard_read.Outcome = .{ .image = try testClipboardImage(alloc, &tmp, "clipboard-full-finish") };
+    const source_dir = try alloc.dupe(u8, outcome.image.source_dir);
+    defer alloc.free(source_dir);
+    try Commands(FakeApp).finishClipboard(&app, &outcome, null);
+    outcome.deinit(alloc);
+
+    try std.testing.expectEqualStrings("input is full; image not attached\n", app.text());
+    try std.testing.expectEqual(@as(usize, 0), app.agent().pending_images.items.len);
+    try std.testing.expectEqual(FakeApp.input_byte_limit, app.input_runtime.edit_state.input.items.len);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(std.testing.io, source_dir, .{}));
+}
+
+test "finishClipboard shows a missing image, a timeout, and a failure as notices" {
+    const alloc = std.testing.allocator;
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    var no_image: clipboard_read.Outcome = .no_image;
+    try Commands(FakeApp).finishClipboard(&app, &no_image, null);
+    var timed_out: clipboard_read.Outcome = .timed_out;
+    try Commands(FakeApp).finishClipboard(&app, &timed_out, null);
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+    var failed: clipboard_read.Outcome = .{ .failed = error.AccessDenied };
+    try Commands(FakeApp).finishClipboard(&app, &failed, null);
+
+    try std.testing.expectEqualStrings(
+        "no image found on clipboard\nclipboard read timed out\nfailed to paste clipboard image: AccessDenied\n",
+        app.text(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.agent().pending_images.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+}
+
+test "dropClipboard tells the user an image was not attached and only logs other outcomes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var app = FakeApp{ .alloc = alloc };
+    defer app.deinit();
+
+    var no_image: clipboard_read.Outcome = .no_image;
+    try Commands(FakeApp).dropClipboard(&app, &no_image);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_count);
+
+    var image: clipboard_read.Outcome = .{ .image = try testClipboardImage(alloc, &tmp, "clipboard-dropped") };
+    const source_dir = try alloc.dupe(u8, image.image.source_dir);
+    defer alloc.free(source_dir);
+    try Commands(FakeApp).dropClipboard(&app, &image);
+    image.deinit(alloc);
+    try std.testing.expectEqualStrings("clipboard image not attached: the agent that asked has closed\n", app.text());
+    try std.testing.expectEqual(@as(usize, 0), app.agent().pending_images.items.len);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(std.testing.io, source_dir, .{}));
 }
