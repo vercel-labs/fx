@@ -70,7 +70,7 @@ After `initialize`, these rules apply to the connection:
 - A client calls an extension's methods only when fx's list names the extension. fx answers a method it doesn't support with the JSON-RPC error `-32601`, "Method not found".
 - Each side ignores the names it doesn't know in the other side's list.
 
-Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, and the following section defines `sh.fx/logPosition`. The table in "Keys in use today" names two more that replace fields fx uses today, `sh.fx/hooks` and `sh.fx/hostTools`, which later sections define.
+Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition`, and the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`. The table in "Keys in use today" names two more that replace fields fx uses today, `sh.fx/hooks` and `sh.fx/hostTools`, which later sections define.
 
 ## Extensions
 
@@ -236,6 +236,83 @@ After the replay, fx answers:
 
 `tests/tla/acp/AcpFollow.tla` models these rules, with the stable message ids of fix X21, and TLC checks that every connection that has the session open holds exactly its saved turns, with no gap and no repeat. Its `Today` configs show where fx breaks them now.
 
+### Session status and list changes
+
+This extension tells clients what each session is doing, which ACP v1 can't, and when the list of sessions changes. It follows ACP v2's [session states](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle), ACP's unstable [`session/status`](https://agentclientprotocol.com/rfds/session-status), and the [session list extensions](https://github.com/agentclientprotocol/agent-client-protocol/pull/2323) draft.
+
+#### Session state
+
+ACP v2 reports what a session is doing with a `state_update`. ACP v1 has no such update, so fx sends it as the `_sh.fx/session/state_update` notification to a client that lists the `sh.fx/sessionState` capability. Its `update` holds ACP's `StateUpdate`, so the notification becomes v2's `state_update` when fx moves to v2. fx sends these states:
+
+| `sh.fx/state` | Meaning |
+| --- | --- |
+| `"running"` | A turn runs |
+| `"requires_action"` | The running turn waits for the user, such as for a permission request |
+| `"idle"` | No turn runs |
+
+These rules apply on each connection that has the session open:
+
+- fx sends a notification each time the state changes, in order with the session's other updates.
+- `running` comes before the first update of a turn. `idle` comes after the turn's last update and before the `session/prompt` response, and its `stopReason` is the turn's.
+- A turn that goes on with steers, as "Steering and queued prompts" says, stays `running`. When a queued prompt or a steer runs as the next turn, fx sends `idle` for the turn that ended, then `running`.
+- A permission request that the turn waits for makes it `requires_action`, and fx sends `running` when the turn goes on.
+- When the client opens the session with `session/load` or `session/resume`, fx sends the current state after any replay and before its response, as ACP v2's resume does, so the client never holds an old one. The client doesn't reset the state when the response arrives. After `session/new`, fx sends `idle` after its response, which gives the client the session's id.
+
+A client that receives a state it doesn't know shows the session as busy until a known state arrives, as ACP v2 says.
+
+When a turn ends, fx sends:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "_sh.fx/session/state_update",
+  "params": {
+    "sessionId": "sess_abc123",
+    "update": { "state": "idle", "stopReason": "end_turn" }
+  }
+}
+```
+
+#### Session status
+
+fx supports ACP's unstable `session/status`, and lists `sessionCapabilities.status` in its `initialize` response. `status` is `"open"` when this fx process holds the session in memory, for any connection, and `"saved"` when the session exists only on disk. A session that fx doesn't know gets `-32002` with `data.sessionId`.
+
+For a client that lists `sh.fx/sessionState`, the response to an open session gives its state as `sh.fx/state` in `_meta`. A response is a snapshot: the state can change right after it, and the state notification tells a client that has the session open when it does.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "status": "open",
+    "_meta": { "sh.fx/state": "running" }
+  }
+}
+```
+
+#### The session list
+
+fx answers `session/list` at once, also while a turn runs on the connection. For a client that lists `sh.fx/sessionState`, each row of a session that fx holds in memory gives its state as `sh.fx/state` in `_meta`, as the draft's `state` field does. A row of a session that is only saved has no state, which means "not reported", not "idle".
+
+#### List changes
+
+A client that lists `sh.fx/listChanges` receives `_sh.fx/session/list_changed`, the draft's hint that a list changed. The hint names the folder of the session that changed, as `cwd`, and holds no rows:
+
+- fx sends the hint to a connection that has called `session/list` with that `cwd`, or with no `cwd`, which lists every folder.
+- A list changes when a session in the folder is saved for the first time, saves a turn, gets a new title, or is deleted. A change of state isn't a list change, because the state notification reports it.
+- fx sends the hint after it saves the change, so a `session/list` that the client sends after the hint returns the change.
+- One hint can stand for several changes. The client reads the first page again and drops the pages after it, as the draft says.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "_sh.fx/session/list_changed",
+  "params": { "cwd": "/home/user/project" }
+}
+```
+
+`tests/tla/acp/AcpSessionState.tla` models these rules, and TLC checks that a connection's view of a session's state is current whenever no state update is on its way, and that a list a connection holds is out of date only while a hint is on its way or after one arrived. Its `Today` configs show where fx breaks them now, and `tests/tla/drivers/acp/session_state/driver.ts` runs `fx acp` along the model.
+
 ## Names in use today
 
 fx's ACP server names its additions today with a `libfx/` prefix, which doesn't follow ACP's extension rules, and its wasm build accepts `session/remove`, which ACP calls `session/delete`. Each one gets the new name in this table:
@@ -313,3 +390,7 @@ The keys and capabilities move with the method names, under the same rules: for 
 | `LogPosition` | A position in a session's log: `sh.fx/position`, and the `position` in `sh.fx/replayFrom` |
 | `ReplayFrom` | The value of `sh.fx/replayFrom` |
 | `Replay` | The value of `sh.fx/replay`: `after_position` or `full` |
+| `SessionState` | The value of `sh.fx/state`: `running`, `requires_action`, or `idle` |
+| `SessionStateUpdate` | The `update` of `_sh.fx/session/state_update`, a part of ACP's `StateUpdate` |
+| `SessionStateUpdateParams` | The params of `_sh.fx/session/state_update` |
+| `ListChangedParams` | The params of `_sh.fx/session/list_changed` |
