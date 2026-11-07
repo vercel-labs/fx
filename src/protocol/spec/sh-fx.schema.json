@@ -30,7 +30,8 @@
         "sh.fx/hostSteering": { "$ref": "#/$defs/Capability" },
         "sh.fx/logPosition": { "$ref": "#/$defs/Capability" },
         "sh.fx/sessionState": { "$ref": "#/$defs/Capability" },
-        "sh.fx/listChanges": { "$ref": "#/$defs/Capability" }
+        "sh.fx/listChanges": { "$ref": "#/$defs/Capability" },
+        "sh.fx/sessionClients": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -43,7 +44,8 @@
         "sh.fx/promptDelivery": { "$ref": "#/$defs/Capability" },
         "sh.fx/logPosition": { "$ref": "#/$defs/Capability" },
         "sh.fx/sessionState": { "$ref": "#/$defs/Capability" },
-        "sh.fx/listChanges": { "$ref": "#/$defs/Capability" }
+        "sh.fx/listChanges": { "$ref": "#/$defs/Capability" },
+        "sh.fx/sessionClients": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -99,6 +101,36 @@
       "description": "The value of sh.fx/replay in the `_meta` of a `session/load` response: whether fx replayed the turns after the position, or the whole session because it didn't know the position.",
       "type": "string",
       "enum": ["after_position", "full"]
+    },
+    "ClientId": {
+      "description": "The id that fx gives a connection when it connects: sh.fx/clientId in the `_meta` of the `initialize` response, sh.fx/client in the `_meta` of a `user_message_chunk` from another client, and the `clientId` of a session client. Opaque.",
+      "type": "string",
+      "minLength": 1
+    },
+    "SessionClient": {
+      "description": "One client that has the session open: its id, and the `clientInfo` it sent at `initialize`, which follows ACP's `Implementation`.",
+      "type": "object",
+      "properties": {
+        "clientId": { "$ref": "#/$defs/ClientId" },
+        "clientInfo": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "title": { "type": "string" },
+            "version": { "type": "string" }
+          }
+        }
+      },
+      "required": ["clientId"]
+    },
+    "ClientsUpdateParams": {
+      "description": "The params of the `_sh.fx/session/clients_update` notification: every client that has the session open.",
+      "type": "object",
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "clients": { "type": "array", "items": { "$ref": "#/$defs/SessionClient" } }
+      },
+      "required": ["sessionId", "clients"]
     },
     "SessionState": {
       "description": "The value of sh.fx/state in the `_meta` of a `session/status` response and of a `session/list` row, and the `state` of a session state update: what the session is doing.",
