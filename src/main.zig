@@ -5342,6 +5342,7 @@ test {
     _ = @import("core/app/app_commands.zig");
     _ = credits_lookup;
     _ = @import("core/app/app_entry_runtime.zig");
+    _ = @import("core/app/app_host_config_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
     _ = input_submit_runtime;
     _ = @import("core/app/app_lifecycle.zig");

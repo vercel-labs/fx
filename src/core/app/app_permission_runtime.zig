@@ -1,5 +1,6 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
+const app_host_config_runtime = @import("app_host_config_runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -339,12 +340,23 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            var attempt = config_runtime.attemptUserPreferences(
+            var attempt = app_host_config_runtime.attemptUserPreferences(
+                App,
                 app.alloc,
                 .{ .yolo_acknowledged = true },
             );
             defer attempt.deinit(app.alloc);
             switch (attempt) {
+                // Held for this process: the host's config store does not
+                // keep the acknowledgment.
+                .host_owned => {
+                    app.permission_state.yolo_acknowledged = true;
+                    debug_trace.logf(
+                        "permission",
+                        "interactive_yolo_acknowledgment_persisted outcome=host_owned",
+                        .{},
+                    );
+                },
                 .outcome => |outcome| {
                     app.permission_state.yolo_acknowledged = true;
                     debug_trace.logf(
@@ -393,12 +405,19 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            var attempt = config_runtime.attemptUserPreferences(
+            var attempt = app_host_config_runtime.attemptUserPreferences(
+                App,
                 app.alloc,
                 .{ .permission_mode = mode },
             );
             defer attempt.deinit(app.alloc);
             switch (attempt) {
+                // selectMode already saved the mode in the host's config store.
+                .host_owned => debug_trace.logf(
+                    "permission",
+                    "interactive_permission_mode_persisted mode={s} outcome=host_owned",
+                    .{permissions.permissionModeLabel(mode)},
+                ),
                 .outcome => |outcome| {
                     debug_trace.logf(
                         "permission",
