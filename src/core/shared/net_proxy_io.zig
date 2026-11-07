@@ -537,9 +537,20 @@ test "a proxy that never answers is ended at the caller's deadline and leaves it
     useSnapshotForTest(TestEnv{ .pairs = &.{.{ "HTTPS_PROXY", url }} });
     defer resetSnapshotForTest();
     var server = try io.concurrent(FakeProxy.serveOne, .{ &proxy, base });
+    defer server.cancel(base);
 
+    // The handle's connect calls the connector directly. Through
+    // HostName.connect, std may run the attempt inline on this thread when
+    // no pool thread is free, and then reports the cancel as UnknownHostName.
+    var lookup_buf: [4]HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(HostName.LookupResult) = .init(&lookup_buf);
+    try HostName.lookup(try HostName.init("silent.invalid"), io, &lookup_queue, .{ .port = 443 });
+    const tunnel = switch (try lookup_queue.getOne(io)) {
+        .address => |address| address,
+        .canonical_name => return error.TestExpectedAddress,
+    };
     const since = beginOpen();
-    var connect = try io.concurrent(testConnect, .{ io, "silent.invalid", 443 });
+    var connect = try io.concurrent(IpAddress.connect, .{ &tunnel, io, .{ .mode = .stream } });
     // The deadline, without waiting for one: once the proxy holds the
     // CONNECT, the caller cancels, as a request's setup deadline does.
     while (!proxy.head_done.load(.acquire)) try base.sleep(.fromMilliseconds(1), .awake);
@@ -547,7 +558,6 @@ test "a proxy that never answers is ended at the caller's deadline and leaves it
         stream.close(io);
         return error.TestExpectedCancel;
     } else |err| try std.testing.expectEqual(error.Canceled, err);
-    server.await(base);
     var buf: [256]u8 = undefined;
     noteOpenFailure(try std.Uri.parse("https://silent.invalid/"), since, error.ConnectionSetupTimedOut);
     try std.testing.expect(std.mem.endsWith(u8, takeRequestFailure(error.ConnectionSetupTimedOut, &buf).?, "did not answer CONNECT to silent.invalid:443"));
