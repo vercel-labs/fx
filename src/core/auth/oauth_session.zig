@@ -806,11 +806,34 @@ fn beginMutation() !Mutation {
 }
 
 fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
-    var probe = MutationLockProbe{ .fx_dir = open_fx_dir.dir };
-    return lockMutationWithOps(open_fx_dir, mutation_lock_wait_ms, .{
-        .ctx = &probe,
-        .try_lock = MutationLockProbe.tryLock,
-    });
+    var fx_dir = open_fx_dir;
+    var shared_dir = openSharedKeychainLockDir(storageBackend()) catch |err| {
+        fx_dir.close();
+        return session_presence.storageError(auth_file_name, err);
+    };
+    defer if (shared_dir) |*dir| dir.close();
+
+    var probe = MutationLockProbe{ .fx_dir = fx_dir.dir };
+    return lockMutationWithBackend(
+        fx_dir,
+        if (shared_dir) |*dir| dir else null,
+        mutation_lock_wait_ms,
+        .{ .ctx = &probe, .try_lock = MutationLockProbe.tryLock },
+        storageBackend(),
+        native_keychain_backend,
+    );
+}
+
+/// Every profile shares the Keychain session, so a profile that `FX_HOME`
+/// moved takes `auth.lock` in the default `~/.fx`. Null otherwise.
+fn openSharedKeychainLockDir(backend: StorageBackend) !?io_mod.VerifiedDir {
+    if (backend != .macos_keychain) return null;
+    const parent = profile_paths.sharedRootParent(io_mod.getenv("HOME")) orelse return null;
+    var parent_dir = io_mod.VerifiedDir{
+        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent, .{ .iterate = true }),
+    };
+    defer parent_dir.close();
+    return try io_mod.openOrCreateVerifiedPrivateDir(&parent_dir, profile_paths.root_dir_name);
 }
 
 fn lockMutationWithOps(
@@ -820,6 +843,7 @@ fn lockMutationWithOps(
 ) !Mutation {
     return lockMutationWithBackend(
         open_fx_dir,
+        null,
         wait_ms,
         ops,
         storageBackend(),
@@ -827,8 +851,10 @@ fn lockMutationWithOps(
     );
 }
 
+/// Locks `auth.lock` in `lock_dir`, or in the profile when null.
 fn lockMutationWithBackend(
     open_fx_dir: io_mod.VerifiedDir,
+    lock_dir: ?*io_mod.VerifiedDir,
     wait_ms: i64,
     ops: io_mod.LockOps,
     backend: StorageBackend,
@@ -838,7 +864,7 @@ fn lockMutationWithBackend(
     errdefer fx_dir.close();
 
     const taken = leased_lock.acquire(
-        &fx_dir,
+        lock_dir orelse &fx_dir,
         mutation_lock_file_name,
         io_mod.awakeMilliTimestamp(),
         wait_ms,
@@ -1186,6 +1212,7 @@ fn writeTestAuthFile(dir: std.Io.Dir, contents: []const u8) !void {
 fn testKeychainMutation(dir: std.Io.Dir, keychain: KeychainBackend) !Mutation {
     return lockMutationWithBackend(
         .{ .dir = try dir.openDir(std.testing.io, ".", .{ .iterate = true }) },
+        null,
         0,
         .{},
         .macos_keychain,
@@ -1636,6 +1663,52 @@ test "OAuth session mutation lock serializes independent handles" {
             .{},
         ),
     );
+}
+
+test "OAuth Keychain mutations from two profiles share one lock folder" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "default");
+    try tmp.dir.createDirPath(std.testing.io, "profile-a");
+    try tmp.dir.createDirPath(std.testing.io, "profile-b");
+    var shared = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, "default", .{ .iterate = true }) };
+    defer shared.close();
+
+    var fake = FakeOAuthKeychain{ .alloc = alloc };
+    defer fake.deinit();
+    var first = try lockMutationWithBackend(
+        .{ .dir = try tmp.dir.openDir(std.testing.io, "profile-a", .{ .iterate = true }) },
+        &shared,
+        0,
+        .{},
+        .macos_keychain,
+        fake.backend(),
+    );
+    defer first.deinit();
+
+    try std.testing.expectError(
+        error.LockBusy,
+        lockMutationWithBackend(
+            .{ .dir = try tmp.dir.openDir(std.testing.io, "profile-b", .{ .iterate = true }) },
+            &shared,
+            0,
+            .{},
+            .macos_keychain,
+            fake.backend(),
+        ),
+    );
+    _ = try tmp.dir.statFile(std.testing.io, "default/" ++ mutation_lock_file_name, .{});
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(std.testing.io, "profile-a/" ++ mutation_lock_file_name, .{}),
+    );
+}
+
+test "OAuth mutations lock in the profile without FX_HOME or without the Keychain" {
+    try std.testing.expect(!profile_paths.fxHomeActive());
+    try std.testing.expect((try openSharedKeychainLockDir(.macos_keychain)) == null);
+    try std.testing.expect((try openSharedKeychainLockDir(.profile_file)) == null);
 }
 
 test "oauth E2E issuer override accepts loopback HTTP only" {

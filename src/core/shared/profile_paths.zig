@@ -114,6 +114,15 @@ pub fn rootName() []const u8 {
     return std.Io.Dir.path.basename(root);
 }
 
+/// The folder that holds the default `~/.fx` while `FX_HOME` is set: `home`,
+/// when it is absolute. Null without `FX_HOME`.
+pub fn sharedRootParent(home: ?[]const u8) ?[]const u8 {
+    if (fx_home == null) return null;
+    const path = home orelse return null;
+    if (!std.Io.Dir.path.isAbsolute(path)) return null;
+    return path;
+}
+
 /// Joins `parts` under fx's folder. The caller owns the result.
 pub fn rootPath(alloc: Allocator, home: []const u8, parts: []const []const u8) ![]u8 {
     var all: std.ArrayList([]const u8) = .empty;
@@ -279,6 +288,16 @@ test "profile path helpers preserve current default locations" {
     const recordings = try recordingsDir(alloc, "/tmp/fake-home");
     defer alloc.free(recordings);
     try std.testing.expectEqualStrings("/tmp/fake-home/.fx/recordings", recordings);
+}
+
+test "FX_HOME leaves the shared folder in the home folder" {
+    defer fx_home = null;
+
+    try std.testing.expect(sharedRootParent("/Users/example") == null);
+    try useFxHome("/tmp/fx-profile", "/Users/example");
+    try std.testing.expectEqualStrings("/Users/example", sharedRootParent("/Users/example").?);
+    try std.testing.expect(sharedRootParent(null) == null);
+    try std.testing.expect(sharedRootParent("relative/home") == null);
 }
 
 test "FX_HOME moves every profile path and how messages name it" {
