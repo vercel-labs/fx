@@ -44,6 +44,7 @@
     {"name": "acp_jsonrpc", "module": "fx", "test": "ACP frames stay one parseable line and read the same however they are split", "iterations": 400000},
     {"name": "mcp_wire", "module": "fx", "test": "MCP wire decoding returns only whole JSON values from valid input", "iterations": 900000},
     {"name": "shell_parity", "module": "fx", "test": "shell parity holds for generated commands", "iterations": 600},
+    {"name": "shell_snapshot_payload", "module": "fx", "test": "snapshot payload parsing keeps its laws on fuzzed sections", "iterations": 350000},
     {"name": "command_lex", "module": "fx", "test": "lexing generated commands is consistent and round-trips through quoting", "iterations": 2700000},
     {"name": "command_classification", "module": "fx", "test": "classifying generated commands stays inside the command and agrees with the lexer", "iterations": 4800000},
     {"name": "cli_flags", "module": "fx", "test": "the flag parser keeps its laws on fuzzed command lines", "iterations": 1200000},
