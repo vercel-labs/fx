@@ -5135,7 +5135,8 @@ describe("gateway stream lifecycle", () => {
         env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,tool,permission" },
         timeoutMs: 15_000,
       });
-      expect(result.code).toBe(0);
+      // The stop fails the turn, as fx's other loop stops do.
+      expect(result.code).toBe(1);
       expect(gateway.requestCount()).toBe(2);
       expect(existsSync(marker)).toBe(false);
       const json = parseAskJson(result.stdout);

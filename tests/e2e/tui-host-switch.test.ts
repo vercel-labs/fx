@@ -1702,6 +1702,59 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "a subagent fx stops for repeated invalid shell calls reports to main that it failed, and why",
+    async () => {
+      const env: Record<string, string> = {};
+      let tracePath = "";
+      let report = "";
+      let laneSteps = 0;
+      // The same invalid call each step: fx validates it, runs nothing, and
+      // stops the subagent's tool loop after the second identical failure.
+      const invalidShell = (id: string) => toolCall(id, "shell", {
+        request: { command: "printf unexpected > must-not-run.txt", tty: true, shell: { kind: "executable", path: "/bin/bash" } },
+        yield_time_ms: "1000",
+      });
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          laneSteps += 1;
+          if (laneSteps > 2) return text("lane4_extra", "LANE4_ASKED_AGAIN");
+          return invalidShell(`lane4_bad_${laneSteps}`);
+        }
+        if (latestUserText(body).includes('"child_id"')) {
+          report = latestUserText(body);
+          return text("main_report", "MAIN_SAW_REPORT");
+        }
+        if (!body.includes('"main_lane4"')) {
+          return toolCall("main_lane4", "subagent", { request: { action: "message", agent: "lane4", message: "LANE4_TASK run the bench" } });
+        }
+        return text("main_waiting", "MAIN_WAITING");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER start lane4");
+        await session.waitForText("MAIN_SAW_REPORT", 60_000);
+        await session.waitForComposer(30_000);
+        expect(traceHas(tracePath, "terminal_validation_retry")).toBe(true);
+        // The subagent asked the model only for its two invalid calls.
+        expect(laneSteps).toBe(2);
+        const screen = await session.captureFullScrollback();
+        expect(screen).toContain("lane4 failed");
+        expect(screen).not.toContain("lane4 completed");
+        // Main's model hears that lane4 failed and why, so it can recover
+        // or tell the user.
+        const fields = JSON.parse(report.slice(report.indexOf("{")));
+        expect(fields.outcome).toBe("failed");
+        expect(fields.output).toContain("Repeated shell validation failures stopped the tool loop.");
+        // lane4's own screen still says why it stopped.
+        await moveAgent(session, 1);
+        await session.waitForText("Repeated shell validation failures stopped the tool loop.", 10_000);
+      }, (home) => {
+        tracePath = join(home, "fx-trace.log");
+        env.FX_TRACE_LOG = tracePath;
+      }, false, env);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a subagent's report that waits for main's running turn never shows as a message the user queued",
     async () => {
       const env: Record<string, string> = {};
