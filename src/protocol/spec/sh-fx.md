@@ -70,7 +70,7 @@ After `initialize`, these rules apply to the connection:
 - A client calls an extension's methods only when fx's list names the extension. fx answers a method it doesn't support with the JSON-RPC error `-32601`, "Method not found".
 - Each side ignores the names it doesn't know in the other side's list.
 
-Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition`, and the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`. The table in "Keys in use today" names two more that replace fields fx uses today, `sh.fx/hooks` and `sh.fx/hostTools`, which later sections define.
+Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, the following section defines `sh.fx/logPosition` and `sh.fx/sessionClients`, and the status section defines `sh.fx/sessionState` and `sh.fx/listChanges`. The table in "Keys in use today" names two more that replace fields fx uses today, `sh.fx/hooks` and `sh.fx/hostTools`, which later sections define.
 
 ## Extensions
 
@@ -236,6 +236,43 @@ After the replay, fx answers:
 
 `tests/tla/acp/AcpFollow.tla` models these rules, with the stable message ids of fix X21, and TLC checks that every connection that has the session open holds exactly its saved turns, with no gap and no repeat. Its `Today` configs show where fx breaks them now.
 
+#### Prompts from other clients
+
+When a prompt starts a turn, or runs after the queue, fx sends its content as `user_message_chunk` updates to every other client that has the session open. ACP v2 requires the Agent to report each prompt it takes, and the sender of a v1 prompt already shows it, so the sender gets no copy. A steer is different: when the turn takes it, every client gets its chunk, the sender included, as "Steers" says, because the chunk marks where the steer joined the turn. For a client that lists `sh.fx/sessionClients`, each chunk's `_meta` names the sender as `sh.fx/client`, with the id from "Who is connected".
+
+#### Permission requests
+
+fx sends a turn's `session/request_permission` to every client that has the session open, and to a client that opens the session while the request waits, after any replay and before the response to its load or resume, as ACP v2 reestablishes a pending request. While no client has the session open, the request waits for the next one.
+
+The first answer decides. fx cancels the request on the other clients with `$/cancel_request`, as ACP lets an Agent cancel its own requests, and ignores a later answer, including their `cancelled` outcome. The tool call's updates then tell every client what happened, as for any permission request.
+
+#### Stopping a turn
+
+`session/cancel` names a session, so any client that has the session open can stop the running turn, whichever client sent its prompt. Every client then sees the turn end, and the prompt's sender gets its response with `stopReason` `cancelled`. A client that doesn't have the session open gets `-32002`.
+
+#### Who is connected
+
+A client that lists `sh.fx/sessionClients` learns which clients have the session open. fx gives each connection an id when it connects, and returns the caller's own id as `sh.fx/clientId` in the `_meta` of its `initialize` response. fx sends the `_sh.fx/session/clients_update` notification with the whole list:
+
+- after a client opens or closes the session, or its connection ends, to every client that has the session open;
+- to a client that opens the session, after any replay and before its response to a load or resume, and after its response to `session/new`.
+
+Each entry gives a client's id and the `clientInfo` that the client sent at `initialize`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "_sh.fx/session/clients_update",
+  "params": {
+    "sessionId": "sess_abc123",
+    "clients": [
+      { "clientId": "c1", "clientInfo": { "name": "fx-desktop", "version": "0.4.0" } },
+      { "clientId": "c2", "clientInfo": { "name": "zed", "version": "0.190.0" } }
+    ]
+  }
+}
+```
+
 ### Session status and list changes
 
 This extension tells clients what each session is doing, which ACP v1 can't, and when the list of sessions changes. It follows ACP v2's [session states](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle), ACP's unstable [`session/status`](https://agentclientprotocol.com/rfds/session-status), and the [session list extensions](https://github.com/agentclientprotocol/agent-client-protocol/pull/2323) draft.
@@ -390,6 +427,9 @@ The keys and capabilities move with the method names, under the same rules: for 
 | `LogPosition` | A position in a session's log: `sh.fx/position`, and the `position` in `sh.fx/replayFrom` |
 | `ReplayFrom` | The value of `sh.fx/replayFrom` |
 | `Replay` | The value of `sh.fx/replay`: `after_position` or `full` |
+| `ClientId` | The id that fx gives a connection: `sh.fx/clientId`, `sh.fx/client`, and the `clientId` of a session client |
+| `SessionClient` | One entry of the list of clients that have a session open |
+| `ClientsUpdateParams` | The params of `_sh.fx/session/clients_update` |
 | `SessionState` | The value of `sh.fx/state`: `running`, `requires_action`, or `idle` |
 | `SessionStateUpdate` | The `update` of `_sh.fx/session/state_update`, a part of ACP's `StateUpdate` |
 | `SessionStateUpdateParams` | The params of `_sh.fx/session/state_update` |
