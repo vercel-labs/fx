@@ -9,6 +9,7 @@ const local_address = @import("../core/shared/local_address.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
 const input_loop_guard = @import("../core/shared/input_loop_guard.zig");
 const io_mod = @import("../core/shared/io.zig");
+const net_proxy_io = @import("../core/shared/net_proxy_io.zig");
 const select_watch = @import("../core/shared/select_watch.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
 const types = @import("../core/shared/types.zig");
@@ -1545,8 +1546,14 @@ fn openGatewayRequestBounded(
     }
 
     if (comptime !builtin.single_threaded) {
+        // A proxy failure is logged on the thread that connects; this request
+        // claims only its own, on its own thread (`net_proxy_io.zig`).
+        const proxy_mark = net_proxy_io.beginOpen();
         const job = try OpenJob.start(pool, uri, options, request_open_override);
-        var opened = try job.waitForOpen(uri, options, epoch.deadline, cancel_flag, reused);
+        var opened = job.waitForOpen(uri, options, epoch.deadline, cancel_flag, reused) catch |err| {
+            net_proxy_io.noteOpenFailure(uri, proxy_mark, err);
+            return err;
+        };
         if (cancel_flag.load(.seq_cst)) {
             opened.deinit();
             return error.Cancelled;
@@ -2677,12 +2684,17 @@ fn openBoundedPostWith(
         .redirect_behavior = .unhandled,
     };
     if (comptime builtin.single_threaded) return error.ConcurrencyUnavailable;
+    // As in openGatewayRequestBounded: this request claims only its own proxy failure.
+    const proxy_mark = net_proxy_io.beginOpen();
     const job = try OpenJob.start(null, target.uri, options, request_open_override);
     var reused = false;
-    var opened = job.waitForOpen(target.uri, options, deadline, cancel_flag, &reused) catch |err| return switch (err) {
-        // The bound error callers of a bounded operation already handle.
-        error.ConnectionSetupTimedOut => error.Timeout,
-        else => err,
+    var opened = job.waitForOpen(target.uri, options, deadline, cancel_flag, &reused) catch |err| {
+        net_proxy_io.noteOpenFailure(target.uri, proxy_mark, err);
+        return switch (err) {
+            // The bound error callers of a bounded operation already handle.
+            error.ConnectionSetupTimedOut => error.Timeout,
+            else => err,
+        };
     };
     if (cancel_flag.load(.seq_cst)) {
         opened.deinit();
@@ -12051,4 +12063,102 @@ test "two hundred Esc presses during stuck unpooled lookups leave no job, client
         try waitForOwnClientOpenJobs();
         _ = try fixture.lateConnection(0);
     }
+}
+
+test "two concurrent opens, one through a failing proxy: only that request names the proxy" {
+    const io = io_mod.getIo();
+    // A loopback proxy that answers its one CONNECT with 407.
+    const Proxy = struct {
+        server: std.Io.net.Server,
+
+        fn serve(p: *@This()) void {
+            const stream = p.server.accept(std.testing.io) catch return;
+            defer stream.close(std.testing.io);
+            var read_buf: [512]u8 = undefined;
+            var reader = stream.reader(std.testing.io, &read_buf);
+            var tail: [4]u8 = @splat(0);
+            while (!std.mem.eql(u8, &tail, "\r\n\r\n")) {
+                const byte = reader.interface.takeByte() catch return;
+                tail = .{ tail[1], tail[2], tail[3], byte };
+            }
+            var write_buf: [128]u8 = undefined;
+            var writer = stream.writer(std.testing.io, &write_buf);
+            writer.interface.writeAll("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n") catch return;
+            writer.interface.flush() catch return;
+        }
+    };
+    const loopback: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var proxy: Proxy = .{ .server = try loopback.listen(std.testing.io, .{ .reuse_address = true }) };
+    defer proxy.server.deinit(std.testing.io);
+    // A closed loopback port that NO_PROXY sends direct.
+    var closed = try loopback.listen(std.testing.io, .{ .reuse_address = true });
+    const closed_port = closed.socket.address.getPort();
+    closed.deinit(std.testing.io);
+
+    var proxy_url_buf: [48]u8 = undefined;
+    const proxy_url = try std.mem.print(&proxy_url_buf, "http://127.0.0.1:{d}", .{proxy.server.socket.address.getPort()});
+    const Env = struct {
+        proxy: []const u8,
+        pub fn get(e: @This(), name: []const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "HTTPS_PROXY")) return e.proxy;
+            if (std.mem.eql(u8, name, "NO_PROXY")) return "localhost";
+            if (std.mem.eql(u8, name, "FX_TEST_NET_PROXY_LOOPBACK")) return "1";
+            return null;
+        }
+    };
+    net_proxy_io.useSnapshotForTest(Env{ .proxy = proxy_url });
+    defer net_proxy_io.resetSnapshotForTest();
+    var server = try io.concurrent(Proxy.serve, .{&proxy});
+
+    const Request = struct {
+        url: []const u8,
+        start: *std.Io.Event,
+        failed: *std.Io.Event,
+        /// The direct request reports only after the proxied failure is
+        /// logged: the order where a shared failure would leak into it.
+        report_after: ?*std.Io.Event = null,
+        err: ?anyerror = null,
+        shown: ?[]const u8 = null,
+        buf: [256]u8 = undefined,
+
+        fn run(r: *@This()) void {
+            const request_io = io_mod.getIo();
+            r.start.waitUncancelable(request_io);
+            var cancel_flag = std.atomic.Value(bool).init(false);
+            const deadline = std.Io.Clock.Timestamp.fromNow(request_io, .{ .clock = .awake, .raw = .fromSeconds(10) });
+            const uri = std.Uri.parse(r.url) catch return;
+            if (openBoundedPost(&cancel_flag, deadline, .{ .uri = uri, .authorization = null })) |opened| {
+                var owned = opened;
+                owned.deinit();
+                r.failed.set(request_io);
+            } else |err| {
+                r.failed.set(request_io);
+                r.err = err;
+                if (r.report_after) |event| event.waitUncancelable(request_io);
+                // What the app shows for the failure, on the request's thread.
+                r.shown = net_proxy_io.takeRequestFailure(err, &r.buf);
+            }
+        }
+    };
+    var start: std.Io.Event = .unset;
+    var proxied_failed: std.Io.Event = .unset;
+    var direct_failed: std.Io.Event = .unset;
+    var direct_url_buf: [48]u8 = undefined;
+    var proxied: Request = .{ .url = "https://proxied.invalid/v1/chat", .start = &start, .failed = &proxied_failed };
+    var direct: Request = .{
+        .url = try std.mem.print(&direct_url_buf, "http://localhost:{d}/v1/chat", .{closed_port}),
+        .start = &start,
+        .failed = &direct_failed,
+        .report_after = &proxied_failed,
+    };
+    var a = try io.concurrent(Request.run, .{&proxied});
+    var b = try io.concurrent(Request.run, .{&direct});
+    start.set(io);
+    a.await(io);
+    b.await(io);
+    server.await(io);
+    try std.testing.expectEqual(@as(?anyerror, error.AccessDenied), proxied.err);
+    try std.testing.expect(std.mem.find(u8, proxied.shown.?, "refused CONNECT to proxied.invalid:443: 407 Proxy Authentication Required") != null);
+    try std.testing.expectEqual(@as(?anyerror, error.ConnectionRefused), direct.err);
+    try std.testing.expect(direct.shown == null);
 }
