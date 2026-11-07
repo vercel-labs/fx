@@ -50,7 +50,6 @@ import { binary, targetHelpers, testEnvironment } from "../lib/context";
 import { TLA_ROOT, outDir, tlcToolchain, writeJson } from "../lib/tlc";
 
 const CAP = 64;
-const MODEL = "openai/gpt-5";
 const MAIN_MARK = "DRIVER_MAIN";
 // A long walk fills main's context, and fx compacts it mid-turn. That
 // request is not one of main's steps; it gets plain notes, as the E2E tests'
@@ -273,6 +272,7 @@ type Outcome = { events: Event[]; mismatch: Event | null; seconds: number; maxRs
 // and `race` rounds of concurrent reads and messages run instead.
 async function runWalk(label: string, children: string[], plan: Planned[], scratch: string, race = 0): Promise<Outcome> {
   const helpers = await targetHelpers();
+  const fakeModel: string = helpers.FAKE_GATEWAY_MODEL;
   const model = new Model(children);
   const events: Event[] = [];
   let mismatch: Event | null = null;
@@ -557,7 +557,7 @@ async function runWalk(label: string, children: string[], plan: Planned[], scrat
       held.set(c, resolve);
       arrive(c, body);
     });
-  }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+  }, { models: [{ id: fakeModel, type: "language", tags: ["tool-use"] }] });
 
   const root = mkdtempSync(join(scratch, `${label}-`));
   home = join(root, "home");
@@ -577,7 +577,7 @@ async function runWalk(label: string, children: string[], plan: Planned[], scrat
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
       FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
       FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-      FX_MODEL: MODEL,
+      FX_MODEL: fakeModel,
       FX_MAX_AGENT_STEPS: "0",
       FX_TRACE_LOG: tracePath,
     }),
