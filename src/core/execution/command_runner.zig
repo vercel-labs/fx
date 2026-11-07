@@ -37,8 +37,9 @@ pub const Config = struct {
     timeout_started_ms: ?i64 = null,
     command_artifact_capability: ?*session_child_store.SessionChildCapability = null,
     command_artifact_dir: ?[]const u8 = null,
-    /// Shell snapshot epoch of the remembered grant that admitted a `user`
-    /// profile command, or null when it was not admitted by a grant.
+    /// Shell snapshot epoch a `user` profile command was admitted under:
+    /// the remembered grant's, or that of the generation whose names its
+    /// routine-command check read. Null when neither admitted it.
     shell_grant_epoch: ?u64 = null,
     /// Variables added to the command's environment after `AI_AGENT`,
     /// such as the `fx mcp call` bridge's address. Borrowed for the run.
@@ -885,12 +886,27 @@ fn executeWithSnapshot(
         // The replay stopped before the command started, so the command has
         // not run. Fail this snapshot and let the caller run it once with
         // full startup.
+        owner.markReplayFailed(generation);
+        // Full startup reads the startup files again, so an approval bound
+        // to this generation's epoch runs only if they have not changed
+        // since its capture (`tests/tla/tool_admission/RoutineNames.tla`
+        // ReplayFail).
+        if (cfg.shell_grant_epoch) |epoch| {
+            owner.checkStartupFiles();
+            if (epoch != owner.approvalEpoch()) {
+                debug_trace.logf(
+                    "core",
+                    "command runner snapshot replay failed generation={d}; dropped its failure marker from the live output; startup files changed, not rerunning",
+                    .{generation.id},
+                );
+                return try approvalResetResult(arena, command, cwd);
+            }
+        }
         debug_trace.logf(
             "core",
             "command runner snapshot replay failed generation={d}; dropped its failure marker from the live output; rerunning with full startup",
             .{generation.id},
         );
-        owner.markReplayFailed(generation);
         return null;
     }
     if (presented) |*filter| filter.finishOrLog();
@@ -2559,6 +2575,106 @@ test "user profile command reruns once with full startup after a failed replay" 
     var notice_buffer: [256]u8 = undefined;
     const notice = shell_snapshot.processOwner().takeUiNotice(&notice_buffer).?;
     try std.testing.expect(std.mem.find(u8, notice, "could not be restored") != null);
+}
+
+/// A capture whose replay appends to the startup file at `startup_path`, a
+/// shell word, and then fails: the files change while the snapshot runs.
+const EditingReplayCapture = struct {
+    var startup_path: []const u8 = "";
+
+    fn capture(request: shell_snapshot.CaptureRequest) shell_snapshot.CaptureOutcome {
+        const generation = shell_snapshot.Generation.create() catch return .{ .failed = .out_of_memory };
+        const alloc = generation.arena.allocator();
+        generation.shell_path = alloc.dupe(u8, request.shell_path) catch {
+            generation.destroy();
+            return .{ .failed = .out_of_memory };
+        };
+        generation.replay = alloc.print("print -r -- '# edited' >> {s}\nfxsnap_broken() {{\n", .{startup_path}) catch {
+            generation.destroy();
+            return .{ .failed = .out_of_memory };
+        };
+        generation.environ.put("PATH", "/usr/bin:/bin") catch {};
+        return .{ .ready = generation };
+    }
+};
+
+/// Points fx's startup-file checks at the test home until the test ends.
+fn installSnapshotTestEnvironment(arena: Allocator, paths: SnapshotTestShell) !*std.process.Environ.Map {
+    const environ = try arena.create(std.process.Environ.Map);
+    environ.* = .init(arena);
+    try environ.put("HOME", paths.home);
+    try environ.put("ZDOTDIR", paths.home);
+    try environ.put("PATH", "/usr/bin:/bin");
+    io_mod.setEnvironMap(environ);
+    return environ;
+}
+
+fn expectAbsent(path: []const u8) !void {
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    return error.TestUnexpectedResult;
+}
+
+test "an approval bound to a snapshot epoch does not rerun with full startup after the files changed" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShell(arena, &tmp, "# startup\n");
+    _ = try installSnapshotTestEnvironment(arena, paths);
+    defer io_mod.resetEnvironForTest();
+    EditingReplayCapture.startup_path = try shellQuote(arena, try std.Io.Dir.path.join(arena, &.{ paths.home, ".zshrc" }));
+    shell_snapshot.resetProcessOwnerForTest(EditingReplayCapture.capture);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    // The approval checked the names of the generation the replay restores.
+    // The full-startup rerun would read the edited files instead.
+    const marker_path = try std.Io.Dir.path.join(arena, &.{ paths.workspace, "ran.log" });
+    const command = try arena.print("print -r -- ran >> {s}", .{try shellQuote(arena, marker_path)});
+    const result = try executeCommandInEnvironment(
+        .{ .max_command_output_bytes = 16 * 1024, .shell_grant_epoch = shell_snapshot.processOwner().approvalEpoch() },
+        arena,
+        command,
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    try std.testing.expectEqual(@as(?i64, 126), result.command_result.?.exit_code);
+    try std.testing.expect(std.mem.find(u8, result.output, "changed after it was approved") != null);
+    try expectAbsent(marker_path);
+}
+
+test "an approval bound to a snapshot epoch reruns with full startup after a failed replay" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShell(arena, &tmp, "# startup\n");
+    _ = try installSnapshotTestEnvironment(arena, paths);
+    defer io_mod.resetEnvironForTest();
+    shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    const marker_path = try std.Io.Dir.path.join(arena, &.{ paths.workspace, "ran.log" });
+    const command = try arena.print("print -r -- ran >> {s}", .{try shellQuote(arena, marker_path)});
+    const result = try executeCommandInEnvironment(
+        .{ .max_command_output_bytes = 16 * 1024, .shell_grant_epoch = shell_snapshot.processOwner().approvalEpoch() },
+        arena,
+        command,
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expectEqualStrings("ran\n", try readAbsoluteFile(arena, marker_path, 4096));
 }
 
 test "bash user profile command hides a failed replay from its output" {

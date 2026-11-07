@@ -171,6 +171,26 @@ function runGit(cwd: string, args: string[]) {
   return result.stdout.toString();
 }
 
+/// The startup files a `user` profile command reads, for either login shell
+/// fx uses: zsh reads `.zshrc` from ZDOTDIR, which the alias tests point at
+/// the temporary home, and a bash login shell reads `.bash_profile`.
+function startupFiles(root: IsolatedRoot): string[] {
+  return [join(root.home, ".zshrc"), join(root.home, ".bash_profile")];
+}
+
+function writeStartupFiles(root: IsolatedRoot, contents: string) {
+  for (const file of startupFiles(root)) writeFileSync(file, contents);
+}
+
+/// An alias line that turns `git` into a command that only leaves `marker`.
+function gitAliasLine(marker: string): string {
+  return `alias git='touch ${marker}'`;
+}
+
+function aliasEnv(root: IsolatedRoot, gateway: ReturnType<typeof startFakeGateway>) {
+  return { ...gatewayEnv(root, gateway), ZDOTDIR: root.home };
+}
+
 function startGateway(
   responses: Parameters<typeof startFakeGateway>[0],
   classifierResponses: NonNullable<
@@ -558,6 +578,139 @@ describe("lean auto mode reliability", () => {
       expect(json.tool_calls).toContainEqual(
         expect.objectContaining({ name: "shell", status: "success" }),
       );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a startup alias reaches review on the first routine command of a process",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "--quiet"]);
+      const marker = join(root.root, "startup-alias-ran");
+      writeStartupFiles(root, `${gitAliasLine(marker)}\n`);
+      const gateway = startGateway(
+        [
+          commandCall("git status --short", "first_git"),
+          (body) => {
+            expect(toolResultText(body, "first_git", "execution-denied")).toContain("review_caution");
+            return fakeGatewayFinalText("startup alias stayed reviewed");
+          },
+        ],
+        [fakeGatewayHeldDecision("startup_alias_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Inspect repository status."],
+        { cwd: root.workspace, env: aliasEnv(root, gateway), timeoutMs: TIMEOUT },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(reviewedActionEvidence(gateway.classifierRequests[0]!.body)).toBe("git status --short");
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a startup alias added during the turn reaches review on the next routine command",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "--quiet"]);
+      const marker = join(root.root, "startup-alias-ran");
+      writeStartupFiles(root, "# no aliases yet\n");
+      const edit = startupFiles(root)
+        .map((file) => `printf '%s\\n' ${JSON.stringify(gitAliasLine(marker))} >> ${JSON.stringify(file)}`)
+        .join(" && ");
+      const gateway = startGateway(
+        [
+          commandCall("echo warm", "warm"),
+          commandCall(edit, "add_alias"),
+          commandCall("git status --short", "edited_git"),
+          (body) => {
+            expect(toolResultText(body, "edited_git", "execution-denied")).toContain("review_caution");
+            return fakeGatewayFinalText("edited alias stayed reviewed");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("clear", "warm_review"),
+          fakeGatewayPermissionDecision("clear", "edit_review"),
+          fakeGatewayHeldDecision("edited_alias_review"),
+        ],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Add the alias, then inspect repository status."],
+        { cwd: root.workspace, env: aliasEnv(root, gateway), timeoutMs: TIMEOUT },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      for (const file of startupFiles(root)) {
+        expect(readFileSync(file, "utf8")).toContain(gitAliasLine(marker));
+      }
+      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(reviewedActionEvidence(gateway.classifierRequests[2]!.body)).toBe("git status --short");
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a routine command that reloads the startup files reaches review",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "--quiet"]);
+      writeStartupFiles(root, "# no aliases\n");
+      const gateway = startGateway(
+        [
+          fakeGatewayToolCall("reload_git", "shell", {
+            request: { action: "run", command: "git status --short", reload: true, yield_time_ms: 30_000 },
+          }),
+          (body) => {
+            expect(toolResultText(body, "reload_git", "execution-denied")).toContain("review_caution");
+            return fakeGatewayFinalText("reload stayed reviewed");
+          },
+        ],
+        [fakeGatewayHeldDecision("reload_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Reload the shell and inspect repository status."],
+        { cwd: root.workspace, env: aliasEnv(root, gateway), timeoutMs: TIMEOUT },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "routine commands stay review-free when the startup files redefine none of their words",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "--quiet"]);
+      writeStartupFiles(root, "alias ll='ls -l'\nexport FX_STARTUP_CONTROL=1\n");
+      const gateway = startGateway(
+        [
+          commandCall("git status --short", "first_git"),
+          commandCall("git status --short --branch", "second_git"),
+          (body) => {
+            expect(toolResultText(body, "second_git")).toContain("No commits yet");
+            return fakeGatewayFinalText("routine commands ran");
+          },
+        ],
+        [fakeGatewayHeldDecision("must_not_review_routine_git")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Inspect repository status twice."],
+        { cwd: root.workspace, env: aliasEnv(root, gateway), timeoutMs: TIMEOUT },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(0);
     },
     TIMEOUT,
   );

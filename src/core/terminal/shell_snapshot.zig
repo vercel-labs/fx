@@ -181,6 +181,28 @@ pub const Generation = struct {
     pub fn defines(self: *const Generation, name: []const u8) bool {
         return self.names.contains(name);
     }
+
+    /// Reports whether any word of `command` names an alias or function
+    /// in the snapshot.
+    fn definesAnyWord(self: *const Generation, command: []const u8) bool {
+        var words = std.mem.tokenizeAny(u8, command, " \t\r\n;|&()<>'\"`$\\{}!");
+        while (words.next()) |word| {
+            if (self.defines(word)) return true;
+        }
+        return false;
+    }
+};
+
+/// What the snapshot shows about the words of a routine command.
+pub const NameCheck = union(enum) {
+    /// No snapshot describes the startup files: the capture or its replay
+    /// failed, so they run in full for every command.
+    unknown,
+    /// A word names an alias or function the startup files define.
+    redefined,
+    /// No word is redefined in the generation captured under this approval
+    /// epoch.
+    clear: u64,
 };
 
 const CaptureFailure = enum {
@@ -408,27 +430,33 @@ pub const Owner = struct {
         return (self.shell_grants.get(target) orelse 0) == self.epoch;
     }
 
-    /// Reports whether fx fell back to full startup after a failed capture,
-    /// so it cannot tell which names the startup files redefine.
-    pub fn startupNamesUnknown(self: *Owner) bool {
-        const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        return self.state == .failed;
-    }
-
-    /// Reports whether any word of `command` names an alias or function in
-    /// the current snapshot, so routine-command checks can defer to review.
-    pub fn definesAnyWord(self: *Owner, command: []const u8) bool {
-        const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        const generation = self.active orelse return false;
-        var words = std.mem.tokenizeAny(u8, command, " \t\r\n;|&()<>'\"`$\\{}!");
-        while (words.next()) |word| {
-            if (generation.defines(word)) return true;
-        }
-        return false;
+    /// Reports whether a word of `command` names an alias or function the
+    /// startup files define, so a routine command can skip review only when
+    /// none does. Captures the snapshot first when there is none yet or the
+    /// files changed since the last capture, as the command's own run would,
+    /// and waits only while a capture runs: `cancel_flag` ends the wait
+    /// without cancelling it. A clear result names the epoch of the
+    /// generation it read, so a run under another one can be refused
+    /// (`tests/tla/tool_admission/RoutineNames.tla` NoUnreviewedAlias).
+    pub fn checkCommandNames(
+        self: *Owner,
+        shell_path: []const u8,
+        cwd: []const u8,
+        command: []const u8,
+        cancel_flag: ?*std.atomic.Value(bool),
+    ) error{Cancelled}!NameCheck {
+        const acquired = self.acquire(shell_path, cwd, .{ .cancel_flag = cancel_flag }) catch |err| switch (err) {
+            error.Cancelled => return error.Cancelled,
+            // No deadline was set.
+            error.TimeoutExpired => return .unknown,
+        };
+        const lease = switch (acquired) {
+            .snapshot => |value| value,
+            .full_startup => return .unknown,
+        };
+        defer lease.release();
+        if (lease.generation.definesAnyWord(command)) return .redefined;
+        return .{ .clear = lease.generation.epoch };
     }
 
     /// Takes the pending fallback notice for a user-facing surface. The
@@ -529,6 +557,10 @@ pub const Owner = struct {
     }
 
     fn startCaptureLocked(self: *Owner, shell_path: []const u8, cwd: []const u8) !void {
+        // A single-threaded build, such as the WebAssembly core, has no
+        // capture thread and no login shell; the caller records the capture
+        // as failed, so a routine command's startup names stay unknown.
+        if (comptime builtin.single_threaded) return error.ThreadSpawnFailed;
         if (self.capture_thread) |thread| {
             // The previous capture already finished; only its thread remains.
             thread.join();
@@ -1067,19 +1099,222 @@ test "snapshot owner resets remembered shell grants on refresh" {
     try testing.expectEqual(@as(u64, 1), owner.shellGrantEpoch("npm test"));
 }
 
-test "snapshot owner reports aliases and functions named in a command" {
+fn checkTestNames(owner: *Owner, command: []const u8) !NameCheck {
+    return owner.checkCommandNames("/bin/zsh", "/tmp", command, null);
+}
+
+test "snapshot owner checks a command's names against a capture it takes first" {
     FakeCapture.reset(0, false);
     var owner: Owner = .{ .capture_fn = FakeCapture.capture };
     defer owner.deinit();
 
-    try testing.expect(!owner.definesAnyWord("ll -a"));
+    // No snapshot yet: the check captures one instead of reporting no names.
+    try testing.expectEqual(NameCheck.redefined, try checkTestNames(&owner, "ll -a"));
+    try testing.expectEqual(@as(u32, 1), FakeCapture.calls.load(.seq_cst));
+    try testing.expectEqual(NameCheck.redefined, try checkTestNames(&owner, "git status && ll"));
+    try testing.expectEqual(NameCheck.redefined, try checkTestNames(&owner, "echo $(ll)"));
+    try testing.expectEqual(NameCheck{ .clear = 0 }, try checkTestNames(&owner, "ls -l"));
+    try testing.expectEqual(NameCheck{ .clear = 0 }, try checkTestNames(&owner, "llama --help"));
+    // The command's own run leases the generation the check read.
     const lease = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
-    defer lease.release();
-    try testing.expect(owner.definesAnyWord("ll -a"));
-    try testing.expect(owner.definesAnyWord("git status && ll"));
-    try testing.expect(owner.definesAnyWord("echo $(ll)"));
-    try testing.expect(!owner.definesAnyWord("ls -l"));
-    try testing.expect(!owner.definesAnyWord("llama --help"));
+    try testing.expectEqual(@as(u64, 0), lease.generation.epoch);
+    lease.release();
+    try testing.expectEqual(@as(u32, 1), FakeCapture.calls.load(.seq_cst));
+
+    // A refresh: the next check captures again and names the new epoch.
+    owner.markDirty(.user_reload);
+    try testing.expectEqual(NameCheck{ .clear = 1 }, try checkTestNames(&owner, "ls -l"));
+    try testing.expectEqual(@as(u32, 2), FakeCapture.calls.load(.seq_cst));
+
+    // A failed capture hides the names, before and after its fallback.
+    FakeCapture.fail = true;
+    owner.markDirty(.user_reload);
+    try testing.expectEqual(NameCheck.unknown, try checkTestNames(&owner, "ls -l"));
+    try testing.expectEqual(NameCheck.unknown, try checkTestNames(&owner, "ls -l"));
+    try testing.expectEqual(@as(u32, 3), FakeCapture.calls.load(.seq_cst));
+}
+
+/// A capture that runs until the test opens it, so a test decides when
+/// the capture ends instead of sleeping past it.
+const GatedCapture = struct {
+    var open: std.atomic.Value(bool) = .init(false);
+    var started: std.atomic.Value(u32) = .init(0);
+
+    fn reset() void {
+        open.store(false, .seq_cst);
+        started.store(0, .seq_cst);
+    }
+
+    fn capture(request: CaptureRequest) CaptureOutcome {
+        _ = started.fetchAdd(1, .seq_cst);
+        while (!open.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+        return FakeCapture.capture(request);
+    }
+};
+
+test "a routine name check stops waiting on cancellation without cancelling the capture" {
+    FakeCapture.reset(0, false);
+    GatedCapture.reset();
+    var owner: Owner = .{ .capture_fn = GatedCapture.capture };
+    defer owner.deinit();
+    // The turn is cancelled while the capture is still running.
+    var cancel = std.atomic.Value(bool).init(true);
+    try testing.expectError(error.Cancelled, owner.checkCommandNames("/bin/zsh", "/tmp", "ll", &cancel));
+
+    // The capture goes on and serves the next check, without a second one.
+    GatedCapture.open.store(true, .seq_cst);
+    try testing.expectEqual(NameCheck.redefined, try checkTestNames(&owner, "ll"));
+    try testing.expectEqual(@as(u32, 1), GatedCapture.started.load(.seq_cst));
+}
+
+test "routine name checks from many threads during refreshes name only epochs a generation had" {
+    FakeCapture.reset(0, false);
+    var owner: Owner = .{ .capture_fn = FakeCapture.capture };
+    defer owner.deinit();
+
+    const Checker = struct {
+        fn run(target: *Owner, failures: *std.atomic.Value(u32)) void {
+            for (0..200) |_| {
+                const check = checkTestNames(target, "git status") catch {
+                    _ = failures.fetchAdd(1, .seq_cst);
+                    return;
+                };
+                switch (check) {
+                    // The epoch a check names is never ahead of the owner's.
+                    .clear => |epoch| if (epoch > target.approvalEpoch()) {
+                        _ = failures.fetchAdd(1, .seq_cst);
+                    },
+                    .redefined, .unknown => _ = failures.fetchAdd(1, .seq_cst),
+                }
+            }
+        }
+    };
+    var failures = std.atomic.Value(u32).init(0);
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Checker.run, .{ &owner, &failures });
+    for (0..50) |_| {
+        owner.markDirty(.agent_reload);
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    for (threads) |thread| thread.join();
+    try testing.expectEqual(@as(u32, 0), failures.load(.seq_cst));
+    // Each refresh started at most one capture, and every lease ended.
+    try testing.expect(FakeCapture.calls.load(.seq_cst) <= 1 + 50);
+    try testing.expect(owner.active.?.leases == 0);
+}
+
+/// The fuzz test's capture: the startup files define `names`, or the
+/// capture fails when `fail` is set.
+const FuzzCapture = struct {
+    var names: []const []const u8 = &.{};
+    var fail: bool = false;
+    var calls: std.atomic.Value(u32) = .init(0);
+
+    fn capture(request: CaptureRequest) CaptureOutcome {
+        _ = calls.fetchAdd(1, .seq_cst);
+        if (fail) return .{ .failed = .timed_out };
+        const generation = Generation.create() catch return .{ .failed = .out_of_memory };
+        const alloc = generation.arena.allocator();
+        generation.shell_path = alloc.dupe(u8, request.shell_path) catch {
+            generation.destroy();
+            return .{ .failed = .out_of_memory };
+        };
+        for (names) |name| generation.names.put(alloc, name, {}) catch {
+            generation.destroy();
+            return .{ .failed = .out_of_memory };
+        };
+        return .{ .ready = generation };
+    }
+};
+
+// Words hold no separator byte and every separator splits words, so the
+// words of a generated command are known without parsing it.
+const fuzz_words = [_][]const u8{ "git", "status", "ll", "--short", "gitk", "xll", "echo" };
+const fuzz_separators = [_][]const u8{ " ", " && ", "; ", " | ", " $(", ") ", " '", "' ", "\t", " {", "} ", "\\", "!" };
+const fuzz_name_sets = [_][]const []const u8{ &.{}, &.{"git"}, &.{"ll"}, &.{ "git", "ll" } };
+
+/// Each input byte is one event: the next capture's startup names, a
+/// failing next capture, a refresh, or a check of a command built from the
+/// bytes after it. The test keeps what the owner should hold and checks
+/// every result against it.
+fn fuzzNameCheckLaws(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [256]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    const input = buffer[0..len];
+
+    FuzzCapture.names = &.{};
+    FuzzCapture.fail = false;
+    FuzzCapture.calls.store(0, .seq_cst);
+    var owner: Owner = .{ .capture_fn = FuzzCapture.capture };
+    defer owner.deinit();
+
+    // The names of the generation a check reads, null before any capture
+    // and after a failed one.
+    var held: ?[]const []const u8 = null;
+    var failed = false;
+    var dirty = false;
+    var epoch: u64 = 0;
+    var captures: u32 = 0;
+    var command_buffer: [512]u8 = undefined;
+    var index: usize = 0;
+    while (index < input.len) : (index += 1) {
+        const byte = input[index];
+        switch (byte % 4) {
+            0 => {
+                FuzzCapture.names = fuzz_name_sets[(byte >> 2) % fuzz_name_sets.len];
+                FuzzCapture.fail = false;
+            },
+            1 => FuzzCapture.fail = true,
+            2 => {
+                owner.markDirty(.user_reload);
+                if (!dirty) epoch += 1;
+                dirty = true;
+            },
+            3 => {
+                const word_count = @min(1 + (byte >> 2) % 6, input.len - index - 1);
+                var command: std.ArrayList(u8) = .initBuffer(&command_buffer);
+                var words: [6][]const u8 = undefined;
+                for (input[index + 1 ..][0..word_count], 0..) |choice, position| {
+                    words[position] = fuzz_words[choice % fuzz_words.len];
+                    command.appendSliceBounded(words[position]) catch unreachable;
+                    command.appendSliceBounded(fuzz_separators[(choice >> 3) % fuzz_separators.len]) catch unreachable;
+                }
+                index += word_count;
+
+                if ((held == null and !failed) or dirty) {
+                    captures += 1;
+                    dirty = false;
+                    failed = FuzzCapture.fail;
+                    held = if (failed) null else FuzzCapture.names;
+                }
+                const expected: NameCheck = if (held) |names| expected: {
+                    for (words[0..word_count]) |word| {
+                        for (names) |name| if (std.mem.eql(u8, word, name)) break :expected .redefined;
+                    }
+                    break :expected .{ .clear = epoch };
+                } else .unknown;
+                try testing.expectEqual(expected, try owner.checkCommandNames("/bin/zsh", "/tmp", command.items, null));
+                // The startup files ran once, plus once per refresh.
+                try testing.expectEqual(captures, FuzzCapture.calls.load(.seq_cst));
+                if (expected == .clear) try testing.expectEqual(epoch, owner.approvalEpoch());
+            },
+            else => unreachable,
+        }
+    }
+}
+
+test "routine name checks keep their laws on fuzzed captures, refreshes, and commands" {
+    try std.testing.fuzz({}, fuzzNameCheckLaws, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            // First check with no snapshot: the capture defines git.
+            "\x04\x03\x00",
+            // A failed capture, a refresh, then names that redefine ll.
+            "\x01\x03\x00\x02\x08\x07\x02\x08",
+            // Checks before and after a refresh, words joined by separators.
+            "\x00\x0b\x50\x29\x02\x0f\x00\x13\x22",
+        }) ++ @import("fuzz_corpus").routine_names.*),
+    });
 }
 
 test "snapshot owner falls back with one notice and recovers after reload" {
