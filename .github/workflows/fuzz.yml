@@ -65,7 +65,7 @@ jobs:
       - name: Setup Zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-unit-ReleaseSafe
 
       # shell_parity compares fx's parse with sh, dash, bash, and zsh.
