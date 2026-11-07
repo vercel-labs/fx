@@ -315,6 +315,37 @@ async function runFirstCallToolScenario(args: {
   }
 }
 
+/// Runs one `fx ask` turn whose model calls each tool in `calls` in order,
+/// one per step, and returns each tool result's text.
+async function runToolSequence(
+  root: ReturnType<typeof createIsolatedRoot>,
+  calls: Array<{ name: string; input: object }>,
+): Promise<string[]> {
+  const outputs: string[] = [];
+  const responses: GatewayResponse[] = calls.map((call, index) => (body: string) => {
+    if (index > 0) outputs.push(toolResultOutput(body, `sequence_${index - 1}`));
+    return toolCall(`sequence_${index}`, call.name, call.input);
+  });
+  responses.push((body) => {
+    outputs.push(toolResultOutput(body, `sequence_${calls.length - 1}`));
+    return finalText("sequence handled");
+  });
+  const gateway = startFakeGateway(responses);
+  try {
+    const result = await runFx(
+      ["ask", "--auto", "--json", "--no-save", "Run the requested searches."],
+      { cwd: root.workspace, env: gatewayEnv(root, gateway, root.home), timeoutMs: TIMEOUT },
+    );
+    const json = parseFxJson(result);
+    expect(gateway.requests).toHaveLength(calls.length + 1);
+    expect(gateway.remainingResponseCount()).toBe(0);
+    expect(json.tool_calls).toEqual(calls.map((call) => ({ name: call.name, status: "success" })));
+    return outputs;
+  } finally {
+    gateway.stop();
+  }
+}
+
 async function runTerminalToolScenario(args: {
   root: ReturnType<typeof createIsolatedRoot>;
   id: string;
@@ -1635,6 +1666,62 @@ describe("filesystem path handling", () => {
             expectedResultOutput: ["big.txt:3001", "LARGE_FILE_NEEDLE"],
           });
         }
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "glob_files and grep_files outside a git repository name the entries they skip",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        for (const path of ["src/app.py", "build/config.py", "dist/old.py", "coverage/c.py"]) {
+          mkdirSync(join(root.workspace, path, ".."), { recursive: true });
+          writeFileSync(join(root.workspace, path), "MAX_RETRIES = 3\n");
+        }
+        const note = "... skipped 3 entries named build, coverage, dist outside a git repository; pass path to search one\n";
+        const grep = { pattern: "MAX_RETRIES", mode: "files_with_matches" };
+        const outputs = await runToolSequence(root, [
+          { name: "grep_files", input: grep },
+          { name: "glob_files", input: { pattern: "**/*.py" } },
+          { name: "grep_files", input: { pattern: "MAX_RETRIES", mode: "count" } },
+          { name: "glob_files", input: { pattern: "**/*.py", mode: "count" } },
+          { name: "grep_files", input: { ...grep, path: "build" } },
+          { name: "grep_files", input: { ...grep, path: "src" } },
+        ]);
+        expect(outputs).toEqual([
+          `[grep] 1 files with matches for MAX_RETRIES\n - src/app.py\n${note}`,
+          `[glob] 1 matches for **/*.py\n - src/app.py\n${note}`,
+          `[grep] count 1 matching lines in 1 files for MAX_RETRIES\n${note}`,
+          `[glob] count 1 matches for **/*.py\n${note}`,
+          "[grep] 1 files with matches for MAX_RETRIES\n - build/config.py\n",
+          "[grep] 1 files with matches for MAX_RETRIES\n - src/app.py\n",
+        ]);
+
+        // A skipped folder is never opened, so one fx can't read is still named.
+        chmodSync(join(root.workspace, "build"), 0o000);
+        try {
+          const unreadable = await runToolSequence(root, [{ name: "grep_files", input: grep }]);
+          expect(unreadable).toEqual([`[grep] 1 files with matches for MAX_RETRIES\n - src/app.py\n${note}`]);
+        } finally {
+          chmodSync(join(root.workspace, "build"), 0o755);
+        }
+
+        // Inside a git repository git's rules decide, so nothing is skipped
+        // by name and there is no note.
+        const init = Bun.spawnSync(["git", "init", "-q"], { cwd: root.workspace });
+        expect(init.exitCode).toBe(0);
+        const inRepository = await runToolSequence(root, [
+          { name: "grep_files", input: grep },
+          { name: "glob_files", input: { pattern: "**/*.py" } },
+        ]);
+        expect(inRepository).toEqual([
+          "[grep] 4 files with matches for MAX_RETRIES\n - build/config.py\n - coverage/c.py\n - dist/old.py\n - src/app.py\n",
+          "[glob] 4 matches for **/*.py\n - build/config.py\n - coverage/c.py\n - dist/old.py\n - src/app.py\n",
+        ]);
       } finally {
         rmSync(root.root, { recursive: true, force: true });
       }

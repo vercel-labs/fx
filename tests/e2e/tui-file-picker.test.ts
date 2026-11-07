@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
   mkdirSync,
@@ -19,6 +21,7 @@ import { FX_BIN, HAS_API_KEY, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewayToolCall,
   heldFakeGatewayFinalText,
   isComposerLine,
   startFakeGateway,
@@ -2407,5 +2410,307 @@ describe("@ file picker", () => {
       expect(replay.stdout).toContain("LIVE_PICKER_OK");
     },
     180_000,
+  );
+});
+
+// The @ snapshot that glob_files and grep_files reuse must keep the entries a
+// scan skipped by name, so their note is the same from it as from a scan
+// (tests/tla/indexer/SkipNote.tla).
+const SKIP_NOTE_FILES = ["src/app.py", "build/config.py", "dist/old.py", "coverage/c.py", "app/build/gen.py"];
+const SKIP_NOTE_SEARCHES = [
+  { name: "grep_files", input: { pattern: "MAX_RETRIES", mode: "files_with_matches" } },
+  { name: "grep_files", input: { pattern: "MAX_RETRIES", mode: "files_with_matches", path: "app" } },
+  { name: "glob_files", input: { pattern: "**/*.py" } },
+];
+const SKIP_NOTE_ROOT = "... skipped 4 entries named build, coverage, dist outside a git repository; pass path to search one\n";
+const SKIP_NOTE_RESULTS = [
+  `[grep] 1 files with matches for MAX_RETRIES\n - src/app.py\n${SKIP_NOTE_ROOT}`,
+  "[grep] no files with matches for MAX_RETRIES\n... skipped 1 entry named build outside a git repository; pass path to search one\n",
+  `[glob] 1 matches for **/*.py\n - src/app.py\n${SKIP_NOTE_ROOT}`,
+];
+// A stamp counts only once it is older than the scan by the indexer's margin
+// (src/core/indexer/tree.zig granularity_margin_ns, 2 s).
+const STAMP_MARGIN_MS = 2_300;
+
+function writeSearchFiles(workspace: string, files: string[]): void {
+  const made = new Set<string>();
+  for (const path of files) {
+    const folder = join(workspace, path, "..");
+    if (!made.has(folder)) mkdirSync(folder, { recursive: true });
+    made.add(folder);
+    writeFileSync(join(workspace, path), "MAX_RETRIES = 3\n");
+  }
+}
+
+function fileIndexDir(current: Fixture): string {
+  return join(current.home, ".fx", "file-index");
+}
+
+function savedSnapshot(current: Fixture): string | null {
+  const dir = fileIndexDir(current);
+  if (!existsSync(dir)) return null;
+  const name = readdirSync(dir).find((entry) => entry.endsWith(".idx"));
+  return name ? join(dir, name) : null;
+}
+
+/// Starts the TUI without waiting for anything; its file index starts at launch.
+async function launchFileIndex(current: Fixture): Promise<TmuxSession> {
+  gateway = startFakeGateway([]);
+  session = await TmuxSession.create({
+    cmd: FX_BIN,
+    cwd: current.workspace,
+    env: mockFxEnvironment(current, gateway, { FX_HOME: join(current.home, ".fx") }),
+    width: 112,
+    height: 32,
+    stderrPath: current.stderrPath,
+    startupWaitMs: 0,
+  });
+  return session;
+}
+
+/// The process group of the fx process under `pane`, once fx has started.
+async function fxProcessGroup(pane: number): Promise<number> {
+  const started = Date.now();
+  while (Date.now() - started < TIMEOUT) {
+    const queue = [pane];
+    while (queue.length > 0) {
+      const pid = queue.shift()!;
+      let name = "";
+      let children = "";
+      try {
+        name = execFileSync("ps", ["-o", "comm=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+      } catch {}
+      if (name.split("/").pop() === "fx") {
+        return Number(execFileSync("ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8" }).trim());
+      }
+      try {
+        children = execFileSync("pgrep", ["-P", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      } catch {}
+      queue.push(...children.split("\n").map(Number).filter((child) => Number.isSafeInteger(child) && child > 0));
+    }
+    await Bun.sleep(5);
+  }
+  throw new Error("fx never started in the tmux pane");
+}
+
+/// Kills everything in the pane's process group with SIGKILL, fx included,
+/// as a crash would, and waits until none of it is left.
+async function crashPane(pane: number): Promise<void> {
+  process.kill(-pane, "SIGKILL");
+  const started = Date.now();
+  while (Date.now() - started < TIMEOUT) {
+    try {
+      execFileSync("pgrep", ["-g", String(pane)], { stdio: "pipe" });
+    } catch {
+      return;
+    }
+    await Bun.sleep(5);
+  }
+  throw new Error(`processes of pane ${pane} outlived SIGKILL`);
+}
+
+/// Waits until the file index's loader has started once more than `before`
+/// times, so a kill lands while it scans or saves.
+async function waitForLoaderStart(current: Fixture, before: number): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < TIMEOUT) {
+    const trace = existsSync(current.tracePath) ? readFileSync(current.tracePath, "utf8") : "";
+    if (trace.split("file index loader entered").length - 1 > before) return;
+    await Bun.sleep(1);
+  }
+  throw new Error(`the file index loader never started\n${readFileSync(current.tracePath, "utf8")}`);
+}
+
+function loaderStarts(current: Fixture): number {
+  return readFileSync(current.tracePath, "utf8").split("file index loader entered").length - 1;
+}
+
+async function closeFileIndex(): Promise<void> {
+  await session?.kill();
+  session = null;
+  gateway?.stop();
+  gateway = null;
+}
+
+async function saveFileIndexSnapshot(current: Fixture): Promise<string> {
+  await launchFileIndex(current);
+  const started = Date.now();
+  while (!savedSnapshot(current) && Date.now() - started < TIMEOUT) await Bun.sleep(25);
+  await closeFileIndex();
+  const saved = savedSnapshot(current);
+  if (!saved) throw new Error(`the TUI saved no file-index snapshot\n${readFileSync(current.tracePath, "utf8")}`);
+  return saved;
+}
+
+function toolResultText(body: string, callId: string): string {
+  const text = (value: unknown): string => {
+    if (typeof value === "string") return value;
+    if (Array.isArray(value)) return value.map(text).join("");
+    if (value && typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      return [text(record.text), text(record.value), text(record.content)].join("");
+    }
+    return "";
+  };
+  const prompt = (JSON.parse(body) as { prompt: Array<{ content: unknown }> }).prompt;
+  const parts = prompt.flatMap((message) => Array.isArray(message.content) ? message.content : []) as Array<Record<string, unknown>>;
+  const result = parts.find((part) => part.type === "tool-result" && part.toolCallId === callId);
+  if (!result) throw new Error(`Missing tool result for ${callId}`);
+  return text(result.output);
+}
+
+/// One `fx ask` turn that runs each search, with the tool results and
+/// whether each listing reused the snapshot, from fx's trace log.
+async function runSearches(
+  current: Fixture,
+  label: string,
+  searches: Array<{ name: string; input: object }>,
+): Promise<{ outputs: string[]; listings: string[] }> {
+  const tracePath = join(current.root, `${label}.trace.log`);
+  const responses = searches.map((search, index) => fakeGatewayToolCall(`search_${index}`, search.name, search.input));
+  responses.push(fakeGatewayFinalText("searched"));
+  const searchGateway = startFakeGateway(responses);
+  try {
+    const result = await runFx(["ask", "--auto", "--json", "--no-save", "Search the folder."], {
+      cwd: current.workspace,
+      env: {
+        HOME: current.home,
+        FX_HOME: join(current.home, ".fx"),
+        AI_GATEWAY_API_KEY: "fake-file-picker-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: searchGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: searchGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: searchGateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${searchGateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_AUTO_UPGRADE: "0",
+        FX_TRACE_LOG: tracePath,
+        FX_TRACE_SCOPES: "core",
+      },
+      timeoutMs: TIMEOUT,
+    });
+    expect(result.code).toBe(0);
+    expect(searchGateway.requests).toHaveLength(searches.length + 1);
+    const last = searchGateway.requests.at(-1)!.body;
+    const outputs = searches.map((_, index) => toolResultText(last, `search_${index}`));
+    const listings = readFileSync(tracePath, "utf8").split("\n").flatMap((line) =>
+      line.includes("tool files reused snapshot") ? ["reused"] : line.includes("tool files scanned") ? ["scanned"] : []
+    );
+    expect(listings).toHaveLength(searches.length);
+    return { outputs, listings };
+  } finally {
+    searchGateway.stop();
+  }
+}
+
+/// The saved snapshot with another format line, under a digest that matches
+/// its payload (src/core/indexer/snapshot.zig).
+function withFormatLine(saved: Buffer, line: string): Buffer {
+  const payload = saved.subarray(saved.indexOf(0x0a) + 1 + 32);
+  return Buffer.concat([Buffer.from(line), createHash("sha256").update(payload).digest(), payload]);
+}
+
+describe("glob_files and grep_files with the @ snapshot", () => {
+  tmuxTest(
+    "the skipped-entry note is the same from the snapshot and when it is cut short, readable by others, older, or never saved",
+    async () => {
+      const current = createFixture("fx-skip-note-snapshot-");
+      writeSearchFiles(current.workspace, SKIP_NOTE_FILES);
+      await Bun.sleep(STAMP_MARGIN_MS);
+      const saved = await saveFileIndexSnapshot(current);
+      const good = readFileSync(saved);
+
+      const reused = await runSearches(current, "reused", SKIP_NOTE_SEARCHES);
+      expect(reused.outputs).toEqual(SKIP_NOTE_RESULTS);
+      expect(reused.listings).toEqual(["reused", "reused", "reused"]);
+
+      const faults: Array<[string, () => void]> = [
+        ["truncated", () => writeFileSync(saved, good.subarray(0, Math.floor(good.length / 2)))],
+        ["readable", () => {
+          writeFileSync(saved, good);
+          chmodSync(saved, 0o644);
+        }],
+        ["older", () => writeFileSync(saved, withFormatLine(good, "fx-file-index-v3\n"))],
+      ];
+      for (const [label, apply] of faults) {
+        chmodSync(saved, 0o600);
+        apply();
+        const result = await runSearches(current, label, SKIP_NOTE_SEARCHES);
+        expect({ label, ...result }).toEqual({ label, outputs: SKIP_NOTE_RESULTS, listings: ["scanned", "scanned", "scanned"] });
+      }
+
+      // A save the file system refuses leaves no snapshot to reuse.
+      rmSync(saved);
+      chmodSync(fileIndexDir(current), 0o500);
+      try {
+        await launchFileIndex(current);
+        await waitForFileText(current.tracePath, "file index cache not saved");
+        await closeFileIndex();
+      } finally {
+        chmodSync(fileIndexDir(current), 0o700);
+      }
+      expect(savedSnapshot(current)).toBeNull();
+      const unsaved = await runSearches(current, "unsaved", SKIP_NOTE_SEARCHES);
+      expect(unsaved).toEqual({ outputs: SKIP_NOTE_RESULTS, listings: ["scanned", "scanned", "scanned"] });
+    },
+    120_000,
+  );
+
+  tmuxTest(
+    "a TUI killed while it saves or refreshes the @ snapshot leaves the skipped-entry note right",
+    async () => {
+      const current = createFixture("fx-skip-note-crash-");
+      const files: string[] = [];
+      // Enough folders that the scan and the save take a while.
+      for (let i = 0; i < 800; i++) {
+        files.push(`pkg${i}/src/index.py`, `pkg${i}/dist/out.py`, `pkg${i}/build/b.py`, `pkg${i}/node_modules/x/i.py`);
+      }
+      writeSearchFiles(current.workspace, files);
+      await Bun.sleep(STAMP_MARGIN_MS);
+      const counts = [
+        { name: "grep_files", input: { pattern: "MAX_RETRIES", mode: "count" } },
+        { name: "glob_files", input: { pattern: "**/*.py", mode: "count" } },
+      ];
+      const expectCounts = (outputs: string[], note: string) => expect(outputs).toEqual([
+        `[grep] count 800 matching lines in 800 files for MAX_RETRIES\n${note}`,
+        `[glob] count 800 matches for **/*.py\n${note}`,
+      ]);
+      const first = "... skipped 2400 entries named build, dist, node_modules outside a git repository; pass path to search one\n";
+      // fx runs in its pane's process group, so killing the group kills fx.
+      const probe = (await launchFileIndex(current)).panePid();
+      expect(await fxProcessGroup(probe)).toBe(probe);
+      await closeFileIndex();
+      const outcomes: string[] = [];
+      // Measured from the loader's start: early kills land in the scan, later
+      // ones in or after the save.
+      for (const delayMs of [0, 40, 120, 400]) {
+        rmSync(fileIndexDir(current), { recursive: true, force: true });
+        const before = loaderStarts(current);
+        const pane = (await launchFileIndex(current)).panePid();
+        await waitForLoaderStart(current, before);
+        await Bun.sleep(delayMs);
+        await crashPane(pane);
+        await closeFileIndex();
+        const result = await runSearches(current, `kill-${delayMs}`, counts);
+        expectCounts(result.outputs, first);
+        outcomes.push(`${delayMs}ms:${result.listings[0]}`);
+      }
+
+      // A refresh killed after an edit: the old snapshot no longer matches the
+      // folder, and a new one holds the new skip.
+      await saveFileIndexSnapshot(current);
+      writeSearchFiles(current.workspace, ["pkg0/coverage/c.py"]);
+      await Bun.sleep(STAMP_MARGIN_MS);
+      const beforeRefresh = loaderStarts(current);
+      const refreshPane = (await launchFileIndex(current)).panePid();
+      await waitForLoaderStart(current, beforeRefresh);
+      await Bun.sleep(40);
+      await crashPane(refreshPane);
+      await closeFileIndex();
+      const refreshed = await runSearches(current, "kill-refresh", counts);
+      expectCounts(refreshed.outputs, "... skipped 2401 entries named build, coverage, dist, node_modules outside a git repository; pass path to search one\n");
+      console.log(`kill outcomes: ${outcomes.join(", ")}; after the refresh: ${refreshed.listings[0]}`);
+    },
+    120_000,
   );
 });

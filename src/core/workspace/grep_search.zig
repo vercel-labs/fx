@@ -42,6 +42,7 @@ pub const Result = struct {
     candidate_incomplete: bool = false,
     candidate_cap_reached: bool = false,
     skipped_overlong: usize = 0,
+    skipped_by_name: tool_files.SkippedByName = .{},
 };
 
 /// Owned-in-arena summary of a grep search count pass.
@@ -53,6 +54,7 @@ pub const CountResult = struct {
     candidate_incomplete: bool = false,
     candidate_cap_reached: bool = false,
     skipped_overlong: usize = 0,
+    skipped_by_name: tool_files.SkippedByName = .{},
 };
 
 /// Collects literal line matches below a directory root. Returned slices are
@@ -211,6 +213,7 @@ const CandidateStats = struct {
     incomplete: bool = false,
     cap_reached: bool = false,
     skipped_overlong: usize = 0,
+    skipped_by_name: tool_files.SkippedByName = .{},
 
     fn fromListing(listing: tool_files.Listing) CandidateStats {
         return .{
@@ -219,6 +222,7 @@ const CandidateStats = struct {
             .incomplete = listing.incomplete,
             .cap_reached = listing.cap_reached,
             .skipped_overlong = listing.skipped_overlong,
+            .skipped_by_name = listing.skipped_by_name,
         };
     }
 };
@@ -232,6 +236,7 @@ fn finishMatches(arena: Allocator, matches: *std.ArrayList(Match), truncated_rea
         .candidate_incomplete = stats.incomplete,
         .candidate_cap_reached = stats.cap_reached,
         .skipped_overlong = stats.skipped_overlong,
+        .skipped_by_name = stats.skipped_by_name,
     };
 }
 
@@ -242,6 +247,7 @@ fn finishCount(result: CountResult, stats: CandidateStats) CountResult {
     out.candidate_incomplete = stats.incomplete;
     out.candidate_cap_reached = stats.cap_reached;
     out.skipped_overlong += stats.skipped_overlong;
+    out.skipped_by_name = stats.skipped_by_name;
     return out;
 }
 
