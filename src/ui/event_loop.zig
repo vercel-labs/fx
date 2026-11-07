@@ -465,27 +465,219 @@ test "event loop distinguishes requested exit from input closure" {
         .commit_frame = rejectUnexpectedEventLoopCommit,
     };
 
-    try std.testing.expectEqual(
-        ExitCause.input_closed,
-        try run(
-            EventLoopClosedTerminal{ .poll_result = .{ .readable = true } },
-            &should_exit,
-            8,
-            callbacks,
-        ),
-    );
-    try std.testing.expect(!should_exit);
+    for ([_]shell_runtime.PollResult{
+        .{ .readable = true },
+        .{ .hung_up = true },
+        .{ .has_error = true },
+    }) |poll_result| {
+        try std.testing.expectEqual(
+            ExitCause.input_closed,
+            try run(
+                EventLoopClosedTerminal{ .poll_result = poll_result },
+                &should_exit,
+                8,
+                callbacks,
+            ),
+        );
+        try std.testing.expect(!should_exit);
+    }
+}
 
-    try std.testing.expectEqual(
-        ExitCause.input_closed,
-        try run(
-            EventLoopClosedTerminal{ .poll_result = .{ .hung_up = true } },
-            &should_exit,
-            8,
-            callbacks,
-        ),
-    );
+/// A terminal that is gone: every poll answers at once with an error, as a
+/// revoked or closed descriptor does, however long the loop asked to wait.
+/// It fails the test if the loop polls it a second time.
+const EventLoopGoneTerminal = struct {
+    polls: *usize,
+    observed_timeout_ms: *i32,
+
+    fn pollInput(self: EventLoopGoneTerminal, timeout_ms: i32) !shell_runtime.PollResult {
+        self.polls.* += 1;
+        if (self.polls.* > 1) return error.PolledAfterTerminalGone;
+        self.observed_timeout_ms.* = timeout_ms;
+        return .{ .has_error = true };
+    }
+
+    fn read(_: EventLoopGoneTerminal, _: []u8) !usize {
+        return error.UnexpectedRead;
+    }
+};
+
+test "event loop ends at an error poll that returns at once without polling again" {
+    var should_exit = false;
+    var polls: usize = 0;
+    var observed_timeout_ms: i32 = 0;
+    var trace = EventLoopTestTrace{ .should_exit = &should_exit };
+
+    const exit_cause = try run(EventLoopGoneTerminal{
+        .polls = &polls,
+        .observed_timeout_ms = &observed_timeout_ms,
+    }, &should_exit, 8, .{
+        .ctx = &trace,
+        .collect_facts = collectEventLoopTestFacts,
+        .next_collected_byte = noCollectedEventLoopByte,
+        .handle_byte = rejectUnexpectedEventLoopByte,
+        .settle_delivery_epoch = rejectUnexpectedEventLoopCommit,
+        .commit_frame = rejectUnexpectedEventLoopCommit,
+    });
+
+    try std.testing.expectEqual(ExitCause.input_closed, exit_cause);
+    try std.testing.expectEqual(@as(usize, 1), polls);
+    try std.testing.expectEqual(@as(i32, 8), observed_timeout_ms);
+    try std.testing.expectEqualStrings("t", trace.bytes[0..trace.len]);
+}
+
+test "cooperative input pump reports an error poll as closed input" {
+    var should_exit = false;
+    var polls: usize = 0;
+    var observed_timeout_ms: i32 = -1;
+    var trace = EventLoopTestTrace{ .should_exit = &should_exit };
+
+    const exit_cause = try pump_ready_input(EventLoopGoneTerminal{
+        .polls = &polls,
+        .observed_timeout_ms = &observed_timeout_ms,
+    }, &should_exit, .{
+        .ctx = &trace,
+        .collect_facts = collectEventLoopTestFacts,
+        .next_collected_byte = noCollectedEventLoopByte,
+        .handle_byte = rejectUnexpectedEventLoopByte,
+        .settle_delivery_epoch = rejectUnexpectedEventLoopCommit,
+        .commit_frame = rejectUnexpectedEventLoopCommit,
+    });
+
+    try std.testing.expectEqual(@as(?ExitCause, .input_closed), exit_cause);
+    try std.testing.expectEqual(@as(usize, 1), polls);
+    try std.testing.expectEqual(@as(i32, 0), observed_timeout_ms);
     try std.testing.expect(!should_exit);
+}
+
+/// A terminal whose poll answers come from fuzzed bytes, mapped through the
+/// real revents mapping. Each byte is one answer: bit 0 POLLIN, bit 1
+/// POLLHUP, bit 2 POLLERR, bit 3 POLLNVAL, and bits 4 to 6 how many bytes the
+/// next read returns, 0 for the end of input. A terminal that answers with
+/// POLLHUP, POLLERR, or POLLNVAL is gone and keeps answering so, without
+/// POLLIN once its input is read, as a revoked or hung-up one does. After the
+/// script, a live terminal stays idle.
+const FuzzPollTerminal = struct {
+    script: []const u8,
+    state: *State,
+
+    const State = struct {
+        next: usize = 0,
+        current: u8 = 0,
+        gone: ?u8 = null,
+        polls_while_gone: usize = 0,
+        read_zero: bool = false,
+        bytes_read: usize = 0,
+    };
+
+    const gone_bits: u8 = 0b1110;
+
+    fn revents(answer: u8) i16 {
+        var bits: i16 = 0;
+        if ((answer & 0b0001) != 0) bits |= std.posix.POLL.IN;
+        if ((answer & 0b0010) != 0) bits |= std.posix.POLL.HUP;
+        if ((answer & 0b0100) != 0) bits |= std.posix.POLL.ERR;
+        if ((answer & 0b1000) != 0) bits |= std.posix.POLL.NVAL;
+        return bits;
+    }
+
+    fn pollInput(self: FuzzPollTerminal, _: i32) !shell_runtime.PollResult {
+        const state = self.state;
+        if (state.gone) |answer| {
+            // Without input left, a gone terminal must end the loop at its
+            // first answer; polling it again is the busy loop.
+            if ((answer & 0b0001) == 0) {
+                state.polls_while_gone += 1;
+                if (state.polls_while_gone > 1) return error.PolledAfterTerminalGone;
+            }
+            state.current = answer;
+            return shell_runtime.pollResultFromRevents(revents(answer));
+        }
+        if (state.next >= self.script.len) {
+            state.current = 0;
+            return .{};
+        }
+        const answer = self.script[state.next];
+        state.next += 1;
+        state.current = answer;
+        if ((answer & gone_bits) != 0) {
+            state.gone = answer;
+            if ((answer & 0b0001) == 0) state.polls_while_gone = 1;
+        }
+        return shell_runtime.pollResultFromRevents(revents(answer));
+    }
+
+    fn read(self: FuzzPollTerminal, buf: []u8) !usize {
+        const state = self.state;
+        const len: usize = (state.current >> 4) & 0b111;
+        // A gone terminal's input is read once; after that it has none.
+        if (state.gone) |*answer| answer.* &= ~@as(u8, 0b0001);
+        if (len == 0) state.read_zero = true;
+        @memset(buf[0..len], 'x');
+        state.bytes_read += len;
+        return len;
+    }
+};
+
+const FuzzPollTrace = struct {
+    handled: usize = 0,
+    terminal: FuzzPollTerminal,
+    should_exit: *bool,
+
+    fn collect(_: *anyopaque) !void {}
+    fn next(_: *anyopaque) ?u8 {
+        return null;
+    }
+    fn handle(ctx: *anyopaque, _: u8) !void {
+        const self: *FuzzPollTrace = @ptrCast(@alignCast(ctx));
+        self.handled += 1;
+    }
+    fn settle(_: *anyopaque) !void {}
+    // Once the script is spent on a live terminal, the person quits.
+    fn commit(ctx: *anyopaque) !void {
+        const self: *FuzzPollTrace = @ptrCast(@alignCast(ctx));
+        const state = self.terminal.state;
+        if (state.gone == null and state.next >= self.terminal.script.len) self.should_exit.* = true;
+    }
+};
+
+fn fuzzTerminalPolls(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buffer: [64]u8 = undefined;
+    const script = buffer[0..@intCast(smith.slice(&buffer))];
+    var state: FuzzPollTerminal.State = .{};
+    var should_exit = false;
+    const terminal = FuzzPollTerminal{ .script = script, .state = &state };
+    var trace = FuzzPollTrace{ .terminal = terminal, .should_exit = &should_exit };
+
+    const exit_cause = try run(terminal, &should_exit, 8, .{
+        .ctx = &trace,
+        .collect_facts = FuzzPollTrace.collect,
+        .next_collected_byte = FuzzPollTrace.next,
+        .handle_byte = FuzzPollTrace.handle,
+        .settle_delivery_epoch = FuzzPollTrace.settle,
+        .commit_frame = FuzzPollTrace.commit,
+    });
+
+    // The loop ends for closed input exactly when the terminal went away or
+    // a read found the end of input, and it handles every byte it read.
+    const closed = state.gone != null or state.read_zero;
+    try std.testing.expectEqual(closed, exit_cause == .input_closed);
+    try std.testing.expectEqual(state.bytes_read, trace.handled);
+}
+
+test "the input loop ends at the first closed poll on fuzzed terminal polls" {
+    try std.testing.fuzz({}, fuzzTerminalPolls, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "\x11\x21",
+            "\x08",
+            "\x31\x08",
+            "\x13\x02",
+            "\x04",
+            "\x01",
+            "\x71\x71\x71\x71\x09",
+        }) ++ @import("fuzz_corpus").terminal_polls.*),
+    });
 }
 
 test "event loop treats a failed final commit after hangup as a clean close" {

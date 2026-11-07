@@ -5359,6 +5359,7 @@ test {
     _ = @import("core/app/app_upgrade_runtime.zig");
     _ = @import("core/app/app_worker_runtime.zig");
     _ = @import("ui/event_loop.zig");
+    _ = @import("ui/shell_runtime.zig");
     _ = @import("ui/resize_tests.zig");
     _ = @import("ui/transcript/transcript_window_fuzz.zig");
     _ = @import("ui/transcript/frozen_prefix_tests.zig");

@@ -36,6 +36,7 @@
     {"name": "vercel_stream", "module": "fx", "test": "Gateway streams give the same result however they are cut into events and reads", "iterations": 460000},
     {"name": "gateway_event_class", "module": "fx", "test": "a Gateway event that is not JSON is resent, a too-deep or duplicate-key one ends the turn, however its bytes arrive", "iterations": 400000},
     {"name": "chat_completions_stream", "module": "fx", "test": "chat completions streams give the same result however they are cut into events and reads", "iterations": 120000},
+    {"name": "terminal_polls", "module": "fx", "test": "the input loop ends at the first closed poll on fuzzed terminal polls", "iterations": 2000000},
     {"name": "terminal_grid", "module": "fx", "test": "terminal grid state survives fragmented feeds, checkpoints, and repaints", "iterations": 50000},
     {"name": "transcript_paint", "module": "fx", "test": "transcript painting keeps the shadow terminal in step with the screen", "iterations": 8000},
     {"name": "markdown_lists", "module": "fx", "test": "Markdown lists render the same however assistant text is split", "iterations": 900000},

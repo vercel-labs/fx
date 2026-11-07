@@ -34,6 +34,8 @@ extern "c" fn posix_openpt(flags: c_int) c_int;
 extern "c" fn grantpt(fd: c_int) c_int;
 extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname(fd: c_int) ?[*:0]u8;
+/// macOS: every open descriptor for the terminal at `path` stops working.
+extern "c" fn revoke(path: [*:0]const u8) c_int;
 
 pub const supports_resize_signal = resize_runtime.supports_resize_signal;
 pub const ResizeHandler = if (builtin.target.os.tag == .wasi)
@@ -135,7 +137,11 @@ pub const TerminalState = struct {
     pub fn disableRawMode(self: *TerminalState) void {
         if (!self.raw_enabled) return;
         if (comptime builtin.target.os.tag != .wasi) {
-            io_mod.tcsetattr(self.stdin_fd, .FLUSH, self.original_termios) catch {};
+            // The terminal may be gone by now: revoked, hung up, or closed
+            // (`tests/tla/shell_runtime/TerminalRevoke.tla` CleanupNeverCrashes).
+            io_mod.tcsetattrBestEffort(self.stdin_fd, .FLUSH, self.original_termios) catch |err| {
+                debug_trace.logf("terminal", "raw_mode_restore_failed err={s}", .{@errorName(err)});
+            };
         }
         self.raw_enabled = false;
     }
@@ -264,14 +270,22 @@ pub const TerminalState = struct {
         }};
 
         _ = try std.posix.poll(&fds, timeout_ms);
-        const revents = fds[0].revents;
-        return .{
-            .readable = (revents & std.posix.POLL.IN) != 0,
-            .hung_up = (revents & std.posix.POLL.HUP) != 0,
-            .has_error = (revents & std.posix.POLL.ERR) != 0,
-        };
+        return pollResultFromRevents(fds[0].revents);
     }
 };
+
+/// Maps the revents of a poll on stdin to a `PollResult`. POLLNVAL counts as
+/// an error: a terminal that macOS revoked, or a descriptor that is no longer
+/// open, reports it alone and at once on every poll, so the event loop must
+/// take it as closed input rather than poll again
+/// (`tests/tla/shell_runtime/TerminalRevoke.tla` NoBusyLoop).
+pub fn pollResultFromRevents(revents: i16) PollResult {
+    return .{
+        .readable = (revents & std.posix.POLL.IN) != 0,
+        .hung_up = (revents & std.posix.POLL.HUP) != 0,
+        .has_error = (revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0,
+    };
+}
 
 fn clearTmuxHistoryForPane(alloc: Allocator, pane: []const u8) void {
     runTmuxHistoryClear(alloc, pane) catch |err| {
@@ -713,6 +727,146 @@ test "enableRawMode preserves carriage return input" {
     var buf: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try std.posix.read(pty.slave, &buf));
     try std.testing.expectEqual(@as(u8, '\r'), buf[0]);
+}
+
+/// A descriptor number no process has open.
+const closed_test_fd: std.posix.fd_t = std.math.maxInt(std.posix.fd_t);
+
+test "terminal poll reports a descriptor that is not open as closed" {
+    if (!supports_test_pty) return error.SkipZigTest;
+
+    const terminal = TerminalState{ .stdin_fd = closed_test_fd };
+    const result = try terminal.pollInput(0);
+    try std.testing.expect(!result.readable);
+    try std.testing.expect(result.closed());
+}
+
+test "raw-mode cleanup returns for a descriptor that is not open" {
+    if (!supports_test_pty) return error.SkipZigTest;
+
+    var terminal = TerminalState{
+        .stdin_fd = closed_test_fd,
+        .original_termios = std.mem.zeroes(std.posix.termios),
+        .raw_enabled = true,
+    };
+    terminal.disableRawMode();
+    try std.testing.expect(!terminal.raw_enabled);
+    terminal.disableRawMode();
+}
+
+test "raw-mode cleanup restores the original termios" {
+    if (!supports_test_pty) return error.SkipZigTest;
+
+    const pty = try TestPty.open();
+    defer pty.close();
+    var terminal = TerminalState{ .stdin_fd = pty.slave };
+    try terminal.captureOriginalTermios();
+    try terminal.enableRawMode();
+    terminal.disableRawMode();
+
+    const restored = try io_mod.tcgetattr(pty.slave);
+    try std.testing.expectEqual(terminal.original_termios.lflag, restored.lflag);
+    try std.testing.expectEqual(terminal.original_termios.iflag, restored.iflag);
+    try std.testing.expectEqualSlices(u8, &terminal.original_termios.cc, &restored.cc);
+    try std.testing.expect(!terminal.raw_enabled);
+}
+
+fn ignoreTestSignal(_: std.posix.SIG) callconv(.c) void {}
+
+/// Interrupts `target` with SIGUSR2 every 10 ms for 100 ms, then reads
+/// everything the PTY's slave has written, so a restore waiting for that
+/// output to drain is interrupted several times before it can finish.
+fn interruptThenDrain(target: std.c.pthread_t, master: std.posix.fd_t) void {
+    for (0..10) |_| {
+        io_mod.sleep(10 * std.time.ns_per_ms);
+        _ = std.c.pthread_kill(target, .USR2);
+    }
+    var buf: [4096]u8 = undefined;
+    var idle_polls: usize = 0;
+    while (idle_polls < 5) {
+        var fds = [_]std.posix.pollfd{.{ .fd = master, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 20) catch return;
+        if (ready == 0) {
+            idle_polls += 1;
+            continue;
+        }
+        idle_polls = 0;
+        if (std.c.read(master, &buf, buf.len) <= 0) return;
+    }
+}
+
+test "raw-mode cleanup retries a restore that a signal interrupts" {
+    if (!supports_test_pty or !supports_resize_signal) return error.SkipZigTest;
+
+    const pty = try TestPty.open();
+    defer pty.close();
+    var terminal = TerminalState{ .stdin_fd = pty.slave };
+    try terminal.captureOriginalTermios();
+    try terminal.enableRawMode();
+
+    // Fill the slave's output queue, so the TCSAFLUSH restore waits for the
+    // master to read it, where a signal interrupts the wait with EINTR.
+    const flags = std.c.fcntl(pty.slave, std.c.F.GETFL);
+    try std.testing.expect(flags >= 0);
+    const nonblocking: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
+    try std.testing.expect(std.c.fcntl(pty.slave, std.c.F.SETFL, flags | nonblocking) >= 0);
+    const fill: [1024]u8 = @splat('x');
+    var queued: usize = 0;
+    while (queued < 1024 * 1024) {
+        const n = std.c.write(pty.slave, &fill, fill.len);
+        if (n <= 0) break;
+        queued += @intCast(n);
+    }
+    try std.testing.expect(std.c.fcntl(pty.slave, std.c.F.SETFL, flags) >= 0);
+
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = ignoreTestSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    var old: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.USR2, &act, &old);
+    defer std.posix.sigaction(.USR2, &old, null);
+
+    const interrupter = try std.Thread.spawn(.{}, interruptThenDrain, .{ std.c.pthread_self(), pty.master });
+    terminal.disableRawMode();
+    interrupter.join();
+
+    const restored = try io_mod.tcgetattr(pty.slave);
+    try std.testing.expectEqual(terminal.original_termios.lflag, restored.lflag);
+    try std.testing.expectEqual(terminal.original_termios.iflag, restored.iflag);
+}
+
+test "a revoked terminal polls as closed and its cleanup returns" {
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const pty = try TestPty.open();
+    defer pty.close();
+    var terminal = TerminalState{ .stdin_fd = pty.slave };
+    try terminal.captureOriginalTermios();
+    try terminal.enableRawMode();
+    const slave_name = ptsname(pty.master) orelse return error.PtyUnavailable;
+    try std.testing.expectEqual(@as(c_int, 0), revoke(slave_name));
+
+    // macOS reports a revoked terminal as POLLNVAL alone, at once.
+    const result = try terminal.pollInput(0);
+    try std.testing.expect(!result.readable);
+    try std.testing.expect(result.closed());
+    terminal.disableRawMode();
+    try std.testing.expect(!terminal.raw_enabled);
+}
+
+test "the best-effort restore returns for a revoked terminal" {
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const pty = try TestPty.open();
+    defer pty.close();
+    const original = try io_mod.tcgetattr(pty.slave);
+    const slave_name = ptsname(pty.master) orelse return error.PtyUnavailable;
+    try std.testing.expectEqual(@as(c_int, 0), revoke(slave_name));
+
+    // macOS answers ENOENT for a terminal it revoked.
+    try io_mod.tcsetattrBestEffort(pty.slave, .FLUSH, original);
 }
 
 test "reconstructive paint re-emits a full transcript in order" {

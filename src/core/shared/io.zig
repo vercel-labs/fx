@@ -1081,6 +1081,38 @@ pub fn tcsetattr(
     };
 }
 
+/// Puts terminal attributes back on the way out, when the terminal may be
+/// gone. A descriptor that is closed (EBADF), hung up (EIO), or no longer a
+/// terminal (EINVAL, ENOTTY), or a terminal that macOS revoked (ENOENT), has
+/// nothing left to restore, so this returns quietly where `tcsetattr` would
+/// reach `unreachable` for EBADF and EINVAL. EINTR is retried. Linux issues
+/// the kernel ioctl for the reason `tcgetattr` gives
+/// (`tests/tla/shell_runtime/TerminalRevoke.tla` CleanupNeverCrashes and
+/// GoneQuietly).
+pub fn tcsetattrBestEffort(
+    fd: std.posix.fd_t,
+    action: std.posix.TCSA,
+    term: std.posix.termios,
+) std.posix.UnexpectedError!void {
+    if (builtin.target.os.tag != .linux) {
+        while (true) switch (std.posix.errno(std.posix.system.tcsetattr(fd, action, &term))) {
+            .INTR => continue,
+            .SUCCESS, .BADF, .INVAL, .IO, .NOTTY => return,
+            .NOENT => if (comptime builtin.target.os.tag.isDarwin()) return else return std.posix.unexpectedErrno(.NOENT),
+            else => |err| return std.posix.unexpectedErrno(err),
+        };
+    }
+    while (true) switch (std.os.linux.errno(std.os.linux.tcsetattr(fd, action, &term))) {
+        .INTR => continue,
+        .SUCCESS, .BADF, .INVAL, .IO, .NOTTY => return,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+}
+
+test "tcsetattrBestEffort returns for a descriptor that is not open" {
+    try tcsetattrBestEffort(std.math.maxInt(std.posix.fd_t), .FLUSH, std.mem.zeroes(std.posix.termios));
+}
+
 test "tcgetattr reports a regular file as not a terminal" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
