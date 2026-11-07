@@ -29,6 +29,13 @@ function cutToolCall(model: string, command: string) {
   return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
 }
 
+// A Chat Completions stream sent as given, with or without the closing [DONE].
+function chatStream(chunks: unknown[], done = true) {
+  return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + (done ? "data: [DONE]\n\n" : ""), { headers: { "content-type": "text/event-stream" } });
+}
+
+const streamUsage = { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 };
+
 /** A request from a subagent, which has no subagent tool of its own. */
 function isChildRequest(body: any): boolean {
   return !body.tools?.some((tool: any) => tool.function?.name === "subagent");
@@ -205,6 +212,91 @@ describe("configured providers", () => {
       expect(f.requests).toHaveLength(1);
     } finally { f.close(); }
   });
+
+  // Shapes that OpenAI-compatible servers send in otherwise valid replies.
+  const benignStreams: Record<string, { usage: boolean; respond(model: string): Response }> = {
+    "an empty model in every chunk": { usage: true, respond: () => chatStream([
+      { id: "chat-local", model: "", choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] },
+      { id: "chat-local", model: "", choices: [{ index: 0, delta: { content: "streamed reply" } }] },
+      { id: "chat-local", model: "", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { id: "chat-local", model: "", choices: [], usage: streamUsage },
+    ]) },
+    "an empty legacy function_call on the finish chunk": { usage: true, respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: { content: "streamed reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: { content: "", role: "assistant", function_call: { name: "", arguments: "" } }, finish_reason: "stop" }], usage: streamUsage },
+    ]) },
+    "no [DONE] after the finished choice": { usage: false, respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "streamed reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: "stop" }] },
+    ], false) },
+    "no [DONE] after the usage trailer": { usage: true, respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "streamed reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { id: "chat-local", model, choices: [], usage: streamUsage },
+    ], false) },
+    "a usage trailer choice without finish_reason": { usage: true, respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "streamed reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {} }], usage: streamUsage },
+    ]) },
+    "a usage trailer choice with a null finish_reason": { usage: true, respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "streamed reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: null }], usage: streamUsage },
+    ]) },
+    "all of them in one reply": { usage: true, respond: () => chatStream([
+      { id: "chat-local", model: "", choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] },
+      { id: "chat-local", model: "", choices: [{ index: 0, delta: { content: "streamed reply" } }] },
+      { id: "chat-local", model: "", choices: [{ index: 0, delta: { content: "", role: "assistant", function_call: { name: "", arguments: "" } }, finish_reason: "stop" }] },
+      { id: "chat-local", model: "", choices: [{ index: 0, delta: {} }], usage: streamUsage },
+    ], false) },
+  };
+
+  test.each(Object.keys(benignStreams))("accepts a reply with %s", async shape => {
+    const f = fixture(body => benignStreams[shape].respond(body.model));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(result.stderr).toBe("");
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.final_output).toBe("streamed reply");
+      if (benignStreams[shape].usage) expect(parsed.usage).toMatchObject({ input_tokens: 12, output_tokens: 3 });
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].body.model).toBe("local-model");
+    } finally { f.close(); }
+  }, 25000);
+
+  // The relaxed shapes keep their strict neighbors: a cut-off stream, a legacy
+  // call that says something, and late content in a trailer still fail the turn.
+  const brokenStreams: Record<string, { failure: string; respond(model: string): Response }> = {
+    "a stream that ends before finish_reason": { failure: "IncompleteStream", respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "cut reply" }, finish_reason: null }] },
+    ], false) },
+    "a finish event cut before its blank line": { failure: "IncompleteStream", respond: model => new Response(
+      `data: ${JSON.stringify({ id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "cut reply" }, finish_reason: null }] })}\n\n` +
+      `data: ${JSON.stringify({ id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}`,
+      { headers: { "content-type": "text/event-stream" } }) },
+    "a populated legacy function_call": { failure: "InvalidChunk", respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: { function_call: { name: "read_file", arguments: "{}" } }, finish_reason: "stop" }] },
+    ]) },
+    "late content in a usage trailer without finish_reason": { failure: "InconsistentFinishReason", respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: { content: "late" } }], usage: streamUsage },
+    ]) },
+  };
+
+  test.each(Object.keys(brokenStreams))("fails the turn on %s without resending", async shape => {
+    const f = fixture(body => brokenStreams[shape].respond(body.model));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(result.code).toBe(1);
+      expect(result.stdout + result.stderr).toContain(brokenStreams[shape].failure);
+      expect(f.requests).toHaveLength(1);
+    } finally { f.close(); }
+  }, 25000);
 
   test("CLI selection persists a configured name and uses only its credential", async () => {
     const f = fixture();
@@ -502,11 +594,13 @@ describe("configured providers", () => {
         if (reviews === 1 || (outcome === "missing" && reviews === 2)) {
           if (outcome === "malformed") return rawToolCalls(body.model, [{ id: "review-1", name: "permission_decision", arguments: "{\"decision\":\"clear\"" }]);
           if (outcome === "refused" || outcome === "truncated" || outcome === "incomplete") {
+            // An incomplete review ends before its finish_reason: a stream
+            // may end without [DONE] once the choice has finished.
             const chunks = [
               { id: "review", model: body.model, choices: [{ index: 0, delta: outcome === "refused" ? { refusal: "Cannot review this." } : { content: "Incomplete review." }, finish_reason: null }] },
-              { id: "review", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: outcome === "truncated" ? "length" : "stop" }] },
+              ...(outcome === "incomplete" ? [] : [{ id: "review", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: outcome === "truncated" ? "length" : "stop" }] }]),
             ];
-            return new Response(chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join("") + (outcome === "incomplete" ? "" : "data: [DONE]\n\n"), { headers: { "content-type": "text/event-stream" } });
+            return chatStream(chunks, outcome !== "incomplete");
           }
           return completion(body.model, "The action looks safe.");
         }
@@ -585,8 +679,13 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 15000);
 
-  test("truncated tool streams cannot execute a partially delivered call", async () => {
-    const f = fixture(body => new Response(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "partial", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "must-not-exist.txt", content: "unsafe" }) } }] }, finish_reason: "tool_calls" }] })}\n\n`, { headers: { "content-type": "text/event-stream" } }));
+  test.each(["before its finish_reason", "inside its finish event"])("truncated tool streams cannot execute a partially delivered call (cut %s)", async cut => {
+    // A stream may end without [DONE] once the choice has finished, so the
+    // cut comes before the finish event arrives whole.
+    const call = { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "partial", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "must-not-exist.txt", content: "unsafe" }) } }] }, finish_reason: null }] };
+    const finish = { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] };
+    const wire = `data: ${JSON.stringify(call)}\n\n` + (cut === "inside its finish event" ? `data: ${JSON.stringify(finish)}` : "");
+    const f = fixture(() => new Response(wire, { headers: { "content-type": "text/event-stream" } }));
     try {
       f.settings.permission_mode = "full-access";
       (f.settings as any).yolo_acknowledged = true;
