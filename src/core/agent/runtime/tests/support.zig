@@ -1723,7 +1723,7 @@ pub const FakeAgentRuntimeDeps = struct {
             },
             .assistant_rendered => |text| text,
             .assistant_restarted => |text| text,
-            .operational => |text| text,
+            .operational, .turn_failure, .saved_reply => |text| text,
         };
         try self.texts.append(self.alloc, try self.alloc.dupe(u8, text));
         if (self.cancel_on_text) |flag| {

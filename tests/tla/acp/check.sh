@@ -22,5 +22,16 @@ cd "$(dirname "$0")"
 
 tlc_verdicts "$@" <<'EOF'
 MCAcpPermissionModes MCAcpPermissionModes -
+# AcpNotices: what a client with and without ACP v1 Session Notices gets for
+# each kind of text fx emits about a turn. MCAcpNotices must pass; Before is
+# fx before the rule, and the other five are planted bugs, each caught by the
+# invariant named. ../drivers/acp/notices/driver.ts runs the real fx acp.
+AcpNotices MCAcpNotices -
+AcpNotices MCAcpNoticesBefore OperationalAsNotice
+AcpNotices MCAcpNoticesFailureNotice FailureReportIsMessage
+AcpNotices MCAcpNoticesSavedReplyNotice ConversationStaysMessages
+AcpNotices MCAcpNoticesFragmentNotice OneNoticePerMessage
+AcpNotices MCAcpNoticesPlainNotice NoticeNeedsCapability
+AcpNotices MCAcpNoticesNoRotate AssistantSplit
 MCAcpSpeed MCAcpSpeed -
 EOF

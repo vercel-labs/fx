@@ -235,6 +235,68 @@ test "ultrafastPromptAllowed requires a verified Gateway capability" {
     try std.testing.expect(!ultrafastCapabilityAllowed(.gateway, true, false));
 }
 
+const NoticeSeverity = enum { info, warning };
+
+const notice_space = " \t\r\n";
+
+/// The title of the notice for `plain`, or null when it holds only
+/// whitespace, such as the line break the runtime sends after a line. A
+/// title stands alone, so the `[context]` tag, which is for the model, and
+/// the whitespace around the text are left out (`tests/tla/acp/AcpNotices.tla`
+/// OneNoticePerMessage).
+fn noticeTitle(plain: []const u8) ?[]const u8 {
+    const untagged = std.mem.cutPrefix(u8, plain, "[context]") orelse plain;
+    const title = std.mem.trim(u8, untagged, notice_space);
+    if (title.len > 0) return title;
+    const whole = std.mem.trim(u8, plain, notice_space);
+    return if (whole.len > 0) whole else null;
+}
+
+test "noticeTitle trims a notice and drops whitespace alone" {
+    try std.testing.expectEqualStrings("MCP description for x", noticeTitle("[context] MCP description for x\n").?);
+    try std.testing.expectEqualStrings("↻ Restarted the answer", noticeTitle("\n\n↻ Restarted the answer\n\n").?);
+    try std.testing.expectEqualStrings("[context]", noticeTitle("[context]").?);
+    try std.testing.expect(noticeTitle("\n") == null);
+    try std.testing.expect(noticeTitle(" \t\r\n") == null);
+    try std.testing.expect(noticeTitle("") == null);
+}
+
+fn fuzzNoticeTitle(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [1024]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    const text = buffer[0..len];
+    const title = noticeTitle(text) orelse {
+        try std.testing.expectEqual(@as(usize, 0), std.mem.trim(u8, text, notice_space).len);
+        return;
+    };
+    try std.testing.expect(title.len > 0);
+    try std.testing.expectEqual(title.len, std.mem.trim(u8, title, notice_space).len);
+    const start = @intFromPtr(title.ptr) - @intFromPtr(text.ptr);
+    try std.testing.expect(start + title.len <= text.len);
+    if (!std.unicode.utf8ValidateSlice(title)) return;
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try acp_types.writeNotice(&out.writer, "info", title);
+    // One frame line, and a client reads back the same title.
+    try std.testing.expect(std.mem.findScalar(u8, out.written(), '\n') == null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(title, parsed.value.object.get("title").?.string);
+}
+
+test "a notice title is trimmed text or none on fuzzed text" {
+    try std.testing.fuzz({}, fuzzNoticeTitle, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "\n",
+            "\n\n↻ Restarted the answer\n\n",
+            "[context]",
+            "[context] \t\r\n",
+            "The model stopped without a reply (provider reason: \"\\\x01\x7f). Asking it to continue.",
+        }) ++ @import("fuzz_corpus").acp_notice_title.*),
+    });
+}
+
 const AgentMessageKind = enum {
     assistant,
     operational,
@@ -304,15 +366,15 @@ const AcpContext = struct {
         try self.sendUpdate(out.writer.buffered());
     }
 
-    /// A notice the client shows outside the conversation (ACP v1).
-    fn sendNotice(self: *AcpContext, text: []const u8) !void {
+    /// A notice the client shows outside the conversation (ACP v1). Text
+    /// that is only whitespace sends nothing.
+    fn sendNotice(self: *AcpContext, severity: NoticeSeverity, text: []const u8) !void {
         const plain = try stripAnsiAlloc(self.alloc, text);
         defer if (plain.ptr != text.ptr) self.alloc.free(plain);
-        // The tag is for the model; a notice's title stands alone.
-        const title = std.mem.trimStart(u8, std.mem.cutPrefix(u8, plain, "[context]") orelse plain, " ");
+        const title = noticeTitle(plain) orelse return;
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeNotice(&out.writer, "info", if (title.len > 0) title else plain);
+        try acp_types.writeNotice(&out.writer, @tagName(severity), title);
         try self.sendUpdate(out.writer.buffered());
     }
 
@@ -3304,10 +3366,20 @@ fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
         },
         .assistant_source => |text| .{ text, ctx.assistantMessageId() },
         .assistant_rendered => return,
-        .assistant_restarted => |text| .{ text, ctx.operationalMessageId() },
-        .operational => |text| .{ text, ctx.operationalMessageId() },
+        // A notice still takes the operational message, so the reply after
+        // it starts a new one (`tests/tla/acp/AcpNotices.tla` AssistantSplit).
+        .assistant_restarted, .operational, .turn_failure, .saved_reply => |text| .{ text, ctx.operationalMessageId() },
     };
     if (text.len == 0) return;
+    // fx's own text about the turn is a notice for a client that shows them.
+    // Why a turn failed and the reply fx saves stay in the conversation: ACP
+    // v1 says an agent must not rely on a notice to report a fatal error,
+    // and session/load replays what fx saved (`tests/tla/acp/AcpNotices.tla`
+    // OperationalAsNotice, FailureReportIsMessage, ConversationStaysMessages).
+    switch (emission) {
+        .assistant_restarted, .operational => if (ctx.state.client_notices) return ctx.sendNotice(.info, text) catch {},
+        else => {},
+    }
     ctx.sendAgentText(message_id, text) catch {};
 }
 
@@ -3357,7 +3429,12 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
 
 fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    ctx.sendAgentText(ctx.operationalMessageId(), text) catch {};
+    const message_id = ctx.operationalMessageId();
+    // A system notice is never a turn's only failure report: when one comes
+    // before a failure, the runtime then returns an error, which the prompt
+    // answers with a JSON-RPC error.
+    if (ctx.state.client_notices) return ctx.sendNotice(.warning, text) catch {};
+    ctx.sendAgentText(message_id, text) catch {};
 }
 
 fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
@@ -3366,13 +3443,17 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     if (!try session.session_rt.claimContextNotice(ctx.alloc, text)) return;
     // ACP v1 Session Notices where the client shows them;
     // otherwise a message, as ACP allows.
-    if (ctx.state.client_notices) return ctx.sendNotice(text) catch {};
+    if (ctx.state.client_notices) return ctx.sendNotice(.info, text) catch {};
     try pushSystemNotice(raw_ctx, text);
 }
 
 fn pushDiffBlock(raw_ctx: *anyopaque, payload: agent_runtime.DiffEntryPayload) !void {
     defer diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
-    try pushText(raw_ctx, .{ .operational = payload.preview });
+    // A diff is conversation content for every client, never a notice.
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const message_id = ctx.operationalMessageId();
+    if (payload.preview.len == 0) return;
+    ctx.sendAgentText(message_id, payload.preview) catch {};
 }
 
 fn pushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
@@ -3390,6 +3471,10 @@ fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u
         std.mem.print(&buf, "HTTP {d}: {s}", .{ @backingInt(status), detail }) catch "HTTP error"
     else
         std.mem.print(&buf, "HTTP {d}", .{@backingInt(status)}) catch "HTTP error";
+    // The failure that ends the turn stays an agent message even for a
+    // client that shows notices: a failed turn returns only its stop reason,
+    // and ACP v1 says an agent must not rely on a notice to report a fatal
+    // error (`tests/tla/acp/AcpNotices.tla` FailureReportIsMessage).
     ctx.sendAgentText(ctx.operationalMessageId(), msg) catch {};
 }
 

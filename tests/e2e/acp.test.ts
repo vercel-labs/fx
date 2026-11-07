@@ -1480,6 +1480,43 @@ async function runPromptBlocks(
   return { promptResult, messages };
 }
 
+// A reply with no text that stops for `other`: fx asks once more, then fails.
+function noticeEmptyReply() {
+  return fakeGatewaySse([{ type: "finish", finishReason: { unified: "other", raw: "UNEXPECTED_TOOL_CALL" } }]);
+}
+
+// A stream that ends after some text, without a finish: fx restarts the answer.
+function noticePartialReply(text: string) {
+  return new Response(`data: ${JSON.stringify({ type: "text-delta", id: "partial", delta: text })}\n\n`, {
+    headers: { "content-type": "text/event-stream" },
+  });
+}
+
+async function startNoticeSession(client: AcpClient, cwd: string, clientCapabilities: Record<string, unknown>) {
+  const init = await client.request("initialize", { protocolVersion: 1, clientCapabilities }, 1) as any;
+  expect(init.error).toBeUndefined();
+  const created = await client.request("session/new", { cwd, mcpServers: [] }, 2) as any;
+  expect(created.error).toBeUndefined();
+  await client.readLine();
+  await client.request("session/set_mode", { modeId: "auto" }, 3);
+}
+
+// One prompt's agent messages and notices, in the order they came.
+async function noticeTurn(client: AcpClient, text: string) {
+  const { promptResult, messages } = await runPrompt(client, text, TIMEOUT);
+  expect(promptResult.error).toBeUndefined();
+  const updates = messages.map((message) => message.params?.update).filter(Boolean);
+  return {
+    stopReason: promptResult.result.stopReason as string,
+    messages: updates
+      .filter((update) => update.sessionUpdate === "agent_message_chunk")
+      .map((update) => ({ text: update.content?.text as string, messageId: update.messageId as string })),
+    notices: updates
+      .filter((update) => update.sessionUpdate === "notice")
+      .map((update) => ({ severity: update.severity, title: update.title })),
+  };
+}
+
 async function runMcpToolPrompt(
   client: AcpClient,
   gateway: ReturnType<typeof startFakeGateway>,
@@ -3277,6 +3314,145 @@ describe("acp: model-independent", () => {
         await client?.close();
         gateway.stop();
         httpFixture.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "an editor that shows notices gets fx's operational text as notices, one per message",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-operational-notices-");
+      const gateway = startFakeGateway([
+        noticeEmptyReply(),
+        finalText("ACP notices reply"),
+        fakeGatewaySse([
+          { type: "text-delta", id: "cut", delta: "ACP length reply" },
+          { type: "finish", finishReason: { unified: "length", raw: "length" } },
+        ]),
+        noticePartialReply("ACP partial reply"),
+        finalText("ACP restarted reply"),
+      ]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startNoticeSession(client, root.workspace, { session: { notices: {} } });
+
+        const nudged = await noticeTurn(client, "Answer after an empty reply.");
+        expect(nudged.stopReason).toBe("end_turn");
+        expect(nudged.notices).toEqual([{
+          severity: "info",
+          title: "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Asking it to continue.",
+        }]);
+        expect(nudged.messages.map((message) => message.text).join("")).toBe("ACP notices reply");
+
+        const cut = await noticeTurn(client, "Answer past the output limit.");
+        expect(cut.notices).toEqual([{ severity: "warning", title: "response hit provider length limit; output may be incomplete" }]);
+        expect(cut.messages.map((message) => message.text).join("")).toBe("ACP length reply");
+
+        const restarted = await noticeTurn(client, "Answer after a dropped stream.");
+        expect(restarted.stopReason).toBe("end_turn");
+        expect(restarted.notices).toEqual([{ severity: "info", title: "↻ Restarted the answer" }]);
+        expect(restarted.messages.map((message) => message.text)).toEqual(["ACP partial reply", "ACP restarted reply"]);
+        // The restarted answer is a new message, as it was when the restart
+        // line sat between them.
+        expect(restarted.messages[1]!.messageId).not.toBe(restarted.messages[0]!.messageId);
+
+        expect(gateway.requests).toHaveLength(5);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "an editor that shows notices keeps a failed turn's reason, \"Done.\", and an HTTP failure as agent messages",
+    async () => {
+      // ACP v1: an agent must not rely on a notice to report a fatal error,
+      // and a notice is not history, so these stay in the conversation.
+      const root = createIsolatedRoot("fx-acp-operational-messages-");
+      const gateway = startFakeGateway([
+        noticeEmptyReply(),
+        noticeEmptyReply(),
+        fakeGatewaySse([{ type: "finish", finishReason: { unified: "stop", raw: "stop" } }]),
+        new Response(JSON.stringify({ error: { message: "rejected fake key" } }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        }),
+      ]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startNoticeSession(client, root.workspace, { session: { notices: {} } });
+
+        const failed = await noticeTurn(client, "Fail after two empty replies.");
+        expect(failed.notices).toEqual([{
+          severity: "info",
+          title: "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Asking it to continue.",
+        }]);
+        expect(failed.messages.map((message) => message.text).join("").trim()).toBe(
+          "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Continue with a follow-up prompt if needed.",
+        );
+
+        const done = await noticeTurn(client, "Finish without text.");
+        expect(done.stopReason).toBe("end_turn");
+        expect(done.notices).toEqual([]);
+        expect(done.messages.map((message) => message.text).join("")).toBe("Done.");
+
+        const refused = await noticeTurn(client, "Fail on the key.");
+        expect(refused.notices).toEqual([]);
+        expect(refused.messages.map((message) => message.text)).toEqual(["AI_GATEWAY_API_KEY authentication failed · HTTP 401"]);
+
+        expect(gateway.requests).toHaveLength(4);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "an editor without notices gets fx's operational text as agent messages, as before",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-operational-plain-");
+      const gateway = startFakeGateway([
+        noticeEmptyReply(),
+        finalText("ACP plain reply"),
+        fakeGatewaySse([
+          { type: "text-delta", id: "cut", delta: "ACP plain length reply" },
+          { type: "finish", finishReason: { unified: "length", raw: "length" } },
+        ]),
+      ]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startNoticeSession(client, root.workspace, {});
+
+        const nudged = await noticeTurn(client, "Answer after an empty reply.");
+        expect(nudged.notices).toEqual([]);
+        expect(nudged.messages.map((message) => message.text)).toEqual([
+          "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Asking it to continue.",
+          "\n",
+          "ACP plain reply",
+        ]);
+
+        const cut = await noticeTurn(client, "Answer past the output limit.");
+        expect(cut.notices).toEqual([]);
+        expect(cut.messages.map((message) => message.text)).toEqual([
+          "ACP plain length reply",
+          "response hit provider length limit; output may be incomplete",
+        ]);
+
+        expect(gateway.requests).toHaveLength(3);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },

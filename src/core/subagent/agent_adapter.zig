@@ -1023,7 +1023,7 @@ fn pushLiveText(raw: *anyopaque, emission: agent_runtime.TextEmission) !void {
         .assistant_source => {},
         .assistant_rendered => |text| context.turn.appendLiveText(text),
         .assistant_restarted => |text| context.turn.appendLiveText(text),
-        .operational => |text| context.turn.appendLiveText(text),
+        .operational, .turn_failure, .saved_reply => |text| context.turn.appendLiveText(text),
     }
 }
 fn pushLiveNotice(raw: *anyopaque, text: []const u8) !void {
