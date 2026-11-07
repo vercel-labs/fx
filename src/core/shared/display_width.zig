@@ -35,6 +35,7 @@ const wide_ranges = packRanges(&unicode_data.wide_ranges);
 const emoji_presentation_ranges = packRanges(&unicode_data.emoji_presentation_ranges);
 const emoji_modifier_ranges = packRanges(&unicode_data.emoji_modifier_ranges);
 const variation_bases = packRanges(&unicode_data.variation_bases);
+const thai_nonspacing_ranges = packRanges(&unicode_data.thai_nonspacing_ranges);
 
 const RgiNode = packed struct(u32) {
     edge_start: u13,
@@ -403,7 +404,8 @@ fn isCombining(codepoint: u21) bool {
         (codepoint >= 0x1dc0 and codepoint <= 0x1dff) or
         (codepoint >= 0x20d0 and codepoint <= 0x20ff) or
         (codepoint >= 0xfe20 and codepoint <= 0xfe2f) or
-        (codepoint >= 0xfe00 and codepoint <= 0xfe0f);
+        (codepoint >= 0xfe00 and codepoint <= 0xfe0f) or
+        isInRanges(codepoint, &thai_nonspacing_ranges);
 }
 
 fn isZeroWidthContinuation(codepoint: u21) bool {
@@ -501,6 +503,7 @@ test "packed display ranges preserve every scalar classification" {
         try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.emoji_presentation_ranges), isInRanges(codepoint, &emoji_presentation_ranges));
         try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.emoji_modifier_ranges), isInRanges(codepoint, &emoji_modifier_ranges));
         try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.variation_bases), isInRanges(codepoint, &variation_bases));
+        try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.thai_nonspacing_ranges), isInRanges(codepoint, &thai_nonspacing_ranges));
     }
 }
 
@@ -623,6 +626,76 @@ test "runeWidth preserves current width table semantics" {
     try std.testing.expectEqual(@as(usize, 1), runeWidth('a'));
     try std.testing.expectEqual(@as(usize, 1), runeWidth(' '));
     try std.testing.expectEqual(@as(usize, 0), runeWidth(0x09));
+}
+
+test "Thai nonspacing marks measure zero cells and spacing Thai measures one" {
+    // Thai's nonspacing marks (general category Mn) are U+0E31,
+    // U+0E34-U+0E3A, and U+0E47-U+0E4E. Terminals draw each one on the
+    // cell before it. Every other Thai code point takes a cell, U+0E33
+    // SARA AM included.
+    const Case = struct { codepoint: u21, width: usize };
+    const boundaries = [_]Case{
+        .{ .codepoint = 0x0E01, .width = 1 },
+        .{ .codepoint = 0x0E30, .width = 1 },
+        .{ .codepoint = 0x0E31, .width = 0 },
+        .{ .codepoint = 0x0E32, .width = 1 },
+        .{ .codepoint = 0x0E33, .width = 1 },
+        .{ .codepoint = 0x0E34, .width = 0 },
+        .{ .codepoint = 0x0E3A, .width = 0 },
+        .{ .codepoint = 0x0E3B, .width = 1 },
+        .{ .codepoint = 0x0E3F, .width = 1 },
+        .{ .codepoint = 0x0E46, .width = 1 },
+        .{ .codepoint = 0x0E47, .width = 0 },
+        .{ .codepoint = 0x0E4E, .width = 0 },
+        .{ .codepoint = 0x0E4F, .width = 1 },
+    };
+    for (boundaries) |case| {
+        try std.testing.expectEqual(case.width, runeWidth(case.codepoint));
+    }
+
+    var codepoint: u21 = 0x0E00;
+    while (codepoint <= 0x0E7F) : (codepoint += 1) {
+        const nonspacing = codepoint == 0x0E31 or
+            (codepoint >= 0x0E34 and codepoint <= 0x0E3A) or
+            (codepoint >= 0x0E47 and codepoint <= 0x0E4E);
+        const expected: usize = if (nonspacing) 0 else 1;
+        try std.testing.expectEqual(expected, runeWidth(codepoint));
+    }
+}
+
+test "Thai nonspacing marks join their base in visibleWidth" {
+    // กั้ง: ก with MAI HAN-AKAT and MAI THO, then ง.
+    try std.testing.expectEqual(@as(usize, 2), visibleWidth("\u{0E01}\u{0E31}\u{0E49}\u{0E07}"));
+    // น้ำ: the tone mark sits on น, and SARA AM takes its own cell.
+    try std.testing.expectEqual(@as(usize, 2), visibleWidth("\u{0E19}\u{0E49}\u{0E33}"));
+    // กั้งabc and ที่นี่ok, as typed in the composer.
+    try std.testing.expectEqual(@as(usize, 5), visibleWidth("\u{0E01}\u{0E31}\u{0E49}\u{0E07}abc"));
+    try std.testing.expectEqual(@as(usize, 4), visibleWidth("\u{0E17}\u{0E35}\u{0E48}\u{0E19}\u{0E35}\u{0E48}ok"));
+    // A mark with no base takes no cell.
+    try std.testing.expectEqual(@as(usize, 0), visibleWidth("\u{0E49}"));
+    // Stacked marks stay on their base however many there are.
+    const mark = "\u{0E49}";
+    var stacked: [3 + 25 * mark.len]u8 = undefined;
+    @memcpy(stacked[0..3], "\u{0E01}");
+    for (0..25) |index| @memcpy(stacked[3 + index * mark.len ..][0..mark.len], mark);
+    try std.testing.expectEqual(@as(usize, 1), visibleWidth(&stacked));
+    // Mixed with a Latin combining mark and a wide character.
+    try std.testing.expectEqual(@as(usize, 5), visibleWidth("e\u{0301}\u{754C}\u{0E01}\u{0E31}\u{0E49}a"));
+}
+
+test "Thai nonspacing marks are zero-width display units" {
+    const word = "\u{0E01}\u{0E31}\u{0E49}\u{0E07}";
+    try std.testing.expectEqual(DisplayUnit{ .byte_len = 3, .cell_width = 1 }, displayUnitAt(word, 0));
+    try std.testing.expectEqual(DisplayUnit{ .byte_len = 3, .cell_width = 0 }, displayUnitAt(word, 3));
+    try std.testing.expectEqual(DisplayUnit{ .byte_len = 3, .cell_width = 0 }, displayUnitAt(word, 6));
+    try std.testing.expectEqual(DisplayUnit{ .byte_len = 3, .cell_width = 1 }, displayUnitAt(word, 9));
+
+    const sara_am = "\u{0E19}\u{0E49}\u{0E33}";
+    try std.testing.expectEqual(DisplayUnit{ .byte_len = 3, .cell_width = 1 }, displayUnitAt(sara_am, 6));
+
+    // Clipping keeps the marks with their base.
+    try std.testing.expectEqualStrings("\u{0E01}\u{0E31}\u{0E49}", prefixByWidth(word, 1));
+    try std.testing.expectEqualStrings(word, suffixByWidth(word, 2));
 }
 
 test "decodeNextRune preserves boundary and invalid-byte behavior" {
@@ -835,6 +908,8 @@ test "fuzz display unit boundaries" {
             "\u{2600}\u{FE0E}\u{2600}\u{FE0F}",
             "\u{1F44D}\u{1F3FD}\u{1F1FA}\u{1F1F8}",
             "#\u{FE0F}\u{20E3}\u{1F469}\u{200D}\u{1F4BB}",
+            "\u{0E01}\u{0E31}\u{0E49}\u{0E07}abc\u{0E17}\u{0E35}\u{0E48}\u{0E19}\u{0E35}\u{0E48}ok",
+            "\u{0E49}\u{0E19}\u{0E49}\u{0E33}\u{0E4E}\u{0E4F}\u{0E3A}\u{0E3B}e\u{0301}\u{754C}",
         }) ++ @import("fuzz_corpus").display_width.*),
     });
 }

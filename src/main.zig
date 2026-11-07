@@ -5537,6 +5537,7 @@ test {
     _ = @import("core/input/horizontal_navigation.zig");
     _ = @import("core/input/edit_history.zig");
     _ = @import("core/input/vertical_navigation.zig");
+    _ = @import("core/input/text_boundaries.zig");
     _ = @import("core/app/input_selection_runtime.zig");
     _ = @import("ui/input/native_clear_probe.zig");
     _ = @import("ui/input/terminal_action_decoder.zig");

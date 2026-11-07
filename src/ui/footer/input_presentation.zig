@@ -1058,7 +1058,10 @@ fn appendLayoutUnit(
     remaining_cells: *usize,
     omitted_positive_unit: *bool,
 ) !void {
-    if (remaining_cells.* == 0) return;
+    // A full row still takes the zero-width units after its last character,
+    // such as Thai vowel and tone marks, which draw on that character's cell.
+    const zero_width_text = unit.kind == .text and unit.cell_width == 0;
+    if (remaining_cells.* == 0 and !zero_width_text) return;
 
     const selected = if (source.selection) |selection|
         unit.raw_start < selection.end and unit.raw_end > selection.start

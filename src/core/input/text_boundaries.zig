@@ -199,6 +199,35 @@ test "character boundaries group terminal character continuations" {
     try std.testing.expectEqual(@as(usize, 1), previousCharacterStart(family, 1 + "👨‍👩‍👧‍👦".len));
 }
 
+test "Thai nonspacing marks move with their base as one character" {
+    // กั้ง: ก with MAI HAN-AKAT and MAI THO is one character, then ง.
+    const word = "\u{0E01}\u{0E31}\u{0E49}\u{0E07}";
+    try std.testing.expectEqual(@as(usize, 9), nextCharacterEnd(word, 0));
+    try std.testing.expectEqual(word.len, nextCharacterEnd(word, 9));
+    try std.testing.expectEqual(@as(usize, 9), previousCharacterStart(word, word.len));
+    try std.testing.expectEqual(@as(usize, 0), previousCharacterStart(word, 9));
+
+    // นุ้ก: SARA U and MAI EK stack on น.
+    const stacked = "\u{0E19}\u{0E38}\u{0E49}\u{0E01}";
+    try std.testing.expectEqual(@as(usize, 9), nextCharacterEnd(stacked, 0));
+    try std.testing.expectEqual(@as(usize, 0), previousCharacterStart(stacked, 9));
+
+    // น้ำ: the tone mark stays on น, and SARA AM is a character of its own.
+    const sara_am = "\u{0E19}\u{0E49}\u{0E33}";
+    try std.testing.expectEqual(@as(usize, 6), nextCharacterEnd(sara_am, 0));
+    try std.testing.expectEqual(@as(usize, 6), previousCharacterStart(sara_am, sara_am.len));
+
+    // Two spacing consonants stay two characters.
+    const spaced = "\u{0E01}\u{0E02}";
+    try std.testing.expectEqual(@as(usize, 3), nextCharacterEnd(spaced, 0));
+    try std.testing.expectEqual(@as(usize, 6), nextCharacterEnd(spaced, 3));
+
+    // Marks with no base are one character, ended by the next base.
+    const bare = "\u{0E49}\u{0E48}a";
+    try std.testing.expectEqual(@as(usize, 6), nextCharacterEnd(bare, 0));
+    try std.testing.expectEqual(@as(usize, 0), previousCharacterStart(bare, 6));
+}
+
 test "character boundaries preserve ascii and precomposed utf8" {
     const text = "AéB";
     try std.testing.expectEqual(@as(usize, 1), nextCharacterEnd(text, 0));

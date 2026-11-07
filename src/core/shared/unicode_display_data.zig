@@ -251,6 +251,16 @@ pub const emoji_modifier_ranges = [_]Range{
     .{ .first = 0x1F3FB, .last = 0x1F3FF },
 };
 
+/// Thai nonspacing marks: General_Category Mn in the Thai block, from the
+/// Unicode 17.0 extracted/DerivedGeneralCategory.txt rather than the files
+/// above. Terminals draw each one on the cell before it. U+0E33 SARA AM is
+/// Lo and takes a cell, so it is not here.
+pub const thai_nonspacing_ranges = [_]Range{
+    .{ .first = 0x0E31, .last = 0x0E31 },
+    .{ .first = 0x0E34, .last = 0x0E3A },
+    .{ .first = 0x0E47, .last = 0x0E4E },
+};
+
 pub const variation_bases = [_]Range{
     .{ .first = 0x0023, .last = 0x0023 },
     .{ .first = 0x002A, .last = 0x002A },

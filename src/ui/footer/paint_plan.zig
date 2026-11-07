@@ -1470,6 +1470,182 @@ test "footer paints an inline completion suffix without moving the composer curs
     );
 }
 
+test "composer cursor follows Thai clusters on the VT grid" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    // Each Thai base carries its nonspacing marks in its own cell, so the
+    // cursor lands one cell past the last character, as terminals draw it.
+    const Case = struct { text: []const u8, cursor_col: u16, cells: []const u21 };
+    const cases = [_]Case{
+        // กั้งabc
+        .{
+            .text = "\u{0E01}\u{0E31}\u{0E49}\u{0E07}abc",
+            .cursor_col = 8,
+            .cells = &.{ 0x0E01, 0x0E07, 'a', 'b', 'c' },
+        },
+        // กั้งabcที่นี่ok
+        .{
+            .text = "\u{0E01}\u{0E31}\u{0E49}\u{0E07}abc\u{0E17}\u{0E35}\u{0E48}\u{0E19}\u{0E35}\u{0E48}ok",
+            .cursor_col = 12,
+            .cells = &.{ 0x0E01, 0x0E07, 'a', 'b', 'c', 0x0E17, 0x0E19, 'o', 'k' },
+        },
+        // น้ำ: SARA AM takes its own cell.
+        .{
+            .text = "\u{0E19}\u{0E49}\u{0E33}",
+            .cursor_col = 5,
+            .cells = &.{ 0x0E19, 0x0E33 },
+        },
+    };
+
+    for (cases) |case| {
+        var input = InputRuntime{};
+        defer input.deinit(alloc);
+        try input.textReplacementState().replace(alloc, case.text);
+
+        var shell = TranscriptRuntime{
+            .layout = .{
+                .rows = 18,
+                .cols = 40,
+                .content_bottom = 12,
+                .divider_top_row = 13,
+                .input_row = 14,
+                .divider_bottom_row = 15,
+                .hint_row = 16,
+            },
+            .owned_top_row = 1,
+            .viewport_top_row = 1,
+            .cursor_row = 8,
+            .cursor_col = 1,
+        };
+        defer shell.deinit(alloc);
+
+        const ctx = testContext(&input);
+        const geometry = input_presentation.measureRawInputGeometry(
+            ctx,
+            shell.layout.cols,
+            shell.layout.content_bottom,
+            true,
+            false,
+            false,
+            false,
+        );
+        const planner_input: FooterPlannerInput = .{
+            .active_label = null,
+            .ctx = ctx,
+            .place_mid_line_active = false,
+            .input_extra = geometry.input_extra,
+            .input_visible = true,
+            .composer_top_chrome_rows = composerTopChromeRows(),
+            .picker_rows = 0,
+            .banner_active = false,
+            .input_summary = geometry.summary,
+            .input_window = geometry.window,
+            .total_lines = geometry.total_lines,
+        };
+
+        const frame_plan = planFooterPaint(&shell, planner_input);
+        var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+        defer frame.deinit(alloc);
+
+        const input_row = frame_plan.paint.footer.input_base;
+        try std.testing.expectEqual(input_row, frame.cursor.row);
+        try std.testing.expectEqual(case.cursor_col, frame.cursor.col);
+
+        var grid = try vt_emulator.Grid.init(alloc, shell.layout.cols, 1);
+        defer grid.deinit();
+        for (frame.rows.items) |row| {
+            if (row.row == input_row) try grid.feed(row.text.items);
+        }
+        for (case.cells, 0..) |codepoint, index| {
+            const cell = grid.cellAt(1, @intCast(3 + index)) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(codepoint, cell.codepoint);
+        }
+        const after = grid.cellAt(1, case.cursor_col) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u21, ' '), after.codepoint);
+    }
+}
+
+test "composer keeps the marks of a Thai cluster in the last column" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    // "┃ " leaves 38 of 40 cells: 37 "a", then กั้ in the last one, then ง
+    // on the next row.
+    const fill: [37]u8 = @splat('a');
+    const text = fill ++ "\u{0E01}\u{0E31}\u{0E49}\u{0E07}".*;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    try input.textReplacementState().replace(alloc, &text);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 18,
+            .cols = 40,
+            .content_bottom = 12,
+            .divider_top_row = 13,
+            .input_row = 14,
+            .divider_bottom_row = 15,
+            .hint_row = 16,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 8,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    const ctx = testContext(&input);
+    const geometry = input_presentation.measureRawInputGeometry(
+        ctx,
+        shell.layout.cols,
+        shell.layout.content_bottom,
+        true,
+        false,
+        false,
+        false,
+    );
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = geometry.input_extra,
+        .input_visible = true,
+        .composer_top_chrome_rows = composerTopChromeRows(),
+        .picker_rows = 0,
+        .banner_active = false,
+        .input_summary = geometry.summary,
+        .input_window = geometry.window,
+        .total_lines = geometry.total_lines,
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+    defer frame.deinit(alloc);
+
+    // The cursor sits after ง on the second row; the full row is above it.
+    try std.testing.expectEqual(frame_plan.paint.footer.input_base, frame.cursor.row);
+    try std.testing.expectEqual(@as(u16, 4), frame.cursor.col);
+    const full_row = frame.cursor.row - 1;
+    var grid = try vt_emulator.Grid.init(alloc, shell.layout.cols, 1);
+    defer grid.deinit();
+    var fed = false;
+    for (frame.rows.items) |row| {
+        if (row.row != full_row) continue;
+        try grid.feed(row.text.items);
+        fed = true;
+    }
+    try std.testing.expect(fed);
+    const before = grid.cellAt(1, shell.layout.cols - 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, 'a'), before.codepoint);
+    try std.testing.expectEqual(@as(u32, 0), before.combining_suffix_id);
+    const last = grid.cellAt(1, shell.layout.cols) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, 0x0E01), last.codepoint);
+    try std.testing.expectEqualStrings("\u{0E31}\u{0E49}", grid.combiningSuffix(last.combining_suffix_id) orelse "");
+}
+
 test "steering banner keeps two clean lines and a composer gap in both delivery modes" {
     for ([_]bool{ false, true }) |waiting| {
         const alloc = std.testing.allocator;
