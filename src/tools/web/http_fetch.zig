@@ -2,6 +2,7 @@ const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const select_watch = @import("../../core/shared/select_watch.zig");
+const tls_roots = @import("../../core/shared/tls_roots.zig");
 const url_policy = @import("url_policy.zig");
 
 const Allocator = std.mem.Allocator;
@@ -516,7 +517,7 @@ fn fetchTls(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: Fet
     defer ca_bundle.deinit(alloc);
     var ca_lock: std.Io.RwLock = .init;
     const now = std.Io.Clock.real.now(zio);
-    ca_bundle.rescan(alloc, zio, now) catch |err| {
+    tls_roots.load(&ca_bundle, alloc, zio, now) catch |err| {
         traceFailure(.tls_handshake, err);
         return err;
     };

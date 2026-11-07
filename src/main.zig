@@ -5390,6 +5390,8 @@ test {
     _ = @import("builtins/context.zig");
     _ = @import("builtins/gateway.zig");
     _ = @import("core/shared/debug_trace.zig");
+    _ = @import("core/shared/http_pool.zig");
+    _ = @import("core/shared/tls_roots.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/output/full_transcript_metadata.zig");
     _ = @import("core/shared/display_width.zig");

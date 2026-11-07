@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const debug_trace = @import("debug_trace.zig");
 const io_mod = @import("io.zig");
 const local_address = @import("local_address.zig");
+const tls_roots = @import("tls_roots.zig");
 
 /// Long-lived HTTP client wrapper that keeps std's ConnectionPool alive
 /// across requests to one product origin. std already implements acquire,
@@ -119,14 +120,12 @@ pub const HttpPool = struct {
         const io = io_mod.getIo();
         const uri = std.Uri.parse(url) catch return;
         const protocol = std.http.Client.Protocol.fromUri(uri) orelse return;
-        if (protocol == .tls) {
-            // Client.connect skips the TLS preamble that Client.request
-            // performs; Tls.create requires ca_bundle loaded and now set.
-            self.ensureTlsReady() catch |err| {
-                debug_trace.logf("gateway", "pool_warm result=error stage=tls_init err={s}", .{@errorName(err)});
-                return;
-            };
-        }
+        // Client.connect skips the TLS preamble that Client.request
+        // performs; Tls.create requires ca_bundle loaded and now set.
+        tls_roots.prepare(&self.client, uri) catch |err| {
+            debug_trace.logf("gateway", "pool_warm result=error stage=tls_init err={s}", .{@errorName(err)});
+            return;
+        };
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
         const host = std.Io.net.HostName.fromUri(uri, &host_buf) catch return;
         const port: u16 = uri.port orelse defaultPort(protocol);
@@ -142,27 +141,6 @@ pub const HttpPool = struct {
         self.client.connection_pool.release(conn, io);
         self.noteActivity();
         debug_trace.logf("gateway", "pool_warm result=ok elapsed_ms={d}", .{io_mod.milliTimestamp() - started});
-    }
-
-    /// Mirrors the cert-bundle preamble of std.http.Client.request so direct
-    /// Client.connect calls are safe. Concurrent with real requests by lock.
-    fn ensureTlsReady(self: *HttpPool) !void {
-        const client = &self.client;
-        const io = client.io;
-        {
-            try client.ca_bundle_lock.lockShared(io);
-            defer client.ca_bundle_lock.unlockShared(io);
-            if (client.now != null) return;
-        }
-        var bundle: std.crypto.Certificate.Bundle = .empty;
-        defer bundle.deinit(client.allocator);
-        const now = std.Io.Clock.real.now(io);
-        bundle.rescan(client.allocator, io, now) catch return error.CertificateBundleLoadFailure;
-        try client.ca_bundle_lock.lock(io);
-        defer client.ca_bundle_lock.unlock(io);
-        if (client.now != null) return; // a concurrent request loaded it first
-        client.now = now;
-        std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
     }
 
     /// Spawns the warmer on a detached thread, at most once per pool.
@@ -204,6 +182,7 @@ pub const HttpPool = struct {
         uri: std.Uri,
         options: std.http.Client.RequestOptions,
     ) std.http.Client.RequestError!PooledRequest {
+        try tls_roots.prepare(&self.client, uri);
         self.refreshTlsClock();
         const io = self.client.io;
         self.setup_lock.lockSharedUncancelable(io);
@@ -363,6 +342,48 @@ test "warmAsync is a no-op in test builds" {
     defer _ = pool.deinit();
     pool.warmAsync("https://127.0.0.1:1/unreachable");
     try std.testing.expect(!pool.warm_started.load(.acquire));
+}
+
+/// A test Io that refuses to open either keychain file std's macOS scan
+/// reads, as a sandbox that denies them does, so no test reads them.
+const KeychainDeniedIo = struct {
+    var vtable: std.Io.VTable = undefined;
+
+    fn io() std.Io {
+        vtable = std.testing.io.vtable.*;
+        vtable.dirOpenFile = open;
+        return .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    }
+
+    fn open(userdata: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+        if (std.mem.eql(u8, path, "/System/Library/Keychains/SystemRootCertificates.keychain") or
+            std.mem.eql(u8, path, "/Library/Keychains/System.keychain")) return error.PermissionDenied;
+        return std.testing.io.vtable.dirOpenFile(userdata, dir, path, options);
+    }
+};
+
+test "the pool loads trusted roots when a sandbox denies the keychain files" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    // Nothing listens on port 1, so each attempt ends at the connect, after
+    // the roots load.
+    var warmed = HttpPool.init(std.testing.allocator);
+    defer _ = warmed.deinit();
+    warmed.client.io = KeychainDeniedIo.io();
+    warmed.warm("https://127.0.0.1:1/");
+    try std.testing.expect(warmed.client.now != null);
+    try std.testing.expect(warmed.client.ca_bundle.map.count() > 0);
+
+    var opened = HttpPool.init(std.testing.allocator);
+    defer _ = opened.deinit();
+    opened.client.io = KeychainDeniedIo.io();
+    const uri = try std.Uri.parse("https://127.0.0.1:1/v1/chat/completions");
+    if (opened.openRequest(.POST, uri, .{})) |pooled| {
+        var request = pooled.request;
+        request.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expect(err != error.CertificateBundleLoadFailure);
+    try std.testing.expect(opened.client.now != null);
+    try std.testing.expect(opened.client.ca_bundle.map.count() > 0);
 }
 
 test "TLS clock refresh leaves an unloaded clock for std to load" {

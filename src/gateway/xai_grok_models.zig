@@ -5,6 +5,7 @@ const grok_session = @import("../core/auth/grok_session.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
+const tls_roots = @import("../core/shared/tls_roots.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
@@ -230,7 +231,7 @@ const FetchOperation = struct {
             extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-identifier", .value = "fx" };
             extra_headers_len += 1;
         }
-        const result = client.fetch(.{
+        const result = tls_roots.fetch(&client, .{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = headers,
