@@ -23,6 +23,7 @@ test {
     _ = @import("core/output/diff.zig");
     _ = @import("core/mcp_host/credentials.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
+    _ = @import("core/permissions/auto_classifier.zig");
     _ = @import("core/session/session_adapter.zig");
     _ = @import("core/profiles/profiles.zig");
     _ = @import("core/session/session_codec.zig");

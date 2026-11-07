@@ -764,6 +764,7 @@ fn reviewRequestForCall(
                 .resolved_cwd = command.resolved_cwd,
                 .background = false,
                 .target_os = command.target_os,
+                .environment = command.environment,
             } };
         } else if (try isShellInputCall(input, arena, call)) blk: {
             break :blk .{ .shell_input = .{
@@ -6481,4 +6482,38 @@ test "automatic trusted-root overwrite preserves configured read disclosure revi
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+}
+
+test "the review request carries the environment a shell command runs in" {
+    // serializeEvidence can describe only the environment this request hands
+    // it, so the wiring is pinned here: each profile reaches the reviewer as
+    // the same environment, with the same shell, that the command runs in.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    const input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    for ([_][]const u8{ "user", "clean" }) |profile| {
+        const call: ToolCall = .{
+            .id = "test-review",
+            .name = "shell",
+            .arguments_json = try arena.print(
+                "{{\"action\":\"run\",\"command\":\"git status\",\"profile\":\"{s}\"}}",
+                .{profile},
+            ),
+        };
+        const context = try runCommandContext(input, arena, call);
+        const request = try reviewRequestForCall(input, arena, call, &.{}, false, null);
+        const command = switch (request.action) {
+            .command => |value| value,
+            else => return error.TestExpectedCommandAction,
+        };
+        try std.testing.expectEqualStrings(profile, @tagName(command.environment));
+        try std.testing.expect(command.environment.eql(context.environment));
+        switch (command.environment) {
+            .user, .clean => |path| try std.testing.expect(std.Io.Dir.path.isAbsolute(path)),
+            .legacy, .workspace_clean => return error.TestExpectedShellRoute,
+        }
+    }
 }
