@@ -18,6 +18,10 @@
 (*    connection goes on.                                                 *)
 (*  - fx never answers -32000, which ACP v1 assigns to "Authentication    *)
 (*    required".                                                          *)
+(*  - The libfx/* methods follow the same rules. Only libfx's minimal     *)
+(*    kernel, in the native addon, serves them. For the open session,     *)
+(*    libfx/steer with no turn running fails with -32600, and the driver  *)
+(*    sends libfx/restore an empty checkpoint, which fails with -32602.   *)
 (*  - A request that fails changes nothing.                               *)
 (*                                                                         *)
 (* `Fixed` set to FALSE gives fx before these rules (origin/main at       *)
@@ -48,7 +52,8 @@ Missing == {"none", "bad"}
 Targets == Ids \cup {Unknown} \cup Missing
 
 \* Requests that act on the open session, and what each answers when it works.
-TargetOps == {"prompt", "mode", "config", "cancel"}
+LibfxOps == {"snapshot", "checkpoint", "handoff", "withdraw", "followup", "steer", "restore"}
+TargetOps == {"prompt", "mode", "config", "cancel"} \cup LibfxOps
 RestoreOps == {"load", "resume"}
 NamingOps == TargetOps \cup RestoreOps \cup {"close"}
 Answer(op) ==
@@ -56,6 +61,11 @@ Answer(op) ==
       [] op = "mode"   -> "null"
       [] op = "config" -> "object"
       [] op = "cancel" -> "null"
+      [] op = "snapshot" -> "object"
+      [] op = "checkpoint" -> "object"
+      [] op = "handoff" -> "null"
+      [] op = "withdraw" -> "object"
+      [] op = "followup" -> "null"
 
 VARIABLES open,     \* the session open in the running process, or "none"
           created,  \* the sessions the client created
@@ -74,6 +84,12 @@ NotFound(op, t) ==
     ELSE Obs(op, t, FALSE, -32602, FALSE, "none")
 
 InvalidParams(op, t) == Obs(op, t, FALSE, -32602, FALSE, "none")
+
+\* The two requests that fail for the open session in the driver's runs.
+OpenFails == {"steer", "restore"}
+OpenFailure(op, t) ==
+    IF op = "steer" THEN Obs(op, t, FALSE, -32600, FALSE, "none")
+    ELSE Obs(op, t, FALSE, -32602, FALSE, "none")
 
 Init ==
     /\ open = "none"
@@ -100,6 +116,9 @@ Restart ==
 Target(op, t) ==
     CASE t \in Missing ->
              /\ last' = InvalidParams(op, t)
+             /\ UNCHANGED state
+      [] t = open /\ op \in OpenFails ->
+             /\ last' = OpenFailure(op, t)
              /\ UNCHANGED state
       [] t = open ->
              /\ last' = Obs(op, t, TRUE, 0, FALSE, Answer(op))
@@ -198,7 +217,7 @@ CloseClosesOpen ==
            /\ open' = "none"]_vars
 
 OpenSessionAnswers ==
-    [][(last'.op \in TargetOps /\ open # "none" /\ last'.arg = open) =>
+    [][(last'.op \in TargetOps \ OpenFails /\ open # "none" /\ last'.arg = open) =>
            /\ last'.ok
            /\ last'.result = Answer(last'.op)]_vars
 
