@@ -19,6 +19,7 @@ test {
     _ = @import("core/images/image_data.zig");
     _ = @import("core/images/image_route.zig");
     _ = @import("core/mcp/elicitation.zig");
+    _ = @import("core/mcp/http_config.zig");
     _ = @import("core/mcp/tool_search.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/mcp_host/credentials.zig");
