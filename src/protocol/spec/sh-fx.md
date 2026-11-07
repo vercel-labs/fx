@@ -273,6 +273,8 @@ Each entry gives a client's id and the `clientInfo` that the client sent at `ini
 }
 ```
 
+`tests/tla/acp/AcpSharedSession.tla` models these rules, and TLC checks that a permission is decided once, that every other client loses the request it can no longer answer, that a client that has read everything fx sent holds every prompt the others sent while it had the session open, and that its list of clients is current. Its `Today` configs show where fx breaks them now.
+
 ### Session status and list changes
 
 This extension tells clients what each session is doing, which ACP v1 can't, and when the list of sessions changes. It follows ACP v2's [session states](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle), ACP's unstable [`session/status`](https://agentclientprotocol.com/rfds/session-status), and the [session list extensions](https://github.com/agentclientprotocol/agent-client-protocol/pull/2323) draft.
