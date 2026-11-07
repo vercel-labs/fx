@@ -683,13 +683,16 @@ pub const ParseError = error{ MissingSection, InvalidEntry } || Allocator.Error;
 pub fn parsePayload(generation: *Generation, payload: []const u8, nonce: []const u8) ParseError!void {
     const alloc = generation.arena.allocator();
     const env_marker = try markerText(alloc, nonce, "ENV", "", "\x00");
+    const zdotdir_marker = try markerText(alloc, nonce, "ZDOTDIR", "", "");
     const names_marker = try markerText(alloc, nonce, "NAMES", "", "");
     const replay_marker = try markerText(alloc, nonce, "REPLAY", "", "");
     const end_marker = try markerText(alloc, nonce, "END", "\x00", "\x00");
 
     const env_start = (std.mem.find(u8, payload, env_marker) orelse return error.MissingSection) + env_marker.len;
     var cursor = env_start;
-    var section: enum { env, names } = .env;
+    // A zsh payload has a ZDOTDIR section with one value between the
+    // environment and the names; a bash payload has none.
+    var section: enum { env, zdotdir, after_zdotdir, names } = .env;
     const replay_start = while (cursor < payload.len) {
         const terminator = std.mem.findScalarPos(u8, payload, cursor, 0) orelse return error.MissingSection;
         const entry = payload[cursor..terminator];
@@ -700,15 +703,25 @@ pub fn parsePayload(generation: *Generation, payload: []const u8, nonce: []const
                     section = .names;
                     continue;
                 }
+                if (std.mem.eql(u8, entry, zdotdir_marker)) {
+                    section = .zdotdir;
+                    continue;
+                }
                 const separator = std.mem.findScalar(u8, entry, '=') orelse return error.InvalidEntry;
                 if (separator == 0) return error.InvalidEntry;
                 const key = entry[0..separator];
                 const value = entry[separator + 1 ..];
                 if (isShellOwned(key)) continue;
-                if (std.mem.eql(u8, key, "ZDOTDIR") and value.len != 0) {
-                    generation.zdotdir = try alloc.dupe(u8, value);
-                }
                 try generation.environ.put(key, value);
+            },
+            .zdotdir => {
+                // An empty value is an unset or empty ZDOTDIR: no folder.
+                if (entry.len != 0) generation.zdotdir = try alloc.dupe(u8, entry);
+                section = .after_zdotdir;
+            },
+            .after_zdotdir => {
+                if (!std.mem.eql(u8, entry, names_marker)) return error.InvalidEntry;
+                section = .names;
             },
             .names => {
                 if (std.mem.eql(u8, entry, replay_marker)) break cursor;
@@ -918,6 +931,10 @@ fn testPayload(alloc: Allocator, nonce: []const u8, chatter: []const u8) ![]u8 {
         "ZDOTDIR=/home/user/.config/zsh\x00",
         "FXSNAP:",
         nonce,
+        ":ZDOTDIR\x00",
+        "/home/user/.config/zsh\x00",
+        "FXSNAP:",
+        nonce,
         ":NAMES\x00",
         "ll\x00fx_function\x00\x00",
         "FXSNAP:",
@@ -971,6 +988,146 @@ test "snapshot payload parsing rejects truncated or malformed payloads" {
     const third = try Generation.create();
     defer third.destroy();
     try testing.expectError(error.MissingSection, parsePayload(third, "no markers here", nonce));
+}
+
+/// A payload with the given environment entries and ZDOTDIR section, and no
+/// names or replay. bash payloads have no ZDOTDIR section.
+fn zdotdirPayload(alloc: Allocator, nonce: []const u8, env: []const u8, zdotdir_entries: ?[]const u8) ![]u8 {
+    const section = if (zdotdir_entries) |entries|
+        try alloc.print("FXSNAP:{s}:ZDOTDIR\x00{s}", .{ nonce, entries })
+    else
+        "";
+    return alloc.print(
+        "FXSNAP:{0s}:ENV\x00{1s}{2s}FXSNAP:{0s}:NAMES\x00FXSNAP:{0s}:REPLAY\x00\x00FXSNAP:{0s}:END\x00",
+        .{ nonce, env, section },
+    );
+}
+
+test "snapshot payload parsing reads ZDOTDIR from its own section whether or not it is exported" {
+    const nonce = "00112233445566778899aabbccddeeff";
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    // Set in ~/.zshenv without export: only the section has it.
+    const unexported = try Generation.create();
+    defer unexported.destroy();
+    try parsePayload(unexported, try zdotdirPayload(scratch, nonce, "PATH=/usr/bin\x00", "/Users/example/.config/zsh\x00"), nonce);
+    try testing.expectEqualStrings("/Users/example/.config/zsh", unexported.zdotdir.?);
+    try testing.expect(unexported.environ.get("ZDOTDIR") == null);
+
+    const exported = try Generation.create();
+    defer exported.destroy();
+    try parsePayload(exported, try zdotdirPayload(
+        scratch,
+        nonce,
+        "ZDOTDIR=/Users/example/zsh\x00",
+        "/Users/example/zsh\x00",
+    ), nonce);
+    try testing.expectEqualStrings("/Users/example/zsh", exported.zdotdir.?);
+    try testing.expectEqualStrings("/Users/example/zsh", exported.environ.get("ZDOTDIR").?);
+
+    // An empty ZDOTDIR names no folder.
+    const empty = try Generation.create();
+    defer empty.destroy();
+    try parsePayload(empty, try zdotdirPayload(scratch, nonce, "", "\x00"), nonce);
+    try testing.expect(empty.zdotdir == null);
+
+    // bash has no ZDOTDIR section; an exported value there means nothing.
+    const bash = try Generation.create();
+    defer bash.destroy();
+    try parsePayload(bash, try zdotdirPayload(scratch, nonce, "ZDOTDIR=/Users/example/zsh\x00", null), nonce);
+    try testing.expect(bash.zdotdir == null);
+    try testing.expectEqualStrings("/Users/example/zsh", bash.environ.get("ZDOTDIR").?);
+
+    const two_values = try Generation.create();
+    defer two_values.destroy();
+    try testing.expectError(error.InvalidEntry, parsePayload(
+        two_values,
+        try zdotdirPayload(scratch, nonce, "", "/Users/example/a\x00/Users/example/b\x00"),
+        nonce,
+    ));
+
+    const cut = try Generation.create();
+    defer cut.destroy();
+    const cut_payload = try std.mem.concat(scratch, u8, &.{ "FXSNAP:", nonce, ":ENV\x00FXSNAP:", nonce, ":ZDOTDIR\x00/Users/example/zsh\x00" });
+    try testing.expectError(error.MissingSection, parsePayload(cut, cut_payload, nonce));
+}
+
+const fuzz_payload_nonce = "00112233445566778899aabbccddeeff";
+const fuzz_payload_markers = [_][]const u8{
+    "FXSNAP:" ++ fuzz_payload_nonce ++ ":ENV\x00",
+    "FXSNAP:" ++ fuzz_payload_nonce ++ ":ZDOTDIR",
+    "FXSNAP:" ++ fuzz_payload_nonce ++ ":NAMES",
+    "FXSNAP:" ++ fuzz_payload_nonce ++ ":REPLAY",
+    "\x00FXSNAP:" ++ fuzz_payload_nonce ++ ":END\x00",
+};
+
+/// Expands a fuzz input into a payload. Byte 0x01 and the byte after it
+/// insert one of the section markers, so the fuzzer reaches every section
+/// in any order; every other byte, NUL included, is copied.
+fn fuzzPayload(alloc: Allocator, input: []const u8) Allocator.Error![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    var index: usize = 0;
+    while (index < input.len) : (index += 1) {
+        if (input[index] == 0x01 and index + 1 < input.len) {
+            index += 1;
+            try output.appendSlice(alloc, fuzz_payload_markers[input[index] % fuzz_payload_markers.len]);
+        } else {
+            try output.append(alloc, input[index]);
+        }
+    }
+    return output.toOwnedSlice(alloc);
+}
+
+fn fuzzSnapshotPayload(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [4096]u8 = undefined;
+    const input = input_buffer[0..smith.slice(&input_buffer)];
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const payload = try fuzzPayload(scratch, input);
+
+    const generation = try Generation.create();
+    defer generation.destroy();
+    parsePayload(generation, payload, fuzz_payload_nonce) catch |err| switch (err) {
+        error.MissingSection, error.InvalidEntry => return,
+        error.OutOfMemory => return err,
+    };
+
+    // The replay ends at the first end marker, so it never holds one.
+    try testing.expect(std.mem.find(u8, generation.replay, fuzz_payload_markers[4]) == null);
+    var entries = generation.environ.iterator();
+    while (entries.next()) |entry| {
+        const key = entry.key_ptr.*;
+        try testing.expect(key.len != 0);
+        try testing.expect(std.mem.findAny(u8, key, "=\x00") == null);
+        try testing.expect(std.mem.findScalar(u8, entry.value_ptr.*, 0) == null);
+        try testing.expect(!isShellOwned(key));
+    }
+    var names = generation.names.keyIterator();
+    while (names.next()) |name| {
+        try testing.expect(name.len != 0);
+        try testing.expect(std.mem.findScalar(u8, name.*, 0) == null);
+    }
+    // A ZDOTDIR comes only from the entry right after its section marker.
+    if (generation.zdotdir) |zdotdir| {
+        try testing.expect(zdotdir.len != 0);
+        const entry = try std.mem.concat(scratch, u8, &.{ fuzz_payload_markers[1], "\x00", zdotdir, "\x00" });
+        try testing.expect(std.mem.find(u8, payload, entry) != null);
+    }
+}
+
+test "snapshot payload parsing keeps its laws on fuzzed sections" {
+    try std.testing.fuzz({}, fuzzSnapshotPayload, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "\x01\x00PATH=/usr/bin\x00\x01\x01\x00/Users/example/.config/zsh\x00\x01\x02\x00ll\x00\x01\x03\x00alias ll='ls -l'\n\x01\x04",
+            "\x01\x00ZDOTDIR=/Users/example/zsh\x00\x01\x02\x00\x01\x03\x00fx () { :; }\n\x01\x04",
+            "\x01\x01\x00/Users/example/zsh\x00\x01\x00\x01\x02\x00\x01\x03\x00\x01\x04",
+            "\x01\x00\x01\x01\x00\x00\x01\x02\x00\x01\x03\x00\x01\x04",
+            "",
+        }) ++ @import("fuzz_corpus").shell_snapshot_payload.*),
+    });
 }
 
 const FakeCapture = struct {
@@ -1200,6 +1357,29 @@ fn writeTestFile(dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
     try dir.writeFile(io_mod.getIo(), .{ .sub_path = path, .data = data });
 }
 
+/// Runs the real capture for `shell_path` with `environ`. Caller destroys the
+/// generation.
+fn captureForTest(shell_path: []const u8, cwd: []const u8, environ: *const Environ.Map) !*Generation {
+    const outcome = captureWithShell(.{ .shell_path = shell_path, .cwd = cwd, .environ = environ });
+    return switch (outcome) {
+        .ready => |value| value,
+        .failed => |reason| {
+            // Names the failure in the test output without a direct write.
+            try testing.expectEqualStrings("ready", @tagName(reason));
+            unreachable;
+        },
+    };
+}
+
+/// Startup-file helpers every real capture replays: loaded `_` and `__`
+/// functions, and one whose body reads like an autoload stub. fx's own
+/// `__fx_snapshot_` names stay out.
+const real_capture_helpers =
+    "_fx_snapshot_helper() { printf 'helper-ok\\n'; }\n" ++
+    "__fxsnap_dunder() { printf 'dunder-ok\\n'; }\n" ++
+    "_fx_snapshot_literal() { printf 'builtin autoload -XU\\n'; }\n" ++
+    "__fx_snapshot_private() { :; }\n";
+
 fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []const u8) !void {
     std.Io.Dir.accessAbsolute(io_mod.getIo(), shell_path, .{}) catch return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
@@ -1208,8 +1388,13 @@ fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
     const home = try io_mod.dirRealpathAlloc(scratch, tmp.dir, ".");
-    try writeTestFile(tmp.dir, file_name, contents);
-    if (std.mem.eql(u8, file_name, ".bashrc")) {
+    try writeTestFile(tmp.dir, file_name, try std.mem.concat(scratch, u8, &.{ contents, real_capture_helpers }));
+    const zsh = std.mem.eql(u8, file_name, ".zshrc");
+    if (zsh) {
+        // An autoloaded completion function that the startup files call.
+        try tmp.dir.createDirPath(io_mod.getIo(), "fn");
+        try writeTestFile(tmp.dir, "fn/_fx_loaded_later", "print -r -- loaded-later\n");
+    } else {
         try writeTestFile(tmp.dir, ".bash_profile", ". \"$HOME/.bashrc\"\n");
     }
 
@@ -1219,15 +1404,7 @@ fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []
     try environ.put("PATH", "/usr/bin:/bin");
     try environ.put("TERM", "dumb");
 
-    const outcome = captureWithShell(.{ .shell_path = shell_path, .cwd = home, .environ = &environ });
-    const generation = switch (outcome) {
-        .ready => |value| value,
-        .failed => |reason| {
-            // Names the failure in the test output without a direct write.
-            try testing.expectEqualStrings("ready", @tagName(reason));
-            unreachable;
-        },
-    };
+    const generation = try captureForTest(shell_path, home, &environ);
     defer generation.destroy();
     try testing.expectEqualStrings("captured-from-startup", generation.environ.get("FX_TEST_SNAPSHOT_MARKER").?);
     try testing.expect(std.mem.startsWith(u8, generation.environ.get("PATH").?, "/opt/fx-snapshot-marker/bin:"));
@@ -1237,6 +1414,22 @@ fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []
     try testing.expect(std.mem.find(u8, generation.replay, "fx_snapshot_function") != null);
     try testing.expect(std.mem.find(u8, generation.replay, "fxll") != null);
     try testing.expect(std.mem.find(u8, generation.replay, "startup chatter") == null);
+    inline for (.{ "_fx_snapshot_helper", "__fxsnap_dunder", "_fx_snapshot_literal" }) |name| {
+        try testing.expect(std.mem.find(u8, generation.replay, name ++ " ()") != null);
+    }
+    try testing.expect(std.mem.find(u8, generation.replay, "__fx_snapshot_private") == null);
+    if (zsh) {
+        // An exported ZDOTDIR is still watched.
+        try testing.expectEqualStrings(home, generation.zdotdir orelse "");
+        // Unloaded completion stubs stay out of the replay but count as
+        // defined names; public stubs and loaded `_` functions are replayed.
+        try testing.expect(generation.defines("_fx_unloaded"));
+        try testing.expect(std.mem.find(u8, generation.replay, "_fx_unloaded") == null);
+        try testing.expect(std.mem.find(u8, generation.replay, "fx_public_unloaded ()") != null);
+        try testing.expect(std.mem.find(u8, generation.replay, "_fx_loaded_later ()") != null);
+    } else {
+        try testing.expect(generation.zdotdir == null);
+    }
 }
 
 test "snapshot capture reads a real zsh login shell" {
@@ -1248,8 +1441,43 @@ test "snapshot capture reads a real zsh login shell" {
             "export PATH=\"/opt/fx-snapshot-marker/bin:$PATH\"\n" ++
             "alias fxll='print -r -- alias-ok'\n" ++
             "fx_snapshot_function() { print -r -- function-ok; }\n" ++
-            "_fx_completion_helper() { :; }\n",
+            "fpath=(\"$HOME/fn\" $fpath)\n" ++
+            "autoload -Uz _fx_unloaded fx_public_unloaded _fx_loaded_later\n" ++
+            "_fx_loaded_later >/dev/null\n",
     );
+}
+
+test "snapshot capture records a ZDOTDIR the startup files set without exporting it" {
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const home = try io_mod.dirRealpathAlloc(scratch, tmp.dir, ".");
+    // A folder name that needs quoting in the replay.
+    const folder = "zd it's\nhere";
+    try tmp.dir.createDirPath(io_mod.getIo(), folder);
+    try writeTestFile(tmp.dir, ".zshenv", "ZDOTDIR=\"$HOME/zd it's\n" ++ "here\"\n");
+    try writeTestFile(tmp.dir, folder ++ "/.zshrc", "export FX_TEST_ZDOTDIR_MARKER=read-from-zdotdir\n");
+
+    var environ = Environ.Map.init(scratch);
+    try environ.put("HOME", home);
+    try environ.put("PATH", "/usr/bin:/bin");
+    try environ.put("TERM", "dumb");
+    const generation = try captureForTest("/bin/zsh", home, &environ);
+    defer generation.destroy();
+    try testing.expectEqualStrings("read-from-zdotdir", generation.environ.get("FX_TEST_ZDOTDIR_MARKER").?);
+    try testing.expectEqualStrings(try std.mem.concat(scratch, u8, &.{ home, "/", folder }), generation.zdotdir orelse "");
+    try testing.expect(generation.environ.get("ZDOTDIR") == null);
+    try testing.expect(std.mem.find(u8, generation.replay, "ZDOTDIR=") != null);
+
+    // Without a ZDOTDIR the replay sets none.
+    try tmp.dir.deleteFile(io_mod.getIo(), ".zshenv");
+    const unset = try captureForTest("/bin/zsh", home, &environ);
+    defer unset.destroy();
+    try testing.expect(unset.zdotdir == null);
+    try testing.expect(std.mem.find(u8, unset.replay, "ZDOTDIR=") == null);
 }
 
 test "snapshot capture reads a real bash login shell" {

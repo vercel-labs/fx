@@ -333,18 +333,39 @@ pub const snapshot_marker_prefix = "FXSNAP:";
 // as Debian's and Ubuntu's global zshrc does, would otherwise make the
 // replayed `run-help () {` a parse error that stops the whole replay. The
 // captured `alias -L` lines then restore exactly the user's aliases.
+//
+// ZDOTDIR gets its own section because a startup file may set it without
+// exporting it, as `ZDOTDIR=~/.config/zsh` in ~/.zshenv does, and then the
+// environment does not show it. The replay restores it with a plain
+// assignment, which leaves it unexported unless the environment exports it.
+//
+// Functions named `_*` are mostly completion functions that compinit only
+// marks for autoloading. Commands never run completion, so those stubs stay
+// out of the replay, which runs before every command. A `_*` function the
+// startup files defined or loaded, such as a helper a public wrapper calls,
+// is replayed.
 const zsh_capture_script =
     \\{
     \\\builtin zmodload zsh/parameter 2>/dev/null
     \\\builtin printf 'FXSNAP:@NONCE@:ENV\0'
     \\/usr/bin/env -0
+    \\\builtin printf 'FXSNAP:@NONCE@:ZDOTDIR\0%s\0' "${ZDOTDIR-}"
     \\\builtin printf 'FXSNAP:@NONCE@:NAMES\0'
     \\\builtin printf '%s\0' ${(k)aliases} ${(k)galiases} ${(k)saliases} ${(k)functions}
     \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
     \\\builtin print -r -- '\builtin unalias -a; \builtin unalias -as'
     \\\builtin typeset -p fpath
+    \\if [[ -n ${ZDOTDIR+set} ]]; then \builtin print -r -- "ZDOTDIR=${(qq)ZDOTDIR}"; fi
+    \\\builtin typeset -A __fx_snapshot_unloaded
+    \\__fx_snapshot_unloaded=()
+    \\for __fx_snapshot_name in ${(f)"$(\builtin functions -u +)"}; do
+    \\  __fx_snapshot_unloaded[$__fx_snapshot_name]=1
+    \\done
     \\for __fx_snapshot_name in ${(ko)functions}; do
-    \\  case $__fx_snapshot_name in (_*|prompt_*|__fx_snapshot_*) continue;; esac
+    \\  case $__fx_snapshot_name in
+    \\    (prompt_*|__fx_snapshot_*) continue;;
+    \\    (_*) (( ${+__fx_snapshot_unloaded[$__fx_snapshot_name]} )) && continue;;
+    \\  esac
     \\  \builtin functions -- $__fx_snapshot_name
     \\done
     \\\builtin alias -L
@@ -369,7 +390,7 @@ const bash_capture_script =
     \\\builtin printf '%s\0' $(\builtin compgen -a) $(\builtin compgen -A function)
     \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
     \\for __fx_snapshot_name in $(\builtin compgen -A function); do
-    \\  case $__fx_snapshot_name in _*|__fx_snapshot_*) continue;; esac
+    \\  case $__fx_snapshot_name in __fx_snapshot_*) continue;; esac
     \\  \builtin declare -f -- "$__fx_snapshot_name"
     \\done
     \\\builtin alias -p
@@ -381,8 +402,9 @@ const bash_capture_script =
 ;
 
 /// Builds the script a login shell runs once to capture its state as a
-/// NUL-delimited payload: exported environment, alias and function names, and
-/// a replay of functions, aliases, and selected options. Every section marker
+/// NUL-delimited payload: exported environment, zsh's ZDOTDIR parameter,
+/// alias and function names, and a replay of functions, aliases, and selected
+/// options. Every section marker
 /// carries `nonce`, so output printed by the user's startup files cannot be
 /// mistaken for the payload. `nonce` must be ASCII hex.
 pub fn snapshotCaptureScript(
