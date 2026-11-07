@@ -37,14 +37,14 @@ runs:
       if: runner.os == 'macOS' && (inputs.zig == 'true' || inputs.llvm == 'true')
       uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       with:
-        version: "0.17.0"
+        version: "0.17.1"
         cache-key: pgso-macos-arm64
 
     - name: Setup Zig
       if: runner.os == 'Linux' && (inputs.zig == 'true' || inputs.llvm == 'true')
       uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       with:
-        version: "0.17.0"
+        version: "0.17.1"
         cache-key: ${{ runner.arch == 'ARM64' && 'pgso-linux-arm64' || 'pgso-linux-x86_64' }}
 
     - name: Install pinned LLVM

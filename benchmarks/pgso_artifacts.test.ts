@@ -451,7 +451,7 @@ test("PGSO provenance rejects unproven manual branch heads without weakening qua
     (pair) => { pair[1].run.head_repository.full_name = "foreign/repository"; },
     (pair) => { pair[1].run.run_attempt++; },
     (pair) => { pair[1].manifest.evidence.artifacts.candidate.signature_valid = false; },
-    (pair) => { pair[1].manifest.evidence.identity.zig_version = "0.17.0"; },
+    (pair) => { pair[1].manifest.evidence.identity.zig_version = "0.0.0"; },
   ];
   for (const mutate of mutations) {
     const pair = structuredClone(valid);
