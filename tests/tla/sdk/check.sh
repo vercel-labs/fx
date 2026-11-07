@@ -243,4 +243,20 @@ for pair in "TrustBody:Invariant OnlySentRuns is violated" "ShareName:Invariant 
         echo "== tenant witness $witness NOT reached" >&2; status=1
     fi
 done
+
+# QueueRecovery.tla: restart recovery on a World the app shares with the
+# Workflow SDK. QueueRecovery is libfx as it is and must pass. NoNamespace is
+# libfx before its sessions recorded their queue namespace: recovery sends
+# them to the Workflow SDK, which fails them. NoBareAck records it but has a
+# route that refuses a recovery message when no agent is named "default",
+# which the World delivers again. ../drivers/sdk/queue-recovery.ts checks
+# runs of the real SDK against it through QueueRecoveryTrace.tla.
+echo "== QueueRecovery"
+# shellcheck source=../lib/tlc.sh
+. ../lib/tlc.sh
+tlc_verdicts <<'VERDICTS' || status=1
+QueueRecovery QueueRecovery -
+QueueRecovery QueueRecovery-NoNamespace LibfxRunsNotFailed
+QueueRecovery QueueRecovery-NoBareAck RecoveryAckedFirstTime
+VERDICTS
 exit "$status"
