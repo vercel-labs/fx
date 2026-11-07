@@ -17,6 +17,7 @@ const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const app_host_config_runtime = @import("app_host_config_runtime.zig");
 const picker_state = @import("../input/picker_state.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const types = @import("../shared/types.zig");
@@ -1016,12 +1017,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn forgetCredentialSource(app: *App) void {
-            var attempt = config_runtime.attemptUserPreferences(
+            var attempt = app_host_config_runtime.attemptUserPreferences(
+                App,
                 app.alloc,
                 .{ .clear_credential_source = true },
             );
             defer attempt.deinit(app.alloc);
             switch (attempt) {
+                .host_owned => debug_trace.logf("auth", "credential choice clear skipped reason=host_owned", .{}),
                 .outcome => debug_trace.logf("auth", "credential choice cleared", .{}),
                 .failure => |failure| debug_trace.logf(
                     "auth",
@@ -1073,12 +1076,14 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            var attempt = config_runtime.attemptUserPreferences(
+            var attempt = app_host_config_runtime.attemptUserPreferences(
+                App,
                 app.alloc,
                 .{ .credential_source = source },
             );
             defer attempt.deinit(app.alloc);
             switch (attempt) {
+                .host_owned => debug_trace.logf("auth", "credential choice not persisted source={t} reason=host_owned", .{source}),
                 .outcome => debug_trace.logf("auth", "credential choice persisted source={t}", .{source}),
                 .failure => |failure| debug_trace.logf(
                     "auth",
@@ -1488,7 +1493,7 @@ pub fn Runtime(comptime App: type) type {
                     }, true);
                 }
             } else {
-                var persistence = config_runtime.attemptUserPreferences(app.alloc, .{
+                var persistence = app_host_config_runtime.attemptUserPreferences(App, app.alloc, .{
                     .provider = target,
                     .model_preference = .{
                         .provider = target,
@@ -1497,7 +1502,7 @@ pub fn Runtime(comptime App: type) type {
                 });
                 defer persistence.deinit(app.alloc);
                 switch (persistence) {
-                    .outcome => try app.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = body }, true),
+                    .outcome, .host_owned => try app.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = body }, true),
                     .failure => |failure| {
                         debug_trace.logf("provider", "runtime switch persistence failed err={s}", .{@errorName(failure.err)});
                         try app.writeDomainNotice(.{
@@ -1762,7 +1767,7 @@ pub fn Runtime(comptime App: type) type {
                         model_persistence_failed = persistence.settings_error != null or
                             persistence.session_error != null;
                     } else {
-                        var persistence = config_runtime.attemptUserPreferences(app.alloc, .{
+                        var persistence = app_host_config_runtime.attemptUserPreferences(App, app.alloc, .{
                             .model_preference = .{
                                 .provider = .gateway,
                                 .model = provider_runtime.modelOf(app, agent),
