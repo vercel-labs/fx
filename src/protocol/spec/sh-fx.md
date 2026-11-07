@@ -131,16 +131,17 @@ These rules apply to both deliveries:
 - A steer holds only text content blocks. fx joins their text, which must be 1 byte to 64 KiB long. A steer with any other block fails with `-32602`, and the client can send the same prompt with `"queue"`.
 - A session holds at most 64 steers and 1 MiB of steer text that no turn has taken yet. A steer past either limit fails with `-32600`, "Steering queue is full".
 - If the model is writing a reply when a steer arrives, fx stops the reply. The turn takes the steer at its next safe point, before its next model request.
+- A steer that arrives between two model requests waits for the turn's next one: after the running tool, or, when the model's reply has ended, the turn goes on with the steer instead of ending.
 - When a turn takes a steer, fx sends a `user_message_chunk` update with the steer's text. Its `_meta` holds `sh.fx/steerInput`, whose `requestId` is the steer's request id.
 
-When a turn ends, the steers it didn't take run together as the next turn, before any queued prompt. This also applies to a steer that arrives after the turn has stopped taking input, and to a turn that the client stopped.
+A steer that arrives after the turn has stopped taking input, and every steer still waiting when the client stops the turn, run together as the next turn, before any queued prompt.
 
 The response to a steer arrives when the turn that took it ends. It carries that turn's `stopReason`, and its `_meta` holds `sh.fx/steeringDelivery`:
 
 | `sh.fx/steeringDelivery` | Meaning |
 | --- | --- |
 | `"absorbed"` | The turn that was running took the steer |
-| `"next_turn"` | The turn that was running ended first, so the steer ran in the next turn |
+| `"next_turn"` | The turn that was running had stopped taking input, or the client stopped it, so the steer ran in the next turn |
 
 #### Queued prompts
 
@@ -155,6 +156,8 @@ The response to a steer arrives when the turn that took it ends. It carries that
 - `session/close` answers each steer and queued prompt that hasn't run with `-32800`.
 
 ACP v2's rule for [prompts during active work](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle) differs on one point: there, `session/cancel` also answers the prompts that haven't run with `-32800`. ACP v1 has no such rule. fx revisits this point when it moves to ACP v2.
+
+`tests/tla/acp/AcpPromptDelivery.tla` models these rules, and TLC checks them in every order of steers, queued prompts, stops, withdrawals, and closing. Its `Today` configs show where fx's ACP path breaks them now.
 
 #### Host steering
 
