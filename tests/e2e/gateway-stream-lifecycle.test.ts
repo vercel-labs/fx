@@ -1997,6 +1997,77 @@ describe("gateway stream lifecycle", () => {
     }
   }, 60_000);
 
+  test("a workspace outside HOME lists no skills from folders above its repository or itself", async () => {
+    const root = createFixtureRoot("skill-walk-boundary");
+    const tracePath = join(root.root, "trace.log");
+    const writeSkill = (base: string, name: string) => {
+      const directory = join(base, ".agents", "skills", name);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(
+        join(directory, "SKILL.md"),
+        `---\nname: ${name}\ndescription: ${name} fixture\n---\n\nbody\n`,
+      );
+    };
+    const gitInit = (directory: string) => {
+      mkdirSync(directory, { recursive: true });
+      const result = Bun.spawnSync(["git", "init", "-q", "--template=", directory], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          HOME: root.home,
+          GIT_CONFIG_NOSYSTEM: "1",
+          LC_ALL: "C",
+        },
+      });
+      if (result.exitCode !== 0) {
+        throw new Error(`git init failed: ${result.stderr.toString()}`);
+      }
+    };
+    // The fixture's HOME is beside these two workspaces, not above them.
+    const repository = join(root.root, "top", "mid", "repo");
+    gitInit(repository);
+    writeSkill(join(root.root, "top"), "walk-above-repository");
+    writeSkill(repository, "walk-repository");
+    const plainParent = join(root.root, "plain");
+    const plainWorkspace = join(plainParent, "workspace");
+    writeSkill(plainParent, "walk-above-workspace");
+    writeSkill(plainWorkspace, "walk-workspace");
+    // A repository under HOME keeps loading the folders up to HOME.
+    const homeRepository = join(root.home, "projects", "repo");
+    gitInit(homeRepository);
+    writeSkill(join(root.home, "projects"), "walk-above-home-repository");
+
+    const gateway = startGateway(() => fakeGatewayFinalText("SKILL_WALK_DONE"));
+    const firstRequest = async (cwd: string) => {
+      const index = gateway.requestCount();
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Say done."],
+        {
+          cwd,
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_SOUND: "0" },
+          timeoutMs: 30_000,
+        },
+      );
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("SKILL_WALK_DONE");
+      return gateway.requests[index]!.body;
+    };
+    try {
+      const inRepository = await firstRequest(repository);
+      expect(advertisedSkillLocations(inRepository, "walk-repository")).toHaveLength(1);
+      expect(advertisedSkillLocations(inRepository, "walk-above-repository")).toEqual([]);
+
+      const inPlainWorkspace = await firstRequest(plainWorkspace);
+      expect(advertisedSkillLocations(inPlainWorkspace, "walk-workspace")).toHaveLength(1);
+      expect(advertisedSkillLocations(inPlainWorkspace, "walk-above-workspace")).toEqual([]);
+
+      const inHomeRepository = await firstRequest(homeRepository);
+      expect(advertisedSkillLocations(inHomeRepository, "walk-above-home-repository")).toHaveLength(1);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("skill_symlink_authorities setting admits external skill links", async () => {
     const root = createFixtureRoot("skill-symlink-authorities");
     const tracePath = join(root.root, "trace.log");

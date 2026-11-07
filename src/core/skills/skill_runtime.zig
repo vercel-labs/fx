@@ -519,6 +519,17 @@ fn appendWorkspaceRoots(
     home: ?[]const u8,
     root_specs: []const skill_contract.RootSpec,
 ) !void {
+    // The walk ends before HOME, which works only when HOME is above the
+    // workspace. Anywhere else, such as a repository under /srv or a process
+    // given its own HOME, it would climb to `/` and load skills from
+    // unrelated folders, so it ends at the nearest repository root instead,
+    // or at the workspace itself outside a repository.
+    const home_above = if (home) |home_root| pathing.pathInside(home_root, workspace_root) else false;
+    const last_dir: ?[]const u8 = if (home_above)
+        null
+    else
+        (try repositoryRoot(alloc, workspace_root)) orelse workspace_root;
+
     var current: ?[]const u8 = workspace_root;
     while (current) |dir| : (current = std.Io.Dir.path.dirname(dir)) {
         if (home) |home_root| {
@@ -528,7 +539,25 @@ fn appendWorkspaceRoots(
         for (root_specs) |spec| {
             try appendSpecRoot(alloc, roots, dir, spec);
         }
+        if (last_dir) |last| {
+            if (std.mem.eql(u8, dir, last)) break;
+        }
     }
+}
+
+/// The nearest folder at or above `start` that holds a `.git` entry (the
+/// directory, or the file a linked worktree has), as a prefix of `start`, or
+/// null outside a repository. An entry that cannot be inspected counts as
+/// absent, so discovery keeps its out-of-memory-only error set.
+fn repositoryRoot(alloc: Allocator, start: []const u8) Allocator.Error!?[]const u8 {
+    var current: ?[]const u8 = start;
+    while (current) |dir| : (current = std.Io.Dir.path.dirname(dir)) {
+        const marker = try std.Io.Dir.path.join(alloc, &.{ dir, ".git" });
+        defer alloc.free(marker);
+        _ = std.Io.Dir.cwd().statFile(io_mod.getIo(), marker, .{ .follow_symlinks = false }) catch continue;
+        return dir;
+    }
+    return null;
 }
 
 fn appendSpecRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), base: []const u8, spec: skill_contract.RootSpec) !void {
@@ -4046,6 +4075,30 @@ fn createTempSymlinkOrSkip(tmp: *std.testing.TmpDir, target_path: []const u8, li
     };
 }
 
+/// A temporary folder in the system temp folder for a workspace that no
+/// repository contains. `std.testing.tmpDir` lives inside this checkout, whose
+/// own `.git` would count as the workspace's repository. Skips the test when
+/// the system temp folder is itself inside a repository.
+fn tmpDirOutsideRepositoryOrSkip(alloc: Allocator) !std.testing.TmpDir {
+    const base = io_mod.realpathAlloc(alloc, io_mod.getenv("TMPDIR") orelse "/tmp") catch return error.SkipZigTest;
+    defer alloc.free(base);
+    var current: ?[]const u8 = base;
+    while (current) |dir| : (current = std.Io.Dir.path.dirname(dir)) {
+        const marker = try std.Io.Dir.path.join(alloc, &.{ dir, ".git" });
+        defer alloc.free(marker);
+        _ = std.Io.Dir.cwd().statFile(io_mod.getIo(), marker, .{ .follow_symlinks = false }) catch continue;
+        return error.SkipZigTest;
+    }
+    var parent_dir = try std.Io.Dir.cwd().openDir(io_mod.getIo(), base, .{});
+    errdefer parent_dir.close(io_mod.getIo());
+    var random_bytes: [12]u8 = undefined;
+    io_mod.getIo().random(&random_bytes);
+    var sub_path: @FieldType(std.testing.TmpDir, "sub_path") = undefined;
+    _ = std.base64.url_safe.Encoder.encode(&sub_path, &random_bytes);
+    const dir = try parent_dir.createDirPathOpen(io_mod.getIo(), &sub_path, .{});
+    return .{ .dir = dir, .parent_dir = parent_dir, .sub_path = sub_path };
+}
+
 extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 fn createTempFifoOrSkip(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []const u8) !void {
@@ -4816,6 +4869,91 @@ test "loadVisibleSkills scans only roots supplied by policy" {
     try std.testing.expectEqual(SkillSource.workspace_claw, discovery.skills[0].source);
     try std.testing.expect(findSkillByName(discovery.skills, "ignored") == null);
     try std.testing.expect(findSkillByName(discovery.skills, "ignored-managed") == null);
+}
+
+test "loadVisibleSkills outside HOME stops the ancestor walk at the repository root" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The temp folder is inside this checkout, so `srv/repo` is a repository
+    // inside another one, and its own `.git` file is the nearest.
+    try writeTempFile(&tmp, "srv/.agents/skills/unrelated/SKILL.md", "---\nname: unrelated\ndescription: above the repository\n---\n\nbody\n");
+    try writeTempFile(&tmp, "srv/repo/.git", "gitdir: /srv/main/.git/worktrees/repo\n");
+    try writeTempFile(&tmp, "srv/repo/.agents/skills/shared/SKILL.md", "---\nname: shared\ndescription: repository root\n---\n\nbody\n");
+    try writeTempFile(&tmp, "srv/repo/app/.agents/skills/local/SKILL.md", "---\nname: local\ndescription: workspace\n---\n\nbody\n");
+    try writeTempFile(&tmp, "home/.fx/skills/.keep", "");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "srv/repo/app");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+
+    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+    defer discovery.deinit(alloc);
+
+    try std.testing.expect(findSkillByName(discovery.skills, "local") != null);
+    try std.testing.expect(findSkillByName(discovery.skills, "shared") != null);
+    try std.testing.expect(findSkillByName(discovery.skills, "unrelated") == null);
+}
+
+test "loadVisibleSkills outside HOME and any repository scans only the workspace" {
+    const alloc = std.testing.allocator;
+    var tmp = try tmpDirOutsideRepositoryOrSkip(alloc);
+    defer tmp.cleanup();
+
+    try writeTempFile(&tmp, "top/.agents/skills/unrelated/SKILL.md", "---\nname: unrelated\ndescription: above the workspace\n---\n\nbody\n");
+    try writeTempFile(&tmp, "top/home2/.agents/skills/local/SKILL.md", "---\nname: local\ndescription: workspace\n---\n\nbody\n");
+    try writeTempFile(&tmp, "top/home/.fx/skills/.keep", "");
+
+    // HOME's path is a prefix of the workspace's, but HOME is not above it.
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "top/home2");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "top/home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "top/home/.fx/skills");
+    defer alloc.free(managed_root);
+
+    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+    defer discovery.deinit(alloc);
+
+    try std.testing.expect(findSkillByName(discovery.skills, "local") != null);
+    try std.testing.expect(findSkillByName(discovery.skills, "unrelated") == null);
+}
+
+test "loadVisibleSkills inside HOME keeps loading ancestors above the repository" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(&tmp, "home/projects/.agents/skills/team/SKILL.md", "---\nname: team\ndescription: shared by projects\n---\n\nbody\n");
+    try writeTempFile(&tmp, "home/projects/repo/.git/HEAD", "ref: refs/heads/main\n");
+    try writeTempFile(&tmp, "home/.agents/skills/review/SKILL.md", "---\nname: review\ndescription: global agents\n---\n\nbody\n");
+    try writeTempFile(&tmp, "home/.fx/skills/.keep", "");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/projects/repo");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+
+    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+    defer discovery.deinit(alloc);
+    try std.testing.expect(findSkillByName(discovery.skills, "team") != null);
+
+    // HOME at the file system root is above every workspace.
+    var from_root_home = try loadVisibleSkills(alloc, workspace_root, "/", managed_root, test_root_policy);
+    defer from_root_home.deinit(alloc);
+    try std.testing.expect(findSkillByName(from_root_home.skills, "team") != null);
+
+    // A workspace at HOME scans no workspace roots, so HOME's skills stay global.
+    var at_home = try loadVisibleSkills(alloc, home_root, home_root, managed_root, test_root_policy);
+    defer at_home.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), at_home.skills.len);
+    try std.testing.expectEqual(SkillSource.global_agents, findSkillByName(at_home.skills, "review").?.source);
 }
 
 test "loadVisibleSkills preserves root-distinct duplicate skill names" {
