@@ -29,7 +29,8 @@ pub const ParseError = Allocator.Error || error{
 /// Returns the owned prompt from `session/new` params, or null when the params
 /// omit `systemPrompt` or set it to null. ACP v1's `systemPrompt` is
 /// `{"mode": ..., "content": [...]}`; fx supports the `append` mode, which every
-/// Agent that advertises the capability must, and text content blocks.
+/// Agent that advertises the capability must, and text content blocks
+/// (`tests/tla/acp/AcpSystemPrompt.tla` V1Accepted and OtherShapesRefused).
 pub fn parse(alloc: Allocator, params_raw: ?[]const u8) ParseError!?[]u8 {
     const raw = params_raw orelse return null;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
