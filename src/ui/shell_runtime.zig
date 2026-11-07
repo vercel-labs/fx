@@ -255,6 +255,21 @@ pub const TerminalState = struct {
         return std.posix.read(self.stdin_fd, out);
     }
 
+    /// Whether the terminal behind stdin is gone, asked after a read on it
+    /// failed with EIO. A terminal that was revoked, closed, or hung up polls
+    /// as closed or is no longer a terminal; macOS 15 can report a revoked
+    /// controlling terminal as readable, so only the second check shows it.
+    /// A background read that SIGTTIN did not stop fails with the same errno
+    /// on a terminal that passes both checks.
+    pub fn inputGone(self: TerminalState) bool {
+        if (comptime builtin.target.os.tag == .wasi) return false;
+        if (self.pollInput(0)) |poll| {
+            if (poll.closed()) return true;
+        } else |_| {}
+        const stdin_file = std.Io.File{ .handle = self.stdin_fd, .flags = .{ .nonblocking = false } };
+        return !(stdin_file.isTty(io_mod.getIo()) catch true);
+    }
+
     pub fn pollInput(self: TerminalState, timeout_ms: i32) !PollResult {
         if (comptime builtin.target.os.tag == .wasi) {
             return switch (wasm_terminal.pollInput(timeout_ms)) {
@@ -867,6 +882,54 @@ test "the best-effort restore returns for a revoked terminal" {
 
     // macOS answers ENOENT for a terminal it revoked.
     try io_mod.tcsetattrBestEffort(pty.slave, .FLUSH, original);
+}
+
+test "a terminal that is still there is not gone" {
+    if (!supports_test_pty) return error.SkipZigTest;
+
+    // A background read that SIGTTIN does not stop fails with EIO on a
+    // terminal like this one, which still polls quietly and answers tcgetattr.
+    const pty = try TestPty.open();
+    defer pty.close();
+    try std.testing.expect(!(TerminalState{ .stdin_fd = pty.slave }).inputGone());
+}
+
+test "a revoked terminal is gone" {
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const pty = try TestPty.open();
+    defer pty.close();
+    const slave_name = ptsname(pty.master) orelse return error.PtyUnavailable;
+    try std.testing.expectEqual(@as(c_int, 0), revoke(slave_name));
+    try std.testing.expect((TerminalState{ .stdin_fd = pty.slave }).inputGone());
+}
+
+test "a terminal whose other side closed is gone" {
+    if (!supports_test_pty) return error.SkipZigTest;
+
+    const pty = try TestPty.open();
+    closeTestFd(pty.master);
+    defer closeTestFd(pty.slave);
+    try std.testing.expect((TerminalState{ .stdin_fd = pty.slave }).inputGone());
+}
+
+test "a descriptor that is not open is gone" {
+    if (!supports_test_pty) return error.SkipZigTest;
+
+    try std.testing.expect((TerminalState{ .stdin_fd = closed_test_fd }).inputGone());
+}
+
+test "stdin that answers no tcgetattr is gone even when its poll is quiet" {
+    if (!supports_test_pty) return error.SkipZigTest;
+
+    // macOS 15 can report a revoked controlling terminal as readable, with
+    // no POLLHUP or POLLNVAL; only tcgetattr then shows it is gone. An empty
+    // pipe whose writer is open polls quietly and is no terminal at all.
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    defer closeTestFd(fds[0]);
+    defer closeTestFd(fds[1]);
+    try std.testing.expect((TerminalState{ .stdin_fd = fds[0] }).inputGone());
 }
 
 test "reconstructive paint re-emits a full transcript in order" {

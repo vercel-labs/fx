@@ -39,6 +39,7 @@ import {
 } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { PtySession, revokeAvailable, revokeTerminal } from "./pty-session";
+import { inForeground, JOB_SHELL, JOB_SHELL_ENV, launchLine, stopped, waitForFxState } from "./job-control";
 import { commandReplays, logLines, onlySessionId, savedSessionIds, savedText, sessionDir, storeRoot } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
@@ -901,6 +902,56 @@ test.skipIf(!revokeAvailable() || !tmuxAvailable())("a revoked tmux pane ends fx
     rmSync(root, { recursive: true, force: true });
   }
 }, TIMEOUT * 2);
+
+test.skipIf(!tmuxAvailable())("Ctrl+Z, bg, and fg keep fx alive", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-job-control-")));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const stderrPath = join(root, "stderr.log");
+  mkdirSync(home);
+  mkdirSync(workspace);
+  const gateway = startFakeGateway([]);
+  let session: TmuxSession | null = null;
+  try {
+    session = await TmuxSession.create({
+      cmd: JOB_SHELL,
+      cwd: workspace,
+      isolated: true,
+      width: 100,
+      height: 30,
+      env: { ...revokedTerminalEnv(home, gateway), ...JOB_SHELL_ENV, VERCEL_OIDC_TOKEN: undefined },
+    });
+    await session.waitForText(/^\$/m, TIMEOUT);
+    await session.sendText(launchLine(FX_BIN, stderrPath));
+    await session.waitForComposer(TIMEOUT);
+    await waitForStartupModels(gateway);
+    await session.waitForStableComposer(TIMEOUT, 500);
+
+    await session.sendKeys("C-z");
+    await session.waitForText("Stopped", TIMEOUT);
+    await waitForFxState(session, FX_BIN, stopped, TIMEOUT);
+
+    // In the background, fx's resume sets raw mode again, and SIGTTOU stops
+    // it there: it waits for fg instead of reading a terminal it can't use.
+    await session.sendText("bg");
+    await session.waitForText(/ &$/m, TIMEOUT);
+    await waitForFxState(session, FX_BIN, stopped, TIMEOUT, 500);
+
+    await session.sendText("fg; echo fx-exit=$?");
+    await waitForFxState(session, FX_BIN, inForeground, TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT, 500);
+    await session.sendText("/quit");
+    const pane = await session.waitForText(/fx-exit=\d+/, TIMEOUT);
+    expect({ exit: pane.match(/fx-exit=(\d+)/)?.[1], stderr: readFileSync(stderrPath, "utf8") })
+      .toEqual({ exit: "0", stderr: "" });
+    expect(gateway.modelRequests).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(0);
+  } finally {
+    await session?.kill();
+    gateway.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
 
 test("wrapped semantic rows join descriptions across full-transcript pages", () => {
   const vs15 = SEMANTIC_TABLE_ROWS.find((row) => row.type === "VS15")!;
