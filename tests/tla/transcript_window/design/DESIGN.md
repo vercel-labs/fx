@@ -37,6 +37,17 @@ current code.
   content for cycles it reads from the log. Notices of the held cycles stay in
   memory like any finished block. Checked before the window was wired in: the
   log holds everything else the main screen and Ctrl+O show.
+- D12: Native history releases a row only when it leaves the screen above the
+  idle footer (composer and status line). The rows a footer surface (the slash
+  picker, a question or approval in place of the composer, a banner, a
+  multi-line draft) pushes off the top are held, not released, and come back
+  when it closes; output while it is open releases rows in order through the
+  history replay, a resize reprint and the recovery after a screen takeover
+  keep them held, and exit, suspend, and a fresh session's scrollback handoff
+  first release every held row. `spec/FooterReclaim.tla` models the main screen's
+  rows under this rule, with `Release = "current"` as main's rule before it;
+  `mutations.json` plants the rule's bugs in both the spec and the transcript
+  runtime (`src/ui/transcript/runtime.zig`).
 
 ## In fx
 
@@ -195,6 +206,10 @@ maps it onto the TLA+ variables.
 | L19 ScreenHoldsHeld | Outside a reprint, every held block is on the screen. |
 | L20 PaintedOnce | No step paints a block already on the screen in this epoch. |
 | L21 ReadBounded | One log reply moves the window by at most `Step` blocks, so a reply costs a bounded amount of work. |
+| L22 FooterAtBottom | The footer is on the bottom rows: the screen above it is full whenever the transcript has the rows to fill it (TUI-32). |
+| L23 HistoryOnce | No row in native history is on the screen, so no frame shows a row twice (native-history finality). |
+| L24 OwedRowsHeld | Every row on the screen or held above it is still in memory: the shell frees a dropped entry only once its rows are in history. |
+| L25 ExitKeepsRows | After exit no row is held: each one is in native history or on the screen when the footer is erased. |
 | L17 PureCore | `transcript_window.zig` imports only `std` and reads no clock, environment, or global. |
 
 ## Enforcement
@@ -221,11 +236,17 @@ maps it onto the TLA+ variables.
 | L19 | `inv:ScreenHoldsHeld`, `trace:ScreenHoldsHeld` |
 | L20 | `prop:PaintedOnce`, `trace:PaintedOnce` |
 | L21 | `prop:ReadBounded`, `trace:ReadBounded` |
+| L22 | `inv:FooterAtBottom`, `trace:FooterAtBottom` |
+| L23 | `inv:HistoryOnce`, `trace:HistoryOnce` |
+| L24 | `inv:OwedRowsHeld`, `trace:OwedRowsHeld` |
+| L25 | `inv:ExitKeepsRows`, `trace:ExitKeepsRows` |
 | L17 | `check:pure-core-imports` (the verify source check), not model checkable |
 
 Prefixes: `inv:` is an invariant in `spec/TranscriptWindow.tla` checked by
-`MCTranscriptWindow.cfg`; `trace:` is the same invariant checked on code traces
-by `spec/TraceTranscriptWindow.tla`; `prop:` is a temporal or action property
+`MCTranscriptWindow.cfg`, or in `spec/FooterReclaim.tla` checked by
+`MCFooterReclaim.cfg`; `trace:` is the same invariant checked on code traces
+by `spec/TraceTranscriptWindow.tla`, or on runtime traces by
+`spec/TraceFooterReclaim.tla`; `prop:` is a temporal or action property
 (`[][A]_vars`) in `MCTranscriptWindow.cfg` or `MCCtrlOReachesStart.cfg`; `test:` is an inline test in the core; `check:` is a
 step of `verify.ts`.
 

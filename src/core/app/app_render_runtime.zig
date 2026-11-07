@@ -943,6 +943,26 @@ pub fn Runtime(comptime App: type) type {
             return std.mem.eql(u8, pendingPickerSpeed(query, speed_index), "fast");
         }
 
+        /// Exit, suspend, and a fresh session hand off the screen, so before
+        /// they do, one frame (drawn by `flush_frame`, the App's one frame
+        /// flush) releases the rows a footer surface holds above the screen
+        /// into native history (`tests/tla/transcript_window/spec/FooterReclaim.tla`
+        /// ExitKeepsRows). Rows still held after it are logged as dropped from
+        /// scrollback; the session log and Ctrl+O keep them.
+        pub fn settleHeldTranscriptRows(app: *App, flush_frame: *const fn (*App) anyerror!void) void {
+            if (!app.shell.requestHeldRowsSettle()) return;
+            flush_frame(app) catch |err| {
+                debug_trace.logf("render", "held_rows_settle_failed err={s}", .{@errorName(err)});
+            };
+            if (app.shell.holdsTranscriptRows()) {
+                debug_trace.logf(
+                    "render",
+                    "held_rows_settle_incomplete dropped=held_transcript_rows_from_scrollback reason=settle_frame_not_committed",
+                    .{},
+                );
+            }
+        }
+
         pub fn flushRequestedFrame(app: *App, agent: *AppAgent) !void {
             if (comptime @hasDecl(@TypeOf(app.shell), "sessionScrollbackHandoffPending")) {
                 if (app.shell.sessionScrollbackHandoffPending()) return;
@@ -1394,10 +1414,10 @@ pub fn Runtime(comptime App: type) type {
                 measurement.changesFooterReservation(presentation_shell)
             else
                 false;
-            const replay_displaced_footer_history = if (footer_measurement) |*measurement|
-                measurement.replaysDisplacedTranscriptHistory(presentation_shell)
+            const held_footer_rows: u16 = if (footer_measurement) |*measurement|
+                measurement.heldFooterRows()
             else
-                false;
+                0;
 
             var footer_frame: surface_frame.SurfaceFooterFrame = undefined;
             var footer_frame_initialized = false;
@@ -1458,7 +1478,7 @@ pub fn Runtime(comptime App: type) type {
                     .prepared_transcript = &prepared_transcript,
                     .resolved_target = &resolved_transcript_target,
                     .footer_reservation_changed = footer_reservation_changed,
-                    .replay_displaced_footer_history = replay_displaced_footer_history,
+                    .held_footer_rows = held_footer_rows,
                     .footer_measurement = if (footer_measurement) |*measurement| measurement else null,
                     .fallback_footer_rows = if (footer_measurement == null)
                         footer_frame.paint.footer
@@ -2153,7 +2173,7 @@ fn FixedPointTranscriptContext(comptime App: type) type {
         prepared_transcript: *?transcript_painter.PreparedTranscriptSurfacePaint,
         resolved_target: *?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget,
         footer_reservation_changed: bool,
-        replay_displaced_footer_history: bool,
+        held_footer_rows: u16,
         footer_measurement: ?*const surface_frame.SurfaceFooterMeasurement,
         fallback_footer_rows: ?render_engine.footer_layout.FooterRows,
         activity_projection: activity_runtime.ActivityProjection,
@@ -2196,7 +2216,7 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 source,
                 prepared,
                 self.footer_reservation_changed,
-                self.replay_displaced_footer_history,
+                self.held_footer_rows,
             );
             self.scroll_facts = scroll_facts;
             const canonical_occupied_rows = if (prepared.selection.last_visible_row >= canonical_area.top)
@@ -4827,6 +4847,9 @@ fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
     var finished = try app.shell.prepareTranscriptSource(alloc, null);
     defer finished.deinit(alloc);
     try std.testing.expect(finished.finality.mutation_pin_start == null);
+    // The draft holds the transcript rows it covers until it clears
+    // (`tests/tla/transcript_window/spec/FooterReclaim.tla` FooterAtBottom).
+    if (cols == 24) app.input_runtime.inputResetState().clearCurrent(alloc);
     var released: u32 = 0;
     for (0..4) |_| released += try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
     try std.testing.expect(released > 0);

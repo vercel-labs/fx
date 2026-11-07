@@ -570,6 +570,16 @@ pub const TranscriptScrollFacts = struct {
     /// existing catch-up machinery settles the debt; footer displacement
     /// (visual ahead of history with nothing to settle) stays unflagged.
     finality_hold: bool = false,
+    /// A frame that re-anchors history (a reset reprint, or recovery from an
+    /// invalid anchor) leaves this many rows above the viewport out of native
+    /// history: the rows a footer surface covers, which are held for its
+    /// close (`tests/tla/transcript_window/spec/FooterReclaim.tla` Resized
+    /// and TookOver).
+    reset_held_rows: u16 = 0,
+    /// The release line sits below the viewport this frame: rows a footer
+    /// surface covers are held between history and the viewport. The gap is
+    /// debt the catch-up pays in order through the history replay.
+    footer_rows_held: bool = false,
 };
 
 pub const RetainedTranscriptBody = render_engine.frame_retention.RetainedTranscriptBody;
@@ -4732,6 +4742,7 @@ const transcript_slot_fields = [_][:0]const u8{
     "cursor_row",
     "cursor_col",
     "transcript_commit_state",
+    "settle_held_rows",
     "publication_projection_invalid",
     "transcript_band_dirty",
     "has_painted_transcript",
@@ -4898,6 +4909,11 @@ pub const TranscriptRuntime = struct {
     /// A settled terminal resize needs a canonical repaint from row one.
     /// It remains pending until the reset frame commits successfully.
     terminal_reset_pending: bool = false,
+    /// The next frames release every row a footer surface holds above the
+    /// screen into native history, so exit and suspend can erase the footer
+    /// without losing them. Cleared once history reaches the viewport
+    /// (`tests/tla/transcript_window/spec/FooterReclaim.tla` ExitKeepsRows).
+    settle_held_rows: bool = false,
     /// A committed resize reset established terminal-bottom ownership that
     /// the next cancellation projection must preserve.
     resize_bottom_anchor_pending: bool = false,
@@ -8010,6 +8026,25 @@ pub const TranscriptRuntime = struct {
         };
     }
 
+    /// Asks the next frame to release the rows a footer surface holds above
+    /// the screen into native history, as exit and suspend do before they
+    /// erase the footer. False when no row is held.
+    pub fn requestHeldRowsSettle(self: *TranscriptRuntime) bool {
+        if (!self.holdsTranscriptRows()) return false;
+        self.settle_held_rows = true;
+        self.markTranscriptDirty();
+        return true;
+    }
+
+    /// Whether rows sit above the viewport that are not in native history
+    /// yet: the rows a footer surface holds.
+    pub fn holdsTranscriptRows(self: *const TranscriptRuntime) bool {
+        return switch (self.transcript_commit_state) {
+            .stable => |anchor| anchor.visual_offset > anchor.history_visual_offset,
+            .invalid, .recovering => false,
+        };
+    }
+
     pub fn historyCatchupPending(self: *const TranscriptRuntime) bool {
         return switch (self.transcript_commit_state) {
             .invalid, .recovering => false,
@@ -8542,7 +8577,7 @@ pub const TranscriptRuntime = struct {
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
     ) TranscriptScrollFacts {
-        return self.planTranscriptScrollForFrame(prepared, false, false);
+        return self.planTranscriptScrollForFrame(prepared, false, 0);
     }
 
     /// Selects the finality floor in flow bytes from the prepared paint's
@@ -8600,9 +8635,9 @@ pub const TranscriptRuntime = struct {
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
         footer_reservation_changed: bool,
-        replay_displaced_footer_history: bool,
+        held_footer_rows: u16,
     ) TranscriptScrollFacts {
-        var facts = self.planTranscriptScrollForFrameUnfiltered(prepared, footer_reservation_changed, replay_displaced_footer_history);
+        var facts = self.planTranscriptScrollForFrameUnfiltered(prepared, footer_reservation_changed, held_footer_rows);
         if (self.committedRetentionIdentity()) |identity| {
             const restore_projection = self.publication_projection_invalid or self.committed_frame_layout.terminal_cols != self.layout.cols or
                 self.committed_frame_layout.terminal_rows != self.layout.rows or facts.recovery_rebase or facts.recovery_projection_deferred;
@@ -8622,19 +8657,26 @@ pub const TranscriptRuntime = struct {
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
         footer_reservation_changed: bool,
-        replay_displaced_footer_history: bool,
+        held_footer_rows: u16,
     ) TranscriptScrollFacts {
         const target_offset = prepared.sourceVisualOffset();
         const target_total_visual_rows = prepared.sourceTotalVisualRows();
         if (self.terminal_reset_pending) {
+            // The reprint releases rows by the same rule as any frame: the
+            // rows a footer surface covers stay out of native history.
+            const reset_held_rows: u16 = if (self.settle_held_rows)
+                0
+            else
+                @intCast(@min(held_footer_rows, target_offset));
             debug_trace.logf(
                 "scroll",
-                "transcript_transition_plan source_state=reset target_visual_offset={d} target_total_visual_rows={d} planned_rows=0",
-                .{ target_offset, target_total_visual_rows },
+                "transcript_transition_plan source_state=reset target_visual_offset={d} target_total_visual_rows={d} held_footer_rows={d} planned_rows=0",
+                .{ target_offset, target_total_visual_rows, reset_held_rows },
             );
             return .{
                 .target_visual_offset = target_offset,
                 .recovery_rebase = true,
+                .reset_held_rows = reset_held_rows,
             };
         }
         const anchor = switch (self.transcript_commit_state) {
@@ -8790,9 +8832,16 @@ pub const TranscriptRuntime = struct {
                         .recovery_tracks_semantic_progress = true,
                     };
                 }
+                // Recovery counts the rows above the viewport as history; the
+                // rows a footer surface holds were never released, so they
+                // stay owed as after a reprint.
                 return .{
                     .target_visual_offset = target_offset,
                     .recovery_rebase = true,
+                    .reset_held_rows = if (self.settle_held_rows)
+                        0
+                    else
+                        @intCast(@min(held_footer_rows, target_offset)),
                 };
             },
         };
@@ -8807,15 +8856,32 @@ pub const TranscriptRuntime = struct {
         const geometry_rebase = footer_reservation_changed and
             width_stable and
             self.resize_history_row_delta == null;
+        // History releases a row only when it leaves the screen above the
+        // idle footer (composer and status line). The rows a footer surface
+        // adds push transcript rows off the top without releasing them: they
+        // are held between history and the viewport and painted back when it
+        // shrinks (`tests/tla/transcript_window/spec/FooterReclaim.tla`
+        // FooterAtBottom). A settle frame before exit or suspend releases
+        // them all (ExitKeepsRows).
+        const release_offset = if (self.settle_held_rows)
+            target_offset
+        else
+            target_offset -| held_footer_rows;
+        // A footer change displaces rows into history only when the release
+        // line passes the committed viewport top, so rows on the screen leave
+        // it above the idle footer (the idle footer grew, or content grew in
+        // the same frame). Rows a surface holds are already off the screen;
+        // they settle through the catch-up under the finality floor.
+        const footer_displaces_history = release_offset > anchor.visual_offset;
         const displaced_history_replay = if (geometry_rebase and
-            replay_displaced_footer_history)
+            (footer_displaces_history or self.settle_held_rows))
             compatibleHistoryReplayRange(
                 prepared,
                 self.layout.cols,
                 prepared.bytes,
                 anchor.flow,
                 anchor.history_visual_offset,
-                target_offset,
+                release_offset,
             )
         else
             null;
@@ -8828,28 +8894,37 @@ pub const TranscriptRuntime = struct {
         // cannot). Either fact missing forces zero release; the frame
         // re-anchors on the new flow and the derived history debt settles
         // on the next compatible frame through the existing replay.
-        const releasable_offset = self.finalityReleasableOffset(prepared, target_offset);
+        const releasable_offset = self.finalityReleasableOffset(prepared, release_offset);
         const releasable_advance = releasable_offset -| anchor.history_visual_offset;
         const committed_projection_offset = committedProjectionVisualOffset(anchor);
         const geometry_history_rows: u32 = if (geometry_rebase and
-            ((source_compatible and source_visual_growth) or
+            ((source_compatible and source_visual_growth and footer_displaces_history) or
                 displaced_history_replay != null))
-            target_offset -| anchor.history_visual_offset
+            release_offset -| anchor.history_visual_offset
         else
             0;
-        // Geometry displacement (footer growth over transcript rows) keeps
-        // its pre-existing semantics: displaced rows are preserved into
-        // history even when mutable, because inline rendering has nowhere
-        // else to keep them. The finality clamp governs content-driven
-        // release only.
+        // Geometry displacement (rows on the screen pushed past the idle
+        // footer's release line) keeps its pre-existing semantics: displaced
+        // rows are preserved into history even when mutable. A footer change
+        // that displaces nothing still settles flagged debt, such as rows a
+        // closing surface held while output arrived, under the finality floor.
         const semantic_rows: u32 = if (geometry_rebase)
-            geometry_history_rows
+            if (geometry_history_rows == 0 and anchor.history_catchup_pending and source_compatible)
+                releasable_advance
+            else
+                geometry_history_rows
         else if (!recovery_rebase)
             // Normal-buffer recovery restores rows the takeover already
             // displaced into scrollback; that restore is display repair,
             // not a content release, so the finality clamp does not apply.
+            // It stops at the release line: rows a footer surface holds
+            // were never displaced, and its close pays them as catch-up.
             if (anchor.normal_buffer_recovery_pending)
-                target_offset -| anchor.history_visual_offset
+                release_offset -| anchor.history_visual_offset
+            else if (self.settle_held_rows)
+                // Exit and suspend settle every held row as it stands: no
+                // later frame repaints it, and a resume reprints it anyway.
+                release_offset -| anchor.history_visual_offset
             else if (anchor.history_catchup_pending)
                 releasable_advance
             else
@@ -8870,7 +8945,7 @@ pub const TranscriptRuntime = struct {
         // (mutable rows above the top) or a same-geometry incompatible frame
         // that had permission to release but no ability to materialize;
         // geometry-driven recovery (resize, reflow) owns its own debt.
-        const finality_hold = releasable_offset < target_offset or
+        const finality_hold = releasable_offset < release_offset or
             (recovery_rebase and
                 width_stable and
                 self.committed_frame_layout.terminal_rows == self.layout.rows and
@@ -8907,7 +8982,7 @@ pub const TranscriptRuntime = struct {
         }
         debug_trace.logf(
             "scroll",
-            "transcript_transition_plan source_state=stable source_start={d} target_start={d} source_visual_offset={d} source_history_visual_offset={d} target_visual_offset={d} releasable_visual_offset={d} source_total_visual_rows={d} target_total_visual_rows={d} resize_reflow_candidate={d} resize_reflow_rows={d} semantic_rows={d} planned_rows={d} width_stable={s} source_compatible={s} footer_reservation_changed={s} replay_displaced_footer_history={s} geometry_rebase={s} recovery_rebase={s}",
+            "transcript_transition_plan source_state=stable source_start={d} target_start={d} source_visual_offset={d} source_history_visual_offset={d} target_visual_offset={d} releasable_visual_offset={d} source_total_visual_rows={d} target_total_visual_rows={d} resize_reflow_candidate={d} resize_reflow_rows={d} semantic_rows={d} planned_rows={d} width_stable={s} source_compatible={s} footer_reservation_changed={s} held_footer_rows={d} release_visual_offset={d} geometry_rebase={s} recovery_rebase={s}",
             .{
                 anchor.selection.start_line,
                 prepared.selection.start_line,
@@ -8924,7 +8999,8 @@ pub const TranscriptRuntime = struct {
                 if (width_stable) "true" else "false",
                 if (source_compatible) "true" else "false",
                 if (footer_reservation_changed) "true" else "false",
-                if (replay_displaced_footer_history) "true" else "false",
+                held_footer_rows,
+                release_offset,
                 if (geometry_rebase) "true" else "false",
                 if (recovery_rebase) "true" else "false",
             },
@@ -8942,6 +9018,7 @@ pub const TranscriptRuntime = struct {
             .finality_hold = finality_hold,
             .recovery_progress_compatible = !recovery_rebase,
             .recovery_tracks_semantic_progress = source_compatible or geometry_rebase,
+            .footer_rows_held = release_offset < target_offset,
         };
     }
 
@@ -9419,10 +9496,11 @@ pub const TranscriptRuntime = struct {
                         target.visual_offset > target.history_visual_offset;
                 } else if (target.history_visual_offset >= target.visual_offset) {
                     target.history_catchup_pending = false;
-                } else if (scroll_facts.finality_hold) {
-                    // Finality withheld release. Preserve the obligation on
-                    // stable anchors until history catches the viewport;
-                    // footer displacement alone never creates one.
+                } else if (scroll_facts.finality_hold or scroll_facts.footer_rows_held) {
+                    // Finality withheld release, or a footer surface holds the
+                    // rows it covers. Preserve the obligation on stable
+                    // anchors until history catches the viewport, so later
+                    // frames release from history, not from the viewport.
                     target.history_catchup_pending = true;
                 }
             },
@@ -9476,6 +9554,19 @@ pub const TranscriptRuntime = struct {
                     accepted_semantic_progress_rows,
                 );
             },
+        }
+        if (scroll_facts.reset_held_rows > 0 and target.body_disposition == .paint) {
+            // The reprint scrolled the held rows less (or the recovery never
+            // released them), so history stops short of the viewport by them.
+            // Closing the surface paints them back; output while it is open
+            // releases them through the history replay
+            // (`tests/tla/transcript_window/spec/FooterReclaim.tla` Resized
+            // and TookOver).
+            target.history_visual_offset = @min(
+                target.history_visual_offset,
+                target.visual_offset -| scroll_facts.reset_held_rows,
+            );
+            target.history_catchup_pending = true;
         }
         if (scroll_facts.publication_hold != .none) {
             try target.stagePreparedProjection(alloc, self.layout, prepared, projection_area, target.history_visual_offset);
@@ -9908,7 +9999,7 @@ pub const TranscriptRuntime = struct {
         source: *const TranscriptPreparationSource,
         prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
         footer_reservation_changed: bool,
-        replay_displaced_footer_history: bool,
+        held_footer_rows: u16,
     ) !TranscriptScrollFacts {
         if (self.borrowsPendingResumeSource(source)) switch (self.transcript_commit_state) {
             .invalid => try transcript_painter.seedPreparedPresentationBoundary(
@@ -9946,7 +10037,7 @@ pub const TranscriptRuntime = struct {
         return self.planTranscriptScrollForFrame(
             prepared,
             footer_reservation_changed,
-            replay_displaced_footer_history,
+            held_footer_rows,
         );
     }
 
@@ -10077,14 +10168,14 @@ pub const TranscriptRuntime = struct {
         plan: *render_engine.paint_plan.PaintPlan,
         scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
         footer_reservation_changed: bool,
-        replay_displaced_footer_history: bool,
+        held_footer_rows: u16,
     ) !TranscriptTransition {
         const scroll_facts = try self.prepareTranscriptScrollFactsForFrame(
             alloc,
             source,
             prepared,
             footer_reservation_changed,
-            replay_displaced_footer_history,
+            held_footer_rows,
         );
         const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
             self.committed_frame_layout.transcript_area,
@@ -10317,7 +10408,11 @@ pub const TranscriptRuntime = struct {
             alloc.free(presentation_resume_bytes);
         };
         if (plan.reset_terminal) {
-            const replay_padding_rows = target_layout.terminal_rows -| target.cursor_row;
+            // Rows a footer surface holds stay out of native history: the
+            // reprint scrolls that many rows less, and the frame paints the
+            // transcript area over them at the target offset.
+            const replay_padding_rows = target_layout.terminal_rows -|
+                (target.cursor_row +| scroll_facts.reset_held_rows);
             document_append_bytes = try transcript_painter.prepareResetReplayDocument(
                 self,
                 alloc,
@@ -10791,6 +10886,9 @@ pub const TranscriptRuntime = struct {
             transition.retention_identity = .{};
 
             self.notebook.last_rendered_cols = transition.target_layout.terminal_cols;
+            if (self.settle_held_rows and transition.history_visual_offset >= transition.visual_offset) {
+                self.settle_held_rows = false;
+            }
             if (pending_resume_bytes > 0) {
                 self.invalidateTranscriptAnchor("resume publication retained source handoff");
                 if (transition.target_flow_owned) {
@@ -13276,7 +13374,7 @@ fn resolveAndSealTranscriptTransitionForRuntimeTest(
         source,
         prepared,
         false,
-        false,
+        0,
     );
     const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
         runtime.committed_frame_layout.transcript_area,
@@ -13878,7 +13976,7 @@ test "pending tail projection seals against the complete frame layout" {
         source,
         &prepared,
         false,
-        false,
+        0,
     );
     const scroll_plan = render_engine.frame_scroll_plan.merge(
         layout.rows,
@@ -14027,7 +14125,7 @@ test "history recovery preserves retained geometry and stages painted frames" {
             &source,
             &prepared,
             repaint,
-            false,
+            0,
         );
         const scroll = render_engine.frame_scroll_plan.merge(layout.rows, 1, 0, facts.planned_rows);
         if (repaint) {

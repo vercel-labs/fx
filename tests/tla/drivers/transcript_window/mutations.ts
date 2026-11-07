@@ -5,19 +5,38 @@
 // the bug names, and the unmutated spec must pass the same config first, so a
 // catch cannot come from a broken config. A core bug must compile, and the
 // edge sweep must then fail; if it does not, code to spec gets a run, and the
-// bug counts as missed only when both pass.
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+// bug counts as missed only when both pass. A runtime bug is planted in a copy
+// of src/ (the transcript runtime's footer reclaim rule) and must compile; the
+// footer reclaim tests in src/ui/resize_tests.zig must then fail, or else the
+// footer runtime driver must fail TLC or count a row other than once.
+import { cpSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { REPO_ROOT } from "../lib/tlc.ts";
 import { codeToSpec } from "./code-to-spec.ts";
+import { footerRuntimeToSpec } from "./footer-runtime-to-spec.ts";
 import { CORE_SOURCE, MODEL_DIR, buildHarness, checkTlc, configConstants, configNames, specFiles, type Config } from "./lib.ts";
 import { specToCode } from "./spec-to-code.ts";
 
-type SpecMutation = { id: string; bug: string; law: string; constants: string; find: string; replace: string };
+type SpecMutation = { id: string; bug: string; law: string; constants: string; find: string; replace: string; spec?: string };
 type CoreMutation = { id: string; bug: string; sweep: string; find: string; replace: string };
+type RuntimeMutation = { id: string; bug: string; file: string; find: string; replace: string };
+
+/// The footer reclaim tests in src/ui/resize_tests.zig that a runtime bug runs
+/// first; the fuzz target needs `zig build`, so the seeded walk stands in.
+const FOOTER_RECLAIM_TESTS = [
+  "puts the footer back on the bottom row",
+  "reaches history in order and close paints the held rows back",
+  "exit with the slash picker open leaves every row",
+  "rows a multi-line draft covers from the first frames",
+  "resize with the slash picker open keeps the covered rows held",
+  "takeover with the slash picker open recovers only the rows it displaced",
+  "recovery from an invalid anchor with the slash picker open keeps the held rows owed",
+  "footer reclaim keeps every row once on seeded random event scripts",
+];
 
 export type MutationResult = { id: string; caught: boolean; by: string; detail: string; ms: number };
 
-export function loadMutations(): { spec: SpecMutation[]; core: CoreMutation[] } {
+export function loadMutations(): { spec: SpecMutation[]; core: CoreMutation[]; runtime: RuntimeMutation[] } {
   return JSON.parse(readFileSync(join(MODEL_DIR, "mutations.json"), "utf8"));
 }
 
@@ -35,20 +54,22 @@ export function singleLawConfig(constantsCfg: string, law: string): string {
   const invariants = new Set([
     ...(configNames(files["MCTranscriptWindow.cfg"]!).INVARIANT ?? []),
     ...(configNames(files["MCTranscriptWindowUnsaved.cfg"]!).INVARIANT ?? []),
+    ...(configNames(files["MCFooterReclaim.cfg"]!).INVARIANT ?? []),
   ]);
   return `CONSTANTS\n${block}\nSPECIFICATION Spec\n${invariants.has(law) ? "INVARIANT" : "PROPERTY"}\n    ${law}\n`;
 }
 
 export async function specMutations(out: string): Promise<MutationResult[]> {
-  const original = specFiles()["TranscriptWindow.tla"]!;
   const controls = new Map<string, boolean>();
   const results: MutationResult[] = [];
   for (const mutation of loadMutations().spec) {
     const started = performance.now();
+    const module = mutation.spec ?? "TranscriptWindow";
+    const original = specFiles()[`${module}.tla`]!;
     const cfg = singleLawConfig(mutation.constants, mutation.law);
     const key = `${mutation.constants}/${mutation.law}`;
     if (!controls.has(key)) {
-      const control = await checkTlc(join(out, "control", key.replace("/", "-")), "TranscriptWindow", "Single.cfg", { ...specFiles(original), "Single.cfg": cfg });
+      const control = await checkTlc(join(out, "control", key.replace("/", "-")), module, "Single.cfg", { ...specFiles(), "Single.cfg": cfg });
       controls.set(key, control.verdict === "pass");
     }
     if (!controls.get(key)) {
@@ -56,7 +77,7 @@ export async function specMutations(out: string): Promise<MutationResult[]> {
       continue;
     }
     const mutated = replaceOnce(original, mutation.find, mutation.replace, mutation.id);
-    const tlc = await checkTlc(join(out, mutation.id), "TranscriptWindow", "Single.cfg", { ...specFiles(mutated), "Single.cfg": cfg });
+    const tlc = await checkTlc(join(out, mutation.id), module, "Single.cfg", { ...specFiles(), [`${module}.tla`]: mutated, "Single.cfg": cfg });
     const caught = tlc.verdict === "violated" && tlc.property === mutation.law;
     results.push({
       id: mutation.id,
@@ -110,4 +131,51 @@ export async function coreMutations(out: string, graphs: Record<string, string>)
     });
   }
   return results;
+}
+
+export async function runtimeMutations(out: string): Promise<MutationResult[]> {
+  const results: MutationResult[] = [];
+  for (const mutation of loadMutations().runtime) {
+    const started = performance.now();
+    const root = join(out, mutation.id, "repo");
+    mkdirSync(root, { recursive: true });
+    cpSync(join(REPO_ROOT, "src"), join(root, "src"), { recursive: true });
+    const source = join(root, mutation.file);
+    writeFileSync(source, replaceOnce(readFileSync(source, "utf8"), mutation.find, mutation.replace, mutation.id));
+    const tests = Bun.spawnSync(
+      ["zig", "test", "-lc", "src/footer_reclaim_root.zig", ...FOOTER_RECLAIM_TESTS.flatMap((name) => ["--test-filter", name]), "--cache-dir", join(REPO_ROOT, ".zig-cache")],
+      { cwd: root, env: { ...process.env, FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1" }, stdout: "pipe", stderr: "pipe" },
+    );
+    const testOutput = `${tests.stdout.toString()}${tests.stderr.toString()}`;
+    if (/\.zig:\d+:\d+: error:/.test(testOutput)) {
+      results.push({ id: mutation.id, caught: false, by: "none", detail: `does not compile: ${testOutput.slice(0, 300)}`, ms: Math.round(performance.now() - started) });
+      continue;
+    }
+    if (tests.exitCode !== 0) {
+      const failed = /test\.(.+?)\.\.\.FAIL/.exec(testOutput)?.[1] ?? /error: '([^']+)' failed/.exec(testOutput)?.[1] ?? "a footer reclaim test";
+      results.push({ id: mutation.id, caught: true, by: "resize tests", detail: failed, ms: Math.round(performance.now() - started) });
+      continue;
+    }
+    const footer = await footerRuntimeToSpec({ dir: join(out, mutation.id, "footer"), randomTraces: 8, length: 20, seed: 7, root });
+    const caught = !footer.compileError && (footer.tlc?.verdict !== "pass" || footer.problem !== null);
+    results.push({
+      id: mutation.id,
+      caught,
+      by: caught ? "footer runtime to spec" : "none",
+      detail: caught ? `TLC ${footer.tlc?.verdict ?? "not run"} ${footer.tlc?.property ?? ""} ${footer.problem ?? ""}`.trim() : "the tests and the driver pass",
+      ms: Math.round(performance.now() - started),
+    });
+  }
+  return results;
+}
+
+// `bun mutations.ts --runtime` runs the runtime bugs on their own; verify.ts
+// runs every kind as stages of check.sh.
+if (import.meta.main && process.argv.includes("--runtime")) {
+  const { outDir } = await import("../lib/tlc.ts");
+  const results = await runtimeMutations(join(outDir("footer-reclaim-mutations"), "runtime"));
+  for (const result of results) console.log(`${result.caught ? "CAUGHT" : "MISSED"} ${result.id}: ${result.by}; ${result.detail} (${result.ms} ms)`);
+  const missed = results.filter((result) => !result.caught);
+  console.log(`${missed.length === 0 ? "PASS" : "FAIL"} runtime mutations: ${results.length - missed.length} of ${results.length} caught`);
+  process.exit(missed.length === 0 ? 0 : 1);
 }

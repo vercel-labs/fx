@@ -159,6 +159,42 @@
       "constants": "MCTranscriptWindowSweep",
       "find": "          THEN LET n == Min(Min(count, Step), Available(pendingDir))",
       "replace": "          THEN LET n == Min(count, Available(pendingDir))"
+    },
+    {
+      "id": "footer-release-current",
+      "bug": "History follows the footer on the screen, so a surface pushes the rows it covers into history and closing it leaves the footer above the bottom rows (main before the design).",
+      "law": "FooterAtBottom",
+      "spec": "FooterReclaim",
+      "constants": "MCFooterReclaim",
+      "find": "IF Release = \"base\" THEN Natural(n, FALSE, first) ELSE Natural(n, o, first)",
+      "replace": "Natural(n, o, first)"
+    },
+    {
+      "id": "footer-repaint-history",
+      "bug": "Closing a surface repaints the tail from rows already in native history, so scrollback shows them twice (the reclaim-by-reprint design).",
+      "law": "HistoryOnce",
+      "spec": "FooterReclaim",
+      "constants": "MCFooterReclaimToday",
+      "find": "        /\\ top' = Max(h, Natural(n, o, epochFirst))",
+      "replace": "        /\\ top' = Natural(n, o, epochFirst)"
+    },
+    {
+      "id": "footer-free-held",
+      "bug": "The shell frees a dropped entry while its rows are still held above the screen, so closing the surface has nothing to paint.",
+      "law": "OwedRowsHeld",
+      "spec": "FooterReclaim",
+      "constants": "MCFooterReclaim",
+      "find": "Freed(to, h) == Max(freed, Min(to, h))",
+      "replace": "Freed(to, h) == Max(freed, to)"
+    },
+    {
+      "id": "footer-exit-unsettled",
+      "bug": "Exit erases the footer while rows are held, so they never reach the terminal's scrollback.",
+      "law": "ExitKeepsRows",
+      "spec": "FooterReclaim",
+      "constants": "MCFooterReclaim",
+      "find": "    /\\ hist' = Max(hist, Natural(rows, open, epochFirst))\n    /\\ top' = Max(hist, Natural(rows, open, epochFirst))\n    /\\ freed' = Freed(dropTo, Max(hist, Natural(rows, open, epochFirst)))",
+      "replace": "    /\\ UNCHANGED <<hist, top, freed>>"
     }
   ],
   "core": [
@@ -259,6 +295,57 @@
       "sweep": "MCTranscriptWindowSweep",
       "find": "            next.ctrlo.open = false;\n            next.ctrlo.pending = 0;",
       "replace": "            next.ctrlo.open = false;"
+    }
+  ],
+  "runtime": [
+    {
+      "id": "footer-runtime-release-current",
+      "bug": "The planner releases history up to the open footer's viewport, so a surface pushes the rows it covers into native history and its close leaves the footer above the bottom rows (main before the change).",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "            target_offset -| held_footer_rows;\n",
+      "replace": "            target_offset;\n"
+    },
+    {
+      "id": "footer-runtime-settle-skipped",
+      "bug": "Exit and suspend ask for the settle frame but the runtime never sets it, so the footer is erased while rows are held.",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "        self.settle_held_rows = true;\n        self.markTranscriptDirty();\n",
+      "replace": "        self.markTranscriptDirty();\n"
+    },
+    {
+      "id": "footer-runtime-reset-releases-held",
+      "bug": "A resize reprint with a surface open records the covered rows as held but scrolls them into native history, so its close paints them a second time.",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "(target.cursor_row +| scroll_facts.reset_held_rows);",
+      "replace": "target.cursor_row;"
+    },
+    {
+      "id": "footer-runtime-reset-holds-nothing",
+      "bug": "A resize reprint with a surface open releases the rows it covers, so its close leaves the footer above the bottom rows.",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "                @intCast(@min(held_footer_rows, target_offset));\n",
+      "replace": "                0;\n"
+    },
+    {
+      "id": "footer-runtime-held-debt-unmarked",
+      "bug": "A frame that holds rows does not mark them as debt, so later output releases rows counted from the viewport and scrollback skips the held ones.",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "scroll_facts.finality_hold or scroll_facts.footer_rows_held",
+      "replace": "scroll_facts.finality_hold"
+    },
+    {
+      "id": "footer-runtime-recovery-releases-held",
+      "bug": "Recovery after a screen takeover restores history up to the open footer's viewport, so the rows a surface holds reach history twice: once by the recovery and once when they are painted back (tui-resume's shell approval handoff after Ctrl+O).",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "            if (anchor.normal_buffer_recovery_pending)\n                release_offset -| anchor.history_visual_offset\n",
+      "replace": "            if (anchor.normal_buffer_recovery_pending)\n                target_offset -| anchor.history_visual_offset\n"
+    },
+    {
+      "id": "footer-runtime-invalid-recovery-counts-held",
+      "bug": "Recovery from an invalid anchor counts every row above the viewport as history, so the rows a surface holds never reach scrollback.",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "                    .reset_held_rows = if (self.settle_held_rows)\n",
+      "replace": "                    .reset_held_rows = if (true)\n"
     }
   ]
 }

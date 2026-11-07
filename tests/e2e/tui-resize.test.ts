@@ -2494,13 +2494,15 @@ describe.skipIf(SKIP)("tui: resize", () => {
           if (!attemptHasReason(candidate, "resize")) return false;
           const commit = attemptLine(candidate, stableCommitTrace);
           return commit !== undefined &&
-            numericTraceField(commit, "history_visual_offset") > 0;
+            numericTraceField(commit, "visual_offset") > 0;
         },
         remainingTimeout(),
       );
+      // The reprint holds the rows the approval covers instead of releasing
+      // them into native history (tests/tla/transcript_window/spec/FooterReclaim.tla).
       const resizeCommit = attemptLine(resizeAttempt, stableCommitTrace)!;
       expect(numericTraceField(resizeCommit, "history_visual_offset"))
-        .toBeGreaterThan(0);
+        .toBeLessThan(numericTraceField(resizeCommit, "visual_offset"));
       await active.waitForText(approvalQuestion, remainingTimeout());
       const resizedScrollback = await captureScrollback("resized-approval");
 
@@ -2572,7 +2574,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
         recording: 1,
         seed: 1,
       });
-      expect(counts.resized).toEqual(counts.beforeResize);
+      // While the approval is open, the rows it covers are out of scrollback;
+      // none shows twice, and the cancel brings every row back exactly once.
+      for (const count of Object.values(counts.resized)) {
+        expect(count).toBeLessThanOrEqual(1);
+      }
       expect(counts.afterCancel).toEqual(counts.beforeResize);
     },
     TIMEOUT,

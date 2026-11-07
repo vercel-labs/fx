@@ -936,15 +936,16 @@ pub const SurfaceFooterMeasurement = struct {
             self.footerReservedBaseRows() != shell.footer_reserved_base_rows;
     }
 
-    pub fn replaysDisplacedTranscriptHistory(
-        self: *const SurfaceFooterMeasurement,
-        shell: *const TranscriptRuntime,
-    ) bool {
-        const measured_rows = @as(u32, self.footer_extra) +
-            @as(u32, self.footerReservedBaseRows());
-        const committed_rows = @as(u32, shell.extra_input_rows) +
-            @as(u32, shell.footer_reserved_base_rows);
-        return measured_rows > committed_rows;
+    /// The rows this footer has above the idle footer (composer and status
+    /// line): a picker, a question or approval in place of the composer, a
+    /// banner, or a multi-line draft. The transcript rows they push off the
+    /// screen are held, not released into native history, and come back when
+    /// the footer shrinks
+    /// (`tests/tla/transcript_window/spec/FooterReclaim.tla` FooterAtBottom).
+    pub fn heldFooterRows(self: *const SurfaceFooterMeasurement) u16 {
+        const rows = @as(u32, self.footer_extra) + @as(u32, self.footerReservedBaseRows());
+        const idle_rows = footer_layout.reservedBaseRows(true, self.composer_top_chrome_rows);
+        return @intCast(@min(rows -| idle_rows, std.math.maxInt(u16)));
     }
 
     pub fn frameInvalidationUpdate(self: *const SurfaceFooterMeasurement) surface_invalidation.FooterExtraUpdate {

@@ -26,8 +26,8 @@ export function checkTraceability(): TraceabilityResult {
   const verify = readFileSync(join(import.meta.dirname, "verify.ts"), "utf8");
   const core = readFileSync(CORE_SOURCE, "utf8");
   const files = specFiles();
-  const spec = files["TranscriptWindow.tla"]!;
-  const trace = files["TraceTranscriptWindow.tla"]!;
+  const spec = `${files["TranscriptWindow.tla"]!}\n${files["FooterReclaim.tla"]!}`;
+  const trace = `${files["TraceTranscriptWindow.tla"]!}\n${files["TraceFooterReclaim.tla"]!}`;
   const problems: string[] = [];
 
   const lawsSection = design.slice(design.indexOf("## Laws"), design.indexOf("## Enforcement"));
@@ -42,9 +42,12 @@ export function checkTraceability(): TraceabilityResult {
   for (const law of enforcement.keys()) if (!laws.has(law)) problems.push(`Enforcement row ${law} has no law`);
 
   const listed = (cfg: string, section: string) => configNames(files[cfg]!)[section] ?? [];
-  const mcInvariants = new Set([...listed("MCTranscriptWindow.cfg", "INVARIANT"), ...listed("MCTranscriptWindowUnsaved.cfg", "INVARIANT")]);
+  const mcInvariants = new Set([...listed("MCTranscriptWindow.cfg", "INVARIANT"), ...listed("MCTranscriptWindowUnsaved.cfg", "INVARIANT"), ...listed("MCFooterReclaim.cfg", "INVARIANT")]);
   const mcProperties = new Set([...listed("MCTranscriptWindow.cfg", "PROPERTY"), ...listed("MCCtrlOReachesStart.cfg", "PROPERTY")]);
-  const traceChecks = new Set([...listed("TraceTranscriptWindow.cfg", "INVARIANT"), ...listed("TraceTranscriptWindow.cfg", "PROPERTY")]);
+  const traceChecks = new Set([
+    ...listed("TraceTranscriptWindow.cfg", "INVARIANT"), ...listed("TraceTranscriptWindow.cfg", "PROPERTY"),
+    ...listed("TraceFooterReclaim.cfg", "INVARIANT"), ...listed("TraceFooterReclaim.cfg", "PROPERTY"),
+  ]);
   const defined = (text: string, name: string) => new RegExp(`^${name} ==`, "m").test(text);
   const enforced = new Set<string>();
   let entries = 0;

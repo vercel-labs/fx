@@ -605,6 +605,66 @@ function longAssistantResponse(): string {
   }).join("\n");
 }
 
+function longAssistantLines(): string[] {
+  return longAssistantResponse().split("\n");
+}
+
+const LATE_FOOTER_ROWS = 3;
+
+function lateFooterRows(): string[] {
+  return Array.from({ length: LATE_FOOTER_ROWS }, (_, index) => `SLASH_FOOTER_LATE_00${index + 1} written while the picker is open.`);
+}
+
+/// How often each SLASH_FOOTER_E2E marker of the long reply occurs.
+function footerMarkerCopies(scrollback: string): number[] {
+  return longAssistantLines().map((_, index) =>
+    countOccurrences(scrollback, `SLASH_FOOTER_E2E_${String(index + 1).padStart(3, "0")}`),
+  );
+}
+
+function lateMarkerCopies(scrollback: string): number[] {
+  return lateFooterRows().map((_, index) => countOccurrences(scrollback, `SLASH_FOOTER_LATE_00${index + 1}`));
+}
+
+function footerReclaimEnv(home: string, server: ReturnType<typeof startFakeGateway>): Record<string, string | undefined> {
+  return {
+    HOME: home,
+    AI_GATEWAY_API_KEY: "fake-footer-reclaim-key",
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_GATEWAY_BASE_URL: server.baseUrl,
+    FX_GATEWAY_CHAT_URL: server.chatUrl,
+    FX_MODEL: "openai/gpt-5",
+    FX_AUTO_UPGRADE: "0",
+    FX_SOUND: "0",
+    FX_DISABLE_KEYCHAIN: "1",
+    NO_COLOR: "1",
+  };
+}
+
+async function waitForTurnEnd(tui: TmuxSession): Promise<void> {
+  await tui.waitForPane((pane) => !pane.includes("esc interrupt") && !pane.includes("Thinking"), 10_000);
+}
+
+/// The pane once five captures 50 ms apart agree, saved under `label`.
+async function stableFooterGrid(tui: TmuxSession, workDir: string, label: string): Promise<string[]> {
+  const deadline = Date.now() + 5_000;
+  let previous = "";
+  let stableSamples = 0;
+  let pane = "";
+  while (Date.now() < deadline && stableSamples < 5) {
+    pane = await tui.capturePaneEscapes();
+    if (pane === previous) stableSamples += 1;
+    else {
+      previous = pane;
+      stableSamples = 0;
+    }
+    await Bun.sleep(50);
+  }
+  if (stableSamples < 5) throw new Error(`Timed out waiting for a stable viewport at ${label}`);
+  writeFileSync(join(workDir, `${label}.pane.txt`), stripAnsi(pane));
+  return gridFromAnsiCapture(pane);
+}
+
 const RENAME_MENU_SKILLS: Record<string, string> = {
   deploy: "ship the app to production",
   fix: "fix the failing test",
@@ -1208,7 +1268,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "slash picker growth preserves displaced transcript history",
+    "slash picker growth holds the rows it covers and dismissal paints them back",
     async () => {
       const workDir = mkdtempSync(join(tmpdir(), "fx-slash-footer-e2e-"));
       workDirs.push(workDir);
@@ -1334,6 +1394,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForText("/feedback", 5_000);
       const afterSlashFeedback = await capture("after-slash-feedback");
 
+      // Dismissing the picker hands its rows back: the transcript tail, the
+      // composer, and the status line return to the rows they had before it
+      // opened, at the bottom of the screen.
       await session.sendKeys("Escape");
       await session.waitForPane(
         (pane) =>
@@ -1342,9 +1405,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
       const afterDismiss = await capture("after-dismiss");
-      expect(visibleTranscriptTailRow(afterDismiss)).toBe(60);
-      expect(composerRow(afterDismiss)).toBe(64);
-      expect(footerStatusRow(afterDismiss)).toBe(66);
+      expect(visibleTranscriptTailRow(afterDismiss)).toBe(69);
+      expect(composerRow(afterDismiss)).toBe(73);
+      expect(footerStatusRow(afterDismiss)).toBe(75);
       await session.sendLiteralText("x");
       await session.waitForPane(
         (pane) =>
@@ -1353,9 +1416,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
       const afterDismissEdit = await capture("after-dismiss-edit");
-      expect(visibleTranscriptTailRow(afterDismissEdit)).toBe(60);
-      expect(composerRow(afterDismissEdit)).toBe(64);
-      expect(footerStatusRow(afterDismissEdit)).toBe(66);
+      expect(visibleTranscriptTailRow(afterDismissEdit)).toBe(69);
+      expect(composerRow(afterDismissEdit)).toBe(73);
+      expect(footerStatusRow(afterDismissEdit)).toBe(75);
 
       await session.sendKeys("C-u");
       await session.waitForPane(hasEmptyComposer, 5_000);
@@ -1376,10 +1439,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(new Set(openComposerRows).size).toBe(1);
       expect(new Set(openFooterRows).size).toBe(1);
       expect(openComposerRows[0]).toBeLessThan(composerRow(afterResponse));
-      expect(composerRow(afterDismiss)).toBeLessThan(closedComposerRow);
+      expect(composerRow(afterDismiss)).toBe(closedComposerRow);
       expect(composerRow(afterDismissEdit)).toBe(composerRow(afterDismiss));
       expect(composerRow(afterClear)).toBe(composerRow(afterDismiss));
-      expect(footerStatusRow(afterDismiss)).toBeLessThan(footerStatusRow(afterResponse));
+      expect(footerStatusRow(afterDismiss)).toBe(footerStatusRow(afterResponse));
       expect(footerStatusRow(afterDismissEdit)).toBe(footerStatusRow(afterDismiss));
       expect(footerStatusRow(afterClear)).toBe(footerStatusRow(afterDismiss));
 
@@ -1416,10 +1479,21 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         expect(copies, `after-response: ${marker}`).toBeLessThanOrEqual(2);
         return { marker, copies };
       });
+      // While the picker is open, the rows it covers are held: they are in
+      // neither scrollback nor the screen, as one band of markers each one
+      // copy short. Once it is dismissed, every marker is back as before.
+      const openLabels = new Set(["after-slash", "after-slash-f", "after-slash-fe", "after-slash-feedback"]);
       for (const label of historyLabels.slice(1)) {
         const scrollback = stripAnsi(readFileSync(join(workDir, `${label}.ansi.txt`), "utf8"));
-        for (const { marker, copies } of expectedMarkerCopies) {
-          expect(countOccurrences(scrollback, marker), `${label}: ${marker}`).toBe(copies);
+        const held: number[] = [];
+        expectedMarkerCopies.forEach(({ marker, copies }, index) => {
+          const seen = countOccurrences(scrollback, marker);
+          if (openLabels.has(label) && seen === copies - 1) held.push(index);
+          else expect(seen, `${label}: ${marker}`).toBe(copies);
+        });
+        if (openLabels.has(label)) {
+          expect(held.length, `${label}: held markers`).toBeGreaterThan(0);
+          expect(held.at(-1)! - held[0]! + 1, `${label}: held markers form one band`).toBe(held.length);
         }
       }
 
@@ -1435,26 +1509,23 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(footerUpdates.some((line) => /show_picker=true/.test(line) && /new=[1-8](?:\s|$)/.test(line))).toBe(false);
       const openUpdateIndex = traceLines.findIndex((line) => /footer_extra_update old=0 new=9 /.test(line));
       expect(openUpdateIndex).toBeGreaterThanOrEqual(0);
+      // Opening holds the nine rows the picker covers: the plan releases none
+      // into native history.
       const openPlan = traceLines.slice(0, openUpdateIndex).reverse().find((line) =>
         line.includes("transcript_transition_plan") &&
-        line.includes("replay_displaced_footer_history=true") &&
-        /planned_rows=[1-9][0-9]*/.test(line)
+        line.includes("held_footer_rows=9 ")
       );
       expect(openPlan).toContain("source_compatible=true");
-      const openCommit = traceLines.slice(openUpdateIndex + 1).find((line) =>
-        line.includes("[frame_diff] attempt_result") &&
-        /planned_scroll_rows=[1-9][0-9]*/.test(line)
-      );
-      expect(openCommit).toMatch(
-        /planned_scroll_rows=([1-9][0-9]*) committed_scroll_rows=\1 .*unplanned_scroll_rows=0/,
-      );
+      expect(openPlan).toContain("semantic_rows=0 planned_rows=0");
+      expect(openPlan).toContain("geometry_rebase=true");
       const closeUpdateIndex = traceLines.findIndex((line) => /footer_extra_update old=9 new=0 /.test(line));
       expect(closeUpdateIndex).toBeGreaterThanOrEqual(0);
       const closePlan = traceLines.slice(openUpdateIndex + 1, closeUpdateIndex).reverse().find((line) =>
         line.includes("transcript_transition_plan") &&
-        line.includes("replay_displaced_footer_history=false")
+        line.includes("held_footer_rows=0 ")
       );
       expect(closePlan).toContain("planned_rows=0");
+      expect(closePlan).toContain("geometry_rebase=true");
       const closeFrame = traceLines.slice(closeUpdateIndex + 1).find((line) => line.includes("[frame_diff] result"));
       expect(closeFrame).toMatch(/full_repaint=true invalidation=external_clear/);
       expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
@@ -1466,6 +1537,286 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const replay = JSON.parse(replayOutput);
       expect(replay.frame_count).toBeGreaterThan(0);
       expect(replay.stdout_bytes).toBeGreaterThan(0);
+    },
+    90_000,
+  );
+
+  test(
+    "slash picker close returns the composer to the bottom row",
+    async () => {
+      // A long transcript and the slash picker opened and closed three times,
+      // the second time with a reply landing while it is open, then /quit
+      // typed through the picker. The rows the picker covers are held, not
+      // pushed into scrollback, so each close puts the composer and status
+      // line back on the bottom rows, and the scrollback holds every
+      // transcript row exactly once.
+      const workDir = mkdtempSync(join(tmpdir(), "fx-footer-reclaim-e2e-"));
+      workDirs.push(workDir);
+      const home = join(workDir, "home");
+      const workspace = join(workDir, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", permission: {} }));
+      const stderrPath = join(workDir, "stderr.log");
+      const late = heldFakeGatewayFinalText();
+      gateway = startFakeGateway([fakeGatewayFinalText(longAssistantResponse()), () => late.response]);
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: footerReclaimEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 24,
+        isolated: true,
+        remainOnExit: true,
+        minimumHistoryLines: 500,
+      });
+      await session.waitForComposer(10_000);
+      await session.sendText("Print the deterministic slash footer transcript fixture.");
+      await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
+      await waitForTurnEnd(session);
+
+      const idle = await stableFooterGrid(session, workDir, "idle");
+      const idleComposer = composerRow(idle);
+      const idleStatus = footerStatusRow(idle);
+      expect(idleStatus, `idle grid:\n${idle.join("\n")}`).toBe(24);
+      const baseline = footerMarkerCopies(stripAnsi(await session.captureFullScrollback()));
+      for (const copies of baseline) expect(copies).toBe(1);
+
+      for (const round of [1, 2, 3]) {
+        if (round === 2) {
+          await session.sendText("Print the late rows.");
+          await session.waitForPane(() => gateway!.requests.length === 2, 10_000);
+        }
+        await session.sendLiteralText("/");
+        await session.waitForText("Commands", 5_000);
+        if (round === 2) {
+          late.release(lateFooterRows().join("\n"));
+          await session.waitForText(`SLASH_FOOTER_LATE_00${LATE_FOOTER_ROWS}`, 10_000);
+          await waitForTurnEnd(session);
+        }
+        const open = await stableFooterGrid(session, workDir, `open-${round}`);
+        expect(composerRow(open)).toBeLessThan(idleComposer);
+        await session.sendKeys("BSpace");
+        await session.waitForPane((pane) => !pane.includes("Commands") && hasEmptyComposer(pane), 5_000);
+        const closed = await stableFooterGrid(session, workDir, `closed-${round}`);
+        expect(composerRow(closed), `round ${round} closed grid:\n${closed.join("\n")}`).toBe(idleComposer);
+        expect(footerStatusRow(closed)).toBe(idleStatus);
+        assertNoBlankGapBetweenTranscriptAndComposer(closed);
+        const scrollback = stripAnsi(await session.captureFullScrollback());
+        expect(footerMarkerCopies(scrollback), `round ${round}`).toEqual(baseline);
+        if (round >= 2) expect(lateMarkerCopies(scrollback), `round ${round}`).toEqual(lateFooterRows().map(() => 1));
+      }
+
+      await session.sendLiteralText("/quit");
+      await session.waitForText("/quit", 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+      const afterExit = stripAnsi(await session.captureFullScrollback());
+      writeFileSync(join(workDir, "after-exit.txt"), afterExit);
+      expect(footerMarkerCopies(afterExit), "after /quit with the picker open").toEqual(baseline);
+      expect(lateMarkerCopies(afterExit), "after /quit with the picker open").toEqual(lateFooterRows().map(() => 1));
+      expect(gateway.requests).toHaveLength(2);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await session.kill();
+      session = null;
+    },
+    90_000,
+  );
+
+  test(
+    "slash picker held rows survive a resize and Ctrl+Z",
+    async () => {
+      // fx runs under a shell so Ctrl+Z stops it and fg resumes it. A resize
+      // with the picker open reprints the transcript and still holds the
+      // rows the picker covers; Ctrl+Z with the picker open first puts the
+      // held rows into scrollback, and the resume reprint holds them again.
+      const workDir = mkdtempSync(join(tmpdir(), "fx-footer-reclaim-shell-e2e-"));
+      workDirs.push(workDir);
+      const home = join(workDir, "home");
+      const workspace = join(workDir, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", permission: {} }));
+      const stderrPath = join(workDir, "stderr.log");
+      gateway = startFakeGateway([fakeGatewayFinalText(longAssistantResponse())]);
+      session = await TmuxSession.create({
+        cmd: "/bin/sh -i",
+        cwd: workspace,
+        env: { ...footerReclaimEnv(home, gateway), PS1: "FOOTER_SHELL> " },
+        width: 100,
+        height: 24,
+        isolated: true,
+        remainOnExit: true,
+        minimumHistoryLines: 500,
+      });
+      await session.waitForText("FOOTER_SHELL>", 10_000);
+      await session.sendText(`${FX_BIN} 2>${stderrPath}`);
+      await session.waitForComposer(10_000);
+      await session.sendText("Print the deterministic slash footer transcript fixture.");
+      await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
+      await waitForTurnEnd(session);
+      const idle = await stableFooterGrid(session, workDir, "idle");
+      const idleComposer = composerRow(idle);
+      expect(footerStatusRow(idle), `idle grid:\n${idle.join("\n")}`).toBe(24);
+      const once = longAssistantLines().map(() => 1);
+      expect(footerMarkerCopies(stripAnsi(await session.captureFullScrollback()))).toEqual(once);
+
+      // A settled resize while the picker is open, then close.
+      await session.sendLiteralText("/");
+      await session.waitForText("Commands", 5_000);
+      await session.resizeWindow(101, 24);
+      await stableFooterGrid(session, workDir, "resized-wide");
+      await session.resizeWindow(100, 24);
+      const resizedOpen = await stableFooterGrid(session, workDir, "resized-open");
+      expect(composerRow(resizedOpen)).toBeLessThan(idleComposer);
+      await session.sendKeys("BSpace");
+      await session.waitForPane((pane) => !pane.includes("Commands") && hasEmptyComposer(pane), 5_000);
+      const resizedClosed = await stableFooterGrid(session, workDir, "resized-closed");
+      expect(composerRow(resizedClosed), `closed after resize:\n${resizedClosed.join("\n")}`).toBe(idleComposer);
+      expect(footerStatusRow(resizedClosed)).toBe(24);
+      assertNoBlankGapBetweenTranscriptAndComposer(resizedClosed);
+      expect(footerMarkerCopies(stripAnsi(await session.captureFullScrollback())), "after the resize").toEqual(once);
+
+      // Ctrl+Z with the picker open: every row is in scrollback while fx is
+      // stopped, then fg reprints and the close puts the composer back.
+      await session.sendLiteralText("/");
+      await session.waitForText("Commands", 5_000);
+      await stableFooterGrid(session, workDir, "before-suspend");
+      await session.sendKeys("C-z");
+      await session.waitForPane((pane) => /stopped|suspended/i.test(pane), 10_000);
+      const suspended = stripAnsi(await session.captureFullScrollback());
+      writeFileSync(join(workDir, "suspended.txt"), suspended);
+      expect(footerMarkerCopies(suspended), "while stopped with the picker open").toEqual(once);
+      await session.sendText("fg");
+      await session.waitForText("Commands", 10_000);
+      await stableFooterGrid(session, workDir, "resumed-open");
+      await session.sendKeys("BSpace");
+      await session.waitForPane((pane) => !pane.includes("Commands") && hasEmptyComposer(pane), 5_000);
+      const resumedClosed = await stableFooterGrid(session, workDir, "resumed-closed");
+      expect(composerRow(resumedClosed), `closed after fg:\n${resumedClosed.join("\n")}`).toBe(idleComposer);
+      expect(footerStatusRow(resumedClosed)).toBe(24);
+      assertNoBlankGapBetweenTranscriptAndComposer(resumedClosed);
+      expect(footerMarkerCopies(stripAnsi(await session.captureFullScrollback())), "after fg").toEqual(once);
+
+      await session.sendText("/quit");
+      await session.waitForText("FOOTER_SHELL>", 10_000);
+      expect(gateway.requests).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await session.kill();
+      session = null;
+    },
+    90_000,
+  );
+
+  test(
+    "slash picker keeps its held rows across the full transcript screen",
+    async () => {
+      // Ctrl+O takes the alternate screen while the picker holds the rows it
+      // covers. Leaving it restores the main screen as it was, so the same
+      // rows are still held, and closing the picker puts every transcript row
+      // in scrollback exactly once with the composer back on its idle row.
+      const workDir = mkdtempSync(join(tmpdir(), "fx-footer-reclaim-ctrl-o-e2e-"));
+      workDirs.push(workDir);
+      const home = join(workDir, "home");
+      const workspace = join(workDir, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", permission: {} }));
+      const stderrPath = join(workDir, "stderr.log");
+      gateway = startFakeGateway([fakeGatewayFinalText(longAssistantResponse())]);
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: footerReclaimEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 24,
+        isolated: true,
+        minimumHistoryLines: 500,
+      });
+      await session.waitForComposer(10_000);
+      await session.sendText("Print the deterministic slash footer transcript fixture.");
+      await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
+      await waitForTurnEnd(session);
+      const idle = await stableFooterGrid(session, workDir, "idle");
+      const once = longAssistantLines().map(() => 1);
+      expect(footerMarkerCopies(stripAnsi(await session.captureFullScrollback()))).toEqual(once);
+
+      await session.sendLiteralText("/");
+      await session.waitForText("Commands", 5_000);
+      await stableFooterGrid(session, workDir, "open");
+      const open = footerMarkerCopies(stripAnsi(await session.captureFullScrollback()));
+      expect(open.every((copies) => copies <= 1)).toBe(true);
+      expect(open.filter((copies) => copies === 0).length).toBeGreaterThan(0);
+
+      await session.sendKeys("C-o");
+      await session.waitForText("esc close · pgup/pgdn scroll", 10_000);
+      await session.sendKeys("C-o");
+      await session.waitForPane(
+        (pane) => !pane.includes("esc close · pgup/pgdn scroll") && pane.includes("Commands"),
+        10_000,
+      );
+      await stableFooterGrid(session, workDir, "back");
+      expect(footerMarkerCopies(stripAnsi(await session.captureFullScrollback())), "after Ctrl+O").toEqual(open);
+
+      await session.sendKeys("BSpace");
+      await session.waitForPane((pane) => !pane.includes("Commands") && hasEmptyComposer(pane), 5_000);
+      const closed = await stableFooterGrid(session, workDir, "closed");
+      expect(composerRow(closed), `closed grid:\n${closed.join("\n")}`).toBe(composerRow(idle));
+      expect(footerStatusRow(closed)).toBe(24);
+      assertNoBlankGapBetweenTranscriptAndComposer(closed);
+      expect(footerMarkerCopies(stripAnsi(await session.captureFullScrollback())), "after close").toEqual(once);
+      expect(gateway.requests).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    90_000,
+  );
+
+  test(
+    "a fresh session started through the slash picker keeps every row in scrollback",
+    async () => {
+      // /new typed through the open picker hands the visible transcript to
+      // scrollback before the fresh session starts; the rows the picker held
+      // reach scrollback with it, each exactly once.
+      const workDir = mkdtempSync(join(tmpdir(), "fx-footer-reclaim-new-e2e-"));
+      workDirs.push(workDir);
+      const home = join(workDir, "home");
+      const workspace = join(workDir, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", permission: {} }));
+      const stderrPath = join(workDir, "stderr.log");
+      gateway = startFakeGateway([fakeGatewayFinalText(longAssistantResponse())]);
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: footerReclaimEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 24,
+        isolated: true,
+        minimumHistoryLines: 500,
+      });
+      await session.waitForComposer(10_000);
+      await session.sendText("Print the deterministic slash footer transcript fixture.");
+      await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
+      await waitForTurnEnd(session);
+      await stableFooterGrid(session, workDir, "idle");
+      const once = longAssistantLines().map(() => 1);
+      expect(footerMarkerCopies(stripAnsi(await session.captureFullScrollback()))).toEqual(once);
+
+      await session.sendLiteralText("/new");
+      await session.waitForText("Commands", 5_000);
+      await stableFooterGrid(session, workDir, "picker-open");
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => !pane.includes("Commands") && hasEmptyComposer(pane), 10_000);
+      await stableFooterGrid(session, workDir, "fresh-session");
+      const scrollback = stripAnsi(await session.captureFullScrollback());
+      writeFileSync(join(workDir, "fresh-session-scrollback.txt"), scrollback);
+      expect(footerMarkerCopies(scrollback), "after /new").toEqual(once);
+      expect(gateway.requests).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     90_000,
   );
