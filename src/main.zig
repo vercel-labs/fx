@@ -1126,8 +1126,15 @@ const App = struct {
         app_lifecycle.closeOnHangup(self.main_agent.worker.isProcessing());
     }
 
+    /// Puts the rows a footer surface holds into native history before the
+    /// screen is handed off: exit, suspend, or a fresh session.
+    pub fn settleHeldTranscriptRows(self: *App) void {
+        RenderAppRuntime.settleHeldTranscriptRows(self, self.screenAgent());
+    }
+
     pub fn releaseTerminal(self: *App) void {
         if (!self.terminal.raw_enabled and !self.terminal.signal_handler_installed) return;
+        if (self.terminal.raw_enabled) self.settleHeldTranscriptRows();
         app_lifecycle.shutdownInteractiveShell(
             &self.terminal,
             &self.shell,
@@ -1142,6 +1149,7 @@ const App = struct {
 
     pub fn suspendToJobControl(self: *App) !void {
         try self.flushBeforeBlockingExternalWork();
+        self.settleHeldTranscriptRows();
         // Suspending clears fx's program status record; report it again on resume.
         defer self.program_status.invalidate();
         try SessionAppRuntime.suspendToJobControl(self, footer_rows);

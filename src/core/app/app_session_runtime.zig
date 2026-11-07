@@ -1065,6 +1065,11 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
                 if (!freshSessionResizeReady(app)) return error.SessionScrollbackHandoffUnavailable;
+                // The handoff scrolls the screen into native history; rows a
+                // footer surface holds are off the screen, so settle them
+                // first (`tests/tla/transcript_window/spec/FooterReclaim.tla`
+                // ExitKeepsRows).
+                if (comptime @hasDecl(App, "settleHeldTranscriptRows")) app.settleHeldTranscriptRows();
                 try app.shell.commitVisibleTranscriptBeforeFreshSession(app.alloc, &app.metrics);
                 beginLiveSessionCancellation(app, agent);
             }

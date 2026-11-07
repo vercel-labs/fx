@@ -2817,15 +2817,14 @@ describe("effect-aware command permissions", () => {
           return lines.some((line) =>
             line.includes("transcript_transition_plan") &&
             line.includes("footer_reservation_changed=true") &&
-            line.includes("replay_displaced_footer_history=true") &&
-            /semantic_rows=([1-9]\d*) planned_rows=\1 .* geometry_rebase=true/.test(line)
+            /held_footer_rows=[1-9]\d* /.test(line) &&
+            line.includes("geometry_rebase=true")
           ) && lines.some((line) =>
             line.includes("transcript_transition_plan") &&
             line.includes("footer_reservation_changed=true") &&
-            line.includes("replay_displaced_footer_history=false") &&
-            line.includes("semantic_rows=0 planned_rows=0") &&
+            line.includes("held_footer_rows=0 ") &&
             line.includes("geometry_rebase=true")
-          ) && trace.includes("transcript_projection_history_floor");
+          );
         },
         45_000,
       );
@@ -2836,24 +2835,23 @@ describe("effect-aware command permissions", () => {
       expect(afterScrollback.indexOf("mode set to ask")).toBeGreaterThan(
         afterScrollback.indexOf(expectedMarkers.at(-1)!),
       );
-      const replayPlan = commandTrace.split(/\r?\n/).find((line) =>
+      // The picker holds the rows it covers: its growth releases none into
+      // native history, and its dismissal hands them back, so no history
+      // floor is needed to keep a row from showing twice.
+      const growthPlan = commandTrace.split(/\r?\n/).find((line) =>
         line.includes("transcript_transition_plan") &&
         line.includes("footer_reservation_changed=true") &&
-        line.includes("replay_displaced_footer_history=true")
+        /held_footer_rows=[1-9]\d* /.test(line)
       );
-      expect(replayPlan).toMatch(
-        /semantic_rows=([1-9]\d*) planned_rows=\1 .* geometry_rebase=true/,
-      );
-      const replayRows = replayPlan!.match(/planned_rows=([1-9]\d*)/)![1];
-      expect(commandTrace).toContain(`terminal_movement planned_rows=${replayRows}`);
+      expect(growthPlan).toContain("semantic_rows=0 planned_rows=0");
+      expect(growthPlan).toContain("geometry_rebase=true");
       const dismissalPlan = commandTrace.split(/\r?\n/).find((line) =>
         line.includes("transcript_transition_plan") &&
         line.includes("footer_reservation_changed=true") &&
-        line.includes("replay_displaced_footer_history=false")
+        line.includes("held_footer_rows=0 ")
       );
-      expect(dismissalPlan).toContain("semantic_rows=0 planned_rows=0");
       expect(dismissalPlan).toContain("geometry_rebase=true");
-      expect(commandTrace).toContain("transcript_projection_history_floor");
+      expect(commandTrace).not.toContain("transcript_projection_history_floor");
       expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")).permission_mode)
         .toBe("ask");
       expect(gateway.requests).toHaveLength(1);
