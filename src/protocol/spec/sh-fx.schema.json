@@ -32,7 +32,9 @@
         "sh.fx/sessionState": { "$ref": "#/$defs/Capability" },
         "sh.fx/listChanges": { "$ref": "#/$defs/Capability" },
         "sh.fx/sessionClients": { "$ref": "#/$defs/Capability" },
-        "sh.fx/subagentPrompts": { "$ref": "#/$defs/Capability" }
+        "sh.fx/subagentPrompts": { "$ref": "#/$defs/Capability" },
+        "sh.fx/fork": { "$ref": "#/$defs/Capability" },
+        "sh.fx/rewind": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -47,7 +49,9 @@
         "sh.fx/sessionState": { "$ref": "#/$defs/Capability" },
         "sh.fx/listChanges": { "$ref": "#/$defs/Capability" },
         "sh.fx/sessionClients": { "$ref": "#/$defs/Capability" },
-        "sh.fx/subagentPrompts": { "$ref": "#/$defs/Capability" }
+        "sh.fx/subagentPrompts": { "$ref": "#/$defs/Capability" },
+        "sh.fx/fork": { "$ref": "#/$defs/Capability" },
+        "sh.fx/rewind": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -141,6 +145,31 @@
         "steer": { "$ref": "#/$defs/Capability" },
         "queue": { "$ref": "#/$defs/Capability" }
       }
+    },
+    "PromptRef": {
+      "description": "A prompt of a session, by the `messageId` of its user message, which stays the same on every load: the value of sh.fx/forkBefore in the `_meta` of `session/fork`, and the `before` of `_sh.fx/session/rewind`.",
+      "type": "object",
+      "properties": {
+        "messageId": { "type": "string", "minLength": 1 }
+      },
+      "required": ["messageId"]
+    },
+    "RewindParams": {
+      "description": "The params of `_sh.fx/session/rewind`: remove the turn of the prompt `before` names, and every turn after it.",
+      "type": "object",
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "before": { "$ref": "#/$defs/PromptRef" }
+      },
+      "required": ["sessionId", "before"]
+    },
+    "HistoryReplacedParams": {
+      "description": "The params of the `_sh.fx/session/history_replaced` notification: a rewind changed the session's history, and the client loads it again.",
+      "type": "object",
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 }
+      },
+      "required": ["sessionId"]
     },
     "SessionState": {
       "description": "The value of sh.fx/state in the `_meta` of a `session/status` response and of a `session/list` row, and the `state` of a session state update: what the session is doing.",
