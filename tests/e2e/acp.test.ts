@@ -3809,14 +3809,16 @@ describe("acp: model-independent", () => {
         expect(init.result.agentCapabilities.sessionCapabilities.systemPrompt).toEqual({});
 
         for (const [id, params, message] of [
-          [20, { systemPrompt: [] }, "systemPrompt must contain at least one content block"],
-          [21, { systemPromptMode: "append" }, "systemPromptMode requires systemPrompt"],
-          [22, {
-            systemPrompt: [{ type: "text", text: "x" }],
-            systemPromptMode: "override",
-          }, 'systemPromptMode supports only "append"'],
-          [23, { systemPrompt: [{ type: "image", data: "AA==", mimeType: "image/png" }] },
+          [20, { systemPrompt: { mode: "append", content: [] } },
+            "systemPrompt.content must contain at least one content block"],
+          // The older RFD shape, a bare array of blocks, is refused.
+          [21, { systemPrompt: [{ type: "text", text: "x" }] },
+            "systemPrompt must be an object with a mode and a content array"],
+          [22, { systemPrompt: { mode: "override", content: [{ type: "text", text: "x" }] } },
+            'systemPrompt.mode supports only "append"'],
+          [23, { systemPrompt: { mode: "append", content: [{ type: "image", data: "AA==", mimeType: "image/png" }] } },
             "systemPrompt supports text content blocks only"],
+          [24, { systemPrompt: { content: [{ type: "text", text: "x" }] } }, "systemPrompt.mode is required"],
         ] as const) {
           const rejected = await client.request("session/new", {
             cwd: root.workspace,
@@ -3833,11 +3835,13 @@ describe("acp: model-independent", () => {
         const created = await client.request("session/new", {
           cwd: root.workspace,
           mcpServers: [],
-          systemPrompt: [
-            { type: "text", text: `You are the assistant inside Mini, a macOS browser. ${marker}` },
-            { type: "text", text: "Use the browser tools for navigation." },
-          ],
-          systemPromptMode: "append",
+          systemPrompt: {
+            mode: "append",
+            content: [
+              { type: "text", text: `You are the assistant inside Mini, a macOS browser. ${marker}` },
+              { type: "text", text: "Use the browser tools for navigation." },
+            ],
+          },
         }, 2) as any;
         expect(created.error).toBeUndefined();
         const sessionId = created.result.sessionId as string;
@@ -3883,6 +3887,86 @@ describe("acp: model-independent", () => {
         expect(prompts).toHaveLength(1);
         expect(JSON.stringify(prompts[0].value)).toContain(marker);
         expect(existsSync(join(root.home, ".fx", "session-files"))).toBe(false);
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    `ACP load and resume refuse, keep, or apply a client system prompt`,
+    async () => {
+      const root = createIsolatedRoot("fx-acp-system-prompt-load-");
+      const gateway = startFakeGateway([
+        finalText("First prompt applied."),
+        finalText("Second prompt applied."),
+        finalText("Second prompt kept."),
+      ]);
+      const systemText = (body: string) => acpGatewayRequest(body).prompt
+        .filter((message) => message.role === "system")
+        .map((message) => acpContentText(message.content))
+        .join("\n");
+      const prompt = (text: string) => ({ mode: "append", content: [{ type: "text", text }] });
+      let sessionId = "";
+      const restore = async (method: string, id: number, extra: object) => await client.request(method, {
+        sessionId,
+        cwd: root.workspace,
+        mcpServers: [],
+        ...extra,
+      }, id) as any;
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", {
+          cwd: root.workspace,
+          mcpServers: [],
+          systemPrompt: prompt("FIRST_SYSTEM_PROMPT"),
+        }, 2) as any;
+        sessionId = created.result.sessionId as string;
+        await client.readLine();
+        expect((await runPrompt(client, "One?", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+        expect(systemText(gateway.requests[0]!.body)).toContain("FIRST_SYSTEM_PROMPT");
+        await client.close();
+
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        // A prompt the session can't apply fails the load, which then doesn't happen.
+        const refused = await restore("session/load", 11, {
+          systemPrompt: { mode: "override", content: [{ type: "text", text: "x" }] },
+        });
+        expect(refused.error).toMatchObject({ code: -32602, message: 'systemPrompt.mode supports only "append"' });
+        const notLoaded = await client.request("session/set_mode", { sessionId, modeId: "auto" }, 12) as any;
+        expect(notLoaded.error).toMatchObject({ code: -32002, message: "No active session" });
+
+        // The same prompt again loads the session and writes nothing new.
+        expect((await restore("session/load", 13, { systemPrompt: prompt("FIRST_SYSTEM_PROMPT") })).error).toBeUndefined();
+        // A different one, sent while the session is active, applies from the next turn.
+        expect((await restore("session/load", 14, { systemPrompt: prompt("SECOND_SYSTEM_PROMPT") })).error).toBeUndefined();
+        expect((await runPrompt(client, "Two?", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+        const second = systemText(gateway.requests[1]!.body);
+        expect(second).toContain("SECOND_SYSTEM_PROMPT");
+        expect(second).not.toContain("FIRST_SYSTEM_PROMPT");
+        await client.close();
+
+        // A resume that omits the prompt keeps the one stored last.
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 20);
+        expect((await restore("session/resume", 21, {})).error).toBeUndefined();
+        expect((await runPrompt(client, "Three?", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+        expect(systemText(gateway.requests[2]!.body)).toContain("SECOND_SYSTEM_PROMPT");
+        expect(client.stderr).toBe("");
+        await client.close();
+
+        const log = readFileSync(join(root.home, ".fx", "sessions", "v2", sessionId, "log.jsonl"), "utf8");
+        const stored = log.trimEnd().split("\n").map((line) => JSON.parse(line))
+          .filter((line) => line.kind === "set" && line.key === "client_prompt")
+          .map((line) => JSON.stringify(line.value));
+        expect(stored).toHaveLength(2);
+        expect(stored[0]).toContain("FIRST_SYSTEM_PROMPT");
+        expect(stored[1]).toContain("SECOND_SYSTEM_PROMPT");
       } finally {
         await client?.close();
         gateway.stop();
@@ -6905,8 +6989,9 @@ describe("acp: model-independent", () => {
           jsonrpc: "2.0",
           id: 2,
           error: {
-            code: -32602,
+            code: -32002,
             message: "No active session",
+            data: { sessionId: "missing-session" },
           },
         });
         expect(client.stderr).toBe("");
@@ -6955,9 +7040,10 @@ describe("acp: model-independent", () => {
           [6, "session/cancel", { sessionId: staleSessionId }],
         ] as const) {
           const response = await client.request(method, params, id) as any;
-          expect(response.error).toMatchObject({
-            code: -32602,
+          expect(response.error).toEqual({
+            code: -32002,
             message: "Session is not active",
+            data: { sessionId: staleSessionId },
           });
         }
 
@@ -6972,11 +7058,69 @@ describe("acp: model-independent", () => {
           },
         });
         const promptResponse = await readResponse(client, promptId);
-        expect(promptResponse.error).toMatchObject({
-          code: -32602,
+        expect(promptResponse.error).toEqual({
+          code: -32002,
           message: "Session is not active",
+          data: { sessionId: staleSessionId },
         });
         expect(gateway.requests).toHaveLength(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session/close of a session that isn't open succeeds and leaves the open session open",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-idempotent-close-");
+      const gateway = startFakeGateway([]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const none = await client.request("session/close", { sessionId: "missing-session" }, 2) as any;
+        expect(none).toMatchObject({ id: 2, result: {} });
+
+        const first = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [] },
+          3,
+        ) as any;
+        await client.readLine();
+        const second = await client.request(
+          "session/new",
+          { cwd: root.workspace, mcpServers: [] },
+          4,
+        ) as any;
+        await client.readLine();
+        const staleSessionId = first.result.sessionId as string;
+        const activeSessionId = second.result.sessionId as string;
+
+        for (const [id, sessionId] of [[5, staleSessionId], [6, "missing-session"]] as const) {
+          const closed = await client.request("session/close", { sessionId }, id) as any;
+          expect(closed).toMatchObject({ id, result: {} });
+        }
+        const stillOpen = await client.request(
+          "session/set_mode",
+          { sessionId: activeSessionId, modeId: "auto" },
+          7,
+        ) as any;
+        expect(stillOpen.error).toBeUndefined();
+
+        const missing = await client.request("session/close", {}, 8) as any;
+        expect(missing.error).toMatchObject({ code: -32602, message: "Missing sessionId" });
+
+        for (const id of [9, 10]) {
+          const closed = await client.request("session/close", { sessionId: activeSessionId }, id) as any;
+          expect(closed).toMatchObject({ id, result: {} });
+        }
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -8237,12 +8381,12 @@ describe("acp: model-independent", () => {
         jsonrpc: "2.0",
         id: null,
         error: {
-          code: -32000,
+          code: -32600,
           message: "Request frame too large",
         },
       });
       expect(client.rawLines[1]).toBe(
-        '{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Request frame too large"}}',
+        '{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Request frame too large"}}',
       );
 
       const next = await client.request("session/new", {}, 7) as any;
@@ -8585,8 +8729,9 @@ describe("acp: model-independent", () => {
           5,
         ) as any;
         expect(missingLoad.error).toEqual({
-          code: -32602,
+          code: -32002,
           message: "Session not found",
+          data: { sessionId: "missing-session" },
         });
 
         owner.endStdin();

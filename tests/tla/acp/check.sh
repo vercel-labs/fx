@@ -4,7 +4,11 @@
 #
 # AcpPermissionModes: the ACP permission-mode contract, which matches the CLI's
 # /permissions. AcpSpeed: the per-session Standard, Fast, and Ultrafast speed
-# contract. AcpPromptDelivery: steering and queued prompts as the sh.fx spec
+# contract. AcpSessionTarget: how a request that names a session is answered,
+# under ACP v1's error rules, in fx acp and in libfx's minimal kernel (the
+# libfx/* methods). AcpSystemPrompt: the client's systemPrompt on session/new,
+# session/load and session/resume, and the prompt each turn sends.
+# AcpPromptDelivery: steering and queued prompts as the sh.fx spec
 # defines them, which haven't landed in src/acp/ yet. AcpFollow: following a
 # session on several connections and catching up by log position, likewise
 # not landed. AcpSessionState: session state, session/status, and list
@@ -12,8 +16,9 @@
 # one session see of each other's prompts, approvals, cancels, and presence,
 # likewise not landed. AcpSubagents: child sessions in the shape of ACP's
 # Subagent Sessions, likewise not landed. AcpForkRewind: forking a session
-# before a prompt and rewinding one, likewise not landed. Their Today configs show fx now, and each
-# must fail on the rule it names. The other configs must pass.
+# before a prompt and rewinding one, likewise not landed. Their Before configs show fx before
+# the fixes, their Today configs show fx now, and each must fail on the rule it
+# names. The other configs must pass.
 #
 # The planted bugs and the runs of the real `fx acp` binary are in
 # ../drivers/acp/:
@@ -21,6 +26,10 @@
 #   bun ../drivers/acp/permission_modes/driver.ts
 #   bun ../drivers/acp/speed/check-spec.ts
 #   bun ../drivers/acp/speed/driver.ts
+#   bun ../drivers/acp/session_target/check-spec.ts
+#   bun ../drivers/acp/session_target/driver.ts   # kernel plans need the native addon
+#   bun ../drivers/acp/system_prompt/check-spec.ts
+#   bun ../drivers/acp/system_prompt/driver.ts
 #   bun ../drivers/acp/prompt_delivery/check-spec.ts
 #   bun ../drivers/acp/prompt_delivery/driver.ts   # today's fx acp; --model rules fails until the rules land
 #   bun ../drivers/acp/follow/check-spec.ts
@@ -52,6 +61,14 @@ status=0
 tlc_verdicts "$@" <<'EOF' || status=1
 MCAcpPermissionModes MCAcpPermissionModes -
 MCAcpSpeed MCAcpSpeed -
+MCAcpSessionTarget MCAcpSessionTarget -
+MCAcpSessionTarget AcpSessionTargetBefore-unknown UnknownSessionAnswer
+MCAcpSessionTarget AcpSessionTargetBefore-close CloseIdempotent
+MCAcpSessionTarget AcpSessionTargetBefore-oversize NeverAuthCode
+MCAcpSystemPrompt MCAcpSystemPrompt -
+MCAcpSystemPrompt AcpSystemPromptBefore-v1-refused V1Accepted
+MCAcpSystemPrompt AcpSystemPromptBefore-old-accepted OtherShapesRefused
+MCAcpSystemPrompt AcpSystemPromptBefore-load-ignores LoadAppliesPrompt
 MCAcpPromptDelivery MCAcpPromptDelivery -
 MCAcpPromptDelivery MCAcpPromptDeliveryRefusals -
 MCAcpPromptDelivery AcpPromptDeliveryToday-interrupt NoSteerWaitsOnReply

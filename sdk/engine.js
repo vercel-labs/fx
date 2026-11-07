@@ -1762,7 +1762,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       try { await journalSettled(); } catch (error) { failure = error; }
       if (closing) return;
       send(failure
-        ? { jsonrpc: "2.0", id: message.id, error: { code: -32000, message: failure.message } }
+        ? { jsonrpc: "2.0", id: message.id, error: { code: -32603, message: failure.message } }
         : { jsonrpc: "2.0", id: message.id, result: {} });
       return;
     }

@@ -633,7 +633,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
 
     var loaded = (js_host_session_store.load(alloc, session_id) catch
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Session could not be loaded" })) orelse
-        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Session not found" });
+        return state.writer.writeError(alloc, msg.id, jsonrpc.sessionNotFound("Session not found", session_id));
     var loaded_owned = true;
     defer if (loaded_owned) loaded.deinit(alloc);
     const sid_copy = try alloc.dupe(u8, loaded.state.id);
@@ -762,6 +762,18 @@ fn handleRestoreSession(
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
     };
+    // ACP v1: a prompt the session cannot apply fails the request before any
+    // restore side effect. One that differs from the stored prompt replaces it
+    // (`tests/tla/acp/AcpSystemPrompt.tla` RefusalChangesNothing and
+    // LoadAppliesPrompt).
+    var requested_system_prompt = client_instructions.parse(state.alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = client_instructions.parseErrorMessage(err),
+        }),
+    };
+    defer if (requested_system_prompt) |text| state.alloc.free(text);
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
         .message = "Missing params",
@@ -846,6 +858,19 @@ fn handleRestoreSession(
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
             server.cancelAndReapActivePrompt(state);
+            // With the prompt worker reaped, nothing reads the old text.
+            if (requested_system_prompt) |text| if (!std.mem.eql(u8, text, active.client_system_prompt)) {
+                if (active.v2) |session| session.setClientPrompt(text) catch |err| {
+                    debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.internal_error,
+                        .message = "Failed to save the client system prompt",
+                    });
+                };
+                if (active.client_system_prompt.len > 0) state.alloc.free(active.client_system_prompt);
+                active.client_system_prompt = text;
+                requested_system_prompt = null;
+            };
             server.disableSubagentHost(state);
             state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
             const previous_host = active.mcp_host;
@@ -889,9 +914,9 @@ fn handleRestoreSession(
         v2_store.notice = .{ .context = &notice, .emit = ConversionNotice.emit };
         defer v2_store.notice = null;
         v2 = session_adapter.Session.resumeSession(alloc, v2_store, .{ .id = session_id }, workspace_root, .acp) catch |err|
-            return handleLoadFailure(state, alloc, msg, err);
+            return handleLoadFailure(state, alloc, msg, session_id, err);
         v2_resumed = v2.?.durableState(alloc, workspace_root) catch |err|
-            return handleLoadFailure(state, alloc, msg, err);
+            return handleLoadFailure(state, alloc, msg, session_id, err);
     }
     const durable: *const session_codec.DurableSessionState = &v2_resumed.?.state;
 
@@ -939,12 +964,26 @@ fn handleRestoreSession(
     // same-session `cwd` rebind has already released it above.
     var client_system_prompt: ?[]u8 = restoredClientSystemPrompt(state.alloc, v2.?) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.ClientSystemPromptUnreadable => return state.writer.writeError(alloc, msg.id, .{
+        // A supplied prompt replaces one that can't be read.
+        error.ClientSystemPromptUnreadable => if (requested_system_prompt == null) return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
             .message = "Session client system prompt could not be restored",
-        }),
+        }) else null,
     };
     defer if (client_system_prompt) |text| state.alloc.free(text);
+    if (requested_system_prompt) |text| {
+        // The session writes nothing for the prompt it already holds.
+        v2.?.setClientPrompt(text) catch |err| {
+            debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Failed to save the client system prompt",
+            });
+        };
+        if (client_system_prompt) |old| state.alloc.free(old);
+        client_system_prompt = text;
+        requested_system_prompt = null;
+    }
     // The session's downloads are its blobs (D44).
     session_rt.configureWebFetchArtifactBlobs(alloc, try v2.?.childCapability(), v2.?.id());
     server.cancelAndReapActivePrompt(state);
@@ -1322,6 +1361,7 @@ fn handleLoadFailure(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
+    session_id: []const u8,
     err: anyerror,
 ) !void {
     debug_trace.logf(
@@ -1380,10 +1420,7 @@ fn handleLoadFailure(
             .message = "Session could not be loaded",
         });
     }
-    return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_params,
-        .message = "Session not found",
-    });
+    return state.writer.writeError(alloc, msg.id, jsonrpc.sessionNotFound("Session not found", session_id));
 }
 
 pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -2820,6 +2857,7 @@ test "ACP load maps one-off child denial to invalid params" {
             &state,
             arena,
             &msg,
+            "child-session",
             error.OneOffSessionNotResumable,
         );
         try std.testing.expect(state.active_session == null);
