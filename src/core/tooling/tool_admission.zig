@@ -1126,24 +1126,20 @@ fn resolveOrdinaryPermissionOutcome(
     if (permission_mode == .auto) {
         if (command_call) {
             const command = try runCommandContext(input, arena, call);
-            // A user-profile alias or function can redefine a routine name,
-            // so those commands go to review instead, as does every command
-            // while a failed capture hides which names are redefined.
             if (command.execution_mode == .captured and
-                !(command.environment == .user and
-                    (shell_snapshot.processOwner().definesAnyWord(command.command) or
-                        shell_snapshot.processOwner().startupNamesUnknown())) and
                 try command_effect.knownReversibleAutoCommand(
                     arena,
                     command.command,
                     false,
                 ))
             {
-                return shellPermissionOutcome(
-                    command,
-                    .once,
-                    .auto_mode,
-                );
+                switch (try routineStartupNames(input, arena, call, command)) {
+                    .review => {},
+                    .run => |epoch| return withShellGrantEpoch(
+                        shellPermissionOutcome(command, .once, .auto_mode),
+                        epoch,
+                    ),
+                }
             }
         }
         return automaticReviewOutcome(
@@ -1157,6 +1153,52 @@ fn resolveOrdinaryPermissionOutcome(
     }
 
     return .{ .decision = .permission_required };
+}
+
+const RoutineStartupNames = union(enum) {
+    /// The names the command runs with are unknown or redefine one of its
+    /// words.
+    review,
+    /// The command may skip review, bound to this shell snapshot epoch, or
+    /// to none when its shell reads no startup files.
+    run: ?u64,
+};
+
+/// A `user` profile alias or function can redefine a routine name, so a
+/// routine command skips review only when fx knows the names it will run
+/// with. The snapshot is captured first when there is none yet or the
+/// startup files changed; a failed capture hides the names, and a reload
+/// replaces them after admission. The approval is bound to the epoch of the
+/// generation checked, so a run under another one is refused
+/// (`tests/tla/tool_admission/RoutineNames.tla` NoUnreviewedAlias).
+fn routineStartupNames(
+    input: Input,
+    arena: Allocator,
+    call: ToolCall,
+    command: command_admission.CommandContext,
+) !RoutineStartupNames {
+    const shell_path = switch (command.environment) {
+        .user => |path| path,
+        .clean, .legacy, .workspace_clean => return .{ .run = null },
+    };
+    const reason = if (shellCallRequestsReload(arena, call))
+        "reload"
+    else switch (try shell_snapshot.processOwner().checkCommandNames(
+        shell_path,
+        command.resolved_cwd,
+        command.command,
+        input.auto_classifier.provider_input.cancel_flag,
+    )) {
+        .clear => |epoch| return .{ .run = epoch },
+        .redefined => "redefined",
+        .unknown => "unknown",
+    };
+    debug_trace.logf(
+        "permission",
+        "event=routine_command_reviewed reason=startup_names_{s} call_id={s}",
+        .{ reason, call.id },
+    );
+    return .review;
 }
 
 fn resolveFileMutationAdmission(
@@ -1981,7 +2023,8 @@ test "shell reload detection reads top-level and wrapped arguments" {
     }
 }
 
-/// Binds the remembered grant's shell snapshot epoch to a shell admission.
+/// Binds the shell snapshot epoch that admitted a shell command, a
+/// remembered grant's or a routine check's, to its authority.
 fn withShellGrantEpoch(
     outcome: command_admission.PermissionOutcome,
     grant_epoch: ?u64,
@@ -5754,9 +5797,187 @@ test "routine commands go to review while the snapshot has fallen back" {
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
+/// A snapshot capture whose startup files define `names`. `calls` counts
+/// captures.
+const StartupNamesCapture = struct {
+    var names: []const []const u8 = &.{};
+    var calls: std.atomic.Value(u32) = .init(0);
+
+    fn install(defined: []const []const u8) void {
+        names = defined;
+        calls.store(0, .seq_cst);
+        shell_snapshot.resetProcessOwnerForTest(capture);
+    }
+
+    fn capture(request: shell_snapshot.CaptureRequest) shell_snapshot.CaptureOutcome {
+        _ = calls.fetchAdd(1, .seq_cst);
+        const generation = shell_snapshot.Generation.create() catch return .{ .failed = .out_of_memory };
+        const alloc = generation.arena.allocator();
+        generation.shell_path = alloc.dupe(u8, request.shell_path) catch {
+            generation.destroy();
+            return .{ .failed = .out_of_memory };
+        };
+        for (names) |name| generation.names.put(alloc, name, {}) catch {
+            generation.destroy();
+            return .{ .failed = .out_of_memory };
+        };
+        return .{ .ready = generation };
+    }
+};
+
+fn admitRoutineTestCommand(
+    input: Input,
+    arena: Allocator,
+    arguments_json: []const u8,
+) !command_admission.PermissionOutcome {
+    return requestPermissionOutcome(
+        input,
+        arena,
+        .{ .id = "routine-startup-names", .name = "shell", .arguments_json = arguments_json },
+        .auto,
+        &.{},
+    );
+}
+
+/// The shell snapshot epoch a routine approval was bound to, or null.
+fn routineTestEpoch(outcome: command_admission.PermissionOutcome) ?u64 {
+    return outcome.execution_authority.?.run_command.shell_allowed.grant_epoch;
+}
+
+test "the first routine command of a process is checked against startup names before it skips review" {
+    // No command has run yet, so no snapshot exists. The startup files alias
+    // `git`, and only a capture can tell.
+    StartupNamesCapture.install(&.{"git"});
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{};
+    const input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(@ptrCast(&fake), FakeAutoClassifier.classify),
+    );
+
+    const outcome = try admitRoutineTestCommand(
+        input,
+        arena_state.allocator(),
+        "{\"action\":\"run\",\"command\":\"git status --short\"}",
+    );
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_classifier,
+        outcome.execution_authority.?.run_command.shell_allowed.source,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(u32, 1), StartupNamesCapture.calls.load(.seq_cst));
+}
+
+test "a routine command after the startup files change is checked against a new capture" {
+    StartupNamesCapture.install(&.{});
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const owner = shell_snapshot.processOwner();
+    const warm = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
+    warm.release();
+    // The startup files now alias `git`, and a refresh is pending.
+    StartupNamesCapture.names = &.{"git"};
+    owner.markDirty(.user_reload);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{};
+    const input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(@ptrCast(&fake), FakeAutoClassifier.classify),
+    );
+    const outcome = try admitRoutineTestCommand(
+        input,
+        arena_state.allocator(),
+        "{\"action\":\"run\",\"command\":\"git status --short\"}",
+    );
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_classifier,
+        outcome.execution_authority.?.run_command.shell_allowed.source,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "a routine command that reloads the startup files goes to review" {
+    StartupNamesCapture.install(&.{});
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const warm = (try shell_snapshot.processOwner().acquire("/bin/zsh", "/tmp", .{})).snapshot;
+    warm.release();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{};
+    const input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(@ptrCast(&fake), FakeAutoClassifier.classify),
+    );
+    // The reload runs after admission, so the names admission could check
+    // are not the ones the command runs with.
+    const outcome = try admitRoutineTestCommand(
+        input,
+        arena_state.allocator(),
+        "{\"action\":\"run\",\"command\":\"git status --short\",\"reload\":true}",
+    );
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_classifier,
+        outcome.execution_authority.?.run_command.shell_allowed.source,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "a routine approval is bound to the snapshot epoch it checked" {
+    StartupNamesCapture.install(&.{});
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const owner = shell_snapshot.processOwner();
+    // An earlier refresh, so the epoch the approval carries is not zero.
+    owner.markDirty(.user_reload);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{};
+    const input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(@ptrCast(&fake), FakeAutoClassifier.classify),
+    );
+    const user = try admitRoutineTestCommand(
+        input,
+        arena_state.allocator(),
+        "{\"action\":\"run\",\"command\":\"git status --short\"}",
+    );
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_mode,
+        user.execution_authority.?.run_command.shell_allowed.source,
+    );
+    try std.testing.expectEqual(@as(?u64, owner.approvalEpoch()), routineTestEpoch(user));
+    try std.testing.expectEqual(@as(u64, 1), routineTestEpoch(user).?);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    // A clean shell reads no startup files, so its approval is not bound.
+    const clean = try admitRoutineTestCommand(
+        input,
+        arena_state.allocator(),
+        "{\"action\":\"run\",\"command\":\"npm test\",\"profile\":\"clean\"}",
+    );
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_mode,
+        clean.execution_authority.?.run_command.shell_allowed.source,
+    );
+    try std.testing.expectEqual(@as(?u64, null), routineTestEpoch(clean));
+}
+
 test "known reversible auto commands bypass the reviewer" {
-    // An earlier test's snapshot could redefine a routine name.
-    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    // Startup files that redefine no routine name, in place of the real ones.
+    StartupNamesCapture.install(&.{});
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
