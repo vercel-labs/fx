@@ -2606,6 +2606,7 @@ fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalO
                 &response.writer,
                 stop_reason,
                 usage,
+                .of(active.state.cfg.minimal_kernel),
             );
             try active.state.writer.writeResponse(active.alloc, active.msg.id, response.writer.buffered());
         },
@@ -2648,7 +2649,12 @@ fn writeSteeringOutcome(
         .stop_reason => |stop_reason| {
             var response: std.Io.Writer.Allocating = .init(active.alloc);
             defer response.deinit();
-            try acp_types.writeSteeringPromptResponse(&response.writer, stop_reason, delivery);
+            try acp_types.writeSteeringPromptResponse(
+                &response.writer,
+                stop_reason,
+                delivery,
+                .of(active.state.cfg.minimal_kernel),
+            );
             try active.state.writer.writeResponse(active.alloc, id, response.written());
         },
         .rpc_error => |rpc_error| try active.state.writer.writeError(active.alloc, id, rpc_error),
