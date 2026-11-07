@@ -3124,6 +3124,29 @@ test "production response head wait accepts slow headers and still expires" {
     try std.testing.expect(watch.finish() == null);
 }
 
+test "a patient response head wait outlasts any silence before the head" {
+    var patient = ConnectedRequestWatch.init(.{ .patient = true });
+    var bounded = ConnectedRequestWatch.init(.{});
+    // t0 precedes both arms, so t0 + 119 s comes before either deadline.
+    const t0 = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    try std.testing.expect(patient.arm_response_head() == null);
+    try std.testing.expect(bounded.arm_response_head() == null);
+    const at = struct {
+        fn ms(base: std.Io.Clock.Timestamp, offset: i64) std.Io.Clock.Timestamp {
+            return .{ .clock = .awake, .raw = base.raw.addDuration(.fromMilliseconds(offset)) };
+        }
+    };
+    try std.testing.expect(!bounded.response_head_expired(at.ms(t0, 119_000)));
+    try std.testing.expect(bounded.response_head_expired(bounded.response_head_deadline));
+    for ([_]i64{ 119_000, 120_000, 125_000, 3_600_000, 86_400_000 }) |offset| {
+        try std.testing.expect(!patient.response_head_expired(at.ms(t0, offset)));
+    }
+    try std.testing.expect(!patient.response_head_expired(patient.response_head_deadline));
+    // Cancellation still ends the wait after any silence.
+    try std.testing.expect(patient.win(.cancelled));
+    try std.testing.expectEqual(error.Cancelled, patient.finish().?);
+}
+
 fn resolveE2eGatewayUrl(env_name: []const u8, default_url: []const u8) ![]const u8 {
     return selectE2eGatewayUrl(io_mod.getenv(env_name), default_url);
 }

@@ -9,7 +9,7 @@
   { "file": "cli.test.ts", "weight": 19 },
   { "file": "compaction-policy.test.ts", "weight": 1 },
   { "file": "config-persistence.test.ts", "weight": 64 },
-  { "file": "configured-providers.test.ts", "weight": 3 },
+  { "file": "configured-providers.test.ts", "weight": 60 },
   { "file": "context-limits-live.test.ts", "weight": 1 },
   { "file": "file-tool-paths.test.ts", "weight": 6 },
   { "file": "poisoned-repository.test.ts", "weight": 5 },
