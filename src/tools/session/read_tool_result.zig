@@ -41,12 +41,13 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     var decoder: tool_args.ArgsDecoder = .{ .alloc = ctx.allocator, .tool = "read_tool_result" };
     var parsed = decoder.parse(args_json) catch |err| return .{ .failure = try decoder.takeFailure(err) };
     defer parsed.deinit();
-    const args = if (parsed.value.object.get("request")) |request| blk: {
-        if (request != .object) {
+    // A model may wrap the fields in request, as an object or as its JSON text.
+    const args = if (parsed.value.object.get("request")) |request|
+        try tool_args.requestWrapperObject(parsed.arena.allocator(), request) orelse {
             return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") };
         }
-        break :blk request.object;
-    } else parsed.value.object;
+    else
+        parsed.value.object;
     if (args.get("search")) |value| {
         // search reads saved history and ignores a handle, so a call that
         // sends both meant to look inside the handle's output.
@@ -343,6 +344,82 @@ test "read_tool_result decodes nested model requests" {
         .query => |query| try std.testing.expectEqualStrings("needle", query),
         .range => return error.TestUnexpectedDecodeFailure,
         .search => return error.TestUnexpectedDecodeFailure,
+    }
+}
+
+test "read_tool_result decodes a nested request sent as JSON text" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(
+        .{ .allocator = alloc },
+        "{\"request\":\"{\\\"handle\\\":\\\"h.txt\\\",\\\"query\\\":\\\"needle\\\"}\"}",
+    );
+    const input = switch (decoded) {
+        .input => |value| value,
+        .failure => |failure| {
+            alloc.free(failure);
+            return error.TestUnexpectedDecodeFailure;
+        },
+    };
+    defer input.deinit(alloc);
+    const typed = input.as(Input);
+    try std.testing.expectEqualStrings("h.txt", typed.handle);
+    switch (typed.selector) {
+        .query => |query| try std.testing.expectEqualStrings("needle", query),
+        .range => return error.TestUnexpectedDecodeFailure,
+        .search => return error.TestUnexpectedDecodeFailure,
+    }
+
+    const searched = try decode(
+        .{ .allocator = alloc },
+        "{\"request\":\"{\\\"search\\\":[\\\"needle\\\"]}\"}",
+    );
+    const search_input = switch (searched) {
+        .input => |value| value,
+        .failure => |failure| {
+            alloc.free(failure);
+            return error.TestUnexpectedDecodeFailure;
+        },
+    };
+    defer search_input.deinit(alloc);
+    switch (search_input.as(Input).selector) {
+        .search => |phrases| {
+            try std.testing.expectEqual(@as(usize, 1), phrases.len);
+            try std.testing.expectEqualStrings("needle", phrases[0]);
+        },
+        .range => return error.TestUnexpectedDecodeFailure,
+        .query => return error.TestUnexpectedDecodeFailure,
+    }
+
+    // Text that names no object, or is longer than the bound, keeps the
+    // failure an object-less request gets.
+    const inner = try alloc.alloc(u8, tool_args.max_request_text_bytes + 1);
+    defer alloc.free(inner);
+    @memset(inner, ' ');
+    @memcpy(inner[0..2], "{}");
+    const oversized_request = try std.json.Stringify.valueAlloc(alloc, .{ .request = inner }, .{});
+    defer alloc.free(oversized_request);
+    for ([_][]const u8{
+        "{\"request\":\"needle\"}",
+        "{\"request\":\"[]\"}",
+        "{\"request\":\"null\"}",
+        "{\"request\":\"\"}",
+        "{\"request\":\"\\\"{\\\\\\\"handle\\\\\\\":\\\\\\\"h.txt\\\\\\\"}\\\"\"}",
+        "{\"request\":3}",
+        oversized_request,
+    }) |args_json| {
+        switch (try decode(.{ .allocator = alloc }, args_json)) {
+            .input => |value| {
+                value.deinit(alloc);
+                return error.TestUnexpectedResult;
+            },
+            .failure => |failure| {
+                defer alloc.free(failure);
+                try std.testing.expectEqualStrings(
+                    "read_tool_result field \"request\" must be an object",
+                    failure,
+                );
+            },
+        }
     }
 }
 
