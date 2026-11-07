@@ -5,9 +5,10 @@
 # AcpPermissionModes: the ACP permission-mode contract, which matches the CLI's
 # /permissions. AcpSpeed: the per-session Standard, Fast, and Ultrafast speed
 # contract. AcpPromptDelivery: steering and queued prompts as the sh.fx spec
-# defines them, which haven't landed in src/acp/ yet; its Today configs show
-# fx's ACP path now, and each must fail on the rule it names. The other
-# configs must pass.
+# defines them, which haven't landed in src/acp/ yet. AcpFollow: following a
+# session on several connections and catching up by log position, likewise
+# not landed. Their Today configs show fx now, and each must fail on the rule
+# it names. The other configs must pass.
 #
 # The planted bugs and the runs of the real `fx acp` binary are in
 # ../drivers/acp/:
@@ -17,6 +18,7 @@
 #   bun ../drivers/acp/speed/driver.ts
 #   bun ../drivers/acp/prompt_delivery/check-spec.ts
 #   bun ../drivers/acp/prompt_delivery/driver.ts   # today's fx acp; --model rules fails until the rules land
+#   bun ../drivers/acp/follow/check-spec.ts
 #
 # With --ci it also runs every ../drivers/acp/*/driver.ts against
 # zig-out/bin/fx, as CI does; the planted bugs stay local, since they measure
@@ -46,6 +48,11 @@ MCAcpPromptDelivery AcpPromptDeliveryToday-interrupt NoSteerWaitsOnReply
 MCAcpPromptDelivery AcpPromptDeliveryToday-lost NothingLost
 MCAcpPromptDelivery AcpPromptDeliveryToday-dropped DeliveryValues
 MCAcpPromptDelivery AcpPromptDeliveryToday-late LateRunTogether
+MCAcpFollow MCAcpFollow -
+MCAcpFollow AcpFollowToday-busy JoinWorks
+MCAcpFollow AcpFollowToday-ids StableIds
+MCAcpFollow AcpFollowToday-position PositionCurrent
+MCAcpFollow AcpFollowToday-replay ReplaySaid
 EOF
 
 if [ "$ci" = true ]; then

@@ -234,6 +234,8 @@ After the replay, fx answers:
 }
 ```
 
+`tests/tla/acp/AcpFollow.tla` models these rules, with the stable message ids of fix X21, and TLC checks that every connection that has the session open holds exactly its saved turns, with no gap and no repeat. Its `Today` configs show where fx breaks them now.
+
 ## Names in use today
 
 fx's ACP server names its additions today with a `libfx/` prefix, which doesn't follow ACP's extension rules, and its wasm build accepts `session/remove`, which ACP calls `session/delete`. Each one gets the new name in this table:
