@@ -4,7 +4,10 @@
 #
 # AcpPermissionModes: the ACP permission-mode contract, which matches the CLI's
 # /permissions. AcpSpeed: the per-session Standard, Fast, and Ultrafast speed
-# contract. Both configs must pass.
+# contract. AcpPromptDelivery: steering and queued prompts as the sh.fx spec
+# defines them, which haven't landed in src/acp/ yet; its Today configs show
+# fx's ACP path now, and each must fail on the rule it names. The other
+# configs must pass.
 #
 # The planted bugs and the runs of the real `fx acp` binary are in
 # ../drivers/acp/:
@@ -12,6 +15,7 @@
 #   bun ../drivers/acp/permission_modes/driver.ts
 #   bun ../drivers/acp/speed/check-spec.ts
 #   bun ../drivers/acp/speed/driver.ts
+#   bun ../drivers/acp/prompt_delivery/check-spec.ts
 #
 # With --ci it also runs every ../drivers/acp/*/driver.ts against
 # zig-out/bin/fx, as CI does; the planted bugs stay local, since they measure
@@ -35,6 +39,13 @@ status=0
 tlc_verdicts "$@" <<'EOF' || status=1
 MCAcpPermissionModes MCAcpPermissionModes -
 MCAcpSpeed MCAcpSpeed -
+MCAcpPromptDelivery MCAcpPromptDelivery -
+MCAcpPromptDelivery MCAcpPromptDeliveryRefusals -
+MCAcpPromptDelivery AcpPromptDeliveryToday-interrupt NoSteerWaitsOnReply
+MCAcpPromptDelivery AcpPromptDeliveryToday-reply-end ReplyEndContinues
+MCAcpPromptDelivery AcpPromptDeliveryToday-lost NothingLost
+MCAcpPromptDelivery AcpPromptDeliveryToday-dropped DeliveryValues
+MCAcpPromptDelivery AcpPromptDeliveryToday-late LateRunTogether
 EOF
 
 if [ "$ci" = true ]; then
