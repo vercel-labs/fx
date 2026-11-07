@@ -9,6 +9,7 @@ test {
     _ = @import("acp/mcp_servers.zig");
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/agent/runtime/execution_memory.zig");
+    _ = @import("core/agent/runtime/response_language.zig");
     _ = @import("core/agent/runtime/vision_contracts.zig");
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("core/cli/cli_flags.zig");
