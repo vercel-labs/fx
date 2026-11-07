@@ -1133,6 +1133,124 @@ test("ACP shell completed and replayed updates show the command output", async (
   }
 }, 45000);
 
+/// The names fx's ACP server may send a client that lists no sh.fx/
+/// capability, which src/protocol/spec/sh-fx.md "Capabilities" limits to
+/// standard ACP, read from the pinned ACP copy. Until fx moves to the sh.fx
+/// names, it still sends the `_meta.fx` keys that sh-fx.md lists in "Keys in
+/// use today"; FX_ACP_STANDARD_ONLY=1 allows none of them, for the change that
+/// moves the names.
+function standardAcpChecker() {
+  const spec = join(REPO_ROOT, "src", "protocol", "spec");
+  const defs = JSON.parse(readFileSync(join(spec, "acp", "v1", "schema.unstable.json"), "utf8")).$defs;
+  const meta = JSON.parse(readFileSync(join(spec, "acp", "v1", "meta.unstable.json"), "utf8"));
+  const clientMethods = new Set<string>(Object.values(meta.clientMethods));
+  const updateKinds = new Set<string>(
+    defs.SessionUpdate.oneOf.map((variant: any) => variant.properties?.sessionUpdate?.const).filter(Boolean),
+  );
+  const responseFields = new Map<string, Set<string>>();
+  for (const [name, def] of Object.entries<any>(defs)) {
+    if (def["x-side"] === "agent" && typeof def["x-method"] === "string" && name.endsWith("Response") && def.properties) {
+      responseFields.set(def["x-method"], new Set(Object.keys(def.properties)));
+    }
+  }
+  const todayKeys = new Set(
+    [...readFileSync(join(spec, "sh-fx.md"), "utf8").matchAll(/^\| `_meta\.fx\.([A-Za-z]+)` \|/gm)].map((match) => match[1]!),
+  );
+  const strict = process.env.FX_ACP_STANDARD_ONLY === "1";
+  /// Problems in what fx sent, given the method each of the client's request
+  /// ids called. Every `_meta` the walk visits counts in `metas`.
+  return (messages: any[], methodOf: (id: unknown, result: any) => string | undefined) => {
+    const problems: string[] = [];
+    let metas = 0;
+    const walk = (value: any, where: string) => {
+      if (Array.isArray(value)) { value.forEach((item, index) => walk(item, `${where}[${index}]`)); return; }
+      if (value === null || typeof value !== "object") return;
+      for (const [key, child] of Object.entries(value)) {
+        if (key === "_meta" && child !== null && typeof child === "object") {
+          metas += 1;
+          for (const [metaKey, metaValue] of Object.entries(child as object)) {
+            if (metaKey !== "fx") { problems.push(`${where}._meta.${metaKey}`); continue; }
+            for (const fxKey of Object.keys(metaValue ?? {})) {
+              if (strict || !todayKeys.has(fxKey)) problems.push(`${where}._meta.fx.${fxKey}`);
+            }
+          }
+        } else {
+          walk(child, `${where}.${key}`);
+        }
+      }
+    };
+    for (const message of messages) {
+      if (typeof message.method === "string") {
+        if (!clientMethods.has(message.method)) problems.push(`method ${message.method}`);
+        const kind = message.params?.update?.sessionUpdate;
+        if (message.method === "session/update" && !updateKinds.has(kind)) problems.push(`session/update ${kind}`);
+        walk(message.params, message.method);
+      } else if (message.result !== undefined && message.result !== null && typeof message.result === "object") {
+        const method = methodOf(message.id, message.result);
+        const fields = method ? responseFields.get(method) : undefined;
+        if (method && fields) {
+          for (const field of Object.keys(message.result)) if (!fields.has(field)) problems.push(`${method} result.${field}`);
+        }
+        walk(message.result, `${method ?? "response"} result`);
+      }
+    }
+    return { problems, metas };
+  };
+}
+
+test("ACP sends a client that lists no sh.fx capability only ACP v1 names", async () => {
+  const check = standardAcpChecker();
+  // The check finds a planted name of each kind.
+  const planted = check([
+    { jsonrpc: "2.0", method: "libfx/hook", params: {} },
+    { jsonrpc: "2.0", method: "session/update", params: { sessionId: "s", update: { sessionUpdate: "fx_thing", _meta: { "sh.fx/state": "idle" } } } },
+    { jsonrpc: "2.0", id: 2, result: { sessionId: "s", systemPromptMode: "append", _meta: { fx: { notAKey: true } } } },
+  ], () => "session/new");
+  expect(planted.problems).toEqual([
+    "method libfx/hook",
+    "session/update fx_thing",
+    "session/update.update._meta.sh.fx/state",
+    "session/new result.systemPromptMode",
+    "session/new result._meta.fx.notAKey",
+  ]);
+
+  const fixture = createConfiguredProviderFixture(body => body.messages.some((message: any) => message.role === "tool")
+    ? configuredCompletion(body.model, "done")
+    : configuredToolCompletion(body.model, "shell", { request: { action: "run", command: "echo plain-client" } }, "call_shell"));
+  const methods: Record<number, string> = { 1: "initialize", 2: "session/new", 3: "session/set_mode", 5: "session/list" };
+  const methodOf = (id: unknown, result: any) => (typeof id === "number" && methods[id]) || (result?.stopReason !== undefined ? "session/prompt" : undefined);
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    await client.request("session/set_mode", { modeId: "full-access" }, 3);
+    const prompt = await runPrompt(client, "Run the command.", TIMEOUT);
+    expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+    const listed = await client.request("session/list", { cwd: fixture.workspace }, 5) as any;
+    if (listed.error) throw new Error(JSON.stringify(listed));
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
+    await client.close();
+    const live = check(client.rawLines.map(line => JSON.parse(line)), methodOf);
+
+    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const loaded = await client.request("session/load", { sessionId: created.result.sessionId, cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    if (loaded.error) throw new Error(JSON.stringify(loaded));
+    const replay = check(client.rawLines.map(line => JSON.parse(line)), (id, result) => id === 2 ? "session/load" : methodOf(id, result));
+
+    expect(live.problems).toEqual([]);
+    expect(replay.problems).toEqual([]);
+    expect(live.metas + replay.metas).toBeGreaterThan(0);
+    expect(client.stderr).toBe("");
+  } finally {
+    await client?.close();
+    fixture.close();
+  }
+}, 45000);
+
 test("ACP finishes tool calls that a cancel stopped before they ran", async () => {
   const root = createIsolatedRoot("fx-acp-cancel-cards-");
   const gateway = startFakeGateway([
