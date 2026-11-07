@@ -37,6 +37,8 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/libfx-model-tlc.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 mkdir -p graphs
 status=0
+# ResumedSteer.tla has a script of its own, check-resumed-steer.sh.
+sh ./check-resumed-steer.sh || status=1
 for tool in send lookup write cutoff leased queue; do
     echo "== DurableSession ($tool)"
     if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \

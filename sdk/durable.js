@@ -1497,6 +1497,9 @@ function createWorldBackend(world, durability) {
 function uiWriter(log, onError, epoch) {
   let queued = [];
   let writing = null;
+  // Steers whose line the stream already holds, so the turn's own line for
+  // each is left out, once.
+  const holds = new Set();
   const send = () => {
     const lines = queued;
     queued = [];
@@ -1507,8 +1510,13 @@ function uiWriter(log, onError, epoch) {
   };
   return {
     push(event) {
+      if (event?.type === "user_message" && holds.delete(event.id)) return;
       queued.push(JSON.stringify(epoch === undefined ? event : { ...event, epoch }));
       if (!writing) send();
+    },
+    // Leaves out the next `user_message` line for each of `ids`.
+    skipShown(ids) {
+      for (const id of ids) holds.add(id);
     },
     // Waits until every line pushed so far is written.
     async settle() {
@@ -2198,6 +2206,11 @@ class SessionWorker {
           // It lands before the turn goes on, so any line the replaced
           // worker writes after it ranks below it and stays hidden.
           await ui.settle();
+          // A steer the resume places shows again, unless a reader sees its
+          // line already: a boundary showed it before the crash lost the
+          // progress that places it. A repeat of a line is better than a turn
+          // that can't resume.
+          ui.skipShown(await shownSteers(log, state.heldIds).catch(() => new Set()));
           // A step the deadline cut off maxCutoffs times in a row would be
           // cut off forever. A cut-off call is not run again, so the model
           // hears it may have partly run; a model request ends the turn,
@@ -2467,7 +2480,8 @@ function uiRanker(high = 0) {
 }
 
 // The ranker as it stands after the first `count` lines of the stream.
-async function uiRankerAt(log, count) {
+// `onShown` gets each line a reader shows.
+async function uiRankerAt(log, count, onShown) {
   const shows = uiRanker();
   if (count === 0) return shows;
   const reader = log.ui.read(0).getReader();
@@ -2482,13 +2496,29 @@ async function uiRankerAt(log, count) {
         const line = buffered.slice(0, index);
         buffered = buffered.slice(index + 1);
         seen += 1;
-        try { shows(JSON.parse(line)); } catch {}
+        try {
+          const event = JSON.parse(line);
+          if (shows(event)) onShown?.(event);
+        } catch {}
       }
     }
   } finally {
     void reader.cancel().catch(() => {});
   }
   return shows;
+}
+
+// Which of the steers `held` a reader's view of the stream shows. Read after
+// `turn_resume` lands, this is exact: a line of the replaced worker's that lands
+// later ranks below it and stays hidden, and the resume's own line shows
+// instead. Nothing is read when no steer is held.
+async function shownSteers(log, held) {
+  const shown = new Set();
+  if (held.length === 0) return shown;
+  await uiRankerAt(log, await log.ui.length(), (event) => {
+    if (event.type === "user_message" && held.includes(event.id)) shown.add(event.id);
+  });
+  return shown;
 }
 
 // What a retried `messageId` finds in its session: its turn still waiting or
