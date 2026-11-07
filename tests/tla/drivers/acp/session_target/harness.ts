@@ -156,12 +156,14 @@ export class Acp {
 
 /// An isolated fx home, workspace, and fake Gateway for one run. Every
 /// prompt's model reply is the final text "done", so no model is called.
+/// `gatewayBodies` keeps each model request's body, in order.
 export class Fixture {
   readonly root: string;
   readonly home: string;
   readonly workspace: string;
   readonly acpLog: object[] = [];
   readonly processes: Array<{ exit: number; stderr: string }> = [];
+  readonly gatewayBodies: string[] = [];
   acp: Acp | null = null;
   private gateway: any = null;
 
@@ -176,7 +178,10 @@ export class Fixture {
 
   async init() {
     const helpers = await targetHelpers();
-    this.gateway = helpers.startDynamicFakeGateway(() => helpers.fakeGatewayFinalText("done"), {});
+    this.gateway = helpers.startDynamicFakeGateway((body: string) => {
+      this.gatewayBodies.push(body);
+      return helpers.fakeGatewayFinalText("done");
+    }, {});
   }
 
   private env(): Record<string, string> {

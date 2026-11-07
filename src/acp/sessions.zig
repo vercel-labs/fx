@@ -763,7 +763,9 @@ fn handleRestoreSession(
         else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
     };
     // ACP v1: a prompt the session cannot apply fails the request before any
-    // restore side effect. One that differs from the stored prompt replaces it.
+    // restore side effect. One that differs from the stored prompt replaces it
+    // (`tests/tla/acp/AcpSystemPrompt.tla` RefusalChangesNothing and
+    // LoadAppliesPrompt).
     var requested_system_prompt = client_instructions.parse(state.alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{
