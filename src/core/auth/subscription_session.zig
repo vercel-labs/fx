@@ -155,7 +155,8 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
                 return error.InsecureAuthFile;
             }
 
-            const bytes = io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes) catch |err| return session_presence.storageError(spec.auth_file_name, err);
+            var wiping: secret.Wiping = .init(alloc);
+            const bytes = io_mod.readFileToEnd(wiping.allocator(), &file, max_auth_file_bytes) catch |err| return session_presence.storageError(spec.auth_file_name, err);
             defer secret.zeroAndFree(alloc, bytes);
             return parse(alloc, bytes) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -215,7 +216,8 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
         }
 
         pub fn parse(alloc: Allocator, bytes: []const u8) !Session {
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+            var wiping: secret.Wiping = .init(alloc);
+            var parsed = try std.json.parseFromSlice(std.json.Value, wiping.allocator(), bytes, .{});
             defer parsed.deinit();
             if (parsed.value != .object) return invalid_session;
             const object = parsed.value.object;
@@ -242,7 +244,8 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
         /// can always be loaded again.
         pub fn stringify(alloc: Allocator, session: Session) ![]u8 {
             if (!types.validCredentialAccountId(session.account_id)) return invalid_session;
-            var out: std.Io.Writer.Allocating = .init(alloc);
+            var wiping: secret.Wiping = .init(alloc);
+            var out: std.Io.Writer.Allocating = .init(wiping.allocator());
             errdefer out.deinit();
             try out.writer.writeAll("{\"version\":1,\"access_token\":");
             try std.json.Stringify.value(session.access_token, .{}, &out.writer);
@@ -330,4 +333,45 @@ test "subscription session refuses to save an account ID it could not load" {
     };
     defer session.deinit(alloc);
     try std.testing.expectError(error.InvalidTestAuthSession, TestStore.stringify(alloc, session));
+}
+
+test "saving and loading a subscription session gives back no block that still holds its tokens" {
+    const testing_allocator = @import("../shared/testing_allocator.zig");
+    // A short token, and one long enough to outgrow a buffer that grows.
+    var long: [1200]u8 = @splat('x');
+    @memcpy(long[0.."SECRET_MARK".len], "SECRET_MARK");
+    for ([_][]const u8{ "SECRET_MARK", &long }) |token| {
+        const session: TestStore.Session = .{
+            .access_token = @constCast(token),
+            .refresh_token = @constCast(token),
+            .expires_at_ms = 1234,
+            .account_id = @constCast("acct_test"),
+        };
+        {
+            var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+            const alloc = scan.allocator();
+            const text = try TestStore.stringify(alloc, session);
+            var loaded = try TestStore.parse(alloc, text);
+            secret.zeroAndFree(alloc, text);
+            loaded.deinit(alloc);
+            try scan.expectWiped();
+        }
+        {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const text = try TestStore.stringify(std.testing.allocator, session);
+            defer secret.zeroAndFree(std.testing.allocator, text);
+            var file = try tmp.dir.createFile(std.testing.io, "test-auth.json", .{
+                .truncate = true,
+                .permissions = std.Io.File.Permissions.fromMode(0o600),
+            });
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, text);
+            var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+            const alloc = scan.allocator();
+            var loaded = (try TestStore.loadFromDir(alloc, &tmp.dir)).?;
+            loaded.deinit(alloc);
+            try scan.expectWiped();
+        }
+    }
 }

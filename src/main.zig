@@ -5411,6 +5411,9 @@ test {
     _ = credentials;
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
+    _ = @import("core/auth/secret.zig");
+    _ = @import("core/auth/subscription_session.zig");
+    _ = @import("core/shared/testing_allocator.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/path_completion.zig");
     _ = @import("core/workspace/directory_completion_job.zig");

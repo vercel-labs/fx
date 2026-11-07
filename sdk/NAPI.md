@@ -228,7 +228,7 @@ Do not replace the tagged wrapped object with a numeric pointer, externalized ad
 
 The API key is copied from the JavaScript string into native heap memory and passed as an in-memory credential override. It is not read from process-global environment state, written into generated package artifacts, or intentionally logged. Per-runtime overrides also avoid mutating environment variables shared by concurrent runtimes and workers.
 
-The copied key remains resident for the runtime lifetime and is freed during destruction. The allocation is not currently zeroized before free. Code handling diagnostics, crash reports, heap inspection, or allocator changes must treat this memory as sensitive. A future zeroization change should cover all destruction and partial-construction paths and must not be optimized away.
+The copied key remains resident for the runtime lifetime. Runtime destruction, and every construction failure after the key is copied, overwrite it with `secret.zeroAndFree` before freeing it, through volatile writes the compiler cannot remove. Until then, code handling diagnostics, crash reports, heap inspection, or allocator changes must treat this memory as sensitive.
 
 ## Native code trust boundary
 

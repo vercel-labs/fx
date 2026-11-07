@@ -531,7 +531,8 @@ fn refreshSession(
     session: *grok_session.Session,
 ) !void {
     try mutation.requireWritable();
-    var body: std.Io.Writer.Allocating = .init(alloc);
+    var wiping: secret.Wiping = .init(alloc);
+    var body: std.Io.Writer.Allocating = .init(wiping.allocator());
     defer body.deinit();
     var form: FormBody = .{};
     try form.append(&body.writer, "grant_type", "refresh_token");
@@ -648,7 +649,8 @@ fn requestRefreshToken(
     }
     const bytes = response.takeBody();
     defer secret.zeroAndFree(alloc, bytes);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    var wiping: secret.Wiping = .init(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, wiping.allocator(), bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidGrokOAuthResponse;
     const object = parsed.value.object;
@@ -681,7 +683,8 @@ fn exchangeAuthorizationCodeForRedirectWithBounds(
     deadline: ?std.Io.Clock.Timestamp,
 ) !TokenSet {
     var form: FormBody = .{};
-    var body: std.Io.Writer.Allocating = .init(alloc);
+    var wiping: secret.Wiping = .init(alloc);
+    var body: std.Io.Writer.Allocating = .init(wiping.allocator());
     defer body.deinit();
     try form.append(&body.writer, "grant_type", "authorization_code");
     try form.append(&body.writer, "client_id", client_id);
@@ -766,7 +769,8 @@ pub fn revokeToken(
 ) !void {
     const endpoint_url = try configuredEndpoint(alloc, e2e_revoke_url_env, revoke_url);
     defer alloc.free(endpoint_url);
-    var body: std.Io.Writer.Allocating = .init(alloc);
+    var wiping: secret.Wiping = .init(alloc);
+    var body: std.Io.Writer.Allocating = .init(wiping.allocator());
     defer body.deinit();
     var form: FormBody = .{};
     try form.append(&body.writer, "token", token);
@@ -1044,4 +1048,47 @@ test "Grok browser callback requires the exact path and state" {
             "expected",
         ),
     );
+}
+
+test "a Grok refresh reply, code exchange, or revocation gives back no block that still holds a secret" {
+    const testing_allocator = @import("../shared/testing_allocator.zig");
+    const Issuer = struct {
+        reply: []const u8,
+
+        fn execute(raw: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .disposition = .accepted, .body = try alloc.dupe(u8, self.reply) };
+        }
+    };
+    {
+        var issuer: Issuer = .{ .reply = "{\"access_token\":\"SECRET_MARK_access\",\"refresh_token\":\"SECRET_MARK_refresh\",\"expires_in\":3600}" };
+        var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+        const alloc = scan.allocator();
+        var token = try requestRefreshToken(alloc, .{ .context = &issuer, .execute_fn = Issuer.execute }, "grant_type=refresh_token");
+        token.deinit(alloc);
+        try scan.expectWiped();
+    }
+    {
+        var issuer: Issuer = .{ .reply = "{\"access_token\":\"new-access\",\"refresh_token\":\"new-refresh\",\"expires_in\":3600}" };
+        var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+        const alloc = scan.allocator();
+        var set = try exchangeAuthorizationCodeForRedirectWithBounds(
+            alloc,
+            .{ .context = &issuer, .execute_fn = Issuer.execute },
+            "http://127.0.0.1:1/oauth2/token",
+            "SECRET_MARK_code",
+            "SECRET_MARK_verifier",
+            "http://127.0.0.1:1/callback",
+            null,
+            null,
+        );
+        set.deinit(alloc);
+        try scan.expectWiped();
+    }
+    {
+        var issuer: Issuer = .{ .reply = "{}" };
+        var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+        try revokeToken(scan.allocator(), .{ .context = &issuer, .execute_fn = Issuer.execute }, "SECRET_MARK_refresh");
+        try scan.expectWiped();
+    }
 }
