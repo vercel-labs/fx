@@ -854,7 +854,6 @@ test "plain scan applies .gitignore files and the skipped names, also below an i
 }
 
 fn expectSkipped(result: Result, expected: []const []const u8) !void {
-    errdefer for (result.tree.skipped) |path| std.debug.print("  skipped {s}\n", .{path});
     try std.testing.expectEqual(expected.len, result.tree.skipped.len);
     for (expected, result.tree.skipped) |want, have| try std.testing.expectEqualStrings(want, have);
 }
