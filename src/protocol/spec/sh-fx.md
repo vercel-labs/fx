@@ -256,7 +256,7 @@ These rules apply on each connection that has the session open:
 - `running` comes before the first update of a turn. `idle` comes after the turn's last update and before the `session/prompt` response, and its `stopReason` is the turn's.
 - A turn that goes on with steers, as "Steering and queued prompts" says, stays `running`. When a queued prompt or a steer runs as the next turn, fx sends `idle` for the turn that ended, then `running`.
 - A permission request that the turn waits for makes it `requires_action`, and fx sends `running` when the turn goes on.
-- When the client opens the session with `session/new`, `session/load`, or `session/resume`, fx sends the current state after its response, so the client never holds an old one.
+- When the client opens the session with `session/load` or `session/resume`, fx sends the current state after any replay and before its response, as ACP v2's resume does, so the client never holds an old one. The client doesn't reset the state when the response arrives. After `session/new`, fx sends `idle` after its response, which gives the client the session's id.
 
 A client that receives a state it doesn't know shows the session as busy until a known state arrives, as ACP v2 says.
 
