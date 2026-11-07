@@ -108,7 +108,9 @@ export async function runTlc(
   const output = stdout + (stderr ? `\n[stderr]\n${stderr}` : "");
   writeFileSync(join(dir, "tlc.log"), output);
   const violated = /Error: (?:Invariant|Action property) (\w+) is violated/.exec(output)?.[1] ?? null;
-  const distinct = /(\d+) distinct states found/.exec(output)?.[1];
+  // TLC's progress lines print counts with thousands separators; the final
+  // line, the last match, prints the whole count.
+  const distinct = [...output.matchAll(/([\d,]+) distinct states found/g)].at(-1)?.[1]?.replaceAll(",", "");
   const depth = /The depth of the complete state graph search is (\d+)/.exec(output)?.[1];
   return {
     exitCode,
