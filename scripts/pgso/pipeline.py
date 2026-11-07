@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import stat
 import sys
@@ -527,6 +528,39 @@ def build_control(
     return paths.control_binary
 
 
+# Zig 0.17.1 writes `-femit-llvm-bc` after LLVM has optimized the module, but
+# PGSO instruments and optimizes the module Zig generated, which is what 0.17.0
+# wrote there. Only `--verbose-llvm-bc=PATH` still writes that module, and
+# `zig build` can't pass it to one step, so `pgso-ir` runs with `--verbose` and
+# the compile it printed runs again with the flag. With no binary to emit, that
+# compile stops before LLVM's passes.
+_VERBOSE_COMMAND = "info(verbose): "
+
+
+def unoptimized_bitcode_argv(build_output: str, bitcode: pathlib.Path) -> tuple[str, ...]:
+    """The compile `zig build pgso-ir --verbose` printed, changed to write the
+    module Zig generated to `bitcode` and nothing else."""
+    compiles = [
+        line.split(_VERBOSE_COMMAND, 1)[1]
+        for line in build_output.splitlines()
+        if _VERBOSE_COMMAND in line and " -femit-llvm-bc" in line
+    ]
+    if len(compiles) != 1:
+        raise PgsoError(f"pgso-ir must print one compile that emits LLVM bitcode, found {len(compiles)}")
+    argv = shlex.split(compiles[0])
+    if argv.count("-femit-llvm-bc") != 1 or argv.count("--listen=-") != 1:
+        raise PgsoError(f"unexpected pgso-ir compile: {compiles[0]}")
+    kept = [
+        argument
+        for argument in argv
+        if argument not in ("-femit-llvm-bc", "--listen=-", "-fno-emit-bin")
+        and not argument.startswith("-femit-bin")
+    ]
+    # Without `--listen=-`, `zig test` would run the tests it built.
+    no_exec = ("--test-no-exec",) if kept[1:2] == ["test"] else ()
+    return (*kept, *no_exec, "-fno-emit-bin", f"--verbose-llvm-bc={bitcode}")
+
+
 def emit_bitcode(
     toolchain: Toolchain,
     spec: ArtifactSpec,
@@ -534,15 +568,30 @@ def emit_bitcode(
     *,
     expected_sha256: str | None = None,
 ) -> str:
-    run_checked(
-        zig_build_argv(toolchain, spec, paths, emit_ir=True),
+    build = run_checked(
+        (*zig_build_argv(toolchain, spec, paths, emit_ir=True), "--verbose"),
         cwd=spec.repo_root,
         env=zig_build_env(paths),
         timeout_s=ZIG_BUILD_TIMEOUT_S,
         log_path=paths.logs / "emit-bitcode.json",
     )
+    if build.stdout_truncated or build.stderr_truncated:
+        raise PgsoError("pgso-ir output was truncated before its compile command")
+    compile_argv = unoptimized_bitcode_argv(build.stdout + "\n" + build.stderr, paths.bitcode)
+    # `pgso-ir` installed the optimized module here; it must not survive.
+    paths.bitcode.unlink(missing_ok=True)
+    run_checked(
+        compile_argv,
+        cwd=spec.repo_root,
+        env=zig_build_env(paths),
+        timeout_s=ZIG_BUILD_TIMEOUT_S,
+        log_path=paths.logs / "emit-unoptimized-bitcode.json",
+    )
     _require_nonempty_file(paths.bitcode, "ReleaseSafe LLVM bitcode")
-    _require_bitcode_header(paths.bitcode)
+    # Zig's own writer never wraps; LLVM's wraps Darwin bitcode.
+    with paths.bitcode.open("rb") as stream:
+        if stream.read(4) != BITCODE_MAGICS[0]:
+            raise PgsoError(f"ReleaseSafe LLVM bitcode was not written by Zig: {paths.bitcode}")
     # Every job derives instrumentation and profile use from this file, so
     # the helper attributes are part of the recorded bitcode identity.
     staged = paths.bitcode.with_name(paths.bitcode.name + ".staged")
