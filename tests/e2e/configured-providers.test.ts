@@ -493,6 +493,36 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 35000);
 
+  // A thinking endpoint such as DeepSeek's refuses an assistant tool call
+  // without its reasoning_content, or restores the reasoning from the call ID,
+  // so the review sends the exact action and its call ID only as instruction
+  // text (tests/tla/auto_classifier/ReviewPacket.tla NoReasoningToReviewer).
+  test("automatic permission review sends no assistant call or reasoning to the custom connection", async () => {
+    const reasoning = "REVIEW_REASONING_SENTINEL: the agent planned this call.";
+    const f = fixture(body => {
+      if (body.tools?.some((tool: any) => tool.function?.name === "permission_decision")) return toolCompletion(body.model, "permission_decision", { decision: "clear" });
+      if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "review finished");
+      return withReasoning(toolCompletion(body.model, "shell", { request: { action: "run", command: "python3 -c 'print(42)'" } }, "call-thinking"), { reasoning_content: reasoning });
+    });
+    try {
+      f.settings.permission_mode = "auto";
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "Run the Python snippet"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const reviews = f.requests.filter(request => request.body.tools?.some((tool: any) => tool.function?.name === "permission_decision"));
+      expect(reviews).toHaveLength(1);
+      const review = reviews[0]!.body;
+      expect(review.messages.map((message: any) => message.role)).toEqual(["system", "user"]);
+      expect(review.messages.some((message: any) => message.tool_calls !== undefined || message.tool_call_id !== undefined)).toBe(false);
+      expect(JSON.stringify(review)).not.toContain(reasoning);
+      expect(review.messages[0].content).toContain('target_tool_call_id: "call-thinking"');
+      expect(review.messages[0].content).toContain("command: python3 -c 'print(42)'");
+      // The main loop still replays the reasoning with the call.
+      const main = f.requests.at(-1)!;
+      expect(main.body.messages.find((message: any) => message.role === "assistant")?.reasoning_content).toBe(reasoning);
+    } finally { f.close(); }
+  }, 35000);
+
   test.each(["clear", "caution", "missing", "malformed", "refused", "truncated", "incomplete"])("custom review response recovery preserves %s outcome", async outcome => {
     let marker = "";
     let reviews = 0;

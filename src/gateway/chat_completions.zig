@@ -301,11 +301,49 @@ fn review(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, r
 }
 fn build_review(raw: *anyopaque, alloc: Allocator, model: []const u8, _: []const u8, instructions: []const types.ChatMessage, messages: []const types.ChatMessage, target_id: []const u8, deadline: std.Io.Clock.Timestamp, cancel: *std.atomic.Value(bool)) ![]u8 {
     const state: *Review = @ptrCast(@alignCast(raw));
-    const expanded = try review_messages.expandPendingToolReviewMessages(alloc, messages, target_id, deadline, cancel);
-    defer alloc.free(expanded);
+    // A thinking endpoint such as DeepSeek's refuses an earlier assistant tool
+    // call without its reasoning_content, or restores the reasoning from the
+    // call ID, and the reviewer must never see that reasoning. So the pending
+    // call stays out of the request; the instruction carries the exact action
+    // and its call ID as text (`tests/tla/auto_classifier/ReviewPacket.tla`
+    // ReviewNeverRejected, NoReasoningToReviewer).
+    const context = try review_messages.pendingToolReviewContext(alloc, messages, target_id, deadline, cancel);
+    debug_trace.logf("permission", "event=auto_review_pending_call_omitted reason=chat_completions_text_only target_call_id={s}", .{target_id});
     const output_limit = if (state.definition.model(model)) |metadata| @min(metadata.max_output_tokens orelse 2048, 2048) else 2048;
-    return build(@ptrCast(@constCast(state.definition)), alloc, .{ .model = model, .instructions = instructions, .messages = expanded, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{}, .max_output_tokens = output_limit });
+    return build(@ptrCast(@constCast(state.definition)), alloc, .{ .model = model, .instructions = instructions, .messages = context, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{}, .max_output_tokens = output_limit });
 }
+
+test "chat completions review request sends only the instruction and the user context" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"}}}
+    );
+    defer registry.deinit(alloc);
+    var state = Review{ .definition = registry.get("local").?, .input = .{} };
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(1000) });
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Review the pending action.\ntarget_tool_call_id: \"call_ds_1\"" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "review_context_kind: normal\n" },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "call_ds_1", .name = "shell", .arguments_json = "{\"request\":{\"action\":\"run\",\"command\":\"rm victim.txt\"}}" }} },
+    };
+    const body = try build_review(&state, alloc, "model", "", &instructions, &messages, "call_ds_1", deadline, &cancel);
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"system\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"permission_decision\"") != null);
+    // A thinking endpoint such as DeepSeek's refuses an assistant tool call
+    // without its reasoning, or restores that reasoning from the call ID, so
+    // neither the call nor its ID goes out natively. The ID stays only as text
+    // in the instruction, and the call's arguments not at all.
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"assistant\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"tool\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"tool_calls\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"tool_call_id\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "rm victim.txt") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "call_ds_1"));
+}
+
 fn ignore_event(_: *anyopaque, _: streams.Event) void {}
 fn free_result(raw: *anyopaque, alloc: Allocator) void {
     const result: *streams.Result = @ptrCast(@alignCast(raw));
