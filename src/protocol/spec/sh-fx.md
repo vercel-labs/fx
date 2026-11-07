@@ -311,6 +311,8 @@ A client that lists `sh.fx/listChanges` receives `_sh.fx/session/list_changed`, 
 }
 ```
 
+`tests/tla/acp/AcpSessionState.tla` models these rules, and TLC checks that a connection's view of a session's state is current whenever no state update is on its way, and that a list a connection holds is out of date only while a hint is on its way or after one arrived. Its `Today` configs show where fx breaks them now, and `tests/tla/drivers/acp/session_state/driver.ts` runs `fx acp` along the model.
+
 ## Names in use today
 
 fx's ACP server names its additions today with a `libfx/` prefix, which doesn't follow ACP's extension rules, and its wasm build accepts `session/remove`, which ACP calls `session/delete`. Each one gets the new name in this table:

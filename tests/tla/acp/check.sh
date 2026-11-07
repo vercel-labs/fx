@@ -7,8 +7,9 @@
 # contract. AcpPromptDelivery: steering and queued prompts as the sh.fx spec
 # defines them, which haven't landed in src/acp/ yet. AcpFollow: following a
 # session on several connections and catching up by log position, likewise
-# not landed. Their Today configs show fx now, and each must fail on the rule
-# it names. The other configs must pass.
+# not landed. AcpSessionState: session state, session/status, and list
+# change hints, likewise not landed. Their Today configs show fx now, and each
+# must fail on the rule it names. The other configs must pass.
 #
 # The planted bugs and the runs of the real `fx acp` binary are in
 # ../drivers/acp/:
@@ -19,6 +20,8 @@
 #   bun ../drivers/acp/prompt_delivery/check-spec.ts
 #   bun ../drivers/acp/prompt_delivery/driver.ts   # today's fx acp; --model rules fails until the rules land
 #   bun ../drivers/acp/follow/check-spec.ts
+#   bun ../drivers/acp/session_state/check-spec.ts
+#   bun ../drivers/acp/session_state/driver.ts   # today's fx acp; --model rules fails until the rules land
 #
 # With --ci it also runs every ../drivers/acp/*/driver.ts against
 # zig-out/bin/fx, as CI does; the planted bugs stay local, since they measure
@@ -53,6 +56,13 @@ MCAcpFollow AcpFollowToday-busy JoinWorks
 MCAcpFollow AcpFollowToday-ids StableIds
 MCAcpFollow AcpFollowToday-position PositionCurrent
 MCAcpFollow AcpFollowToday-replay ReplaySaid
+MCAcpSessionState MCAcpSessionState -
+MCAcpSessionState MCAcpSessionStateLists -
+MCAcpSessionState AcpSessionStateToday-state StateCurrent
+MCAcpSessionState AcpSessionStateToday-order UpdatesWhileRunning
+MCAcpSessionState AcpSessionStateToday-list ListFresh
+MCAcpSessionState AcpSessionStateToday-busy ListAnswered
+MCAcpSessionState AcpSessionStateToday-status StatusTruthful
 EOF
 
 if [ "$ci" = true ]; then
