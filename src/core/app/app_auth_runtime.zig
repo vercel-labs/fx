@@ -2259,6 +2259,8 @@ pub fn Runtime(comptime App: type) type {
                 error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. The current credential is unchanged." },
                 error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
                 error.ExpiredToken, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "The Vercel sign-in code expired. The current credential is unchanged; run /login to try again." },
+                error.TeamsUnavailable => .{ .topic = "auth", .tone = .@"error", .body = login_flow.teams_unavailable_message ++ " The current credential is unchanged; run /login to try again." },
+                error.NoTeams => .{ .topic = "auth", .tone = .@"error", .body = login_flow.no_teams_message ++ " The current credential is unchanged." },
                 else => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in failed. The current credential is unchanged." },
             };
             try writeAuthNotice(app, notice);
