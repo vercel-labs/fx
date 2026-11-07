@@ -1002,6 +1002,68 @@ test "Grok refresh frees each token once when the reply's lifetime is unusable" 
     try std.testing.expect(token.refresh_token == null);
 }
 
+fn fuzzRefreshReply(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+    if (smith.valueRangeAtMost(u8, 0, 3) == 0) {
+        // Bytes that need not be a reply at all.
+        var raw: [192]u8 = undefined;
+        try body.writer.writeAll(raw[0..smith.slice(&raw)]);
+    } else {
+        try body.writer.writeAll("{\"access_token\":\"new-access\"");
+        if (smith.value(bool)) try body.writer.writeAll(",\"refresh_token\":\"rotated-refresh\"");
+        switch (smith.valueRangeAtMost(u8, 0, 3)) {
+            0 => {},
+            1 => try body.writer.print(",\"expires_in\":{d}", .{smith.value(i64)}),
+            // Lifetimes whose sum with now is close to overflowing.
+            2 => try body.writer.print(",\"expires_in\":{d}", .{@divTrunc(std.math.maxInt(i64), std.time.ms_per_s) - smith.valueRangeAtMost(i64, -1000, 1000)}),
+            else => try body.writer.print(",\"expires_in\":{d}", .{smith.valueRangeAtMost(i64, 1, 1 << 40)}),
+        }
+        try body.writer.writeAll("}");
+    }
+    const Issuer = struct {
+        reply: []const u8,
+        account: []const u8,
+
+        fn execute(raw: ?*anyopaque, a: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const text = if (request.method == .get)
+                try a.print("{{\"sub\":\"{s}\"}}", .{self.account})
+            else
+                try a.dupe(u8, self.reply);
+            return .{ .disposition = .accepted, .body = text };
+        }
+    };
+    var issuer = Issuer{ .reply = body.written(), .account = if (smith.value(bool)) "acct_grok" else "acct_other" };
+    const transport: oauth_transport.Provider = .{ .context = &issuer, .execute_fn = Issuer.execute };
+
+    var token = requestRefreshToken(alloc, transport, "grant_type=refresh_token") catch return;
+    // refreshSession releases the reply the same way whatever happens next.
+    defer token.deinit(alloc);
+    // The refresh token the new session must hold: the rotated one, or a
+    // copy of the saved one.
+    const want = try alloc.dupe(u8, token.refresh_token orelse "old-refresh");
+    defer alloc.free(want);
+    var current = grok_session.Session{
+        .access_token = try alloc.dupe(u8, "old-access"),
+        .refresh_token = try alloc.dupe(u8, "old-refresh"),
+        .expires_at_ms = 0,
+        .account_id = try alloc.dupe(u8, "acct_grok"),
+    };
+    defer current.deinit(alloc);
+    var replacement = refreshReplacement(alloc, transport, &token, current) catch return;
+    defer replacement.deinit(alloc);
+    try std.testing.expect(token.refresh_token == null);
+    try std.testing.expectEqualStrings(want, replacement.refresh_token);
+}
+
+test "a Grok refresh frees each token once on fuzzed replies" {
+    try std.testing.fuzz({}, fuzzRefreshReply, .{
+        .corpus = &(@import("fuzz_seed").slices(.{""}) ++ @import("fuzz_corpus").grok_refresh_reply.*),
+    });
+}
+
 test "Grok browser authorization URL uses PKCE without device authentication" {
     const url = try buildBrowserAuthorizationUrl(
         std.testing.allocator,
