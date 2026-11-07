@@ -41,7 +41,7 @@ jobs:
       - name: Setup Zig
         uses: ./.github/actions/setup-zig
         with:
-          version: "0.17.0"
+          version: "0.17.1"
           cache-key: ci-unit-ReleaseSafe
 
       # The session manager's tests take a minute, so their races are always

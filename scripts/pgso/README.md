@@ -10,7 +10,7 @@ The driver requires:
 
 - macOS on an arm64 host
 - generic `aarch64-macos` output
-- Zig `0.17.0`
+- Zig `0.17.1`
 - LLVM `22.1.8` tools, profile runtime, and C library (`lib/libLLVM.dylib`) from one configured LLVM root
 - the selected Xcode macOS SDK and native Apple linker with arm64 support
 - Bun `1.3.14`
@@ -153,6 +153,15 @@ same input. After four rounds, `check-outlined` fails the run on any that
 remain. `outline-rounds-*.json` in the logs directory records each round's
 outlined functions, the functions it found, and the callers it excluded.
 This is [llvm/llvm-project#239126](https://github.com/llvm/llvm-project/issues/239126).
+
+The pipeline starts from the module Zig generates, before any LLVM pass. Zig
+0.17.1's `-femit-llvm-bc`, which `zig build pgso-ir` installs, is written after
+LLVM's passes, and only `--verbose-llvm-bc=PATH` still writes the module before
+them. `zig build` can't pass that flag to one step, so `emit_bitcode` runs
+`pgso-ir` with `--verbose` and then runs the compile it printed again, with the
+flag and `-fno-emit-bin`, which stops before LLVM's passes. The step fails
+unless Zig's own writer wrote the file: LLVM's writer wraps Darwin bitcode, and
+Zig's never does.
 
 Four size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
