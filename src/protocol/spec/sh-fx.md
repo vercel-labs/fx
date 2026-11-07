@@ -70,7 +70,7 @@ After `initialize`, these rules apply to the connection:
 - A client calls an extension's methods only when fx's list names the extension. fx answers a method it doesn't support with the JSON-RPC error `-32601`, "Method not found".
 - Each side ignores the names it doesn't know in the other side's list.
 
-Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`. The table in "Keys in use today" names two more that replace fields fx uses today, `sh.fx/hooks` and `sh.fx/hostTools`, which later sections define.
+Each extension's section defines its capabilities, which `AgentCapabilitiesMeta` and `ClientCapabilitiesMeta` in `sh-fx.schema.json` also list. The steering section defines `sh.fx/promptDelivery` and `sh.fx/hostSteering`, and the following section defines `sh.fx/logPosition`. The table in "Keys in use today" names two more that replace fields fx uses today, `sh.fx/hooks` and `sh.fx/hostTools`, which later sections define.
 
 ## Extensions
 
@@ -79,9 +79,8 @@ Each extension gets its own section here when it is written.
 | Extension | What it adds | ACP proposal it follows |
 | --- | --- | --- |
 | Steering and queued prompts | Input to a running turn, and prompts that wait for the running turn to end | [Prompt delivery](https://github.com/agentclientprotocol/agent-client-protocol/pull/1261), a draft for ACP v2 |
-| Following a session | Several clients on one live session, and whether each session is running | [Multi-Client Session Attach](https://github.com/agentclientprotocol/agent-client-protocol/pull/533) and [`session/status`](https://agentclientprotocol.com/rfds/session-status) |
-| Session list changes | A notification when the list of sessions changes | None |
-| Journal position | The position of each update in the session's log, so a client that reconnects continues without a gap | `replayFrom` in the [session resume replay proposal](https://agentclientprotocol.com/rfds/v2/session-resume-replay) for ACP v2 |
+| Following a session | Several clients on one live session, and catching up after a reconnect | ACP v2's [session setup](https://agentclientprotocol.com/protocol/v2/session-setup), which lets a session be active on several connections, and [Multi-Client Session Attach](https://github.com/agentclientprotocol/agent-client-protocol/pull/533) for the events between clients |
+| Session status and list changes | Whether each session is open and running, and a notification when the list of sessions changes | [`session/status`](https://agentclientprotocol.com/rfds/session-status), in ACP's unstable schema, and [session list extensions](https://github.com/agentclientprotocol/agent-client-protocol/pull/2323) |
 | Subagents | The child sessions that a turn starts | [Subagent Sessions](https://agentclientprotocol.com/rfds/subagents) |
 | Fork and rewind | A new session copied from a point in another, and the removal of the latest turns | [`session/fork`](https://agentclientprotocol.com/rfds/session-fork) for fork, and none for rewind |
 | Turn diff | The combined file changes of one turn | None |
@@ -172,6 +171,71 @@ A host that keeps the session's journal itself, such as fx's SDK, steers through
 
 A `user_message_chunk` update for a host steer carries a `requestId` of `null` in `sh.fx/steerInput`, and the steer's input id as `inputId`.
 
+### Following a session
+
+A session can be open on several connections at once, which ACP v2's [session setup](https://agentclientprotocol.com/protocol/v2/session-setup) allows an Agent to do. A client joins a session that another client runs with ACP's own methods, on a connection to the fx process that runs the session:
+
+- `session/load` replays the whole session, then the updates that the running turn has sent so far, then live updates.
+- `session/resume` sends live updates from that point on.
+
+Joining needs no capability, so a client that knows only ACP can follow a session.
+
+While the session is open on another connection, fx keeps the session's `cwd`, `additionalDirectories`, and `mcpServers`, and doesn't use the ones in the joining client's request. The response's `_meta` gives the session's folder as `sh.fx/cwd`. A `systemPrompt` in the request applies as on any load or resume: a prompt that differs from the session's replaces it from the next turn, for every client.
+
+Every client of a session may send prompts. A prompt that arrives while a turn runs follows "Steering and queued prompts", and fx keeps one order for the input of all clients.
+
+`session/close` closes the session on the calling connection only. While the session is open on another connection, it stays open there, and a running turn goes on. A connection that closes acts the same way.
+
+#### Catching up
+
+A client that lists `sh.fx/logPosition` learns its place in the session's log, so that after a reconnect it receives only what it misses.
+
+fx's session log saves whole turns. A position names the last turn saved, as an opaque string that the client stores and sends back unchanged. fx gives the current position in these places:
+
+- the `_meta` of the response to `session/load` and `session/resume`, as `sh.fx/position`;
+- the `_meta` of a `session_info_update` that fx sends to every client of the session when it saves a turn, with `updatedAt` set to the time of the save.
+
+To catch up, the client sends the position in the `_meta` of `session/load` as `sh.fx/replayFrom`. fx replays only the turns saved after that position, then the updates of the running turn so far, then live updates. When fx doesn't know the position, for example after a compaction rewrote the log, it replays the whole session. The response's `sh.fx/replay` says which one happened:
+
+| `sh.fx/replay` | Meaning |
+| --- | --- |
+| `"after_position"` | fx replayed the turns saved after the position |
+| `"full"` | fx didn't know the position and replayed the whole session |
+
+For example, a client that comes back after a lost connection sends:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "session/load",
+  "params": {
+    "sessionId": "sess_abc123",
+    "cwd": "/home/user/project",
+    "mcpServers": [],
+    "_meta": { "sh.fx/replayFrom": { "position": "g7f3a.41" } }
+  }
+}
+```
+
+After the replay, fx answers:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "_meta": {
+      "sh.fx/replay": "after_position",
+      "sh.fx/position": "g7f3a.44",
+      "sh.fx/cwd": "/home/user/project"
+    }
+  }
+}
+```
+
+`tests/tla/acp/AcpFollow.tla` models these rules, with the stable message ids of fix X21, and TLC checks that every connection that has the session open holds exactly its saved turns, with no gap and no repeat. Its `Today` configs show where fx breaks them now.
+
 ## Names in use today
 
 fx's ACP server names its additions today with a `libfx/` prefix, which doesn't follow ACP's extension rules, and its wasm build accepts `session/remove`, which ACP calls `session/delete`. Each one gets the new name in this table:
@@ -246,3 +310,6 @@ The keys and capabilities move with the method names, under the same rules: for 
 | `PromptDelivery` | The value of `sh.fx/delivery`: `steer` or `queue` |
 | `SteeringDelivery` | The value of `sh.fx/steeringDelivery`: `absorbed` or `next_turn` |
 | `SteerInput` | The value of `sh.fx/steerInput` |
+| `LogPosition` | A position in a session's log: `sh.fx/position`, and the `position` in `sh.fx/replayFrom` |
+| `ReplayFrom` | The value of `sh.fx/replayFrom` |
+| `Replay` | The value of `sh.fx/replay`: `after_position` or `full` |
