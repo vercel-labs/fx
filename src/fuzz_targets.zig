@@ -29,6 +29,7 @@ test {
     _ = @import("core/session/session_event.zig");
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/shared/fuzzy_match.zig");
+    _ = @import("core/shared/net_proxy.zig");
     _ = @import("core/shared/types.zig");
     _ = @import("core/shell_command/command_classification.zig");
     _ = @import("core/shell_command/command_effect.zig");

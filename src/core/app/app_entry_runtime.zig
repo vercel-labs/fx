@@ -19,6 +19,7 @@ const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
+const net_proxy_io = @import("../shared/net_proxy_io.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const terminal_env = @import("../shared/terminal_env.zig");
 const vt_emulator = @import("../terminal/engine.zig");
@@ -600,8 +601,12 @@ fn commandFailure(deps: RunDeps, err: anyerror) BeforeInteractiveResult {
 fn tryWriteErrorMessage(deps: RunDeps, err: anyerror) void {
     debug_trace.logf("core", "command error err={s}", .{@errorName(err)});
     var words: [128]u8 = undefined;
+    // A request that failed at the proxy names the proxy and the reason.
+    var proxy_failure: [512]u8 = undefined;
     writeStderr(deps, "fx: ");
-    writeStderr(deps, config_runtime.modelNotSelectedMessage(err) orelse types.plainErrorText(@errorName(err), &words));
+    writeStderr(deps, net_proxy_io.takeRequestFailure(err, &proxy_failure) orelse
+        config_runtime.modelNotSelectedMessage(err) orelse
+        types.plainErrorText(@errorName(err), &words));
     writeStderr(deps, "\n");
 }
 

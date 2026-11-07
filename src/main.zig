@@ -5439,6 +5439,8 @@ test {
     _ = @import("core/shared/io.zig");
     _ = @import("core/shared/leased_lock.zig");
     _ = @import("core/shared/message.zig");
+    _ = @import("core/shared/net_proxy.zig");
+    _ = @import("core/shared/net_proxy_io.zig");
     _ = @import("core/shared/token_estimate.zig");
     _ = @import("core/shell_command/command_effect.zig");
     _ = @import("core/shell_command/safe_git.zig");

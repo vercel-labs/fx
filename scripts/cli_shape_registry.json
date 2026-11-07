@@ -229,6 +229,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_NET_PROXY_LOOPBACK": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_OAUTH_ISSUER_URL": {
       "job": "test",
       "stability": "internal"

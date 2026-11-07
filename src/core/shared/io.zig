@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
 const profile_paths = @import("profile_paths.zig");
+const net_proxy_io = @import("net_proxy_io.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
 
@@ -21,7 +22,16 @@ var global_raw_environ: ?RawEnviron = null;
 var global_libc_environ: bool = false;
 
 pub fn setIo(zio: std.Io) void {
-    real_io = process_io_for(builtin.target.os.tag, zio);
+    real_io = processIo(zio);
+}
+
+/// The process Io: the Darwin spawn adapter, then the proxy connector in
+/// front of every lookup and connect by host name (`net_proxy_io.zig`).
+/// WebAssembly builds have no sockets of their own and keep the Io they get.
+fn processIo(zio: std.Io) std.Io {
+    const selected = process_io_for(builtin.target.os.tag, zio);
+    if (comptime builtin.target.cpu.arch.isWasm()) return selected;
+    return net_proxy_io.wrap(selected);
 }
 
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
@@ -37,8 +47,8 @@ pub noinline fn getIo() std.Io {
 }
 
 noinline fn fallbackIo() std.Io {
-    if (comptime builtin.is_test) return process_io_for(builtin.target.os.tag, std.testing.io);
-    return process_io_for(builtin.target.os.tag, fallback_threaded.io());
+    if (comptime builtin.is_test) return processIo(std.testing.io);
+    return processIo(fallback_threaded.io());
 }
 
 /// Opens an absolute directory path without following any path component.

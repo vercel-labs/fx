@@ -2,6 +2,7 @@ const std = @import("std");
 const diagnostics = @import("../../core/workspace/diagnostics.zig");
 const fetch_args = @import("fetch_args.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const net_proxy_io = @import("../../core/shared/net_proxy_io.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
@@ -186,10 +187,14 @@ fn fetchConvertedOutcome(ctx: tool_dispatch.DispatchContext, url: []const u8, tr
     defer ctx.allocator.free(display_url);
     emitProgress(ctx, .{ .fetching = display_url });
     const transport_started_at_ms = io_mod.milliTimestamp();
+    // A proxy failure held on this thread belongs to this fetch alone: one
+    // address can fail at the proxy before another one answers.
+    net_proxy_io.clearRequestFailure();
     var result = http_fetch.fetch(ctx.allocator, target, .{ .cancel_flag = ctx.cancel_flag }, transport) catch |err| {
         recordTargetHttpDiagnostic(transport_started_at_ms, 0, 0, @errorName(err));
         return .{ .failure = try transportFailureBody(ctx.allocator, err, url) };
     };
+    net_proxy_io.clearRequestFailure();
     defer result.deinit(ctx.allocator);
 
     return switch (result) {
@@ -255,17 +260,20 @@ fn fetchFailureBody(alloc: Allocator, err: url_policy.Error, url: []const u8) to
 }
 
 fn transportFailureBody(alloc: Allocator, err: anyerror, url: []const u8) tool_dispatch.DispatchError![]u8 {
+    var proxy_buf: [512]u8 = undefined;
+    const proxy_failure = net_proxy_io.takeRequestFailure(err, &proxy_buf);
     const display_url = try text_utils.redactUrlForDisplay(alloc, url);
     defer alloc.free(display_url);
     const details = [_]tool_result_errors.Detail{
         .{ .name = "field", .value = .{ .string = "url" } },
         .{ .name = "url", .value = .{ .string = display_url } },
         .{ .name = "error", .value = .{ .string = @errorName(err) } },
+        .{ .name = "proxy", .value = .{ .string = proxy_failure orelse "" } },
     };
     return try tool_result_errors.toolExecutionFailureJson(alloc, .{
         .tool_name = "web_fetch",
         .message = "web_fetch transport failed",
-        .details = &details,
+        .details = if (proxy_failure != null) &details else details[0..3],
         .suggestion = "Retry after checking the remote server's DNS, network, TLS, or HTTP response behavior. Use web_search when direct retrieval remains unavailable.",
     });
 }

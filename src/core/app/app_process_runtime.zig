@@ -5,6 +5,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const net_proxy_io = @import("../shared/net_proxy_io.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
 const compactor = @import("../compactor/compactor.zig");
@@ -144,6 +145,10 @@ pub fn Runtime(comptime App: type) type {
         /// only to the trace.
         fn formatErrorBody(alloc: std.mem.Allocator, context: []const u8, err: anyerror) ![]u8 {
             debug_trace.logf("worker", "error notice context={s} err={s}", .{ context, @errorName(err) });
+            // A request on this worker that failed at the proxy names the
+            // proxy and the reason (`net_proxy_io.takeRequestFailure`).
+            var proxy_failure: [512]u8 = undefined;
+            if (net_proxy_io.takeRequestFailure(err, &proxy_failure)) |text| return alloc.print("{s}: {s}", .{ context, text });
             switch (err) {
                 error.ConnectionSetupTimedOut => return alloc.dupe(u8, "Connection setup timed out after 30 seconds."),
                 error.TlsInitializationFailed => return alloc.dupe(u8, "Couldn't make a secure connection."),
