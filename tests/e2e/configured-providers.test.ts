@@ -36,6 +36,18 @@ function chatStream(chunks: unknown[], done = true) {
 
 const streamUsage = { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 };
 
+// Servers such as Cloudflare Workers AI send each chunk's own token counts,
+// on the finish chunk too, before the reply's counts in the trailer.
+function perChunkUsage(model: string, trailer: unknown[] | null, done = true) {
+  const finish = [{ index: 0, delta: {}, finish_reason: "stop" }];
+  return chatStream([
+    { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "streamed reply" }, finish_reason: null }], usage: { prompt_tokens: 12, completion_tokens: 1, total_tokens: 13 } },
+    { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: null }], usage: { prompt_tokens: 0, completion_tokens: 1, total_tokens: 1 } },
+    { id: "chat-local", model, choices: finish, usage: { prompt_tokens: 0, completion_tokens: 1, total_tokens: 1 } },
+    ...(trailer ? [{ id: "chat-local", model, choices: trailer, usage: streamUsage }] : []),
+  ], done);
+}
+
 /** A request from a subagent, which has no subagent tool of its own. */
 function isChildRequest(body: any): boolean {
   return !body.tools?.some((tool: any) => tool.function?.name === "subagent");
@@ -214,7 +226,8 @@ describe("configured providers", () => {
   });
 
   // Shapes that OpenAI-compatible servers send in otherwise valid replies.
-  const benignStreams: Record<string, { usage: boolean; respond(model: string): Response }> = {
+  // `usage` is the usage fx must report: true for streamUsage's counts.
+  const benignStreams: Record<string, { usage: boolean | { input_tokens: number; output_tokens: number }; respond(model: string): Response | Promise<Response> }> = {
     "an empty model in every chunk": { usage: true, respond: () => chatStream([
       { id: "chat-local", model: "", choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] },
       { id: "chat-local", model: "", choices: [{ index: 0, delta: { content: "streamed reply" } }] },
@@ -251,6 +264,29 @@ describe("configured providers", () => {
       { id: "chat-local", model: "", choices: [{ index: 0, delta: { content: "", role: "assistant", function_call: { name: "", arguments: "" } }, finish_reason: "stop" }] },
       { id: "chat-local", model: "", choices: [{ index: 0, delta: {} }], usage: streamUsage },
     ], false) },
+    "per-chunk usage counts before a usage trailer": { usage: true, respond: model => perChunkUsage(model, []) },
+    "per-chunk usage counts before the finished choice repeated with usage": {
+      usage: true, respond: model => perChunkUsage(model, [{ index: 0, delta: {}, finish_reason: "stop" }]),
+    },
+    "per-chunk usage counts on content chunks and a finish chunk without usage": { usage: true, respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "streamed" } }], usage: { prompt_tokens: 12, completion_tokens: 1, total_tokens: 13 } },
+      { id: "chat-local", model, choices: [{ index: 0, delta: { content: " reply" } }], usage: { prompt_tokens: 0, completion_tokens: 1, total_tokens: 1 } },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { id: "chat-local", model, choices: [], usage: streamUsage },
+    ]) },
+    // Without a trailer fx records the counts it kept: those of the first
+    // chunk, since every later count fell.
+    "per-chunk usage counts and no usage trailer": { usage: { input_tokens: 12, output_tokens: 1 }, respond: model => perChunkUsage(model, null) },
+    "per-chunk usage counts, no usage trailer, and no [DONE]": {
+      usage: { input_tokens: 12, output_tokens: 1 }, respond: model => perChunkUsage(model, null, false),
+    },
+    // The reader drops an event the close cut short, so the cut trailer counts
+    // for nothing and the counts kept stay.
+    "per-chunk usage counts and a usage trailer cut before its blank line": {
+      usage: { input_tokens: 12, output_tokens: 1 },
+      respond: async model => new Response(await perChunkUsage(model, null, false).text() + `data: ${JSON.stringify({ id: "chat-local", model, choices: [], usage: streamUsage })}`,
+        { headers: { "content-type": "text/event-stream" } }),
+    },
   };
 
   test.each(Object.keys(benignStreams))("accepts a reply with %s", async shape => {
@@ -261,14 +297,16 @@ describe("configured providers", () => {
       expect(result.stderr).toBe("");
       const parsed = JSON.parse(result.stdout);
       expect(parsed.final_output).toBe("streamed reply");
-      if (benignStreams[shape].usage) expect(parsed.usage).toMatchObject({ input_tokens: 12, output_tokens: 3 });
+      const usage = benignStreams[shape].usage;
+      if (usage) expect(parsed.usage).toMatchObject(usage === true ? { input_tokens: 12, output_tokens: 3 } : usage);
       expect(f.requests).toHaveLength(1);
       expect(f.requests[0].body.model).toBe("local-model");
     } finally { f.close(); }
   }, 25000);
 
   // The relaxed shapes keep their strict neighbors: a cut-off stream, a legacy
-  // call that says something, and late content in a trailer still fail the turn.
+  // call that says something, late content in a trailer, and a usage trailer
+  // that falls below or changes the counts already reported still fail the turn.
   const brokenStreams: Record<string, { failure: string; respond(model: string): Response }> = {
     "a stream that ends before finish_reason": { failure: "IncompleteStream", respond: model => chatStream([
       { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "cut reply" }, finish_reason: null }] },
@@ -285,6 +323,21 @@ describe("configured providers", () => {
       { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "reply" }, finish_reason: null }] },
       { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
       { id: "chat-local", model, choices: [{ index: 0, delta: { content: "late" } }], usage: streamUsage },
+    ]) },
+    "per-chunk usage counts cut before finish_reason": { failure: "IncompleteStream", respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "cut reply" }, finish_reason: null }], usage: { prompt_tokens: 12, completion_tokens: 1, total_tokens: 13 } },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: null }], usage: { prompt_tokens: 0, completion_tokens: 1, total_tokens: 1 } },
+    ], false) },
+    "a usage trailer below the counts a chunk reported": { failure: "ConflictingIdentity", respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "reply" }, finish_reason: null }], usage: streamUsage },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { id: "chat-local", model, choices: [], usage: { prompt_tokens: 12, completion_tokens: 2, total_tokens: 14 } },
+    ]) },
+    "a second usage trailer with other counts": { failure: "ConflictingIdentity", respond: model => chatStream([
+      { id: "chat-local", model, choices: [{ index: 0, delta: { role: "assistant", content: "reply" }, finish_reason: null }] },
+      { id: "chat-local", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { id: "chat-local", model, choices: [], usage: streamUsage },
+      { id: "chat-local", model, choices: [], usage: { prompt_tokens: 12, completion_tokens: 2, total_tokens: 14 } },
     ]) },
   };
 

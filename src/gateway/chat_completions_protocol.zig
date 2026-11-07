@@ -742,7 +742,9 @@ pub const Reducer = struct {
             self.refusal_seen = self.refusal_seen or refusal.len != 0;
         }
         if (non_null(delta, "tool_calls")) |value| try self.accept_tools(value);
-        if (non_null(root, "usage")) |usage| try self.accept_usage(usage, non_null(choice, "finish_reason") != null);
+        // Usage on a chunk with a choice, the finish chunk included, is
+        // provisional; only a trailer's is final.
+        if (non_null(root, "usage")) |usage| try self.accept_usage(usage, false);
         if (non_null(choice, "finish_reason")) |value| {
             const reason = try string(value);
             self.finish_reason = if (std.mem.eql(u8, reason, "stop")) .stop else if (std.mem.eql(u8, reason, "tool_calls")) .tool_calls else if (std.mem.eql(u8, reason, "length")) .length else if (std.mem.eql(u8, reason, "content_filter")) .content_filter else return error.InvalidFinishReason;
@@ -870,6 +872,14 @@ pub const Reducer = struct {
         }
     }
 
+    /// `final` is true for a usage trailer after the finished choice. Usage on
+    /// a chunk with a choice is provisional: some servers, such as Cloudflare
+    /// Workers AI, send each chunk's own counts there and the reply's counts
+    /// in the trailer, so a provisional usage that would lower a kept count
+    /// is dropped whole. A final usage must not lower a kept count, and once
+    /// final a count must not change. Without a trailer, the reply keeps the
+    /// last provisional usage that lowered nothing
+    /// (`tests/tla/chat_completions/ChatStream.tla` RecordsUsage).
     fn accept_usage(self: *Reducer, value: std.json.Value, final: bool) Error!void {
         const fields = try object(value);
         const incoming = types.Usage{
@@ -901,9 +911,12 @@ pub const Reducer = struct {
             [_]?u64{ usage.input_tokens, usage.output_tokens, total },
             [_]bool{ self.usage_final_fields.input, self.usage_final_fields.output, self.usage_final_fields.total },
         ) |previous, current, was_final| {
-            if (previous) |prior| {
-                if (current.? < prior or (was_final and current.? != prior)) return error.ConflictingIdentity;
+            const prior = previous orelse continue;
+            if (current.? < prior) {
+                if (!final) return;
+                return error.ConflictingIdentity;
             }
+            if (was_final and current.? != prior) return error.ConflictingIdentity;
         }
         self.usage = usage;
         self.usage_total = total;
@@ -1533,7 +1546,7 @@ test "chat completions reasoning presentation checks cancellation before content
     }
 }
 
-test "chat completions progress usage can finalize in a trailer but cannot decrease or contradict finals" {
+test "chat completions progress usage can finalize in a trailer but finals cannot decrease or contradict" {
     const alloc = std.testing.allocator;
     const progress = "{\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}";
     var reducer = try Reducer.init(alloc, test_request(), .{});
@@ -1547,9 +1560,11 @@ test "chat completions progress usage can finalize in a trailer but cannot decre
     var result = try reducer.finish(false);
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(?u64, 3), result.completed.completion.usage.output_tokens);
-    for ([_]struct { usage: []const u8, failure: Error }{
-        .{ .usage = "{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}", .failure = error.ConflictingIdentity },
-        .{ .usage = "{\"prompt_tokens\":10,\"completion_tokens\":0,\"total_tokens\":10}", .failure = error.ConflictingIdentity },
+    // A count below a kept one fails a trailer; on a chunk with a choice the
+    // usage is provisional and dropped, keeping the earlier counts.
+    for ([_]struct { usage: []const u8, failure: Error, provisional_drop: bool = false }{
+        .{ .usage = "{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}", .failure = error.ConflictingIdentity, .provisional_drop = true },
+        .{ .usage = "{\"prompt_tokens\":10,\"completion_tokens\":0,\"total_tokens\":10}", .failure = error.ConflictingIdentity, .provisional_drop = true },
         .{ .usage = "{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":11}", .failure = error.InvalidChunk },
         .{ .usage = "{\"prompt_tokens\":10,\"completion_tokens\":-1}", .failure = error.InvalidChunk },
         .{ .usage = "{\"prompt_tokens\":10,\"total_tokens\":9}", .failure = error.InvalidChunk },
@@ -1560,6 +1575,13 @@ test "chat completions progress usage can finalize in a trailer but cannot decre
         if (final) try test_accept(&invalid, test_stop);
         const chunk = try alloc.print("{{\"choices\":{s},\"usage\":{s}}}", .{ if (final) "[]" else "[{\"index\":0,\"delta\":{}}]", case.usage });
         defer alloc.free(chunk);
+        if (!final and case.provisional_drop) {
+            try test_accept(&invalid, chunk);
+            try std.testing.expectEqual(@as(?u64, 10), invalid.usage.input_tokens);
+            try std.testing.expectEqual(@as(?u64, 1), invalid.usage.output_tokens);
+            try std.testing.expectEqual(@as(?u64, 11), invalid.usage_total);
+            continue;
+        }
         try std.testing.expectError(case.failure, invalid.accept(chunk, false));
     };
     var totals = try Reducer.init(alloc, test_request(), .{});
@@ -1723,9 +1745,11 @@ test "chat completions partial usage rejects conflicts against merged observatio
         .{ .first = "{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}", .next = "{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}", .final = true, .failure = error.ConflictingIdentity },
         .{ .first = "{\"prompt_tokens\":9223372036854775807}", .next = "{\"completion_tokens\":9223372036854775807,\"total_tokens\":9223372036854775807}", .failure = error.InvalidChunk },
         .{ .first = "{\"prompt_tokens\":10,\"total_tokens\":13}", .next = "{\"completion_tokens\":4}", .final = true, .failure = error.InvalidChunk },
-        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"prompt_tokens\":9}", .failure = error.ConflictingIdentity },
-        .{ .first = "{\"completion_tokens\":3}", .next = "{\"completion_tokens\":2}", .failure = error.ConflictingIdentity },
-        .{ .first = "{\"total_tokens\":13}", .next = "{\"total_tokens\":12}", .failure = error.ConflictingIdentity },
+        // A final count that falls; a provisional one is dropped instead
+        // (test "chat completions provisional usage without a trailer records the counts kept").
+        .{ .first = "{\"prompt_tokens\":10}", .next = "{\"prompt_tokens\":9}", .final = true, .failure = error.ConflictingIdentity },
+        .{ .first = "{\"completion_tokens\":3}", .next = "{\"completion_tokens\":2}", .final = true, .failure = error.ConflictingIdentity },
+        .{ .first = "{\"total_tokens\":13}", .next = "{\"total_tokens\":12}", .final = true, .failure = error.ConflictingIdentity },
         .{ .first = "{\"prompt_tokens\":10}", .next = "{\"prompt_tokens\":11}", .final = true, .failure = error.ConflictingIdentity },
         .{ .first = "{\"completion_tokens\":3}", .next = "{\"completion_tokens\":4}", .final = true, .failure = error.ConflictingIdentity },
         .{ .first = "{\"total_tokens\":13}", .next = "{\"total_tokens\":14}", .final = true, .failure = error.ConflictingIdentity },
@@ -1746,6 +1770,129 @@ test "chat completions partial usage rejects conflicts against merged observatio
         try std.testing.expectEqual(previous_total, reducer.usage_total);
         try std.testing.expectEqualDeep(previous_final_fields, reducer.usage_final_fields);
         try std.testing.expectEqual(.closed, reducer.phase);
+    }
+}
+
+// Cloudflare Workers AI sends each chunk's own counts in `usage`, on the finish
+// chunk too, and the reply's counts in the trailer (the stream PR #1203 tested).
+const test_delta_text = "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0,\"total_tokens\":10}}";
+const test_delta_empty = "{\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}";
+const test_delta_stop = "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}";
+
+test "chat completions provisional usage lets per-chunk counts reach a cumulative trailer" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "[]", "[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]", "[{\"index\":0,\"delta\":{}}]" }) |choices| {
+        const trailer = try alloc.print("{{\"choices\":{s},\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}}}}", .{choices});
+        defer alloc.free(trailer);
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_delta_text);
+        try test_accept(&reducer, test_delta_empty);
+        try test_accept(&reducer, test_delta_stop);
+        try test_accept(&reducer, trailer);
+        try test_accept(&reducer, "[DONE]");
+        var result = try reducer.finish(false);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(?u64, 10), result.completed.completion.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 3), result.completed.completion.usage.output_tokens);
+        try std.testing.expectEqualStrings("OK", result.completed.completion.content.?);
+    }
+    // Counts on content chunks and a finish chunk without usage.
+    const wire = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok-\"}}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":1,\"total_tokens\":13}}\n\n" ++
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"delta\"}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}\n\n" ++
+        "data: " ++ test_stop ++ "\n\n" ++
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":2,\"total_tokens\":14}}\n\ndata: [DONE]\n\n";
+    var source = std.Io.Reader.fixed(wire);
+    const cancelled = std.atomic.Value(bool).init(false);
+    var result = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("ok-delta", result.completed.completion.content.?);
+    try std.testing.expectEqual(@as(?u64, 12), result.completed.completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 2), result.completed.completion.usage.output_tokens);
+}
+
+test "chat completions provisional usage without a trailer records the counts kept" {
+    const alloc = std.testing.allocator;
+    // A count that would fall is dropped whole, even when another count in the
+    // same usage rises, and its chunk still delivers content and calls.
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok-\"}}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":1,\"total_tokens\":13}}");
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"delta\"}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":5,\"total_tokens\":5}}");
+    try std.testing.expectEqual(@as(?u64, 12), reducer.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 1), reducer.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 13), reducer.usage_total);
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}");
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}");
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("ok-delta", result.completed.completion.content.?);
+    try std.testing.expectEqual(@as(usize, 1), result.completed.completion.tool_calls.len);
+    try std.testing.expectEqual(@as(?u64, 12), result.completed.completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 1), result.completed.completion.usage.output_tokens);
+    // Without [DONE] either: the reply keeps the counts of the first chunk.
+    const deltas = "data: " ++ test_delta_text ++ "\n\ndata: " ++ test_delta_empty ++ "\n\ndata: " ++ test_delta_stop ++ "\n\n";
+    var source = std.Io.Reader.fixed(deltas);
+    const cancelled = std.atomic.Value(bool).init(false);
+    var ended = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null);
+    defer ended.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 10), ended.completed.completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 0), ended.completed.completion.usage.output_tokens);
+    // Running counts keep the latest, the finish chunk's included.
+    var running = try Reducer.init(alloc, test_request(), .{});
+    defer running.deinit();
+    try test_usage_snapshot(&running, "{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}");
+    try test_usage_snapshot(&running, "{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}");
+    try test_usage_snapshot(&running, "{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}");
+    try test_accept(&running, "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13}}");
+    try test_accept(&running, "[DONE]");
+    var kept = try running.finish(false);
+    defer kept.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 10), kept.completed.completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 3), kept.completed.completion.usage.output_tokens);
+}
+
+test "chat completions provisional usage keeps final usage and malformed usage strict" {
+    const alloc = std.testing.allocator;
+    const usage_10 = "{\"prompt_tokens\":12,\"completion_tokens\":1,\"total_tokens\":13}";
+    const usage_20 = "{\"prompt_tokens\":12,\"completion_tokens\":2,\"total_tokens\":14}";
+    const usage_30 = "{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}";
+    for ([_]struct { progress: ?[]const u8 = null, finish: ?[]const u8 = null, first: ?[]const u8 = null, next: []const u8, failure: Error }{
+        // A trailer below a count a chunk with a choice already reported.
+        .{ .progress = usage_20, .next = usage_10, .failure = error.ConflictingIdentity },
+        .{ .finish = usage_30, .next = usage_20, .failure = error.ConflictingIdentity },
+        // A later trailer that falls or rises.
+        .{ .first = usage_30, .next = usage_20, .failure = error.ConflictingIdentity },
+        .{ .first = usage_30, .next = usage_10, .failure = error.ConflictingIdentity },
+        .{ .first = usage_20, .next = usage_30, .failure = error.ConflictingIdentity },
+        .{ .progress = usage_10, .first = usage_20, .next = "{\"prompt_tokens\":11,\"completion_tokens\":2,\"total_tokens\":13}", .failure = error.ConflictingIdentity },
+    }) |case| for ([_]bool{ false, true }) |repeated_choice| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        if (case.progress) |usage| try test_usage_snapshot(&reducer, usage);
+        if (case.finish) |usage| {
+            const finish = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{s}}}", .{usage});
+            defer alloc.free(finish);
+            try test_accept(&reducer, finish);
+        } else try test_accept(&reducer, test_stop);
+        if (case.first) |usage| try test_usage_snapshot(&reducer, usage);
+        const trailer = try alloc.print("{{\"choices\":{s},\"usage\":{s}}}", .{ if (repeated_choice) "[{\"index\":0,\"delta\":{}}]" else "[]", case.next });
+        defer alloc.free(trailer);
+        try std.testing.expectError(case.failure, reducer.accept(trailer, false));
+        try std.testing.expectError(error.StreamClosed, reducer.finish(false));
+    };
+    // A provisional usage is still checked on its own terms before it is kept
+    // or dropped: a total that disagrees with its counts is malformed.
+    for ([_][]const u8{
+        "{\"prompt_tokens\":12,\"completion_tokens\":2,\"total_tokens\":13}",
+        "{\"prompt_tokens\":0,\"completion_tokens\":5,\"total_tokens\":1}",
+        "{\"prompt_tokens\":0,\"completion_tokens\":-1}",
+    }) |usage| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_usage_snapshot(&reducer, usage_10);
+        try std.testing.expectError(error.InvalidChunk, test_usage_snapshot(&reducer, usage));
     }
 }
 
@@ -2521,6 +2668,11 @@ fn fuzzChunkedStream(_: void, smith: *std.testing.Smith) !void {
     const with_placeholder = smith.boolWeighted(1, 1);
     const trailer = smith.valueRangeAtMost(u8, 0, 2);
     const without_done = smith.boolWeighted(1, 1);
+    // Cloudflare Workers AI's per-chunk counts: the first chunk's, then one
+    // completion token for each later chunk, the finish chunk's included.
+    const per_chunk_usage = smith.boolWeighted(1, 1);
+    const first_usage = "data: {\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":1,\"total_tokens\":8}}\n\n";
+    const delta_usage = "{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}";
 
     var wire_buffer: std.Io.Writer.Allocating = .init(arena);
     const wire = &wire_buffer.writer;
@@ -2537,6 +2689,7 @@ fn fuzzChunkedStream(_: void, smith: *std.testing.Smith) !void {
         } else {
             try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{f}}}}}]}}", piece);
         }
+        if (per_chunk_usage) try wire.writeAll(if (index == 0) first_usage else "data: {\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":" ++ delta_usage ++ "}\n\n");
     }
     if (with_tool) {
         for (try arguments.pieces(arena), 0..) |piece, index| {
@@ -2549,7 +2702,12 @@ fn fuzzChunkedStream(_: void, smith: *std.testing.Smith) !void {
     }
     const reason = if (with_tool) "tool_calls" else "stop";
     const placeholder = if (with_placeholder) "\"function_call\":{\"name\":\"\",\"arguments\":\"\"}" else "";
-    try wire.print("data: {{\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{{s}}},\"finish_reason\":\"{s}\"}}]}}\n\n", .{ if (empty_model) "" else "resolved-model", placeholder, reason });
+    try wire.print("data: {{\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{{s}}},\"finish_reason\":\"{s}\"}}]{s}}}\n\n", .{
+        if (empty_model) "" else "resolved-model",
+        placeholder,
+        reason,
+        if (per_chunk_usage) ",\"usage\":" ++ delta_usage else "",
+    });
     switch (trailer) {
         0 => {},
         1 => try wire.writeAll("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\n"),
@@ -2570,7 +2728,10 @@ fn fuzzChunkedStream(_: void, smith: *std.testing.Smith) !void {
     try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
     try deltas.expectEqual(content.text.items, reasoning.text.items);
     try stream_fuzz.expectToolCall(completion.tool_calls, with_tool, "call-1", arguments.text.items);
-    try std.testing.expectEqual(@as(?u64, if (trailer == 0) null else 7), completion.usage.input_tokens);
+    // A trailer's counts win; without one the first chunk's counts stay,
+    // since every later per-chunk count is lower.
+    try std.testing.expectEqual(@as(?u64, if (trailer == 0 and !per_chunk_usage) null else 7), completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, if (trailer != 0) 2 else if (per_chunk_usage) 1 else null), completion.usage.output_tokens);
 }
 
 test "chat completions streams give the same result however they are cut into events and reads" {
