@@ -634,7 +634,8 @@ class AcpClient {
   private pendingSessionTargets = new Map<number | string, string>();
   private pendingNewSessions = new Set<number | string>();
   readonly rawLines: string[] = [];
-  private permissionOptionId: "allow_once" | "allow_always" | "reject_once" = "reject_once";
+  /// How readLine answers a permission request; null leaves it for the test.
+  private permissionOptionId: "allow_once" | "allow_always" | "reject_once" | null = "reject_once";
   private elicitationHandler?: (
     params: Record<string, unknown>,
     id: number | string,
@@ -703,7 +704,7 @@ class AcpClient {
     return this._closed;
   }
 
-  setPermissionOption(optionId: "allow_once" | "allow_always" | "reject_once"): void {
+  setPermissionOption(optionId: "allow_once" | "allow_always" | "reject_once" | null): void {
     this.permissionOptionId = optionId;
   }
 
@@ -786,7 +787,7 @@ class AcpClient {
         if (message.error === undefined) this.activeSessionId = sessionId;
       }
     }
-    if (message.method === "session/request_permission" && message.id !== undefined) {
+    if (message.method === "session/request_permission" && message.id !== undefined && this.permissionOptionId !== null) {
       this.send({
         jsonrpc: "2.0",
         id: message.id,
@@ -10094,6 +10095,407 @@ describe("acp: model-independent", () => {
       } finally {
         await client?.close();
         gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
+describe("acp: subagent permission requests", () => {
+  let client: AcpClient | undefined;
+
+  afterEach(async () => {
+    await client?.close();
+    client = undefined;
+  });
+
+  /// A parent that sends each named subagent one write, in one turn, and
+  /// subagents that call write_file and then finish once it is decided. A
+  /// subagent's request never offers the subagent tool, so the requests tell
+  /// apart. `holdFirst` holds that subagent's first request until `release`;
+  /// `noWrite` subagents finish without a write; `afterCalls` answers the
+  /// parent's request after its subagent calls, and `onReport` the parent's
+  /// turns that a report starts. A subagent's phase write waits for a parent
+  /// model reply in flight, so no option holds a parent reply.
+  function subagentWrites(
+    names: string[],
+    options: {
+      holdFirst?: string;
+      noWrite?: string[];
+      afterCalls?: (body: string) => Response | Promise<Response>;
+      onReport?: (body: string) => Response | Promise<Response>;
+    } = {},
+  ) {
+    const seen: Array<{ who: string; kind: string; body: string }> = [];
+    let release = () => {};
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes('"name":"subagent"')) {
+        const name = names.find((candidate) => body.includes(`Write ${candidate}.txt.`));
+        if (!name) {
+          seen.push({ who: "unknown", kind: "final", body });
+          return finalText("done");
+        }
+        if (body.includes(`w_${name}`)) {
+          seen.push({ who: name, kind: "after-decision", body });
+          return finalText(`${name} done`);
+        }
+        seen.push({ who: name, kind: "first", body });
+        if (options.holdFirst === name) await held;
+        if (options.noWrite?.includes(name)) return finalText(`${name} done`);
+        return fileToolCall(`w_${name}`, `${name}.txt`, `${name} wrote this\n`);
+      }
+      if (acpLatestUserIsReport(body)) {
+        if (options.onReport) return options.onReport(body);
+        seen.push({ who: "parent", kind: "report", body });
+        return finalText("SUBAGENT_REPORT_DONE");
+      }
+      if (names.some((name) => body.includes(`call_${name}`))) {
+        if (options.afterCalls) return options.afterCalls(body);
+        seen.push({ who: "parent", kind: "after-calls", body });
+        return finalText("SUBAGENT_PARENT_DONE");
+      }
+      seen.push({ who: "parent", kind: "calls", body });
+      return fakeGatewaySse([
+        ...names.map((name) => ({
+          type: "tool-call",
+          toolCallId: `call_${name}`,
+          toolName: "subagent",
+          input: { request: { action: "message", agent: name, message: `Write ${name}.txt.` } },
+        })),
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]);
+    });
+    const count = (who: string, kind: string) => seen.filter((entry) => entry.who === who && entry.kind === kind).length;
+    return { gateway, seen, count, release };
+  }
+
+  async function startAskSession(root: ReturnType<typeof createIsolatedRoot>, gateway: { baseUrl: string; chatUrl: string }, hooks = false) {
+    client = await AcpClient.create({
+      cwd: root.workspace,
+      env: { ...fakeGatewayEnv(root, gateway as any), FX_DISABLE_KEYCHAIN: "1", FX_SOUND: "0", FX_HOME: join(root.home, ".fx") },
+    });
+    const sessionId = await startAutoSession(client, hooks);
+    const mode = await client.request("session/set_mode", { modeId: "ask" }, 4) as any;
+    expect(mode.error).toBeUndefined();
+    return sessionId;
+  }
+
+  /// Reads the client's messages into `messages` until `done` holds.
+  async function readMessagesUntil(messages: any[], label: string, done: () => boolean, timeoutMs = TIMEOUT) {
+    const deadline = Date.now() + timeoutMs;
+    while (!done()) {
+      if (Date.now() > deadline) {
+        const seen = messages.map((message) => message.method ?? `response ${message.id}`);
+        throw new Error(`timed out waiting for ${label}; read ${JSON.stringify(seen)}`);
+      }
+      try {
+        messages.push(await client!.readLine(Math.min(200, Math.max(50, deadline - Date.now()))));
+      } catch (err) {
+        if (!(err instanceof AcpReadTimeoutError)) throw err;
+      }
+    }
+  }
+
+  const permissionRequests = (messages: any[]) => messages.filter((message) => message.method === "session/request_permission");
+  const requestFor = (messages: any[], name: string) => permissionRequests(messages).find((message) => message.params?._meta?.fx?.subagent?.name === name);
+  const responseTo = (messages: any[], id: number) => messages.find((message) => message.id === id && (message.result !== undefined || message.error !== undefined));
+  const withdrawn = (messages: any[], requestId: number) => messages.some((message) => message.method === "$/cancel_request" && message.params?.requestId === requestId);
+  const answer = (requestId: number, optionId: string) => client!.send({ jsonrpc: "2.0", id: requestId, result: { outcome: { outcome: "selected", optionId } } });
+
+  function expectNamesSubagent(request: any, sessionId: string, name: string) {
+    expect(request.params.sessionId).toBe(sessionId);
+    const subagent = request.params._meta.fx.subagent;
+    expect(subagent.name).toBe(name);
+    expect(typeof subagent.childId).toBe("string");
+    expect(subagent.childId).not.toBe(sessionId);
+    expect(typeof subagent.workId).toBe("string");
+    expect(request.params.toolCall.rawInput.path).toBe(`${name}.txt`);
+  }
+
+  test(
+    "a subagent's permission request reaches the client on the parent session",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-ask-");
+      const fixture = subagentWrites(["writer"]);
+      try {
+        const sessionId = await startAskSession(root, fixture.gateway, true);
+        client!.setPermissionOption("allow_once");
+        const result = await runPrompt(client!, "Delegate the write.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        const requests = permissionRequests(result.messages);
+        expect(requests).toHaveLength(1);
+        expectNamesSubagent(requests[0], sessionId, "writer");
+        expect(readFileSync(join(root.workspace, "writer.txt"), "utf8")).toBe("writer wrote this\n");
+        // The subagent's own hooks show the wait, named by its write.
+        const wait = client!.hookEvents.find((event) => event.type === "wait.start" && event.data.kind === "approval");
+        expect(wait.data.callId).toBe("w_writer");
+        expect(wait.sessionId).toBe(requests[0].params._meta.fx.subagent.childId);
+        expect(client!.hookEvents.find((event) => event.type === "wait.end" && event.data.requestId === wait.data.requestId).data.outcome).toBe("accepted");
+        expect(fixture.count("parent", "calls")).toBe(1);
+        expect(fixture.count("writer", "first")).toBe(1);
+        expect(fixture.count("writer", "after-decision")).toBe(1);
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "two subagents asking at once each get their own request and answer",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-two-");
+      const fixture = subagentWrites(["alpha", "beta"]);
+      try {
+        const sessionId = await startAskSession(root, fixture.gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 60, "Delegate both writes.");
+        await readMessagesUntil(messages, "two subagent requests", () => permissionRequests(messages).length === 2);
+        const alpha = requestFor(messages, "alpha"), beta = requestFor(messages, "beta");
+        expectNamesSubagent(alpha, sessionId, "alpha");
+        expectNamesSubagent(beta, sessionId, "beta");
+        expect(alpha.id).not.toBe(beta.id);
+        expect(alpha.params._meta.fx.subagent.childId).not.toBe(beta.params._meta.fx.subagent.childId);
+        // Answered in the other order: the second request first.
+        answer(beta.id, "reject_once");
+        answer(alpha.id, "allow_once");
+        await readMessagesUntil(messages, "the prompt's response", () => responseTo(messages, 60) !== undefined);
+        expect(responseTo(messages, 60).result.stopReason).toBe("end_turn");
+        expect(permissionRequests(messages)).toHaveLength(2);
+        expect(readFileSync(join(root.workspace, "alpha.txt"), "utf8")).toBe("alpha wrote this\n");
+        expect(existsSync(join(root.workspace, "beta.txt"))).toBe(false);
+        for (const name of ["alpha", "beta"]) {
+          expect(fixture.count(name, "first")).toBe(1);
+          expect(fixture.count(name, "after-decision")).toBe(1);
+        }
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session/cancel withdraws an open subagent request, and a late allow runs nothing",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-cancel-");
+      const fixture = subagentWrites(["alpha"]);
+      try {
+        await startAskSession(root, fixture.gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 61, "Delegate the write.");
+        await readMessagesUntil(messages, "alpha's request", () => requestFor(messages, "alpha") !== undefined);
+        const request = requestFor(messages, "alpha");
+        client!.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
+        await readMessagesUntil(messages, "the cancelled prompt and the withdrawn request", () =>
+          responseTo(messages, 61) !== undefined && withdrawn(messages, request.id));
+        expect(responseTo(messages, 61).result.stopReason).toBe("cancelled");
+        // A client that ignores $/cancel_request answers anyway.
+        answer(request.id, "allow_once");
+        await readMessagesUntil(messages, "alpha's turn after its decision", () => fixture.count("alpha", "after-decision") === 1);
+        const next = await runPrompt(client!, "Continue.", TIMEOUT);
+        expect(next.promptResult.result.stopReason).toBe("end_turn");
+        expect(existsSync(join(root.workspace, "alpha.txt"))).toBe(false);
+        expect(permissionRequests([...messages, ...next.messages])).toHaveLength(1);
+        expect(fixture.count("alpha", "first")).toBe(1);
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent that asks after its prompt closed is denied at once",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-closed-");
+      const fixture = subagentWrites(["alpha"], { holdFirst: "alpha" });
+      try {
+        await startAskSession(root, fixture.gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 62, "Delegate the write.");
+        await readMessagesUntil(messages, "alpha's first model request", () => fixture.count("alpha", "first") === 1);
+        client!.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
+        await readMessagesUntil(messages, "the cancelled prompt", () => responseTo(messages, 62) !== undefined);
+        expect(responseTo(messages, 62).result.stopReason).toBe("cancelled");
+        // Alpha reaches its write with no prompt open.
+        fixture.release();
+        await readMessagesUntil(messages, "alpha's turn after its decision", () => fixture.count("alpha", "after-decision") === 1);
+        expect(permissionRequests(messages)).toHaveLength(0);
+        const next = await runPrompt(client!, "Continue.", TIMEOUT);
+        expect(next.promptResult.result.stopReason).toBe("end_turn");
+        expect(permissionRequests(next.messages)).toHaveLength(0);
+        expect(existsSync(join(root.workspace, "alpha.txt"))).toBe(false);
+        expect(client!.stderr).toBe("");
+      } finally {
+        fixture.release();
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  for (const [how, reply] of [
+    ["an error", { error: { code: -32601, message: "Method not found" } }],
+    ["garbage", { result: { outcome: { outcome: "selected", optionId: "allow_everything" }, extra: [1, 2] } }],
+    ["a cancelled outcome", { result: { outcome: { outcome: "cancelled" } } }],
+  ] as const) {
+    test(
+      `${how} in answer to a subagent's request denies its write`,
+      async () => {
+        const root = createIsolatedRoot("fx-acp-subagent-fault-");
+        const fixture = subagentWrites(["alpha"]);
+        try {
+          await startAskSession(root, fixture.gateway);
+          client!.setPermissionOption(null);
+          const messages: any[] = [];
+          sendPrompt(client!, 63, "Delegate the write.");
+          await readMessagesUntil(messages, "alpha's request", () => requestFor(messages, "alpha") !== undefined);
+          client!.send({ jsonrpc: "2.0", id: requestFor(messages, "alpha").id, ...reply });
+          await readMessagesUntil(messages, "the prompt's response", () => responseTo(messages, 63) !== undefined);
+          expect(responseTo(messages, 63).result.stopReason).toBe("end_turn");
+          expect(existsSync(join(root.workspace, "alpha.txt"))).toBe(false);
+          expect(fixture.count("alpha", "after-decision")).toBe(1);
+          expect(client!.stderr).toBe("");
+        } finally {
+          await client?.close();
+          fixture.gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
+
+  test(
+    "a subagent's request stays open after the parent's own turn fails",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-fail-");
+      const fixture = subagentWrites(["alpha"], {
+        // The parent's turn fails right after it sends alpha.
+        afterCalls: () => new Response(JSON.stringify({ error: { message: "invalid request", type: "invalid_request_error" } }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        }),
+      });
+      try {
+        await startAskSession(root, fixture.gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 65, "Delegate the write.");
+        await readMessagesUntil(messages, "alpha's request and the parent's failure", () =>
+          requestFor(messages, "alpha") !== undefined && JSON.stringify(messages).includes("HTTP 400"));
+        const request = requestFor(messages, "alpha");
+        // The prompt stays open for its subagent.
+        expect(responseTo(messages, 65)).toBeUndefined();
+        expect(withdrawn(messages, request.id)).toBe(false);
+        answer(request.id, "allow_once");
+        await readMessagesUntil(messages, "the prompt's response", () => responseTo(messages, 65) !== undefined);
+        expect(responseTo(messages, 65).result).toBeDefined();
+        expect(readFileSync(join(root.workspace, "alpha.txt"), "utf8")).toBe("alpha wrote this\n");
+        expect(permissionRequests(messages)).toHaveLength(1);
+      } finally {
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "more subagents than the client may be asked at once are denied, and the rest are answered",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-many-");
+      const names = Array.from({ length: 40 }, (_, n) => `s${String(n + 1).padStart(2, "0")}`);
+      const fixture = subagentWrites(names);
+      try {
+        const sessionId = await startAskSession(root, fixture.gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 66, "Delegate forty writes.");
+        // Nothing is answered until each subagent has a request open or its
+        // denial: fx keeps at most 32 requests open at the client
+        // (`max_pending_outbound` in src/acp/server.zig) and denies the rest.
+        await readMessagesUntil(messages, "every subagent asked or denied", () =>
+          permissionRequests(messages).length + names.filter((name) => fixture.count(name, "after-decision") === 1).length === names.length);
+        const requests = permissionRequests(messages);
+        expect(requests).toHaveLength(32);
+        expect(new Set(requests.map((request) => request.id)).size).toBe(32);
+        for (const request of requests) expectNamesSubagent(request, sessionId, request.params._meta.fx.subagent.name);
+        for (const request of requests) answer(request.id, "allow_once");
+        await readMessagesUntil(messages, "the prompt's response", () => responseTo(messages, 66) !== undefined, 60_000);
+        expect(responseTo(messages, 66).result.stopReason).toBe("end_turn");
+        const asked = new Set(requests.map((request) => request.params._meta.fx.subagent.name));
+        for (const name of names) expect(existsSync(join(root.workspace, `${name}.txt`))).toBe(asked.has(name));
+        expect(requests.some((request) => withdrawn(messages, request.id))).toBe(false);
+        for (const name of names) {
+          expect(fixture.count(name, "first")).toBe(1);
+          expect(fixture.count(name, "after-decision")).toBe(1);
+        }
+        expect(client!.stderr).toBe("");
+      } finally {
+        await client?.close();
+        fixture.gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    90_000,
+  );
+
+  test(
+    "the parent's stop ends a subagent's wait on the client",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-stop-");
+      let stopped = false;
+      // Beta reports once alpha's request is at the client, and the parent's
+      // turn that beta's report starts stops alpha.
+      const fixture = subagentWrites(["alpha", "beta"], {
+        holdFirst: "beta",
+        noWrite: ["beta"],
+        onReport: () => {
+          if (stopped) return finalText("SUBAGENT_PARENT_STOPPED");
+          stopped = true;
+          return fakeGatewayToolCall("stop_alpha", "subagent", { request: { action: "stop", agent: "alpha" } });
+        },
+      });
+      try {
+        const sessionId = await startAskSession(root, fixture.gateway);
+        client!.setPermissionOption(null);
+        const messages: any[] = [];
+        sendPrompt(client!, 64, "Delegate the write, then stop it.");
+        await readMessagesUntil(messages, "alpha's request", () => requestFor(messages, "alpha") !== undefined);
+        const request = requestFor(messages, "alpha");
+        expectNamesSubagent(request, sessionId, "alpha");
+        fixture.release();
+        await readMessagesUntil(messages, "the withdrawn request and the prompt's response", () =>
+          withdrawn(messages, request.id) && responseTo(messages, 64) !== undefined);
+        expect(stopped).toBe(true);
+        expect(responseTo(messages, 64).result.stopReason).toBe("end_turn");
+        expect(permissionRequests(messages)).toHaveLength(1);
+        expect(existsSync(join(root.workspace, "alpha.txt"))).toBe(false);
+        expect(fixture.count("alpha", "after-decision")).toBe(0);
+        expect(client!.stderr).toBe("");
+      } finally {
+        fixture.release();
+        await client?.close();
+        fixture.gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },
