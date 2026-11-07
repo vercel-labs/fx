@@ -29,6 +29,8 @@ const FOOTER_RECLAIM_TESTS = [
   "exit with the slash picker open leaves every row",
   "rows a multi-line draft covers from the first frames",
   "resize with the slash picker open keeps the covered rows held",
+  "takeover with the slash picker open recovers only the rows it displaced",
+  "recovery from an invalid anchor with the slash picker open keeps the held rows owed",
   "footer reclaim keeps every row once on seeded random event scripts",
 ];
 

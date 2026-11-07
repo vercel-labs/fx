@@ -100,6 +100,16 @@ Resized ==
     /\ act' = "Resized"
     /\ UNCHANGED <<rows, open, exited, dropTo>>
 
+\* A screen takeover (Ctrl+O's full transcript, external damage) gives the
+\* screen back with the same rows and footer; the frame after it releases
+\* rows by the same rule as any frame, so recovery never releases a row the
+\* open surface holds (normal-buffer and invalid-anchor recovery in
+\* planTranscriptScrollForFrame).
+TookOver ==
+    /\ ~exited
+    /\ Frame(rows, open, "TookOver")
+    /\ UNCHANGED <<rows, open, exited, epochFirst, dropTo, resizes>>
+
 \* Exit, suspend, and a fresh session's scrollback handoff first draw one
 \* frame that releases every held row, so erasing the footer leaves each row
 \* in history or on the screen.
@@ -118,7 +128,7 @@ Next ==
     \/ \E k \in 1..Burst : Output(k)
     \/ Opened \/ Closed
     \/ \E to \in 1..MaxRows : Dropped(to)
-    \/ Resized \/ Exited \/ Done
+    \/ Resized \/ TookOver \/ Exited \/ Done
 
 Spec == Init /\ [][Next]_vars
 

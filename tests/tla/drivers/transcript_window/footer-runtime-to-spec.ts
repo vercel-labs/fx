@@ -3,8 +3,8 @@
 // src/ui/resize_tests.zig, built from src/footer_reclaim_root.zig) and has
 // TLC check every run against FooterReclaim.tla through
 // TraceFooterReclaim.tla. Each script writes rows, opens and closes the slash
-// picker, resizes the window, and ends with what exit and suspend do before
-// they erase the footer. Besides TLC, the run fails when a written row is in
+// picker, resizes the window, takes the screen over and gives it back, and
+// ends with what exit and suspend do before they erase the footer. Besides TLC, the run fails when a written row is in
 // native history plus the screen other than exactly once after exit, which
 // the resize harness's physical history probe counts from the bytes fx wrote.
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -52,6 +52,8 @@ const SCRIPTED: { name: string; events: string[] }[] = [
   { name: "a resize with the picker open, then close", events: ["o1", "o29", "open", "resize", "close", "o1", "exit"] },
   { name: "output and a resize with the picker open, exit with it open", events: ["o1", "o29", "open", "o2", "resize", "o1", "exit"] },
   { name: "a resize with the picker closed between two opens", events: ["o1", "o29", "open", "close", "resize", "open", "close", "exit"] },
+  { name: "a takeover with the picker open, output, then close", events: ["o1", "o29", "open", "takeover", "o2", "o2", "close", "o1", "exit"] },
+  { name: "an invalid anchor with the picker open, output, then close", events: ["o1", "o29", "open", "invalidate", "o2", "o2", "close", "o1", "exit"] },
 ];
 
 function randomScript(next: () => number, length: number): string[] {
@@ -61,6 +63,8 @@ function randomScript(next: () => number, length: number): string[] {
     const roll = next();
     if (roll < 0.45) events.push(`o${1 + Math.floor(next() * 3)}`);
     else if (roll < 0.5) events.push("resize");
+    else if (roll < 0.53) events.push("takeover");
+    else if (roll < 0.56) events.push("invalidate");
     else if (!open) {
       events.push("open");
       open = true;

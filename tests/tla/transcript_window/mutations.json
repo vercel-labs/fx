@@ -332,6 +332,20 @@
       "file": "src/ui/transcript/runtime.zig",
       "find": "scroll_facts.finality_hold or scroll_facts.footer_rows_held",
       "replace": "scroll_facts.finality_hold"
+    },
+    {
+      "id": "footer-runtime-recovery-releases-held",
+      "bug": "Recovery after a screen takeover restores history up to the open footer's viewport, so the rows a surface holds reach history twice: once by the recovery and once when they are painted back (tui-resume's shell approval handoff after Ctrl+O).",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "            if (anchor.normal_buffer_recovery_pending)\n                release_offset -| anchor.history_visual_offset\n",
+      "replace": "            if (anchor.normal_buffer_recovery_pending)\n                target_offset -| anchor.history_visual_offset\n"
+    },
+    {
+      "id": "footer-runtime-invalid-recovery-counts-held",
+      "bug": "Recovery from an invalid anchor counts every row above the viewport as history, so the rows a surface holds never reach scrollback.",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "                    .reset_held_rows = if (self.settle_held_rows)\n",
+      "replace": "                    .reset_held_rows = if (true)\n"
     }
   ]
 }

@@ -570,10 +570,11 @@ pub const TranscriptScrollFacts = struct {
     /// existing catch-up machinery settles the debt; footer displacement
     /// (visual ahead of history with nothing to settle) stays unflagged.
     finality_hold: bool = false,
-    /// A reset reprint leaves this many rows above the viewport out of
-    /// native history: the rows a footer surface covers, which are held for
-    /// its close (`tests/tla/transcript_window/spec/FooterReclaim.tla`
-    /// Resized).
+    /// A frame that re-anchors history (a reset reprint, or recovery from an
+    /// invalid anchor) leaves this many rows above the viewport out of native
+    /// history: the rows a footer surface covers, which are held for its
+    /// close (`tests/tla/transcript_window/spec/FooterReclaim.tla` Resized
+    /// and TookOver).
     reset_held_rows: u16 = 0,
     /// The release line sits below the viewport this frame: rows a footer
     /// surface covers are held between history and the viewport. The gap is
@@ -8831,9 +8832,16 @@ pub const TranscriptRuntime = struct {
                         .recovery_tracks_semantic_progress = true,
                     };
                 }
+                // Recovery counts the rows above the viewport as history; the
+                // rows a footer surface holds were never released, so they
+                // stay owed as after a reprint.
                 return .{
                     .target_visual_offset = target_offset,
                     .recovery_rebase = true,
+                    .reset_held_rows = if (self.settle_held_rows)
+                        0
+                    else
+                        @intCast(@min(held_footer_rows, target_offset)),
                 };
             },
         };
@@ -8909,8 +8917,10 @@ pub const TranscriptRuntime = struct {
             // Normal-buffer recovery restores rows the takeover already
             // displaced into scrollback; that restore is display repair,
             // not a content release, so the finality clamp does not apply.
+            // It stops at the release line: rows a footer surface holds
+            // were never displaced, and its close pays them as catch-up.
             if (anchor.normal_buffer_recovery_pending)
-                target_offset -| anchor.history_visual_offset
+                release_offset -| anchor.history_visual_offset
             else if (self.settle_held_rows)
                 // Exit and suspend settle every held row as it stands: no
                 // later frame repaints it, and a resume reprints it anyway.
@@ -9546,11 +9556,12 @@ pub const TranscriptRuntime = struct {
             },
         }
         if (scroll_facts.reset_held_rows > 0 and target.body_disposition == .paint) {
-            // The reprint scrolled the held rows less, so history stops short
-            // of the viewport by them. Closing the surface paints them back;
-            // output while it is open releases them through the history
-            // replay (`tests/tla/transcript_window/spec/FooterReclaim.tla`
-            // Resized).
+            // The reprint scrolled the held rows less (or the recovery never
+            // released them), so history stops short of the viewport by them.
+            // Closing the surface paints them back; output while it is open
+            // releases them through the history replay
+            // (`tests/tla/transcript_window/spec/FooterReclaim.tla` Resized
+            // and TookOver).
             target.history_visual_offset = @min(
                 target.history_visual_offset,
                 target.visual_offset -| scroll_facts.reset_held_rows,

@@ -42,8 +42,9 @@ current code.
   picker, a question or approval in place of the composer, a banner, a
   multi-line draft) pushes off the top are held, not released, and come back
   when it closes; output while it is open releases rows in order through the
-  history replay, a resize reprint keeps them held, and exit, suspend, and a
-  fresh session's scrollback handoff first release every held row. `spec/FooterReclaim.tla` models the main screen's
+  history replay, a resize reprint and the recovery after a screen takeover
+  keep them held, and exit, suspend, and a fresh session's scrollback handoff
+  first release every held row. `spec/FooterReclaim.tla` models the main screen's
   rows under this rule, with `Release = "current"` as main's rule before it;
   `mutations.json` plants the rule's bugs in both the spec and the transcript
   runtime (`src/ui/transcript/runtime.zig`).

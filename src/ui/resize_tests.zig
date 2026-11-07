@@ -6652,7 +6652,9 @@ test "compact command completion keeps restored history footer stable" {
     defer approval.deinit(alloc);
 
     try h.shell.initViewport(&h.metrics, 1);
-    _ = try h.shell.appendRawTranscriptEntry(alloc, text_utils.repeat("history\n", 30));
+    // Taller than the idle screen: the approval holds the rows it covers and
+    // paints them back when it clears, so only overflow puts rows in history.
+    _ = try h.shell.appendRawTranscriptEntry(alloc, text_utils.repeat("history\n", 45));
     const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "command" };
     _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
         .id = id,
@@ -9472,6 +9474,28 @@ const FooterReclaimRun = struct {
         self.resizes += 1;
     }
 
+    /// What Ctrl+O's full transcript leaves when the anchor is invalidated
+    /// while it is open: the anchor stays stable in normal-buffer recovery.
+    /// No frame is drawn at full depth; the harness has no alternate screen.
+    fn ctrlOTakeoverWithoutFrame(self: *FooterReclaimRun) !void {
+        _ = try self.h.shell.setTranscriptPresentationDepth(self.h.alloc, .full);
+        self.h.shell.invalidateTranscriptAnchor("footer_reclaim_ctrl_o_takeover");
+        _ = try self.h.shell.setTranscriptPresentationDepth(self.h.alloc, .inline_mode);
+    }
+
+    /// A Ctrl+O takeover, then the frame that gives the screen back.
+    fn ctrlOTakeover(self: *FooterReclaimRun) !void {
+        try self.ctrlOTakeoverWithoutFrame();
+        try self.frame();
+    }
+
+    /// What a takeover leaves when Ctrl+O is closed and nothing is published:
+    /// an invalid anchor, then the frame that recovers from it.
+    fn invalidAnchorTakeover(self: *FooterReclaimRun) !void {
+        self.h.shell.invalidateTranscriptAnchor("footer_reclaim_invalid_anchor");
+        try self.frame();
+    }
+
     /// What exit and suspend do before they erase the footer: one frame
     /// that settles the held rows.
     fn exit(self: *FooterReclaimRun) !void {
@@ -9605,6 +9629,57 @@ test "rows a multi-line draft covers from the first frames reach history in orde
     try run.expectEveryRowOnce();
 }
 
+/// While the slash picker is open the rows it covers stay out of history: a
+/// takeover displaced none of them, so recovery must not count them.
+fn expectFooterReclaimRowsHeld(run: *FooterReclaimRun) !void {
+    const diagnostic = run.h.shell.transcriptCommitDiagnostic();
+    try std.testing.expect(diagnostic.history_visual_offset < diagnostic.visual_offset);
+}
+
+test "a Ctrl+O takeover with the slash picker open recovers only the rows it displaced" {
+    // Recovery after a takeover restores rows the takeover pushed into
+    // scrollback; the rows the picker holds were never pushed there, so
+    // releasing them writes them to history twice (tests/e2e/tui-resume.test.ts
+    // "a shell approval handoff does not duplicate a long Ctrl-O transcript
+    // in scrollback").
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.output(1);
+    try run.output(29);
+    try run.openPicker();
+    try run.ctrlOTakeoverWithoutFrame();
+    try std.testing.expect(run.h.shell.transcript_commit_state.stable.normal_buffer_recovery_pending);
+    try run.frame();
+    try expectFooterReclaimRowsHeld(&run);
+    for (0..3) |_| {
+        try run.output(2);
+        try run.expectNoRowTwice();
+        try expectFooterReclaimRowsHeld(&run);
+    }
+    try run.closePicker();
+    try run.expectFooterAtBottom();
+    try run.expectEveryRowOnce();
+}
+
+test "recovery from an invalid anchor with the slash picker open keeps the held rows owed" {
+    // Recovery counts the rows above the viewport as history; the rows the
+    // picker holds were never released, so counting them drops them from
+    // scrollback.
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.output(1);
+    try run.output(29);
+    try run.openPicker();
+    try run.invalidAnchorTakeover();
+    for (0..3) |_| {
+        try run.output(2);
+        try run.expectNoRowTwice();
+    }
+    try run.closePicker();
+    try run.expectFooterAtBottom();
+    try run.expectEveryRowOnce();
+}
+
 test "a resize with the slash picker open keeps the covered rows held for the close" {
     var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
     defer run.deinit();
@@ -9650,8 +9725,9 @@ const FooterReclaimSeededDraws = struct {
     }
 };
 
-/// Output, slash picker open and close, and resizes in a drawn order on a
-/// drawn screen height, then exit. After every step no row is in history
+/// Output, slash picker open and close, resizes, and screen takeovers (Ctrl+O
+/// recovery and an invalid anchor) in a drawn order on a drawn screen height,
+/// then exit. After every step no row is in history
 /// and on the screen twice; whenever the picker is closed the footer is on
 /// the bottom row and every row is there once; after exit every row is.
 fn driveFooterReclaim(draws: anytype) !void {
@@ -9660,10 +9736,12 @@ fn driveFooterReclaim(draws: anytype) !void {
     try run.output(1);
     try run.output(draws.range(u32, 1, 60));
     for (0..draws.range(u8, 0, 16)) |_| {
-        switch (draws.range(u8, 0, 5)) {
+        switch (draws.range(u8, 0, 6)) {
             0, 1 => try run.output(draws.range(u32, 1, 4)),
             2, 3 => if (run.open) try run.closePicker() else try run.openPicker(),
-            else => try run.resize(),
+            4 => try run.resize(),
+            5 => try run.ctrlOTakeover(),
+            else => try run.invalidAnchorTakeover(),
         }
         try run.expectNoRowTwice();
         if (!run.open) {
@@ -9719,8 +9797,9 @@ const FooterReclaimTraceResult = struct {
 // script in $FX_FOOTER_RECLAIM_EVENTS and writes what the runtime committed
 // after each step to $FX_FOOTER_RECLAIM_TRACE. Without those variables it does
 // nothing. Events: "o<k>" writes k rows, "open" and "close" the slash picker,
-// "resize" a window resize away and back, and "exit" what exit and suspend do
-// before they erase the footer.
+// "resize" a window resize away and back, "takeover" a Ctrl+O takeover and
+// "invalidate" an invalid anchor as a takeover leaves them, and "exit" what
+// exit and suspend do before they erase the footer.
 test "footer reclaim runtime trace driver" {
     io_mod.setLibcEnviron();
     defer io_mod.resetEnvironForTest();
@@ -9753,6 +9832,12 @@ test "footer reclaim runtime trace driver" {
             } else if (std.mem.eql(u8, event, "resize")) blk: {
                 try run.resize();
                 break :blk "Resized";
+            } else if (std.mem.eql(u8, event, "takeover")) blk: {
+                try run.ctrlOTakeover();
+                break :blk "TookOver";
+            } else if (std.mem.eql(u8, event, "invalidate")) blk: {
+                try run.invalidAnchorTakeover();
+                break :blk "TookOver";
             } else if (std.mem.eql(u8, event, "exit")) blk: {
                 try run.exit();
                 break :blk "Exited";

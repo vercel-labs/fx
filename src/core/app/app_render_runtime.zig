@@ -943,14 +943,15 @@ pub fn Runtime(comptime App: type) type {
             return std.mem.eql(u8, pendingPickerSpeed(query, speed_index), "fast");
         }
 
-        /// Exit and suspend erase the footer, so before they do, one frame
-        /// releases the rows a footer surface holds above the screen into
-        /// native history (`tests/tla/transcript_window/spec/FooterReclaim.tla`
+        /// Exit, suspend, and a fresh session hand off the screen, so before
+        /// they do, one frame (drawn by `flush_frame`, the App's one frame
+        /// flush) releases the rows a footer surface holds above the screen
+        /// into native history (`tests/tla/transcript_window/spec/FooterReclaim.tla`
         /// ExitKeepsRows). Rows still held after it are logged as dropped from
         /// scrollback; the session log and Ctrl+O keep them.
-        pub fn settleHeldTranscriptRows(app: *App, agent: *AppAgent) void {
+        pub fn settleHeldTranscriptRows(app: *App, flush_frame: *const fn (*App) anyerror!void) void {
             if (!app.shell.requestHeldRowsSettle()) return;
-            flushRequestedFrame(app, agent) catch |err| {
+            flush_frame(app) catch |err| {
                 debug_trace.logf("render", "held_rows_settle_failed err={s}", .{@errorName(err)});
             };
             if (app.shell.holdsTranscriptRows()) {
@@ -4846,6 +4847,9 @@ fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
     var finished = try app.shell.prepareTranscriptSource(alloc, null);
     defer finished.deinit(alloc);
     try std.testing.expect(finished.finality.mutation_pin_start == null);
+    // The draft holds the transcript rows it covers until it clears
+    // (`tests/tla/transcript_window/spec/FooterReclaim.tla` FooterAtBottom).
+    if (cols == 24) app.input_runtime.inputResetState().clearCurrent(alloc);
     var released: u32 = 0;
     for (0..4) |_| released += try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
     try std.testing.expect(released > 0);

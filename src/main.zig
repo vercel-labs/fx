@@ -1129,7 +1129,7 @@ const App = struct {
     /// Puts the rows a footer surface holds into native history before the
     /// screen is handed off: exit, suspend, or a fresh session.
     pub fn settleHeldTranscriptRows(self: *App) void {
-        RenderAppRuntime.settleHeldTranscriptRows(self, self.screenAgent());
+        RenderAppRuntime.settleHeldTranscriptRows(self, flushRequestedFrame);
     }
 
     pub fn releaseTerminal(self: *App) void {

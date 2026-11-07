@@ -2,7 +2,8 @@
 \* Checks traces the real transcript runtime produced against FooterReclaim.
 \*
 \* tests/tla/drivers/transcript_window/footer-runtime-to-spec.ts runs event
-\* scripts (output, slash picker open and close, resizes, exit) through
+\* scripts (output, slash picker open and close, resizes, screen takeovers,
+\* exit) through
 \* TranscriptRuntime in the resize harness ("footer reclaim runtime trace
 \* driver" in src/ui/resize_tests.zig) and writes each run as a sequence of
 \* states into FooterTraceData.tla: the committed anchor's total visual rows,
