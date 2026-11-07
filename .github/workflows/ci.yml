@@ -491,6 +491,7 @@ jobs:
           bun tests/tla/drivers/drive-steer.mjs faults --walks 20 --seed 4
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 4 --hooks
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 6 --backend wasm
+          bun tests/tla/drivers/drive-resumed-steer.mjs --walks 12 --seed 3
 
       - name: Test libfx on a World
         run: |

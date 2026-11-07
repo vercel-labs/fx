@@ -477,6 +477,24 @@ if (childMode && process.argv[6] === "steer") {
   console.log(JSON.stringify({ sessionId: session.id, executionId: runs.find(([name]) => name === "lookup")?.[1] }));
   await new Promise(() => {});
 }
+// With `waiting-steer`, a steer waits for the running tool when the child
+// dies. It reports whether the log recorded the turn taking the steer: from
+// then on no worker sends it to the turn again, so only the resume can show it.
+if (childMode && process.argv[6] === "waiting-steer") {
+  gate("lookup");
+  const agent = createFxAgent(agentOptions(await durabilityAt(process.argv[5])));
+  const session = agent.session();
+  void session.prompt("use lookup", { messageId: "crash-turn" }).result.catch(() => {});
+  await gates.get("lookup").started;
+  await session.steer("a waiting steer", { messageId: "crash-waiting" });
+  const internals = agent[Symbol.for("libfx.durableInternals")];
+  const log = await internals.openLog(session.id);
+  const held = async () => (await log.read()).some(({ entry }) => entry?.marks?.some((mark) => mark.accepted === "crash-waiting"));
+  const accepted = await until(held, "the turn to take the steer", 2000).then(() => true, () => false);
+  await internals.settled(session.id);
+  console.log(JSON.stringify({ sessionId: session.id, accepted }));
+  await new Promise(() => {});
+}
 if (childMode) {
   const dir = process.argv[5];
   const tool = process.argv[6];
@@ -1355,6 +1373,94 @@ for (const tool of ["lookup", "send"]) {
   });
 }
 
+// A steer the turn took while a tool ran, and never placed, reaches the model
+// in the resumed turn's next request. The stream shows it there, once.
+test("a steer waiting for a tool when the deadline cuts it off shows once where the resumed turn takes it", async () => {
+  const deadlines = [];
+  const agent = createFxAgent(agentOptions(await durabilityFor({ maxDurationMs: 1500 * timeScale, reserveMs: 1000 * timeScale }), {
+    onEvent: (event) => { if (event.type === "session.deadline") deadlines.push(event); },
+  }));
+  const held = gate("lookup");
+  const turn = agent.prompt("use lookup");
+  await held.started;
+  // The call never returns on its own; a rerun goes through at once.
+  gates.delete("lookup");
+  const session = agent.session(agent.sessionId);
+  await session.steer("a steer at the deadline", { messageId: "deadline-waiting" });
+  // The deadline comes after the turn takes the steer, which waits for the
+  // call. The WebAssembly core takes steers at a boundary instead.
+  const log = await agent[Symbol.for("libfx.durableInternals")].openLog(session.id);
+  if (engineBackend === "native") await until(async () => (await log.read()).some(({ entry }) => entry?.marks?.some((mark) => mark.accepted === "deadline-waiting")), "the turn to take the steer", 1000 * timeScale);
+  const { result } = await collect(turn);
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(deadlines.length, 1, "the worker stopped itself once, before its deadline");
+  const lines = await readLines(session.stream(0), 64);
+  const note = `stream: ${lines.map((line) => line.type).filter((type) => !type.endsWith("_delta")).join(" ")}`;
+  assert.equal(userTexts(requests.at(-1)).filter((text) => text.includes("a steer at the deadline")).length, 1, `the steer reached the model once; ${note}`);
+  assert.deepEqual(lines.filter((line) => line.type === "user_message").map(({ text, id }) => ({ text, id })), [{ text: "a steer at the deadline", id: "deadline-waiting" }], `the steer shows once; ${note}`);
+  assertShownAfterTool(lines, note);
+  await agent.close();
+});
+
+// Each steer shows once, in the order sent.
+test("two steers waiting for a tool when the deadline cuts it off each show once, in the order sent", async () => {
+  const agent = createFxAgent(agentOptions(await durabilityFor({ maxDurationMs: 1500 * timeScale, reserveMs: 1000 * timeScale })));
+  const held = gate("lookup");
+  const turn = agent.prompt("use lookup");
+  await held.started;
+  gates.delete("lookup");
+  const session = agent.session(agent.sessionId);
+  const log = await agent[Symbol.for("libfx.durableInternals")].openLog(session.id);
+  for (const id of ["deadline-first", "deadline-second"]) {
+    await session.steer(`steer ${id}`, { messageId: id });
+    if (engineBackend === "native") await until(async () => (await log.read()).some(({ entry }) => entry?.marks?.some((mark) => mark.accepted === id)), `the turn to take ${id}`, 1000 * timeScale);
+  }
+  assert.equal((await collect(turn)).result.stopReason, "end_turn");
+  const lines = await readLines(session.stream(0), 64);
+  const note = `stream: ${lines.map((line) => line.type).filter((type) => !type.endsWith("_delta")).join(" ")}`;
+  assert.deepEqual(lines.filter((line) => line.type === "user_message").map(({ id }) => id), ["deadline-first", "deadline-second"], `both steers show once, in order; ${note}`);
+  assertShownAfterTool(lines, note);
+  await agent.close();
+});
+
+// A resume that ends before its first request places nothing, so it shows
+// nothing: the model never got the steer.
+test("a resumed turn cancelled before its first request shows no line for the steer it never placed", async () => {
+  // The native core takes the steer while the call runs; the WebAssembly core
+  // takes it at a boundary, so it holds no such steer to resume with.
+  if (engineBackend !== "native") return;
+  const agent = createFxAgent(agentOptions(await durabilityFor()));
+  const held = gate("lookup");
+  const session = agent.session();
+  const turn = session.prompt("use lookup", { messageId: "cancelled-resume-turn" });
+  void turn.result.catch(() => {});
+  await held.started;
+  await session.steer("steer cancelled-resume", { messageId: "cancelled-resume-steer" });
+  const log = await agent[Symbol.for("libfx.durableInternals")].openLog(session.id);
+  await until(async () => (await log.read()).some(({ entry }) => entry?.marks?.some((mark) => mark.accepted === "cancelled-resume-steer")), "the turn to take the steer");
+  const before = runs.filter(([name]) => name === "lookup").length;
+  agent[Symbol.for("libfx.durableInternals")].stopAtDeadline(session.id);
+  // The resume runs the call again, and the held call keeps it before its first request.
+  await until(() => runs.filter(([name]) => name === "lookup").length > before, "the resumed turn to run the call again");
+  await session.cancel();
+  // The worker gives the cancel to the running turn, which waits for the call.
+  await new Promise((wait) => setTimeout(wait, durabilityKind === "memory" ? 50 : 600));
+  gates.delete("lookup");
+  held.open();
+  const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "cancelled-resume-turn", "the cancelled turn's end");
+  const note = `stream: ${lines.map((line) => line.type).filter((type) => !type.endsWith("_delta")).join(" ")}`;
+  assert.ok(lines.some((line) => line.type === "turn_resume"), `the turn was resumed; ${note}`);
+  assert.deepEqual(lines.filter((line) => line.type === "user_message").map(({ id }) => id), [], `no steer shows before the model got it; ${note}`);
+  await agent.close();
+});
+
+// A steer that waited for a tool reaches the model after the tool's result,
+// so it shows there too.
+function assertShownAfterTool(lines, note) {
+  const types = lines.map((line) => line.type);
+  assert.ok(types.lastIndexOf("tool_end") < types.indexOf("user_message"), `the steer shows after the tool's result; ${note}`);
+}
+
 // A call the resume answers as possibly run ends on the session stream, once,
 // with what the model heard, so a viewer never shows it running for good.
 function assertEndedAsPossiblyRun(lines, id) {
@@ -1644,6 +1750,46 @@ if (durabilityKind === "local") {
 }
 
 if (durabilityKind !== "memory") {
+  // `alreadyShown`: the crash falls after the worker showed the steer and
+  // before the log heard the steer was placed, so the stream holds its line
+  // already and the resume must not show it a second time.
+  for (const alreadyShown of [false, true]) test(`a steer waiting for a tool when a crash ends its worker ${alreadyShown ? "shows once when its line reached the stream first" : "shows where the resumed turn takes it"}`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-durable-waiting-steer-"));
+    dirs.push(dir);
+    const child = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url), durabilityKind, engineBackend, "--child", dir, "waiting-steer"], {
+      stdio: ["ignore", "pipe", "inherit"], env: { ...process.env },
+    });
+    const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    try {
+      await until(() => output.includes("\n"), "the child to hold the steer", testTimeoutMs / 2);
+    } finally {
+      child.kill("SIGKILL");
+      await exited;
+    }
+    const { sessionId, accepted } = JSON.parse(output.trim().split("\n")[0]);
+    // The native core takes a steer while a tool runs. The WebAssembly core
+    // takes steers from its host at a boundary, so there the steer is still
+    // a stored input, which the resumed turn takes and shows at its start.
+    if (engineBackend === "native") assert.ok(accepted, "the log recorded the turn taking the steer before the crash");
+    else if (alreadyShown) return;
+    const agent = createFxAgent(agentOptions(await durabilityAt(dir)));
+    const session = agent.session(sessionId);
+    if (alreadyShown) {
+      const [first] = await readLines(session.stream(0), 1);
+      const log = await agent[Symbol.for("libfx.durableInternals")].openLog(sessionId);
+      await log.ui.write([JSON.stringify({ type: "user_message", text: "a waiting steer", id: "crash-waiting", messageId: "crash-turn", epoch: first.epoch })]);
+    }
+    assert.equal((await session.resume().result).stopReason, "end_turn");
+    const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "crash-turn", "the resumed turn");
+    const note = `stream: ${lines.map((line) => line.type).filter((type) => !type.endsWith("_delta")).join(" ")}`;
+    assert.equal(userTexts(requests.at(-1)).filter((text) => text.includes("a waiting steer")).length, 1, `the steer reached the model once; ${note}`);
+    assert.deepEqual(lines.filter((line) => line.type === "user_message").map(({ text, id }) => ({ text, id })), [{ text: "a waiting steer", id: "crash-waiting" }], `the steer shows once; ${note}`);
+    if (!alreadyShown) assertShownAfterTool(lines, note);
+    await agent.close();
+  });
+
   test("a prompt accepted just before a crash still runs", async () => {
     const dir = await mkdtemp(join(tmpdir(), "libfx-durable-accepted-"));
     dirs.push(dir);
