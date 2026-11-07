@@ -154,13 +154,10 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     });
     defer opened.deinit();
     const http = &opened.request;
-    var watch: client_mod.ConnectionWatch = .init(.{
-        .timeout_ms = 120_000,
-        .stall_timeout_ms = client_mod.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
-    });
+    var watch = headWatch(request.deadline);
     defer watch.stop();
     if (http.connection) |connection| try watch.start(request.cancel_flag, request.deadline, connection.stream_writer.stream);
-    // The 120 s head wait also bounds sending the request.
+    // A bounded head wait also bounds sending the request.
     if (watch.armHead()) |err| return err;
     http.transfer_encoding = .{ .content_length = payload.len };
     var buffer: [8192]u8 = undefined;
@@ -206,6 +203,32 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
         return err;
     }
     return result;
+}
+
+/// The watch for one request's connection. An agent stream has no caller
+/// deadline, and it waits for its response head as the AI Gateway's agent
+/// path does (`streamGatewayCompletionCore` in client.zig): a cold local model
+/// can take minutes before its first byte, so silence alone never ends a sent
+/// request. A dead socket, cancellation, or the body stall window after the
+/// head still does (`tests/tla/connection_watch/HeadWait.tla`
+/// SilenceNeverDropsAgent). A request with its own deadline, such as a
+/// permission review, keeps the bounded wait (OwnDeadlineBounded).
+fn headWatch(deadline: ?std.Io.Clock.Timestamp) client_mod.ConnectionWatch {
+    return .init(.{
+        .patient = deadline == null,
+        .stall_timeout_ms = client_mod.ConnectionWatch.bodyStallTimeoutMs(deadline),
+    });
+}
+
+test "configured agent streams wait for their head as the Gateway does, and deadline requests keep the bound" {
+    const agent = headWatch(null);
+    try std.testing.expect(agent.state.timing.patient);
+    try std.testing.expectEqual(client_mod.ConnectionWatch.bodyStallTimeoutMs(null), agent.state.timing.stall_timeout_ms);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromSeconds(30) });
+    const bounded = headWatch(deadline);
+    try std.testing.expect(!bounded.state.timing.patient);
+    try std.testing.expectEqual(@as(i64, 120_000), bounded.state.timing.timeout_ms);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), bounded.state.timing.stall_timeout_ms);
 }
 
 /// Parses a successful streamed reply from `reader`, telling `progress` about
