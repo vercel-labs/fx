@@ -50,6 +50,9 @@
     {"name": "ask_questions_text", "module": "fx", "test": "ask_user_question questions sent as JSON text decode or refuse arbitrary bytes", "iterations": 250000},
     {"name": "transcript_window", "module": "fx", "test": "the transcript window keeps the model's laws on arbitrary event sequences", "iterations": 2000000},
     {"name": "frozen_prefix", "module": "fx", "test": "a runtime resuming after its frozen prefix matches a full render on arbitrary edits", "iterations": 1500},
-    {"name": "session_title", "module": "fx", "test": "session titles keep their rules on fuzzed input", "iterations": 5000000}
+    {"name": "session_title", "module": "fx", "test": "session titles keep their rules on fuzzed input", "iterations": 5000000},
+    {"name": "subscription_expiry", "module": "fx", "test": "a stored subscription expiry reads as expired or live on fuzzed values", "iterations": 30000},
+    {"name": "grok_refresh_reply", "module": "fx", "test": "a Grok refresh frees each token once on fuzzed replies", "iterations": 30000},
+    {"name": "codex_refresh_reply", "module": "fx", "test": "a Codex refresh frees each token once on fuzzed replies", "iterations": 30000}
   ]
 }
