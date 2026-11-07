@@ -471,7 +471,9 @@ jobs:
           jar="$RUNNER_TEMP/tla2tools.jar"
           curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
-          TLA2TOOLS_JAR="$jar" tests/tla/sdk/check.sh
+          # drive-steer.mjs has TLC check its walks too, so every command needs the jar.
+          export TLA2TOOLS_JAR="$jar"
+          tests/tla/sdk/check.sh
           bun tests/tla/drivers/drive.mjs send --walks 40
           bun tests/tla/drivers/drive.mjs send --walks 20 --seed 3 --hooks
           bun tests/tla/drivers/drive.mjs lookup --walks 40 --seed 7
