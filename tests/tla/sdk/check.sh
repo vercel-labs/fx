@@ -73,9 +73,10 @@ for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoAct
         echo "== witness $witness NOT reached" >&2; status=1
     fi
 done
-# DurableSteer.tla: where each message a user sends ends up. The ideal graph
-# has no faults, and the faults graph adds cancels, deadline handoffs and
-# client retries.
+# DurableSteer.tla: where each message a user sends ends up, from this
+# process or another. The ideal graph has no faults, and the faults graph
+# adds cancels, deadline handoffs and client retries. drive-steer.mjs walks
+# both and has TLC check its walks with DurableSteerTrace.tla.
 for graph in ideal faults; do
     echo "== DurableSteer ($graph)"
     if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
@@ -85,13 +86,28 @@ for graph in ideal faults; do
     fi
     grep -E 'distinct states|depth of' "$work/steer-$graph.log"
 done
+# The faults graph with a record the worker writes in flight, which the
+# drivers do not walk: steers that land behind it wait for it, in slot order.
+echo "== DurableSteer (writes)"
+if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup \
+    -metadir "$work/steer-writes" -config DurableSteer-writes.cfg DurableSteer.tla > "$work/steer-writes.log" 2>&1; then
+    cat "$work/steer-writes.log"; status=1
+else
+    grep -E 'distinct states|depth of' "$work/steer-writes.log"
+fi
 # Each witness turns one rule off and must break the property it protects:
 # without Interrupt a steer waits on a streaming reply, without HandBack a
 # cancel loses a steer that never reached the model, without JoinBeforeStart
-# a steer sent before the first turn starts runs as a turn of its own, and
-# without Dedupe a retried steer reaches the model twice.
+# a steer sent before the first turn starts runs as a turn of its own,
+# without Dedupe a retried steer reaches the model twice, without HandOver a
+# steer this process stored misses the request with a tool's result that
+# came before its worker read the log, without ReadFirst a steer handed
+# over ahead of one another process stored first reaches the model first,
+# and without SlotOrder a steer that lands behind a record the worker is
+# still writing waits for a read and misses the tool's result.
 for pair in NoInterrupt:NoSteerWaitsOnReply NoHandBack:NothingLost \
-    NoJoinBeforeStart:PreStartJoins NoDedupe:AtMostOnce; do
+    NoJoinBeforeStart:PreStartJoins NoDedupe:AtMostOnce \
+    NoHandOver:SteerJoinsToolResult NoReadFirst:AdmissionOrder NoSlotOrder:SteerJoinsToolResult; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/sw-$witness" \
         -config "SteerWitness-$witness.cfg" DurableSteer.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then
