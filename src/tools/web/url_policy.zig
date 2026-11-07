@@ -539,7 +539,17 @@ fn ipv4InCidr(bytes: [4]u8, prefix: [4]u8, bits: u6) bool {
     return (value & mask) == (prefix_value & mask);
 }
 
+/// The RFC 6052 well-known NAT64 prefix, 64:ff9b::/96.
+const nat64_well_known_prefix = [12]u8{ 0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 };
+
 fn isPublicIpv6(bytes: [16]u8) bool {
+    // DNS64 puts a host's IPv4 address in the last 32 bits of the well-known
+    // prefix, and a NAT64 gateway forwards the packet there, so the IPv4 rule
+    // decides. The local-use prefix 64:ff9b:1::/48 stays non-public: the
+    // network chooses where it translates (`tests/tla/web/FetchAdmission.tla`
+    // NoUnsafeDial, PublicHostAdmitted).
+    if (std.mem.eql(u8, bytes[0..12], &nat64_well_known_prefix)) return isPublicIpv4(bytes[12..16].*);
+
     const in_ipv6_global_unicast = (bytes[0] & 0xe0) == 0x20;
     if (std.Io.net.Ip4Address.fromIp6(.{ .bytes = bytes, .port = 0 })) |ip4| {
         return isPublicIpv4(ip4.bytes) and in_ipv6_global_unicast;
@@ -661,6 +671,60 @@ test "web_fetch rejects public and private ipv4 mapped ipv6 literals" {
     }
 }
 
+test "web_fetch nat64 well-known prefix addresses are judged by their embedded ipv4 address" {
+    const admitted = [_][]const u8{
+        "64:ff9b::40ef:7b41", // 64.239.123.65
+        "64:ff9b::40ef:6d41", // 64.239.109.65
+        "64:ff9b::5db8:d822", // 93.184.216.34
+    };
+    for (admitted) |text| {
+        const address = try std.Io.net.IpAddress.parse(text, 443);
+        try std.testing.expect(isPublicAddress(address));
+    }
+
+    const rejected = [_][]const u8{
+        "64:ff9b::", // 0.0.0.0
+        "64:ff9b::7f00:1", // 127.0.0.1
+        "64:ff9b::a00:1", // 10.0.0.1
+        "64:ff9b::6440:1", // 100.64.0.1
+        "64:ff9b::a9fe:a9fe", // 169.254.169.254
+        "64:ff9b::ac10:1", // 172.16.0.1
+        "64:ff9b::c0a8:1", // 192.168.0.1
+        "64:ff9b::ffff:ffff", // 255.255.255.255
+        // Outside 64:ff9b::/96 the network chooses the translation.
+        "64:ff9b:1::5db8:d822", // RFC 8215 local-use prefix
+        "64:ff9b::1:5db8:d822",
+        // IPv4-compatible addresses are deprecated and never public.
+        "::a00:1",
+        "::a9fe:a9fe",
+        "::5db8:d822",
+    };
+    for (rejected) |text| {
+        const address = try std.Io.net.IpAddress.parse(text, 443);
+        try std.testing.expect(!isPublicAddress(address));
+    }
+}
+
+test "web_fetch nat64 literals of public addresses are admitted and private ones refused" {
+    const alloc = std.testing.allocator;
+
+    var public = try normalize(alloc, "https://[64:ff9b::40ef:7b41]/");
+    defer public.deinit(alloc);
+    try std.testing.expect(public.literal_address != null);
+    try std.testing.expectEqualStrings("64:ff9b::40ef:7b41", public.canonical_host);
+
+    try std.testing.expectError(error.NonPublicAddress, normalize(alloc, "https://[64:ff9b::7f00:1]/"));
+    try std.testing.expectError(error.NonPublicAddress, normalize(alloc, "https://[0064:FF9B:0000:0000:0000:0000:7F00:0001]/"));
+    try std.testing.expectError(error.NonPublicAddress, normalize(alloc, "https://[64:ff9b:1::5db8:d822]/"));
+
+    // A dotted IPv4 tail is refused too, whether or not std parses it.
+    if (normalize(alloc, "https://[64:ff9b::127.0.0.1]/")) |admitted| {
+        var url = admitted;
+        url.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
 test "web_fetch relative redirect resolves before admission and malformed location fails closed" {
     const alloc = std.testing.allocator;
 
@@ -729,12 +793,12 @@ test "url policy admits only URLs it reads back the same way" {
 }
 
 const fuzz_url_pieces = [_][]const u8{
-    "https://",       "http://",       "HTTPS://",        "ftp://", "https:", "//",  "/",             "?",         "#",
-    "@",              ":",             ".",               "[",      "]",      "%",   "%2e",           "%2F",       "%41",
-    "..",             "example.com",   "WWW.Example.COM", "www.",   "a",      "b-c", "xn--bcher-kva", "localhost", "internal",
-    "local",          "127.0.0.1",     "8.8.8.8",         "0x7f",   "010",    "1",   "256",           "::1",       "2606:4700::1",
-    "::ffff:8.8.8.8", "fe80::1%25en0", ":443",            ":80",    ":8080",  ":0",  ":65536",        "user:pass", "q=1&r=2",
-    " ",              "\\",            "\xc3\xa9",        "~",
+    "https://",       "http://",       "HTTPS://",        "ftp://", "https:",    "//",          "/",             "?",         "#",
+    "@",              ":",             ".",               "[",      "]",         "%",           "%2e",           "%2F",       "%41",
+    "..",             "example.com",   "WWW.Example.COM", "www.",   "a",         "b-c",         "xn--bcher-kva", "localhost", "internal",
+    "local",          "127.0.0.1",     "8.8.8.8",         "0x7f",   "010",       "1",           "256",           "::1",       "2606:4700::1",
+    "::ffff:8.8.8.8", "fe80::1%25en0", ":443",            ":80",    ":8080",     ":0",          ":65536",        "user:pass", "q=1&r=2",
+    " ",              "\\",            "\xc3\xa9",        "~",      "64:ff9b::", "64:ff9b:1::", "7f00:1",        "40ef:7b41", "a9fe:a9fe",
 };
 
 fn appendFuzzUrl(alloc: Allocator, smith: *std.testing.Smith, out: *std.ArrayList(u8)) !void {
@@ -786,6 +850,20 @@ fn fuzzUrlPolicy(_: void, smith: *std.testing.Smith) !void {
 fn expectFuzzAdmittedUrl(alloc: Allocator, url: ValidatedUrl) !void {
     try std.testing.expectEqual(Scheme.https, url.scheme);
     if (url.literal_address) |address| try std.testing.expect(isPublicAddress(address));
+
+    // An admitted IPv6 literal is global unicast, or a 64:ff9b::/96 NAT64
+    // address whose IPv4 address the IPv4 literal path admits as well.
+    if (url.literal_address) |address| switch (address) {
+        .ip4 => {},
+        .ip6 => |ip6| if (std.mem.eql(u8, ip6.bytes[0..12], &.{ 0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 })) {
+            var buffer: [32]u8 = undefined;
+            const embedded = try std.mem.print(&buffer, "https://{d}.{d}.{d}.{d}/", .{ ip6.bytes[12], ip6.bytes[13], ip6.bytes[14], ip6.bytes[15] });
+            var ipv4 = try normalize(alloc, embedded);
+            ipv4.deinit(alloc);
+        } else {
+            try std.testing.expect((ip6.bytes[0] & 0xe0) == 0x20);
+        },
+    };
 
     // Reading the retrieval URL again gives the same URL.
     var again = try normalize(alloc, url.retrieval_url);
