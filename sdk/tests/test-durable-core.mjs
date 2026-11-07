@@ -19,6 +19,9 @@ const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import
 // whether a worker lives, so leases are held without renewals; see
 // queue-world.mjs.
 const { queueWorldAt, closeQueueWorlds } = durabilityKind === "world" || durabilityKind === "queue" ? await import("./queue-world.mjs") : {};
+// "world" also restarts an app whose World recovers its runs at startup; see
+// restarted-world.mjs.
+const { restartedWorldAt } = durabilityKind === "world" ? await import("./restarted-world.mjs") : {};
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const dirs = [];
@@ -1634,6 +1637,75 @@ if (durabilityKind === "world") {
     await second.close();
     assert.equal((await first.session().prompt("three", { messageId: "turn-3" }).result).stopReason, "end_turn");
     await first.close();
+  });
+
+  // An app that shares its World with the Workflow SDK restarts, and the
+  // World recovers its runs as it starts: a run that recorded no queue
+  // namespace goes to the Workflow SDK's queue, which fails a run whose
+  // workflow it lacks (`tests/tla/sdk/QueueRecovery.tla` LibfxRunsNotFailed).
+  // A recovery message carries no prompt, so libfx acks it at once, whatever
+  // its agents are named (RecoveryAckedFirstTime).
+  for (const name of ["default", "ops"]) {
+    test(`a World that recovers its runs at startup hands ${name === "default" ? "an agent with no name" : "a named agent"} its session back, acks it once, and the session goes on`, async () => {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-core-recovery-"));
+      dirs.push(dir);
+      const named = name === "default" ? {} : { name };
+      const before = createAgent({ durability: await durabilityAt(dir), ...named });
+      const session = before.session();
+      assert.equal((await session.prompt("alpha", { messageId: "turn-a" }).result).stopReason, "end_turn");
+      await before.close();
+      const restarted = await restartedWorldAt(dir);
+      try {
+        const after = createAgent({ durability: restarted.durability, ...named });
+        // It takes the World's deliveries before the World starts.
+        await after.newSessionId();
+        await restarted.start();
+        const ofSession = () => restarted.deliveries.filter((delivery) => delivery.runId === session.id);
+        for (let waited = 0; ofSession().length === 0 && waited < 5000; waited += 20) await sleep(20);
+        assert.deepEqual(await restarted.run(session.id), { status: "running", namespace: "libfx" }, "the session's run is not failed");
+        // world-local delivers a refused message again 5 s later.
+        assert.deepEqual(ofSession().map(({ consumer, attempt, status }) => ({ consumer, attempt, status })), [{ consumer: "libfx", attempt: 1, status: 200 }], "libfx's route took the session's run and acked it");
+        const { text, result } = await textOf(after.session(session.id).prompt("beta", { messageId: "turn-b" }));
+        assert.equal(result.stopReason, "end_turn");
+        assert.equal(text, "beta-0 beta-1 beta-2");
+        assert.deepEqual(JSON.parse(decoder.decode(await after.session(session.id).checkpoint())), ["alpha-0", "alpha-1", "alpha-2", "beta-0", "beta-1", "beta-2"]);
+        await after.close();
+      } finally {
+        await restarted.close();
+      }
+    });
+  }
+
+  // The same for a World that delivers over HTTP, to the route the app
+  // mounts: Workflow's Postgres World recovers its runs too.
+  test("a route acks a recovery message, which carries no prompt, at once, whatever its agents are named", async () => {
+    const { createWorld } = await import(new URL("../durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-recovery-route-"));
+    dirs.push(dir);
+    const stored = createWorld({ dataDir: dir, recoverActiveRuns: false });
+    await stored.start();
+    const instance = {
+      ...stored,
+      registerHandler: undefined,
+      queue: async () => ({ messageId: "msg_route" }),
+      createQueueHandler: (_prefix, handler) => async (request) => {
+        try {
+          await handler(await request.json(), { queueName: "__libfx_wkf_workflow_libfx/session", messageId: "msg_recovery", attempt: 1 });
+          return new Response("ok");
+        } catch (error) {
+          return Response.json({ code: error?.code }, { status: 500 });
+        }
+      },
+    };
+    const ops = createAgent({ durability: world(instance, { name: "route", queueDurable: true }), name: "ops" });
+    try {
+      await ops.newSessionId();
+      const response = await ops.wakeHandler()(new Request("https://app.example/wake", { method: "POST", body: JSON.stringify({ runId: await ops.newSessionId() }) }));
+      assert.equal(response.status, 200, `the route acked the message: ${await response.clone().text()}`);
+    } finally {
+      await ops.close();
+      await stored.close();
+    }
   });
 }
 

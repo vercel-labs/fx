@@ -706,7 +706,20 @@ const uiStreamOf = (runId) => `${runId.replace(/^wrun_/, "strm_")}_user_bGliZngt
 // The stream that holds an image, named as the UI stream is, with the
 // namespace "libfx-image-" and the image's name.
 const imageStreamOf = (runId, name) => `${runId.replace(/^wrun_/, "strm_")}_user_${base64url(`libfx-image-${name}`)}`;
-const queuePrefix = "__libfx_wkf_workflow_";
+// libfx's queue namespace. A World names a namespace's queue
+// `__<namespace>_wkf_workflow_`, and each session's run records the
+// namespace when libfx creates it, so a World that queues its active runs
+// again as it starts sends a session back to libfx's queue, not to the
+// Workflow SDK's, which fails a run whose workflow it lacks
+// (`tests/tla/sdk/QueueRecovery.tla` LibfxRunsNotFailed).
+const queueNamespace = "libfx";
+const queuePrefix = `__${queueNamespace}_wkf_workflow_`;
+// Whether a queue message carries a libfx prompt. A World's recovery queues
+// `{ runId }` alone, which names no agent and runs nothing, so libfx's
+// routes ack it before they look for an agent: a process whose agents all
+// have names would refuse it, and the World would deliver it again and
+// again (`tests/tla/sdk/QueueRecovery.tla` RecoveryAckedFirstTime).
+const carriesPrompt = (message) => message?.input !== null && typeof message?.input === "object";
 // The name of an agent created without one, and of whatever a message or a
 // session from before names belonged to.
 const defaultAgentName = "default";
@@ -995,8 +1008,8 @@ function createWorldBackend(world, durability) {
   });
   // `meta` says which queue message this is and which delivery of it.
   const deliverTo = async (handle, message, meta) => {
-    const input = message?.input;
-    if (!input || typeof input !== "object") return undefined;
+    if (!carriesPrompt(message)) return undefined;
+    const input = message.input;
     if (!handle) {
       // A World libfx created closes with its agent. The app's own World
       // outlives it, so its queue keeps the message for the next agent.
@@ -1014,6 +1027,7 @@ function createWorldBackend(world, durability) {
   // message names, on the store it names, whichever agent's route it is. A
   // message from before stores were named is for this World's store.
   const queueHandler = world.createQueueHandler(queuePrefix, async (message, meta) => {
+    if (!carriesPrompt(message)) return undefined;
     const named = agentOf(message?.input);
     const agent = await agentOnStore(named, typeof message?.input?.store === "string" ? message.input.store : store);
     if (!agent) throw noAgentNamed(named);
@@ -1124,7 +1138,7 @@ function createWorldBackend(world, durability) {
           const slot = slotWritten(await world.events.create(runId, {
             eventType: "run_created",
             ...spec,
-            eventData: { deploymentId, workflowName: "libfx/session", input: encoder.encode("{}") },
+            eventData: { deploymentId, workflowName: "libfx/session", input: encoder.encode("{}"), executionContext: { queueNamespace } },
           }));
           made = slot === firstEventSlot;
           passOver(slot);
@@ -1459,6 +1473,7 @@ function createWorldBackend(world, durability) {
         listeners = new Map();
         listenersOf.set(world, listeners);
         world.registerHandler(queuePrefix, world.createQueueHandler(queuePrefix, async (message, meta) => {
+          if (!carriesPrompt(message)) return undefined;
           const named = agentOf(message?.input);
           const group = listeners.get(named);
           if (group) return deliverTo(group.members[group.turn++ % group.members.length], message, meta);
