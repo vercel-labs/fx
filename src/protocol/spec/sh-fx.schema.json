@@ -31,7 +31,8 @@
         "sh.fx/logPosition": { "$ref": "#/$defs/Capability" },
         "sh.fx/sessionState": { "$ref": "#/$defs/Capability" },
         "sh.fx/listChanges": { "$ref": "#/$defs/Capability" },
-        "sh.fx/sessionClients": { "$ref": "#/$defs/Capability" }
+        "sh.fx/sessionClients": { "$ref": "#/$defs/Capability" },
+        "sh.fx/subagentPrompts": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -45,7 +46,8 @@
         "sh.fx/logPosition": { "$ref": "#/$defs/Capability" },
         "sh.fx/sessionState": { "$ref": "#/$defs/Capability" },
         "sh.fx/listChanges": { "$ref": "#/$defs/Capability" },
-        "sh.fx/sessionClients": { "$ref": "#/$defs/Capability" }
+        "sh.fx/sessionClients": { "$ref": "#/$defs/Capability" },
+        "sh.fx/subagentPrompts": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -131,6 +133,14 @@
         "clients": { "type": "array", "items": { "$ref": "#/$defs/SessionClient" } }
       },
       "required": ["sessionId", "clients"]
+    },
+    "SubagentPrompt": {
+      "description": "The value of sh.fx/prompt in the `_meta` of a child's `capabilities` in a `subagent_update`: the child accepts `session/prompt` from the client, with the deliveries listed, for a client that lists sh.fx/subagentPrompts.",
+      "type": "object",
+      "properties": {
+        "steer": { "$ref": "#/$defs/Capability" },
+        "queue": { "$ref": "#/$defs/Capability" }
+      }
     },
     "SessionState": {
       "description": "The value of sh.fx/state in the `_meta` of a `session/status` response and of a `session/list` row, and the `state` of a session state update: what the session is doing.",
