@@ -636,9 +636,11 @@ function createMemoryBackend({ maxDurationMs, reserveMs } = {}) {
             throw new FencedError(`another worker continued session ${id}`);
           }
           const cursor = String(session.entries.length + 1);
-          session.entries.push({ cursor, entry: structuredClone(entry) });
+          const stored = { cursor, entry: structuredClone(entry) };
+          session.entries.push(stored);
           if (chained) session.head = cursor;
-          for (const watcher of session.watchers) watcher();
+          // Each watcher hears of the entry as it lands, with the entry.
+          for (const watcher of session.watchers) watcher(stored);
           return cursor;
         },
         watch(fn) {
@@ -953,10 +955,70 @@ function createWorldBackend(world, durability) {
   const created = new Set();
   // Runs being created now: writes that go out together create a run once.
   const creating = new Map();
-  // Workers in this process hear about each other's entries at once; others
-  // poll.
+  // Workers in this process hear about each other's entries at once, each
+  // with the entry it wrote and its cursor; others poll.
   const watchers = new Map();
-  const changed = (runId) => { for (const watcher of watchers.get(runId) ?? []) watcher(); };
+  const changed = (runId, appended) => { for (const watcher of watchers.get(runId) ?? []) watcher(appended); };
+  // This process's writes to each run that took a slot and have not been
+  // heard of yet, and the inputs that landed meanwhile and wait for them.
+  const writing = new Map();
+  const writingTo = (runId) => {
+    let writes = writing.get(runId);
+    if (!writes) writing.set(runId, writes = { inFlight: 0, waiting: new Set() });
+    return writes;
+  };
+  const writeEvent = async (runId, event, options) => {
+    const writes = writingTo(runId);
+    writes.inFlight += 1;
+    try {
+      return await world.events.create(runId, event, options);
+    } catch (error) {
+      writes.inFlight -= 1;
+      hearAll(runId, writes);
+      throw error;
+    }
+  };
+  // Once none of this process's writes to the run is in flight, the inputs
+  // that waited, and `appended`, are heard of in slot order.
+  const hearAll = (runId, writes, appended = null) => {
+    if (writes.inFlight > 0) return;
+    const waited = [...writes.waiting];
+    writing.delete(runId);
+    const ready = [...waited.map((waiter) => waiter.appended), ...(appended ? [appended] : [])];
+    ready.sort((a, b) => Number(a.cursor) - Number(b.cursor));
+    for (const waiter of waited) clearTimeout(waiter.timer);
+    for (const item of ready) {
+      try { changed(runId, item); } catch {}
+    }
+    for (const waiter of waited) waiter.wake();
+  };
+  // An entry this process wrote landed at its slot. Its watchers hear of it
+  // at once, unless it is an input that landed while another write of this
+  // process to the run is in flight: a write that took the slot before it
+  // can land after it, and the running turn's worker would then see an entry
+  // before the input unread and leave the input to a read. The input waits
+  // for those writes, at most the poll interval, so the watchers hear of
+  // them in slot order and the input is handed over before its sender hears
+  // it was stored (`tests/tla/sdk/DurableSteer.tla` SlotOrder). The worker's
+  // own records never wait. Returns a promise only when the input waits.
+  const landed = (runId, appended) => {
+    const writes = writingTo(runId);
+    writes.inFlight -= 1;
+    if (writes.inFlight === 0) return hearAll(runId, writes, appended);
+    if (appended.entry?.k !== "input") {
+      changed(runId, appended);
+      return undefined;
+    }
+    return new Promise((wake) => {
+      const waiter = { appended, wake, timer: null };
+      waiter.timer = setTimeout(() => {
+        writes.waiting.delete(waiter);
+        try { changed(runId, appended); } catch {}
+        wake();
+      }, pollMs ?? 1000);
+      writes.waiting.add(waiter);
+    });
+  };
   // Each run's log as this process last read it: the entries read() returned,
   // the newest slot seen, and the checkpoint's `through` they start after.
   // The log only appends, so a later read lists only slots after `known`.
@@ -1279,7 +1341,7 @@ function createWorldBackend(world, durability) {
           let result;
           for (let recounted = false; ;) {
             try {
-              result = await world.events.create(runId, event, expected === undefined ? { eventCount: after } : { eventCount: after, inBand: true, expectedSeqInBand: expected });
+              result = await writeEvent(runId, event, expected === undefined ? { eventCount: after } : { eventCount: after, inBand: true, expectedSeqInBand: expected });
               break;
             } catch (error) {
               if (expected === undefined) throw error;
@@ -1314,7 +1376,8 @@ function createWorldBackend(world, durability) {
           const slot = slotOf(result.event);
           if (slot > known) known = slot;
           if (expected !== undefined && result.allocated !== undefined) noteInBand(String(slot), expected + result.allocated);
-          changed(runId);
+          const waiting = landed(runId, { cursor: String(slot), entry: structuredClone(entry) });
+          if (waiting) await waiting;
           if (!chained || slot === after + 1) return String(slot);
           const reported = Array.isArray(result.events) ? result.events : (await newestFirst(after, false)).events.map((item) => ({ eventId: `evnt_${String(item.cursor).padStart(26, "0")}`, ...item }));
           for (const event of reported) {
@@ -2383,6 +2446,14 @@ class SessionWorker {
       if (!joinable(steer.input)) endTurn();
       else if (!ending) void turn.steer(steer.input, steer.messageId).catch(() => {});
     };
+    // What one stored input does to the turn, once: a steer joins it or ends
+    // it, and its cancel cancels it.
+    const take = (entry) => {
+      if (entry?.k !== "input" || applied.has(entry.key)) return;
+      applied.add(entry.key);
+      if (entry.type === "steer") steerTurn(entry);
+      else if (entry.type === "cancel" && (entry.target === undefined || entry.target === messageId)) turn.cancel();
+    };
     const apply = async () => {
       if (stopped) return;
       if (polling) { again = true; return; }
@@ -2393,15 +2464,30 @@ class SessionWorker {
           const entries = await log.readSince(since);
           for (const { cursor, entry } of entries) {
             if (Number(cursor) > Number(since)) since = cursor;
-            if (entry?.k !== "input" || applied.has(entry.key)) continue;
-            applied.add(entry.key);
-            if (entry.type === "steer") steerTurn(entry);
-            else if (entry.type === "cancel" && (entry.target === undefined || entry.target === messageId)) turn.cancel();
+            take(entry);
           }
         } while (again && !stopped);
       } catch {} finally {
         polling = false;
       }
+    };
+    // An entry this process appends reaches the turn as it lands, before its
+    // writer hears it was stored, so a tool that returns after that finds the
+    // steer waiting (`tests/tla/sdk/DurableSteer.tla` SteerJoinsToolResult).
+    // Only when the worker has read every entry before it: one stored behind
+    // an entry the worker has not read, such as another process's, waits for
+    // the read, so the turn takes inputs in the order the log stored them
+    // (AdmissionOrder). Each append still starts a read, as before, for what
+    // other processes stored. The append that stored the entry calls this,
+    // so nothing here may make that append fail.
+    const handOver = (appended) => {
+      try {
+        if (!stopped && appended && Number(appended.cursor) === Number(since) + 1) {
+          since = appended.cursor;
+          take(appended.entry);
+        }
+      } catch {}
+      void apply();
     };
     for (const steer of state.steers) {
       applied.add(steer.key);
@@ -2411,7 +2497,7 @@ class SessionWorker {
     // An open turn whose engine kept stopping is cancelled the way a user
     // would, so the prompts behind it can run.
     if (state.cancelOpen || (state.stuck && state.openTurn?.id === messageId)) turn.cancel();
-    const unwatch = log.watch?.(() => { void apply(); });
+    const unwatch = log.watch?.(handOver);
     const timer = this.backend.pollMs ? setInterval(() => { void apply(); }, this.backend.pollMs) : null;
     void apply();
     let result;

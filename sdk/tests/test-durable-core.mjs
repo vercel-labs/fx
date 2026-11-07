@@ -441,6 +441,211 @@ function holdStep(word) {
 // How long a test waits for a cancel to reach the log.
 const landMs = durabilityKind === "memory" ? 50 : 400;
 
+// Agents whose turns record the id of each steer handed to them, as it
+// reaches the turn. A turn throws at once for a steer whose id ends in
+// `-throws`, as an engine that is shutting down can.
+const handed = [];
+const createSteeredAgent = createDurableAgentFactory({
+  harness: () => {
+    const plugged = scriptedHarness()();
+    const recording = (turn) => ({
+      ...turn,
+      steer(_input, id) {
+        if (id.endsWith("-throws")) throw new Error("the engine is shutting down");
+        handed.push(id);
+        return Promise.resolve();
+      },
+    });
+    return {
+      async open(args) {
+        const engine = await plugged.open(args);
+        return new Proxy(engine, {
+          get(target, key) {
+            const value = Reflect.get(target, key);
+            return key === "prompt" || key === "resume" ? (...callArgs) => recording(value.apply(target, callArgs)) : value;
+          },
+        });
+      },
+    };
+  },
+  defaultDurability: async () => memory(),
+  name: "createSteeredAgent",
+});
+// A durability whose running workers never read the log on their timer
+// during a test, so a steer reaches a turn only when the log hands it over
+// or a read an append starts brings it.
+const unpolled = (durability) => ({ ...durability, pollMs: 3_600_000 });
+const steersHanded = (prefix) => handed.filter((id) => id.startsWith(prefix));
+// A World durability whose log reads each take `readMs` longer, and whose
+// record writes can be held: after `holdRecord()`, the next record takes its
+// slot and lands only once the test lets it go. A memory() durability has no
+// World and is returned as it is.
+function pacedWorld(base, { readMs = 0 } = {}) {
+  if (typeof base.world !== "function") return [base, null];
+  const pace = { hold: null };
+  const durability = {
+    ...base,
+    world: async () => {
+      const world = await base.world();
+      const list = world.events.list.bind(world.events);
+      const create = world.events.create.bind(world.events);
+      const events = Object.assign(Object.create(world.events), {
+        async list(...listArgs) {
+          if (readMs > 0) await sleep(readMs);
+          return list(...listArgs);
+        },
+        async create(runId, event, ...rest) {
+          const result = await create(runId, event, ...rest);
+          const hold = pace.hold;
+          if (hold && event?.eventType === "step_created" && JSON.parse(decoder.decode(event.eventData.input)).k === "record") {
+            pace.hold = null;
+            hold.taken();
+            await hold.released;
+          }
+          return result;
+        },
+      });
+      return Object.assign(Object.create(world), { events });
+    },
+  };
+  const holdRecord = () => {
+    const hold = {};
+    hold.released = new Promise((go) => { hold.release = go; });
+    const slotTaken = new Promise((go) => { hold.taken = go; });
+    pace.hold = hold;
+    return { slotTaken, release: () => hold.release() };
+  };
+  return [durability, holdRecord];
+}
+
+// `tests/tla/sdk/DurableSteer.tla` SteerJoinsToolResult: a steer this
+// server stores reaches its running turn before steer() resolves, so a tool
+// that returns right after finds it waiting. The worker's reads are slow,
+// so a steer that lands while the read the last one started is still under
+// way finds the worker's read position moved past the last one only when the
+// hand-over moved it.
+test("a steer this server stores while a turn runs reaches the turn before steer() resolves", async () => {
+  const [durability] = pacedWorld(await durabilityFor(), { readMs: 150 });
+  const agent = createSteeredAgent({ durability: unpolled(durability) });
+  const session = agent.session();
+  const held = holdStep("handover-1");
+  const turn = session.prompt("handover", { messageId: "handover-turn" });
+  await held.holding;
+  // The worker has read what the turn's start wrote.
+  await sleep(durabilityKind === "memory" ? 200 : 900);
+  for (const id of ["handover-a", "handover-b", "handover-c"]) {
+    await session.steer(`guide ${id}`, { messageId: id });
+    assert.ok(handed.includes(id), `${id} reached the running turn before steer() resolved`);
+  }
+  // Two steers sent together each reach the turn before their steer() resolves.
+  const pair = ["handover-d", "handover-e"];
+  await Promise.all(pair.map(async (id) => {
+    await session.steer(`guide ${id}`, { messageId: id });
+    assert.ok(handed.includes(id), `${id}, sent with another, reached the running turn before steer() resolved`);
+  }));
+  // Sent again with its id, a steer reaches the turn once.
+  await session.steer("guide handover-a", { messageId: "handover-a" });
+  // A turn that throws as a steer reaches it does not fail the steer's store.
+  assert.deepEqual(await session.steer("guide anyway", { messageId: "handover-throws" }), { messageId: "handover-throws" });
+  held.release();
+  const { result } = await textOf(turn);
+  assert.equal(result.stopReason, "end_turn");
+  const taken = steersHanded("handover-");
+  assert.deepEqual(taken.slice(0, 3), ["handover-a", "handover-b", "handover-c"], "the steers sent one at a time reached the turn in the order they were stored");
+  assert.deepEqual([...taken.slice(3)].sort(), pair, "each steer reached the turn once");
+  await agent.close();
+});
+
+if (durabilityKind !== "memory") {
+  // `tests/tla/sdk/DurableSteer.tla` SlotOrder: a steer that lands while a
+  // record this server writes has its slot and has not landed waits for the
+  // record, so the worker hears of both in slot order and takes the steer as
+  // handed over, before steer() resolves.
+  test("a steer stored while this server's own record is still landing reaches the turn before steer() resolves", async () => {
+    const [durability, holdRecord] = pacedWorld(await durabilityFor());
+    const agent = createSteeredAgent({ durability: unpolled(durability) });
+    const session = agent.session();
+    const held = holdStep("landing-1");
+    const turn = session.prompt("landing", { messageId: "landing-turn" });
+    await held.holding;
+    await sleep(200);
+    // The record of step 1 takes its slot and lands only when let go.
+    const record = holdRecord();
+    held.release();
+    await record.slotTaken;
+    let resolved = false;
+    const steered = session.steer("guide landing-a", { messageId: "landing-a" }).then(() => { resolved = true; });
+    await sleep(300);
+    assert.equal(resolved, false, "steer() waits for the record that took the slot before it");
+    record.release();
+    await steered;
+    assert.deepEqual(steersHanded("landing-"), ["landing-a"], "the steer reached the running turn before steer() resolved");
+    const { result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    await agent.close();
+  });
+
+  // The wait ends at the poll interval: a record that does not land by then
+  // holds steer() no longer, and the steer reaches the turn on a read.
+  test("a steer whose record before it does not land within the poll interval resolves anyway, and the worker reads it", async () => {
+    const [durability, holdRecord] = pacedWorld(await durabilityFor());
+    const pollMs = 200;
+    const agent = createSteeredAgent({ durability: { ...durability, pollMs } });
+    const session = agent.session();
+    const held = holdStep("tardy-1");
+    const turn = session.prompt("tardy", { messageId: "tardy-turn" });
+    await held.holding;
+    await sleep(300);
+    const record = holdRecord();
+    held.release();
+    await record.slotTaken;
+    const started = Date.now();
+    await session.steer("guide tardy-a", { messageId: "tardy-a" });
+    const waited = Date.now() - started;
+    assert.ok(waited < pollMs * 4, `steer() waited ${waited} ms, longer than the poll interval allows`);
+    record.release();
+    for (let tries = 0; !handed.includes("tardy-a"); tries += 1) {
+      assert.ok(tries < 300, "the worker never read the steer");
+      await sleep(10);
+    }
+    assert.ok(waited >= pollMs * 0.75, `steer() returned after ${waited} ms, before the poll interval, while the record was still landing`);
+    const { result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    await agent.close();
+  });
+}
+
+if (durabilityKind !== "memory") {
+  // `tests/tla/sdk/DurableSteer.tla` AdmissionOrder: a steer stored behind
+  // one the worker has not read waits for the read, so the turn takes both
+  // in the order the log stored them.
+  test("a steer another server stored first reaches the running turn first", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-steer-order-"));
+    dirs.push(dir);
+    const agent = createSteeredAgent({ durability: unpolled(await durabilityAt(dir)) });
+    const other = createSteeredAgent({ durability: unpolled(await durabilityAt(dir)) });
+    const session = agent.session();
+    const held = holdStep("ordered-1");
+    const turn = session.prompt("ordered", { messageId: "ordered-turn" });
+    await held.holding;
+    await sleep(200);
+    await other.session(session.id).steer("from the other server", { messageId: "ordered-there" });
+    await sleep(300);
+    assert.deepEqual(steersHanded("ordered-"), [], "the worker has not read the other server's steer");
+    await session.steer("from this server", { messageId: "ordered-here" });
+    for (let tries = 0; !handed.includes("ordered-here"); tries += 1) {
+      assert.ok(tries < 300, "the steer stored here never reached the turn");
+      await sleep(10);
+    }
+    assert.deepEqual(steersHanded("ordered-"), ["ordered-there", "ordered-here"], "the turn took the steers in the order the log stored them");
+    held.release();
+    const { result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    await agent.close();
+    await other.close();
+  });
+}
+
 test("a turn that ends before writing a record runs once, and the session goes on", async () => {
   const agent = createAgent({ durability: await durabilityFor() });
   const session = agent.session();

@@ -1008,6 +1008,28 @@ test("a steer reaches the running turn at its next model request", async () => {
   await agent.close();
 });
 
+// A steer this process stores reaches the running turn as it lands, so a
+// tool that returns the moment steer() resolves still finds it waiting
+// (`tests/tla/sdk/DurableSteer.tla` SteerJoinsToolResult).
+test("a steer sent while a tool runs is in the request with the tool's result, however soon the tool returns", async () => {
+  const agent = createFxAgent(agentOptions(await durabilityFor()));
+  const session = agent.session();
+  for (let round = 0; round < 20; round += 1) {
+    const held = gate("lookup");
+    const turn = session.prompt(`use lookup in round ${round}`);
+    await held.started;
+    await session.steer(`and say round ${round}`);
+    const withResult = requests.length;
+    held.open();
+    gates.delete("lookup");
+    const { result } = await collect(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.ok(toolResults(requests[withResult] ?? []).length > 0, `round ${round}: request ${withResult} carried the tool's result`);
+    assert.ok(userTexts(requests[withResult]).some((text) => text.includes(`and say round ${round}`)), `round ${round}: the request with the tool's result carried the steer`);
+  }
+  await agent.close();
+});
+
 // The session's lines from the start until `done` holds for one of them.
 async function linesUntil(session, done, label, ms = 15_000 * timeScale) {
   const reader = session.stream(0).getReader();
