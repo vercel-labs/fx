@@ -6,18 +6,26 @@
 // chunks, a finished choice, usage trailers, and an end ([DONE], a clean
 // close, or a close inside an unterminated last event). A chunk's model may be
 // absent, empty, or one of two names, and its delta may carry an empty or a
-// populated legacy function_call. The driver runs a named list of edge cases,
-// then --random seeded replies. Wire details the model treats as the same,
-// such as an omitted or null finish_reason and the shape of an empty
-// function_call, are drawn from the seed too.
+// populated legacy function_call. A chunk's usage is the model's count n:
+// {prompt_tokens: 12, completion_tokens: n, total_tokens: 12 + n}. Where the
+// model drops a count, on a chunk with a choice whose n is below the largest
+// count so far, the wire may instead be Cloudflare's per-chunk delta, with
+// prompt_tokens 0 and a completion count that may even rise. The driver runs a
+// named list of edge cases, then --random seeded replies. Wire details the
+// model treats as the same, such as an omitted or null finish_reason, the
+// shape of an empty function_call, and the shape of a dropped count, are drawn
+// from the seed too.
 //
 // For each run it records the events sent, whether fx completed the reply
-// (exit 0) or failed it, and the error fx named. When fx completes a reply
-// with a tool call it runs the tool and asks again; the server answers that
-// with plain text. TLC replays every run through the model's own actions.
-// --self-check also replays them through the model of fx before the change
-// (Bug = "today"), which must reject them. --bug NAME checks them against
-// another of the model's Bug values instead of the design.
+// (exit 0) or failed it, the error fx named, and the completion tokens fx
+// reported. When fx completes a reply with a tool call it runs the tool and
+// asks again; the server answers that with plain text and no usage. TLC
+// replays every run through the model's own actions, and a completed reply
+// must report the count the model kept. --self-check also replays them
+// through the model of fx before the change (Bug = "today"), which must
+// reject them. --bug NAME checks them against another of the model's Bug
+// values instead of the design; on fx just before the usage change, use
+// --bug old_usage.
 //
 // Every fx process runs under `env -i` with each variable written out: a
 // temporary HOME and FX_HOME, FX_DISABLE_KEYCHAIN=1, FX_SOUND=0, a fake key,
@@ -40,7 +48,8 @@ import { TLA_ROOT, outDir, tlcToolchain, writeJson } from "../lib/tlc";
 type Choice = "none" | "empty" | "content" | "call" | "stop" | "tools";
 type Model = "absent" | "empty" | "a" | "b";
 type LegacyCall = "none" | "empty" | "full";
-type Chunk = { kind: "chunk"; choice: Choice; model: Model; fc: LegacyCall; usage: boolean };
+// `usage` is the model's count, 0 for a chunk without usage.
+type Chunk = { kind: "chunk"; choice: Choice; model: Model; fc: LegacyCall; usage: number };
 type End = { kind: "done" | "eof" | "cut" };
 type Event = Chunk | End;
 type Outcome = "completed" | "failed" | "unknown";
@@ -49,16 +58,18 @@ type Observation = {
   events: Event[];
   outcome: Outcome;
   error: string;
-  evidence: { exit: number; requests: number; paths: string[]; final_output: string; tail: string; seed: number };
+  usage: number;
+  evidence: { exit: number; requests: number; paths: string[]; final_output: string; reported: unknown; tail: string; seed: number };
 };
 type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 
 const tlaDir = join(TLA_ROOT, "chat_completions");
 const MODEL = "local-model";
 const NAMES: Record<Model, string | null> = { absent: null, empty: "", a: "served-model-a", b: "served-model-b" };
-const USAGE = { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 };
-const BUGS = ["none", "today", "old_model", "old_function_call", "old_eof", "old_reason",
-  "eof_any_phase", "skip_models", "accept_call", "late_content", "no_usage", "skip_tools"];
+const PROMPT_TOKENS = 12;
+const BUGS = ["none", "today", "old_usage", "old_model", "old_function_call", "old_eof", "old_reason",
+  "old_progress", "old_finish", "eof_any_phase", "skip_models", "accept_call", "late_content", "no_usage",
+  "skip_tools", "lax_final", "skip_progress"];
 
 function option(name: string, fallback: number): number {
   const at = process.argv.indexOf(name);
@@ -104,8 +115,10 @@ function pick<T>(next: () => number, weighted: Array<[T, number]>): T {
   return weighted.at(-1)![0];
 }
 
-const c = (choice: Choice, model: Model = "absent", fc: LegacyCall = "none", usage = false): Chunk =>
+const c = (choice: Choice, model: Model = "absent", fc: LegacyCall = "none", usage = 0): Chunk =>
   ({ kind: "chunk", choice, model, fc, usage });
+// A chunk with no model or function_call that reports usage count n.
+const u = (choice: Choice, n: number): Chunk => c(choice, "absent", "none", n);
 const done: End = { kind: "done" };
 const eof: End = { kind: "eof" };
 const cut: End = { kind: "cut" };
@@ -115,41 +128,67 @@ const opening = c("content");
 
 // The edge cases the examiner reports name, one reply each.
 const EDGES: Event[][] = [
-  [c("content", "empty"), c("stop", "empty"), c("none", "empty", "none", true), done],
-  [c("content", "empty"), c("content", "a"), c("stop", "empty"), c("none", "empty", "none", true), done],
+  [c("content", "empty"), c("stop", "empty"), c("none", "empty", "none", 1), done],
+  [c("content", "empty"), c("content", "a"), c("stop", "empty"), c("none", "empty", "none", 1), done],
   [c("content", "a"), c("stop", "b"), done],
-  [c("content", "a"), c("stop", "a", "empty", true), done],
+  [c("content", "a"), c("stop", "a", "empty", 1), done],
   [c("empty", "absent", "empty"), c("stop"), done],
   [c("stop", "absent", "full"), done],
   [c("call", "absent", "full"), c("tools"), done],
-  [c("stop"), c("stop", "absent", "empty", true), done],
-  [c("stop"), c("empty", "absent", "full", true), done],
+  [c("stop"), c("stop", "absent", "empty", 1), done],
+  [c("stop"), c("empty", "absent", "full", 1), done],
   [c("stop"), eof],
-  [c("stop"), c("none", "absent", "none", true), eof],
+  [c("stop"), u("none", 1), eof],
   [c("stop"), cut],
-  [c("stop"), c("none", "absent", "none", true), cut],
+  [c("stop"), u("none", 1), cut],
   [eof],
   [cut],
   [done],
-  [c("stop"), c("empty", "absent", "none", true), done],
-  [c("stop"), c("empty", "absent", "none", true), eof],
+  [c("stop"), u("empty", 1), done],
+  [c("stop"), u("empty", 1), eof],
   [c("stop"), c("empty"), done],
-  [c("stop"), c("content", "absent", "none", true), done],
-  [c("stop"), c("tools", "absent", "none", true), done],
+  [c("stop"), u("content", 1), done],
+  [c("stop"), u("tools", 1), done],
   [c("call"), c("tools"), eof],
-  [c("call"), c("tools"), c("empty", "absent", "none", true), eof],
+  [c("call"), c("tools"), u("empty", 1), eof],
   [c("call"), eof],
   [c("call"), cut],
   [c("call"), c("stop"), done],
   [c("tools"), done],
-  [c("none", "absent", "none", true), c("stop"), done],
-  [c("content", "empty"), c("stop", "empty", "empty"), c("empty", "empty", "none", true), eof],
+  [u("none", 1), c("stop"), done],
+  [c("content", "empty"), c("stop", "empty", "empty"), c("empty", "empty", "none", 1), eof],
+  // Usage. Per-chunk counts that fall, one on the finish chunk too, before a
+  // cumulative trailer of either shape (PR #1203).
+  [u("content", 2), u("empty", 1), u("stop", 1), u("none", 2), done],
+  [u("content", 2), u("empty", 1), u("stop", 1), u("stop", 2), done],
+  // The examiner's delta_usage reply: a finish chunk without usage.
+  [u("content", 2), u("content", 1), c("stop"), u("none", 2), done],
+  // No trailer: fx records the largest count it kept.
+  [u("content", 2), u("content", 1), u("stop", 1), done],
+  [u("content", 2), u("content", 1), u("stop", 1), eof],
+  [u("content", 1), u("content", 2), c("stop"), eof],
+  // An equal count is kept; the trailer may match it.
+  [u("content", 1), u("content", 1), c("stop"), u("none", 1), done],
+  // A finish chunk's count is provisional, so a larger trailer replaces it.
+  [u("stop", 1), u("none", 2), done],
+  // Final counts stay strict: below a provisional count, or unlike the first.
+  [u("content", 2), c("stop"), u("none", 1), done],
+  [u("content", 2), u("stop", 1), u("empty", 1), done],
+  [c("stop"), u("none", 2), u("none", 1), done],
+  [c("stop"), u("none", 1), u("none", 2), done],
+  [c("stop"), u("none", 1), u("stop", 2), eof],
+  // A dropped count with a tool call, and cuts right after a dropped count.
+  [u("call", 2), u("tools", 1), u("none", 2), done],
+  [u("content", 2), u("content", 1), cut],
+  [u("content", 2), u("call", 1), eof],
+  [u("content", 2), u("stop", 1), u("none", 2), cut],
 ];
 
 function randomReply(next: () => number): Event[] {
   const model = (): Model => pick(next, [["absent", 4], ["empty", 3], ["a", 2.5], ["b", 0.5]]);
   const fc = (): LegacyCall => pick(next, [["none", 7], ["empty", 2.5], ["full", 0.5]]);
-  const usage = () => next() < 0.4;
+  const usage = () => pick(next, [[0, 6], [1, 2], [2, 2]]);
+  const final = () => pick(next, [[0, 2], [1, 4], [2, 4]]);
   const events: Event[] = [];
   const body = Math.floor(next() * 3);
   for (let n = 0; n < body; n++) {
@@ -160,7 +199,7 @@ function randomReply(next: () => number): Event[] {
     const trailers = Math.floor(next() * 3);
     for (let n = 0; n < trailers; n++) {
       events.push(c(pick(next, [["none", 4], ["empty", 3], ["stop", 1.5], ["tools", 0.5], ["content", 0.5], ["call", 0.5]]),
-        model(), fc(), next() < 0.8));
+        model(), fc(), final()));
     }
   }
   events.push(pick(next, [[done, 4], [eof, 4], [cut, 2]]));
@@ -177,6 +216,22 @@ function replies(): Event[][] {
 // The wire form of one reply. `next` draws the details the model ignores.
 function wire(events: Event[], next: () => number): string {
   let sawCall = false;
+  // The largest count on a chunk with a choice so far, and whether the
+  // finished choice has gone out: after it every chunk is a trailer.
+  let kept = 0;
+  let finished = false;
+  const usageFor = (event: Chunk) => {
+    const n = event.usage;
+    const provisional = !finished && event.choice !== "none";
+    if (provisional && n < kept && next() < 0.5) {
+      // Cloudflare's per-chunk delta: no prompt tokens, and a completion
+      // count that may rise while the prompt count falls.
+      const completion = pick(next, [[n, 1], [kept + 1, 1]]);
+      return { prompt_tokens: 0, completion_tokens: completion, total_tokens: completion };
+    }
+    if (provisional) kept = Math.max(kept, n);
+    return { prompt_tokens: PROMPT_TOKENS, completion_tokens: n, total_tokens: PROMPT_TOKENS + n };
+  };
   const frames: string[] = [];
   events.forEach((event, index) => {
     if (event.kind === "done") return frames.push("data: [DONE]\n\n");
@@ -207,7 +262,8 @@ function wire(events: Event[], next: () => number): string {
       else if (next() < 0.5) choice.finish_reason = null;
       chunk.choices = [choice];
     }
-    if (event.usage) chunk.usage = USAGE;
+    if (event.usage > 0) chunk.usage = usageFor(event);
+    if (event.choice === "stop" || event.choice === "tools") finished = true;
     frames.push(`data: ${JSON.stringify(chunk)}\n\n`);
   });
   return frames.join("");
@@ -282,7 +338,7 @@ async function runReply(id: string, events: Event[], seed: number, scratch: stri
       child.exited,
     ]);
     clearTimeout(timer);
-    let parsed: { final_output?: unknown; error?: unknown } = {};
+    let parsed: { final_output?: unknown; error?: unknown; usage?: { output_tokens?: unknown } } = {};
     try {
       parsed = JSON.parse(stdout.trim());
     } catch {
@@ -291,8 +347,12 @@ async function runReply(id: string, events: Event[], seed: number, scratch: stri
     const chats = paths.filter((path) => path === "/v1/chat/completions").length;
     let outcome: Outcome = "unknown";
     let error = "none";
-    if (exit === 0 && typeof parsed.final_output === "string") outcome = "completed";
-    else if (exit === 1 && typeof parsed.error === "string" && chats === 1) {
+    // fx adds every step's usage and prints null for a count no step reported.
+    const reported = parsed.usage?.output_tokens;
+    const usage = typeof reported === "number" ? reported : 0;
+    if (exit === 0 && typeof parsed.final_output === "string" && (reported === null || typeof reported === "number")) {
+      outcome = "completed";
+    } else if (exit === 1 && typeof parsed.error === "string" && chats === 1) {
       outcome = "failed";
       error = parsed.error;
     }
@@ -301,11 +361,13 @@ async function runReply(id: string, events: Event[], seed: number, scratch: stri
       events,
       outcome,
       error,
+      usage,
       evidence: {
         exit,
         requests: chats,
         paths,
         final_output: String(parsed.final_output ?? ""),
+        reported: parsed.usage ?? null,
         tail: `${stdout}\n${stderr}`.slice(-400),
         seed,
       },
@@ -318,12 +380,12 @@ async function runReply(id: string, events: Event[], seed: number, scratch: stri
 
 const str = (value: string) => JSON.stringify(value);
 const tlaEvent = (event: Event) => event.kind === "chunk"
-  ? `[kind |-> "chunk", choice |-> ${str(event.choice)}, model |-> ${str(event.model)}, fc |-> ${str(event.fc)}, usage |-> ${event.usage ? "TRUE" : "FALSE"}]`
-  : `[kind |-> ${str(event.kind)}, choice |-> "none", model |-> "absent", fc |-> "none", usage |-> FALSE]`;
+  ? `[kind |-> "chunk", choice |-> ${str(event.choice)}, model |-> ${str(event.model)}, fc |-> ${str(event.fc)}, usage |-> ${event.usage}]`
+  : `[kind |-> ${str(event.kind)}, choice |-> "none", model |-> "absent", fc |-> "none", usage |-> 0]`;
 
 function observedModule(observations: Observation[]): string {
   const value = (o: Observation) =>
-    `[events |-> <<${o.events.map(tlaEvent).join(", ")}>>, outcome |-> ${str(o.outcome)}, error |-> ${str(o.error)}]`;
+    `[events |-> <<${o.events.map(tlaEvent).join(", ")}>>, outcome |-> ${str(o.outcome)}, error |-> ${str(o.error)}, usage |-> ${o.usage}]`;
   return [
     "------------------------- MODULE ChatStreamObserved -------------------------",
     "(* Generated by tests/tla/drivers/chat_completions/driver.ts. Do not edit. *)",
