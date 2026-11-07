@@ -346,6 +346,16 @@ const AgentMessageKind = enum {
     operational,
 };
 
+/// The subagent a turn belongs to: its permission requests name it, are
+/// admitted only while the parent's prompt is open, and stop waiting when
+/// the subagent is stopped. Borrowed for the subagent's run.
+const SubagentAsker = struct {
+    child_id: []const u8,
+    work_id: []const u8,
+    name: ?[]const u8,
+    stop: *const std.atomic.Value(bool),
+};
+
 /// What a turn reads of the session's model route.
 const RouteView = struct {
     provider: model_provider.ProviderId,
@@ -449,6 +459,8 @@ const AcpContext = struct {
     /// never opened steering cancels nothing this way.
     saw_host_steering_open: bool = false,
     closed_host_steering: bool = false,
+    /// Set for a subagent's turn.
+    subagent: ?SubagentAsker = null,
     /// The MCP host a subagent's turn uses, read once with its mode under the
     /// authority lock, since a reload that keeps the subagent running may set
     /// the session's host. Null for a prompt's own context: a reload joins
@@ -1853,6 +1865,12 @@ pub fn runSubagentChild(
         .captured_permission_mode = admission.permission_mode,
         .captured_mcp_host = .{ .host = captured_host },
         .route = &route,
+        .subagent = .{
+            .child_id = turn.child_id orelse return error.ProviderFailed,
+            .work_id = turn.active_work_id orelse return error.ProviderFailed,
+            .name = turn.child_name,
+            .stop = cancel,
+        },
     };
     defer ctx.deinitPublishedToolCalls();
     var child_bridge: libfx_hooks.Bridge = undefined;
@@ -3019,7 +3037,10 @@ fn requestAcpPermission(
     try writeValidatedToolArguments(alloc, &validated_arguments.writer, call.arguments_json);
 
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const request_id = server.beginPermissionRequest(ctx.state) orelse return error.PermissionRequestAlreadyPending;
+    const request_id = if (ctx.subagent) |asker|
+        beginSubagentRequest(ctx.state, asker) orelse return permission_request.OwnedPermissionResponse.init(alloc, .deny, null)
+    else
+        server.beginPermissionRequest(ctx.state) orelse return error.PermissionRequestAlreadyPending;
     errdefer {
         server.cancelPermissionRequest(ctx.state, request_id);
         _ = server.awaitPermissionDecision(ctx.state, request_id);
@@ -3049,7 +3070,9 @@ fn requestAcpPermission(
     try writePermissionOption(&params.writer, "allow_always", "Allow for this session", "allow_always");
     try params.writer.writeByte(',');
     try writePermissionOption(&params.writer, "reject_once", "Reject", "reject_once");
-    try params.writer.writeAll("]}");
+    try params.writer.writeByte(']');
+    if (ctx.subagent) |asker| try writeSubagentMeta(&params.writer, asker);
+    try params.writer.writeByte('}');
 
     try ctx.state.writer.writeRequest(
         alloc,
@@ -3057,8 +3080,37 @@ fn requestAcpPermission(
         "session/request_permission",
         params.writer.buffered(),
     );
-    const decision = server.awaitPermissionDecision(ctx.state, request_id);
+    const decision = if (ctx.subagent) |asker|
+        server.awaitPermissionDecisionOrStop(ctx.state, request_id, asker.stop)
+    else
+        server.awaitPermissionDecision(ctx.state, request_id);
     return permission_request.OwnedPermissionResponse.init(alloc, decision, null);
+}
+
+/// A subagent's request id, or null when it is denied at once: the subagent
+/// was stopped, no prompt is open, or the registry is full.
+fn beginSubagentRequest(state: *server.ServerState, asker: SubagentAsker) ?u64 {
+    if (asker.stop.load(.seq_cst)) {
+        debug_trace.logf("acp", "subagent permission denied child_id={s} work_id={s} reason=stopped", .{ asker.child_id, asker.work_id });
+        return null;
+    }
+    return server.beginSubagentPermissionRequest(state) catch |err| {
+        debug_trace.logf("acp", "subagent permission denied child_id={s} work_id={s} reason={s}", .{ asker.child_id, asker.work_id, @errorName(err) });
+        return null;
+    };
+}
+
+/// `,"_meta":{"fx":{"subagent":{...}}}`: who asks, so a client can show it.
+fn writeSubagentMeta(writer: *std.Io.Writer, asker: SubagentAsker) !void {
+    try writer.writeAll(",\"_meta\":{\"fx\":{\"subagent\":{\"childId\":");
+    try jsonrpc.writeJsonStr(asker.child_id, writer);
+    try writer.writeAll(",\"workId\":");
+    try jsonrpc.writeJsonStr(asker.work_id, writer);
+    if (asker.name) |name| {
+        try writer.writeAll(",\"name\":");
+        try jsonrpc.writeJsonStr(name, writer);
+    }
+    try writer.writeAll("}}}");
 }
 
 fn writeValidatedToolArguments(alloc: Allocator, writer: *std.Io.Writer, arguments_json: []const u8) !void {

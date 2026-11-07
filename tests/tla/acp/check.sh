@@ -4,7 +4,10 @@
 #
 # AcpPermissionModes: the ACP permission-mode contract, which matches the CLI's
 # /permissions. AcpSpeed: the per-session Standard, Fast, and Ultrafast speed
-# contract. Both configs must pass.
+# contract. Both configs must pass. AcpChildApproval: how a subagent's
+# permission request reaches the client through its parent session. Its
+# design configs must pass; the code before it (MCAcpChildApprovalToday) and
+# two planted bugs must each break the property they name.
 #
 # AcpStopReasons: ACP v1 stop reasons for fx acp, fx's own names for libfx, and
 # a stop reason that agrees with what the next prompt holds, for every cause: a
@@ -25,6 +28,8 @@
 #   bun ../drivers/acp/speed/check-spec.ts
 #   bun ../drivers/acp/speed/driver.ts
 #   bun ../drivers/acp/conformance/driver.ts
+
+#   bun ../drivers/acp/child_approval/driver.ts
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 set -eu
@@ -65,4 +70,11 @@ AcpCommandOutput MCAcpCommandOutput -
 AcpCommandOutput MCAcpCommandOutputRaw ProgressValidUtf8
 AcpCommandOutput MCAcpCommandOutputSharedTail NothingLost
 AcpCommandOutput MCAcpCommandOutputNoFlush NothingLost
+
+AcpChildApproval MCAcpChildApproval -
+AcpChildApproval MCAcpChildApprovalAnswered -
+AcpChildApproval MCAcpChildApprovalNoHost -
+AcpChildApproval MCAcpChildApprovalToday temporal
+AcpChildApproval MCAcpChildApprovalSplitGate NoStrandedRequest
+AcpChildApproval MCAcpChildApprovalStopIgnored temporal
 EOF
