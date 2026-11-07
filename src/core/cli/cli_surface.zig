@@ -1212,6 +1212,8 @@ fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_pr
         error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first",
         error.AccessDenied, error.ChatGptAuthorizationFailed, error.GrokAuthorizationFailed => "authorization denied",
         error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run fx login again",
+        error.TeamsUnavailable => login_flow.teams_unavailable_message ++ " Nothing was saved; run fx login to try again.",
+        error.NoTeams => login_flow.no_teams_message ++ " Nothing was saved.",
         else => "failed to sign in",
     });
 }
