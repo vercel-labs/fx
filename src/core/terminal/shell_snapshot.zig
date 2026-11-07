@@ -557,6 +557,10 @@ pub const Owner = struct {
     }
 
     fn startCaptureLocked(self: *Owner, shell_path: []const u8, cwd: []const u8) !void {
+        // A single-threaded build, such as the WebAssembly core, has no
+        // capture thread and no login shell; the caller records the capture
+        // as failed, so a routine command's startup names stay unknown.
+        if (comptime builtin.single_threaded) return error.ThreadSpawnFailed;
         if (self.capture_thread) |thread| {
             // The previous capture already finished; only its thread remains.
             thread.join();
