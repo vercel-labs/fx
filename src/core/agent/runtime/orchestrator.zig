@@ -9165,8 +9165,8 @@ fn processQueuedPromptLoop(
                 finish_trace.finish("invalid_tool_finish");
                 return error.ModelError;
             },
-            // Only the step-limit finish passes this; a completion never has it.
-            .step_limited => unreachable,
+            // Only a finish passes these; a completion never has them.
+            .step_limited, .kept_failure => unreachable,
         }
         if (successful_vision_mode == .required and completion.tool_calls.len == 0) {
             try pushTerminalAutoRetryStatusIfNeeded(

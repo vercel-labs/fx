@@ -1,10 +1,14 @@
 // Runtime driver: drives the real `fx acp` binary against a local fake
 // Gateway and asks TLC whether what a client sees is a behavior of the models
 // in tests/tla/acp/:
-//   - the stop reason of finished, length-limited, step-limited, failed,
-//     cancelled, and steered turns, and whether the next prompt's request holds
-//     the turn the stop reason ended (AcpStopReasons.tla, through
-//     AcpStopReasonsTrace.tla);
+//   - the stop reason of finished, length-limited, step-limited, kept-failure,
+//     dropped-failure, cancelled, and steered turns, and whether the next
+//     prompt's request holds the turn the stop reason ended
+//     (AcpStopReasons.tla, through AcpStopReasonsTrace.tla). A kept failure is
+//     a failed turn fx saves (an empty reply twice, malformed tool arguments,
+//     a repeated terminal validation or shell failure, a failed request after
+//     a tool step); a dropped failure is one it leaves out (HTTP 401 or 400 on
+//     the first request, a stream cut inside a tool call);
 //   - the config options of session/new, session/set_config_option, and
 //     session/load (AcpConfigCategories.tla, through
 //     AcpConfigCategoriesTrace.tla);
@@ -152,12 +156,14 @@ async function stopReasons(fxBin: string, helpers: Helpers): Promise<StopObserva
 
   /// One turn that ends for `cause`. With `probe`, a second prompt follows and
   /// the first request it makes says whether the next prompt holds the first
-  /// prompt, which is its own probe text.
+  /// prompt, which is its own probe text, and each text in `keeps` (the first
+  /// tool call's id): the turn is kept when all are there, dropped when none
+  /// is, and a request with some of them fails the run.
   const single = async (
     name: string,
     cause: string,
     replies: unknown[],
-    options: { steps?: number; mode?: string; probe?: boolean } = {},
+    options: { steps?: number; mode?: string; probe?: boolean; keeps?: string[] } = {},
   ) => {
     const run = makeRun(`fx-acp-conf-${name}-`);
     const gateway = helpers.startFakeGateway(replies);
@@ -177,7 +183,10 @@ async function stopReasons(fxBin: string, helpers: Helpers): Promise<StopObserva
         requireGatewayRequests(gateway, before + 1, `${name} next prompt`);
         const request = gateway.requests[before] as { body: string };
         if (!request.body.includes("Next question.")) throw new Error(`${name}: the next request lacks the next prompt`);
-        history = request.body.includes(probe) ? "kept" : "dropped";
+        const held = [probe, ...(options.keeps ?? [])].map((text) => request.body.includes(text));
+        if (held.every(Boolean)) history = "kept";
+        else if (!held.some(Boolean)) history = "dropped";
+        else throw new Error(`${name}: the next request holds only part of the turn: ${JSON.stringify(held)}`);
       }
       observations.push({ cause, response: "prompt", wire: String(answer.result.stopReason), history });
     } finally {
@@ -188,7 +197,7 @@ async function stopReasons(fxBin: string, helpers: Helpers): Promise<StopObserva
   };
   await single("finished", "finished", [helpers.fakeGatewayFinalText("Done."), helpers.fakeGatewayFinalText("Next.")], { probe: true });
   await single("length", "length_limit", [lengthReply()]);
-  await single("auth", "request_failed", [unauthorized(), helpers.fakeGatewayFinalText("Next.")], { probe: true });
+  await single("auth", "dropped_failure", [unauthorized(), helpers.fakeGatewayFinalText("Next.")], { probe: true });
   // The step limit of two ends the turn after its second model request, and
   // the next prompt carries on from where it stopped.
   await single(
@@ -197,6 +206,86 @@ async function stopReasons(fxBin: string, helpers: Helpers): Promise<StopObserva
     [shellCall(helpers, "limit_step_1"), shellCall(helpers, "limit_step_2"), helpers.fakeGatewayFinalText("Next.")],
     { steps: 2, mode: "full-access", probe: true },
   );
+
+
+  // A failed turn fx keeps. Each ends the turn with a notice that says to
+  // continue, and the saved history holds the prompt and, where the turn ran a
+  // tool call, the call.
+  const emptyReply = () => helpers.fakeGatewaySse([
+    { type: "finish", finishReason: { unified: "other", raw: "UNEXPECTED_TOOL_CALL" }, usage: { inputTokens: { total: 3 }, outputTokens: { total: 8 } } },
+  ]);
+  const invalidShell = (id: string, pathFirst: boolean) => helpers.fakeGatewaySse([
+    {
+      type: "tool-call",
+      toolCallId: id,
+      toolName: "shell",
+      input: {
+        request: {
+          command: "printf unexpected > must-not-run.txt",
+          tty: true,
+          shell: pathFirst ? { path: "/bin/bash", kind: "executable" } : { kind: "executable", path: "/bin/bash" },
+        },
+        yield_time_ms: "1000",
+      },
+    },
+    { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+  ]);
+  const failingShell = (id: string) =>
+    helpers.fakeGatewayToolCall(id, "shell", { request: { action: "run", command: "echo bad >&2; exit 1", yield_time_ms: 30_000 } });
+  const badRequest = () => new Response(JSON.stringify({ error: { message: "bad request" } }), {
+    status: 400,
+    headers: { "content-type": "application/json" },
+  });
+  const next = () => helpers.fakeGatewayFinalText("Next.");
+  await single("empty-twice", "kept_failure", [emptyReply(), emptyReply(), next()], { probe: true });
+  await single(
+    "malformed",
+    "kept_failure",
+    [
+      helpers.fakeGatewaySse([
+        { type: "tool-call", toolCallId: "malformed_1", toolName: "ask_user_question", input: '{"depth":1,"depth":2}' },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]),
+      helpers.fakeGatewaySse([
+        { type: "tool-call", toolCallId: "malformed_2", toolName: "ask_user_question", input: '{"depth":1,"depth":2}' },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]),
+      helpers.fakeGatewaySse([
+        { type: "tool-call", toolCallId: "malformed_3", toolName: "read_file", input: '{"path":"README.md",}' },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]),
+      next(),
+    ],
+    { probe: true, keeps: ["malformed_1"] },
+  );
+  await single(
+    "terminal-validation",
+    "kept_failure",
+    [invalidShell("invalid_1", false), invalidShell("invalid_2", true), next()],
+    { mode: "full-access", probe: true, keeps: ["invalid_1"] },
+  );
+  await single(
+    "shell-failure",
+    "kept_failure",
+    [failingShell("fail_1"), failingShell("fail_2"), failingShell("fail_3"), next()],
+    { mode: "full-access", probe: true, keeps: ["fail_1"] },
+  );
+  await single(
+    "tool-then-400",
+    "kept_failure",
+    [shellCall(helpers, "tool_1"), badRequest(), next()],
+    { mode: "full-access", probe: true, keeps: ["tool_1"] },
+  );
+
+  // A failed turn fx leaves out: HTTP 400 on the first request, and a stream
+  // that breaks inside a tool call before any call ran.
+  await single("first-400", "dropped_failure", [badRequest(), next()], { probe: true });
+  const brokenSearch = () => new Response(
+    `data: ${JSON.stringify({ type: "tool-input-start", id: "search_open", toolName: "exa_search" })}\n\n`
+      + `data: ${JSON.stringify({ type: "tool-input-delta", id: "search_open", delta: "{\"query\":" })}\n\n`,
+    { headers: { "content-type": "text/event-stream" } },
+  );
+  await single("broken-search", "dropped_failure", [...Array.from({ length: 12 }, brokenSearch), next()], { probe: true, keeps: ["search_open"] });
 
   // A cancel while the model is still answering.
   {
@@ -476,8 +565,20 @@ function controls(stop: StopObservation[], options: OptionsObservation[], output
   if (kept) kept.history = "dropped";
   // A failed request's turn still in the next request.
   const keptFailure = structuredClone(stop);
-  const failed = keptFailure.find((o) => o.cause === "request_failed");
+  const failed = keptFailure.find((o) => o.cause === "dropped_failure" && o.history === "dropped");
   if (failed) failed.history = "kept";
+  // A failed turn fx keeps answered with refusal, as fx did before it.
+  const refusedKept = structuredClone(stop);
+  const keptAnswer = refusedKept.find((o) => o.cause === "kept_failure");
+  if (keptAnswer) keptAnswer.wire = "refusal";
+  // A failed turn fx leaves out answered with end_turn.
+  const endedDropped = structuredClone(stop);
+  const droppedAnswer = endedDropped.find((o) => o.cause === "dropped_failure");
+  if (droppedAnswer) droppedAnswer.wire = "end_turn";
+  // A failed turn answered with end_turn that the next request leaves out.
+  const droppedKept = structuredClone(stop);
+  const keptHistory = droppedKept.find((o) => o.cause === "kept_failure" && o.history === "kept");
+  if (keptHistory) keptHistory.history = "dropped";
   const tamperedOptions = structuredClone(options);
   const provider = tamperedOptions[0]?.options.find((o) => o.id === "provider");
   if (provider) provider.category = "model";
@@ -489,6 +590,9 @@ function controls(stop: StopObservation[], options: OptionsObservation[], output
     { name: "stop-step-limit-refusal", model: "stop" as const, trace: refusedLimit, expect: "REJECTED" },
     { name: "stop-step-limit-dropped", model: "stop" as const, trace: droppedLimit, expect: "REJECTED" },
     { name: "stop-failure-kept", model: "stop" as const, trace: keptFailure, expect: "REJECTED" },
+    { name: "stop-kept-failure-refusal", model: "stop" as const, trace: refusedKept, expect: "REJECTED" },
+    { name: "stop-dropped-failure-end-turn", model: "stop" as const, trace: endedDropped, expect: "REJECTED" },
+    { name: "stop-kept-failure-dropped", model: "stop" as const, trace: droppedKept, expect: "REJECTED" },
     { name: "options-provider-model", model: "options" as const, trace: tamperedOptions, expect: "REJECTED" },
     { name: "output-invalid-frame", model: "output" as const, trace: tamperedOutput, expect: "REJECTED" },
     { name: "stop-empty", model: "stop" as const, trace: [], expect: "TOOL_ERROR" },

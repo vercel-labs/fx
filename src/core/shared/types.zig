@@ -2104,6 +2104,12 @@ pub const ProviderCompletionDisposition = enum {
     /// disposition: only the step-limit finish passes it, so a host can tell
     /// the stop from every other failed turn.
     step_limited,
+    /// The turn ended as failed and fx saved it, so the history holds its
+    /// prompt, its tool calls, and the notice. No model request has this
+    /// disposition: `TurnFinalizationGuard.finish` sets it for a failed finish
+    /// that carries a finished prompt and no disposition of its own, so a host
+    /// can tell the turn from one fx left out of the history.
+    kept_failure,
 };
 
 pub fn allToolCallsProviderExecuted(tool_calls: []const ToolCall) bool {

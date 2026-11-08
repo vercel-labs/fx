@@ -168,7 +168,8 @@ pub const TurnFinalizationGuard = struct {
 
         self.cleanup_agent_terminal_leases();
 
-        self.deps.finalize_turn(self.deps.ctx, self.turn_id, outcome, disposition) catch |err| {
+        const settled = settledDisposition(outcome, disposition, finished_prompt != null);
+        self.deps.finalize_turn(self.deps.ctx, self.turn_id, outcome, settled) catch |err| {
             self.state = .fatal;
             if (finished_prompt) |finished| {
                 types.freeFinishedPrompt(std.heap.c_allocator, finished);
@@ -181,7 +182,7 @@ pub const TurnFinalizationGuard = struct {
         defer lifecycle_runtime.dispatchPostTurnEndCheckpoint(self.lifecycle, .{
             .turn_id = self.turn_id,
             .outcome = outcome,
-            .provider_disposition = disposition,
+            .provider_disposition = settled,
         });
 
         if (finished_prompt) |finished| {
@@ -191,6 +192,40 @@ pub const TurnFinalizationGuard = struct {
         }
     }
 };
+
+/// What a finish tells its host about the turn's place in the history. A
+/// disposition the caller passed stays. A failed finish that carries a
+/// finished prompt and no disposition is a kept failure: fx attaches a finished
+/// prompt exactly where it saves the turn in the history, so the next request
+/// holds this turn and the host must not report it as left out
+/// (`tests/tla/acp/AcpStopReasons.tla` RefusalLeavesTurnOut, DroppedTurnRefuses).
+fn settledDisposition(
+    outcome: types.TurnPresentationOutcome,
+    disposition: ?types.ProviderCompletionDisposition,
+    finished_prompt_attached: bool,
+) ?types.ProviderCompletionDisposition {
+    if (disposition != null) return disposition;
+    if (outcome == .failed and finished_prompt_attached) return .kept_failure;
+    return null;
+}
+
+test "settledDisposition fills a null disposition only for a failed finish with a finished prompt" {
+    const Disposition = types.ProviderCompletionDisposition;
+    // The rule.
+    try std.testing.expectEqual(@as(?Disposition, .kept_failure), settledDisposition(.failed, null, true));
+    // A failed turn fx did not save has no finished prompt.
+    try std.testing.expectEqual(@as(?Disposition, null), settledDisposition(.failed, null, false));
+    // No other outcome is a failure.
+    for ([_]types.TurnPresentationOutcome{ .completed, .interrupted, .paused }) |outcome| {
+        try std.testing.expectEqual(@as(?Disposition, null), settledDisposition(outcome, null, true));
+    }
+    // A disposition the caller passed always stays.
+    for ([_]Disposition{ .completed, .length_limited, .step_limited, .kept_failure }) |explicit| {
+        for ([_]bool{ false, true }) |attached| {
+            try std.testing.expectEqual(@as(?Disposition, explicit), settledDisposition(.failed, explicit, attached));
+        }
+    }
+}
 
 pub const TerminalText = struct {
     history: []const u8,

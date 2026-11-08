@@ -71,6 +71,8 @@ const mode_registry = @import("../core/modes/mode_registry.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const display_width = @import("../core/shared/display_width.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
+const command_output_text = @import("command_output_text.zig");
+const CommandOutputText = command_output_text.CommandOutputText;
 const tool_projection_mod = @import("../core/tooling/tool_projection.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_admission = @import("../core/tooling/tool_admission.zig");
@@ -197,40 +199,6 @@ const ToolCallCard = enum {
     open,
     awaiting_provider_terminal,
     finished,
-};
-
-/// Command output arrives in chunks cut at byte counts, so a chunk can end
-/// partway through a UTF-8 character. Holds that unfinished end, at most
-/// `text_utils.max_incomplete_utf8_tail` bytes, until the stream's next chunk,
-/// and escapes bytes that are not valid UTF-8, so every progress update is
-/// valid JSON text (`tests/tla/acp/AcpCommandOutput.tla` ProgressValidUtf8,
-/// NothingLost).
-const CommandOutputText = struct {
-    pending: [text_utils.max_incomplete_utf8_tail]u8 = undefined,
-    pending_len: u8 = 0,
-
-    /// The text to send for `chunk` after the bytes held from the chunk
-    /// before. Caller owns the result.
-    fn append(self: *CommandOutputText, alloc: Allocator, chunk: []const u8) ![]u8 {
-        const joined: ?[]u8 = if (self.pending_len > 0)
-            try std.mem.concat(alloc, u8, &.{ self.pending[0..self.pending_len], chunk })
-        else
-            null;
-        defer if (joined) |bytes| alloc.free(bytes);
-        const raw: []const u8 = joined orelse chunk;
-        const end = raw.len - text_utils.incompleteUtf8Tail(raw);
-        const text = try text_utils.dupeValidUtf8(alloc, raw[0..end]);
-        self.pending_len = @intCast(raw.len - end);
-        @memcpy(self.pending[0..self.pending_len], raw[end..]);
-        return text;
-    }
-
-    /// The held bytes, escaped, once the stream ends. Caller owns the result.
-    fn finish(self: *CommandOutputText, alloc: Allocator) ![]u8 {
-        const text = try text_utils.dupeValidUtf8(alloc, self.pending[0..self.pending_len]);
-        self.pending_len = 0;
-        return text;
-    }
 };
 
 /// What one call's command output holds back, per stream.
@@ -2382,6 +2350,11 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
         // not a refusal, which ACP drops from the next prompt
         // (`tests/tla/acp/AcpStopReasons.tla` RefusalLeavesTurnOut).
         ctx.stop_reason = .max_model_turns;
+    } else if (disposition == .kept_failure) {
+        // fx saved this failed turn, so the next prompt holds it. ACP drops a
+        // refused turn from the next prompt, so the turn ends with end_turn
+        // (`tests/tla/acp/AcpStopReasons.tla` RefusalLeavesTurnOut).
+        ctx.stop_reason = .end_turn;
     } else if (outcome == .failed or outcome == .paused) {
         ctx.stop_reason = .refused;
     }
@@ -4665,45 +4638,6 @@ test "ACP command output from a worker thread keeps its own lock beside the turn
     try std.testing.expectEqualStrings("\\xe2\\x82", main_text);
 }
 
-test "command output text is valid UTF-8 and matches the whole output however it is split" {
-    try std.testing.fuzz({}, fuzzCommandOutputText, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "",
-            "a\xd0\xafb",
-            "\xf0\x9f\x98\x80\xe2\x82\xac",
-            "\xe2\x82",
-            "\xff\xd0",
-            "\x80\x80\x80\xf0\x90\x80",
-            "\xc0\xaf\xed\xa0\x80\xf4\x90\x80\x80",
-        }) ++ @import("fuzz_corpus").acp_command_output_utf8.*),
-    });
-}
-
-fn fuzzCommandOutputText(_: void, smith: *std.testing.Smith) !void {
-    const alloc = std.testing.allocator;
-    var buffer: [256]u8 = undefined;
-    const raw = buffer[0..smith.slice(&buffer)];
-    var output: CommandOutputText = .{};
-    var joined: std.ArrayList(u8) = .empty;
-    defer joined.deinit(alloc);
-    var rest = raw;
-    while (rest.len > 0) {
-        const len = 1 + smith.index(rest.len);
-        const text = try output.append(alloc, rest[0..len]);
-        defer alloc.free(text);
-        try std.testing.expect(std.unicode.utf8ValidateSlice(text));
-        try joined.appendSlice(alloc, text);
-        rest = rest[len..];
-    }
-    const tail = try output.finish(alloc);
-    defer alloc.free(tail);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(tail));
-    try joined.appendSlice(alloc, tail);
-    const whole = try text_utils.dupeValidUtf8(alloc, raw);
-    defer alloc.free(whole);
-    try std.testing.expectEqualStrings(whole, joined.items);
-}
-
 test "ACP message IDs rotate when the logical message kind resumes" {
     const alloc = std.testing.allocator;
     var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
@@ -5605,19 +5539,26 @@ test "ACP deps validate malformed registered calls" {
 }
 
 test "ACP finalization maps each turn ending to its stop reason" {
+    // `acp` is what `fx acp` sends and `libfx` is what libfx's result carries.
+    // A failed turn fx keeps in its history ends with end_turn, one it leaves
+    // out ends with refusal (refused for libfx), and a step-limit stop ends
+    // with max_turn_requests (max_model_turns for libfx).
     const cases = [_]struct {
         outcome: types.TurnPresentationOutcome,
         disposition: ?types.ProviderCompletionDisposition,
         expected: acp_types.StopReason,
+        acp: []const u8,
+        libfx: []const u8,
     }{
-        .{ .outcome = .completed, .disposition = .length_limited, .expected = .max_output_tokens },
-        .{ .outcome = .failed, .disposition = .length_limited, .expected = .max_output_tokens },
-        .{ .outcome = .failed, .disposition = .step_limited, .expected = .max_model_turns },
-        .{ .outcome = .failed, .disposition = null, .expected = .refused },
-        .{ .outcome = .paused, .disposition = null, .expected = .refused },
-        .{ .outcome = .completed, .disposition = null, .expected = .end_turn },
-        .{ .outcome = .completed, .disposition = .completed, .expected = .end_turn },
-        .{ .outcome = .interrupted, .disposition = null, .expected = .end_turn },
+        .{ .outcome = .completed, .disposition = .length_limited, .expected = .max_output_tokens, .acp = "max_tokens", .libfx = "max_output_tokens" },
+        .{ .outcome = .failed, .disposition = .length_limited, .expected = .max_output_tokens, .acp = "max_tokens", .libfx = "max_output_tokens" },
+        .{ .outcome = .failed, .disposition = .step_limited, .expected = .max_model_turns, .acp = "max_turn_requests", .libfx = "max_model_turns" },
+        .{ .outcome = .failed, .disposition = .kept_failure, .expected = .end_turn, .acp = "end_turn", .libfx = "end_turn" },
+        .{ .outcome = .failed, .disposition = null, .expected = .refused, .acp = "refusal", .libfx = "refused" },
+        .{ .outcome = .paused, .disposition = null, .expected = .refused, .acp = "refusal", .libfx = "refused" },
+        .{ .outcome = .completed, .disposition = null, .expected = .end_turn, .acp = "end_turn", .libfx = "end_turn" },
+        .{ .outcome = .completed, .disposition = .completed, .expected = .end_turn, .acp = "end_turn", .libfx = "end_turn" },
+        .{ .outcome = .interrupted, .disposition = null, .expected = .end_turn, .acp = "end_turn", .libfx = "end_turn" },
     };
 
     for (cases) |case| {
@@ -5630,6 +5571,17 @@ test "ACP finalization maps each turn ending to its stop reason" {
         try deps.finalize_turn(deps.ctx, 8, case.outcome, case.disposition);
 
         try std.testing.expectEqual(case.expected, ctx.stop_reason);
+        for ([_]acp_types.PromptProtocol{ .acp, .libfx }) |protocol| {
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try acp_types.writePromptResponse(&out.writer, ctx.stop_reason, protocol);
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(
+                if (protocol == .acp) case.acp else case.libfx,
+                parsed.value.object.get("stopReason").?.string,
+            );
+        }
     }
 }
 

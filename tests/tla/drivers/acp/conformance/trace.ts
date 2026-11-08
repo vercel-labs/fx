@@ -247,6 +247,8 @@ const MODELS = {
       "    LibfxMapped = FALSE",
       "    StepLimitNamed = TRUE",
       "    StepLimitDropped = FALSE",
+      "    KeptFailureEnds = TRUE",
+      "    DroppedFailureEnds = FALSE",
       ...TRACE_TAIL,
     ],
     length: (o: StopObservation[]) => o.length,

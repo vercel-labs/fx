@@ -1402,9 +1402,11 @@ async function stepLimitedSession(steps: number | undefined, replies: Response[]
 }
 
 // ACP says `refusal` leaves the turn out of the next prompt and
-// `max_turn_requests` does not. fx keeps the turn the step limit stopped and
-// drops one a failed request stopped (`tests/tla/acp/AcpStopReasons.tla`
-// RefusalLeavesTurnOut, TurnLimitKeepsTurn).
+// `max_turn_requests` does not. A failed turn that fx keeps in its history ends
+// with `end_turn`, one it leaves out ends with `refusal`, and a step-limit stop
+// ends with `max_turn_requests` and keeps its turn
+// (`tests/tla/acp/AcpStopReasons.tla` RefusalLeavesTurnOut, DroppedTurnRefuses,
+// TurnLimitKeepsTurn).
 test("ACP answers a step-limit stop with max_turn_requests and keeps the turn", async () => {
   const run = await stepLimitedSession(
     2,
@@ -1435,7 +1437,7 @@ test("ACP answers a step limit of one with max_turn_requests, and a turn that en
   expect(last.stopReasons).toEqual(["end_turn"]);
 }, 90000);
 
-test("ACP answers a failed request with refusal and leaves the prompt out of the next request", async () => {
+test("ACP answers a failed first request with refusal and leaves the prompt out of the next request", async () => {
   const run = await stepLimitedSession(
     2,
     [
@@ -1451,6 +1453,89 @@ test("ACP answers a failed request with refusal and leaves the prompt out of the
   expect(run.requests).toHaveLength(2);
   expect(run.requests[1]).toContain("Next question.");
   expect(run.requests[1]).not.toContain("This prompt fails.");
+}, 45000);
+
+test("ACP answers a stream cut inside a tool call with refusal and leaves the prompt out of the next request", async () => {
+  // Every attempt announces a provider search and breaks off, so recovery gives
+  // up before a call ran and fx saves nothing of the turn.
+  const brokenSearch = () => new Response(
+    `data: ${JSON.stringify({ type: "tool-input-start", id: "search_open", toolName: "exa_search" })}\n\n`
+      + `data: ${JSON.stringify({ type: "tool-input-delta", id: "search_open", delta: "{\"query\":" })}\n\n`,
+    { headers: { "content-type": "text/event-stream" } },
+  );
+  const run = await stepLimitedSession(
+    undefined,
+    [...Array.from({ length: 12 }, brokenSearch), finalText("Fresh start.")],
+    ["This prompt fails.", "Next question."],
+  );
+  expect(run.stopReasons[0]).toBe("refusal");
+  const next = run.requests.find(body => body.includes("Next question."))!;
+  expect(next).not.toContain("This prompt fails.");
+  expect(next).not.toContain("search_open");
+}, 60000);
+
+/// A kept failed turn: the turn ends as failed with a notice, fx saves it, and
+/// the next request holds the prompt and `kept`, so the turn ends with `end_turn`.
+async function expectKeptFailedTurn(replies: Response[], kept: string[], steps?: number) {
+  const run = await stepLimitedSession(steps, [...replies, finalText("Picked up.")], ["This prompt fails.", "Next question."]);
+  expect(run.stopReasons).toEqual(["end_turn", "end_turn"]);
+  expect(run.requests).toHaveLength(replies.length + 1);
+  const next = run.requests[replies.length]!;
+  expect(next).toContain("Next question.");
+  for (const text of ["This prompt fails.", ...kept]) expect(next).toContain(text);
+}
+
+const emptyReply = () => fakeGatewaySse([
+  { type: "finish", finishReason: { unified: "other", raw: "UNEXPECTED_TOOL_CALL" }, usage: { inputTokens: { total: 3 }, outputTokens: { total: 8 } } },
+]);
+
+test("ACP ends a kept failed turn, an empty reply twice, with end_turn and holds it in the next request", async () => {
+  await expectKeptFailedTurn([emptyReply(), emptyReply()], []);
+}, 45000);
+
+test("ACP ends a kept failed turn, malformed tool arguments three times, with end_turn and holds it in the next request", async () => {
+  await expectKeptFailedTurn(
+    [
+      fakeGatewaySerializedToolCall("malformed_1", "ask_user_question", '{"depth":1,"depth":2}'),
+      fakeGatewaySerializedToolCall("malformed_2", "ask_user_question", '{"depth":1,"depth":2}'),
+      fakeGatewaySerializedToolCall("malformed_3", "read_file", '{"path":"README.md",}'),
+    ],
+    ["malformed_1"],
+  );
+}, 45000);
+
+test("ACP ends a kept failed turn, a repeated terminal validation failure, with end_turn and holds it in the next request", async () => {
+  // The shell request names its executable in two key orders, and fx does not run it.
+  const invalid = (id: string, pathFirst: boolean) => fakeGatewaySse([
+    {
+      type: "tool-call",
+      toolCallId: id,
+      toolName: "shell",
+      input: {
+        request: {
+          command: "printf unexpected > must-not-run.txt",
+          tty: true,
+          shell: pathFirst ? { path: "/bin/bash", kind: "executable" } : { kind: "executable", path: "/bin/bash" },
+        },
+        yield_time_ms: "1000",
+      },
+    },
+    { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+  ]);
+  await expectKeptFailedTurn([invalid("invalid_1", false), invalid("invalid_2", true)], ["invalid_1"]);
+}, 45000);
+
+test("ACP ends a kept failed turn, three identical shell failures, with end_turn and holds it in the next request", async () => {
+  const failing = (id: string) => fakeShellRun(id, "echo bad >&2; exit 1");
+  await expectKeptFailedTurn([failing("fail_1"), failing("fail_2"), failing("fail_3")], ["fail_1"]);
+}, 45000);
+
+test("ACP ends a kept failed turn, a failed request after a tool step, with end_turn and holds its tool call in the next request", async () => {
+  const badRequest = new Response(JSON.stringify({ error: { message: "bad request" } }), {
+    status: 400,
+    headers: { "content-type": "application/json" },
+  });
+  await expectKeptFailedTurn([fakeShellRun("tool_1", "echo one"), badRequest], ["tool_1"]);
 }, 45000);
 
 function createIsolatedRoot(prefix: string) {
