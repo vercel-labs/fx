@@ -9,9 +9,10 @@
 (* review, as it does today; this model does not change which commands     *)
 (* reach review. Every other command gets a review request, whose command  *)
 (* action is serialized into the review packet. A packet with incomplete   *)
-(* action evidence is held as unavailable without a reviewer call. A       *)
-(* complete packet goes to the reviewer, which may answer clear or         *)
-(* caution; only clear runs the command, in the environment of the call.   *)
+(* action evidence is held as evidence_incomplete ("Safety review evidence *)
+(* incomplete; action held") without a reviewer call. A complete packet    *)
+(* goes to the reviewer, which may answer clear or caution; only clear     *)
+(* runs the command, in the environment of the call.                       *)
 (*                                                                         *)
 (* The environments are those of command_environment.Environment:          *)
 (*   user             the user's login shell, which reads the user's       *)
@@ -64,7 +65,7 @@ VARIABLES
     packet,         \* what the reviewer is shown about the interpreter
     reviewed,       \* the call went to review
     reviewerCalls,  \* reviewer requests sent for this call
-    decision,       \* "none", "clear", "caution", "unavailable", "unreviewed"
+    decision,       \* "none", "clear", "caution", "evidence_incomplete", "unreviewed"
     ran,            \* the command ran
     startupRan,     \* the user's startup files ran before it
     calls           \* calls admitted so far
@@ -154,7 +155,7 @@ HoldIncomplete ==
     /\ phase = "serialized"
     /\ ~packet.complete
     /\ phase' = "decided"
-    /\ decision' = "unavailable"
+    /\ decision' = "evidence_incomplete"
     /\ UNCHANGED <<call, requestEnv, requestShell, packet, reviewed, reviewerCalls, ran, startupRan, calls>>
 
 \* The reviewer is outside fx's control: it may answer either way.
@@ -178,7 +179,7 @@ Execute ==
 
 Hold ==
     /\ phase = "decided"
-    /\ decision \in {"caution", "unavailable"}
+    /\ decision \in {"caution", "evidence_incomplete"}
     /\ phase' = "done"
     /\ UNCHANGED <<call, requestEnv, requestShell, packet, reviewed, reviewerCalls, decision, ran, startupRan, calls>>
 
@@ -213,7 +214,7 @@ TypeOK ==
     /\ packet.complete \in BOOLEAN
     /\ reviewed \in BOOLEAN
     /\ reviewerCalls \in 0..1
-    /\ decision \in {"none", "clear", "caution", "unavailable", "unreviewed"}
+    /\ decision \in {"none", "clear", "caution", "evidence_incomplete", "unreviewed"}
     /\ ran \in BOOLEAN
     /\ startupRan \in BOOLEAN
     /\ calls \in 0..MaxCalls
@@ -232,11 +233,11 @@ StartupDisclosed ==
         /\ packet.startup = StartupOf(call.env)
         /\ (packet.startup = "applies") <=> startupRan
 
-\* A shell-routed command whose shell cannot be named is held as
-\* unavailable without a reviewer call, and never runs after review.
+\* A shell-routed command whose shell cannot be named is held for incomplete
+\* review evidence without a reviewer call, and never runs after review.
 UnnamedShellNeverRuns ==
     (phase = "done" /\ reviewed /\ ShellRouted(call.env) /\ call.shell = "none") =>
-        /\ decision = "unavailable"
+        /\ decision = "evidence_incomplete"
         /\ reviewerCalls = 0
         /\ ~ran
 

@@ -260,7 +260,7 @@ async function runTurn(helpers: any, scratch: string, turnId: string, turnCases:
       if (reviewed) {
         if (result.type === "text" || result.type === "error-text") decision = "clear";
         else if (result.text.includes("review_caution")) decision = "caution";
-        else if (result.text.includes("review_unavailable") || result.text.includes("review_evidence_incomplete")) decision = "unavailable";
+        else if (result.text.includes("review_evidence_incomplete")) decision = "evidence_incomplete";
         else decision = `unknown:${result.type}`;
       }
       const identity = reviewed ? mine[0].identity : "";

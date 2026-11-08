@@ -7,11 +7,12 @@
 # command-environment.cfg is the design and must pass: a reviewed command
 # runs only after a clear on a packet that names its environment, its shell,
 # and whether the user's startup aliases and functions apply, and a
-# shell-routed command that cannot name its shell is held as unavailable
-# without a reviewer call. command-environment-today.cfg is fx before it,
-# whose packet named none of that and still said the evidence was complete
-# (ReviewerSeesInterpreter). Each command-environment-mutation-*.cfg plants
-# one defect, and the rule it names must catch it:
+# shell-routed command that cannot name its shell is held for incomplete
+# review evidence without a reviewer call. command-environment-today.cfg is
+# fx before it, whose packet named none of that and still said the evidence
+# was complete (ReviewerSeesInterpreter). Each
+# command-environment-mutation-*.cfg plants one defect, and the rule it names
+# must catch it:
 #
 #   unwired           the request drops the call's environment          ReviewerSeesInterpreter
 #   no-startup        no line says whether startup definitions apply    StartupDisclosed
