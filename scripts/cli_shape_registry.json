@@ -121,6 +121,14 @@
       "job": "diagnostics",
       "stability": "stable"
     },
+    "FX_TEST_ACP_PERMISSION_INSERTED": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_ACP_PERMISSION_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_ACP_PROMPT_REAP_READY": {
       "job": "test",
       "stability": "internal"
