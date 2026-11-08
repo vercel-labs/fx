@@ -40,6 +40,23 @@
 (* team picker used to take it as a key to ignore and read again, at once, *)
 (* forever (Bug = "picker_ignores_eof").                                   *)
 (*                                                                         *)
+(* The fourth site, "sign_in", is the wait of fx login vercel for browser  *)
+(* authorization (waitBetweenPolls and waitForEnterOn in                   *)
+(* src/core/auth/login_flow.zig). It sets no raw mode, so it has nothing   *)
+(* to restore. Between polls of the issuer it waits for a key in slices of *)
+(* 100 ms, and a pass that returns at once with nothing to do goes round   *)
+(* again with no time passing: a spin, as in Poll. A poll that answers     *)
+(* HUP, ERR, or NVAL without IN means stdin is gone. The wait used to take *)
+(* that as "no key" and return at once; it now sleeps out the slice. Bug = *)
+(* "sign_in_spins" is the wait before that fix, and Bug =                  *)
+(* "sign_in_nval" a fix that misses POLLNVAL alone, which every    *)
+(* poll after a revoke outside the wait reports. A poll that answers       *)
+(* POLLIN, as a revoke inside it does, is a key: the read ends and the     *)
+(* prompt stops polling stdin. Either way eof records that the wait knows  *)
+(* stdin is gone. The sign-in itself goes on polling the issuer until the  *)
+(* device code is approved, refused, or expires (SignInEnds), so a gone    *)
+(* terminal does not end it sooner.                                        *)
+(*                                                                         *)
 (* Job control moves fx between the foreground ("fg"), stopped, and the    *)
 (* background ("bg"). Ctrl+Z (Suspend) stops fx. With SIGTTIN and SIGTTOU  *)
 (* at their default (stops), a background fx stops at its first terminal   *)
@@ -67,14 +84,18 @@
 (* team picker and the masked key prompt still restore through             *)
 (* std.posix.tcsetattr. Bug = "picker_ignores_eof" is fx with every        *)
 (* restore fixed and the team picker still reading again after a read of 0.*)
+(* Bug = "sign_in_spins" is fx with every fix but the sign-in wait's, and  *)
+(* "sign_in_nval" fixes the wait for HUP and ERR but not NVAL.     *)
 (***************************************************************************)
 EXTENDS Naturals
 
 CONSTANTS MaxSpins, MaxIntr, Bug
 
 Bugs == {"none", "today", "prompts_strict", "picker_ignores_eof", "nval_ignored", "badf_unreachable",
-         "enoent_unexpected", "no_eintr_retry", "eio_always_eof", "eio_poll_only"}
-Sites == {"shell", "team_picker", "masked_key"}
+         "enoent_unexpected", "no_eintr_retry", "eio_always_eof", "eio_poll_only",
+         "sign_in_spins", "sign_in_nval"}
+Prompts == {"team_picker", "masked_key"}
+Sites == {"shell", "sign_in"} \cup Prompts
 ASSUME Bug \in Bugs
 
 VARIABLES
@@ -91,8 +112,10 @@ VARIABLES
     job,      \* "fg", "stopped", or "bg"
     eio,      \* a revoked terminal polls as readable and fails reads with EIO
     stops,    \* SIGTTIN and SIGTTOU keep their default action
-    site,     \* "shell", "team_picker", or "masked_key": who restores the terminal
-    eof       \* a prompt's read returned 0, the end of input
+    site,     \* "shell", "team_picker", "masked_key", or "sign_in": who runs, and
+              \* for the first three, restores the terminal
+    eof       \* stdin reached its end for the code that reads it: a prompt's read
+              \* returned 0, or the sign-in wait found stdin gone
 
 vars == <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
 
@@ -220,7 +243,7 @@ Drain ==
 \* The person answers or cancels at a prompt: it returns to its caller, which
 \* restores the terminal on the way out (a defer).
 PromptReturns ==
-    /\ site # "shell"
+    /\ site \in Prompts
     /\ phase = "loop"
     /\ ~Gone
     /\ EndLoop("requested")
@@ -243,7 +266,7 @@ IgnoresEof ==
 \* and exits 1), unless the prompt ignores the end of input and reads again,
 \* which returns at once with nothing to do, as a poll on a gone terminal does.
 PromptRead ==
-    /\ site # "shell"
+    /\ site \in Prompts
     /\ phase = "loop"
     /\ Gone
     /\ IF ReadsZero /\ IgnoresEof
@@ -255,6 +278,46 @@ PromptRead ==
             /\ eof' = (eof \/ ReadsZero)
             /\ UNCHANGED spins
     /\ UNCHANGED <<tty, waking, queued, dirty, intr, restore, job, eio, stops, site>>
+
+\* A poll the sign-in wait takes as "stdin is gone": HUP, ERR, or NVAL
+\* without IN (classifyStdinPoll in login_flow.zig).
+SignInGone(r) == r # {} /\ ~Readable(r)
+
+\* Whether the wait returns at once on such an answer, with no time passing.
+\* It did before the fix, and still does for POLLNVAL alone in the planted
+\* variant.
+SignInReturnsAtOnce(r) ==
+    /\ SignInGone(r)
+    /\ \/ Bug \in {"today", "sign_in_spins"}
+       \/ Bug = "sign_in_nval" /\ "NVAL" \in r
+
+\* One pass of waitBetweenPolls on the wait for a key (waitForEnterOn). A
+\* pass on a live terminal waits its slice, and one on a terminal that is
+\* gone sleeps out the rest of it, so neither is a spin; one that returns at
+\* once is.
+SignInWait ==
+    /\ site = "sign_in"
+    /\ phase = "loop"
+    /\ waking' = FALSE
+    /\ LET r == Revents IN
+       IF SignInReturnsAtOnce(r)
+       THEN /\ spins < MaxSpins
+            /\ spins' = spins + 1
+            /\ UNCHANGED eof
+       ELSE /\ UNCHANGED spins
+            /\ eof' = (eof \/ Gone)
+    /\ UNCHANGED <<tty, queued, dirty, phase, cause, intr, restore, job, eio, stops, site>>
+
+\* The device code is approved, refused, or expires, whatever the terminal
+\* is doing. The wait changed no terminal setting, so nothing is left to
+\* restore.
+SignInEnds ==
+    /\ site = "sign_in"
+    /\ phase = "loop"
+    /\ phase' = "exited"
+    /\ cause' = "sign_in_ended"
+    /\ restore' = "gone"
+    /\ UNCHANGED <<tty, waking, queued, dirty, spins, intr, job, eio, stops, site, eof>>
 
 -----------------------------------------------------------------------------
 (* The restore (TerminalState.disableRawMode, TeamPickerRawMode.disable,   *)
@@ -272,7 +335,7 @@ Errno ==
 \* The restore goes through std.posix.tcsetattr, which treats EBADF and EINVAL
 \* as unreachable and reports ENOENT as an unexpected errno: in every site
 \* before the change, and in the prompts before their fix.
-StrictRestore == Bug = "today" \/ (Bug = "prompts_strict" /\ site # "shell")
+StrictRestore == Bug = "today" \/ (Bug = "prompts_strict" /\ site \in Prompts)
 
 Outcome(e) ==
     CASE e = "SUCCESS" -> "restored"
@@ -324,7 +387,7 @@ Revoke ==
 \* revoke(2) while fx waits in its poll, which wakes with POLLHUP, or with
 \* POLLIN where eio holds.
 RevokeInPoll ==
-    /\ site = "shell"
+    /\ site \in {"shell", "sign_in"}
     /\ phase = "loop"
     /\ job = "fg"
     /\ tty = "live"
@@ -399,9 +462,10 @@ Ended ==
 Environment ==
     Type \/ Revoke \/ RevokeInPoll \/ Hangup \/ CloseFd \/ Suspend \/ Bg \/ Fg \/ Background
 
-Next == Poll \/ Drain \/ PromptReturns \/ PromptRead \/ Restore \/ Environment \/ Ended
+Next == Poll \/ Drain \/ PromptReturns \/ PromptRead \/ SignInWait \/ SignInEnds \/ Restore \/ Environment \/ Ended
 
-Spec == Init /\ [][Next]_vars /\ WF_vars(Poll) /\ WF_vars(Drain) /\ WF_vars(PromptRead) /\ WF_vars(Restore)
+Spec == Init /\ [][Next]_vars /\ WF_vars(Poll) /\ WF_vars(Drain) /\ WF_vars(PromptRead) /\ WF_vars(SignInEnds)
+        /\ WF_vars(Restore)
 
 -----------------------------------------------------------------------------
 
@@ -411,7 +475,7 @@ TypeOK ==
     /\ queued \in BOOLEAN
     /\ dirty \in BOOLEAN
     /\ phase \in {"loop", "cleanup", "exited", "crashed"}
-    /\ cause \in {"none", "requested", "input_closed", "write_failed", "read_failed", "prompt_failed"}
+    /\ cause \in {"none", "requested", "input_closed", "write_failed", "read_failed", "prompt_failed", "sign_in_ended"}
     /\ spins \in 0..MaxSpins
     /\ intr \in 0..MaxIntr
     /\ restore \in {"pending", "restored", "gone", "error", "lost"}
@@ -422,15 +486,16 @@ TypeOK ==
     /\ eof \in BOOLEAN
 
 \* A pass of the loop never returns at once with nothing to do: once the
-\* terminal is gone, the next poll ends the loop.
+\* terminal is gone, the next poll ends the loop, and the sign-in wait
+\* sleeps out its slice.
 NoBusyLoop == spins = 0
 
 \* The cleanup never aborts, whatever state the terminal is in.
 CleanupNeverCrashes == phase # "crashed"
 
 \* A terminal that is still there gets its original settings back, even
-\* when signals interrupt the restore.
-RestoredWhenLive == (phase = "exited" /\ tty = "live") => restore = "restored"
+\* when signals interrupt the restore. The sign-in wait changes none.
+RestoredWhenLive == (phase = "exited" /\ tty = "live" /\ site # "sign_in") => restore = "restored"
 
 \* The cleanup of a terminal that is gone stays quiet: no unexpected errno.
 GoneQuietly == restore # "error"
@@ -451,7 +516,7 @@ ReadErrorOnlyWhenLive == cause = "read_failed" => tty = "live"
 JobControlKeepsFx == (stops /\ job # "fg") => phase = "loop"
 
 \* Once the terminal is gone, fx ends: the interactive shell, and a prompt
-\* that waits for a key.
+\* that waits for a key. The sign-in ends when its device code does.
 GoneEndsLoop == Gone ~> (phase \in {"exited", "crashed"})
 
 \* A prompt never reads again after a read of 0, the end of input.

@@ -979,6 +979,108 @@ test.skipIf(!revokeAvailable())("a revoked terminal ends the team picker instead
   }
 }, TIMEOUT * 2);
 
+// `fx login vercel` waits for browser authorization: it polls the issuer once a
+// second and, between polls, waits up to 100 ms at a time for a key that opens
+// the browser. A revoke that lands while fx is outside that wait, here in a
+// request to the issuer, leaves every later poll of stdin reporting POLLNVAL
+// alone, at once. The wait took that as "no key" and returned at once, so fx
+// went round its loop at full CPU until the code expired
+// (`tests/tla/shell_runtime/TerminalRevoke.tla` NoBusyLoop). The sign-in must
+// go on waiting and polling the issuer at low CPU.
+test.skipIf(!revokeAvailable())("a revoked terminal does not make the sign-in wait spin", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-revoked-sign-in-")));
+  for (const dir of ["home", "workspace", "pty", "bin"]) mkdirSync(join(root, dir));
+  // The wait opens the browser on a key, through `open`: a fake one on PATH
+  // means no browser starts.
+  writeFileSync(join(root, "bin", "open"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const tokenRequests: number[] = [];
+  let holdTokenRequest: number | null = 2;
+  let tokenRequestHeld = false;
+  let releaseTokenRequest: () => void = () => {};
+  const release = new Promise<void>((resolve) => (releaseTokenRequest = resolve));
+  const issuer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const base = `http://127.0.0.1:${issuer.port}`;
+      if (url.pathname === "/.well-known/openid-configuration") {
+        return Response.json({
+          issuer: base,
+          device_authorization_endpoint: `${base}/oauth/device`,
+          token_endpoint: `${base}/oauth/token`,
+        });
+      }
+      if (url.pathname === "/oauth/device") {
+        return Response.json({
+          device_code: "device-code",
+          user_code: "TEST-CODE",
+          verification_uri: `${base}/verify`,
+          verification_uri_complete: `${base}/verify?code=TEST-CODE`,
+          expires_in: 600,
+          interval: 1,
+        });
+      }
+      if (url.pathname === "/oauth/token") {
+        tokenRequests.push(Date.now());
+        // Hold one answer: fx is then in a request, not in its wait for a key.
+        if (tokenRequests.length === holdTokenRequest) {
+          tokenRequestHeld = true;
+          await release;
+        }
+        return Response.json({ error: "authorization_pending" }, { status: 400 });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  const gateway = startFakeGateway([]);
+  const pty = await PtySession.launch({
+    bin: FX_BIN,
+    args: ["login", "vercel"],
+    cwd: join(root, "workspace"),
+    dir: join(root, "pty"),
+    env: {
+      ...revokedTerminalEnv(join(root, "home"), gateway),
+      PATH: join(root, "bin"),
+      FX_TEST_OAUTH_ISSUER_URL: `http://127.0.0.1:${issuer.port}`,
+    },
+  });
+  try {
+    expect(await pty.waitForOutput((text) => text.includes("Waiting for authentication"), TIMEOUT)).toBe(true);
+    const heldBy = Date.now() + TIMEOUT;
+    while (!tokenRequestHeld) {
+      if (Date.now() > heldBy) throw new Error("fx never made its second token request");
+      await Bun.sleep(10);
+    }
+    pty.revoke();
+    holdTokenRequest = null;
+    releaseTokenRequest();
+    const requestsAtRevoke = tokenRequests.length;
+
+    // fx is back in its loop with a terminal that is gone.
+    await Bun.sleep(300);
+    const before = pty.cpuSeconds() ?? 0;
+    await Bun.sleep(1_000);
+    const burned = (pty.cpuSeconds() ?? 0) - before;
+    expect({ exit: pty.exited(), lowCpu: burned < 0.5 }).toEqual({ exit: null, lowCpu: true });
+
+    // The sign-in goes on polling the issuer, as it does when no key is pressed.
+    const deadline = Date.now() + 5_000;
+    while (tokenRequests.length <= requestsAtRevoke && Date.now() < deadline) await Bun.sleep(50);
+    expect(tokenRequests.length).toBeGreaterThan(requestsAtRevoke);
+
+    expect(pty.stderr()).toBe("");
+    expect(gateway.modelRequests).toHaveLength(0);
+    expect(gateway.requests).toHaveLength(0);
+  } finally {
+    releaseTokenRequest();
+    await pty.dispose();
+    gateway.stop();
+    issuer.stop(true);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
 test.skipIf(!tmuxAvailable())("Ctrl+Z, bg, and fg keep fx alive", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-job-control-")));
   const home = join(root, "home");

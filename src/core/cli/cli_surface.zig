@@ -2619,21 +2619,10 @@ const MaskedKeyRawMode = struct {
 
 fn ignoreMask(_: ?*anyopaque, _: []const u8) anyerror!void {}
 
-/// A pipe that already holds `bytes` and whose write end is closed: reads
-/// return the bytes and then 0, as a terminal at end of input does.
-fn pipeAtEndOfInput(bytes: []const u8) !std.posix.fd_t {
-    var fds: [2]std.posix.fd_t = undefined;
-    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
-    errdefer testing_pty.closeFd(fds[0]);
-    defer testing_pty.closeFd(fds[1]);
-    if (bytes.len > 0 and std.c.write(fds[1], bytes.ptr, bytes.len) != bytes.len) return error.PipeFailed;
-    return fds[0];
-}
-
 test "masked key prompt ends at a read of 0" {
     if (!testing_pty.supported) return error.SkipZigTest;
 
-    const fd = try pipeAtEndOfInput("");
+    const fd = try testing_pty.pipeAtEndOfInput("");
     defer testing_pty.closeFd(fd);
     try std.testing.expectError(error.SetupCancelled, readMaskedKeyFrom(fd, std.testing.allocator, ignoreMask, null));
 }
@@ -2641,7 +2630,7 @@ test "masked key prompt ends at a read of 0" {
 test "masked key prompt ends at a read of 0 in the middle of a key and frees what was typed" {
     if (!testing_pty.supported) return error.SkipZigTest;
 
-    const fd = try pipeAtEndOfInput("ab");
+    const fd = try testing_pty.pipeAtEndOfInput("ab");
     defer testing_pty.closeFd(fd);
     try std.testing.expectError(error.SetupCancelled, readMaskedKeyFrom(fd, std.testing.allocator, ignoreMask, null));
 }
@@ -2649,7 +2638,7 @@ test "masked key prompt ends at a read of 0 in the middle of a key and frees wha
 test "masked key prompt returns the key typed before Enter" {
     if (!testing_pty.supported) return error.SkipZigTest;
 
-    const fd = try pipeAtEndOfInput("ab\r");
+    const fd = try testing_pty.pipeAtEndOfInput("ab\r");
     defer testing_pty.closeFd(fd);
     const key = try readMaskedKeyFrom(fd, std.testing.allocator, ignoreMask, null);
     defer secret.zeroAndFree(std.testing.allocator, key);
@@ -2673,10 +2662,7 @@ test "masked key prompt restore puts the original settings back on a live termin
 
     const pty = try testing_pty.TestPty.open();
     defer pty.close();
-    const original = try io_mod.tcgetattr(pty.slave);
-    var raw_settings = original;
-    raw_settings.lflag.ECHO = !original.lflag.ECHO;
-    try io_mod.tcsetattr(pty.slave, .NOW, raw_settings);
+    const original = try pty.flipEcho();
 
     var raw = MaskedKeyRawMode{ .original = original, .active = true, .fd = pty.slave };
     raw.disable();

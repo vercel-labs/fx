@@ -22,9 +22,16 @@
 # restore fixed and the team picker still taking a read of 0, the end of input
 # on a revoked terminal, as a key to ignore: it read again at once and never
 # ended (terminal-revoke-today-picker, NoReadAfterEof, and
-# terminal-revoke-today-picker-liveness, GoneEndsLoop). Each
-# terminal-revoke-mutation-*.cfg plants one defect, and the rule it names must
-# catch it:
+# terminal-revoke-today-picker-liveness, GoneEndsLoop). The sign-in wait of
+# fx login vercel is the fourth site. Its wait for a key polls stdin in slices
+# of 100 ms and used to return at once on a poll that answered POLLHUP,
+# POLLERR, or POLLNVAL without POLLIN, so a terminal that macOS revoked while
+# fx was in a request to the issuer, which leaves every later poll answering
+# POLLNVAL alone, sent it round its loop at full CPU. The
+# terminal-revoke-today-sign-in config is fx with every other fix and without
+# that one (NoBusyLoop); the fixed wait sleeps out its slice and the sign-in
+# goes on polling the issuer. Each terminal-revoke-mutation-*.cfg plants one
+# defect, and the rule it names must catch it:
 #
 #   nval-ignored       POLLNVAL is not counted as closed input        NoBusyLoop
 #   badf-unreachable   EBADF from the restore aborts fx                CleanupNeverCrashes
@@ -32,6 +39,7 @@
 #   no-eintr-retry     a restore that EINTR interrupts is not retried  RestoredWhenLive
 #   eio-always-eof     every EIO read ends input, without the check    InputClosedOnlyWhenGone
 #   eio-poll-only      the check asks poll and not tcgetattr           ReadErrorOnlyWhenLive
+#   sign-in-nval       the sign-in wait misses POLLNVAL alone         NoBusyLoop
 #
 # TerminalRevokeTrace.tla checks runs of the built fx binary against the
 # model; tests/tla/drivers/shell_runtime/driver.ts runs it.
@@ -58,10 +66,12 @@ TerminalRevoke terminal-revoke-today-prompts CleanupNeverCrashes
 TerminalRevoke terminal-revoke-today-prompts-errno GoneQuietly
 TerminalRevoke terminal-revoke-today-picker NoReadAfterEof
 TerminalRevoke terminal-revoke-today-picker-liveness temporal
+TerminalRevoke terminal-revoke-today-sign-in NoBusyLoop
 TerminalRevoke terminal-revoke-mutation-nval-ignored NoBusyLoop
 TerminalRevoke terminal-revoke-mutation-badf-unreachable CleanupNeverCrashes
 TerminalRevoke terminal-revoke-mutation-enoent-unexpected GoneQuietly
 TerminalRevoke terminal-revoke-mutation-no-eintr-retry RestoredWhenLive
 TerminalRevoke terminal-revoke-mutation-eio-always-eof InputClosedOnlyWhenGone
 TerminalRevoke terminal-revoke-mutation-eio-poll-only ReadErrorOnlyWhenLive
+TerminalRevoke terminal-revoke-mutation-sign-in-nval NoBusyLoop
 VERDICTS

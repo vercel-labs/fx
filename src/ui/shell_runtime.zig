@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const terminal_env = @import("../core/shared/terminal_env.zig");
+const testing_pty = @import("../core/shared/testing_pty.zig");
 const types = @import("../core/shared/types.zig");
 const transcript_runtime = @import("transcript/runtime.zig");
 const frame_layout = @import("render_engine/frame_layout.zig");
@@ -19,23 +20,6 @@ const TranscriptRuntime = transcript_runtime.TranscriptRuntime;
 
 const TmuxHistoryClearRunner = *const fn (Allocator, []const []const u8) anyerror!void;
 var tmux_history_clear_test_runner: if (builtin.is_test) ?TmuxHistoryClearRunner else void = if (builtin.is_test) null else {};
-
-const supports_test_pty = switch (builtin.target.os.tag) {
-    .linux,
-    .macos,
-    .freebsd,
-    .netbsd,
-    .openbsd,
-    => true,
-    else => false,
-};
-
-extern "c" fn posix_openpt(flags: c_int) c_int;
-extern "c" fn grantpt(fd: c_int) c_int;
-extern "c" fn unlockpt(fd: c_int) c_int;
-extern "c" fn ptsname(fd: c_int) ?[*:0]u8;
-/// macOS: every open descriptor for the terminal at `path` stops working.
-extern "c" fn revoke(path: [*:0]const u8) c_int;
 
 pub const supports_resize_signal = resize_runtime.supports_resize_signal;
 pub const ResizeHandler = if (builtin.target.os.tag == .wasi)
@@ -623,47 +607,10 @@ test "direct Apple Terminal uses RIS for terminal history resets" {
     try std.testing.expect(!historyResetUsesRisForValues("Ghostty", null));
 }
 
-const TestPty = struct {
-    master: std.posix.fd_t,
-    slave: std.posix.fd_t,
-
-    fn open() !TestPty {
-        const flags = std.posix.O{
-            .ACCMODE = .RDWR,
-            .NOCTTY = true,
-            .CLOEXEC = true,
-        };
-        const flags_int: c_int = @bitCast(flags);
-        const master_fd = posix_openpt(flags_int);
-        if (master_fd < 0) return error.PtyUnavailable;
-        errdefer closeTestFd(master_fd);
-
-        if (grantpt(master_fd) != 0) return error.PtyUnavailable;
-        if (unlockpt(master_fd) != 0) return error.PtyUnavailable;
-        const slave_name = ptsname(master_fd) orelse return error.PtyUnavailable;
-        const slave_fd = try std.posix.openatZ(std.posix.AT.FDCWD, slave_name, flags, 0);
-        errdefer closeTestFd(slave_fd);
-
-        return .{
-            .master = master_fd,
-            .slave = slave_fd,
-        };
-    }
-
-    fn close(self: TestPty) void {
-        closeTestFd(self.master);
-        closeTestFd(self.slave);
-    }
-};
-
-fn closeTestFd(fd: std.posix.fd_t) void {
-    (std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).close(io_mod.getIo());
-}
-
 test "enableRawMode preserves already queued input" {
-    if (!supports_test_pty) return error.SkipZigTest;
+    if (!testing_pty.supported) return error.SkipZigTest;
 
-    const pty = try TestPty.open();
+    const pty = try testing_pty.TestPty.open();
     defer pty.close();
 
     var original = try io_mod.tcgetattr(pty.slave);
@@ -704,9 +651,9 @@ test "enableRawMode preserves already queued input" {
 }
 
 test "enableRawMode preserves carriage return input" {
-    if (!supports_test_pty) return error.SkipZigTest;
+    if (!testing_pty.supported) return error.SkipZigTest;
 
-    const pty = try TestPty.open();
+    const pty = try testing_pty.TestPty.open();
     defer pty.close();
 
     var original = try io_mod.tcgetattr(pty.slave);
@@ -744,23 +691,20 @@ test "enableRawMode preserves carriage return input" {
     try std.testing.expectEqual(@as(u8, '\r'), buf[0]);
 }
 
-/// A descriptor number no process has open.
-const closed_test_fd: std.posix.fd_t = std.math.maxInt(std.posix.fd_t);
-
 test "terminal poll reports a descriptor that is not open as closed" {
-    if (!supports_test_pty) return error.SkipZigTest;
+    if (!testing_pty.supported) return error.SkipZigTest;
 
-    const terminal = TerminalState{ .stdin_fd = closed_test_fd };
+    const terminal = TerminalState{ .stdin_fd = testing_pty.closed_fd };
     const result = try terminal.pollInput(0);
     try std.testing.expect(!result.readable);
     try std.testing.expect(result.closed());
 }
 
 test "raw-mode cleanup returns for a descriptor that is not open" {
-    if (!supports_test_pty) return error.SkipZigTest;
+    if (!testing_pty.supported) return error.SkipZigTest;
 
     var terminal = TerminalState{
-        .stdin_fd = closed_test_fd,
+        .stdin_fd = testing_pty.closed_fd,
         .original_termios = std.mem.zeroes(std.posix.termios),
         .raw_enabled = true,
     };
@@ -770,9 +714,9 @@ test "raw-mode cleanup returns for a descriptor that is not open" {
 }
 
 test "raw-mode cleanup restores the original termios" {
-    if (!supports_test_pty) return error.SkipZigTest;
+    if (!testing_pty.supported) return error.SkipZigTest;
 
-    const pty = try TestPty.open();
+    const pty = try testing_pty.TestPty.open();
     defer pty.close();
     var terminal = TerminalState{ .stdin_fd = pty.slave };
     try terminal.captureOriginalTermios();
@@ -811,9 +755,9 @@ fn interruptThenDrain(target: std.c.pthread_t, master: std.posix.fd_t) void {
 }
 
 test "raw-mode cleanup retries a restore that a signal interrupts" {
-    if (!supports_test_pty or !supports_resize_signal) return error.SkipZigTest;
+    if (!testing_pty.supported or !supports_resize_signal) return error.SkipZigTest;
 
-    const pty = try TestPty.open();
+    const pty = try testing_pty.TestPty.open();
     defer pty.close();
     var terminal = TerminalState{ .stdin_fd = pty.slave };
     try terminal.captureOriginalTermios();
@@ -855,13 +799,12 @@ test "raw-mode cleanup retries a restore that a signal interrupts" {
 test "a revoked terminal polls as closed and its cleanup returns" {
     if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
 
-    const pty = try TestPty.open();
+    const pty = try testing_pty.TestPty.open();
     defer pty.close();
     var terminal = TerminalState{ .stdin_fd = pty.slave };
     try terminal.captureOriginalTermios();
     try terminal.enableRawMode();
-    const slave_name = ptsname(pty.master) orelse return error.PtyUnavailable;
-    try std.testing.expectEqual(@as(c_int, 0), revoke(slave_name));
+    try pty.revokeSlave();
 
     // macOS reports a revoked terminal as POLLNVAL alone, at once.
     const result = try terminal.pollInput(0);
@@ -874,22 +817,21 @@ test "a revoked terminal polls as closed and its cleanup returns" {
 test "the best-effort restore returns for a revoked terminal" {
     if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
 
-    const pty = try TestPty.open();
+    const pty = try testing_pty.TestPty.open();
     defer pty.close();
     const original = try io_mod.tcgetattr(pty.slave);
-    const slave_name = ptsname(pty.master) orelse return error.PtyUnavailable;
-    try std.testing.expectEqual(@as(c_int, 0), revoke(slave_name));
+    try pty.revokeSlave();
 
     // macOS answers ENOENT for a terminal it revoked.
     try io_mod.tcsetattrBestEffort(pty.slave, .FLUSH, original);
 }
 
 test "a terminal that is still there is not gone" {
-    if (!supports_test_pty) return error.SkipZigTest;
+    if (!testing_pty.supported) return error.SkipZigTest;
 
     // A background read that SIGTTIN does not stop fails with EIO on a
     // terminal like this one, which still polls quietly and answers tcgetattr.
-    const pty = try TestPty.open();
+    const pty = try testing_pty.TestPty.open();
     defer pty.close();
     try std.testing.expect(!(TerminalState{ .stdin_fd = pty.slave }).inputGone());
 }
@@ -897,38 +839,37 @@ test "a terminal that is still there is not gone" {
 test "a revoked terminal is gone" {
     if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
 
-    const pty = try TestPty.open();
+    const pty = try testing_pty.TestPty.open();
     defer pty.close();
-    const slave_name = ptsname(pty.master) orelse return error.PtyUnavailable;
-    try std.testing.expectEqual(@as(c_int, 0), revoke(slave_name));
+    try pty.revokeSlave();
     try std.testing.expect((TerminalState{ .stdin_fd = pty.slave }).inputGone());
 }
 
 test "a terminal whose other side closed is gone" {
-    if (!supports_test_pty) return error.SkipZigTest;
+    if (!testing_pty.supported) return error.SkipZigTest;
 
-    const pty = try TestPty.open();
-    closeTestFd(pty.master);
-    defer closeTestFd(pty.slave);
+    const pty = try testing_pty.TestPty.open();
+    testing_pty.closeFd(pty.master);
+    defer testing_pty.closeFd(pty.slave);
     try std.testing.expect((TerminalState{ .stdin_fd = pty.slave }).inputGone());
 }
 
 test "a descriptor that is not open is gone" {
-    if (!supports_test_pty) return error.SkipZigTest;
+    if (!testing_pty.supported) return error.SkipZigTest;
 
-    try std.testing.expect((TerminalState{ .stdin_fd = closed_test_fd }).inputGone());
+    try std.testing.expect((TerminalState{ .stdin_fd = testing_pty.closed_fd }).inputGone());
 }
 
 test "stdin that answers no tcgetattr is gone even when its poll is quiet" {
-    if (!supports_test_pty) return error.SkipZigTest;
+    if (!testing_pty.supported) return error.SkipZigTest;
 
     // macOS 15 can report a revoked controlling terminal as readable, with
     // no POLLHUP or POLLNVAL; only tcgetattr then shows it is gone. An empty
     // pipe whose writer is open polls quietly and is no terminal at all.
     var fds: [2]std.posix.fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return error.PipeFailed;
-    defer closeTestFd(fds[0]);
-    defer closeTestFd(fds[1]);
+    defer testing_pty.closeFd(fds[0]);
+    defer testing_pty.closeFd(fds[1]);
     try std.testing.expect((TerminalState{ .stdin_fd = fds[0] }).inputGone());
 }
 

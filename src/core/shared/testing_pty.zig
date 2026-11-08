@@ -1,8 +1,10 @@
 //! A pseudo-terminal for tests that need a real terminal behind a descriptor:
 //! one that is live, one whose other side closed, or, on macOS, one the system
-//! revoked. Import it only from test blocks.
+//! revoked, and the other descriptors those tests lean on. Import it only from
+//! test blocks.
 const std = @import("std");
 const builtin = @import("builtin");
+const io_mod = @import("io.zig");
 
 pub const supported = switch (builtin.target.os.tag) {
     .linux,
@@ -50,6 +52,16 @@ pub const TestPty = struct {
         closeFd(self.slave);
     }
 
+    /// Flips ECHO on the slave and returns the settings from before the flip,
+    /// so a test can tell whether a later restore put them back.
+    pub fn flipEcho(self: TestPty) !std.posix.termios {
+        const original = try io_mod.tcgetattr(self.slave);
+        var flipped = original;
+        flipped.lflag.ECHO = !original.lflag.ECHO;
+        try io_mod.tcsetattr(self.slave, .NOW, flipped);
+        return original;
+    }
+
     /// Revokes the terminal, as macOS does when its window goes away: every
     /// open descriptor for it, `slave` included, stops working.
     pub fn revokeSlave(self: TestPty) !void {
@@ -60,4 +72,16 @@ pub const TestPty = struct {
 
 pub fn closeFd(fd: std.posix.fd_t) void {
     _ = std.c.close(fd);
+}
+
+/// A pipe that already holds `bytes` and whose write end is closed: reads
+/// return the bytes and then 0, as a terminal at end of input does. The caller
+/// closes the returned read end.
+pub fn pipeAtEndOfInput(bytes: []const u8) !std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    errdefer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+    if (bytes.len > 0 and std.c.write(fds[1], bytes.ptr, bytes.len) != bytes.len) return error.PipeFailed;
+    return fds[0];
 }

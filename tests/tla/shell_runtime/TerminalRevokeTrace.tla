@@ -9,15 +9,16 @@
 (*   events   what the driver did to fx's terminal, in order: "Type" (it   *)
 (*            typed text), "Quit" (it typed /quit), "Revoke" (revoke(2)    *)
 (*            while fx runs, which may wake the poll fx waits in),         *)
-(*            "RevokeStopped" (revoke(2) while fx is stopped, so after a   *)
-(*            poll, never in one), "Hangup" (it closed the terminal's      *)
-(*            other side), "Suspend" (Ctrl+Z), "Bg" and "Fg" (the shell's  *)
-(*            job commands), or "Background" (reads start failing with     *)
-(*            EIO on a terminal that is still there)                       *)
+(*            "RevokeStopped" (revoke(2) while fx is stopped or held in a  *)
+(*            request, so after a poll, never in one), "Hangup" (it        *)
+(*            closed the terminal's other side), "Suspend" (Ctrl+Z), "Bg"  *)
+(*            and "Fg" (the shell's job commands), or "Background" (reads  *)
+(*            start failing with EIO on a terminal that is still there)    *)
 (*   end      how fx ended up: "exited" (status 0), "failed" (status 1     *)
 (*            with an fx error on stderr), "crashed" (an abort),           *)
-(*            "spinning" (still running and burning CPU), or "other"       *)
-(*            (still running idle, or another exit)                        *)
+(*            "spinning" (still running and burning CPU), "waiting" (still *)
+(*            running idle, as the sign-in wait does on a terminal that is *)
+(*            gone), or "other" (another exit)                             *)
 (*   restore  "restored" (the terminal's settings after fx exited match    *)
 (*            those before), "quiet" (nothing to compare and stderr is     *)
 (*            empty), "clean" (a shell owns the settings afterwards, and   *)
@@ -26,16 +27,17 @@
 (*            back)                                                        *)
 (*   eio      the run answered reads on a revoked terminal with EIO        *)
 (*   stops    SIGTTIN and SIGTTOU kept their default action                *)
-(*   site     who restored the terminal: "shell" (fx's interactive shell), *)
-(*            "team_picker" (fx teams), or "masked_key" (the key prompt)   *)
+(*   site     who ran: "shell" (fx's interactive shell), "team_picker"     *)
+(*            (fx teams), "masked_key" (the key prompt), or "sign_in" (the *)
+(*            wait of fx login vercel for browser authorization)           *)
 (*                                                                         *)
-(* fx's own steps (Poll, Drain, PromptReturns, PromptRead, Restore) run    *)
-(* freely between the driver's events; a read of typed input asks fx to    *)
-(* quit exactly when the driver typed /quit. The run index k advances only *)
-(* when the model has used all of a run's events and ended in exactly the  *)
-(* observed way. The trace is ACCEPTED when TLC violates NotAllMatched,    *)
-(* which is reachable only after every run matched. A completed search     *)
-(* means REJECTED.                                                         *)
+(* fx's own steps (Poll, Drain, PromptReturns, PromptRead, SignInWait,     *)
+(* SignInEnds, Restore) run freely between the driver's events; a read of  *)
+(* typed input asks fx to quit exactly when the driver typed /quit. The    *)
+(* run index k advances only when the model has used all of a run's events *)
+(* and ended in exactly the observed way. The trace is ACCEPTED when TLC   *)
+(* violates NotAllMatched, which is reachable only after every run         *)
+(* matched. A completed search means REJECTED.                             *)
 (***************************************************************************)
 EXTENDS TerminalRevoke, TerminalRevokeObserved
 
@@ -93,6 +95,8 @@ FxStep ==
        \/ Drain
        \/ PromptReturns
        \/ PromptRead
+       \/ SignInWait
+       \/ SignInEnds
        \/ Restore
     /\ UNCHANGED <<k, j, typed>>
 
@@ -114,6 +118,9 @@ Matches(o) ==
                                   /\ restore \in RestoreSeen(o.restore)
          [] o.end = "crashed"  -> phase = "crashed"
          [] o.end = "spinning" -> phase = "loop" /\ Gone /\ spins = MaxSpins
+         \* Still waiting after the terminal went, and it took at least one
+         \* pass to find out (eof): the sign-in wait sleeps out its slices.
+         [] o.end = "waiting"  -> phase = "loop" /\ Gone /\ spins = 0 /\ eof
          [] OTHER              -> FALSE
 
 Advance ==

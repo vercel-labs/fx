@@ -36,6 +36,22 @@
 //                         picker must end on, within 2 s and without burning
 //                         CPU, and not read again (NoReadAfterEof)
 //
+// Three more runs start fx login vercel on the PTY, which waits for browser
+// authorization against a local fake issuer, and take its terminal away while
+// it waits. Between polls of the issuer the wait offers to open the browser on
+// a key, and it must go on waiting, and polling the issuer, at low CPU:
+//
+//   sign-in-revoke-stopped  revoke the terminal while the issuer holds fx's
+//                         second token request, so fx is in a request and not
+//                         in its wait for a key: every later poll of stdin
+//                         reports POLLNVAL alone, which the wait took as no key
+//                         and returned on at once, spinning at full CPU
+//   sign-in-revoke-idle   revoke while fx waits for a key: the poll wakes with
+//                         POLLIN and POLLHUP, which is a key
+//   sign-in-hangup        close the other side: the same answer
+//
+// A fake open on PATH records the browser launches, so none starts.
+//
 // Two more runs start fx from an interactive bash in tmux and take it through
 // Ctrl+Z, bg, fg, and /quit: job-control with SIGTTIN and SIGTTOU at their
 // default, and job-control-signals-ignored with fx started with both ignored.
@@ -55,7 +71,10 @@
 // reject them, and the team picker run through the model of fx before the
 // prompts' fix (Bug = "prompts_strict"), and through the model of fx where the
 // team picker reads again after a read of 0 (Bug = "picker_ignores_eof"),
-// which must reject them too.
+// which must reject them too, and the sign-in run that revoked the terminal in
+// a request through the model of fx before the sign-in wait's fix (Bug =
+// "sign_in_spins") and through the model of a fix that misses POLLNVAL alone
+// (Bug = "sign_in_nval").
 //
 // revoke(2) exists only on macOS here, so the driver runs only there.
 //
@@ -74,9 +93,9 @@ import { binary, targetHelpers, targetModule } from "../lib/context";
 import { TLA_ROOT, outDir, runTlc, writeJson } from "../lib/tlc";
 
 type Event = "Type" | "Quit" | "Revoke" | "RevokeStopped" | "Hangup" | "Suspend" | "Bg" | "Fg" | "Background";
-type End = "exited" | "failed" | "crashed" | "spinning" | "other";
+type End = "exited" | "failed" | "crashed" | "spinning" | "waiting" | "other";
 type Restore = "restored" | "quiet" | "clean" | "error" | "lost" | "none";
-type Site = "shell" | "team_picker";
+type Site = "shell" | "team_picker" | "sign_in";
 type Scenario =
   | "quit"
   | "hangup"
@@ -90,6 +109,9 @@ type Scenario =
   | "live-eio"
   | "team-picker-revoke-eio"
   | "team-picker-revoke"
+  | "sign-in-revoke-stopped"
+  | "sign-in-revoke-idle"
+  | "sign-in-hangup"
   | "job-control"
   | "job-control-signals-ignored";
 type Observation = {
@@ -129,6 +151,9 @@ const SCENARIOS: Scenario[] = [
   "live-eio",
   "team-picker-revoke-eio",
   "team-picker-revoke",
+  "sign-in-revoke-stopped",
+  "sign-in-revoke-idle",
+  "sign-in-hangup",
   "job-control",
   "job-control-signals-ignored",
 ];
@@ -537,6 +562,175 @@ async function runTeamPicker(
   }
 }
 
+// fx login vercel on the PTY, waiting for browser authorization. A local fake
+// issuer answers the device flow and keeps every token request pending. For
+// sign-in-revoke-stopped it holds the second token request until the driver
+// has revoked the terminal, so the revoke lands while fx is in a request. fx
+// then goes on, with a terminal whose every poll reports POLLNVAL alone. The
+// wait must neither exit nor burn CPU, and the sign-in must poll the issuer
+// again. A fake `open` first on PATH records browser launches.
+async function runSignIn(
+  helpers: any,
+  pty: any,
+  gateway: any,
+  id: string,
+  scenario: Scenario,
+  scratch: string,
+): Promise<Observation> {
+  const root = mkdtempSync(join(scratch, `${id}-`));
+  for (const dir of ["home", "fx-home", "workspace", "pty", "bin"]) mkdirSync(join(root, dir));
+  const modelsBefore = gateway.modelRequests.length;
+  const chatBefore = gateway.requests.length;
+  const openedPath = join(root, "opened.log");
+  writeFileSync(join(root, "bin", "open"), `#!/bin/sh\nprintf '%s\\n' "$@" >> '${openedPath}'\n`, { mode: 0o755 });
+  let tokenRequests = 0;
+  let holdAt: number | null = scenario === "sign-in-revoke-stopped" ? 2 : null;
+  let held = false;
+  let release: () => void = () => {};
+  const released = new Promise<void>((resolve) => (release = resolve));
+  const issuer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const base = `http://127.0.0.1:${issuer.port}`;
+      if (url.pathname === "/.well-known/openid-configuration") {
+        return Response.json({
+          issuer: base,
+          device_authorization_endpoint: `${base}/oauth/device`,
+          token_endpoint: `${base}/oauth/token`,
+        });
+      }
+      if (url.pathname === "/oauth/device") {
+        return Response.json({
+          device_code: "device-code",
+          user_code: "TEST-CODE",
+          verification_uri: `${base}/verify`,
+          verification_uri_complete: `${base}/verify?code=TEST-CODE`,
+          expires_in: 600,
+          interval: 1,
+        });
+      }
+      if (url.pathname === "/oauth/token") {
+        tokenRequests += 1;
+        if (tokenRequests === holdAt) {
+          held = true;
+          await released;
+        }
+        return Response.json({ error: "authorization_pending" }, { status: 400 });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  const session = await pty.PtySession.launch({
+    bin: binary,
+    args: ["login", "vercel"],
+    cwd: join(root, "workspace"),
+    dir: join(root, "pty"),
+    env: {
+      ...fxEnv(helpers, gateway, root),
+      PATH: join(root, "bin"),
+      FX_TEST_OAUTH_ISSUER_URL: `http://127.0.0.1:${issuer.port}`,
+    },
+  });
+  try {
+    if (!(await session.waitForOutput((text: string) => text.includes("Waiting for authentication"), 15_000))) {
+      throw new Error(`${id}: fx login never said it waits for authentication; stderr: ${session.stderr()}`);
+    }
+    const events: Event[] = [];
+    const untilTokenRequests = async (count: number) => {
+      const deadline = Date.now() + 15_000;
+      while (tokenRequests < count) {
+        if (Date.now() > deadline) throw new Error(`${id}: fx made fewer than ${count} token requests`);
+        await Bun.sleep(10);
+      }
+    };
+    switch (scenario) {
+      case "sign-in-revoke-stopped":
+        {
+          const deadline = Date.now() + 15_000;
+          while (!held) {
+            if (Date.now() > deadline) throw new Error(`${id}: fx never made its second token request`);
+            await Bun.sleep(10);
+          }
+        }
+        session.revoke();
+        events.push("RevokeStopped");
+        holdAt = null;
+        release();
+        break;
+      case "sign-in-revoke-idle":
+        // Wait until fx has answered a token request and is in its wait for a key.
+        await untilTokenRequests(1);
+        await Bun.sleep(350);
+        session.revoke();
+        events.push("Revoke");
+        break;
+      case "sign-in-hangup":
+        await untilTokenRequests(1);
+        await Bun.sleep(350);
+        session.hangUp();
+        events.push("Hangup");
+        break;
+    }
+    const requestsAtEvent = tokenRequests;
+    const eventAt = performance.now();
+    await Bun.sleep(300);
+    const exit = session.exited();
+    let end: End;
+    let cpuAfter: number | null = null;
+    if (exit) {
+      if (exit.code === 0) end = "exited";
+      else if (exit.signal === "SIGABRT" || /panic/.test(session.stderr())) end = "crashed";
+      else if (exit.code === 1 && FX_ERROR.test(session.stderr())) end = "failed";
+      else end = "other";
+    } else {
+      const before = session.cpuSeconds();
+      await Bun.sleep(SPIN_WINDOW_MS);
+      cpuAfter = session.cpuSeconds();
+      const burned = before !== null && cpuAfter !== null ? cpuAfter - before : 0;
+      end = burned >= SPIN_CPU_SECONDS ? "spinning" : "waiting";
+    }
+    if (end === "waiting") {
+      // The sign-in goes on polling the issuer, as it does when no key is pressed.
+      const deadline = Date.now() + 5_000;
+      while (tokenRequests <= requestsAtEvent && Date.now() < deadline) await Bun.sleep(50);
+      if (tokenRequests <= requestsAtEvent) throw new Error(`${id}: fx waited but never polled the issuer again`);
+    }
+    const opened = readLines(openedPath).length;
+    return {
+      id,
+      scenario,
+      delay_ms: 0,
+      events,
+      end,
+      restore: "none",
+      eio: false,
+      stops: true,
+      site: "sign_in",
+      evidence: {
+        exit,
+        exited_after_ms: exit ? Math.round(performance.now() - eventAt) : null,
+        cpu_seconds_after: cpuAfter,
+        stderr: session.stderr().slice(0, 2_000),
+        gateway: {
+          models: gateway.modelRequests.length - modelsBefore,
+          chat: gateway.requests.length - chatBefore,
+        },
+        issuer: [`token_requests=${tokenRequests}`, `after_event=${tokenRequests - requestsAtEvent}`, `browser_opens=${opened}`],
+        interposer: [],
+        job_states: [],
+        trace_errors: [],
+      },
+    };
+  } finally {
+    release();
+    await session.dispose();
+    issuer.stop(true);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 // fx from an interactive bash in tmux, through Ctrl+Z, bg, fg, and /quit.
 async function runJobControl(
   helpers: any,
@@ -728,6 +922,8 @@ async function main(): Promise<number> {
         ? await runJobControl(helpers, jobs, gateway, id, run.scenario, scratch)
         : run.scenario.startsWith("team-picker-revoke")
         ? await runTeamPicker(helpers, pty, gateway, id, run.scenario === "team-picker-revoke-eio", scratch, out)
+        : run.scenario.startsWith("sign-in-")
+        ? await runSignIn(helpers, pty, gateway, id, run.scenario, scratch)
         : await runScenario(helpers, pty, gateway, id, run.scenario, run.delay, scratch, out);
       observations.push(observation);
       const { gateway: counted, issuer, exited_after_ms, cpu_seconds_after, interposer, job_states, trace_errors } = observation.evidence;
@@ -770,11 +966,23 @@ async function main(): Promise<number> {
     // restore reported an unexpected errno, so a quiet restore must not fit;
     // through fx where the picker reads again after a read of 0, the plain
     // revoke would have spun, so a run that ended must not fit.
-    const prompts = observations.filter((o) => o.site !== "shell");
+    const prompts = observations.filter((o) => o.site === "team_picker");
     for (const [name, bug] of [["prompts-strict", "prompts_strict"], ["picker-ignores-eof", "picker_ignores_eof"]]) {
       if (prompts.length === 0) break;
       const replay = await check(join(out, name!), prompts, bug!);
       console.log(`TLC TerminalRevokeTrace Bug=${bug} (prompt runs only): ${replay.verdict} (must be REJECTED)`);
+      if (replay.verdict === "TOOL_ERROR") status = 2;
+      else if (replay.verdict !== "REJECTED" && status === 0) status = 1;
+    }
+    // The sign-in wait. The run that revoked the terminal in a request leaves
+    // every poll of stdin reporting POLLNVAL alone: through fx before the wait's
+    // fix, and through a fix that misses POLLNVAL, that run spins, so a run that
+    // kept waiting must not fit.
+    const signIn = observations.filter((o) => o.site === "sign_in" && o.events.includes("RevokeStopped"));
+    for (const [name, bug] of [["sign-in-spins", "sign_in_spins"], ["sign-in-nval", "sign_in_nval"]]) {
+      if (signIn.length === 0) break;
+      const replay = await check(join(out, name!), signIn, bug!);
+      console.log(`TLC TerminalRevokeTrace Bug=${bug} (sign-in revoke run only): ${replay.verdict} (must be REJECTED)`);
       if (replay.verdict === "TOOL_ERROR") status = 2;
       else if (replay.verdict !== "REJECTED" && status === 0) status = 1;
     }

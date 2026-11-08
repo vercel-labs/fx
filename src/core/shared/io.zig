@@ -1126,9 +1126,10 @@ test "tcsetattrBestEffort returns for a pipe, which is no terminal" {
 
 test "tcsetattrBestEffort returns for a terminal whose other side closed" {
     const testing_pty = @import("testing_pty.zig");
-    // Linux hangs up a terminal when its master closes, and answers EIO.
-    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (!testing_pty.supported) return error.SkipZigTest;
 
+    // Linux hangs up a terminal when its master closes and answers EIO; macOS
+    // answers success or an error that is ignored. Each returns quietly.
     const pty = try testing_pty.TestPty.open();
     testing_pty.closeFd(pty.master);
     defer testing_pty.closeFd(pty.slave);
