@@ -4296,6 +4296,45 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("ask accepts the requested script when a non-English request quotes English", async () => {
+    const translated = "잠금 파일이 다시 손상되었습니다. 즉시 확인하겠습니다.";
+    for (const [label, prompt] of [
+      ["vietnamese", "Dịch nội dung sau sang tiếng Hàn. The lockfile is broken again."],
+      ["indonesian", "Terjemahkan ke bahasa Korea. The lockfile is broken again."],
+      // Each accent is a base letter and a combining mark.
+      ["vietnamese-decomposed", "Di\u0323ch giu\u0301p. The lockfile is broken again."],
+      // "we" is a Dutch word, and the English list leaves it out.
+      ["dutch", "Kunnen we dit vandaag nog oplossen? The lockfile is broken again."],
+      // "can" is English only in "can't": a name with a Turkish ending is not.
+      ["turkish-name", "Bunu Can'a Korece yaz. The lockfile is broken again."],
+      // A no-break space between words, written as an escape.
+      ["indonesian-no-break-spaces", "Terjemahkan\u00a0ke\u00a0bahasa\u00a0Korea. The lockfile is broken again."],
+      // A line break other than LF ends the request's own clause.
+      ["indonesian-carriage-return", "Terjemahkan ke bahasa Korea\rThe lockfile is broken again."],
+      ["indonesian-line-separator", "Terjemahkan ke bahasa Korea\u2028Why is the lockfile broken again?"],
+    ] as const) {
+      const root = createFixtureRoot(`response-language-${label}`);
+      const gateway = startGateway(() => fakeGatewayFinalText(translated));
+      try {
+        const result = await runFx(["ask", "--json", "--auto", "--no-save", prompt], {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+          timeoutMs: 15_000,
+        });
+
+        expect({ label, code: result.code, stderr: result.stderr }).toEqual({ label, code: 0, stderr: "" });
+        expect(parseAskJson(result.stdout).output).toBe(translated);
+        expect(gateway.requestCount()).toBe(1);
+        expect(gateway.requests[0]!.body).not.toContain(
+          "The previous candidate used a different language",
+        );
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }
+  });
+
   test("legacy tool projection preserves surviving calls and replay through saved resume", async () => {
     for (const { tool, input } of [
       { tool: "terminal", input: { action: "read", session_id: "missing" } },
