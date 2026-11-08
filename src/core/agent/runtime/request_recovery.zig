@@ -57,8 +57,10 @@ const cancel_poll_ms: u64 = 25;
 const ticker_interval_ns: i96 = if (builtin.is_test) 5 * std.time.ns_per_ms else tick_ms * std.time.ns_per_ms;
 /// The virtual boot clock tests start at.
 const test_epoch_ms: u64 = 1_000_000;
-/// Room for the proxy sentence a status carries. `net_proxy.statusWithProxy`
-/// cuts it to the status's own 95 bytes, so more is never shown.
+/// Room for the proxy note a status carries. The note is the short form of the
+/// failure, at most `net_proxy.max_notice_bytes`; a longer text is still cut by
+/// `net_proxy.statusWithProxy` to the status's own 95 bytes, so more is never
+/// shown.
 const proxy_note_capacity = 160;
 
 /// The module's failure kind for each of fx's transient causes, and null for
@@ -117,10 +119,11 @@ pub const RequestRecovery = struct {
     ticker_wake: std.Io.Condition = .init,
     /// Single-threaded builds tick from the transport's cooperative pulse.
     inner_pulse: ?agent_stream_provider.CooperativePulse = null,
-    /// The sentence of the proxy failure that ended the latest send, when it
+    /// The short note of the proxy failure that ended the latest send, when it
     /// failed at the proxy: every waiting and retrying status carries it until
     /// a send gets an answer, so the person is not told only that the network
-    /// is down (`tests/tla/net_proxy/NetProxy.tla` RetryNoticeNamesProxy).
+    /// is down (`tests/tla/net_proxy/NetProxy.tla` RetryNoticeNamesProxy), and
+    /// the status keeps its wait part (`NoticeKeepsWait`).
     proxy_note: [proxy_note_capacity]u8 = undefined,
     proxy_note_len: u8 = 0,
     /// The module's newest save, and whether it reached the turn.
@@ -256,9 +259,10 @@ pub const RequestRecovery = struct {
     }
 
     /// `failed`, for a send that failed at the proxy: `proxy_failure` is the
-    /// sentence the connection held (`net_proxy_io.takeRequestFailure`), and
-    /// the statuses that follow carry it. Null for any other failure, which
-    /// drops the sentence of an earlier one.
+    /// short note of the failure the connection held
+    /// (`net_proxy_io.takeRequestFailureNotice`), and the statuses that follow
+    /// carry it. Null for any other failure, which drops the note of an earlier
+    /// one.
     pub fn failedWith(self: *RequestRecovery, failure: Failure, proxy_failure: ?[]const u8) !?Send {
         // An answer given before this failure answers nothing.
         if (self.continue_flag) |flag| flag.store(false, .seq_cst);
@@ -584,9 +588,10 @@ pub const RequestRecovery = struct {
         }
     }
 
-    /// Adds the held proxy sentence to a waiting or retrying status. The text
-    /// stays the module's 95 bytes (`net_proxy.statusWithProxy`), and the
-    /// 46-column short form, which has no room for a proxy, stays as it is.
+    /// Adds the held proxy note to a waiting or retrying status. The text stays
+    /// the module's 95 bytes and keeps its cause and its wait part
+    /// (`net_proxy.statusWithProxy`), and the 46-column short form, which has no
+    /// room for a proxy, stays as it is.
     fn nameProxyLocked(self: *RequestRecovery, status: *types.RouteRecoveryStatus) void {
         if (self.proxy_note_len == 0) return;
         switch (status.kind) {
@@ -863,7 +868,7 @@ test "a send that failed at the proxy names it in every status until another fai
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
     defer request.deinit();
 
-    const dead = "could not connect to proxy 127.0.0.1:54321 (connection refused)";
+    const dead = "proxy 127.0.0.1:54321 unreachable";
     _ = try request.start(false, null);
     _ = try request.failedWith(.{ .kind = .offline }, dead);
     _ = (try request.waitForSend()).?;
@@ -871,8 +876,7 @@ test "a send that failed at the proxy names it in every status until another fai
     var texts = statusTexts(&fake, &buf);
     try std.testing.expectEqual(@as(usize, 2), texts.len);
     try std.testing.expectEqualStrings("Offline \u{b7} next try in 1s \u{b7} " ++ dead, texts[0]);
-    // The attempt gives way so the sentence stays whole in 95 bytes.
-    try std.testing.expectEqualStrings("Offline \u{b7} retrying \u{b7} " ++ dead, texts[1]);
+    try std.testing.expectEqualStrings("Offline \u{b7} retrying \u{b7} attempt 2 \u{b7} " ++ dead, texts[1]);
 
     // Another failure that is not the proxy's drops the sentence.
     _ = try request.failed(.{ .kind = .dropped });
@@ -892,7 +896,7 @@ test "a send that failed at the proxy names it in every status until another fai
     try std.testing.expectEqual(@as(usize, 0), shown[shown.len - 1].text.len);
 }
 
-test "a long proxy sentence keeps itself whole, and no status passes 95 bytes" {
+test "a proxy note at its longest keeps the cause and the wait part of every status, and no status passes 95 bytes" {
     var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
     defer fake.deinit();
     const deps = fake.deps();
@@ -900,21 +904,37 @@ test "a long proxy sentence keeps itself whole, and no status passes 95 bytes" {
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
     defer request.deinit();
 
-    const refused = "proxy 127.0.0.1:54321 refused CONNECT to proxy-target.test:443: 502 Bad Gateway";
+    // The longest note: a 253-byte host cut to fit, the longest port and the
+    // longest cause.
+    var host: [253]u8 = @splat('h');
+    const failure = net_proxy.Failure.init(.no_answer, &host, 65535, "x.ai", 443);
+    var note_buf: [net_proxy.max_notice_bytes]u8 = undefined;
+    const note = failure.shortText(&note_buf);
+    try std.testing.expect(std.mem.endsWith(u8, note, ":65535 did not answer"));
+    try std.testing.expect(std.mem.find(u8, note, "\u{2026}") != null);
+
     _ = try request.start(false, null);
-    for (0..12) |_| {
-        _ = try request.failedWith(.{ .kind = .offline }, refused);
-        _ = (try request.waitForSend()).?;
+    const kinds = [_]recovery.Failure.Kind{ .offline, .dropped, .server, .unreadable, .rate_limited };
+    for (kinds) |kind| {
+        for (0..6) |_| {
+            _ = try request.failedWith(.{ .kind = kind }, note);
+            _ = (try request.waitForSend()).?;
+        }
     }
-    try std.testing.expect(fake.route_recovery_statuses.items.len >= 24);
+    try std.testing.expect(fake.route_recovery_statuses.items.len >= kinds.len * 12);
     for (fake.route_recovery_statuses.items) |status| {
-        try std.testing.expect(status.text.len <= recovery.Text.capacity);
-        try std.testing.expect(std.mem.startsWith(u8, status.text.slice(), "Offline"));
-        try std.testing.expect(std.mem.endsWith(u8, status.text.slice(), refused));
-        try std.testing.expect(std.unicode.utf8ValidateSlice(status.text.slice()));
+        const text = status.text.slice();
+        if (status.kind != .waiting and status.kind != .retrying) continue;
+        try std.testing.expect(text.len <= recovery.Text.capacity);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+        // The note stays whole, after the status.
+        try std.testing.expect(std.mem.endsWith(u8, text, note));
+        const status_part = text[0 .. text.len - note.len - " \u{b7} ".len];
+        // The cause and the wait or the retry stay; only the attempt gives way.
+        try std.testing.expect(std.mem.find(u8, status_part, "next try in ") != null or std.mem.find(u8, status_part, "retrying") != null);
     }
 
-    // A sentence past any room is cut, and the status still fits.
+    // A note past its budget is cut, and the status still fits.
     var long: [200]u8 = @splat('p');
     _ = try request.failedWith(.{ .kind = .dropped }, &long);
     const last = fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1];

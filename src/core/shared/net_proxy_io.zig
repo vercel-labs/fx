@@ -226,6 +226,24 @@ pub fn takeRequestFailure(err: anyerror, buf: []u8) ?[]const u8 {
     return takeHeldFailure(buf);
 }
 
+/// The short form of the proxy failure this thread's request holds, for the
+/// retry notice (`net_proxy.Failure.shortText`, at most `notice_bytes`), when
+/// `err` is one a proxy failure returns. The full sentence is for the final
+/// error and `fx models`, which take it with `takeRequestFailure` and
+/// `takeHeldFailure`. Clears what it read either way.
+pub fn takeRequestFailureNotice(err: anyerror, buf: []u8) ?[]const u8 {
+    if (!net_proxy.isProxyFailureError(err)) {
+        request_failure = null;
+        return null;
+    }
+    const failure = request_failure orelse return null;
+    request_failure = null;
+    return failure.shortText(buf);
+}
+
+/// The room `takeRequestFailureNotice` needs in its buffer.
+pub const notice_bytes = net_proxy.max_notice_bytes;
+
 /// The text of the proxy failure this thread holds, for a caller that knows
 /// its own failure was a transport failure but not which error it was, as
 /// `fx models` does. Clears what it read.

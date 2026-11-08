@@ -12,10 +12,13 @@
 //! but `.ok` fails the connection with the real `connectError` and adds the
 //! real failure to the real `FailureLog`. A report claims from that log only
 //! when the real `isProxyFailureError` says the failure came from the proxy. A
-//! failure fx retries claims the same way for its retry notice, and the real
-//! `statusWithProxy` puts the sentence into a status line, which must fit its
-//! 95 bytes and keep the sentence. After every operation it reports what each
-//! connection holds, what went on the wire, and the log's records and claims.
+//! failure fx retries claims the same way for its retry notice. The real
+//! `Failure.shortText` and `statusWithProxy` put the proxy's name into each
+//! status line the retry can show, the longest ones included, with a proxy host
+//! of 253 bytes: the notice is "proxy" when every line keeps its cause, its wait
+//! part and the whole note within 95 bytes, and "proxy_cut" when one does not.
+//! After every operation it reports what each connection holds, what went on
+//! the wire, and the log's records and claims.
 const std = @import("std");
 const net_proxy = @import("net_proxy");
 const url_policy = @import("url_policy");
@@ -47,9 +50,30 @@ const Result = struct {
     @"error": ?[]const u8 = null,
 };
 
+/// The proxy's host: 253 bytes, as long as a host name can be, in labels of at
+/// most 63 bytes, so any sentence or uncut host fills a status text and the real
+/// parser still accepts it.
+const proxy_host = blk: {
+    var bytes: [253]u8 = @splat('p');
+    bytes[63] = '.';
+    bytes[127] = '.';
+    bytes[191] = '.';
+    break :blk bytes;
+};
+
+const proxy_url = blk: {
+    const head = "http://user:pass@";
+    const tail = ":3128";
+    var bytes: [head.len + proxy_host.len + tail.len]u8 = undefined;
+    @memcpy(bytes[0..head.len], head);
+    @memcpy(bytes[head.len..][0..proxy_host.len], &proxy_host);
+    @memcpy(bytes[head.len + proxy_host.len ..], tail);
+    break :blk bytes;
+};
+
 const Env = struct {
     pub fn getenv(_: Env, name: []const u8) ?[]const u8 {
-        if (std.mem.eql(u8, name, "https_proxy")) return "http://user:pass@proxy.example:3128";
+        if (std.mem.eql(u8, name, "https_proxy")) return &proxy_url;
         if (std.mem.eql(u8, name, "no_proxy")) return "bypass.example";
         return null;
     }
@@ -155,6 +179,47 @@ fn cannedAnswer(a: []const u8) []const u8 {
     return ""; // silent, or dead: nothing is read
 }
 
+/// The longest status lines a retry can show beside a proxy note: the cause,
+/// the wait or the retry, then the clock and the attempt, which give way first.
+const worst_statuses = [_][]const u8{
+    "Offline \u{b7} next try in 59m 59s",
+    "Connection lost \u{b7} next try in 59m 59s \u{b7} attempt 65535",
+    "Unreadable reply \u{b7} next try in 59m 59s \u{b7} attempt 65535",
+    "Gateway error \u{b7} next try in 59m 59s \u{b7} attempt 65535",
+    "Rate limited \u{b7} next try in 59m 59s \u{b7} attempt 65535",
+    "Offline \u{b7} retrying \u{b7} attempt 65535",
+    "Connection lost \u{b7} retrying \u{b7} attempt 65535",
+    "Gateway error \u{b7} retrying without Fast \u{b7} attempt 65535",
+};
+
+/// The status up to its second separator: the cause and the wait or retry part.
+fn firstTwoParts(status: []const u8) []const u8 {
+    const separator = " \u{b7} ";
+    const first = std.mem.find(u8, status, separator) orelse return status;
+    const rest = status[first + separator.len ..];
+    const second = std.mem.find(u8, rest, separator) orelse return status;
+    return status[0 .. first + separator.len + second];
+}
+
+/// What the retry notice for `failure` says, in the model's words: "proxy"
+/// when it names the proxy within the note's budget and every status keeps its
+/// cause, its wait part and the whole note in 95 bytes; "proxy_cut" when one
+/// status loses any of them.
+fn noticeOf(failure: *const net_proxy.Failure) []const u8 {
+    // A note longer than its budget shows in full, so a short form that does
+    // not cut its host cannot hide behind the buffer.
+    var note_buf: [1024]u8 = undefined;
+    const note = failure.shortText(&note_buf);
+    if (note.len > net_proxy.max_notice_bytes) return "proxy_cut";
+    var line: [95]u8 = undefined;
+    for (worst_statuses) |status| {
+        const text = net_proxy.statusWithProxy(&line, status, note);
+        if (!std.mem.startsWith(u8, text, firstTwoParts(status))) return "proxy_cut";
+        if (!std.mem.endsWith(u8, text, note)) return "proxy_cut";
+    }
+    return "proxy";
+}
+
 fn run(lab: *Lab, op: Op) !void {
     if (is(op.op, "walk")) {
         const targets = op.targets orelse return error.WalkWithoutTargets;
@@ -240,20 +305,9 @@ fn run(lab: *Lab, op: Op) !void {
         if (net_proxy.isProxyFailureError(err)) {
             const host = try connectHost(c.target, &host_buf);
             if (lab.log.claim(host, 443, c.since)) |failure| {
-                c.notice = "proxy";
+                c.notice = noticeOf(&failure);
                 c.ngot = targetOfHost(failure.target());
                 lab.claimed += 1;
-                // The retry notice carries the sentence in a status line of
-                // 95 bytes, whatever the status says.
-                var sentence_buf: [512]u8 = undefined;
-                const sentence = failure.text(&sentence_buf);
-                var line: [95]u8 = undefined;
-                for ([_][]const u8{ "Offline \u{b7} next try in 1s", "Connection lost \u{b7} retrying \u{b7} attempt 112 \u{b7} 1h 02m" }) |status| {
-                    const text = net_proxy.statusWithProxy(&line, status, sentence);
-                    // A sentence longer than the line is cut; one that fits stays whole.
-                    if (text.len > line.len) return error.NoticePastItsRoom;
-                    if (sentence.len <= line.len and std.mem.find(u8, text, sentence) == null) return error.NoticeLacksProxySentence;
-                }
             }
         }
     } else if (is(op.op, "report")) {

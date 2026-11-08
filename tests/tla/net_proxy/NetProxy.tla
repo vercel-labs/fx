@@ -30,7 +30,9 @@ which reports: it shows the proxy text only when it claims a record, and a
 claim uses the record up. got is the target the claimed record names. A
 failure that fx retries (a dead proxy, a 5xx answer, no answer) shows a retry
 notice instead, which names the proxy the same way: notice is what the notice
-says, and ngot the target the claimed record names.
+says, and ngot the target the claimed record names. A notice has 95 bytes, and
+it must keep its wait part ("next try in", "retrying") as well as name the
+proxy; "proxy_cut" is a notice that named the proxy and lost the wait part.
 
 The constants switch the mechanisms on and off:
   UseProxy         fx reads the proxy variables at all (FALSE is fx today)
@@ -51,11 +53,18 @@ The constants switch the mechanisms on and off:
   NoticeMode       what a retry notice says. "own_target": it claims a record
                    as DetailMode does and names the proxy; "generic": it says
                    only that the network is down; "global": it reads any record
+  NoticeForm       how a notice names the proxy. "short": host:port and the
+                   cause in at most 48 bytes, the host cut with an ellipsis, so
+                   the wait part always fits; "full": the whole sentence, which
+                   leaves no room for the wait part when it is long, as a 502's
+                   sentence is; "short_uncut": a short form whose host is not cut
+  LongHost         the proxy's host name is as long as a host name can be (253
+                   bytes), so any sentence or uncut host fills the status text
 *)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS UseProxy, AuthOnConnect, TlsAfterConnect, NoFallback, SharedFlag, PinFetchIp, DetailMode,
-          InterimMode, NoticeMode
+          InterimMode, NoticeMode, NoticeForm, LongHost
 
 Conns == {"a", "b"}
 Targets == {"routed", "bypass", "fetch_public", "fetch_private"}
@@ -63,7 +72,7 @@ Answers == {"ok", "auth", "refused", "garbage", "silent", "interim", "switching"
 Phases == {"idle", "routed", "connect_sent", "answered", "open", "sent", "failed"}
 Routes == {"none", "direct", "tunnel", "forward"}
 Shown == {"unread", "none", "proxy"}
-Notices == {"unread", "generic", "proxy"}
+Notices == {"unread", "generic", "proxy", "proxy_cut"}
 
 VARIABLES target, phase, route, answer, wire, supports, records, claimed, shown, got, notice, ngot
 
@@ -212,6 +221,17 @@ Report(c) ==
                      /\ UNCHANGED <<claimed, got>>
     /\ UNCHANGED <<target, phase, route, answer, wire, supports, records, notice, ngot>>
 
+\* A notice that names the proxy loses its wait part when what it says does not
+\* fit the 95 bytes beside it: the full sentence of a 502 never fits, and with a
+\* 253-byte host nothing but a cut host does.
+Cuts(c) ==
+    \/ NoticeForm = "full" /\ (answer[c] = "refused" \/ LongHost)
+    \/ NoticeForm = "short_uncut" /\ LongHost
+
+NamedNotice(c) == IF Cuts(c) THEN "proxy_cut" ELSE "proxy"
+
+NamesProxy(n) == n \in {"proxy", "proxy_cut"}
+
 \* A failed connect that fx retries shows a retry notice. With "own_target"
 \* the notice claims an unclaimed record for its own target, as a report does,
 \* and names the proxy; with "generic" it says only that the network is down;
@@ -229,13 +249,13 @@ Notify(c) ==
                 IN IF mine # {}
                      THEN \E r \in mine:
                             /\ claimed' = claimed \cup {r}
-                            /\ notice' = [notice EXCEPT ![c] = "proxy"]
+                            /\ notice' = [notice EXCEPT ![c] = NamedNotice(c)]
                             /\ ngot' = [ngot EXCEPT ![c] = target[r]]
                      ELSE /\ notice' = [notice EXCEPT ![c] = "generic"]
                           /\ UNCHANGED <<claimed, ngot>>
            ELSE IF records # {}
                   THEN \E r \in records:
-                         /\ notice' = [notice EXCEPT ![c] = "proxy"]
+                         /\ notice' = [notice EXCEPT ![c] = NamedNotice(c)]
                          /\ ngot' = [ngot EXCEPT ![c] = target[r]]
                          /\ UNCHANGED claimed
                   ELSE /\ notice' = [notice EXCEPT ![c] = "generic"]
@@ -285,7 +305,7 @@ DetailNamesOwnTarget ==
 \* Each logged failure is shown at most once, in a report or a retry notice:
 \* reading it clears it.
 DetailReadOnce ==
-    Cardinality({c \in Conns : shown[c] = "proxy" \/ notice[c] = "proxy"}) <= Cardinality(records)
+    Cardinality({c \in Conns : shown[c] = "proxy" \/ NamesProxy(notice[c])}) <= Cardinality(records)
 
 \* Clearing never loses a failure: a request whose connect failed at the
 \* proxy and has reported shows the proxy text.
@@ -306,14 +326,20 @@ SwitchingRefused ==
 \* person who mistyped HTTPS_PROXY is told the network is down.
 RetryNoticeNamesProxy ==
     \A c \in Conns:
-        (FailedAtProxy(c) /\ Retryable(answer[c]) /\ notice[c] # "unread") => notice[c] = "proxy"
+        (FailedAtProxy(c) /\ Retryable(answer[c]) /\ notice[c] # "unread") => NamesProxy(notice[c])
 
 \* Only a request whose own connect failed at the proxy, and that fx retries,
 \* shows proxy text in a notice.
 NoticeBelongsToFailingConnect ==
-    \A c \in Conns: notice[c] = "proxy" => (FailedAtProxy(c) /\ Retryable(answer[c]))
+    \A c \in Conns: NamesProxy(notice[c]) => (FailedAtProxy(c) /\ Retryable(answer[c]))
 
 \* A notice that names the proxy names its own target.
 NoticeNamesOwnTarget ==
-    \A c \in Conns: notice[c] = "proxy" => ngot[c] = target[c]
+    \A c \in Conns: NamesProxy(notice[c]) => ngot[c] = target[c]
+
+\* A retry notice that names the proxy still says when the next try is, or that
+\* fx is retrying. The proxy sentence must not push the wait out of the status
+\* text, whatever the answer and however long the proxy's host name is.
+NoticeKeepsWait ==
+    \A c \in Conns: notice[c] # "proxy_cut"
 =============================================================================

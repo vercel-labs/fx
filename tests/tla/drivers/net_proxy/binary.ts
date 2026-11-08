@@ -10,11 +10,14 @@
 // through the tunnel, what did the retry notices and the final error say), and
 // writes it as a one-record module. TLC says whether the model can produce it.
 //
-// With --self-check every observation is also checked against the model of the
-// connector as first written, which refuses interim heads, says only that the
-// network is down when it retries, keeps slices of the environment, and refuses
-// underscores. It must reject what the repaired fx did in every scenario where
-// the two differ, and accept the rest, so the check cannot pass for any fx.
+// With --self-check every observation is also checked against two models of
+// older connectors. The connector as first written refuses interim heads, says
+// only that the network is down when it retries, keeps slices of the
+// environment, and refuses underscores. The connector as pushed before the short
+// notice puts the whole sentence into the retry notice, which leaves no room for
+// the wait when the sentence is long. Each must reject what the repaired fx did
+// in every scenario where the two differ, and accept the rest, so the check
+// cannot pass for any fx.
 //
 // Everything is local: loopback proxies, a loopback provider, a fake AI Gateway,
 // a temporary FX_HOME, and FX_SOUND=0. No model is called.
@@ -31,8 +34,11 @@ const TARGET = "proxy-target.test";
 const DESIGN = {
   UseProxy: "TRUE", AuthOnConnect: "TRUE", TlsAfterConnect: "TRUE", NoFallback: "TRUE", SharedFlag: "FALSE",
   PinFetchIp: "TRUE", DetailMode: "\"own_target\"", InterimMode: "\"skip_not_101\"", NoticeMode: "\"own_target\"",
+  NoticeForm: "\"short\"", LongHost: "FALSE",
 };
 const FIRST = { ...DESIGN, InterimMode: "\"refuse\"", NoticeMode: "\"generic\"" };
+/** The connector as pushed before the short notice: the whole sentence in the notice. */
+const PUSHED = { ...DESIGN, NoticeForm: "\"full\"" };
 const ENV_DESIGN = {
   Guard: "\"upper_only\"", BorrowHost: "FALSE", BorrowNoProxy: "FALSE", AcceptsUnderscore: "TRUE", AcceptsBang: "FALSE", NamesReasons: "TRUE",
 };
@@ -58,15 +64,23 @@ type Connection = {
   retried: boolean;
   /** Whether the connector as first written did the same, so the model of it must accept the observation. */
   sameAsFirst: boolean;
+  /** Whether the connector as pushed before the short notice did the same. */
+  sameAsPushed: boolean;
+  /** A proxy host name that never resolves, in place of 127.0.0.1:<port>; its port is 3128. */
+  host?: string;
 };
 
+/** Three labels of 61 letters, one of 59, and .invalid: a 253-byte host that never resolves. */
+const LONG_HOST = ["a".repeat(61), "b".repeat(61), "c".repeat(61), "d".repeat(59)].join(".") + ".invalid";
+
 const connections: Connection[] = [
-  { name: "interim 102 before 200", answer: "interim", proxy: { interim: 102 }, completes: true, sentence: null, retried: false, sameAsFirst: false },
-  { name: "interim 100 before 200", answer: "interim", proxy: { interim: 100 }, completes: true, sentence: null, retried: false, sameAsFirst: false },
-  { name: "101 before 200", answer: "switching", proxy: { status: 101 }, completes: false, sentence: p => `proxy 127.0.0.1:${p} refused CONNECT to ${TARGET}:443: 101`, retried: false, sameAsFirst: true },
-  { name: "407", answer: "auth", proxy: { status: 407 }, completes: false, sentence: p => `proxy 127.0.0.1:${p} refused CONNECT to ${TARGET}:443: 407`, retried: false, sameAsFirst: true },
-  { name: "502", answer: "refused", proxy: { status: 502 }, completes: false, sentence: p => `proxy 127.0.0.1:${p} refused CONNECT to ${TARGET}:443: 502`, retried: true, sameAsFirst: false },
-  { name: "a proxy that is down", answer: "dead", proxy: "down", completes: false, sentence: p => `could not connect to proxy 127.0.0.1:${p} (connection refused)`, retried: true, sameAsFirst: false },
+  { name: "interim 102 before 200", answer: "interim", proxy: { interim: 102 }, completes: true, sentence: null, retried: false, sameAsFirst: false, sameAsPushed: true },
+  { name: "interim 100 before 200", answer: "interim", proxy: { interim: 100 }, completes: true, sentence: null, retried: false, sameAsFirst: false, sameAsPushed: true },
+  { name: "101 before 200", answer: "switching", proxy: { status: 101 }, completes: false, sentence: p => `proxy 127.0.0.1:${p} refused CONNECT to ${TARGET}:443: 101`, retried: false, sameAsFirst: true, sameAsPushed: true },
+  { name: "407", answer: "auth", proxy: { status: 407 }, completes: false, sentence: p => `proxy 127.0.0.1:${p} refused CONNECT to ${TARGET}:443: 407`, retried: false, sameAsFirst: true, sameAsPushed: true },
+  { name: "502", answer: "refused", proxy: { status: 502 }, completes: false, sentence: null, retried: true, sameAsFirst: false, sameAsPushed: false },
+  { name: "a proxy that is down", answer: "dead", proxy: "down", completes: false, sentence: null, retried: true, sameAsFirst: false, sameAsPushed: true },
+  { name: "a proxy host of 253 bytes that never resolves", answer: "dead", proxy: "down", host: LONG_HOST, completes: false, sentence: null, retried: true, sameAsFirst: false, sameAsPushed: false },
 ];
 
 /** A host class in the proxy URL, the way NetProxyEnv.tla names it. */
@@ -179,7 +193,9 @@ function environment(home: string, gatewayEnv: Record<string, string>, extra: Re
   };
 }
 
-const retryNotices = (stderr: string) => stderr.split("\n").filter(line => /^\[notice\] (Offline|Connection lost)/.test(line));
+/** The retry notices: the status lines fx prints while it waits, and a line that has lost its cause to a long note. */
+const retryNotices = (stderr: string) =>
+  stderr.split("\n").filter(line => /^\[notice\] (Offline|Connection lost|Gateway error|Unreadable reply|Rate limited|could not connect|proxy )/.test(line));
 
 type ConnObservation = { target: string; answer: string; phase: string; shown: string; notice: string };
 type EnvObservation = { cls: string; accepted: boolean; reason: string };
@@ -193,7 +209,7 @@ async function observeConnection(root: string, scenario: Connection): Promise<{ 
   try {
     const home = profile(root, "conn", scenario.completes ? `${provider.base}/v1` : `https://${TARGET}/v1`);
     const env = environment(home, gateway.env, {
-      HTTPS_PROXY: `http://127.0.0.1:${port}`,
+      HTTPS_PROXY: scenario.host ? `http://${scenario.host}:3128` : `http://127.0.0.1:${port}`,
       ...(scenario.completes ? { FX_TEST_NET_PROXY_LOOPBACK: "1" } : {}),
     });
     const run = await runFx(env, scenario.retried ? stderr => stderr.includes("retrying") : null, 30_000);
@@ -202,9 +218,14 @@ async function observeConnection(root: string, scenario: Connection): Promise<{ 
     const phase = scenario.completes && run.code === 0 && run.stdout.includes("NET_PROXY_DRIVER_OK") && through ? "sent" : "failed";
     // A line names the proxy when it carries the scenario's sentence, or, for
     // a scenario with none, when it says which proxy it means.
-    const names = (line: string) => (sentence !== null ? line.includes(sentence) : line.includes(`proxy 127.0.0.1:${port}`));
+    const mark = scenario.host ? `proxy ${scenario.host.slice(0, 12)}` : `proxy 127.0.0.1:${port}`;
+    const names = (line: string) => (sentence !== null ? line.includes(sentence) : line.includes(mark));
+    // A retry notice names the proxy and keeps its wait part, or has lost it.
+    const keepsWait = (line: string) => /next try in|retrying/.test(line);
     const notices = retryNotices(run.stderr);
-    const notice = notices.length === 0 ? "unread" : notices.every(names) ? "proxy" : "generic";
+    const notice = notices.length === 0 ? "unread"
+      : !notices.every(line => line.includes(mark)) ? "generic"
+      : notices.every(keepsWait) ? "proxy" : "proxy_cut";
     const ended = run.code === 1;
     const errors = run.stderr.split("\n").filter(line => line.startsWith("fx: "));
     const shown = !ended ? "unread" : errors.some(names) ? "proxy" : "none";
@@ -282,17 +303,22 @@ export async function runBinaryScenarios(out: string, selfCheck: boolean): Promi
   for (const [index, scenario] of connections.entries()) {
     const { observation, evidence } = await observeConnection(root, scenario);
     const dir = join(out, `binary-conn-${index}`);
-    const verdict = await trace(join(dir, "design"), "NetProxyTrace", "NetProxyObserved", connRecord(observation), DESIGN);
+    const longHost = { LongHost: scenario.host ? "TRUE" : "FALSE" };
+    const verdict = await trace(join(dir, "design"), "NetProxyTrace", "NetProxyObserved", connRecord(observation), { ...DESIGN, ...longHost });
     say(`binary ${scenario.name}: ${JSON.stringify(observation)} -> design ${verdict}`);
     if (verdict !== "ACCEPTED") {
       say(`  evidence: ${evidence}`);
       ok = false;
     }
     if (selfCheck) {
-      const first = await trace(join(dir, "first"), "NetProxyTrace", "NetProxyObserved", connRecord(observation), FIRST);
+      const first = await trace(join(dir, "first"), "NetProxyTrace", "NetProxyObserved", connRecord(observation), { ...FIRST, ...longHost });
       const want: Verdict = scenario.sameAsFirst ? "ACCEPTED" : "REJECTED";
       say(`  self-check: the connector as first written ${first} (must be ${want})`);
       if (first !== want) ok = false;
+      const pushed = await trace(join(dir, "pushed"), "NetProxyTrace", "NetProxyObserved", connRecord(observation), { ...PUSHED, ...longHost });
+      const wantPushed: Verdict = scenario.sameAsPushed ? "ACCEPTED" : "REJECTED";
+      say(`  self-check: the connector before the short notice ${pushed} (must be ${wantPushed})`);
+      if (pushed !== wantPushed) ok = false;
     }
   }
   for (const [index, hostClass] of hostClasses.entries()) {

@@ -412,6 +412,17 @@ function retryNotices(run: Run): string[] {
   return retryNoticeLines(run.stderr);
 }
 
+/**
+ * A retry notice that names the proxy ends in `note` and still says when the
+ * next try is, or that fx is retrying, within the 95 bytes of a status text.
+ * The full sentence stays in the final error and in `fx models`.
+ */
+function expectNoticeKeepsWait(line: string, note: string, run: Run): void {
+  expect(line, show(run)).toMatch(/^\[notice\] [^\u00b7]+ \u00b7 (next try in \d+s|retrying)/);
+  expect(line.endsWith(` \u00b7 ${note}`), show(run)).toBe(true);
+  expect(Buffer.byteLength(line) - "[notice] ".length, show(run)).toBeLessThanOrEqual(95);
+}
+
 describe("net proxy failures name the proxy", () => {
   for (const family of [
     { name: "AI Gateway", custom: false },
@@ -448,10 +459,10 @@ describe("net proxy failures name the proxy", () => {
           timeoutMs: 30_000,
           until: ({ stderr }) => retryNoticeLines(stderr).length >= 2,
         });
-        const sentence = `could not connect to proxy 127.0.0.1:${dead} (connection refused)`;
+        const note = `proxy 127.0.0.1:${dead} unreachable`;
         const notices = retryNotices(run);
         expect(notices.length, show(run)).toBeGreaterThanOrEqual(2);
-        for (const line of notices) expect(line, show(run)).toContain(sentence);
+        for (const line of notices) expectNoticeKeepsWait(line, note, run);
         expect(run.stderr).not.toContain("ConnectionRefused");
         // Nothing reached the fake provider: every request needed the proxy.
         expect(subscription?.remotePorts.length ?? 0).toBe(0);
@@ -469,16 +480,16 @@ describe("net proxy failures name the proxy", () => {
     const home = newHome("bad-gateway-notice");
     try {
       writeProvider(home, `https://${TARGET}/v1`);
-      // A sentence this long leaves no room in 95 bytes for "retrying", so the
-      // run is stopped on the second notice, not on a word.
       const run = await runFx(askCustom, baseEnv(home, { ...gateway.env, HTTPS_PROXY: proxy.url() }), {
         timeoutMs: 25_000,
-        until: ({ stderr }) => retryNoticeLines(stderr).length >= 2,
+        until: ({ stderr }) => stderr.includes("retrying"),
       });
-      const sentence = `proxy 127.0.0.1:${proxy.port} refused CONNECT to ${TARGET}:443: 502 Bad Gateway`;
+      const note = `proxy 127.0.0.1:${proxy.port} answered 502`;
       const notices = retryNotices(run);
       expect(notices.length, show(run)).toBeGreaterThanOrEqual(2);
-      for (const line of notices) expect(line, show(run)).toContain(sentence);
+      for (const line of notices) expectNoticeKeepsWait(line, note, run);
+      expect(notices.some(line => line.includes("next try in")), show(run)).toBe(true);
+      expect(notices.some(line => line.includes("retrying")), show(run)).toBe(true);
       for (const entry of proxy.log) expect(entry.requestLine).toBe(`CONNECT ${TARGET}:443 HTTP/1.1`);
     } finally {
       proxy.close();
@@ -554,7 +565,32 @@ describe("net proxy failures name the proxy", () => {
         until: ({ stderr }) => stderr.includes("[notice] Offline"),
       });
       expect(run.stderr).not.toContain("is not a proxy URL fx can read");
-      expect(run.stderr, show(run)).toMatch(/could not connect to proxy squid_proxy\.invalid:3128 \((cannot resolve host|DNS lookup failed|host unreachable)\)/);
+      for (const line of retryNotices(run)) expectNoticeKeepsWait(line, "proxy squid_proxy.invalid:3128 unreachable", run);
+    } finally {
+      gateway.stop();
+    }
+  }, TIMEOUT);
+
+  test("a proxy host of 253 bytes is cut in the notice, which still says when the next try is", async () => {
+    const gateway = serveGateway();
+    const home = newHome("long-host");
+    // Three labels of 61 letters, one of 59, and .invalid make a 253-byte host
+    // that never resolves, so the proxy cannot be reached.
+    const host = ["a".repeat(61), "b".repeat(61), "c".repeat(61), "d".repeat(59)].join(".") + ".invalid";
+    expect(host.length).toBe(253);
+    try {
+      writeProvider(home, `https://${TARGET}/v1`);
+      const run = await runFx(askCustom, baseEnv(home, { ...gateway.env, HTTPS_PROXY: `http://${host}:3128` }), {
+        timeoutMs: 25_000,
+        until: ({ stderr }) => stderr.includes("retrying"),
+      });
+      // 48 bytes: "proxy ", 22 letters of the host and an ellipsis, ":3128", " unreachable".
+      const note = `proxy ${"a".repeat(22)}\u2026:3128 unreachable`;
+      expect(Buffer.byteLength(note)).toBe(48);
+      const notices = retryNotices(run);
+      expect(notices.length, show(run)).toBeGreaterThanOrEqual(2);
+      for (const line of notices) expectNoticeKeepsWait(line, note, run);
+      expect(notices.some(line => line.includes("retrying")), show(run)).toBe(true);
     } finally {
       gateway.stop();
     }
@@ -637,8 +673,9 @@ describe("net proxy failures name the proxy", () => {
       await session.waitForComposer();
       await session.sendText("hi");
       await session.sendKeys("Enter");
-      const pane = await session.waitForText(`could not connect to proxy 127.0.0.1:${dead} (connection refused)`, 25_000);
+      const pane = await session.waitForText(`proxy 127.0.0.1:${dead} unreachable`, 25_000);
       expect(pane).toContain("Offline");
+      expect(pane).toMatch(/next try in \d+s|retrying/);
     } finally {
       await session.kill();
       gateway.stop();

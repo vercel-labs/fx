@@ -14,8 +14,10 @@ one record:
   shown   what the failed request said when it ended: "proxy" when its error
           names the proxy, "none" when it does not, "unread" when it did not
           end
-  notice  what the retry notices said: "proxy" when they name the proxy,
-          "generic" when they do not, "unread" when there were none
+  notice  what the retry notices said: "proxy" when they name the proxy and
+          keep their wait part ("next try in", "retrying"), "proxy_cut" when
+          they name it but lost the wait part, "generic" when they do not name
+          it, "unread" when there were none
 
 The observation is ACCEPTED when TLC violates NotObserved, which holds in a
 state exactly when the model reached what fx did. A completed search means

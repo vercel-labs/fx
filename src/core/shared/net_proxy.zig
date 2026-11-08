@@ -23,6 +23,13 @@ const max_proxy_url_bytes = 1024;
 const max_domain_bytes = 64 * 1024;
 /// The longest scheme or host a refusal repeats in its message.
 const max_detail_bytes = 48;
+/// The most bytes a retry notice gives to the proxy: "proxy HOST:PORT" and the
+/// cause in a few words (`Failure.shortText`). A status text holds 95 bytes
+/// (`src/core/recovery/recovery.zig` Text.capacity). The longest cause and wait
+/// part, "Unreadable reply · next try in 59m 59s", take 39, and a separator 4,
+/// so a note of 48 leaves the cause and the wait whole, and the clock and the
+/// attempt give way first (`statusWithProxy`).
+pub const max_notice_bytes = 48;
 /// Routes loopback through the proxy too, for end-to-end tests whose fake
 /// endpoints fx accepts only on loopback (`tests/e2e/net-proxy.test.ts`).
 pub const loopback_test_variable = "FX_TEST_NET_PROXY_LOOPBACK";
@@ -586,6 +593,52 @@ pub const Failure = struct {
         f.write(&w) catch {};
         return w.buffered();
     }
+
+    /// The failure in a few words for a retry notice, at most
+    /// `max_notice_bytes`: "proxy 127.0.0.1:50132 answered 502", "proxy
+    /// 127.0.0.1:50132 unreachable". A host too long for the room is cut with an
+    /// ellipsis, inside the brackets of an IPv6 address, and the port and the
+    /// cause stay whole. A refused proxy variable has no host, so the variable
+    /// says it: "HTTPS_PROXY unusable". The full sentence (`write`) stays in the
+    /// final error and in `fx models`. `buf` holds `max_notice_bytes` or more;
+    /// a smaller one cuts the text short.
+    pub fn shortText(f: *const Failure, buf: []u8) []const u8 {
+        var w = std.Io.Writer.fixed(buf);
+        f.writeShort(&w) catch {};
+        return w.buffered();
+    }
+
+    fn writeShort(f: *const Failure, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var cause_buf: [24]u8 = undefined;
+        const cause: []const u8 = switch (f.kind) {
+            .refused => std.mem.print(&cause_buf, "answered {d}", .{f.status}) catch "answered an error",
+            .unreachable_proxy => "unreachable",
+            .no_answer => "did not answer",
+            .malformed => "sent bad data",
+            .unsupported_scheme, .invalid_url => return w.print("{s} unusable", .{f.variable()}),
+        };
+        var port_buf: [8]u8 = undefined;
+        const port = std.mem.print(&port_buf, ":{d} ", .{f.proxy_port}) catch ": ";
+        const host = f.proxyHost();
+        const bracket = std.mem.findScalar(u8, host, ':') != null;
+        const prefix = "proxy ";
+        const ellipsis = "\u{2026}";
+        const fixed = prefix.len + (if (bracket) @as(usize, 2) else 0) + port.len + cause.len;
+        const room = max_notice_bytes -| fixed;
+        try w.writeAll(prefix);
+        if (bracket) try w.writeByte('[');
+        if (host.len <= room) {
+            try w.writeAll(host);
+        } else {
+            var keep = room -| ellipsis.len;
+            while (keep > 0 and keep < host.len and (host[keep] & 0xc0) == 0x80) keep -= 1;
+            try w.writeAll(host[0..keep]);
+            try w.writeAll(ellipsis);
+        }
+        if (bracket) try w.writeByte(']');
+        try w.writeAll(port);
+        try w.writeAll(cause);
+    }
 };
 
 fn copyInto(buf: []u8, bytes: []const u8) u8 {
@@ -647,14 +700,15 @@ pub fn isProxyFailureError(err: anyerror) bool {
 /// writes them.
 const status_separator = " \u{b7} ";
 
-/// `status` with the sentence of a proxy failure added, in at most `out.len`
+/// `status` with a note about a proxy failure added, in at most `out.len`
 /// bytes, so a retry notice names the proxy and a person who mistyped
 /// HTTPS_PROXY is not told only that the network is down
-/// (`tests/tla/net_proxy/NetProxy.tla` RetryNoticeNamesProxy). The sentence
-/// stays whole when it can: the status gives way first, last part first (the
-/// clock, the attempt, what the wait or retry is, and at the end the cause).
-/// A sentence longer than the room is cut at a character and ends in "…".
-/// The result lives in `out`.
+/// (`tests/tla/net_proxy/NetProxy.tla` RetryNoticeNamesProxy). The note is
+/// `Failure.shortText`, at most `max_notice_bytes`, so the cause and the wait
+/// part of the status always stay (`NoticeKeepsWait`): the status gives way
+/// first, last part first (the clock, the attempt, and only then what the wait
+/// or retry is and the cause). A note longer than the room is cut at a character
+/// and ends in "…". The result lives in `out`.
 pub fn statusWithProxy(out: []u8, status: []const u8, sentence: []const u8) []const u8 {
     var keep = status.len;
     while (keep > 0 and keep + status_separator.len + sentence.len > out.len) {
@@ -1264,6 +1318,162 @@ test "a retry notice always fits, stays valid text, and names the proxy when the
     }
 }
 
+fn shortFailure(kind: FailureKind, host: []const u8, port: u16, status: u16) Failure {
+    var f = Failure.init(kind, host, port, "x.ai", 443);
+    f.status = status;
+    return f;
+}
+
+test "the short form of a proxy failure names the proxy and the cause in a few words" {
+    var buf: [max_notice_bytes]u8 = undefined;
+    const cases = [_]struct { Failure, []const u8 }{
+        .{ shortFailure(.refused, "127.0.0.1", 50132, 502), "proxy 127.0.0.1:50132 answered 502" },
+        .{ shortFailure(.refused, "127.0.0.1", 50132, 503), "proxy 127.0.0.1:50132 answered 503" },
+        .{ shortFailure(.refused, "127.0.0.1", 50132, 504), "proxy 127.0.0.1:50132 answered 504" },
+        .{ shortFailure(.unreachable_proxy, "127.0.0.1", 50132, 0), "proxy 127.0.0.1:50132 unreachable" },
+        .{ shortFailure(.no_answer, "127.0.0.1", 50132, 0), "proxy 127.0.0.1:50132 did not answer" },
+        .{ shortFailure(.malformed, "127.0.0.1", 50132, 0), "proxy 127.0.0.1:50132 sent bad data" },
+        .{ shortFailure(.unreachable_proxy, "fd00::1", 3128, 0), "proxy [fd00::1]:3128 unreachable" },
+        .{ shortFailure(.unreachable_proxy, "squid_proxy.invalid", 3128, 0), "proxy squid_proxy.invalid:3128 unreachable" },
+    };
+    for (cases) |case| try std.testing.expectEqualStrings(case[1], case[0].shortText(&buf));
+
+    // A refused proxy variable has no host to name; the variable says it.
+    const refused = Failure.refusal(.{ .variable = "HTTPS_PROXY", .reason = .bad_port }, "x.ai", 443);
+    try std.testing.expectEqualStrings("HTTPS_PROXY unusable", refused.shortText(&buf));
+    const socks = Failure.refusal(.{ .variable = "ALL_PROXY", .reason = .unsupported_scheme, .detail = "socks5" }, "x.ai", 443);
+    try std.testing.expectEqualStrings("ALL_PROXY unusable", socks.shortText(&buf));
+
+    // The full sentence is untouched.
+    var full: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "proxy 127.0.0.1:50132 refused CONNECT to x.ai:443: 502 Bad Gateway",
+        cases[0][0].text(&full),
+    );
+}
+
+test "a proxy host past the budget is cut with an ellipsis, and the port and the cause stay whole" {
+    var buf: [max_notice_bytes]u8 = undefined;
+    var host: [253]u8 = @splat('h');
+
+    // 25 bytes of host is the most "proxy HOST:3128 unreachable" holds in 48 bytes.
+    const fits = shortFailure(.unreachable_proxy, host[0..25], 3128, 0).shortText(&buf);
+    try std.testing.expectEqual(@as(usize, max_notice_bytes), fits.len);
+    try std.testing.expect(std.mem.find(u8, fits, "\u{2026}") == null);
+    // One byte more is cut, and the cut host plus its ellipsis take the same 25 bytes.
+    const over = shortFailure(.unreachable_proxy, host[0..26], 3128, 0).shortText(&buf);
+    try std.testing.expectEqualStrings("proxy hhhhhhhhhhhhhhhhhhhhhh\u{2026}:3128 unreachable", over);
+    try std.testing.expectEqual(@as(usize, max_notice_bytes), over.len);
+    // The longest host name.
+    const longest = shortFailure(.unreachable_proxy, &host, 3128, 0).shortText(&buf);
+    try std.testing.expectEqualStrings(over, longest);
+
+    // The longest port and the longest cause leave the least room for the host.
+    const tight = shortFailure(.no_answer, &host, 65535, 0).shortText(&buf);
+    try std.testing.expectEqualStrings("proxy hhhhhhhhhhhhhhhhhh\u{2026}:65535 did not answer", tight);
+    try std.testing.expect(tight.len <= max_notice_bytes);
+
+    // A host is never a multi-byte name, but the cut must still end on a
+    // character: the euro sign takes three bytes, and the cut at 22 falls
+    // inside the eighth.
+    var euros: [60]u8 = undefined;
+    for (0..20) |i| @memcpy(euros[i * 3 ..][0..3], "\u{20ac}");
+    const euro = shortFailure(.unreachable_proxy, &euros, 3128, 0).shortText(&buf);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(euro));
+    try std.testing.expect(euro.len <= max_notice_bytes);
+    try std.testing.expect(std.mem.find(u8, euro, "\u{2026}:3128 unreachable") != null);
+
+    // An IPv6 address is cut inside its brackets.
+    const v6 = shortFailure(.unreachable_proxy, "2001:0db8:85a3:0000:0000:8a2e:0370:7334", 3128, 0).shortText(&buf);
+    try std.testing.expectEqualStrings("proxy [2001:0db8:85a3:0000:\u{2026}]:3128 unreachable", v6);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(v6));
+}
+
+test "a notice with the short form keeps the cause and the wait part of every status that takes it" {
+    const sep = status_separator;
+    const statuses = [_][]const u8{
+        "Offline \u{b7} next try in 59m 59s",
+        "Connection lost \u{b7} next try in 59m 59s \u{b7} attempt 65535",
+        "Unreadable reply \u{b7} next try in 59m 59s \u{b7} attempt 65535",
+        "Gateway error \u{b7} next try in 59m 59s \u{b7} attempt 65535",
+        "Rate limited \u{b7} next try in 59m 59s \u{b7} attempt 65535",
+        "Offline \u{b7} retrying \u{b7} attempt 65535",
+        "Connection lost \u{b7} retrying \u{b7} attempt 65535",
+        "Gateway error \u{b7} retrying without Fast \u{b7} attempt 65535",
+    };
+    var host: [253]u8 = @splat('h');
+    const failures = [_]Failure{
+        shortFailure(.refused, &host, 65535, 504),
+        shortFailure(.unreachable_proxy, &host, 65535, 0),
+        shortFailure(.no_answer, &host, 65535, 0),
+        shortFailure(.malformed, &host, 65535, 0),
+    };
+    var note_buf: [max_notice_bytes]u8 = undefined;
+    var line: [95]u8 = undefined;
+    for (failures) |failure| {
+        const note = failure.shortText(&note_buf);
+        for (statuses) |status| {
+            const text = statusWithProxy(&line, status, note);
+            // The first two parts, the cause and the wait or the retry, stay.
+            const first = std.mem.find(u8, status, sep).?;
+            const second = std.mem.find(u8, status[first + sep.len ..], sep);
+            const kept = status[0..if (second) |s| first + sep.len + s else status.len];
+            try std.testing.expect(text.len <= line.len);
+            try std.testing.expect(std.mem.startsWith(u8, text, kept));
+            // The note stays whole, after a separator.
+            try std.testing.expect(std.mem.endsWith(u8, text, note));
+            try std.testing.expect(std.mem.endsWith(u8, text[0 .. text.len - note.len], sep));
+            try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+        }
+    }
+}
+
+test "the short form fits its budget, stays valid text, and keeps its port and cause, for random hosts" {
+    const seed: u64 = 0x73686f72_74666f72;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789-._";
+    var host_buf: [253]u8 = undefined;
+    var note_buf: [max_notice_bytes]u8 = undefined;
+    var expect_buf: [32]u8 = undefined;
+    for (0..20_000) |_| {
+        const kinds = [_]FailureKind{ .refused, .unreachable_proxy, .no_answer, .malformed };
+        const kind = kinds[random.uintLessThan(usize, kinds.len)];
+        const ipv6 = random.boolean();
+        const len = random.intRangeAtMost(usize, 1, host_buf.len);
+        for (host_buf[0..len]) |*byte| byte.* = if (ipv6) "0123456789abcdef:"[random.uintLessThan(usize, 17)] else alphabet[random.uintLessThan(usize, alphabet.len)];
+        if (ipv6) host_buf[0] = '2';
+        if (ipv6 and std.mem.findScalar(u8, host_buf[0..len], ':') == null) host_buf[len - 1] = ':';
+        const host = host_buf[0..len];
+        const port = random.intRangeAtMost(u16, 1, 65535);
+        const status = random.intRangeAtMost(u16, 500, 599);
+        const failure = shortFailure(kind, host, port, status);
+        errdefer std.debug.print("seed {x} kind {t} host {s} port {d}\n", .{ seed, kind, host, port });
+        const note = failure.shortText(&note_buf);
+        try std.testing.expect(note.len <= max_notice_bytes);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(note));
+        try std.testing.expect(std.mem.startsWith(u8, note, "proxy "));
+        const tail = switch (kind) {
+            .refused => try std.mem.print(&expect_buf, ":{d} answered {d}", .{ port, status }),
+            .unreachable_proxy => try std.mem.print(&expect_buf, ":{d} unreachable", .{port}),
+            .no_answer => try std.mem.print(&expect_buf, ":{d} did not answer", .{port}),
+            .malformed => try std.mem.print(&expect_buf, ":{d} sent bad data", .{port}),
+            .unsupported_scheme, .invalid_url => "",
+        };
+        const close = if (ipv6) "]" else "";
+        try std.testing.expect(std.mem.endsWith(u8, note, tail));
+        try std.testing.expect(std.mem.endsWith(u8, note[0 .. note.len - tail.len], close));
+        // A host that fits is named whole; one that does not is cut with an ellipsis.
+        const room = max_notice_bytes - "proxy ".len - close.len * 2 - tail.len;
+        if (len <= room) {
+            try std.testing.expect(std.mem.find(u8, note, host) != null);
+            try std.testing.expect(std.mem.find(u8, note, "\u{2026}") == null);
+        } else {
+            try std.testing.expect(std.mem.find(u8, note, "\u{2026}") != null);
+        }
+    }
+}
+
 fn fuzzAnswer(_: void, smith: *std.testing.Smith) !void {
     var buf: [max_answer_head_bytes + 64]u8 = undefined;
     const len = smith.slice(&buf);
@@ -1324,6 +1534,13 @@ fn fuzzEnvironment(_: void, smith: *std.testing.Smith) !void {
             try std.testing.expect(t.host.len > 0);
             const f = answerFailure(.{ .status = 407 }, t, host, port).?;
             if (t.authorization) |value| try std.testing.expect(std.mem.find(u8, f.text(&text_buf), value) == null);
+            // The short form a retry notice carries fits its budget and never
+            // repeats the credentials either.
+            var note_buf: [max_notice_bytes]u8 = undefined;
+            const note = f.shortText(&note_buf);
+            try std.testing.expect(note.len <= max_notice_bytes);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(note));
+            if (t.authorization) |value| try std.testing.expect(std.mem.find(u8, note, value) == null);
         },
         .refuse => |r| {
             // A refusal names only the variable and a short plain scheme.

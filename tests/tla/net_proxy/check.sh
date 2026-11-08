@@ -14,9 +14,13 @@
 # forwarding (NoPlainRequest). net-proxy-refuses-interim.cfg and
 # net-proxy-generic-notice.cfg are the connector as first written: any 1xx head
 # ends the CONNECT as a refusal (InterimOpens), and a retried failure says only
-# that the network is down (RetryNoticeNamesProxy). Each
-# net-proxy-mutation-*.cfg plants one defect, and the rule it names must catch
-# it:
+# that the network is down (RetryNoticeNamesProxy). net-proxy-full-notice.cfg is
+# the connector as pushed before the short notice: the retry notice carries the
+# whole sentence, which a 502's is too long to fit beside "next try in" and
+# "retrying" in the 95 bytes of a status text (NoticeKeepsWait). The design
+# shortens the notice to host:port and the cause in at most 48 bytes, cutting a
+# 253-byte host, and passes with LongHost = TRUE. Each net-proxy-mutation-*.cfg
+# plants one defect, and the rule it names must catch it:
 #
 #   fallback-on-failure    a failed CONNECT retries as a forward request      NoPlainRequest
 #   no-tls-after-connect   the request goes into the tunnel without TLS       NoPlainRequest
@@ -24,6 +28,7 @@
 #   shared-detail          any request reads a process-wide last failure      DetailBelongsToFailingConnect
 #   skip-switching         a 101 is skipped as if it were interim             SwitchingRefused
 #   shared-notice          a retry notice reads another request's failure     NoticeNamesOwnTarget
+#   short-uncut            the short notice does not cut a 253-byte host      NoticeKeepsWait
 #
 # NetProxyEnv.tla, the environment. net-proxy-env.cfg is the design and must
 # pass. The configs without a mutation name are the connector as first
@@ -52,12 +57,14 @@ NetProxy net-proxy-today NoDirectWhenRouted
 NetProxy net-proxy-std NoPlainRequest
 NetProxy net-proxy-refuses-interim InterimOpens
 NetProxy net-proxy-generic-notice RetryNoticeNamesProxy
+NetProxy net-proxy-full-notice NoticeKeepsWait
 NetProxy net-proxy-mutation-fallback-on-failure NoPlainRequest
 NetProxy net-proxy-mutation-no-tls-after-connect NoPlainRequest
 NetProxy net-proxy-mutation-fetch-by-name NoPrivateReach
 NetProxy net-proxy-mutation-shared-detail DetailBelongsToFailingConnect
 NetProxy net-proxy-mutation-skip-switching SwitchingRefused
 NetProxy net-proxy-mutation-shared-notice NoticeNamesOwnTarget
+NetProxy net-proxy-mutation-short-uncut NoticeKeepsWait
 NetProxyEnv net-proxy-env -
 NetProxyEnv net-proxy-env-borrowed-host HostStable
 NetProxyEnv net-proxy-env-borrowed-no-proxy NoProxyStable

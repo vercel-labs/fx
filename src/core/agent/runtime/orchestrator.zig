@@ -8225,12 +8225,14 @@ fn processQueuedPromptLoop(
                 );
                 var delay_completed = true;
                 if (will_auto_retry) {
-                    // A connection that failed at the proxy held its sentence
-                    // on this thread; the retry status names the proxy.
-                    var proxy_failure: [512]u8 = undefined;
+                    // A connection that failed at the proxy held its failure
+                    // on this thread; the retry status names the proxy in a few
+                    // words, so it keeps its wait. The final error and
+                    // `fx models` show the whole sentence.
+                    var proxy_notice: [net_proxy_io.notice_bytes]u8 = undefined;
                     _ = try request_recovery.failedWith(
                         .{ .kind = failure_kind.? },
-                        net_proxy_io.takeRequestFailure(err, &proxy_failure),
+                        net_proxy_io.takeRequestFailureNotice(err, &proxy_notice),
                     );
                     delay_completed = try request_recovery.waitForSend() != null;
                 }

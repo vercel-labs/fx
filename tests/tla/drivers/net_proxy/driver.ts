@@ -9,13 +9,14 @@
 // way net_proxy_io.zig, web_fetch, and the gateway use it:
 //   lab.zig      the route, the CONNECT writer, the answer reader (interim
 //                heads too), the error mapping, the failure log, and the retry
-//                notice's status text
+//                notice's short form and status text, with a 253-byte proxy host
 //   lab_env.zig  the real parser, reading environment buffers the lab
 //                overwrites in place the way a host program's setenv does
 // After every step what the real code holds must match the model's next state.
 // binary.ts then runs zig-out/bin/fx through a proxy that sends 102 before its
-// 200, one that is down, one that answers 502, and a proxy URL whose host has
-// an underscore, and has TLC check what fx did against the design.
+// 200, one that is down, one that answers 502, a proxy whose host name has 253
+// bytes, and a proxy URL whose host has an underscore, and has TLC check what
+// fx did against the design.
 //
 // Usage (from the repository root):
 //   bun tests/tla/drivers/net_proxy/driver.ts
@@ -282,6 +283,7 @@ const sortSet = (value: unknown): string[] => [...(Array.isArray(value) ? value 
 const connConstants = [
   "UseProxy = TRUE", "AuthOnConnect = TRUE", "TlsAfterConnect = TRUE", "NoFallback = TRUE", "SharedFlag = FALSE",
   "PinFetchIp = TRUE", "DetailMode = \"own_target\"", "InterimMode = \"skip_not_101\"", "NoticeMode = \"own_target\"",
+  "NoticeForm = \"short\"", "LongHost = TRUE",
 ];
 
 // The connection a step moved: the one whose own fields changed.
@@ -439,10 +441,16 @@ if (options.selfCheck) {
       planted: "if (status >= 100 and status < 200) continue;",
     },
     {
-      name: "drops the proxy sentence from a retry notice",
+      name: "drops the proxy note from a retry notice",
       lab: "conn",
       target: "        @memcpy(out[len..][0..sentence.len], sentence);\n        return out[0 .. len + sentence.len];",
       planted: "        @memcpy(out[len..][0..sentence.len], sentence);\n        out[len] = '#';\n        return out[0 .. len + sentence.len];",
+    },
+    {
+      name: "keeps a long proxy host whole in the short notice",
+      lab: "conn",
+      target: "        if (host.len <= room) {\n            try w.writeAll(host);",
+      planted: "        if (host.len <= room or room < max_notice_bytes) {\n            try w.writeAll(host);",
     },
     {
       name: "keeps a slice of the environment for the proxy host",
