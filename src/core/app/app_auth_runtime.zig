@@ -831,16 +831,6 @@ pub fn Runtime(comptime App: type) type {
                     defer owned.deinit(app.alloc);
                     switch (owned) {
                         .vercel => |*selection| {
-                            if (selection.teams.items.len == 0) {
-                                _ = app.auth.popPickerStage(app.alloc);
-                                try writeAuthNotice(app, .{
-                                    .topic = "auth",
-                                    .tone = .@"error",
-                                    .body = "Signed in to Vercel, but no Vercel teams could be loaded. The current credential is unchanged.",
-                                });
-                                cancelPromptRetryAfterAuth(app, agent);
-                                return;
-                            }
                             try app.auth.refreshSourceInventory(app.alloc);
                             app.auth.openTeamPicker(app.alloc, selection);
                             try writeAuthNotice(app, .{
@@ -1561,7 +1551,10 @@ pub fn Runtime(comptime App: type) type {
                 if (err == error.NoSession or auth_runtime.classifyCredentialFailure(.fx_login, err).requiresSignIn()) {
                     return .needs_sign_in;
                 }
-                if (err != error.NoTeams and err != error.TeamRequestFailed) {
+                // A list with entries but no team fx can use is a problem with
+                // the team list, not with the credential
+                // (`tests/tla/auth/SignInTeams.tla` SameOutcomeEverywhere).
+                if (err != error.NoTeams and err != error.TeamRequestFailed and err != error.InvalidTeamsResponse) {
                     if (err == error.OutOfMemory) return err;
                     const body = try auth_runtime.preparationFailureText(app.alloc, .gateway, err);
                     defer app.alloc.free(body);
@@ -1572,7 +1565,8 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "auth",
                     .tone = if (err == error.NoTeams) .neutral else .@"error",
                     .body = switch (err) {
-                        error.NoTeams => "No Vercel teams are available for this account.",
+                        error.NoTeams => login_flow.no_teams_message,
+                        error.InvalidTeamsResponse => login_flow.teams_unavailable_message ++ " The current team is unchanged.",
                         else => "Could not reach Vercel to list teams. The current team is unchanged.",
                     },
                 }, true);
@@ -1583,7 +1577,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .neutral,
-                    .body = "No Vercel teams are available for this account.",
+                    .body = login_flow.no_teams_message,
                 }, true);
                 return .unavailable;
             }
@@ -1626,7 +1620,7 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .@"error",
                     .body = switch (err) {
                         error.NoSession => "The fx login session is no longer available. Sign in to change teams.",
-                        error.NoTeams => "No Vercel teams are available for this account.",
+                        error.NoTeams => login_flow.no_teams_message,
                         else => "Could not load Vercel teams. The current team is unchanged.",
                     },
                 }, true);
@@ -2259,6 +2253,8 @@ pub fn Runtime(comptime App: type) type {
                 error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. The current credential is unchanged." },
                 error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
                 error.ExpiredToken, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "The Vercel sign-in code expired. The current credential is unchanged; run /login to try again." },
+                error.TeamsUnavailable => .{ .topic = "auth", .tone = .@"error", .body = login_flow.teams_unavailable_message ++ " The current credential is unchanged; run /login to try again." },
+                error.NoTeams => .{ .topic = "auth", .tone = .@"error", .body = login_flow.no_teams_message ++ " The current credential is unchanged." },
                 else => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in failed. The current credential is unchanged." },
             };
             try writeAuthNotice(app, notice);
@@ -2564,6 +2560,8 @@ const TestAuth = struct {
     /// A credential is selected but past its refresh deadline.
     credential_due: bool = false,
     team_selection: TestTeamSelection = .{},
+    /// Team lists the provider picker took for its team column.
+    adopted_team_lists: usize = 0,
     sign_in_url: ?[]const u8 = null,
     picker_pop_count: usize = 0,
     sign_in_entry_active: bool = false,
@@ -2717,6 +2715,10 @@ const TestAuth = struct {
     }
 
     fn openTeamPicker(_: *TestAuth, _: std.mem.Allocator, _: *login_flow.TeamSelection) void {}
+
+    fn adoptTeamSelection(self: *TestAuth, _: std.mem.Allocator, _: *login_flow.TeamSelection) void {
+        self.adopted_team_lists += 1;
+    }
 
     fn refreshSelectedCredentialIfNeeded(
         self: *TestAuth,
@@ -3366,19 +3368,13 @@ test "team change on an active fx login reloads and remembers the selected crede
     try std.testing.expectEqual(credentials.Source.fx_login, app.last_preference_source.?);
 }
 
-test "teamless direct login does not activate or persist an unvalidated authority" {
+test "team picker says the account has no teams in the words every path uses" {
     var app: TestApp = .{};
     defer app.deinit();
-    app.auth.select_result = true;
-    app.auth.sign_in_transition = .{ .succeeded = .{ .vercel = .{} } };
 
-    try Runtime(TestApp).collectSignInFacts(&app, (&app).agent());
+    try Runtime(TestApp).finishTeamPicker(&app, error.NoTeams);
 
-    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, app.auth.active_source.?);
-    try std.testing.expectEqual(@as(usize, 0), app.preference_write_count);
-    try std.testing.expectEqual(@as(?credentials.Source, null), app.last_preference_source);
-    try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "no Vercel teams") != null);
+    try std.testing.expectEqualStrings(login_flow.no_teams_message ++ "\n", app.transcript.items);
 }
 
 test "failed preference persistence keeps a validated team credential active" {
@@ -3442,6 +3438,60 @@ test "team source load failure preserves the environment source and preference" 
     try std.testing.expectEqual(@as(usize, 0), app.preference_write_count);
     try std.testing.expect(app.auth.picker_closed);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "could not be loaded") != null);
+}
+
+test "provider picker reports a team list it cannot use as unavailable and changes nothing" {
+    const Column = Runtime(TestApp).TeamColumn;
+    const cases = [_]struct { err: anyerror, text: []const u8 }{
+        .{
+            .err = error.InvalidTeamsResponse,
+            .text = login_flow.teams_unavailable_message ++ " The current team is unchanged.\n",
+        },
+        .{
+            .err = error.TeamRequestFailed,
+            .text = "Could not reach Vercel to list teams. The current team is unchanged.\n",
+        },
+        .{ .err = error.NoTeams, .text = login_flow.no_teams_message ++ "\n" },
+    };
+    for (cases) |case| {
+        var app: TestApp = .{};
+        defer app.deinit();
+
+        const column = try Runtime(TestApp).finishTeamsForProviderPicker(&app, case.err);
+
+        try std.testing.expectEqual(@as(Column, .unavailable), column);
+        try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
+        try std.testing.expectEqualStrings(case.text, app.transcript.items);
+        try std.testing.expectEqual(@as(usize, 0), app.preference_write_count);
+        try std.testing.expectEqual(@as(usize, 0), app.auth.adopted_team_lists);
+    }
+}
+
+test "provider picker offers a list that holds a team" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    var selection: login_flow.TeamSelection = .{};
+    try selection.teams.append(app.alloc, .{
+        .id = try app.alloc.dupe(u8, "team_1"),
+        .slug = try app.alloc.dupe(u8, "one"),
+        .name = try app.alloc.dupe(u8, "One"),
+    });
+
+    const column = try Runtime(TestApp).finishTeamsForProviderPicker(&app, selection);
+
+    try std.testing.expectEqual(@as(Runtime(TestApp).TeamColumn, .ready), column);
+    try std.testing.expectEqual(@as(usize, 1), app.auth.adopted_team_lists);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+}
+
+test "provider picker says the account has no teams for an empty list" {
+    var app: TestApp = .{};
+    defer app.deinit();
+
+    const column = try Runtime(TestApp).finishTeamsForProviderPicker(&app, login_flow.TeamSelection{});
+
+    try std.testing.expectEqual(@as(Runtime(TestApp).TeamColumn, .unavailable), column);
+    try std.testing.expectEqualStrings(login_flow.no_teams_message ++ "\n", app.transcript.items);
 }
 
 test "team catalog rejection preserves the previous authority before commit" {

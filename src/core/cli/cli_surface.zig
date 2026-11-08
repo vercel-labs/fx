@@ -1212,6 +1212,8 @@ fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_pr
         error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first",
         error.AccessDenied, error.ChatGptAuthorizationFailed, error.GrokAuthorizationFailed => "authorization denied",
         error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run fx login again",
+        error.TeamsUnavailable => login_flow.teams_unavailable_message ++ " Nothing was saved; run fx login to try again.",
+        error.NoTeams => login_flow.no_teams_message ++ " Nothing was saved.",
         else => "failed to sign in",
     });
 }
@@ -1742,6 +1744,11 @@ fn runNonInteractiveWithDeps(
                     error.NoSession => "fx teams: run fx login first\n",
                     error.SessionChanged => "fx teams: authentication changed; try again\n",
                     error.TeamRequestFailed => "fx teams: failed to list Vercel teams\n",
+                    // A list with no usable team, or an empty one, says the same
+                    // here as in fx login, /login and the provider picker
+                    // (`tests/tla/auth/SignInTeams.tla` SameOutcomeEverywhere).
+                    error.InvalidTeamsResponse => "fx teams: " ++ login_flow.teams_unavailable_message ++ " The current team is unchanged.\n",
+                    error.NoTeams => "fx teams: " ++ login_flow.no_teams_message ++ "\n",
                     error.InvalidTeamSelection => "fx teams: no team selected\n",
                     error.AccessDenied => "fx teams: authorization denied\n",
                     error.TeamValidationFailed => "fx teams: selected team could not access AI Gateway\n",

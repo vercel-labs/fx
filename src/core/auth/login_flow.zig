@@ -5,6 +5,7 @@ const credentials = @import("credentials.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
 const grok_session = @import("grok_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const display_width = @import("../shared/display_width.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
@@ -13,6 +14,8 @@ const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
+const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -34,8 +37,15 @@ pub const LoginError = error{
     SessionChanged,
     NoRefreshToken,
     NoTeams,
+    /// The team list could not be loaded or held no team fx can use.
+    TeamsUnavailable,
     InvalidTeamSelection,
 };
+
+/// What a sign-in says when its team list failed or held no usable team.
+pub const teams_unavailable_message = "Your Vercel teams could not be loaded.";
+/// What a sign-in says when the account has no Vercel teams.
+pub const no_teams_message = "No Vercel teams are available for this account.";
 
 const LogoutError = error{SessionDeleteFailed};
 
@@ -727,7 +737,7 @@ fn completeSignIn(
     client_id: []const u8,
     token: *oauth.TokenSet,
 ) !SignInCompletion {
-    var teams = fetchTeams(alloc, transport, token.access_token, issuer_url) catch std.ArrayList(Team).empty;
+    var teams = try fetchSignInTeams(alloc, transport, token.access_token, issuer_url);
     errdefer freeTeams(alloc, &teams);
     const now_ms = io_mod.milliTimestamp();
     const session = try take_login_session(alloc, issuer_url, client_id, token, null, now_ms);
@@ -778,10 +788,10 @@ pub fn runLogin(
     );
     defer token.deinit(alloc);
 
-    var teams = fetchTeams(alloc, transport, token.access_token, prepared.metadata.issuer) catch std.ArrayList(Team).empty;
+    var teams = try fetchSignInTeams(alloc, transport, token.access_token, prepared.metadata.issuer);
     defer freeTeams(alloc, &teams);
-    const selected_team_index = try selectTeam(alloc, teams.items, null);
-    const selected_team = if (selected_team_index) |index| &teams.items[index] else null;
+    const selected_team_index = (try selectTeam(alloc, teams.items, null)) orelse return LoginError.NoTeams;
+    const selected_team = &teams.items[selected_team_index];
 
     const now_ms = io_mod.milliTimestamp();
     var session = try take_login_session(
@@ -1244,6 +1254,32 @@ fn discardStdinLine() void {
     }
 }
 
+/// The account's teams for a new sign-in. A list that failed or held no
+/// usable team is TeamsUnavailable and an empty one is NoTeams, so a sign-in
+/// never saves a session with no team over the one it had
+/// (`tests/tla/auth/SignInTeams.tla` KeepsPriorSession, TellsTheTruth).
+fn fetchSignInTeams(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    access_token: []const u8,
+    issuer_url: []const u8,
+) !std.ArrayList(Team) {
+    var teams = fetchTeams(alloc, transport, access_token, issuer_url) catch |err| {
+        const failure: anyerror = err;
+        switch (failure) {
+            error.OutOfMemory, error.Cancelled => return failure,
+            else => {},
+        }
+        debug_trace.logf("auth", "sign-in team list unavailable err={s}", .{@errorName(failure)});
+        return LoginError.TeamsUnavailable;
+    };
+    if (teams.items.len == 0) {
+        teams.deinit(alloc);
+        return LoginError.NoTeams;
+    }
+    return teams;
+}
+
 /// Lists the account's teams through `transport`, which bounds the request
 /// with a deadline and the caller's cancel flag.
 fn fetchTeams(
@@ -1304,23 +1340,113 @@ fn parseTeams(alloc: Allocator, bytes: []const u8) !std.ArrayList(Team) {
 
     var teams: std.ArrayList(Team) = .empty;
     errdefer freeTeams(alloc, &teams);
+    var dropped: usize = 0;
     for (teams_value.array.items) |entry| {
-        if (entry != .object) continue;
-        const id = entry.object.get("id") orelse continue;
-        const slug = entry.object.get("slug") orelse continue;
-        if (id != .string or slug != .string) continue;
-        const name_value = entry.object.get("name");
-        const name = if (name_value != null and name_value.? == .string and name_value.?.string.len > 0)
-            name_value.?.string
-        else
-            slug.string;
-        var team = try dupeTeam(alloc, id.string, slug.string, name);
+        var team = (try readTeam(alloc, entry)) orelse {
+            dropped += 1;
+            continue;
+        };
         teams.append(alloc, team) catch |err| {
             team.deinit(alloc);
             return err;
         };
     }
+    if (dropped > 0) {
+        debug_trace.logf("auth", "team list skipped unreadable entries dropped={d} kept={d}", .{ dropped, teams.items.len });
+    }
+    // Entries, but none fx can use: a response fx could not read, not an
+    // account with no teams.
+    if (teams.items.len == 0 and dropped > 0) return error.InvalidTeamsResponse;
     return teams;
+}
+
+/// One team from a /v2/teams entry, or null when the entry has no string id
+/// or slug, an id the gateway would reject, or a slug the terminal would act
+/// on. A session saved with a team id the gateway rejects cannot make a
+/// request (`tests/tla/auth/SignInTeams.tla` SavesOnlyUsableTeam). The name
+/// loses its control characters and is the slug when nothing printable is
+/// left, so no team text reaches a terminal raw (`tests/tla/auth/SignInTeams.tla`
+/// NoCrash, NoRawControls).
+fn readTeam(alloc: Allocator, entry: std.json.Value) !?Team {
+    if (entry != .object) return null;
+    const id = entry.object.get("id") orelse return null;
+    const slug = entry.object.get("slug") orelse return null;
+    if (id != .string or slug != .string) return null;
+    if (!types.validGatewayTeam(id.string) or !isPrintableTeamText(slug.string)) return null;
+    const raw_name = if (entry.object.get("name")) |value| switch (value) {
+        .string => |text| text,
+        else => "",
+    } else "";
+    const name = (try printableTeamName(alloc, raw_name)) orelse try alloc.dupe(u8, slug.string);
+    errdefer alloc.free(name);
+    const owned_id = try alloc.dupe(u8, id.string);
+    errdefer alloc.free(owned_id);
+    return .{
+        .id = owned_id,
+        .slug = try alloc.dupe(u8, slug.string),
+        .name = name,
+    };
+}
+
+const TeamTextKind = enum { printable, space, control };
+
+const TeamTextUnit = struct {
+    len: usize,
+    kind: TeamTextKind,
+};
+
+/// The character at `index` of a team's name or slug: printable, ASCII
+/// whitespace, or something a terminal acts on instead of showing: a C0
+/// control, DEL, a C1 control, or a byte outside valid UTF-8.
+fn teamTextUnit(raw: []const u8, index: usize) TeamTextUnit {
+    const byte = raw[index];
+    if (byte < 0x80) {
+        if (std.ascii.isWhitespace(byte)) return .{ .len = 1, .kind = .space };
+        if (std.ascii.isControl(byte)) return .{ .len = 1, .kind = .control };
+        return .{ .len = 1, .kind = .printable };
+    }
+    const len = std.unicode.utf8ByteSequenceLength(byte) catch return .{ .len = 1, .kind = .control };
+    if (index + len > raw.len) return .{ .len = 1, .kind = .control };
+    const codepoint = display_width.decodeUtf8Sequence(raw[index .. index + len]) catch
+        return .{ .len = 1, .kind = .control };
+    return .{ .len = len, .kind = if (codepoint <= 0x9f) .control else .printable };
+}
+
+/// `raw` without its control characters, with each run of whitespace made
+/// one space and the ends trimmed, or null when nothing printable is left.
+/// Caller owns the result.
+fn printableTeamName(alloc: Allocator, raw: []const u8) !?[]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var space = false;
+    var index: usize = 0;
+    while (index < raw.len) {
+        const unit = teamTextUnit(raw, index);
+        switch (unit.kind) {
+            .space => space = out.items.len > 0,
+            .control => {},
+            .printable => {
+                if (space) try out.append(alloc, ' ');
+                space = false;
+                try out.appendSlice(alloc, raw[index .. index + unit.len]);
+            },
+        }
+        index += unit.len;
+    }
+    if (out.items.len == 0) return null;
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Whether `raw` is non-empty and shows as it is, with no whitespace.
+fn isPrintableTeamText(raw: []const u8) bool {
+    if (raw.len == 0) return false;
+    var index: usize = 0;
+    while (index < raw.len) {
+        const unit = teamTextUnit(raw, index);
+        if (unit.kind != .printable) return false;
+        index += unit.len;
+    }
+    return true;
 }
 
 fn selectTeam(alloc: Allocator, teams: []const Team, current: ?[]const u8) !?usize {
@@ -1553,20 +1679,6 @@ fn vtimeIndex() usize {
     };
 }
 
-fn dupeTeam(alloc: Allocator, source_id: []const u8, source_slug: []const u8, source_name: []const u8) !Team {
-    const id = try alloc.dupe(u8, source_id);
-    errdefer alloc.free(id);
-    const slug = try alloc.dupe(u8, source_slug);
-    errdefer alloc.free(slug);
-    const name = try alloc.dupe(u8, source_name);
-    errdefer alloc.free(name);
-    return .{
-        .id = id,
-        .slug = slug,
-        .name = name,
-    };
-}
-
 fn check_parse_teams_allocation_failures(alloc: Allocator) !void {
     var teams = try parseTeams(
         alloc,
@@ -1768,6 +1880,241 @@ test "login flow parses teams" {
     try std.testing.expectEqualStrings("team_1", teams.items[0].id);
     try std.testing.expectEqualStrings("Vercel Labs", teams.items[0].name);
     try std.testing.expectEqualStrings("personal", teams.items[1].name);
+}
+
+test "login flow shows team names without their control characters" {
+    const alloc = std.testing.allocator;
+    var teams = try parseTeams(alloc,
+        \\{"teams":[
+        \\{"id":"team_1","slug":"vercel-labs","name":"Example\u001b[2J Team"},
+        \\{"id":"team_2","slug":"other-team","name":"\u001b\u0007\u009b"},
+        \\{"id":"team_3","slug":"third-team","name":"Third\u009b2J\u007f\tTeam\r\nName"},
+        \\{"id":"team_4","slug":"blank","name":"  \t "},
+        \\{"id":"team_5","slug":"emoji","name":"Caf\u00e9 \ud83d\udc69\u200d\ud83d\udcbb"}
+        \\]}
+    );
+    defer freeTeams(alloc, &teams);
+    try std.testing.expectEqual(@as(usize, 5), teams.items.len);
+    try std.testing.expectEqualStrings("Example[2J Team", teams.items[0].name);
+    // Nothing printable is left, so the slug stands in.
+    try std.testing.expectEqualStrings("other-team", teams.items[1].name);
+    try std.testing.expectEqualStrings("Third2J Team Name", teams.items[2].name);
+    try std.testing.expectEqualStrings("blank", teams.items[3].name);
+    try std.testing.expectEqualStrings("Caf\u{e9} \u{1f469}\u{200d}\u{1f4bb}", teams.items[4].name);
+    try std.testing.expectEqualStrings("vercel-labs", teams.items[0].slug);
+}
+
+test "login flow skips teams it cannot show or use" {
+    const alloc = std.testing.allocator;
+    var teams = try parseTeams(alloc,
+        \\{"teams":[
+        \\{"id":99,"slug":"bad-id"},
+        \\"not-a-team",
+        \\{"slug":"no-id"},
+        \\{"id":"","slug":"empty-id"},
+        \\{"id":"team_2","slug":""},
+        \\{"id":"team_3","slug":"bad\u0007slug","name":"Bad Slug"},
+        \\{"id":"team_4","slug":"bad\u009bslug"},
+        \\{"id":"team_5","slug":"two words"},
+        \\{"id":"bad id","slug":"spaced-id"},
+        \\{"id":"team/slash","slug":"slashed-id"},
+        \\{"id":"t\u00ebam_unicode","slug":"unicode-id"},
+        \\{"id":"team_1","slug":"good","name":"Good"}
+        \\]}
+    );
+    defer freeTeams(alloc, &teams);
+    try std.testing.expectEqual(@as(usize, 1), teams.items.len);
+    try std.testing.expectEqualStrings("team_1", teams.items[0].id);
+}
+
+test "login flow skips a team id the gateway would reject" {
+    const alloc = std.testing.allocator;
+    const bad_ids = [_][]const u8{ "bad id", "team/slash", "t\\u00ebam_unicode", "team?x=1", "team\\u0000id" };
+    for (bad_ids) |bad_id| {
+        // Alone, the entry leaves no team; next to a good team it is skipped.
+        const alone = try alloc.print("{{\"teams\":[{{\"id\":\"{s}\",\"slug\":\"odd\"}}]}}", .{bad_id});
+        defer alloc.free(alone);
+        try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, alone));
+
+        const mixed = try alloc.print(
+            "{{\"teams\":[{{\"id\":\"{s}\",\"slug\":\"odd\"}},{{\"id\":\"team_1\",\"slug\":\"good\"}}]}}",
+            .{bad_id},
+        );
+        defer alloc.free(mixed);
+        var teams = try parseTeams(alloc, mixed);
+        defer freeTeams(alloc, &teams);
+        try std.testing.expectEqual(@as(usize, 1), teams.items.len);
+        try std.testing.expectEqualStrings("team_1", teams.items[0].id);
+    }
+}
+
+test "login flow keeps a team id up to the gateway's length limit" {
+    const alloc = std.testing.allocator;
+    const longest: [128]u8 = @splat('a');
+    const past_limit: [129]u8 = @splat('a');
+    const at_limit = try alloc.print("{{\"teams\":[{{\"id\":\"{s}\",\"slug\":\"long\"}}]}}", .{&longest});
+    defer alloc.free(at_limit);
+    var teams = try parseTeams(alloc, at_limit);
+    defer freeTeams(alloc, &teams);
+    try std.testing.expectEqual(@as(usize, 1), teams.items.len);
+    try std.testing.expectEqualStrings(&longest, teams.items[0].id);
+
+    const past = try alloc.print("{{\"teams\":[{{\"id\":\"{s}\",\"slug\":\"long\"}}]}}", .{&past_limit});
+    defer alloc.free(past);
+    try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, past));
+}
+
+test "login flow rejects a team list with nothing usable in it" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, "{\"teams\":[{\"id\":123,\"slug\":\"acme\"}]}"));
+    try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, "{\"teams\":[{\"slug\":\"no-id\"},\"not-a-team\"]}"));
+    try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, "{\"teams\":[{\"id\":\"t\",\"slug\":\"\\u001b[2J\"}]}"));
+    try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, "{\"teams\":[{\"id\":\"bad id\",\"slug\":\"a\"},{\"id\":\"team/slash\",\"slug\":\"b\"}]}"));
+    try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, "{\"teams\":{}}"));
+    try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, "[]"));
+}
+
+test "login flow accepts an empty team list" {
+    var teams = try parseTeams(std.testing.allocator, "{\"teams\":[]}");
+    defer freeTeams(std.testing.allocator, &teams);
+    try std.testing.expectEqual(@as(usize, 0), teams.items.len);
+}
+
+/// Bytes the fuzzer may hand to `parseTeams`; a team list fx reads is far
+/// larger, but the rules hold the same way for every entry.
+const max_fuzz_team_list_bytes = 4096;
+
+fn fuzzTeamList(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [max_fuzz_team_list_bytes]u8 = undefined;
+    const len = smith.slice(&buffer);
+    var teams = parseTeams(std.testing.allocator, buffer[0..len]) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer freeTeams(std.testing.allocator, &teams);
+    for (teams.items) |team| {
+        // The gateway takes a team id only in this form, and a saved sign-in
+        // whose team fails it can no longer be used.
+        try std.testing.expect(types.validGatewayTeam(team.id));
+        try std.testing.expect(team.slug.len > 0);
+        try std.testing.expect(team.name.len > 0);
+        // Valid UTF-8 with no C0 control, DEL, or C1 control, on one line.
+        for ([_][]const u8{ team.name, team.slug }) |text| {
+            try std.testing.expect(text_utils.isTerminalSafeText(text));
+            try std.testing.expect(std.mem.findAny(u8, text, "\n\t") == null);
+        }
+    }
+}
+
+test "team list parsing keeps names and slugs terminal-safe on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzTeamList, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"teams\":[{\"id\":\"team_1\",\"slug\":\"one\",\"name\":\"Example\\u001b[2J Team\"}]}",
+            "{\"teams\":[{\"id\":\"team_1\",\"slug\":\"one\\u009b\",\"name\":\"One\"},{\"id\":\"team_2\",\"slug\":\"two\",\"name\":\"\\u0007\\r\\n\"}]}",
+            "{\"teams\":[{\"id\":\"team_1\",\"slug\":\"one\",\"name\":\"\\ud83d\\udc69\\u200d\\ud83d\\udcbb\\u007f\"}]}",
+            "{\"teams\":[{\"id\":7,\"slug\":\"seven\"},\"x\"]}",
+            "{\"teams\":[{\"id\":\"bad id\",\"slug\":\"spaced\"},{\"id\":\"team/slash\",\"slug\":\"slashed\"},{\"id\":\"team_1\",\"slug\":\"one\"}]}",
+            "{\"teams\":[]}",
+            "{",
+        }) ++ @import("fuzz_corpus").team_list.*),
+    });
+}
+
+/// Answers every request with one team list, as /v2/teams would.
+const TeamListTransport = struct {
+    disposition: oauth_transport.Disposition,
+    body: []const u8,
+    requests: usize = 0,
+
+    fn provider(self: *@This()) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.requests += 1;
+        try std.testing.expectEqualStrings(teams_endpoint, request.url);
+        return .{ .disposition = self.disposition, .body = try alloc.dupe(u8, self.body) };
+    }
+};
+
+test "sign-in fails without saving when the team list leaves no team" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        disposition: oauth_transport.Disposition,
+        body: []const u8,
+        expected: anyerror,
+    }{
+        .{ .disposition = .rejected, .body = "upstream failure", .expected = error.TeamsUnavailable },
+        .{ .disposition = .accepted, .body = "<html></html>", .expected = error.TeamsUnavailable },
+        .{ .disposition = .accepted, .body = "{\"teams\":[{\"id\":123,\"slug\":\"acme\"}]}", .expected = error.TeamsUnavailable },
+        .{ .disposition = .accepted, .body = "{\"teams\":[{\"id\":\"bad id\",\"slug\":\"a\"},{\"id\":\"team/slash\",\"slug\":\"b\"}]}", .expected = error.TeamsUnavailable },
+        .{ .disposition = .accepted, .body = "{\"teams\":[]}", .expected = error.NoTeams },
+    };
+    for (cases) |case| {
+        var runtime: SignInRuntime = .{};
+        defer runtime.deinit(alloc);
+        var state = CooperativeSignInTestState.init(alloc, &.{ .pending, .success });
+        defer state.deinit();
+        var transport: TeamListTransport = .{ .disposition = case.disposition, .body = case.body };
+        var deps = state.deps();
+        deps.complete = completeSignIn;
+        deps.oauth_transport = transport.provider();
+        try std.testing.expect(try runtime.startPreparedCooperative(alloc, try makeTestPreparedLogin(alloc), deps));
+
+        // The fake clock holds the second poll back until the device
+        // interval has passed; the team list is asked for only after the token.
+        runtime.pulseCooperative(alloc);
+        state.poll.now_ms += 999;
+        runtime.pulseCooperative(alloc);
+        try std.testing.expectEqual(@as(usize, 1), state.poll.poll_index);
+        try std.testing.expectEqual(@as(usize, 0), transport.requests);
+        state.poll.now_ms += 1;
+        runtime.pulseCooperative(alloc);
+        try std.testing.expectEqual(@as(usize, 2), state.poll.poll_index);
+        try std.testing.expectEqual(@as(usize, 1), transport.requests);
+
+        try std.testing.expectEqual(@as(usize, 0), state.save_count);
+        try std.testing.expectEqual(@as(usize, 1), state.finish_count);
+        try std.testing.expect(!state.finished_saved);
+        var transition = runtime.pollTransition(alloc);
+        switch (transition) {
+            .failed => |err| try std.testing.expectEqual(case.expected, err),
+            .succeeded => |*completion| {
+                completion.deinit(alloc);
+                return error.TestExpectedFailedSignIn;
+            },
+            .none, .cancelled => return error.TestExpectedFailedSignIn,
+        }
+    }
+}
+
+test "sign-in saves once when the team list has a team" {
+    const alloc = std.testing.allocator;
+    var runtime: SignInRuntime = .{};
+    defer runtime.deinit(alloc);
+    var state = CooperativeSignInTestState.init(alloc, &.{.success});
+    defer state.deinit();
+    var transport: TeamListTransport = .{
+        .disposition = .accepted,
+        .body = "{\"teams\":[{\"id\":\"team_1\",\"slug\":\"one\",\"name\":\"One\\u001b[2J\"}]}",
+    };
+    var deps = state.deps();
+    deps.complete = completeSignIn;
+    deps.oauth_transport = transport.provider();
+    try std.testing.expect(try runtime.startPreparedCooperative(alloc, try makeTestPreparedLogin(alloc), deps));
+    runtime.pulseCooperative(alloc);
+    try std.testing.expectEqual(@as(usize, 1), state.save_count);
+    var transition = runtime.pollTransition(alloc);
+    switch (transition) {
+        .succeeded => |*completion| {
+            defer completion.deinit(alloc);
+            const teams = completion.vercel.teams.items;
+            try std.testing.expectEqual(@as(usize, 1), teams.len);
+            try std.testing.expectEqualStrings("One[2J", teams[0].name);
+        },
+        .failed, .none, .cancelled => return error.TestExpectedSignIn,
+    }
 }
 
 const ScriptedPollResult = enum {
