@@ -98,10 +98,17 @@ const MUTANTS: Mutant[] = [
     expect: "ImageSteerRefused",
     msgs: "MCRefusals",
   },
+  {
+    id: "stop-fails-steers",
+    note: "session/cancel fails the steers it finds waiting, as fx did before the rules",
+    from: `            /\\ answers' = AnswerTurn(cur, "cancelled")`,
+    to: `            /\\ answers' = [m \\in Msgs |-> IF m \\in Range(waiting) THEN Err(-32800) ELSE AnswerTurn(cur, "cancelled")[m]]`,
+    expect: "StopKeepsSteers",
+  },
 ];
 
 const SPEC_FILES = ["AcpPromptDelivery.tla", "MCAcpPromptDelivery.tla", "MCAcpPromptDelivery.cfg", "MCAcpPromptDeliveryRefusals.cfg"];
-const ACTION_PROPERTIES = new Set(["AnsweredOnce", "ReplyEndContinues", "LateRunTogether", "ImageSteerRefused"]);
+const ACTION_PROPERTIES = new Set(["AnsweredOnce", "ReplyEndContinues", "LateRunTogether", "ImageSteerRefused", "StopKeepsSteers"]);
 
 /// Checks a mutant against its target property alone, so a kill shows that
 /// property catches the mistake whichever one TLC would check first.

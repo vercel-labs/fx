@@ -279,18 +279,18 @@ function journalLoadError(message, code, cause) {
   return error;
 }
 
-// The core's libfx/journal_open errors, by their exact message. The journal
+// The core's _sh.fx/journal/open errors, by their exact message. The journal
 // tests open a journal for each, so rewording one fails them, except the size
 // limit: libfx refuses a journal over it before the core sees one, so that
 // entry is a backstop.
 const journalOpenErrorCodes = new Map([
-  ["Invalid libfx journal", "FX_JOURNAL_INVALID"],
-  ["libfx journal events are out of order", "FX_JOURNAL_INVALID"],
-  ["libfx journal is too large", "FX_JOURNAL_TOO_LARGE"],
-  ["libfx journal holds more than 1024 turns", "FX_JOURNAL_TOO_LARGE"],
-  ["libfx journal images are too large", "FX_JOURNAL_TOO_LARGE"],
-  ["Invalid libfx journal images", "FX_JOURNAL_INVALID"],
-  ["libfx image does not match its name", "FX_JOURNAL_IMAGE_MISSING"],
+  ["Invalid journal", "FX_JOURNAL_INVALID"],
+  ["Journal events are out of order", "FX_JOURNAL_INVALID"],
+  ["Journal is too large", "FX_JOURNAL_TOO_LARGE"],
+  ["Journal holds more than 1024 turns", "FX_JOURNAL_TOO_LARGE"],
+  ["Journal images are too large", "FX_JOURNAL_TOO_LARGE"],
+  ["Invalid journal images", "FX_JOURNAL_INVALID"],
+  ["Image does not match its name", "FX_JOURNAL_IMAGE_MISSING"],
 ]);
 
 // An image's name in a persistence's image store: the lowercase hex SHA-256
@@ -303,7 +303,7 @@ async function imageName(bytes) {
 }
 
 function imageMissingError(name, cause) {
-  const error = journalLoadError(`libfx journal names an image the store does not hold: ${name}`, "FX_JOURNAL_IMAGE_MISSING", cause);
+  const error = journalLoadError(`Journal names an image the store does not hold: ${name}`, "FX_JOURNAL_IMAGE_MISSING", cause);
   error.image = name;
   return error;
 }
@@ -361,7 +361,7 @@ const rerunCallIds = Symbol("libfx.rerun");
 export const resumeOutputShown = Symbol.for("libfx.resumeOutputShown");
 
 function journalAppendError(cause) {
-  const error = new Error("libfx journal append failed", { cause });
+  const error = new Error("Journal append failed", { cause });
   error.code = "FX_JOURNAL_APPEND_FAILED";
   return error;
 }
@@ -439,13 +439,13 @@ function decodeJournalRecord(data) {
   let value;
   try { value = JSON.parse(decoder.decode(persistenceBytes(data, "a journal record's data"))); } catch (error) {
     if (error instanceof TypeError && /must be bytes/.test(error.message)) throw error;
-    throw journalLoadError("Invalid libfx journal", "FX_JOURNAL_INVALID", error);
+    throw journalLoadError("Invalid journal", "FX_JOURNAL_INVALID", error);
   }
   if (value?.format !== journalRecordFormat || !Array.isArray(value.events)) {
     if (typeof value?.format === "string" && value.format.startsWith("libfx-journal-v")) {
-      throw new FxJournalVersionError("libfx journal was written by a newer fx");
+      throw new FxJournalVersionError("Journal was written by a newer fx");
     }
-    throw journalLoadError("Invalid libfx journal", "FX_JOURNAL_INVALID");
+    throw journalLoadError("Invalid journal", "FX_JOURNAL_INVALID");
   }
   return value.events;
 }
@@ -454,7 +454,7 @@ function decodeJournalRecord(data) {
 // byte, then the seq as a little-endian u64. The core checks the rest.
 function checkpointSeq(bytes) {
   if (bytes.byteLength < 13 || decoder.decode(bytes.subarray(0, 4)) !== "FXSN") {
-    throw journalLoadError("Invalid libfx journal", "FX_JOURNAL_INVALID");
+    throw journalLoadError("Invalid journal", "FX_JOURNAL_INVALID");
   }
   return Number(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(5, true));
 }
@@ -474,7 +474,7 @@ async function loadPersistence(persistence) {
     const { data, through } = loaded.checkpoint;
     if (!validCursor(through)) throw new TypeError("persistence.load() checkpoint.through must be a cursor string");
     checkpoint = persistenceBytes(data, "checkpoint.data").slice();
-    if (checkpoint.byteLength > maxCheckpointBytes) throw journalLoadError("libfx journal is too large", "FX_JOURNAL_TOO_LARGE");
+    if (checkpoint.byteLength > maxCheckpointBytes) throw journalLoadError("Journal is too large", "FX_JOURNAL_TOO_LARGE");
     covered = checkpointSeq(checkpoint);
     head = through;
   }
@@ -541,14 +541,22 @@ function agentEnvironment(options) {
   };
 }
 
+// The core's codes for a model setting the model doesn't support, and the
+// capability each names. The SDK reports them with its own LIBFX_ prefix.
+const unsupportedModelSettings = new Map([
+  ["MODEL_UNSUPPORTED_EFFORT", "effort"],
+  ["MODEL_UNSUPPORTED_FAST", "fast"],
+  ["MODEL_UNSUPPORTED_ULTRAFAST", "ultrafast"],
+]);
+
 function agentRpcError(response) {
   const error = new Error(response.message);
   error[coreAnswered] = true;
   const data = response.data;
-  if (data && ["LIBFX_MODEL_UNSUPPORTED_EFFORT", "LIBFX_MODEL_UNSUPPORTED_FAST", "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST"].includes(data.code) &&
+  if (data && unsupportedModelSettings.has(data.code) &&
     typeof data.model === "string" &&
-    data.capability === (data.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ? "fast" : data.code === "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST" ? "ultrafast" : "effort")) {
-    error.code = data.code;
+    data.capability === unsupportedModelSettings.get(data.code)) {
+    error.code = `LIBFX_${data.code}`;
     error.model = data.model;
     error.capability = data.capability;
   }
@@ -874,7 +882,7 @@ function promptFrameSize(prompt, countImages = true) {
     type: "image",
     mimeType: block.mimeType,
     ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
-    ...(block.data === undefined && block.bytes === undefined ? {} : { _meta: { fx: { attachment: 0xffffffff } } }),
+    ...(block.data === undefined && block.bytes === undefined ? {} : { _meta: { "sh.fx/attachment": 0xffffffff } }),
   });
   return encoder.encode(JSON.stringify({ sessionId: "", prompt: projected })).length +
     encodedImageBytes + promptFrameEnvelopeBytes;
@@ -1164,7 +1172,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
   // Checked before the core starts, and with the core's message, so both
   // backends report it the same way.
   if (initialCheckpoint && initialCheckpoint.byteLength > maxCheckpointBytes) {
-    throw new Error("libfx checkpoint is too large");
+    throw new Error("Checkpoint is too large");
   }
   const pending = new Map();
   let nextId = 1;
@@ -1439,7 +1447,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       // A save begun before close() finishes; close() waits for it.
       if (activeTurn) return;
       if (bytesSinceCheckpoint === 0 || (!force && bytesSinceCheckpoint < checkpointAfterBytes)) return;
-      const response = await request("libfx/snapshot", { sessionId, checkpointMeta });
+      const response = await request("_sh.fx/journal/snapshot", { sessionId, checkpointMeta });
       const id = response?.snapshotAttachment;
       if (!Number.isSafeInteger(id) || id <= 0) return;
       const bytes = runtime.takeAttachment?.(id);
@@ -1658,7 +1666,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
   async function takeCheckpoint() {
     if (closing) throw new Error("fx agent is closed");
     if (activeTurn) throw new Error("cannot checkpoint while a prompt is active");
-    const response = await request("libfx/checkpoint", { sessionId, checkpointMeta });
+    const response = await request("_sh.fx/session/checkpoint", { sessionId, checkpointMeta });
     const id = response?.checkpointAttachment;
     const bytes = Number.isSafeInteger(id) && id > 0 ? runtime.takeAttachment?.(id) : null;
     if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) throw new Error("fx returned an invalid checkpoint");
@@ -1686,9 +1694,9 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
   const sendPrompt = (blocks, resuming = false, followUp = null, turnId = null, rerun = [], yieldAt = undefined, outputShown = false) => {
     // A journaled turn given a time to stop at yields before its first model
     // request after it, keeping the turn open.
-    const stopAt = journal && yieldAt !== undefined ? { yieldAt } : {};
+    const stopAt = journal && yieldAt !== undefined ? { "sh.fx/yieldAt": yieldAt } : {};
     if (resuming) {
-      return request("session/prompt", { sessionId, prompt: [], _meta: { fx: { continueRecovery: true, ...(outputShown ? {} : { freshOutput: true }), ...(rerun.length ? { rerun } : {}), ...stopAt } } });
+      return request("session/prompt", { sessionId, prompt: [], _meta: { "sh.fx/continueRecovery": true, ...(outputShown ? {} : { "sh.fx/freshOutput": true }), ...(rerun.length ? { "sh.fx/rerun": rerun } : {}), ...stopAt } });
     }
     const images = blocks.filter((block) => block.type === "image" && block.bytes !== undefined);
     const ids = images.length ? attachBytes(images.map((block) => block.bytes)) : [];
@@ -1698,16 +1706,16 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       mimeType: block.mimeType,
       ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
       // An image the store holds carries its name, so the core names it too.
-      ...(block.bytes === undefined ? {} : { _meta: { fx: { attachment: ids[next++], ...(block.stored === undefined ? {} : { stored: block.stored }) } } }),
+      ...(block.bytes === undefined ? {} : { _meta: { "sh.fx/attachment": ids[next++], ...(block.stored === undefined ? {} : { "sh.fx/storedImage": block.stored }) } }),
     });
     // A follow-up's turn places it; the core records it as accepted first
     // when the host could not. A journaled turn's first progress records its id.
-    const fx = {
-      ...(followUp ? { inputId: followUp.id, inputAccepted: followUp.accepted } : {}),
-      ...((journal || options.hooks) && turnId ? { turnId } : {}),
+    const meta = {
+      ...(followUp ? { "sh.fx/inputId": followUp.id, "sh.fx/inputAccepted": followUp.accepted } : {}),
+      ...((journal || options.hooks) && turnId ? { "sh.fx/turnId": turnId } : {}),
       ...stopAt,
     };
-    return request("session/prompt", { sessionId, prompt, ...(Object.keys(fx).length ? { _meta: { fx } } : {}) });
+    return request("session/prompt", { sessionId, prompt, ...(Object.keys(meta).length ? { _meta: meta } : {}) });
   };
   runtime.exited.then((code) => {
     hookScopes.clear();
@@ -1722,7 +1730,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
     emit("runtime.exit", { code });
   });
   runtime.setLineHandler((message, size) => {
-    if (message.method === "libfx/hook") {
+    if (message.method === "_sh.fx/hooks/event") {
       if (message.params?.rootSessionId === sessionId && message.params?.version === 1) {
         if (message.params.type === "turn.end" && handedOff) message.params.data.handoff = true;
         hook(message.params);
@@ -1730,7 +1738,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       return;
     }
     emit("acp.receive", { message });
-    if (message.method === "libfx/journal_append") {
+    if (message.method === "_sh.fx/journal/append") {
       if (journal && message.params?.sessionId === sessionId) {
         queueJournalEvents(message.params.events, message.params.barrier === true);
       }
@@ -1756,7 +1764,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       send({ jsonrpc: "2.0", id: message.id, result: optionId ? { outcome: { outcome: "selected", optionId } } : { outcome: { outcome: "cancelled" } } });
       return;
     }
-    if (message.method === "libfx/journal_flush") {
+    if (message.method === "_sh.fx/journal/flush") {
       // Every append the core sent before this request is already queued.
       let failure = null;
       try { await journalSettled(); } catch (error) { failure = error; }
@@ -1766,7 +1774,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
         : { jsonrpc: "2.0", id: message.id, result: {} });
       return;
     }
-    if (message.method === "libfx/tool_call") {
+    if (message.method === "_sh.fx/tools/call") {
       const { content, isError, rich, cancelled } = await executeHostTool(
         message.params?.name,
         message.params?.input,
@@ -1789,26 +1797,34 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
     if (message.error) waiter.reject(agentRpcError(message.error)); else waiter.resolve(message.result);
   }
   try {
-    await request("initialize", {
+    // The extensions the SDK uses, by their sh.fx names. The core sends an
+    // extension's messages only when both sides list it.
+    const initialized = await request("initialize", {
       protocolVersion: 1,
       clientCapabilities: {
-        ...(hostTools.descriptors.length || instructions
-          ? { libfx: { tools: hostTools.descriptors, instructions } }
-          : {}),
+        _meta: {
+          "sh.fx/hostSteering": {},
+          "sh.fx/journal": {},
+          "sh.fx/hooks": {},
+          ...(hostTools.descriptors.length ? { "sh.fx/hostTools": { tools: hostTools.descriptors } } : {}),
+        },
       },
     });
+    const coreExtensions = initialized?.agentCapabilities?._meta ?? {};
 
     const loaded = persistence ? await loadPersistence(persistence) : null;
     const requestedSessionId = options.sessionId ?? null;
-    const sessionResult = await request("libfx/new", {
+    if (options.hooks && !Object.hasOwn(coreExtensions, "sh.fx/hooks")) throw new Error("Semantic hooks require a libfx core that lists sh.fx/hooks");
+    const sessionResult = await request("_sh.fx/session/new", {
       ...(requestedSessionId === null ? {} : { sessionId: requestedSessionId }),
       ...(options.hooks ? { hooks: { captureContent: options.hooks.captureContent === true } } : {}),
+      // Instructions go after the core's own, as ACP's systemPrompt in append mode.
+      ...(instructions.trim() ? { systemPrompt: { mode: "append", content: [{ type: "text", text: instructions }] } } : {}),
     });
     sessionId = sessionResult.sessionId;
-    if (options.hooks && sessionResult?._meta?.fx?.hooksVersion !== 1) throw new Error("Semantic hooks require a matching libfx core with hooks version 1");
     if (initialCheckpoint) {
       const [checkpointAttachment] = attachBytes([initialCheckpoint]);
-      const restored = await request("libfx/restore", { sessionId, checkpointAttachment }).catch((error) => {
+      const restored = await request("_sh.fx/session/restore", { sessionId, checkpointAttachment }).catch((error) => {
         if (/newer fx/.test(error?.message ?? "")) throw new FxJournalVersionError(error.message);
         throw error;
       });
@@ -1817,7 +1833,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
     if (journal) {
       const { events, checkpoint } = loaded;
       const journalBytes = events.length > 0 ? encoder.encode(JSON.stringify(withoutSupersededProgress(events))) : null;
-      if (journalBytes && journalBytes.byteLength > maxJournalBytes) throw journalLoadError("libfx journal is too large", "FX_JOURNAL_TOO_LARGE");
+      if (journalBytes && journalBytes.byteLength > maxJournalBytes) throw journalLoadError("Journal is too large", "FX_JOURNAL_TOO_LARGE");
       const openFailed = (error) => {
         const message = error?.message ?? "";
         if (/newer fx/.test(message)) throw new FxJournalVersionError(message);
@@ -1838,7 +1854,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
         if (checkpoint) attachments.push(["snapshotAttachment", checkpoint]);
         const ids = attachments.length ? attachBytes(attachments.map(([, bytes]) => bytes)) : [];
         attachments.forEach(([name], index) => { params[name] = ids[index]; });
-        return request("libfx/journal_open", params).catch(openFailed);
+        return request("_sh.fx/journal/open", params).catch(openFailed);
       };
       // Stages the images a history names, read from the store, in batches
       // the attachment table holds. A store that lacks one fails the open:
@@ -1852,7 +1868,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
           const images = batch.map(({ name }, index) => ({ name, attachment: ids[index] }));
           batch = [];
           batchBytes = 0;
-          await request("libfx/journal_images", { sessionId, images }).catch(openFailed);
+          await request("_sh.fx/journal/stage_images", { sessionId, images }).catch(openFailed);
         };
         for (const name of new Set(names.map(String))) {
           const stored = imageStore ? await imageStorage.get(name) : undefined;
@@ -1999,7 +2015,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       if (journal && activeTurn && typeof runtime.steer !== "function") {
         // The native core records it now, ahead of the turn that will run it.
         entry.accepted = true;
-        accepted = request("libfx/follow_up", { sessionId, id, text })
+        accepted = request("_sh.fx/session/follow_up", { sessionId, id, text })
           .then(() => waitForInput(`accepted:${id}`))
           .then(() => ({ id }), (error) => {
             const index = followUps.indexOf(entry);
@@ -2088,7 +2104,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
       }
       if (update.sessionUpdate === "user_message_chunk" && update.content?.type === "text") {
         // A steer shows where it joined the turn, with the id it was sent with.
-        const id = update._meta?.fx?.steering?.inputId;
+        const id = update._meta?.["sh.fx/steerInput"]?.inputId;
         return { type: "user_message", text: update.content.text, ...(typeof id === "string" ? { id } : {}) };
       }
       if (update.sessionUpdate === "tool_call") {
@@ -2240,7 +2256,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
             // and shows where it joined the turn then.
             return accepted().then(() => ({ id }), (error) => (error?.code === "FX_STEER_WITHDRAWN" ? { id, withdrawn: true } : Promise.reject(error)));
           }
-          return request("libfx/steer", { sessionId, text, id }).then(accepted).then(() => ({ id }));
+          return request("_sh.fx/session/steer", { sessionId, text, id }).then(accepted).then(() => ({ id }));
         } catch (error) {
           return Promise.reject(error);
         }
@@ -2314,7 +2330,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
           rejectInputWaiters([`accepted:${id}`], withdrawnSteer(id));
           return Promise.resolve("withdrawn");
         }
-        return request("libfx/withdraw", { sessionId, id }).then(async (response) => {
+        return request("_sh.fx/session/withdraw_steer", { sessionId, id }).then(async (response) => {
           if (response?.result !== "withdrawn") return "already_placed";
           if (journal) await waitForInput(`withdrawn:${id}`);
           return "withdrawn";
@@ -2331,7 +2347,7 @@ export async function createFxEngine(options = {}, defaultRuntimeFactory = undef
               runtime.handOffSteering();
               return undefined;
             }
-            return request("libfx/handoff", { sessionId }).then(() => undefined);
+            return request("_sh.fx/session/end_turn_for_steer", { sessionId }).then(() => undefined);
           };
           const sent = promptStarted && resolvePromptStart ? promptStarted.then((started) => (started === true ? send() : undefined)) : Promise.resolve().then(send);
           return sent.catch(() => {});

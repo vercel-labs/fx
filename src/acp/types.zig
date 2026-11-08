@@ -6,6 +6,7 @@ const io_mod = @import("../core/shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 const writeJsonStr = jsonrpc.writeJsonStr;
+const sh_fx = @import("sh_fx.zig");
 
 pub const MessageIdBuffer = [32]u8;
 
@@ -18,46 +19,44 @@ pub fn generateMessageId(storage: *MessageIdBuffer) []const u8 {
 
 pub const protocol_version: u32 = 1;
 
-/// Returns the borrowed value at `_meta.fx.<key>` on an ACP params object.
-/// fx reads and writes its protocol extensions under that one namespace.
-pub fn fxMetaField(object: std.json.ObjectMap, key: []const u8) ?std.json.Value {
+/// Returns the borrowed value at `_meta[key]` on an ACP object, where `key` is
+/// an `sh.fx/` key from `src/protocol/spec/sh-fx.md`.
+pub fn metaField(object: std.json.ObjectMap, key: []const u8) ?std.json.Value {
     const meta = object.get("_meta") orelse return null;
     if (meta != .object) return null;
-    const fx = meta.object.get("fx") orelse return null;
-    if (fx != .object) return null;
-    return fx.object.get(key);
+    return meta.object.get(key);
 }
 
-/// Returns `_meta.fx.<key>` when it is a JSON boolean.
-pub fn fxMetaBool(object: std.json.ObjectMap, key: []const u8) ?bool {
-    const value = fxMetaField(object, key) orelse return null;
+/// Returns `_meta[key]` when it is a JSON boolean.
+pub fn metaBool(object: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = metaField(object, key) orelse return null;
     return if (value == .bool) value.bool else null;
 }
 
-/// Returns `_meta.fx.<key>` when it is a JSON integer.
-pub fn fxMetaInteger(object: std.json.ObjectMap, key: []const u8) ?i64 {
-    const value = fxMetaField(object, key) orelse return null;
+/// Returns `_meta[key]` when it is a JSON integer.
+pub fn metaInteger(object: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = metaField(object, key) orelse return null;
     return if (value == .integer) value.integer else null;
 }
 
-const model_recovery_update_prefix = "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"fx\":{\"modelResponseRecovery\":";
+const model_recovery_update_prefix = "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"sh.fx/modelResponseRecovery\":";
 
 /// What a session load reports for a request an earlier fx process was
-/// running when it stopped.
-/// `_meta.fx.modelResponseRecovery`: the recovery module's shape, as in
-/// `fx ask --json` (decision 38). Null clears the client's status.
+/// running when it stopped, for a client that lists
+/// `sh.fx/modelResponseRecovery`. The key holds the recovery module's shape,
+/// as in `fx ask --json` (decision 38). Null clears the client's status.
 pub fn writeModelRecoveryInfoUpdate(
     writer: *std.Io.Writer,
     status: ?core_types.RouteRecoveryStatus,
 ) !void {
     try writer.writeAll(model_recovery_update_prefix);
     const recovery = status orelse {
-        try writer.writeAll("null}}}");
+        try writer.writeAll("null}}");
         return;
     };
     var label_buf: [core_types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
     try recovery.report(&label_buf).writeJson(writer);
-    try writer.writeAll("}}}");
+    try writer.writeAll("}}");
 }
 
 pub const StopReason = enum {
@@ -186,8 +185,8 @@ pub fn writeUserImageChunk(
     try w.writeAll("}}");
 }
 
-/// Host-facing identity of a tool call, sent as `_meta.fx.toolCall` so
-/// clients never need to match on tool names.
+/// Host-facing identity of a tool call, sent as `sh.fx/toolCall` to a client
+/// that lists it, so clients never need to match on tool names.
 pub const ToolCallMeta = struct {
     /// fx's own discovery or bookkeeping step, which hosts may hide.
     internal: bool = false,
@@ -196,7 +195,7 @@ pub const ToolCallMeta = struct {
 };
 
 fn writeToolCallMeta(w: *std.Io.Writer, meta: ToolCallMeta) !void {
-    try w.writeAll(",\"_meta\":{\"fx\":{\"toolCall\":{\"internal\":");
+    try w.writeAll(",\"_meta\":{\"sh.fx/toolCall\":{\"internal\":");
     try w.writeAll(if (meta.internal) "true" else "false");
     if (meta.mcp) |mcp| {
         try w.writeAll(",\"mcp\":{\"server\":");
@@ -205,7 +204,7 @@ fn writeToolCallMeta(w: *std.Io.Writer, meta: ToolCallMeta) !void {
         try writeJsonStr(mcp.tool, w);
         try w.writeByte('}');
     }
-    try w.writeAll("}}}");
+    try w.writeAll("}}");
 }
 
 pub fn writeToolCall(
@@ -216,7 +215,8 @@ pub fn writeToolCall(
     kind: ToolCallKind,
     status: ToolCallStatus,
     raw_input: ?std.json.Value,
-    meta: ToolCallMeta,
+    /// Null for a client that doesn't list `sh.fx/toolCall`.
+    meta: ?ToolCallMeta,
 ) !void {
     try w.writeAll("{\"sessionUpdate\":\"tool_call\",\"toolCallId\":");
     try writeJsonStr(tool_call_id, w);
@@ -232,7 +232,7 @@ pub fn writeToolCall(
         try w.writeAll(",\"rawInput\":");
         try std.json.Stringify.value(value, .{}, w);
     }
-    try writeToolCallMeta(w, meta);
+    if (meta) |value| try writeToolCallMeta(w, value);
     try w.writeAll("}");
 }
 
@@ -267,8 +267,10 @@ pub const AgentCapabilities = struct {
     image_prompts: bool,
     /// Accepts client `mcpServers` on session setup.
     mcp_servers: bool = true,
-    /// Accepts steering prompts through `session/prompt` during a turn.
-    steering: bool = false,
+    /// The extensions fx lists in `agentCapabilities._meta`.
+    extensions: sh_fx.Set = .empty,
+    /// Deletes saved sessions through ACP's `session/delete`.
+    session_delete: bool = false,
     /// Accepts a client system prompt on `session/new` in append mode.
     system_prompt: bool = false,
     /// Serves `type: "acp"` MCP servers over this connection.
@@ -291,12 +293,30 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilitie
     });
     try w.writeAll("\"sessionCapabilities\":{\"list\":{},\"resume\":{},\"close\":{}");
     if (capabilities.system_prompt) try w.writeAll(",\"systemPrompt\":{}");
+    if (capabilities.session_delete) try w.writeAll(",\"delete\":{}");
     try w.writeByte('}');
-    try w.print(",\"_meta\":{{\"fx\":{{\"steering\":{s}}}}}", .{if (capabilities.steering) "true" else "false"});
+    try writeExtensionList(w, capabilities.extensions);
     try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
     try writeJsonStr(build_options.app_version, w);
     try w.writeAll("},");
     try w.writeAll("\"authMethods\":[]}");
+}
+
+/// Writes fx's extensions as `agentCapabilities._meta`, or nothing when fx
+/// lists none. fx's steers are the one delivery it supports until queued
+/// prompts land, so `sh.fx/promptDelivery` names only `steer`.
+fn writeExtensionList(w: *std.Io.Writer, extensions: sh_fx.Set) !void {
+    if (extensions.count() == 0) return;
+    try w.writeAll(",\"_meta\":{");
+    var first = true;
+    var it = extensions.iterator();
+    while (it.next()) |extension| {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try writeJsonStr(extension.capabilityName(), w);
+        try w.writeAll(if (extension == .prompt_delivery) ":{\"steer\":{}}" else ":{}");
+    }
+    try w.writeByte('}');
 }
 
 pub fn writePromptResponse(w: *std.Io.Writer, reason: StopReason) !void {
@@ -305,58 +325,84 @@ pub fn writePromptResponse(w: *std.Io.Writer, reason: StopReason) !void {
     try w.writeAll("}");
 }
 
-/// How a steering `session/prompt` fared in the turn that received it.
+/// How a steer ran, as `sh.fx/steeringDelivery`. `next_turn` comes with
+/// queued prompts; until then, a steer that no turn took fails.
 pub const SteeringDelivery = enum {
     absorbed,
-    dropped,
 };
 
 /// Answers a steering prompt with its receiving turn's stop reason. Usage is
 /// reported once, on the response to the prompt that started the turn.
-pub fn writeSteeringPromptResponse(w: *std.Io.Writer, reason: StopReason, delivery: SteeringDelivery) !void {
+/// `delivery` is null for a client that doesn't list `sh.fx/promptDelivery`.
+pub fn writeSteeringPromptResponse(w: *std.Io.Writer, reason: StopReason, delivery: ?SteeringDelivery) !void {
     try w.writeAll("{\"stopReason\":");
     try writeJsonStr(reason.jsonString(), w);
-    try w.writeAll(",\"_meta\":{\"fx\":{\"steering\":");
-    try writeJsonStr(@tagName(delivery), w);
-    try w.writeAll("}}}");
+    if (delivery) |value| {
+        try w.writeAll(",\"_meta\":{\"sh.fx/steeringDelivery\":");
+        try writeJsonStr(@tagName(value), w);
+        try w.writeByte('}');
+    }
+    try w.writeAll("}");
 }
 
-/// Replays delivered steering where the agent inserted it into the turn. A
-/// libfx steer carries the input id its host gave it.
+/// Replays delivered steering where the agent inserted it into the turn.
+/// `steer_input` adds `sh.fx/steerInput`, with the steer's request id and,
+/// for a host's steer, the input id the host gave it.
 pub fn writeSteeringUserMessageChunk(
     w: *std.Io.Writer,
     message_id: []const u8,
     text: []const u8,
     request_id: ?jsonrpc.RequestId,
     input_id: ?[]const u8,
+    steer_input: bool,
 ) !void {
     try w.writeAll("{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":");
     try writeJsonStr(message_id, w);
     try w.writeAll(",\"content\":{\"type\":\"text\",\"text\":");
     try writeJsonStr(text, w);
-    try w.writeAll("},\"_meta\":{\"fx\":{\"steering\":{\"requestId\":");
-    try jsonrpc.Writer.writeId(w, request_id);
-    if (input_id) |id| {
-        try w.writeAll(",\"inputId\":");
-        try writeJsonStr(id, w);
+    try w.writeByte('}');
+    if (steer_input) {
+        try w.writeAll(",\"_meta\":{\"sh.fx/steerInput\":{\"requestId\":");
+        try jsonrpc.Writer.writeId(w, request_id);
+        if (input_id) |id| {
+            try w.writeAll(",\"inputId\":");
+            try writeJsonStr(id, w);
+        }
+        try w.writeAll("}}");
     }
-    try w.writeAll("}}}}");
+    try w.writeAll("}");
 }
 
-test "steering replay carries a libfx input id only when it has one" {
+test "steering replay carries a host's input id only when it has one" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeSteeringUserMessageChunk(&out.writer, "m1", "use tabs", .{ .integer = 4 }, null);
+    try writeSteeringUserMessageChunk(&out.writer, "m1", "use tabs", .{ .integer = 4 }, null, true);
     try std.testing.expectEqualStrings(
-        "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m1\",\"content\":{\"type\":\"text\",\"text\":\"use tabs\"},\"_meta\":{\"fx\":{\"steering\":{\"requestId\":4}}}}",
+        "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m1\",\"content\":{\"type\":\"text\",\"text\":\"use tabs\"},\"_meta\":{\"sh.fx/steerInput\":{\"requestId\":4}}}",
         out.written(),
     );
     out.clearRetainingCapacity();
-    try writeSteeringUserMessageChunk(&out.writer, "m2", "be brief", null, "s1");
+    try writeSteeringUserMessageChunk(&out.writer, "m2", "be brief", null, "s1", true);
     try std.testing.expectEqualStrings(
-        "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m2\",\"content\":{\"type\":\"text\",\"text\":\"be brief\"},\"_meta\":{\"fx\":{\"steering\":{\"requestId\":null,\"inputId\":\"s1\"}}}}",
+        "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m2\",\"content\":{\"type\":\"text\",\"text\":\"be brief\"},\"_meta\":{\"sh.fx/steerInput\":{\"requestId\":null,\"inputId\":\"s1\"}}}",
         out.written(),
     );
+}
+
+test "steering replay and responses carry no sh.fx key for a client that doesn't list it" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeSteeringUserMessageChunk(&out.writer, "m1", "use tabs", .{ .integer = 4 }, null, false);
+    try std.testing.expectEqualStrings(
+        "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m1\",\"content\":{\"type\":\"text\",\"text\":\"use tabs\"}}",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+    try writeSteeringPromptResponse(&out.writer, .end_turn, null);
+    try std.testing.expectEqualStrings("{\"stopReason\":\"end_turn\"}", out.written());
+    out.clearRetainingCapacity();
+    try writeSteeringPromptResponse(&out.writer, .end_turn, .absorbed);
+    try std.testing.expectEqualStrings("{\"stopReason\":\"end_turn\",\"_meta\":{\"sh.fx/steeringDelivery\":\"absorbed\"}}", out.written());
 }
 
 pub fn writePromptResponseWithUsage(
@@ -436,7 +482,7 @@ test "writeToolCall produces valid json" {
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
     defer parsed.deinit();
-    const tool_call_meta = parsed.value.object.get("_meta").?.object.get("fx").?.object.get("toolCall").?.object;
+    const tool_call_meta = parsed.value.object.get("_meta").?.object.get("sh.fx/toolCall").?.object;
     try std.testing.expect(!tool_call_meta.get("internal").?.bool);
     try std.testing.expect(tool_call_meta.get("mcp") == null);
 
@@ -525,7 +571,12 @@ test "writeInitializeResponse contains required fields" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeInitializeResponse(&out.writer, .{ .image_prompts = true, .steering = true, .system_prompt = true, .mcp_over_acp = true });
+    try writeInitializeResponse(&out.writer, .{
+        .image_prompts = true,
+        .extensions = .initMany(&.{ .prompt_delivery, .tool_call }),
+        .system_prompt = true,
+        .mcp_over_acp = true,
+    });
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
     defer parsed.deinit();
 
@@ -547,8 +598,24 @@ test "writeInitializeResponse contains required fields" {
     try std.testing.expect(mcp_capabilities.get("acp").?.bool);
     const session_capabilities = agent_capabilities.get("sessionCapabilities").?.object;
     try std.testing.expectEqual(@as(usize, 0), session_capabilities.get("systemPrompt").?.object.count());
-    const fx_meta = agent_capabilities.get("_meta").?.object.get("fx").?.object;
-    try std.testing.expect(fx_meta.get("steering").?.bool);
+    try std.testing.expect(session_capabilities.get("delete") == null);
+    const extensions = agent_capabilities.get("_meta").?.object;
+    try std.testing.expectEqual(@as(usize, 2), extensions.count());
+    try std.testing.expect(extensions.get("sh.fx/promptDelivery").?.object.get("steer") != null);
+    try std.testing.expect(extensions.get("sh.fx/promptDelivery").?.object.get("queue") == null);
+    try std.testing.expectEqual(@as(usize, 0), extensions.get("sh.fx/toolCall").?.object.count());
+}
+
+test "writeInitializeResponse lists no _meta when fx lists no extension" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeInitializeResponse(&out.writer, .{ .image_prompts = false, .session_delete = true });
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    const agent_capabilities = parsed.value.object.get("agentCapabilities").?.object;
+    try std.testing.expect(agent_capabilities.get("_meta") == null);
+    try std.testing.expect(agent_capabilities.get("sessionCapabilities").?.object.get("delete") != null);
 }
 
 test "writeInitializeResponse withholds MCP transports a host rejects" {
@@ -573,7 +640,7 @@ test "writeToolCall separates MCP server and tool identity" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("Evaluate JavaScript", parsed.value.object.get("title").?.string);
-    const meta = parsed.value.object.get("_meta").?.object.get("fx").?.object.get("toolCall").?.object;
+    const meta = parsed.value.object.get("_meta").?.object.get("sh.fx/toolCall").?.object;
     try std.testing.expect(!meta.get("internal").?.bool);
     try std.testing.expectEqualStrings("mini", meta.get("mcp").?.object.get("server").?.string);
     try std.testing.expectEqualStrings("browser_eval", meta.get("mcp").?.object.get("tool").?.string);
@@ -620,11 +687,21 @@ test "model recovery info update wraps the shared report and is clearable" {
         .attempt = 4,
     });
     try std.testing.expectEqualStrings(
-        "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"fx\":{\"modelResponseRecovery\":{\"state\":\"waiting\",\"attempt\":4,\"message\":\"Gateway error · next try in 8s · attempt 4 · 1m 12s\"}}}}",
+        "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"sh.fx/modelResponseRecovery\":{\"state\":\"waiting\",\"attempt\":4,\"message\":\"Gateway error · next try in 8s · attempt 4 · 1m 12s\"}}}",
         out.writer.buffered(),
     );
 
     out.writer.end = 0;
     try writeModelRecoveryInfoUpdate(&out.writer, null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"modelResponseRecovery\":null") != null);
+    try std.testing.expectEqualStrings(
+        "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"sh.fx/modelResponseRecovery\":null}}",
+        out.writer.buffered(),
+    );
+}
+
+test "writeToolCall leaves out sh.fx/toolCall for a client that doesn't list it" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeToolCall(&out.writer, "call_1", "read_file", "Reading file", .read, .pending, null, null);
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "_meta") == null);
 }

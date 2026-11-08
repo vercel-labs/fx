@@ -120,14 +120,12 @@ pub fn load(
     return text;
 }
 
-/// Joins host instructions with the client prompt for the system slot, after
-/// fx's built-in instructions. Caller owns the result.
-pub fn compose(alloc: Allocator, host_instructions: []const u8, client_prompt: []const u8) ![]u8 {
-    if (client_prompt.len == 0) return alloc.dupe(u8, host_instructions);
-    const separator = if (host_instructions.len > 0) "\n\n" else "";
+/// The client prompt as it goes in the system slot, after fx's built-in
+/// instructions, or an empty string when there is none. Caller owns the
+/// result.
+pub fn compose(alloc: Allocator, client_prompt: []const u8) ![]u8 {
+    if (client_prompt.len == 0) return alloc.dupe(u8, "");
     return std.mem.concat(alloc, u8, &.{
-        host_instructions,
-        separator,
         "<client_instructions>\n",
         client_prompt,
         "\n</client_instructions>",
@@ -178,19 +176,15 @@ test "client system prompt rejects invalid combinations before a session exists"
     try std.testing.expectError(error.SystemPromptTooLarge, parse(alloc, json));
 }
 
-test "client system prompt composes after host instructions" {
+test "client system prompt composes inside its tags" {
     const alloc = std.testing.allocator;
-    const only_host = try compose(alloc, "host", "");
-    defer alloc.free(only_host);
-    try std.testing.expectEqualStrings("host", only_host);
+    const none = try compose(alloc, "");
+    defer alloc.free(none);
+    try std.testing.expectEqualStrings("", none);
 
-    const both = try compose(alloc, "host", "client");
-    defer alloc.free(both);
-    try std.testing.expectEqualStrings("host\n\n<client_instructions>\nclient\n</client_instructions>", both);
-
-    const only_client = try compose(alloc, "", "client");
-    defer alloc.free(only_client);
-    try std.testing.expectEqualStrings("<client_instructions>\nclient\n</client_instructions>", only_client);
+    const client = try compose(alloc, "client");
+    defer alloc.free(client);
+    try std.testing.expectEqualStrings("<client_instructions>\nclient\n</client_instructions>", client);
 }
 
 test "client system prompt of exactly the size limit survives a restore" {

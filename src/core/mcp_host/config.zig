@@ -43,7 +43,7 @@ pub const Server = struct {
     slack_app: bool = false,
     held: ?Held = null,
     /// An editor's server whose tools go to the model every turn (ACP
-    /// `_meta.fx.alwaysLoaded`).
+    /// `sh.fx/alwaysLoaded`).
     always_loaded: bool = false,
     /// The variable a `missing_env` or `invalid_env` server names.
     missing: ?[]const u8 = null,

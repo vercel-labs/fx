@@ -623,7 +623,15 @@ class AcpReadTimeoutError extends Error {
   }
 }
 
+/// The extensions `fx acp` lists at initialize, by their sh.fx names
+/// (src/protocol/spec/sh-fx.md "Capabilities"). AcpClient lists them all at
+/// initialize, so these tests see fx's sh.fx keys, unless the test makes a
+/// plain client or lists its own `clientCapabilities._meta`.
+const FX_EXTENSIONS = ["sh.fx/promptDelivery", "sh.fx/hooks", "sh.fx/toolCall", "sh.fx/permissionMode", "sh.fx/modelResponseRecovery"];
+
 class AcpClient {
+  /// A plain client lists no sh.fx extension at initialize.
+  plain = false;
   private proc: ChildProcess;
   private buffer: string = "";
   private lines: string[] = [];
@@ -668,6 +676,7 @@ class AcpClient {
     args?: string[];
     env?: Record<string, string | undefined>;
     omitHome?: boolean;
+    plain?: boolean;
   }): Promise<AcpClient> {
     const args = opts?.args ?? ["acp"];
     const inheritedEnv: Record<string, string | undefined> = { ...process.env };
@@ -688,7 +697,9 @@ class AcpClient {
       cwd: opts?.cwd ?? REPO_ROOT,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    return new AcpClient(proc);
+    const client = new AcpClient(proc);
+    client.plain = opts?.plain ?? false;
+    return client;
   }
 
   get stderr(): string {
@@ -696,7 +707,7 @@ class AcpClient {
   }
 
   get hookEvents(): any[] {
-    return this.rawLines.map(line => JSON.parse(line)).filter(message => message.method === "libfx/hook").map(message => message.params);
+    return this.rawLines.map(line => JSON.parse(line)).filter(message => message.method === "_sh.fx/hooks/event").map(message => message.params);
   }
 
   get closed(): boolean {
@@ -726,6 +737,13 @@ class AcpClient {
 
   send(msg: object): void {
     let outgoing = msg as any;
+    const capabilities = outgoing.params?.clientCapabilities ?? {};
+    if (outgoing.method === "initialize" && !this.plain && capabilities._meta === undefined) {
+      outgoing = {
+        ...outgoing,
+        params: { ...outgoing.params, clientCapabilities: { ...capabilities, _meta: Object.fromEntries(FX_EXTENSIONS.map((name) => [name, {}])) } },
+      };
+    }
     if (
       outgoing.method === "session/new" &&
       (typeof outgoing.id === "number" || typeof outgoing.id === "string")
@@ -872,9 +890,10 @@ test("ACP load and resume negotiate hooks and clear them when omitted", async ()
     expect(created.error).toBeUndefined();
     const sessionId = created.result.sessionId;
     for (const method of ["session/load", "session/resume"]) {
-      const enabled = await client.request(method, { sessionId, mcpServers: [], _meta: { fx: { hooks: { captureContent: true } } } }) as any;
+      const enabled = await client.request(method, { sessionId, mcpServers: [], _meta: { "sh.fx/hooks": { captureContent: true } } }) as any;
       expect(enabled.error).toBeUndefined();
-      expect(enabled.result._meta.fx.hooksVersion).toBe(1);
+      // fx lists sh.fx/hooks at initialize; the response carries no key of its own.
+      expect(enabled.result._meta).toBeUndefined();
       await runPrompt(client, "observe this prompt");
       expect(client.hookEvents.some(event => event.type === "turn.end")).toBe(true);
       const count = client.hookEvents.length;
@@ -1045,7 +1064,7 @@ test("configured provider ACP runs a direct call to a supplied MCP tool that is 
     await client.request("initialize", { protocolVersion: 1 }, 1);
     const created = await client.request("session/new", {
       cwd: fixture.workspace,
-      mcpServers: [{ ...acpHttpServer(httpFixture, "acp"), _meta: { fx: { alwaysLoaded: false } } }],
+      mcpServers: [{ ...acpHttpServer(httpFixture, "acp"), _meta: { "sh.fx/alwaysLoaded": false } }],
     }, 2) as any;
     if (created.error) throw new Error(JSON.stringify(created));
     await client.readLine();
@@ -1135,10 +1154,9 @@ test("ACP shell completed and replayed updates show the command output", async (
 
 /// The names fx's ACP server may send a client that lists no sh.fx/
 /// capability, which src/protocol/spec/sh-fx.md "Capabilities" limits to
-/// standard ACP, read from the pinned ACP copy. Until fx moves to the sh.fx
-/// names, it still sends the `_meta.fx` keys that sh-fx.md lists in "Keys in
-/// use today"; FX_ACP_STANDARD_ONLY=1 allows none of them, for the change that
-/// moves the names.
+/// standard ACP, read from the pinned ACP copy. The one other thing such a
+/// client sees is fx's own list of extensions, in `agentCapabilities._meta` of
+/// the initialize response.
 function standardAcpChecker() {
   const spec = join(REPO_ROOT, "src", "protocol", "spec");
   const defs = JSON.parse(readFileSync(join(spec, "acp", "v1", "schema.unstable.json"), "utf8")).$defs;
@@ -1153,10 +1171,7 @@ function standardAcpChecker() {
       responseFields.set(def["x-method"], new Set(Object.keys(def.properties)));
     }
   }
-  const todayKeys = new Set(
-    [...readFileSync(join(spec, "sh-fx.md"), "utf8").matchAll(/^\| `_meta\.fx\.([A-Za-z]+)` \|/gm)].map((match) => match[1]!),
-  );
-  const strict = process.env.FX_ACP_STANDARD_ONLY === "1";
+  const capabilityName = /^sh\.fx\/[a-z][A-Za-z0-9]*$/;
   /// Problems in what fx sent, given the method each of the client's request
   /// ids called. Every `_meta` the walk visits counts in `metas`.
   return (messages: any[], methodOf: (id: unknown, result: any) => string | undefined) => {
@@ -1168,11 +1183,9 @@ function standardAcpChecker() {
       for (const [key, child] of Object.entries(value)) {
         if (key === "_meta" && child !== null && typeof child === "object") {
           metas += 1;
-          for (const [metaKey, metaValue] of Object.entries(child as object)) {
-            if (metaKey !== "fx") { problems.push(`${where}._meta.${metaKey}`); continue; }
-            for (const fxKey of Object.keys(metaValue ?? {})) {
-              if (strict || !todayKeys.has(fxKey)) problems.push(`${where}._meta.fx.${fxKey}`);
-            }
+          const extensionList = where === "initialize result.agentCapabilities";
+          for (const metaKey of Object.keys(child as object)) {
+            if (!(extensionList && capabilityName.test(metaKey))) problems.push(`${where}._meta.${metaKey}`);
           }
         } else {
           walk(child, `${where}.${key}`);
@@ -1204,14 +1217,16 @@ test("ACP sends a client that lists no sh.fx capability only ACP v1 names", asyn
   const planted = check([
     { jsonrpc: "2.0", method: "libfx/hook", params: {} },
     { jsonrpc: "2.0", method: "session/update", params: { sessionId: "s", update: { sessionUpdate: "fx_thing", _meta: { "sh.fx/state": "idle" } } } },
-    { jsonrpc: "2.0", id: 2, result: { sessionId: "s", systemPromptMode: "append", _meta: { fx: { notAKey: true } } } },
-  ], () => "session/new");
+    { jsonrpc: "2.0", id: 2, result: { sessionId: "s", systemPromptMode: "append", _meta: { fx: { steering: true } } } },
+    { jsonrpc: "2.0", id: 1, result: { protocolVersion: 1, agentCapabilities: { _meta: { "sh.fx/toolCall": {}, fx: {} } } } },
+  ], (id) => id === 1 ? "initialize" : "session/new");
   expect(planted.problems).toEqual([
     "method libfx/hook",
     "session/update fx_thing",
     "session/update.update._meta.sh.fx/state",
     "session/new result.systemPromptMode",
-    "session/new result._meta.fx.notAKey",
+    "session/new result._meta.fx",
+    "initialize result.agentCapabilities._meta.fx",
   ]);
 
   const fixture = createConfiguredProviderFixture(body => body.messages.some((message: any) => message.role === "tool")
@@ -1221,7 +1236,7 @@ test("ACP sends a client that lists no sh.fx capability only ACP v1 names", asyn
   const methodOf = (id: unknown, result: any) => (typeof id === "number" && methods[id]) || (result?.stopReason !== undefined ? "session/prompt" : undefined);
   let client: AcpClient | undefined;
   try {
-    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env, plain: true });
     await client.request("initialize", { protocolVersion: 1 }, 1);
     const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
     if (created.error) throw new Error(JSON.stringify(created));
@@ -1235,7 +1250,7 @@ test("ACP sends a client that lists no sh.fx capability only ACP v1 names", asyn
     await client.close();
     const live = check(client.rawLines.map(line => JSON.parse(line)), methodOf);
 
-    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env, plain: true });
     await client.request("initialize", { protocolVersion: 1 }, 1);
     const loaded = await client.request("session/load", { sessionId: created.result.sessionId, cwd: fixture.workspace, mcpServers: [] }, 2) as any;
     if (loaded.error) throw new Error(JSON.stringify(loaded));
@@ -1541,7 +1556,7 @@ function sendSteeringPrompt(client: AcpClient, id: number, text: string): void {
     jsonrpc: "2.0",
     id,
     method: "session/prompt",
-    params: { prompt: [{ type: "text", text }], _meta: { fx: { steer: true } } },
+    params: { prompt: [{ type: "text", text }], _meta: { "sh.fx/delivery": "steer" } },
   });
 }
 
@@ -1560,7 +1575,7 @@ function expectSavedOriginal(home: string, sessionId: string, body: string, orig
 
 async function startAutoSession(client: AcpClient, hooks = false) {
   await client.request("initialize", { protocolVersion: 1 }, 1);
-  const created = await client.request("session/new", { mcpServers: [], ...(hooks ? { _meta: { fx: { hooks: { captureContent: true } } } } : {}) }, 2) as any;
+  const created = await client.request("session/new", { mcpServers: [], ...(hooks ? { _meta: { "sh.fx/hooks": { captureContent: true } } } : {}) }, 2) as any;
   await client.readLine(); // consume session/update notification
   await client.request("session/set_mode", { modeId: "auto" }, 3);
   return created.result.sessionId as string;
@@ -1852,10 +1867,10 @@ describe("acp: model-independent", () => {
         // The module's status shape, then a `recovered` that carries only the
         // attempt that succeeded.
         expect(allUpdates).toMatch(
-          /"modelResponseRecovery":\{"state":"waiting","attempt":1,"message":"Connection lost · next try in 1s · attempt 1"\}/,
+          /"sh\.fx\/modelResponseRecovery":\{"state":"waiting","attempt":1,"message":"Connection lost · next try in 1s · attempt 1"\}/,
         );
         expect(allUpdates).toContain(
-          '"modelResponseRecovery":{"state":"recovered","attempt":4}',
+          '"sh.fx/modelResponseRecovery":{"state":"recovered","attempt":4}',
         );
         // The partial streamed once, then the full replacement (which carries
         // the partial as its prefix) streamed once.
@@ -2020,7 +2035,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ordinary ACP ignores private libfx host capabilities",
+    "ordinary ACP ignores the host tools capability and refuses the SDK's methods",
     async () => {
       const root = createIsolatedRoot("fx-acp-private-capabilities-");
       const gateway = startFakeGateway([finalText("ACP_PRIVATE_CAPABILITIES_IGNORED")]);
@@ -2034,13 +2049,15 @@ describe("acp: model-independent", () => {
           {
             protocolVersion: 1,
             clientCapabilities: {
+              // The old private capability and the new extension, both ignored.
               libfx: {
-                tools: [{
-                  name: "private_lookup",
-                  description: "Private libfx tool",
-                  inputSchema: { type: "object" },
-                }],
+                tools: [{ name: "private_lookup", description: "Private libfx tool", inputSchema: { type: "object" } }],
                 instructions: "PRIVATE_LIBFX_INSTRUCTIONS",
+              },
+              _meta: {
+                "sh.fx/hostTools": {
+                  tools: [{ name: "private_lookup", description: "Private libfx tool", inputSchema: { type: "object" } }],
+                },
               },
             },
           },
@@ -2083,9 +2100,9 @@ describe("acp: model-independent", () => {
         await client.readLine();
 
         for (const [id, method, params] of [
-          [3, "libfx/checkpoint", { sessionId }],
-          [4, "libfx/restore", { sessionId, checkpoint: "" }],
-          [5, "libfx/new", {}],
+          [3, "_sh.fx/session/checkpoint", { sessionId }],
+          [4, "_sh.fx/session/restore", { sessionId, checkpoint: "" }],
+          [5, "_sh.fx/session/new", {}],
         ] as const) {
           expect(await client.request(method, params, id)).toMatchObject({
             jsonrpc: "2.0",
@@ -3239,7 +3256,7 @@ describe("acp: model-independent", () => {
           "session/new",
           {
             cwd: root.workspace,
-            _meta: { fx: { hooks: { captureContent: true } } },
+            _meta: { "sh.fx/hooks": { captureContent: true } },
             mcpServers: [{
               type: "http",
               name: "fixture",
@@ -3271,10 +3288,10 @@ describe("acp: model-independent", () => {
           .filter((message) => message.params?.update?.sessionUpdate === "tool_call")
           .map((message) => message.params.update);
         const toolCall = (id: string) => toolCalls.find((update) => update.toolCallId === id);
-        expect(toolCall("search_http")?._meta.fx.toolCall).toEqual({ internal: true });
-        expect(toolCall("select_http")?._meta.fx.toolCall).toEqual({ internal: true });
+        expect(toolCall("search_http")?._meta["sh.fx/toolCall"]).toEqual({ internal: true });
+        expect(toolCall("select_http")?._meta["sh.fx/toolCall"]).toEqual({ internal: true });
         expect(toolCall("call_http")?.name).toBe(MCP_TOOL_NAME);
-        expect(toolCall("call_http")?._meta.fx.toolCall).toEqual({
+        expect(toolCall("call_http")?._meta["sh.fx/toolCall"]).toEqual({
           internal: false,
           mcp: { server: "fixture", tool: "echo" },
         });
@@ -3328,7 +3345,7 @@ describe("acp: model-independent", () => {
           "session/new",
           {
             cwd: root.workspace,
-            mcpServers: [{ type: "http", name: "fixture", url: httpFixture.url, headers: [], _meta: { fx: { alwaysLoaded: false } } }],
+            mcpServers: [{ type: "http", name: "fixture", url: httpFixture.url, headers: [], _meta: { "sh.fx/alwaysLoaded": false } }],
           },
           2,
         ) as any;
@@ -3377,7 +3394,7 @@ describe("acp: model-independent", () => {
           "session/new",
           {
             cwd: root.workspace,
-            mcpServers: [{ type: "http", name: "fixture", url: httpFixture.url, headers: [], _meta: { fx: { alwaysLoaded: false } } }],
+            mcpServers: [{ type: "http", name: "fixture", url: httpFixture.url, headers: [], _meta: { "sh.fx/alwaysLoaded": false } }],
           },
           2,
         ) as any;
@@ -3445,7 +3462,7 @@ describe("acp: model-independent", () => {
 
         const lazy = await client.request(
           "session/new",
-          { cwd: root.workspace, mcpServers: [{ ...server, _meta: { fx: { alwaysLoaded: false } } }] },
+          { cwd: root.workspace, mcpServers: [{ ...server, _meta: { "sh.fx/alwaysLoaded": false } }] },
           4,
         ) as any;
         expect(lazy.error).toBeUndefined();
@@ -3624,7 +3641,7 @@ describe("acp: model-independent", () => {
             cwd: root.workspace,
             mcpServers: [{
               ...acpHttpServer(httpFixture, "acp"),
-              _meta: { fx: { alwaysLoaded: false } },
+              _meta: { "sh.fx/alwaysLoaded": false },
             }],
           },
           2,
@@ -3676,7 +3693,7 @@ describe("acp: model-independent", () => {
           env: fakeGatewayEnv(root, gateway),
         });
         const init = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
-        expect(init.result.agentCapabilities._meta.fx.steering).toBe(true);
+        expect(init.result.agentCapabilities._meta["sh.fx/promptDelivery"]).toEqual({ steer: {} });
         const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
         expect(created.error).toBeUndefined();
         await client.readLine();
@@ -3695,14 +3712,14 @@ describe("acp: model-independent", () => {
         const steered = responses.get(101)!;
         expect(steered.error).toBeUndefined();
         expect(steered.result.stopReason).toBe("end_turn");
-        expect(steered.result._meta.fx.steering).toBe("absorbed");
+        expect(steered.result._meta["sh.fx/steeringDelivery"]).toBe("absorbed");
         expect(steered.result.usage).toBeUndefined();
 
         const replay = messages.find((message) =>
           message.params?.update?.sessionUpdate === "user_message_chunk" &&
           message.params.update.content?.text === "No, the other tab."
         );
-        expect(replay?.params.update._meta.fx.steering.requestId).toBe(101);
+        expect(replay?.params.update._meta["sh.fx/steerInput"].requestId).toBe(101);
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[0]!.body).not.toContain("No, the other tab.");
         expect(gateway.requests[1]!.body).toContain("No, the other tab.");
@@ -3732,7 +3749,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP reports queued steering as cancelled when the turn is cancelled",
+    "ACP fails a waiting steer with -32800 when the turn is cancelled",
     async () => {
       const root = createIsolatedRoot("fx-acp-steer-cancel-");
       const firstRequest = deferred<void>();
@@ -3763,8 +3780,9 @@ describe("acp: model-independent", () => {
 
         const { responses, messages } = await readUntilResponses(client, [200, 201]);
         expect(responses.get(200)!.result.stopReason).toBe("cancelled");
-        expect(responses.get(201)!.result.stopReason).toBe("cancelled");
-        expect(responses.get(201)!.result._meta.fx.steering).toBe("dropped");
+        // Until queued prompts land, a stop fails the steers it finds waiting
+        // (tests/tla/acp/AcpPromptDelivery.tla, Today configs).
+        expect(responses.get(201)!.error).toEqual({ code: -32800, message: "Request cancelled" });
         expect(messages.some((message) =>
           message.params?.update?.sessionUpdate === "user_message_chunk"
         )).toBe(false);
@@ -3804,7 +3822,7 @@ describe("acp: model-independent", () => {
         });
         const init = await client.request("initialize", {
           protocolVersion: 1,
-          _meta: { fx: { terminal: false } },
+          _meta: { "sh.fx/terminalUi": false },
         }, 1) as any;
         expect(init.result.agentCapabilities.sessionCapabilities.systemPrompt).toEqual({});
 
@@ -4087,7 +4105,7 @@ describe("acp: model-independent", () => {
         const opted = await client.request("session/new", {
           cwd: root.workspace,
           mcpServers: [],
-          _meta: { fx: { profileMcpServers: true } },
+          _meta: { "sh.fx/profileMcpServers": true },
         }, 3) as any;
         expect(opted.error).toBeUndefined();
         await client.readLine();
@@ -4230,12 +4248,12 @@ describe("acp: model-independent", () => {
         sendSteeringPrompt(client, 11, "Just the title.");
         releaseFirst.resolve();
         const live = await readUntilResponses(client, [10, 11]);
-        expect(live.responses.get(11)!.result._meta.fx.steering).toBe("absorbed");
+        expect(live.responses.get(11)!.result._meta["sh.fx/steeringDelivery"]).toBe("absorbed");
         const liveCall = live.messages
           .map((message) => message.params?.update)
           .find((update) => update?.sessionUpdate === "tool_call" && update.name === "mcp_mini_browser_read");
         expect(liveCall.title).toBe("Read page");
-        expect(liveCall._meta.fx.toolCall).toEqual(identity);
+        expect(liveCall._meta["sh.fx/toolCall"]).toEqual(identity);
         expect(served).toContain("tools/call");
         await client.close();
 
@@ -4258,12 +4276,12 @@ describe("acp: model-independent", () => {
         );
         expect(readIndex).toBeGreaterThanOrEqual(0);
         expect(updates[readIndex].title).toBe("Read page");
-        expect(updates[readIndex]._meta.fx.toolCall).toEqual(identity);
+        expect(updates[readIndex]._meta["sh.fx/toolCall"]).toEqual(identity);
         const steerIndex = updates.findIndex((update) =>
           update.sessionUpdate === "user_message_chunk" && update.content?.text === "Just the title."
         );
         expect(steerIndex).toBeGreaterThan(readIndex);
-        expect(updates[steerIndex]._meta.fx.steering).toEqual({ requestId: null });
+        expect(updates[steerIndex]._meta["sh.fx/steerInput"]).toEqual({ requestId: null });
         // Replay sends the server nothing.
         expect(served).toHaveLength(servedBeforeLoad);
         expect(client.stderr).toBe("");
@@ -5596,7 +5614,7 @@ describe("acp: model-independent", () => {
           "session/new",
           {
             cwd: root.workspace,
-            _meta: { fx: { hooks: { captureContent: true } } },
+            _meta: { "sh.fx/hooks": { captureContent: true } },
             mcpServers: [acpStdioServer(
               "unused",
               pidPath,
@@ -5712,7 +5730,7 @@ describe("acp: model-independent", () => {
           "session/new",
           {
             cwd: root.workspace,
-            _meta: { fx: { hooks: { captureContent: true } } },
+            _meta: { "sh.fx/hooks": { captureContent: true } },
             mcpServers: [acpStdioServer("unused", pidPath, "mrtr_input_required", {
               FX_MCP_WIRE_LOG: wirePath,
               FX_MCP_EXPECT_ELICITATION: "form",
@@ -5789,7 +5807,7 @@ describe("acp: model-independent", () => {
           "session/new",
           {
             cwd: root.workspace,
-            _meta: { fx: { hooks: { captureContent: true } } },
+            _meta: { "sh.fx/hooks": { captureContent: true } },
             mcpServers: [acpStdioServer(
               "unused",
               pidPath,
@@ -5947,7 +5965,7 @@ describe("acp: model-independent", () => {
           "session/new",
           {
             cwd: root.workspace,
-            _meta: { fx: { hooks: { captureContent: true } } },
+            _meta: { "sh.fx/hooks": { captureContent: true } },
             mcpServers: [acpStdioServer(
               "unused",
               pidPath,
@@ -10235,9 +10253,9 @@ describe("acp: model-independent", () => {
           expect(mode.currentValue).toBe(expected);
           expect(created.result.modes.currentModeId).toBe(expected);
           expect(mode.options).toEqual([
-            { value: "auto", name: "Auto", description: expect.any(String), _meta: { fx: { permissionMode: "auto" } } },
-            { value: "ask", name: "Ask", description: expect.any(String), _meta: { fx: { permissionMode: "ask" } } },
-            { value: "full-access", name: "Full access", description: expect.any(String), _meta: { fx: { permissionMode: "yolo" } } },
+            { value: "auto", name: "Auto", description: expect.any(String), _meta: { "sh.fx/permissionMode": "auto" } },
+            { value: "ask", name: "Ask", description: expect.any(String), _meta: { "sh.fx/permissionMode": "ask" } },
+            { value: "full-access", name: "Full access", description: expect.any(String), _meta: { "sh.fx/permissionMode": "yolo" } },
           ]);
           expect(created.result.modes.availableModes.map((entry: any) => entry.id)).toEqual(["auto", "ask", "full-access"]);
         } finally {

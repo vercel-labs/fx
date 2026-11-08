@@ -56,6 +56,10 @@ pub const ErrorCode = struct {
     /// ACP's "Resource not found", such as a request that names a session that doesn't exist or
     /// isn't open on the connection.
     pub const resource_not_found: i64 = -32002;
+    /// ACP's "Request cancelled", for a request that the client's own cancel
+    /// ended before it ran, such as a steer still waiting when the client
+    /// stops the turn.
+    pub const request_cancelled: i64 = -32800;
 };
 
 pub const RequestId = union(enum) {
@@ -628,14 +632,14 @@ test "Writer Frame formats protocol lines" {
                 .code = ErrorCode.invalid_params,
                 .message = "Unsupported fast mode",
                 .data = .{ .model_capability = .{
-                    .code = "LIBFX_MODEL_UNSUPPORTED_FAST",
+                    .code = "MODEL_UNSUPPORTED_FAST",
                     .model = "provider/quoted\"model",
                     .capability = "fast",
                 } },
             },
         } }).write(&out.writer);
         try std.testing.expectEqualStrings(
-            "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32602,\"message\":\"Unsupported fast mode\",\"data\":{\"code\":\"LIBFX_MODEL_UNSUPPORTED_FAST\",\"model\":\"provider/quoted\\\"model\",\"capability\":\"fast\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32602,\"message\":\"Unsupported fast mode\",\"data\":{\"code\":\"MODEL_UNSUPPORTED_FAST\",\"model\":\"provider/quoted\\\"model\",\"capability\":\"fast\"}}}\n",
             out.writer.buffered(),
         );
     }
@@ -757,7 +761,7 @@ test "Writer keeps each frame on one line when caller JSON has line breaks" {
     var capture: Capture = .{};
     defer capture.bytes.deinit(alloc);
     var writer = Writer.initCallback(&capture, Capture.write);
-    try writer.writeRequest(alloc, .{ .integer = 1 }, "libfx/tool_call", "{\"name\":\"todo\",\"input\":" ++ input ++ "}");
+    try writer.writeRequest(alloc, .{ .integer = 1 }, "_sh.fx/tools/call", "{\"name\":\"todo\",\"input\":" ++ input ++ "}");
     try writer.writeNotification(alloc, "session/update", input);
     try writer.writeResponse(alloc, .{ .integer = 2 }, input);
 

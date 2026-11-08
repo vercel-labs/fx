@@ -2,7 +2,7 @@
 
 This folder holds `sh.fx`, the draft specification of the extensions that fx adds to version 1 of the [Agent Client Protocol](https://agentclientprotocol.com) (ACP), and a pinned copy of ACP's own schema that the extensions build on.
 
-fx doesn't implement the specification yet. Its ACP server in `src/acp/` still names its additions as `libfx/*` methods and `_meta.fx` keys. Each change that moves the server to the `sh.fx` names updates this folder in the same pull request.
+fx's ACP server in `src/acp/` and its SDK use the `sh.fx` names, and fx lists the extensions it serves at `initialize`. Several extensions in the specification have not landed in the server yet; each section says what fx does today. A change that lands one updates this folder in the same pull request.
 
 | File | Contents |
 | --- | --- |

@@ -29,6 +29,7 @@ const image_attachments = @import("../core/images/image_attachments.zig");
 const image_data = @import("../core/images/image_data.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
+const sh_fx = @import("sh_fx.zig");
 const server = @import("server.zig");
 const sessions = @import("sessions.zig");
 const client_instructions = @import("client_instructions.zig");
@@ -138,7 +139,7 @@ fn promptInputFailure(err: anyerror) anyerror!TerminalOutcome {
         } },
         error.PromptImagesTooLarge => .{ .rpc_error = .{
             .code = ErrorCode.invalid_params,
-            .message = "Prompt images exceed the libfx limit",
+            .message = "Prompt images exceed the attachment limit",
         } },
         else => err,
     };
@@ -320,6 +321,7 @@ const AcpContext = struct {
         self: *AcpContext,
         status: types.RouteRecoveryStatus,
     ) !void {
+        if (!self.state.extensions.contains(.model_response_recovery)) return;
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeModelRecoveryInfoUpdate(&out.writer, status);
@@ -327,6 +329,7 @@ const AcpContext = struct {
     }
 
     fn clearModelRecoveryStatus(self: *AcpContext) !void {
+        if (!self.state.extensions.contains(.model_response_recovery)) return;
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeModelRecoveryInfoUpdate(&out.writer, null);
@@ -385,7 +388,8 @@ const AcpContext = struct {
         errdefer self.alloc.free(owned_id);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeToolCall(&out.writer, owned_id, name, presentation.title, kind, .pending, raw_input, presentation.meta);
+        const meta: ?acp_types.ToolCallMeta = if (self.state.extensions.contains(.tool_call)) presentation.meta else null;
+        try acp_types.writeToolCall(&out.writer, owned_id, name, presentation.title, kind, .pending, raw_input, meta);
         try self.sendUpdate(out.writer.buffered());
         self.published_tool_calls.putAssumeCapacity(
             owned_id,
@@ -677,6 +681,8 @@ fn hostToolProvider(state: *server.ServerState) ?tool_dispatch.HostToolProvider 
     };
 }
 
+/// Asks the client to run one of the tools it listed in `sh.fx/hostTools`,
+/// as a `_sh.fx/tools/call` request, and waits for its result.
 fn callHostTool(
     raw_state: *anyopaque,
     alloc: Allocator,
@@ -718,7 +724,7 @@ fn callHostTool(
     state.writer.writeRequest(
         alloc,
         .{ .integer = @intCast(outbound_id) },
-        "libfx/tool_call",
+        sh_fx.method.tools_call,
         params.written(),
     ) catch return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
 
@@ -1095,11 +1101,7 @@ pub fn handlePrompt(
 
     var skill_catalog = state.skills.acquireCatalog();
     defer skill_catalog.deinit();
-    const host_instructions = try client_instructions.compose(
-        alloc,
-        state.host_instructions,
-        session.client_system_prompt,
-    );
+    const host_instructions = try client_instructions.compose(alloc, session.client_system_prompt);
     defer alloc.free(host_instructions);
     for (state.context_snapshot.notices) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
 
@@ -1692,20 +1694,20 @@ fn parsePromptInputWithFirstImageId(
 
     if (parsed.value != .object) return .{ .text = try alloc.dupe(u8, "") };
 
-    const continue_recovery = acp_types.fxMetaBool(parsed.value.object, "continueRecovery") orelse false;
-    const fresh_output = acp_types.fxMetaBool(parsed.value.object, "freshOutput") orelse false;
-    const input_id: ?[]const u8 = if (acp_types.fxMetaField(parsed.value.object, "inputId")) |value|
+    const continue_recovery = acp_types.metaBool(parsed.value.object, "sh.fx/continueRecovery") orelse false;
+    const fresh_output = acp_types.metaBool(parsed.value.object, "sh.fx/freshOutput") orelse false;
+    const input_id: ?[]const u8 = if (acp_types.metaField(parsed.value.object, "sh.fx/inputId")) |value|
         if (value == .string and libfx_steering.validInputId(value.string)) value.string else null
     else
         null;
-    const input_accepted = acp_types.fxMetaBool(parsed.value.object, "inputAccepted") orelse false;
-    const turn_id: ?[]const u8 = if (acp_types.fxMetaField(parsed.value.object, "turnId")) |value|
+    const input_accepted = acp_types.metaBool(parsed.value.object, "sh.fx/inputAccepted") orelse false;
+    const turn_id: ?[]const u8 = if (acp_types.metaField(parsed.value.object, "sh.fx/turnId")) |value|
         if (value == .string and libfx_steering.validInputId(value.string)) value.string else null
     else
         null;
-    const rerun_value = acp_types.fxMetaField(parsed.value.object, "rerun");
+    const rerun_value = acp_types.metaField(parsed.value.object, "sh.fx/rerun");
     // A JavaScript host gives a time it can hold as a number.
-    const yield_at_ms: ?i64 = if (acp_types.fxMetaInteger(parsed.value.object, "yieldAt")) |ms|
+    const yield_at_ms: ?i64 = if (acp_types.metaInteger(parsed.value.object, "sh.fx/yieldAt")) |ms|
         if (ms > 0 and ms <= max_host_time_ms) ms else null
     else
         null;
@@ -1754,7 +1756,7 @@ fn parsePromptInputWithFirstImageId(
                 if (value != .string or !image_data.validSourceRef(value.string)) return error.InvalidPromptImage;
                 break :ref value.string;
             } else null;
-            const decoded = if (acp_types.fxMetaField(block.object, "attachment")) |attachment| bytes: {
+            const decoded = if (acp_types.metaField(block.object, "sh.fx/attachment")) |attachment| bytes: {
                 if (block.object.get("data") != null) return error.InvalidPromptImage;
                 break :bytes try takePromptImageAttachment(alloc, attachments, attachment);
             } else if (block.object.get("data")) |data_value|
@@ -1765,7 +1767,7 @@ fn parsePromptInputWithFirstImageId(
             };
             errdefer alloc.free(decoded);
             // A host with an image store names the bytes it stored first.
-            const stored_name: ?session_codec.ImageName = if (acp_types.fxMetaField(block.object, "stored")) |value| name: {
+            const stored_name: ?session_codec.ImageName = if (acp_types.metaField(block.object, "sh.fx/storedImage")) |value| name: {
                 if (value != .string or decoded.len == 0) return error.InvalidPromptImage;
                 break :name session_codec.imageName(value.string) orelse return error.InvalidPromptImage;
             } else null;
@@ -1994,7 +1996,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
 }
 
 /// Drains steering at a turn boundary. ACP clients steer by sending
-/// `session/prompt` with `_meta.fx.steer` during a turn; each delivered message
+/// `session/prompt` with `sh.fx/delivery` `"steer"` during a turn; each delivered message
 /// is replayed as a user message where it joined the turn. A cancelled ACP
 /// turn stops instead of continuing with queued steering, and the steering
 /// prompt responses report what was dropped. A libfx turn continues past a
@@ -2137,7 +2139,7 @@ fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrp
     try update.writer.writeAll("{\"sessionId\":");
     try jsonrpc.writeJsonStr(ctx.session_id, &update.writer);
     try update.writer.writeAll(",\"update\":");
-    try acp_types.writeSteeringUserMessageChunk(&update.writer, message_id, text, request_id, input_id);
+    try acp_types.writeSteeringUserMessageChunk(&update.writer, message_id, text, request_id, input_id, ctx.state.sendsSteerInput());
     try update.writer.writeByte('}');
     try ctx.state.writer.writeNotification(ctx.alloc, "session/update", update.written());
 }
@@ -2919,7 +2921,7 @@ fn flushJournal(state: *server.ServerState, alloc: Allocator, session_id: []cons
     try params.writer.writeAll("{\"sessionId\":");
     try jsonrpc.writeJsonStr(session_id, &params.writer);
     try params.writer.writeByte('}');
-    state.writer.writeRequest(alloc, .{ .integer = @intCast(outbound_id) }, "libfx/journal_flush", params.written()) catch
+    state.writer.writeRequest(alloc, .{ .integer = @intCast(outbound_id) }, sh_fx.method.journal_flush, params.written()) catch
         return error.JournalFlushFailed;
     var response = server.awaitOutboundResponse(state, outbound_id, .journal) orelse return error.JournalFlushFailed;
     awaiting = false;
@@ -3963,7 +3965,7 @@ test "parsePromptInput handles empty prompt array" {
 test "parsePromptInput accepts explicit recovery continuation metadata" {
     const alloc = std.testing.allocator;
     const params =
-        "{\"sessionId\":\"s1\",\"prompt\":[],\"_meta\":{\"fx\":{\"continueRecovery\":true}}}";
+        "{\"sessionId\":\"s1\",\"prompt\":[],\"_meta\":{\"sh.fx/continueRecovery\":true}}";
     var result = try parsePromptInput(alloc, params);
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), result.text.len);
@@ -3975,7 +3977,7 @@ test "parsePromptInput accepts explicit recovery continuation metadata" {
 test "parsePromptInput reads whether a resume's host holds the turn's earlier output" {
     const alloc = std.testing.allocator;
     const params =
-        "{\"sessionId\":\"s1\",\"prompt\":[],\"_meta\":{\"fx\":{\"continueRecovery\":true,\"freshOutput\":true}}}";
+        "{\"sessionId\":\"s1\",\"prompt\":[],\"_meta\":{\"sh.fx/continueRecovery\":true,\"sh.fx/freshOutput\":true}}";
     var result = try parsePromptInput(alloc, params);
     defer result.deinit(alloc);
     try std.testing.expect(result.continue_recovery);
@@ -3985,7 +3987,7 @@ test "parsePromptInput reads whether a resume's host holds the turn's earlier ou
 test "parsePromptInput keeps the call ids a resume runs again and drops the rest" {
     const alloc = std.testing.allocator;
     const params =
-        "{\"sessionId\":\"s1\",\"prompt\":[],\"_meta\":{\"fx\":{\"continueRecovery\":true,\"rerun\":[\"call-1\",7,\"\",\"call-2\"]}}}";
+        "{\"sessionId\":\"s1\",\"prompt\":[],\"_meta\":{\"sh.fx/continueRecovery\":true,\"sh.fx/rerun\":[\"call-1\",7,\"\",\"call-2\"]}}";
     var result = try parsePromptInput(alloc, params);
     defer result.deinit(alloc);
     try std.testing.expect(result.continue_recovery);
@@ -4114,8 +4116,8 @@ const TestAttachmentStore = struct {
 test "parsePromptInput takes raw image bytes from a host attachment" {
     const alloc = std.testing.allocator;
     const cases = [_][]const u8{
-        "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"look\"},{\"type\":\"image\",\"mimeType\":\"image/png\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}",
-        "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"look\"},{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:raw\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}",
+        "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"look\"},{\"type\":\"image\",\"mimeType\":\"image/png\",\"_meta\":{\"sh.fx/attachment\":3}}]}",
+        "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"look\"},{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:raw\",\"_meta\":{\"sh.fx/attachment\":3}}]}",
     };
     for (cases, 0..) |params, index| {
         var attachments = TestAttachmentStore{ .id = 3, .bytes = "\x89PNG\r\n\x1a\nraw" };
@@ -4138,7 +4140,7 @@ test "parsePromptInput takes raw image bytes from a host attachment" {
 
 test "parsePromptInput rejects unusable image attachment references" {
     const alloc = std.testing.allocator;
-    const reference = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:original\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
+    const reference = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:original\",\"_meta\":{\"sh.fx/attachment\":3}}]}";
 
     // Standard ACP hosts have no attachment store.
     try std.testing.expectError(error.UnsupportedPromptImage, parsePromptInput(alloc, reference));
@@ -4152,17 +4154,17 @@ test "parsePromptInput rejects unusable image attachment references" {
     var oversized = TestAttachmentStore{ .id = 3, .bytes = "x", .too_large = true };
     try std.testing.expectError(error.ImageTooLarge, parsePromptInputWithFirstImageId(alloc, reference, 1, oversized.store()));
 
-    const zero_id = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"_meta\":{\"fx\":{\"attachment\":0}}}]}";
+    const zero_id = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"_meta\":{\"sh.fx/attachment\":0}}]}";
     var unused = TestAttachmentStore{ .id = 0, .bytes = "x" };
     try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, zero_id, 1, unused.store()));
     try std.testing.expectEqual(@as(usize, 0), unused.taken);
 
-    const ambiguous = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:original\",\"data\":\"aGVsbG8=\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
+    const ambiguous = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:original\",\"data\":\"aGVsbG8=\",\"_meta\":{\"sh.fx/attachment\":3}}]}";
     var stored = TestAttachmentStore{ .id = 3, .bytes = "x" };
     try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, ambiguous, 1, stored.store()));
     try std.testing.expectEqual(@as(usize, 0), stored.taken);
 
-    const invalid_ref = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"bad\\nref\",\"_meta\":{\"fx\":{\"attachment\":3}}}]}";
+    const invalid_ref = "{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"bad\\nref\",\"_meta\":{\"sh.fx/attachment\":3}}]}";
     try std.testing.expectError(error.InvalidPromptImage, parsePromptInputWithFirstImageId(alloc, invalid_ref, 1, stored.store()));
     try std.testing.expectEqual(@as(usize, 0), stored.taken);
 }
