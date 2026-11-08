@@ -1156,9 +1156,9 @@ test "subagent history makes every removed manager action inert" {
             .arguments_json = "{\"command\":{\"configure\":{\"id\":\"child-1\",\"name\":\"renamed\"}}}",
         },
         .{
-            .id = "current-run",
+            .id = "current-message",
             .name = "subagent",
-            .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"current\"}}",
+            .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"worker\",\"message\":\"current\"}}",
         },
     };
     const stored_result =
@@ -1167,7 +1167,7 @@ test "subagent history makes every removed manager action inert" {
         .{ .role = .assistant, .tool_calls = &calls },
         .{ .role = .tool, .tool_call_id = "legacy-create", .tool_name = "subagent", .content = stored_result },
         .{ .role = .tool, .tool_call_id = "legacy-configure", .tool_name = "subagent", .content = "configured" },
-        .{ .role = .tool, .tool_call_id = "current-run", .tool_name = "subagent", .content = stored_result },
+        .{ .role = .tool, .tool_call_id = "current-message", .tool_name = "subagent", .content = stored_result },
     };
 
     const projected = try project_subagent_request_messages(
@@ -1182,9 +1182,9 @@ test "subagent history makes every removed manager action inert" {
     try std.testing.expectEqual(@as(usize, 1), projected[0].tool_calls.len);
     // A stored wrapped call replays with the top-level arguments the schema
     // now advertises.
-    try std.testing.expectEqualStrings("{\"action\":\"run\",\"task\":\"current\"}", projected[0].tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings("{\"action\":\"message\",\"agent\":\"worker\",\"message\":\"current\"}", projected[0].tool_calls[0].arguments_json);
     try std.testing.expectEqual(types.ChatRole.tool, projected[1].role);
-    try std.testing.expectEqualStrings("current-run", projected[1].tool_call_id.?);
+    try std.testing.expectEqualStrings("current-message", projected[1].tool_call_id.?);
     try std.testing.expect(std.mem.find(u8, projected[1].content.?, "operation_id") == null);
     try std.testing.expectEqual(types.ChatRole.assistant, projected[2].role);
     try std.testing.expect(std.mem.find(

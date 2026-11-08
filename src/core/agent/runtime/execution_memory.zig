@@ -833,7 +833,7 @@ test "interrupted execution memory retains marked feedback through mixed user ta
 test "interrupted execution memory keeps steering typed right after a tool result" {
     const alloc = std.testing.allocator;
     var calls = [_]ToolCall{
-        .{ .id = "call_done", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"work\"}}" },
+        .{ .id = "call_done", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"worker\",\"message\":\"work\"}}" },
         .{ .id = "call_active", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" },
     };
     const steering = try steeringMessage(alloc, "check the tests too");

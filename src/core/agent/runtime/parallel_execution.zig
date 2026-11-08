@@ -713,8 +713,8 @@ test "parallel classifier keeps one leading registered subagent group" {
     };
     const registry = tool_dispatch.Registry{ .tools = &tools };
     const calls = [_]ToolCall{
-        toolCall("child_1", "subagent", "{\"request\":{\"action\":\"run\",\"task\":\"first\"}}"),
-        toolCall("child_2", "subagent", "{\"request\":{\"action\":\"run\",\"task\":\"second\"}}"),
+        toolCall("child_1", "subagent", "{\"request\":{\"action\":\"message\",\"agent\":\"first\",\"message\":\"first\"}}"),
+        toolCall("child_2", "subagent", "{\"request\":{\"action\":\"message\",\"agent\":\"second\",\"message\":\"second\"}}"),
         toolCall("read_1", "read_file", "{\"path\":\"README.md\"}"),
     };
 
