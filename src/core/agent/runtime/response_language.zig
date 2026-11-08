@@ -145,35 +145,14 @@ fn has_non_ascii_latin_letter(text: []const u8) bool {
     var index: usize = 0;
     var after_latin_letter = false;
     while (index < text.len) {
-        const follows_latin_letter = after_latin_letter;
-        after_latin_letter = false;
-        if (text[index] < 0x80) {
-            after_latin_letter = std.ascii.isAlphabetic(text[index]);
-            index += 1;
-            continue;
-        }
-        const decoded = decode_at(text, index) orelse {
-            index += 1;
-            continue;
-        };
-        const codepoint = decoded.codepoint;
-        if (is_latin_letter_outside_ascii(codepoint)) return true;
-        if (follows_latin_letter and
-            codepoint >= combining_accents_first and codepoint <= combining_accents_last) return true;
-        index += decoded.width;
+        const rune = display_width.decodeNextRune(text, index);
+        index += rune.len;
+        if (is_latin_letter_outside_ascii(rune.codepoint)) return true;
+        if (after_latin_letter and
+            rune.codepoint >= combining_accents_first and rune.codepoint <= combining_accents_last) return true;
+        after_latin_letter = rune.codepoint < 0x80 and std.ascii.isAlphabetic(@intCast(rune.codepoint));
     }
     return false;
-}
-
-const DecodedCodepoint = struct { codepoint: u21, width: usize };
-
-/// The codepoint that starts at `index`, or null for a malformed or cut-short
-/// sequence, which one byte of the caller's scan then skips.
-fn decode_at(text: []const u8, index: usize) ?DecodedCodepoint {
-    const width = std.unicode.utf8ByteSequenceLength(text[index]) catch return null;
-    if (index + width > text.len) return null;
-    const codepoint = display_width.decodeUtf8Sequence(text[index .. index + width]) catch return null;
-    return .{ .codepoint = codepoint, .width = width };
 }
 
 fn is_latin_letter_outside_ascii(codepoint: u21) bool {
@@ -182,11 +161,32 @@ fn is_latin_letter_outside_ascii(codepoint: u21) bool {
         codepoint != 0x00D7 and codepoint != 0x00F7;
 }
 
+/// The Unicode space separators that split words: the no-break space, the Ogham
+/// space, the en and em spaces and their narrower forms (U+2000 to U+200A), the
+/// narrow no-break space, the medium mathematical space, and the ideographic
+/// space.
+fn is_unicode_space(codepoint: u21) bool {
+    return switch (codepoint) {
+        0x00A0, 0x1680, 0x2000...0x200A, 0x202F, 0x205F, 0x3000 => true,
+        else => false,
+    };
+}
+
+/// The length in bytes of the space that starts at `index`, ASCII white space
+/// or a Unicode space separator, or 0 when no space starts there.
+fn space_len_at(text: []const u8, index: usize) usize {
+    const byte = text[index];
+    if (byte < 0x80) return @intFromBool(std.ascii.isWhitespace(byte));
+    const rune = display_width.decodeNextRune(text, index);
+    return if (is_unicode_space(rune.codepoint)) rune.len else 0;
+}
+
 /// Whether some clause of `minimum_clause_words` or more words, outside code
 /// spans, has no English function word: words of another language, even when
 /// the rest of the prompt is English. A clause ends at a line break or at a
-/// word that ends in . ! ? : or ;. A word is a whitespace-separated token with
-/// an ASCII letter.
+/// word that ends in . ! ? : or ;. A word is a token with an ASCII letter
+/// between spaces, which are ASCII white space and the Unicode space
+/// separators of `is_unicode_space`.
 fn has_clause_without_english(text: []const u8) bool {
     var words: usize = 0;
     var has_function_word = false;
@@ -199,8 +199,9 @@ fn has_clause_without_english(text: []const u8) bool {
             in_code = !in_code;
             continue;
         }
-        if (std.ascii.isWhitespace(byte)) {
-            index += 1;
+        const space_len = space_len_at(text, index);
+        if (space_len > 0) {
+            index += space_len;
             if (byte != '\n' or in_code) continue;
             if (words >= minimum_clause_words and !has_function_word) return true;
             words = 0;
@@ -208,7 +209,7 @@ fn has_clause_without_english(text: []const u8) bool {
             continue;
         }
         const start = index;
-        while (index < text.len and text[index] != '`' and !std.ascii.isWhitespace(text[index])) : (index += 1) {}
+        while (index < text.len and text[index] != '`' and space_len_at(text, index) == 0) : (index += 1) {}
         if (in_code) continue;
         const token = text[start..index];
         if (has_ascii_letter(token)) {
@@ -256,14 +257,30 @@ const english_function_words = english_authority_words ++ [_][]const u8{
 };
 
 /// The start of a contraction: "don" in "don't", "it" in "it's". These count
-/// as English only before an apostrophe, because "don", "won", "haven", "can",
-/// "let", "it", and "we" are words of Spanish, Dutch, Turkish, Vietnamese, and
-/// other languages.
+/// as English only before an apostrophe and an English ending, because "don",
+/// "won", "haven", "can", "let", "it", and "we" are words of Spanish, Dutch,
+/// Turkish, Vietnamese, and other languages, and Turkish gives a name its own
+/// ending after an apostrophe, as in "Can'a".
 const english_contraction_stems = [_][]const u8{
     "don",   "doesn", "didn",   "isn",    "aren",    "wasn",
     "weren", "won",   "wouldn", "couldn", "shouldn", "haven",
     "hasn",  "can",   "let",    "it",     "we",
 };
+
+/// What English adds after the apostrophe of a contraction: "t" in "don't", "s"
+/// in "it's", "re" in "we're", "ll", "ve", "d", and "m".
+const english_contraction_endings = [_][]const u8{ "t", "s", "re", "ll", "ve", "d", "m" };
+
+/// Whether the letters at the start of `after_apostrophe` are exactly one of
+/// the `english_contraction_endings`, in either case.
+fn starts_with_english_contraction_ending(after_apostrophe: []const u8) bool {
+    var len: usize = 0;
+    while (len < after_apostrophe.len and std.ascii.isAlphabetic(after_apostrophe[len])) : (len += 1) {}
+    for (english_contraction_endings) |ending| {
+        if (std.ascii.eqlIgnoreCase(after_apostrophe[0..len], ending)) return true;
+    }
+    return false;
+}
 
 /// Whether a token is an English function word, allowing punctuation around
 /// it and a contraction such as "don't" or "it’s" after it.
@@ -274,7 +291,13 @@ fn is_english_function_word(token: []const u8) bool {
     while (end < token.len and std.ascii.isAlphabetic(token[end])) : (end += 1) {}
     if (start == end) return false;
     const rest = token[end..];
-    const contracted = rest.len > 0 and (rest[0] == '\'' or std.mem.startsWith(u8, rest, "\u{2019}"));
+    const apostrophe_len: usize = if (rest.len > 0 and rest[0] == '\'')
+        1
+    else if (std.mem.startsWith(u8, rest, "\u{2019}"))
+        "\u{2019}".len
+    else
+        0;
+    const contracted = apostrophe_len > 0;
     if (rest.len > 0 and !contracted) {
         for (rest) |byte| {
             if (std.ascii.isAlphanumeric(byte)) return false;
@@ -285,7 +308,7 @@ fn is_english_function_word(token: []const u8) bool {
     for (english_function_words) |candidate| {
         if (std.ascii.eqlIgnoreCase(word, candidate)) return true;
     }
-    if (contracted) {
+    if (contracted and starts_with_english_contraction_ending(rest[apostrophe_len..])) {
         for (english_contraction_stems) |stem| {
             if (std.ascii.eqlIgnoreCase(word, stem)) return true;
         }
@@ -447,6 +470,9 @@ test "response language expectation counts decomposed accents like precomposed l
         "The lockfile is broken again. \u{301}",
         "Why is 3\u{301} wrong in the lockfile parser?",
         "Why is the lockfile \u{301}broken again?",
+        // Straight after a character that is not a letter of ASCII.
+        "The lockfile is broken again \u{2014}\u{301}",
+        "The lockfile is broken again. \u{754C}\u{301}",
     };
     for (stray_marks) |prompt| {
         try std.testing.expectEqual(Script.latin, infer_expectation(prompt).?);
@@ -579,6 +605,129 @@ test "response language expectation keeps English that uses contractions" {
     try std.testing.expect(infer_expectation("Let touch parsing. Why does it break?") == null);
 }
 
+test "response language expectation counts a contraction stem only before an English ending" {
+    const apostrophes = [_][]const u8{ "'", "\u{2019}" };
+    // The endings of English contractions, in either case.
+    const english_endings = [_][]const u8{ "t", "s", "re", "ll", "ve", "d", "m", "T", "S", "RE" };
+    // Endings that other languages put after an apostrophe, and near misses.
+    const other_endings = [_][]const u8{ "", "a", "e", "da", "dan", "nin", "tt", "ss", "res", "x", "\u{131}n" };
+    for (apostrophes) |apostrophe| {
+        for (english_endings) |ending| {
+            var buffer: [32]u8 = undefined;
+            const token = try std.mem.print(&buffer, "can{s}{s}", .{ apostrophe, ending });
+            errdefer std.debug.print("expected English: {s}\n", .{token});
+            try std.testing.expect(is_english_function_word(token));
+        }
+        for (other_endings) |ending| {
+            var buffer: [32]u8 = undefined;
+            const token = try std.mem.print(&buffer, "Can{s}{s}", .{ apostrophe, ending });
+            errdefer std.debug.print("expected not English: {s}\n", .{token});
+            try std.testing.expect(!is_english_function_word(token));
+        }
+    }
+    // Punctuation around a contraction does not change it.
+    try std.testing.expect(is_english_function_word("(Don't"));
+    try std.testing.expect(is_english_function_word("it's."));
+    try std.testing.expect(is_english_function_word("can't,"));
+    try std.testing.expect(is_english_function_word("won't-fix"));
+}
+
+test "response language expectation reads a name with a case ending as a word of its language" {
+    const requests = [_][]const u8{
+        // Turkish: a name with a case ending after an apostrophe.
+        "Bunu Can'a Korece yaz. The lockfile is broken again.",
+        "Bunu Can\u{2019}a Korece yaz. The lockfile is broken again.",
+        "Bunu Can'dan Korece iste. The lockfile is broken again.",
+        "Bunu Ali'nin dosyasina Korece yaz. The lockfile is broken again.",
+        // A stem with no ending after its apostrophe is not a contraction.
+        "Bunu Can' Korece yaz. The lockfile is broken again.",
+        // French elision.
+        "Je bois l'eau froide. The lockfile is broken again.",
+    };
+    for (requests) |prompt| {
+        errdefer std.debug.print("expected no expectation for: {s}\n", .{prompt});
+        try std.testing.expect(infer_expectation(prompt) == null);
+    }
+}
+
+/// The Unicode space separators that split words.
+const unicode_spaces = [_]u21{
+    0x00A0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006,
+    0x2007, 0x2008, 0x2009, 0x200A, 0x202F, 0x205F, 0x3000,
+};
+/// Characters that do not split words: ones just outside each range, and the
+/// next line, Mongolian vowel separator, line separator, and paragraph
+/// separator.
+const not_spaces = [_]u21{
+    0x0085, 0x009F, 0x00A1, 0x167F, 0x1681, 0x180E, 0x1FFF, 0x200B, 0x2028, 0x2029,
+    0x205E, 0x2060, 0x2FFF, 0x3001,
+};
+
+/// `words` joined by `separator`, then `tail`, written into `buffer`.
+fn joined_request(buffer: []u8, words: []const []const u8, separator: u21, tail: []const u8) ![]const u8 {
+    var len: usize = 0;
+    for (words, 0..) |word, index| {
+        if (index > 0) len += try std.unicode.utf8Encode(separator, buffer[len..]);
+        @memcpy(buffer[len..][0..word.len], word);
+        len += word.len;
+    }
+    @memcpy(buffer[len..][0..tail.len], tail);
+    return buffer[0 .. len + tail.len];
+}
+
+test "response language expectation splits words at Unicode spaces" {
+    const words = [_][]const u8{ "Terjemahkan", "ke", "bahasa", "Korea." };
+    const tail = " The lockfile is broken again.";
+    for (unicode_spaces) |space| {
+        var buffer: [128]u8 = undefined;
+        const prompt = try joined_request(&buffer, &words, space, tail);
+        errdefer std.debug.print("expected no expectation for U+{X:0>4}: {s}\n", .{ space, prompt });
+        try std.testing.expect(infer_expectation(prompt) == null);
+    }
+    // Three words, one of them joined to its neighbor by a no-break space.
+    try std.testing.expect(infer_expectation("Terjemahkan ke\u{A0}Korea. The lockfile is broken again.") == null);
+    // The space at either end of the prompt, after the clause's full stop, and
+    // before a line break.
+    try std.testing.expect(infer_expectation("\u{A0}Terjemahkan ke bahasa Korea.\u{A0}The lockfile is broken again.") == null);
+    try std.testing.expect(infer_expectation("Terjemahkan ke bahasa Korea.\u{A0}\nThe lockfile is broken again.") == null);
+    try std.testing.expect(infer_expectation("The lockfile is broken again. Terjemahkan\u{3000}ke\u{3000}bahasa\u{3000}Korea.\u{3000}") == null);
+}
+
+test "response language expectation splits words only at the listed Unicode spaces" {
+    const words = [_][]const u8{ "Terjemahkan", "ke", "bahasa", "Korea." };
+    const tail = " The lockfile is broken again.";
+    for (not_spaces) |character| {
+        var buffer: [128]u8 = undefined;
+        const prompt = try joined_request(&buffer, &words, character, tail);
+        errdefer std.debug.print("expected a Latin expectation for U+{X:0>4}: {s}\n", .{ character, prompt });
+        try std.testing.expectEqual(Script.latin, infer_expectation(prompt).?);
+    }
+    // A lone continuation byte or a cut-short lead is not a space.
+    try std.testing.expectEqual(
+        Script.latin,
+        infer_expectation("Terjemahkan\xA0ke\xA0bahasa\xA0Korea. The lockfile is broken again.").?,
+    );
+    try std.testing.expectEqual(
+        Script.latin,
+        infer_expectation("Terjemahkan\xC2ke\xC2bahasa\xC2Korea. The lockfile is broken again.").?,
+    );
+}
+
+test "response language expectation keeps English that has Unicode spaces" {
+    const words = [_][]const u8{ "The", "lockfile", "is", "broken", "again." };
+    for (unicode_spaces) |space| {
+        var buffer: [128]u8 = undefined;
+        const prompt = try joined_request(&buffer, &words, space, "");
+        errdefer std.debug.print("expected a Latin expectation for U+{X:0>4}: {s}\n", .{ space, prompt });
+        try std.testing.expectEqual(Script.latin, infer_expectation(prompt).?);
+    }
+    // White space inside a code span never counts as a word.
+    try std.testing.expectEqual(
+        Script.latin,
+        infer_expectation("Why does `foo\u{A0}bar\u{A0}baz\u{A0}qux` fail?").?,
+    );
+}
+
 const fuzz_prompt_capacity = 512;
 
 fn fuzzInferExpectation(_: void, smith: *std.testing.Smith) anyerror!void {
@@ -586,19 +735,32 @@ fn fuzzInferExpectation(_: void, smith: *std.testing.Smith) anyerror!void {
     // as a base letter with a combining mark. With no space, a lead byte at
     // the end of the random bytes can claim more bytes than remain.
     const accents = [_][]const u8{ " \u{1ECB}", "\u{E9}", "e\u{301}" };
-    const bare_clause = "Tolong terjemahkan ini.\n";
-    var buffer: [bare_clause.len + fuzz_prompt_capacity + 4]u8 = undefined;
-    @memcpy(buffer[0..bare_clause.len], bare_clause);
-    const len: usize = @intCast(smith.slice(buffer[bare_clause.len..][0..fuzz_prompt_capacity]));
-    const prompt = buffer[bare_clause.len..][0..len];
+    // Clauses of three words with no English function word: with ASCII spaces,
+    // with Unicode spaces, and with a name that has a Turkish ending.
+    const bare_clauses = [_][]const u8{
+        "Tolong terjemahkan ini.\n",
+        "Tolong\u{A0}terjemahkan\u{202F}ini.\n",
+        "Tolong\u{3000}terjemahkan\u{2003}ini.\n",
+        "Bunu Can'a Korece yaz.\n",
+    };
+    var random: [fuzz_prompt_capacity]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&random));
     // fx only ever expects a Latin reply.
-    if (infer_expectation(prompt)) |script| try std.testing.expectEqual(Script.latin, script);
-    // A clause of three words with no English function word, or a Latin
-    // letter outside ASCII, means the prompt may not be English.
-    try std.testing.expect(infer_expectation(buffer[0 .. bare_clause.len + len]) == null);
+    if (infer_expectation(random[0..len])) |script| try std.testing.expectEqual(Script.latin, script);
+    // A clause of three words with no English function word means the prompt
+    // may not be English.
+    for (bare_clauses) |bare_clause| {
+        var buffer: [fuzz_prompt_capacity + 64]u8 = undefined;
+        @memcpy(buffer[0..bare_clause.len], bare_clause);
+        @memcpy(buffer[bare_clause.len..][0..len], random[0..len]);
+        try std.testing.expect(infer_expectation(buffer[0 .. bare_clause.len + len]) == null);
+    }
+    // So does a Latin letter outside ASCII.
+    var lettered: [fuzz_prompt_capacity + 8]u8 = undefined;
+    @memcpy(lettered[0..len], random[0..len]);
     for (accents) |accent| {
-        @memcpy(buffer[bare_clause.len + len ..][0..accent.len], accent);
-        try std.testing.expect(infer_expectation(buffer[bare_clause.len..][0 .. len + accent.len]) == null);
+        @memcpy(lettered[len..][0..accent.len], accent);
+        try std.testing.expect(infer_expectation(lettered[0 .. len + accent.len]) == null);
     }
 }
 

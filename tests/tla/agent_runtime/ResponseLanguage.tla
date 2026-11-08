@@ -26,15 +26,22 @@
 (*           with no English function word                                 *)
 (*   shared  a bare clause uses a word that English also has, such as      *)
 (*           Dutch "we" or Polish "to"                                     *)
+(*   stem    a bare clause has an English contraction stem before an       *)
+(*           ending that English does not use, such as Turkish "Can'a"     *)
+(*           ("can" is English only in "can't")                            *)
+(*   space   a bare clause has its words split by a Unicode space, such    *)
+(*           as U+00A0, U+202F, or U+3000, not by an ASCII one             *)
 (*                                                                         *)
-(* Prompts holds what a person can write. A request in another Latin-     *)
-(* script language either names its language in English, has an accented *)
+(* Prompts holds what a person can write. A request in another Latin-      *)
+(* script language either names its language in English, has an accented   *)
 (* letter (with its accent in the letter or stored apart), or has a bare   *)
 (* clause: its own words are not English. A request that runs its words    *)
-(* into the English with no punctuation between them, or whose only        *)
-(* shared word is "the" or "that", breaks that; AllowUnmarked = TRUE adds  *)
-(* it, and response-language-limit.cfg shows the guard still rejects the   *)
-(* reply then.                                                             *)
+(* into the English with no punctuation between them, whose clauses all    *)
+(* have fewer than three words, whose bare clause sits after a stray       *)
+(* backtick that makes the rest a code span, or whose only English         *)
+(* function words are "the", "that", or a capital "I", breaks that;        *)
+(* AllowUnmarked = TRUE adds it, and response-language-limit.cfg shows the *)
+(* guard still rejects the reply then.                                     *)
 (*                                                                         *)
 (* The law is RequestedLanguageAccepted: the expectation follows the       *)
 (* request's language, so a request in another language never gets the     *)
@@ -42,9 +49,11 @@
 (*                                                                         *)
 (* Rule picks the inference: "fixed" for fx now, "today" for fx before the *)
 (* fix of #809, and "accent_only" for the accented-letter rule alone. Bug  *)
-(* plants one defect; check.sh names the rule that must catch each. The   *)
+(* plants one defect; check.sh names the rule that must catch each. The    *)
 (* defects cut_hides, marks_ignored, and shared_hides are the three flaws  *)
-(* of the first fix of #809, and first_cut has all three.                  *)
+(* of the first fix of #809, and first_cut has all three. The defects      *)
+(* stem_hides and space_hides are the two flaws of the second fix, and     *)
+(* second_cut has both.                                                    *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences
 
@@ -54,10 +63,13 @@ Langs == {"english", "other"}
 PromptScripts == {"latin", "nonlatin", "none"}
 AllPrompts == [lang : Langs, script : PromptScripts, word : BOOLEAN,
                switch : BOOLEAN, accent : BOOLEAN, mark : BOOLEAN,
-               cut : BOOLEAN, bare : BOOLEAN, shared : BOOLEAN]
+               cut : BOOLEAN, bare : BOOLEAN, shared : BOOLEAN,
+               stem : BOOLEAN, space : BOOLEAN]
 Prompts == {p \in AllPrompts :
               /\ p.cut => (p.accent \/ p.mark)
               /\ p.shared => (p.lang = "other" /\ p.bare)
+              /\ p.stem => (p.lang = "other" /\ p.bare)
+              /\ p.space => (p.lang = "other" /\ p.bare)
               /\ (p.lang = "other" /\ p.script = "latin" /\ ~p.switch)
                      => (p.accent \/ p.mark \/ p.bare \/ AllowUnmarked)}
 
@@ -89,13 +101,23 @@ MarksIgnored == Bug \in {"marks_ignored", "first_cut"}
 \* shared_hides: the English word list held words that other languages use.
 SharedHides == Bug \in {"shared_hides", "first_cut"}
 
+\* The two flaws of the second fix of #809.
+\* stem_hides: a contraction stem counted as English before any ending.
+StemHides == Bug \in {"stem_hides", "second_cut"}
+\* space_hides: the clause splitter knew only ASCII white space.
+SpaceHides == Bug \in {"space_hides", "second_cut"}
+
 \* has_non_ascii_latin_letter: the scan finds an accented letter.
 AccentSeen(p) ==
     /\ ~(CutHides /\ p.cut)
     /\ (p.accent \/ (p.mark /\ ~MarksIgnored))
 
 \* has_clause_without_english: some clause is judged to have no English word.
-BareSeen(p) == p.bare /\ ~(SharedHides /\ p.shared)
+BareSeen(p) ==
+    /\ p.bare
+    /\ ~(SharedHides /\ p.shared)
+    /\ ~(StemHides /\ p.stem)
+    /\ ~(SpaceHides /\ p.space)
 
 \* infer_expectation: Latin only for a prompt that reads as English.
 Expect(p) ==
@@ -196,7 +218,8 @@ ClearEnglish(p) ==
 
 \* #809: the expectation follows the request's language. fx never expects a
 \* script for, and so never rejects the reply to, a request written in another
-\* language, whatever English it quotes and whichever words it shares with it.
+\* language that shows it, with an accented letter or a bare clause, whatever
+\* English it quotes and whichever words it shares with it.
 RequestedLanguageAccepted ==
     prompt.lang = "other" =>
         /\ expected = "none"

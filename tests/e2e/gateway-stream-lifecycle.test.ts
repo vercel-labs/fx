@@ -4305,6 +4305,10 @@ describe("gateway stream lifecycle", () => {
       ["vietnamese-decomposed", "Di\u0323ch giu\u0301p. The lockfile is broken again."],
       // "we" is a Dutch word, and the English list leaves it out.
       ["dutch", "Kunnen we dit vandaag nog oplossen? The lockfile is broken again."],
+      // "can" is English only in "can't": a name with a Turkish ending is not.
+      ["turkish-name", "Bunu Can'a Korece yaz. The lockfile is broken again."],
+      // A no-break space between words, written as an escape.
+      ["indonesian-no-break-spaces", "Terjemahkan\u00a0ke\u00a0bahasa\u00a0Korea. The lockfile is broken again."],
     ] as const) {
       const root = createFixtureRoot(`response-language-${label}`);
       const gateway = startGateway(() => fakeGatewayFinalText(translated));

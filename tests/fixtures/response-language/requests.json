@@ -482,6 +482,41 @@
       "lang": "de",
       "text": "Prüfe bitte diese Datei. Here is the log: the parser crashed on this input.",
       "form": "decomposed"
+    },
+    {
+      "lang": "tr",
+      "text": "Bunu Can'a Korece yaz. The lockfile is broken again.",
+      "stem": "can"
+    },
+    {
+      "lang": "tr",
+      "text": "Bunu Can’a Korece yaz. Error: the build failed after this change.",
+      "stem": "can"
+    },
+    {
+      "lang": "tr",
+      "text": "Bunu Can'a ve Ali'ye Korece anlat. Please check why the test fails.",
+      "stem": "can"
+    },
+    {
+      "lang": "id",
+      "text": "Terjemahkan\u00a0ke\u00a0bahasa\u00a0Korea. The lockfile is broken again."
+    },
+    {
+      "lang": "id",
+      "text": "Terjemahkan\u202fke\u202fbahasa\u202fKorea. Here is the log: the parser crashed on this input."
+    },
+    {
+      "lang": "id",
+      "text": "Tolong\u3000terjemahkan\u3000teks\u3000ini. What does this stack trace mean?"
+    },
+    {
+      "lang": "id",
+      "text": "Terjemahkan ke\u00a0Korea. The lockfile is broken again."
+    },
+    {
+      "lang": "ms",
+      "text": "Sila\u2003terjemahkan\u2003ayat\u2003ini. The cache is not cleared when you switch the profile."
     }
   ]
 }

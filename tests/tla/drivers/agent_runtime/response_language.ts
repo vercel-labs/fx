@@ -6,10 +6,12 @@
 // name its script, and tool calls with English or Korean text. The prompts
 // cover plain English, English that names a language or has an accented name
 // or a terse clause, and requests in Vietnamese, Indonesian, Malay, Spanish,
-// Dutch, Polish, and Chinese that quote English, some with their accents stored
-// as base letters and combining marks and some with a word that English shares
-// with their language. Each prompt's labels say what the model needs to know
-// about it (ResponseLanguage.tla, Prompts). The driver runs every script up to
+// Dutch, Polish, Turkish, and Chinese that quote English, some with their
+// accents stored as base letters and combining marks, some with a word that
+// English shares with their language, some with a name that has a Turkish
+// ending after an apostrophe, and some with Unicode spaces between their words.
+// Each prompt's labels say what the model needs to know about it
+// (ResponseLanguage.tla, Prompts). The driver runs every script up to
 // --depth replies for every prompt, then --random seeded longer ones. When fx
 // asks for more replies than the script holds, the gateway serves English
 // text, and that reply is part of what was observed.
@@ -28,8 +30,9 @@
 // prompt, tool results, or the correction), which replies' text reached the
 // output, and how the turn ended. TLC replays the turns through the model's
 // own actions. --self-check also replays them through the model of fx before
-// the fix of #809 (Rule = "today") and through the model of the first fix
-// (Bug = "first_cut"), which must both reject them.
+// the fix of #809 (Rule = "today"), through the model of the first fix
+// (Bug = "first_cut"), and through the model of the second fix
+// (Bug = "second_cut"), which must all reject them.
 //
 // Usage (from the repository root, after zig build):
 //   bun tests/tla/drivers/agent_runtime/response_language.ts
@@ -59,6 +62,8 @@ type Labels = {
   cut: boolean;
   bare: boolean;
   shared: boolean;
+  stem: boolean;
+  space: boolean;
 };
 type Prompt = { text: string; labels: Labels };
 type Observation = {
@@ -85,14 +90,14 @@ const english = (text: string, labels: Partial<Labels> = {}): Prompt => ({
   text,
   labels: {
     lang: "english", script: "latin", word: true, switch: false,
-    accent: false, mark: false, cut: false, bare: false, shared: false, ...labels,
+    accent: false, mark: false, cut: false, bare: false, shared: false, stem: false, space: false, ...labels,
   },
 });
 const other = (text: string, labels: Partial<Labels>): Prompt => ({
   text,
   labels: {
     lang: "other", script: "latin", word: true, switch: false,
-    accent: false, mark: false, cut: false, bare: false, shared: false, ...labels,
+    accent: false, mark: false, cut: false, bare: false, shared: false, stem: false, space: false, ...labels,
   },
 });
 
@@ -132,6 +137,20 @@ const PROMPTS: Prompt[] = [
   other("Kunnen we dit vandaag nog oplossen? The lockfile is broken again.", { bare: true, shared: true }),
   other("Powiedz my jak to dziala w korejskim. The lockfile is broken again.", { bare: true, shared: true }),
   other("Ban can sua loi nay ngay. The lockfile is broken again.", { bare: true, shared: true }),
+  // "can" is English only in "can't": a Turkish name with a case ending, with
+  // an ASCII or a typographic apostrophe, is not an English contraction.
+  other("Bunu Can'a Korece yaz. The lockfile is broken again.", { bare: true, stem: true }),
+  other("Bunu Can\u2019a Korece yaz. The lockfile is broken again.", { bare: true, stem: true }),
+  // Words split by a no-break, a narrow no-break, or an ideographic space.
+  other("Terjemahkan\u00a0ke\u00a0bahasa\u00a0Korea. The lockfile is broken again.", { bare: true, space: true }),
+  other("Terjemahkan\u202fke\u202fbahasa\u202fKorea. The lockfile is broken again.", { bare: true, space: true }),
+  other("Terjemahkan\u3000ke\u3000bahasa\u3000Korea. The lockfile is broken again.", { bare: true, space: true }),
+  // English keeps the guard with each ending of a contraction and with a
+  // no-break space between its words.
+  english("Can't reproduce it locally. Why does it fail?"),
+  english("We'll fix parsing first. Why does it break?"),
+  english("It\u2019s broken again. Why does it break?"),
+  english("The\u00a0lockfile is broken again."),
 ];
 
 // tests/fixtures/response-language/requests.json: realistic short requests, run
@@ -139,11 +158,12 @@ const PROMPTS: Prompt[] = [
 // a request the guard cannot read as English (word, bare) or that names a
 // language (switch). "other" holds requests in other Latin-script languages,
 // each followed by quoted English; "shared" lists the words it has that older
-// English word lists counted, and "form": "decomposed" stores its accents as
-// base letters and combining marks. The labels that the text itself decides
-// (accent, mark) come from its characters.
+// English word lists counted, "stem" names the contraction stem it has before
+// an ending English does not use, and "form": "decomposed" stores its accents
+// as base letters and combining marks. The labels that the text itself decides
+// (accent, mark, space) come from its characters.
 type FixtureEnglish = string | { text: string; word?: boolean; bare?: boolean; switch?: boolean; form?: "decomposed" };
-type FixtureOther = { lang: string; text: string; shared?: string; form?: "decomposed" };
+type FixtureOther = { lang: string; text: string; shared?: string; stem?: string; form?: "decomposed" };
 type Fixture = { english: FixtureEnglish[]; other: FixtureOther[] };
 type Request = { group: "english" | "other"; lang: string; prompt: Prompt };
 const FIXTURE_PATH = join(TLA_ROOT, "..", "fixtures", "response-language", "requests.json");
@@ -164,6 +184,10 @@ function letterLabels(text: string): { accent: boolean; mark: boolean } {
   return { accent, mark };
 }
 
+// Whether the text has a Unicode space that fx splits words at: U+00A0, U+1680,
+// U+2000 to U+200A, U+202F, U+205F, or U+3000.
+const hasUnicodeSpace = (text: string): boolean => /[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/.test(text);
+
 function fixtureRequests(): Request[] {
   const fixture = JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as Fixture;
   const requests: Request[] = [];
@@ -182,7 +206,13 @@ function fixtureRequests(): Request[] {
     requests.push({
       group: "other",
       lang: item.lang,
-      prompt: other(text, { ...letterLabels(text), bare: true, shared: item.shared !== undefined }),
+      prompt: other(text, {
+        ...letterLabels(text),
+        bare: true,
+        shared: item.shared !== undefined,
+        stem: item.stem !== undefined,
+        space: hasUnicodeSpace(text),
+      }),
     });
   }
   return requests;
@@ -370,7 +400,8 @@ function observedModule(observations: Observation[]): string {
   const labels = (l: Labels) =>
     `[lang |-> ${str(l.lang)}, script |-> ${str(l.script)}, word |-> ${bool(l.word)}, ` +
     `switch |-> ${bool(l.switch)}, accent |-> ${bool(l.accent)}, mark |-> ${bool(l.mark)}, ` +
-    `cut |-> ${bool(l.cut)}, bare |-> ${bool(l.bare)}, shared |-> ${bool(l.shared)}]`;
+    `cut |-> ${bool(l.cut)}, bare |-> ${bool(l.bare)}, shared |-> ${bool(l.shared)}, ` +
+    `stem |-> ${bool(l.stem)}, space |-> ${bool(l.space)}]`;
   const replies = (rs: Reply[]) =>
     `<<${rs.map((r) => `[script |-> ${str(r.script)}, tools |-> ${bool(r.tools)}]`).join(", ")}>>`;
   const value = (o: Observation) =>
@@ -508,6 +539,9 @@ async function main(): Promise<number> {
     const firstCut = await runTrace(observations, "fixed", out, "first_cut");
     console.log(`self-check, the model of the first fix of #809: ${firstCut.verdict} (must be REJECTED)`);
     if (firstCut.verdict !== "REJECTED") return firstCut.verdict === "TOOL_ERROR" ? 2 : 1;
+    const secondCut = await runTrace(observations, "fixed", out, "second_cut");
+    console.log(`self-check, the model of the second fix of #809: ${secondCut.verdict} (must be REJECTED)`);
+    if (secondCut.verdict !== "REJECTED") return secondCut.verdict === "TOOL_ERROR" ? 2 : 1;
   }
   console.log("ACCEPTED");
   return 0;
