@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const net_proxy_io = @import("../shared/net_proxy_io.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const helpers = @import("upgrade_helpers.zig");
 const update_target = @import("update_target.zig");
@@ -14,9 +15,13 @@ const found_hold_ns = 150 * std.time.ns_per_ms;
 pub const RunResult = struct {
     snapshot: output_contracts.UpgradeSnapshot,
     target_owned: ?update_target.Target = null,
+    /// The snapshot's error message when it names the proxy, which a fixed
+    /// string cannot.
+    message_owned: ?[]u8 = null,
 
     pub fn deinit(self: *RunResult, alloc: Allocator) void {
         if (self.target_owned) |*target| target.deinit(alloc);
+        if (self.message_owned) |message| alloc.free(message);
         self.* = undefined;
     }
 };
@@ -77,7 +82,11 @@ fn completeRunResult(
             var target = target_value;
             target.deinit(alloc);
         }
-        return workerErrorToRunError(e);
+        const run_error = workerErrorToRunError(e);
+        // A request that failed at the proxy says so beside the fixed text
+        // (`tests/tla/net_proxy/NetProxyCallers.tla` UpgradeNamesProxy).
+        if (worker_result.proxyText()) |sentence| return failureResultNamingProxy(alloc, current, channel, run_error, sentence);
+        return run_error;
     }
 
     const target = worker_result.target_owned orelse return error.FetchFailed;
@@ -127,6 +136,23 @@ fn failureResult(
         .status = .failed,
         .err_message = failureMessage(err),
     } };
+}
+
+/// `failureResult` with the proxy's sentence after the fixed message, as
+/// "<message>: <sentence>". The result owns the message; when memory is short
+/// the fixed message stands.
+fn failureResultNamingProxy(
+    alloc: Allocator,
+    current: update_target.CurrentBuild,
+    channel: update_target.Channel,
+    err: RunError,
+    sentence: []const u8,
+) RunResult {
+    var result = failureResult(current, channel, err);
+    const message = alloc.print("{s}: {s}", .{ failureMessage(err), sentence }) catch return result;
+    result.message_owned = message;
+    result.snapshot.err_message = message;
+    return result;
 }
 
 fn failureMessage(err: RunError) []const u8 {
@@ -182,7 +208,7 @@ fn upgradeWorkerInner(
 ) !void {
     const cdn_base = helpers.resolveCdnBase();
     const fetched_target = helpers.fetchTarget(alloc, channel, cdn_base, .{}) catch {
-        result.err = .fetch_failed;
+        result.fail(.fetch_failed);
         return;
     };
     result.target_owned = fetched_target;
@@ -219,7 +245,7 @@ fn upgradeWorkerInner(
         .start = progressDownloadStart,
         .update = progressDownloadUpdate,
     }, .{}) catch {
-        result.err = .download_failed;
+        result.fail(.download_failed);
         return;
     };
     progress.markFinishing();
@@ -228,11 +254,11 @@ fn upgradeWorkerInner(
     defer alloc.free(checksum_url);
 
     helpers.verifyChecksum(&client, archive_path, checksum_url, .{}) catch |err| {
-        result.err = switch (err) {
+        result.fail(switch (err) {
             error.ChecksumFetchFailed => .checksum_fetch_failed,
             error.ChecksumMismatch => .checksum_mismatch,
             error.Cancelled => .cancelled,
-        };
+        });
         return;
     };
 
@@ -392,6 +418,28 @@ fn formatProgressLine(buf: []u8, percent: u8) []const u8 {
 const WorkerResult = struct {
     target_owned: ?update_target.Target = null,
     err: ?UpgradeError = null,
+    /// The sentence of the proxy failure the failed request left on the worker
+    /// thread, in `proxy_len` bytes: the held failure is thread-local, so the
+    /// worker reads it and the caller of `run` shows it after the join.
+    proxy_buf: [512]u8 = undefined,
+    proxy_len: usize = 0,
+
+    /// Records why the worker stopped. A request that failed to fetch or
+    /// download also takes the proxy failure it left, when it left one
+    /// (`net_proxy_io.takeHeldFailure`).
+    fn fail(self: *WorkerResult, err: UpgradeError) void {
+        self.err = err;
+        switch (err) {
+            .fetch_failed, .download_failed, .checksum_fetch_failed => {
+                if (net_proxy_io.takeHeldFailure(&self.proxy_buf)) |sentence| self.proxy_len = sentence.len;
+            },
+            else => {},
+        }
+    }
+
+    fn proxyText(self: *const WorkerResult) ?[]const u8 {
+        return if (self.proxy_len == 0) null else self.proxy_buf[0..self.proxy_len];
+    }
 };
 
 const UpgradeError = enum {
@@ -494,6 +542,67 @@ test "failureResult preserves active error messages" {
     try std.testing.expectEqualStrings("0.2.10", result.snapshot.current);
     try std.testing.expectEqualStrings("", result.snapshot.latest);
     try std.testing.expectEqualStrings("downloaded archive failed integrity check", result.snapshot.err_message.?);
+}
+
+const net_proxy = @import("../shared/net_proxy.zig");
+const test_proxy: net_proxy.Proxy = .{ .host = "127.0.0.1", .port = 3128, .authorization = null, .variable = "HTTPS_PROXY" };
+const test_build: update_target.CurrentBuild = .{ .channel = .stable, .version = "0.2.10", .revision = "0123456789ab" };
+
+test "an upgrade request that failed at the proxy names it beside the fixed message, and frees what it allocated" {
+    const alloc = std.testing.allocator;
+    defer net_proxy_io.clearRequestFailure();
+    for ([_]struct { UpgradeError, []const u8 }{
+        .{ .fetch_failed, "failed to fetch latest version from CDN" },
+        .{ .download_failed, "failed to download release archive" },
+        .{ .checksum_fetch_failed, "failed to fetch checksum from CDN" },
+    }) |case| {
+        net_proxy_io.holdForRequest(net_proxy_io.unreachableProxyFailure(test_proxy, "releases.fx.sh", 443, error.ConnectionRefused));
+        var worker: WorkerResult = .{};
+        worker.fail(case[0]);
+        var result = try completeRunResult(alloc, test_build, .stable, worker);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(output_contracts.UpgradeSnapshot.Status.failed, result.snapshot.status);
+        const want = try alloc.print("{s}: could not connect to proxy 127.0.0.1:3128 (connection refused)", .{case[1]});
+        defer alloc.free(want);
+        try std.testing.expectEqualStrings(want, result.snapshot.err_message.?);
+        // Rendered as text and as JSON, which is what `fx upgrade` prints.
+        const text = try result.snapshot.render(alloc, .text);
+        defer alloc.free(text);
+        try std.testing.expect(std.mem.startsWith(u8, text, "error: failed to "));
+        const json = try result.snapshot.render(alloc, .json);
+        defer alloc.free(json);
+        try std.testing.expect(std.mem.find(u8, json, "could not connect to proxy 127.0.0.1:3128 (connection refused)\"}") != null);
+    }
+}
+
+test "an upgrade failure that is not a request's, or that held no proxy failure, keeps the fixed message" {
+    const alloc = std.testing.allocator;
+    defer net_proxy_io.clearRequestFailure();
+    // Nothing held: today's error, as with no proxy.
+    var plain: WorkerResult = .{};
+    plain.fail(.download_failed);
+    try std.testing.expectError(error.DownloadFailed, completeRunResult(alloc, test_build, .stable, plain));
+
+    // A failure that came from the archive itself never takes a sentence a
+    // request left, and leaves it where it was.
+    net_proxy_io.holdForRequest(net_proxy_io.unreachableProxyFailure(test_proxy, "releases.fx.sh", 443, error.ConnectionRefused));
+    var mismatch: WorkerResult = .{};
+    mismatch.fail(.checksum_mismatch);
+    try std.testing.expectError(error.ChecksumMismatch, completeRunResult(alloc, test_build, .stable, mismatch));
+    var buf: [512]u8 = undefined;
+    try std.testing.expect(net_proxy_io.takeHeldFailure(&buf) != null);
+}
+
+test "an upgrade message that cannot be allocated falls back to the fixed message" {
+    defer net_proxy_io.clearRequestFailure();
+    net_proxy_io.holdForRequest(net_proxy_io.unreachableProxyFailure(test_proxy, "releases.fx.sh", 443, error.ConnectionRefused));
+    var worker: WorkerResult = .{};
+    worker.fail(.fetch_failed);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var result = try completeRunResult(failing.allocator(), test_build, .stable, worker);
+    defer result.deinit(failing.allocator());
+    try std.testing.expectEqualStrings("failed to fetch latest version from CDN", result.snapshot.err_message.?);
+    try std.testing.expect(result.message_owned == null);
 }
 
 test "progressPercent clamps download progress to 100" {

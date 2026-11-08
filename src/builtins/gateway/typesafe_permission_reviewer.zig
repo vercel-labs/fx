@@ -13,6 +13,7 @@ const permission_auto_classifier = @import("../../core/permissions/auto_classifi
 const types = @import("../../core/shared/types.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const net_proxy_io = @import("../../core/shared/net_proxy_io.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -364,6 +365,8 @@ fn sendReview(
     defer out.deinit();
 
     debug_trace.logf("permission", "event=auto_review_typesafe_transport_start payload_bytes={d} via_gateway={}", .{ payload.len, config.via_gateway });
+    // A connection that fails at a proxy is claimed here, for the trace line below.
+    const proxy_mark = net_proxy_io.beginOpen();
     const result = client.fetch(.{
         .location = .{ .url = config.endpoint },
         .method = .POST,
@@ -378,9 +381,11 @@ fn sendReview(
         .redirect_behavior = .unhandled,
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (std.Uri.parse(config.endpoint)) |uri| net_proxy_io.noteOpenFailure(uri, proxy_mark, err) else |_| {}
         const outcome: permission_auto_classifier.TransportOutcome =
             if (err == error.Cancelled or cancel_flag.load(.seq_cst)) .cancelled else .transient_failure;
-        debug_trace.logf("permission", "event=auto_review_typesafe_transport result={s} reason=fetch_error error={s}", .{ @tagName(outcome), @errorName(err) });
+        var proxy_note: [net_proxy_io.trace_note_bytes]u8 = undefined;
+        debug_trace.logf("permission", "event=auto_review_typesafe_transport result={s} reason=fetch_error error={s}{s}", .{ @tagName(outcome), @errorName(err), net_proxy_io.takeTraceNote(err, &proxy_note) });
         return outcome;
     };
     if (cancel_flag.load(.seq_cst)) return .cancelled;

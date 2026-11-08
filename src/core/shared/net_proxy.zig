@@ -594,6 +594,25 @@ pub const Failure = struct {
         return w.buffered();
     }
 
+    /// ` proxy="<sentence>"`, to end a trace line about a request that failed at
+    /// the proxy: the trace says what a reviewer's transport error never shows on
+    /// screen. `buf` holds `trace_note_bytes` or more; a smaller one cuts the
+    /// sentence short, and one under nine bytes holds no note.
+    pub fn traceNote(f: *const Failure, buf: []u8) []const u8 {
+        const open = " proxy=\"";
+        if (buf.len <= open.len) return "";
+        // The last byte is kept for the closing quote, however long the sentence is.
+        var w = std.Io.Writer.fixed(buf[0 .. buf.len - 1]);
+        w.writeAll(open) catch return "";
+        f.write(&w) catch {};
+        const used = w.buffered().len;
+        buf[used] = '"';
+        return buf[0 .. used + 1];
+    }
+
+    /// The room `traceNote` needs for any sentence `text` can hold in 512 bytes.
+    pub const trace_note_bytes = 512 + 9;
+
     /// The failure in a few words for a retry notice, at most
     /// `max_notice_bytes`: "proxy 127.0.0.1:50132 answered 502", "proxy
     /// 127.0.0.1:50132 unreachable". A host too long for the room is cut with an
@@ -678,9 +697,13 @@ pub fn connectError(f: *const Failure) IpAddress.ConnectError {
 }
 
 /// Whether `err` can come from a failed proxy connection, so a request that
-/// fails with it may claim its proxy failure. Others never do.
+/// fails with it may claim its proxy failure. Others never do. A version lookup
+/// returns one error for every failure, `ProviderVersionUnavailable`, after its
+/// request claimed the proxy's sentence (`tests/tla/net_proxy/NetProxyCallers.tla`
+/// VersionNamesProxy); one that failed elsewhere holds no sentence.
 pub fn isProxyFailureError(err: anyerror) bool {
     return switch (err) {
+        error.ProviderVersionUnavailable,
         error.AccessDenied,
         error.ProtocolUnsupportedBySystem,
         error.ConnectionRefused,
@@ -1061,6 +1084,15 @@ test "a failure names the proxy and the reason, and maps to an error fx acts on"
     try std.testing.expect(isProxyFailureError(error.ConnectionSetupTimedOut));
     try std.testing.expect(!isProxyFailureError(error.TlsInitializationFailed));
     try std.testing.expect(!isProxyFailureError(error.Cancelled));
+}
+
+test "a version lookup that failed at the proxy may claim its failure, and the lookup's other errors may not" {
+    // The lookup returns this one error for every failure, after its request
+    // claimed the proxy's sentence (src/gateway/provider_versions.zig).
+    try std.testing.expect(isProxyFailureError(error.ProviderVersionUnavailable));
+    try std.testing.expect(!isProxyFailureError(error.Cancelled));
+    try std.testing.expect(!isProxyFailureError(error.InvalidProviderVersion));
+    try std.testing.expect(!isProxyFailureError(error.ProviderVersionResponseTooLarge));
 }
 
 test "a request claims only its own target's failures, oldest first, once" {
@@ -1474,6 +1506,72 @@ test "the short form fits its budget, stays valid text, and keeps its port and c
     }
 }
 
+test "the trace note holds the whole sentence in quotes, and a small buffer cuts the sentence and keeps the quote" {
+    const proxy: Proxy = .{ .host = "127.0.0.1", .port = 3128, .authorization = "Basic c2VjcmV0", .variable = "HTTPS_PROXY" };
+    var buf: [Failure.trace_note_bytes]u8 = undefined;
+    const refused = answerFailure(.{ .status = 407 }, proxy, "x.ai", 443).?;
+    try std.testing.expectEqualStrings(
+        " proxy=\"proxy 127.0.0.1:3128 refused CONNECT to x.ai:443: 407 Proxy Authentication Required\"",
+        refused.traceNote(&buf),
+    );
+    const down = Failure.init(.unreachable_proxy, "127.0.0.1", 3128, "x.ai", 443).withDetail("connection refused");
+    try std.testing.expectEqualStrings(" proxy=\"could not connect to proxy 127.0.0.1:3128 (connection refused)\"", down.traceNote(&buf));
+    try std.testing.expect(std.mem.find(u8, refused.traceNote(&buf), "c2VjcmV0") == null);
+
+    // The closing quote is kept however small the buffer is.
+    var small: [20]u8 = undefined;
+    try std.testing.expectEqualStrings(" proxy=\"proxy 127.0.0.1:3128 refused CONNECT to x.ai:443: 407 Proxy Authentication Required\""[0..19] ++ "\"", refused.traceNote(&small));
+    try std.testing.expectEqualStrings(" proxy=\"\"", refused.traceNote(buf[0..9]));
+    try std.testing.expectEqualStrings("", refused.traceNote(buf[0..8]));
+    try std.testing.expectEqualStrings("", refused.traceNote(buf[0..0]));
+
+    // Two hosts of 253 bytes make a sentence longer than the room: the note
+    // fills the room, ends in the quote, and never runs past the buffer.
+    const long_proxy: [253]u8 = @splat('a');
+    const long_target: [253]u8 = @splat('b');
+    var long = Failure.init(.refused, &long_proxy, 3128, &long_target, 443);
+    long.status = 407;
+    const note = long.traceNote(&buf);
+    try std.testing.expectEqual(@as(usize, Failure.trace_note_bytes), note.len);
+    try std.testing.expect(std.mem.startsWith(u8, note, " proxy=\"proxy aaaa"));
+    try std.testing.expectEqual(@as(u8, '"'), note[note.len - 1]);
+}
+
+test "5000 random failures make a trace note that fits, is quoted, and repeats no credentials" {
+    const seed: u64 = 0x74726163_65206e74;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789-._";
+    var proxy_buf: [253]u8 = undefined;
+    var target_buf: [253]u8 = undefined;
+    var buf: [Failure.trace_note_bytes]u8 = undefined;
+    var secret_buf: [24]u8 = undefined;
+    for (0..5_000) |_| {
+        const proxy_len = random.intRangeAtMost(usize, 1, proxy_buf.len);
+        const target_len = random.intRangeAtMost(usize, 1, target_buf.len);
+        for (proxy_buf[0..proxy_len]) |*byte| byte.* = alphabet[random.uintLessThan(usize, alphabet.len)];
+        for (target_buf[0..target_len]) |*byte| byte.* = alphabet[random.uintLessThan(usize, alphabet.len)];
+        const secret = std.mem.print(&secret_buf, "Basic s{x}", .{random.int(u64)}) catch unreachable;
+        const proxy: Proxy = .{ .host = proxy_buf[0..proxy_len], .port = random.intRangeAtMost(u16, 1, 65535), .authorization = secret, .variable = "HTTPS_PROXY" };
+        const target = target_buf[0..target_len];
+        const failures = [_]Failure{
+            answerFailure(.{ .status = random.intRangeAtMost(u16, 100, 599) }, proxy, target, 443).?,
+            answerFailure(.malformed, proxy, target, 443).?,
+            answerFailure(.closed, proxy, target, 443).?,
+            Failure.init(.unreachable_proxy, proxy.host, proxy.port, target, 443).withDetail("connection refused"),
+        };
+        for (failures) |failure| {
+            errdefer std.debug.print("seed {x} kind {t} proxy {s} target {s}\n", .{ seed, failure.kind, proxy.host, target });
+            const note = failure.traceNote(&buf);
+            try std.testing.expect(note.len >= " proxy=\"\"".len and note.len <= Failure.trace_note_bytes);
+            try std.testing.expect(std.mem.startsWith(u8, note, " proxy=\""));
+            try std.testing.expectEqual(@as(u8, '"'), note[note.len - 1]);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(note));
+            try std.testing.expect(std.mem.find(u8, note, secret) == null);
+        }
+    }
+}
+
 fn fuzzAnswer(_: void, smith: *std.testing.Smith) !void {
     var buf: [max_answer_head_bytes + 64]u8 = undefined;
     const len = smith.slice(&buf);
@@ -1541,6 +1639,18 @@ fn fuzzEnvironment(_: void, smith: *std.testing.Smith) !void {
             try std.testing.expect(note.len <= max_notice_bytes);
             try std.testing.expect(std.unicode.utf8ValidateSlice(note));
             if (t.authorization) |value| try std.testing.expect(std.mem.find(u8, note, value) == null);
+            // The trace note a reviewer's failed request carries fits its room,
+            // ends in its quote, and repeats no credentials, for each way the
+            // connection can fail.
+            var trace_buf: [Failure.trace_note_bytes]u8 = undefined;
+            const unreachable_proxy = Failure.init(.unreachable_proxy, t.host, t.port, host, port).withDetail("connection refused");
+            for ([_]Failure{ f, unreachable_proxy }) |failure| {
+                const trace_note = failure.traceNote(&trace_buf);
+                try std.testing.expect(trace_note.len <= Failure.trace_note_bytes);
+                try std.testing.expect(std.mem.startsWith(u8, trace_note, " proxy=\""));
+                try std.testing.expectEqual(@as(u8, '"'), trace_note[trace_note.len - 1]);
+                if (t.authorization) |value| try std.testing.expect(std.mem.find(u8, trace_note, value) == null);
+            }
         },
         .refuse => |r| {
             // A refusal names only the variable and a short plain scheme.

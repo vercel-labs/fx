@@ -23,7 +23,7 @@ import { FX_BIN } from "../evals/eval-helpers";
 import { completion } from "./fixtures/chat-completions";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
 import { startConnectProxy } from "./fixtures/net-proxy/proxy";
-import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { TmuxSession, fakeGatewayFinalText, fakeShellRun, startFakeGateway, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 60_000;
 const TARGET = "proxy-target.test";
@@ -828,3 +828,196 @@ test("an MCP HTTP server is reached only through the proxy", async () => {
     mcp.stop();
   }
 }, TIMEOUT);
+
+/** A fake release server for `fx upgrade`: the latest version is there, no archive is. */
+function serveRelease() {
+  return serveLocal((_request, path) => (path === "/latest.txt" ? new Response("9.9.9\n") : new Response("missing", { status: 404 })));
+}
+
+/** A profile with a valid Grok sign-in, so `fx ask` goes straight to its version lookup. */
+function grokHome(name: string): string {
+  const home = newHome(name);
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ auto_upgrade: false, permission_mode: "ask" }), { mode: 0o600 });
+  writeValidSubscriptionLogin(home, "grok");
+  return home;
+}
+
+describe("net proxy failures in version lookups, fx upgrade, and reviewer traces", () => {
+  test("a Grok client version lookup behind a proxy fx cannot reach ends fx ask naming the proxy", async () => {
+    const dead = await closedPort();
+    const grok = serveSubscription("grok", "NEVER_REACHED");
+    const home = grokHome("version-dead");
+    try {
+      const env = baseEnv(home, { ...grok.env, HTTPS_PROXY: `http://127.0.0.1:${dead}`, FX_TEST_NET_PROXY_LOOPBACK: "1" });
+      const run = await runFx(ask, env, { timeoutMs: 30_000 });
+      expect(run.code, show(run)).toBe(1);
+      expect(run.stderr, show(run)).toContain(`fx: could not connect to proxy 127.0.0.1:${dead} (connection refused)`);
+      expect(run.stderr).not.toContain("provider version unavailable");
+      expect(run.stderr).not.toContain("ConnectionRefused");
+      // Nothing reached the fake: the lookup needed the proxy, and ended the run.
+      expect(grok.remotePorts.length).toBe(0);
+    } finally {
+      grok.stop();
+    }
+  }, TIMEOUT);
+
+  test("a Grok client version lookup behind a proxy that refuses CONNECT names the proxy and its answer", async () => {
+    const proxy = await startConnectProxy({ status: 407 });
+    const grok = serveSubscription("grok", "NEVER_REACHED");
+    const home = grokHome("version-407");
+    try {
+      const env = baseEnv(home, { ...grok.env, HTTPS_PROXY: proxy.url(CREDENTIALS), FX_TEST_NET_PROXY_LOOPBACK: "1" });
+      const run = await runFx(ask, env, { timeoutMs: 30_000 });
+      expect(run.code, show(run)).toBe(1);
+      expect(run.stderr, show(run)).toContain(`fx: proxy 127.0.0.1:${proxy.port} refused CONNECT to 127.0.0.1:${grok.port}: 407 Proxy Authentication Required`);
+      expect(run.stderr + run.stdout).not.toContain("p%40ss");
+      expect(grok.remotePorts.length).toBe(0);
+    } finally {
+      proxy.close();
+      grok.stop();
+    }
+  }, TIMEOUT);
+
+  test("a Grok client version lookup that fails for another reason keeps its own text, with a proxy that works and with none", async () => {
+    const proxy = await startConnectProxy();
+    const grok = serveSubscription("grok", "NEVER_REACHED");
+    const broken = serveLocal(() => new Response("no release", { status: 500 }));
+    const home = grokHome("version-500");
+    try {
+      for (const withProxy of [true, false]) {
+        const env = baseEnv(home, {
+          ...grok.env,
+          FX_TEST_GROK_VERSION_URL: `${broken.base}/version`,
+          ...(withProxy ? { HTTPS_PROXY: proxy.url(), FX_TEST_NET_PROXY_LOOPBACK: "1" } : {}),
+        });
+        const run = await runFx(ask, env, { timeoutMs: 30_000 });
+        expect(run.code, show(run)).toBe(1);
+        expect(run.stderr, show(run)).toContain("fx: provider version unavailable");
+        expect(run.stderr).not.toContain("proxy");
+        if (withProxy) {
+          // The lookup did go through the proxy, and the proxy was not at fault.
+          expect(proxy.log.some(entry => entry.requestLine === `CONNECT 127.0.0.1:${broken.port} HTTP/1.1`), JSON.stringify(proxy.log)).toBe(true);
+        }
+      }
+    } finally {
+      proxy.close();
+      grok.stop();
+      broken.stop();
+    }
+  }, TIMEOUT);
+
+  test("fx models names the proxy when Codex's version lookup, made inside its catalog fetch, cannot connect", async () => {
+    const dead = await closedPort();
+    const codex = serveSubscription("codex", "NEVER_REACHED");
+    const home = newHome("codex-models-dead");
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ auto_upgrade: false, permission_mode: "ask" }), { mode: 0o600 });
+    writeValidSubscriptionLogin(home, "codex");
+    try {
+      const env = baseEnv(home, { ...codex.env, HTTPS_PROXY: `http://127.0.0.1:${dead}`, FX_TEST_NET_PROXY_LOOPBACK: "1" });
+      const run = await runFx(["models"], env, { timeoutMs: 45_000 });
+      expect(run.code, show(run)).toBe(1);
+      expect(run.stderr, show(run)).toContain(`could not connect to proxy 127.0.0.1:${dead} (connection refused)`);
+      expect(codex.remotePorts.length).toBe(0);
+    } finally {
+      codex.stop();
+    }
+  }, 60_000);
+
+  test("fx upgrade through a proxy fx cannot reach names the proxy, as text and as JSON", async () => {
+    const dead = await closedPort();
+    const release = serveRelease();
+    const home = newHome("upgrade-dead");
+    try {
+      const env = baseEnv(home, { FX_TEST_UPGRADE_BASE_URL: release.base, HTTPS_PROXY: `http://127.0.0.1:${dead}`, FX_TEST_NET_PROXY_LOOPBACK: "1" });
+      const sentence = `could not connect to proxy 127.0.0.1:${dead} (connection refused)`;
+      const text = await runFx(["upgrade"], env, { timeoutMs: 40_000 });
+      expect(text.code, show(text)).toBe(1);
+      expect(text.stdout, show(text)).toBe(`error: failed to fetch latest version from CDN: ${sentence}\n`);
+      const json = await runFx(["upgrade", "--json"], env, { timeoutMs: 40_000 });
+      expect(json.code, show(json)).toBe(1);
+      expect(JSON.parse(json.stdout), show(json)).toEqual({ kind: "upgrade", error: `failed to fetch latest version from CDN: ${sentence}` });
+      expect(release.remotePorts.length).toBe(0);
+    } finally {
+      release.stop();
+    }
+  }, 90_000);
+
+  test("fx upgrade whose proxy refuses the archive download names the proxy in the download error", async () => {
+    const proxy = await startConnectProxy({ refuseAfter: 1 });
+    const release = serveRelease();
+    const home = newHome("upgrade-407");
+    try {
+      const env = baseEnv(home, { FX_TEST_UPGRADE_BASE_URL: release.base, HTTPS_PROXY: proxy.url(CREDENTIALS), FX_TEST_NET_PROXY_LOOPBACK: "1" });
+      const run = await runFx(["upgrade"], env, { timeoutMs: 40_000 });
+      expect(run.code, show(run)).toBe(1);
+      expect(run.stdout, show(run)).toBe(`error: failed to download release archive: proxy 127.0.0.1:${proxy.port} refused CONNECT to 127.0.0.1:${release.port}: 407 Proxy Authentication Required\n`);
+      // The version came through the tunnel, and the archive request never did.
+      expect(release.paths).toEqual(["/latest.txt"]);
+      expect(run.stdout + run.stderr).not.toContain("p%40ss");
+    } finally {
+      proxy.close();
+      release.stop();
+    }
+  }, TIMEOUT);
+
+  test("fx upgrade keeps today's texts when the proxy is not at fault, with a proxy that works and with none", async () => {
+    const proxy = await startConnectProxy();
+    const release = serveRelease();
+    const home = newHome("upgrade-plain");
+    try {
+      for (const withProxy of [true, false]) {
+        const env = baseEnv(home, {
+          FX_TEST_UPGRADE_BASE_URL: release.base,
+          ...(withProxy ? { HTTPS_PROXY: proxy.url(), FX_TEST_NET_PROXY_LOOPBACK: "1" } : {}),
+        });
+        const run = await runFx(["upgrade"], env, { timeoutMs: 40_000 });
+        expect(run.code, show(run)).toBe(1);
+        expect(run.stdout, show(run)).toBe("error: failed to download release archive\n");
+        const json = await runFx(["upgrade", "--json"], env, { timeoutMs: 40_000 });
+        expect(JSON.parse(json.stdout), show(json)).toEqual({ kind: "upgrade", error: "failed to download release archive" });
+      }
+      // The proxy relayed the version and the archive requests: it was not at fault.
+      expect(proxy.log.some(entry => entry.requestLine === `CONNECT 127.0.0.1:${release.port} HTTP/1.1`), JSON.stringify(proxy.log)).toBe(true);
+    } finally {
+      proxy.close();
+      release.stop();
+    }
+  }, 120_000);
+
+  test("a reviewer that cannot reach its endpoint through the proxy leaves the proxy in its trace line and nowhere on screen", async () => {
+    const dead = await closedPort();
+    const marker = "REVIEWER_PROXY_TRACE";
+    const gateway = startFakeGateway([fakeShellRun("cmd_1", `printf '%s' "${marker}"`), fakeGatewayFinalText("Held the command.")]);
+    const home = newHome("reviewer-trace");
+    const trace = join(home, "reviewer-trace.log");
+    try {
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ auto_upgrade: false, sandbox: "none", permission: {} }), { mode: 0o600 });
+      const env = baseEnv(home, {
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_MODEL: "openai/gpt-5",
+        FX_PERMISSION_MODE: "auto",
+        FX_REVIEW_MODEL: "typesafeai/jev",
+        TYPESAFE_API_KEY: "net-proxy-reviewer-key",
+        // The gateway is on loopback and goes direct; the reviewer's host
+        // resolves nowhere, so only the proxy could reach it.
+        TYPESAFE_BASE_URL: "https://jev-reviewer.test/v1/systemone",
+        HTTPS_PROXY: `http://127.0.0.1:${dead}`,
+        FX_TRACE_LOG: trace,
+        FX_TRACE_SCOPES: "permission",
+      });
+      const run = await runFx(["ask", "--auto", "--quiet", "--json", "Print the marker."], env, { timeoutMs: 40_000 });
+      expect(existsSync(trace), show(run)).toBe(true);
+      const lines = readFileSync(trace, "utf8").split("\n").filter(line => line.includes("event=auto_review_typesafe_transport result="));
+      expect(lines.length, show(run)).toBeGreaterThanOrEqual(1);
+      for (const line of lines) {
+        expect(line).toContain("reason=fetch_error");
+        expect(line.endsWith(` proxy="could not connect to proxy 127.0.0.1:${dead} (connection refused)"`), line).toBe(true);
+      }
+      // No new user-visible field: the proxy is in the trace and nowhere else.
+      expect(run.stdout + run.stderr).not.toContain("could not connect to proxy");
+    } finally {
+      gateway.stop();
+    }
+  }, 90_000);
+});

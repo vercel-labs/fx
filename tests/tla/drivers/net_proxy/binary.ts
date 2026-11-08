@@ -1,6 +1,7 @@
 // Runs the built fx through proxies that answer in the ways the repair of
 // PR #1728 is about, and has TLC check what fx did against the design
-// (tests/tla/net_proxy/NetProxyTrace.tla and NetProxyEnvTrace.tla).
+// (tests/tla/net_proxy/NetProxyTrace.tla, NetProxyEnvTrace.tla, and
+// NetProxyCallersTrace.tla).
 //
 // Each scenario is one environment action in the model's words: a proxy that
 // sends 102 or 100 before its 200, one that sends 101, one that answers 502,
@@ -10,14 +11,22 @@
 // through the tunnel, what did the retry notices and the final error say), and
 // writes it as a one-record module. TLC says whether the model can produce it.
 //
+// A third kind of scenario is a caller that fails and shows an error text: a Grok
+// client version lookup that ends `fx ask`, and `fx upgrade`. Each runs behind a
+// proxy that is down, one that refuses CONNECT, one that works while the server
+// fails, and no proxy at all, and the driver reads whether the text names the
+// proxy (NetProxyCallers.tla: a caller names the proxy for its own failure at
+// the proxy, and never otherwise).
+//
 // With --self-check every observation is also checked against two models of
 // older connectors. The connector as first written refuses interim heads, says
 // only that the network is down when it retries, keeps slices of the
 // environment, and refuses underscores. The connector as pushed before the short
 // notice puts the whole sentence into the retry notice, which leaves no room for
-// the wait when the sentence is long. Each must reject what the repaired fx did
-// in every scenario where the two differ, and accept the rest, so the check
-// cannot pass for any fx.
+// the wait when the sentence is long. A third model is fx before the callers took
+// the proxy's sentence, which shows fixed text for the version lookup and for
+// fx upgrade. Each must reject what the repaired fx did in every scenario where
+// the two differ, and accept the rest, so the check cannot pass for any fx.
 //
 // Everything is local: loopback proxies, a loopback provider, a fake AI Gateway,
 // a temporary FX_HOME, and FX_SOUND=0. No model is called.
@@ -45,6 +54,11 @@ const ENV_DESIGN = {
 const ENV_FIRST = {
   Guard: "\"none\"", BorrowHost: "TRUE", BorrowNoProxy: "TRUE", AcceptsUnderscore: "FALSE", AcceptsBang: "FALSE", NamesReasons: "FALSE",
 };
+
+/** The callers' design: the version lookup and fx upgrade take the proxy's sentence. */
+const CALLERS_DESIGN = { VersionClaims: "TRUE", UpgradeClaims: "TRUE", ClearsAtStart: "TRUE", NamesWithoutFailure: "FALSE" };
+/** fx before they did: both show fixed text. */
+const CALLERS_HEAD = { ...CALLERS_DESIGN, VersionClaims: "FALSE", UpgradeClaims: "FALSE" };
 
 type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 type Run = { code: number | null; stdout: string; stderr: string; ms: number };
@@ -91,6 +105,29 @@ const hostClasses: HostClass[] = [
   { cls: "bang", url: "http://bad_host!:3128", sameAsFirst: false },
   { cls: "no_host", url: "http:///path", sameAsFirst: false },
   { cls: "bad_port", url: "http://proxy.invalid:99999", sameAsFirst: false },
+];
+
+/** A caller that fails and shows an error text, in NetProxyCallers.tla's words. */
+type CallerScenario = {
+  name: string;
+  caller: "version" | "upgrade";
+  proxy: "set" | "unset";
+  cause: "at_proxy" | "elsewhere";
+  /** The proxy the run has: down, refusing CONNECT (from the first, or after one relayed), working, or none. */
+  via: "down" | "refuses" | "refuses_after_first" | "works" | "none";
+  /** Whether fx before the callers took the sentence showed the same text, so that model must accept the observation. */
+  sameAsHead: boolean;
+};
+
+const callerScenarios: CallerScenario[] = [
+  { name: "a Grok version lookup behind a proxy that is down", caller: "version", proxy: "set", cause: "at_proxy", via: "down", sameAsHead: false },
+  { name: "a Grok version lookup behind a proxy that refuses CONNECT", caller: "version", proxy: "set", cause: "at_proxy", via: "refuses", sameAsHead: false },
+  { name: "a Grok version lookup that fails behind a proxy that works", caller: "version", proxy: "set", cause: "elsewhere", via: "works", sameAsHead: true },
+  { name: "a Grok version lookup that fails with no proxy", caller: "version", proxy: "unset", cause: "elsewhere", via: "none", sameAsHead: true },
+  { name: "fx upgrade behind a proxy that is down", caller: "upgrade", proxy: "set", cause: "at_proxy", via: "down", sameAsHead: false },
+  { name: "fx upgrade behind a proxy that refuses the download", caller: "upgrade", proxy: "set", cause: "at_proxy", via: "refuses_after_first", sameAsHead: false },
+  { name: "fx upgrade whose download fails behind a proxy that works", caller: "upgrade", proxy: "set", cause: "elsewhere", via: "works", sameAsHead: true },
+  { name: "fx upgrade whose download fails with no proxy", caller: "upgrade", proxy: "unset", cause: "elsewhere", via: "none", sameAsHead: true },
 ];
 
 function serveLocal(handle: (request: Request, path: string) => Response | Promise<Response>) {
@@ -146,10 +183,12 @@ function profile(root: string, name: string, baseUrl: string): string {
   return home;
 }
 
+const customAsk = ["ask", "--provider", "custom", "--model", "custom-model", "--no-save", "hi"];
+
 /** Runs fx with exactly `env`; `until` sees the stderr so far and stops the run once it holds. */
-async function runFx(env: Record<string, string>, until: ((stderr: string) => boolean) | null, timeoutMs: number): Promise<Run> {
+async function runFx(env: Record<string, string>, until: ((stderr: string) => boolean) | null, timeoutMs: number, argv: string[] = customAsk): Promise<Run> {
   const started = performance.now();
-  const child = Bun.spawn([fxBin(), "ask", "--provider", "custom", "--model", "custom-model", "--no-save", "hi"], {
+  const child = Bun.spawn([fxBin(), ...argv], {
     cwd: env.HOME, env, stdin: "ignore", stdout: "pipe", stderr: "pipe",
   });
   const out = { stdout: "", stderr: "" };
@@ -199,6 +238,7 @@ const retryNotices = (stderr: string) =>
 
 type ConnObservation = { target: string; answer: string; phase: string; shown: string; notice: string };
 type EnvObservation = { cls: string; accepted: boolean; reason: string };
+type CallerObservation = { caller: string; proxy: string; cause: string; text: string };
 
 async function observeConnection(root: string, scenario: Connection): Promise<{ observation: ConnObservation; evidence: string }> {
   const gateway = serveGateway();
@@ -265,6 +305,83 @@ async function observeHostClass(root: string, hostClass: HostClass): Promise<{ o
   }
 }
 
+/** A profile with a valid Grok sign-in, so `fx ask` goes straight to its version lookup. */
+function grokProfile(root: string, name: string): string {
+  const home = mkdtempSync(join(root, `${name}-`));
+  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ auto_upgrade: false, permission_mode: "ask" }), { mode: 0o600 });
+  writeFileSync(join(home, ".fx", "grok-auth.json"), JSON.stringify({
+    version: 1,
+    access_token: "grok-fresh",
+    refresh_token: "grok-refresh",
+    expires_at_ms: Date.now() + 3_600_000,
+    account_id: "acct_net_proxy_driver",
+  }) + "\n", { mode: 0o600 });
+  return home;
+}
+
+async function observeCaller(root: string, scenario: CallerScenario): Promise<{ observation: CallerObservation; evidence: string }> {
+  // The server the caller talks to. A Grok version lookup fails with a 500; fx
+  // upgrade finds a latest version and no archive, so its download fails.
+  const server = scenario.caller === "version"
+    ? serveLocal(() => new Response("no release", { status: 500 }))
+    : serveLocal((_request, path) => (path === "/latest.txt" ? new Response("9.9.9\n") : new Response("missing", { status: 404 })));
+  const dead = scenario.via === "down" ? await closedPort() : 0;
+  const proxy = scenario.via === "refuses" ? await startConnectProxy({ status: 407 })
+    : scenario.via === "refuses_after_first" ? await startConnectProxy({ refuseAfter: 1 })
+    : scenario.via === "works" ? await startConnectProxy()
+    : null;
+  const port = proxy ? proxy.port : dead;
+  try {
+    const routed = scenario.via !== "none"
+      ? { HTTPS_PROXY: `http://127.0.0.1:${port}`, FX_TEST_NET_PROXY_LOOPBACK: "1" }
+      : {};
+    const home = scenario.caller === "version" ? grokProfile(root, "caller-version") : profile(root, "caller-upgrade", "http://127.0.0.1:9/v1");
+    const env = scenario.caller === "version"
+      ? environment(home, {}, {
+        FX_PROVIDER: "grok",
+        FX_MODEL: "grok-4.20",
+        // Every Grok endpoint is the local server, so nothing can leave the machine.
+        FX_TEST_GROK_VERSION_URL: `${server.base}/version`,
+        FX_TEST_XAI_GROK_RESPONSES_URL: `${server.base}/responses`,
+        FX_TEST_XAI_GROK_MODELS_URL: `${server.base}/models`,
+        FX_TEST_XAI_GROK_MODALITIES_URL: `${server.base}/modalities`,
+        FX_TEST_GROK_TOKEN_URL: `${server.base}/token`,
+        FX_TEST_GROK_USERINFO_URL: `${server.base}/userinfo`,
+        ...routed,
+      })
+      : environment(home, {}, { FX_TEST_UPGRADE_BASE_URL: server.base, ...routed });
+    delete env.AI_GATEWAY_API_KEY;
+    const run = await runFx(env, null, 40_000, scenario.caller === "version" ? ["ask", "--no-save", "hi"] : ["upgrade"]);
+    // The text the run ended with: an error line on stderr for fx ask, the
+    // error on stdout for fx upgrade.
+    const shown = scenario.caller === "version"
+      ? run.stderr.split("\n").filter(line => line.startsWith("fx: ")).join("\n")
+      : run.stdout.split("\n").filter(line => line.startsWith("error: ")).join("\n");
+    // What each caller said before it took the proxy's sentence: fixed text.
+    const fixed = scenario.caller === "version"
+      ? ["fx: provider version unavailable"]
+      : ["error: failed to fetch latest version from CDN", "error: failed to download release archive", "error: failed to fetch checksum from CDN"];
+    const namesProxy = proxy !== null || scenario.via === "down"
+      ? shown.includes(`proxy 127.0.0.1:${port}`)
+      : false;
+    // "proxy" when the text names the proxy; "default" only when it is exactly
+    // one of the caller's fixed texts; anything else is not a run the model
+    // describes.
+    const text = ended(run) && namesProxy ? "proxy" : ended(run) && fixed.includes(shown) ? "default" : "unread";
+    return {
+      observation: { caller: scenario.caller, proxy: scenario.proxy, cause: scenario.cause, text },
+      evidence: `exit ${run.code} after ${Math.round(run.ms)} ms; shown ${JSON.stringify(shown)}; stderr ${JSON.stringify(run.stderr.slice(-200))}`,
+    };
+  } finally {
+    proxy?.close();
+    server.stop();
+  }
+}
+
+/** The run ended on its own with a failure, rather than succeeding or being killed. */
+const ended = (run: Run) => run.code === 1;
+
 const quote = (value: string) => JSON.stringify(value);
 
 function cfg(constants: Record<string, string>, extra: string[]): string {
@@ -272,7 +389,7 @@ function cfg(constants: Record<string, string>, extra: string[]): string {
     "INVARIANT NotObserved", ...extra, "CHECK_DEADLOCK FALSE", ""].join("\n");
 }
 
-async function trace(dir: string, module: "NetProxyTrace" | "NetProxyEnvTrace", observedModule: string, observed: string, constants: Record<string, string>): Promise<Verdict> {
+async function trace(dir: string, module: "NetProxyTrace" | "NetProxyEnvTrace" | "NetProxyCallersTrace", observedModule: string, observed: string, constants: Record<string, string>): Promise<Verdict> {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, `${observedModule}.tla`), [
     `---- MODULE ${observedModule} ----`,
@@ -282,7 +399,9 @@ async function trace(dir: string, module: "NetProxyTrace" | "NetProxyEnvTrace", 
     "",
   ].join("\n"));
   writeFileSync(join(dir, "trace.cfg"), cfg(constants, []));
-  const base = module === "NetProxyTrace" ? ["NetProxy.tla", "NetProxyTrace.tla"] : ["NetProxyEnv.tla", "NetProxyEnvTrace.tla"];
+  const base = module === "NetProxyTrace" ? ["NetProxy.tla", "NetProxyTrace.tla"]
+    : module === "NetProxyEnvTrace" ? ["NetProxyEnv.tla", "NetProxyEnvTrace.tla"]
+    : ["NetProxyCallers.tla", "NetProxyCallersTrace.tla"];
   const run = await runTlc(dir, module, "trace.cfg", base, join(TLA_ROOT, "net_proxy"));
   if (run.violated === "NotObserved") return "ACCEPTED";
   if (run.exitCode === 0 && run.output.includes("Model checking completed. No error has been found.")) return "REJECTED";
@@ -291,6 +410,8 @@ async function trace(dir: string, module: "NetProxyTrace" | "NetProxyEnvTrace", 
 
 const connRecord = (o: ConnObservation) =>
   `Observed == [target |-> ${quote(o.target)}, answer |-> ${quote(o.answer)}, phase |-> ${quote(o.phase)}, shown |-> ${quote(o.shown)}, notice |-> ${quote(o.notice)}]`;
+const callerRecord = (o: CallerObservation) =>
+  `ObservedCallers == [caller |-> ${quote(o.caller)}, proxy |-> ${quote(o.proxy)}, cause |-> ${quote(o.cause)}, text |-> ${quote(o.text)}]`;
 const envRecord = (o: EnvObservation) =>
   `ObservedEnv == [cls |-> ${quote(o.cls)}, accepted |-> ${o.accepted ? "TRUE" : "FALSE"}, reason |-> ${quote(o.reason)}]`;
 
@@ -335,6 +456,22 @@ export async function runBinaryScenarios(out: string, selfCheck: boolean): Promi
       const want: Verdict = hostClass.sameAsFirst ? "ACCEPTED" : "REJECTED";
       say(`  self-check: the connector as first written ${first} (must be ${want})`);
       if (first !== want) ok = false;
+    }
+  }
+  for (const [index, scenario] of callerScenarios.entries()) {
+    const { observation, evidence } = await observeCaller(root, scenario);
+    const dir = join(out, `binary-caller-${index}`);
+    const verdict = await trace(join(dir, "design"), "NetProxyCallersTrace", "NetProxyCallersObserved", callerRecord(observation), CALLERS_DESIGN);
+    say(`binary ${scenario.name}: ${JSON.stringify(observation)} -> design ${verdict}`);
+    if (verdict !== "ACCEPTED") {
+      say(`  evidence: ${evidence}`);
+      ok = false;
+    }
+    if (selfCheck) {
+      const head = await trace(join(dir, "head"), "NetProxyCallersTrace", "NetProxyCallersObserved", callerRecord(observation), CALLERS_HEAD);
+      const want: Verdict = scenario.sameAsHead ? "ACCEPTED" : "REJECTED";
+      say(`  self-check: fx before the callers took the proxy's sentence ${head} (must be ${want})`);
+      if (head !== want) ok = false;
     }
   }
   return ok;

@@ -2,6 +2,8 @@
 // two models, tests/tla/net_proxy/NetProxy.tla (connections) and
 // NetProxyEnv.tla (what fx reads from the environment and keeps), with the
 // design's constants, and runs the built fx through proxies that misbehave.
+// NetProxyCallers.tla (which caller names a proxy failure) is checked on the
+// built fx only.
 //
 // TLC writes each model's state graph. The driver walks every edge along a
 // shortest path from an initial state, then seeded random paths. Each model
@@ -16,7 +18,10 @@
 // binary.ts then runs zig-out/bin/fx through a proxy that sends 102 before its
 // 200, one that is down, one that answers 502, a proxy whose host name has 253
 // bytes, and a proxy URL whose host has an underscore, and has TLC check what
-// fx did against the design.
+// fx did against the design. It also runs a Grok client version lookup and
+// `fx upgrade` behind a proxy that is down, one that refuses CONNECT, one that
+// works while the server fails, and none, and has TLC check, against
+// tests/tla/net_proxy/NetProxyCallers.tla, which of them name the proxy.
 //
 // Usage (from the repository root):
 //   bun tests/tla/drivers/net_proxy/driver.ts

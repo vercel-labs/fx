@@ -244,6 +244,24 @@ pub fn takeRequestFailureNotice(err: anyerror, buf: []u8) ?[]const u8 {
 /// The room `takeRequestFailureNotice` needs in its buffer.
 pub const notice_bytes = net_proxy.max_notice_bytes;
 
+/// ` proxy="<sentence>"` for the end of a trace line about a request that
+/// failed with `err`, or "" when `err` is not one a proxy failure returns or
+/// this thread holds none: the permission reviewers' transport errors name the
+/// proxy in their trace line and nowhere else, so their outcome and the screen
+/// stay as they were. Clears what it read either way.
+pub fn takeTraceNote(err: anyerror, buf: *[trace_note_bytes]u8) []const u8 {
+    if (!net_proxy.isProxyFailureError(err)) {
+        request_failure = null;
+        return "";
+    }
+    const failure = request_failure orelse return "";
+    request_failure = null;
+    return failure.traceNote(buf);
+}
+
+/// The room `takeTraceNote` needs in its buffer.
+pub const trace_note_bytes = net_proxy.Failure.trace_note_bytes;
+
 /// The text of the proxy failure this thread holds, for a caller that knows
 /// its own failure was a transport failure but not which error it was, as
 /// `fx models` does. Clears what it read.
@@ -469,6 +487,102 @@ test "a proxy fx cannot connect to is named with the cause in plain words, never
     for (cases) |case| {
         const failure = unreachableProxyFailure(proxy, "x.ai", 443, case[0]);
         try std.testing.expectEqualStrings(case[1], failure.text(&buf));
+    }
+}
+
+test "a version lookup that failed at the proxy shows its sentence once, and one that did not shows nothing" {
+    const proxy: net_proxy.Proxy = .{ .host = "127.0.0.1", .port = 3128, .authorization = null, .variable = "HTTPS_PROXY" };
+    const sentence = "could not connect to proxy 127.0.0.1:3128 (connection refused)";
+    var buf: [512]u8 = undefined;
+    defer clearRequestFailure();
+
+    holdForRequest(unreachableProxyFailure(proxy, "x.ai", 443, error.ConnectionRefused));
+    const shown = takeRequestFailure(error.ProviderVersionUnavailable, &buf);
+    try std.testing.expect(shown != null);
+    try std.testing.expectEqualStrings(sentence, shown.?);
+    // Reading clears it: the next lookup that fails for another reason has none.
+    try std.testing.expect(takeRequestFailure(error.ProviderVersionUnavailable, &buf) == null);
+
+    // An error a proxy failure never returns clears what is held, and shows nothing.
+    holdForRequest(unreachableProxyFailure(proxy, "x.ai", 443, error.ConnectionRefused));
+    try std.testing.expect(takeRequestFailure(error.Cancelled, &buf) == null);
+    try std.testing.expect(takeRequestFailure(error.ProviderVersionUnavailable, &buf) == null);
+}
+
+test "a trace note carries the held sentence once, and an error that is not a proxy's carries none" {
+    const proxy: net_proxy.Proxy = .{ .host = "127.0.0.1", .port = 3128, .authorization = null, .variable = "HTTPS_PROXY" };
+    var buf: [trace_note_bytes]u8 = undefined;
+    defer clearRequestFailure();
+
+    holdForRequest(unreachableProxyFailure(proxy, "x.ai", 443, error.ConnectionRefused));
+    try std.testing.expectEqualStrings(
+        " proxy=\"could not connect to proxy 127.0.0.1:3128 (connection refused)\"",
+        takeTraceNote(error.ConnectionResetByPeer, &buf),
+    );
+    // Reading clears it, and a request that held none has no note.
+    try std.testing.expectEqualStrings("", takeTraceNote(error.ConnectionResetByPeer, &buf));
+    // An error a proxy failure never returns clears what is held, and has none.
+    holdForRequest(unreachableProxyFailure(proxy, "x.ai", 443, error.ConnectionRefused));
+    try std.testing.expectEqualStrings("", takeTraceNote(error.Cancelled, &buf));
+    try std.testing.expectEqualStrings("", takeTraceNote(error.ConnectionResetByPeer, &buf));
+}
+
+test "threads that each fail at the proxy claim only their own sentence, thousands of times" {
+    const threads = 8;
+    const rounds = 2_000;
+    // The threads record in step, so at most two rounds of failures are in the
+    // log at once, under its capacity: a failure is lost only when more than
+    // `FailureLog.capacity` others come between its record and its claim.
+    const Round = struct {
+        arrived: std.atomic.Value(usize) = .init(0),
+
+        fn wait(r: *@This(), round: usize) void {
+            _ = r.arrived.fetchAdd(1, .acq_rel);
+            while (r.arrived.load(.acquire) < (round + 1) * threads) std.Thread.yield() catch {};
+        }
+    };
+    const Worker = struct {
+        index: usize,
+        steps: *Round,
+        claimed: usize = 0,
+        wrong: usize = 0,
+
+        fn run(w: *@This()) void {
+            var host_buf: [32]u8 = undefined;
+            var uri_buf: [64]u8 = undefined;
+            var text_buf: [512]u8 = undefined;
+            const host = std.mem.print(&host_buf, "t{d}.stress.test", .{w.index}) catch return;
+            const uri_text = std.mem.print(&uri_buf, "https://{s}/", .{host}) catch return;
+            const uri = std.Uri.parse(uri_text) catch return;
+            for (0..rounds) |round| {
+                const since = beginOpen();
+                // Its own failure, logged beside every other thread's.
+                var failure = net_proxy.Failure.init(.refused, "p.test", 3128, host, 443);
+                failure.status = if (round % 2 == 0) 407 else 504;
+                recordFailure(io_mod.getIo(), failure);
+                w.steps.wait(round);
+                noteOpenFailure(uri, since, error.AccessDenied);
+                const shown = takeRequestFailure(error.AccessDenied, &text_buf) orelse {
+                    w.wrong += 1;
+                    continue;
+                };
+                // The sentence names this thread's target and this round's answer, once.
+                var want_buf: [128]u8 = undefined;
+                const want = std.mem.print(&want_buf, "refused CONNECT to {s}:443: {d}", .{ host, failure.status }) catch return;
+                if (std.mem.find(u8, shown, want) != null) w.claimed += 1 else w.wrong += 1;
+                if (takeRequestFailure(error.AccessDenied, &text_buf) != null) w.wrong += 1;
+            }
+        }
+    };
+    var steps: Round = .{};
+    var workers: [threads]Worker = undefined;
+    var spawned: [threads]std.Thread = undefined;
+    for (&workers, 0..) |*w, i| w.* = .{ .index = i, .steps = &steps };
+    for (&spawned, &workers) |*thread, *w| thread.* = try std.Thread.spawn(.{}, Worker.run, .{w});
+    for (spawned) |thread| thread.join();
+    for (workers) |w| {
+        try std.testing.expectEqual(@as(usize, 0), w.wrong);
+        try std.testing.expectEqual(@as(usize, rounds), w.claimed);
     }
 }
 

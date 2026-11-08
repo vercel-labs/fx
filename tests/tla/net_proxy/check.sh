@@ -42,10 +42,23 @@
 #   guard-https            the CGI guard also ignores HTTPS_PROXY             HttpsIgnoresCgi
 #   accept-bang            a host with a character no host has is accepted    BadInputRefused
 #
-# tests/tla/drivers/net_proxy/driver.ts walks net_proxy.zig along both
+# NetProxyCallers.tla, who names a proxy failure in the text it shows.
+# net-proxy-callers.cfg is the design and must pass: the model request, a Grok
+# version lookup, and a request of fx upgrade each name the proxy whose failure
+# ended them, and no caller names a proxy when none is set. The configs
+# without a mutation name are fx before the callers took the sentence, one law
+# each: error.ProviderVersionUnavailable is not an error the claim accepts, so
+# the version lookup shows fixed text (VersionNamesProxy); fx upgrade turns
+# every request error into fixed text (UpgradeNamesProxy).
+#
+#   mutation-stale        a request does not clear what an earlier one left      OwnFailureOnly
+#   mutation-fixed-text   a caller prints a proxy sentence with no proxy set     NoProxyKeepsDefault
+#
+# tests/tla/drivers/net_proxy/driver.ts walks net_proxy.zig along the first two
 # models' state graphs, and runs the built fx through a proxy that sends 102
-# before its 200, a proxy that is down, and a proxy host with an underscore,
-# with TLC checking what it saw against the design.
+# before its 200, a proxy that is down, a proxy host with an underscore, a Grok
+# version lookup, and fx upgrade, with TLC checking what it saw against the
+# design.
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 set -eu
@@ -74,4 +87,9 @@ NetProxyEnv net-proxy-env-generic-reasons RefusalNamesRealReason
 NetProxyEnv net-proxy-env-mutation-guard-lower LowerStillApplies
 NetProxyEnv net-proxy-env-mutation-guard-https HttpsIgnoresCgi
 NetProxyEnv net-proxy-env-mutation-accept-bang BadInputRefused
+NetProxyCallers net-proxy-callers -
+NetProxyCallers net-proxy-callers-no-version VersionNamesProxy
+NetProxyCallers net-proxy-callers-no-upgrade UpgradeNamesProxy
+NetProxyCallers net-proxy-callers-mutation-stale OwnFailureOnly
+NetProxyCallers net-proxy-callers-mutation-fixed-text NoProxyKeepsDefault
 VERDICTS

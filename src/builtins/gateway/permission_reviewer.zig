@@ -2,6 +2,7 @@ const std = @import("std");
 const gateway_client = @import("../../gateway/client.zig");
 const permission_auto_classifier = @import("../../core/permissions/auto_classifier.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const net_proxy_io = @import("../../core/shared/net_proxy_io.zig");
 const types = @import("../../core/shared/types.zig");
 const stream_provider = @import("../../core/agent/stream_provider.zig");
 const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
@@ -226,10 +227,15 @@ fn mapTransportError(
             .transient_failure
         else
             .permanent_failure;
+    // A request that failed at the proxy names it in the trace, and only there.
+    // The sentence is held on this thread only when the connection opened on
+    // it; this reviewer's bounded completion opens on a task of its own, so the
+    // line stays plain until that task hands its failure to its caller.
+    var proxy_note: [net_proxy_io.trace_note_bytes]u8 = undefined;
     debug_trace.logf(
         "permission",
-        "event=auto_review_transport result={s} reason=transport_error error={s}",
-        .{ @tagName(std.meta.activeTag(outcome)), @errorName(err) },
+        "event=auto_review_transport result={s} reason=transport_error error={s}{s}",
+        .{ @tagName(std.meta.activeTag(outcome)), @errorName(err), net_proxy_io.takeTraceNote(err, &proxy_note) },
     );
     return outcome;
 }

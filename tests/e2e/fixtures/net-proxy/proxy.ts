@@ -5,7 +5,8 @@
 // 127.0.0.1 itself goes to that port. It never resolves a name or reaches
 // past the machine. `status` makes it answer every CONNECT with that status,
 // `garbage` with bytes that are not HTTP, and `silent` with nothing; `interim`
-// sends an interim head with that status before the 200.
+// sends an interim head with that status before the 200, and `refuseAfter`
+// relays that many CONNECTs and answers the rest with 407.
 import net from "node:net";
 
 export type ProxyEntry = {
@@ -27,6 +28,8 @@ export type ProxyOptions = {
   early?: boolean;
   /** Sends `HTTP/1.1 <interim> Processing` before the 200 (RFC 9110 section 15.2). */
   interim?: number;
+  /** Relays this many CONNECTs, then answers every later one with 407. */
+  refuseAfter?: number;
 };
 
 /** The server name extension of a TLS ClientHello, or null. */
@@ -91,6 +94,9 @@ export async function startConnectProxy(options: ProxyOptions = {}) {
       const rest = head.subarray(end + 4);
       const match = /^CONNECT (\S+):(\d+) HTTP\/1\.[01]$/.exec(requestLine);
       if (!match) return void client.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+      if (options.refuseAfter !== undefined && log.length > options.refuseAfter) {
+        return void client.end('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="test"\r\n\r\n');
+      }
       if (options.silent) return;
       if (options.garbage) return void client.end("\x16\x03\x01\x00\x05hello");
       if (options.early) return void client.end("HTTP/1.1 200 Connection established\r\n\r\nearly");
