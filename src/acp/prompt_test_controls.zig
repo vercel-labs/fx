@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const io_mod = @import("../core/shared/io.zig");
 const hold_marker = @import("../core/shared/hold_marker.zig");
+const test_markers = @import("../core/shared/test_markers.zig");
 
 const Controls = struct {
     terminal_ready_path: []const u8,
@@ -16,6 +17,20 @@ pub fn pauseAfterTerminalWrite() void {
     const control = controls() orelse return;
     hold_marker.write(control.terminal_ready_path, "terminal_response_written") catch return;
     while (!pathExists(control.release_path)) {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
+/// Holds a permission request after its registry entry is inserted and before
+/// the request is written, so a test can cancel in that gap. Both paths are
+/// set only by the tests of one fx process that asks once
+/// (`tests/e2e/acp.test.ts`, `tests/tla/drivers/acp/child_approval/driver.ts`).
+pub fn pauseBeforePermissionWrite() void {
+    if (comptime build_options.libfx) return;
+    const inserted_path = io_mod.getenv("FX_TEST_ACP_PERMISSION_INSERTED") orelse return;
+    const release_path = io_mod.getenv("FX_TEST_ACP_PERMISSION_RELEASE") orelse return;
+    test_markers.writeMarker(inserted_path, "permission_request_inserted") catch return;
+    while (!pathExists(release_path)) {
         io_mod.sleep(std.time.ns_per_ms);
     }
 }

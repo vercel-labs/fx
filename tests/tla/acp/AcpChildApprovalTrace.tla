@@ -6,8 +6,12 @@
 (* (tests/tla/drivers/acp/child_approval/driver.ts). Steps the client      *)
 (* cannot see (a subagent's own turn, fx reading an answer, a decision)   *)
 (* may run between observations, but none of them may show the client a   *)
-(* request. A parent's stop is observed when the fake Gateway hands the    *)
-(* parent the stop call.                                                   *)
+(* request, announce a card, or end one. A parent's stop is observed when  *)
+(* the fake Gateway hands the parent the stop call.                        *)
+(*                                                                         *)
+(* A card's call id is observed too: a subagent's must differ from every   *)
+(* id the parent's own cards used (ParentIds) and from every earlier       *)
+(* subagent card's. That is the model's UniqueIds, read off the run.       *)
 (*                                                                         *)
 (* NotDone is a sentinel: TLC reporting it violated means every            *)
 (* observation matched a step of the spec. Exhausting the search without  *)
@@ -22,20 +26,34 @@ traceVars == <<vars, i>>
 \* A step the client cannot see.
 Hidden ==
     /\ \E c \in Children : FxStep(c)
+    /\ \A c \in Children : sent'[c] => sent[c]
     /\ \A c \in Children : atClient'[c] => atClient[c]
+    /\ \A c \in Children : card[c] = "none" => card'[c] = "none"
+    /\ \A c \in Children : card'[c] \in FinalCards => card[c] \in FinalCards
 
 Observed(o) ==
-    CASE o.op = "request"     -> /\ \E c \in Children : FxStep(c)
-                                 /\ ~atClient[o.c] /\ atClient'[o.c]
-      [] o.op = "answer"      -> ClientSend(o.c, o.a)
-      [] o.op = "late"        -> LateSend(o.c, o.a)
-      [] o.op = "stop"        -> Stop(o.c)
-      [] o.op = "cancel"      -> Cancel
-      [] o.op = "promptEnd"   -> PromptEnd
-      [] o.op = "promptStart" -> Reopen
-      [] o.op = "final"       -> /\ UNCHANGED vars
-                                 /\ \A c \in Children : child[c] = "done" /\ result[c] = o.results[c]
-      [] OTHER                -> FALSE
+    CASE o.op = "announce"     -> /\ \E c \in Children : FxStep(c)
+                                  /\ card[o.c] = "none" /\ card'[o.c] = "pending"
+                                  /\ o.tc \notin ParentIds
+                                  /\ \A j \in 1..i : TraceLog[j].op = "announce" => TraceLog[j].tc # o.tc
+      [] o.op = "request"      -> /\ \E c \in Children : FxStep(c)
+                                  /\ ~atClient[o.c] /\ atClient'[o.c]
+      [] o.op = "lateRequest"  -> /\ Send(o.c) /\ entry[o.c] = "cancelled"
+      [] o.op = "card"         -> /\ FinishCard(o.c) /\ card'[o.c] = o.status
+      [] o.op = "answer"       -> ClientSend(o.c, o.a)
+      [] o.op = "late"         -> LateSend(o.c, o.a)
+      [] o.op = "stop"         -> Stop(o.c)
+      [] o.op = "cancel"       -> Cancel
+      [] o.op = "promptEnd"    -> PromptEnd
+      [] o.op = "promptStart"  -> Reopen
+      [] o.op = "pRequest"     -> ParentAsk /\ parent' = "open"
+      [] o.op = "pAnswer"      -> ParentAnswer
+      [] o.op = "otherRequest" -> OtherAsk
+      [] o.op = "otherAnswer"  -> OtherAnswer
+      [] o.op = "final"        -> /\ UNCHANGED vars
+                                  /\ \A c \in Children : child[c] = "done" /\ result[c] = o.results[c]
+                                  /\ \A c \in Children : card[c] # "pending"
+      [] OTHER                 -> FALSE
 
 TraceInit == Init /\ i = 0
 

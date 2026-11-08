@@ -6,8 +6,12 @@
 # /permissions. AcpSpeed: the per-session Standard, Fast, and Ultrafast speed
 # contract. Both configs must pass. AcpChildApproval: how a subagent's
 # permission request reaches the client through its parent session. Its
-# design configs must pass; the code before it (MCAcpChildApprovalToday) and
-# two planted bugs must each break the property they name.
+# design configs (MCAcpChildApproval, MCAcpChildApprovalReserve,
+# MCAcpChildApprovalAnswered, MCAcpChildApprovalNoHost) must pass. The code
+# before the change (MCAcpChildApprovalToday), two planted bugs, and the
+# behavior of the head the repair started from, one config per law
+# (StaleCard, SpawnLeak, SharedIds, Starved, CancelGap), must each break the
+# property they name.
 #
 # AcpStopReasons: ACP v1 stop reasons for fx acp, fx's own names for libfx, and
 # a stop reason that agrees with what the next prompt holds, for every cause: a
@@ -72,9 +76,15 @@ AcpCommandOutput MCAcpCommandOutputSharedTail NothingLost
 AcpCommandOutput MCAcpCommandOutputNoFlush NothingLost
 
 AcpChildApproval MCAcpChildApproval -
+AcpChildApproval MCAcpChildApprovalReserve -
 AcpChildApproval MCAcpChildApprovalAnswered -
 AcpChildApproval MCAcpChildApprovalNoHost -
 AcpChildApproval MCAcpChildApprovalToday temporal
 AcpChildApproval MCAcpChildApprovalSplitGate NoStrandedRequest
 AcpChildApproval MCAcpChildApprovalStopIgnored temporal
+AcpChildApproval MCAcpChildApprovalStaleCard temporal
+AcpChildApproval MCAcpChildApprovalSpawnLeak NoStrandedRequest
+AcpChildApproval MCAcpChildApprovalSharedIds UniqueIds
+AcpChildApproval MCAcpChildApprovalStarved ParentNeverStarved
+AcpChildApproval MCAcpChildApprovalCancelGap ShownRequestIsOpen
 EOF
