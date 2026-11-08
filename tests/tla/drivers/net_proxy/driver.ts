@@ -1,19 +1,28 @@
 // Walks the proxy connector's core (src/core/shared/net_proxy.zig) along its
-// model, tests/tla/net_proxy/NetProxy.tla, with the design's constants.
+// two models, tests/tla/net_proxy/NetProxy.tla (connections) and
+// NetProxyEnv.tla (what fx reads from the environment and keeps), with the
+// design's constants, and runs the built fx through proxies that misbehave.
 //
-// TLC writes the model's state graph. The driver walks every edge along a
+// TLC writes each model's state graph. The driver walks every edge along a
 // shortest path from an initial state, then seeded random paths. Each model
-// step becomes an operation for lab.zig, which runs the real route, CONNECT
-// writer, answer reader, error mapping, and failure log the way
-// net_proxy_io.zig, web_fetch, and the gateway use them. After every step
-// each connection's phase, route, answer, shown text, and claimed target, the
-// wire, the failure records, and the number of claims must match the model's
-// next state.
+// step becomes an operation for a small Zig lab, which runs the real code the
+// way net_proxy_io.zig, web_fetch, and the gateway use it:
+//   lab.zig      the route, the CONNECT writer, the answer reader (interim
+//                heads too), the error mapping, the failure log, and the retry
+//                notice's status text
+//   lab_env.zig  the real parser, reading environment buffers the lab
+//                overwrites in place the way a host program's setenv does
+// After every step what the real code holds must match the model's next state.
+// binary.ts then runs zig-out/bin/fx through a proxy that sends 102 before its
+// 200, one that is down, one that answers 502, and a proxy URL whose host has
+// an underscore, and has TLC check what fx did against the design.
 //
 // Usage (from the repository root):
 //   bun tests/tla/drivers/net_proxy/driver.ts
 //   bun tests/tla/drivers/net_proxy/driver.ts --self-check
 //   bun tests/tla/drivers/net_proxy/driver.ts --walks 500 --steps 14 --seed 7
+//   bun tests/tla/drivers/net_proxy/driver.ts --binary-only   (just the built fx)
+//   bun tests/tla/drivers/net_proxy/driver.ts --no-binary     (just the core)
 //
 // Exit codes: 0 every walk matched, 1 a mismatch (or a self-check that was
 // not rejected), 2 a toolchain or build failure.
@@ -21,19 +30,25 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseValue } from "../graph.mjs";
 import { REPO_ROOT, TLA_ROOT, outDir, runTlc } from "../lib/tlc";
+import { runBinaryScenarios } from "./binary";
 
 type Model = Record<string, any>;
 type Edge = { to: string; label: string };
 type Graph = { states: Map<string, Model>; next: Map<string, Edge[]>; inits: string[] };
 type Op = Record<string, unknown> & { op: string };
-type Conn = { target: string; phase: string; route: string; answer: string; shown: string; got: string };
+type Conn = { target: string; phase: string; route: string; answer: string; shown: string; got: string; notice: string; ngot: string };
 type WireRecord = { c: string; hop: string; kind: string; dest: string };
 type Result = { conns: { a: Conn; b: Conn }; wire: WireRecord[]; records: string[]; claimed: number; error: string | null };
+type Obs = { http: string; host: string; internal: string };
+type EnvResult = {
+  snapped: boolean; s_http: string; s_https: string; s_host: string; obs: Obs[];
+  parsed: boolean; accepted: boolean; reason: string; error: string | null;
+};
 type Hop = { from: string; to: string; label: string };
 type Walk = { init: string; hops: Hop[] };
 
 const conns = ["a", "b"] as const;
-const perConn = ["phase", "route", "answer", "shown", "got"] as const;
+const perConn = ["phase", "route", "answer", "shown", "got", "notice", "ngot"] as const;
 
 function flag(name: string): boolean {
   return process.argv.includes(name);
@@ -49,6 +64,8 @@ function option(name: string, fallback: number): number {
 
 const options = {
   selfCheck: flag("--self-check"),
+  binaryOnly: flag("--binary-only"),
+  noBinary: flag("--no-binary"),
   walks: option("--walks", 200),
   steps: option("--steps", 14),
   seed: option("--seed", 1),
@@ -71,12 +88,20 @@ function rng(seed: number): () => number {
   };
 }
 
-function buildLab(moduleSource: string, out: string, name: string): string {
+type Lab = { file: string; deps: string[] };
+const connLab: Lab = { file: "lab.zig", deps: ["net_proxy", "url_policy"] };
+const envLab: Lab = { file: "lab_env.zig", deps: ["net_proxy"] };
+
+function buildLab(lab: Lab, moduleSource: string, out: string, name: string): string {
   const bin = join(out, name);
+  const modules: Record<string, string> = {
+    net_proxy: moduleSource,
+    url_policy: join(REPO_ROOT, "src", "tools", "web", "url_policy.zig"),
+  };
   const build = Bun.spawnSync(
-    ["zig", "build-exe", "-O", "ReleaseSafe", "--dep", "net_proxy", "--dep", "url_policy",
-      `-Mroot=${join(TLA_ROOT, "drivers", "net_proxy", "lab.zig")}`, `-Mnet_proxy=${moduleSource}`,
-      `-Murl_policy=${join(REPO_ROOT, "src", "tools", "web", "url_policy.zig")}`,
+    ["zig", "build-exe", "-O", "ReleaseSafe", ...lab.deps.flatMap(dep => ["--dep", dep]),
+      `-Mroot=${join(TLA_ROOT, "drivers", "net_proxy", lab.file)}`,
+      ...lab.deps.map(dep => `-M${dep}=${modules[dep]}`),
       "--name", name, `-femit-bin=${bin}`],
     { cwd: REPO_ROOT, stdout: "pipe", stderr: "pipe" },
   );
@@ -84,16 +109,14 @@ function buildLab(moduleSource: string, out: string, name: string): string {
   return bin;
 }
 
-async function loadGraph(out: string): Promise<Graph> {
-  const dir = join(out, "graph");
-  const cfg = ["INIT Init", "NEXT Next", "CONSTANTS", "    UseProxy = TRUE", "    AuthOnConnect = TRUE",
-    "    TlsAfterConnect = TRUE", "    NoFallback = TRUE", "    SharedFlag = FALSE", "    PinFetchIp = TRUE",
-    "    DetailMode = \"own_target\"", "CHECK_DEADLOCK FALSE", ""].join("\n");
+async function loadGraph(out: string, name: string, module: string, constants: string[]): Promise<Graph> {
+  const dir = join(out, `graph-${name}`);
+  const cfg = ["INIT Init", "NEXT Next", "CONSTANTS", ...constants.map(line => `    ${line}`), "CHECK_DEADLOCK FALSE", ""].join("\n");
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "Driver.cfg"), cfg);
-  const run = await runTlc(dir, "NetProxy", "Driver.cfg", ["NetProxy.tla"], join(TLA_ROOT, "net_proxy"),
+  const run = await runTlc(dir, module, "Driver.cfg", [`${module}.tla`], join(TLA_ROOT, "net_proxy"),
     ["-dump", "dot,actionlabels", "graph"]);
-  if (run.exitCode !== 0) fail(2, `TLC failed on NetProxy.tla (exit ${run.exitCode}); see ${join(dir, "tlc.log")}`);
+  if (run.exitCode !== 0) fail(2, `TLC failed on ${module}.tla (exit ${run.exitCode}); see ${join(dir, "tlc.log")}`);
   const dot = readFileSync(join(dir, "graph.dot"), "utf8");
   const states = new Map<string, Model>();
   const next = new Map<string, Edge[]>();
@@ -119,30 +142,8 @@ async function loadGraph(out: string): Promise<Graph> {
     if (/style\s*=\s*filled/.test(rest!)) inits.push(id!);
   }
   if (inits.length === 0) fail(2, "the graph has no initial state");
-  console.log(`graph: ${states.size} states, ${inits.length} initial, ${run.durationMs} ms`);
+  console.log(`graph ${module}: ${states.size} states, ${inits.length} initial, ${run.durationMs} ms`);
   return { states, next, inits };
-}
-
-// The connection a step moved: the one whose own fields changed.
-function movedConn(from: Model, to: Model): string {
-  const moved = conns.filter(c => perConn.some(field => from[field][c] !== to[field][c]));
-  if (moved.length !== 1) throw new Error(`a step moved ${moved.length} connections`);
-  return moved[0]!;
-}
-
-function opFor(hop: Hop, graph: Graph): Op {
-  const from = graph.states.get(hop.from)!;
-  const to = graph.states.get(hop.to)!;
-  const c = movedConn(from, to);
-  switch (hop.label) {
-    case "Lookup": return { op: "lookup", c };
-    case "SendConnect": return { op: "send_connect", c };
-    case "ProxyAnswers": return { op: "answer", c, a: to.answer[c] };
-    case "TunnelOpens": case "TunnelFails": return { op: "finish_connect", c };
-    case "SendStep": return { op: "send", c };
-    case "Report": return { op: "report", c };
-    default: throw new Error(`no mapping for model action ${hop.label}`);
-  }
 }
 
 // One walk per edge: the shortest path from an initial state to the edge's
@@ -199,69 +200,58 @@ function randomWalks(graph: Graph, seed: number): Walk[] {
   return walks;
 }
 
-function runLab(bin: string, walks: Walk[], graph: Graph, out: string, name: string): Result[] {
+function runLab<T>(bin: string, walks: Walk[], graph: Graph, out: string, name: string, start: (init: Model) => Op, opFor: (hop: Hop, graph: Graph) => Op): T[] {
   const opsPath = join(out, `${name}.ops.jsonl`);
   const resultsPath = join(out, `${name}.results.jsonl`);
   const lines: string[] = [];
   for (const walk of walks) {
-    const init = graph.states.get(walk.init)!;
-    lines.push(JSON.stringify({ op: "walk", targets: init.target }));
+    lines.push(JSON.stringify(start(graph.states.get(walk.init)!)));
     for (const hop of walk.hops) lines.push(JSON.stringify(opFor(hop, graph)));
   }
   writeFileSync(opsPath, `${lines.join("\n")}\n`);
   const run = Bun.spawnSync([bin, opsPath, resultsPath], { stdout: "pipe", stderr: "pipe" });
   if (run.exitCode !== 0) fail(2, `${name} exited ${run.exitCode}:\n${new TextDecoder().decode(run.stderr)}`);
-  const results = readFileSync(resultsPath, "utf8").trim().split("\n").map(line => JSON.parse(line) as Result);
+  const results = readFileSync(resultsPath, "utf8").trim().split("\n").map(line => JSON.parse(line) as T);
   if (results.length !== lines.length) fail(2, `${name} answered ${results.length} of ${lines.length} operations`);
   return results;
 }
 
-const sortWire = (wire: WireRecord[]) =>
-  wire.map(w => ({ c: w.c, hop: w.hop, kind: w.kind, dest: w.dest })).map(w => JSON.stringify(w)).sort();
-
-// TLC prints a set of strings as a set; parseValue reads it as an array.
-const sortSet = (value: unknown): string[] => [...(Array.isArray(value) ? value : [])].map(String).sort();
-
 type Mismatch = { walk: number; step: number; path: string[]; field: string; model: unknown; real: unknown };
+type Outcome = { mismatches: Mismatch[]; seen: Map<string, number> };
 
-// The refinement mapping: each connection's own fields, the wire as a set,
-// the failure records as a set, and the number of claims must equal the
-// model's. `tamper` expects a 407 to open the tunnel, to prove the checks can
-// fail.
-function check(walks: Walk[], graph: Graph, results: Result[], tamper: boolean) {
+// Walks `walks` through `results` (one start result, then one per hop) and
+// compares each step with `compare`, which calls `expect(field, model, real)`.
+function check<T>(
+  walks: Walk[],
+  graph: Graph,
+  results: T[],
+  compare: (hop: Hop, t: Model, result: T, expect: (field: string, model: unknown, real: unknown) => void) => void,
+  error: (result: T) => string | null,
+): Outcome {
   const mismatches: Mismatch[] = [];
   const seen = new Map<string, number>();
   let r = 0;
   walks.forEach((walk, w) => {
-    r += 1; // the walk's reset
+    r += 1; // the walk's start
     let failed = false;
     walk.hops.forEach((hop, i) => {
       const result = results[r]!;
       r += 1;
       if (failed) return;
       seen.set(hop.label, (seen.get(hop.label) ?? 0) + 1);
-      const t = graph.states.get(hop.to)!;
       const expect = (field: string, model: unknown, real: unknown) => {
         if (failed || JSON.stringify(model) === JSON.stringify(real)) return;
         failed = true;
         mismatches.push({ walk: w, step: i, path: walk.hops.slice(0, i + 1).map(x => x.label), field, model, real });
       };
-      if (result.error) expect("lab error", null, result.error);
-      for (const c of conns) {
-        for (const field of perConn) {
-          const model = tamper && field === "phase" && hop.label === "TunnelFails" && t.answer[c] === "auth" ? "open" : t[field][c];
-          expect(`${c}.${field}`, model, result.conns[c][field]);
-        }
-      }
-      expect("wire", sortWire(t.wire as WireRecord[]), sortWire(result.wire));
-      expect("records", sortSet(t.records), [...result.records].sort());
-      expect("claimed", sortSet(t.claimed).length, result.claimed);
+      expect("lab error", null, error(result));
+      compare(hop, graph.states.get(hop.to)!, result, expect);
     });
   });
   return { mismatches, seen };
 }
 
-function report(name: string, walks: Walk[], outcome: ReturnType<typeof check>): boolean {
+function report(name: string, walks: Walk[], outcome: Outcome): boolean {
   const steps = walks.reduce((sum, walk) => sum + walk.hops.length, 0);
   console.log(`${name}: ${walks.length} walks, ${steps} steps, ${outcome.mismatches.length} mismatching walks`);
   for (const m of outcome.mismatches.slice(0, 3)) {
@@ -271,47 +261,224 @@ function report(name: string, walks: Walk[], outcome: ReturnType<typeof check>):
   return outcome.mismatches.length === 0;
 }
 
-const out = outDir("net-proxy-driver");
-const started = performance.now();
-const module = join(REPO_ROOT, "src", "core", "shared", "net_proxy.zig");
-const lab = buildLab(module, out, "net_proxy_lab");
-const graph = await loadGraph(out);
-const walks = [...edgeWalks(graph), ...randomWalks(graph, options.seed)];
-const results = runLab(lab, walks, graph, out, "net_proxy_lab");
-const outcome = check(walks, graph, results, false);
-let ok = report("module", walks, outcome);
-const coverage = [...outcome.seen.entries()].sort((a, b) => b[1] - a[1]).map(([label, count]) => `${label} ${count}`).join(", ");
-console.log(`steps per action: ${coverage}`);
-for (const label of ["Lookup", "SendConnect", "ProxyAnswers", "TunnelOpens", "TunnelFails", "SendStep", "Report"]) {
-  if (!outcome.seen.has(label)) {
-    console.log(`action ${label} was never walked`);
-    ok = false;
+function coverage(outcome: Outcome, labels: string[]): boolean {
+  const steps = [...outcome.seen.entries()].sort((a, b) => b[1] - a[1]).map(([label, count]) => `${label} ${count}`).join(", ");
+  console.log(`steps per action: ${steps}`);
+  let ok = true;
+  for (const label of labels) {
+    if (!outcome.seen.has(label)) {
+      console.log(`action ${label} was never walked`);
+      ok = false;
+    }
+  }
+  return ok;
+}
+
+// TLC prints a set of strings as a set; parseValue reads it as an array.
+const sortSet = (value: unknown): string[] => [...(Array.isArray(value) ? value : [])].map(String).sort();
+
+// ---- NetProxy.tla: connections ----
+
+const connConstants = [
+  "UseProxy = TRUE", "AuthOnConnect = TRUE", "TlsAfterConnect = TRUE", "NoFallback = TRUE", "SharedFlag = FALSE",
+  "PinFetchIp = TRUE", "DetailMode = \"own_target\"", "InterimMode = \"skip_not_101\"", "NoticeMode = \"own_target\"",
+];
+
+// The connection a step moved: the one whose own fields changed.
+function movedConn(from: Model, to: Model): string {
+  const moved = conns.filter(c => perConn.some(field => from[field][c] !== to[field][c]));
+  if (moved.length !== 1) throw new Error(`a step moved ${moved.length} connections`);
+  return moved[0]!;
+}
+
+function connOp(hop: Hop, graph: Graph): Op {
+  const from = graph.states.get(hop.from)!;
+  const to = graph.states.get(hop.to)!;
+  const c = movedConn(from, to);
+  switch (hop.label) {
+    case "Lookup": return { op: "lookup", c };
+    case "SendConnect": return { op: "send_connect", c };
+    case "ProxyAnswers": return { op: "answer", c, a: to.answer[c] };
+    case "TunnelOpens": case "TunnelFails": return { op: "finish_connect", c };
+    case "SendStep": return { op: "send", c };
+    case "Report": return { op: "report", c };
+    case "Notify": return { op: "notify", c };
+    default: throw new Error(`no mapping for model action ${hop.label}`);
   }
 }
 
+const sortWire = (wire: WireRecord[]) =>
+  wire.map(w => ({ c: w.c, hop: w.hop, kind: w.kind, dest: w.dest })).map(w => JSON.stringify(w)).sort();
+
+// The refinement mapping: each connection's own fields, the wire as a set, the
+// failure records as a set, and the number of claims must equal the model's.
+// `tamper` expects a 407 to open the tunnel, to prove the checks can fail.
+function connCheck(walks: Walk[], graph: Graph, results: Result[], tamper: boolean): Outcome {
+  return check(walks, graph, results, (hop, t, result, expect) => {
+    for (const c of conns) {
+      for (const field of perConn) {
+        const model = tamper && field === "phase" && hop.label === "TunnelFails" && t.answer[c] === "auth" ? "open" : t[field][c];
+        expect(`${c}.${field}`, model, result.conns[c][field]);
+      }
+    }
+    expect("wire", sortWire(t.wire as WireRecord[]), sortWire(result.wire));
+    expect("records", sortSet(t.records), [...result.records].sort());
+    expect("claimed", sortSet(t.claimed).length, result.claimed);
+  }, result => result.error);
+}
+
+// ---- NetProxyEnv.tla: the environment ----
+
+const envConstants = [
+  "Guard = \"upper_only\"", "BorrowHost = FALSE", "BorrowNoProxy = FALSE", "AcceptsUnderscore = TRUE", "AcceptsBang = FALSE",
+  "NamesReasons = TRUE",
+];
+
+function envStart(init: Model): Op {
+  return { op: "env_reset", rm: init.rm, up: init.up, lo: init.lo, hs: init.hs, ph: init.ph, np: init.np, cls: init.cls };
+}
+
+function envOp(hop: Hop, graph: Graph): Op {
+  const to = graph.states.get(hop.to)!;
+  switch (hop.label) {
+    case "Snap": return { op: "env_snap" };
+    case "SetHost": return { op: "env_set_host", ph: to.ph };
+    case "SetNoProxy": return { op: "env_set_no_proxy", np: to.np };
+    case "Route": return { op: "env_route" };
+    case "Parse": return { op: "env_parse" };
+    default: throw new Error(`no mapping for model action ${hop.label}`);
+  }
+}
+
+const sortObs = (obs: Obs[]) => obs.map(o => JSON.stringify({ http: o.http, host: o.host, internal: o.internal })).sort();
+
+// What the snapshot holds, read live from its memory, and every route decided
+// so far, must equal the model's; s_np is the model's own record of the list
+// the snapshot read, which the code shows only through the routes.
+function envCheck(walks: Walk[], graph: Graph, results: EnvResult[]): Outcome {
+  return check(walks, graph, results, (_hop, t, result, expect) => {
+    expect("snapped", t.snapped, result.snapped);
+    expect("s_http", t.s_http, result.s_http);
+    expect("s_https", t.s_https, result.s_https);
+    expect("s_host", t.s_host, result.s_host);
+    expect("obs", sortObs(t.obs as Obs[]), sortObs(result.obs));
+    expect("parsed", t.parsed, result.parsed);
+    expect("accepted", t.accepted, result.accepted);
+    expect("reason", t.reason, result.reason);
+  }, result => result.error);
+}
+
+// ---- main ----
+
+const out = outDir("net-proxy-driver");
+const started = performance.now();
+if (options.binaryOnly) {
+  const passed = await runBinaryScenarios(out, options.selfCheck);
+  console.log(`${passed ? "ok" : "FAIL"} in ${Math.round(performance.now() - started)} ms; output in ${out}`);
+  process.exit(passed ? 0 : 1);
+}
+
+const module = join(REPO_ROOT, "src", "core", "shared", "net_proxy.zig");
+
+const connGraph = await loadGraph(out, "conn", "NetProxy", connConstants);
+const connWalks = [...edgeWalks(connGraph), ...randomWalks(connGraph, options.seed)];
+const connBin = buildLab(connLab, module, out, "net_proxy_lab");
+const connStart = (init: Model): Op => ({ op: "walk", targets: init.target });
+const runConn = (bin: string, name: string) => runLab<Result>(bin, connWalks, connGraph, out, name, connStart, connOp);
+const connOutcome = connCheck(connWalks, connGraph, runConn(connBin, "net_proxy_lab"), false);
+let ok = report("connections", connWalks, connOutcome);
+ok = coverage(connOutcome, ["Lookup", "SendConnect", "ProxyAnswers", "TunnelOpens", "TunnelFails", "SendStep", "Report", "Notify"]) && ok;
+
+const envGraph = await loadGraph(out, "env", "NetProxyEnv", envConstants);
+const envWalks = [...edgeWalks(envGraph), ...randomWalks(envGraph, options.seed)];
+const envBin = buildLab(envLab, module, out, "net_proxy_env_lab");
+const runEnv = (bin: string, name: string) => runLab<EnvResult>(bin, envWalks, envGraph, out, name, envStart, envOp);
+const envOutcome = envCheck(envWalks, envGraph, runEnv(envBin, "net_proxy_env_lab"));
+ok = report("environment", envWalks, envOutcome) && ok;
+ok = coverage(envOutcome, ["Snap", "SetHost", "SetNoProxy", "Route", "Parse"]) && ok;
+
 if (options.selfCheck) {
-  // Planted defects in the core, each one expression of net_proxy.zig.
+  // Planted defects in the core, each one expression of net_proxy.zig, and the
+  // lab whose walks must catch it.
   const source = readFileSync(module, "utf8");
-  const mutants = [
+  const mutants: { name: string; lab: "conn" | "env"; target: string; planted: string }[] = [
     {
       name: "opens the tunnel on a 407",
+      lab: "conn",
       target: "if (status >= 200 and status < 300) return .ok;",
       planted: "if (status >= 200 and status < 500) return .ok;",
     },
     {
       name: "ignores NO_PROXY",
+      lab: "conn",
       target: "if (noProxyMatches(entry, host, port)) return .direct;",
       planted: "if (noProxyMatches(entry, host, port) and port == 0) return .direct;",
     },
     {
       name: "sends CONNECT without Proxy-Authorization",
+      lab: "conn",
       target: "if (authorization) |value| try w.print(\"Proxy-Authorization: {s}\\r\\n\", .{value});",
       planted: "_ = authorization;",
     },
     {
       name: "claims a failure logged for another target",
+      lab: "conn",
       target: "if (!entry.failure.targetIs(host, port)) continue;",
       planted: "if (!entry.failure.targetIs(host, port) and false) continue;",
+    },
+    {
+      name: "refuses an interim head",
+      lab: "conn",
+      target: "if (status >= 100 and status < 200 and status != 101) continue;",
+      planted: "if (status >= 100 and status < 200 and status != 101 and false) continue;",
+    },
+    {
+      name: "skips a 101 as if it were interim",
+      lab: "conn",
+      target: "if (status >= 100 and status < 200 and status != 101) continue;",
+      planted: "if (status >= 100 and status < 200) continue;",
+    },
+    {
+      name: "drops the proxy sentence from a retry notice",
+      lab: "conn",
+      target: "        @memcpy(out[len..][0..sentence.len], sentence);\n        return out[0 .. len + sentence.len];",
+      planted: "        @memcpy(out[len..][0..sentence.len], sentence);\n        out[len] = '#';\n        return out[0 .. len + sentence.len];",
+    },
+    {
+      name: "keeps a slice of the environment for the proxy host",
+      lab: "env",
+      target: "        .host = host,\n        .port = port,",
+      planted: "        .host = bare,\n        .port = port,",
+    },
+    {
+      name: "keeps a slice of the environment for a NO_PROXY domain",
+      lab: "env",
+      target: "parsed.domain = copy;",
+      planted: "parsed.domain = if (copy.len == 0) copy else parsed.domain;",
+    },
+    {
+      name: "reads an uppercase HTTP_PROXY under REQUEST_METHOD",
+      lab: "env",
+      target: ".{ .name = \"HTTP_PROXY\", .value = if (cgi) null else upper_http },",
+      planted: ".{ .name = \"HTTP_PROXY\", .value = upper_http },",
+    },
+    {
+      name: "ignores a lowercase http_proxy under REQUEST_METHOD",
+      lab: "env",
+      target: ".{ .name = \"http_proxy\", .value = env.getenv(\"http_proxy\") },",
+      planted: ".{ .name = \"http_proxy\", .value = if (cgi) null else env.getenv(\"http_proxy\") },",
+    },
+    {
+      name: "refuses a proxy host with an underscore",
+      lab: "env",
+      target: "out.* = if (byte == '_') 'x' else byte;",
+      planted: "out.* = byte;",
+    },
+    {
+      name: "names every refusal the same way",
+      lab: "env",
+      target: "const component = uri.host orelse return refuse(found.name, .no_host, \"\");",
+      planted: "const component = uri.host orelse return refuse(found.name, .unreadable_url, \"\");",
     },
   ];
   let mutantsCaught = true;
@@ -321,15 +488,19 @@ if (options.selfCheck) {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "net_proxy.zig"), source.replace(mutant.target, mutant.planted));
     const name = `net_proxy_lab_mutant_${index}`;
-    const bin = buildLab(join(dir, "net_proxy.zig"), out, name);
-    const caught = check(walks, graph, runLab(bin, walks, graph, out, name), false).mismatches.length > 0;
+    const bin = buildLab(mutant.lab === "conn" ? connLab : envLab, join(dir, "net_proxy.zig"), out, name);
+    const caught = mutant.lab === "conn"
+      ? connCheck(connWalks, connGraph, runConn(bin, name), false).mismatches.length > 0
+      : envCheck(envWalks, envGraph, runEnv(bin, name)).mismatches.length > 0;
     console.log(`self-check: core that ${mutant.name} ${caught ? "rejected" : "NOT rejected"}`);
     mutantsCaught &&= caught;
   });
-  const tamperCaught = check(walks, graph, results, true).mismatches.length > 0;
+  const tamperCaught = connCheck(connWalks, connGraph, runConn(connBin, "net_proxy_lab"), true).mismatches.length > 0;
   console.log(`self-check: tampered expectation ${tamperCaught ? "rejected" : "NOT rejected"}`);
   ok = ok && mutantsCaught && tamperCaught;
 }
+
+if (!options.noBinary) ok = (await runBinaryScenarios(out, options.selfCheck)) && ok;
 
 console.log(`${ok ? "ok" : "FAIL"} in ${Math.round(performance.now() - started)} ms; output in ${out}`);
 process.exit(ok ? 0 : 1);

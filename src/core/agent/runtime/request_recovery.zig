@@ -36,6 +36,7 @@ const builtin = @import("builtin");
 const recovery = @import("../../recovery/recovery.zig");
 const types = @import("../../shared/types.zig");
 const io_mod = @import("../../shared/io.zig");
+const net_proxy = @import("../../shared/net_proxy.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const runtime_deps = @import("deps.zig");
@@ -56,6 +57,9 @@ const cancel_poll_ms: u64 = 25;
 const ticker_interval_ns: i96 = if (builtin.is_test) 5 * std.time.ns_per_ms else tick_ms * std.time.ns_per_ms;
 /// The virtual boot clock tests start at.
 const test_epoch_ms: u64 = 1_000_000;
+/// Room for the proxy sentence a status carries. `net_proxy.statusWithProxy`
+/// cuts it to the status's own 95 bytes, so more is never shown.
+const proxy_note_capacity = 160;
 
 /// The module's failure kind for each of fx's transient causes, and null for
 /// a cause that never reaches it. Every failure site in the turn loop reports
@@ -113,6 +117,12 @@ pub const RequestRecovery = struct {
     ticker_wake: std.Io.Condition = .init,
     /// Single-threaded builds tick from the transport's cooperative pulse.
     inner_pulse: ?agent_stream_provider.CooperativePulse = null,
+    /// The sentence of the proxy failure that ended the latest send, when it
+    /// failed at the proxy: every waiting and retrying status carries it until
+    /// a send gets an answer, so the person is not told only that the network
+    /// is down (`tests/tla/net_proxy/NetProxy.tla` RetryNoticeNamesProxy).
+    proxy_note: [proxy_note_capacity]u8 = undefined,
+    proxy_note_len: u8 = 0,
     /// The module's newest save, and whether it reached the turn.
     record: ?recovery.Record = null,
     record_written: bool = false,
@@ -242,9 +252,23 @@ pub const RequestRecovery = struct {
     /// which only compaction does. Any other kind makes the module wait or
     /// ask the user; the caller then calls `waitForSend`.
     pub fn failed(self: *RequestRecovery, failure: Failure) !?Send {
+        return self.failedWith(failure, null);
+    }
+
+    /// `failed`, for a send that failed at the proxy: `proxy_failure` is the
+    /// sentence the connection held (`net_proxy_io.takeRequestFailure`), and
+    /// the statuses that follow carry it. Null for any other failure, which
+    /// drops the sentence of an earlier one.
+    pub fn failedWith(self: *RequestRecovery, failure: Failure, proxy_failure: ?[]const u8) !?Send {
         // An answer given before this failure answers nothing.
         if (self.continue_flag) |flag| flag.store(false, .seq_cst);
-        return self.event(.{ .failed = failure });
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const note = proxy_failure orelse "";
+        self.proxy_note_len = @intCast(@min(note.len, self.proxy_note.len));
+        @memcpy(self.proxy_note[0..self.proxy_note_len], note[0..self.proxy_note_len]);
+        return self.stepLocked(.{ .failed = failure });
     }
 
     /// Whether the host can answer a request that needs the user. Hosts that
@@ -485,6 +509,12 @@ pub const RequestRecovery = struct {
         // fx is exiting with the clean record saved; nothing replaces it.
         if (self.closed) return null;
         const now_ms = self.nowMs();
+        // A send that gets an answer, or a request that ends, has no proxy
+        // failure to name.
+        switch (value) {
+            .responding, .succeeded, .user_cancel => self.proxy_note_len = 0,
+            else => {},
+        }
         const plan = recovery.step(&self.state, value, now_ms);
         if (plan.send) |send| {
             self.attempts +|= 1;
@@ -542,7 +572,9 @@ pub const RequestRecovery = struct {
     }
 
     fn showLocked(self: *RequestRecovery, status: recovery.Status) !void {
-        if (types.RouteRecoveryStatus.fromRecovery(status, self.attempts)) |shown| {
+        if (types.RouteRecoveryStatus.fromRecovery(status, self.attempts)) |module_status| {
+            var shown = module_status;
+            self.nameProxyLocked(&shown);
             self.recovery_shown = true;
             self.host_showing = true;
             try self.deps.push_route_recovery_status(self.deps.ctx, shown);
@@ -550,6 +582,21 @@ pub const RequestRecovery = struct {
             self.host_showing = false;
             try self.deps.push_event(self.deps.ctx, .clear_route_recovery_status);
         }
+    }
+
+    /// Adds the held proxy sentence to a waiting or retrying status. The text
+    /// stays the module's 95 bytes (`net_proxy.statusWithProxy`), and the
+    /// 46-column short form, which has no room for a proxy, stays as it is.
+    fn nameProxyLocked(self: *RequestRecovery, status: *types.RouteRecoveryStatus) void {
+        if (self.proxy_note_len == 0) return;
+        switch (status.kind) {
+            .waiting, .retrying => {},
+            else => return,
+        }
+        var text: [recovery.Text.capacity]u8 = undefined;
+        const named = net_proxy.statusWithProxy(&text, status.text.slice(), self.proxy_note[0..self.proxy_note_len]);
+        @memcpy(status.text.bytes[0..named.len], named);
+        status.text.len = @intCast(named.len);
     }
 
     fn nowMs(self: *RequestRecovery) u64 {
@@ -806,6 +853,102 @@ test "the countdown refreshes once a second while waiting" {
     try std.testing.expectEqualStrings("Rate limited · next try in 2s · attempt 1", texts[1]);
     try std.testing.expectEqualStrings("Rate limited · next try in 1s · attempt 1", texts[2]);
     try std.testing.expectEqualStrings("Rate limited · retrying · attempt 2", texts[3]);
+}
+
+test "a send that failed at the proxy names it in every status until another failure or an answer" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    const dead = "could not connect to proxy 127.0.0.1:54321 (connection refused)";
+    _ = try request.start(false, null);
+    _ = try request.failedWith(.{ .kind = .offline }, dead);
+    _ = (try request.waitForSend()).?;
+    var buf: [8][]const u8 = undefined;
+    var texts = statusTexts(&fake, &buf);
+    try std.testing.expectEqual(@as(usize, 2), texts.len);
+    try std.testing.expectEqualStrings("Offline \u{b7} next try in 1s \u{b7} " ++ dead, texts[0]);
+    // The attempt gives way so the sentence stays whole in 95 bytes.
+    try std.testing.expectEqualStrings("Offline \u{b7} retrying \u{b7} " ++ dead, texts[1]);
+
+    // Another failure that is not the proxy's drops the sentence.
+    _ = try request.failed(.{ .kind = .dropped });
+    texts = statusTexts(&fake, &buf);
+    try std.testing.expectEqualStrings("Connection lost \u{b7} next try in 1s \u{b7} attempt 2", texts[texts.len - 1]);
+
+    // The next one at the proxy names it again, and an answer ends it.
+    _ = (try request.waitForSend()).?;
+    _ = try request.failedWith(.{ .kind = .offline }, dead);
+    texts = statusTexts(&fake, &buf);
+    try std.testing.expect(std.mem.endsWith(u8, texts[texts.len - 1], dead));
+    _ = (try request.waitForSend()).?;
+    request.responding();
+    try request.succeeded();
+    const shown = fake.route_recovery_statuses.items;
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.recovered, shown[shown.len - 1].kind);
+    try std.testing.expectEqual(@as(usize, 0), shown[shown.len - 1].text.len);
+}
+
+test "a long proxy sentence keeps itself whole, and no status passes 95 bytes" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    const refused = "proxy 127.0.0.1:54321 refused CONNECT to proxy-target.test:443: 502 Bad Gateway";
+    _ = try request.start(false, null);
+    for (0..12) |_| {
+        _ = try request.failedWith(.{ .kind = .offline }, refused);
+        _ = (try request.waitForSend()).?;
+    }
+    try std.testing.expect(fake.route_recovery_statuses.items.len >= 24);
+    for (fake.route_recovery_statuses.items) |status| {
+        try std.testing.expect(status.text.len <= recovery.Text.capacity);
+        try std.testing.expect(std.mem.startsWith(u8, status.text.slice(), "Offline"));
+        try std.testing.expect(std.mem.endsWith(u8, status.text.slice(), refused));
+        try std.testing.expect(std.unicode.utf8ValidateSlice(status.text.slice()));
+    }
+
+    // A sentence past any room is cut, and the status still fits.
+    var long: [200]u8 = @splat('p');
+    _ = try request.failedWith(.{ .kind = .dropped }, &long);
+    const last = fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1];
+    try std.testing.expect(last.text.len <= recovery.Text.capacity);
+    try std.testing.expect(std.mem.endsWith(u8, last.text.slice(), "\u{2026}"));
+}
+
+test "failures that set the proxy sentence race neither the status ticker nor a send" {
+    if (comptime builtin.single_threaded) return error.SkipZigTest;
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    request.ticker_enabled = true;
+    defer request.deinit();
+
+    _ = try request.start(false, null);
+    const io = io_mod.getIo();
+    for (0..100) |i| {
+        _ = try request.failedWith(.{ .kind = .dropped }, if (i % 2 == 0) "proxy 127.0.0.1:3128 did not answer CONNECT to x.ai:443" else null);
+        _ = (try request.waitForSend()).?;
+        // The ticker publishes the retrying status while this thread goes on.
+        request.beginSend();
+        _ = request.virtual_now_ms.fetchAdd(1_000, .seq_cst);
+        io.sleep(.fromNanoseconds(2 * std.time.ns_per_ms), .awake) catch {};
+        request.endSend();
+    }
+    request.mutex.lockUncancelable(io);
+    defer request.mutex.unlock(io);
+    for (fake.route_recovery_statuses.items) |status| {
+        try std.testing.expect(status.text.len <= recovery.Text.capacity);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(status.text.slice()));
+    }
 }
 
 test "the in-flight ticker hands the line back to the thinking row" {

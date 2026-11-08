@@ -338,7 +338,11 @@ fn isRedirectStatus(status: std.http.Status) bool {
 
 fn resolveDefault(_: *anyopaque, alloc: Allocator, host: []const u8, port: u16, options: FetchOptions) anyerror![]IpAddress {
     try checkControl(options);
-    const host_name = try std.Io.net.HostName.init(host);
+    return resolveName(alloc, try std.Io.net.HostName.init(host), port, options);
+}
+
+fn resolveName(alloc: Allocator, host_name: std.Io.net.HostName, port: u16, options: FetchOptions) anyerror![]IpAddress {
+    try checkControl(options);
     if (options.deadline) |deadline| return resolveWithDeadline(alloc, host_name, port, deadline, options);
     return collectLookup(alloc, host_name, port, options);
 }
@@ -476,7 +480,7 @@ fn connectThroughProxy(ctx: *anyopaque, address: IpAddress, options: FetchOption
     const target_port = address.getPort();
     const fd = connectProxy(tunnel.alloc, proxy, options) catch |err| {
         if (err != error.Canceled and err != error.Cancelled) {
-            net_proxy_io.holdForRequest(net_proxy.Failure.init(.unreachable_proxy, proxy.host, proxy.port, target_host, target_port).withDetail(@errorName(err)));
+            net_proxy_io.holdForRequest(net_proxy_io.unreachableProxyFailure(proxy, target_host, target_port, err));
         }
         return err;
     };
@@ -521,7 +525,9 @@ fn connectProxy(alloc: Allocator, proxy: net_proxy.Proxy, options: FetchOptions)
     if (IpAddress.parse(proxy.host, proxy.port)) |address| {
         return connectPinned(address, options);
     } else |_| {}
-    const addresses = try resolveDefault(undefined, alloc, proxy.host, proxy.port, options);
+    // The proxy's host was checked when the snapshot read it. HostName.init
+    // would refuse the underscores that service names such as squid_proxy have.
+    const addresses = try resolveName(alloc, .{ .bytes = proxy.host }, proxy.port, options);
     defer alloc.free(addresses);
     var last_err: anyerror = error.NoAddressReturned;
     for (addresses) |address| {
@@ -4211,7 +4217,7 @@ fn testTunnelTransport(answer: IpAddress) Transport {
 
 const TestProxyEnv = struct {
     proxy: []const u8,
-    pub fn get(e: TestProxyEnv, name: []const u8) ?[]const u8 {
+    pub fn getenv(e: TestProxyEnv, name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, name, "HTTPS_PROXY") or std.mem.eql(u8, name, "HTTP_PROXY")) return e.proxy;
         return null;
     }

@@ -15,7 +15,8 @@
 // Every fx run gets an environment built from nothing but what the test
 // writes out, so no proxy or credential from the developer's shell leaks in.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
@@ -123,28 +124,50 @@ function serveGateway(text = "GATEWAY_PROXY_OK") {
   return { ...gateway, env: { FX_GATEWAY_BASE_URL: gateway.base, FX_GATEWAY_CHAT_URL: `${gateway.base}/v4/ai/language-model` } };
 }
 
+type Output = { stdout: string; stderr: string };
+
 /**
  * Runs the built fx with exactly `env` and nothing inherited. `until` is
- * polled while it runs; once it holds, fx is stopped after `graceMs`.
+ * polled with the output so far while it runs; once it holds, fx is stopped
+ * after `graceMs`.
  */
-async function runFx(argv: string[], env: Record<string, string>, options: { timeoutMs?: number; until?: () => boolean; graceMs?: number } = {}): Promise<Run> {
+async function runFx(argv: string[], env: Record<string, string>, options: { timeoutMs?: number; until?: (output: Output) => boolean; graceMs?: number } = {}): Promise<Run> {
   const started = performance.now();
   const child = Bun.spawn([FX_BIN, ...argv], { cwd: env.HOME, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const output: Output = { stdout: "", stderr: "" };
+  const pump = async (stream: ReadableStream<Uint8Array>, key: keyof Output) => {
+    const decoder = new TextDecoder();
+    const reader = stream.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      output[key] += decoder.decode(value, { stream: true });
+    }
+  };
+  const pumps = Promise.all([pump(child.stdout, "stdout"), pump(child.stderr, "stderr")]);
   const timer = setTimeout(() => child.kill(), options.timeoutMs ?? 30_000);
   let poll: ReturnType<typeof setInterval> | undefined;
   if (options.until) {
     poll = setInterval(() => {
-      if (!options.until!()) return;
+      if (!options.until!(output)) return;
       clearInterval(poll);
       setTimeout(() => child.kill(), options.graceMs ?? 500);
     }, 50);
   }
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
-  ]);
+  const code = await child.exited;
+  await pumps;
   clearTimeout(timer);
   if (poll) clearInterval(poll);
-  return { code: child.signalCode ? null : code, stdout, stderr, ms: performance.now() - started };
+  return { code: child.signalCode ? null : code, stdout: output.stdout, stderr: output.stderr, ms: performance.now() - started };
+}
+
+/** A loopback port nothing listens on: a proxy that is down. */
+async function closedPort(): Promise<number> {
+  const server = net.createServer();
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as net.AddressInfo).port;
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  return port;
 }
 
 function baseEnv(home: string, extra: Record<string, string>): Record<string, string> {
@@ -380,6 +403,249 @@ describe("net proxy", () => {
   }, TIMEOUT);
 });
 
+/** The retry notices `fx ask` printed on stderr, one per line. */
+function retryNoticeLines(stderr: string): string[] {
+  return stderr.split("\n").filter(line => /^\[notice\] (Offline|Connection lost)/.test(line));
+}
+
+function retryNotices(run: Run): string[] {
+  return retryNoticeLines(run.stderr);
+}
+
+describe("net proxy failures name the proxy", () => {
+  for (const family of [
+    { name: "AI Gateway", custom: false },
+    { name: "a custom chat-completions provider", custom: true },
+    { name: "a Codex subscription", custom: false, subscription: "codex" as const },
+    { name: "a Grok subscription", custom: false, subscription: "grok" as const },
+  ]) {
+    test(`${family.name}: a proxy fx cannot reach is retried, and the notices name it as the cause`, async () => {
+      const dead = await closedPort();
+      const gateway = serveGateway();
+      const subscription = family.subscription ? serveSubscription(family.subscription, "NEVER_REACHED") : null;
+      // Grok's client version is looked up before its first request, and a
+      // lookup that fails ends the run before any request. A second fake,
+      // which NO_PROXY keeps off the proxy, answers it, so the model request
+      // is what meets the dead proxy.
+      const version = family.subscription === "grok" ? serveLocal(() => new Response("1.0.13\n")) : null;
+      const home = newHome("dead-proxy");
+      try {
+        if (family.custom) writeProvider(home, `https://${TARGET}/v1`);
+        if (family.subscription) {
+          writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ auto_upgrade: false, permission_mode: "ask" }), { mode: 0o600 });
+          writeValidSubscriptionLogin(home, family.subscription);
+        }
+        const env = baseEnv(home, {
+          ...gateway.env,
+          ...(subscription ? subscription.env : {}),
+          ...(version ? { FX_TEST_GROK_VERSION_URL: `${version.base}/version`, NO_PROXY: `127.0.0.1:${version.port}` } : {}),
+          ...(family.custom ? {} : { FX_TEST_NET_PROXY_LOOPBACK: "1" }),
+          ...(family.custom || subscription ? {} : { FX_MODEL: "openai/gpt-5" }),
+          HTTPS_PROXY: `http://127.0.0.1:${dead}`,
+        });
+        if (subscription) delete env.AI_GATEWAY_API_KEY;
+        const run = await runFx(family.custom ? askCustom : ask, env, {
+          timeoutMs: 30_000,
+          until: ({ stderr }) => retryNoticeLines(stderr).length >= 2,
+        });
+        const sentence = `could not connect to proxy 127.0.0.1:${dead} (connection refused)`;
+        const notices = retryNotices(run);
+        expect(notices.length, show(run)).toBeGreaterThanOrEqual(2);
+        for (const line of notices) expect(line, show(run)).toContain(sentence);
+        expect(run.stderr).not.toContain("ConnectionRefused");
+        // Nothing reached the fake provider: every request needed the proxy.
+        expect(subscription?.remotePorts.length ?? 0).toBe(0);
+      } finally {
+        gateway.stop();
+        subscription?.stop();
+        version?.stop();
+      }
+    }, TIMEOUT);
+  }
+
+  test("a proxy that answers 502 is retried, and the notices name it and its answer", async () => {
+    const proxy = await startConnectProxy({ status: 502 });
+    const gateway = serveGateway();
+    const home = newHome("bad-gateway-notice");
+    try {
+      writeProvider(home, `https://${TARGET}/v1`);
+      // A sentence this long leaves no room in 95 bytes for "retrying", so the
+      // run is stopped on the second notice, not on a word.
+      const run = await runFx(askCustom, baseEnv(home, { ...gateway.env, HTTPS_PROXY: proxy.url() }), {
+        timeoutMs: 25_000,
+        until: ({ stderr }) => retryNoticeLines(stderr).length >= 2,
+      });
+      const sentence = `proxy 127.0.0.1:${proxy.port} refused CONNECT to ${TARGET}:443: 502 Bad Gateway`;
+      const notices = retryNotices(run);
+      expect(notices.length, show(run)).toBeGreaterThanOrEqual(2);
+      for (const line of notices) expect(line, show(run)).toContain(sentence);
+      for (const entry of proxy.log) expect(entry.requestLine).toBe(`CONNECT ${TARGET}:443 HTTP/1.1`);
+    } finally {
+      proxy.close();
+      gateway.stop();
+    }
+  }, TIMEOUT);
+
+  test("fx models names the proxy when it cannot connect through it", async () => {
+    const dead = await closedPort();
+    const bad = await startConnectProxy({ status: 502 });
+    const gateway = serveGateway();
+    try {
+      for (const { proxy, sentence } of [
+        { proxy: `http://127.0.0.1:${dead}`, sentence: `could not connect to proxy 127.0.0.1:${dead} (connection refused)` },
+        { proxy: bad.url(), sentence: `proxy 127.0.0.1:${bad.port} refused CONNECT to 127.0.0.1:${gateway.port}: 502 Bad Gateway` },
+      ]) {
+        const home = newHome("models-proxy");
+        const env = baseEnv(home, { ...gateway.env, FX_MODEL: "openai/gpt-5", HTTPS_PROXY: proxy, FX_TEST_NET_PROXY_LOOPBACK: "1" });
+        const run = await runFx(["models"], env, { timeoutMs: 45_000 });
+        expect(run.code, show(run)).toBe(1);
+        expect(run.stderr, show(run)).toContain(`fx models: could not list models: couldn't connect to AI Gateway: ${sentence}; check your network connection or firewall`);
+        const json = await runFx(["models", "--json"], env, { timeoutMs: 45_000 });
+        expect(JSON.parse(json.stdout).error, show(json)).toContain(sentence);
+      }
+    } finally {
+      bad.close();
+      gateway.stop();
+    }
+  }, 120_000);
+
+  test("a proxy that sends 102 before its 200 opens the tunnel, and one that sends 101 does not", async () => {
+    for (const interim of [102, 100]) {
+      const proxy = await startConnectProxy({ interim });
+      const provider = serveLocal(() => completion("custom-model", "INTERIM_PROXY_OK"));
+      const gateway = serveGateway();
+      const home = newHome("interim");
+      try {
+        writeProvider(home, `${provider.base}/v1`);
+        const run = await runFx(askCustom, baseEnv(home, { ...gateway.env, HTTPS_PROXY: proxy.url(), FX_TEST_NET_PROXY_LOOPBACK: "1" }));
+        expect(run.code, show(run)).toBe(0);
+        expect(run.stdout).toContain("INTERIM_PROXY_OK");
+        expect(proxy.log.some(entry => entry.requestLine === `CONNECT 127.0.0.1:${provider.port} HTTP/1.1`), JSON.stringify(proxy.log)).toBe(true);
+        for (const port of provider.remotePorts) expect(proxy.upstreamPorts.has(port)).toBe(true);
+      } finally {
+        proxy.close();
+        provider.stop();
+        gateway.stop();
+      }
+    }
+    const refusing = await startConnectProxy({ status: 101 });
+    const gateway = serveGateway();
+    const home = newHome("switching");
+    try {
+      writeProvider(home, `https://${TARGET}/v1`);
+      const run = await runFx(askCustom, baseEnv(home, { ...gateway.env, HTTPS_PROXY: refusing.url() }), { timeoutMs: 20_000 });
+      expect(run.code, show(run)).toBe(1);
+      expect(run.stderr).toContain(`proxy 127.0.0.1:${refusing.port} refused CONNECT to ${TARGET}:443: 101`);
+    } finally {
+      refusing.close();
+      gateway.stop();
+    }
+  }, 120_000);
+
+  test("a proxy host with an underscore is accepted, and its failure is named", async () => {
+    const gateway = serveGateway();
+    const home = newHome("underscore");
+    try {
+      writeProvider(home, `https://${TARGET}/v1`);
+      // .invalid never resolves, so the proxy cannot be reached; fx must say
+      // that, and not that the value is not a proxy URL.
+      const run = await runFx(askCustom, baseEnv(home, { ...gateway.env, HTTPS_PROXY: "http://squid_proxy.invalid:3128" }), {
+        timeoutMs: 25_000,
+        until: ({ stderr }) => stderr.includes("[notice] Offline"),
+      });
+      expect(run.stderr).not.toContain("is not a proxy URL fx can read");
+      expect(run.stderr, show(run)).toMatch(/could not connect to proxy squid_proxy\.invalid:3128 \((cannot resolve host|DNS lookup failed|host unreachable)\)/);
+    } finally {
+      gateway.stop();
+    }
+  }, TIMEOUT);
+
+  test("every refused proxy variable names its own reason, and never repeats hostile bytes", async () => {
+    const gateway = serveGateway();
+    const home = newHome("reasons");
+    try {
+      writeProvider(home, `https://${TARGET}/v1`);
+      for (const [value, message] of [
+        ["http:///path", "HTTPS_PROXY has no host name; use http://host:port"],
+        ["http://bad_host!:1", "HTTPS_PROXY has a host name fx cannot use: bad_host!"],
+        ["http://a%1b%5b31mb:80", "HTTPS_PROXY has a host name fx cannot use"],
+        ["http://proxy.test:99999", "HTTPS_PROXY has a port fx cannot use; use a number from 1 to 65535"],
+        ["http://[::1", "HTTPS_PROXY is not a proxy URL fx can read; use http://host:port"],
+      ] as const) {
+        const run = await runFx(askCustom, baseEnv(home, { ...gateway.env, HTTPS_PROXY: value }), { timeoutMs: 20_000 });
+        expect(run.code, show(run)).toBe(1);
+        expect(run.stderr, show(run)).toContain(`fx: ${message}`);
+        expect(run.stderr).not.toContain("\x1b[31m");
+      }
+    } finally {
+      gateway.stop();
+    }
+  }, TIMEOUT);
+
+  test("NO_PROXY entries fx drops are logged once, however long the list", async () => {
+    for (const extra of [2, 4_000]) {
+      const proxy = await startConnectProxy({ status: 407 });
+      const gateway = serveGateway();
+      const home = newHome("no-proxy-drops");
+      const trace = join(home, "net-proxy-trace.log");
+      try {
+        writeProvider(home, `https://${TARGET}/v1`);
+        // Two entries that do not parse, 1000 that fit, and `extra` past the limit.
+        const entries = ["bad:port", "10.0.0.0/33", ...Array.from({ length: 1000 + extra }, (_, i) => `d${i}.corp.test`)];
+        const run = await runFx(askCustom, baseEnv(home, {
+          ...gateway.env,
+          HTTPS_PROXY: proxy.url(),
+          NO_PROXY: entries.join(","),
+          FX_TRACE_LOG: trace,
+          FX_TRACE_SCOPES: "net_proxy",
+        }), { timeoutMs: 20_000 });
+        expect(run.code, show(run)).toBe(1);
+        expect(run.stderr).toContain("refused CONNECT");
+        expect(existsSync(trace)).toBe(true);
+        const dropped = readFileSync(trace, "utf8").split("\n").filter(line => line.includes("no_proxy dropped"));
+        expect(dropped.length, dropped.join("\n")).toBe(1);
+        expect(dropped[0]).toContain(`invalid=2 over_limit=${extra}`);
+      } finally {
+        proxy.close();
+        gateway.stop();
+      }
+    }
+  }, 120_000);
+
+  test.skipIf(!tmuxAvailable())("the interactive app names a proxy it cannot reach in its status line", async () => {
+    const dead = await closedPort();
+    const gateway = serveGateway();
+    const home = newHome("tui-dead");
+    writeProvider(home, `https://${TARGET}/v1`);
+    const session = await TmuxSession.create({
+      cwd: home,
+      width: 200,
+      isolated: true,
+      env: {
+        ...baseEnv(home, gateway.env),
+        HTTPS_PROXY: `http://127.0.0.1:${dead}`,
+        HTTP_PROXY: undefined,
+        ALL_PROXY: undefined,
+        NO_PROXY: undefined,
+        https_proxy: undefined,
+        http_proxy: undefined,
+        all_proxy: undefined,
+        no_proxy: undefined,
+      },
+    });
+    try {
+      await session.waitForComposer();
+      await session.sendText("hi");
+      await session.sendKeys("Enter");
+      const pane = await session.waitForText(`could not connect to proxy 127.0.0.1:${dead} (connection refused)`, 25_000);
+      expect(pane).toContain("Offline");
+    } finally {
+      await session.kill();
+      gateway.stop();
+    }
+  }, TIMEOUT);
+});
+
 type Subscription = "codex" | "grok";
 const SUBSCRIPTION_ACCOUNT = "acct_net_proxy_e2e";
 
@@ -398,6 +664,17 @@ function writeExpiredSubscriptionLogin(home: string, provider: Subscription) {
     access_token: subscriptionAccessToken(provider, "stale"),
     refresh_token: `${provider}-refresh`,
     expires_at_ms: Date.now() - 60_000,
+    account_id: SUBSCRIPTION_ACCOUNT,
+  }) + "\n", { mode: 0o600 });
+}
+
+/** A sign-in that has not expired, so fx goes straight to the model request. */
+function writeValidSubscriptionLogin(home: string, provider: Subscription) {
+  writeFileSync(join(home, ".fx", provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json"), JSON.stringify({
+    version: 1,
+    access_token: subscriptionAccessToken(provider, "fresh"),
+    refresh_token: `${provider}-refresh`,
+    expires_at_ms: Date.now() + 3_600_000,
     account_id: SUBSCRIPTION_ACCOUNT,
   }) + "\n", { mode: 0o600 });
 }

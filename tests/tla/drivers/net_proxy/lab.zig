@@ -11,9 +11,11 @@
 //! proxy's canned answer goes through the real `readConnectAnswer`; anything
 //! but `.ok` fails the connection with the real `connectError` and adds the
 //! real failure to the real `FailureLog`. A report claims from that log only
-//! when the real `isProxyFailureError` says the failure came from the proxy.
-//! After every operation it reports what each connection holds, what went on
-//! the wire, and the log's records and claims.
+//! when the real `isProxyFailureError` says the failure came from the proxy. A
+//! failure fx retries claims the same way for its retry notice, and the real
+//! `statusWithProxy` puts the sentence into a status line, which must fit its
+//! 95 bytes and keep the sentence. After every operation it reports what each
+//! connection holds, what went on the wire, and the log's records and claims.
 const std = @import("std");
 const net_proxy = @import("net_proxy");
 const url_policy = @import("url_policy");
@@ -32,6 +34,8 @@ const ConnOut = struct {
     answer: []const u8,
     shown: []const u8,
     got: []const u8,
+    notice: []const u8,
+    ngot: []const u8,
 };
 const Wire = struct { c: []const u8, hop: []const u8, kind: []const u8, dest: []const u8 };
 
@@ -44,7 +48,7 @@ const Result = struct {
 };
 
 const Env = struct {
-    pub fn get(_: Env, name: []const u8) ?[]const u8 {
+    pub fn getenv(_: Env, name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, name, "https_proxy")) return "http://user:pass@proxy.example:3128";
         if (std.mem.eql(u8, name, "no_proxy")) return "bypass.example";
         return null;
@@ -58,12 +62,23 @@ const Conn = struct {
     answer: []const u8 = "none",
     shown: []const u8 = "unread",
     got: []const u8 = "none",
+    notice: []const u8 = "unread",
+    ngot: []const u8 = "none",
     canned: []const u8 = "",
     since: u64 = 0,
     err: ?anyerror = null,
 
     fn out(c: Conn) ConnOut {
-        return .{ .target = c.target, .phase = c.phase, .route = c.route, .answer = c.answer, .shown = c.shown, .got = c.got };
+        return .{
+            .target = c.target,
+            .phase = c.phase,
+            .route = c.route,
+            .answer = c.answer,
+            .shown = c.shown,
+            .got = c.got,
+            .notice = c.notice,
+            .ngot = c.ngot,
+        };
     }
 };
 
@@ -135,7 +150,9 @@ fn cannedAnswer(a: []const u8) []const u8 {
     if (is(a, "auth")) return "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"p\"\r\n\r\n";
     if (is(a, "refused")) return "HTTP/1.1 503 Service Unavailable\r\n\r\n";
     if (is(a, "garbage")) return "\x16\x03\x01\x00\x05hello";
-    return ""; // silent: the caller's deadline ends the read with nothing
+    if (is(a, "interim")) return "HTTP/1.1 102 Processing\r\n\r\nHTTP/1.1 200 Connection established\r\n\r\n";
+    if (is(a, "switching")) return "HTTP/1.1 101 Switching Protocols\r\n\r\nHTTP/1.1 200 OK\r\n\r\n";
+    return ""; // silent, or dead: nothing is read
 }
 
 fn run(lab: *Lab, op: Op) !void {
@@ -190,11 +207,16 @@ fn run(lab: *Lab, op: Op) !void {
         c.phase = "answered";
     } else if (is(op.op, "finish_connect")) {
         if (!is(c.phase, "answered")) return error.FinishWithoutAnswer;
-        var r = std.Io.Reader.fixed(c.canned);
-        const answer = try net_proxy.readConnectAnswer(&r);
         const proxy = net_proxy.route(&lab.snapshot, hostOf(c.target), 443, .https).tunnel;
         const host = try connectHost(c.target, &host_buf);
-        if (net_proxy.answerFailure(answer, proxy, host, 443)) |failure| {
+        // A proxy that is down never answers: the connection to it fails, as
+        // net_proxy_io.connectIp records it.
+        var r = std.Io.Reader.fixed(c.canned);
+        const failure_or_open: ?net_proxy.Failure = if (is(c.answer, "dead"))
+            net_proxy.Failure.init(.unreachable_proxy, proxy.host, proxy.port, host, 443).withDetail("connection refused")
+        else
+            net_proxy.answerFailure(try net_proxy.readConnectAnswer(&r), proxy, host, 443);
+        if (failure_or_open) |failure| {
             c.phase = "failed";
             c.err = net_proxy.connectError(&failure);
             lab.log.add(failure);
@@ -211,6 +233,29 @@ fn run(lab: *Lab, op: Op) !void {
             lab.record(.{ .c = name, .hop = "proxy", .kind = "tls", .dest = dest });
         } else return error.SendWithoutConnection;
         c.phase = "sent";
+    } else if (is(op.op, "notify")) {
+        if (!is(c.phase, "failed") or !is(c.notice, "unread")) return error.NotifyWithoutFailure;
+        const err = c.err orelse return error.FailureWithoutError;
+        c.notice = "generic";
+        if (net_proxy.isProxyFailureError(err)) {
+            const host = try connectHost(c.target, &host_buf);
+            if (lab.log.claim(host, 443, c.since)) |failure| {
+                c.notice = "proxy";
+                c.ngot = targetOfHost(failure.target());
+                lab.claimed += 1;
+                // The retry notice carries the sentence in a status line of
+                // 95 bytes, whatever the status says.
+                var sentence_buf: [512]u8 = undefined;
+                const sentence = failure.text(&sentence_buf);
+                var line: [95]u8 = undefined;
+                for ([_][]const u8{ "Offline \u{b7} next try in 1s", "Connection lost \u{b7} retrying \u{b7} attempt 112 \u{b7} 1h 02m" }) |status| {
+                    const text = net_proxy.statusWithProxy(&line, status, sentence);
+                    // A sentence longer than the line is cut; one that fits stays whole.
+                    if (text.len > line.len) return error.NoticePastItsRoom;
+                    if (sentence.len <= line.len and std.mem.find(u8, text, sentence) == null) return error.NoticeLacksProxySentence;
+                }
+            }
+        }
     } else if (is(op.op, "report")) {
         if (!is(c.phase, "failed") or !is(c.shown, "unread")) return error.ReportWithoutFailure;
         const err = c.err orelse return error.FailureWithoutError;

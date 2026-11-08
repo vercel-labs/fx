@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const net_proxy = @import("net_proxy.zig");
 const io_mod = @import("io.zig");
 const debug_trace = @import("debug_trace.zig");
+const types = @import("types.zig");
 
 const HostName = std.Io.net.HostName;
 const IpAddress = std.Io.net.IpAddress;
@@ -66,17 +67,30 @@ var snapshot_ready: std.atomic.Value(bool) = .init(false);
 var snapshot_lock: std.Io.Mutex = .init;
 
 const ProcessEnv = struct {
-    pub fn get(_: ProcessEnv, name: []const u8) ?[]const u8 {
+    pub fn getenv(_: ProcessEnv, name: []const u8) ?[]const u8 {
         return io_mod.getenv(name);
     }
 };
+
+/// Reads the snapshot from `env`, and says in the trace what it dropped of the
+/// person's own settings: NO_PROXY entries that are not an entry or are past
+/// the limit, and an uppercase HTTP_PROXY a set REQUEST_METHOD makes it ignore.
+fn parseSnapshot(env: anytype) void {
+    net_proxy.parse(&snapshot, env);
+    if (snapshot.no_proxy_invalid != 0 or snapshot.no_proxy_over_limit != 0) {
+        debug_trace.logf("net_proxy", "no_proxy dropped invalid={d} over_limit={d}", .{ snapshot.no_proxy_invalid, snapshot.no_proxy_over_limit });
+    }
+    if (snapshot.http_proxy_ignored) {
+        debug_trace.logf("net_proxy", "HTTP_PROXY ignored because REQUEST_METHOD is set", .{});
+    }
+}
 
 fn current(io: std.Io) *const net_proxy.Snapshot {
     if (snapshot_ready.load(.acquire)) return &snapshot;
     snapshot_lock.lockUncancelable(io);
     defer snapshot_lock.unlock(io);
     if (!snapshot_ready.load(.acquire)) {
-        net_proxy.parse(&snapshot, ProcessEnv{});
+        parseSnapshot(ProcessEnv{});
         snapshot_ready.store(true, .release);
     }
     return &snapshot;
@@ -205,10 +219,30 @@ pub fn clearRequestFailure() void {
 /// The text of the proxy failure this thread's request holds, when `err` is
 /// one a proxy failure returns. Clears what it read either way.
 pub fn takeRequestFailure(err: anyerror, buf: []u8) ?[]const u8 {
+    if (!net_proxy.isProxyFailureError(err)) {
+        request_failure = null;
+        return null;
+    }
+    return takeHeldFailure(buf);
+}
+
+/// The text of the proxy failure this thread holds, for a caller that knows
+/// its own failure was a transport failure but not which error it was, as
+/// `fx models` does. Clears what it read.
+pub fn takeHeldFailure(buf: []u8) ?[]const u8 {
     const failure = request_failure orelse return null;
     request_failure = null;
-    if (!net_proxy.isProxyFailureError(err)) return null;
     return failure.text(buf);
+}
+
+/// The failure of a connection fx could not open to the proxy itself, for
+/// `target_host:target_port`. `err` is what the connect returned; the failure
+/// says it in plain words, as fx says every error, and keeps the raw name for
+/// the trace.
+pub fn unreachableProxyFailure(proxy: net_proxy.Proxy, target_host: []const u8, target_port: u16, err: anyerror) net_proxy.Failure {
+    var words: [64]u8 = undefined;
+    return net_proxy.Failure.init(.unreachable_proxy, proxy.host, proxy.port, target_host, target_port)
+        .withDetail(types.plainErrorText(@errorName(err), &words));
 }
 
 fn lookup(
@@ -261,7 +295,7 @@ fn connectIp(
     };
     const stream = connectProxy(io, proxy, options) catch |err| {
         if (err == error.Canceled) return error.Canceled;
-        recordFailure(io, net_proxy.Failure.init(.unreachable_proxy, proxy.host, proxy.port, target.name(), target.port).withDetail(@errorName(err)));
+        recordFailure(io, unreachableProxyFailure(proxy, target.name(), target.port, err));
         return switch (err) {
             error.Canceled => unreachable,
             error.ConnectionRefused, error.HostUnreachable, error.NetworkUnreachable, error.NetworkDown, error.Timeout, error.AccessDenied, error.ConnectionResetByPeer => |e| e,
@@ -312,7 +346,9 @@ fn connectProxy(io: std.Io, proxy: net_proxy.Proxy, options: IpAddress.ConnectOp
     if (IpAddress.parse(proxy.host, proxy.port)) |address| {
         return address.connect(io, options);
     } else |_| {}
-    const host = try HostName.init(proxy.host);
+    // The proxy's host was checked when the snapshot read it, and HostName.init
+    // would refuse the underscores that service names such as squid_proxy have.
+    const host: HostName = .{ .bytes = proxy.host };
     return host.connect(io, proxy.port, options);
 }
 
@@ -320,7 +356,7 @@ fn connectProxy(io: std.Io, proxy: net_proxy.Proxy, options: IpAddress.ConnectOp
 /// `resetSnapshotForTest`, so later tests read the process environment again.
 pub fn useSnapshotForTest(env: anytype) void {
     if (!builtin.is_test) @compileError("useSnapshotForTest is for tests");
-    net_proxy.parse(&snapshot, env);
+    parseSnapshot(env);
     snapshot_ready.store(true, .release);
 }
 
@@ -337,7 +373,7 @@ pub fn resetSnapshotForTest() void {
 
 const TestEnv = struct {
     pairs: []const [2][]const u8,
-    pub fn get(e: TestEnv, name: []const u8) ?[]const u8 {
+    pub fn getenv(e: TestEnv, name: []const u8) ?[]const u8 {
         for (e.pairs) |pair| if (std.mem.eql(u8, pair[0], name)) return pair[1];
         return null;
     }
@@ -398,6 +434,24 @@ const FakeProxy = struct {
 
 fn testConnect(io: std.Io, host: []const u8, port: u16) (HostName.ConnectError || HostName.ValidateError)!std.Io.net.Stream {
     return (try HostName.init(host)).connect(io, port, .{ .mode = .stream });
+}
+
+test "a proxy fx cannot connect to is named with the cause in plain words, never a raw error name" {
+    const proxy: net_proxy.Proxy = .{ .host = "127.0.0.1", .port = 3128, .authorization = null, .variable = "HTTPS_PROXY" };
+    const cases = [_]struct { anyerror, []const u8 }{
+        .{ error.ConnectionRefused, "could not connect to proxy 127.0.0.1:3128 (connection refused)" },
+        .{ error.AccessDenied, "could not connect to proxy 127.0.0.1:3128 (permission denied)" },
+        .{ error.UnknownHostName, "could not connect to proxy 127.0.0.1:3128 (cannot resolve host)" },
+        .{ error.NameServerFailure, "could not connect to proxy 127.0.0.1:3128 (DNS lookup failed)" },
+        .{ error.HostUnreachable, "could not connect to proxy 127.0.0.1:3128 (host unreachable)" },
+        // A name fx has no phrase for is split into words.
+        .{ error.SystemResources, "could not connect to proxy 127.0.0.1:3128 (system resources)" },
+    };
+    var buf: [256]u8 = undefined;
+    for (cases) |case| {
+        const failure = unreachableProxyFailure(proxy, "x.ai", 443, case[0]);
+        try std.testing.expectEqualStrings(case[1], failure.text(&buf));
+    }
 }
 
 test "a routed host is reached only through CONNECT, and the tunnel carries the bytes" {
@@ -553,7 +607,12 @@ test "a proxy that never answers is ended at the caller's deadline and leaves it
     var connect = try io.concurrent(IpAddress.connect, .{ &tunnel, io, .{ .mode = .stream } });
     // The deadline, without waiting for one: once the proxy holds the
     // CONNECT, the caller cancels, as a request's setup deadline does.
-    while (!proxy.head_done.load(.acquire)) try base.sleep(.fromMilliseconds(1), .awake);
+    // A connect that fails before it sends CONNECT must fail the test, not hang it.
+    var waited_ms: u32 = 0;
+    while (!proxy.head_done.load(.acquire)) : (waited_ms += 1) {
+        if (waited_ms >= 5_000) return error.TestProxyNeverRead;
+        try base.sleep(.fromMilliseconds(1), .awake);
+    }
     if (connect.cancel(io)) |stream| {
         stream.close(io);
         return error.TestExpectedCancel;

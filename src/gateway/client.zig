@@ -2456,7 +2456,28 @@ fn runBoundedStreamOperation(
     );
 }
 
+/// Runs `operation` on a task of its own, bounded by `deadline` and the cancel
+/// flag. An operation that names its `url` and fails at a proxy leaves the
+/// proxy's sentence on this thread for whoever shows the error, claimed here
+/// because the connection was made on the operation's task, not this thread
+/// (`net_proxy_io.zig`; `fx models` shows it).
 pub fn runBoundedHttpOperation(
+    comptime Result: type,
+    alloc: std.mem.Allocator,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: std.Io.Clock.Timestamp,
+    operation: anytype,
+) !Result {
+    const proxy_mark = net_proxy_io.beginOpen();
+    return runBoundedHttpOperationOnTask(Result, alloc, cancel_flag, deadline, operation) catch |err| {
+        if (comptime @hasField(@TypeOf(operation.*), "url")) {
+            if (std.Uri.parse(operation.url)) |uri| net_proxy_io.noteOpenFailure(uri, proxy_mark, err) else |_| {}
+        }
+        return err;
+    };
+}
+
+fn runBoundedHttpOperationOnTask(
     comptime Result: type,
     alloc: std.mem.Allocator,
     cancel_flag: *std.atomic.Value(bool),
@@ -12099,7 +12120,7 @@ test "two concurrent opens, one through a failing proxy: only that request names
     const proxy_url = try std.mem.print(&proxy_url_buf, "http://127.0.0.1:{d}", .{proxy.server.socket.address.getPort()});
     const Env = struct {
         proxy: []const u8,
-        pub fn get(e: @This(), name: []const u8) ?[]const u8 {
+        pub fn getenv(e: @This(), name: []const u8) ?[]const u8 {
             if (std.mem.eql(u8, name, "HTTPS_PROXY")) return e.proxy;
             if (std.mem.eql(u8, name, "NO_PROXY")) return "localhost";
             if (std.mem.eql(u8, name, "FX_TEST_NET_PROXY_LOOPBACK")) return "1";

@@ -13,8 +13,10 @@ Two connections run at once. Each has a target:
   fetch_public   a web_fetch URL whose local DNS answer is public
   fetch_private  a web_fetch URL whose local DNS answer is private
 The proxy requires credentials and answers each CONNECT with 200 (ok),
-407 (auth), 503 (refused), bytes that are not HTTP (garbage), or nothing
-before the caller's deadline (silent).
+407 (auth), 503 (refused), bytes that are not HTTP (garbage), nothing before
+the caller's deadline (silent), an interim head such as 102 and then 200
+(interim), or 101 and then 200 (switching). A proxy that cannot be reached
+at all is the answer dead.
 
 The wire records what fx sends and where:
   hop   "direct" (straight to the host) or "proxy"
@@ -23,9 +25,12 @@ The wire records what fx sends and where:
   dest  "target", or "private" for a private web_fetch address
 
 A CONNECT that fails leaves one record in the failure log, for its own
-target. A failed request then reports: it shows the proxy text only when it
-claims a record, and a claim uses the record up. got is the target the
-claimed record names.
+target. A failure that fx does not retry (407, garbage, 101) ends the request,
+which reports: it shows the proxy text only when it claims a record, and a
+claim uses the record up. got is the target the claimed record names. A
+failure that fx retries (a dead proxy, a 5xx answer, no answer) shows a retry
+notice instead, which names the proxy the same way: notice is what the notice
+says, and ngot the target the claimed record names.
 
 The constants switch the mechanisms on and off:
   UseProxy         fx reads the proxy variables at all (FALSE is fx today)
@@ -38,21 +43,31 @@ The constants switch the mechanisms on and off:
                    own target, and only when its own failure came from the
                    proxy; "global": any request reads the last record, as a
                    process-wide last error would
+  InterimMode      how an interim head before the final answer is read.
+                   "skip_not_101": 1xx heads other than 101 are skipped and
+                   the final answer decides (RFC 9110 section 15.2); "refuse":
+                   any 1xx ends the CONNECT as a refusal; "skip_all": 101 is
+                   skipped too
+  NoticeMode       what a retry notice says. "own_target": it claims a record
+                   as DetailMode does and names the proxy; "generic": it says
+                   only that the network is down; "global": it reads any record
 *)
 EXTENDS Naturals, FiniteSets
 
-CONSTANTS UseProxy, AuthOnConnect, TlsAfterConnect, NoFallback, SharedFlag, PinFetchIp, DetailMode
+CONSTANTS UseProxy, AuthOnConnect, TlsAfterConnect, NoFallback, SharedFlag, PinFetchIp, DetailMode,
+          InterimMode, NoticeMode
 
 Conns == {"a", "b"}
 Targets == {"routed", "bypass", "fetch_public", "fetch_private"}
-Answers == {"ok", "auth", "refused", "garbage", "silent"}
+Answers == {"ok", "auth", "refused", "garbage", "silent", "interim", "switching", "dead"}
 Phases == {"idle", "routed", "connect_sent", "answered", "open", "sent", "failed"}
 Routes == {"none", "direct", "tunnel", "forward"}
 Shown == {"unread", "none", "proxy"}
+Notices == {"unread", "generic", "proxy"}
 
-VARIABLES target, phase, route, answer, wire, supports, records, claimed, shown, got
+VARIABLES target, phase, route, answer, wire, supports, records, claimed, shown, got, notice, ngot
 
-vars == <<target, phase, route, answer, wire, supports, records, claimed, shown, got>>
+vars == <<target, phase, route, answer, wire, supports, records, claimed, shown, got, notice, ngot>>
 
 Record(c, hop, kind, dest) == [c |-> c, hop |-> hop, kind |-> kind, dest |-> dest]
 
@@ -64,6 +79,17 @@ Dest(c) == IF target[c] = "fetch_private" THEN "private" ELSE "target"
 \* The failure came from the proxy: it answered the CONNECT, and not with 200.
 FailedAtProxy(c) == phase[c] = "failed" /\ answer[c] \notin {"none", "ok"}
 
+\* fx retries what may pass on its own: a dead proxy, a 5xx answer, and no
+\* answer. Every other failure ends the request.
+Retryable(a) == a \in {"refused", "silent", "dead"}
+
+\* Whether an answer opens the tunnel. A 1xx head other than 101 is interim:
+\* the final answer that follows it decides, and the proxy sends 200.
+Opens(a) ==
+    \/ a = "ok"
+    \/ (a = "interim" /\ InterimMode # "refuse")
+    \/ (a = "switching" /\ InterimMode = "skip_all")
+
 TypeOK ==
     /\ target \in [Conns -> Targets]
     /\ phase \in [Conns -> Phases]
@@ -74,6 +100,8 @@ TypeOK ==
     /\ claimed \subseteq records
     /\ shown \in [Conns -> Shown]
     /\ got \in [Conns -> Targets \cup {"none"}]
+    /\ notice \in [Conns -> Notices]
+    /\ ngot \in [Conns -> Targets \cup {"none"}]
 
 Init ==
     /\ target \in [Conns -> Targets]
@@ -86,6 +114,8 @@ Init ==
     /\ claimed = {}
     /\ shown = [c \in Conns |-> "unread"]
     /\ got = [c \in Conns |-> "none"]
+    /\ notice = [c \in Conns |-> "unread"]
+    /\ ngot = [c \in Conns |-> "none"]
 
 \* The route decision. In the design it is a pure function of the immutable
 \* snapshot and the host; with SharedFlag it also reads std's shared flag.
@@ -102,35 +132,35 @@ Lookup(c) ==
                       ELSE "tunnel"
              IN route' = [route EXCEPT ![c] = r]
           /\ phase' = [phase EXCEPT ![c] = "routed"]
-    /\ UNCHANGED <<target, answer, wire, supports, records, claimed, shown, got>>
+    /\ UNCHANGED <<target, answer, wire, supports, records, claimed, shown, got, notice, ngot>>
 
 SendConnect(c) ==
     /\ phase[c] = "routed"
     /\ route[c] = "tunnel"
     /\ wire' = wire \cup {Record(c, "proxy", "connect", Dest(c))}
     /\ phase' = [phase EXCEPT ![c] = "connect_sent"]
-    /\ UNCHANGED <<target, route, answer, supports, records, claimed, shown, got>>
+    /\ UNCHANGED <<target, route, answer, supports, records, claimed, shown, got, notice, ngot>>
 
 \* The proxy needs credentials: without them it can only answer 407.
 ProxyAnswers(c, a) ==
     /\ phase[c] = "connect_sent"
-    /\ AuthOnConnect \/ a = "auth"
+    /\ AuthOnConnect \/ a \in {"auth", "dead"}
     /\ answer' = [answer EXCEPT ![c] = a]
     /\ phase' = [phase EXCEPT ![c] = "answered"]
-    /\ UNCHANGED <<target, route, wire, supports, records, claimed, shown, got>>
+    /\ UNCHANGED <<target, route, wire, supports, records, claimed, shown, got, notice, ngot>>
 
 TunnelOpens(c) ==
     /\ phase[c] = "answered"
-    /\ answer[c] = "ok"
+    /\ Opens(answer[c])
     /\ phase' = [phase EXCEPT ![c] = "open"]
-    /\ UNCHANGED <<target, route, answer, wire, supports, records, claimed, shown, got>>
+    /\ UNCHANGED <<target, route, answer, wire, supports, records, claimed, shown, got, notice, ngot>>
 
 \* A CONNECT that did not answer 200. The design fails the connection and
 \* logs one record for it. std clears supports_connect unless the answer was
 \* a 5xx and retries the same request as a plain-text forward-proxy request.
 TunnelFails(c) ==
     /\ phase[c] = "answered"
-    /\ answer[c] # "ok"
+    /\ ~Opens(answer[c])
     /\ IF NoFallback
          THEN /\ phase' = [phase EXCEPT ![c] = "failed"]
               /\ records' = records \cup {c}
@@ -139,7 +169,7 @@ TunnelFails(c) ==
               /\ route' = [route EXCEPT ![c] = "forward"]
               /\ supports' = IF SharedFlag THEN answer[c] = "refused" ELSE supports
               /\ UNCHANGED records
-    /\ UNCHANGED <<target, answer, wire, claimed, shown, got>>
+    /\ UNCHANGED <<target, answer, wire, claimed, shown, got, notice, ngot>>
 
 Send(c) ==
     \/ /\ phase[c] = "routed"
@@ -154,7 +184,7 @@ Send(c) ==
        /\ wire' = wire \cup {Record(c, "proxy", IF TlsAfterConnect THEN "tls" ELSE "plain", Dest(c))}
        /\ phase' = [phase EXCEPT ![c] = "sent"]
 
-SendStep(c) == Send(c) /\ UNCHANGED <<target, route, answer, supports, records, claimed, shown, got>>
+SendStep(c) == Send(c) /\ UNCHANGED <<target, route, answer, supports, records, claimed, shown, got, notice, ngot>>
 
 \* A failed request decides what it shows. With "own_target" it claims an
 \* unclaimed record for its own target, and only when its own failure came
@@ -162,6 +192,7 @@ SendStep(c) == Send(c) /\ UNCHANGED <<target, route, answer, supports, records, 
 \* whatever was logged last and leaves it for the next reader.
 Report(c) ==
     /\ phase[c] = "failed"
+    /\ ~Retryable(answer[c])
     /\ shown[c] = "unread"
     /\ IF DetailMode = "own_target"
          THEN LET mine == {r \in records \ claimed : target[r] = target[c]}
@@ -179,7 +210,37 @@ Report(c) ==
                        /\ UNCHANGED claimed
                 ELSE /\ shown' = [shown EXCEPT ![c] = "none"]
                      /\ UNCHANGED <<claimed, got>>
-    /\ UNCHANGED <<target, phase, route, answer, wire, supports, records>>
+    /\ UNCHANGED <<target, phase, route, answer, wire, supports, records, notice, ngot>>
+
+\* A failed connect that fx retries shows a retry notice. With "own_target"
+\* the notice claims an unclaimed record for its own target, as a report does,
+\* and names the proxy; with "generic" it says only that the network is down;
+\* with "global" it reads whatever was logged and leaves it for the next
+\* reader.
+Notify(c) ==
+    /\ phase[c] = "failed"
+    /\ Retryable(answer[c])
+    /\ notice[c] = "unread"
+    /\ IF NoticeMode = "generic"
+         THEN /\ notice' = [notice EXCEPT ![c] = "generic"]
+              /\ UNCHANGED <<claimed, ngot>>
+         ELSE IF NoticeMode = "own_target"
+           THEN LET mine == {r \in records \ claimed : target[r] = target[c]}
+                IN IF mine # {}
+                     THEN \E r \in mine:
+                            /\ claimed' = claimed \cup {r}
+                            /\ notice' = [notice EXCEPT ![c] = "proxy"]
+                            /\ ngot' = [ngot EXCEPT ![c] = target[r]]
+                     ELSE /\ notice' = [notice EXCEPT ![c] = "generic"]
+                          /\ UNCHANGED <<claimed, ngot>>
+           ELSE IF records # {}
+                  THEN \E r \in records:
+                         /\ notice' = [notice EXCEPT ![c] = "proxy"]
+                         /\ ngot' = [ngot EXCEPT ![c] = target[r]]
+                         /\ UNCHANGED claimed
+                  ELSE /\ notice' = [notice EXCEPT ![c] = "generic"]
+                       /\ UNCHANGED <<claimed, ngot>>
+    /\ UNCHANGED <<target, phase, route, answer, wire, supports, records, shown, got>>
 
 Next ==
     \E c \in Conns:
@@ -190,6 +251,7 @@ Next ==
         \/ TunnelFails(c)
         \/ SendStep(c)
         \/ Report(c)
+        \/ Notify(c)
 
 Spec == Init /\ [][Next]_vars
 
@@ -220,12 +282,38 @@ DetailBelongsToFailingConnect ==
 DetailNamesOwnTarget ==
     \A c \in Conns: shown[c] = "proxy" => got[c] = target[c]
 
-\* Each logged failure is shown at most once: reading it clears it.
+\* Each logged failure is shown at most once, in a report or a retry notice:
+\* reading it clears it.
 DetailReadOnce ==
-    Cardinality({c \in Conns : shown[c] = "proxy"}) <= Cardinality(records)
+    Cardinality({c \in Conns : shown[c] = "proxy" \/ notice[c] = "proxy"}) <= Cardinality(records)
 
 \* Clearing never loses a failure: a request whose connect failed at the
 \* proxy and has reported shows the proxy text.
 DetailNotLost ==
     \A c \in Conns: (FailedAtProxy(c) /\ shown[c] # "unread") => shown[c] = "proxy"
+
+\* An interim head (100 to 199, but not 101) before the final answer never
+\* fails the CONNECT: a client must parse one or more 1xx responses before a
+\* final one (RFC 9110 section 15.2).
+InterimOpens ==
+    \A c \in Conns: answer[c] = "interim" => phase[c] # "failed"
+
+\* A 101 is not interim: it switches protocols, so it never opens the tunnel.
+SwitchingRefused ==
+    \A c \in Conns: answer[c] = "switching" => phase[c] \notin {"open", "sent"}
+
+\* A retry notice for a failure at the proxy names the proxy. Without it a
+\* person who mistyped HTTPS_PROXY is told the network is down.
+RetryNoticeNamesProxy ==
+    \A c \in Conns:
+        (FailedAtProxy(c) /\ Retryable(answer[c]) /\ notice[c] # "unread") => notice[c] = "proxy"
+
+\* Only a request whose own connect failed at the proxy, and that fx retries,
+\* shows proxy text in a notice.
+NoticeBelongsToFailingConnect ==
+    \A c \in Conns: notice[c] = "proxy" => (FailedAtProxy(c) /\ Retryable(answer[c]))
+
+\* A notice that names the proxy names its own target.
+NoticeNamesOwnTarget ==
+    \A c \in Conns: notice[c] = "proxy" => ngot[c] = target[c]
 =============================================================================

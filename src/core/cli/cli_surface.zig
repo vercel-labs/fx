@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const net_proxy_io = @import("../shared/net_proxy_io.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
@@ -1932,7 +1933,16 @@ fn runNonInteractiveWithDeps(
                 .loaded => |loaded| loaded,
                 .failure => |failure| {
                     const error_name = @errorName(failure.failure.asError());
-                    const message = try modelListFailureMessage(alloc, failure.failure, startup.provider);
+                    // The catalog request ran on this thread, so a connection
+                    // that failed at the proxy held its sentence here.
+                    var proxy_failure: [512]u8 = undefined;
+                    const held = net_proxy_io.takeHeldFailure(&proxy_failure);
+                    const message = try modelListFailureMessage(
+                        alloc,
+                        failure.failure,
+                        startup.provider,
+                        if (failure.failure.category == .transport) held else null,
+                    );
                     defer alloc.free(message);
                     if (opts.format == .json) {
                         try writeJsonCommandFailureCode(
@@ -3209,9 +3219,20 @@ fn modelDetails(
 }
 
 /// What `fx models` says when it could not load the catalog. A connection fx
-/// could not make is named as one. The caller owns the text.
-fn modelListFailureMessage(alloc: Allocator, failure: model_catalog.Failure, provider: model_provider.ProviderId) Allocator.Error![]u8 {
+/// could not make is named as one, and when it failed at a proxy, `proxy_failure`
+/// (the sentence the connection held) says which proxy and why, so a mistyped
+/// HTTPS_PROXY is not read as a network that is down. The caller owns the text.
+fn modelListFailureMessage(
+    alloc: Allocator,
+    failure: model_catalog.Failure,
+    provider: model_provider.ProviderId,
+    proxy_failure: ?[]const u8,
+) Allocator.Error![]u8 {
     if (failure.category == .transport) {
+        if (proxy_failure) |sentence| return alloc.print(
+            "could not list models: couldn't connect to {s}: {s}; check your network connection or firewall",
+            .{ model_catalog.serviceName(provider), sentence },
+        );
         return alloc.print(
             "could not list models: couldn't connect to {s}; check your network connection or firewall",
             .{model_catalog.serviceName(provider)},
@@ -6255,6 +6276,28 @@ test "runIfRequested model fetch failure is handled" {
         "fx models: could not list models: Unavailable\n",
         capture.stderr.written(),
     );
+}
+
+test "fx models names the proxy a failed connection went through, and only for a transport failure" {
+    const alloc = std.testing.allocator;
+    const sentence = "could not connect to proxy 127.0.0.1:9 (connection refused)";
+    const transport: model_catalog.Failure = .{ .category = .transport, .retryable = true };
+    const named = try modelListFailureMessage(alloc, transport, .gateway, sentence);
+    defer alloc.free(named);
+    try std.testing.expectEqualStrings(
+        "could not list models: couldn't connect to AI Gateway: " ++ sentence ++ "; check your network connection or firewall",
+        named,
+    );
+    const plain = try modelListFailureMessage(alloc, transport, .gateway, null);
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings(
+        "could not list models: couldn't connect to AI Gateway; check your network connection or firewall",
+        plain,
+    );
+    // A failure that is not a connection never carries a proxy sentence.
+    const other = try modelListFailureMessage(alloc, .{ .category = .http_status, .http_status = .bad_request }, .gateway, sentence);
+    defer alloc.free(other);
+    try std.testing.expectEqualStrings("could not list models: Unavailable", other);
 }
 
 test "runIfRequested model fetch failure preserves json output" {

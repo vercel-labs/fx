@@ -22,6 +22,7 @@ const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const io_mod = @import("../../shared/io.zig");
+const net_proxy_io = @import("../../shared/net_proxy_io.zig");
 const host_target = @import("../../hosts/target.zig");
 const secret = @import("../../auth/secret.zig");
 const auth_transition = @import("../../auth/auth_transition.zig");
@@ -8224,7 +8225,13 @@ fn processQueuedPromptLoop(
                 );
                 var delay_completed = true;
                 if (will_auto_retry) {
-                    _ = try request_recovery.failed(.{ .kind = failure_kind.? });
+                    // A connection that failed at the proxy held its sentence
+                    // on this thread; the retry status names the proxy.
+                    var proxy_failure: [512]u8 = undefined;
+                    _ = try request_recovery.failedWith(
+                        .{ .kind = failure_kind.? },
+                        net_proxy_io.takeRequestFailure(err, &proxy_failure),
+                    );
                     delay_completed = try request_recovery.waitForSend() != null;
                 }
                 if (cancel_requested or !delay_completed) {

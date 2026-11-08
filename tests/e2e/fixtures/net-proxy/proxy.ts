@@ -4,7 +4,8 @@
 // the routes it knows and pipes the tunnel to 127.0.0.1:<port>; a CONNECT to
 // 127.0.0.1 itself goes to that port. It never resolves a name or reaches
 // past the machine. `status` makes it answer every CONNECT with that status,
-// `garbage` with bytes that are not HTTP, and `silent` with nothing.
+// `garbage` with bytes that are not HTTP, and `silent` with nothing; `interim`
+// sends an interim head with that status before the 200.
 import net from "node:net";
 
 export type ProxyEntry = {
@@ -24,6 +25,8 @@ export type ProxyOptions = {
   silent?: boolean;
   /** Answers 200 and then sends bytes before the client speaks. */
   early?: boolean;
+  /** Sends `HTTP/1.1 <interim> Processing` before the 200 (RFC 9110 section 15.2). */
+  interim?: number;
 };
 
 /** The server name extension of a TLS ClientHello, or null. */
@@ -100,6 +103,7 @@ export async function startConnectProxy(options: ProxyOptions = {}) {
       if (local === undefined) return void client.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
       const upstream = net.connect(local, "127.0.0.1", () => {
         upstreamPorts.add(upstream.localPort!);
+        if (options.interim !== undefined) client.write(`HTTP/1.1 ${options.interim} Processing\r\n\r\n`);
         client.write("HTTP/1.1 200 Connection established\r\n\r\n");
         let first = Buffer.alloc(0);
         const forward = (data: Buffer) => {
