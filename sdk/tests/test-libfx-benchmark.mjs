@@ -7,6 +7,8 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { benchmarkInstructionsBytes, sampleStats } from "../../benchmarks/libfx/workload.mjs";
 
+const clientInstructionsTagBytes = "<client_instructions>\n".length + "\n</client_instructions>".length;
+
 assert.deepEqual(sampleStats([4, 1, 3, 2]), { count: 4, mean: 2.5, p50: 2, p95: 4, max: 4 });
 assert.equal(sampleStats(Array.from({ length: 100 }, (_, index) => index + 1)).p99, 99);
 for (const invalid of [[], [NaN], [Infinity], [null], [-1]]) assert.throws(() => sampleStats(invalid), TypeError);
@@ -40,8 +42,10 @@ for (const backend of ["native", "wasm"]) {
   assert.ok(sample.total_ms >= sample.spawn_to_first_stdout_ms);
   assert.equal(sample.non_prompt_fetches, 1, "cold samples must count the model catalog lookup");
   assert.ok(sample.request_bytes > 0);
-  assert.equal(sample.system_context_bytes, benchmarkInstructionsBytes);
-  assert.equal(sample.system_context_overhead_bytes, 0);
+  // The instructions travel as ACP's systemPrompt, which the core wraps in its
+  // client_instructions tags and adds nothing else.
+  assert.equal(sample.system_context_bytes, benchmarkInstructionsBytes + clientInstructionsTagBytes);
+  assert.equal(sample.system_context_overhead_bytes, clientInstructionsTagBytes);
 
   const runtimeResult = spawnSync(command, [
     ...(runtime === "node" && backend === "wasm" ? ["--experimental-wasm-jspi"] : []),
