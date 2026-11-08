@@ -196,23 +196,42 @@ function subscriptionAccessToken(provider: Subscription, signature: string): str
   return `header.${payload}.${signature}`;
 }
 
-function writeExpiredSubscriptionLogin(home: string, provider: Subscription, accessToken: string): void {
+function subscriptionAuthPath(home: string, provider: Subscription): string {
+  return join(home, ".fx", provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json");
+}
+
+/** `expiresAtMs` is JSON text, so it can hold an i64 that a JS number can't. */
+function writeExpiredSubscriptionLogin(
+  home: string,
+  provider: Subscription,
+  accessToken: string,
+  expiresAtMs = String(Date.now() - 60_000),
+): void {
   const fxDir = join(home, ".fx");
   mkdirSync(fxDir, { recursive: true, mode: 0o700 });
   chmodSync(fxDir, 0o700);
-  const authPath = join(fxDir, provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json");
-  writeFileSync(authPath, JSON.stringify({
+  const authPath = subscriptionAuthPath(home, provider);
+  const login = JSON.stringify({
     version: 1,
     access_token: accessToken,
     refresh_token: `${provider}-refresh`,
-    expires_at_ms: Date.now() - 60_000,
+    expires_at_ms: 0,
     account_id: SUBSCRIPTION_ACCOUNT,
-  }) + "\n", { mode: 0o600 });
+  }).replace('"expires_at_ms":0', `"expires_at_ms":${expiresAtMs}`);
+  writeFileSync(authPath, login + "\n", { mode: 0o600 });
   chmodSync(authPath, 0o600);
 }
 
-/** Codex's or Grok's sign-in and model endpoints, answering refreshes after `beforeTokenResponse`. */
-function startFakeSubscription(provider: Subscription, refreshedAccessToken: string, beforeTokenResponse: () => Promise<void>) {
+/**
+ * Codex's or Grok's sign-in and model endpoints, answering refreshes after
+ * `beforeTokenResponse`, with `tokenReply` as the body when it's given.
+ */
+function startFakeSubscription(
+  provider: Subscription,
+  refreshedAccessToken: string,
+  beforeTokenResponse: () => Promise<void>,
+  tokenReply?: string,
+) {
   const tokenRequests: string[] = [];
   /** Each model request's headers. */
   const modelRequests: string[] = [];
@@ -232,6 +251,7 @@ function startFakeSubscription(provider: Subscription, refreshedAccessToken: str
       if (path === "/token") {
         tokenRequests.push(path);
         await beforeTokenResponse();
+        if (tokenReply) return new Response(tokenReply, { headers: { "content-type": "application/json" } });
         return Response.json({ access_token: refreshedAccessToken, refresh_token: `${provider}-refresh-next`, expires_in: 3600 });
       }
       if (path === "/userinfo") return Response.json({ sub: SUBSCRIPTION_ACCOUNT });
@@ -312,6 +332,98 @@ for (const provider of ["codex", "grok"] as const) {
           expect(headers).toContain(fresh);
           expect(headers).not.toContain(stale);
         }
+      } finally {
+        gateway.stop();
+        fake.stop();
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+}
+
+// The saved expiry is any JSON integer. The smallest i64 used to overflow
+// when fx subtracted its one-minute margin, and abort every command.
+for (const provider of ["codex", "grok"] as const) {
+  test(
+    `status reads an out-of-range saved ${provider} expiry as expired`,
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), `fx-auth-expiry-range-${provider}-e2e-`));
+      const fake = startFakeSubscription(provider, subscriptionAccessToken(provider, "fresh"), async () => {});
+      writeExpiredSubscriptionLogin(home, provider, subscriptionAccessToken(provider, "stale"), "-9223372036854775808");
+      const authPath = subscriptionAuthPath(home, provider);
+      const seeded = readFileSync(authPath, "utf8");
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
+        FX_AUTO_UPGRADE: "0",
+        ...fake.env,
+      };
+
+      try {
+        const status = await runFx(["status", "--json"], { env, timeoutMs: TIMEOUT });
+        expect(
+          status.code,
+          `signal: ${status.signal}\nstdout: ${status.stdout}\nstderr: ${status.stderr}`,
+        ).toBe(0);
+        expect(JSON.parse(status.stdout).auth_expired).toBe(true);
+        expect(fake.tokenRequests).toEqual([]);
+        expect(readFileSync(authPath, "utf8")).toBe(seeded);
+      } finally {
+        fake.stop();
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+}
+
+// A refresh reply that rotates the refresh token but gives a lifetime fx
+// can't use retires the login. fx used to free the rotated token twice here.
+const unusableLifetimes = [
+  { provider: "codex", lifetime: "an overflowing", extra: ',"expires_in":9223372036854775807' },
+  { provider: "grok", lifetime: "an overflowing", extra: ',"expires_in":9223372036854775807' },
+  { provider: "grok", lifetime: "no", extra: "" },
+] as const;
+for (const { provider, lifetime, extra } of unusableLifetimes) {
+  test(
+    `a ${provider} refresh that rotates the token with ${lifetime} lifetime retires the login`,
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), `fx-auth-refresh-lifetime-${provider}-e2e-`));
+      const fresh = subscriptionAccessToken(provider, "fresh");
+      const reply = `{"access_token":${JSON.stringify(fresh)},"refresh_token":"${provider}-refresh-next"${extra}}`;
+      const fake = startFakeSubscription(provider, fresh, async () => {}, reply);
+      writeExpiredSubscriptionLogin(home, provider, subscriptionAccessToken(provider, "stale"));
+      // Unused: keeps fx away from the real gateway.
+      const gateway = startFakeGateway([]);
+
+      try {
+        const result = await runFx(["ask", "--json", "--no-save", "refresh first"], {
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            ...fake.env,
+          },
+          timeoutMs: TIMEOUT,
+        });
+        expect(
+          { code: result.code, signal: result.signal },
+          `stdout: ${result.stdout}\nstderr: ${result.stderr}`,
+        ).toEqual({ code: 1, signal: null });
+        expect(result.stderr).not.toContain("panic");
+        expect(fake.tokenRequests).toHaveLength(1);
+        expect(fake.modelRequests).toEqual([]);
+        expect(gateway.requests).toHaveLength(0);
+        expect(existsSync(subscriptionAuthPath(home, provider))).toBe(false);
       } finally {
         gateway.stop();
         fake.stop();

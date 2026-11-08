@@ -219,7 +219,9 @@ pub const Auth = struct {
 
     /// Request `key` is about to go out.
     pub fn beforeSend(a: *Auth, key: u64) Error!void {
-        const expiring = if (a.expires_at_ms) |at| a.now() + a.skew_ms >= at else false;
+        // The saved skew is any i64, so the sum saturates: a skew at the top of
+        // i64 reaches every expiry, and an expiry at the bottom is always passed.
+        const expiring = if (a.expires_at_ms) |at| a.now() +| a.skew_ms >= at else false;
         try a.stepGate(.{ .send = .{ .key = key, .expiring = expiring } });
     }
 
@@ -1020,6 +1022,17 @@ test "a refused refresh asks for a sign-in naming the refusal, and so does a log
     }
 }
 
+/// A seed for `fuzzRestore` in the form it reads: the little-endian length of
+/// the saved credential, then its bytes.
+fn restoreSeed(comptime saved: []const u8) []const u8 {
+    return comptime encoded: {
+        var len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len, saved.len, .little);
+        const input = len ++ saved[0..saved.len].*;
+        break :encoded &input;
+    };
+}
+
 /// A saved credential of any shape: `restore` takes it or returns false, and
 /// a false keeps the credential in use.
 fn fuzzRestore(_: void, smith: *std.testing.Smith) !void {
@@ -1048,6 +1061,14 @@ fn fuzzRestore(_: void, smith: *std.testing.Smith) !void {
     if (taken) {
         try testing.expect(oauth.validToken(a.access.?));
         try testing.expect(a.cred != null);
+        // Whatever expiry and skew it saved, the next request asks for a
+        // refresh or goes out: the check never aborts.
+        a.actions.clearRetainingCapacity();
+        a.beforeSend(1) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.TestUnexpectedResult,
+        };
+        try testing.expect(a.actions.items.len > 0);
     } else {
         try testing.expectEqualStrings("at1", a.access.?);
         try testing.expectEqualStrings("http://127.0.0.1:9/token", a.cred.?.token_endpoint);
@@ -1065,8 +1086,58 @@ test "a saved credential of any shape is taken whole or not at all" {
             "{\"access\":\"at2\",\"refresh\":null,\"expires_at_ms\":\"soon\",\"skew_ms\":-1,\"token_endpoint\":\"http://127.0.0.1:9/token\",\"revocation_endpoint\":null,\"resource\":\"r\",\"client_id\":\"c\",\"client_secret\":null,\"method\":\"none\",\"scope\":[\"a\",7],\"step_up\":{}}",
             "{\"access\":\"at2\",\"token_endpoint\":\"https://0.0.0.0:1/token\",\"resource\":\"r\",\"client_id\":\"c\",\"method\":\"none\"}",
             "{\"access\":\"at2\",\"token_endpoint\":\"http://127.0.0.1:9/token\",\"resource\":\"r\",\"client_id\":\"c\",\"method\":\"dpop\"}",
+            // The expiry and skew at the edges of i64, which the next request adds to the clock.
+            restoreSeed("{\"access\":\"at2\",\"refresh\":\"rt\",\"expires_at_ms\":4102444800000,\"skew_ms\":9223372036854775807,\"token_endpoint\":\"http://127.0.0.1:9/token\",\"resource\":\"r\",\"client_id\":\"c\",\"method\":\"none\"}"),
+            restoreSeed("{\"access\":\"at2\",\"refresh\":\"rt\",\"expires_at_ms\":9223372036854775807,\"skew_ms\":9223372036854775807,\"token_endpoint\":\"http://127.0.0.1:9/token\",\"resource\":\"r\",\"client_id\":\"c\",\"method\":\"none\"}"),
+            restoreSeed("{\"access\":\"at2\",\"refresh\":\"rt\",\"expires_at_ms\":-9223372036854775808,\"skew_ms\":-9223372036854775808,\"token_endpoint\":\"http://127.0.0.1:9/token\",\"resource\":\"r\",\"client_id\":\"c\",\"method\":\"none\"}"),
+            restoreSeed("{\"access\":\"at2\",\"refresh\":null,\"expires_at_ms\":4102444800000,\"skew_ms\":-9223372036854775808,\"token_endpoint\":\"http://127.0.0.1:9/token\",\"resource\":\"r\",\"client_id\":\"c\",\"method\":\"none\"}"),
         },
     });
+}
+
+test "a saved skew or expiry at the edge of i64 saturates the expiry check instead of overflowing" {
+    const testing = std.testing;
+    var client: http.Client = undefined;
+    try client.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:9/mcp" });
+    defer client.deinit();
+    var a: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{ .refresh_via_host = true }, null);
+    defer a.deinit();
+    const saved = "{{\"access\":\"at\",\"refresh\":\"rt\",\"expires_at_ms\":{d},\"skew_ms\":{d},\"token_endpoint\":\"http://127.0.0.1:9/token\"," ++
+        "\"revocation_endpoint\":null,\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\"}}";
+    const now = a.now();
+    const hour: i64 = 3_600_000;
+    const max = std.math.maxInt(i64);
+    const min = std.math.minInt(i64);
+    const cases = [_]struct { expires_at_ms: i64, skew_ms: i64, due: bool }{
+        // The skew is added to the clock. At the top of i64 the sum saturates,
+        // so every expiry is within it and the login is due.
+        .{ .expires_at_ms = now + hour, .skew_ms = max, .due = true },
+        .{ .expires_at_ms = now + hour, .skew_ms = max - 1, .due = true },
+        .{ .expires_at_ms = max, .skew_ms = max, .due = true },
+        .{ .expires_at_ms = 0, .skew_ms = max, .due = true },
+        // An expiry at the bottom of i64 is out of range and reads as expired,
+        // whatever the skew.
+        .{ .expires_at_ms = min, .skew_ms = min, .due = true },
+        .{ .expires_at_ms = min, .skew_ms = -1, .due = true },
+        .{ .expires_at_ms = min, .skew_ms = 0, .due = true },
+        // A negative skew is no window before the expiry: a login that
+        // expires later reads as live.
+        .{ .expires_at_ms = now + hour, .skew_ms = min, .due = false },
+        .{ .expires_at_ms = now + hour, .skew_ms = -1, .due = false },
+        // An ordinary skew, and an expiry at the top of i64 that it cannot reach.
+        .{ .expires_at_ms = now + hour, .skew_ms = 30_000, .due = false },
+        .{ .expires_at_ms = now - hour, .skew_ms = 30_000, .due = true },
+        .{ .expires_at_ms = max, .skew_ms = 30_000, .due = false },
+    };
+    var buffer: [512]u8 = undefined;
+    for (cases, 1..) |case, key| {
+        try testing.expect(try a.restore(try std.mem.print(&buffer, saved, .{ case.expires_at_ms, case.skew_ms })));
+        a.actions.clearRetainingCapacity();
+        try a.beforeSend(key);
+        // A login that is due waits for the host's refresh; one that is live goes out.
+        try testing.expect(a.actions.items.len > 0);
+        try testing.expectEqual(case.due, a.actions.items[0] == .refresh_due);
+    }
 }
 
 test "a request a sign-in is needed for gives up only after the sign-in is announced" {

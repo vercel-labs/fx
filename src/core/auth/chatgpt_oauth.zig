@@ -458,10 +458,12 @@ fn refreshReplacement(
     if (!std.mem.eql(u8, account_id, current.account_id)) {
         return error.ChatGptAccountChanged;
     }
-    const refresh_token = if (token.refresh_token) |rotated|
-        rotated
-    else
-        try alloc.dupe(u8, current.refresh_token);
+    // Taking the rotated token out of the reply leaves the errdefer below its
+    // only owner, so a failed check frees it once.
+    const refresh_token = if (token.refresh_token) |rotated| blk: {
+        token.refresh_token = null;
+        break :blk rotated;
+    } else try alloc.dupe(u8, current.refresh_token);
     errdefer secret.zeroAndFree(alloc, refresh_token);
     const expires_at_ms = if (token.expires_in) |expires_in| blk: {
         const duration_ms = std.math.mul(i64, expires_in, std.time.ms_per_s) catch
@@ -476,7 +478,6 @@ fn refreshReplacement(
         .account_id = account_id,
     };
     token.access_token = &.{};
-    if (token.refresh_token != null) token.refresh_token = null;
     return replacement;
 }
 
@@ -843,6 +844,131 @@ test "Codex refresh uses JSON and accepts omitted token rotation and lifetime" {
     try std.testing.expect(std.mem.find(u8, state.payload[0..state.payload_len], "\"grant_type\":\"refresh_token\"") != null);
     try std.testing.expect(response.refresh_token == null);
     try std.testing.expect(response.expires_in == null);
+}
+
+/// The saved login a refresh in these tests starts from, owned by the caller.
+fn savedSession(alloc: Allocator) !chatgpt_session.Session {
+    const access_token = try alloc.dupe(u8, "old-access");
+    errdefer alloc.free(access_token);
+    const refresh_token = try alloc.dupe(u8, "old-refresh");
+    errdefer alloc.free(refresh_token);
+    return .{
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+        .expires_at_ms = 0,
+        .account_id = try alloc.dupe(u8, "acct_test"),
+    };
+}
+
+test "Codex refresh frees each token once when the reply's lifetime is unusable" {
+    const alloc = std.testing.allocator;
+    // The access token names the same account but carries no `exp`, so a
+    // missing `expires_in` cannot be filled in from it either.
+    const payload =
+        \\{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_test"}}
+    ;
+    const encoded = try alloc.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(payload.len));
+    defer alloc.free(encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, payload);
+    const access_token = try alloc.print("header.{s}.signature", .{encoded});
+    defer alloc.free(access_token);
+
+    var current = try savedSession(alloc);
+    defer current.deinit(alloc);
+
+    // A lifetime whose milliseconds overflow, one that overflows when added
+    // to now, and none at all, with and without a rotated refresh token.
+    const lifetimes = [_]?i64{ std.math.maxInt(i64), @divTrunc(std.math.maxInt(i64), std.time.ms_per_s), null };
+    for (lifetimes) |expires_in| {
+        for ([_]bool{ true, false }) |rotated| {
+            var token = RefreshTokenResponse{
+                .access_token = try alloc.dupe(u8, access_token),
+                .refresh_token = if (rotated) try alloc.dupe(u8, "rotated-refresh") else null,
+                .expires_in = expires_in,
+            };
+            // refreshSession releases the reply the same way after a failure.
+            defer token.deinit(alloc);
+            try std.testing.expectError(error.InvalidChatGptOAuthResponse, refreshReplacement(alloc, &token, current));
+        }
+    }
+
+    // A usable lifetime moves the rotated token into the new session.
+    var token = RefreshTokenResponse{
+        .access_token = try alloc.dupe(u8, access_token),
+        .refresh_token = try alloc.dupe(u8, "rotated-refresh"),
+        .expires_in = 3600,
+    };
+    defer token.deinit(alloc);
+    var replacement = try refreshReplacement(alloc, &token, current);
+    defer replacement.deinit(alloc);
+    try std.testing.expectEqualStrings("rotated-refresh", replacement.refresh_token);
+    try std.testing.expect(token.refresh_token == null);
+}
+
+fn fuzzRefreshReply(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+    if (smith.valueRangeAtMost(u8, 0, 3) == 0) {
+        // Bytes that need not be a reply at all.
+        var raw: [192]u8 = undefined;
+        try body.writer.writeAll(raw[0..smith.slice(&raw)]);
+    } else {
+        const rotated = smith.value(bool);
+        const lifetime: ?i64 = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+            0 => null,
+            1 => smith.value(i64),
+            // Lifetimes whose sum with now is close to overflowing.
+            2 => @divTrunc(std.math.maxInt(i64), std.time.ms_per_s) - smith.valueRangeAtMost(i64, -1000, 1000),
+            else => smith.valueRangeAtMost(i64, 1, 1 << 40),
+        };
+        // The access token names an account, and may carry an exp claim
+        // that stands in for a missing lifetime.
+        var claims: std.Io.Writer.Allocating = .init(alloc);
+        defer claims.deinit();
+        const account = if (smith.value(bool)) "acct_test" else "acct_other";
+        try claims.writer.print("{{\"https://api.openai.com/auth\":{{\"chatgpt_account_id\":\"{s}\"}}", .{account});
+        if (smith.value(bool)) try claims.writer.print(",\"exp\":{d}", .{smith.value(i64)});
+        try claims.writer.writeAll("}");
+        const encoded = try alloc.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(claims.written().len));
+        defer alloc.free(encoded);
+        _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, claims.written());
+
+        try body.writer.print("{{\"access_token\":\"header.{s}.signature\"", .{encoded});
+        if (rotated) try body.writer.writeAll(",\"refresh_token\":\"rotated-refresh\"");
+        if (lifetime) |value| try body.writer.print(",\"expires_in\":{d}", .{value});
+        try body.writer.writeAll("}");
+    }
+    const Issuer = struct {
+        reply: []const u8,
+
+        fn execute(raw: ?*anyopaque, a: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .disposition = .accepted, .body = try a.dupe(u8, self.reply) };
+        }
+    };
+    var issuer = Issuer{ .reply = body.written() };
+    const transport: oauth_transport.Provider = .{ .context = &issuer, .execute_fn = Issuer.execute };
+
+    var token = requestRefreshToken(alloc, transport, "{\"grant_type\":\"refresh_token\"}") catch return;
+    // refreshSession releases the reply the same way whatever happens next.
+    defer token.deinit(alloc);
+    // The refresh token the new session must hold: the rotated one, or a
+    // copy of the saved one.
+    const want = try alloc.dupe(u8, token.refresh_token orelse "old-refresh");
+    defer alloc.free(want);
+    var current = try savedSession(alloc);
+    defer current.deinit(alloc);
+    var replacement = refreshReplacement(alloc, &token, current) catch return;
+    defer replacement.deinit(alloc);
+    try std.testing.expect(token.refresh_token == null);
+    try std.testing.expectEqualStrings(want, replacement.refresh_token);
+}
+
+test "a Codex refresh frees each token once on fuzzed replies" {
+    try std.testing.fuzz({}, fuzzRefreshReply, .{
+        .corpus = &(@import("fuzz_seed").slices(.{""}) ++ @import("fuzz_corpus").codex_refresh_reply.*),
+    });
 }
 
 test "ChatGPT browser authorization URL uses PKCE without device authentication" {
