@@ -1,8 +1,10 @@
 // Runtime driver: drives the real `fx acp` binary against a local fake
 // Gateway and asks TLC whether what a client sees is a behavior of the models
 // in tests/tla/acp/:
-//   - the stop reason of finished, length-limited, refused, cancelled, and
-//     steered turns (AcpStopReasons.tla, through AcpStopReasonsTrace.tla);
+//   - the stop reason of finished, length-limited, step-limited, failed,
+//     cancelled, and steered turns, and whether the next prompt's request holds
+//     the turn the stop reason ended (AcpStopReasons.tla, through
+//     AcpStopReasonsTrace.tla);
 //   - the config options of session/new, session/set_config_option, and
 //     session/load (AcpConfigCategories.tla, through
 //     AcpConfigCategoriesTrace.tla);
@@ -10,6 +12,8 @@
 //     characters, on stdout and stderr (AcpCommandOutput.tla, through
 //     AcpCommandOutputTrace.tla). Each plan makes the command runner cut
 //     output where the plan says: a line end, 4096 bytes without one, or exit.
+//     The command holds on a named pipe after each write until the driver has
+//     read that write's progress frame, so no run depends on timing.
 //
 //   bun tests/tla/drivers/acp/conformance/driver.ts --label main   # after zig build
 //
@@ -17,6 +21,7 @@
 // full, with a fake key and the fake Gateway's URLs, and each run checks the
 // fake Gateway saw its requests.
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { REPO_ROOT, outDir, sha256File, sha256Text, tlcToolchain, writeJson } from "../../lib/tlc";
@@ -74,7 +79,7 @@ function makeRun(prefix: string, settings: object = {}): Run {
 
 /// The whole environment of an fx process under test, written out: nothing
 /// is inherited, so no real credential or Gateway URL can reach it.
-function fxEnvironment(run: Run, gateway: Gateway): Record<string, string> {
+function fxEnvironment(run: Run, gateway: Gateway, extra: Record<string, string> = {}): Record<string, string> {
   return {
     PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
     SHELL: "/bin/sh",
@@ -92,13 +97,14 @@ function fxEnvironment(run: Run, gateway: Gateway): Record<string, string> {
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    ...extra,
   };
 }
 
-function spawnAcp(fxBin: string, run: Run, gateway: Gateway): Acp {
+function spawnAcp(fxBin: string, run: Run, gateway: Gateway, extra: Record<string, string> = {}): Acp {
   return new Acp(Bun.spawn([fxBin, "acp"], {
     cwd: run.workspace,
-    env: fxEnvironment(run, gateway),
+    env: fxEnvironment(run, gateway, extra),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -129,6 +135,10 @@ function deferred() {
 
 // ----------------------------------------------------------- stop reasons --
 
+/// One shell call that runs at once, for a model reply that asks for it.
+const shellCall = (helpers: Helpers, id: string) =>
+  helpers.fakeGatewayToolCall(id, "shell", { request: { action: "run", command: "echo one", yield_time_ms: 30_000 } });
+
 async function stopReasons(fxBin: string, helpers: Helpers): Promise<StopObservation[]> {
   const observations: StopObservation[] = [];
   const lengthReply = () => helpers.fakeGatewaySse([
@@ -140,25 +150,53 @@ async function stopReasons(fxBin: string, helpers: Helpers): Promise<StopObserva
     headers: { "content-type": "application/json" },
   });
 
-  const single = async (name: string, reason: string, reply: () => Response) => {
+  /// One turn that ends for `cause`. With `probe`, a second prompt follows and
+  /// the first request it makes says whether the next prompt holds the first
+  /// prompt, which is its own probe text.
+  const single = async (
+    name: string,
+    cause: string,
+    replies: unknown[],
+    options: { steps?: number; mode?: string; probe?: boolean } = {},
+  ) => {
     const run = makeRun(`fx-acp-conf-${name}-`);
-    const gateway = helpers.startFakeGateway([reply()]);
-    const acp = spawnAcp(fxBin, run, gateway);
+    const gateway = helpers.startFakeGateway(replies);
+    const extra = options.steps === undefined ? {} : { FX_MAX_AGENT_STEPS: String(options.steps) };
+    const acp = spawnAcp(fxBin, run, gateway, extra);
     try {
-      const { sessionId } = await startSession(acp, run, "auto");
-      const answer = await acp.call("session/prompt", { sessionId, prompt: [{ type: "text", text: "Answer." }] });
+      const { sessionId } = await startSession(acp, run, options.mode ?? "auto");
+      const probe = `Probe for ${name}.`;
+      const answer = await acp.call("session/prompt", { sessionId, prompt: [{ type: "text", text: probe }] });
       if (answer?.error) throw new Error(`${name}: session/prompt failed: ${JSON.stringify(answer.error)}`);
       requireGatewayRequests(gateway, 1, name);
-      observations.push({ reason, response: "prompt", wire: String(answer.result.stopReason) });
+      let history: StopObservation["history"] = "unseen";
+      if (options.probe) {
+        const before = gateway.requests.length;
+        const next = await acp.call("session/prompt", { sessionId, prompt: [{ type: "text", text: "Next question." }] });
+        if (next?.error) throw new Error(`${name}: the next session/prompt failed: ${JSON.stringify(next.error)}`);
+        requireGatewayRequests(gateway, before + 1, `${name} next prompt`);
+        const request = gateway.requests[before] as { body: string };
+        if (!request.body.includes("Next question.")) throw new Error(`${name}: the next request lacks the next prompt`);
+        history = request.body.includes(probe) ? "kept" : "dropped";
+      }
+      observations.push({ cause, response: "prompt", wire: String(answer.result.stopReason), history });
     } finally {
       await acp.close();
       gateway.stop();
       rmSync(run.root, { recursive: true, force: true });
     }
   };
-  await single("end-turn", "end_turn", () => helpers.fakeGatewayFinalText("Done."));
-  await single("length", "max_output_tokens", lengthReply);
-  await single("auth", "refused", unauthorized);
+  await single("finished", "finished", [helpers.fakeGatewayFinalText("Done."), helpers.fakeGatewayFinalText("Next.")], { probe: true });
+  await single("length", "length_limit", [lengthReply()]);
+  await single("auth", "request_failed", [unauthorized(), helpers.fakeGatewayFinalText("Next.")], { probe: true });
+  // The step limit of two ends the turn after its second model request, and
+  // the next prompt carries on from where it stopped.
+  await single(
+    "step-limit",
+    "step_limit",
+    [shellCall(helpers, "limit_step_1"), shellCall(helpers, "limit_step_2"), helpers.fakeGatewayFinalText("Next.")],
+    { steps: 2, mode: "full-access", probe: true },
+  );
 
   // A cancel while the model is still answering.
   {
@@ -180,7 +218,7 @@ async function stopReasons(fxBin: string, helpers: Helpers): Promise<StopObserva
       const answer = (await acp.responses([id])).get(id);
       if (answer?.error) throw new Error(`cancel: session/prompt failed: ${JSON.stringify(answer.error)}`);
       requireGatewayRequests(gateway, 1, "cancel");
-      observations.push({ reason: "cancelled", response: "prompt", wire: String(answer.result.stopReason) });
+      observations.push({ cause: "cancelled", response: "prompt", wire: String(answer.result.stopReason), history: "unseen" });
     } finally {
       release.resolve();
       await acp.close();
@@ -189,10 +227,10 @@ async function stopReasons(fxBin: string, helpers: Helpers): Promise<StopObserva
     }
   }
 
-  // A steering prompt the turn absorbs, and the turn then hits the length
-  // limit: both responses carry the turn's reason.
-  {
-    const run = makeRun("fx-acp-conf-steer-");
+  // A steering prompt the turn absorbs, and the turn then ends: both responses
+  // carry the turn's reason.
+  const steered = async (name: string, cause: string, second: unknown, steps?: number) => {
+    const run = makeRun(`fx-acp-conf-steer-${name}-`);
     const asked = deferred();
     const release = deferred();
     const gateway = helpers.startFakeGateway([
@@ -201,11 +239,11 @@ async function stopReasons(fxBin: string, helpers: Helpers): Promise<StopObserva
         await release.promise;
         return helpers.fakeGatewayFinalText("First answer.");
       },
-      lengthReply(),
+      second,
     ]);
-    const acp = spawnAcp(fxBin, run, gateway);
+    const acp = spawnAcp(fxBin, run, gateway, steps === undefined ? {} : { FX_MAX_AGENT_STEPS: String(steps) });
     try {
-      const { sessionId } = await startSession(acp, run, "auto");
+      const { sessionId } = await startSession(acp, run, "full-access");
       const first = acp.allocateId();
       acp.send(first, "session/prompt", { sessionId, prompt: [{ type: "text", text: "First question." }] });
       await asked.promise;
@@ -214,19 +252,23 @@ async function stopReasons(fxBin: string, helpers: Helpers): Promise<StopObserva
       release.resolve();
       const answers = await acp.responses([first, steer]);
       const original = answers.get(first);
-      const steered = answers.get(steer);
-      if (original?.error || steered?.error) throw new Error(`steer: ${JSON.stringify({ original, steered })}`);
-      if (steered.result?._meta?.fx?.steering !== "absorbed") throw new Error(`steer: not absorbed: ${JSON.stringify(steered)}`);
-      requireGatewayRequests(gateway, 2, "steer");
-      observations.push({ reason: "max_output_tokens", response: "prompt", wire: String(original.result.stopReason) });
-      observations.push({ reason: "max_output_tokens", response: "steering", wire: String(steered.result.stopReason) });
+      const steeredAnswer = answers.get(steer);
+      if (original?.error || steeredAnswer?.error) throw new Error(`${name}: ${JSON.stringify({ original, steeredAnswer })}`);
+      if (steeredAnswer.result?._meta?.fx?.steering !== "absorbed") throw new Error(`${name}: not absorbed: ${JSON.stringify(steeredAnswer)}`);
+      requireGatewayRequests(gateway, 2, name);
+      observations.push({ cause, response: "prompt", wire: String(original.result.stopReason), history: "unseen" });
+      observations.push({ cause, response: "steering", wire: String(steeredAnswer.result.stopReason), history: "unseen" });
     } finally {
       release.resolve();
       await acp.close();
       gateway.stop();
       rmSync(run.root, { recursive: true, force: true });
     }
-  }
+  };
+  await steered("length", "length_limit", lengthReply());
+  // The steering prompt starts the second model request, which asks for a
+  // command and meets the step limit of two.
+  await steered("step-limit", "step_limit", shellCall(helpers, "steer_limit_step"), 2);
   return observations;
 }
 
@@ -330,15 +372,31 @@ function randomOutputPlans(count: number, seed: number): OutputPlan[] {
   });
 }
 
-/// A POSIX shell command that writes each chunk, then pauses so the runner
-/// delivers it before the next one starts.
-function commandFor(plan: OutputPlan): string {
+/// The runner delivers a chunk at once when it fills 4096 bytes or ends a line,
+/// which sends one progress frame. What is left at exit waits for the call to end.
+const sendsFrame = (chunk: PlanChunk) => chunk.pad > 0 || chunk.bytes.at(-1) === NEWLINE;
+
+/// A POSIX shell command that writes each chunk. After each chunk that sends a
+/// frame it reads the named pipe `gates[n]`, which the driver writes once it
+/// has read that frame, so the next chunk reaches the runner as a chunk of its
+/// own whatever the speed of the machine.
+function commandFor(plan: OutputPlan, gates: string[]): string {
   const octal = (bytes: number[]) => bytes.map((byte) => `\\${byte.toString(8).padStart(3, "0")}`).join("");
+  let held = 0;
   return plan.chunks.map((chunk) => {
     const redirect = chunk.src === "stderr" ? " >&2" : "";
     const write = chunk.pad > 0 ? `printf '%${chunk.pad}s${octal(chunk.bytes)}' ' '` : `printf '${octal(chunk.bytes)}'`;
-    return `${write}${redirect}; sleep 0.3`;
+    return sendsFrame(chunk) ? `${write}${redirect}; read _ < '${gates[held++]}'` : `${write}${redirect}`;
   }).join("; ");
+}
+
+/// The progress frames fx has sent so far for `callId`: updates that carry text.
+function progressFrames(acp: Acp, callId: string): number {
+  return acp.lines.filter(({ message }) => {
+    const update = message?.params?.update;
+    if (update?.toolCallId !== callId || update.sessionUpdate !== "tool_call_update" || update.status !== "in_progress") return false;
+    return (update.content ?? []).some((item: any) => (item?.content?.text ?? "") !== "");
+  }).length;
 }
 
 function eventsFor(plan: OutputPlan): OutputEvent[] {
@@ -354,14 +412,25 @@ function eventsFor(plan: OutputPlan): OutputEvent[] {
 async function commandOutput(fxBin: string, helpers: Helpers, plan: OutputPlan): Promise<{ events: OutputEvent[]; frames: OutputFrame[] }> {
   const callId = "conformance_shell";
   const run = makeRun("fx-acp-conf-output-");
+  const gates = plan.chunks.filter(sendsFrame).map((_, index) => join(run.root, `gate-${index}`));
+  for (const gate of gates) {
+    const made = Bun.spawnSync(["mkfifo", gate]);
+    if (made.exitCode !== 0) throw new Error(`${plan.name}: mkfifo ${gate} failed: ${made.stderr.toString()}`);
+  }
   const gateway = helpers.startFakeGateway([
-    helpers.fakeGatewayToolCall(callId, "shell", { request: { action: "run", command: commandFor(plan), yield_time_ms: 30_000 } }),
+    helpers.fakeGatewayToolCall(callId, "shell", { request: { action: "run", command: commandFor(plan, gates), yield_time_ms: 30_000 } }),
     helpers.fakeGatewayFinalText("Ran it."),
   ]);
   const acp = spawnAcp(fxBin, run, gateway);
   try {
     const { sessionId } = await startSession(acp, run, "full-access");
-    const answer = await acp.call("session/prompt", { sessionId, prompt: [{ type: "text", text: "Run the command." }] }, 60_000);
+    const id = acp.allocateId();
+    acp.send(id, "session/prompt", { sessionId, prompt: [{ type: "text", text: "Run the command." }] });
+    for (const [index, gate] of gates.entries()) {
+      await acp.until(() => progressFrames(acp, callId) > index, `${plan.name}: the progress frame for write ${index + 1}`);
+      await writeFile(gate, "go\n");
+    }
+    const answer = (await acp.responses([id], 60_000)).get(id);
     if (answer?.error) throw new Error(`${plan.name}: session/prompt failed: ${JSON.stringify(answer.error)}`);
     requireGatewayRequests(gateway, 2, plan.name);
     const frames: OutputFrame[] = [];
@@ -395,8 +464,20 @@ async function commandOutput(fxBin: string, helpers: Helpers, plan: OutputPlan):
 
 function controls(stop: StopObservation[], options: OptionsObservation[], output: { events: OutputEvent[]; frames: OutputFrame[] }) {
   const tamperedStop = structuredClone(stop);
-  const length = tamperedStop.find((o) => o.reason === "max_output_tokens");
+  const length = tamperedStop.find((o) => o.cause === "length_limit");
   if (length) length.wire = "max_output_tokens";
+  // The step limit answered with refusal, as fx did before it named itself.
+  const refusedLimit = structuredClone(stop);
+  const limit = refusedLimit.find((o) => o.cause === "step_limit" && o.history === "kept");
+  if (limit) limit.wire = "refusal";
+  // The step limit's turn missing from the next request.
+  const droppedLimit = structuredClone(stop);
+  const kept = droppedLimit.find((o) => o.cause === "step_limit" && o.history === "kept");
+  if (kept) kept.history = "dropped";
+  // A failed request's turn still in the next request.
+  const keptFailure = structuredClone(stop);
+  const failed = keptFailure.find((o) => o.cause === "request_failed");
+  if (failed) failed.history = "kept";
   const tamperedOptions = structuredClone(options);
   const provider = tamperedOptions[0]?.options.find((o) => o.id === "provider");
   if (provider) provider.category = "model";
@@ -405,6 +486,9 @@ function controls(stop: StopObservation[], options: OptionsObservation[], output
   if (frame) frame.valid = false;
   return [
     { name: "stop-unmapped-length", model: "stop" as const, trace: tamperedStop, expect: "REJECTED" },
+    { name: "stop-step-limit-refusal", model: "stop" as const, trace: refusedLimit, expect: "REJECTED" },
+    { name: "stop-step-limit-dropped", model: "stop" as const, trace: droppedLimit, expect: "REJECTED" },
+    { name: "stop-failure-kept", model: "stop" as const, trace: keptFailure, expect: "REJECTED" },
     { name: "options-provider-model", model: "options" as const, trace: tamperedOptions, expect: "REJECTED" },
     { name: "output-invalid-frame", model: "output" as const, trace: tamperedOutput, expect: "REJECTED" },
     { name: "stop-empty", model: "stop" as const, trace: [], expect: "TOOL_ERROR" },

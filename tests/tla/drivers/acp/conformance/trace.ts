@@ -107,6 +107,21 @@ export class Acp {
     return this.nextId++;
   }
 
+  /// Waits until `condition` holds, re-checking each time fx writes a line.
+  async until(condition: () => boolean, what: string, timeoutMs = 30_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!condition()) {
+      if (this.closed) throw new Error(`fx acp exited while waiting for ${what}: ${this.stderr}`);
+      const left = deadline - Date.now();
+      if (left <= 0) throw new Error(`timed out waiting for ${what}: ${this.stderr}`);
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, left);
+        this.wake = () => { clearTimeout(timer); resolve(); };
+      });
+      this.wake = null;
+    }
+  }
+
   async responses(ids: number[], timeoutMs = 30_000): Promise<Map<number, any>> {
     const deadline = Date.now() + timeoutMs;
     const found = new Map<number, any>();
@@ -173,7 +188,15 @@ const tlaSeq = (values: string[]) => `<<${values.map(tla).join(", ")}>>`;
 
 export type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 
-export type StopObservation = { reason: string; response: "prompt" | "steering"; wire: string };
+/// `cause` is what the scenario does to end the turn. `history` is whether the
+/// next prompt's request held the turn's prompt, or unseen when the scenario
+/// sent no next prompt.
+export type StopObservation = {
+  cause: string;
+  response: "prompt" | "steering";
+  wire: string;
+  history: "kept" | "dropped" | "unseen";
+};
 export type OptionsObservation = { op: "new" | "load" | "set"; options: Array<{ id: string; category: string }> };
 export type OutputEvent = { kind: "chunk" | "finish"; src: "stdout" | "stderr"; bytes: string[] };
 export type OutputFrame = { text: string[]; valid: boolean };
@@ -189,7 +212,8 @@ function obsModule(name: string, body: string[]): string {
 }
 
 function stopObs(observations: StopObservation[]): string {
-  const record = (o: StopObservation) => `[reason |-> ${tla(o.reason)}, response |-> ${tla(o.response)}, wire |-> ${tla(o.wire)}]`;
+  const record = (o: StopObservation) =>
+    `[cause |-> ${tla(o.cause)}, response |-> ${tla(o.response)}, wire |-> ${tla(o.wire)}, history |-> ${tla(o.history)}]`;
   return obsModule("AcpStopReasonsObs", [
     'TraceProtocol == "acp"',
     `TraceLog == <<${observations.map(record).join(",\n  ")}>>`,
@@ -217,7 +241,14 @@ const MODELS = {
   stop: {
     spec: "AcpStopReasons",
     obs: stopObs,
-    cfg: ["CONSTANTS", "    Mapped = TRUE", "    LibfxMapped = FALSE", ...TRACE_TAIL],
+    cfg: [
+      "CONSTANTS",
+      "    Mapped = TRUE",
+      "    LibfxMapped = FALSE",
+      "    StepLimitNamed = TRUE",
+      "    StepLimitDropped = FALSE",
+      ...TRACE_TAIL,
+    ],
     length: (o: StopObservation[]) => o.length,
   },
   options: {

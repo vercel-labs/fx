@@ -49,9 +49,9 @@ Esc(s) ==
 (* Valid UTF-8 text; an escape is ASCII. *)
 Valid(s) == Esc(s) = s
 
-(* completeUtf8Prefix: where the trailing sequence a later chunk may still *)
-(* complete starts, or Len(s) + 1 when there is none. Only the last three *)
-(* bytes can start one.                                                    *)
+(* text_utils.incompleteUtf8Tail: where the trailing sequence a later chunk *)
+(* may still complete starts, or Len(s) + 1 when there is none. Only the   *)
+(* last three bytes can start one.                                         *)
 HoldFrom(s) ==
     LET n == Len(s)
         starts == {k \in (IF n > 3 THEN n - 2 ELSE 1)..n : s[k] # "C"}

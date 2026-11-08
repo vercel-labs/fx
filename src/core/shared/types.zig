@@ -2100,6 +2100,10 @@ pub const ProviderCompletionDisposition = enum {
     interrupted,
     provider_failure,
     invalid_completion,
+    /// The turn stopped at the agent step limit. No model request has this
+    /// disposition: only the step-limit finish passes it, so a host can tell
+    /// the stop from every other failed turn.
+    step_limited,
 };
 
 pub fn allToolCallsProviderExecuted(tool_calls: []const ToolCall) bool {

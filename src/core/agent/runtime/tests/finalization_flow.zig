@@ -355,6 +355,8 @@ test "processQueuedPrompt stops repeated malformed calls before another provider
     try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
     try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    // Only the step limit has its own disposition: this failure has none.
+    try std.testing.expect(hooks.finalized_disposition == null);
     try std.testing.expectEqualStrings(notice, hooks.history_assistant_text.?);
     try std.testing.expectEqualStrings(notice, hooks.finish_assistant_text.?);
     try std.testing.expect(
@@ -510,7 +512,10 @@ test "processQueuedPrompt step limit pushes configured notice and finish event" 
         hooks.history_turns.items[0],
     ) orelse return error.TestExpectedTurnSummary;
     try std.testing.expectEqual(hooks.finish_summary.?, propagated_summary);
-    try std.testing.expect(hooks.finalized_disposition == null);
+    // A step-limit stop carries its own disposition, so a host can tell it
+    // from every other failed turn (`tests/tla/acp/AcpStopReasons.tla`).
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, .step_limited), hooks.finalized_disposition);
 }
 
 test "processQueuedPrompt step limit persists malformed argument failure execution" {
@@ -1214,6 +1219,7 @@ test "common Stop step limit retains candidate and current-turn execution" {
         deps.finish_presentation_text.?,
     );
     try std.testing.expectEqualStrings("Agent step limit reached; continue with a follow-up prompt if needed.", turn.assistant);
+    try std.testing.expectEqual(@as(?types.ProviderCompletionDisposition, .step_limited), deps.finalized_disposition);
     try std.testing.expectEqual(@as(usize, 2), turn.execution.tool_steps.len);
     try std.testing.expectEqualStrings("candidate", turn.execution.tool_steps[0].assistant.?);
     try std.testing.expectEqualStrings(

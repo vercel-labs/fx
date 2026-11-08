@@ -6,12 +6,16 @@
 # /permissions. AcpSpeed: the per-session Standard, Fast, and Ultrafast speed
 # contract. Both configs must pass.
 #
-# AcpStopReasons: ACP v1 stop reasons for fx acp, fx's own names for libfx.
+# AcpStopReasons: ACP v1 stop reasons for fx acp, fx's own names for libfx, and
+# a stop reason that agrees with what the next prompt holds: the step limit
+# answers max_turn_requests and keeps its turn, a failed request answers
+# refusal and drops its turn.
 # AcpConfigCategories: only the model option has config category `model`.
 # AcpCommandOutput: command progress text stays valid UTF-8 when a chunk ends
 # inside a character. Their fixed configs must pass. The configs with fx's
-# behavior before the fix (Unmapped, Shared, Raw) and the planted bugs
-# (LibfxMapped, SharedTail, NoFlush) must each violate the named invariant.
+# behavior before the fix (Unmapped, StepLimitRefused, Shared, Raw) and the
+# planted bugs (LibfxMapped, StepLimitDropped, SharedTail, NoFlush) must each
+# violate the named invariant.
 #
 # The planted bugs and the runs of the real `fx acp` binary are in
 # ../drivers/acp/:
@@ -34,6 +38,8 @@ MCAcpSpeed MCAcpSpeed -
 AcpStopReasons MCAcpStopReasons -
 AcpStopReasons MCAcpStopReasonsUnmapped AcpStopReasonValid
 AcpStopReasons MCAcpStopReasonsLibfxMapped LibfxKeepsNames
+AcpStopReasons MCAcpStopReasonsStepLimitRefused RefusalLeavesTurnOut
+AcpStopReasons MCAcpStopReasonsStepLimitDropped TurnLimitKeepsTurn
 AcpConfigCategories MCAcpConfigCategories -
 AcpConfigCategories MCAcpConfigCategoriesShared ModelPickerFirst
 AcpCommandOutput MCAcpCommandOutput -

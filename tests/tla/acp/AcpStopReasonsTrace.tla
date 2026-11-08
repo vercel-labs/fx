@@ -3,9 +3,11 @@
 (* Trace validation: replays the stop reasons one run of the real `fx acp` *)
 (* binary answered against AcpStopReasons. TraceLog and TraceProtocol come *)
 (* from the generated AcpStopReasonsObs module; each TraceLog element is   *)
-(*   [reason, response, wire]                                              *)
-(* where reason is the internal reason the driver's scenario ends the     *)
-(* turn with and wire is the stopReason fx sent.                           *)
+(*   [cause, response, wire, history]                                      *)
+(* where cause is what the driver's scenario does to end the turn, wire is *)
+(* the stopReason fx sent, and history is kept or dropped when the driver  *)
+(* sent a next prompt and read whether its request held the turn, and      *)
+(* unseen when it did not.                                                 *)
 (*                                                                         *)
 (* NotDone is a sentinel: TLC reporting it violated means every            *)
 (* observation matched a spec step.                                        *)
@@ -22,8 +24,9 @@ TraceInit == /\ i = 0
 
 TraceNext == /\ i < Len(TraceLog)
              /\ \E o \in {TraceLog[i + 1]} :
-                    /\ Answer(o.reason, o.response)
+                    /\ Answer(o.cause, o.response)
                     /\ wire' = o.wire
+                    /\ o.history \in {"unseen", History(o.cause)}
              /\ i' = i + 1
 
 TraceSpec == TraceInit /\ [][TraceNext]_traceVars

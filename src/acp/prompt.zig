@@ -201,11 +201,12 @@ const ToolCallCard = enum {
 
 /// Command output arrives in chunks cut at byte counts, so a chunk can end
 /// partway through a UTF-8 character. Holds that unfinished end, at most
-/// three bytes, until the stream's next chunk, and escapes bytes that are
-/// not valid UTF-8, so every progress update is valid JSON text
-/// (`tests/tla/acp/AcpCommandOutput.tla` ProgressValidUtf8, NothingLost).
+/// `text_utils.max_incomplete_utf8_tail` bytes, until the stream's next chunk,
+/// and escapes bytes that are not valid UTF-8, so every progress update is
+/// valid JSON text (`tests/tla/acp/AcpCommandOutput.tla` ProgressValidUtf8,
+/// NothingLost).
 const CommandOutputText = struct {
-    pending: [3]u8 = undefined,
+    pending: [text_utils.max_incomplete_utf8_tail]u8 = undefined,
     pending_len: u8 = 0,
 
     /// The text to send for `chunk` after the bytes held from the chunk
@@ -217,7 +218,7 @@ const CommandOutputText = struct {
             null;
         defer if (joined) |bytes| alloc.free(bytes);
         const raw: []const u8 = joined orelse chunk;
-        const end = completeUtf8Prefix(raw);
+        const end = raw.len - text_utils.incompleteUtf8Tail(raw);
         const text = try text_utils.dupeValidUtf8(alloc, raw[0..end]);
         self.pending_len = @intCast(raw.len - end);
         @memcpy(self.pending[0..self.pending_len], raw[end..]);
@@ -231,21 +232,6 @@ const CommandOutputText = struct {
         return text;
     }
 };
-
-/// The length of `bytes` without a trailing UTF-8 sequence that the next
-/// chunk may still complete. A sequence is at most four bytes, so only the
-/// last three bytes can start one.
-fn completeUtf8Prefix(bytes: []const u8) usize {
-    const floor = bytes.len -| 3;
-    var start = bytes.len;
-    while (start > floor) {
-        start -= 1;
-        if (bytes[start] & 0xc0 == 0x80) continue;
-        const sequence_len = std.unicode.utf8ByteSequenceLength(bytes[start]) catch return bytes.len;
-        return if (bytes.len - start < sequence_len) start else bytes.len;
-    }
-    return bytes.len;
-}
 
 /// What one call's command output holds back, per stream.
 const CommandOutputTail = struct {
@@ -2391,6 +2377,11 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     if (disposition == .length_limited) {
         ctx.stop_reason = .max_output_tokens;
+    } else if (disposition == .step_limited) {
+        // The turn keeps its prompt and tool calls for a follow-up, so it is
+        // not a refusal, which ACP drops from the next prompt
+        // (`tests/tla/acp/AcpStopReasons.tla` RefusalLeavesTurnOut).
+        ctx.stop_reason = .max_model_turns;
     } else if (outcome == .failed or outcome == .paused) {
         ctx.stop_reason = .refused;
     }
@@ -5613,7 +5604,7 @@ test "ACP deps validate malformed registered calls" {
     try std.testing.expectEqualStrings("web_fetch field \"url\" must be a string", result.failure);
 }
 
-test "ACP finalization maps failed turns and provider length" {
+test "ACP finalization maps each turn ending to its stop reason" {
     const cases = [_]struct {
         outcome: types.TurnPresentationOutcome,
         disposition: ?types.ProviderCompletionDisposition,
@@ -5621,7 +5612,12 @@ test "ACP finalization maps failed turns and provider length" {
     }{
         .{ .outcome = .completed, .disposition = .length_limited, .expected = .max_output_tokens },
         .{ .outcome = .failed, .disposition = .length_limited, .expected = .max_output_tokens },
+        .{ .outcome = .failed, .disposition = .step_limited, .expected = .max_model_turns },
         .{ .outcome = .failed, .disposition = null, .expected = .refused },
+        .{ .outcome = .paused, .disposition = null, .expected = .refused },
+        .{ .outcome = .completed, .disposition = null, .expected = .end_turn },
+        .{ .outcome = .completed, .disposition = .completed, .expected = .end_turn },
+        .{ .outcome = .interrupted, .disposition = null, .expected = .end_turn },
     };
 
     for (cases) |case| {
