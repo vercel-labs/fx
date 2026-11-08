@@ -483,11 +483,13 @@ pub const TurnContext = struct {
     }
 
     /// Asks the host's prompter, which answers on this thread. A subagent that
-    /// cannot be asked, because the host gave no prompter, its phase did not
-    /// change, or the prompter failed, fails with
-    /// `error.PermissionPromptUnavailable`: admission turns that into an
-    /// outcome that says approval was required and could not be asked, where a
-    /// denial would say the person refused. Nothing runs, and the trace says why.
+    /// cannot be asked fails with `error.PermissionPromptUnavailable`, which
+    /// says noninteractive mode (fx ask gives subagents no prompter), or with
+    /// the error that names why when the host's prompter knows: the prompt is
+    /// closed, the subagent was stopped, too many requests are open, or the
+    /// client cannot be reached. Admission turns each into an outcome that
+    /// says approval was required and could not be asked, where a denial
+    /// would say the person refused. Nothing runs, and the trace says why.
     fn askHost(
         self: *TurnContext,
         alloc: Allocator,
@@ -511,7 +513,9 @@ pub const TurnContext = struct {
         };
         return host.request(alloc, request, call, review, grant_offer) catch |err| {
             debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=host err={s}", .{ child_id, work_id, @errorName(err) });
-            return error.PermissionPromptUnavailable;
+            // The error that names the cause passes through; any other
+            // failure of the host's prompter names none.
+            return if (permission_prompter.unavailableCause(err) != null) err else error.PermissionPromptUnavailable;
         };
     }
 

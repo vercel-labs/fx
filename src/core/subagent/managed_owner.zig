@@ -1184,6 +1184,8 @@ const CancellationJoinTest = struct {
     turn: ?*execution.TurnContext = null,
     request_id: u64 = 0,
     decision: ?types.ToolPermissionDecision = null,
+    /// The wait ended because the worker was stopped.
+    stopped: bool = false,
     effects: usize = 0,
     commits: usize = 0,
 
@@ -1223,7 +1225,14 @@ const CancellationJoinTest = struct {
             .{ .label = "review child action" },
             null,
             .{ .context = self, .observe_fn = observe },
-        ) catch return error.ProviderFailed;
+        ) catch |err| {
+            // A wait the stop ended is no decision: the person did not refuse.
+            if (err == error.PermissionPromptStopped) {
+                self.stopped = true;
+                return error.Cancelled;
+            }
+            return error.ProviderFailed;
+        };
         defer response.deinit();
         self.decision = response.decision;
         if (cancel.load(.seq_cst) or worker.isCancelRequested()) return error.Cancelled;
@@ -1343,7 +1352,9 @@ fn testCancellationJoin(timing: enum { pending, before_permission, before_attach
             try CancellationJoinTest.wait(&fixture.returned);
             break :blk true;
         };
-        try std.testing.expectEqual(@as(?types.ToolPermissionDecision, .deny), fixture.decision);
+        // The stop ends the wait as a refusal that says so, never as a denial.
+        try std.testing.expect(fixture.stopped);
+        try std.testing.expect(fixture.decision == null);
         for ([_]types.ToolPermissionDecision{ .once, .deny }) |decision| {
             try std.testing.expectEqual(worker_runtime.PermissionSubmissionResult.no_pending, try route.submit_fn(
                 route.context,

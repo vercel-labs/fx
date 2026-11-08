@@ -4,14 +4,20 @@
 (* `fx acp` binary against AcpChildApproval. TraceLog comes from the       *)
 (* generated AcpChildApprovalObs module                                    *)
 (* (tests/tla/drivers/acp/child_approval/driver.ts). Steps the client      *)
-(* cannot see (a subagent's own turn, fx reading an answer, a decision)   *)
-(* may run between observations, but none of them may show the client a   *)
-(* request, announce a card, or end one. A parent's stop is observed when  *)
-(* the fake Gateway hands the parent the stop call.                        *)
+(* cannot see (a subagent's own turn, fx reading an answer, a decision,    *)
+(* the prompt thread taking and letting go of the card lock) may run       *)
+(* between observations, but none of them may show the client a request,   *)
+(* announce a card, or end one. A parent's stop is observed when the fake  *)
+(* Gateway hands the parent the stop call.                                 *)
 (*                                                                         *)
 (* A card's call id is observed too: a subagent's must differ from every   *)
 (* id the parent's own cards used (ParentIds) and from every earlier       *)
 (* subagent card's. That is the model's UniqueIds, read off the run.       *)
+(*                                                                         *)
+(* A card's end is observed whoever ended it: the child's runtime, or the  *)
+(* prompt's end closing it. The prompt's response is observed too, and     *)
+(* once it is, no card may change until the next prompt starts             *)
+(* (NoCardChangeAfterResponse).                                            *)
 (*                                                                         *)
 (* NotDone is a sentinel: TLC reporting it violated means every            *)
 (* observation matched a step of the spec. Exhausting the search without  *)
@@ -25,7 +31,8 @@ traceVars == <<vars, i>>
 
 \* A step the client cannot see.
 Hidden ==
-    /\ \E c \in Children : FxStep(c)
+    /\ \/ \E c \in Children : FxStep(c)
+       \/ BeginClose \/ EndClose
     /\ \A c \in Children : sent'[c] => sent[c]
     /\ \A c \in Children : atClient'[c] => atClient[c]
     /\ \A c \in Children : card[c] = "none" => card'[c] = "none"
@@ -39,12 +46,15 @@ Observed(o) ==
       [] o.op = "request"      -> /\ \E c \in Children : FxStep(c)
                                   /\ ~atClient[o.c] /\ atClient'[o.c]
       [] o.op = "lateRequest"  -> /\ Send(o.c) /\ entry[o.c] = "cancelled"
-      [] o.op = "card"         -> /\ FinishCard(o.c) /\ card'[o.c] = o.status
+      [] o.op = "card"         -> /\ \/ FinishCard(o.c)
+                                     \/ CloseCard(o.c)
+                                  /\ card'[o.c] = o.status
       [] o.op = "answer"       -> ClientSend(o.c, o.a)
       [] o.op = "late"         -> LateSend(o.c, o.a)
       [] o.op = "stop"         -> Stop(o.c)
       [] o.op = "cancel"       -> Cancel
       [] o.op = "promptEnd"    -> PromptEnd
+      [] o.op = "response"     -> Respond
       [] o.op = "promptStart"  -> Reopen
       [] o.op = "pRequest"     -> ParentAsk /\ parent' = "open"
       [] o.op = "pAnswer"      -> ParentAnswer

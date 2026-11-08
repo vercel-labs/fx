@@ -279,11 +279,20 @@ const AcpContext = struct {
     closed_host_steering: bool = false,
     /// Set for a subagent's turn.
     subagent: ?SubagentAsker = null,
+    /// A subagent's run: how many of its calls announced a card, and, by the
+    /// model's call id (owned), the order of the latest of them. A model
+    /// repeats an id from one reply to the next, so the id alone does not name
+    /// a call (`tests/tla/acp/AcpChildApproval.tla` UniqueIds).
+    announced_calls: u32 = 0,
+    latest_call: std.StringHashMapUnmanaged(u32) = .empty,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
         while (keys.next()) |key| self.alloc.free(key.*);
         self.published_tool_calls.deinit(self.alloc);
+        var calls = self.latest_call.keyIterator();
+        while (calls.next()) |key| self.alloc.free(key.*);
+        self.latest_call.deinit(self.alloc);
     }
 
     fn sendUpdate(self: *AcpContext, update_json: []const u8) !void {
@@ -368,19 +377,68 @@ const AcpContext = struct {
         };
     }
 
-    /// The id a call's card and its permission request carry in the session.
-    /// The model that chose `call_id` numbers its calls from one like every
-    /// other conversation, so a subagent's card leads with its child id and
-    /// the id stays unique in the session
+    /// The id the card of the call the model named `call_id` carries, with its
+    /// permission request, in the session. The model numbers its calls from
+    /// one like every other conversation, and one run's model repeats an id,
+    /// so a subagent's card leads with its child id and the order its call
+    /// took among the run's announced calls: `<child id>:<order>:<call id>`.
+    /// It names the run's latest call of that id, and stays the same across
+    /// the card's updates, so every id is unique in the session
     /// (`tests/tla/acp/AcpChildApproval.tla` UniqueIds). Allocated in `arena`.
     fn cardId(self: *const AcpContext, arena: Allocator, call_id: []const u8) ![]const u8 {
         const asker = self.subagent orelse return call_id;
-        return arena.print("{s}:{s}", .{ asker.child_id, call_id });
+        const order = self.latest_call.get(call_id) orelse 0;
+        return arena.print("{s}:{d}:{s}", .{ asker.child_id, order, call_id });
+    }
+
+    /// A subagent's call announces a card: it takes the next order in the
+    /// run, and the model's id names it until a later call reuses the id.
+    /// Returns the card's id, allocated in `arena`.
+    fn startCall(self: *AcpContext, arena: Allocator, call_id: []const u8) ![]const u8 {
+        const order = self.announced_calls + 1;
+        const slot = try self.latest_call.getOrPut(self.alloc, call_id);
+        if (!slot.found_existing) {
+            slot.key_ptr.* = self.alloc.dupe(u8, call_id) catch |err| {
+                self.latest_call.removeByPtr(slot.key_ptr);
+                return err;
+            };
+        }
+        slot.value_ptr.* = order;
+        self.announced_calls = order;
+        return self.cardId(arena, call_id);
+    }
+
+    /// Whether a subagent's card has ended: its call reported its end, or the
+    /// prompt's end closed it. The caller holds `subagent_cards_mutex`.
+    fn subagentCardEnded(self: *const AcpContext, card_id: []const u8) bool {
+        return self.finalUpdateSent(card_id) or !server.subagentCardOpenLocked(self.state, card_id);
+    }
+
+    /// Announces a subagent call's card under the card lock the prompt's end
+    /// closes the cards with. After that the cards are shut, so the call is
+    /// refused: a card announced then would change after the response.
+    fn announceSubagentCard(self: *AcpContext, arena: Allocator, call: ToolCall) ![]const u8 {
+        const state = self.state;
+        state.subagent_cards_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_cards_mutex.unlock(io_mod.getIo());
+        if (!state.subagent_cards_open) {
+            const asker = self.subagent.?;
+            debug_trace.logf("acp", "subagent card not announced child_id={s} call_id={s} reason=prompt_closed", .{ asker.child_id, call.id });
+            return error.PermissionPromptClosed;
+        }
+        const card = try self.sendToolCallPending(arena, call);
+        try server.registerSubagentCardLocked(state, card);
+        return card;
     }
 
     fn sendToolCallPending(self: *AcpContext, arena: Allocator, call: ToolCall) ![]const u8 {
-        const card_id = try self.cardId(arena, call.id);
-        if (self.published_tool_calls.getKey(card_id)) |published| return published;
+        var card_id = try self.cardId(arena, call.id);
+        if (self.published_tool_calls.getKey(card_id)) |published| {
+            // The same call asked again keeps its card. A subagent call that
+            // reuses the id of one whose card ended is a new call.
+            if (self.subagent == null or !self.subagentCardEnded(published)) return published;
+        }
+        if (self.subagent != null) card_id = try self.startCall(arena, call.id);
         const registry = self.toolRegistry();
         const mcp_identity = if (registry.lookup(call.name) == null) self.mcpToolIdentity(arena, call.name) else null;
         if (mcp_identity) |identity| self.rememberToolIdentity(call.name, identity);
@@ -457,6 +515,26 @@ const AcpContext = struct {
             self.sendToolCallError(entry.key_ptr.*, text) catch |err| {
                 debug_trace.logf("acp", "tool call card left open call_id={s} err={s}", .{ entry.key_ptr.*, @errorName(err) });
             };
+        }
+    }
+
+    /// Ends the cards of a subagent's run that no call ended and the prompt's
+    /// end did not close, at the run's end, under the card lock. A card the
+    /// prompt's end closed already ended for the client.
+    fn finishSubagentCards(self: *AcpContext, text: []const u8) void {
+        const state = self.state;
+        state.subagent_cards_mutex.lockUncancelable(io_mod.getIo());
+        defer state.subagent_cards_mutex.unlock(io_mod.getIo());
+        var cards = self.published_tool_calls.iterator();
+        while (cards.next()) |entry| {
+            if (entry.value_ptr.* == .finished) continue;
+            if (server.subagentCardOpenLocked(state, entry.key_ptr.*)) {
+                self.sendToolCallError(entry.key_ptr.*, text) catch |err| {
+                    debug_trace.logf("acp", "tool call card left open call_id={s} err={s}", .{ entry.key_ptr.*, @errorName(err) });
+                };
+                server.forgetSubagentCardLocked(state, entry.key_ptr.*);
+            }
+            entry.value_ptr.* = .finished;
         }
     }
 
@@ -740,12 +818,17 @@ fn callHostTool(
     params.writer.writeAll(",\"input\":") catch return error.OutOfMemory;
     params.writer.writeAll(arguments_json) catch return error.OutOfMemory;
     params.writer.writeByte('}') catch return error.OutOfMemory;
+    prompt_test_controls.pauseBeforeRequestWrite("host_tool", outbound_id);
     state.writer.writeRequest(
         alloc,
         .{ .integer = @intCast(outbound_id) },
         "libfx/tool_call",
         params.written(),
     ) catch return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
+    // A cancel that came between the insert and this write sent its
+    // $/cancel_request ahead of the request
+    // (`tests/tla/acp/AcpChildApproval.tla` NoStaleRequest).
+    server.withdrawIfCancelled(state, outbound_id);
 
     var response = server.awaitOutboundResponse(state, outbound_id, .host_tool) orelse
         return .{ .failure = try alloc.dupe(u8, "Host tool request failed") };
@@ -1384,8 +1467,41 @@ pub fn runSubagentChild(
     }, turn, message, admission, cancel);
     // A card no call ended, because the run was cancelled or failed first,
     // ends with the run, as a parent's cards end with its turn.
-    ctx.finishOpenToolCalls(unfinishedChildCallText(outcome, cancel.load(.seq_cst)));
+    ctx.finishSubagentCards(unfinishedChildCallText(outcome, cancel.load(.seq_cst)));
     return outcome;
+}
+
+/// The text a card the prompt's end closes carries, as the parent's own cards
+/// that no call ended carry theirs.
+pub fn subagentCardText(outcome: TerminalOutcome) []const u8 {
+    const presentation: types.TurnPresentationOutcome = switch (outcome) {
+        .stop_reason => |reason| if (reason == .cancelled) .interrupted else .completed,
+        .rpc_error => .failed,
+    };
+    return unfinishedToolCallText(presentation, outcome == .stop_reason and outcome.stop_reason == .cancelled);
+}
+
+/// Ends every subagent card still open, with `text`, and shuts the cards, under
+/// the lock the subagents' threads announce and update them with: the prompt's
+/// end calls it before the response, so no card changes after the response
+/// (`tests/tla/acp/AcpChildApproval.tla` NoCardChangeAfterResponse). A card
+/// announced or updated later is refused or skipped.
+pub fn closeSubagentCards(state: *server.ServerState, text: []const u8) void {
+    state.subagent_cards_mutex.lockUncancelable(io_mod.getIo());
+    defer state.subagent_cards_mutex.unlock(io_mod.getIo());
+    state.subagent_cards_open = false;
+    const session_id = if (state.active_session) |*session| session.session_id else null;
+    var cards = state.subagent_cards.keyIterator();
+    while (cards.next()) |card| {
+        if (session_id) |id| {
+            var closing = AcpContext{ .alloc = state.alloc, .state = state, .session_id = id };
+            closing.sendToolCallError(card.*, text) catch |err| {
+                debug_trace.logf("acp", "tool call card left open call_id={s} err={s}", .{ card.*, @errorName(err) });
+            };
+        }
+        state.alloc.free(card.*);
+    }
+    state.subagent_cards.clearRetainingCapacity();
 }
 
 fn unfinishedChildCallText(
@@ -1410,17 +1526,28 @@ fn recordChildToolActivity(
     phase: runtime_deps.ToolActivityPhase,
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const asker = ctx.subagent orelse return;
-    const card_id = try ctx.alloc.print("{s}:{s}", .{ asker.child_id, call_id });
-    defer ctx.alloc.free(card_id);
+    if (ctx.subagent == null) return;
+    var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena_state.deinit();
+    const card_id = try ctx.cardId(arena_state.allocator(), call_id);
+    // Under the card lock the prompt's end closes the cards with: a card it
+    // closed, or a call it ended before this report, shows no further update.
+    const state = ctx.state;
+    state.subagent_cards_mutex.lockUncancelable(io_mod.getIo());
+    defer state.subagent_cards_mutex.unlock(io_mod.getIo());
     const card = ctx.published_tool_calls.getKey(card_id) orelse return;
     if (ctx.finalUpdateSent(card)) return;
+    if (!server.subagentCardOpenLocked(state, card)) {
+        ctx.markCardFinished(card);
+        return;
+    }
     switch (phase) {
         .started => try ctx.sendToolCallProgressText(card, null),
         .succeeded => try ctx.sendToolCallCompletedWithCommandResult(card, null, null),
         .failed => try ctx.sendToolCallError(card, "Failed"),
         .denied => try ctx.sendToolCallError(card, "Denied"),
     }
+    if (ctx.finalUpdateSent(card)) server.forgetSubagentCardLocked(state, card);
 }
 
 fn refreshProjectContext(
@@ -2522,7 +2649,7 @@ fn requestAcpPermission(
 
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const request_id = if (ctx.subagent) |asker|
-        beginSubagentRequest(ctx.state, asker) orelse return error.PermissionPromptUnavailable
+        try beginSubagentRequest(ctx.state, asker)
     else
         server.beginPermissionRequest(ctx.state) orelse return error.PermissionRequestAlreadyPending;
     errdefer {
@@ -2532,7 +2659,10 @@ fn requestAcpPermission(
 
     var pending_arena = std.heap.ArenaAllocator.init(alloc);
     defer pending_arena.deinit();
-    const tool_call_id = try ctx.sendToolCallPending(pending_arena.allocator(), call);
+    const tool_call_id = if (ctx.subagent != null)
+        try ctx.announceSubagentCard(pending_arena.allocator(), call)
+    else
+        try ctx.sendToolCallPending(pending_arena.allocator(), call);
 
     var params: std.Io.Writer.Allocating = .init(alloc);
     defer params.deinit();
@@ -2558,36 +2688,48 @@ fn requestAcpPermission(
     if (ctx.subagent) |asker| try writeSubagentMeta(&params.writer, asker);
     try params.writer.writeByte('}');
 
-    prompt_test_controls.pauseBeforePermissionWrite();
-    try ctx.state.writer.writeRequest(
+    prompt_test_controls.pauseBeforeRequestWrite("permission", request_id);
+    ctx.state.writer.writeRequest(
         alloc,
         .{ .integer = @intCast(request_id) },
         "session/request_permission",
         params.writer.buffered(),
-    );
+    ) catch |err| {
+        // A subagent's refusal names why nobody could be asked; the parent's
+        // own turn fails with the write's error.
+        return if (ctx.subagent != null) error.PermissionPromptClientUnavailable else err;
+    };
     // A cancel that came between the insert and this write sent its
     // $/cancel_request ahead of the request.
     server.withdrawIfCancelled(ctx.state, request_id);
     const decision = if (ctx.subagent) |asker|
-        server.awaitPermissionDecisionOrStop(ctx.state, request_id, asker.stop)
+        try server.awaitPermissionDecisionOrStop(ctx.state, request_id, asker.stop)
     else
         server.awaitPermissionDecision(ctx.state, request_id);
     return permission_request.OwnedPermissionResponse.init(alloc, decision, null);
 }
 
-/// A subagent's request id, or null when nobody can be asked: the subagent
-/// was stopped, no prompt is open, or the registry has no slot for a subagent.
-/// The caller then fails with `error.PermissionPromptUnavailable`, which
-/// admission reads as "approval was required and could not be asked", not as
-/// a refusal by the person.
-fn beginSubagentRequest(state: *server.ServerState, asker: SubagentAsker) ?u64 {
+/// A subagent's request id, or the error that says why nobody can be asked:
+/// the subagent was stopped (`PermissionPromptStopped`), no prompt is open
+/// (`PermissionPromptClosed`), or the registry has no slot for a subagent
+/// (`PermissionPromptFull`). Admission reads each as "approval was required
+/// and could not be asked", with that cause, not as a refusal by the person.
+fn beginSubagentRequest(
+    state: *server.ServerState,
+    asker: SubagentAsker,
+) error{ PermissionPromptStopped, PermissionPromptClosed, PermissionPromptFull, PermissionPromptUnavailable }!u64 {
     if (asker.stop.load(.seq_cst)) {
         debug_trace.logf("acp", "subagent permission refused child_id={s} work_id={s} reason=stopped", .{ asker.child_id, asker.work_id });
-        return null;
+        return error.PermissionPromptStopped;
     }
     return server.beginSubagentPermissionRequest(state) catch |err| {
         debug_trace.logf("acp", "subagent permission refused child_id={s} work_id={s} reason={s}", .{ asker.child_id, asker.work_id, @errorName(err) });
-        return null;
+        return switch (err) {
+            error.PromptClosed => error.PermissionPromptClosed,
+            error.RequestsFull => error.PermissionPromptFull,
+            // Out of memory for the entry names no cause.
+            error.OutOfMemory => error.PermissionPromptUnavailable,
+        };
     };
 }
 
@@ -3034,8 +3176,12 @@ fn flushJournal(state: *server.ServerState, alloc: Allocator, session_id: []cons
     try params.writer.writeAll("{\"sessionId\":");
     try jsonrpc.writeJsonStr(session_id, &params.writer);
     try params.writer.writeByte('}');
+    prompt_test_controls.pauseBeforeRequestWrite("journal", outbound_id);
     state.writer.writeRequest(alloc, .{ .integer = @intCast(outbound_id) }, "libfx/journal_flush", params.written()) catch
         return error.JournalFlushFailed;
+    // A cancel between the insert and the write is withdrawn again after it
+    // (`tests/tla/acp/AcpChildApproval.tla` NoStaleRequest).
+    server.withdrawIfCancelled(state, outbound_id);
     var response = server.awaitOutboundResponse(state, outbound_id, .journal) orelse return error.JournalFlushFailed;
     awaiting = false;
     defer response.deinit(state.alloc);
@@ -3669,12 +3815,16 @@ fn requestAcpElicitation(
     var wait_outcome: observation.WaitOutcome = .failed;
     var wait_error: ?[]const u8 = null;
     defer if (!wait_finished) if (wait) |value| value.end(if (responder.operation_cancel_flag != null and responder.operation_cancel_flag.?.load(.seq_cst)) .cancelled else wait_outcome, &.{}, wait_error);
+    prompt_test_controls.pauseBeforeRequestWrite("elicitation", outbound_id);
     try state.writer.writeRequest(
         alloc,
         .{ .integer = @intCast(outbound_id) },
         "elicitation/create",
         params,
     );
+    // A cancel between the insert and the write is withdrawn again after it
+    // (`tests/tla/acp/AcpChildApproval.tla` NoStaleRequest).
+    server.withdrawIfCancelled(state, outbound_id);
 
     const maybe_response = awaitAcpElicitationResponse(
         state,
@@ -5271,11 +5421,14 @@ test "a subagent's card carries its child id and ends once with its call's statu
     };
     defer ctx.deinitPublishedToolCalls();
 
+    state.subagent_cards_open = true;
+
     const call: ToolCall = .{ .id = "call_1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"content\":\"x\"}" };
-    const card = try ctx.sendToolCallPending(alloc, call);
-    try std.testing.expectEqualStrings("child_a:call_1", card);
-    // The id stays the same across the card's updates.
-    try std.testing.expectEqualStrings(card, try ctx.sendToolCallPending(alloc, call));
+    const card = try ctx.announceSubagentCard(alloc, call);
+    try std.testing.expectEqualStrings("child_a:1:call_1", card);
+    // The id stays the same across the card's updates, and a call asked again
+    // before its card ended keeps its card.
+    try std.testing.expectEqualStrings(card, try ctx.announceSubagentCard(alloc, call));
     try recordChildToolActivity(&ctx, "call_1", "write_file", .started);
     // A call that asked nothing has no card.
     try recordChildToolActivity(&ctx, "call_2", "read_file", .started);
@@ -5283,7 +5436,7 @@ test "a subagent's card carries its child id and ends once with its call's statu
     try recordChildToolActivity(&ctx, "call_1", "write_file", .succeeded);
     // An ended card ends no more, by a later report or by the run's end.
     try recordChildToolActivity(&ctx, "call_1", "write_file", .failed);
-    ctx.finishOpenToolCalls("Cancelled");
+    ctx.finishSubagentCards("Cancelled");
     try capture.sync(io_mod.getIo());
 
     var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-subagent-cards.jsonl", .{});
@@ -5296,7 +5449,7 @@ test "a subagent's card carries its child id and ends once with its call's statu
         if (line.len == 0) continue;
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
         const update = parsed.value.object.get("params").?.object.get("update").?.object;
-        try std.testing.expectEqualStrings("child_a:call_1", update.get("toolCallId").?.string);
+        try std.testing.expectEqualStrings("child_a:1:call_1", update.get("toolCallId").?.string);
         try std.testing.expect(count < statuses.len);
         statuses[count] = update.get("status").?.string;
         count += 1;
@@ -5313,6 +5466,230 @@ test "a card a subagent's run leaves open reads as the run's outcome" {
     try std.testing.expectEqualStrings("Cancelled", unfinishedChildCallText(error.Cancelled, false));
     try std.testing.expectEqualStrings("Tool failed", unfinishedChildCallText(error.ProviderFailed, false));
     try std.testing.expectEqualStrings("Cancelled", unfinishedChildCallText(error.ProviderFailed, true));
+}
+
+/// What a client reads from fx, frame by frame, in order.
+const FrameLog = struct {
+    frames: std.ArrayList([]u8) = .empty,
+    /// The client cannot be sent a permission request.
+    fail_permission_requests: bool = false,
+
+    fn write(raw: ?*anyopaque, frame: []const u8) !void {
+        const self: *FrameLog = @ptrCast(@alignCast(raw.?));
+        if (self.fail_permission_requests and std.mem.find(u8, frame, "\"method\":\"session/request_permission\"") != null) {
+            return error.BrokenPipe;
+        }
+        try self.frames.append(std.testing.allocator, try std.testing.allocator.dupe(u8, frame));
+    }
+
+    fn deinit(self: *FrameLog) void {
+        for (self.frames.items) |frame| std.testing.allocator.free(frame);
+        self.frames.deinit(std.testing.allocator);
+    }
+
+    /// The statuses card `id` showed, in order.
+    fn statuses(self: *const FrameLog, alloc: Allocator, id: []const u8) ![]const []const u8 {
+        var found: std.ArrayList([]const u8) = .empty;
+        for (self.frames.items) |frame| {
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, frame, .{});
+            const params = parsed.value.object.get("params") orelse continue;
+            if (params != .object) continue;
+            const update = (params.object.get("update") orelse continue);
+            if (update != .object) continue;
+            const card = update.object.get("toolCallId") orelse continue;
+            if (!std.mem.eql(u8, card.string, id)) continue;
+            try found.append(alloc, update.object.get("status").?.string);
+        }
+        return found.toOwnedSlice(alloc);
+    }
+
+    fn expectStatuses(self: *const FrameLog, id: []const u8, expected: []const []const u8) !void {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const found = try self.statuses(arena_state.allocator(), id);
+        try std.testing.expectEqual(expected.len, found.len);
+        for (expected, found) |want, got| try std.testing.expectEqualStrings(want, got);
+    }
+};
+
+fn childContext(state: *server.ServerState, stop: *const std.atomic.Value(bool)) AcpContext {
+    return .{
+        .alloc = state.alloc,
+        .state = state,
+        .session_id = "session_1",
+        .subagent = .{ .child_id = "child_a", .work_id = "work_1", .name = "writer", .stop = stop },
+    };
+}
+
+test "a subagent run whose model repeats a call id announces a card for each call" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var frames = FrameLog{};
+    defer frames.deinit();
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&frames, FrameLog.write);
+    state.subagent_cards_open = true;
+    var stop = std.atomic.Value(bool).init(false);
+    var ctx = childContext(&state, &stop);
+    defer ctx.deinitPublishedToolCalls();
+
+    const first_call: ToolCall = .{ .id = "call_1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"content\":\"a\"}" };
+    const second_call: ToolCall = .{ .id = "call_1", .name = "write_file", .arguments_json = "{\"path\":\"b.txt\",\"content\":\"b\"}" };
+    const other_call: ToolCall = .{ .id = "call_2", .name = "write_file", .arguments_json = "{\"path\":\"c.txt\",\"content\":\"c\"}" };
+
+    const first = try ctx.announceSubagentCard(arena, first_call);
+    try recordChildToolActivity(&ctx, "call_1", "write_file", .started);
+    try recordChildToolActivity(&ctx, "call_1", "write_file", .succeeded);
+    // The model's next reply numbers its call call_1 again: a new call, with a
+    // card of its own, and the updates the id names are now its updates.
+    const second = try ctx.announceSubagentCard(arena, second_call);
+    const other = try ctx.announceSubagentCard(arena, other_call);
+    try recordChildToolActivity(&ctx, "call_1", "write_file", .started);
+    try recordChildToolActivity(&ctx, "call_1", "write_file", .failed);
+    // A call asked again before its card ended keeps its card.
+    try std.testing.expectEqualStrings(other, try ctx.announceSubagentCard(arena, other_call));
+
+    try std.testing.expectEqualStrings("child_a:1:call_1", first);
+    try std.testing.expectEqualStrings("child_a:2:call_1", second);
+    try std.testing.expectEqualStrings("child_a:3:call_2", other);
+    try frames.expectStatuses("child_a:1:call_1", &.{ "pending", "in_progress", "completed" });
+    try frames.expectStatuses("child_a:2:call_1", &.{ "pending", "in_progress", "failed" });
+    try frames.expectStatuses("child_a:3:call_2", &.{"pending"});
+}
+
+test "a card the prompt's end closed shows no later update, and no card is announced after it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var frames = FrameLog{};
+    defer frames.deinit();
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&frames, FrameLog.write);
+    state.subagent_cards_open = true;
+    var stop = std.atomic.Value(bool).init(false);
+    var ctx = childContext(&state, &stop);
+    defer ctx.deinitPublishedToolCalls();
+
+    const call: ToolCall = .{ .id = "call_1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"content\":\"a\"}" };
+    const card = try ctx.announceSubagentCard(arena, call);
+    closeSubagentCards(&state, "Cancelled");
+    // The call's own report after the close, and the run's end, add nothing.
+    try recordChildToolActivity(&ctx, "call_1", "write_file", .succeeded);
+    ctx.finishSubagentCards("Tool failed");
+    try frames.expectStatuses(card, &.{ "pending", "failed" });
+    // A call that asks now is refused, with no card.
+    try std.testing.expectError(error.PermissionPromptClosed, ctx.announceSubagentCard(arena, call));
+    try std.testing.expectEqual(@as(usize, 2), frames.frames.items.len);
+    // The next prompt opens the cards again, and the model's id names a new call.
+    state.subagent_cards_open = true;
+    try std.testing.expectEqualStrings("child_a:2:call_1", try ctx.announceSubagentCard(arena, call));
+}
+
+test "the text a card the prompt's end closes carries follows the prompt's outcome" {
+    try std.testing.expectEqualStrings("Cancelled", subagentCardText(.{ .stop_reason = .cancelled }));
+    try std.testing.expectEqualStrings("Tool completion was not reported", subagentCardText(.{ .stop_reason = .end_turn }));
+    try std.testing.expectEqualStrings("Tool failed", subagentCardText(.{ .rpc_error = .{ .code = -32603, .message = "failed" } }));
+}
+
+test "a subagent that cannot be asked fails with the error that names why" {
+    const alloc = std.testing.allocator;
+    var frames = FrameLog{};
+    defer frames.deinit();
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&frames, FrameLog.write);
+    var stop = std.atomic.Value(bool).init(false);
+    var ctx = childContext(&state, &stop);
+    defer ctx.deinitPublishedToolCalls();
+    const request: permission_request.PermissionRequest = .{ .label = "Allow write?" };
+    const call: ToolCall = .{ .id = "call_1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"content\":\"a\"}" };
+
+    // No prompt is open.
+    try std.testing.expectError(error.PermissionPromptClosed, requestAcpPermission(&ctx, alloc, request, call, null, null));
+    state.subagent_asks_open = true;
+    state.subagent_cards_open = true;
+
+    // The subagent was stopped.
+    stop.store(true, .seq_cst);
+    try std.testing.expectError(error.PermissionPromptStopped, requestAcpPermission(&ctx, alloc, request, call, null, null));
+    stop.store(false, .seq_cst);
+
+    // The cards are shut though the registry still takes requests: the
+    // request that was inserted is cancelled and forgotten.
+    state.subagent_cards_open = false;
+    try std.testing.expectError(error.PermissionPromptClosed, requestAcpPermission(&ctx, alloc, request, call, null, null));
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+    state.subagent_cards_open = true;
+
+    // The client cannot be sent the request.
+    frames.fail_permission_requests = true;
+    try std.testing.expectError(error.PermissionPromptClientUnavailable, requestAcpPermission(&ctx, alloc, request, call, null, null));
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+    frames.fail_permission_requests = false;
+
+    // Too many requests are open.
+    var open: usize = 0;
+    while (server.beginSubagentPermissionRequest(&state)) |_| open += 1 else |err| try std.testing.expectEqual(error.RequestsFull, err);
+    try std.testing.expect(open > 0);
+    try std.testing.expectError(error.PermissionPromptFull, requestAcpPermission(&ctx, alloc, request, call, null, null));
+}
+
+var gap_state: ?*server.ServerState = null;
+
+/// Stands in for a `session/cancel` that comes while a request waits between
+/// its insert and its write.
+fn cancelInGap(_: []const u8, request_id: u64) void {
+    if (gap_state) |state| server.cancelOutboundRequest(state, request_id);
+}
+
+/// A request cancelled in its gap is announced as cancelled before it is
+/// written, and withdrawn again after: three frames, the notice twice.
+fn expectWithdrawnAgain(frames: *const FrameLog, method: []const u8) !void {
+    try std.testing.expectEqual(@as(usize, 3), frames.frames.items.len);
+    try std.testing.expect(std.mem.find(u8, frames.frames.items[0], "\"method\":\"$/cancel_request\"") != null);
+    var wanted: [64]u8 = undefined;
+    try std.testing.expect(std.mem.find(u8, frames.frames.items[1], try std.mem.print(&wanted, "\"method\":\"{s}\"", .{method})) != null);
+    try std.testing.expect(std.mem.find(u8, frames.frames.items[2], "\"method\":\"$/cancel_request\"") != null);
+    try std.testing.expectEqualStrings(frames.frames.items[0], frames.frames.items[2]);
+}
+
+test "a host tool request cancelled between its insert and its write is withdrawn again after the write" {
+    const alloc = std.testing.allocator;
+    var frames = FrameLog{};
+    defer frames.deinit();
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&frames, FrameLog.write);
+    gap_state = &state;
+    prompt_test_controls.before_request_write_hook = cancelInGap;
+    defer {
+        gap_state = null;
+        prompt_test_controls.before_request_write_hook = null;
+    }
+    try std.testing.expectError(error.Cancelled, callHostTool(&state, alloc, "lookup", "call_1", "{}", 1024, null));
+    try expectWithdrawnAgain(&frames, "libfx/tool_call");
+}
+
+test "a journal flush cancelled between its insert and its write is withdrawn again after the write" {
+    const alloc = std.testing.allocator;
+    var frames = FrameLog{};
+    defer frames.deinit();
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = jsonrpc.Writer.initCallback(&frames, FrameLog.write);
+    gap_state = &state;
+    prompt_test_controls.before_request_write_hook = cancelInGap;
+    defer {
+        gap_state = null;
+        prompt_test_controls.before_request_write_hook = null;
+    }
+    try std.testing.expectError(error.Cancelled, flushJournal(&state, alloc, "session_1"));
+    try expectWithdrawnAgain(&frames, "libfx/journal_flush");
 }
 
 test "ACP propagateGrant stores deduped runtime session grants" {

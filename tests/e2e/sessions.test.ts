@@ -2279,6 +2279,10 @@ test("fx ask denies a subagent's gated write at once in ask mode", async () => {
     expect(seen.filter((kind) => kind === "child-after")).toHaveLength(1);
     expect(afterDenial).toContain("permission_required");
     expect(afterDenial).toContain("The tool did not run");
+    // fx ask is noninteractive, so its text stays; the causes fx acp names
+    // (a closed prompt, a stop, a full registry) do not apply to it.
+    expect(afterDenial).toContain("Noninteractive mode cannot show an approval prompt");
+    expect(afterDenial).not.toContain("fx could not ask because");
     expect(afterDenial).not.toContain("user_denied");
     expect(afterDenial).not.toContain("Permission denied by user");
     expect(JSON.parse(result.stdout).output).toContain("PARENT_REPORT_DONE");

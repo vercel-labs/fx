@@ -54,6 +54,26 @@ pub const Prompter = struct {
     }
 };
 
+/// The cause a prompter's failure carries, or null for one that names none. A
+/// prompter that cannot ask fails with `error.PermissionPromptUnavailable`, or
+/// with the error here that names why; admission turns either into an outcome
+/// that says approval was needed and could not be asked, never into a refusal
+/// by the person.
+pub fn unavailableCause(err: anyerror) ?types.ApprovalUnavailableCause {
+    return switch (err) {
+        error.PermissionPromptClosed => .prompt_closed,
+        error.PermissionPromptStopped => .stopped,
+        error.PermissionPromptFull => .requests_full,
+        error.PermissionPromptClientUnavailable => .client_unavailable,
+        else => null,
+    };
+}
+
+/// Whether a prompter's failure means approval could not be asked.
+pub fn isUnavailable(err: anyerror) bool {
+    return err == error.PermissionPromptUnavailable or unavailableCause(err) != null;
+}
+
 test "approval observer pairs actual prompt attempts without changing their decisions" {
     const Fixture = struct {
         decision: types.ToolPermissionDecision = .once,

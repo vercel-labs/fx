@@ -172,6 +172,18 @@ pub fn toolPermissionDeniedJson(alloc: Allocator, tool_name: []const u8, reason:
         .user_denied, .auto_denied, .policy_denied, .permission_required => {},
         .review_caution, .review_evidence_incomplete, .review_unavailable => unreachable,
     }
+    return permissionDeniedJson(alloc, tool_name, reason, permissionDeniedSuggestion(reason));
+}
+
+/// The result of a call that needs approval fx could not ask for, because of
+/// `cause`. It is a `permission_required` refusal like any other, so the
+/// model does not read it as a refusal by the person, and it names the cause
+/// where the plain one says noninteractive mode, which is false in fx acp.
+pub fn toolApprovalUnavailableJson(alloc: Allocator, tool_name: []const u8, cause: types.ApprovalUnavailableCause) Allocator.Error![]u8 {
+    return permissionDeniedJson(alloc, tool_name, .permission_required, approvalUnavailableSuggestion(cause));
+}
+
+fn permissionDeniedJson(alloc: Allocator, tool_name: []const u8, reason: types.ToolPermissionDenialReason, suggestion: []const u8) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     out.writer.writeAll("{\"error\":{\"type\":\"tool_permission_denied\",\"tool_name\":") catch return error.OutOfMemory;
@@ -181,7 +193,7 @@ pub fn toolPermissionDeniedJson(alloc: Allocator, tool_name: []const u8, reason:
     out.writer.writeAll(",\"reason\":") catch return error.OutOfMemory;
     std.json.Stringify.value(@tagName(reason), .{}, &out.writer) catch return error.OutOfMemory;
     out.writer.writeAll(",\"denied\":true,\"suggestion\":") catch return error.OutOfMemory;
-    writeMaskedJsonString(alloc, &out.writer, permissionDeniedSuggestion(reason)) catch return error.OutOfMemory;
+    writeMaskedJsonString(alloc, &out.writer, suggestion) catch return error.OutOfMemory;
     out.writer.writeAll("}}") catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
@@ -271,6 +283,15 @@ fn permissionDeniedSuggestion(
         .review_unavailable => "The action did not run because safety review was unavailable. Continue with a different safe action or retry later.",
         .policy_denied => "The tool did not run. Do not retry unchanged; explain the configured policy blocker or use an allowed alternative.",
         .permission_required => "The tool did not run. Noninteractive mode cannot show an approval prompt. Rerun interactively to approve, or configure a narrow permission rule before retrying.",
+    };
+}
+
+fn approvalUnavailableSuggestion(cause: types.ApprovalUnavailableCause) []const u8 {
+    return switch (cause) {
+        .prompt_closed => "The tool did not run: it needs approval, and fx could not ask because the prompt it belongs to ended or was cancelled. Do not retry unchanged; explain what needs approval, or use an action that needs none.",
+        .stopped => "The tool did not run: it needs approval, and fx could not ask because the agent that asked was stopped. Do not retry unchanged; explain what needs approval, or use an action that needs none.",
+        .requests_full => "The tool did not run: it needs approval, and fx could not ask because too many approval requests are open. Retry once they are answered, or use an action that needs none.",
+        .client_unavailable => "The tool did not run: it needs approval, and fx could not ask because the client cannot show approval prompts. Do not retry unchanged; explain what needs approval, or use an action that needs none.",
     };
 }
 
@@ -641,6 +662,34 @@ test "review hold JSON preserves typed reasons apart from permission denial" {
     try std.testing.expect(toolPermissionDenialReason(
         "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"review_caution\"}}",
     ) == null);
+}
+
+test "an approval that could not be asked reads as its cause, and not as noninteractive mode or a refusal" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { cause: types.ApprovalUnavailableCause, because: []const u8 }{
+        .{ .cause = .prompt_closed, .because = "fx could not ask because the prompt it belongs to ended or was cancelled." },
+        .{ .cause = .stopped, .because = "fx could not ask because the agent that asked was stopped." },
+        .{ .cause = .requests_full, .because = "fx could not ask because too many approval requests are open." },
+        .{ .cause = .client_unavailable, .because = "fx could not ask because the client cannot show approval prompts." },
+    };
+    for (cases) |case| {
+        const payload = try toolApprovalUnavailableJson(alloc, "write_file", case.cause);
+        defer alloc.free(payload);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+        defer parsed.deinit();
+        const failure = parsed.value.object.get("error").?.object;
+        // The same refusal as any approval that could not be asked.
+        try std.testing.expectEqualStrings("tool_permission_denied", failure.get("type").?.string);
+        try std.testing.expectEqualStrings("permission_required", failure.get("reason").?.string);
+        try std.testing.expectEqualStrings("Tool approval is required before this tool can run", failure.get("message").?.string);
+        try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, toolPermissionDenialReason(payload).?);
+        // It names what is true: the tool did not run, it needs approval, and why.
+        const suggestion = failure.get("suggestion").?.string;
+        try std.testing.expect(std.mem.startsWith(u8, suggestion, "The tool did not run: it needs approval, and "));
+        try std.testing.expect(std.mem.find(u8, suggestion, case.because) != null);
+        try std.testing.expect(std.mem.find(u8, suggestion, "Noninteractive mode") == null);
+        try std.testing.expect(std.mem.find(u8, suggestion, "denied") == null);
+    }
 }
 
 test "tool permission denied JSON explains policy and headless blockers" {

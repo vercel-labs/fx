@@ -2666,11 +2666,16 @@ pub const WorkerRuntime = struct {
         for (self.queued_prompts.items) |*prompt| try appendGrantToQueuedPrompt(alloc, prompt, tool_name, target_path);
     }
 
+    /// A permission wait the worker's stop ended before anyone answered. It is
+    /// a refusal that names the stop, not the person's denial
+    /// (`tests/tla/acp/AcpChildApproval.tla` ReadsTrue).
+    pub const PermissionStopped = error{PermissionPromptStopped};
+
     pub fn requestPermissionBlocking(
         self: *WorkerRuntime,
         alloc: std.mem.Allocator,
         request: permission_request.PermissionRequest,
-    ) permission_request.RequestCloneError!permission_request.OwnedPermissionResponse {
+    ) (permission_request.RequestCloneError || PermissionStopped)!permission_request.OwnedPermissionResponse {
         return self.requestPermissionBlockingWithReview(alloc, request, null);
     }
 
@@ -2679,7 +2684,7 @@ pub const WorkerRuntime = struct {
         alloc: std.mem.Allocator,
         request: permission_request.PermissionRequest,
         review: ?*const diff_mod.FileReview,
-    ) permission_request.RequestCloneError!permission_request.OwnedPermissionResponse {
+    ) (permission_request.RequestCloneError || PermissionStopped)!permission_request.OwnedPermissionResponse {
         return self.requestPermissionBlockingObserved(alloc, request, review, null) catch |err| switch (err) {
             error.PermissionRegistrationFailed,
             error.PermissionCapacityExceeded,
@@ -2707,7 +2712,7 @@ pub const WorkerRuntime = struct {
         request: permission_request.PermissionRequest,
         review: ?*const diff_mod.FileReview,
         observer: ?PermissionRequestObserver,
-    ) (permission_request.RequestCloneError || error{
+    ) (permission_request.RequestCloneError || PermissionStopped || error{
         PermissionRegistrationFailed,
         PermissionCapacityExceeded,
     })!permission_request.OwnedPermissionResponse {
@@ -2750,8 +2755,7 @@ pub const WorkerRuntime = struct {
             self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
         }
 
-        const response = self.pending_permission_response orelse
-            permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
+        const answer = self.pending_permission_response;
         self.pending_permission_waiting = false;
         self.pending_permission_response = null;
         if (self.pending_permission_request_shared) |*old| {
@@ -2759,7 +2763,9 @@ pub const WorkerRuntime = struct {
             self.pending_permission_request_shared = null;
         }
         self.pending_permission_review = null;
-        return response;
+        // Woken with no answer: the worker was stopped, or the wait was
+        // cancelled. Nobody refused, so this is not a denial.
+        return answer orelse error.PermissionPromptStopped;
     }
 
     pub fn submitPermissionResponse(
@@ -7735,8 +7741,10 @@ test "permission blocking handles submit and stop" {
     _ = try waitForPermissionLabel(&stop_runtime, "Stop?");
     stop_runtime.requestStop();
     stop_thread.join();
-    try std.testing.expect(stop_state.err == null);
-    try std.testing.expectEqual(types.ToolPermissionDecision.deny, stop_state.decision.?);
+    // A stop ends the wait with a refusal that names it. Nobody denied the
+    // action, so it is not a plain deny, which would read as the person's.
+    try std.testing.expectEqual(error.PermissionPromptStopped, stop_state.err.?);
+    try std.testing.expect(stop_state.decision == null);
     var stop_snapshot = try stop_runtime.snapshotState(alloc);
     defer stop_snapshot.deinit(alloc);
     try std.testing.expect(stop_snapshot.pending_permission_request == null);
@@ -7749,8 +7757,8 @@ test "permission blocking handles submit and stop" {
     _ = try waitForPermissionLabel(&shutdown_runtime, "Shutdown?");
     shutdown_runtime.requestShutdown();
     shutdown_thread.join();
-    try std.testing.expect(shutdown_state.err == null);
-    try std.testing.expectEqual(types.ToolPermissionDecision.deny, shutdown_state.decision.?);
+    try std.testing.expectEqual(error.PermissionPromptStopped, shutdown_state.err.?);
+    try std.testing.expect(shutdown_state.decision == null);
     var shutdown_snapshot = try shutdown_runtime.snapshotState(alloc);
     defer shutdown_snapshot.deinit(alloc);
     try std.testing.expect(shutdown_snapshot.pending_permission_request == null);

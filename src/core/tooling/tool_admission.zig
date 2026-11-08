@@ -1827,9 +1827,9 @@ fn requestFileMutationPermissionOutcomeFromAdmission(
                 call,
                 review,
                 authorization.grant_offer.?.grants,
-            ) catch |err| switch (err) {
-                error.PermissionPromptUnavailable => break :blk unavailable,
-                else => return err,
+            ) catch |err| {
+                if (!permission_prompter.isUnavailable(err)) return err;
+                break :blk approvalUnavailableOutcome(unavailable, err);
             };
             defer response.deinit();
             var outcome: command_admission.PermissionOutcome = .{
@@ -2044,6 +2044,53 @@ fn permissionOutcomeForResponse(
     return outcome;
 }
 
+/// `unavailable` with the cause the prompter's failure `err` names, when it
+/// names one. The model reads that approval was needed and could not be
+/// asked, and why, rather than that the person refused.
+fn approvalUnavailableOutcome(
+    unavailable: command_admission.PermissionOutcome,
+    err: anyerror,
+) command_admission.PermissionOutcome {
+    var outcome = unavailable;
+    outcome.approval_unavailable = permission_prompter.unavailableCause(err);
+    return outcome;
+}
+
+test "an approval that could not be asked carries the cause its prompter named" {
+    const unavailable: command_admission.PermissionOutcome = .{
+        .decision = .permission_required,
+        .denial_reason = .permission_required,
+        .requirement = .approval_required,
+    };
+    const named = [_]struct { err: anyerror, cause: types.ApprovalUnavailableCause }{
+        .{ .err = error.PermissionPromptClosed, .cause = .prompt_closed },
+        .{ .err = error.PermissionPromptStopped, .cause = .stopped },
+        .{ .err = error.PermissionPromptFull, .cause = .requests_full },
+        .{ .err = error.PermissionPromptClientUnavailable, .cause = .client_unavailable },
+    };
+    for (named) |case| {
+        const outcome = approvalUnavailableOutcome(unavailable, case.err);
+        try std.testing.expectEqual(case.cause, outcome.approval_unavailable.?);
+        try std.testing.expectEqual(types.ToolPermissionDecision.permission_required, outcome.decision);
+        try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, outcome.denial_reason.?);
+    }
+    // A prompter that names no cause leaves it null: noninteractive mode.
+    try std.testing.expect(approvalUnavailableOutcome(unavailable, error.PermissionPromptUnavailable).approval_unavailable == null);
+
+    // Only a failure that means approval could not be asked is a refusal;
+    // any other failure is not turned into one.
+    for ([_]anyerror{
+        error.PermissionPromptUnavailable,
+        error.PermissionPromptClosed,
+        error.PermissionPromptStopped,
+        error.PermissionPromptFull,
+        error.PermissionPromptClientUnavailable,
+    }) |err| try std.testing.expect(permission_prompter.isUnavailable(err));
+    try std.testing.expect(!permission_prompter.isUnavailable(error.OutOfMemory));
+    try std.testing.expect(!permission_prompter.isUnavailable(error.Cancelled));
+    try std.testing.expect(permission_prompter.unavailableCause(error.OutOfMemory) == null);
+}
+
 fn humanApprovalProvenance(
     decision: ToolPermissionDecision,
 ) command_admission.HumanApprovalProvenance {
@@ -2082,9 +2129,9 @@ fn promptPermissionOutcome(
         call,
         null,
         grant_offer,
-    ) catch |err| switch (err) {
-        error.PermissionPromptUnavailable => return unavailable,
-        else => return err,
+    ) catch |err| {
+        if (!permission_prompter.isUnavailable(err)) return err;
+        return approvalUnavailableOutcome(unavailable, err);
     };
     defer response.deinit();
     var outcome = try permissionOutcomeForResponse(
