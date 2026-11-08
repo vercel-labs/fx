@@ -11,9 +11,15 @@
 # ended (GoneEndsLoop), and the restore of a closed descriptor reached
 # std.posix.tcsetattr's unreachable (CleanupNeverCrashes). Where a revoked
 # terminal fails reads with EIO, as macOS 15 answered, the loop reported the
-# read error (terminal-revoke-today-eio, ReadErrorOnlyWhenLive). Each
-# terminal-revoke-mutation-*.cfg plants one defect, and the rule it names must
-# catch it:
+# read error (terminal-revoke-today-eio, ReadErrorOnlyWhenLive). The team
+# picker and the masked key prompt restore the terminal on the way out too.
+# The terminal-revoke-today-prompts* configs are fx with the shell's fix and
+# without theirs, where those restores still went through the strict
+# tcsetattr: a closed descriptor reached its unreachable
+# (terminal-revoke-today-prompts, CleanupNeverCrashes), and ENOENT from a
+# revoked terminal was an unexpected errno (terminal-revoke-today-prompts-errno,
+# GoneQuietly). Each terminal-revoke-mutation-*.cfg plants one defect, and the
+# rule it names must catch it:
 #
 #   nval-ignored       POLLNVAL is not counted as closed input        NoBusyLoop
 #   badf-unreachable   EBADF from the restore aborts fx                CleanupNeverCrashes
@@ -43,6 +49,8 @@ TerminalRevoke terminal-revoke-today NoBusyLoop
 TerminalRevoke terminal-revoke-today-cleanup CleanupNeverCrashes
 TerminalRevoke terminal-revoke-today-liveness temporal
 TerminalRevoke terminal-revoke-today-eio ReadErrorOnlyWhenLive
+TerminalRevoke terminal-revoke-today-prompts CleanupNeverCrashes
+TerminalRevoke terminal-revoke-today-prompts-errno GoneQuietly
 TerminalRevoke terminal-revoke-mutation-nval-ignored NoBusyLoop
 TerminalRevoke terminal-revoke-mutation-badf-unreachable CleanupNeverCrashes
 TerminalRevoke terminal-revoke-mutation-enoent-unexpected GoneQuietly

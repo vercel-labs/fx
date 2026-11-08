@@ -43,15 +43,13 @@ fn readInput(terminal: anytype, buf: []u8) !usize {
             .pointer => |pointer| pointer.child,
             else => @TypeOf(terminal),
         };
-        if (comptime @hasDecl(Terminal, "inputGone")) {
-            if (@as(anyerror, err) == error.InputOutput) {
-                if (terminal.inputGone()) {
-                    debug_trace.logf("event_loop", "read_failed err=InputOutput terminal=gone action=end_of_input", .{});
-                    return 0;
-                }
-                debug_trace.logf("event_loop", "read_failed err=InputOutput terminal=live action=error", .{});
-            }
+        if (comptime !@hasDecl(Terminal, "inputGone")) return err;
+        if (@as(anyerror, err) != error.InputOutput) return err;
+        if (terminal.inputGone()) {
+            debug_trace.logf("event_loop", "read_failed err=InputOutput terminal=gone action=end_of_input", .{});
+            return 0;
         }
+        debug_trace.logf("event_loop", "read_failed err=InputOutput terminal=live action=error", .{});
         return err;
     };
 }
@@ -538,14 +536,7 @@ test "event loop ends at an error poll that returns at once without polling agai
     const exit_cause = try run(EventLoopGoneTerminal{
         .polls = &polls,
         .observed_timeout_ms = &observed_timeout_ms,
-    }, &should_exit, 8, .{
-        .ctx = &trace,
-        .collect_facts = collectEventLoopTestFacts,
-        .next_collected_byte = noCollectedEventLoopByte,
-        .handle_byte = rejectUnexpectedEventLoopByte,
-        .settle_delivery_epoch = rejectUnexpectedEventLoopCommit,
-        .commit_frame = rejectUnexpectedEventLoopCommit,
-    });
+    }, &should_exit, 8, rejectingCallbacks(&trace));
 
     try std.testing.expectEqual(ExitCause.input_closed, exit_cause);
     try std.testing.expectEqual(@as(usize, 1), polls);
@@ -562,14 +553,7 @@ test "cooperative input pump reports an error poll as closed input" {
     const exit_cause = try pump_ready_input(EventLoopGoneTerminal{
         .polls = &polls,
         .observed_timeout_ms = &observed_timeout_ms,
-    }, &should_exit, .{
-        .ctx = &trace,
-        .collect_facts = collectEventLoopTestFacts,
-        .next_collected_byte = noCollectedEventLoopByte,
-        .handle_byte = rejectUnexpectedEventLoopByte,
-        .settle_delivery_epoch = rejectUnexpectedEventLoopCommit,
-        .commit_frame = rejectUnexpectedEventLoopCommit,
-    });
+    }, &should_exit, rejectingCallbacks(&trace));
 
     try std.testing.expectEqual(@as(?ExitCause, .input_closed), exit_cause);
     try std.testing.expectEqual(@as(usize, 1), polls);
@@ -614,6 +598,18 @@ const EventLoopFailingReadTerminal = struct {
         return self.gone;
     }
 };
+
+/// Callbacks that fail the test if the loop handles a byte, settles, or draws.
+fn rejectingCallbacks(trace: *EventLoopTestTrace) EventLoopCallbacks {
+    return .{
+        .ctx = trace,
+        .collect_facts = collectEventLoopTestFacts,
+        .next_collected_byte = noCollectedEventLoopByte,
+        .handle_byte = rejectUnexpectedEventLoopByte,
+        .settle_delivery_epoch = rejectUnexpectedEventLoopCommit,
+        .commit_frame = rejectUnexpectedEventLoopCommit,
+    };
+}
 
 fn failingReadCallbacks(trace: *EventLoopTestTrace) EventLoopCallbacks {
     return .{

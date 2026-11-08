@@ -26,6 +26,16 @@
 (* No SIGHUP reaches fx here: the terminal is not fx's controlling         *)
 (* terminal, or SIGHUP is blocked or ignored.                              *)
 (*                                                                         *)
+(* Three callers put stdin in raw mode and restore it on the way out, and  *)
+(* site names the one that runs. "shell" is the interactive shell above.   *)
+(* "team_picker" is the team picker of fx login and fx teams               *)
+(* (TeamPickerRawMode in src/core/auth/login_flow.zig), and "masked_key"   *)
+(* is the API key prompt of fx login vercel --api-key (MaskedKeyRawMode    *)
+(* in src/core/cli/cli_surface.zig). A prompt reads stdin directly, with   *)
+(* no poll, and returns when the person answers or a read fails on a       *)
+(* terminal that is gone (PromptReturns); its read loop is not modeled,    *)
+(* only that it returns and restores the terminal through the same Restore.*)
+(*                                                                         *)
 (* Job control moves fx between the foreground ("fg"), stopped, and the    *)
 (* background ("bg"). Ctrl+Z (Suspend) stops fx. With SIGTTIN and SIGTTOU  *)
 (* at their default (stops), a background fx stops at its first terminal   *)
@@ -48,14 +58,18 @@
 (* Bug = "today" is fx before the change: POLLNVAL was dropped, the        *)
 (* restore went through std.posix.tcsetattr, which treats EBADF and EINVAL *)
 (* as unreachable and reports ENOENT as an unexpected errno, and every     *)
-(* read that failed with EIO ended fx with an error.                       *)
+(* read that failed with EIO ended fx with an error. Bug =                 *)
+(* "prompts_strict" is fx with the shell's fix but not the prompts': the   *)
+(* team picker and the masked key prompt still restore through             *)
+(* std.posix.tcsetattr.                                                    *)
 (***************************************************************************)
 EXTENDS Naturals
 
 CONSTANTS MaxSpins, MaxIntr, Bug
 
-Bugs == {"none", "today", "nval_ignored", "badf_unreachable", "enoent_unexpected", "no_eintr_retry",
-         "eio_always_eof", "eio_poll_only"}
+Bugs == {"none", "today", "prompts_strict", "nval_ignored", "badf_unreachable", "enoent_unexpected",
+         "no_eintr_retry", "eio_always_eof", "eio_poll_only"}
+Sites == {"shell", "team_picker", "masked_key"}
 ASSUME Bug \in Bugs
 
 VARIABLES
@@ -65,15 +79,16 @@ VARIABLES
     dirty,    \* fx read input it has not drawn yet
     phase,    \* "loop", "cleanup", "exited", or "crashed"
     cause,    \* why the loop ended: "none", "requested", "input_closed",
-              \* "write_failed", or "read_failed"
+              \* "write_failed", "read_failed", or "prompt_failed"
     spins,    \* passes of the loop that returned at once with nothing to do
     intr,     \* EINTRs the environment can still deliver to the restore
     restore,  \* "pending", "restored", "gone", "error", or "lost"
     job,      \* "fg", "stopped", or "bg"
     eio,      \* a revoked terminal polls as readable and fails reads with EIO
-    stops     \* SIGTTIN and SIGTTOU keep their default action
+    stops,    \* SIGTTIN and SIGTTOU keep their default action
+    site      \* "shell", "team_picker", or "masked_key": who restores the terminal
 
-vars == <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops>>
+vars == <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site>>
 
 Init ==
     /\ tty = "live"
@@ -88,6 +103,7 @@ Init ==
     /\ job = "fg"
     /\ eio \in BOOLEAN
     /\ stops \in BOOLEAN
+    /\ site \in Sites
 
 Gone == tty # "live"
 Running == phase \in {"loop", "cleanup"}
@@ -142,6 +158,7 @@ ReadFailed == EndLoop(IF EndsInput THEN "input_closed" ELSE "read_failed")
 
 \* One pass of event_loop.run's waiting poll.
 Poll ==
+    /\ site = "shell"
     /\ phase = "loop"
     /\ job # "stopped"
     /\ ~dirty
@@ -150,7 +167,7 @@ Poll ==
        IF Readable(r)
        THEN IF ReadFails
             THEN /\ ReadFailed
-                 /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops>>
+                 /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site>>
             ELSE IF queued
             \* The bytes are read and handled; one of them may ask fx to quit,
             \* which ends the loop before any frame is drawn.
@@ -160,20 +177,20 @@ Poll ==
                                      /\ UNCHANGED dirty
                                 ELSE /\ dirty' = TRUE
                                      /\ UNCHANGED <<phase, cause>>
-                 /\ UNCHANGED <<tty, spins, intr, restore, job, eio, stops>>
+                 /\ UNCHANGED <<tty, spins, intr, restore, job, eio, stops, site>>
             \* read returned 0: the end of input.
             ELSE /\ EndLoop("input_closed")
-                 /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops>>
+                 /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site>>
        ELSE IF Closed(r)
        THEN /\ EndLoop("input_closed")
-            /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops>>
+            /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site>>
        \* Nothing to do: settle, commit a frame, and poll again. On a live
        \* terminal that pass waited its timeout; on one that is gone it
        \* returned at once.
        ELSE /\ IF Gone THEN /\ spins < MaxSpins
                             /\ spins' = spins + 1
                        ELSE UNCHANGED spins
-            /\ UNCHANGED <<tty, queued, dirty, phase, cause, intr, restore, job, eio, stops>>
+            /\ UNCHANGED <<tty, queued, dirty, phase, cause, intr, restore, job, eio, stops, site>>
 
 \* After a read: the loop's poll(0), then the frame for what it read. A poll
 \* that still reports input reads again, and a read that fails with EIO gets
@@ -181,6 +198,7 @@ Poll ==
 \* final frame that fails to write is only logged; a frame written to a
 \* terminal that is gone fails and ends fx with an error.
 Drain ==
+    /\ site = "shell"
     /\ phase = "loop"
     /\ job # "stopped"
     /\ dirty
@@ -190,10 +208,21 @@ Drain ==
        ELSE IF Closed(r) THEN EndLoop("input_closed")
        ELSE IF Gone THEN EndLoop("write_failed")
        ELSE UNCHANGED <<phase, cause>>
-    /\ UNCHANGED <<tty, waking, queued, spins, intr, restore, job, eio, stops>>
+    /\ UNCHANGED <<tty, waking, queued, spins, intr, restore, job, eio, stops, site>>
+
+\* A prompt (readTeamPickerKey, readMaskedKeyDefault) returns to its caller,
+\* which restores the terminal on the way out (a defer): the person answered
+\* or cancelled, or a read failed because the terminal is gone and the
+\* prompt reports the error.
+PromptReturns ==
+    /\ site # "shell"
+    /\ phase = "loop"
+    /\ EndLoop(IF Gone THEN "prompt_failed" ELSE "requested")
+    /\ UNCHANGED <<tty, waking, queued, dirty, spins, intr, restore, job, eio, stops, site>>
 
 -----------------------------------------------------------------------------
-(* The restore (TerminalState.disableRawMode -> tcsetattrBestEffort).       *)
+(* The restore (TerminalState.disableRawMode, TeamPickerRawMode.disable,   *)
+(* and MaskedKeyRawMode.disable, each through tcsetattrBestEffort).        *)
 
 Errno ==
     CASE tty = "live"    -> "SUCCESS"
@@ -204,10 +233,15 @@ Errno ==
 \* What one call that did not fail with EINTR leaves: "restored", "gone"
 \* (nothing left to restore, returned quietly), "error" (an unexpected
 \* errno, which Debug builds print to stderr), or "crashed" (unreachable).
+\* The restore goes through std.posix.tcsetattr, which treats EBADF and EINVAL
+\* as unreachable and reports ENOENT as an unexpected errno: in every site
+\* before the change, and in the prompts before their fix.
+StrictRestore == Bug = "today" \/ (Bug = "prompts_strict" /\ site # "shell")
+
 Outcome(e) ==
     CASE e = "SUCCESS" -> "restored"
-      [] e = "EBADF" /\ Bug \in {"today", "badf_unreachable"} -> "crashed"
-      [] e = "ENOENT" /\ Bug \in {"today", "enoent_unexpected"} -> "error"
+      [] e = "EBADF" /\ (StrictRestore \/ Bug = "badf_unreachable") -> "crashed"
+      [] e = "ENOENT" /\ (StrictRestore \/ Bug = "enoent_unexpected") -> "error"
       [] OTHER -> "gone"
 
 Restore ==
@@ -226,18 +260,19 @@ Restore ==
                 ELSE /\ phase' = "exited"
                      /\ restore' = o
           /\ UNCHANGED intr
-    /\ UNCHANGED <<tty, waking, queued, dirty, cause, spins, job, eio, stops>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, cause, spins, job, eio, stops, site>>
 
 -----------------------------------------------------------------------------
 (* The environment.                                                         *)
 
 \* The person types; the bytes wait until the loop reads them.
 Type ==
+    /\ site = "shell"
     /\ phase = "loop"
     /\ tty = "live"
     /\ ~queued
     /\ queued' = TRUE
-    /\ UNCHANGED <<tty, waking, dirty, phase, cause, spins, intr, restore, job, eio, stops>>
+    /\ UNCHANGED <<tty, waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site>>
 
 \* The terminal goes away only while fx is in the foreground.
 
@@ -248,11 +283,12 @@ Revoke ==
     /\ tty = "live"
     /\ tty' = "revoked"
     /\ queued' = FALSE
-    /\ UNCHANGED <<waking, dirty, phase, cause, spins, intr, restore, job, eio, stops>>
+    /\ UNCHANGED <<waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site>>
 
 \* revoke(2) while fx waits in its poll, which wakes with POLLHUP, or with
 \* POLLIN where eio holds.
 RevokeInPoll ==
+    /\ site = "shell"
     /\ phase = "loop"
     /\ job = "fg"
     /\ tty = "live"
@@ -260,7 +296,7 @@ RevokeInPoll ==
     /\ ~dirty
     /\ tty' = "revoked"
     /\ waking' = TRUE
-    /\ UNCHANGED <<queued, dirty, phase, cause, spins, intr, restore, job, eio, stops>>
+    /\ UNCHANGED <<queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site>>
 
 \* The terminal's other side closes.
 Hangup ==
@@ -268,7 +304,7 @@ Hangup ==
     /\ job = "fg"
     /\ tty = "live"
     /\ tty' = "hungup"
-    /\ UNCHANGED <<waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops>>
+    /\ UNCHANGED <<waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site>>
 
 \* The descriptor itself is closed under fx.
 CloseFd ==
@@ -277,18 +313,19 @@ CloseFd ==
     /\ tty = "live"
     /\ tty' = "closed"
     /\ queued' = FALSE
-    /\ UNCHANGED <<waking, dirty, phase, cause, spins, intr, restore, job, eio, stops>>
+    /\ UNCHANGED <<waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site>>
 
 \* Ctrl+Z: fx reads the key, restores the terminal, and stops itself with
 \* SIGTSTP (suspendToJobControl).
 Suspend ==
+    /\ site = "shell"
     /\ phase = "loop"
     /\ job = "fg"
     /\ tty = "live"
     /\ ~queued
     /\ ~dirty
     /\ job' = "stopped"
-    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site>>
 
 \* The shell's bg: fx continues in the background. Its resume first sets
 \* raw mode again (resumeTerminalAfterJobControl), and SIGTTOU stops that
@@ -298,7 +335,7 @@ Bg ==
     /\ job = "stopped"
     /\ tty = "live"
     /\ job' = IF stops THEN "stopped" ELSE "bg"
-    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site>>
 
 \* The shell's fg: fx continues in the foreground.
 Fg ==
@@ -306,17 +343,18 @@ Fg ==
     /\ job \in {"stopped", "bg"}
     /\ tty = "live"
     /\ job' = "fg"
-    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site>>
 
 \* Another job takes the terminal while fx keeps running, which only a
 \* parent that ignores SIGTTIN and SIGTTOU allows.
 Background ==
+    /\ site = "shell"
     /\ phase = "loop"
     /\ job = "fg"
     /\ tty = "live"
     /\ ~stops
     /\ job' = "bg"
-    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site>>
 
 Ended ==
     /\ phase \in {"exited", "crashed"}
@@ -325,7 +363,7 @@ Ended ==
 Environment ==
     Type \/ Revoke \/ RevokeInPoll \/ Hangup \/ CloseFd \/ Suspend \/ Bg \/ Fg \/ Background
 
-Next == Poll \/ Drain \/ Restore \/ Environment \/ Ended
+Next == Poll \/ Drain \/ PromptReturns \/ Restore \/ Environment \/ Ended
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Poll) /\ WF_vars(Drain) /\ WF_vars(Restore)
 
@@ -337,13 +375,14 @@ TypeOK ==
     /\ queued \in BOOLEAN
     /\ dirty \in BOOLEAN
     /\ phase \in {"loop", "cleanup", "exited", "crashed"}
-    /\ cause \in {"none", "requested", "input_closed", "write_failed", "read_failed"}
+    /\ cause \in {"none", "requested", "input_closed", "write_failed", "read_failed", "prompt_failed"}
     /\ spins \in 0..MaxSpins
     /\ intr \in 0..MaxIntr
     /\ restore \in {"pending", "restored", "gone", "error", "lost"}
     /\ job \in {"fg", "stopped", "bg"}
     /\ eio \in BOOLEAN
     /\ stops \in BOOLEAN
+    /\ site \in Sites
 
 \* A pass of the loop never returns at once with nothing to do: once the
 \* terminal is gone, the next poll ends the loop.
@@ -374,6 +413,7 @@ ReadErrorOnlyWhenLive == cause = "read_failed" => tty = "live"
 \* background read ends fx with an error (ReadErrorOnlyWhenLive allows it).
 JobControlKeepsFx == (stops /\ job # "fg") => phase = "loop"
 
-\* Once the terminal is gone, fx ends.
-GoneEndsLoop == Gone ~> (phase \in {"exited", "crashed"})
+\* Once the terminal is gone, the interactive shell ends. A prompt's own read
+\* loop is not modeled, so nothing is claimed about when a prompt returns.
+GoneEndsLoop == (site = "shell" /\ Gone) ~> (phase \in {"exited", "crashed"})
 =============================================================================

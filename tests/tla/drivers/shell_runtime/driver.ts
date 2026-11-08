@@ -24,6 +24,13 @@
 //                         while it is still there, as for a background read
 //                         that SIGTTIN does not stop, and the driver types a key
 //
+// One more run starts fx teams on the PTY and revokes the terminal while its
+// team picker waits for a key, answered the macOS 15 way as revoke-idle-eio is:
+//
+//   team-picker-revoke-eio  the picker's read fails with EIO, fx teams returns
+//                         its error, and the picker's restore meets a terminal
+//                         that is gone: it must stay quiet (no unexpected errno)
+//
 // Two more runs start fx from an interactive bash in tmux and take it through
 // Ctrl+Z, bg, fg, and /quit: job-control with SIGTTIN and SIGTTOU at their
 // default, and job-control-signals-ignored with fx started with both ignored.
@@ -40,7 +47,8 @@
 // gone. TLC
 // replays every run through the model's own actions. --self-check also replays
 // them through the model of fx before the change (Bug = "today"), which must
-// reject them.
+// reject them, and the team picker run through the model of fx before the
+// prompts' fix (Bug = "prompts_strict"), which must reject it too.
 //
 // revoke(2) exists only on macOS here, so the driver runs only there.
 //
@@ -48,6 +56,7 @@
 //   bun tests/tla/drivers/shell_runtime/driver.ts
 //   bun tests/tla/drivers/shell_runtime/driver.ts --self-check
 //   bun tests/tla/drivers/shell_runtime/driver.ts --random 20 --seed 7
+//   bun tests/tla/drivers/shell_runtime/driver.ts --scenario team-picker-revoke-eio
 //
 // Exit codes: 0 every run accepted (and the self-check rejected), 1 a run the
 // model cannot produce, 2 a toolchain, build, or harness failure.
@@ -60,6 +69,7 @@ import { TLA_ROOT, outDir, runTlc, writeJson } from "../lib/tlc";
 type Event = "Type" | "Quit" | "Revoke" | "RevokeStopped" | "Hangup" | "Suspend" | "Bg" | "Fg" | "Background";
 type End = "exited" | "failed" | "crashed" | "spinning" | "other";
 type Restore = "restored" | "quiet" | "clean" | "error" | "lost" | "none";
+type Site = "shell" | "team_picker";
 type Scenario =
   | "quit"
   | "hangup"
@@ -71,6 +81,7 @@ type Scenario =
   | "revoke-idle-eio"
   | "revoke-stopped-eio"
   | "live-eio"
+  | "team-picker-revoke-eio"
   | "job-control"
   | "job-control-signals-ignored";
 type Observation = {
@@ -82,12 +93,14 @@ type Observation = {
   restore: Restore;
   eio: boolean;
   stops: boolean;
+  site: Site;
   evidence: {
     exit: { code: number | null; signal: string | null } | null;
     exited_after_ms: number | null;
     cpu_seconds_after: number | null;
     stderr: string;
     gateway: { models: number; chat: number };
+    issuer: string[];
     interposer: string[];
     job_states: Array<string | null>;
     trace_errors: string[];
@@ -106,6 +119,7 @@ const SCENARIOS: Scenario[] = [
   "revoke-idle-eio",
   "revoke-stopped-eio",
   "live-eio",
+  "team-picker-revoke-eio",
   "job-control",
   "job-control-signals-ignored",
 ];
@@ -121,8 +135,11 @@ const EIO_MODE: Partial<Record<Scenario, "revoked" | "live">> = {
   "revoke-idle-eio": "revoked",
   "revoke-stopped-eio": "revoked",
   "live-eio": "live",
+  "team-picker-revoke-eio": "revoked",
 };
 const tlaDir = join(TLA_ROOT, "shell_runtime");
+// An fx error line on stderr: `fx: ...`, or `fx <command>: ...`.
+const FX_ERROR = /^fx(?: [\w-]+)?: /m;
 // How long fx has to exit after its terminal goes away, and how long a run that
 // is still going is watched for CPU use before it counts as spinning.
 const EXIT_WAIT_MS = 3_000;
@@ -137,8 +154,17 @@ function option(name: string, fallback: number): number {
   return value;
 }
 
+function scenarioOption(): Scenario | null {
+  const at = process.argv.indexOf("--scenario");
+  if (at < 0) return null;
+  const name = process.argv[at + 1] as Scenario;
+  if (!SCENARIOS.includes(name)) throw new Error(`--scenario takes one of: ${SCENARIOS.join(", ")}`);
+  return name;
+}
+
 const options = {
   selfCheck: process.argv.includes("--self-check"),
+  scenario: scenarioOption(),
   random: option("--random", 6),
   seed: option("--seed", 1),
 };
@@ -345,6 +371,7 @@ async function runScenario(
       restore,
       eio: eioMode === "revoked",
       stops: eioMode !== "live",
+      site: "shell",
       evidence: {
         exit,
         exited_after_ms: exitedAfter,
@@ -354,6 +381,7 @@ async function runScenario(
           models: gateway.modelRequests.length - modelsBefore,
           chat: gateway.requests.length - chatBefore,
         },
+        issuer: [],
         interposer: [...new Set(interposer)],
         job_states: [],
         trace_errors: [],
@@ -361,6 +389,133 @@ async function runScenario(
     };
   } finally {
     await session.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// fx teams on the PTY, revoked while its team picker waits for a key. A local
+// fake issuer answers the one request for the account's two teams. stdin-eio.c
+// makes the revoked stdin fail reads with EIO, as macos-15-arm64 answers; this
+// machine answers a read of 0 instead. The picker's read fails, it returns its
+// error, and the restore on its way out meets a terminal that is gone.
+async function runTeamPicker(
+  helpers: any,
+  pty: any,
+  gateway: any,
+  id: string,
+  scratch: string,
+  out: string,
+): Promise<Observation> {
+  const root = mkdtempSync(join(scratch, `${id}-`));
+  for (const dir of ["home", "fx-home", "workspace", "pty"]) mkdirSync(join(root, dir));
+  const modelsBefore = gateway.modelRequests.length;
+  const chatBefore = gateway.requests.length;
+  const issuerRequests: string[] = [];
+  const issuer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const url = new URL(request.url);
+      issuerRequests.push(`${request.method} ${url.pathname}`);
+      if (url.pathname !== "/v2/teams") return new Response("not found", { status: 404 });
+      return Response.json({
+        teams: [
+          { id: "team_1", slug: "example-one", name: "Example One" },
+          { id: "team_2", slug: "example-two", name: "Example Two" },
+        ],
+      });
+    },
+  });
+  const issuerUrl = `http://127.0.0.1:${issuer.port}`;
+  writeFileSync(
+    join(root, "fx-home", "auth.json"),
+    JSON.stringify({
+      version: 1,
+      issuer: issuerUrl,
+      client_id: "test-client",
+      access_token: "fake-access-token",
+      refresh_token: "fake-refresh-token",
+      expires_at_ms: Date.now() + 3_600_000,
+      scope: "openid offline_access use:ai-gateway",
+      token_type: "Bearer",
+      team_id: "team_1",
+      team_slug: "example-one",
+    }) + "\n",
+    { mode: 0o600 },
+  );
+  const eioRecord = join(root, "stdin-eio.record");
+  const session = await pty.PtySession.launch({
+    bin: binary,
+    args: ["teams"],
+    cwd: join(root, "workspace"),
+    dir: join(root, "pty"),
+    env: {
+      ...fxEnv(helpers, gateway, root),
+      FX_TEST_OAUTH_ISSUER_URL: issuerUrl,
+      DYLD_INSERT_LIBRARIES: stdinEioLibrary(out),
+      FX_STDIN_EIO_MODE: "revoked",
+      FX_STDIN_EIO_RECORD: eioRecord,
+    },
+  });
+  try {
+    if (!(await session.waitForOutput((text: string) => text.includes("Example Two"), 15_000))) {
+      throw new Error(`${id}: fx teams never drew its team picker; stderr: ${session.stderr()}`);
+    }
+    // The picker is waiting for a key.
+    await session.waitForQuietOutput(300, 15_000);
+    session.revoke();
+    const started = performance.now();
+    const exit = await session.waitForExit(EXIT_WAIT_MS);
+    const exitedAfter = exit ? Math.round(performance.now() - started) : null;
+    const stderr = session.stderr();
+    let end: End;
+    let restore: Restore = "none";
+    let cpuAfter: number | null = null;
+    if (exit) {
+      if (exit.code === 0) end = "exited";
+      else if (exit.signal === "SIGABRT" || /panic/.test(stderr)) end = "crashed";
+      else if (exit.code === 1 && FX_ERROR.test(stderr)) end = "failed";
+      else end = "other";
+      if (end === "exited" || end === "failed") restore = /unexpected errno/.test(stderr) ? "error" : "quiet";
+    } else {
+      const before = session.cpuSeconds();
+      await Bun.sleep(SPIN_WINDOW_MS);
+      cpuAfter = session.cpuSeconds();
+      const burned = before !== null && cpuAfter !== null ? cpuAfter - before : 0;
+      end = burned >= SPIN_CPU_SECONDS ? "spinning" : "other";
+    }
+    const interposer = readLines(eioRecord);
+    if (!interposer.some((line) => line.startsWith("read-eio"))) {
+      throw new Error(`${id}: stdin-eio.c never failed a read, so the run did not reach the EIO path`);
+    }
+    return {
+      id,
+      scenario: "team-picker-revoke-eio",
+      delay_ms: 0,
+      events: ["Revoke"],
+      end,
+      restore,
+      eio: true,
+      stops: true,
+      site: "team_picker",
+      evidence: {
+        exit,
+        exited_after_ms: exitedAfter,
+        cpu_seconds_after: cpuAfter,
+        stderr: stderr.slice(0, 2_000),
+        gateway: {
+          models: gateway.modelRequests.length - modelsBefore,
+          chat: gateway.requests.length - chatBefore,
+        },
+        issuer: issuerRequests,
+        interposer: [...new Set(interposer)],
+        job_states: [],
+        trace_errors: [],
+      },
+    };
+  } finally {
+    await session.dispose();
+    issuer.stop(true);
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -410,6 +565,7 @@ async function runJobControl(
       restore: /unexpected errno/.test(stderr) ? "error" : "clean",
       eio: false,
       stops: !ignore,
+      site: "shell",
       evidence: {
         exit: code === null ? null : { code, signal: null },
         exited_after_ms: null,
@@ -419,6 +575,7 @@ async function runJobControl(
           models: gateway.modelRequests.length - modelsBefore,
           chat: gateway.requests.length - chatBefore,
         },
+        issuer: [],
         interposer: [],
         job_states: states,
         trace_errors: traceErrors(),
@@ -485,7 +642,8 @@ function tlaString(value: string): string {
 function observedModule(observations: Observation[]): string {
   const records = observations.map((o) =>
     `    [events |-> <<${o.events.map(tlaString).join(", ")}>>, end |-> ${tlaString(o.end)}, ` +
-      `restore |-> ${tlaString(o.restore)}, eio |-> ${o.eio ? "TRUE" : "FALSE"}, stops |-> ${o.stops ? "TRUE" : "FALSE"}]`
+      `restore |-> ${tlaString(o.restore)}, eio |-> ${o.eio ? "TRUE" : "FALSE"}, stops |-> ${o.stops ? "TRUE" : "FALSE"}, ` +
+      `site |-> ${tlaString(o.site)}]`
   );
   return [
     "---------------------- MODULE TerminalRevokeObserved ----------------------",
@@ -535,9 +693,11 @@ async function main(): Promise<number> {
   const out = outDir("shell-runtime");
   const scratch = realpathSync(mkdtempSync(join(tmpdir(), "fx-tla-terminal-revoke-")));
   const gateway = helpers.startFakeGateway([]);
-  const runs: Array<{ scenario: Scenario; delay: number }> = SCENARIOS.map((scenario) => ({ scenario, delay: 0 }));
+  const runs: Array<{ scenario: Scenario; delay: number }> = (options.scenario ? [options.scenario] : SCENARIOS).map(
+    (scenario) => ({ scenario, delay: 0 }),
+  );
   const next = generator(options.seed);
-  for (let i = 0; i < options.random; i++) {
+  for (let i = 0; i < (options.scenario ? 0 : options.random); i++) {
     runs.push({
       scenario: RANDOM_SCENARIOS[Math.floor(next() * RANDOM_SCENARIOS.length)]!,
       delay: Math.floor(next() * 800),
@@ -549,20 +709,29 @@ async function main(): Promise<number> {
       const id = `run${index + 1}`;
       const observation = run.scenario.startsWith("job-control")
         ? await runJobControl(helpers, jobs, gateway, id, run.scenario, scratch)
+        : run.scenario === "team-picker-revoke-eio"
+        ? await runTeamPicker(helpers, pty, gateway, id, scratch, out)
         : await runScenario(helpers, pty, gateway, id, run.scenario, run.delay, scratch, out);
       observations.push(observation);
-      const { gateway: counted, exited_after_ms, cpu_seconds_after, interposer, job_states, trace_errors } = observation.evidence;
+      const { gateway: counted, issuer, exited_after_ms, cpu_seconds_after, interposer, job_states, trace_errors } = observation.evidence;
       console.log(
         `${observation.id} ${observation.scenario} delay=${observation.delay_ms}ms events=${observation.events.join(",")} ` +
           `end=${observation.end} restore=${observation.restore} exited_after_ms=${exited_after_ms} ` +
           `cpu_after=${cpu_seconds_after} gateway_models=${counted.models} gateway_chat=${counted.chat}` +
+          (issuer.length ? ` issuer=${issuer.join(",")}` : "") +
           (interposer.length ? ` stdin_eio=${interposer.join(",")}` : "") +
           (job_states.length ? ` fx_states=${job_states.join(",")}` : "") +
           (trace_errors.length ? ` trace=${JSON.stringify(trace_errors.join(" | ").slice(0, 200))}` : "") +
           (observation.end !== "exited" ? ` stderr=${JSON.stringify(observation.evidence.stderr.slice(0, 120))}` : ""),
       );
-      if (counted.models !== 1 || counted.chat !== 0) {
-        console.error(`${observation.id}: expected the fake gateway to count 1 models request and no chat request`);
+      // A shell run asks the fake gateway for its models once; fx teams never does.
+      const expectedModels = observation.site === "shell" ? 1 : 0;
+      if (counted.models !== expectedModels || counted.chat !== 0) {
+        console.error(`${observation.id}: expected the fake gateway to count ${expectedModels} models request and no chat request`);
+        return 2;
+      }
+      if (observation.site === "team_picker" && issuer.join(",") !== "GET /v2/teams") {
+        console.error(`${observation.id}: expected the fake issuer to count one teams request, saw ${issuer.join(",") || "none"}`);
         return 2;
       }
     }
@@ -580,6 +749,15 @@ async function main(): Promise<number> {
     console.log(`TLC TerminalRevokeTrace Bug=today: ${today.verdict} (must be REJECTED)`);
     if (today.verdict === "TOOL_ERROR") status = 2;
     else if (today.verdict !== "REJECTED" && status === 0) status = 1;
+    // The team picker run alone, through fx before the prompts' fix: its
+    // restore reported an unexpected errno, so a quiet restore must not fit.
+    const prompts = observations.filter((o) => o.site !== "shell");
+    if (prompts.length > 0) {
+      const strict = await check(join(out, "prompts-strict"), prompts, "prompts_strict");
+      console.log(`TLC TerminalRevokeTrace Bug=prompts_strict (prompt runs only): ${strict.verdict} (must be REJECTED)`);
+      if (strict.verdict === "TOOL_ERROR") status = 2;
+      else if (strict.verdict !== "REJECTED" && status === 0) status = 1;
+    }
   }
   console.log(`output: ${out}`);
   return status;

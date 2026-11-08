@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const testing_pty = @import("../shared/testing_pty.zig");
 const builtin = @import("builtin");
 const credentials = @import("credentials.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
@@ -1492,6 +1493,7 @@ fn parseEscapeTeamPickerKey(bytes: []const u8) TeamPickerKey {
 const TeamPickerRawMode = struct {
     original: std.posix.termios = undefined,
     active: bool = false,
+    fd: std.posix.fd_t = std.posix.STDIN_FILENO,
 
     fn enable() !TeamPickerRawMode {
         if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
@@ -1530,7 +1532,9 @@ const TeamPickerRawMode = struct {
 
     fn disable(self: *TeamPickerRawMode) void {
         if (!self.active) return;
-        io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        // The terminal may be gone by now: revoked, hung up, or closed
+        // (`tests/tla/shell_runtime/TerminalRevoke.tla` CleanupNeverCrashes).
+        io_mod.tcsetattrBestEffort(self.fd, .FLUSH, self.original) catch {};
         self.active = false;
     }
 };
@@ -1670,6 +1674,66 @@ test "single team selection does not allocate" {
     var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
 
     try std.testing.expect((try selectTeam(failing.allocator(), &teams, null)) != null);
+}
+
+test "team picker restore returns for a descriptor that is not open" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    var raw = TeamPickerRawMode{
+        .original = std.mem.zeroes(std.posix.termios),
+        .active = true,
+        .fd = testing_pty.closed_fd,
+    };
+    raw.disable();
+    try std.testing.expect(!raw.active);
+}
+
+test "team picker restore puts the original settings back on a live terminal" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    defer pty.close();
+    const original = try io_mod.tcgetattr(pty.slave);
+    var raw_settings = original;
+    raw_settings.lflag.ECHO = !original.lflag.ECHO;
+    try io_mod.tcsetattr(pty.slave, .NOW, raw_settings);
+
+    var raw = TeamPickerRawMode{ .original = original, .active = true, .fd = pty.slave };
+    raw.disable();
+
+    try std.testing.expect(!raw.active);
+    const restored = try io_mod.tcgetattr(pty.slave);
+    try std.testing.expectEqual(original.lflag, restored.lflag);
+}
+
+test "team picker restore leaves a terminal alone when raw mode never became active" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    defer pty.close();
+    const original = try io_mod.tcgetattr(pty.slave);
+    var other_settings = original;
+    other_settings.lflag.ECHO = !original.lflag.ECHO;
+    try io_mod.tcsetattr(pty.slave, .NOW, other_settings);
+
+    var raw = TeamPickerRawMode{ .original = original, .active = false, .fd = pty.slave };
+    raw.disable();
+
+    const after = try io_mod.tcgetattr(pty.slave);
+    try std.testing.expectEqual(other_settings.lflag, after.lflag);
+}
+
+test "team picker restore returns for a revoked terminal" {
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    defer pty.close();
+    const original = try io_mod.tcgetattr(pty.slave);
+    try pty.revokeSlave();
+
+    var raw = TeamPickerRawMode{ .original = original, .active = true, .fd = pty.slave };
+    raw.disable();
+    try std.testing.expect(!raw.active);
 }
 
 test "team selection stages an owned validation credential before commit" {

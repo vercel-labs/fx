@@ -1113,6 +1113,28 @@ test "tcsetattrBestEffort returns for a descriptor that is not open" {
     try tcsetattrBestEffort(std.math.maxInt(std.posix.fd_t), .FLUSH, std.mem.zeroes(std.posix.termios));
 }
 
+test "tcsetattrBestEffort returns for a pipe, which is no terminal" {
+    const testing_pty = @import("testing_pty.zig");
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    defer testing_pty.closeFd(fds[0]);
+    defer testing_pty.closeFd(fds[1]);
+    try tcsetattrBestEffort(fds[0], .FLUSH, std.mem.zeroes(std.posix.termios));
+}
+
+test "tcsetattrBestEffort returns for a terminal whose other side closed" {
+    const testing_pty = @import("testing_pty.zig");
+    // Linux hangs up a terminal when its master closes, and answers EIO.
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    testing_pty.closeFd(pty.master);
+    defer testing_pty.closeFd(pty.slave);
+    try tcsetattrBestEffort(pty.slave, .FLUSH, std.mem.zeroes(std.posix.termios));
+}
+
 test "tcgetattr reports a regular file as not a terminal" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
