@@ -32,9 +32,13 @@
 (* (TeamPickerRawMode in src/core/auth/login_flow.zig), and "masked_key"   *)
 (* is the API key prompt of fx login vercel --api-key (MaskedKeyRawMode    *)
 (* in src/core/cli/cli_surface.zig). A prompt reads stdin directly, with   *)
-(* no poll, and returns when the person answers or a read fails on a       *)
-(* terminal that is gone (PromptReturns); its read loop is not modeled,    *)
-(* only that it returns and restores the terminal through the same Restore.*)
+(* no poll. It returns when the person answers (PromptReturns), or when    *)
+(* a read on a terminal that is gone fails or reads 0, the end of input    *)
+(* (PromptRead), and then restores the terminal through the same Restore.  *)
+(* A read of 0 is the end of input: macOS answers it for a revoked         *)
+(* terminal unless eio holds, and for one whose other side closed. The     *)
+(* team picker used to take it as a key to ignore and read again, at once, *)
+(* forever (Bug = "picker_ignores_eof").                                   *)
 (*                                                                         *)
 (* Job control moves fx between the foreground ("fg"), stopped, and the    *)
 (* background ("bg"). Ctrl+Z (Suspend) stops fx. With SIGTTIN and SIGTTOU  *)
@@ -61,14 +65,15 @@
 (* read that failed with EIO ended fx with an error. Bug =                 *)
 (* "prompts_strict" is fx with the shell's fix but not the prompts': the   *)
 (* team picker and the masked key prompt still restore through             *)
-(* std.posix.tcsetattr.                                                    *)
+(* std.posix.tcsetattr. Bug = "picker_ignores_eof" is fx with every        *)
+(* restore fixed and the team picker still reading again after a read of 0.*)
 (***************************************************************************)
 EXTENDS Naturals
 
 CONSTANTS MaxSpins, MaxIntr, Bug
 
-Bugs == {"none", "today", "prompts_strict", "nval_ignored", "badf_unreachable", "enoent_unexpected",
-         "no_eintr_retry", "eio_always_eof", "eio_poll_only"}
+Bugs == {"none", "today", "prompts_strict", "picker_ignores_eof", "nval_ignored", "badf_unreachable",
+         "enoent_unexpected", "no_eintr_retry", "eio_always_eof", "eio_poll_only"}
 Sites == {"shell", "team_picker", "masked_key"}
 ASSUME Bug \in Bugs
 
@@ -86,9 +91,10 @@ VARIABLES
     job,      \* "fg", "stopped", or "bg"
     eio,      \* a revoked terminal polls as readable and fails reads with EIO
     stops,    \* SIGTTIN and SIGTTOU keep their default action
-    site      \* "shell", "team_picker", or "masked_key": who restores the terminal
+    site,     \* "shell", "team_picker", or "masked_key": who restores the terminal
+    eof       \* a prompt's read returned 0, the end of input
 
-vars == <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site>>
+vars == <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
 
 Init ==
     /\ tty = "live"
@@ -104,6 +110,7 @@ Init ==
     /\ eio \in BOOLEAN
     /\ stops \in BOOLEAN
     /\ site \in Sites
+    /\ eof = FALSE
 
 Gone == tty # "live"
 Running == phase \in {"loop", "cleanup"}
@@ -167,7 +174,7 @@ Poll ==
        IF Readable(r)
        THEN IF ReadFails
             THEN /\ ReadFailed
-                 /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site>>
+                 /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site, eof>>
             ELSE IF queued
             \* The bytes are read and handled; one of them may ask fx to quit,
             \* which ends the loop before any frame is drawn.
@@ -177,20 +184,20 @@ Poll ==
                                      /\ UNCHANGED dirty
                                 ELSE /\ dirty' = TRUE
                                      /\ UNCHANGED <<phase, cause>>
-                 /\ UNCHANGED <<tty, spins, intr, restore, job, eio, stops, site>>
+                 /\ UNCHANGED <<tty, spins, intr, restore, job, eio, stops, site, eof>>
             \* read returned 0: the end of input.
             ELSE /\ EndLoop("input_closed")
-                 /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site>>
+                 /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site, eof>>
        ELSE IF Closed(r)
        THEN /\ EndLoop("input_closed")
-            /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site>>
+            /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site, eof>>
        \* Nothing to do: settle, commit a frame, and poll again. On a live
        \* terminal that pass waited its timeout; on one that is gone it
        \* returned at once.
        ELSE /\ IF Gone THEN /\ spins < MaxSpins
                             /\ spins' = spins + 1
                        ELSE UNCHANGED spins
-            /\ UNCHANGED <<tty, queued, dirty, phase, cause, intr, restore, job, eio, stops, site>>
+            /\ UNCHANGED <<tty, queued, dirty, phase, cause, intr, restore, job, eio, stops, site, eof>>
 
 \* After a read: the loop's poll(0), then the frame for what it read. A poll
 \* that still reports input reads again, and a read that fails with EIO gets
@@ -208,17 +215,46 @@ Drain ==
        ELSE IF Closed(r) THEN EndLoop("input_closed")
        ELSE IF Gone THEN EndLoop("write_failed")
        ELSE UNCHANGED <<phase, cause>>
-    /\ UNCHANGED <<tty, waking, queued, spins, intr, restore, job, eio, stops, site>>
+    /\ UNCHANGED <<tty, waking, queued, spins, intr, restore, job, eio, stops, site, eof>>
 
-\* A prompt (readTeamPickerKey, readMaskedKeyDefault) returns to its caller,
-\* which restores the terminal on the way out (a defer): the person answered
-\* or cancelled, or a read failed because the terminal is gone and the
-\* prompt reports the error.
+\* The person answers or cancels at a prompt: it returns to its caller, which
+\* restores the terminal on the way out (a defer).
 PromptReturns ==
     /\ site # "shell"
     /\ phase = "loop"
-    /\ EndLoop(IF Gone THEN "prompt_failed" ELSE "requested")
-    /\ UNCHANGED <<tty, waking, queued, dirty, spins, intr, restore, job, eio, stops, site>>
+    /\ ~Gone
+    /\ EndLoop("requested")
+    /\ UNCHANGED <<tty, waking, queued, dirty, spins, intr, restore, job, eio, stops, site, eof>>
+
+\* A read on a terminal that reads 0 at the end of input: macOS answers that
+\* for a revoked terminal unless eio holds, and for one whose other side closed.
+\* A revoked terminal with eio fails the read with EIO, and a closed descriptor
+\* fails it with EBADF.
+ReadsZero == tty = "hungup" \/ (tty = "revoked" /\ ~eio)
+
+\* readTeamPickerKey took a read of 0 as a key to ignore, so it read again.
+\* readMaskedKeyDefault returns SetupCancelled at a read of 0.
+IgnoresEof ==
+    /\ site = "team_picker"
+    /\ Bug \in {"today", "prompts_strict", "picker_ignores_eof"}
+
+\* One read of stdin by a prompt on a terminal that is gone: a failed read or
+\* a read of 0 returns the prompt's error (the caller prints a short message
+\* and exits 1), unless the prompt ignores the end of input and reads again,
+\* which returns at once with nothing to do, as a poll on a gone terminal does.
+PromptRead ==
+    /\ site # "shell"
+    /\ phase = "loop"
+    /\ Gone
+    /\ IF ReadsZero /\ IgnoresEof
+       THEN /\ spins < MaxSpins
+            /\ spins' = spins + 1
+            /\ eof' = TRUE
+            /\ UNCHANGED <<phase, cause>>
+       ELSE /\ EndLoop("prompt_failed")
+            /\ eof' = (eof \/ ReadsZero)
+            /\ UNCHANGED spins
+    /\ UNCHANGED <<tty, waking, queued, dirty, intr, restore, job, eio, stops, site>>
 
 -----------------------------------------------------------------------------
 (* The restore (TerminalState.disableRawMode, TeamPickerRawMode.disable,   *)
@@ -260,7 +296,7 @@ Restore ==
                 ELSE /\ phase' = "exited"
                      /\ restore' = o
           /\ UNCHANGED intr
-    /\ UNCHANGED <<tty, waking, queued, dirty, cause, spins, job, eio, stops, site>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, cause, spins, job, eio, stops, site, eof>>
 
 -----------------------------------------------------------------------------
 (* The environment.                                                         *)
@@ -272,7 +308,7 @@ Type ==
     /\ tty = "live"
     /\ ~queued
     /\ queued' = TRUE
-    /\ UNCHANGED <<tty, waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site>>
+    /\ UNCHANGED <<tty, waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
 
 \* The terminal goes away only while fx is in the foreground.
 
@@ -283,7 +319,7 @@ Revoke ==
     /\ tty = "live"
     /\ tty' = "revoked"
     /\ queued' = FALSE
-    /\ UNCHANGED <<waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site>>
+    /\ UNCHANGED <<waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
 
 \* revoke(2) while fx waits in its poll, which wakes with POLLHUP, or with
 \* POLLIN where eio holds.
@@ -296,7 +332,7 @@ RevokeInPoll ==
     /\ ~dirty
     /\ tty' = "revoked"
     /\ waking' = TRUE
-    /\ UNCHANGED <<queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site>>
+    /\ UNCHANGED <<queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
 
 \* The terminal's other side closes.
 Hangup ==
@@ -304,7 +340,7 @@ Hangup ==
     /\ job = "fg"
     /\ tty = "live"
     /\ tty' = "hungup"
-    /\ UNCHANGED <<waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site>>
+    /\ UNCHANGED <<waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
 
 \* The descriptor itself is closed under fx.
 CloseFd ==
@@ -313,7 +349,7 @@ CloseFd ==
     /\ tty = "live"
     /\ tty' = "closed"
     /\ queued' = FALSE
-    /\ UNCHANGED <<waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site>>
+    /\ UNCHANGED <<waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
 
 \* Ctrl+Z: fx reads the key, restores the terminal, and stops itself with
 \* SIGTSTP (suspendToJobControl).
@@ -325,7 +361,7 @@ Suspend ==
     /\ ~queued
     /\ ~dirty
     /\ job' = "stopped"
-    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site, eof>>
 
 \* The shell's bg: fx continues in the background. Its resume first sets
 \* raw mode again (resumeTerminalAfterJobControl), and SIGTTOU stops that
@@ -335,7 +371,7 @@ Bg ==
     /\ job = "stopped"
     /\ tty = "live"
     /\ job' = IF stops THEN "stopped" ELSE "bg"
-    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site, eof>>
 
 \* The shell's fg: fx continues in the foreground.
 Fg ==
@@ -343,7 +379,7 @@ Fg ==
     /\ job \in {"stopped", "bg"}
     /\ tty = "live"
     /\ job' = "fg"
-    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site, eof>>
 
 \* Another job takes the terminal while fx keeps running, which only a
 \* parent that ignores SIGTTIN and SIGTTOU allows.
@@ -354,7 +390,7 @@ Background ==
     /\ tty = "live"
     /\ ~stops
     /\ job' = "bg"
-    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site, eof>>
 
 Ended ==
     /\ phase \in {"exited", "crashed"}
@@ -363,9 +399,9 @@ Ended ==
 Environment ==
     Type \/ Revoke \/ RevokeInPoll \/ Hangup \/ CloseFd \/ Suspend \/ Bg \/ Fg \/ Background
 
-Next == Poll \/ Drain \/ PromptReturns \/ Restore \/ Environment \/ Ended
+Next == Poll \/ Drain \/ PromptReturns \/ PromptRead \/ Restore \/ Environment \/ Ended
 
-Spec == Init /\ [][Next]_vars /\ WF_vars(Poll) /\ WF_vars(Drain) /\ WF_vars(Restore)
+Spec == Init /\ [][Next]_vars /\ WF_vars(Poll) /\ WF_vars(Drain) /\ WF_vars(PromptRead) /\ WF_vars(Restore)
 
 -----------------------------------------------------------------------------
 
@@ -383,6 +419,7 @@ TypeOK ==
     /\ eio \in BOOLEAN
     /\ stops \in BOOLEAN
     /\ site \in Sites
+    /\ eof \in BOOLEAN
 
 \* A pass of the loop never returns at once with nothing to do: once the
 \* terminal is gone, the next poll ends the loop.
@@ -413,7 +450,10 @@ ReadErrorOnlyWhenLive == cause = "read_failed" => tty = "live"
 \* background read ends fx with an error (ReadErrorOnlyWhenLive allows it).
 JobControlKeepsFx == (stops /\ job # "fg") => phase = "loop"
 
-\* Once the terminal is gone, the interactive shell ends. A prompt's own read
-\* loop is not modeled, so nothing is claimed about when a prompt returns.
-GoneEndsLoop == (site = "shell" /\ Gone) ~> (phase \in {"exited", "crashed"})
+\* Once the terminal is gone, fx ends: the interactive shell, and a prompt
+\* that waits for a key.
+GoneEndsLoop == Gone ~> (phase \in {"exited", "crashed"})
+
+\* A prompt never reads again after a read of 0, the end of input.
+NoReadAfterEof == [][~(PromptRead /\ eof)]_vars
 =============================================================================

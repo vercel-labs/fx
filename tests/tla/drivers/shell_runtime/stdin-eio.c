@@ -8,7 +8,9 @@
 //                              read on stdin fails with EIO: what
 //                              macos-15-arm64 answered for a revoked
 //                              controlling terminal, where this machine
-//                              answers POLLNVAL and a read of 0.
+//                              answers POLLNVAL and a read of 0. A read that
+//                              was already waiting when the terminal went, and
+//                              returns 0, fails with EIO too.
 //   FX_STDIN_EIO_MODE=live     while the file FX_STDIN_EIO_ARM exists, a read
 //                              on stdin fails with EIO and the terminal stays
 //                              as it is: a background read that SIGTTIN did
@@ -69,7 +71,13 @@ static ssize_t fault_read(int fd, void *buf, size_t size) {
         errno = EIO;
         return -1;
     }
-    return read(fd, buf, size);
+    ssize_t got = read(fd, buf, size);
+    if (got == 0 && fd == STDIN_FILENO && mode_is("revoked") && stdin_gone()) {
+        record("read-eio-revoked");
+        errno = EIO;
+        return -1;
+    }
+    return got;
 }
 
 __attribute__((used, section("__DATA,__interpose")))

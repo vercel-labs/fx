@@ -1382,7 +1382,7 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
     try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
 
     while (true) {
-        switch (try readTeamPickerKey()) {
+        switch (try readTeamPickerKey(raw.fd)) {
             .up => {
                 selected = if (selected == 0) teams.len - 1 else selected - 1;
                 try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
@@ -1436,23 +1436,29 @@ const TeamPickerKey = union(enum) {
     ignored,
 };
 
-fn readTeamPickerKey() !TeamPickerKey {
+fn readTeamPickerKey(fd: std.posix.fd_t) !TeamPickerKey {
     var buf: [8]u8 = undefined;
-    const first_read = try std.posix.read(std.posix.STDIN_FILENO, buf[0..1]);
-    if (first_read == 0) return .ignored;
+    const first_read = try std.posix.read(fd, buf[0..1]);
+    if (first_read == 0) {
+        // The end of input: a terminal that is gone reads 0. Cancelling ends
+        // the picker, where reading again would return at once, forever
+        // (`tests/tla/shell_runtime/TerminalRevoke.tla` NoReadAfterEof).
+        debug_trace.logf("auth", "team_picker_input_closed action=cancel", .{});
+        return .cancel;
+    }
 
     var len = first_read;
     if (buf[0] == 0x1b) {
         while (len < buf.len) {
             if (escapeSequenceComplete(buf[0..len])) break;
             var fds = [_]std.posix.pollfd{.{
-                .fd = std.posix.STDIN_FILENO,
+                .fd = fd,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
             const ready = try std.posix.poll(&fds, 25);
             if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) break;
-            const n = try std.posix.read(std.posix.STDIN_FILENO, buf[len .. len + 1]);
+            const n = try std.posix.read(fd, buf[len .. len + 1]);
             if (n == 0) break;
             len += n;
         }
@@ -1674,6 +1680,48 @@ test "single team selection does not allocate" {
     var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
 
     try std.testing.expect((try selectTeam(failing.allocator(), &teams, null)) != null);
+}
+
+/// A pipe that already holds `bytes` and whose write end is closed: reads
+/// return the bytes and then 0, as a terminal at end of input does.
+fn pipeAtEndOfInput(bytes: []const u8) !std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    errdefer testing_pty.closeFd(fds[0]);
+    defer testing_pty.closeFd(fds[1]);
+    if (bytes.len > 0 and std.c.write(fds[1], bytes.ptr, bytes.len) != bytes.len) return error.PipeFailed;
+    return fds[0];
+}
+
+test "team picker key: a read of 0 cancels the picker" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const fd = try pipeAtEndOfInput("");
+    defer testing_pty.closeFd(fd);
+    try std.testing.expectEqual(TeamPickerKey.cancel, try readTeamPickerKey(fd));
+    // The end of input stays the end of input.
+    try std.testing.expectEqual(TeamPickerKey.cancel, try readTeamPickerKey(fd));
+}
+
+test "team picker key: a read of 0 inside an escape sequence ends the key" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const fd = try pipeAtEndOfInput("\x1b");
+    defer testing_pty.closeFd(fd);
+    try std.testing.expectEqual(TeamPickerKey.cancel, try readTeamPickerKey(fd));
+    try std.testing.expectEqual(TeamPickerKey.cancel, try readTeamPickerKey(fd));
+}
+
+test "team picker key: arrows, digits, Enter, and Ctrl+C parse as before" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const fd = try pipeAtEndOfInput("\x1b[A\x1b[B3\r\x03");
+    defer testing_pty.closeFd(fd);
+    try std.testing.expectEqual(TeamPickerKey.up, try readTeamPickerKey(fd));
+    try std.testing.expectEqual(TeamPickerKey.down, try readTeamPickerKey(fd));
+    try std.testing.expectEqual(TeamPickerKey{ .number = 3 }, try readTeamPickerKey(fd));
+    try std.testing.expectEqual(TeamPickerKey.enter, try readTeamPickerKey(fd));
+    try std.testing.expectEqual(TeamPickerKey.cancel, try readTeamPickerKey(fd));
 }
 
 test "team picker restore returns for a descriptor that is not open" {

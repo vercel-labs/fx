@@ -903,6 +903,82 @@ test.skipIf(!revokeAvailable() || !tmuxAvailable())("a revoked tmux pane ends fx
   }
 }, TIMEOUT * 2);
 
+// The team picker of fx teams reads keys on its own, with no poll. A revoked
+// terminal reads as 0 on this Mac and fails reads with EIO on macOS 15; the
+// picker once took a read of 0 as a key to ignore and read again at full CPU
+// (`tests/tla/shell_runtime/TerminalRevoke.tla` NoReadAfterEof). It must end
+// with status 1 and a short message, and restore the terminal quietly.
+test.skipIf(!revokeAvailable())("a revoked terminal ends the team picker instead of spinning", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-revoked-picker-")));
+  const home = join(root, "home");
+  for (const dir of ["home", "workspace", "pty"]) mkdirSync(join(root, dir));
+  const issuerRequests: string[] = [];
+  const issuer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const url = new URL(request.url);
+      issuerRequests.push(`${request.method} ${url.pathname}`);
+      if (url.pathname !== "/v2/teams") return new Response("not found", { status: 404 });
+      return Response.json({
+        teams: [
+          { id: "team_1", slug: "example-one", name: "Example One" },
+          { id: "team_2", slug: "example-two", name: "Example Two" },
+        ],
+      });
+    },
+  });
+  const issuerUrl = `http://127.0.0.1:${issuer.port}`;
+  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  writeFileSync(
+    join(home, ".fx", "auth.json"),
+    JSON.stringify({
+      version: 1,
+      issuer: issuerUrl,
+      client_id: "test-client",
+      access_token: "fake-access-token",
+      refresh_token: "fake-refresh-token",
+      expires_at_ms: Date.now() + 3_600_000,
+      scope: "openid offline_access use:ai-gateway",
+      token_type: "Bearer",
+      team_id: "team_1",
+      team_slug: "example-one",
+    }) + "\n",
+    { mode: 0o600 },
+  );
+  const gateway = startFakeGateway([]);
+  const pty = await PtySession.launch({
+    bin: FX_BIN,
+    args: ["teams"],
+    cwd: join(root, "workspace"),
+    dir: join(root, "pty"),
+    env: { ...revokedTerminalEnv(home, gateway), FX_TEST_OAUTH_ISSUER_URL: issuerUrl },
+  });
+  try {
+    expect(await pty.waitForOutput((text) => text.includes("Example Two"), TIMEOUT)).toBe(true);
+    // The picker waits for a key.
+    expect(await pty.waitForQuietOutput(300, TIMEOUT)).toBe(true);
+    pty.revoke();
+    const exit = await pty.waitForExit(2_000);
+    let burned = 0;
+    if (!exit) {
+      const before = pty.cpuSeconds() ?? 0;
+      await Bun.sleep(1_000);
+      burned = (pty.cpuSeconds() ?? 0) - before;
+    }
+    expect({ exit, lowCpu: burned < 0.5 }).toEqual({ exit: { code: 1, signal: null }, lowCpu: true });
+    expect(pty.stderr()).toMatch(/^fx teams: (no team selected|failed to switch team)\n$/);
+    expect(issuerRequests).toEqual(["GET /v2/teams"]);
+    expect(gateway.modelRequests).toHaveLength(0);
+    expect(gateway.requests).toHaveLength(0);
+  } finally {
+    await pty.dispose();
+    gateway.stop();
+    issuer.stop(true);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
 test.skipIf(!tmuxAvailable())("Ctrl+Z, bg, and fg keep fx alive", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-job-control-")));
   const home = join(root, "home");

@@ -29,13 +29,13 @@
 (*   site     who restored the terminal: "shell" (fx's interactive shell), *)
 (*            "team_picker" (fx teams), or "masked_key" (the key prompt)   *)
 (*                                                                         *)
-(* fx's own steps (Poll, Drain, PromptReturns, Restore) run freely between *)
-(* the driver's events; a read of typed input asks fx to quit exactly when *)
-(* the driver typed /quit. The run index k advances only when the model    *)
-(* has used all of a run's events and ended in exactly the observed way.   *)
-(* The trace is ACCEPTED when TLC violates NotAllMatched, which is         *)
-(* reachable only after every run matched. A completed search means        *)
-(* REJECTED.                                                               *)
+(* fx's own steps (Poll, Drain, PromptReturns, PromptRead, Restore) run    *)
+(* freely between the driver's events; a read of typed input asks fx to    *)
+(* quit exactly when the driver typed /quit. The run index k advances only *)
+(* when the model has used all of a run's events and ended in exactly the  *)
+(* observed way. The trace is ACCEPTED when TLC violates NotAllMatched,    *)
+(* which is reachable only after every run matched. A completed search     *)
+(* means REJECTED.                                                         *)
 (***************************************************************************)
 EXTENDS TerminalRevoke, TerminalRevokeObserved
 
@@ -67,6 +67,7 @@ Reset(o) ==
     /\ eio' = o.eio
     /\ stops' = o.stops
     /\ site' = o.site
+    /\ eof' = FALSE
 
 \* The driver's next event.
 DriverStep ==
@@ -91,6 +92,7 @@ FxStep ==
           /\ (queued /\ ~queued') => ((cause' = "requested") <=> (typed = "quit"))
        \/ Drain
        \/ PromptReturns
+       \/ PromptRead
        \/ Restore
     /\ UNCHANGED <<k, j, typed>>
 

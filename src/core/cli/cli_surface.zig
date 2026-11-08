@@ -2522,7 +2522,15 @@ fn readMaskedKeyDefault(
 ) ![]u8 {
     var raw = try MaskedKeyRawMode.enable();
     defer raw.disable();
+    return readMaskedKeyFrom(raw.fd, alloc, write_mask, write_ctx);
+}
 
+fn readMaskedKeyFrom(
+    fd: std.posix.fd_t,
+    alloc: Allocator,
+    write_mask: WriteFn,
+    write_ctx: ?*anyopaque,
+) ![]u8 {
     var input: std.ArrayList(u8) = .empty;
     errdefer {
         if (input.capacity > 0) secret.zeroAndFree(alloc, input.allocatedSlice());
@@ -2530,7 +2538,7 @@ fn readMaskedKeyDefault(
 
     while (input.items.len < 8 * 1024) {
         var byte: [1]u8 = undefined;
-        if (try std.posix.read(std.posix.STDIN_FILENO, &byte) == 0) return error.SetupCancelled;
+        if (try std.posix.read(fd, &byte) == 0) return error.SetupCancelled;
         switch (byte[0]) {
             '\r', '\n' => {
                 if (input.items.len == 0) continue;
@@ -2608,6 +2616,45 @@ const MaskedKeyRawMode = struct {
         self.active = false;
     }
 };
+
+fn ignoreMask(_: ?*anyopaque, _: []const u8) anyerror!void {}
+
+/// A pipe that already holds `bytes` and whose write end is closed: reads
+/// return the bytes and then 0, as a terminal at end of input does.
+fn pipeAtEndOfInput(bytes: []const u8) !std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    errdefer testing_pty.closeFd(fds[0]);
+    defer testing_pty.closeFd(fds[1]);
+    if (bytes.len > 0 and std.c.write(fds[1], bytes.ptr, bytes.len) != bytes.len) return error.PipeFailed;
+    return fds[0];
+}
+
+test "masked key prompt ends at a read of 0" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const fd = try pipeAtEndOfInput("");
+    defer testing_pty.closeFd(fd);
+    try std.testing.expectError(error.SetupCancelled, readMaskedKeyFrom(fd, std.testing.allocator, ignoreMask, null));
+}
+
+test "masked key prompt ends at a read of 0 in the middle of a key and frees what was typed" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const fd = try pipeAtEndOfInput("ab");
+    defer testing_pty.closeFd(fd);
+    try std.testing.expectError(error.SetupCancelled, readMaskedKeyFrom(fd, std.testing.allocator, ignoreMask, null));
+}
+
+test "masked key prompt returns the key typed before Enter" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const fd = try pipeAtEndOfInput("ab\r");
+    defer testing_pty.closeFd(fd);
+    const key = try readMaskedKeyFrom(fd, std.testing.allocator, ignoreMask, null);
+    defer secret.zeroAndFree(std.testing.allocator, key);
+    try std.testing.expectEqualStrings("ab", key);
+}
 
 test "masked key prompt restore returns for a descriptor that is not open" {
     if (!testing_pty.supported) return error.SkipZigTest;

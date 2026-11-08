@@ -18,8 +18,13 @@
 # tcsetattr: a closed descriptor reached its unreachable
 # (terminal-revoke-today-prompts, CleanupNeverCrashes), and ENOENT from a
 # revoked terminal was an unexpected errno (terminal-revoke-today-prompts-errno,
-# GoneQuietly). Each terminal-revoke-mutation-*.cfg plants one defect, and the
-# rule it names must catch it:
+# GoneQuietly). The terminal-revoke-today-picker* configs are fx with every
+# restore fixed and the team picker still taking a read of 0, the end of input
+# on a revoked terminal, as a key to ignore: it read again at once and never
+# ended (terminal-revoke-today-picker, NoReadAfterEof, and
+# terminal-revoke-today-picker-liveness, GoneEndsLoop). Each
+# terminal-revoke-mutation-*.cfg plants one defect, and the rule it names must
+# catch it:
 #
 #   nval-ignored       POLLNVAL is not counted as closed input        NoBusyLoop
 #   badf-unreachable   EBADF from the restore aborts fx                CleanupNeverCrashes
@@ -51,6 +56,8 @@ TerminalRevoke terminal-revoke-today-liveness temporal
 TerminalRevoke terminal-revoke-today-eio ReadErrorOnlyWhenLive
 TerminalRevoke terminal-revoke-today-prompts CleanupNeverCrashes
 TerminalRevoke terminal-revoke-today-prompts-errno GoneQuietly
+TerminalRevoke terminal-revoke-today-picker NoReadAfterEof
+TerminalRevoke terminal-revoke-today-picker-liveness temporal
 TerminalRevoke terminal-revoke-mutation-nval-ignored NoBusyLoop
 TerminalRevoke terminal-revoke-mutation-badf-unreachable CleanupNeverCrashes
 TerminalRevoke terminal-revoke-mutation-enoent-unexpected GoneQuietly

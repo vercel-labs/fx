@@ -24,12 +24,17 @@
 //                         while it is still there, as for a background read
 //                         that SIGTTIN does not stop, and the driver types a key
 //
-// One more run starts fx teams on the PTY and revokes the terminal while its
-// team picker waits for a key, answered the macOS 15 way as revoke-idle-eio is:
+// Two more runs start fx teams on the PTY and revoke the terminal while its
+// team picker waits for a key, the first answered the macOS 15 way as
+// revoke-idle-eio is:
 //
 //   team-picker-revoke-eio  the picker's read fails with EIO, fx teams returns
 //                         its error, and the picker's restore meets a terminal
 //                         that is gone: it must stay quiet (no unexpected errno)
+//   team-picker-revoke      the same revoke with no interposer: this machine
+//                         answers a read of 0, the end of input, which the
+//                         picker must end on, within 2 s and without burning
+//                         CPU, and not read again (NoReadAfterEof)
 //
 // Two more runs start fx from an interactive bash in tmux and take it through
 // Ctrl+Z, bg, fg, and /quit: job-control with SIGTTIN and SIGTTOU at their
@@ -48,7 +53,9 @@
 // replays every run through the model's own actions. --self-check also replays
 // them through the model of fx before the change (Bug = "today"), which must
 // reject them, and the team picker run through the model of fx before the
-// prompts' fix (Bug = "prompts_strict"), which must reject it too.
+// prompts' fix (Bug = "prompts_strict"), and through the model of fx where the
+// team picker reads again after a read of 0 (Bug = "picker_ignores_eof"),
+// which must reject them too.
 //
 // revoke(2) exists only on macOS here, so the driver runs only there.
 //
@@ -56,7 +63,7 @@
 //   bun tests/tla/drivers/shell_runtime/driver.ts
 //   bun tests/tla/drivers/shell_runtime/driver.ts --self-check
 //   bun tests/tla/drivers/shell_runtime/driver.ts --random 20 --seed 7
-//   bun tests/tla/drivers/shell_runtime/driver.ts --scenario team-picker-revoke-eio
+//   bun tests/tla/drivers/shell_runtime/driver.ts --scenario team-picker-revoke
 //
 // Exit codes: 0 every run accepted (and the self-check rejected), 1 a run the
 // model cannot produce, 2 a toolchain, build, or harness failure.
@@ -82,6 +89,7 @@ type Scenario =
   | "revoke-stopped-eio"
   | "live-eio"
   | "team-picker-revoke-eio"
+  | "team-picker-revoke"
   | "job-control"
   | "job-control-signals-ignored";
 type Observation = {
@@ -120,6 +128,7 @@ const SCENARIOS: Scenario[] = [
   "revoke-stopped-eio",
   "live-eio",
   "team-picker-revoke-eio",
+  "team-picker-revoke",
   "job-control",
   "job-control-signals-ignored",
 ];
@@ -137,6 +146,8 @@ const EIO_MODE: Partial<Record<Scenario, "revoked" | "live">> = {
   "live-eio": "live",
   "team-picker-revoke-eio": "revoked",
 };
+// The team picker's run must end this fast, and not burn CPU while it waits.
+const PICKER_EXIT_WAIT_MS = 2_000;
 const tlaDir = join(TLA_ROOT, "shell_runtime");
 // An fx error line on stderr: `fx: ...`, or `fx <command>: ...`.
 const FX_ERROR = /^fx(?: [\w-]+)?: /m;
@@ -394,15 +405,17 @@ async function runScenario(
 }
 
 // fx teams on the PTY, revoked while its team picker waits for a key. A local
-// fake issuer answers the one request for the account's two teams. stdin-eio.c
-// makes the revoked stdin fail reads with EIO, as macos-15-arm64 answers; this
-// machine answers a read of 0 instead. The picker's read fails, it returns its
-// error, and the restore on its way out meets a terminal that is gone.
+// fake issuer answers the one request for the account's two teams. With
+// `emulateEio`, stdin-eio.c makes the revoked stdin fail reads with EIO, as
+// macos-15-arm64 answers; without it this machine answers a read of 0, the end
+// of input. Either way the picker returns its error and the restore on its way
+// out meets a terminal that is gone.
 async function runTeamPicker(
   helpers: any,
   pty: any,
   gateway: any,
   id: string,
+  emulateEio: boolean,
   scratch: string,
   out: string,
 ): Promise<Observation> {
@@ -452,9 +465,13 @@ async function runTeamPicker(
     env: {
       ...fxEnv(helpers, gateway, root),
       FX_TEST_OAUTH_ISSUER_URL: issuerUrl,
-      DYLD_INSERT_LIBRARIES: stdinEioLibrary(out),
-      FX_STDIN_EIO_MODE: "revoked",
-      FX_STDIN_EIO_RECORD: eioRecord,
+      ...(emulateEio
+        ? {
+            DYLD_INSERT_LIBRARIES: stdinEioLibrary(out),
+            FX_STDIN_EIO_MODE: "revoked",
+            FX_STDIN_EIO_RECORD: eioRecord,
+          }
+        : {}),
     },
   });
   try {
@@ -465,7 +482,7 @@ async function runTeamPicker(
     await session.waitForQuietOutput(300, 15_000);
     session.revoke();
     const started = performance.now();
-    const exit = await session.waitForExit(EXIT_WAIT_MS);
+    const exit = await session.waitForExit(PICKER_EXIT_WAIT_MS);
     const exitedAfter = exit ? Math.round(performance.now() - started) : null;
     const stderr = session.stderr();
     let end: End;
@@ -485,17 +502,17 @@ async function runTeamPicker(
       end = burned >= SPIN_CPU_SECONDS ? "spinning" : "other";
     }
     const interposer = readLines(eioRecord);
-    if (!interposer.some((line) => line.startsWith("read-eio"))) {
+    if (emulateEio && !interposer.some((line) => line.startsWith("read-eio"))) {
       throw new Error(`${id}: stdin-eio.c never failed a read, so the run did not reach the EIO path`);
     }
     return {
       id,
-      scenario: "team-picker-revoke-eio",
+      scenario: emulateEio ? "team-picker-revoke-eio" : "team-picker-revoke",
       delay_ms: 0,
       events: ["Revoke"],
       end,
       restore,
-      eio: true,
+      eio: emulateEio,
       stops: true,
       site: "team_picker",
       evidence: {
@@ -709,8 +726,8 @@ async function main(): Promise<number> {
       const id = `run${index + 1}`;
       const observation = run.scenario.startsWith("job-control")
         ? await runJobControl(helpers, jobs, gateway, id, run.scenario, scratch)
-        : run.scenario === "team-picker-revoke-eio"
-        ? await runTeamPicker(helpers, pty, gateway, id, scratch, out)
+        : run.scenario.startsWith("team-picker-revoke")
+        ? await runTeamPicker(helpers, pty, gateway, id, run.scenario === "team-picker-revoke-eio", scratch, out)
         : await runScenario(helpers, pty, gateway, id, run.scenario, run.delay, scratch, out);
       observations.push(observation);
       const { gateway: counted, issuer, exited_after_ms, cpu_seconds_after, interposer, job_states, trace_errors } = observation.evidence;
@@ -749,14 +766,17 @@ async function main(): Promise<number> {
     console.log(`TLC TerminalRevokeTrace Bug=today: ${today.verdict} (must be REJECTED)`);
     if (today.verdict === "TOOL_ERROR") status = 2;
     else if (today.verdict !== "REJECTED" && status === 0) status = 1;
-    // The team picker run alone, through fx before the prompts' fix: its
-    // restore reported an unexpected errno, so a quiet restore must not fit.
+    // The team picker runs alone. Through fx before the prompts' fix, the
+    // restore reported an unexpected errno, so a quiet restore must not fit;
+    // through fx where the picker reads again after a read of 0, the plain
+    // revoke would have spun, so a run that ended must not fit.
     const prompts = observations.filter((o) => o.site !== "shell");
-    if (prompts.length > 0) {
-      const strict = await check(join(out, "prompts-strict"), prompts, "prompts_strict");
-      console.log(`TLC TerminalRevokeTrace Bug=prompts_strict (prompt runs only): ${strict.verdict} (must be REJECTED)`);
-      if (strict.verdict === "TOOL_ERROR") status = 2;
-      else if (strict.verdict !== "REJECTED" && status === 0) status = 1;
+    for (const [name, bug] of [["prompts-strict", "prompts_strict"], ["picker-ignores-eof", "picker_ignores_eof"]]) {
+      if (prompts.length === 0) break;
+      const replay = await check(join(out, name!), prompts, bug!);
+      console.log(`TLC TerminalRevokeTrace Bug=${bug} (prompt runs only): ${replay.verdict} (must be REJECTED)`);
+      if (replay.verdict === "TOOL_ERROR") status = 2;
+      else if (replay.verdict !== "REJECTED" && status === 0) status = 1;
     }
   }
   console.log(`output: ${out}`);
