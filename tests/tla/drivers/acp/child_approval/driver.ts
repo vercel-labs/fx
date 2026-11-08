@@ -6,7 +6,7 @@
 //   bun tests/tla/drivers/acp/child_approval/driver.ts                  # every plan
 //   bun tests/tla/drivers/acp/child_approval/driver.ts --plans ordering # two at once, cancel, closed gate, parent stop and failure
 //   bun tests/tla/drivers/acp/child_approval/driver.ts --plans faults   # error, garbage, cancelled answers
-//   bun tests/tla/drivers/acp/child_approval/driver.ts --plans cards    # one card per call, ending once; ids unique in the session
+//   bun tests/tla/drivers/acp/child_approval/driver.ts --plans cards    # one card per call, ending once; ids unique in the session, a run's repeated call id, every card closed before a cancel's response
 //   bun tests/tla/drivers/acp/child_approval/driver.ts --plans capacity # 33 subagents, then the parent's own request
 //   bun tests/tla/drivers/acp/child_approval/driver.ts --plans gap      # a cancel between a request's insert and its write
 //   bun tests/tla/drivers/acp/child_approval/driver.ts --repeat 10      # run each plan ten times
@@ -42,13 +42,13 @@ type Obs =
   | { op: "announce"; c: string; tc: string }
   | { op: "card"; c: string; status: Status }
   | { op: "answer" | "late"; c: string; a: Answer }
-  | { op: "cancel" | "promptEnd" | "promptStart" | "pRequest" | "pAnswer" | "otherRequest" | "otherAnswer" }
+  | { op: "cancel" | "promptEnd" | "response" | "promptStart" | "pRequest" | "pAnswer" | "otherRequest" | "otherAnswer" }
   | { op: "final"; results: Record<string, "ran" | "denied" | "none"> };
 
 // ------------------------------------------------------------- ACP client --
 
 type PermissionRequest = { id: number; name: string | null; params: any; withdrawn: boolean; answered: boolean; sub: boolean };
-type Card = { id: string; name: string; statuses: string[] };
+type Card = { id: string; name: string; model: string | undefined; statuses: string[] };
 
 class Client {
   private buffer = "";
@@ -65,6 +65,10 @@ class Client {
   /// plans add what they do.
   obs: Obs[] = [];
   childNames: string[] = [];
+  /// The model children of a subagent whose run makes several calls, in call
+  /// order; another subagent's one call is MODEL[name].
+  runCalls = new Map<string, string[]>();
+  private readonly seenCalls = new Map<string, number>();
   stderr = "";
   exited = false;
 
@@ -85,6 +89,15 @@ class Client {
     })();
   }
 
+  /// The model child of the next announce or request of `name`'s calls.
+  private nextCall(name: string, kind: "announce" | "request"): string | undefined {
+    const list = this.runCalls.get(name) ?? (MODEL[name] === undefined ? [] : [MODEL[name]!]);
+    const key = `${kind}:${name}`;
+    const n = this.seenCalls.get(key) ?? 0;
+    this.seenCalls.set(key, n + 1);
+    return list[Math.min(n, list.length - 1)];
+  }
+
   private receive(message: any) {
     this.log.push({ at: Date.now(), dir: "in", message });
     if (message.method === "session/request_permission" && message.id !== undefined) {
@@ -93,7 +106,7 @@ class Client {
       const name = typeof meta?.name === "string" ? meta.name : /^(\w+)\.txt$/.exec(path)?.[1] ?? null;
       const early = this.withdrawnEarly.has(message.id);
       this.permissions.push({ id: message.id, name, params: message.params, withdrawn: early, answered: false, sub: meta !== undefined });
-      const model = name === null ? undefined : MODEL[name];
+      const model = name === null || meta === undefined ? undefined : this.nextCall(name, "request");
       if (meta === undefined) this.obs.push({ op: "pRequest" });
       else if (model === undefined) this.obs.push({ op: "otherRequest" });
       else this.obs.push({ op: early ? "lateRequest" : "request", c: model });
@@ -115,20 +128,20 @@ class Client {
     if (typeof id !== "string") return;
     if (update.sessionUpdate === "tool_call") {
       const path = String(update.rawInput?.path ?? "");
-      const name = this.childNames.find((child) => path === `${child}.txt`);
+      const name = this.childNames.find((child) => path === `${child}.txt` || path === `${child}2.txt`);
       if (name === undefined) {
         this.parentCards.add(id);
         return;
       }
-      this.cards.set(id, { id, name, statuses: [update.status] });
-      const model = MODEL[name];
+      const model = this.nextCall(name, "announce");
+      this.cards.set(id, { id, name, model, statuses: [update.status] });
       if (model !== undefined) this.obs.push({ op: "announce", c: model, tc: id });
       return;
     }
     const card = this.cards.get(id);
     if (!card || update.sessionUpdate !== "tool_call_update") return;
     card.statuses.push(update.status);
-    const model = MODEL[card.name];
+    const model = card.model;
     if (model !== undefined && (update.status === "completed" || update.status === "failed")) {
       this.obs.push({ op: "card", c: model, status: update.status });
     }
@@ -140,9 +153,18 @@ class Client {
     (this.proc.stdin as any).flush?.();
   }
 
+  /// A prompt's response is observed as it arrives: after every card update
+  /// it follows. A prompt that ends without a cancel ends first, which closes
+  /// its gate; a cancel was observed when the plan sent it.
   request(method: string, params: object): Promise<any> {
     const id = this.nextId++;
-    const response = new Promise<any>((resolve) => this.pending.set(id, resolve));
+    const response = new Promise<any>((resolve) => this.pending.set(id, (message: any) => {
+      if (method === "session/prompt") {
+        if (message.result?.stopReason !== "cancelled") this.obs.push({ op: "promptEnd" });
+        this.obs.push({ op: "response" });
+      }
+      resolve(message);
+    }));
     this.send({ jsonrpc: "2.0", id, method, params });
     return response;
   }
@@ -199,6 +221,9 @@ class Fixture {
   /// The call id every subagent's write uses, when the plan sets one, as
   /// models of different conversations number their calls alike.
   childCallId: string | null = null;
+  /// Subagents whose model writes twice in one run and numbers both writes
+  /// alike: `<name>.txt`, then `<name>2.txt`, both as call_1.
+  writesTwice = new Set<string>();
   /// Environment for the fx process beyond the fixture's own.
   extraEnv: Record<string, string> = {};
   private readonly gateway: any;
@@ -221,6 +246,16 @@ class Fixture {
       if (!name) {
         this.gatewaySeen.push({ who: "unknown", kind: "final" });
         return fakeGatewayFinalText("done");
+      }
+      if (this.writesTwice.has(name)) {
+        const decided = (JSON.parse(body).prompt ?? []).filter((item: any) => item.role === "tool").length;
+        if (decided >= 2) {
+          this.gatewaySeen.push({ who: name, kind: "after-decision" });
+          return fakeGatewayFinalText(`${name} done`);
+        }
+        this.gatewaySeen.push({ who: name, kind: decided === 0 ? "first" : "second" });
+        const file = decided === 0 ? `${name}.txt` : `${name}2.txt`;
+        return fakeGatewayToolCall("call_1", "write_file", { path: file, content: `${name} wrote ${file}\n` });
       }
       if (body.includes(this.callId(name))) {
         this.gatewaySeen.push({ who: name, kind: "after-decision" });
@@ -322,6 +357,8 @@ type Plan = {
   group: "ordering" | "faults" | "cards" | "capacity" | "gap";
   children: string[];
   prompts: number;
+  /// The modeled children c1 and c2 are two calls of one subagent run.
+  oneRun?: boolean;
   repeat?: number;
   setup?: (f: Fixture) => void;
   run: (f: Fixture, c: Client, sessionId: string, obs: Obs[]) => Promise<void>;
@@ -384,7 +421,6 @@ const PLANS: Plan[] = [
       client.answer(alpha, "allow"); obs.push({ op: "answer", c: "c1", a: "allow" });
       const response = await waitForResponse(done, client);
       expect(response.result?.stopReason === "end_turn", `end_turn, got ${JSON.stringify(response.result ?? response.error)}`);
-      obs.push({ op: "promptEnd" });
       expect(f.wrote("alpha") && !f.wrote("beta"), "only alpha.txt written");
       expect(client.permissions.length === 2, `two requests in all, got ${client.permissions.length}`);
       checkCard(client, alpha, "completed");
@@ -407,7 +443,6 @@ const PLANS: Plan[] = [
       obs.push({ op: "promptStart" });
       const second = await waitForResponse(prompt(client, sessionId, "Continue."), client);
       expect(second.result?.stopReason === "end_turn", `end_turn, got ${JSON.stringify(second.result ?? second.error)}`);
-      obs.push({ op: "promptEnd" });
       expect(!f.wrote("alpha"), "alpha.txt not written after a late allow");
       expect(client.permissions.length === 1, "one request in all");
       checkCard(client, request, "failed");
@@ -430,7 +465,6 @@ const PLANS: Plan[] = [
       obs.push({ op: "promptStart" });
       const second = await waitForResponse(prompt(client, sessionId, "Continue."), client);
       expect(second.result?.stopReason === "end_turn", `end_turn, got ${JSON.stringify(second.result ?? second.error)}`);
-      obs.push({ op: "promptEnd" });
       expect(!f.wrote("alpha"), "alpha.txt not written");
       expectGateway(f, ["alpha"], ["alpha"]);
       obs.push(final({ alpha: "denied" }));
@@ -463,7 +497,6 @@ const PLANS: Plan[] = [
       await waitFor("$/cancel_request for alpha's request", () => request.withdrawn, client);
       const response = await waitForResponse(done, client);
       expect(response.result?.stopReason === "end_turn", `end_turn, got ${JSON.stringify(response.result ?? response.error)}`);
-      obs.push({ op: "promptEnd" });
       expect(!f.wrote("alpha"), "alpha.txt not written after the stop");
       expect(!request.answered && client.permissions.length === 1, "one request in all, never answered");
       checkCard(client, request, "failed");
@@ -494,7 +527,6 @@ const PLANS: Plan[] = [
       // The failed turn sets the prompt's stop reason; the prompt still returns.
       const response = await waitForResponse(done, client);
       expect(response.result !== undefined, `a result, got ${JSON.stringify(response.error)}`);
-      obs.push({ op: "promptEnd" });
       expect(f.wrote("alpha"), "alpha.txt written after its allow");
       checkCard(client, request, "completed");
       expectGateway(f, ["alpha"], ["alpha"]);
@@ -513,7 +545,6 @@ const PLANS: Plan[] = [
       obs.push({ op: "answer", c: "c1", a: how === "cancelled" ? "reject" : how });
       const response = await waitForResponse(done, client);
       expect(response.result?.stopReason === "end_turn", `end_turn, got ${JSON.stringify(response.result ?? response.error)}`);
-      obs.push({ op: "promptEnd" });
       expect(!f.wrote("alpha"), `alpha.txt not written after a ${how} answer`);
       checkCard(client, request, "failed");
       expectGateway(f, ["alpha"], ["alpha"]);
@@ -533,17 +564,71 @@ const PLANS: Plan[] = [
       checkMeta(beta, sessionId, "beta");
       const ids = [alpha, beta].map((request) => request.params?.toolCall?.toolCallId);
       expect(ids[0] !== ids[1], `two different toolCallIds, got ${JSON.stringify(ids)}`);
-      expect(ids[0] === `${alpha.params._meta.fx.subagent.childId}:call_1` && ids[1] === `${beta.params._meta.fx.subagent.childId}:call_1`,
-        `each id led by its child id, got ${JSON.stringify(ids)}`);
+      expect(ids[0] === `${alpha.params._meta.fx.subagent.childId}:1:call_1` && ids[1] === `${beta.params._meta.fx.subagent.childId}:1:call_1`,
+        `each id led by its child id and the call's order in its run, got ${JSON.stringify(ids)}`);
       client.answer(alpha, "allow"); obs.push({ op: "answer", c: "c1", a: "allow" });
       client.answer(beta, "reject"); obs.push({ op: "answer", c: "c2", a: "reject" });
       const response = await waitForResponse(done, client);
       expect(response.result?.stopReason === "end_turn", `end_turn, got ${JSON.stringify(response.result ?? response.error)}`);
-      obs.push({ op: "promptEnd" });
       expect(f.wrote("alpha") && !f.wrote("beta"), "only alpha.txt written");
       checkCard(client, alpha, "completed");
       checkCard(client, beta, "failed");
       obs.push(final({ alpha: "ran", beta: "denied" }));
+    },
+  },
+  {
+    // One subagent's model numbers both of its writes call_1. Each call is
+    // announced with a card of its own, whose id carries the call's order in
+    // its run, and each card is announced pending and ends once, with its
+    // own call's status.
+    name: "repeated-call-id", group: "cards", children: ["alpha"], prompts: 1, oneRun: true, repeat: 3,
+    setup(f) { f.writesTwice.add("alpha"); },
+    async run(f, client, sessionId, obs) {
+      client.runCalls.set("alpha", ["c1", "c2"]);
+      const done = prompt(client, sessionId, "Delegate the writes.");
+      const first = await waitFor("alpha's first request", () => client.permissions[0], client);
+      checkMeta(first, sessionId, "alpha");
+      client.answer(first, "allow"); obs.push({ op: "answer", c: "c1", a: "allow" });
+      const second = await waitFor("alpha's second request", () => client.permissions[1], client);
+      client.answer(second, "allow"); obs.push({ op: "answer", c: "c2", a: "allow" });
+      const response = await waitForResponse(done, client);
+      expect(response.result?.stopReason === "end_turn", `end_turn, got ${JSON.stringify(response.result ?? response.error)}`);
+      const childId = first.params?._meta?.fx?.subagent?.childId;
+      const ids = [first, second].map((request) => request.params?.toolCall?.toolCallId);
+      expect(ids[0] === `${childId}:1:call_1` && ids[1] === `${childId}:2:call_1`, `ids led by the child id and the call's order, got ${JSON.stringify(ids)}`);
+      expect(f.wrote("alpha") && existsSync(join(f.workspace, "alpha2.txt")), "both files written");
+      checkCard(client, first, "completed");
+      checkCard(client, second, "completed");
+      expect(f.count("alpha", "first") === 1 && f.count("alpha", "second") === 1 && f.count("alpha", "after-decision") === 1,
+        `alpha's three model requests, got ${JSON.stringify(f.gatewaySeen)}`);
+      obs.push({ op: "final", results: { c1: "ran", c2: "ran" } });
+    },
+  },
+  {
+    // session/cancel with two subagent requests open. Each card's closing
+    // update is read before the prompt's response, as ACP's prompt turn
+    // requires, and the subagents' own later ends add no update.
+    name: "cancel-closes-cards", group: "cards", children: ["alpha", "beta"], prompts: 1, repeat: 3,
+    async run(f, client, sessionId, obs) {
+      const done = prompt(client, sessionId, "Delegate both writes.");
+      await waitFor("two subagent requests open", () => client.permissions.length >= 2, client);
+      const alpha = requestFor(client, "alpha")!, beta = requestFor(client, "beta")!;
+      client.send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } }); obs.push({ op: "cancel" });
+      const cancelled = await waitForResponse(done, client);
+      expect(cancelled.result?.stopReason === "cancelled", `cancelled, got ${JSON.stringify(cancelled.result ?? cancelled.error)}`);
+      const responseAt = client.log.findIndex((entry) => entry.dir === "in" && entry.message.result?.stopReason === "cancelled");
+      for (const request of [alpha, beta]) {
+        const id = request.params?.toolCall?.toolCallId;
+        const closedAt = client.log.findIndex((entry) => entry.dir === "in" && entry.message.method === "session/update" &&
+          entry.message.params?.update?.toolCallId === id && entry.message.params.update.status === "failed");
+        expect(closedAt >= 0 && closedAt < responseAt, `${id}'s card closed (at ${closedAt}) before the response (at ${responseAt})`);
+      }
+      await waitFor("both subagents' turns after their decision", () => f.seen("alpha", "after-decision") && f.seen("beta", "after-decision"), client);
+      expect(!f.wrote("alpha") && !f.wrote("beta"), "no file written after the cancel");
+      checkCard(client, alpha, "failed");
+      checkCard(client, beta, "failed");
+      expectGateway(f, ["alpha", "beta"], ["alpha", "beta"]);
+      obs.push(final({ alpha: "denied", beta: "denied" }));
     },
   },
   {
@@ -577,7 +662,6 @@ const PLANS: Plan[] = [
       }
       const response = await waitForResponse(done, client);
       expect(response.result?.stopReason === "end_turn", `end_turn, got ${JSON.stringify(response.result ?? response.error)}`);
-      obs.push({ op: "promptEnd" });
       expect(f.wrote("root"), "root.txt written after the parent's own allow");
       expect(writers.filter((name) => f.wrote(name)).length === CAPACITY - 1, `${CAPACITY - 1} writers wrote their file`);
       obs.push(final({}));
@@ -589,23 +673,22 @@ const PLANS: Plan[] = [
     // client must be told again that it is withdrawn.
     name: "cancel-between-insert-and-write", group: "gap", children: ["alpha"], prompts: 2,
     setup(f) {
-      f.extraEnv.FX_TEST_ACP_PERMISSION_INSERTED = join(f.root, "request-inserted");
-      f.extraEnv.FX_TEST_ACP_PERMISSION_RELEASE = join(f.root, "request-release");
+      f.extraEnv.FX_TEST_ACP_REQUEST_INSERTED = join(f.root, "request-inserted");
+      f.extraEnv.FX_TEST_ACP_REQUEST_RELEASE = join(f.root, "request-release");
     },
     async run(f, client, sessionId, obs) {
-      const inserted = f.extraEnv.FX_TEST_ACP_PERMISSION_INSERTED!;
+      const inserted = f.extraEnv.FX_TEST_ACP_REQUEST_INSERTED!;
       const first = prompt(client, sessionId, "Delegate the write.");
       await waitFor("alpha's request held after its insert", () => existsSync(inserted) && client.cards.size === 1, client);
       expect(client.permissions.length === 0, "the request is not written yet");
       client.send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } }); obs.push({ op: "cancel" });
       const cancelled = await waitForResponse(first, client);
       expect(cancelled.result?.stopReason === "cancelled", `cancelled, got ${JSON.stringify(cancelled.result ?? cancelled.error)}`);
-      writeFileSync(f.extraEnv.FX_TEST_ACP_PERMISSION_RELEASE!, "");
+      writeFileSync(f.extraEnv.FX_TEST_ACP_REQUEST_RELEASE!, "");
       await waitFor("alpha's turn after its decision", () => f.seen("alpha", "after-decision"), client);
       obs.push({ op: "promptStart" });
       const second = await waitForResponse(prompt(client, sessionId, "Continue."), client);
       expect(second.result?.stopReason === "end_turn", `end_turn, got ${JSON.stringify(second.result ?? second.error)}`);
-      obs.push({ op: "promptEnd" });
       const request = client.permissions[0];
       expect(request !== undefined, "alpha's request written after the cancel");
       // The client was told, after the request, that it is withdrawn.
@@ -660,7 +743,7 @@ function obsModule(obs: Obs[], parentIds: string[]): string {
   ].join("\n");
 }
 
-async function validate(obs: Obs[], parentIds: string[], prompts: number, dir: string) {
+async function validate(obs: Obs[], parentIds: string[], prompts: number, dir: string, oneRun = false) {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "AcpChildApprovalObs.tla"), obsModule(obs, parentIds));
   writeFileSync(join(dir, "AcpChildApprovalTrace.cfg"), [
@@ -677,6 +760,13 @@ async function validate(obs: Obs[], parentIds: string[], prompts: number, dir: s
     "    ResendCancel = TRUE",
     "    OthersMayAsk = TRUE",
     `    Capacity = ${CAPACITY}`,
+    `    OneRun = ${oneRun ? "TRUE" : "FALSE"}`,
+    // The prompt's response and the closing of its cards are watched in every
+    // run; the refusal cause and the other request kinds are not observable
+    // from the client's side.
+    '    Track = {"responses"}',
+    '    Fixed = {"seq", "closeCards", "cardGate", "carryCause", "stopRefuses", "steerCloses"}',
+    "    Kinds = {}",
     "INIT TraceInit",
     "NEXT TraceNext",
     "INVARIANT NotDone",
@@ -709,24 +799,30 @@ let plantedFailed = 0;
 // The trace check must be able to say no: TLC must reject each planted run,
 // each of which breaks one law the model holds.
 const ask = (c: string, tc: string): Obs[] => [{ op: "announce", c, tc }, { op: "request", c }];
-const PLANTED: Array<{ name: string; prompts: number; parentIds?: string[]; obs: Obs[] }> = [
+const PLANTED: Array<{ name: string; prompts: number; parentIds?: string[]; oneRun?: boolean; obs: Obs[] }> = [
   // A request shown after the cancel, with no withdrawal after it.
   { name: "request-after-cancel", prompts: 1, obs: [{ op: "announce", c: "c1", tc: "x1" }, { op: "cancel" }, { op: "request", c: "c1" }] },
-  { name: "late-allow-ran", prompts: 2, obs: [...ask("c1", "x1"), { op: "cancel" }, { op: "late", c: "c1", a: "allow" }, { op: "promptStart" }, { op: "card", c: "c1", status: "failed" }, { op: "promptEnd" }, { op: "final", results: { c1: "ran", c2: "none" } }] },
-  { name: "rejected-write-ran", prompts: 1, obs: [...ask("c1", "x1"), ...ask("c2", "x2"), { op: "answer", c: "c2", a: "reject" }, { op: "answer", c: "c1", a: "allow" }, { op: "card", c: "c1", status: "completed" }, { op: "card", c: "c2", status: "failed" }, { op: "promptEnd" }, { op: "final", results: { c1: "ran", c2: "ran" } }] },
+  { name: "late-allow-ran", prompts: 2, obs: [...ask("c1", "x1"), { op: "cancel" }, { op: "card", c: "c1", status: "failed" }, { op: "response" }, { op: "late", c: "c1", a: "allow" }, { op: "promptStart" }, { op: "promptEnd" }, { op: "response" }, { op: "final", results: { c1: "ran", c2: "none" } }] },
+  { name: "rejected-write-ran", prompts: 1, obs: [...ask("c1", "x1"), ...ask("c2", "x2"), { op: "answer", c: "c2", a: "reject" }, { op: "answer", c: "c1", a: "allow" }, { op: "card", c: "c1", status: "completed" }, { op: "card", c: "c2", status: "failed" }, { op: "promptEnd" }, { op: "response" }, { op: "final", results: { c1: "ran", c2: "ran" } }] },
   // A card announced and never ended.
-  { name: "card-never-ended", prompts: 1, obs: [...ask("c1", "x1"), { op: "answer", c: "c1", a: "allow" }, { op: "promptEnd" }, { op: "final", results: { c1: "ran", c2: "none" } }] },
+  { name: "card-never-ended", prompts: 1, obs: [...ask("c1", "x1"), { op: "answer", c: "c1", a: "allow" }, { op: "promptEnd" }, { op: "response" }, { op: "final", results: { c1: "ran", c2: "none" } }] },
   // A card that ends twice, or with a status its call did not have.
   { name: "card-ended-twice", prompts: 1, obs: [...ask("c1", "x1"), { op: "answer", c: "c1", a: "allow" }, { op: "card", c: "c1", status: "completed" }, { op: "card", c: "c1", status: "failed" }] },
   { name: "card-wrong-status", prompts: 1, obs: [...ask("c1", "x1"), { op: "answer", c: "c1", a: "reject" }, { op: "card", c: "c1", status: "completed" }] },
   // Two subagent cards with one id, and a subagent card with the parent's.
   { name: "shared-id", prompts: 1, obs: [{ op: "announce", c: "c1", tc: "call_1" }, { op: "announce", c: "c2", tc: "call_1" }] },
   { name: "parent-id", prompts: 1, parentIds: ["call_1"], obs: [{ op: "announce", c: "c1", tc: "call_1" }] },
+  // One run's second call whose card has the id of its first call's.
+  { name: "repeated-run-id", prompts: 1, oneRun: true, obs: [{ op: "announce", c: "c1", tc: "k:call_1" }, { op: "request", c: "c1" }, { op: "answer", c: "c1", a: "allow" }, { op: "card", c: "c1", status: "completed" }, { op: "announce", c: "c2", tc: "k:call_1" }] },
+  // The response before a card the cancel left open ends.
+  { name: "response-before-card-closed", prompts: 1, obs: [...ask("c1", "x1"), { op: "cancel" }, { op: "response" }, { op: "card", c: "c1", status: "failed" }] },
+  // A card that ends after the response.
+  { name: "card-after-response", prompts: 1, obs: [...ask("c1", "x1"), { op: "answer", c: "c1", a: "allow" }, { op: "promptEnd" }, { op: "response" }, { op: "card", c: "c1", status: "completed" }] },
   // A 32nd subagent request: the last slot is the parent's.
   { name: "subagent-takes-last-slot", prompts: 1, obs: Array.from({ length: CAPACITY }, (): Obs => ({ op: "otherRequest" })) },
 ];
 for (const planted of PLANTED) {
-  const tlc = await validate(planted.obs, planted.parentIds ?? [], planted.prompts, join(out, "planted", planted.name));
+  const tlc = await validate(planted.obs, planted.parentIds ?? [], planted.prompts, join(out, "planted", planted.name), planted.oneRun ?? false);
   const rejected = !tlc.accepted && tlc.exitCode === 0;
   if (!rejected) plantedFailed += 1;
   console.log(`${rejected ? "ok  " : "FAIL"}  planted ${planted.name}: ${rejected ? "TLC rejected it" : `TLC exit ${tlc.exitCode}, accepted ${tlc.accepted}`}`);
@@ -748,7 +844,7 @@ for (const plan of expanded) {
     client = started.client;
     client.obs = obs;
     await plan.run(fixture, client, started.sessionId, obs);
-    const tlc = await validate(obs, [...client.parentCards], plan.prompts, join(out, plan.name));
+    const tlc = await validate(obs, [...client.parentCards], plan.prompts, join(out, plan.name), plan.oneRun ?? false);
     if (!tlc.accepted) verdict = `TLC rejected the run (exit ${tlc.exitCode}, violated ${tlc.violated})`;
     if (client.stderr.includes("ThreadSanitizer")) verdict = "ThreadSanitizer reported a race (see run.json)";
   } catch (err) {

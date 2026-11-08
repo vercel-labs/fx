@@ -7,11 +7,15 @@
 # contract. Both configs must pass. AcpChildApproval: how a subagent's
 # permission request reaches the client through its parent session. Its
 # design configs (MCAcpChildApproval, MCAcpChildApprovalReserve,
-# MCAcpChildApprovalAnswered, MCAcpChildApprovalNoHost) must pass. The code
-# before the change (MCAcpChildApprovalToday), two planted bugs, and the
-# behavior of the head the repair started from, one config per law
-# (StaleCard, SpawnLeak, SharedIds, Starved, CancelGap), must each break the
-# property they name.
+# MCAcpChildApprovalAnswered, MCAcpChildApprovalNoHost, and one per later
+# law: Run, Close, Cause, WorkerStop, Kinds) must pass. The code before the
+# change (MCAcpChildApprovalToday), two planted bugs, and the behavior of the
+# heads the repairs started from, one config per law (StaleCard, SpawnLeak,
+# SharedIds, Starved, CancelGap, RepeatedIds, LateResponse, GuessedCause,
+# StopReads, KindGap, SteerLeak), and the planted wrong variants NoCardGate
+# and KindGapElicitation must each break the property they name. Track, Fixed,
+# OneRun, and Kinds in a config switch on the parts of the model it checks, so
+# each law has a small config.
 #
 # AcpStopReasons: ACP v1 stop reasons for fx acp, fx's own names for libfx, and
 # a stop reason that agrees with what the next prompt holds, for every cause: a
@@ -87,4 +91,17 @@ AcpChildApproval MCAcpChildApprovalSpawnLeak NoStrandedRequest
 AcpChildApproval MCAcpChildApprovalSharedIds UniqueIds
 AcpChildApproval MCAcpChildApprovalStarved ParentNeverStarved
 AcpChildApproval MCAcpChildApprovalCancelGap ShownRequestIsOpen
+AcpChildApproval MCAcpChildApprovalRun -
+AcpChildApproval MCAcpChildApprovalClose -
+AcpChildApproval MCAcpChildApprovalCause -
+AcpChildApproval MCAcpChildApprovalWorkerStop -
+AcpChildApproval MCAcpChildApprovalKinds -
+AcpChildApproval MCAcpChildApprovalRepeatedIds UniqueIds
+AcpChildApproval MCAcpChildApprovalLateResponse NoCardChangeAfterResponse
+AcpChildApproval MCAcpChildApprovalNoCardGate NoCardChangeAfterResponse
+AcpChildApproval MCAcpChildApprovalGuessedCause ReadsTrue
+AcpChildApproval MCAcpChildApprovalStopReads ReadsTrue
+AcpChildApproval MCAcpChildApprovalKindGap NoStaleRequest
+AcpChildApproval MCAcpChildApprovalKindGapElicitation NoStaleRequest
+AcpChildApproval MCAcpChildApprovalSteerLeak SteeringEnded
 EOF
