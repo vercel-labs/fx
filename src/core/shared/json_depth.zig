@@ -1,9 +1,11 @@
-//! A nesting limit for JSON that a provider sends, checked on the raw text
-//! before fx parses it. std.json parses any depth, but std.json.Stringify
-//! stops past 256 levels in safe builds, and a recursive walk can run out of
-//! stack, so a provider value deeper than this must never reach either one.
+//! A nesting limit for JSON that arrives from outside fx, checked on the raw
+//! text before fx parses it: what a provider sends, and the JSON text a model
+//! puts in a tool call's `request`. std.json parses any depth, but
+//! std.json.Stringify stops past 256 levels in safe builds, and a recursive
+//! walk can run out of stack, so a value deeper than this must never reach
+//! either one.
 const std = @import("std");
-const text_utils = @import("../core/shared/text_utils.zig");
+const text_utils = @import("text_utils.zig");
 
 /// Deep enough for any real tool input or provider metadata, and far enough
 /// under Stringify's 256 levels that fx can wrap a value when it saves it.

@@ -4,16 +4,21 @@
 // Each case is one `fx ask` against a local fake gateway that sends one call to
 // shell, read_tool_result, or subagent, shaped as the model's arguments can be:
 // flat, wrapped in `request` as an object or as its JSON text, as text longer
-// than the 64 KiB bound, as text that names no object, or as a wrapper with a
-// field beside it. For each call it records whether the tool ran it (the shell
-// command wrote its marker, the saved output was read, the delegation returned
-// ok) and how the next request replayed it: as the flat call, or as sent. TLC
-// replays the calls through the model's own actions. --self-check also replays
-// them through the model of fx before the change (Bug = "today"), which must
-// reject them. --stress N adds one reply with N shell calls sent as JSON text,
-// one with text exactly at the bound and one a byte past it, and prints the
-// wall time and the binary's peak memory; every one of those calls is checked
-// by TLC as well.
+// than the 64 KiB bound, as text that names no object, as text nested 64 levels
+// (read) or 65, 256, 257 and 300 levels (past the limit), or as a wrapper with a
+// field beside it. A subagent call is sent for each of its five actions, as the
+// flat call, an object wrapper, and JSON text. The nesting sits in a field the
+// tool needs as a string, so a nested text is never a call a tool runs. For each
+// call it records whether the tool ran it (the shell command wrote its marker,
+// the saved output was read, the delegation reached the subagent provider and
+// was not refused by its decoder) and how the next request replayed it: as the
+// flat call, or as sent. A fx that exits other than 0 fails the run before TLC
+// looks at it. TLC replays the calls through the model's own actions.
+// --self-check also replays them through the model with each planted defect (the
+// Bug values of RequestWrapper.tla), which must reject them. --stress N adds one
+// reply with N shell calls sent as JSON text, one with text exactly at the bound
+// and one a byte past it, and 24 nested ones, and prints the wall time and the
+// binary's peak memory; every one of those calls is checked by TLC as well.
 //
 // Usage (from the repository root, after zig build):
 //   bun tests/tla/drivers/agent_runtime/request-wrapper.ts
@@ -32,6 +37,8 @@ type Shape =
   | "flat"
   | "object"
   | "text"
+  | "text_nested"
+  | "text_deep"
   | "text_oversized"
   | "text_not_object"
   | "object_sibling"
@@ -40,7 +47,9 @@ type Replay = "flat" | "as_sent" | "unknown";
 type Observation = {
   id: string;
   tool: Tool;
+  action: string;
   shape: Shape;
+  depth: number;
   ran: boolean;
   replay: Replay;
   evidence: { exit: number; requests: number; result: string; replayed: unknown; tail: string };
@@ -48,7 +57,25 @@ type Observation = {
 type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 
 const TOOLS: Tool[] = ["shell", "read_tool_result", "subagent"];
-const SHAPES: Shape[] = ["flat", "object", "text", "text_oversized", "text_not_object", "object_sibling", "text_sibling"];
+const SHAPES: Shape[] = [
+  "flat", "object", "text", "text_nested", "text_deep", "text_oversized", "text_not_object", "object_sibling", "text_sibling",
+];
+const EXACT: Shape[] = ["flat", "object", "text"];
+// The actions of the subagent tool (subagent_model_contract.Action) and the call
+// each one sends.
+const SUBAGENT_INNER: Record<string, Record<string, unknown>> = {
+  message: { action: "message", agent: "worker", message: "Report done." },
+  wait: { action: "wait" },
+  status: { action: "status" },
+  stop: { action: "stop", agent: "worker" },
+  close: { action: "close", agent: "worker" },
+};
+// json_depth.max_depth in src/core/shared/json_depth.zig is 64: text nested
+// that deep is read, and deeper text is left as sent. std.json.Stringify aborts
+// a safe build from 257 levels on.
+const DEPTHS: Partial<Record<Shape, number[]>> = { text_nested: [64], text_deep: [65, 256, 257, 300] };
+// The error codes a tool's decoder gives a call it refuses.
+const DECODE_REFUSALS = ["invalid_json", "invalid_field_type", "missing_field", "unknown_field", "invalid_enum"];
 const MODEL = "openai/gpt-5.5";
 // tool_args.max_request_text_bytes in src/core/tooling/tool_args.zig.
 const BOUND = 64 * 1024;
@@ -76,8 +103,32 @@ function padded(inner: object, length: number): string {
   return text + " ".repeat(length - text.length);
 }
 
-/// The arguments the model sends for `shape`, around the flat call `inner`.
-/// `sibling` is a field the tool takes, sent beside the wrapper.
+/// `levels` arrays around a 0.
+function nest(levels: number): unknown {
+  let value: unknown = 0;
+  for (let level = 0; level < levels; level++) value = [value];
+  return value;
+}
+
+/// The arguments the model sends for `shape`, and the flat call fx makes of
+/// them when it reads them. `sibling` is a field the tool takes, sent beside the
+/// wrapper. A nested shape sends `inner` with `field`, which the tool needs as
+/// a string, holding arrays, so the text is `depth` levels deep: the call's
+/// object and `depth - 1` arrays.
+function build(
+  shape: Shape,
+  inner: Record<string, unknown>,
+  sibling: Record<string, unknown>,
+  field: string,
+  depth: number,
+): { sent: Record<string, unknown>; flat: Record<string, unknown> } {
+  if (shape === "text_nested" || shape === "text_deep") {
+    const junk = { ...inner, [field]: nest(depth - 1) };
+    return { sent: { request: JSON.stringify(junk) }, flat: junk };
+  }
+  return { sent: shaped(shape, inner, sibling), flat: inner };
+}
+
 function shaped(shape: Shape, inner: Record<string, unknown>, sibling: Record<string, unknown>): Record<string, unknown> {
   switch (shape) {
     case "flat":
@@ -94,6 +145,9 @@ function shaped(shape: Shape, inner: Record<string, unknown>, sibling: Record<st
       return { request: inner, ...sibling };
     case "text_sibling":
       return { request: JSON.stringify(inner), ...sibling };
+    case "text_nested":
+    case "text_deep":
+      throw new Error(`${shape} is built by build()`);
   }
 }
 
@@ -142,9 +196,14 @@ function shellOk(result: string): boolean {
   }
 }
 
+/// Whether the call reached the subagent provider: its decoder did not refuse
+/// it. A stop or close of an agent that does not exist is answered by the
+/// provider, and counts as run.
 function delegated(result: string): boolean {
   try {
-    return (JSON.parse(result) as { ok?: boolean }).ok === true;
+    const parsed = JSON.parse(result) as { ok?: boolean; error_code?: string };
+    if (parsed.ok === true) return true;
+    return typeof parsed.error_code === "string" && !DECODE_REFUSALS.includes(parsed.error_code);
   } catch {
     return false;
   }
@@ -202,10 +261,10 @@ async function runAsk(helpers: any, id: string, scratch: string, respond: (body:
   }
 }
 
-async function shellCase(helpers: any, id: string, shape: Shape, scratch: string): Promise<Observation> {
+async function shellCase(helpers: any, id: string, shape: Shape, depth: number, scratch: string): Promise<Observation> {
   const { fakeGatewayToolCall, fakeGatewayFinalText } = helpers;
   const inner = { action: "run", command: "printf ran > marker.txt", profile: "clean" };
-  const sent = shaped(shape, inner, { cwd: "." });
+  const { sent, flat } = build(shape, inner, { cwd: "." }, "command", depth);
   let result = "";
   let replayed: unknown = null;
   let step = 0;
@@ -218,9 +277,9 @@ async function shellCase(helpers: any, id: string, shape: Shape, scratch: string
   try {
     const marked = existsSync(join(turn.workspace, "marker.txt"));
     return {
-      id, tool: "shell", shape,
+      id, tool: "shell", action: "none", shape, depth,
       ran: marked && shellOk(result),
-      replay: replayOf(replayed, inner, sent),
+      replay: replayOf(replayed, flat, sent),
       evidence: { exit: turn.exit, requests: turn.requests, result: result.slice(0, 400), replayed, tail: turn.tail },
     };
   } finally {
@@ -228,10 +287,11 @@ async function shellCase(helpers: any, id: string, shape: Shape, scratch: string
   }
 }
 
-async function readResultCase(helpers: any, id: string, shape: Shape, scratch: string): Promise<Observation> {
+async function readResultCase(helpers: any, id: string, shape: Shape, depth: number, scratch: string): Promise<Observation> {
   const { fakeGatewayToolCall, fakeGatewayFinalText } = helpers;
-  let inner: Record<string, unknown> = {};
+  let flat: Record<string, unknown> = {};
   let sent: Record<string, unknown> = {};
+  let handle = "";
   let result = "";
   let replayed: unknown = null;
   let step = 0;
@@ -240,9 +300,8 @@ async function readResultCase(helpers: any, id: string, shape: Shape, scratch: s
       case 0:
         return fakeGatewayToolCall("large_read", "read_file", { path: "large.txt" });
       case 1: {
-        const handle = /<tool_result_handle>([^<]+)<\/tool_result_handle>/.exec(toolResult(body, "large_read") ?? "")?.[1] ?? "";
-        inner = { handle, query: NEEDLE };
-        sent = shaped(shape, inner, { query: "other" });
+        handle = /<tool_result_handle>([^<]+)<\/tool_result_handle>/.exec(toolResult(body, "large_read") ?? "")?.[1] ?? "";
+        ({ sent, flat } = build(shape, { handle, query: NEEDLE }, { query: "other" }, "handle", depth));
         return fakeGatewayToolCall("wrapped", "read_tool_result", sent);
       }
       default:
@@ -256,11 +315,11 @@ async function readResultCase(helpers: any, id: string, shape: Shape, scratch: s
     writeFileSync(join(workspace, "large.txt"), `${lines.join("\n")}\n`);
   });
   try {
-    if (!("handle" in inner) || inner.handle === "") throw new Error(`${id}: read_file returned no handle: ${turn.tail}`);
+    if (handle === "") throw new Error(`${id}: read_file returned no handle: ${turn.tail}`);
     return {
-      id, tool: "read_tool_result", shape,
+      id, tool: "read_tool_result", action: "none", shape, depth,
       ran: result.includes(NEEDLE) && result.includes("<tool_result_query"),
-      replay: replayOf(replayed, inner, sent),
+      replay: replayOf(replayed, flat, sent),
       evidence: { exit: turn.exit, requests: turn.requests, result: result.slice(0, 400), replayed, tail: turn.tail },
     };
   } finally {
@@ -268,10 +327,10 @@ async function readResultCase(helpers: any, id: string, shape: Shape, scratch: s
   }
 }
 
-async function subagentCase(helpers: any, id: string, shape: Shape, scratch: string): Promise<Observation> {
+async function subagentCase(helpers: any, id: string, action: string, shape: Shape, depth: number, scratch: string): Promise<Observation> {
   const { fakeGatewayToolCall, fakeGatewayFinalText } = helpers;
-  const inner = { action: "message", agent: "worker", message: "Report done." };
-  const sent = shaped(shape, inner, { agent: "worker" });
+  const inner = SUBAGENT_INNER[action]!;
+  const { sent, flat } = build(shape, inner, { agent: "worker" }, "message", depth);
   let issued = false;
   let answered = false;
   let result = "";
@@ -294,9 +353,9 @@ async function subagentCase(helpers: any, id: string, shape: Shape, scratch: str
   });
   try {
     return {
-      id, tool: "subagent", shape,
+      id, tool: "subagent", action, shape, depth,
       ran: delegated(result),
-      replay: replayOf(replayed, inner, sent),
+      replay: replayOf(replayed, flat, sent),
       evidence: { exit: turn.exit, requests: turn.requests, result: result.slice(0, 400), replayed, tail: turn.tail },
     };
   } finally {
@@ -305,18 +364,27 @@ async function subagentCase(helpers: any, id: string, shape: Shape, scratch: str
 }
 
 /// One reply with `count` shell calls sent as JSON text, then one at the bound
-/// and one a byte past it. Every call is one observation.
+/// and one a byte past it, then six each of text nested 64, 65, 257 and 300
+/// levels. Every call is one observation.
 async function stressCase(helpers: any, count: number, scratch: string): Promise<{ observations: Observation[]; seconds: number; tail: string }> {
   const { fakeGatewaySse, fakeGatewayFinalText } = helpers;
-  const calls: Array<{ id: string; shape: Shape; inner: object; sent: object }> = [];
+  // `writes` is whether the call is one the shell runs, so a marker shows it ran.
+  const calls: Array<{ id: string; shape: Shape; depth: number; flat: object; sent: object; writes: boolean }> = [];
   for (let i = 0; i < count; i++) {
     const inner = { action: "run", command: `printf '%s\\n' ${i} >> stress.txt`, profile: "clean" };
-    calls.push({ id: `stress_${i}`, shape: "text", inner, sent: { request: JSON.stringify(inner) } });
+    calls.push({ id: `stress_${i}`, shape: "text", depth: 1, flat: inner, sent: { request: JSON.stringify(inner) }, writes: true });
   }
   const atBound = { action: "run", command: "printf ran > at-bound.txt", profile: "clean" };
-  calls.push({ id: "at_bound", shape: "text", inner: atBound, sent: { request: padded(atBound, BOUND) } });
+  calls.push({ id: "at_bound", shape: "text", depth: 1, flat: atBound, sent: { request: padded(atBound, BOUND) }, writes: true });
   const pastBound = { action: "run", command: "printf ran > past-bound.txt", profile: "clean" };
-  calls.push({ id: "past_bound", shape: "text_oversized", inner: pastBound, sent: { request: padded(pastBound, BOUND + 1) } });
+  calls.push({ id: "past_bound", shape: "text_oversized", depth: 1, flat: pastBound, sent: { request: padded(pastBound, BOUND + 1) }, writes: true });
+  for (const depth of [64, 65, 257, 300]) {
+    for (let k = 0; k < 6; k++) {
+      const shape: Shape = depth <= 64 ? "text_nested" : "text_deep";
+      const { sent, flat } = build(shape, { action: "run", command: "printf ran > nested.txt", profile: "clean" }, {}, "command", depth);
+      calls.push({ id: `nested_${depth}_${k}`, shape, depth, flat, sent, writes: false });
+    }
+  }
   let body2 = "";
   let step = 0;
   const started = performance.now();
@@ -339,13 +407,14 @@ async function stressCase(helpers: any, count: number, scratch: string): Promise
       const result = body2 ? toolResult(body2, call.id) ?? "" : "";
       const replayed = body2 ? replayedInput(body2, call.id) : null;
       let wrote = false;
-      if (call.id === "at_bound") wrote = existsSync(join(turn.workspace, "at-bound.txt"));
+      if (!call.writes) wrote = false;
+      else if (call.id === "at_bound") wrote = existsSync(join(turn.workspace, "at-bound.txt"));
       else if (call.id === "past_bound") wrote = existsSync(join(turn.workspace, "past-bound.txt"));
       else wrote = lines.has(String(index));
       return {
-        id: call.id, tool: "shell", shape: call.shape,
+        id: call.id, tool: "shell", action: "none", shape: call.shape, depth: call.depth,
         ran: wrote && shellOk(result),
-        replay: replayOf(replayed, call.inner, call.sent),
+        replay: replayOf(replayed, call.flat, call.sent),
         evidence: { exit: turn.exit, requests: turn.requests, result: result.slice(0, 200), replayed: null, tail: "" },
       };
     });
@@ -359,7 +428,8 @@ const str = (value: string) => JSON.stringify(value);
 
 function observedModule(observations: Observation[]): string {
   const value = (o: Observation) =>
-    `[tool |-> ${str(o.tool)}, shape |-> ${str(o.shape)}, ran |-> ${o.ran ? "TRUE" : "FALSE"}, replay |-> ${str(o.replay)}]`;
+    `[tool |-> ${str(o.tool)}, action |-> ${str(o.action)}, shape |-> ${str(o.shape)}, depth |-> ${o.depth}, ` +
+    `ran |-> ${o.ran ? "TRUE" : "FALSE"}, replay |-> ${str(o.replay)}]`;
   return [
     "------------------------ MODULE RequestWrapperObserved ------------------------",
     "(* Generated by tests/tla/drivers/agent_runtime/request-wrapper.ts. Do not edit. *)",
@@ -401,23 +471,56 @@ async function firstMismatch(observations: Observation[], bug: string, parent: s
   return observations[low - 1] ?? null;
 }
 
+type Case = { tool: Tool; action: string; shape: Shape; depth: number };
+
+/// Every tool with every shape, at each depth a nested shape takes. A subagent
+/// call is sent for each action, as the flat call, an object wrapper, and JSON
+/// text, and for every shape with its message action.
+function allCases(): Case[] {
+  return TOOLS.flatMap((tool) =>
+    (tool === "subagent" ? Object.keys(SUBAGENT_INNER) : ["none"]).flatMap((action) =>
+      SHAPES.filter((shape) => action === "none" || action === "message" || EXACT.includes(shape)).flatMap((shape) =>
+        (DEPTHS[shape] ?? [1]).map((depth) => ({ tool, action, shape, depth })),
+      ),
+    ),
+  );
+}
+
+/// `fn` over `items`, at most `limit` at a time, results in order.
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) {
+        const index = next++;
+        results[index] = await fn(items[index]!);
+      }
+    }),
+  );
+  return results;
+}
+
+// The Bug values of RequestWrapper.tla, each one a planted defect.
+const PLANTED = ["today", "no_bound", "siblings", "replay_raw", "decode_side", "no_depth_bound", "action_list", "limit_exclusive"];
+
 async function main(): Promise<number> {
   const helpers = await targetHelpers();
   const out = outDir("request_wrapper");
   const scratch = join(out, "calls");
   mkdirSync(scratch, { recursive: true });
   const started = performance.now();
-  const cases = TOOLS.flatMap((tool) => SHAPES.map((shape) => ({ tool, shape })));
-  const observations = await Promise.all(cases.map(({ tool, shape }) => {
-    const id = `${tool}-${shape}`;
-    if (tool === "shell") return shellCase(helpers, id, shape, scratch);
-    if (tool === "read_tool_result") return readResultCase(helpers, id, shape, scratch);
-    return subagentCase(helpers, id, shape, scratch);
-  }));
+  const cases = allCases();
+  const observations = await mapLimit(cases, 16, ({ tool, action, shape, depth }) => {
+    const id = `${tool}-${action}-${shape}-${depth}`;
+    if (tool === "shell") return shellCase(helpers, id, shape, depth, scratch);
+    if (tool === "read_tool_result") return readResultCase(helpers, id, shape, depth, scratch);
+    return subagentCase(helpers, id, action, shape, depth, scratch);
+  });
   if (options.stress > 0) {
     const stress = await stressCase(helpers, options.stress, scratch);
     const ran = stress.observations.filter((o) => o.ran).length;
-    console.log(`stress: ${options.stress} JSON-text shell calls plus one at the bound and one past it in one reply, ` +
+    console.log(`stress: ${options.stress} JSON-text shell calls, one at the bound and one past it, and 24 nested ones in one reply, ` +
       `${ran} ran, ${stress.seconds}s, ${stress.tail.split("\n").at(-1)}`);
     observations.push(...stress.observations);
   }
@@ -425,10 +528,19 @@ async function main(): Promise<number> {
   writeJson(join(out, "observations.json"), observations);
   console.log(`${observations.length} calls of ${binary} in ${seconds}s`);
   for (const o of observations.slice(0, cases.length)) {
-    console.log(`  ${o.tool.padEnd(16)} ${o.shape.padEnd(16)} ran=${o.ran} replay=${o.replay}`);
+    console.log(`  ${o.tool.padEnd(16)} ${o.action.padEnd(8)} ${o.shape.padEnd(16)} depth=${String(o.depth).padEnd(3)} ran=${o.ran} replay=${o.replay}`);
   }
   console.log(`observations: ${join(out, "observations.json")}`);
 
+  // A fx that exits other than 0 failed the call, whatever the model says of it.
+  const crashed = observations.filter((o) => o.evidence.exit !== 0);
+  if (crashed.length > 0) {
+    for (const o of crashed.slice(0, 6)) {
+      console.log(`REJECTED: fx exited ${o.evidence.exit} on ${o.id}: ${o.evidence.tail.replace(/\s+/g, " ").slice(-160)}`);
+    }
+    console.log(`REJECTED: ${crashed.length} of ${observations.length} calls ended fx with an exit other than 0`);
+    return 1;
+  }
   const unserved = observations.find((o) => o.evidence.requests < 2);
   if (unserved) {
     console.log(`TOOL_ERROR: call ${unserved.id} did not run against the local gateway: ${JSON.stringify(unserved.evidence)}`);
@@ -449,9 +561,11 @@ async function main(): Promise<number> {
     return 1;
   }
   if (options.selfCheck) {
-    const today = await runTrace(observations, "today", out);
-    console.log(`self-check, the model of fx before the change: ${today.verdict} (must be REJECTED)`);
-    if (today.verdict !== "REJECTED") return today.verdict === "TOOL_ERROR" ? 2 : 1;
+    for (const bug of PLANTED) {
+      const planted = await runTrace(observations, bug, out);
+      console.log(`self-check, the model with the planted defect ${bug}: ${planted.verdict} (must be REJECTED)`);
+      if (planted.verdict !== "REJECTED") return planted.verdict === "TOOL_ERROR" ? 2 : 1;
+    }
   }
   console.log("ACCEPTED");
   return 0;

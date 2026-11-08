@@ -5254,6 +5254,100 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
+  // fx refuses provider JSON nested more than 64 levels, and the same limit holds
+  // for the text a model puts in `request`: deeper text is left as sent, like
+  // any request fx cannot read, and never reaches the JSON encoder, which aborts
+  // fx past 256 levels. The nesting sits in a field each tool needs as a string,
+  // so no such text is a valid call: text of 64 levels is read and the tool
+  // refuses its field, and deeper text stays wrapped.
+  const nestedRequestCases = [
+    { tool: "shell", field: "command", flat: { action: "run", command: "true", profile: "clean" } },
+    { tool: "read_tool_result", field: "handle", flat: { handle: "result-x", query: "needle" } },
+    { tool: "subagent", field: "message", flat: { action: "message", agent: "worker", message: "work" } },
+  ];
+  for (const { tool, field, flat } of nestedRequestCases) {
+    for (const levels of [64, 65, 256, 257, 300]) {
+      test(`${tool} ${levels <= 64 ? "reads" : "refuses"} request text nested ${levels} levels and fx keeps running`, async () => {
+        const root = createFixtureRoot(`${tool}-request-nested-${levels}`);
+        // The text is `levels` levels deep: the call's own object, and `levels - 1` arrays in its field.
+        let nested: unknown = 0;
+        for (let level = 1; level < levels; level++) nested = [nested];
+        const junk = { ...flat, [field]: nested };
+        const sent = { request: JSON.stringify(junk) };
+        let step = 0;
+        let output = "";
+        let replayed: unknown = null;
+        const gateway = startGateway((body) => {
+          switch (step++) {
+            case 0:
+              return fakeGatewayToolCall("nested_request", tool, sent);
+            case 1:
+              output = toolResultOutput(body, "nested_request");
+              replayed = replayedToolCallInput(body, "nested_request");
+              return fakeGatewayFinalText("NESTED_REQUEST_DONE");
+            default:
+              return new Response("unexpected request", { status: 500 });
+          }
+        });
+        try {
+          const result = await runFx(["ask", "--json", "--yolo", "Use the tool once."], {
+            cwd: root.workspace,
+            env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+            timeoutMs: 15_000,
+          });
+          expect(result.stderr).not.toMatch(/panic/i);
+          expect(result.code, result.stderr).toBe(0);
+          expect(parseAskJson(result.stdout).output).toContain("NESTED_REQUEST_DONE");
+          expect(gateway.requestCount()).toBe(2);
+          // The tool refused the call, and the next request replays the form fx kept.
+          expect(output).not.toBe("");
+          expect(replayed).toEqual(levels <= 64 ? junk : sent);
+        } finally {
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }, 30_000);
+    }
+  }
+
+  for (const action of ["wait", "status"]) {
+    test(`subagent ${action} sent as JSON text runs and replays flat`, async () => {
+      const root = createFixtureRoot(`subagent-${action}-request-json-text`);
+      const flat = { action };
+      let step = 0;
+      let output = "";
+      let replayed: unknown = null;
+      const gateway = startGateway((body) => {
+        switch (step++) {
+          case 0:
+            return fakeGatewayToolCall("json_text_lifecycle", "subagent", { request: JSON.stringify(flat) });
+          case 1:
+            output = toolResultOutput(body, "json_text_lifecycle");
+            replayed = replayedToolCallInput(body, "json_text_lifecycle");
+            return fakeGatewayFinalText("JSON_TEXT_LIFECYCLE_DONE");
+          default:
+            return new Response("unexpected request", { status: 500 });
+        }
+      });
+      try {
+        const result = await runFx(["ask", "--json", "--auto", `Call subagent ${action} once.`], {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+          timeoutMs: 15_000,
+        });
+        expect(result.code, result.stderr).toBe(0);
+        expect(parseAskJson(result.stdout).output).toContain("JSON_TEXT_LIFECYCLE_DONE");
+        expect(gateway.requestCount()).toBe(2);
+        expect(JSON.parse(output).ok, output).toBe(true);
+        expect(replayed).toEqual(flat);
+        expect(result.stderr).not.toMatch(/panic|error:|error\./i);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 30_000);
+  }
+
   test("shell request correction stops repeated failures after both batch results", async () => {
     const root = createFixtureRoot("shell-correction-repeat");
     const tracePath = join(root.root, "trace.log");

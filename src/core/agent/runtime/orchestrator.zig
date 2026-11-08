@@ -1344,16 +1344,16 @@ fn normalized_terminal_request_arguments(
     return try out.toOwnedSlice();
 }
 
-fn managed_subagent_action(action: []const u8) ?[]const u8 {
-    for ([_][]const u8{ "run", "message" }) |known| {
-        if (std.mem.eql(u8, action, known)) return known;
-    }
-    return null;
+/// Whether `action` is one of the actions the subagent tool takes. The tool's
+/// own decoder reads an object wrapper but never JSON text, so intake unwraps
+/// both for every one of them.
+fn is_subagent_action(action: []const u8) bool {
+    return std.meta.stringToEnum(subagent_model_contract.Action, action) != null;
 }
 
 /// Returns the top-level arguments of an exact {"request":...} subagent call
-/// around an object or its JSON text whose action is run or message, or null
-/// to keep the call as it was sent.
+/// around an object or its JSON text whose action is one the tool takes, or
+/// null to keep the call as it was sent.
 fn normalized_subagent_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -1367,7 +1367,7 @@ fn normalized_subagent_request_arguments(
     const request = parsed.value.object.get("request") orelse return null;
     const object = try tool_args.requestWrapperObject(parsed.arena.allocator(), request) orelse return null;
     const action = object.get("action") orelse return null;
-    if (action != .string or managed_subagent_action(action.string) == null) return null;
+    if (action != .string or !is_subagent_action(action.string)) return null;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -1527,12 +1527,12 @@ test "subagent intake unwraps an exact request wrapper" {
     };
     const registry = tool_dispatch.Registry{ .tools = &.{tool} };
     const calls = [_]ToolCall{
-        .{ .id = "flat", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"review\"}" },
+        .{ .id = "flat", .name = "subagent", .arguments_json = "{\"action\":\"status\"}" },
         .{ .id = "message", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review\"}}" },
-        .{ .id = "run", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"wrapped\"}}" },
+        .{ .id = "wait", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"wait\"}}" },
         .{ .id = "legacy", .name = "subagent", .arguments_json = "{\"command\":{\"lifecycle\":{\"id\":\"child-4\",\"action\":\"cancel\"}}}" },
-        .{ .id = "unknown-action", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"wait\"}}" },
-        .{ .id = "beside", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"a\"},\"task\":\"b\"}" },
+        .{ .id = "unknown-action", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"wrapped\"}}" },
+        .{ .id = "beside", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"wait\"},\"agent\":\"b\"}" },
     };
 
     const normalized = try normalize_subagent_request_tool_calls(
@@ -1547,9 +1547,10 @@ test "subagent intake unwraps an exact request wrapper" {
         "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review\"}",
         normalized[1].arguments_json,
     );
-    try std.testing.expectEqualStrings("{\"action\":\"run\",\"task\":\"wrapped\"}", normalized[2].arguments_json);
-    // Anything but an exact wrapper around a known action reaches the decoder
-    // as sent, which names what is wrong with it.
+    try std.testing.expectEqualStrings("{\"action\":\"wait\"}", normalized[2].arguments_json);
+    // Anything but an exact wrapper around one of the tool's actions reaches
+    // the decoder as sent, which names what is wrong with it. `run` is not an
+    // action.
     for (calls[3..], normalized[3..]) |call, result| {
         try std.testing.expectEqual(call.arguments_json.ptr, result.arguments_json.ptr);
     }
@@ -1562,7 +1563,7 @@ test "subagent intake unwraps an exact request wrapper" {
     try std.testing.expectEqual(calls[0..].ptr, ineligible.ptr);
 }
 
-test "subagent intake reads an exact request sent as JSON text as the flat call" {
+test "subagent intake reads an exact request sent as JSON text for every action the tool takes" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1576,29 +1577,77 @@ test "subagent intake reads an exact request sent as JSON text as the flat call"
         .reads_only_fn = undefined,
         .irreversible_fn = undefined,
     };
-    const calls = [_]ToolCall{
-        .{ .id = "run", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"task\\\":\\\"wrapped\\\"}\"}" },
-        .{ .id = "message", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"message\\\",\\\"agent\\\":\\\"reviewer\\\",\\\"message\\\":\\\"review\\\"}\"}" },
-        .{ .id = "unknown-action", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"wait\\\"}\"}" },
-        .{ .id = "not-an-object", .name = "subagent", .arguments_json = "{\"request\":\"run\"}" },
-        .{ .id = "beside", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"task\\\":\\\"a\\\"}\",\"task\":\"b\"}" },
-    };
+    const registry = tool_dispatch.Registry{ .tools = &.{tool} };
 
-    const normalized = try normalize_subagent_request_tool_calls(
-        arena,
-        .{ .tools = &.{tool} },
-        true,
-        &calls,
-    );
-    try std.testing.expectEqualStrings("{\"action\":\"run\",\"task\":\"wrapped\"}", normalized[0].arguments_json);
+    // Each action the tool takes, sent as the JSON text of its flat call.
+    const actions = @typeInfo(subagent_model_contract.Action).@"enum".field_names;
+    try std.testing.expectEqual(@as(usize, 5), actions.len);
+    inline for (actions) |name| {
+        const sent = try arena.print("{{\"request\":\"{{\\\"action\\\":\\\"{s}\\\"}}\"}}", .{name});
+        const calls = [_]ToolCall{.{ .id = name, .name = "subagent", .arguments_json = sent }};
+        const normalized = try normalize_subagent_request_tool_calls(arena, registry, true, &calls);
+        try std.testing.expectEqualStrings("{\"action\":\"" ++ name ++ "\"}", normalized[0].arguments_json);
+    }
+
+    const calls = [_]ToolCall{
+        .{ .id = "message", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"message\\\",\\\"agent\\\":\\\"reviewer\\\",\\\"message\\\":\\\"review\\\"}\"}" },
+        .{ .id = "run", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"task\\\":\\\"wrapped\\\"}\"}" },
+        .{ .id = "not-an-object", .name = "subagent", .arguments_json = "{\"request\":\"wait\"}" },
+        .{ .id = "beside", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"wait\\\"}\",\"agent\":\"b\"}" },
+    };
+    const normalized = try normalize_subagent_request_tool_calls(arena, registry, true, &calls);
     try std.testing.expectEqualStrings(
         "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review\"}",
-        normalized[1].arguments_json,
+        normalized[0].arguments_json,
     );
-    // The same calls that stay as sent in object form stay as sent here.
-    for (calls[2..], normalized[2..]) |call, result| {
+    // The same calls that stay as sent in object form stay as sent here, and
+    // `run` is not an action.
+    for (calls[1..], normalized[1..]) |call, result| {
         try std.testing.expectEqual(call.arguments_json.ptr, result.arguments_json.ptr);
     }
+}
+
+/// `{"request":"<text>"}` where the text is a call whose `field` holds arrays,
+/// so the text nests `levels` levels deep. `call` has `{s}` where the field's
+/// value goes.
+fn nestedRequestArguments(arena: Allocator, call: []const u8, levels: usize) ![]u8 {
+    const open = try arena.alloc(u8, levels - 1);
+    @memset(open, '[');
+    const close = try arena.alloc(u8, levels - 1);
+    @memset(close, ']');
+    const value = try std.mem.concat(arena, u8, &.{ open, "0", close });
+    const text = try std.mem.replaceOwned(u8, arena, call, "{s}", value);
+    return try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{});
+}
+
+test "request intake reads text nested up to 64 levels and leaves deeper text as sent for every tool" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const shell_call = "{\"action\":\"run\",\"command\":{s},\"profile\":\"clean\"}";
+    const subagent_call = "{\"action\":\"message\",\"agent\":\"worker\",\"message\":{s}}";
+    const read_call = "{\"handle\":{s},\"query\":\"needle\"}";
+    // 256 and 257 are the levels where std.json.Stringify aborts a safe build.
+    for ([_]usize{ 65, 100, 256, 257, 300, 1000 }) |levels| {
+        const shell = try nestedRequestArguments(arena, shell_call, levels);
+        try std.testing.expectEqual(@as(?[]u8, null), try normalized_terminal_request_arguments(arena, shell, null));
+        const subagent = try nestedRequestArguments(arena, subagent_call, levels);
+        try std.testing.expectEqual(@as(?[]u8, null), try normalized_subagent_request_arguments(arena, subagent));
+        const read = try nestedRequestArguments(arena, read_call, levels);
+        try std.testing.expectEqual(@as(?[]u8, null), try projected_read_tool_result_arguments(arena, read));
+    }
+
+    // At 64 levels the text is read and written back out as the flat call.
+    const shell = try nestedRequestArguments(arena, shell_call, 64);
+    const shell_flat = (try normalized_terminal_request_arguments(arena, shell, null)) orelse return error.TestExpectedRead;
+    try std.testing.expect(std.mem.startsWith(u8, shell_flat, "{\"action\":\"run\",\"command\":[[["));
+    const subagent = try nestedRequestArguments(arena, subagent_call, 64);
+    const subagent_flat = (try normalized_subagent_request_arguments(arena, subagent)) orelse return error.TestExpectedRead;
+    try std.testing.expect(std.mem.startsWith(u8, subagent_flat, "{\"action\":\"message\",\"agent\":\"worker\",\"message\":[[["));
+    const read = try nestedRequestArguments(arena, read_call, 64);
+    const read_flat = (try projected_read_tool_result_arguments(arena, read)) orelse return error.TestExpectedRead;
+    try std.testing.expect(std.mem.startsWith(u8, read_flat, "{\"handle\":[[["));
 }
 
 test "request unwrapping skips only required vision calls" {
