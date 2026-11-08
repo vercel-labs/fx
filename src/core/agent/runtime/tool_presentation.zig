@@ -2654,7 +2654,7 @@ test "subagent terminal summary preserves request row before child status" {
         &hooks,
         arena,
         3,
-        .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}" },
+        .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"inspect auth\"}" },
         true,
         null,
         .{
@@ -2682,7 +2682,7 @@ test "subagent terminal summary preserves request row before child status" {
         &hooks,
         arena,
         3,
-        .{ .id = "child-fallback", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}" },
+        .{ .id = "child-fallback", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"inspect auth\"}" },
         true,
         null,
         .{ .model_output = "{\"ok\":true,\"result\":\"done\"}" },

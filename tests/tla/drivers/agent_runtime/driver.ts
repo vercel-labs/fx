@@ -18,6 +18,10 @@
 // tool step followed by an empty reply, with no step limit, and prints its wall
 // time and the binary's peak memory.
 //
+// When every turn is accepted, it runs request-wrapper.ts, the driver of
+// RequestWrapper.tla, with --self-check when it was given, so one run walks
+// both agent_runtime models. --no-request-wrapper leaves that out.
+//
 // Usage (from the repository root, after zig build):
 //   bun tests/tla/drivers/agent_runtime/driver.ts
 //   bun tests/tla/drivers/agent_runtime/driver.ts --self-check
@@ -62,6 +66,7 @@ function option(name: string, fallback: number): number {
 
 const options = {
   selfCheck: process.argv.includes("--self-check"),
+  requestWrapper: !process.argv.includes("--no-request-wrapper"),
   depth: option("--depth", 3),
   random: option("--random", 40),
   seed: option("--seed", 1),
@@ -338,7 +343,13 @@ async function main(): Promise<number> {
     if (today.verdict !== "REJECTED") return today.verdict === "TOOL_ERROR" ? 2 : 1;
   }
   console.log("ACCEPTED");
-  return 0;
+  if (!options.requestWrapper) return 0;
+  console.log("request-wrapper.ts:");
+  const wrapper = Bun.spawn(
+    [process.execPath, join(import.meta.dirname, "request-wrapper.ts"), ...(options.selfCheck ? ["--self-check"] : [])],
+    { stdin: "ignore", stdout: "inherit", stderr: "inherit" },
+  );
+  return await wrapper.exited;
 }
 
 try {

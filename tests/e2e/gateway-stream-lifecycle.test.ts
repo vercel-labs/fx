@@ -785,6 +785,16 @@ function toolResultOutput(body: string, callId: string): string {
   return contentText(result.output);
 }
 
+// The input of a tool call as the request replays it to the model.
+function replayedToolCallInput(body: string, callId: string): unknown {
+  const parts = gatewayRequest(body).prompt.flatMap((message) =>
+    Array.isArray(message.content) ? message.content : []
+  ) as Array<Record<string, unknown>>;
+  return parts.find((part) =>
+    part.type === "tool-call" && part.toolCallId === callId
+  )?.input;
+}
+
 // A shell result leaves out every field that is null or false.
 type ShellResult = {
   session_id?: string;
@@ -5271,6 +5281,243 @@ describe("gateway stream lifecycle", () => {
       rmSync(root.root, { recursive: true, force: true });
     }
   });
+
+  // Some models, such as MiMo, send the whole call as the JSON text of a
+  // request object. fx reads it as the flat call it describes.
+  test("shell runs a request sent as JSON text once, and review reads the flat call", async () => {
+    const root = createFixtureRoot("shell-request-json-text");
+    const marker = join(root.workspace, "executions.txt");
+    const bin = join(root.root, "bin");
+    mkdirSync(bin, { recursive: true });
+    const recorder = join(bin, "record-once");
+    writeFileSync(recorder, "#!/bin/sh\nprintf 'once\\n' >> executions.txt\nprintf JSON_TEXT_SHELL_OK\n");
+    chmodSync(recorder, 0o755);
+    const flat = { action: "run", command: recorder, profile: "clean" };
+    let step = 0;
+    let replayed: unknown = null;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall("json_text_shell", "shell", { request: JSON.stringify(flat) });
+        case 1:
+          expect(shellResult(body, "json_text_shell")).toMatchObject({
+            state: "completed", exit_code: 0, output_delta: "JSON_TEXT_SHELL_OK",
+          });
+          replayed = replayedToolCallInput(body, "json_text_shell");
+          return fakeGatewayFinalText("JSON_TEXT_SHELL_COMPLETE");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "Run the recorder once."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        timeoutMs: 15_000,
+      });
+      expect(result.code, result.stderr).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("JSON_TEXT_SHELL_COMPLETE");
+      expect(readFileSync(marker, "utf8")).toBe("once\n");
+      expect(gateway.requestCount()).toBe(2);
+      // Review reads the command from the decoded call, and history replays
+      // the call the schema advertises.
+      expect(gateway.classifierRequests).toHaveLength(1);
+      const review = gatewayRequest(gateway.classifierRequests[0]!.body).prompt
+        .map((message) => contentText(message.content))
+        .join("\n");
+      expect(review).toContain(`command: ${recorder}`);
+      expect(replayed).toEqual(flat);
+      expect(result.stderr).not.toMatch(/panic|error:|error\./i);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("read_tool_result reads a request sent as JSON text and replays it flat", async () => {
+    const root = createFixtureRoot("read-result-request-json-text");
+    const needle = "E2E_JSON_TEXT_NEEDLE";
+    const lines = Array.from(
+      { length: 500 },
+      (_, index) => `fixture line ${index.toString().padStart(3, "0")}: ${"x".repeat(72)}`,
+    );
+    lines[300] = needle;
+    writeFileSync(join(root.workspace, "large-result.txt"), `${lines.join("\n")}\n`);
+    let step = 0;
+    let handle = "";
+    let replayed: unknown = null;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall("json_text_read_file", "read_file", { path: "large-result.txt" });
+        case 1: {
+          handle = toolResultOutput(body, "json_text_read_file")
+            .match(/<tool_result_handle>([^<]+)<\/tool_result_handle>/)?.[1] ?? "";
+          expect(handle).not.toBe("");
+          return fakeGatewayToolCall("json_text_read_result", "read_tool_result", {
+            request: JSON.stringify({ handle, query: needle }),
+          });
+        }
+        case 2: {
+          const output = toolResultOutput(body, "json_text_read_result");
+          expect(output).toContain(needle);
+          expect(output).toContain(`<tool_result_query handle="${handle}">`);
+          replayed = replayedToolCallInput(body, "json_text_read_result");
+          return fakeGatewayFinalText("JSON_TEXT_READ_COMPLETE");
+        }
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--yolo", "Inspect the retained large result."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        timeoutMs: 15_000,
+      });
+      const json = parseAskJson(result.stdout);
+      expect(result.code, result.stderr).toBe(0);
+      expect(json.output).toContain("JSON_TEXT_READ_COMPLETE");
+      expect(gateway.requestCount()).toBe(3);
+      expect(json.tool_calls).toContainEqual({ name: "read_tool_result", status: "success" });
+      expect(replayed).toEqual({ handle, query: needle });
+      expect(result.stderr).not.toMatch(/panic|error:|error\./i);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("subagent delegates a request sent as JSON text and replays it flat", async () => {
+    const root = createFixtureRoot("subagent-request-json-text");
+    const flat = { action: "message", agent: "worker", message: "Do the JSON text work." };
+    let replayed: unknown = null;
+    const gateway = startDynamicFakeGateway((body) => {
+      // The child has no subagent tool.
+      if (!body.includes('"name":"subagent"')) return fakeGatewayFinalText("CHILD_JSON_TEXT_DONE");
+      // The child's report starts the parent's next turn.
+      if (latestUserIsReport(body)) {
+        expect(body).toContain("CHILD_JSON_TEXT_DONE");
+        return fakeGatewayFinalText("JSON_TEXT_REPORT_READ");
+      }
+      if (hasCurrentToolResult(body, "json_text_delegate")) {
+        expect(JSON.parse(toolResultOutput(body, "json_text_delegate")).ok).toBe(true);
+        replayed = replayedToolCallInput(body, "json_text_delegate");
+        return fakeGatewayFinalText("JSON_TEXT_DELEGATION_SENT");
+      }
+      return fakeGatewayToolCall("json_text_delegate", "subagent", { request: JSON.stringify(flat) });
+    }, { classifierDecision: "clear" });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "Ask a worker for the JSON text work."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_TRACE_SCOPES: "subagent" },
+        timeoutMs: 15_000,
+      });
+      const json = parseAskJson(result.stdout);
+      expect(result.code, result.stderr).toBe(0);
+      expect(json.final_output).toBe("JSON_TEXT_REPORT_READ");
+      expect(json.tool_calls).toContainEqual({ name: "subagent", status: "success" });
+      expect(replayed).toEqual(flat);
+      expect(result.stderr).not.toMatch(/panic|error:|error\./i);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  // fx refuses provider JSON nested more than 64 levels, and the same limit holds
+  // for the text a model puts in `request`: deeper text is left as sent, like
+  // any request fx cannot read, and never reaches the JSON encoder, which aborts
+  // fx past 256 levels. The nesting sits in a field each tool needs as a string,
+  // so no such text is a valid call: text of 64 levels is read and the tool
+  // refuses its field, and deeper text stays wrapped.
+  const nestedRequestCases = [
+    { tool: "shell", field: "command", flat: { action: "run", command: "true", profile: "clean" } },
+    { tool: "read_tool_result", field: "handle", flat: { handle: "result-x", query: "needle" } },
+    { tool: "subagent", field: "message", flat: { action: "message", agent: "worker", message: "work" } },
+  ];
+  for (const { tool, field, flat } of nestedRequestCases) {
+    for (const levels of [64, 65, 256, 257, 300]) {
+      test(`${tool} ${levels <= 64 ? "reads" : "refuses"} request text nested ${levels} levels and fx keeps running`, async () => {
+        const root = createFixtureRoot(`${tool}-request-nested-${levels}`);
+        // The text is `levels` levels deep: the call's own object, and `levels - 1` arrays in its field.
+        let nested: unknown = 0;
+        for (let level = 1; level < levels; level++) nested = [nested];
+        const junk = { ...flat, [field]: nested };
+        const sent = { request: JSON.stringify(junk) };
+        let step = 0;
+        let output = "";
+        let replayed: unknown = null;
+        const gateway = startGateway((body) => {
+          switch (step++) {
+            case 0:
+              return fakeGatewayToolCall("nested_request", tool, sent);
+            case 1:
+              output = toolResultOutput(body, "nested_request");
+              replayed = replayedToolCallInput(body, "nested_request");
+              return fakeGatewayFinalText("NESTED_REQUEST_DONE");
+            default:
+              return new Response("unexpected request", { status: 500 });
+          }
+        });
+        try {
+          const result = await runFx(["ask", "--json", "--yolo", "Use the tool once."], {
+            cwd: root.workspace,
+            env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+            timeoutMs: 15_000,
+          });
+          expect(result.stderr).not.toMatch(/panic/i);
+          expect(result.code, result.stderr).toBe(0);
+          expect(parseAskJson(result.stdout).output).toContain("NESTED_REQUEST_DONE");
+          expect(gateway.requestCount()).toBe(2);
+          // The tool refused the call, and the next request replays the form fx kept.
+          expect(output).not.toBe("");
+          expect(replayed).toEqual(levels <= 64 ? junk : sent);
+        } finally {
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }, 30_000);
+    }
+  }
+
+  for (const action of ["wait", "status"]) {
+    test(`subagent ${action} sent as JSON text runs and replays flat`, async () => {
+      const root = createFixtureRoot(`subagent-${action}-request-json-text`);
+      const flat = { action };
+      let step = 0;
+      let output = "";
+      let replayed: unknown = null;
+      const gateway = startGateway((body) => {
+        switch (step++) {
+          case 0:
+            return fakeGatewayToolCall("json_text_lifecycle", "subagent", { request: JSON.stringify(flat) });
+          case 1:
+            output = toolResultOutput(body, "json_text_lifecycle");
+            replayed = replayedToolCallInput(body, "json_text_lifecycle");
+            return fakeGatewayFinalText("JSON_TEXT_LIFECYCLE_DONE");
+          default:
+            return new Response("unexpected request", { status: 500 });
+        }
+      });
+      try {
+        const result = await runFx(["ask", "--json", "--auto", `Call subagent ${action} once.`], {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+          timeoutMs: 15_000,
+        });
+        expect(result.code, result.stderr).toBe(0);
+        expect(parseAskJson(result.stdout).output).toContain("JSON_TEXT_LIFECYCLE_DONE");
+        expect(gateway.requestCount()).toBe(2);
+        expect(JSON.parse(output).ok, output).toBe(true);
+        expect(replayed).toEqual(flat);
+        expect(result.stderr).not.toMatch(/panic|error:|error\./i);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 30_000);
+  }
 
   test("shell request correction stops repeated failures after both batch results", async () => {
     const root = createFixtureRoot("shell-correction-repeat");

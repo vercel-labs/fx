@@ -3,6 +3,7 @@ const result_store = @import("../session/result_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const compactor = @import("../compactor/compactor.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
@@ -38,11 +39,13 @@ const RequestView = struct {
     const Kind = enum { range, query, images, record, history_search };
 };
 
-fn requestView(args: std.json.ObjectMap) ?RequestView {
-    const object = if (args.get("request")) |request| switch (request) {
-        .object => |value| value,
-        else => return null,
-    } else args;
+/// A `request` sent as JSON text is decoded in `alloc`, as `decode` reads it,
+/// and the view's strings live in `alloc` or `args`.
+fn requestView(alloc: Allocator, args: std.json.ObjectMap) Allocator.Error!?RequestView {
+    const object = if (args.get("request")) |request|
+        try tool_args.requestWrapperObject(alloc, request) orelse return null
+    else
+        args;
     if (object.get("search") != null) return .{ .kind = .history_search };
     const handle = switch (object.get("handle") orelse return null) {
         .string => |value| std.mem.trim(u8, value, " \t\r\n"),
@@ -98,10 +101,19 @@ fn readPresentation(
     };
 }
 
+/// What `presentation` decodes a `request` sent as JSON text in. A presentation
+/// callback has no allocator, and a call that asks for a handle or a search
+/// needs far less. A request whose decoded form does not fit in this buffer, or
+/// that is nested more deeply than the request depth limit, keeps the generic
+/// row.
+const presentation_buffer_bytes = 4096;
+
 /// Labels a call by what it reads instead of one shared "tool result" label.
 /// The resolved row text from `displayTarget` replaces the default object.
 pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
-    const view = requestView(args) orelse return null;
+    var buffer: [presentation_buffer_bytes]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    const view = (requestView(fixed.allocator(), args) catch return null) orelse return null;
     return switch (view.kind) {
         .range => readPresentation("Reading", "Read", outputNoun(view.handle, "more command output", "more output")),
         .query => readPresentation("Searching", "Searched", outputNoun(view.handle, "command output", "saved output")),
@@ -117,7 +129,7 @@ pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
 pub fn requestedHandle(alloc: Allocator, arguments_json: []const u8) Allocator.Error!?[]u8 {
     var parsed = (try parseArguments(alloc, arguments_json)) orelse return null;
     defer parsed.deinit();
-    const view = requestView(parsed.value.object) orelse return null;
+    const view = (try requestView(parsed.arena.allocator(), parsed.value.object)) orelse return null;
     switch (view.kind) {
         .record, .history_search => return null,
         .range, .query, .images => {},
@@ -137,7 +149,7 @@ pub fn displayTarget(
 ) Allocator.Error!?[]u8 {
     var parsed = (try parseArguments(alloc, arguments_json)) orelse return null;
     defer parsed.deinit();
-    const view = requestView(parsed.value.object) orelse return null;
+    const view = (try requestView(parsed.arena.allocator(), parsed.value.object)) orelse return null;
     switch (view.kind) {
         .range => {
             const name = source orelse return null;
@@ -238,4 +250,131 @@ test "read_tool_result requested handles match what validate opens" {
     try std.testing.expect(try requestedHandle(alloc, "{\"request\":{\"handle\":\"T5\"}}") == null);
     try std.testing.expect(try requestedHandle(alloc, "{\"request\":{\"search\":[\"x\"]}}") == null);
     try std.testing.expect(try requestedHandle(alloc, "[]") == null);
+}
+
+test "read_tool_result rows read a request sent as JSON text like its object form" {
+    const replay = "fx-command-replay-0123.bin";
+    try expectPresentation("{\"request\":\"{\\\"search\\\":[\\\"retry budget\\\"]}\"}", "Searching", "Searched", "earlier conversation");
+    try expectPresentation("{\"request\":\"{\\\"handle\\\":\\\"" ++ replay ++ "\\\"}\"}", "Reading", "Read", "more command output");
+    try expectPresentation("{\"request\":\"{\\\"handle\\\":\\\"result-x\\\",\\\"query\\\":\\\"error:\\\"}\"}", "Searching", "Searched", "saved output");
+    try expectPresentation("{\"request\":\"{\\\"handle\\\":\\\" t5 \\\"}\"}", "Opening", "Opened", "earlier conversation");
+    try expectPresentation("{\"request\":\"{\\\"handle\\\":\\\"image-result-abc\\\"}\"}", "Reloading", "Reloaded", "saved images");
+}
+
+/// The arguments of a handle call whose request is JSON text that nests
+/// `levels` levels deep: the call's object, and `levels - 1` arrays in `pad`.
+fn textNestedRequest(alloc: Allocator, levels: usize) ![]u8 {
+    const open = try alloc.alloc(u8, levels - 1);
+    defer alloc.free(open);
+    @memset(open, '[');
+    const close = try alloc.alloc(u8, levels - 1);
+    defer alloc.free(close);
+    @memset(close, ']');
+    return try alloc.print("{{\"request\":\"{{\\\"handle\\\":\\\"result-x\\\",\\\"pad\\\":{s}{s}}}\"}}", .{ open, close });
+}
+
+/// The arguments of a handle search whose request is JSON text with a query
+/// of `query_bytes` bytes.
+fn textQueryRequest(alloc: Allocator, query_bytes: usize) ![]u8 {
+    const query = try alloc.alloc(u8, query_bytes);
+    defer alloc.free(query);
+    @memset(query, 'x');
+    return try alloc.print("{{\"request\":\"{{\\\"handle\\\":\\\"result-x\\\",\\\"query\\\":\\\"{s}\\\"}}\"}}", .{query});
+}
+
+/// The arguments of a history search for `phrases` short phrases, whose
+/// request is the search's JSON text when `as_text` is set and its object
+/// otherwise.
+fn searchRequest(alloc: Allocator, phrases: usize, as_text: bool) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(alloc);
+    for (0..phrases) |index| {
+        const phrase = try alloc.print("{s}\"phrase {d:0>2}\"", .{ if (index == 0) "" else ",", index });
+        defer alloc.free(phrase);
+        try list.appendSlice(alloc, phrase);
+    }
+    const search = try alloc.print("{{\"search\":[{s}]}}", .{list.items});
+    defer alloc.free(search);
+    if (!as_text) return try alloc.print("{{\"request\":{s}}}", .{search});
+    const quoted = try std.json.Stringify.valueAlloc(alloc, search, .{});
+    defer alloc.free(quoted);
+    return try alloc.print("{{\"request\":{s}}}", .{quoted});
+}
+
+test "read_tool_result rows keep the generic row for JSON text that does not fit the 4 KiB buffer" {
+    const alloc = std.testing.allocator;
+
+    // Text that decodes in the buffer is read, and text that does not leaves
+    // the row as the generic one, as for any request the row cannot read.
+    const inside = try textQueryRequest(alloc, 1500);
+    defer alloc.free(inside);
+    try expectPresentation(inside, "Searching", "Searched", "saved output");
+    const outside = try textQueryRequest(alloc, 5000);
+    defer alloc.free(outside);
+    var parsed_outside = try std.json.parseFromSlice(std.json.Value, alloc, outside, .{});
+    defer parsed_outside.deinit();
+    try std.testing.expect(presentation(parsed_outside.value.object) == null);
+}
+
+test "read_tool_result rows keep the generic row for a search list whose decoded form does not fit the buffer" {
+    const alloc = std.testing.allocator;
+
+    // 30 short phrases are under 2 KiB of text, yet the list does not fit the
+    // buffer once decoded: the decoded form decides the row, not the text's size.
+    const long_text = try searchRequest(alloc, 30, true);
+    defer alloc.free(long_text);
+    try std.testing.expect(long_text.len < 2048);
+    var parsed_long = try std.json.parseFromSlice(std.json.Value, alloc, long_text, .{});
+    defer parsed_long.deinit();
+    try std.testing.expect(presentation(parsed_long.value.object) == null);
+
+    // The same search as an object has no text to decode, and a short list as
+    // text fits, so the buffer is the only reason the long one falls back.
+    const as_object = try searchRequest(alloc, 30, false);
+    defer alloc.free(as_object);
+    try expectPresentation(as_object, "Searching", "Searched", "earlier conversation");
+    const short_text = try searchRequest(alloc, 3, true);
+    defer alloc.free(short_text);
+    try expectPresentation(short_text, "Searching", "Searched", "earlier conversation");
+}
+
+test "read_tool_result handles read JSON text nested up to 64 levels and no deeper" {
+    const alloc = std.testing.allocator;
+
+    const at_limit = try textNestedRequest(alloc, 64);
+    defer alloc.free(at_limit);
+    const handle = (try requestedHandle(alloc, at_limit)) orelse return error.TestExpectedHandle;
+    defer alloc.free(handle);
+    try std.testing.expectEqualStrings("result-x.txt", handle);
+
+    // One level more is not read, like any other text the tool does not read.
+    const past_limit = try textNestedRequest(alloc, 65);
+    defer alloc.free(past_limit);
+    try std.testing.expect(try requestedHandle(alloc, past_limit) == null);
+    try std.testing.expect(try displayTarget(alloc, past_limit, null) == null);
+
+    // The row's own decode leaves the same text as the generic row.
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, past_limit, .{});
+    defer parsed.deinit();
+    try std.testing.expect(presentation(parsed.value.object) == null);
+}
+
+test "read_tool_result handles and display targets read JSON text of any size within the bound" {
+    const alloc = std.testing.allocator;
+    const handle = (try requestedHandle(alloc, "{\"request\":\"{\\\"handle\\\":\\\" result-shell-abc \\\"}\"}")) orelse
+        return error.TestExpectedHandle;
+    defer alloc.free(handle);
+    try std.testing.expectEqualStrings("result-shell-abc.txt", handle);
+    try std.testing.expect(try requestedHandle(alloc, "{\"request\":\"{\\\"search\\\":[\\\"x\\\"]}\"}") == null);
+
+    try expectDisplayTarget("{\"request\":\"{\\\"handle\\\":\\\"result-x\\\",\\\"query\\\":\\\"needle\\\"}\"}", null, "saved output for \"needle\"");
+    // Past the 4 KiB the row's own decode allows, these have a heap to read in.
+    const large = try textQueryRequest(alloc, 10_000);
+    defer alloc.free(large);
+    const target = (try displayTarget(alloc, large, null)) orelse return error.TestExpectedDisplayTarget;
+    defer alloc.free(target);
+    try std.testing.expect(std.mem.startsWith(u8, target, "saved output for \"xxxx"));
+    const large_handle = (try requestedHandle(alloc, large)) orelse return error.TestExpectedHandle;
+    defer alloc.free(large_handle);
+    try std.testing.expectEqualStrings("result-x.txt", large_handle);
 }
