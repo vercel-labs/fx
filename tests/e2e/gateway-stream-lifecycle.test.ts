@@ -4301,6 +4301,10 @@ describe("gateway stream lifecycle", () => {
     for (const [label, prompt] of [
       ["vietnamese", "Dịch nội dung sau sang tiếng Hàn. The lockfile is broken again."],
       ["indonesian", "Terjemahkan ke bahasa Korea. The lockfile is broken again."],
+      // Each accent is a base letter and a combining mark.
+      ["vietnamese-decomposed", "Di\u0323ch giu\u0301p. The lockfile is broken again."],
+      // "we" is a Dutch word, and the English list leaves it out.
+      ["dutch", "Kunnen we dit vandaag nog oplossen? The lockfile is broken again."],
     ] as const) {
       const root = createFixtureRoot(`response-language-${label}`);
       const gateway = startGateway(() => fakeGatewayFinalText(translated));

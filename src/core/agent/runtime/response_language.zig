@@ -5,6 +5,11 @@ const text_utils = @import("../../shared/text_utils.zig");
 
 const minimum_letters: usize = 5;
 const minimum_unexpected_prose_letters: usize = 8;
+/// A clause shorter than this is too short to say it is not English.
+const minimum_clause_words: usize = 3;
+/// The combining accents that follow a base letter, such as U+0323 after "i".
+const combining_accents_first: u21 = 0x0300;
+const combining_accents_last: u21 = 0x036F;
 
 pub const Script = language_script.Script;
 pub const Evidence = language_script.Profile;
@@ -132,36 +137,56 @@ fn contains_ignore_case(haystack: []const u8, needle: []const u8) bool {
 }
 
 /// Whether the text has a Latin letter outside ASCII, such as "ị" or "é",
-/// which English prose does not use. Malformed bytes are skipped one at a
-/// time, so a cut-short sequence cannot hide the letter after it.
+/// which English prose does not use. The same letter stored as a base letter
+/// and a combining accent, "i" and U+0323, counts too. Malformed bytes are
+/// skipped one at a time, so a cut-short sequence cannot hide the letter
+/// after it.
 fn has_non_ascii_latin_letter(text: []const u8) bool {
     var index: usize = 0;
+    var after_latin_letter = false;
     while (index < text.len) {
+        const follows_latin_letter = after_latin_letter;
+        after_latin_letter = false;
         if (text[index] < 0x80) {
+            after_latin_letter = std.ascii.isAlphabetic(text[index]);
             index += 1;
             continue;
         }
-        const width = std.unicode.utf8ByteSequenceLength(text[index]) catch {
+        const decoded = decode_at(text, index) orelse {
             index += 1;
             continue;
         };
-        if (index + width > text.len) return false;
-        const codepoint = display_width.decodeUtf8Sequence(text[index .. index + width]) catch {
-            index += 1;
-            continue;
-        };
-        // U+00D7 and U+00F7 are the signs × and ÷, not letters.
-        if ((codepoint >= 0x00C0 and codepoint <= 0x024F and codepoint != 0x00D7 and codepoint != 0x00F7) or
-            (codepoint >= 0x1E00 and codepoint <= 0x1EFF)) return true;
-        index += width;
+        const codepoint = decoded.codepoint;
+        if (is_latin_letter_outside_ascii(codepoint)) return true;
+        if (follows_latin_letter and
+            codepoint >= combining_accents_first and codepoint <= combining_accents_last) return true;
+        index += decoded.width;
     }
     return false;
 }
 
-/// Whether some clause of three or more words, outside code spans, has no
-/// English function word: words of another language, even when the rest of
-/// the prompt is English. A clause ends at a line break or at a word that ends
-/// in . ! ? : or ;. A word is a whitespace-separated token with an ASCII letter.
+const DecodedCodepoint = struct { codepoint: u21, width: usize };
+
+/// The codepoint that starts at `index`, or null for a malformed or cut-short
+/// sequence, which one byte of the caller's scan then skips.
+fn decode_at(text: []const u8, index: usize) ?DecodedCodepoint {
+    const width = std.unicode.utf8ByteSequenceLength(text[index]) catch return null;
+    if (index + width > text.len) return null;
+    const codepoint = display_width.decodeUtf8Sequence(text[index .. index + width]) catch return null;
+    return .{ .codepoint = codepoint, .width = width };
+}
+
+fn is_latin_letter_outside_ascii(codepoint: u21) bool {
+    // U+00D7 and U+00F7 are the signs × and ÷, not letters.
+    return codepoint >= 0x80 and language_script.is_latin_codepoint(codepoint) and
+        codepoint != 0x00D7 and codepoint != 0x00F7;
+}
+
+/// Whether some clause of `minimum_clause_words` or more words, outside code
+/// spans, has no English function word: words of another language, even when
+/// the rest of the prompt is English. A clause ends at a line break or at a
+/// word that ends in . ! ? : or ;. A word is a whitespace-separated token with
+/// an ASCII letter.
 fn has_clause_without_english(text: []const u8) bool {
     var words: usize = 0;
     var has_function_word = false;
@@ -177,7 +202,7 @@ fn has_clause_without_english(text: []const u8) bool {
         if (std.ascii.isWhitespace(byte)) {
             index += 1;
             if (byte != '\n' or in_code) continue;
-            if (words >= 3 and !has_function_word) return true;
+            if (words >= minimum_clause_words and !has_function_word) return true;
             words = 0;
             has_function_word = false;
             continue;
@@ -191,12 +216,12 @@ fn has_clause_without_english(text: []const u8) bool {
             if (is_english_function_word(token)) has_function_word = true;
         }
         if (std.mem.findScalar(u8, ".!?:;", token[token.len - 1]) != null) {
-            if (words >= 3 and !has_function_word) return true;
+            if (words >= minimum_clause_words and !has_function_word) return true;
             words = 0;
             has_function_word = false;
         }
     }
-    return words >= 3 and !has_function_word;
+    return words >= minimum_clause_words and !has_function_word;
 }
 
 fn has_ascii_letter(token: []const u8) bool {
@@ -206,25 +231,38 @@ fn has_ascii_letter(token: []const u8) bool {
     return false;
 }
 
-/// Short words that other Latin-script languages also use, such as "a",
-/// "in", "is", and "do", are left out, so they cannot pass a clause in
-/// another language as English. "I" counts only as a capital.
-const english_function_words = [_][]const u8{
-    "the",    "this",   "that",    "these",   "those",   "you",   "your",
-    "please", "what",   "why",     "how",     "should",  "would", "could",
-    "will",   "and",    "or",      "of",      "to",      "are",   "were",
-    "be",     "been",   "being",   "it",      "its",     "with",  "for",
-    "from",   "by",     "if",      "then",    "than",    "not",   "does",
-    "did",    "can",    "have",    "has",     "had",     "haven", "hasn",
-    "don",    "doesn",  "didn",    "isn",     "aren",    "wasn",  "weren",
-    "won",    "wouldn", "couldn",  "shouldn", "let",     "we",    "my",
-    "our",    "us",     "they",    "them",    "their",   "there", "here",
-    "which",  "who",    "whose",   "when",    "where",   "about", "into",
-    "after",  "before", "but",     "all",     "any",     "some",  "each",
-    "every",  "only",   "more",    "very",    "also",    "just",  "same",
-    "such",   "other",  "without", "through", "because", "while", "until",
-    "since",  "over",   "under",   "yes",     "she",     "his",   "her",
-    "him",    "out",    "up",
+/// English words that other Latin-script languages do not use as ordinary
+/// words. One of them in a prompt marks it as possibly English
+/// (`has_english_authority_signal`), and in a clause it marks the clause as
+/// English.
+const english_authority_words = [_][]const u8{
+    "the",    "this", "that", "these", "those",  "you",   "your",
+    "please", "what", "why",  "how",   "should", "would", "could",
+};
+
+/// More English function words, with the same rule. Words that another
+/// Latin-script language also uses as ordinary words are left out, so they
+/// cannot pass a clause in that language as English: "a", "in", "is", and
+/// "do", and thirty more such as "to" (Polish, Czech), "we" and "of" (Dutch),
+/// "by" and "my" (Czech, Polish), "her" (Turkish), "can" (Vietnamese), "for"
+/// (Danish), and "will" (German). "I" counts only as a capital.
+const english_function_words = english_authority_words ++ [_][]const u8{
+    "and",   "were",  "being",   "its",     "with",    "from",  "if",
+    "then",  "does",  "did",     "they",    "their",   "there", "here",
+    "our",   "which", "who",     "whose",   "when",    "where", "about",
+    "into",  "after", "before",  "some",    "each",    "every", "only",
+    "very",  "other", "without", "through", "because", "while", "until",
+    "since", "yes",   "she",     "him",     "out",     "up",
+};
+
+/// The start of a contraction: "don" in "don't", "it" in "it's". These count
+/// as English only before an apostrophe, because "don", "won", "haven", "can",
+/// "let", "it", and "we" are words of Spanish, Dutch, Turkish, Vietnamese, and
+/// other languages.
+const english_contraction_stems = [_][]const u8{
+    "don",   "doesn", "didn",   "isn",    "aren",    "wasn",
+    "weren", "won",   "wouldn", "couldn", "shouldn", "haven",
+    "hasn",  "can",   "let",    "it",     "we",
 };
 
 /// Whether a token is an English function word, allowing punctuation around
@@ -236,7 +274,8 @@ fn is_english_function_word(token: []const u8) bool {
     while (end < token.len and std.ascii.isAlphabetic(token[end])) : (end += 1) {}
     if (start == end) return false;
     const rest = token[end..];
-    if (rest.len > 0 and rest[0] != '\'' and !std.mem.startsWith(u8, rest, "\u{2019}")) {
+    const contracted = rest.len > 0 and (rest[0] == '\'' or std.mem.startsWith(u8, rest, "\u{2019}"));
+    if (rest.len > 0 and !contracted) {
         for (rest) |byte| {
             if (std.ascii.isAlphanumeric(byte)) return false;
         }
@@ -246,27 +285,15 @@ fn is_english_function_word(token: []const u8) bool {
     for (english_function_words) |candidate| {
         if (std.ascii.eqlIgnoreCase(word, candidate)) return true;
     }
+    if (contracted) {
+        for (english_contraction_stems) |stem| {
+            if (std.ascii.eqlIgnoreCase(word, stem)) return true;
+        }
+    }
     return false;
 }
 
 fn has_english_authority_signal(text: []const u8) bool {
-    const words = [_][]const u8{
-        "the",
-        "this",
-        "that",
-        "these",
-        "those",
-        "you",
-        "your",
-        "please",
-        "what",
-        "why",
-        "how",
-        "should",
-        "would",
-        "could",
-        "will",
-    };
     var start: usize = 0;
     while (start < text.len) {
         while (start < text.len and !std.ascii.isAlphabetic(text[start])) : (start += 1) {}
@@ -274,7 +301,7 @@ fn has_english_authority_signal(text: []const u8) bool {
         while (start < text.len and std.ascii.isAlphabetic(text[start])) : (start += 1) {}
         if (word_start == start) continue;
         const word = text[word_start..start];
-        for (words) |candidate| {
+        for (english_authority_words) |candidate| {
             if (std.ascii.eqlIgnoreCase(word, candidate)) return true;
         }
     }
@@ -364,6 +391,10 @@ test "response language expectation judges clauses of three or more words" {
     // Two words are too few to say a clause is not English.
     try std.testing.expectEqual(Script.latin, infer_expectation("Tolong terjemahkan. The lockfile is broken again.").?);
     try std.testing.expect(infer_expectation("Tolong terjemahkan ini. The lockfile is broken again.") == null);
+    // "it" and "to" are words of Vietnamese and Polish, so a clause whose only
+    // English words are such words is not judged English either.
+    try std.testing.expect(infer_expectation("Make it work now. Please check the result.") == null);
+    try std.testing.expectEqual(Script.latin, infer_expectation("Make the parser work now. Please check the result.").?);
 }
 
 test "response language expectation tolerates malformed UTF-8" {
@@ -372,16 +403,191 @@ test "response language expectation tolerates malformed UTF-8" {
     try std.testing.expectEqual(Script.latin, infer_expectation("The lockfile is broken again. \xc3").?);
     // A sequence cut short does not hide the accented letter after it.
     try std.testing.expect(infer_expectation("The lockfile is broken again. \xe1 é") == null);
+    // A 2-, 3-, or 4-byte lead that claims more bytes than remain skips one
+    // byte, whether or not an accented letter follows it.
+    try std.testing.expect(infer_expectation("The lockfile is broken again. \xc3\xc3\xa9") == null);
+    try std.testing.expect(infer_expectation("The lockfile is broken again. \xe1\xc3\xa9") == null);
+    try std.testing.expect(infer_expectation("The lockfile is broken again. \xf0\xc3\xa9") == null);
+    try std.testing.expect(infer_expectation("The lockfile is broken again. \xf0\xe1\xbb\x8b") == null);
+    try std.testing.expectEqual(Script.latin, infer_expectation("The lockfile is broken again. \xf0").?);
+    try std.testing.expectEqual(Script.latin, infer_expectation("The lockfile is broken again. \xe1\xbb").?);
+    try std.testing.expectEqual(Script.latin, infer_expectation("The lockfile is broken again. \xf0\x9f\x98").?);
     try std.testing.expect(infer_expectation("") == null);
     try std.testing.expect(infer_expectation("?! ... ;") == null);
+}
+
+test "response language expectation counts decomposed accents like precomposed letters" {
+    // Each pair is the same request: letters with accents, then base letters
+    // followed by combining marks (U+0300 to U+036F).
+    const pairs = [_][2][]const u8{
+        .{
+            "Dịch giúp tôi. The lockfile is broken again.",
+            "Di\u{323}ch giu\u{301}p to\u{302}i. The lockfile is broken again.",
+        },
+        .{
+            "Réponds vite, s'il te plaît. The lockfile is broken again.",
+            "Re\u{301}ponds vite, s'il te plai\u{302}t. The lockfile is broken again.",
+        },
+        .{
+            "Zrób to dla mnie. The lockfile is broken again.",
+            "Zro\u{301}b to dla mnie. The lockfile is broken again.",
+        },
+        .{
+            "Ask José to review the lockfile.",
+            "Ask Jose\u{301} to review the lockfile.",
+        },
+    };
+    for (pairs) |pair| {
+        try std.testing.expect(infer_expectation(pair[0]) == null);
+        try std.testing.expect(infer_expectation(pair[1]) == null);
+    }
+    // A combining mark counts only straight after a Latin letter.
+    const stray_marks = [_][]const u8{
+        "\u{301}The lockfile is broken again.",
+        "The lockfile is broken again. \u{301}",
+        "Why is 3\u{301} wrong in the lockfile parser?",
+        "Why is the lockfile \u{301}broken again?",
+    };
+    for (stray_marks) |prompt| {
+        try std.testing.expectEqual(Script.latin, infer_expectation(prompt).?);
+    }
+}
+
+/// The prompts for which `infer_expectation` does not give `expected`, one per
+/// line, for a test to compare with an empty string.
+fn unexpected_expectations(prompts: []const []const u8, expected: ?Script) ![]u8 {
+    var misses: std.ArrayList(u8) = .empty;
+    errdefer misses.deinit(std.testing.allocator);
+    for (prompts) |prompt| {
+        if (infer_expectation(prompt) == expected) continue;
+        try misses.appendSlice(std.testing.allocator, prompt);
+        try misses.append(std.testing.allocator, '\n');
+    }
+    return misses.toOwnedSlice(std.testing.allocator);
+}
+
+test "response language expectation ignores English words that another language uses" {
+    // One request for each word that the English list leaves out because a
+    // Latin-script language uses it as an ordinary word, written without
+    // accents and followed by quoted English.
+    const requests = [_][]const u8{
+        "Sprawdz to w pliku konfiguracyjnym. The lockfile is broken again.", // to: Polish
+        "Kunnen we dit vandaag nog oplossen? The lockfile is broken again.", // we: Dutch
+        "Is dit een bug of een feature? The lockfile is broken again.", // of: Dutch
+        "Mohl by to nekdo zkontrolovat? The lockfile is broken again.", // by: Czech
+        "Her gun yeni bir hata cikiyor. The lockfile is broken again.", // her: Turkish
+        "Praat even over de nieuwe build. The lockfile is broken again.", // over: Dutch
+        "Let goed op de volgorde van de tests. The lockfile is broken again.", // let: Dutch
+        "My musimy to jeszcze sprawdzic. The lockfile is broken again.", // my: Polish
+        "Hij had de test nooit gedraaid. The lockfile is broken again.", // had: Dutch
+        "Det er for langsomt i dag. The lockfile is broken again.", // for: Danish
+        "Ich will das Problem verstehen. The lockfile is broken again.", // will: German
+        "Also gut, dann pruefen wir das. The lockfile is broken again.", // also: German
+        "All diese Tests laufen zu langsam. The lockfile is broken again.", // all: German
+        "Tu has cambiado el archivo de configuracion. The lockfile is broken again.", // has: Spanish
+        "Vi skal have den nye version ud. The lockfile is broken again.", // have: Danish
+        "Det kraschar under installationen. The lockfile is broken again.", // under: Swedish
+        "Us enviare el resum de la prova. The lockfile is broken again.", // us: Catalan
+        "Det var just det jag menade. The lockfile is broken again.", // just: Swedish
+        "Ali more koda delovati brez tega? The lockfile is broken again.", // more: Slovene
+        "Same testy nic nie sprawdzaja. The lockfile is broken again.", // same: Polish
+        "Ban can sua loi nay ngay. The lockfile is broken again.", // can: Vietnamese
+        "Can bey bu dosyayi inceledi mi? The lockfile is broken again.", // can: Turkish
+        "Aplicatia are o eroare noua. The lockfile is broken again.", // are: Romanian
+        "Be, ara ho revisem tot junts. The lockfile is broken again.", // be: Catalan
+        "Or, le test echoue toujours. The lockfile is broken again.", // or: French
+        "Ik heb het been gebroken tijdens het testen. The lockfile is broken again.", // been: Dutch
+        "Giao dien than thien voi nguoi dung. The lockfile is broken again.", // than: Vietnamese
+        "Hay them mot dong vao file nay. The lockfile is broken again.", // them: Vietnamese
+        "Chi con it viec de lam. The lockfile is broken again.", // it: Vietnamese
+        "Bu not defterine yazilmali. The lockfile is broken again.", // not: Turkish
+        "Le but est de corriger ce test. The lockfile is broken again.", // but: French
+        "Aquest any no hi ha errors. The lockfile is broken again.", // any: Catalan
+        "Such den Fehler in der Datei. The lockfile is broken again.", // such: German
+        "Bu his cok garip. The lockfile is broken again.", // his: Turkish
+        // "don", "won", and "haven" are words in Spanish and Dutch; they count
+        // as English only before an apostrophe.
+        "Don Pablo revisa el codigo hoy. The lockfile is broken again.",
+        "Ons team won de benchmark. The lockfile is broken again.",
+        "Open de haven voor de nieuwe service. The lockfile is broken again.",
+        // The requests that came back as English for "we", "of", "over",
+        // "her", "by", and "my".
+        "Kunnen we dit naar het Koreaans vertalen? The lockfile is broken again.",
+        "Vertaal dit naar het Koreaans of Japans. The lockfile is broken again.",
+        "Kun je dit over zetten naar het Koreaans? The lockfile is broken again.",
+        "Her dosyayi korece cevir. The lockfile is broken again.",
+        "Mohl by jsi to prelozit do korejstiny? The lockfile is broken again.",
+        "Powiedz my jak to dziala w korejskim. The lockfile is broken again.",
+    };
+    const misses = try unexpected_expectations(&requests, null);
+    defer std.testing.allocator.free(misses);
+    try std.testing.expectEqualStrings("", misses);
+}
+
+test "response language expectation recognizes each English authority word" {
+    // Each request has one authority word, which is also the only English word
+    // of its clause.
+    const requests = [_][]const u8{
+        "The build fails now.",
+        "Fix this bug.",
+        "Fix that bug.",
+        "Fix these bugs.",
+        "Fix those bugs.",
+        "Can you run zig build?",
+        "Run your tests.",
+        "Please run zig build.",
+        "What broke zig build?",
+        "Why is zig build slow?",
+        "How slow is zig build?",
+        "Should zig build pass?",
+        "Would zig build pass?",
+        "Could zig build pass?",
+    };
+    const misses = try unexpected_expectations(&requests, .latin);
+    defer std.testing.allocator.free(misses);
+    try std.testing.expectEqualStrings("", misses);
+}
+
+test "response language expectation keeps English that uses contractions" {
+    const requests = [_][]const u8{
+        "Don't touch parsing. Why does it break?",
+        "Don’t touch parsing. Why does it break?",
+        "Can't reproduce it locally. Why does it fail?",
+        "Let's fix parsing first. Why does it break?",
+        "It's broken again. Why does it break?",
+        "We're stuck on parsing. Why does it break?",
+        "We won't touch parsing. Why does it break?",
+        "Please fix the flaky test. We can't merge it.",
+        // The stem is the only English word of its clause.
+        "Doesn't build on Linux. Why does it break?",
+        "Didn't finish in time. Why does it break?",
+        "Isn't fixed in main. Why does it break?",
+        "Aren't tests flaky today? Why does it break?",
+        "Wasn't tested on Linux. Why does it break?",
+        "Weren't merged in time. Why does it break?",
+        "Wouldn't build on Linux. Why does it break?",
+        "Couldn't reproduce on Linux. Why does it break?",
+        "Shouldn't build on Linux. Why does it break?",
+        "Haven't touched parsing code. Why does it break?",
+        "Hasn't changed in weeks. Why does it break?",
+    };
+    const misses = try unexpected_expectations(&requests, .latin);
+    defer std.testing.allocator.free(misses);
+    try std.testing.expectEqualStrings("", misses);
+    // Without the apostrophe the same words belong to other languages.
+    try std.testing.expect(infer_expectation("Don touch parsing. Why does it break?") == null);
+    try std.testing.expect(infer_expectation("Let touch parsing. Why does it break?") == null);
 }
 
 const fuzz_prompt_capacity = 512;
 
 fn fuzzInferExpectation(_: void, smith: *std.testing.Smith) anyerror!void {
-    const accented = " \u{1ECB}";
+    // Letters that follow the random bytes: after a space, with no space, and
+    // as a base letter with a combining mark. With no space, a lead byte at
+    // the end of the random bytes can claim more bytes than remain.
+    const accents = [_][]const u8{ " \u{1ECB}", "\u{E9}", "e\u{301}" };
     const bare_clause = "Tolong terjemahkan ini.\n";
-    var buffer: [bare_clause.len + fuzz_prompt_capacity + accented.len]u8 = undefined;
+    var buffer: [bare_clause.len + fuzz_prompt_capacity + 4]u8 = undefined;
     @memcpy(buffer[0..bare_clause.len], bare_clause);
     const len: usize = @intCast(smith.slice(buffer[bare_clause.len..][0..fuzz_prompt_capacity]));
     const prompt = buffer[bare_clause.len..][0..len];
@@ -390,8 +596,10 @@ fn fuzzInferExpectation(_: void, smith: *std.testing.Smith) anyerror!void {
     // A clause of three words with no English function word, or a Latin
     // letter outside ASCII, means the prompt may not be English.
     try std.testing.expect(infer_expectation(buffer[0 .. bare_clause.len + len]) == null);
-    @memcpy(buffer[bare_clause.len + len ..][0..accented.len], accented);
-    try std.testing.expect(infer_expectation(buffer[bare_clause.len..][0 .. len + accented.len]) == null);
+    for (accents) |accent| {
+        @memcpy(buffer[bare_clause.len + len ..][0..accent.len], accent);
+        try std.testing.expect(infer_expectation(buffer[bare_clause.len..][0 .. len + accent.len]) == null);
+    }
 }
 
 test "response language expectation stays conservative on fuzzed prompts" {
@@ -402,6 +610,9 @@ test "response language expectation stays conservative on fuzzed prompts" {
             "Terjemahkan ke bahasa Korea. The lockfile is broken again.",
             "Why does `zig build test` fail?\n```\nconst x = 1;\n```\nPlease check.",
             "The lockfile is broken \xf0\x9f",
+            // A 4-byte lead at the end that the appended "é" cannot complete.
+            "The lockfile is broken again. \xf0",
+            "Di\u{323}ch giu\u{301}p. The lockfile is broken again.",
             "\xff\xfe\xe1",
             "",
         }) ++ @import("fuzz_corpus").response_language_expectation.*),

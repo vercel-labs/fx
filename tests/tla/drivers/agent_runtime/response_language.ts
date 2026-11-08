@@ -6,26 +6,40 @@
 // name its script, and tool calls with English or Korean text. The prompts
 // cover plain English, English that names a language or has an accented name
 // or a terse clause, and requests in Vietnamese, Indonesian, Malay, Spanish,
-// and Chinese that quote English. Each prompt's labels say what the model
-// needs to know about it (ResponseLanguage.tla, Prompts). The driver runs every
-// script up to --depth replies for every prompt, then --random seeded longer
-// ones. When fx asks for more replies than the script holds, the gateway
-// serves English text, and that reply is part of what was observed.
+// Dutch, Polish, and Chinese that quote English, some with their accents stored
+// as base letters and combining marks and some with a word that English shares
+// with their language. Each prompt's labels say what the model needs to know
+// about it (ResponseLanguage.tla, Prompts). The driver runs every script up to
+// --depth replies for every prompt, then --random seeded longer ones. When fx
+// asks for more replies than the script holds, the gateway serves English
+// text, and that reply is part of what was observed.
+//
+// It also runs every request of tests/fixtures/response-language/requests.json
+// once with a Korean reply, and reports how many of the English and of the
+// other-language requests fx guarded (replaced the Korean reply). --requests
+// runs only those and skips TLC, for comparing two binaries with FX_BIN.
+//
+// A request cannot carry a lead byte that claims more bytes than remain: fx
+// ask and a pasted prompt refuse text that is not UTF-8, and ACP and the SDK
+// carry JSON. The Zig tests and the fuzz target of response_language.zig cover
+// that case, and the model's cut-hides config shows the rule catches it.
 //
 // For each turn it records the replies served, what each request carried (the
 // prompt, tool results, or the correction), which replies' text reached the
 // output, and how the turn ended. TLC replays the turns through the model's
 // own actions. --self-check also replays them through the model of fx before
-// the fix of #809 (Rule = "today"), which must reject them.
+// the fix of #809 (Rule = "today") and through the model of the first fix
+// (Bug = "first_cut"), which must both reject them.
 //
 // Usage (from the repository root, after zig build):
 //   bun tests/tla/drivers/agent_runtime/response_language.ts
 //   bun tests/tla/drivers/agent_runtime/response_language.ts --self-check
 //   bun tests/tla/drivers/agent_runtime/response_language.ts --depth 1 --random 200 --seed 7 --jobs 8
+//   FX_BIN=/path/to/fx bun tests/tla/drivers/agent_runtime/response_language.ts --requests
 //
 // Exit codes: 0 every turn accepted (and the self-check rejected), 1 a turn the
 // model cannot produce, 2 a toolchain, build, or harness failure.
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { binary, targetHelpers, testEnvironment } from "../lib/context";
 import { TLA_ROOT, outDir, runTlc, writeJson } from "../lib/tlc";
@@ -41,7 +55,10 @@ type Labels = {
   word: boolean;
   switch: boolean;
   accent: boolean;
+  mark: boolean;
+  cut: boolean;
   bare: boolean;
+  shared: boolean;
 };
 type Prompt = { text: string; labels: Labels };
 type Observation = {
@@ -66,19 +83,32 @@ const tlaDir = join(TLA_ROOT, "agent_runtime");
 
 const english = (text: string, labels: Partial<Labels> = {}): Prompt => ({
   text,
-  labels: { lang: "english", script: "latin", word: true, switch: false, accent: false, bare: false, ...labels },
+  labels: {
+    lang: "english", script: "latin", word: true, switch: false,
+    accent: false, mark: false, cut: false, bare: false, shared: false, ...labels,
+  },
 });
 const other = (text: string, labels: Partial<Labels>): Prompt => ({
   text,
-  labels: { lang: "other", script: "latin", word: true, switch: false, accent: false, bare: false, ...labels },
+  labels: {
+    lang: "other", script: "latin", word: true, switch: false,
+    accent: false, mark: false, cut: false, bare: false, shared: false, ...labels,
+  },
 });
 
+// A request cannot hold a lead byte that claims more bytes than remain: fx ask
+// and a pasted prompt both refuse text that is not UTF-8 (cli_ask.zig,
+// input_paste_runtime.zig), and the JSON of ACP and the SDK is UTF-8. So no
+// prompt here sets `cut`; the Zig tests, the fuzz target, and the model's
+// cut-hides config cover it.
 const PROMPTS: Prompt[] = [
   english("The lockfile is broken again. Say what you will inspect next."),
   english("Please read notes.txt and explain the result."),
   english("Why does `zig build test` fail on this branch?"),
+  english("Don't touch parsing. Why does it break?"),
   english("Translate the following into Korean. The lockfile is broken again.", { switch: true }),
   english("Ask José to review the lockfile.", { accent: true }),
+  english("Ask Jose\u0301 to review the lockfile.", { mark: true }),
   english("Run zig build. Then tell me why the lockfile is broken.", { bare: true }),
   english("Fix lockfile parsing.", { word: false, bare: true }),
   other("Dịch nội dung sau sang tiếng Hàn. The lockfile is broken again.", { accent: true, bare: true }),
@@ -88,7 +118,75 @@ const PROMPTS: Prompt[] = [
   other("The lockfile is broken again. Sila terjemahkan ayat ini ke bahasa Korea.", { bare: true }),
   other("Traduce esto al coreano. The lockfile is broken again.", { bare: true }),
   other("请把下面的内容翻译成韩语。The lockfile is broken again.", { script: "nonlatin" }),
+  // The accent is a base letter and a combining mark (U+0323, U+0301, U+0302).
+  // A clause of two words is too short to be judged, so the accent alone must
+  // make the guard abstain; the same request with its letters precomposed is
+  // the control.
+  other("Dịch giúp. The lockfile is broken again.", { accent: true }),
+  other("Di\u0323ch giu\u0301p. The lockfile is broken again.", { mark: true }),
+  other("Réponds vite. The lockfile is broken again.", { accent: true }),
+  other("Re\u0301ponds vite. The lockfile is broken again.", { mark: true }),
+  other("Di\u0323ch giu\u0301p to\u0302i. The lockfile is broken again.", { mark: true, bare: true }),
+  other("Re\u0301ponds vite, s'il te plai\u0302t. The lockfile is broken again.", { mark: true, bare: true }),
+  // Words that English shares with Dutch, Polish, and Vietnamese.
+  other("Kunnen we dit vandaag nog oplossen? The lockfile is broken again.", { bare: true, shared: true }),
+  other("Powiedz my jak to dziala w korejskim. The lockfile is broken again.", { bare: true, shared: true }),
+  other("Ban can sua loi nay ngay. The lockfile is broken again.", { bare: true, shared: true }),
 ];
+
+// tests/fixtures/response-language/requests.json: realistic short requests, run
+// once each with a Korean reply. "english" holds plain strings, and objects for
+// a request the guard cannot read as English (word, bare) or that names a
+// language (switch). "other" holds requests in other Latin-script languages,
+// each followed by quoted English; "shared" lists the words it has that older
+// English word lists counted, and "form": "decomposed" stores its accents as
+// base letters and combining marks. The labels that the text itself decides
+// (accent, mark) come from its characters.
+type FixtureEnglish = string | { text: string; word?: boolean; bare?: boolean; switch?: boolean; form?: "decomposed" };
+type FixtureOther = { lang: string; text: string; shared?: string; form?: "decomposed" };
+type Fixture = { english: FixtureEnglish[]; other: FixtureOther[] };
+type Request = { group: "english" | "other"; lang: string; prompt: Prompt };
+const FIXTURE_PATH = join(TLA_ROOT, "..", "fixtures", "response-language", "requests.json");
+
+// What the characters of a request say: an accented Latin letter outside ASCII,
+// or a combining mark (U+0300 to U+036F).
+function letterLabels(text: string): { accent: boolean; mark: boolean } {
+  let accent = false;
+  let mark = false;
+  for (const char of text) {
+    const code = char.codePointAt(0)!;
+    if (code < 0x80) continue;
+    if (code >= 0x300 && code <= 0x36f) mark = true;
+    else if ((code >= 0xc0 && code <= 0x24f && code !== 0xd7 && code !== 0xf7) || (code >= 0x1e00 && code <= 0x1eff)) {
+      accent = true;
+    }
+  }
+  return { accent, mark };
+}
+
+function fixtureRequests(): Request[] {
+  const fixture = JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as Fixture;
+  const requests: Request[] = [];
+  for (const entry of fixture.english) {
+    const item = typeof entry === "string" ? { text: entry } : entry;
+    const text = (item as { form?: string }).form === "decomposed" ? item.text.normalize("NFD") : item.text.normalize("NFC");
+    const { word, bare, switch: names } = item as { word?: boolean; bare?: boolean; switch?: boolean };
+    requests.push({
+      group: "english",
+      lang: "english",
+      prompt: english(text, { ...letterLabels(text), word: word ?? true, bare: bare ?? false, switch: names ?? false }),
+    });
+  }
+  for (const item of fixture.other) {
+    const text = item.form === "decomposed" ? item.text.normalize("NFD") : item.text.normalize("NFC");
+    requests.push({
+      group: "other",
+      lang: item.lang,
+      prompt: other(text, { ...letterLabels(text), bare: true, shared: item.shared !== undefined }),
+    });
+  }
+  return requests;
+}
 
 // Each reply's text is distinct, so the output shows which replies fx kept.
 const KOREAN = [
@@ -128,6 +226,7 @@ function option(name: string, fallback: number): number {
 
 const options = {
   selfCheck: process.argv.includes("--self-check"),
+  requestsOnly: process.argv.includes("--requests"),
   depth: option("--depth", 2),
   random: option("--random", 40),
   seed: option("--seed", 1),
@@ -148,6 +247,10 @@ function generator(seed: number) {
 
 function cases(): Array<{ prompt: Prompt; script: Kind[] }> {
   const result: Array<{ prompt: Prompt; script: Kind[] }> = [];
+  // Every fixture request once, answered in Korean: fx either accepts the
+  // reply or replaces it once.
+  for (const request of fixtureRequests()) result.push({ prompt: request.prompt, script: ["nonlatin"] });
+  if (options.requestsOnly) return result;
   const grow = (prefix: Kind[]) => {
     if (prefix.length > 0) for (const prompt of PROMPTS) result.push({ prompt, script: prefix });
     if (prefix.length === options.depth) return;
@@ -266,7 +369,8 @@ const bool = (value: boolean) => (value ? "TRUE" : "FALSE");
 function observedModule(observations: Observation[]): string {
   const labels = (l: Labels) =>
     `[lang |-> ${str(l.lang)}, script |-> ${str(l.script)}, word |-> ${bool(l.word)}, ` +
-    `switch |-> ${bool(l.switch)}, accent |-> ${bool(l.accent)}, bare |-> ${bool(l.bare)}]`;
+    `switch |-> ${bool(l.switch)}, accent |-> ${bool(l.accent)}, mark |-> ${bool(l.mark)}, ` +
+    `cut |-> ${bool(l.cut)}, bare |-> ${bool(l.bare)}, shared |-> ${bool(l.shared)}]`;
   const replies = (rs: Reply[]) =>
     `<<${rs.map((r) => `[script |-> ${str(r.script)}, tools |-> ${bool(r.tools)}]`).join(", ")}>>`;
   const value = (o: Observation) =>
@@ -282,14 +386,19 @@ function observedModule(observations: Observation[]): string {
   ].join("\n");
 }
 
-async function runTrace(observations: Observation[], rule: string, parent: string): Promise<{ verdict: Verdict; dir: string }> {
-  const dir = mkdtempSync(join(parent, `trace-${rule}-`));
+async function runTrace(
+  observations: Observation[],
+  rule: string,
+  parent: string,
+  bug = "none",
+): Promise<{ verdict: Verdict; dir: string }> {
+  const dir = mkdtempSync(join(parent, `trace-${rule}-${bug}-`));
   writeFileSync(join(dir, "ResponseLanguageObserved.tla"), observedModule(observations));
   writeFileSync(join(dir, "trace.cfg"), [
     "SPECIFICATION TraceSpec",
     "CONSTANTS",
     `  Rule = ${str(rule)}`,
-    '  Bug = "none"',
+    `  Bug = ${str(bug)}`,
     "  MaxRequests = 1000",
     "  AllowUnmarked = FALSE",
     "INVARIANT NotAllMatched",
@@ -361,6 +470,23 @@ async function main(): Promise<number> {
   console.log(`${observations.length} turns of ${binary} in ${seconds}s, ${JSON.stringify(counts)}`);
   console.log(`observations: ${join(out, "observations.json")}`);
 
+  // The fixture requests are the first turns. A request is guarded when fx
+  // expected a Latin reply and so replaced the Korean one.
+  const requests = fixtureRequests();
+  const results = requests.map((request, index) => ({
+    group: request.group,
+    lang: request.lang,
+    text: request.prompt.text,
+    guarded: observations[index]!.sent.includes("correction"),
+  }));
+  writeJson(join(out, "requests-result.json"), results);
+  for (const group of ["english", "other"] as const) {
+    const members = results.filter((result) => result.group === group);
+    const guarded = members.filter((result) => result.guarded).length;
+    console.log(`fixture ${group}: ${guarded} of ${members.length} requests guarded (${join(out, "requests-result.json")})`);
+  }
+  if (options.requestsOnly) return 0;
+
   const unknown = observations.find((o) => o.outcome === "unknown" || o.sent.includes("unknown"));
   if (unknown) {
     console.log(`REJECTED: turn ${unknown.id} ended in a way the driver cannot read: ${JSON.stringify(unknown)}`);
@@ -379,6 +505,9 @@ async function main(): Promise<number> {
     const today = await runTrace(observations, "today", out);
     console.log(`self-check, the model of fx before the fix of #809: ${today.verdict} (must be REJECTED)`);
     if (today.verdict !== "REJECTED") return today.verdict === "TOOL_ERROR" ? 2 : 1;
+    const firstCut = await runTrace(observations, "fixed", out, "first_cut");
+    console.log(`self-check, the model of the first fix of #809: ${firstCut.verdict} (must be REJECTED)`);
+    if (firstCut.verdict !== "REJECTED") return firstCut.verdict === "TOOL_ERROR" ? 2 : 1;
   }
   console.log("ACCEPTED");
   return 0;

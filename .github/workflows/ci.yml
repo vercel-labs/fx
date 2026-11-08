@@ -100,6 +100,9 @@ jobs:
       - name: Walk fx ask turns along the empty-reply model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/driver.ts --self-check
 
+      - name: Walk fx ask turns along the response language model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/response_language.ts --self-check
+
       # The zsh user profile tests in src/core/execution/command_runner.zig
       # skip without /bin/zsh. They start interactive zsh with no terminal,
       # where Ubuntu's global zshrc runs compinit, and on this runner compinit
