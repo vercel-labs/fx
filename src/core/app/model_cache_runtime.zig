@@ -633,7 +633,7 @@ pub const Runtime = struct {
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        return self.state == .loading;
+        return self.state == .loading or (self.state == .failed and self.fetch_in_flight);
     }
 
     pub fn openMenu(self: *Self) !void {
@@ -1422,6 +1422,7 @@ test "model cache retries a failed catalog behind the failed state so requests w
     try waitForFetchToSettle(&runtime);
     _ = try runtime.pollLoadTransition();
     try std.testing.expect(runtime.isFailed());
+    try std.testing.expect(!runtime.isLoading());
 
     source.fail = false;
     source.open.store(false, .seq_cst);
@@ -1429,7 +1430,7 @@ test "model cache retries a failed catalog behind the failed state so requests w
     runtime.startWarmup(source.provider(), public, .activity);
     try std.testing.expect(fetchInFlight(&runtime));
     try std.testing.expect(runtime.isFailed());
-    try std.testing.expect(!runtime.isLoading());
+    try std.testing.expect(runtime.isLoading());
 
     // A set cancel flag fails any wait at once, so the error proves the
     // request waits on the retry.
