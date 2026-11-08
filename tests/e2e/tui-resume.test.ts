@@ -9487,9 +9487,11 @@ test.skipIf(!tmuxAvailable())(
 // first frame after that handoff must scroll the rows the turn covers into
 // scrollback; if it paints in place they are lost. The terminal is tall enough
 // (80x73) that one publication frame, 64 rows, fits in the transcript area.
-// A publication frame can also be lost where the prompt was submitted, long
-// before the handoff, so the rows are checked only around the handoff: the
-// last 200 resumed rows, six publication frames.
+// A frame can also paint the tail of the transcript in place of one
+// publication frame's rows where the prompt was submitted, long before the
+// handoff, whatever the build. So the rows are checked by their final run: the
+// consecutive rows that end the scrollback must reach back past the last 200
+// resumed rows, six publication frames, which the handoff covers.
 const PUBLISHING_ROWS = 8000;
 const PUBLISHING_CHECKED_ROWS = 200;
 const PUBLISHING_TURN_ROWS = ["PUBLISHING_TURN_ROW_1", "PUBLISHING_TURN_ROW_2", "PUBLISHING_TURN_ROW_3"];
@@ -9525,14 +9527,16 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(PUBLISHING_TURN_ROWS[PUBLISHING_TURN_ROWS.length - 1]!, TIMEOUT * 2);
       await active.waitForStableComposer(TIMEOUT, 500);
 
-      // Scrollback and screen, as numbers: the rows around the handoff are
-      // consecutive up to the last resumed one, then the turn follows once each.
+      // Scrollback and screen, as numbers: the rows that end the scrollback
+      // are consecutive up to the last resumed one, from before the handoff,
+      // then the turn follows once each.
       const full = await active.captureFullScrollback();
       const shown = [...full.matchAll(/^\s*row (\d{5})\s*$/gm)].map((match) => Number(match[1]));
       expect(shown.length).toBeGreaterThan(PUBLISHING_CHECKED_ROWS);
-      const firstChecked = PUBLISHING_ROWS - PUBLISHING_CHECKED_ROWS + 1;
-      const expected = Array.from({ length: PUBLISHING_CHECKED_ROWS }, (_, offset) => firstChecked + offset);
-      expect(shown.filter((index) => index >= firstChecked)).toEqual(expected);
+      let runStart = shown.length - 1;
+      while (runStart > 0 && shown[runStart - 1] === shown[runStart]! - 1) runStart--;
+      expect(shown[shown.length - 1]).toBe(PUBLISHING_ROWS);
+      expect(shown[runStart]!).toBeLessThanOrEqual(PUBLISHING_ROWS - PUBLISHING_CHECKED_ROWS + 1);
       expect([...full.matchAll(/PUBLISHING_TURN_ROW_\d/g)].map((match) => match[0])).toEqual(PUBLISHING_TURN_ROWS);
       expect(gateway.requests.length).toBeGreaterThanOrEqual(2);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
