@@ -136,7 +136,13 @@ try {
     assert.equal(headers.get("x-session-affinity"), headers.get("x-session-id"), "libfx must retain Gateway session affinity");
   }
   assert.deepEqual(systemText(requestBodies[0]), [], "omitted instructions must not add hidden system context");
-  assert.deepEqual(systemText(requestBodies[1]), ["HOST_INSTRUCTIONS_ONLY"], "host instructions must be the complete system context");
+  // Instructions travel as ACP's systemPrompt in append mode, which the core
+  // puts in the system slot inside its client_instructions tags.
+  assert.deepEqual(
+    systemText(requestBodies[1]),
+    ["<client_instructions>\nHOST_INSTRUCTIONS_ONLY\n</client_instructions>"],
+    "host instructions must be the complete system context",
+  );
   assert.match(JSON.stringify(requestBodies[0]), /NO_INSTRUCTIONS_REQUEST/);
   assert.match(JSON.stringify(requestBodies[1]), /HOST_INSTRUCTIONS_REQUEST/);
 
