@@ -2042,6 +2042,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .push_tool_lifecycle = pushToolLifecycle,
         .push_diff_block = pushDiffBlock,
         .push_system_notice = pushSystemNotice,
+        .push_turn_failure_notice = pushTurnFailureNotice,
         .push_context_notice = pushContextNotice,
         .push_command_output_complete = pushCommandOutputComplete,
         .push_http_error = pushHttpError,
@@ -3430,11 +3431,24 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
 fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const message_id = ctx.operationalMessageId();
-    // A system notice is never a turn's only failure report: when one comes
-    // before a failure, the runtime then returns an error, which the prompt
-    // answers with a JSON-RPC error.
+    // No system notice says why a turn ended. The text of a turn that ends on
+    // an error goes through pushTurnFailureNotice, and the one system notice
+    // that comes with a turn's end, the provider length limit warning, sits
+    // beside the reply and the max_output_tokens stop reason, so a client
+    // that ignores it loses nothing (`tests/tla/acp/AcpNotices.tla`
+    // NoTurnEndingNotice).
     if (ctx.state.client_notices) return ctx.sendNotice(.warning, text) catch {};
     ctx.sendAgentText(message_id, text) catch {};
+}
+
+/// The text that ends a turn on an error, such as a provider's error event or
+/// a reply in the wrong language. The prompt then answers with a JSON-RPC
+/// error, so this text is the only reason the turn ended, and ACP v1 says an
+/// agent must not rely on a notice for that. It stays an agent message for
+/// every client (`tests/tla/acp/AcpNotices.tla` NoTurnEndingNotice).
+fn pushTurnFailureNotice(raw_ctx: *anyopaque, text: []const u8) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.sendAgentText(ctx.operationalMessageId(), text) catch {};
 }
 
 fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {

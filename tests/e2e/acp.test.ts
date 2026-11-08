@@ -1502,12 +1502,9 @@ async function startNoticeSession(client: AcpClient, cwd: string, clientCapabili
 }
 
 // One prompt's agent messages and notices, in the order they came.
-async function noticeTurn(client: AcpClient, text: string) {
-  const { promptResult, messages } = await runPrompt(client, text, TIMEOUT);
-  expect(promptResult.error).toBeUndefined();
+function noticeUpdates(messages: any[]) {
   const updates = messages.map((message) => message.params?.update).filter(Boolean);
   return {
-    stopReason: promptResult.result.stopReason as string,
     messages: updates
       .filter((update) => update.sessionUpdate === "agent_message_chunk")
       .map((update) => ({ text: update.content?.text as string, messageId: update.messageId as string })),
@@ -1516,6 +1513,40 @@ async function noticeTurn(client: AcpClient, text: string) {
       .map((update) => ({ severity: update.severity, title: update.title })),
   };
 }
+
+async function noticeTurn(client: AcpClient, text: string) {
+  const { promptResult, messages } = await runPrompt(client, text, TIMEOUT);
+  expect(promptResult.error).toBeUndefined();
+  return { stopReason: promptResult.result.stopReason as string, ...noticeUpdates(messages) };
+}
+
+// A prompt that ends on an error answers with a JSON-RPC error, not a stop
+// reason, so what the client got before it is the only reason the turn ended.
+async function noticeFailedTurn(client: AcpClient, text: string) {
+  const { promptResult, messages } = await runPrompt(client, text, TIMEOUT);
+  expect(promptResult.result).toBeUndefined();
+  return { error: promptResult.error as { code: number; message: string }, ...noticeUpdates(messages) };
+}
+
+// An invalid_request_error event is not retryable, so the turn ends on it.
+function noticeProviderErrorReply(message: string) {
+  return fakeGatewaySse([
+    { type: "error", error: { code: "invalid_request_error", message } },
+    { type: "finish", finishReason: { unified: "error" } },
+  ]);
+}
+
+// Han script against an English prompt: fx asks once more, then fails.
+function noticeWrongLanguageReply() {
+  return fakeGatewaySse([
+    { type: "text-delta", id: "wrong-language", delta: "我会先检查锁文件和依赖清单。" },
+    { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+  ]);
+}
+
+const PROVIDER_ERROR_TEXT = "invalid_request_error: ACP_TURN_ENDING_PROVIDER_ERROR";
+const LANGUAGE_FAILURE_TEXT =
+  "The model response used a different language than your request, and fx could not accept it. Retry or name the response language explicitly.";
 
 async function runMcpToolPrompt(
   client: AcpClient,
@@ -3447,6 +3478,105 @@ describe("acp: model-independent", () => {
           "ACP plain length reply",
           "response hit provider length limit; output may be incomplete",
         ]);
+
+        expect(gateway.requests).toHaveLength(3);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  // A provider error event and a response-language failure end the turn on an
+  // error, so the prompt answers with a JSON-RPC error and the text fx shows
+  // is the only reason. ACP v1 says an agent must not rely on a notice for
+  // that, so a client that shows notices gets it as an agent message.
+  test(
+    "a turn-ending provider error reaches an editor that shows notices as an agent message, not a notice",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-turn-ending-provider-");
+      const gateway = startFakeGateway([noticeProviderErrorReply("ACP_TURN_ENDING_PROVIDER_ERROR")]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startNoticeSession(client, root.workspace, { session: { notices: {} } });
+
+        const failed = await noticeFailedTurn(client, "Fail on a provider error.");
+        expect(failed.error).toBeDefined();
+        expect(failed.notices).toEqual([]);
+        expect(failed.messages.map((message) => message.text)).toEqual([PROVIDER_ERROR_TEXT]);
+
+        expect(gateway.requests).toHaveLength(1);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "a turn-ending response-language failure reaches an editor that shows notices as an agent message, not a notice",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-turn-ending-language-");
+      const gateway = startFakeGateway([
+        noticeWrongLanguageReply(),
+        noticeWrongLanguageReply(),
+        // The correction works the second time: nothing ends the turn.
+        noticeWrongLanguageReply(),
+        finalText("ACP corrected reply"),
+      ]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startNoticeSession(client, root.workspace, { session: { notices: {} } });
+
+        const failed = await noticeFailedTurn(client, "The lockfile is broken again.");
+        expect(failed.error).toBeDefined();
+        expect(failed.notices).toEqual([]);
+        expect(failed.messages.map((message) => message.text)).toEqual([LANGUAGE_FAILURE_TEXT]);
+        // One correction request, then the failure.
+        expect(gateway.requests).toHaveLength(2);
+
+        const corrected = await noticeTurn(client, "Check the lockfile once more.");
+        expect(corrected.stopReason).toBe("end_turn");
+        expect(corrected.notices).toEqual([]);
+        expect(corrected.messages.map((message) => message.text).join("")).toBe("ACP corrected reply");
+        expect(gateway.requests).toHaveLength(4);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "an editor without notices gets a turn-ending provider error and language failure as one agent message each, as before",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-turn-ending-plain-");
+      const gateway = startFakeGateway([
+        noticeProviderErrorReply("ACP_TURN_ENDING_PROVIDER_ERROR"),
+        noticeWrongLanguageReply(),
+        noticeWrongLanguageReply(),
+      ]);
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await startNoticeSession(client, root.workspace, {});
+
+        // No chunk follows the text, such as a line break.
+        const provider = await noticeFailedTurn(client, "Fail on a provider error.");
+        expect(provider.notices).toEqual([]);
+        expect(provider.messages.map((message) => message.text)).toEqual([PROVIDER_ERROR_TEXT]);
+
+        const language = await noticeFailedTurn(client, "The lockfile is broken again.");
+        expect(language.notices).toEqual([]);
+        expect(language.messages.map((message) => message.text)).toEqual([LANGUAGE_FAILURE_TEXT]);
 
         expect(gateway.requests).toHaveLength(3);
         expect(client.stderr).toBe("");

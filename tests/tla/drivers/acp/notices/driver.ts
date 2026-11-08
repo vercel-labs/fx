@@ -5,6 +5,13 @@
 // checks, for the notices client, that the turn's agent messages match what
 // session/load replays, except an HTTP failure, which fx doesn't save.
 //
+// The text of every cause that ends a turn must reach a notices client as an
+// agent message, never a notice. Plans cover an HTTP failure, a second empty
+// reply, a provider error event (with and without a finish), and a
+// response-language failure that ends the turn after its one correction; the
+// step limit's text goes out through the second empty reply's callback. A
+// language correction that works ends nothing, and has a plan too.
+//
 //   bun tests/tla/drivers/acp/notices/driver.ts                # after zig build
 //   bun tests/tla/drivers/acp/notices/driver.ts --stress 100   # adds one turn with 100 stalls
 //
@@ -33,13 +40,29 @@ type Reply =
   | "length_text" //    text cut by the output limit
   | "length_tools" //   only a tool call cut by the output limit
   | "partial_eof" //    text, then the stream ends without a finish
-  | "tool_step"; //     text and a glob_files call
+  | "tool_step" //      text and a glob_files call
+  | "invalid_request_event" //      an invalid_request_error event, then finish `error`
+  | "invalid_request_no_finish" //  the same event with no finish: the code wins
+  | "wrong_language"; //            text in another script than the prompt's
 
 // requests is how many model requests the fake Gateway must see. replay
 // says whether the notices client's agent messages must match what
 // session/load replays: fx saves no HTTP failure (it saves "fx stopped
 // before this turn finished"), and saves no partial answer it restarted.
-export type Plan = { name: string; replies: Reply[]; requests: number; replay: boolean };
+// rpcError says the turn ends with a JSON-RPC error instead of a stop
+// reason, so the text a client got is the only reason it ended. expectKind
+// names the kind of text the turn must have sent as an agent message.
+export type Plan = {
+  name: string;
+  replies: Reply[];
+  requests: number;
+  replay: boolean;
+  rpcError?: boolean;
+  expectKind?: string;
+  // The exact number of updates the client gets: a plain client must not get
+  // a chunk beyond the text, such as a line break.
+  observed?: number;
+};
 
 const PLANS: Plan[] = [
   { name: "nudge-then-reply", replies: ["empty_other", "reply"], requests: 2, replay: true },
@@ -49,6 +72,13 @@ const PLANS: Plan[] = [
   { name: "length-cut-text", replies: ["length_text"], requests: 1, replay: true },
   { name: "length-cut-tools", replies: ["length_tools", "length_tools"], requests: 2, replay: true },
   { name: "restart-after-partial", replies: ["partial_eof", "reply"], requests: 2, replay: false },
+  // The turns below end on a provider error or a language failure, so the
+  // prompt answers with a JSON-RPC error and the text is the only reason.
+  { name: "provider-error-event", replies: ["invalid_request_event"], requests: 1, replay: false, rpcError: true, expectKind: "turn_failure_notice", observed: 1 },
+  { name: "provider-error-no-finish", replies: ["invalid_request_no_finish"], requests: 1, replay: false, rpcError: true, expectKind: "turn_failure_notice", observed: 1 },
+  { name: "language-failure", replies: ["wrong_language", "wrong_language"], requests: 2, replay: false, rpcError: true, expectKind: "turn_failure_notice", observed: 1 },
+  // The correction works, so nothing ends the turn and no failure text is sent.
+  { name: "language-corrected", replies: ["wrong_language", "reply"], requests: 2, replay: true },
 ];
 
 export function stressPlan(stalls: number): Plan {
@@ -92,6 +122,18 @@ function respond(reply: Reply, n: number): Response {
         { type: "tool-call", toolCallId: `call_${n}`, toolName: "glob_files", input: { pattern: "*" } },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_calls" } },
       ]);
+    case "invalid_request_event":
+      return fakeGatewaySse([
+        { type: "error", error: { code: "invalid_request_error", message: "NOTICE_CHECK_INVALID_REQUEST" } },
+        { type: "finish", finishReason: { unified: "error" } },
+      ]);
+    case "invalid_request_no_finish":
+      return fakeGatewaySse([
+        { type: "error", error: { code: "invalid_request_error", message: "NOTICE_CHECK_INVALID_NO_FINISH" } },
+      ]);
+    case "wrong_language":
+      // The prompt is English; Han script is a clear mismatch.
+      return fakeGatewaySse([{ type: "text-delta", id: `t${n}`, delta: "我会先检查锁文件和依赖清单。" }, stop]);
   }
 }
 
@@ -114,6 +156,9 @@ export function classify(raw: string): string {
   if (/Restarted the answer$|^Response interrupted\. Restarting\.$/.test(text)) return "restarted";
   if (/^response hit provider length limit|^File change committed, but some secondary reporting failed\.$/.test(text)) return "system";
   if (/authentication failed · HTTP \d{3}$|^HTTP \d{3}/.test(text)) return "http_failure";
+  // The text that ends a turn on a provider error event or a language failure.
+  if (/NOTICE_CHECK_INVALID_/.test(text)) return "turn_failure_notice";
+  if (/^The model response used a different language than your request, and fx could not accept it\./.test(text)) return "turn_failure_notice";
   if (/^\[context\]|^skill discovery /.test(text)) return "context";
   return "unknown";
 }
@@ -248,6 +293,7 @@ export async function runPlan(plan: Plan, client: Client, binary: string, dir: s
   let stderr = "";
   let updates: any[] = [];
   let stopReason: string | null = null;
+  let rpcError: unknown = null;
   let replayed: any[] = [];
   let error: string | null = null;
   let acp = spawn();
@@ -258,8 +304,13 @@ export async function runPlan(plan: Plan, client: Client, binary: string, dir: s
     if (!sessionId) throw new Error(`session/new failed: ${JSON.stringify(created.response)}`);
     await acp.call("session/set_mode", { sessionId, modeId: "auto" });
     const prompt = await acp.call("session/prompt", { sessionId, prompt: [{ type: "text", text: "Answer the notice check." }] }, 120_000);
-    if (prompt.response.error) throw new Error(`session/prompt failed: ${JSON.stringify(prompt.response.error)}`);
-    stopReason = prompt.response.result?.stopReason ?? null;
+    if (prompt.response.error) {
+      if (!plan.rpcError) throw new Error(`session/prompt failed: ${JSON.stringify(prompt.response.error)}`);
+      rpcError = prompt.response.error;
+    } else {
+      if (plan.rpcError) throw new Error(`session/prompt ended with ${prompt.response.result?.stopReason}, expected a JSON-RPC error`);
+      stopReason = prompt.response.result?.stopReason ?? null;
+    }
     updates = prompt.notes;
     stderr += acp.stderr;
     exits.push(await acp.close());
@@ -286,9 +337,9 @@ export async function runPlan(plan: Plan, client: Client, binary: string, dir: s
     .filter((u) => u?.sessionUpdate === "agent_message_chunk")
     .map((u) => u.content?.text ?? "").join("").replace(/\s+/g, " ").trim();
   writeJson(join(dir, "observations.json"), observations);
-  writeJson(join(dir, "result.json"), { plan, client, served, stopReason, exits, stderr, error, live, replay });
+  writeJson(join(dir, "result.json"), { plan, client, served, stopReason, rpcError, exits, stderr, error, live, replay });
   writeFileSync(join(dir, "acp.jsonl"), log.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
-  return { observations, served, stopReason, exits, stderr, error, live, replay };
+  return { observations, served, stopReason, rpcError, exits, stderr, error, live, replay };
 }
 
 // ---------------------------------------------------------------- TLC side --
@@ -369,6 +420,14 @@ async function main() {
       if (run.error) problems.push(run.error);
       if (checked && checked.verdict !== "ACCEPTED") problems.push(`TLC ${checked.verdict}`);
       if (run.served !== plan.requests) problems.push(`fake Gateway served ${run.served} model requests, expected ${plan.requests}`);
+      // The text that ends a turn is an agent message for every client: a
+      // notice may be ignored, and the turn's only other answer is an error.
+      if (plan.observed !== undefined && run.observations.length !== plan.observed) {
+        problems.push(`the client got ${run.observations.length} updates, expected ${plan.observed}: ${run.observations.map((o) => `${o.type}/${o.kind}`).join(", ")}`);
+      }
+      if (plan.expectKind && !run.observations.some((o) => o.type === "message" && o.kind === plan.expectKind)) {
+        problems.push(`no agent message of kind ${plan.expectKind}; the client got ${run.observations.map((o) => `${o.type}/${o.kind}`).join(", ") || "nothing"}`);
+      }
       if (run.stderr.trim() !== "") problems.push(`stderr: ${run.stderr.trim().slice(0, 300)}`);
       if (run.exits.some((code) => code !== 0)) problems.push(`exit codes ${run.exits.join(",")}`);
       if (client === "notices" && plan.replay && run.live !== run.replay) problems.push(`live messages ${JSON.stringify(run.live)} differ from session/load ${JSON.stringify(run.replay)}`);
@@ -393,6 +452,8 @@ async function main() {
     { name: "failure-as-notice", expect: "REJECTED", notices: true, obs: [notice("turn_failure", "error")] },
     { name: "reply-joins-across-notice", expect: "REJECTED", notices: true, obs: [message("assistant"), notice("restarted"), message("assistant", true)] },
     { name: "plain-gets-notice", expect: "REJECTED", notices: false, obs: [notice("system", "warning")] },
+    { name: "turn-ending-text-as-message", expect: "ACCEPTED", notices: true, obs: [message("turn_failure_notice")] },
+    { name: "turn-ending-text-as-notice", expect: "REJECTED", notices: true, obs: [notice("turn_failure_notice", "warning")] },
     { name: "empty", expect: "TOOL_ERROR", notices: true, obs: [] as Observation[] },
   ];
   for (const control of controls) {

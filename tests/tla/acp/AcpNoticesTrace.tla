@@ -41,8 +41,8 @@ TraceInit ==
 
 Observe ==
     /\ i < Len(TraceLog)
-    /\ \E o \in {TraceLog[i + 1]}, k \in Kinds, b \in BOOLEAN :
-           /\ Emit(k, b)
+    /\ \E o \in {TraceLog[i + 1]}, k \in Kinds, b \in BOOLEAN, c \in Causes \cup {NoCause} :
+           /\ Emit(k, b, c)
            /\ Match(o)'
     /\ i' = i + 1
     /\ silent' = 0
@@ -51,7 +51,7 @@ Unobserved ==
     /\ silent < 3
     /\ \/ Start
        \/ \E k \in Blankable :
-              /\ Emit(k, TRUE)
+              /\ Emit(k, TRUE, NoCause)
               /\ (Last.out.type = "none")'
     /\ i' = i
     /\ silent' = silent + 1
