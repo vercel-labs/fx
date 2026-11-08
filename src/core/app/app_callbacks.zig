@@ -1253,7 +1253,7 @@ pub fn Bindings(comptime App: type) type {
                 .assistant_restarted => |text| try app_worker_runtime.Runtime(App).pushEvent(app, agent, .{
                     .assistant_presentation = .{ .attempt_restart = @constCast(text) },
                 }),
-                .operational => |text| try app_worker_runtime.Runtime(App).pushText(app, agent, text),
+                .operational, .turn_failure, .saved_reply => |text| try app_worker_runtime.Runtime(App).pushText(app, agent, text),
             }
         }
 

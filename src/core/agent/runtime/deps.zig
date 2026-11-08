@@ -170,7 +170,18 @@ pub const TextEmission = union(enum) {
     assistant_source: []const u8,
     assistant_rendered: []const u8,
     assistant_restarted: []const u8,
+    /// fx's own text about the turn, such as a notice that it resends.
     operational: []const u8,
+    /// Operational text that says why the turn failed, sent as the turn
+    /// ends. A host shows it as `operational` text; ACP keeps it an agent
+    /// message even for a client that shows notices, since a client may
+    /// ignore notices (`tests/tla/acp/AcpNotices.tla` FailureReportIsMessage).
+    turn_failure: []const u8,
+    /// Operational text fx saves as the assistant's reply, such as "Done."
+    /// for a reply with no text. A host shows it as `operational` text; ACP
+    /// keeps it an agent message so the turn matches what session/load
+    /// replays (`tests/tla/acp/AcpNotices.tla` ConversationStaysMessages).
+    saved_reply: []const u8,
 };
 
 /// Accent colors for diff add/remove markers. Named fields so the two styles
@@ -268,6 +279,12 @@ pub const AgentRuntimeDeps = struct {
     push_tool_lifecycle: *const fn (ctx: *anyopaque, event: types.ToolLifecycleEvent) anyerror!void = discardToolLifecycle,
     push_diff_block: *const fn (ctx: *anyopaque, payload: DiffEntryPayload) anyerror!void,
     push_system_notice: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void,
+    /// The text that ends a turn on an error, such as a provider's error
+    /// event. A host that sets no hook shows it as a system notice. ACP sets
+    /// one to keep it an agent message, since a client may ignore a notice
+    /// and this text is then the only reason the turn ended
+    /// (`tests/tla/acp/AcpNotices.tla` NoTurnEndingNotice).
+    push_turn_failure_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
     push_interactive_notice: ?*const fn (ctx: *anyopaque, notice: types.SemanticNotice) anyerror!void = null,
     /// Source-limit notices use a session-scoped deduplicating path when the
     /// host provides one; ordinary system notices remain unaffected.
@@ -310,6 +327,11 @@ pub const AgentRuntimeDeps = struct {
 
     pub fn pushContextNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
         if (self.push_context_notice) |push| return push(self.ctx, text);
+        return self.push_system_notice(self.ctx, text);
+    }
+
+    pub fn pushTurnFailureNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
+        if (self.push_turn_failure_notice) |push| return push(self.ctx, text);
         return self.push_system_notice(self.ctx, text);
     }
 
