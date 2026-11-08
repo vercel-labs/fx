@@ -11,17 +11,27 @@
 //   FX_SOUND=0 bun test ./benchmarks/startup_fixture.test.ts
 //   FX_STARTUP_FUZZ_RUNS=200 FX_STARTUP_FUZZ_SEED=7 bun test ./benchmarks/startup_fixture.test.ts -t fuzz
 //   FX_STARTUP_STRESS=1 bun test ./benchmarks/startup_fixture.test.ts -t stress
-//   FX_STARTUP_MUTANT=pid-path bun test ./benchmarks/startup_fixture.test.ts   # must fail
+//   FX_STARTUP_MUTANT=pid-path bun test ./benchmarks/startup_fixture.test.ts   # must fail: the early-exit tests that plant a PID folder
 import { afterAll, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MARKER, PREFIX, fixtureNames, folderOf, fxBinary, plant, realHyperfine, runStartup } from "../tests/tla/drivers/benchmarks/run";
+import { fxBin } from "../tests/tla/drivers/lib/tlc";
+import { MARKER, PREFIX, fixtureNames, folderOf, plant, realHyperfine, runStartup } from "../tests/tla/drivers/benchmarks/run";
 
 const root = mkdtempSync(join(tmpdir(), "fx-startup-fixture-test-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-const built = existsSync(fxBinary());
+function hasBinary(): boolean {
+  try {
+    fxBin();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const built = hasBinary();
 const canBench = built && realHyperfine() !== null;
 // A run that reaches hyperfine runs the whole benchmark, which takes seconds.
 const LONG = 300_000;
@@ -64,6 +74,16 @@ test.skipIf(!built)("a folder already at the old PID path survives an early exit
   expect(intact(tmp, run.pidName)).toBe(true);
   expect(run.after).toEqual([run.pidName]);
 }, LONG);
+
+test("the pid-path planted bug is the script before the change: it removes a folder at the old PID path", async () => {
+  const s = scratch("pid-path");
+  const tmp = folder(join(s, "tmp"));
+  const run = await runStartup({ scratch: s, tmpdir: tmp, plantPid: true, mutant: "pid-path" });
+  expect(run.stdout).toContain("error: fx binary not found");
+  expect(run.code).toBe(1);
+  expect(intact(tmp, run.pidName)).toBe(false);
+  expect(run.after).toEqual([]);
+});
 
 test.skipIf(!canBench)("a normal run removes the folder it made and nothing else", async () => {
   const s = scratch("normal");

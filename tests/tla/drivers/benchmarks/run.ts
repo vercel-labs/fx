@@ -26,18 +26,23 @@
 //   FX_STARTUP_MUTANT  plant one of MUTANTS in the copy of the script
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { REPO_ROOT } from "../lib/tlc";
+import { REPO_ROOT, fxBin } from "../lib/tlc";
 
 export const PREFIX = "fx-session-list-benchmark";
 export const MARKER = "unrelated-marker";
 const HELPERS = ["session_list_fixture.py", "summarize.py", "check_budgets.py"];
 // Every program the script runs by name, apart from hyperfine.
 const TOOLS = ["bash", "chmod", "dirname", "mkdir", "mktemp", "python3", "rm"];
+// A run that reaches hyperfine runs the whole benchmark.
+const RUN_TIMEOUT_MS = 300_000;
 
 // Planted bugs, each a text change to the script after the fix. A test or the
 // driver must reject a run of each.
 export const MUTANTS: Record<string, { from: string; to: string }> = {
-  // The script before the change: the folder named from the PID.
+  // The script before the change: the folder named from the PID, not made by
+  // mktemp. With the rest of the script unchanged, this is that script. `to`
+  // holds $$, which String.replace reads as one $ in a string replacement, so
+  // scriptText replaces with a function.
   "pid-path": {
     from: 'SESSION_FIXTURE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/fx-session-list-benchmark.XXXXXX")"',
     to: 'SESSION_FIXTURE_ROOT="${TMPDIR:-/tmp}/fx-session-list-benchmark-$$"',
@@ -53,7 +58,7 @@ export const MUTANTS: Record<string, { from: string; to: string }> = {
 
 export type Hyperfine = "real" | "missing" | "sigterm" | "sigkill";
 
-export type RunOptions = {
+type RunOptions = {
   scratch: string; // a private folder for this run's repository copy, PATH, and logs
   tmpdir: string; // the TMPDIR the script gets; it may be missing or a file
   plantPid?: boolean; // plant a folder at the old path before the script starts
@@ -61,7 +66,6 @@ export type RunOptions = {
   binary?: boolean; // link zig-out/bin/fx to the built binary
   hyperfine?: Hyperfine;
   mutant?: string; // one of MUTANTS; FX_STARTUP_MUTANT when left out
-  timeoutMs?: number;
 };
 
 export type RunResult = {
@@ -91,12 +95,8 @@ const PRELUDE = [
   'exec bash "$@"',
 ].join("\n");
 
-export function shellQuote(value: string): string {
+function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
-export function fxBinary(): string {
-  return process.env.FX_BIN ?? join(REPO_ROOT, "zig-out", "bin", "fx");
 }
 
 export function realHyperfine(): string | null {
@@ -105,13 +105,16 @@ export function realHyperfine(): string | null {
 
 /// The script under test: FX_STARTUP_SCRIPT or the checkout's, with
 /// FX_STARTUP_MUTANT or `mutant` planted in it.
-export function scriptText(mutant = process.env.FX_STARTUP_MUTANT ?? ""): string {
+function scriptText(mutant = process.env.FX_STARTUP_MUTANT ?? ""): string {
   const text = readFileSync(process.env.FX_STARTUP_SCRIPT ?? join(REPO_ROOT, "benchmarks", "startup.sh"), "utf8");
   if (!mutant) return text;
   const planted = MUTANTS[mutant];
   if (!planted) throw new Error(`no mutant ${mutant}; known: ${Object.keys(MUTANTS).join(", ")}`);
   if (!text.includes(planted.from)) throw new Error(`mutant ${mutant} no longer applies to the script`);
-  return text.replace(planted.from, planted.to);
+  // A function, so that $$, $&, and the other replacement patterns in `to` stay as written.
+  const mutated = text.replace(planted.from, () => planted.to);
+  if (!mutated.includes(planted.to)) throw new Error(`mutant ${mutant}: the planted text is not in the script`);
+  return mutated;
 }
 
 /// Plants a folder of someone else's in TMPDIR, with a marker file in it.
@@ -175,10 +178,8 @@ export async function runStartup(options: RunOptions): Promise<RunResult> {
   writeFileSync(join(repo, "benchmarks", "startup.sh"), scriptText(options.mutant));
   for (const name of HELPERS) copyFileSync(join(REPO_ROOT, "benchmarks", name), join(repo, "benchmarks", name));
   if (options.binary) {
-    const binary = fxBinary();
-    if (!existsSync(binary)) throw new Error(`missing ${binary}; run zig build first or set FX_BIN`);
     mkdirSync(join(repo, "zig-out", "bin"), { recursive: true });
-    symlinkSync(binary, join(repo, "zig-out", "bin", "fx"));
+    symlinkSync(fxBin(), join(repo, "zig-out", "bin", "fx"));
   }
   for (const name of TOOLS) symlinkSync(tool(name), join(bin, name));
   if (hyperfine !== "missing") {
@@ -227,11 +228,11 @@ export async function runStartup(options: RunOptions): Promise<RunResult> {
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill(9);
-    }, options.timeoutMs ?? 300_000);
+    }, RUN_TIMEOUT_MS);
     const [stdout, stderr] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
     await child.exited;
     clearTimeout(timer);
-    if (timedOut) throw new Error(`benchmarks/startup.sh did not end in ${options.timeoutMs ?? 300_000} ms: ${stdout.slice(-400)}`);
+    if (timedOut) throw new Error(`benchmarks/startup.sh did not end in ${RUN_TIMEOUT_MS} ms: ${stdout.slice(-400)}`);
 
     const pidName = `${PREFIX}-${child.pid}`;
     const planted = [...before];

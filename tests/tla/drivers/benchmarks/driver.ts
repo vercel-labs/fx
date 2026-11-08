@@ -14,8 +14,10 @@
 //
 // --self-check also replays them through the model of the script before the
 // change (Bug = "today"), which must reject them, and runs every scenario
-// again on each planted bug in run.ts MUTANTS, whose runs the model must
-// reject.
+// again on each planted bug in run.ts MUTANTS. The runs of a planted bug must
+// be rejected by the design and accepted by the model of that bug (BUG_MODELS),
+// so each bug is rejected for its own reason. A run the model has no names for
+// fails the self-check.
 //
 // Usage (from the repository root, after zig build, with hyperfine installed):
 //   bun tests/tla/drivers/benchmarks/driver.ts
@@ -23,10 +25,10 @@
 //
 // Exit codes: 0 every run accepted (and the self-check rejected), 1 a run the
 // model cannot produce, 2 a toolchain or harness failure.
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { TLA_ROOT, outDir, runTlc, writeJson } from "../lib/tlc";
-import { MUTANTS, PREFIX, type Hyperfine, type RunResult, folderOf, fxBinary, plant, realHyperfine, runStartup } from "./run";
+import { TLA_ROOT, fxBin, outDir, runTlc, writeJson } from "../lib/tlc";
+import { MUTANTS, PREFIX, type Hyperfine, type RunResult, folderOf, plant, realHyperfine, runStartup } from "./run";
 
 type Scenario = {
   id: string;
@@ -70,6 +72,14 @@ type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 
 const tlaDir = join(TLA_ROOT, "benchmarks");
 const selfCheck = process.argv.includes("--self-check");
+
+// The Bug value in StartupFixture.tla that models each planted bug in run.ts.
+// pid-path is the script before the change, which Bug = "today" models.
+const BUG_MODELS: Record<string, string> = {
+  "pid-path": "today",
+  "glob-cleanup": "glob_cleanup",
+  "no-trap": "no_trap",
+};
 
 class Harness extends Error {}
 // A run the model has no names for, such as one that made two folders.
@@ -196,7 +206,11 @@ async function rejectedRuns(observations: Observation[], bug: string, parent: st
 }
 
 async function main(): Promise<number> {
-  if (!existsSync(fxBinary())) throw new Harness(`missing ${fxBinary()}; run zig build first or set FX_BIN`);
+  try {
+    fxBin();
+  } catch (error) {
+    throw new Harness(error instanceof Error ? error.message : String(error));
+  }
   if (!realHyperfine()) throw new Harness("hyperfine is not on PATH; the normal run needs it");
   const out = outDir("benchmarks");
   console.log(`output: ${out}`);
@@ -218,16 +232,22 @@ async function main(): Promise<number> {
     console.log(`self-check, the model of the script before the change: ${today.verdict} (must be REJECTED)`);
     if (today.verdict !== "REJECTED") return today.verdict === "TOOL_ERROR" ? 2 : 1;
     for (const mutant of Object.keys(MUTANTS)) {
-      let verdict: Verdict;
+      const model = BUG_MODELS[mutant];
+      if (!model) throw new Harness(`no model of the planted bug ${mutant}; add it to BUG_MODELS`);
+      let bugRuns: Observation[];
       try {
-        verdict = (await trace(await runScenarios(runs, mutant), "none", out)).verdict;
+        bugRuns = await runScenarios(runs, mutant);
       } catch (error) {
         if (!(error instanceof Unmodeled)) throw error;
-        console.log(`planted bug ${mutant}: ${error.message}`);
-        verdict = "REJECTED";
+        console.log(`self-check, planted bug ${mutant}: ${error.message}; the model of the bug cannot say why it is rejected`);
+        return 1;
       }
-      console.log(`self-check, planted bug ${mutant}: ${verdict} (must be REJECTED)`);
-      if (verdict !== "REJECTED") return verdict === "TOOL_ERROR" ? 2 : 1;
+      const design = await trace(bugRuns, "none", out);
+      const own = await trace(bugRuns, model, out);
+      console.log(`self-check, planted bug ${mutant}: the design ${design.verdict} (must be REJECTED), ` +
+        `the model of the bug, Bug = ${str(model)}, ${own.verdict} (must be ACCEPTED)`);
+      if (design.verdict === "TOOL_ERROR" || own.verdict === "TOOL_ERROR") return 2;
+      if (design.verdict !== "REJECTED" || own.verdict !== "ACCEPTED") return 1;
     }
   }
   console.log("ACCEPTED");
