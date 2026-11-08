@@ -41,6 +41,7 @@ const sm = @import("session_manager");
 /// A line boundary in a session log, for hosts that walk it.
 pub const LogCursor = sm.Cursor;
 const debug_trace = @import("../shared/debug_trace.zig");
+const write_test_controls = @import("write_test_controls.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
@@ -927,6 +928,13 @@ const BlobHost = struct {
     /// The open session; null once it closed.
     session: ?sm.Session,
     mutex: std.Io.Mutex = .init,
+    /// One write of the session at a time. `Session.write` holds it from
+    /// taking the due records until it clears them, so two writes on
+    /// different threads, such as main's compaction line and a subagent's
+    /// finish line, never take the same records
+    /// (`tests/tla/session/SessionWrite.tla` NoStaleRemoval, ListedOnce).
+    /// Taken before `life` and `mutex`, and never while holding either.
+    write_lock: std.Io.Mutex = .init,
     refs: usize = 1,
     /// Blobs stored since the last item that lists them (D44).
     pending: std.ArrayList(Hash) = .empty,
@@ -1487,12 +1495,16 @@ pub const Session = struct {
     /// stores kept since the last such line, so verify and recover see a
     /// lost one as damage (D39, D44). Compactor records kept since the last
     /// `compaction_records` line get a new one first, so the line that
-    /// cites them never lands without them (D50).
+    /// cites them never lands without them (D50). Writes of the session run
+    /// one at a time (`BlobHost.write_lock`).
     fn write(self: *Session, events: []const sm.Event) sm.AppendError!u64 {
+        self.host.write_lock.lockUncancelable(io_mod.getIo());
+        defer self.host.write_lock.unlock(io_mod.getIo());
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
         const a = scratch.allocator();
         const due = try self.host.recordsDue(a);
+        if (due) |records| write_test_controls.holdDueRecords(records.added.len);
         const with_records = if (due) |records| try std.mem.concat(a, sm.Event, &.{ try self.recordLines(a, records), events }) else events;
         const pending = try self.host.pendingCopy(a);
         const batch = try listPending(a, with_records, pending);
@@ -8129,6 +8141,208 @@ test "an older session moves off its side folder on its first writable open, and
     try testing.expectEqual(@as(?[]u8, null), lost.inline_data);
     try testing.expectEqual(@as(?[]u8, null), lost.blob_path);
     try testing.expect(std.mem.endsWith(u8, lost.snapshot_path.?, "images/" ++ OldSideFolder.image_name));
+}
+
+/// Every `compaction_records` setting in session `id`'s log, as the count
+/// of records each lists besides its own map, and how many records they
+/// list in all. Fails when a setting leaves out its map or two list the same
+/// record (D50). In `arena`.
+fn recordListings(arena: Allocator, manager: *sm.Manager, id: []const u8) !struct { counts: []usize, records: usize } {
+    var page = try manager.read(testing.allocator, id, .start, .forward, 10_000);
+    defer page.deinit();
+    var counts: std.ArrayList(usize) = .empty;
+    var listed: std.array_hash_map.String(void) = .empty;
+    for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        if (body != .set or body.set.key != .compaction_records) continue;
+        const value = try std.json.parseFromSliceLeaky(struct { map: []const u8 }, arena, body.set.value, .{ .allocate = .alloc_always });
+        var lists_map = false;
+        var count: usize = 0;
+        for (body.set.blobs) |hash| {
+            if (std.mem.eql(u8, hash, value.map)) {
+                lists_map = true;
+                continue;
+            }
+            const slot = try listed.getOrPut(arena, try arena.dupe(u8, hash));
+            try testing.expect(!slot.found_existing);
+            count += 1;
+        }
+        try testing.expect(lists_map);
+        try counts.append(arena, count);
+    }
+    return .{ .counts = counts.items, .records = listed.count() };
+}
+
+/// Holds the first write that takes due records until `go` is set, so a
+/// test can run another write of the session, or keep a record, meanwhile.
+const HeldWrite = struct {
+    var held: std.Io.Event = .unset;
+    var go: std.Io.Event = .unset;
+    var calls = std.atomic.Value(u32).init(0);
+
+    fn arm() void {
+        held = .unset;
+        go = .unset;
+        calls.store(0, .seq_cst);
+        write_test_controls.test_hold = hold;
+    }
+
+    fn disarm() void {
+        write_test_controls.test_hold = null;
+    }
+
+    fn hold(_: usize) void {
+        if (calls.fetchAdd(1, .seq_cst) != 0) return;
+        held.set(io_mod.getIo());
+        go.waitUncancelable(io_mod.getIo());
+    }
+
+    fn write(session: *Session, text: []const u8, done: *std.atomic.Value(bool), failed: *std.atomic.Value(bool)) void {
+        session.setClientPrompt(text) catch failed.store(true, .seq_cst);
+        done.store(true, .seq_cst);
+    }
+
+    /// A subagent's line, as when one is spawned or finishes: unlike
+    /// `setClientPrompt`, it doesn't take `Session.mutex`, so only the write
+    /// lock makes it wait.
+    fn childLine(session: *Session, child: []const u8, done: *std.atomic.Value(bool), failed: *std.atomic.Value(bool)) void {
+        session.appendChildLines(&.{.{ .spawned = .{ .child = child, .work_id = "w1", .data = "{\"kind\":\"persistent\"}" } }}) catch failed.store(true, .seq_cst);
+        done.store(true, .seq_cst);
+    }
+};
+
+test "a write that took due records makes the session's other writes wait, and a record kept meanwhile stays due (D50)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    try s.beginTurn();
+    const records = result_store.compactorStore(try s.childCapability());
+    try records.write(testing.allocator, "compacted-T1.txt", "T1 first\n");
+    try records.write(testing.allocator, "compacted-T2.txt", "T2 second\n");
+    HeldWrite.arm();
+    defer HeldWrite.disarm();
+    var first_done = std.atomic.Value(bool).init(false);
+    var second_done = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    const first = try std.Thread.spawn(.{}, HeldWrite.write, .{ s, "first", &first_done, &failed });
+    HeldWrite.held.waitUncancelable(io_mod.getIo());
+    // The first write holds T1 and T2. A subagent's line from another
+    // thread, as during main's compaction, waits for it.
+    const second = try std.Thread.spawn(.{}, HeldWrite.childLine, .{ s, "1786460757754-kid", &second_done, &failed });
+    // The compactor keeps a record meanwhile, after the first write took
+    // its records.
+    try records.write(testing.allocator, "compacted-T3.txt", "T3 third\n");
+    io_mod.sleep(50 * std.time.ns_per_ms);
+    try testing.expect(!first_done.load(.seq_cst));
+    try testing.expect(!second_done.load(.seq_cst));
+    HeldWrite.go.set(io_mod.getIo());
+    first.join();
+    second.join();
+    try testing.expect(!failed.load(.seq_cst));
+    // The first write lists T1 and T2, and the second the T3 it found due.
+    const listings = try recordListings(arena_state.allocator(), t.store.manager, s.id());
+    try testing.expectEqualSlices(usize, &.{ 2, 1 }, listings.counts);
+}
+
+test "a write whose append fails keeps its records due and lets the next write go (D50)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    try s.beginTurn();
+    const records = result_store.compactorStore(try s.childCapability());
+    try records.write(testing.allocator, "compacted-T1.txt", "T1 first\n");
+    // The manager refuses a finish line for a child the session never
+    // spawned, so nothing of that batch lands, its records line included.
+    if (s.appendChildLines(&.{.{ .finished = .{ .child = "never-spawned", .work_id = "w", .outcome = .ok } }})) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try testing.expectEqual(@as(usize, 0), try countSettings(t.store.manager, s.id(), .compaction_records));
+    // The record is still due, and the write after the failure lists it.
+    try s.setClientPrompt("after the failure");
+    const listings = try recordListings(arena_state.allocator(), t.store.manager, s.id());
+    try testing.expectEqualSlices(usize, &.{1}, listings.counts);
+}
+
+test "fuzzed puts and writes list each compactor record once (D50)" {
+    try std.testing.fuzz({}, fuzzRecordsListing, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "\x00",
+            "\x00\x02\x00\x03\x01",
+            "\x00\x01\x05\x02\x00\x00\x03\x02\x09",
+            "\x03\x00\x04\x00\x02\x01\x02\x03\x00\x0d",
+        }) ++ @import("fuzz_corpus").session_records_listing.*),
+    });
+}
+
+/// Each byte is one step: keep a new record (0), keep a record again under
+/// a name already kept (1), save a setting that cites nothing (2), or end
+/// the turn and start the next (3). Every record kept must then be listed
+/// by exactly one `compaction_records` setting, each setting lists its own
+/// map too, and the session resumes with every name kept (D50).
+fn fuzzRecordsListing(_: void, smith: *std.testing.Smith) !void {
+    var steps: [24]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&steps));
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var open = true;
+    defer if (open) s.close();
+    try s.beginTurn();
+    const records = result_store.compactorStore(try s.childCapability());
+    var kept: usize = 0;
+    var puts: usize = 0;
+    var name_buf: [32]u8 = undefined;
+    var body_buf: [48]u8 = undefined;
+    for (steps[0..len], 0..) |step, index| {
+        switch (step % 4) {
+            0, 1 => {
+                const slot = if (step % 4 == 1 and kept > 0) (step / 4) % kept else blk: {
+                    kept += 1;
+                    break :blk kept - 1;
+                };
+                puts += 1;
+                const name = try std.mem.print(&name_buf, "compacted-T{d}.txt", .{slot});
+                const body = try std.mem.print(&body_buf, "T{d} result {d}\n", .{ slot, puts });
+                try records.write(testing.allocator, name, body);
+            },
+            2 => try s.setClientPrompt(try std.mem.print(&body_buf, "prompt {d}", .{index})),
+            else => {
+                try s.commitTurn(assistantTurn("step", "done"), types.ConversationLanguage.default());
+                try s.beginTurn();
+            },
+        }
+    }
+    try s.commitTurn(assistantTurn("last", "done"), types.ConversationLanguage.default());
+
+    var listings_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer listings_arena.deinit();
+    const listings = try recordListings(listings_arena.allocator(), t.store.manager, s.id());
+    // Each put kept new bytes, so each is its own record.
+    try testing.expectEqual(puts, listings.records);
+
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    open = false;
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const names = try result_store.compactorStore(try r.childCapability()).list(arena_state.allocator());
+    try testing.expectEqual(kept, names.len);
 }
 
 test "compactor records on v2 are recorded by one setting with the next write, and come back on resume and in a fork (D50)" {
