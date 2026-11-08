@@ -286,7 +286,7 @@ pub fn parseProfileJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(
 /// The profile's servers. With `skipped`, an entry fx can't read is left out
 /// and noted there instead of failing the file.
 pub fn parseProfileServers(alloc: Allocator, json_text: []const u8, skipped: ?*std.ArrayList(WorkspaceDiagnostic)) !std.ArrayList(McpServerConfig) {
-    var result = try parseProfileDocumentInto(alloc, json_text, skipped);
+    var result = try parseProfileDocument(alloc, json_text, skipped);
     defer result.deinit(alloc);
     const configs = result.configs;
     result.configs = .empty;
@@ -301,11 +301,10 @@ noinline fn failProfileParseDynamic(err: anyerror) anyerror!ProfileParseResult {
     return err;
 }
 
-pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfileParseResult {
-    return parseProfileDocumentInto(alloc, json_text, null);
-}
-
-fn parseProfileDocumentInto(alloc: Allocator, json_text: []const u8, skipped: ?*std.ArrayList(WorkspaceDiagnostic)) !ProfileParseResult {
+/// The profile's servers and what the file says about itself. With `skipped`,
+/// an entry fx can't read is left out and noted there instead of failing the
+/// file.
+pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8, skipped: ?*std.ArrayList(WorkspaceDiagnostic)) !ProfileParseResult {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| switch (err) {
         error.OutOfMemory => return failProfileParse(error.OutOfMemory),
         else => return failProfileParse(error.McpConfigInvalidJson),
@@ -1486,6 +1485,7 @@ test "profile document accepts mcpServers alias and preserves strict entry parsi
     var result = try parseProfileDocument(
         alloc,
         "{\"mcpServers\":{\"local\":{\"command\":\"node\",\"args\":[\"server.js\"]}}}",
+        null,
     );
     defer result.deinit(alloc);
 
@@ -1501,6 +1501,7 @@ test "profile document keeps canonical mcp and reports ignored nonempty alias" {
     var result = try parseProfileDocument(
         alloc,
         "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"mcpServers\":{\"ignored\":{\"command\":\"two\"}}}",
+        null,
     );
     defer result.deinit(alloc);
 
@@ -1542,6 +1543,7 @@ test "profile document blocks suspicious sibling keys beside canonical mcp" {
     var result = try parseProfileDocument(
         alloc,
         "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"MCP-Servers\":{\"shadow\":{\"command\":\"two\"}},\"metadata\":{\"owner\":\"team\"}}",
+        null,
     );
     defer result.deinit(alloc);
 
@@ -1558,6 +1560,7 @@ test "profile document reports the first exact server-like unsupported key" {
     var result = try parseProfileDocument(
         alloc,
         "{\"metadata\":{\"entry\":{\"command\":\"ignored\"}},\"MCP-Servers\":{\"one\":{\"command\":\"node\"}},\"servers\":{\"two\":{\"url\":\"https://example.test/mcp\"}}}",
+        null,
     );
     defer result.deinit(alloc);
 
@@ -1581,7 +1584,7 @@ test "profile document bounds suspicious-key scans" {
     const json = try out.toOwnedSlice();
     defer alloc.free(json);
 
-    var result = try parseProfileDocument(alloc, json);
+    var result = try parseProfileDocument(alloc, json, null);
     defer result.deinit(alloc);
     try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_key_scan_indeterminate, result.diagnostic.?.cause);
     try std.testing.expect(!result.mutation_allowed);
@@ -1721,6 +1724,7 @@ test "workspace environment diagnostics isolate entries and profile values stay 
     var profile = try parseProfileDocument(
         alloc,
         "{\"mcp\":{\"literal\":{\"command\":\"${COMMAND}\"}}}",
+        null,
     );
     defer profile.deinit(alloc);
     try std.testing.expectEqualStrings("${COMMAND}", profile.configs.items[0].command.?);
@@ -2113,6 +2117,89 @@ test "a profile HTTP server on loopback loads with or without a port, and plain 
         defer alloc.free(words);
         try std.testing.expectEqualStrings(words, said);
     }
+}
+
+/// The entries under "mcp", or under "mcpServers" when there is no "mcp".
+fn profileEntryCount(alloc: Allocator, text: []const u8) !usize {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, text, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    const servers = object.get("mcp") orelse object.get("mcpServers") orelse return 0;
+    return servers.object.count();
+}
+
+fn fuzzProfileEntries(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var buffer: [1024]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    const text = buffer[0..len];
+
+    var skipped: std.ArrayList(WorkspaceDiagnostic) = .empty;
+    defer {
+        for (skipped.items) |*note| note.deinit(alloc);
+        skipped.deinit(alloc);
+    }
+    var read = parseProfileDocument(alloc, text, &skipped) catch |err| switch (err) {
+        // A file fx can't read as a whole fails with or without a list. No
+        // error about one entry gets out of a read that has a list.
+        error.McpConfigInvalidJson, error.McpConfigRootMustBeObject, error.McpConfigServersMustBeObject => {
+            if (parseProfileJson(alloc, text)) |configs| {
+                var leaked = configs;
+                deinitConfigs(alloc, &leaked);
+                return error.TestUnexpectedResult;
+            } else |plain| try std.testing.expectEqual(err, plain);
+            return;
+        },
+        else => return err,
+    };
+    defer read.deinit(alloc);
+
+    // Each entry is loaded or named, and none is both.
+    var invalid: usize = 0;
+    for (skipped.items) |note| {
+        if (note.cause == .invalid_entry) invalid += 1;
+    }
+    try std.testing.expectEqual(try profileEntryCount(alloc, text), read.configs.items.len + invalid);
+
+    // Without a list, the first entry fx can't read fails the file. A file
+    // with no such entry loads the same entries either way.
+    if (parseProfileJson(alloc, text)) |configs| {
+        var plain = configs;
+        defer deinitConfigs(alloc, &plain);
+        try std.testing.expectEqual(@as(usize, 0), invalid);
+        try std.testing.expectEqual(read.configs.items.len, plain.items.len);
+    } else |_| {
+        try std.testing.expect(invalid > 0);
+    }
+
+    // Every surface reads the file with the same rules.
+    var again: std.ArrayList(WorkspaceDiagnostic) = .empty;
+    defer {
+        for (again.items) |*note| note.deinit(alloc);
+        again.deinit(alloc);
+    }
+    var servers = try parseProfileServers(alloc, text, &again);
+    defer deinitConfigs(alloc, &servers);
+    try std.testing.expectEqual(read.configs.items.len, servers.items.len);
+    try std.testing.expectEqual(skipped.items.len, again.items.len);
+    for (read.configs.items, servers.items) |one, other| try std.testing.expectEqualStrings(one.name, other.name);
+}
+
+test "a profile read with a skipped list loads or names each entry for fuzzed files" {
+    try std.testing.fuzz({}, fuzzProfileEntries, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "{}",
+            "{\"mcp\":{}}",
+            "{\"mcp\":[]}",
+            "{\"mcp\":",
+            "{\"mcp\":{\"a\":{\"type\":\"local\",\"command\":[\"true\"]}}}",
+            "{\"mcpServers\":{\"a\":{\"command\":\"true\"},\"b\":7}}",
+            "{\"mcp\":{\"bad\":{\"type\":\"http\",\"url\":\"http://example.com/mcp\"},\"ok\":{\"type\":\"http\",\"url\":\"http://localhost/mcp\"},\"stdio\":{\"type\":\"local\",\"command\":[\"/usr/bin/true\"]}}}",
+            "{\"mcp\":{\"a\":{\"type\":\"local\"},\"b\":{\"type\":\"pigeon\"},\"c\":{\"url\":\"https://example.com/mcp\"}},\"mcpServers\":{\"d\":{\"command\":\"x\"}}}",
+            "{\"mcp\":{\"a\":{\"command\":\"x\"}},\"MCP-Servers\":{\"b\":{\"command\":\"y\"}}}",
+        }) ++ @import("fuzz_corpus").mcp_profile_entries.*),
+    });
 }
 
 test "a project entry fx can't read says why in words" {

@@ -908,6 +908,130 @@ describe("cli: status", () => {
   );
 
   test(
+    "status and doctor keep the readable profile MCP servers and name each entry they skip",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-mcp-profile-skipped-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const fxDir = join(home, ".fx");
+      mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+      mkdirSync(workspace);
+      const profile =
+        JSON.stringify({
+          mcp: {
+            bad: { type: "http", url: "http://example.com/mcp" },
+            "local-server": { type: "http", url: "http://localhost/mcp" },
+            "stdio-good": { type: "local", command: ["/usr/bin/true"] },
+          },
+        }) + "\n";
+      writeFileSync(join(fxDir, "mcp.json"), profile, { mode: 0o600 });
+      const gateway = startFakeGateway([]);
+
+      try {
+        const env = {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "mcp-profile-skipped-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        };
+        const cwd = realpathSync(workspace);
+        const before = snapshotTree(home);
+        const note = `~/.fx/mcp.json server 'bad' was skipped: its "url" isn't valid.`;
+
+        const statusText = await runFx(["status"], { cwd, env });
+        const statusJsonResult = await runFx(["status", "--json"], { cwd, env });
+        const doctorText = await runFx(["doctor"], { cwd, env });
+        const doctorJsonResult = await runFx(["doctor", "--json"], { cwd, env });
+
+        for (const result of [statusText, statusJsonResult, doctorText, doctorJsonResult]) {
+          expect(result.code).toBe(0);
+          expect(result.stderr).toBe("");
+        }
+
+        for (const [prefix, text] of [
+          ["status", statusText.stdout],
+          ["doctor", doctorText.stdout],
+        ] as const) {
+          expect(text).toContain(`[${prefix}] mcp_servers=2 mcp_configuration_issues=1\n`);
+          expect(text).toContain(`[${prefix}] mcp_server=local-server source=profile `);
+          expect(text).toContain(`[${prefix}] mcp_server=stdio-good source=profile `);
+          expect(text).toContain(`[${prefix}] mcp_configuration_issue=${note}\n`);
+          expect(text).not.toContain("mcp_inspection_error");
+          expect(text).not.toContain("McpConfigInvalidUrl");
+        }
+        expect(statusText.stdout).not.toContain("mcp_config_error");
+        expect(statusText.stdout).toContain(
+          "[status] mcp_config_warning=skipped_entry key=bad additional_matches=0\n",
+        );
+        expect(doctorText.stdout).toContain(
+          "[warn] mcp_config: ~/.fx/mcp.json warning: skipped_entry key=bad additional_matches=0\n",
+        );
+        expect(doctorText.stdout).not.toContain("[fail] mcp_config");
+
+        const status = JSON.parse(statusJsonResult.stdout);
+        expect(status).not.toHaveProperty("mcp_config_error");
+        expect(status.mcp_config_warning).toEqual({
+          cause: "skipped_entry",
+          key: "bad",
+          additional_matches: 0,
+        });
+        const doctor = JSON.parse(doctorJsonResult.stdout);
+        for (const mcp of [status.mcp, doctor.mcp]) {
+          expect(mcp.servers.map((server: { name: string }) => server.name)).toEqual([
+            "local-server",
+            "stdio-good",
+          ]);
+          expect(mcp.configuration_issues).toEqual([note]);
+          expect(mcp.inspection_error).toBeNull();
+        }
+        expect(doctor.fail_count).toBe(0);
+        expect(
+          doctor.checks.filter((check: { name: string }) => check.name === "mcp_config"),
+        ).toEqual([
+          {
+            name: "mcp_config",
+            status: "warn",
+            detail: "~/.fx/mcp.json warning: skipped_entry key=bad additional_matches=0",
+          },
+        ]);
+        expect(gateway.requestCount()).toBe(0);
+        expect(snapshotTree(home)).toEqual(before);
+        expect(readFileSync(join(fxDir, "mcp.json"), "utf8")).toBe(profile);
+
+        // A name past the warning's 128 bytes is cut between characters, so
+        // the key stays a string in the JSON output.
+        const longName = "\u4e16".repeat(50);
+        writeFileSync(
+          join(fxDir, "mcp.json"),
+          JSON.stringify({ mcp: { [longName]: { type: "http", url: "http://example.com/mcp" } } }) + "\n",
+          { mode: 0o600 },
+        );
+        const longStatus = JSON.parse((await runFx(["status", "--json"], { cwd, env })).stdout);
+        expect(longStatus.mcp_config_warning).toEqual({
+          cause: "skipped_entry",
+          key: "\u4e16".repeat(42),
+          additional_matches: 0,
+        });
+        const longDoctor = JSON.parse((await runFx(["doctor", "--json"], { cwd, env })).stdout);
+        const longCheck = longDoctor.checks.find((check: { name: string }) => check.name === "mcp_config");
+        expect(longCheck.status).toBe("warn");
+        expect(longCheck.detail).toBe(
+          `~/.fx/mcp.json warning: skipped_entry key=${"\u4e16".repeat(42)} additional_matches=0`,
+        );
+        expect(longStatus.mcp.configuration_issues).toHaveLength(1);
+        expect(gateway.requestCount()).toBe(0);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "doctor names unknown settings keys while status stays quiet",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-unknown-settings-")));

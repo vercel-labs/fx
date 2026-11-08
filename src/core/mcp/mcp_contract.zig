@@ -19,6 +19,9 @@ pub const ProfileConfigWarningCause = enum {
     ignored_mcp_servers_alias,
     suspicious_server_key,
     suspicious_key_scan_indeterminate,
+    /// An entry fx can't read was skipped; the rest of the file loaded. The
+    /// key is the first such entry and `additional_matches` counts the others.
+    skipped_entry,
 };
 
 pub const ProfileConfigWarning = struct {

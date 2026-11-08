@@ -1,12 +1,17 @@
 // Runs the built fx binary along tests/tla/mcp_config/ProfileLoad.tla and has
 // TLC check every run it observes (ProfileLoadTrace.tla).
 //
-// Each case is one profile mcp.json. The driver reads it two ways: with
-// `fx mcp list --json` (the CLI, as the TUI reads it) and with an ACP session
-// that sets _meta.fx.profileMcpServers and sends one prompt. For each it
-// records which entries fx ran and which it named as skipped: the servers in
-// the JSON and the stderr notes, and the servers listed in the first model
-// request and the "ACP profile MCP config skipped" trace lines. Entries are
+// Each case is one profile mcp.json. The driver reads it four ways: with
+// `fx mcp list --json` (the CLI, as the TUI reads it), with an ACP session
+// that sets _meta.fx.profileMcpServers and sends one prompt, and with
+// `fx status --json` and `fx doctor --json`. For each it records which
+// entries fx ran or listed and which it named as skipped: the servers in the
+// JSON and the stderr notes, the servers listed in the first model request and
+// the "ACP profile MCP config skipped" trace lines, and the servers and
+// configuration issues in the status and doctor JSON. For status and doctor it
+// also records whether the profile was reported as unreadable (mcp_config_error,
+// a failing mcp_config check) and whether as a warning (mcp_config_warning, a
+// warning mcp_config check). Entries are
 // URLs of every form the URL rule tells apart, a stdio server, and entries fx
 // can't read for other reasons. The cases are each entry alone, every
 // bad-and-good pair of a few, the profile from issue #1218, and --random
@@ -14,23 +19,29 @@
 //
 // Each entry's kind comes from the driver's own reading of its URL, not from
 // fx. TLC replays the runs through the model of the fix (--model fix, the
-// default) or of fx before it (--model before); --self-check also requires
-// the other model to reject them. Every fx process runs through `env -i` with
+// default), of fx before this change to fx status and fx doctor (--model head:
+// loopback URLs and ACP skip an entry, status and doctor fail the whole file),
+// or of fx before issue #1218 was fixed (--model before); --self-check also
+// requires the other model to reject them. Every fx process runs through `env -i` with
 // a temporary profile, FX_SOUND=0, FX_DISABLE_KEYCHAIN=1, and a local fake
 // gateway whose request count is checked.
 //
 // Other modes, which TLC does not check:
-//   --stress N   one profile of N entries, half of them bad, through both
+//   --stress N   one profile of N entries, half of them bad, through all four
 //                surfaces; checks the counts and prints the wall times
 //   --faults     a profile that is a folder, a symlink loop, not JSON, or has
-//                "mcp" as an array; and http://localhost/mcp with nothing on
-//                port 80 beside a working stdio server
-//   --crash      SIGKILL fx acp while a profile server runs, then start again
+//                "mcp" as an array, through every surface; and
+//                http://localhost/mcp with nothing on port 80 beside a working
+//                stdio server
+//   --crash      SIGKILL fx acp while a profile server runs, then start again;
+//                SIGKILL fx status and fx doctor at several moments on a large
+//                profile, which must stay byte for byte the same
 //
 // Usage (from the repository root, after zig build):
 //   bun tests/tla/drivers/mcp_config/driver.ts
 //   bun tests/tla/drivers/mcp_config/driver.ts --self-check --random 40 --seed 7
-//   bun tests/tla/drivers/mcp_config/driver.ts --model before   # fx before the fix
+//   bun tests/tla/drivers/mcp_config/driver.ts --model head     # fx before status and doctor skip
+//   bun tests/tla/drivers/mcp_config/driver.ts --model before   # fx before issue #1218
 //   bun tests/tla/drivers/mcp_config/driver.ts --stress 1000
 //
 // Exit codes: 0 every run accepted (or the mode's checks held), 1 a run the
@@ -43,13 +54,16 @@ import { REPO_ROOT, TLA_ROOT, outDir, runTlc, writeJson } from "../lib/tlc";
 type Scheme = "https" | "http" | "other" | "stdio" | "broken";
 type Kind = { scheme: Scheme; host: "loopback" | "remote" | "none"; port: boolean; extra: boolean };
 type Entry = { label: string; config: unknown; kind: Kind };
-type Surface = "cli" | "acp";
+type Surface = "cli" | "acp" | "status" | "doctor";
+type Inspect = "status" | "doctor";
 type Observation = {
   id: string;
   labels: string[];
   file: Kind[];
   loaded: Record<Surface, number[]>;
   noted: Record<Surface, number[]>;
+  failed: Record<Inspect, boolean>;
+  warned: Record<Inspect, boolean>;
   evidence: Record<string, unknown>;
 };
 type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
@@ -57,8 +71,9 @@ type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 const FIXTURE = join(REPO_ROOT, "tests", "e2e", "fixtures", "mcp-modern-stdio.mjs");
 const tlaDir = join(TLA_ROOT, "mcp_config");
 const MODELS = {
-  fix: { PortRule: "loopback", AcpSkips: "TRUE" },
-  before: { PortRule: "required", AcpSkips: "FALSE" },
+  fix: { PortRule: "loopback", AcpSkips: "TRUE", StatusSkips: "TRUE", DoctorSkips: "TRUE" },
+  head: { PortRule: "loopback", AcpSkips: "TRUE", StatusSkips: "FALSE", DoctorSkips: "FALSE" },
+  before: { PortRule: "required", AcpSkips: "FALSE", StatusSkips: "FALSE", DoctorSkips: "FALSE" },
 } as const;
 
 function option(name: string, fallback: number): number {
@@ -72,7 +87,7 @@ function option(name: string, fallback: number): number {
 function modelOption(): keyof typeof MODELS {
   const at = process.argv.indexOf("--model");
   const value = at < 0 ? "fix" : process.argv[at + 1];
-  if (value !== "fix" && value !== "before") throw new Error("--model takes fix or before");
+  if (value !== "fix" && value !== "head" && value !== "before") throw new Error("--model takes fix, head, or before");
   return value;
 }
 
@@ -234,6 +249,29 @@ async function listCli(helpers: any, root: Root, args: string[] = ["mcp", "list"
   }
 }
 
+// fx status --json or fx doctor --json: the servers it lists and the entries it
+// names as skipped (mcp.servers and mcp.configuration_issues), and whether it
+// reported the profile as unreadable or as a warning.
+async function inspectCli(helpers: any, root: Root, command: Inspect) {
+  const run = await listCli(helpers, root, [command, "--json"]);
+  if (run.exit !== 0) throw new Error(`fx ${command} exited ${run.exit}: ${run.stderr}`);
+  const json = JSON.parse(run.stdout);
+  const mcp = json.mcp as { servers: Array<{ name: string }>; configuration_issues: string[]; inspection_error: string | null };
+  const check = command === "doctor"
+    ? (json.checks as Array<{ name: string; status: string }>).find((entry) => entry.name === "mcp_config")
+    : undefined;
+  return {
+    loaded: mcp.servers.map((server) => serverIndex(server.name)),
+    noted: mcp.configuration_issues.flatMap((issue) => [...issue.matchAll(/server '([^']+)' was skipped/g)].map((m) => serverIndex(m[1]!))),
+    issues: mcp.configuration_issues,
+    inspectionError: mcp.inspection_error,
+    failed: command === "status" ? "mcp_config_error" in json : check?.status === "fail",
+    warned: command === "status" ? json.mcp_config_warning?.cause === "skipped_entry" : check?.status === "warn",
+    stderr: run.stderr,
+    gatewayRequests: run.gatewayRequests,
+  };
+}
+
 class Acp {
   private buffer = "";
   private reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -348,13 +386,37 @@ async function observe(helpers: any, parent: string, id: string, entries: Entry[
     if (acp.gatewayRequests !== 1) throw new Error(`${id}: fx acp sent ${acp.gatewayRequests} model requests, expected 1`);
     if (acp.stopReason !== "end_turn") throw new Error(`${id}: fx acp turn ended ${acp.stopReason}`);
     if (acp.omitted !== 0) throw new Error(`${id}: the catalog left out ${acp.omitted} servers`);
+    const status = await inspectCli(helpers, root, "status");
+    const doctor = await inspectCli(helpers, root, "doctor");
+    for (const [name, run] of [["status", status], ["doctor", doctor]] as const) {
+      if (run.gatewayRequests !== 0) throw new Error(`${id}: fx ${name} sent ${run.gatewayRequests} model requests, expected 0`);
+      if (run.stderr !== "") throw new Error(`${id}: fx ${name} wrote to stderr: ${run.stderr}`);
+    }
     return {
       id,
       labels: entries.map((one) => one.label),
       file: entries.map((one) => one.kind),
-      loaded: { cli: sortedUnique(cliLoaded), acp: sortedUnique(acp.listed.map(serverIndex)) },
-      noted: { cli: sortedUnique(cliNoted), acp: sortedUnique(acp.skippedLines.map(serverIndex)) },
-      evidence: { cli_stderr: cli.stderr, acp_unavailable: acp.unavailable, acp_stderr: acp.stderr },
+      loaded: {
+        cli: sortedUnique(cliLoaded),
+        acp: sortedUnique(acp.listed.map(serverIndex)),
+        status: sortedUnique(status.loaded),
+        doctor: sortedUnique(doctor.loaded),
+      },
+      noted: {
+        cli: sortedUnique(cliNoted),
+        acp: sortedUnique(acp.skippedLines.map(serverIndex)),
+        status: sortedUnique(status.noted),
+        doctor: sortedUnique(doctor.noted),
+      },
+      failed: { status: status.failed, doctor: doctor.failed },
+      warned: { status: status.warned, doctor: doctor.warned },
+      evidence: {
+        cli_stderr: cli.stderr,
+        acp_unavailable: acp.unavailable,
+        acp_stderr: acp.stderr,
+        status_inspection_error: status.inspectionError,
+        doctor_inspection_error: doctor.inspectionError,
+      },
     };
   } finally {
     rmSync(root.root, { recursive: true, force: true });
@@ -366,11 +428,18 @@ const set = (values: number[]) => `{${values.join(", ")}}`;
 const kindValue = (k: Kind) =>
   `[scheme |-> ${str(k.scheme)}, host |-> ${str(k.host)}, port |-> ${k.port ? "TRUE" : "FALSE"}, extra |-> ${k.extra ? "TRUE" : "FALSE"}]`;
 
+const bool = (value: boolean) => (value ? "TRUE" : "FALSE");
+
 function observedModule(observations: Observation[]): string {
+  const surfaces = (by: Record<Surface, number[]>) =>
+    `[cli |-> ${set(by.cli)}, acp |-> ${set(by.acp)}, status |-> ${set(by.status)}, doctor |-> ${set(by.doctor)}]`;
+  const flags = (by: Record<Inspect, boolean>) => `[status |-> ${bool(by.status)}, doctor |-> ${bool(by.doctor)}]`;
   const value = (o: Observation) =>
     `[file |-> <<${o.file.map(kindValue).join(", ")}>>,\n   ` +
-    `loaded |-> [cli |-> ${set(o.loaded.cli)}, acp |-> ${set(o.loaded.acp)}],\n   ` +
-    `noted |-> [cli |-> ${set(o.noted.cli)}, acp |-> ${set(o.noted.acp)}]]`;
+    `loaded |-> ${surfaces(o.loaded)},\n   ` +
+    `noted |-> ${surfaces(o.noted)},\n   ` +
+    `failed |-> ${flags(o.failed)},\n   ` +
+    `warned |-> ${flags(o.warned)}]`;
   return [
     "---- MODULE ProfileLoadObserved ----",
     "\\* Generated by tests/tla/drivers/mcp_config/driver.ts. Do not edit.",
@@ -390,6 +459,8 @@ async function runTrace(observations: Observation[], model: keyof typeof MODELS,
     "  N = 0",
     `  PortRule = ${str(MODELS[model].PortRule)}`,
     `  AcpSkips = ${MODELS[model].AcpSkips}`,
+    `  StatusSkips = ${MODELS[model].StatusSkips}`,
+    `  DoctorSkips = ${MODELS[model].DoctorSkips}`,
     "  Mutation = \"none\"",
     "INVARIANT NotAllMatched",
     "CHECK_DEADLOCK FALSE",
@@ -430,7 +501,7 @@ async function trace(helpers: any, out: string): Promise<number> {
   }));
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
   writeJson(join(out, "observations.json"), observations);
-  console.log(`${observations.length} profiles of ${binary}, each through fx mcp list and fx acp, in ${seconds}s (seed ${options.seed})`);
+  console.log(`${observations.length} profiles of ${binary}, each through fx mcp list, fx acp, fx status, and fx doctor, in ${seconds}s (seed ${options.seed})`);
   console.log(`observations: ${join(out, "observations.json")}`);
 
   const other = options.model === "fix" ? "before" : "fix";
@@ -479,6 +550,16 @@ async function stress(helpers: any, out: string, n: number): Promise<number> {
   check(failures, acp.listed.length + acp.omitted === good, `the catalog listed ${acp.listed.length} and left out ${acp.omitted}, expected ${good} in all`);
   check(failures, acp.skippedLines.length === n - good, `fx acp logged ${acp.skippedLines.length} skipped, expected ${n - good}`);
   check(failures, acp.stderr === "", `fx acp stderr empty (${JSON.stringify(acp.stderr.slice(0, 200))})`);
+  for (const command of ["status", "doctor"] as const) {
+    started = performance.now();
+    const run = await inspectCli(helpers, root, command);
+    const seconds = ((performance.now() - started) / 1000).toFixed(2);
+    check(failures, run.gatewayRequests === 0 && run.stderr === "", `fx ${command} sent ${run.gatewayRequests} model requests, stderr ${JSON.stringify(run.stderr.slice(0, 200))} (${seconds}s)`);
+    check(failures, run.loaded.length === good, `fx ${command} listed ${run.loaded.length} of ${n} entries, expected ${good}`);
+    check(failures, run.noted.length === n - good, `fx ${command} named ${run.noted.length} skipped, expected ${n - good}`);
+    check(failures, !run.failed && run.warned === (n > good) && run.inspectionError === null,
+      `fx ${command} reports a warning, not a failure (failed ${run.failed}, warned ${run.warned}, error ${run.inspectionError})`);
+  }
   rmSync(root.root, { recursive: true, force: true });
   console.log(failures.length === 0 ? `stress ${n}: every check held` : `stress ${n}: ${failures.length} checks failed`);
   return failures.length === 0 ? 0 : 1;
@@ -501,6 +582,14 @@ async function faults(helpers: any, out: string): Promise<number> {
     const acp = await runAcp(helpers, root);
     check(failures, acp.stopReason === "end_turn" && acp.listed.length === 0 && acp.unavailable !== null && acp.stderr === "",
       `profile ${what}: the ACP session still runs, with no profile server and ${JSON.stringify(acp.unavailable)}`);
+    // The file as a whole is unreadable, so fx status and fx doctor report a
+    // failure with the error's name, list no server, and name no entry.
+    for (const command of ["status", "doctor"] as const) {
+      const run = await inspectCli(helpers, root, command);
+      check(failures, run.failed && !run.warned && run.inspectionError !== null && run.loaded.length === 0 && run.noted.length === 0
+        && run.gatewayRequests === 0 && run.stderr === "",
+        `profile ${what}: fx ${command} reports a failure (${run.inspectionError}), lists no server, names no entry`);
+    }
     rmSync(root.root, { recursive: true, force: true });
   }
 
@@ -551,6 +640,39 @@ async function crash(helpers: any, out: string): Promise<number> {
   check(failures, again.listed.includes("good") && !again.listed.includes("bad") && again.skippedLines.includes("bad"),
     `after a restart the session lists ${JSON.stringify(again.listed)} and logs ${JSON.stringify(again.skippedLines)} as skipped`);
   rmSync(root.root, { recursive: true, force: true });
+
+  // fx status and fx doctor only read the profile. Kill each at several
+  // moments of a run over a large profile: the file stays byte for byte the
+  // same, and the next run is right.
+  const big = makeRoot(out, "crash-inspect");
+  const entries = Array.from({ length: 400 }, (_, i) => [entry("http://example.com/mcp"), entry("stdio"), entry("http://localhost/mcp"), entry("no command")][i % 4]!);
+  const good = entries.filter((one) => one.kind.scheme === "stdio" || one.kind.host === "loopback").length;
+  writeProfile(big, entries);
+  const bigBefore = readFileSync(join(big.fxHome, "mcp.json"));
+  for (const command of ["status", "doctor"] as const) {
+    const exits: string[] = [];
+    for (const delay of [0, 5, 15, 40, 100]) {
+      const gateway = helpers.startFakeGateway([]);
+      try {
+        const child = Bun.spawn([...envArgv(big, gateway), binary, command, "--json"], {
+          cwd: big.workspace, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+        });
+        const timer = setTimeout(() => child.kill("SIGKILL"), delay);
+        await child.exited;
+        clearTimeout(timer);
+        exits.push(`${delay}ms:${child.signalCode ?? child.exitCode}`);
+        check(failures, gateway.requestCount() === 0, `fx ${command} killed after ${delay}ms sent ${gateway.requestCount()} model requests`);
+      } finally {
+        gateway.stop();
+      }
+      check(failures, Buffer.compare(bigBefore, readFileSync(join(big.fxHome, "mcp.json"))) === 0,
+        `~/.fx/mcp.json is byte for byte the same after fx ${command} was killed after ${delay}ms`);
+    }
+    const again = await inspectCli(helpers, big, command);
+    check(failures, again.loaded.length === good && again.noted.length === entries.length - good && !again.failed && again.warned,
+      `after the kills fx ${command} lists ${again.loaded.length} of ${entries.length} (expected ${good}), names ${again.noted.length} skipped, and warns (kills: ${exits.join(" ")})`);
+  }
+  rmSync(big.root, { recursive: true, force: true });
   console.log(failures.length === 0 ? "crash: every check held" : `crash: ${failures.length} checks failed`);
   return failures.length === 0 ? 0 : 1;
 }

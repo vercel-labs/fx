@@ -203,7 +203,11 @@ pub fn inspectProfileConfig(
     const config_path = try configPathFromHome(alloc, home);
     defer alloc.free(config_path);
 
-    var document = loadProfileDocumentFromPath(alloc, config_path) catch |err| {
+    // An entry fx can't read is skipped, so it doesn't fail the file; `fx mcp`
+    // notes it itself.
+    var skipped: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty;
+    defer freeDiagnostics(alloc, &skipped);
+    var document = loadProfileDocumentFromPath(alloc, config_path, &skipped) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failed = err };
     };
@@ -220,16 +224,22 @@ pub fn inspectLocalConfig(
 ) error{OutOfMemory}!mcp_health.LocalConfigInspection {
     var profile: std.ArrayList(McpServerConfig) = .empty;
     defer freeConfigs(alloc, &profile);
+    // Entries of the profile fx can't read: each is left out and named as a
+    // configuration issue, ahead of the project's, as `loadNativeConfigs` does.
+    var profile_notes: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty;
+    defer freeDiagnostics(alloc, &profile_notes);
     var profile_diagnostic: mcp_contract.ProfileConfigDiagnostic = .clear;
     if (io_mod.homeDir()) |home| {
         const config_path = try configPathFromHome(alloc, home);
         defer alloc.free(config_path);
-        var document = loadProfileDocumentFromPath(alloc, config_path) catch |err| {
+        var document = loadProfileDocumentFromPath(alloc, config_path, &profile_notes) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return emptyLocalInspection(alloc, .{ .failed = err }, @errorName(err));
         };
         defer document.deinit(alloc);
         profile_diagnostic = if (document.diagnostic) |warning|
+            .{ .warning = warning }
+        else if (skippedEntryWarning(profile_notes.items)) |warning|
             .{ .warning = warning }
         else
             .clear;
@@ -242,6 +252,7 @@ pub fn inspectLocalConfig(
         return localInspectionFromConfigs(
             alloc,
             profile.items,
+            profile_notes.items,
             &.{},
             profile_diagnostic,
             null,
@@ -271,10 +282,40 @@ pub fn inspectLocalConfig(
     return localInspectionFromConfigs(
         alloc,
         configs.items,
+        profile_notes.items,
         workspace.diagnostics.items,
         profile_diagnostic,
         null,
     );
+}
+
+/// The warning for the entries a profile read skipped: the first one by name
+/// and how many more. Null when it skipped none. Notes about names a
+/// "mcpServers" alias left unread are not entries fx couldn't read.
+fn skippedEntryWarning(notes: []const project_config.WorkspaceDiagnostic) ?mcp_contract.ProfileConfigWarning {
+    var first: ?[]const u8 = null;
+    var count: usize = 0;
+    for (notes) |note| {
+        if (note.cause != .invalid_entry) continue;
+        if (first == null) first = note.server_name;
+        count += 1;
+    }
+    const name = first orelse return null;
+    return mcp_contract.ProfileConfigWarning.init(.skipped_entry, wholeCharacters(name, mcp_contract.max_profile_config_warning_key_bytes), count - 1);
+}
+
+/// The most of `text`, valid UTF-8, that fits in `max` bytes without cutting a
+/// character in half; a key cut in half is not a string in the JSON output.
+fn wholeCharacters(text: []const u8, max: usize) []const u8 {
+    if (text.len <= max) return text;
+    var end = max;
+    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    return text[0..end];
+}
+
+fn freeDiagnostics(alloc: Allocator, diagnostics: *std.ArrayList(project_config.WorkspaceDiagnostic)) void {
+    for (diagnostics.items) |*diagnostic| diagnostic.deinit(alloc);
+    diagnostics.deinit(alloc);
 }
 
 fn emptyLocalInspection(
@@ -286,14 +327,17 @@ fn emptyLocalInspection(
         alloc,
         &.{},
         &.{},
+        &.{},
         profile_diagnostic,
         inspection_error,
     );
 }
 
+/// `profile_notes` come ahead of `diagnostics` in the configuration issues.
 fn localInspectionFromConfigs(
     alloc: Allocator,
     configs: []const McpServerConfig,
+    profile_notes: []const project_config.WorkspaceDiagnostic,
     diagnostics: []const project_config.WorkspaceDiagnostic,
     profile_diagnostic: mcp_contract.ProfileConfigDiagnostic,
     inspection_error: ?[]const u8,
@@ -318,17 +362,19 @@ fn localInspectionFromConfigs(
         servers_initialized += 1;
     }
 
-    const issues = try alloc.alloc(mcp_health.ConfigurationIssue, diagnostics.len);
+    const issues = try alloc.alloc(mcp_health.ConfigurationIssue, profile_notes.len + diagnostics.len);
     var issues_initialized: usize = 0;
     errdefer {
         for (issues[0..issues_initialized]) |*issue| issue.deinit(alloc);
         alloc.free(issues);
     }
-    for (diagnostics, 0..) |diagnostic, index| {
-        issues[index] = .{
-            .message = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic),
-        };
-        issues_initialized += 1;
+    for ([_][]const project_config.WorkspaceDiagnostic{ profile_notes, diagnostics }) |notes| {
+        for (notes) |diagnostic| {
+            issues[issues_initialized] = .{
+                .message = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic),
+            };
+            issues_initialized += 1;
+        }
     }
     return .{
         .profile_diagnostic = profile_diagnostic,
@@ -371,13 +417,15 @@ fn loadConfigFromJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(Mc
     return project_config.parseProfileJson(alloc, json_text);
 }
 
+/// With `skipped`, see `project_config.parseProfileDocument`.
 fn loadProfileDocumentFromPath(
     alloc: Allocator,
     path: []const u8,
+    skipped: ?*std.ArrayList(project_config.WorkspaceDiagnostic),
 ) !project_config.ProfileParseResult {
     const json_text = (try config_file.read(alloc, path)) orelse return .{};
     defer alloc.free(json_text);
-    return project_config.parseProfileDocument(alloc, json_text);
+    return project_config.parseProfileDocument(alloc, json_text, skipped);
 }
 
 fn saveConfigsToPath(alloc: Allocator, path: []const u8, configs: []const McpServerConfig) !void {
@@ -753,6 +801,215 @@ test "MCP config diagnostic preserves parser allocation failure" {
         error.OutOfMemory,
         loadConfigFromJson(failing.allocator(), "{\"mcp\":{}}"),
     );
+}
+
+const status_profile_one_bad =
+    \\{"mcp":{
+    \\ "bad":{"type":"http","url":"http://example.com/mcp"},
+    \\ "local-server":{"type":"http","url":"http://localhost/mcp"},
+    \\ "stdio-good":{"type":"local","command":["/usr/bin/true"]}
+    \\}}
+;
+
+fn expectNoted(inspection: *const mcp_health.LocalConfigInspection, notes: []const []const u8) !void {
+    try std.testing.expectEqual(notes.len, inspection.snapshot.configuration_issues.len);
+    for (inspection.snapshot.configuration_issues, notes) |issue, want| {
+        try std.testing.expectEqualStrings(want, issue.message);
+    }
+}
+
+fn expectSkippedWarning(diagnostic: mcp_contract.ProfileConfigDiagnostic, first: []const u8, more: usize) !void {
+    switch (diagnostic) {
+        .warning => |warning| {
+            try std.testing.expectEqual(mcp_contract.ProfileConfigWarningCause.skipped_entry, warning.cause);
+            try std.testing.expectEqualStrings(first, warning.key().?);
+            try std.testing.expectEqual(more, warning.additional_matches);
+        },
+        .clear, .failed => return error.TestUnexpectedResult,
+    }
+}
+
+test "status and doctor keep the readable profile servers when one entry can't be read" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "home/.fx/mcp.json", status_profile_one_bad);
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try tmpDirPath(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace_root = try tmpDirPath(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const test_home = try TestHome.install(alloc, home);
+    defer test_home.deinit();
+
+    var inspection = try inspectLocalConfig(alloc, workspace_root);
+    defer inspection.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?[]const u8, null), inspection.inspection_error);
+    try std.testing.expectEqual(@as(usize, 2), inspection.snapshot.servers.len);
+    try std.testing.expectEqualStrings("local-server", inspection.snapshot.servers[0].configured_name);
+    try std.testing.expectEqualStrings("stdio-good", inspection.snapshot.servers[1].configured_name);
+    try expectNoted(&inspection, &.{"~/.fx/mcp.json server 'bad' was skipped: its \"url\" isn't valid."});
+    try expectSkippedWarning(inspection.profile_diagnostic, "bad", 0);
+}
+
+test "a profile whose only entry can't be read lists no server and still names it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "home/.fx/mcp.json",
+        \\{"mcp":{"bad":{"type":"http","url":"http://example.com/mcp"}}}
+    );
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try tmpDirPath(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace_root = try tmpDirPath(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const test_home = try TestHome.install(alloc, home);
+    defer test_home.deinit();
+
+    var inspection = try inspectLocalConfig(alloc, workspace_root);
+    defer inspection.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?[]const u8, null), inspection.inspection_error);
+    try std.testing.expectEqual(@as(usize, 0), inspection.snapshot.servers.len);
+    try expectNoted(&inspection, &.{"~/.fx/mcp.json server 'bad' was skipped: its \"url\" isn't valid."});
+    try expectSkippedWarning(inspection.profile_diagnostic, "bad", 0);
+}
+
+test "status and doctor name every entry they skip, and keep a warning the file already has" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "home/.fx/mcp.json",
+        \\{"mcp":{
+        \\ "first":{"type":"http","url":"http://example.com/mcp"},
+        \\ "ok":{"type":"local","command":["/usr/bin/true"]},
+        \\ "second":{"type":"local"},
+        \\ "evil\u001b[31m":{"type":"http","url":"http://example.com:8080/mcp"}
+        \\}}
+    );
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try tmpDirPath(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace_root = try tmpDirPath(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const test_home = try TestHome.install(alloc, home);
+    defer test_home.deinit();
+
+    {
+        var inspection = try inspectLocalConfig(alloc, workspace_root);
+        defer inspection.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), inspection.snapshot.servers.len);
+        try std.testing.expectEqualStrings("ok", inspection.snapshot.servers[0].configured_name);
+        // Each note, in the file's order, with the escape sequence escaped.
+        try expectNoted(&inspection, &.{
+            "~/.fx/mcp.json server 'first' was skipped: its \"url\" isn't valid.",
+            "~/.fx/mcp.json server 'second' was skipped: it needs a \"command\", with any \"args\" as strings.",
+            "~/.fx/mcp.json server 'evil\\x1b[31m' was skipped: its \"url\" isn't valid.",
+        });
+        try expectSkippedWarning(inspection.profile_diagnostic, "first", 2);
+    }
+
+    // A warning the file already has stays, and the entry is still named.
+    try writeTempFile(&tmp, "home/.fx/mcp.json",
+        \\{"mcp":{"bad":{"type":"http","url":"http://example.com/mcp"}},"MCP-Servers":{"x":{"command":"node"}}}
+    );
+    var inspection = try inspectLocalConfig(alloc, workspace_root);
+    defer inspection.deinit(alloc);
+    try expectNoted(&inspection, &.{"~/.fx/mcp.json server 'bad' was skipped: its \"url\" isn't valid."});
+    switch (inspection.profile_diagnostic) {
+        .warning => |warning| try std.testing.expectEqual(mcp_contract.ProfileConfigWarningCause.suspicious_server_key, warning.cause),
+        .clear, .failed => return error.TestUnexpectedResult,
+    }
+}
+
+test "the warning for a skipped entry cuts a long name between characters" {
+    var name: [150]u8 = undefined;
+    for (0..50) |i| @memcpy(name[i * 3 ..][0..3], "\u{4e16}");
+    const notes = [_]project_config.WorkspaceDiagnostic{.{ .server_name = name[0..], .cause = .invalid_entry }};
+
+    const warning = skippedEntryWarning(&notes).?;
+    try std.testing.expect(std.unicode.utf8ValidateSlice(warning.key().?));
+    try std.testing.expectEqual(@as(usize, 126), warning.key().?.len);
+    try std.testing.expectEqualStrings(name[0..126], warning.key().?);
+    try std.testing.expectEqualStrings("ab", wholeCharacters("abc", 2));
+    try std.testing.expectEqualStrings("a", wholeCharacters("a\u{e9}", 2));
+    try std.testing.expectEqualStrings("", wholeCharacters("\u{e9}", 1));
+}
+
+test "status and doctor name the servers a mcpServers alias leaves unread, beside any entry they skip" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "home/.fx/mcp.json",
+        \\{"mcp":{"ok":{"type":"local","command":["/usr/bin/true"]},"bad":{"type":"http","url":"http://example.com/mcp"}},
+        \\ "mcpServers":{"other":{"command":"true"}}}
+    );
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try tmpDirPath(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace_root = try tmpDirPath(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const test_home = try TestHome.install(alloc, home);
+    defer test_home.deinit();
+
+    var inspection = try inspectLocalConfig(alloc, workspace_root);
+    defer inspection.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?[]const u8, null), inspection.inspection_error);
+    try std.testing.expectEqual(@as(usize, 1), inspection.snapshot.servers.len);
+    try std.testing.expectEqualStrings("ok", inspection.snapshot.servers[0].configured_name);
+    try expectNoted(&inspection, &.{
+        "~/.fx/mcp.json server 'bad' was skipped: its \"url\" isn't valid.",
+        "~/.fx/mcp.json server 'other' was skipped: the file has both \"mcp\" and \"mcpServers\", and fx reads only \"mcp\"; merge them into one.",
+    });
+    // The file's own warning stays the one status and doctor show.
+    switch (inspection.profile_diagnostic) {
+        .warning => |warning| try std.testing.expectEqual(mcp_contract.ProfileConfigWarningCause.ignored_mcp_servers_alias, warning.cause),
+        .clear, .failed => return error.TestUnexpectedResult,
+    }
+}
+
+test "a profile fx can't read as a whole still fails status and doctor" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "home/.fx/mcp.json", "{\"mcp\":");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try tmpDirPath(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace_root = try tmpDirPath(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const test_home = try TestHome.install(alloc, home);
+    defer test_home.deinit();
+
+    var inspection = try inspectLocalConfig(alloc, workspace_root);
+    defer inspection.deinit(alloc);
+
+    try std.testing.expectEqualStrings("McpConfigInvalidJson", inspection.inspection_error.?);
+    try std.testing.expectEqual(@as(usize, 0), inspection.snapshot.servers.len);
+    try std.testing.expectEqual(@as(usize, 0), inspection.snapshot.configuration_issues.len);
+    switch (inspection.profile_diagnostic) {
+        .failed => |err| try std.testing.expectEqual(error.McpConfigInvalidJson, err),
+        .clear, .warning => return error.TestUnexpectedResult,
+    }
+}
+
+test "MCP config diagnostic does not fail the profile for one entry fx can't read" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "home/.fx/mcp.json", status_profile_one_bad);
+    const home = try tmpDirPath(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const test_home = try TestHome.install(alloc, home);
+    defer test_home.deinit();
+
+    switch (try inspectProfileConfig(alloc)) {
+        .clear, .warning => {},
+        .failed => return error.TestUnexpectedResult,
+    }
 }
 
 test "workspace MCP loading expands command args environment and HTTP headers" {
