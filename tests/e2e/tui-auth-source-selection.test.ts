@@ -4151,6 +4151,14 @@ const TERMINAL_CONTROL = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/;
 const TEAMS_UNAVAILABLE_CLI =
   "fx login: Your Vercel teams could not be loaded. Nothing was saved; run fx login to try again.\n";
 const TEAMS_UNAVAILABLE_NOTICE = "Your Vercel teams could not be loaded.";
+const TEAMS_UNAVAILABLE_PICKER_NOTICE = `${TEAMS_UNAVAILABLE_NOTICE} The current team is unchanged.`;
+// Teams whose ids the gateway would refuse as a team: it takes only letters,
+// digits, "-" and "_", up to 128 bytes.
+const GATEWAY_REJECTED_TEAMS = [
+  { id: "bad id", slug: "spaced-id", name: "Spaced Id" },
+  { id: "team/slash", slug: "slashed-id", name: "Slashed Id" },
+  { id: "t\u00ebam_unicode", slug: "unicode-id", name: "Unicode Id" },
+];
 
 function fxLoginEnv(
   testHome: string,
@@ -4215,6 +4223,10 @@ for (const failure of [
   {
     name: "a team whose slug holds a control character",
     response: () => Response.json({ teams: [{ id: "team_123", slug: "bad\u001b[2Jslug", name: "Bad Slug" }] }),
+  },
+  {
+    name: "only teams whose id the gateway rejects",
+    response: () => Response.json({ teams: GATEWAY_REJECTED_TEAMS }),
   },
 ]) {
   test(`fx login keeps the saved sign-in when ${failure.name} leaves no team`, async () => {
@@ -4305,6 +4317,59 @@ test("fx login offers the readable teams when some entries are unreadable", asyn
   expect(result.stdout).not.toMatch(TERMINAL_CONTROL);
   const persisted = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as { team_id?: string };
   expect(persisted.team_id).toBe("team_123");
+}, 60_000);
+
+test("fx login offers only the teams the gateway accepts", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-cli-login-gateway-ids-"));
+  gateway = startFakeGateway([]);
+  oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+    teamsResponse: () => Response.json({
+      teams: [
+        ...GATEWAY_REJECTED_TEAMS,
+        { id: "team_123", slug: "vercel-labs", name: "Vercel Labs" },
+        { id: "team_456", slug: "other-team", name: "Other Team" },
+      ],
+    }),
+  });
+
+  const result = await runFx(["login"], {
+    env: fxLoginEnv(home, oauth.issuerUrl, gateway),
+    timeoutMs: TIMEOUT,
+  });
+
+  expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+  expect(result.stdout).toContain("  1. Vercel Labs (vercel-labs) (default)\n");
+  expect(result.stdout).toContain("  2. Other Team (other-team)\n");
+  for (const rejected of GATEWAY_REJECTED_TEAMS) expect(result.stdout).not.toContain(rejected.slug);
+  expect(result.stdout).toContain("Signed in to Vercel.");
+  const persisted = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as { team_id?: string };
+  expect(persisted.team_id).toBe("team_123");
+  expect(result.stderr).toBe("");
+}, 60_000);
+
+test("fx login signs in with the one team whose id the gateway accepts", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-cli-login-gateway-one-id-"));
+  gateway = startFakeGateway([]);
+  oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+    teamsResponse: () => Response.json({
+      teams: [...GATEWAY_REJECTED_TEAMS, { id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+    }),
+  });
+
+  const result = await runFx(["login"], {
+    env: fxLoginEnv(home, oauth.issuerUrl, gateway),
+    timeoutMs: TIMEOUT,
+  });
+
+  expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+  expect(result.stdout).toContain("Signed in to Vercel.");
+  expect(result.stderr).toBe("");
+  const persisted = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as {
+    team_id?: string;
+    team_slug?: string;
+  };
+  expect(persisted.team_id).toBe("team_123");
+  expect(persisted.team_slug).toBe("vercel-labs");
 }, 60_000);
 
 test("fx login killed while the team list loads keeps the saved sign-in", async () => {
@@ -4400,7 +4465,114 @@ tmuxTest(
 );
 
 tmuxTest(
-  "a sign-in opened by an expired login keeps the saved session when the team list fails",
+  "/login says the Vercel teams could not be loaded when no listed team has an id the gateway accepts",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-login-gateway-ids-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+      teamsResponse: () => Response.json({ teams: GATEWAY_REJECTED_TEAMS }),
+    });
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+    await session.sendKeys("Enter");
+    const notice = await session.waitForText(TEAMS_UNAVAILABLE_NOTICE, TIMEOUT);
+    expect(notice).not.toContain("Signed in to Vercel");
+    expect(notice).not.toContain("Choose a team to finish setup");
+    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+// The provider picker lists teams with the saved sign-in instead of signing in
+// again. A list with no usable team is the same problem there as in fx login
+// and /login: it says so, and the saved sign-in keeps its team.
+for (const unusable of [
+  {
+    name: "only unreadable team entries",
+    response: () => Response.json({ teams: [{ id: 123, slug: "acme" }, "x"] }),
+  },
+  { name: "only teams whose id the gateway rejects", response: () => Response.json({ teams: GATEWAY_REJECTED_TEAMS }) },
+  { name: "a body that is JSON but not a team list", response: () => Response.json({ teams: "none" }) },
+]) {
+  tmuxTest(
+    `the provider picker says the Vercel teams could not be loaded for ${unusable.name} and keeps the saved sign-in`,
+    async () => {
+      home = mkdtempSync(join(tmpdir(), "fx-tui-picker-unusable-teams-"));
+      stderrPath = join(home, "stderr.log");
+      writeFileSync(stderrPath, "");
+      gateway = startFakeGateway([]);
+      oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+        teamsResponse: unusable.response,
+      });
+      writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+      const authPath = join(home, ".fx", "auth.json");
+      const seeded = readFileSync(authPath);
+
+      session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+      await session.waitForComposer(TIMEOUT);
+      await openProviderPicker(session);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+      await session.sendKeys("Enter");
+      const notice = await session.waitForText(TEAMS_UNAVAILABLE_PICKER_NOTICE, TIMEOUT);
+      expect(notice).not.toContain("Credential refresh");
+      expect(notice).not.toContain("Vercel team · Search:");
+      await session.waitForComposer(TIMEOUT);
+      expect(readFileSync(authPath).equals(seeded)).toBe(true);
+      expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual(["GET /v2/teams"]);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
+}
+
+tmuxTest(
+  "the provider picker offers only the teams the gateway accepts",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-picker-gateway-ids-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+      teamsResponse: () => Response.json({
+        teams: [...GATEWAY_REJECTED_TEAMS, { id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+      }),
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_old");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await openProviderPicker(session);
+    await session.sendKeys("Enter");
+    await session.waitForPane((pane) => pane.includes("oauth") && pane.includes("api-key"), TIMEOUT);
+    await session.sendKeys("Enter");
+    const picker = await session.waitForText("vercel-labs", TIMEOUT);
+    for (const rejected of GATEWAY_REJECTED_TEAMS) {
+      expect(picker).not.toContain(rejected.name);
+      expect(picker).not.toContain(rejected.slug);
+    }
+    await session.sendKeys("Enter");
+    await session.waitForText("Changed Vercel team to Vercel Labs", TIMEOUT);
+    const persisted = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as { team_id?: string };
+    expect(persisted.team_id).toBe("team_123");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "a sign-in opened by an expired login has no saved session when the team list is asked for and saves nothing when it fails",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-recovery-teams-unavailable-"));
     stderrPath = join(home, "stderr.log");

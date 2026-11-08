@@ -3,7 +3,8 @@
 # (src/core/auth/login_flow.zig runLogin and completeSignIn) with TLC and
 # require each config's expected verdict.
 #
-# sign-in-teams.cfg and sign-in-teams-deep.cfg are the design and must pass.
+# sign-in-teams.cfg and sign-in-teams-deep.cfg are the design and must pass: for
+# `fx login`, the in-app /login, and the picker's team column.
 # Each sign-in-teams-today-*.cfg is fx before it, and each rule it names must
 # catch it:
 #
@@ -20,6 +21,9 @@
 #   swallow     a failed team request is read as an empty list                TellsTheTruth
 #   unreadable  a list with no usable entry is read as an empty list          TellsTheTruth
 #   strict      a team whose name holds control characters is dropped         OffersEveryTeam
+#   id          a team id the gateway rejects is kept and saved               SavesOnlyUsableTeam
+#   picker      the picker reports a list it cannot read as a credential      SameOutcomeEverywhere
+#               problem
 #
 # SignInTeamsTrace.tla checks sign-ins of the built fx binary against the
 # model; tests/tla/drivers/auth/driver.ts runs it.
@@ -49,4 +53,6 @@ SignInTeams sign-in-teams-mutation-save KeepsPriorSession
 SignInTeams sign-in-teams-mutation-swallow TellsTheTruth
 SignInTeams sign-in-teams-mutation-unreadable TellsTheTruth
 SignInTeams sign-in-teams-mutation-strict OffersEveryTeam
+SignInTeams sign-in-teams-mutation-id SavesOnlyUsableTeam
+SignInTeams sign-in-teams-mutation-picker SameOutcomeEverywhere
 VERDICTS

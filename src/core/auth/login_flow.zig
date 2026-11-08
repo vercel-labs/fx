@@ -15,6 +15,7 @@ const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -1360,16 +1361,18 @@ fn parseTeams(alloc: Allocator, bytes: []const u8) !std.ArrayList(Team) {
 }
 
 /// One team from a /v2/teams entry, or null when the entry has no string id
-/// or slug, or a slug the terminal would act on. The name loses its control
-/// characters and is the slug when nothing printable is left, so no team
-/// text reaches a terminal raw (`tests/tla/auth/SignInTeams.tla` NoCrash,
-/// NoRawControls).
+/// or slug, an id the gateway would reject, or a slug the terminal would act
+/// on. A session saved with a team id the gateway rejects cannot make a
+/// request (`tests/tla/auth/SignInTeams.tla` SavesOnlyUsableTeam). The name
+/// loses its control characters and is the slug when nothing printable is
+/// left, so no team text reaches a terminal raw (`tests/tla/auth/SignInTeams.tla`
+/// NoCrash, NoRawControls).
 fn readTeam(alloc: Allocator, entry: std.json.Value) !?Team {
     if (entry != .object) return null;
     const id = entry.object.get("id") orelse return null;
     const slug = entry.object.get("slug") orelse return null;
     if (id != .string or slug != .string) return null;
-    if (id.string.len == 0 or !isPrintableTeamText(slug.string)) return null;
+    if (!types.validGatewayTeam(id.string) or !isPrintableTeamText(slug.string)) return null;
     const raw_name = if (entry.object.get("name")) |value| switch (value) {
         .string => |text| text,
         else => "",
@@ -1913,6 +1916,9 @@ test "login flow skips teams it cannot show or use" {
         \\{"id":"team_3","slug":"bad\u0007slug","name":"Bad Slug"},
         \\{"id":"team_4","slug":"bad\u009bslug"},
         \\{"id":"team_5","slug":"two words"},
+        \\{"id":"bad id","slug":"spaced-id"},
+        \\{"id":"team/slash","slug":"slashed-id"},
+        \\{"id":"t\u00ebam_unicode","slug":"unicode-id"},
         \\{"id":"team_1","slug":"good","name":"Good"}
         \\]}
     );
@@ -1921,11 +1927,49 @@ test "login flow skips teams it cannot show or use" {
     try std.testing.expectEqualStrings("team_1", teams.items[0].id);
 }
 
+test "login flow skips a team id the gateway would reject" {
+    const alloc = std.testing.allocator;
+    const bad_ids = [_][]const u8{ "bad id", "team/slash", "t\\u00ebam_unicode", "team?x=1", "team\\u0000id" };
+    for (bad_ids) |bad_id| {
+        // Alone, the entry leaves no team; next to a good team it is skipped.
+        const alone = try alloc.print("{{\"teams\":[{{\"id\":\"{s}\",\"slug\":\"odd\"}}]}}", .{bad_id});
+        defer alloc.free(alone);
+        try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, alone));
+
+        const mixed = try alloc.print(
+            "{{\"teams\":[{{\"id\":\"{s}\",\"slug\":\"odd\"}},{{\"id\":\"team_1\",\"slug\":\"good\"}}]}}",
+            .{bad_id},
+        );
+        defer alloc.free(mixed);
+        var teams = try parseTeams(alloc, mixed);
+        defer freeTeams(alloc, &teams);
+        try std.testing.expectEqual(@as(usize, 1), teams.items.len);
+        try std.testing.expectEqualStrings("team_1", teams.items[0].id);
+    }
+}
+
+test "login flow keeps a team id up to the gateway's length limit" {
+    const alloc = std.testing.allocator;
+    const longest: [128]u8 = @splat('a');
+    const past_limit: [129]u8 = @splat('a');
+    const at_limit = try alloc.print("{{\"teams\":[{{\"id\":\"{s}\",\"slug\":\"long\"}}]}}", .{&longest});
+    defer alloc.free(at_limit);
+    var teams = try parseTeams(alloc, at_limit);
+    defer freeTeams(alloc, &teams);
+    try std.testing.expectEqual(@as(usize, 1), teams.items.len);
+    try std.testing.expectEqualStrings(&longest, teams.items[0].id);
+
+    const past = try alloc.print("{{\"teams\":[{{\"id\":\"{s}\",\"slug\":\"long\"}}]}}", .{&past_limit});
+    defer alloc.free(past);
+    try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, past));
+}
+
 test "login flow rejects a team list with nothing usable in it" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, "{\"teams\":[{\"id\":123,\"slug\":\"acme\"}]}"));
     try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, "{\"teams\":[{\"slug\":\"no-id\"},\"not-a-team\"]}"));
     try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, "{\"teams\":[{\"id\":\"t\",\"slug\":\"\\u001b[2J\"}]}"));
+    try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, "{\"teams\":[{\"id\":\"bad id\",\"slug\":\"a\"},{\"id\":\"team/slash\",\"slug\":\"b\"}]}"));
     try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, "{\"teams\":{}}"));
     try std.testing.expectError(error.InvalidTeamsResponse, parseTeams(alloc, "[]"));
 }
@@ -1949,7 +1993,9 @@ fn fuzzTeamList(_: void, smith: *std.testing.Smith) !void {
     };
     defer freeTeams(std.testing.allocator, &teams);
     for (teams.items) |team| {
-        try std.testing.expect(team.id.len > 0);
+        // The gateway takes a team id only in this form, and a saved sign-in
+        // whose team fails it can no longer be used.
+        try std.testing.expect(types.validGatewayTeam(team.id));
         try std.testing.expect(team.slug.len > 0);
         try std.testing.expect(team.name.len > 0);
         // Valid UTF-8 with no C0 control, DEL, or C1 control, on one line.
@@ -1967,6 +2013,7 @@ test "team list parsing keeps names and slugs terminal-safe on fuzzed bytes" {
             "{\"teams\":[{\"id\":\"team_1\",\"slug\":\"one\\u009b\",\"name\":\"One\"},{\"id\":\"team_2\",\"slug\":\"two\",\"name\":\"\\u0007\\r\\n\"}]}",
             "{\"teams\":[{\"id\":\"team_1\",\"slug\":\"one\",\"name\":\"\\ud83d\\udc69\\u200d\\ud83d\\udcbb\\u007f\"}]}",
             "{\"teams\":[{\"id\":7,\"slug\":\"seven\"},\"x\"]}",
+            "{\"teams\":[{\"id\":\"bad id\",\"slug\":\"spaced\"},{\"id\":\"team/slash\",\"slug\":\"slashed\"},{\"id\":\"team_1\",\"slug\":\"one\"}]}",
             "{\"teams\":[]}",
             "{",
         }) ++ @import("fuzz_corpus").team_list.*),
@@ -2001,6 +2048,7 @@ test "sign-in fails without saving when the team list leaves no team" {
         .{ .disposition = .rejected, .body = "upstream failure", .expected = error.TeamsUnavailable },
         .{ .disposition = .accepted, .body = "<html></html>", .expected = error.TeamsUnavailable },
         .{ .disposition = .accepted, .body = "{\"teams\":[{\"id\":123,\"slug\":\"acme\"}]}", .expected = error.TeamsUnavailable },
+        .{ .disposition = .accepted, .body = "{\"teams\":[{\"id\":\"bad id\",\"slug\":\"a\"},{\"id\":\"team/slash\",\"slug\":\"b\"}]}", .expected = error.TeamsUnavailable },
         .{ .disposition = .accepted, .body = "{\"teams\":[]}", .expected = error.NoTeams },
     };
     for (cases) |case| {

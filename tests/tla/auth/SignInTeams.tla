@@ -2,20 +2,27 @@
 (***************************************************************************)
 (* What a Vercel sign-in does with the team list it reads after the token  *)
 (* arrives (src/core/auth/login_flow.zig): `fx login` in a shell           *)
-(* (runLogin), and the in-app /login (SignInRuntime.completeToken with     *)
+(* (runLogin), the in-app /login (SignInRuntime.completeToken with         *)
 (* completeSignIn, then collectSignInFacts in                              *)
-(* src/core/app/app_auth_runtime.zig).                                     *)
+(* src/core/app/app_auth_runtime.zig), and the team column of the in-app   *)
+(* /login and /provider picker, which lists the teams with a saved         *)
+(* sign-in and asks for no new token (finishTeamsForProviderPicker).       *)
 (*                                                                         *)
 (* /v2/teams answers with one of:                                          *)
 (*   status "error"    a non-2xx status, a transport failure, or a body    *)
 (*                     past the size limit                                 *)
-(*   status "garbage"  a 2xx body that is not a team list                  *)
+(*   status "garbage"  a 2xx body that is not a team list. The picker      *)
+(*                     reads a body that is not even JSON as a credential  *)
+(*                     failure, as it did before this change; the driver   *)
+(*                     sends the picker only garbage that parses as JSON.  *)
 (*   status "ok"       a list of entries, each one of:                     *)
 (*     "plain"       a readable team with a printable name                 *)
 (*     "ctl_name"    a readable team whose name mixes control characters   *)
 (*                   with text, such as "Example\x1b[2J Team"              *)
 (*     "ctl_only"    a readable team whose name has nothing printable      *)
 (*     "ctl_slug"    a team whose slug holds a control character           *)
+(*     "bad_id"      a team whose id the gateway rejects, such as          *)
+(*                   "bad id" or "team/slash" (types.validGatewayTeam)     *)
 (*     "unreadable"  not an object, or no string id or slug                *)
 (*                                                                         *)
 (* A team is usable when its id and slug can be used and shown: "plain",   *)
@@ -23,20 +30,24 @@
 (*                                                                         *)
 (* saved is what the session store holds: "none", "teamed" (the session    *)
 (* from before this sign-in), "new_teamless" (the new token with no team), *)
-(* or "new_teamed". prior is what it held at the start. The in-app sign-in *)
+(* "new_teamed", or "reteamed" (the saved session, with the team the       *)
+(* picker chose). prior is what it held at the start. The in-app sign-in   *)
 (* saves the new session before its team picker opens, and the picker's    *)
-(* choice adds the team; `fx login` picks the team first and saves once.   *)
+(* choice adds the team; `fx login` picks the team first and saves once;   *)
+(* the picker path saves nothing until the person chooses a team. team is  *)
+(* the kind of entry saved as the team, or "none".                         *)
 (*                                                                         *)
 (* Rule picks the code: "design" is the fix, "today" is fx before it, and  *)
 (* each "mut_*" plants one defect; check.sh names the rule that catches    *)
-(* it. SignInTeamsTrace.tla replays runs of the built fx against this      *)
+(* it. The picker path is modeled for the fix only: "today" has no picker  *)
+(* runs. SignInTeamsTrace.tla replays runs of the built fx against this    *)
 (* model; tests/tla/drivers/auth/driver.ts makes them.                     *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS Surfaces, Priors, MaxEntries, Rule
 
-Entries == {"plain", "ctl_name", "ctl_only", "ctl_slug", "unreadable"}
+Entries == {"plain", "ctl_name", "ctl_only", "ctl_slug", "bad_id", "unreadable"}
 Lists == UNION {[1..n -> Entries] : n \in 0..MaxEntries}
 Responses ==
     {[status |-> s, entries |-> <<>>] : s \in {"error", "garbage"}}
@@ -44,21 +55,24 @@ Responses ==
 NoResponse == [status |-> "none", entries |-> <<>>]
 
 Outcomes == {"none", "signed_in", "picking", "picker_closed", "teams_unavailable",
-             "no_teams", "gateway_missing", "notice_saved", "crashed", "killed", "cancelled"}
-Saves == {"none", "teamed", "new_teamless", "new_teamed"}
+             "no_teams", "gateway_missing", "notice_saved", "credential_failure",
+             "crashed", "killed", "cancelled"}
+Saves == {"none", "teamed", "new_teamless", "new_teamed", "reteamed"}
+Teams == {"none"} \cup Entries
 
 VARIABLES
-    surface,  \* "cli" (fx login) or "app" (the in-app /login)
+    surface,  \* "cli" (fx login), "app" (the in-app /login), or "picker" (its team column)
     prior,    \* what the session store held before the sign-in
     phase,    \* "waiting" for the token, "fetching" the teams, "picking", "done"
     resp,     \* what /v2/teams answered
     saved,    \* what the session store holds
+    team,     \* the kind of entry saved as the team, or "none"
     outcome,  \* what the person was told, or how fx ended
     offered,  \* how many teams the picker offered
     rawOut,   \* fx wrote a team's control characters to the terminal
     alive     \* the fx process is still running
 
-vars == <<surface, prior, phase, resp, saved, outcome, offered, rawOut, alive>>
+vars == <<surface, prior, phase, resp, saved, team, outcome, offered, rawOut, alive>>
 
 -----------------------------------------------------------------------------
 (* What the response is, whatever the code makes of it. *)
@@ -75,10 +89,12 @@ Truth(r) ==
 
 (* What the code makes of it under Rule. *)
 
-\* parseTeams keeps an entry.
+\* parseTeams keeps an entry. "mut_id" is readTeam without its check of the
+\* id: any non-empty id counts, as fx kept one before this change too.
 Keeps(e) ==
     CASE Rule \in {"today", "mut_slug"} -> e # "unreadable"
       [] Rule = "mut_strict" -> e = "plain"
+      [] Rule = "mut_id" -> Usable(e) \/ e = "bad_id"
       [] OTHER -> Usable(e)
 
 \* A kept entry's name still holds its control characters. The driver's
@@ -102,14 +118,39 @@ Result(r) ==
         THEN IF Rule \in {"today", "mut_unreadable"} THEN "empty" ELSE "unavailable"
     ELSE "teams"
 
+\* What the picker's team column says when the list is unavailable. A failed
+\* request always said so. "mut_picker" is finishTeamsForProviderPicker
+\* without its case for InvalidTeamsResponse, which a list that could not be
+\* read or held no usable team reaches: it reported a credential problem.
+PickerFailure(r) ==
+    IF Rule = "mut_picker" /\ r.status # "error"
+        THEN "credential_failure"
+        ELSE "teams_unavailable"
+
 -----------------------------------------------------------------------------
 
+\* The picker path starts from a saved sign-in and asks for the teams at once.
+Starts(s, p) ==
+    /\ s = "picker" => (p = "teamed" /\ Rule # "today")
+    /\ surface' = s
+    /\ prior' = p
+    /\ phase' = IF s = "picker" THEN "fetching" ELSE "waiting"
+    /\ resp' = NoResponse
+    /\ saved' = p
+    /\ team' = "none"
+    /\ outcome' = "none"
+    /\ offered' = 0
+    /\ rawOut' = FALSE
+    /\ alive' = TRUE
+
 InitWith(s, p) ==
+    /\ s = "picker" => (p = "teamed" /\ Rule # "today")
     /\ surface = s
     /\ prior = p
-    /\ phase = "waiting"
+    /\ phase = IF s = "picker" THEN "fetching" ELSE "waiting"
     /\ resp = NoResponse
     /\ saved = p
+    /\ team = "none"
     /\ outcome = "none"
     /\ offered = 0
     /\ rawOut = FALSE
@@ -118,44 +159,38 @@ InitWith(s, p) ==
 Init == \E s \in Surfaces, p \in Priors : InitWith(s, p)
 
 \* A fresh sign-in, for trace validation of several runs in a row.
-Reset(s, p) ==
-    /\ surface' = s
-    /\ prior' = p
-    /\ phase' = "waiting"
-    /\ resp' = NoResponse
-    /\ saved' = p
-    /\ outcome' = "none"
-    /\ offered' = 0
-    /\ rawOut' = FALSE
-    /\ alive' = TRUE
+Reset(s, p) == Starts(s, p)
 
 \* The issuer grants the token; fx asks for the teams.
 Token ==
     /\ phase = "waiting"
     /\ phase' = "fetching"
-    /\ UNCHANGED <<surface, prior, resp, saved, outcome, offered, rawOut, alive>>
+    /\ UNCHANGED <<surface, prior, resp, saved, team, outcome, offered, rawOut, alive>>
 
 \* The sign-in ends without a team and says why.
 Fail(o) ==
     /\ phase' = "done"
     /\ outcome' = o
     /\ saved' = IF Rule = "mut_save" THEN "new_teamless" ELSE saved
-    /\ UNCHANGED <<offered, rawOut, alive>>
+    /\ UNCHANGED <<offered, rawOut, alive, team>>
 
 \* fx before the change: an empty list saved the session with no team.
 SaveTeamless ==
     /\ phase' = "done"
     /\ saved' = "new_teamless"
     /\ outcome' = IF surface = "cli" THEN "gateway_missing" ELSE "notice_saved"
-    /\ UNCHANGED <<offered, rawOut, alive>>
+    /\ UNCHANGED <<offered, rawOut, alive, team>>
 
 \* fx login lists the teams when there are two or more, takes the default
-\* (the first), and saves the session with it.
+\* (the first), and saves the session with it. A team whose id the gateway
+\* rejects is saved all the same under "today" and "mut_id", and the next
+\* step cannot use it.
 CliTeams(k) ==
     /\ offered' = Len(k)
     /\ rawOut' = (Len(k) >= 2 /\ \E i \in DOMAIN k : RawName(k[i]) \/ RawSlug(k[i]))
     /\ saved' = "new_teamed"
-    /\ outcome' = "signed_in"
+    /\ team' = k[1]
+    /\ outcome' = IF k[1] = "bad_id" THEN "gateway_missing" ELSE "signed_in"
     /\ phase' = "done"
     /\ UNCHANGED alive
 
@@ -164,7 +199,7 @@ CliTeams(k) ==
 AppTeams(k) ==
     /\ offered' = Len(k)
     /\ saved' = "new_teamless"
-    /\ UNCHANGED rawOut
+    /\ UNCHANGED <<rawOut, team>>
     /\ IF \E i \in DOMAIN k : BreaksBand(k[i])
          THEN /\ alive' = FALSE
               /\ outcome' = "crashed"
@@ -173,20 +208,32 @@ AppTeams(k) ==
               /\ outcome' = "picking"
               /\ phase' = "picking"
 
+\* The picker's team column offers the teams and saves nothing yet.
+PickerTeams(k) ==
+    /\ offered' = Len(k)
+    /\ outcome' = "picking"
+    /\ phase' = "picking"
+    /\ UNCHANGED <<saved, team, rawOut, alive>>
+
 Answer(r) ==
     /\ phase = "fetching"
     /\ resp' = r
     /\ UNCHANGED <<surface, prior>>
-    /\ CASE Result(r) = "unavailable" -> Fail("teams_unavailable")
+    /\ CASE Result(r) = "unavailable" ->
+               Fail(IF surface = "picker" THEN PickerFailure(r) ELSE "teams_unavailable")
          [] Result(r) = "empty" -> IF Rule = "today" THEN SaveTeamless ELSE Fail("no_teams")
-         [] Result(r) = "teams" -> IF surface = "cli" THEN CliTeams(Kept(r)) ELSE AppTeams(Kept(r))
+         [] Result(r) = "teams" ->
+               IF surface = "cli" THEN CliTeams(Kept(r))
+               ELSE IF surface = "app" THEN AppTeams(Kept(r))
+               ELSE PickerTeams(Kept(r))
 
 \* The person takes the picker's first team, the default. fx saves it, then
 \* says so with the team's name and slug.
 Pick ==
     /\ phase = "picking"
     /\ phase' = "done"
-    /\ saved' = "new_teamed"
+    /\ saved' = IF surface = "picker" THEN "reteamed" ELSE "new_teamed"
+    /\ team' = Kept(resp)[1]
     /\ IF RawSlug(Kept(resp)[1])
          THEN /\ alive' = FALSE
               /\ outcome' = "crashed"
@@ -199,7 +246,7 @@ ClosePicker ==
     /\ phase = "picking"
     /\ phase' = "done"
     /\ outcome' = "picker_closed"
-    /\ UNCHANGED <<surface, prior, resp, saved, offered, rawOut, alive>>
+    /\ UNCHANGED <<surface, prior, resp, saved, team, offered, rawOut, alive>>
 
 \* The in-app sign-in is cancelled before it saves anything.
 Cancel ==
@@ -207,7 +254,7 @@ Cancel ==
     /\ phase \in {"waiting", "fetching"}
     /\ phase' = "done"
     /\ outcome' = "cancelled"
-    /\ UNCHANGED <<surface, prior, resp, saved, offered, rawOut, alive>>
+    /\ UNCHANGED <<surface, prior, resp, saved, team, offered, rawOut, alive>>
 
 \* fx is killed at any point; a kill saves nothing.
 Kill ==
@@ -215,7 +262,7 @@ Kill ==
     /\ phase' = "done"
     /\ alive' = FALSE
     /\ outcome' = "killed"
-    /\ UNCHANGED <<surface, prior, resp, saved, offered, rawOut>>
+    /\ UNCHANGED <<surface, prior, resp, saved, team, offered, rawOut>>
 
 Ended == phase = "done" /\ UNCHANGED vars
 
@@ -233,11 +280,13 @@ Spec == Init /\ [][Next]_vars
 -----------------------------------------------------------------------------
 
 TypeOK ==
-    /\ surface \in {"cli", "app"}
+    /\ surface \in {"cli", "app", "picker"}
     /\ prior \in {"none", "teamed"}
+    /\ surface = "picker" => prior = "teamed"
     /\ phase \in {"waiting", "fetching", "picking", "done"}
     /\ resp \in Responses \cup {NoResponse}
     /\ saved \in Saves
+    /\ team \in Teams
     /\ outcome \in Outcomes
     /\ offered \in 0..MaxEntries
     /\ rawOut \in BOOLEAN
@@ -266,4 +315,27 @@ TellsTheTruth ==
 \* Every usable team is offered, control characters in its name or not.
 OffersEveryTeam ==
     outcome \in {"signed_in", "picking", "picker_closed"} => offered = UsableCount(resp)
+
+\* An entry that cannot be used is never saved as the team: a saved sign-in
+\* whose team the gateway rejects cannot make a request, and replaces one
+\* that could.
+SavesOnlyUsableTeam == team = "none" \/ Usable(team)
+
+\* What fx login says for a list, which every path says for the same list.
+Said(r) ==
+    CASE Truth(r) = "unavailable" -> "teams_unavailable"
+      [] Truth(r) = "empty" -> "no_teams"
+      [] OTHER -> "teams"
+
+\* What a finished sign-in's outcome tells the person about the list.
+Heard(o) ==
+    CASE o \in {"teams_unavailable", "no_teams"} -> o
+      [] o \in {"signed_in", "picking", "picker_closed"} -> "teams"
+      [] OTHER -> "other"
+
+\* fx login, the in-app /login, and the picker's team column tell the same
+\* story for the same list: a list with no usable team is never a credential
+\* problem, a sign-in with no team, or an account with no teams.
+SameOutcomeEverywhere ==
+    (Answered /\ outcome \notin {"killed", "cancelled", "crashed"}) => Heard(outcome) = Said(resp)
 =============================================================================
