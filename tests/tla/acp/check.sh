@@ -6,8 +6,12 @@
 # /permissions. AcpSpeed: the per-session Standard, Fast, and Ultrafast speed
 # contract. Both configs must pass. AcpChildApproval: how a subagent's
 # permission request reaches the client through its parent session. Its
-# design configs must pass; the code before it (MCAcpChildApprovalToday) and
-# two planted bugs must each break the property they name.
+# design configs (MCAcpChildApproval, MCAcpChildApprovalReserve,
+# MCAcpChildApprovalAnswered, MCAcpChildApprovalNoHost) must pass. The code
+# before the change (MCAcpChildApprovalToday), two planted bugs, and the
+# behavior of the head the repair started from, one config per law
+# (StaleCard, SpawnLeak, SharedIds, Starved, CancelGap), must each break the
+# property they name.
 #
 # The planted bugs and the runs of the real `fx acp` binary are in
 # ../drivers/acp/:
@@ -28,9 +32,15 @@ tlc_verdicts "$@" <<'EOF'
 MCAcpPermissionModes MCAcpPermissionModes -
 MCAcpSpeed MCAcpSpeed -
 AcpChildApproval MCAcpChildApproval -
+AcpChildApproval MCAcpChildApprovalReserve -
 AcpChildApproval MCAcpChildApprovalAnswered -
 AcpChildApproval MCAcpChildApprovalNoHost -
 AcpChildApproval MCAcpChildApprovalToday temporal
 AcpChildApproval MCAcpChildApprovalSplitGate NoStrandedRequest
 AcpChildApproval MCAcpChildApprovalStopIgnored temporal
+AcpChildApproval MCAcpChildApprovalStaleCard temporal
+AcpChildApproval MCAcpChildApprovalSpawnLeak NoStrandedRequest
+AcpChildApproval MCAcpChildApprovalSharedIds UniqueIds
+AcpChildApproval MCAcpChildApprovalStarved ParentNeverStarved
+AcpChildApproval MCAcpChildApprovalCancelGap ShownRequestIsOpen
 EOF

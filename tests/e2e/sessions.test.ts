@@ -2240,7 +2240,8 @@ test("fx ask runs a subagent as a v2 child with its own log, recorded in the par
 
 test("fx ask denies a subagent's gated write at once in ask mode", async () => {
   // fx ask has no way to ask the person for a subagent, so the subagent's
-  // write is denied at once instead of waiting forever (SEC-81).
+  // write is refused at once instead of waiting forever, and its model reads
+  // why: nobody was asked, which is not a refusal by the person.
   const fixture = createFixture("fx-v2-subagent-ask-deny-");
   const seen: string[] = [];
   let afterDenial = "";
@@ -2276,7 +2277,10 @@ test("fx ask denies a subagent's gated write at once in ask mode", async () => {
     expect(existsSync(join(fixture.workspace, "child.txt"))).toBe(false);
     expect(seen.filter((kind) => kind === "child-first")).toHaveLength(1);
     expect(seen.filter((kind) => kind === "child-after")).toHaveLength(1);
-    expect(afterDenial).toContain("denied");
+    expect(afterDenial).toContain("permission_required");
+    expect(afterDenial).toContain("The tool did not run");
+    expect(afterDenial).not.toContain("user_denied");
+    expect(afterDenial).not.toContain("Permission denied by user");
     expect(JSON.parse(result.stdout).output).toContain("PARENT_REPORT_DONE");
   } finally {
     gateway.stop();

@@ -300,9 +300,14 @@ pub const TurnContext = struct {
     approval_worker_route: ?approval_registry_mod.WorkerRoute = null,
     /// For a turn no screen shows, in fx acp and fx ask: the prompter its
     /// host handed the run. A permission request goes to it on this turn's
-    /// thread; with none, the request is denied at once rather than left
-    /// waiting on a worker nobody reads.
+    /// thread; with none, the request fails at once with
+    /// `error.PermissionPromptUnavailable` rather than waiting on a worker
+    /// nobody reads.
     host_prompter: ?permission_prompter.Prompter = null,
+    /// Where the host hears each of this turn's calls start and end, when it
+    /// shows them: fx acp ends the card a permission request announced with
+    /// the call's real status. Set for the length of one run.
+    tool_activity_sink: ?runtime_deps.ToolActivityRecorder = null,
     child_id: ?[]const u8 = null,
     /// The name the parent gave the child, such as `reviewer`, or null for a
     /// one-off. Borrowed for the turn.
@@ -477,8 +482,12 @@ pub const TurnContext = struct {
         );
     }
 
-    /// Asks the host's prompter, which answers on this thread. Every path
-    /// without an answer denies, and the trace says why (SEC-81).
+    /// Asks the host's prompter, which answers on this thread. A subagent that
+    /// cannot be asked, because the host gave no prompter, its phase did not
+    /// change, or the prompter failed, fails with
+    /// `error.PermissionPromptUnavailable`: admission turns that into an
+    /// outcome that says approval was required and could not be asked, where a
+    /// denial would say the person refused. Nothing runs, and the trace says why.
     fn askHost(
         self: *TurnContext,
         alloc: Allocator,
@@ -490,19 +499,19 @@ pub const TurnContext = struct {
         work_id: []const u8,
     ) !permission_request.OwnedPermissionResponse {
         const host = self.host_prompter orelse {
-            debug_trace.logf("subagent", "approval denied child_id={s} work_id={s} reason=no_host_prompter", .{ child_id, work_id });
-            return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
+            debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=no_host_prompter", .{ child_id, work_id });
+            return error.PermissionPromptUnavailable;
         };
         self.transitionPhase(work_id, .awaiting_approval) catch |err| {
-            debug_trace.logf("subagent", "approval denied child_id={s} work_id={s} reason=phase err={s}", .{ child_id, work_id, @errorName(err) });
-            return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
+            debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=phase err={s}", .{ child_id, work_id, @errorName(err) });
+            return error.PermissionPromptUnavailable;
         };
         defer self.transitionPhase(work_id, .running) catch |err| {
             debug_trace.logf("subagent", "approval phase not restored child_id={s} work_id={s} err={s}", .{ child_id, work_id, @errorName(err) });
         };
         return host.request(alloc, request, call, review, grant_offer) catch |err| {
-            debug_trace.logf("subagent", "approval denied child_id={s} work_id={s} reason=host err={s}", .{ child_id, work_id, @errorName(err) });
-            return permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
+            debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=host err={s}", .{ child_id, work_id, @errorName(err) });
+            return error.PermissionPromptUnavailable;
         };
     }
 
@@ -557,11 +566,15 @@ pub const TurnContext = struct {
     }
 
     fn recordToolActivity(
-        _: *anyopaque,
-        _: []const u8,
-        _: []const u8,
-        _: runtime_deps.ToolActivityPhase,
-    ) !void {}
+        raw: *anyopaque,
+        call_id: []const u8,
+        tool_name: []const u8,
+        phase: runtime_deps.ToolActivityPhase,
+    ) !void {
+        const self: *TurnContext = @ptrCast(@alignCast(raw));
+        const sink = self.tool_activity_sink orelse return;
+        try sink.record(call_id, tool_name, phase);
+    }
 
     pub fn registerApproval(
         self: *TurnContext,

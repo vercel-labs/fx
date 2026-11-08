@@ -1075,23 +1075,25 @@ fn handleClientResponse(state: *ServerState, alloc: Allocator, msg: *const jsonr
         return;
     } else null;
 
-    state.outbound_mutex.lockUncancelable(io_mod.getIo());
-    defer state.outbound_mutex.unlock(io_mod.getIo());
-    const pending = state.pending_outbound.getPtr(numeric_id) orelse {
-        if (result_copy) |value| alloc.free(value);
-        if (error_copy) |value| alloc.free(value);
-        return;
+    // An answer for no request fx waits on, or for one already settled, is
+    // dropped; the trace says which.
+    const ignored: ?[]const u8 = blk: {
+        state.outbound_mutex.lockUncancelable(io_mod.getIo());
+        defer state.outbound_mutex.unlock(io_mod.getIo());
+        const pending = state.pending_outbound.getPtr(numeric_id) orelse break :blk "no_pending_request";
+        if (pending.response != null) break :blk "already_settled";
+        pending.response = .{
+            .result_json = result_copy,
+            .error_json = error_copy,
+        };
+        state.outbound_cond.broadcast(io_mod.getIo());
+        break :blk null;
     };
-    if (pending.response != null) {
+    if (ignored) |reason| {
+        debug_trace.logf("acp", "client answer ignored id={d} reason={s}", .{ numeric_id, reason });
         if (result_copy) |value| alloc.free(value);
         if (error_copy) |value| alloc.free(value);
-        return;
     }
-    pending.response = .{
-        .result_json = result_copy,
-        .error_json = error_copy,
-    };
-    state.outbound_cond.broadcast(io_mod.getIo());
 }
 
 fn parsePermissionDecision(root: std.json.Value) ?types.ToolPermissionDecision {
@@ -1113,14 +1115,20 @@ fn parsePermissionDecision(root: std.json.Value) ?types.ToolPermissionDecision {
 pub fn beginOutboundRequest(state: *ServerState, kind: OutboundKind) !?u64 {
     state.outbound_mutex.lockUncancelable(io_mod.getIo());
     defer state.outbound_mutex.unlock(io_mod.getIo());
-    if (state.pending_outbound.count() >= max_pending_outbound or
+    return insertPendingLocked(state, .{ .kind = kind }, max_pending_outbound);
+}
+
+/// Inserts `entry` under the next request id. Null when the registry already
+/// holds `limit` entries or the ids ran out. The caller holds `outbound_mutex`.
+fn insertPendingLocked(state: *ServerState, entry: PendingOutbound, limit: usize) error{OutOfMemory}!?u64 {
+    if (state.pending_outbound.count() >= limit or
         state.next_outbound_request_id > @as(u64, @intCast(std.math.maxInt(i64))))
     {
         return null;
     }
     const id = state.next_outbound_request_id;
+    try state.pending_outbound.put(state.alloc, id, entry);
     state.next_outbound_request_id += 1;
-    try state.pending_outbound.put(state.alloc, id, .{ .kind = kind });
     return id;
 }
 
@@ -1188,13 +1196,22 @@ fn cancelOutboundRequestLocked(state: *ServerState, id: u64) bool {
 }
 
 fn cancelPendingOutbound(state: *ServerState, notify_client: bool) void {
+    cancelPendingEntries(state, false, notify_client, "session_cancel");
+}
+
+/// Shuts the subagent gate and cancels every unanswered outbound request, or
+/// with `only_subagent` just the subagents' permission requests, in one hold
+/// of the lock, so the client is never left showing one with no prompt to
+/// answer it in. A cancelled prompt takes no more subagent requests. Each
+/// cancelled id is traced with `reason`.
+fn cancelPendingEntries(state: *ServerState, only_subagent: bool, notify_client: bool, reason: []const u8) void {
     var cancelled_ids: [max_pending_outbound]u64 = undefined;
     var cancelled_count: usize = 0;
     state.outbound_mutex.lockUncancelable(io_mod.getIo());
-    // A cancelled prompt takes no more subagent requests.
     state.subagent_asks_open = false;
     var pending = state.pending_outbound.iterator();
     while (pending.next()) |entry| {
+        if (only_subagent and !entry.value_ptr.subagent) continue;
         if (entry.value_ptr.response != null) continue;
         entry.value_ptr.response = .{ .cancelled = true };
         cancelled_ids[cancelled_count] = entry.key_ptr.*;
@@ -1202,9 +1219,10 @@ fn cancelPendingOutbound(state: *ServerState, notify_client: bool) void {
     }
     state.outbound_cond.broadcast(io_mod.getIo());
     state.outbound_mutex.unlock(io_mod.getIo());
-
-    if (!notify_client) return;
-    for (cancelled_ids[0..cancelled_count]) |id| publishRequestCancellation(state, id);
+    for (cancelled_ids[0..cancelled_count]) |id| {
+        debug_trace.logf("acp", "outbound request cancelled id={d} reason={s}", .{ id, reason });
+        if (notify_client) publishRequestCancellation(state, id);
+    }
 }
 
 fn publishRequestCancellation(state: *ServerState, id: u64) void {
@@ -1454,43 +1472,65 @@ pub fn beginPermissionRequest(state: *ServerState) ?u64 {
 
 pub fn awaitPermissionDecision(state: *ServerState, id: u64) types.ToolPermissionDecision {
     const response = awaitOutboundResponse(state, id, .permission) orelse return .deny;
-    return takePermissionDecision(state.alloc, response);
+    return takePermissionDecision(state.alloc, id, response);
 }
 
-/// The decision a client's answer to a permission request carries, and frees
-/// the answer. Only an exact allow option allows; a cancelled, error,
-/// malformed, or unknown answer denies.
-fn takePermissionDecision(alloc: Allocator, owned: OutboundResponse) types.ToolPermissionDecision {
+/// The decision a client's answer to permission request `id` carries, and
+/// frees the answer. Only an exact allow option allows; a cancelled, error,
+/// malformed, or unknown answer denies, and the trace names which kind of
+/// answer it was. A cancelled request is traced where it was cancelled.
+fn takePermissionDecision(alloc: Allocator, id: u64, owned: OutboundResponse) types.ToolPermissionDecision {
     var response = owned;
     defer response.deinit(alloc);
-    if (response.cancelled or response.error_json != null) return .deny;
-    const raw = response.result_json orelse return .deny;
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return .deny;
+    if (response.cancelled) return .deny;
+    if (response.error_json != null) return denyAnswer(id, "client_error");
+    const raw = response.result_json orelse return denyAnswer(id, "no_result");
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return denyAnswer(id, "malformed_answer");
     defer parsed.deinit();
-    return parsePermissionDecision(parsed.value) orelse .deny;
+    return parsePermissionDecision(parsed.value) orelse denyAnswer(id, "unknown_outcome");
+}
+
+fn denyAnswer(id: u64, reason: []const u8) types.ToolPermissionDecision {
+    debug_trace.logf("acp", "permission answer denied id={d} reason={s}", .{ id, reason });
+    return .deny;
 }
 
 pub fn cancelPermissionRequest(state: *ServerState, id: u64) void {
     cancelOutboundRequest(state, id);
 }
 
+/// The entries a subagent's permission request may find in the registry: one
+/// fewer than it holds, so the parent's own request always has a slot
+/// (`tests/tla/acp/AcpChildApproval.tla` ParentNeverStarved).
+const subagent_pending_limit = max_pending_outbound - 1;
+
 /// Begins a subagent's permission request. It fails when no prompt is open
-/// or the registry is full, and the caller then denies at once. The check and
-/// the insert hold one lock, so closing the prompt cannot fall between them
-/// (`tests/tla/acp/AcpChildApproval.tla` NoStrandedRequest).
+/// or the registry has no slot for a subagent, and the caller then refuses at
+/// once. The check and the insert hold one lock, so closing the prompt cannot
+/// fall between them (`tests/tla/acp/AcpChildApproval.tla` NoStrandedRequest).
 pub fn beginSubagentPermissionRequest(state: *ServerState) error{ PromptClosed, RequestsFull, OutOfMemory }!u64 {
     state.outbound_mutex.lockUncancelable(io_mod.getIo());
     defer state.outbound_mutex.unlock(io_mod.getIo());
     if (!state.subagent_asks_open) return error.PromptClosed;
-    if (state.pending_outbound.count() >= max_pending_outbound or
-        state.next_outbound_request_id > @as(u64, @intCast(std.math.maxInt(i64))))
-    {
-        return error.RequestsFull;
-    }
-    const id = state.next_outbound_request_id;
-    try state.pending_outbound.put(state.alloc, id, .{ .kind = .permission, .subagent = true });
-    state.next_outbound_request_id += 1;
-    return id;
+    const entry: PendingOutbound = .{ .kind = .permission, .subagent = true };
+    return (try insertPendingLocked(state, entry, subagent_pending_limit)) orelse error.RequestsFull;
+}
+
+/// Withdraws a request again when it was cancelled before it was written: the
+/// cancel's `$/cancel_request` went out ahead of the request, so a client
+/// that shows the request now would show one nobody waits for
+/// (`tests/tla/acp/AcpChildApproval.tla` ShownRequestIsOpen). Call it after
+/// the write.
+pub fn withdrawIfCancelled(state: *ServerState, id: u64) void {
+    state.outbound_mutex.lockUncancelable(io_mod.getIo());
+    const cancelled = if (state.pending_outbound.getPtr(id)) |pending|
+        if (pending.response) |response| response.cancelled else false
+    else
+        false;
+    state.outbound_mutex.unlock(io_mod.getIo());
+    if (!cancelled) return;
+    debug_trace.logf("acp", "outbound request withdrawn again id={d} reason=cancelled_before_write", .{id});
+    publishRequestCancellation(state, id);
 }
 
 /// How often a subagent's wait for its answer looks at its stop flag.
@@ -1532,7 +1572,7 @@ pub fn awaitPermissionDecisionOrStop(
         debug_trace.logf("acp", "subagent permission request withdrawn id={d} reason=stopped", .{id});
         publishRequestCancellation(state, id);
     }
-    return takePermissionDecision(state.alloc, response orelse return .deny);
+    return takePermissionDecision(state.alloc, id, response orelse return .deny);
 }
 
 /// Opens the gate for subagents' permission requests as a prompt starts.
@@ -1542,27 +1582,10 @@ fn openSubagentAsks(state: *ServerState) void {
     state.subagent_asks_open = true;
 }
 
-/// Shuts the gate as a prompt ends and cancels every subagent request still
-/// open in the same hold of the lock, so the client is never left showing one
-/// with no prompt to answer it in.
+/// Shuts the gate as a prompt ends, or as one fails to start, and cancels
+/// every subagent request still open.
 fn closeSubagentAsks(state: *ServerState, notify_client: bool) void {
-    var cancelled_ids: [max_pending_outbound]u64 = undefined;
-    var cancelled_count: usize = 0;
-    state.outbound_mutex.lockUncancelable(io_mod.getIo());
-    state.subagent_asks_open = false;
-    var pending = state.pending_outbound.iterator();
-    while (pending.next()) |entry| {
-        if (!entry.value_ptr.subagent or entry.value_ptr.response != null) continue;
-        entry.value_ptr.response = .{ .cancelled = true };
-        cancelled_ids[cancelled_count] = entry.key_ptr.*;
-        cancelled_count += 1;
-    }
-    state.outbound_cond.broadcast(io_mod.getIo());
-    state.outbound_mutex.unlock(io_mod.getIo());
-    for (cancelled_ids[0..cancelled_count]) |id| {
-        debug_trace.logf("acp", "subagent permission request cancelled id={d} reason=prompt_closed", .{id});
-        if (notify_client) publishRequestCancellation(state, id);
-    }
+    cancelPendingEntries(state, true, notify_client, "prompt_closed");
 }
 
 fn dispatchNotification(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -2504,7 +2527,23 @@ fn handleKernelSteer(
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
+const PromptSpawn = fn (*ActivePrompt) anyerror!std.Thread;
+
+fn spawnPromptWorker(active: *ActivePrompt) anyerror!std.Thread {
+    return std.Thread.spawn(.{}, promptWorkerMain, .{active});
+}
+
 fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
+    return startPromptWith(state, alloc, msg, spawnPromptWorker);
+}
+
+/// `spawn` starts the prompt's thread; a test passes one that fails.
+fn startPromptWith(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+    comptime spawn: PromptSpawn,
+) !void {
     if (!try requireActiveSessionTarget(state, alloc, msg)) return;
     const session = if (state.active_session) |*active| active else unreachable;
     const active = try alloc.create(ActivePrompt);
@@ -2521,12 +2560,16 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
     session.cancel_flag.store(false, .seq_cst);
     session.steering.open(state.alloc);
     openSubagentAsks(state);
+    // The prompt's thread shuts the gate as the prompt ends. A start that
+    // fails has no thread to do it, so it shuts the gate itself
+    // (`tests/tla/acp/AcpChildApproval.tla` SpawnClosesGate).
+    errdefer closeSubagentAsks(state, false);
     if (comptime host_target.is_wasm) {
         promptWorkerMain(active);
         jsonrpc.freeMessage(active.alloc, &active.msg);
         active.alloc.destroy(active);
     } else {
-        active.thread = try std.Thread.spawn(.{}, promptWorkerMain, .{active});
+        active.thread = try spawn(active);
         state.active_prompt = active;
     }
 }
@@ -4663,7 +4706,8 @@ test "a permission answer allows only when it selects an allow option, on fuzzed
 /// The first byte says how the answer arrived: `r` a plain result, `e` a
 /// result together with a JSON-RPC error, `c` a result for a request already
 /// cancelled, and anything else an error alone. The rest is the result. Only
-/// a plain result that selects `allow_once` or `allow_always` allows (SEC-81).
+/// a plain result that selects `allow_once` or `allow_always` allows; any
+/// other answer denies.
 fn fuzzPermissionAnswer(_: void, smith: *std.testing.Smith) anyerror!void {
     const alloc = std.testing.allocator;
     var buffer: [512]u8 = undefined;
@@ -4679,7 +4723,7 @@ fn fuzzPermissionAnswer(_: void, smith: *std.testing.Smith) anyerror!void {
             return err;
         };
     }
-    const decision = takePermissionDecision(alloc, answer);
+    const decision = takePermissionDecision(alloc, 1, answer);
     if (decision == .deny) return;
     try std.testing.expect(how == 'r');
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
@@ -4733,6 +4777,112 @@ test "ACP outbound waiters resolve to deny on cancellation" {
     cancelPermissionRequest(&state, second);
     try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, second));
     try std.testing.expect(capture.saw_request_cancellation);
+}
+
+test "a subagent's requests leave the registry's last slot to the parent's own" {
+    const alloc = std.testing.allocator;
+    var state = ServerState{ .alloc = alloc, .cfg = undefined, .writer = jsonrpc.Writer.init() };
+    defer state.pending_outbound.deinit(alloc);
+    openSubagentAsks(&state);
+
+    var asked: usize = 0;
+    while (true) {
+        _ = beginSubagentPermissionRequest(&state) catch |err| {
+            try std.testing.expectEqual(error.RequestsFull, err);
+            break;
+        };
+        asked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, max_pending_outbound - 1), asked);
+    // The parent's own request finds the slot, and then the table is full for
+    // every kind.
+    try std.testing.expect(beginPermissionRequest(&state) != null);
+    try std.testing.expect(beginPermissionRequest(&state) == null);
+    try std.testing.expect((try beginOutboundRequest(&state, .elicitation)) == null);
+    try std.testing.expectEqual(@as(usize, max_pending_outbound), state.pending_outbound.count());
+}
+
+test "closing the subagent gate cancels subagent requests and no other kind's" {
+    const alloc = std.testing.allocator;
+    var state = ServerState{ .alloc = alloc, .cfg = undefined, .writer = jsonrpc.Writer.init() };
+    defer state.pending_outbound.deinit(alloc);
+    try std.testing.expectError(error.PromptClosed, beginSubagentPermissionRequest(&state));
+    openSubagentAsks(&state);
+    const subagent = try beginSubagentPermissionRequest(&state);
+    const own = beginPermissionRequest(&state) orelse return error.TestExpectedEqual;
+
+    closeSubagentAsks(&state, false);
+    try std.testing.expect(!state.subagent_asks_open);
+    try std.testing.expectError(error.PromptClosed, beginSubagentPermissionRequest(&state));
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, subagent));
+    try std.testing.expect(state.pending_outbound.getPtr(own).?.response == null);
+
+    // A session/cancel cancels every kind.
+    cancelPendingOutbound(&state, false);
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, own));
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+}
+
+test "a request cancelled before it was written is withdrawn again after the write" {
+    const Capture = struct {
+        withdrawals: usize = 0,
+
+        fn write(raw: ?*anyopaque, frame: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (std.mem.find(u8, frame, "\"method\":\"$/cancel_request\"") != null) self.withdrawals += 1;
+        }
+    };
+    var capture = Capture{};
+    var state = ServerState{
+        .alloc = std.testing.allocator,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&capture, Capture.write),
+    };
+    defer state.pending_outbound.deinit(state.alloc);
+
+    const id = beginPermissionRequest(&state) orelse return error.TestExpectedEqual;
+    // Not cancelled: nothing is sent.
+    withdrawIfCancelled(&state, id);
+    try std.testing.expectEqual(@as(usize, 0), capture.withdrawals);
+    // The cancel's notice goes out ahead of the request, and the write is
+    // followed by a second one.
+    cancelPendingOutbound(&state, true);
+    try std.testing.expectEqual(@as(usize, 1), capture.withdrawals);
+    withdrawIfCancelled(&state, id);
+    try std.testing.expectEqual(@as(usize, 2), capture.withdrawals);
+    // A request fx has forgotten is not withdrawn again.
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, id));
+    withdrawIfCancelled(&state, id);
+    try std.testing.expectEqual(@as(usize, 2), capture.withdrawals);
+}
+
+fn failingPromptSpawn(_: *ActivePrompt) anyerror!std.Thread {
+    return error.SystemResources;
+}
+
+test "a prompt that fails to start leaves the subagent gate shut" {
+    const alloc = std.testing.allocator;
+    var state = ServerState{ .alloc = alloc, .cfg = undefined, .writer = jsonrpc.Writer.init() };
+    defer state.pending_outbound.deinit(alloc);
+    var session: ActiveSessionState = undefined;
+    session.session_id = try alloc.dupe(u8, "session_1");
+    defer alloc.free(session.session_id);
+    session.mode = "ask";
+    session.permission_mode = .ask;
+    session.cancel_flag = std.atomic.Value(bool).init(false);
+    session.steering = .{};
+    state.active_session = session;
+
+    const msg = jsonrpc.Message{
+        .id = .{ .integer = 1 },
+        .method = "session/prompt",
+        .params_raw = "{\"sessionId\":\"session_1\",\"prompt\":[]}",
+    };
+    try std.testing.expectError(error.SystemResources, startPromptWith(&state, alloc, &msg, failingPromptSpawn));
+    // No thread was started, so nothing else would shut the gate.
+    try std.testing.expect(!state.subagent_asks_open);
+    try std.testing.expect(state.active_prompt == null);
+    try std.testing.expectError(error.PromptClosed, beginSubagentPermissionRequest(&state));
 }
 
 test "ACP outbound responses correlate out of order and ignore unknown ids" {

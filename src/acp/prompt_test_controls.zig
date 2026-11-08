@@ -21,6 +21,20 @@ pub fn pauseAfterTerminalWrite() void {
     }
 }
 
+/// Holds a permission request after its registry entry is inserted and before
+/// the request is written, so a test can cancel in that gap. Both paths are
+/// set only by the tests of one fx process that asks once
+/// (`tests/e2e/acp.test.ts`, `tests/tla/drivers/acp/child_approval/driver.ts`).
+pub fn pauseBeforePermissionWrite() void {
+    if (comptime build_options.libfx) return;
+    const inserted_path = io_mod.getenv("FX_TEST_ACP_PERMISSION_INSERTED") orelse return;
+    const release_path = io_mod.getenv("FX_TEST_ACP_PERMISSION_RELEASE") orelse return;
+    writeMarker(inserted_path, "permission_request_inserted") catch return;
+    while (!pathExists(release_path)) {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
 pub fn noteReapBeforeJoin() void {
     if (comptime build_options.libfx) return;
     const control = controls() orelse return;
