@@ -30,6 +30,7 @@ const render_engine = @import("render_engine.zig");
 const render_request = @import("render_request.zig");
 const shell_runtime = @import("shell_runtime.zig");
 const shimmer_runtime = @import("transcript/shimmer_runtime.zig");
+const resume_projection = @import("transcript/resume_projection.zig");
 const transcript_painter = @import("transcript/painter.zig");
 const transcript_runtime = @import("transcript/runtime.zig");
 const full_transcript_screen = @import("full_transcript_screen.zig");
@@ -8558,6 +8559,217 @@ test "append pending wrap bounded resume publishes each soft wrapped row once" {
     try std.testing.expect(frames > 0 and frames < 10);
     try std.testing.expectEqualStrings(expected.items, probe.history.items);
     try expectGridContains(&h, "00000299");
+}
+
+const ResumeHandoffCase = struct {
+    /// Entries of a turn submitted while the resume publishes: they stay out of
+    /// the published flow, and the first live frame shows them.
+    hidden_turn_entries: usize,
+    /// Lines in each hidden entry. An entry covers its lines and the separator
+    /// row before it.
+    lines_per_hidden_entry: usize = 1,
+    /// The last resumed row fills the terminal width, so the cursor stands in a
+    /// pending wrap when the publication ends.
+    wide_last_row: bool = false,
+    /// Entries added after the first live frame has painted.
+    late_turn_entries: usize = 0,
+    /// Rows the composer takes from the transcript area in the first live frame.
+    reserved_rows: u16 = 0,
+};
+
+fn expectMarkerOnce(
+    alloc: std.mem.Allocator,
+    full: []const u8,
+    marker: []const u8,
+    problems: *std.ArrayList(u8),
+) !void {
+    const seen = std.mem.count(u8, full, marker);
+    if (seen == 1) return;
+    var problem: [48]u8 = undefined;
+    try problems.appendSlice(alloc, try std.mem.print(&problem, "{s} x{d}; ", .{ marker, seen }));
+}
+
+/// Resumes 120 rows through the real publication, runs through the handoff,
+/// and checks that every resumed row and every turn row is in history or on the
+/// screen exactly once. Returns the rows the first live frame scrolled.
+fn expectResumeHandoffKeepsRowsOnce(case: ResumeHandoffCase) !u16 {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 12, 10, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(h.vt.cols, h.vt.rows);
+    defer probe.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    const resumed_rows = 120;
+    var projection = try resume_projection.ResumeProjection.init(alloc, &h.shell, 42, 1);
+    defer projection.deinit();
+    for (0..resumed_rows) |i| {
+        var buf: [32]u8 = undefined;
+        const row = if (case.wide_last_row and i == resumed_rows - 1)
+            try std.mem.print(&buf, "row {d:0>4} pad\n", .{i})
+        else
+            try std.mem.print(&buf, "row {d:0>4}\n", .{i});
+        _ = try projection.appendRawClassified(row, .unknown_raw);
+    }
+    try projection.finalize();
+    projection.install(&h.shell);
+
+    // A prompt is submitted while the resume still publishes. Its turn joins
+    // the live entries but stays out of the published flow until the handoff.
+    for (0..case.hidden_turn_entries) |entry| {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(alloc);
+        for (0..case.lines_per_hidden_entry) |line| {
+            var buf: [24]u8 = undefined;
+            try text.appendSlice(alloc, try std.mem.print(&buf, "turn {d:0>2}-{d:0>2}\n", .{ entry, line }));
+        }
+        _ = try h.shell.appendRawTranscriptEntry(alloc, text.items);
+    }
+
+    var frames: usize = 0;
+    while (h.shell.pendingResumeFlow().len > 0) : (frames += 1) {
+        try std.testing.expect(frames < 100);
+        try h.renderTranscriptFrame();
+        try capturePhysicalFrame(&h, &probe);
+    }
+    // The first frame after the handoff paints the live flow, which now ends
+    // with the turn. No frame re-anchored the viewport in between.
+    try h.renderTranscriptFrameWithBottomReservation(case.reserved_rows);
+    try capturePhysicalFrame(&h, &probe);
+    const first_live_scroll = h.last_frame.committed_scroll_rows;
+
+    for (0..case.late_turn_entries) |i| {
+        var buf: [16]u8 = undefined;
+        _ = try h.shell.appendRawTranscriptEntry(alloc, try std.mem.print(&buf, "late {d:0>4}\n", .{i}));
+    }
+    for (0..2) |_| {
+        try h.renderTranscriptFrame();
+        try capturePhysicalFrame(&h, &probe);
+    }
+
+    const grid = try captureTrimmedGrid(&h, alloc);
+    defer alloc.free(grid);
+    const full = try std.mem.concat(alloc, u8, &.{ probe.history.items, grid });
+    defer alloc.free(full);
+    // Every row appears once, either in history or on screen.
+    var problems: std.ArrayList(u8) = .empty;
+    defer problems.deinit(alloc);
+    for (0..resumed_rows) |i| {
+        var buf: [16]u8 = undefined;
+        try expectMarkerOnce(alloc, full, try std.mem.print(&buf, "row {d:0>4}", .{i}), &problems);
+    }
+    for (0..case.hidden_turn_entries) |entry| {
+        for (0..case.lines_per_hidden_entry) |line| {
+            var buf: [16]u8 = undefined;
+            try expectMarkerOnce(alloc, full, try std.mem.print(&buf, "turn {d:0>2}-{d:0>2}", .{ entry, line }), &problems);
+        }
+    }
+    for (0..case.late_turn_entries) |i| {
+        var buf: [16]u8 = undefined;
+        try expectMarkerOnce(alloc, full, try std.mem.print(&buf, "late {d:0>4}", .{i}), &problems);
+    }
+    try std.testing.expectEqualStrings("", problems.items);
+
+    // The rows appear in order with their blank separator rows, and the screen
+    // below the transcript area is blank.
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(alloc);
+    for (0..resumed_rows) |i| {
+        var buf: [32]u8 = undefined;
+        if (i > 0) try expected.append(alloc, '\n');
+        const row = if (case.wide_last_row and i == resumed_rows - 1)
+            try std.mem.print(&buf, "row {d:0>4} pad\n", .{i})
+        else
+            try std.mem.print(&buf, "row {d:0>4}\n", .{i});
+        try expected.appendSlice(alloc, row);
+    }
+    for (0..case.hidden_turn_entries) |entry| {
+        try expected.append(alloc, '\n');
+        for (0..case.lines_per_hidden_entry) |line| {
+            var buf: [24]u8 = undefined;
+            try expected.appendSlice(alloc, try std.mem.print(&buf, "turn {d:0>2}-{d:0>2}\n", .{ entry, line }));
+        }
+    }
+    for (0..case.late_turn_entries) |i| {
+        var buf: [24]u8 = undefined;
+        try expected.appendSlice(alloc, try std.mem.print(&buf, "\nlate {d:0>4}\n", .{i}));
+    }
+    const below_area = h.vt.rows - h.shell.committed_frame_layout.transcript_area.height();
+    try expected.appendNTimes(alloc, '\n', below_area);
+    try std.testing.expectEqualStrings(expected.items, full);
+    return first_live_scroll;
+}
+
+// The transcript area is 6 rows tall in these cases. An entry of one line
+// adds 2 rows (separator and line), so the growth in rows is written out.
+
+test "first frame after a resume handoff scrolls the rows its growth covers into history once" {
+    try std.testing.expectEqual(@as(u16, 2), try expectResumeHandoffKeepsRowsOnce(.{ .hidden_turn_entries = 1 }));
+}
+
+test "resume handoff growth equal to the transcript area scrolls every old row once" {
+    try std.testing.expectEqual(@as(u16, 6), try expectResumeHandoffKeepsRowsOnce(.{ .hidden_turn_entries = 3 }));
+}
+
+test "resume handoff growth of one row more than the transcript area keeps every row once" {
+    try std.testing.expectEqual(@as(u16, 7), try expectResumeHandoffKeepsRowsOnce(.{
+        .hidden_turn_entries = 1,
+        .lines_per_hidden_entry = 6,
+    }));
+}
+
+test "resume handoff growth of twice the transcript area keeps every row once" {
+    try std.testing.expectEqual(@as(u16, 12), try expectResumeHandoffKeepsRowsOnce(.{ .hidden_turn_entries = 6 }));
+}
+
+test "first frame after a resume handoff keeps the rows of growth taller than the transcript area" {
+    try std.testing.expectEqual(@as(u16, 24), try expectResumeHandoffKeepsRowsOnce(.{ .hidden_turn_entries = 12 }));
+}
+
+test "resume handoff keeps every row once when the last old row ends at the terminal width" {
+    try std.testing.expectEqual(@as(u16, 2), try expectResumeHandoffKeepsRowsOnce(.{
+        .hidden_turn_entries = 1,
+        .wide_last_row = true,
+    }));
+    try std.testing.expectEqual(@as(u16, 12), try expectResumeHandoffKeepsRowsOnce(.{
+        .hidden_turn_entries = 6,
+        .wide_last_row = true,
+    }));
+    try std.testing.expectEqual(@as(u16, 24), try expectResumeHandoffKeepsRowsOnce(.{
+        .hidden_turn_entries = 12,
+        .wide_last_row = true,
+    }));
+}
+
+test "a resume handoff without growth scrolls nothing in the first live frame" {
+    try std.testing.expectEqual(@as(u16, 0), try expectResumeHandoffKeepsRowsOnce(.{ .hidden_turn_entries = 0 }));
+    try std.testing.expectEqual(@as(u16, 0), try expectResumeHandoffKeepsRowsOnce(.{
+        .hidden_turn_entries = 0,
+        .wide_last_row = true,
+    }));
+}
+
+test "growth after an idle frame following a resume handoff keeps every row once" {
+    try std.testing.expectEqual(@as(u16, 0), try expectResumeHandoffKeepsRowsOnce(.{
+        .hidden_turn_entries = 0,
+        .late_turn_entries = 3,
+    }));
+}
+
+test "growth taller than the transcript area after an idle frame following a resume handoff keeps every row once" {
+    try std.testing.expectEqual(@as(u16, 0), try expectResumeHandoffKeepsRowsOnce(.{
+        .hidden_turn_entries = 0,
+        .late_turn_entries = 6,
+    }));
+    try std.testing.expectEqual(@as(u16, 0), try expectResumeHandoffKeepsRowsOnce(.{
+        .hidden_turn_entries = 0,
+        .late_turn_entries = 12,
+    }));
+}
+
+test "first frame after a resume handoff keeps the rows when the composer is taller" {
+    // Two rows of composer growth and two rows of turn.
+    try std.testing.expectEqual(@as(u16, 6), try expectResumeHandoffKeepsRowsOnce(.{ .hidden_turn_entries = 2, .reserved_rows = 2 }));
 }
 
 test "recorded tool rows enter physical history when the viewport advances" {
