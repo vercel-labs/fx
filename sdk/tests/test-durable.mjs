@@ -1096,6 +1096,61 @@ test("a steer with an image ends the streaming turn, and runs as the next turn",
   await agent.close();
 });
 
+// Text over the engine's 64 KiB steering limit, which the durable 8 MiB
+// input limit still takes.
+const longSteer = (name) => `${name}: ${"x".repeat(64 * 1024)}`;
+
+test("a steer over 64 KiB of text ends the streaming turn, and runs as the next turn", async () => {
+  const agent = createFxAgent(agentOptions(await durabilityFor()));
+  const session = agent.session();
+  const before = slow.length;
+  const turn = session.prompt("slow reply");
+  const { messageId } = await turn.accepted;
+  await until(() => slow.length > before && slow.at(-1).sent > 0, "the reply to stream");
+  await session.steer(longSteer("long"), { messageId: "m-long" });
+  await session.steer("and keep it small", { messageId: "m-after-long" });
+  const first = await turn.result;
+  assert.notEqual(first.stopReason, "end_turn", "the running turn did not finish its reply");
+  assert.ok(slow[before].sent < slowFrames, `the running reply sent ${slow[before].sent} of ${slowFrames} words, not cut short`);
+  const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-long", "the long steer's turn");
+  assert.deepEqual(lines.filter((line) => line.type === "turn_start").map((line) => line.messageId), [messageId, "m-long"]);
+  const last = userTexts(requests.at(-1));
+  assert.equal(last.filter((text) => text.startsWith("long: ")).length, 1, "the long steer reached the model once");
+  assert.ok(last.some((text) => text.includes("and keep it small")), "the steer after it joined its turn");
+  await agent.close();
+});
+
+test("two steers over 64 KiB of text sent together each run as a turn, and the session goes on", async () => {
+  const agent = createFxAgent(agentOptions(await durabilityFor()));
+  const session = agent.session();
+  const before = slow.length;
+  const turn = session.prompt("slow reply");
+  const { messageId } = await turn.accepted;
+  await until(() => slow.length > before && slow.at(-1).sent > 0, "the reply to stream");
+  // The first opens a turn of its own and the second joins it there, where
+  // the engine refuses it as it starts.
+  await Promise.all([
+    session.steer(longSteer("first"), { messageId: "m-long-1" }),
+    session.steer(longSteer("second"), { messageId: "m-long-2" }),
+  ]);
+  await turn.result;
+  const ended = (id) => (line) => line.type === "turn_end" && line.messageId === id;
+  const lines = await linesUntil(session, (line) => ended("m-long-1")(line) || ended("m-long-2")(line), "a long steer's turn");
+  const all = lines.some(ended("m-long-1")) && lines.some(ended("m-long-2"))
+    ? lines
+    : await linesUntil(session, (line) => ended(lines.some(ended("m-long-1")) ? "m-long-2" : "m-long-1")(line), "the other long steer's turn");
+  const starts = all.filter((line) => line.type === "turn_start").map((line) => line.messageId);
+  assert.equal(starts[0], messageId);
+  assert.deepEqual(starts.slice(1).sort(), ["m-long-1", "m-long-2"], "each long steer ran as a turn of its own");
+  const { result } = await collect(session.prompt("still there?"));
+  assert.equal(result.stopReason, "end_turn", "the session takes prompts after them");
+  const last = userTexts(requests.at(-1));
+  for (const name of ["first", "second"]) {
+    assert.equal(last.filter((text) => text.startsWith(`${name}: `)).length, 1, `the ${name} long steer reached the model once`);
+  }
+  await agent.close();
+});
+
 test("a cancel keeps the steer its turn never took, and it runs next", async () => {
   const agent = createFxAgent(agentOptions(await durabilityFor()));
   const held = gate("lookup");
