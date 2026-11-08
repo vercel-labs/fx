@@ -19,18 +19,37 @@
 (* whether it is exported, and whether the startup file zsh read was the   *)
 (* current one.                                                            *)
 (*                                                                          *)
+(* A capture takes time. fx stamps the folders it knows when it starts     *)
+(* (BeginCapture), the login shell reads its startup file (ReadFile), and  *)
+(* fx installs the snapshot when the shell is done (FinishCapture). The    *)
+(* user can edit a file at any point in between, and no command runs from  *)
+(* a snapshot until the capture is done. The folder the startup files move *)
+(* ZDOTDIR to is not known when the capture starts. fx counts a file there *)
+(* whose time is at or after the capture's start as changed.               *)
+(*                                                                          *)
 (* FilterRule and ZdotdirRule pick fx's rules. "fixed" is fx with this     *)
-(* change. "old" and "env_only" are fx before it: every `_*` function was  *)
-(* dropped, and ZDOTDIR came only from the exported environment, so it was *)
-(* neither watched nor restored when unexported. The other values plant    *)
-(* one broken rule each.                                                   *)
+(* change. "old" and "env_only" are fx before the ZDOTDIR watch: every     *)
+(* `_*` function was dropped, and ZDOTDIR came only from the exported      *)
+(* environment, so it was neither watched nor restored when unexported.    *)
+(* "stamp_late" is fx with the watch but before the capture-start rule: it *)
+(* stamped the moved folder when the capture finished, so an edit made     *)
+(* while the capture ran became the baseline. The other values plant one   *)
+(* broken rule each.                                                       *)
+(*                                                                          *)
+(* A command can also find that the restored shell rejects the replay      *)
+(* (ReplayFails). fx then runs commands with the full startup until a      *)
+(* watched file changes. "failed_layout" is fx with the ZDOTDIR watch      *)
+(* before the repair of that state: it compared the failure's stamps, laid *)
+(* out for the generation's ZDOTDIR, with stamps laid out for none, so it  *)
+(* saw a change that never happened and captured before every command.     *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS FilterRule, ZdotdirRule, MaxEdits, MaxRuns
 
 ASSUME FilterRule \in {"fixed", "old", "keep_stubs", "keep_private"}
-ASSUME ZdotdirRule \in {"fixed", "env_only", "no_restore", "restore_exported"}
+ASSUME ZdotdirRule \in {"fixed", "env_only", "no_restore", "restore_exported", "stamp_late",
+                         "failed_layout"}
 ASSUME MaxEdits \in Nat /\ MaxRuns \in Nat \ {0}
 
 Funcs == {"wrap", "_helper", "__dunder", "_comp", "__fx_snapshot_x"}
@@ -49,8 +68,14 @@ None == "none"
 NoSnap == [replay |-> {}, names |-> {}, zdotdir |-> None, zval |-> None,
            zexp |-> FALSE, watched |-> {}, stamps |-> [d \in Dirs |-> 0], read |-> 0]
 
-VARIABLES shell, inherited, zmode, fstate, ver, snap, captures, seen
-vars == <<shell, inherited, zmode, fstate, ver, snap, captures, seen>>
+VARIABLES shell, inherited, zmode, fstate, ver, snap, captures, seen, phase, startVer, readVer, failed
+vars == <<shell, inherited, zmode, fstate, ver, snap, captures, seen, phase, startVer, readVer, failed>>
+
+\* idle: no capture runs. started: fx stamped the folders it knows and the
+\* shell has not read the startup file yet. read: the shell read it, and fx
+\* has not installed the snapshot. startVer is each folder's version when the
+\* capture started; readVer is the version of the file the shell read.
+Phases == {"idle", "started", "read"}
 
 FStates(s) == IF s = "zsh" THEN {"absent", "stub", "loaded"} ELSE {"absent", "loaded"}
 
@@ -99,7 +124,26 @@ Watched(z) ==
     IF shell = "bash" THEN {"home"}
     ELSE {"home"} \cup (IF inherited THEN {"inherited"} ELSE {}) \cup (IF z = None THEN {} ELSE {z})
 
-Changed == snap # NoSnap /\ \E d \in snap.watched : snap.stamps[d] # ver[d]
+\* The folders fx knows when a capture starts: HOME and an inherited ZDOTDIR.
+StartKnown == {"home"} \cup (IF inherited THEN {"inherited"} ELSE {})
+\* What a later check compares each folder with. fx stamps the known folders
+\* when the capture starts. A version above the start version in the moved
+\* folder stands for a file whose time is at or after that start. "stamp_late"
+\* stamps the moved folder when the capture finishes instead.
+CaptureStamps ==
+    [d \in Dirs |-> IF ZdotdirRule = "stamp_late" /\ d \notin StartKnown THEN ver[d] ELSE startVer[d]]
+
+\* "failed_layout" compares a failed snapshot's stamps with the wrong layout
+\* whenever the snapshot watches a folder fx did not know when the capture started.
+LayoutMismatch ==
+    /\ failed
+    /\ ZdotdirRule = "failed_layout"
+    /\ snap.watched \ StartKnown # {}
+
+\* A watched file's stamp differs from the file now.
+StampDiffers == \E d \in snap.watched : snap.stamps[d] # ver[d]
+
+Changed == snap # NoSnap /\ (LayoutMismatch \/ StampDiffers)
 
 \* --- Actions ---------------------------------------------------------------
 Init ==
@@ -111,38 +155,73 @@ Init ==
     /\ snap = NoSnap
     /\ captures = 0
     /\ seen = <<>>
+    /\ phase = "idle"
+    /\ startVer = [d \in Dirs |-> 0]
+    /\ readVer = 0
+    /\ failed = FALSE
 
-\* The first capture, or a new one after a watched file changed.
-Capture ==
+\* The first capture, or a new one after a watched file changed, starts.
+BeginCapture ==
+    /\ phase = "idle"
     /\ snap = NoSnap \/ Changed
+    /\ phase' = "started"
+    /\ startVer' = ver
+    /\ failed' = FALSE
+    /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, snap, captures, seen, readVer>>
+
+\* The login shell reads the startup file of ReadDir.
+ReadFile ==
+    /\ phase = "started"
+    /\ phase' = "read"
+    /\ readVer' = ver[ReadDir]
+    /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, snap, captures, seen, startVer, failed>>
+
+\* fx installs the snapshot the shell reported.
+FinishCapture ==
+    /\ phase = "read"
     /\ snap' = [replay |-> {f \in Funcs : Replayed(f)},
                 names |-> {f \in Funcs : fstate[f] # "absent"},
                 zdotdir |-> RecordedZ,
                 zval |-> CommandZ,
                 zexp |-> CommandZExported,
                 watched |-> Watched(RecordedZ),
-                stamps |-> ver,
-                read |-> ver[ReadDir]]
+                stamps |-> CaptureStamps,
+                read |-> readVer]
     /\ captures' = captures + 1
-    /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, seen>>
+    /\ phase' = "idle"
+    /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, seen, startVer, readVer, failed>>
 
-\* The user edits a startup file in folder d.
+\* The user edits a startup file in folder d, between commands or while a
+\* capture runs.
 Edit(d) ==
-    /\ snap # NoSnap
+    /\ snap # NoSnap \/ phase # "idle"
     /\ ver[d] < MaxEdits
     /\ ver' = [ver EXCEPT ![d] = @ + 1]
-    /\ UNCHANGED <<shell, inherited, zmode, fstate, snap, captures, seen>>
+    /\ UNCHANGED <<shell, inherited, zmode, fstate, snap, captures, seen, phase, startVer, readVer, failed>>
 
-\* A command runs from the snapshot once no watched file changed.
+\* A command runs from the snapshot once no capture runs and no watched file
+\* changed.
 Run ==
+    /\ phase = "idle"
     /\ snap # NoSnap
+    /\ ~failed
     /\ ~Changed
     /\ Len(seen) < MaxRuns
     /\ seen' = Append(seen, [callable |-> snap.replay, z |-> snap.zval, zexp |-> snap.zexp,
                              fresh |-> snap.read = ver[ReadDir], captures |-> captures])
-    /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, snap, captures>>
+    /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, snap, captures, phase, startVer, readVer, failed>>
 
-Next == Capture \/ Run \/ \E d \in Dirs : Edit(d)
+\* The restored shell rejects the replay while no watched file changed: commands
+\* run with the full startup until a watched file changes.
+ReplayFails ==
+    /\ phase = "idle"
+    /\ snap # NoSnap
+    /\ ~failed
+    /\ ~Changed
+    /\ failed' = TRUE
+    /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, snap, captures, seen, phase, startVer, readVer>>
+
+Next == BeginCapture \/ ReadFile \/ FinishCapture \/ Run \/ ReplayFails \/ \E d \in Dirs : Edit(d)
 Spec == Init /\ [][Next]_vars
 
 \* --- Rules -----------------------------------------------------------------
@@ -150,6 +229,10 @@ TypeOK ==
     /\ fstate \in [Funcs -> {"absent", "stub", "loaded"}]
     /\ ver \in [Dirs -> 0..MaxEdits]
     /\ captures \in Nat
+    /\ phase \in Phases
+    /\ startVer \in [Dirs -> 0..MaxEdits]
+    /\ readVer \in 0..MaxEdits
+    /\ failed \in BOOLEAN
 
 \* Every function the startup files define and load can be called in a
 \* command, so a wrapper that calls `_` or `__` helpers works (#1329).
@@ -171,6 +254,17 @@ NamesComplete ==
 \* A command never runs with a startup file older than the one zsh reads
 \* (#1512): an edit there is seen before the next command.
 FreshAfterEdit == \A i \in 1..Len(seen) : seen[i].fresh
+
+\* A snapshot taken while a watched startup file changed is never current:
+\* once the capture is over and no watched file changed since fx stamped it,
+\* the snapshot holds the file zsh reads as it now is. An edit made while the
+\* capture ran, in the folder the startup files moved ZDOTDIR to, counts.
+CurrentIsFresh ==
+    (snap # NoSnap /\ phase = "idle" /\ ~Changed) => snap.read = ver[ReadDir]
+
+\* After a replay failure, fx sees a change only when a watched file changed,
+\* so it does not capture before every command while nothing changed.
+FailedChangeIsReal == (failed /\ Changed) => StampDiffers
 
 \* A command sees ZDOTDIR as the login shell left it, exported or not.
 ZdotdirAsLogin ==

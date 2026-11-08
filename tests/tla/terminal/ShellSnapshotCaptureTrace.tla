@@ -8,8 +8,10 @@
 (* of cases. Each case gives the login shell, whether fx inherited a       *)
 (* ZDOTDIR, what the startup files do with ZDOTDIR, the state of each      *)
 (* function they define, and the events of one `fx ask` run in order: a    *)
-(* command with what it saw, or an edit of the startup file the shell      *)
-(* reads.                                                                  *)
+(* command with what it saw, an edit of the startup file the shell reads   *)
+(* between commands, or an edit of it while a capture runs (window_edit).  *)
+(* The driver holds the capture after the shell read the file, so it knows *)
+(* the edit came inside the capture.                                       *)
 (*                                                                          *)
 (* Cases are replayed in order. The index k advances only when the model   *)
 (* has produced every event of the case in exactly the observed way. The   *)
@@ -30,6 +32,10 @@ InitWith(c) ==
     /\ snap = NoSnap
     /\ captures = 0
     /\ seen = <<>>
+    /\ phase = "idle"
+    /\ startVer = [d \in Dirs |-> 0]
+    /\ readVer = 0
+    /\ failed = FALSE
 
 ResetTo(c) ==
     /\ shell' = c.shell
@@ -40,17 +46,35 @@ ResetTo(c) ==
     /\ snap' = NoSnap
     /\ captures' = 0
     /\ seen' = <<>>
+    /\ phase' = "idle"
+    /\ startVer' = [d \in Dirs |-> 0]
+    /\ readVer' = 0
+    /\ failed' = FALSE
 
 TraceInit == k = 1 /\ pos = 1 /\ InitWith(Observed[1])
 
 Pending == k <= Len(Observed) /\ pos <= Len(Observed[k].events)
 Event == Observed[k].events[pos]
 
-TCapture == k <= Len(Observed) /\ Capture /\ UNCHANGED <<k, pos>>
+\* The capture's own steps are not events: the log shows only what a user can see.
+TBegin == k <= Len(Observed) /\ BeginCapture /\ UNCHANGED <<k, pos>>
+TRead == k <= Len(Observed) /\ ReadFile /\ UNCHANGED <<k, pos>>
+TFinish == k <= Len(Observed) /\ FinishCapture /\ UNCHANGED <<k, pos>>
 
+\* An edit between commands.
 TEdit ==
     /\ Pending
     /\ Event.kind = "edit"
+    /\ phase = "idle"
+    /\ Edit(ReadDir)
+    /\ pos' = pos + 1
+    /\ UNCHANGED k
+
+\* An edit after the shell read the startup file and before fx finished the capture.
+TWindowEdit ==
+    /\ Pending
+    /\ Event.kind = "window_edit"
+    /\ phase = "read"
     /\ Edit(ReadDir)
     /\ pos' = pos + 1
     /\ UNCHANGED k
@@ -70,7 +94,7 @@ Advance ==
     /\ pos' = 1
     /\ IF k + 1 <= Len(Observed) THEN ResetTo(Observed[k + 1]) ELSE UNCHANGED vars
 
-TraceSpec == TraceInit /\ [][TCapture \/ TEdit \/ TRun \/ Advance]_traceVars
+TraceSpec == TraceInit /\ [][TBegin \/ TRead \/ TFinish \/ TEdit \/ TWindowEdit \/ TRun \/ Advance]_traceVars
 
 \* Sentinel: violated exactly when every case matched.
 NotAllMatched == k <= Len(Observed)

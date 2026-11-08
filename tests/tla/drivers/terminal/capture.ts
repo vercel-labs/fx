@@ -10,12 +10,18 @@
 // ZDOTDIR and whether it is exported, the marker the startup file exports, and
 // how many times the startup files ran.
 //
+// A window case edits the startup file while fx captures the snapshot. Its
+// startup file says it was read and waits; the driver replaces the file at
+// that moment and lets the shell go on. The first probe then shows whether fx
+// noticed the edit made inside the capture.
+//
 // TLC replays the cases through the model's own actions under fx's rules.
-// --self-check also replays them under the rules of fx before this change
-// (every `_` function dropped, ZDOTDIR read only from the environment), which
-// must reject them. --rules old swaps the two: run against a binary built
-// before the change (FX_BIN), the old rules must accept its cases and today's
-// must reject them.
+// --self-check also replays them under the rules of fx before the ZDOTDIR
+// change (every `_` function dropped, ZDOTDIR read only from the environment)
+// and under the rules before the capture-start rule (the moved folder stamped
+// when the capture ends), which must reject them. --rules old and --rules head
+// swap the two: run against a binary built before the change (FX_BIN), those
+// rules must accept its cases and today's must reject them.
 //
 // fx runs the login shell from the passwd entry, so the cases are zsh's or
 // bash's, whichever this machine has.
@@ -25,10 +31,11 @@
 //   bun tests/tla/drivers/terminal/capture.ts --self-check
 //   bun tests/tla/drivers/terminal/capture.ts --random 40 --seed 7 --jobs 8
 //   FX_BIN=/path/to/older/fx bun tests/tla/drivers/terminal/capture.ts --rules old --self-check
+//   FX_BIN=/path/to/fx-before-the-capture-start-rule bun tests/tla/drivers/terminal/capture.ts --rules head
 //
 // Exit codes: 0 every run accepted (and the self-check rejected), 1 a run the
 // model cannot produce, 2 a toolchain, build, or harness failure.
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { binary, targetHelpers, testEnvironment } from "../lib/context";
 import { TLA_ROOT, outDir, runTlc, writeJson } from "../lib/tlc";
@@ -38,8 +45,16 @@ type FState = "absent" | "stub" | "loaded";
 type ZMode = "keep" | "unset" | "export_moved" | "local_moved" | "assign_moved";
 type Dir = "home" | "inherited" | "moved";
 type Saw = { callable: string[]; z: string; zexp: boolean; fresh: boolean; captures: number };
-type Event = { kind: "run"; saw: Saw } | { kind: "edit" };
-type Case = { id: string; shell: Shell; inherited: boolean; zmode: ZMode; fstate: Record<string, FState> };
+type Event = { kind: "run"; saw: Saw } | { kind: "edit" } | { kind: "window_edit" };
+type Case = {
+  id: string;
+  shell: Shell;
+  inherited: boolean;
+  zmode: ZMode;
+  fstate: Record<string, FState>;
+  // The edit lands while the capture runs, not between two commands.
+  window: boolean;
+};
 type Observation = Case & { events: Event[]; evidence: { exit: number; requests: number; seconds: number; tail: string } };
 type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 type Rules = { filter: string; zdotdir: string };
@@ -59,16 +74,20 @@ function option(name: string, fallback: number): number {
   return value;
 }
 
-const RULES: Record<string, Rules> = {
+type RuleSet = "fixed" | "old" | "head";
+const RULES: Record<RuleSet, Rules> = {
   fixed: { filter: "fixed", zdotdir: "fixed" },
+  // fx before the ZDOTDIR change.
   old: { filter: "old", zdotdir: "env_only" },
+  // fx with the ZDOTDIR watch, before the capture-start rule.
+  head: { filter: "fixed", zdotdir: "stamp_late" },
 };
 
-function rulesOption(): "fixed" | "old" {
+function rulesOption(): RuleSet {
   const at = process.argv.indexOf("--rules");
   if (at < 0) return "fixed";
   const value = process.argv[at + 1];
-  if (value !== "fixed" && value !== "old") throw new Error("--rules takes fixed or old");
+  if (value !== "fixed" && value !== "old" && value !== "head") throw new Error("--rules takes fixed, old, or head");
   return value;
 }
 
@@ -122,8 +141,16 @@ function cases(shell: Shell): Case[] {
   for (const fstate of patterns) {
     for (const zmode of modes) {
       for (const inherited of inherit) {
-        result.push({ id: `case${result.length}`, shell, inherited, zmode, fstate });
+        result.push({ id: `case${result.length}`, shell, inherited, zmode, fstate, window: false });
       }
+    }
+  }
+  // An edit inside the capture, for every place the startup files can send
+  // ZDOTDIR: the model's discriminating cases move it to a folder fx cannot
+  // have stamped before the capture.
+  for (const zmode of modes) {
+    for (const inherited of inherit) {
+      result.push({ id: `case${result.length}`, shell, inherited, zmode, fstate: all("loaded"), window: true });
     }
   }
   const next = generator(options.seed);
@@ -132,7 +159,8 @@ function cases(shell: Shell): Case[] {
     const fstate = Object.fromEntries(FUNCS.map((f) => [f, states[Math.floor(next() * states.length)]!]));
     const zmode = modes[Math.floor(next() * modes.length)]!;
     const inherited = inherit[Math.floor(next() * inherit.length)]!;
-    result.push({ id: `case${result.length}`, shell, inherited, zmode, fstate });
+    const window = next() < 0.3;
+    result.push({ id: `case${result.length}`, shell, inherited, zmode, fstate, window });
   }
   return result;
 }
@@ -153,6 +181,14 @@ const ZSHENV: Record<ZMode, string> = {
   assign_moved: "ZDOTDIR=\"$HOME/moved\"\n",
 };
 
+const WINDOW_GATE = [
+  "if [ ! -e \"$HOME/release\" ]; then",
+  "  : > \"$HOME/reached\"",
+  "  i=0",
+  "  while [ ! -e \"$HOME/release\" ] && [ \"$i\" -lt 100 ]; do sleep 0.05; i=$((i + 1)); done",
+  "fi",
+].join("\n");
+
 function startupFile(c: Case): string {
   const lines = ["printf '%s\\n' loaded >> \"$HOME/rc.log\"", "export FX_CAPTURE_MARK=0"];
   if (c.shell === "zsh") lines.push("fpath=(\"$HOME/fn\" $fpath)");
@@ -170,6 +206,9 @@ function startupFile(c: Case): string {
         break;
     }
   }
+  // The window case's shell says it read this file and waits for the driver to
+  // edit it. A later capture finds the release file and goes on.
+  if (c.window) lines.push(WINDOW_GATE);
   return `${lines.join("\n")}\n`;
 }
 
@@ -238,20 +277,41 @@ function readSaw(output: string, dirs: Record<Dir, string>, version: number): Sa
   };
 }
 
+// Waits until the shell says it read the startup file, replaces the file the
+// way an editor saving it would (a new file under the same name), and lets the
+// shell go on. Returns whether it edited.
+async function holdAndEdit(home: string, rcPath: string, over: () => boolean): Promise<boolean> {
+  const reached = join(home, "reached");
+  const deadline = Date.now() + 60_000;
+  while (!existsSync(reached)) {
+    if (over() || Date.now() > deadline) return false;
+    await Bun.sleep(20);
+  }
+  const next = `${rcPath}.next`;
+  writeFileSync(next, `${readFileSync(rcPath, "utf8")}export FX_CAPTURE_MARK=1\n`);
+  renameSync(next, rcPath);
+  writeFileSync(join(home, "release"), "");
+  return true;
+}
+
 async function runCase(helpers: any, c: Case, scratch: string): Promise<Observation> {
   const root = mkdtempSync(join(scratch, `${c.id}-`));
   const { home, dirs, rcPath, workspace, fxHome } = writeCase(root, c);
   const call = (id: string) =>
     helpers.fakeGatewayToolCall(id, "shell", { request: { action: "run", command: PROBE, yield_time_ms: 30_000 } });
-  const gateway = helpers.startFakeGateway([
-    call("probe_before"),
-    () => {
-      // The user edits the startup file the shell reads between two commands.
-      appendFileSync(rcPath, "export FX_CAPTURE_MARK=1\n");
-      return call("probe_after");
-    },
-    helpers.fakeGatewayFinalText("CAPTURE_CASE_DONE"),
-  ]);
+  const gateway = helpers.startFakeGateway(
+    c.window
+      ? [call("probe_window"), helpers.fakeGatewayFinalText("CAPTURE_CASE_DONE")]
+      : [
+        call("probe_before"),
+        () => {
+          // The user edits the startup file the shell reads between two commands.
+          appendFileSync(rcPath, "export FX_CAPTURE_MARK=1\n");
+          return call("probe_after");
+        },
+        helpers.fakeGatewayFinalText("CAPTURE_CASE_DONE"),
+      ],
+  );
   try {
     const started = performance.now();
     const env: Record<string, string> = {
@@ -273,25 +333,35 @@ async function runCase(helpers: any, c: Case, scratch: string): Promise<Observat
       stderr: "pipe",
     });
     const timer = setTimeout(() => child.kill(9), 90_000);
+    let over = false;
+    const edited = c.window ? holdAndEdit(home, rcPath, () => over) : Promise.resolve(false);
     const [stdout, stderr, exit] = await Promise.all([
       new Response(child.stdout).text(),
       new Response(child.stderr).text(),
       child.exited,
     ]);
+    over = true;
     clearTimeout(timer);
     const events: Event[] = [];
-    const before = gateway.requests[1] ? toolResult(gateway.requests[1].body, "probe_before") : null;
-    const after = gateway.requests[2] ? toolResult(gateway.requests[2].body, "probe_after") : null;
-    const first = before === null ? null : readSaw(before, dirs, 0);
-    const second = after === null ? null : readSaw(after, dirs, 1);
-    if (first) events.push({ kind: "run", saw: first });
-    if (first && second) events.push({ kind: "edit" }, { kind: "run", saw: second });
+    if (c.window) {
+      // One probe, after the edit made inside the capture.
+      const window = gateway.requests[1] ? toolResult(gateway.requests[1].body, "probe_window") : null;
+      const saw = window === null ? null : readSaw(window, dirs, 1);
+      if (saw && (await edited)) events.push({ kind: "window_edit" }, { kind: "run", saw });
+    } else {
+      const before = gateway.requests[1] ? toolResult(gateway.requests[1].body, "probe_before") : null;
+      const after = gateway.requests[2] ? toolResult(gateway.requests[2].body, "probe_after") : null;
+      const first = before === null ? null : readSaw(before, dirs, 0);
+      const second = after === null ? null : readSaw(after, dirs, 1);
+      if (first) events.push({ kind: "run", saw: first });
+      if (first && second) events.push({ kind: "edit" }, { kind: "run", saw: second });
+    }
     return {
       ...c,
       events,
       evidence: {
         exit,
-        // Every request must reach this fake gateway: two probes and the answer.
+        // Every request must reach this fake gateway: the probes and the answer.
         requests: gateway.requests.length,
         seconds: Math.round((performance.now() - started) / 100) / 10,
         tail: `${stdout.slice(-400)}\n${stderr.slice(-400)}`,
@@ -315,7 +385,8 @@ function tlaSaw(saw: Saw): string {
     `fresh |-> ${saw.fresh ? "TRUE" : "FALSE"}, captures |-> ${saw.captures}]`;
 }
 
-// Edit events carry a placeholder, so every event record has the same fields.
+// Edit events, between commands or inside a capture, carry a placeholder, so
+// every event record has the same fields.
 const NO_SAW: Saw = { callable: [], z: "none", zexp: false, fresh: true, captures: 0 };
 
 function observedModule(observations: Observation[]): string {
@@ -397,14 +468,26 @@ async function main(): Promise<number> {
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
   console.log(`${observations.length} ${shell} cases of ${binary} in ${seconds}s`);
   console.log(`observations: ${join(out, "observations.json")}`);
-  const broken = observations.find((o) => o.events.length !== 3 || o.evidence.exit !== 0 || o.evidence.requests !== 3);
+  // A window case has one probe and two events: the edit inside the capture,
+  // then the run. The others have two probes and three events: run, edit, run.
+  // Every request reaches the fake gateway: the probes and the answer.
+  const broken = observations.find((o) => {
+    const probes = o.window ? 1 : 2;
+    return o.events.length !== probes + 1 || o.evidence.exit !== 0 || o.evidence.requests !== probes + 1;
+  });
   if (broken) {
     console.log(`TOOL_ERROR: case ${broken.id} did not finish both probes: ${JSON.stringify(broken)}`);
     return 2;
   }
 
-  const label = { fixed: "the rules with the change", old: "the rules of fx before the change" };
-  const other = options.rules === "fixed" ? "old" : "fixed";
+  const label: Record<RuleSet, string> = {
+    fixed: "the rules with the change",
+    old: "the rules of fx before the ZDOTDIR change",
+    head: "the rules of fx before the capture-start rule",
+  };
+  // Rules that must reject what this binary did: the fixed binary against both
+  // older rule sets, an older binary against the fixed rules.
+  const others: RuleSet[] = options.rules === "fixed" ? ["old", "head"] : ["fixed"];
   const design = await runTrace(observations, RULES[options.rules]!, out);
   console.log(`${label[options.rules]}: ${design.verdict} (TLC work ${design.dir})`);
   if (design.verdict === "TOOL_ERROR") return 2;
@@ -414,9 +497,19 @@ async function main(): Promise<number> {
     return 1;
   }
   if (options.selfCheck) {
-    const check = await runTrace(observations, RULES[other]!, out);
-    console.log(`self-check, ${label[other]}: ${check.verdict} (must be REJECTED)`);
-    if (check.verdict !== "REJECTED") return check.verdict === "TOOL_ERROR" ? 2 : 1;
+    for (const other of others) {
+      const check = await runTrace(observations, RULES[other], out);
+      console.log(`self-check, ${label[other]}: ${check.verdict} (must be REJECTED)`);
+      if (check.verdict !== "REJECTED") return check.verdict === "TOOL_ERROR" ? 2 : 1;
+    }
+    if (options.rules === "fixed") {
+      // The window cases alone are what the rules before the capture-start rule
+      // cannot produce: every case without an edit inside a capture they accept.
+      const plain = observations.filter((o) => !o.window);
+      const check = await runTrace(plain, RULES.head, out);
+      console.log(`self-check, ${label.head} on the ${plain.length} cases without a window edit: ${check.verdict} (must be ACCEPTED)`);
+      if (check.verdict !== "ACCEPTED") return check.verdict === "TOOL_ERROR" ? 2 : 1;
+    }
   }
   console.log("ACCEPTED");
   return 0;
