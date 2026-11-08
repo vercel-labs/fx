@@ -1,21 +1,32 @@
 // Runs the built fx binary along tests/tla/auth/SubscriptionRefresh.tla and has
 // TLC check every run it observes (SubscriptionRefreshTrace.tla).
 //
-// Each run is one `fx status --json` or `fx ask --json --no-save` on a fresh
-// profile whose saved Grok or Codex login has a chosen expiry, against a local
-// fake issuer and provider. The status runs cover the expiries at the edges of
-// i64 and of the one-minute margin. The ask runs start from an expired login,
-// and the fake issuer answers the refresh with every reply the model knows: a
-// rotated refresh token or none, a usable, missing, or overflowing lifetime,
-// the same account or another, and a save that works or fails because the
-// auth file was made read-only. Two more ask runs start from the smallest i64.
+// Each subscription run is one `fx status --json` or `fx ask --json --no-save`
+// on a fresh profile whose saved Grok or Codex login has a chosen expiry,
+// against a local fake issuer and provider. The status runs cover the
+// expiries at the edges of i64 and of the one-minute margin. The ask runs
+// start from an expired login, and the fake issuer answers the refresh with
+// every reply the model knows: a rotated refresh token or none, a usable,
+// missing, or overflowing lifetime, the same account or another, and a save
+// that works or fails because the auth file was made read-only. Two more ask
+// runs start from the smallest i64.
+//
+// Each MCP run is one `fx mcp show fixture --json` on a fresh profile whose
+// saved MCP login has a chosen expires_at_ms and skew_ms, both at the edges of
+// i64 among them, against a local MCP server that takes the saved token and
+// the one a refresh brings, and a token endpoint that answers one refresh.
+// fx asks the saved expiry and skew before its first request: a login that is
+// due is refreshed and saved first (due), and one that is not goes out as
+// saved (sent).
 //
 // For each run the driver records the outcome (the expiry read as expired or
 // live, the prompt answered, the login signed out, the account changed, the
-// save failed, an integer overflow abort, or any other crash) and what is left
-// of the saved login. TLC replays the runs through the model's own actions.
-// --self-check also replays them through the model of fx before the fix
-// (ClearAtTake and Saturating FALSE), which must reject them.
+// save failed, the MCP request due or sent, an integer overflow abort, or any
+// other crash) and what is left of the saved login. TLC replays the runs
+// through the model's own actions. --self-check also replays them through the
+// model of fx before the PR (ClearAtTake and Saturating FALSE, SendAdd
+// "plain") and the model of this PR's head before the MCP fix (SendAdd
+// "plain"), which must each reject them.
 //
 // fx runs only through `env -i` with every variable written out: a temporary
 // HOME and FX_HOME, FX_DISABLE_KEYCHAIN=1, FX_SOUND=0, the fake endpoints, and
@@ -32,16 +43,18 @@
 // failure.
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { binary, targetHelpers } from "../lib/context";
+import { binary, targetHelpers, targetModule } from "../lib/context";
 import { TLA_ROOT, outDir, runTlc, writeJson } from "../lib/tlc";
 
 type Provider = "codex" | "grok";
 type Lifetime = "ok" | "missing" | "overflow";
 type ReplySpec = { rotated: boolean; lifetime: Lifetime; account: "same" | "changed"; save: "ok" | "fail" };
 type ModelReply = ReplySpec | { rotated: false; lifetime: "none"; account: "none"; save: "none" };
-type Outcome = "expired" | "live" | "answered" | "signed_out" | "account_changed" | "save_failed" | "abort" | "crash" | "unknown";
+type Outcome = "expired" | "live" | "due" | "sent" | "answered" | "signed_out" | "account_changed" | "save_failed" | "abort" | "crash" | "unknown";
 type FileState = "saved" | "rotated" | "deleted" | "unknown";
-type Case = { id: string; cmd: "status" | "ask"; provider: Provider; expiry: Expiry; reply: ModelReply };
+type SubscriptionCase = { id: string; cmd: "status" | "ask"; provider: Provider; expiry: Expiry; reply: ModelReply };
+type McpCase = { id: string; cmd: "send"; provider: "mcp"; expiry: Expiry; skew: Skew; reply: ModelReply };
+type Case = SubscriptionCase | McpCase;
 type Observation = Case & {
   outcome: Outcome;
   file: FileState;
@@ -51,6 +64,8 @@ type Observation = Case & {
 type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 
 const NO_REPLY: ModelReply = { rotated: false, lifetime: "none", account: "none", save: "none" };
+// The one-minute margin of a subscription login (Skew in the model).
+const SUBSCRIPTION_SKEW_MODEL = 6;
 const ACCOUNT = "acct_tla_driver";
 const OTHER_ACCOUNT = "acct_tla_other";
 const ANSWER = "AUTH_DRIVER_ANSWER";
@@ -74,6 +89,21 @@ const EXPIRIES: Expiry[] = [
 ];
 const byName = (name: string) => EXPIRIES.find((e) => e.name === name)!;
 
+// The skew_ms an MCP login saves, as the credential holds it, and its place on
+// the same range. fx adds it to the clock (about 1.8e12 ms), so the model's Now
+// of 60 stands for that and each skew keeps its place against the sum's
+// overflow: the values from 2^63 - 1 - now upward overflow, the rest do not.
+type Skew = { name: string; json: string; model: number };
+const SKEWS: Skew[] = [
+  { name: "i64-min", json: "-9223372036854775808", model: -128 },
+  { name: "minus-one", json: "-1", model: -1 },
+  { name: "zero", json: "0", model: 0 },
+  { name: "default", json: "30000", model: 3 },
+  { name: "i64-max-minus-one", json: "9223372036854775806", model: 126 },
+  { name: "i64-max", json: "9223372036854775807", model: 127 },
+];
+const MCP_EXPIRIES = ["i64-min", "zero", "hour-ago", "hour-ahead", "i64-max"].map(byName);
+
 function option(name: string, fallback: number): number {
   const at = process.argv.indexOf(name);
   if (at < 0) return fallback;
@@ -85,6 +115,11 @@ const options = { selfCheck: process.argv.includes("--self-check"), jobs: option
 
 function cases(): Case[] {
   const out: Case[] = [];
+  for (const expiry of MCP_EXPIRIES) {
+    for (const skew of SKEWS) {
+      out.push({ id: `send-mcp-${expiry.name}-skew-${skew.name}`, cmd: "send", provider: "mcp", expiry, skew, reply: NO_REPLY });
+    }
+  }
   for (const provider of ["codex", "grok"] as const) {
     for (const expiry of EXPIRIES) {
       out.push({ id: `status-${provider}-${expiry.name}`, cmd: "status", provider, expiry, reply: NO_REPLY });
@@ -116,7 +151,7 @@ function accessToken(provider: Provider, account: string, tag: string): string {
   return `header.${payload}.${tag}`;
 }
 
-function tokenReply(c: Case): string {
+function tokenReply(c: SubscriptionCase): string {
   const reply = c.reply as ReplySpec;
   const account = c.provider === "codex" && reply.account === "changed" ? OTHER_ACCOUNT : ACCOUNT;
   let body = `{"access_token":${JSON.stringify(accessToken(c.provider, account, "fresh"))}`;
@@ -127,7 +162,7 @@ function tokenReply(c: Case): string {
 }
 
 /** The fake issuer and provider for one run, and a fake gateway that must stay unused. */
-function startFakes(c: Case, authPath: string, helpers: any) {
+function startFakes(c: SubscriptionCase, authPath: string, helpers: any) {
   const requests: string[] = [];
   const unexpected: string[] = [];
   let modelRequests = 0;
@@ -213,7 +248,7 @@ function startFakes(c: Case, authPath: string, helpers: any) {
   };
 }
 
-function seedLogin(home: string, c: Case): string {
+function seedLogin(home: string, c: SubscriptionCase): string {
   const fxDir = join(home, ".fx");
   mkdirSync(fxDir, { recursive: true, mode: 0o700 });
   chmodSync(fxDir, 0o700);
@@ -240,7 +275,7 @@ function fileState(authPath: string, provider: Provider): FileState {
   return "unknown";
 }
 
-function classify(c: Case, exit: number | null, signal: string | null, stdout: string, stderr: string): Outcome {
+function classify(c: SubscriptionCase, exit: number | null, signal: string | null, stdout: string, stderr: string): Outcome {
   const all = `${stdout}\n${stderr}`;
   if (all.includes("integer overflow")) return "abort";
   if (signal !== null || exit === null || exit > 1) return "crash";
@@ -269,7 +304,7 @@ function classify(c: Case, exit: number | null, signal: string | null, stdout: s
   return "unknown";
 }
 
-async function runCase(c: Case, helpers: any, scratch: string): Promise<Observation> {
+async function runSubscriptionCase(c: SubscriptionCase, helpers: any, scratch: string): Promise<Observation> {
   const root = mkdtempSync(join(scratch, `${c.id}-`));
   const home = join(root, "home");
   const tmp = join(root, "tmp");
@@ -325,6 +360,180 @@ async function runCase(c: Case, helpers: any, scratch: string): Promise<Observat
   }
 }
 
+const MCP_ACCESS_SAVED = "mcp-access-saved-driver";
+const MCP_ACCESS_FRESH = "mcp-access-fresh-driver";
+const MCP_REFRESH_SAVED = "mcp-refresh-saved-driver";
+const MCP_REFRESH_NEXT = "mcp-refresh-next-driver";
+const MCP_CLIENT_ID = "fx-mcp-auth-test";
+
+/**
+ * A local MCP server that takes the saved access token and the one a refresh
+ * brings, and the token endpoint beside it, which answers a refresh with the
+ * second. Anything else it is asked for is recorded as unexpected.
+ */
+async function startMcpFakes() {
+  const fixtures = await targetModule("fixtures/mcp-modern-http.ts");
+  const upstream = fixtures.startModernMcpHttpFixture("json");
+  const mcpRequests: Array<{ method: string; authorization: string | null }> = [];
+  const unexpected: string[] = [];
+  let tokenRequests = 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      const body = request.method === "GET" ? "" : await request.text();
+      if (path === "/mcp") {
+        const authorization = request.headers.get("authorization");
+        mcpRequests.push({ method: request.method, authorization });
+        const token = authorization?.startsWith("Bearer ") ? authorization.slice(7) : "";
+        if (token !== MCP_ACCESS_SAVED && token !== MCP_ACCESS_FRESH) return new Response("", { status: 401 });
+        const headers = new Headers(request.headers);
+        headers.set("connection", "close");
+        // No pooled connection between the two fakes: a socket the fixture just closed must not be reused.
+        return await fetch(upstream.url, { method: request.method, headers, keepalive: false, ...(body === "" ? {} : { body }) });
+      }
+      if (path === "/token") {
+        tokenRequests += 1;
+        const form = new URLSearchParams(body);
+        if (form.get("grant_type") !== "refresh_token" || form.get("refresh_token") !== MCP_REFRESH_SAVED) {
+          unexpected.push(`POST /token ${form.get("grant_type")}`);
+        }
+        return Response.json({
+          access_token: MCP_ACCESS_FRESH, refresh_token: MCP_REFRESH_NEXT, token_type: "Bearer",
+          scope: "tools.read offline_access", expires_in: 3600,
+        });
+      }
+      unexpected.push(`${request.method} ${path}`);
+      return new Response("not found", { status: 404 });
+    },
+  });
+  const gatewayRequests: string[] = [];
+  const gateway = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      gatewayRequests.push(`${request.method} ${new URL(request.url).pathname}`);
+      return new Response("the fake gateway is not part of this run", { status: 500 });
+    },
+  });
+  return {
+    base: `http://127.0.0.1:${server.port}`,
+    gatewayBase: `http://127.0.0.1:${gateway.port}`,
+    mcpRequests,
+    unexpected,
+    gatewayRequests,
+    tokens: () => tokenRequests,
+    stop() {
+      server.stop(true);
+      gateway.stop(true);
+      upstream.stop();
+    },
+  };
+}
+
+/** The login store as fx saved it: the refresh token it holds tells whether a refresh ran. */
+function mcpFileState(storePath: string): FileState {
+  if (!existsSync(storePath)) return "deleted";
+  try {
+    const store = JSON.parse(readFileSync(storePath, "utf8"));
+    const entry = store.servers?.find((server: any) => server.name === "fixture");
+    if (!entry) return "deleted";
+    const saved = JSON.parse(entry.credential);
+    if (saved.refresh === MCP_REFRESH_SAVED) return "saved";
+    if (saved.refresh === MCP_REFRESH_NEXT) return "rotated";
+  } catch {
+    // An unreadable or partly written store is not a state the model has.
+  }
+  return "unknown";
+}
+
+function classifyMcp(exit: number | null, signal: string | null, stdout: string, stderr: string, tokens: number, first: string | null): Outcome {
+  if (`${stdout}\n${stderr}`.includes("integer overflow")) return "abort";
+  if (signal !== null || exit === null || exit > 1) return "crash";
+  let json: any = null;
+  try {
+    json = JSON.parse(stdout);
+  } catch {
+    json = null;
+  }
+  if (exit !== 0 || json?.status !== "ready") return "unknown";
+  if (tokens === 1 && first === `Bearer ${MCP_ACCESS_FRESH}`) return "due";
+  if (tokens === 0 && first === `Bearer ${MCP_ACCESS_SAVED}`) return "sent";
+  return "unknown";
+}
+
+async function runMcpCase(c: McpCase, scratch: string): Promise<Observation> {
+  const root = mkdtempSync(join(scratch, `${c.id}-`));
+  const home = join(root, "home");
+  const tmp = join(root, "tmp");
+  mkdirSync(home, { recursive: true });
+  mkdirSync(tmp, { recursive: true });
+  const fxDir = join(home, ".fx");
+  mkdirSync(join(fxDir, "mcp-credentials"), { recursive: true, mode: 0o700 });
+  chmodSync(fxDir, 0o700);
+  const fakes = await startMcpFakes();
+  try {
+    const url = `${fakes.base}/mcp`;
+    writeFileSync(join(fxDir, "settings.json"), "{}");
+    writeFileSync(join(fxDir, "mcp.json"), JSON.stringify({
+      mcp: { fixture: { type: "http", url, oauth: { client_id: MCP_CLIENT_ID, scopes: ["tools.read"] }, startup_timeout_ms: 5_000 } },
+    }));
+    // The credential's numbers are written as text: JavaScript cannot hold 2^63 - 1.
+    const credential = `{"access":${str(MCP_ACCESS_SAVED)},"refresh":${str(MCP_REFRESH_SAVED)},"expires_at_ms":${c.expiry.json()},` +
+      `"skew_ms":${c.skew.json},"token_endpoint":${str(`${fakes.base}/token`)},"revocation_endpoint":${str(`${fakes.base}/revoke`)},` +
+      `"resource":${str(url)},"client_id":${str(MCP_CLIENT_ID)},"client_secret":null,"method":"none"}`;
+    const storePath = join(fxDir, "mcp-credentials", "credentials-v3.json");
+    writeFileSync(storePath, JSON.stringify({ version: 1, servers: [{ name: "fixture", url, credential }] }), { mode: 0o600 });
+    const vars: Record<string, string> = {
+      HOME: home,
+      PATH: "/usr/bin:/bin",
+      TMPDIR: tmp,
+      FX_HOME: fxDir,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_SOUND: "0",
+      FX_AUTO_UPGRADE: "0",
+      FX_E2E_DISABLE_DOTENV: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
+      NO_COLOR: "1",
+      AI_GATEWAY_API_KEY: "fake-auth-driver-key",
+      FX_GATEWAY_BASE_URL: fakes.gatewayBase,
+      FX_GATEWAY_CHAT_URL: `${fakes.gatewayBase}/v1/chat/completions`,
+    };
+    const argv = ["/usr/bin/env", "-i", ...Object.entries(vars).map(([k, v]) => `${k}=${v}`), binary, "mcp", "show", "fixture", "--json"];
+    const started = performance.now();
+    const child = Bun.spawn(argv, { cwd: root, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+    const [stdout, stderr] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    await child.exited;
+    clearTimeout(timer);
+    const signal = child.signalCode ?? null;
+    const exit = signal === null ? child.exitCode : null;
+    const anomalies = [...fakes.unexpected];
+    if (fakes.gatewayRequests.length > 0) anomalies.push(`the fake gateway got ${fakes.gatewayRequests.join(", ")}`);
+    const outcome = classifyMcp(exit, signal, stdout, stderr, fakes.tokens(), fakes.mcpRequests[0]?.authorization ?? null);
+    if (outcome !== "abort" && outcome !== "crash" && fakes.mcpRequests.length === 0) anomalies.push("no request reached the fake MCP server");
+    return {
+      ...c,
+      outcome,
+      file: mcpFileState(storePath),
+      anomalies,
+      evidence: {
+        exit, signal, stdout: stdout.slice(-600), stderr: stderr.slice(-600),
+        requests: fakes.mcpRequests.map((r) => `${r.method} /mcp ${r.authorization ?? "no token"}`).concat(Array(fakes.tokens()).fill("POST /token")),
+        seconds: Math.round(performance.now() - started) / 1000,
+      },
+    };
+  } finally {
+    fakes.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+async function runCase(c: Case, helpers: any, scratch: string): Promise<Observation> {
+  return c.provider === "mcp" ? await runMcpCase(c, scratch) : await runSubscriptionCase(c, helpers, scratch);
+}
+
 const str = (value: string) => JSON.stringify(value);
 
 function replyValue(r: ModelReply): string {
@@ -334,6 +543,7 @@ function replyValue(r: ModelReply): string {
 function observedModule(observations: Observation[]): string {
   const value = (o: Observation) =>
     `[cmd |-> ${str(o.cmd)}, provider |-> ${str(o.provider)}, stored |-> ${o.expiry.model}, ` +
+    `margin |-> ${o.provider === "mcp" ? o.skew.model : SUBSCRIPTION_SKEW_MODEL}, ` +
     `reply |-> ${replyValue(o.reply)}, outcome |-> ${str(o.outcome)}, file |-> ${str(o.file)}]`;
   return [
     "--------------------- MODULE SubscriptionRefreshObserved ---------------------",
@@ -345,22 +555,33 @@ function observedModule(observations: Observation[]): string {
   ].join("\n");
 }
 
-async function runTrace(observations: Observation[], model: "design" | "today", parent: string): Promise<{ verdict: Verdict; dir: string }> {
+// The model the runs are replayed through: the design, or fx as it was.
+type Model = "design" | "before-pr" | "before-mcp-fix";
+const MODELS: Record<Model, { fixed: "TRUE" | "FALSE"; sendAdd: string }> = {
+  design: { fixed: "TRUE", sendAdd: "saturate" },
+  "before-pr": { fixed: "FALSE", sendAdd: "plain" },
+  // This PR's head before the MCP fix: the subscription logins were fixed.
+  "before-mcp-fix": { fixed: "TRUE", sendAdd: "plain" },
+};
+
+async function runTrace(observations: Observation[], model: Model, parent: string): Promise<{ verdict: Verdict; dir: string }> {
   const dir = mkdtempSync(join(parent, `trace-${model}-`));
   writeFileSync(join(dir, "SubscriptionRefreshObserved.tla"), observedModule(observations));
-  const before = model === "today" ? "FALSE" : "TRUE";
+  const { fixed, sendAdd } = MODELS[model];
   writeFileSync(join(dir, "trace.cfg"), [
     "SPECIFICATION TraceSpec",
     "CONSTANTS",
-    '    Providers = {"codex", "grok"}',
+    '    Providers = {"codex", "grok", "mcp"}',
     "    Expiries <- AllExpiries",
+    "    Margins <- AllMargins",
     "    Bound = 128",
     "    Skew = 6",
     "    Now = 60",
-    `    ClearAtTake = ${before}`,
-    `    Saturating = ${before}`,
+    `    ClearAtTake = ${fixed}`,
+    `    Saturating = ${fixed}`,
     "    SignOutBadReply = TRUE",
     "    SaveRotated = TRUE",
+    `    SendAdd = "${sendAdd}"`,
     "INVARIANT NotAllMatched",
     "CHECK_DEADLOCK FALSE",
     "",
@@ -373,7 +594,7 @@ async function runTrace(observations: Observation[], model: "design" | "today", 
 }
 
 // The first run the model cannot produce: the shortest rejected prefix.
-async function firstMismatch(observations: Observation[], model: "design" | "today", parent: string): Promise<Observation | null> {
+async function firstMismatch(observations: Observation[], model: Model, parent: string): Promise<Observation | null> {
   let low = 1;
   let high = observations.length;
   while (low < high) {
@@ -431,9 +652,11 @@ async function main(): Promise<number> {
     return 1;
   }
   if (options.selfCheck) {
-    const today = await runTrace(observations, "today", out);
-    console.log(`self-check, the model of fx before the fix: ${today.verdict} (must be REJECTED)`);
-    if (today.verdict !== "REJECTED") return today.verdict === "TOOL_ERROR" ? 2 : 1;
+    for (const [model, name] of [["before-pr", "fx before the PR"], ["before-mcp-fix", "the PR's head before the MCP fix"]] as const) {
+      const old = await runTrace(observations, model, out);
+      console.log(`self-check, the model of ${name}: ${old.verdict} (must be REJECTED)`);
+      if (old.verdict !== "REJECTED") return old.verdict === "TOOL_ERROR" ? 2 : 1;
+    }
   }
   console.log("ACCEPTED");
   return 0;

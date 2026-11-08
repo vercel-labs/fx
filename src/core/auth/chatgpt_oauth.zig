@@ -846,6 +846,20 @@ test "Codex refresh uses JSON and accepts omitted token rotation and lifetime" {
     try std.testing.expect(response.expires_in == null);
 }
 
+/// The saved login a refresh in these tests starts from, owned by the caller.
+fn savedSession(alloc: Allocator) !chatgpt_session.Session {
+    const access_token = try alloc.dupe(u8, "old-access");
+    errdefer alloc.free(access_token);
+    const refresh_token = try alloc.dupe(u8, "old-refresh");
+    errdefer alloc.free(refresh_token);
+    return .{
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+        .expires_at_ms = 0,
+        .account_id = try alloc.dupe(u8, "acct_test"),
+    };
+}
+
 test "Codex refresh frees each token once when the reply's lifetime is unusable" {
     const alloc = std.testing.allocator;
     // The access token names the same account but carries no `exp`, so a
@@ -859,12 +873,7 @@ test "Codex refresh frees each token once when the reply's lifetime is unusable"
     const access_token = try alloc.print("header.{s}.signature", .{encoded});
     defer alloc.free(access_token);
 
-    var current = chatgpt_session.Session{
-        .access_token = try alloc.dupe(u8, "old-access"),
-        .refresh_token = try alloc.dupe(u8, "old-refresh"),
-        .expires_at_ms = 0,
-        .account_id = try alloc.dupe(u8, "acct_test"),
-    };
+    var current = try savedSession(alloc);
     defer current.deinit(alloc);
 
     // A lifetime whose milliseconds overflow, one that overflows when added
@@ -948,12 +957,7 @@ fn fuzzRefreshReply(_: void, smith: *std.testing.Smith) !void {
     // copy of the saved one.
     const want = try alloc.dupe(u8, token.refresh_token orelse "old-refresh");
     defer alloc.free(want);
-    var current = chatgpt_session.Session{
-        .access_token = try alloc.dupe(u8, "old-access"),
-        .refresh_token = try alloc.dupe(u8, "old-refresh"),
-        .expires_at_ms = 0,
-        .account_id = try alloc.dupe(u8, "acct_test"),
-    };
+    var current = try savedSession(alloc);
     defer current.deinit(alloc);
     var replacement = refreshReplacement(alloc, &token, current) catch return;
     defer replacement.deinit(alloc);

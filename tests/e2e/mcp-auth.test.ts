@@ -2499,6 +2499,45 @@ describe("MCP login", () => {
     expect(auth.protectedToolCalls).toBe(1);
   }, 60_000);
 
+  // The saved skew_ms is any i64 the file holds. Added to the clock with a plain +,
+  // the largest one aborted fx with "integer overflow" before its first request.
+  // JSON.stringify can't write 2^63 - 1, so the test puts the saved text in itself.
+  const showWithSavedSkew = async (skew: string) => {
+    upstream = startModernMcpHttpFixture("json");
+    const fixture = (auth = startAuthFixture(upstream.url));
+    const root = createRoot(fixture);
+    const store = seedV2Credential(root, fixture, { expires_at_ms: Date.now() + 3_600_000, skew_ms: 1 });
+    const text = readFileSync(store, "utf8");
+    expect(text).toContain('\\"skew_ms\\":1,');
+    writeFileSync(store, text.replace('\\"skew_ms\\":1,', `\\"skew_ms\\":${skew},`));
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    return { show, store, fixture, mcpRequests: fixture.requests.filter((request) => request.path === "/mcp") };
+  };
+
+  test("a saved login whose skew_ms is the largest i64 doesn't abort fx; it is renewed before the first request", async () => {
+    const { show, store, fixture, mcpRequests } = await showWithSavedSkew("9223372036854775807");
+    expect(show.signal).toBeNull();
+    expect(show.stderr).not.toContain("integer overflow");
+    expect(show.code).toBe(0);
+    expect(JSON.parse(show.stdout).status).toBe("ready");
+    // Its expiry is an hour away, but a skew that large reaches it: due for renewal.
+    expect(fixture.refreshes).toBe(1);
+    expect(mcpRequests[0]?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
+    expect(readFileSync(store, "utf8")).toContain(REFRESH_ROTATED);
+  }, 60_000);
+
+  test("a saved login whose skew_ms is the smallest i64 doesn't abort fx; its token is used until it expires", async () => {
+    const { show, store, fixture, mcpRequests } = await showWithSavedSkew("-9223372036854775808");
+    expect(show.signal).toBeNull();
+    expect(show.stderr).not.toContain("integer overflow");
+    expect(show.code).toBe(0);
+    expect(JSON.parse(show.stdout).status).toBe("ready");
+    // A negative skew is no window before the expiry, which is an hour away.
+    expect(fixture.refreshes).toBe(0);
+    expect(mcpRequests[0]?.authorization).toBe(`Bearer ${ACCESS_INITIAL}`);
+    expect(readFileSync(store, "utf8")).toContain(REFRESH_INITIAL);
+  }, 60_000);
+
   // Before, a shell that started before another terminal signed in logged out
   // without that login, which stayed valid at the server for every other fx.
   test.skipIf(!tmuxAvailable())("a logout in a shell revokes the login another terminal saved after the shell started", async () => {
