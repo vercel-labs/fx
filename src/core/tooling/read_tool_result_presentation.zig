@@ -103,8 +103,9 @@ fn readPresentation(
 
 /// What `presentation` decodes a `request` sent as JSON text in. A presentation
 /// callback has no allocator, and a call that asks for a handle or a search
-/// needs far less. Decoding takes about twice the text's size, so a text of
-/// more than about 2 KiB, or nested deeply, keeps the generic row.
+/// needs far less. A request whose decoded form does not fit in this buffer, or
+/// that is nested more deeply than the request depth limit, keeps the generic
+/// row.
 const presentation_buffer_bytes = 4096;
 
 /// Labels a call by what it reads instead of one shared "tool result" label.
@@ -281,6 +282,25 @@ fn textQueryRequest(alloc: Allocator, query_bytes: usize) ![]u8 {
     return try alloc.print("{{\"request\":\"{{\\\"handle\\\":\\\"result-x\\\",\\\"query\\\":\\\"{s}\\\"}}\"}}", .{query});
 }
 
+/// The arguments of a history search for `phrases` short phrases, whose
+/// request is the search's JSON text when `as_text` is set and its object
+/// otherwise.
+fn searchRequest(alloc: Allocator, phrases: usize, as_text: bool) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(alloc);
+    for (0..phrases) |index| {
+        const phrase = try alloc.print("{s}\"phrase {d:0>2}\"", .{ if (index == 0) "" else ",", index });
+        defer alloc.free(phrase);
+        try list.appendSlice(alloc, phrase);
+    }
+    const search = try alloc.print("{{\"search\":[{s}]}}", .{list.items});
+    defer alloc.free(search);
+    if (!as_text) return try alloc.print("{{\"request\":{s}}}", .{search});
+    const quoted = try std.json.Stringify.valueAlloc(alloc, search, .{});
+    defer alloc.free(quoted);
+    return try alloc.print("{{\"request\":{s}}}", .{quoted});
+}
+
 test "read_tool_result rows keep the generic row for JSON text that does not fit the 4 KiB buffer" {
     const alloc = std.testing.allocator;
 
@@ -294,6 +314,28 @@ test "read_tool_result rows keep the generic row for JSON text that does not fit
     var parsed_outside = try std.json.parseFromSlice(std.json.Value, alloc, outside, .{});
     defer parsed_outside.deinit();
     try std.testing.expect(presentation(parsed_outside.value.object) == null);
+}
+
+test "read_tool_result rows keep the generic row for a search list whose decoded form does not fit the buffer" {
+    const alloc = std.testing.allocator;
+
+    // 30 short phrases are under 2 KiB of text, yet the list does not fit the
+    // buffer once decoded: the decoded form decides the row, not the text's size.
+    const long_text = try searchRequest(alloc, 30, true);
+    defer alloc.free(long_text);
+    try std.testing.expect(long_text.len < 2048);
+    var parsed_long = try std.json.parseFromSlice(std.json.Value, alloc, long_text, .{});
+    defer parsed_long.deinit();
+    try std.testing.expect(presentation(parsed_long.value.object) == null);
+
+    // The same search as an object has no text to decode, and a short list as
+    // text fits, so the buffer is the only reason the long one falls back.
+    const as_object = try searchRequest(alloc, 30, false);
+    defer alloc.free(as_object);
+    try expectPresentation(as_object, "Searching", "Searched", "earlier conversation");
+    const short_text = try searchRequest(alloc, 3, true);
+    defer alloc.free(short_text);
+    try expectPresentation(short_text, "Searching", "Searched", "earlier conversation");
 }
 
 test "read_tool_result handles read JSON text nested up to 64 levels and no deeper" {
