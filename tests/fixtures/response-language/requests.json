@@ -105,7 +105,10 @@
     {
       "text": "Ask José to review the lockfile.",
       "form": "decomposed"
-    }
+    },
+    "Please check the lockfile\rWhy does it break again?",
+    "Why does the parser fail\u2028Please read the log.",
+    "Please check the lockfile\fWhy does it break again?"
   ],
   "other": [
     {
@@ -517,6 +520,34 @@
     {
       "lang": "ms",
       "text": "Sila\u2003terjemahkan\u2003ayat\u2003ini. The cache is not cleared when you switch the profile."
+    },
+    {
+      "lang": "id",
+      "text": "Terjemahkan ke bahasa Korea\rThe lockfile is broken again."
+    },
+    {
+      "lang": "id",
+      "text": "Terjemahkan ke bahasa Korea\u2028Why is the lockfile broken again?"
+    },
+    {
+      "lang": "ms",
+      "text": "Sila terjemahkan ayat ini\u2029Please check why the test fails."
+    },
+    {
+      "lang": "tl",
+      "text": "Isalin mo ito sa Hapon\rThe cache is not cleared when you switch the profile."
+    },
+    {
+      "lang": "es",
+      "text": "Traduce esto al coreano\u0085Please check the lockfile again."
+    },
+    {
+      "lang": "nl",
+      "text": "Vertaal dit naar het Koreaans\u000bHere is the log: the parser crashed on this input."
+    },
+    {
+      "lang": "pt",
+      "text": "Traduza isto para o coreano\fWhat does this stack trace mean?"
     }
   ]
 }

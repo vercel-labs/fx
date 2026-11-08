@@ -25,7 +25,8 @@
 # combining accents, and whose word list held words that other languages use
 # (RequestedLanguageAccepted). response-language-second-cut.cfg is the second
 # fix, whose contraction rule took "Can'a" for English and whose clause
-# splitter knew only ASCII spaces (RequestedLanguageAccepted).
+# splitter knew only ASCII spaces (RequestedLanguageAccepted). The third fix
+# is the mutation break-hides below: only LF ended a clause.
 # response-language-limit.cfg adds requests that run into the English with no
 # punctuation, have only clauses of fewer than three words, have a stray
 # backtick, or share only "the", "that", or a capital "I" with it, which the
@@ -39,6 +40,7 @@
 #   shared-hides      the word list has words other languages use           RequestedLanguageAccepted
 #   stem-hides        a contraction stem counts before any ending           RequestedLanguageAccepted
 #   space-hides       only ASCII spaces split words                         RequestedLanguageAccepted
+#   break-hides       a line break other than LF ends no clause             RequestedLanguageAccepted
 #   abstain-all       the guard never expects a script                      EnglishGuardKept
 #   retry-twice       no cap on corrections                                 OneCorrection
 #   tools-reject      a reply with tool calls is replaced                   CallsKept
@@ -80,6 +82,7 @@ ResponseLanguage response-language-mutation-marks-ignored RequestedLanguageAccep
 ResponseLanguage response-language-mutation-shared-hides RequestedLanguageAccepted
 ResponseLanguage response-language-mutation-stem-hides RequestedLanguageAccepted
 ResponseLanguage response-language-mutation-space-hides RequestedLanguageAccepted
+ResponseLanguage response-language-mutation-break-hides RequestedLanguageAccepted
 ResponseLanguage response-language-mutation-abstain-all EnglishGuardKept
 ResponseLanguage response-language-mutation-retry-twice OneCorrection
 ResponseLanguage response-language-mutation-tools-reject CallsKept

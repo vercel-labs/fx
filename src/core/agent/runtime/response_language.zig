@@ -1,7 +1,9 @@
 const std = @import("std");
+const ascii_case = @import("../../shared/ascii_case.zig");
 const display_width = @import("../../shared/display_width.zig");
 const language_script = @import("../../shared/language_script.zig");
 const text_utils = @import("../../shared/text_utils.zig");
+const unicode_classes = @import("../presentation/unicode_classes.zig");
 
 const minimum_letters: usize = 5;
 const minimum_unexpected_prose_letters: usize = 8;
@@ -122,16 +124,7 @@ fn may_request_language_switch(prompt: []const u8) bool {
         "thai",
     };
     for (signals) |signal| {
-        if (contains_ignore_case(prompt, signal)) return true;
-    }
-    return false;
-}
-
-fn contains_ignore_case(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0 or needle.len > haystack.len) return false;
-    var index: usize = 0;
-    while (index <= haystack.len - needle.len) : (index += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+        if (ascii_case.containsIgnoreCase(prompt, signal)) return true;
     }
     return false;
 }
@@ -161,32 +154,37 @@ fn is_latin_letter_outside_ascii(codepoint: u21) bool {
         codepoint != 0x00D7 and codepoint != 0x00F7;
 }
 
-/// The Unicode space separators that split words: the no-break space, the Ogham
-/// space, the en and em spaces and their narrower forms (U+2000 to U+200A), the
-/// narrow no-break space, the medium mathematical space, and the ideographic
-/// space.
-fn is_unicode_space(codepoint: u21) bool {
-    return switch (codepoint) {
-        0x00A0, 0x1680, 0x2000...0x200A, 0x202F, 0x205F, 0x3000 => true,
-        else => false,
-    };
-}
+/// What separates words at one place in a prompt.
+const Separator = struct {
+    /// Its length in bytes, or 0 when no separator starts there.
+    len: usize,
+    /// Whether it is a line break, which also ends a clause.
+    line_break: bool,
+};
 
-/// The length in bytes of the space that starts at `index`, ASCII white space
-/// or a Unicode space separator, or 0 when no space starts there.
-fn space_len_at(text: []const u8, index: usize) usize {
+/// The separator that starts at `index`: ASCII white space, a Unicode space
+/// separator of `unicode_classes.isWhitespace`, or a line break. The line
+/// breaks are LF, VT, FF, and CR, the next line (U+0085), the line separator
+/// (U+2028), and the paragraph separator (U+2029).
+fn separator_at(text: []const u8, index: usize) Separator {
     const byte = text[index];
-    if (byte < 0x80) return @intFromBool(std.ascii.isWhitespace(byte));
+    if (byte < 0x80) return .{
+        .len = @intFromBool(std.ascii.isWhitespace(byte)),
+        .line_break = byte >= '\n' and byte <= '\r',
+    };
     const rune = display_width.decodeNextRune(text, index);
-    return if (is_unicode_space(rune.codepoint)) rune.len else 0;
+    const line_break = rune.codepoint == 0x0085 or rune.codepoint == 0x2028 or rune.codepoint == 0x2029;
+    return .{
+        .len = if (line_break or unicode_classes.isWhitespace(rune.codepoint)) rune.len else 0,
+        .line_break = line_break,
+    };
 }
 
 /// Whether some clause of `minimum_clause_words` or more words, outside code
 /// spans, has no English function word: words of another language, even when
 /// the rest of the prompt is English. A clause ends at a line break or at a
 /// word that ends in . ! ? : or ;. A word is a token with an ASCII letter
-/// between spaces, which are ASCII white space and the Unicode space
-/// separators of `is_unicode_space`.
+/// between the separators of `separator_at`.
 fn has_clause_without_english(text: []const u8) bool {
     var words: usize = 0;
     var has_function_word = false;
@@ -199,17 +197,17 @@ fn has_clause_without_english(text: []const u8) bool {
             in_code = !in_code;
             continue;
         }
-        const space_len = space_len_at(text, index);
-        if (space_len > 0) {
-            index += space_len;
-            if (byte != '\n' or in_code) continue;
+        const separator = separator_at(text, index);
+        if (separator.len > 0) {
+            index += separator.len;
+            if (!separator.line_break or in_code) continue;
             if (words >= minimum_clause_words and !has_function_word) return true;
             words = 0;
             has_function_word = false;
             continue;
         }
         const start = index;
-        while (index < text.len and text[index] != '`' and space_len_at(text, index) == 0) : (index += 1) {}
+        while (index < text.len and text[index] != '`' and separator_at(text, index).len == 0) : (index += 1) {}
         if (in_code) continue;
         const token = text[start..index];
         if (has_ascii_letter(token)) {
@@ -656,11 +654,18 @@ const unicode_spaces = [_]u21{
     0x2007, 0x2008, 0x2009, 0x200A, 0x202F, 0x205F, 0x3000,
 };
 /// Characters that do not split words: ones just outside each range, and the
-/// next line, Mongolian vowel separator, line separator, and paragraph
-/// separator.
+/// Mongolian vowel separator.
 const not_spaces = [_]u21{
-    0x0085, 0x009F, 0x00A1, 0x167F, 0x1681, 0x180E, 0x1FFF, 0x200B, 0x2028, 0x2029,
-    0x205E, 0x2060, 0x2FFF, 0x3001,
+    0x009F, 0x00A1, 0x167F, 0x1681, 0x180E, 0x1FFF, 0x200B, 0x205E, 0x2060, 0x2FFF, 0x3001,
+};
+/// The line breaks, which split words and also end a clause: LF, VT, FF, CR, the
+/// next line, the line separator, and the paragraph separator.
+const line_breaks = [_]u21{ '\n', 0x0B, 0x0C, '\r', 0x0085, 0x2028, 0x2029 };
+/// Characters that do not end a clause: spaces, which only split words, and
+/// characters next to the line breaks, which are not separators at all.
+const not_line_breaks = [_]u21{
+    ' ',    '\t',   0x0E,   0x1F,   0x7F,   0x0084, 0x0086, 0x00A0, 0x180E,
+    0x2003, 0x2027, 0x202A, 0x2060, 0x3000,
 };
 
 /// `words` joined by `separator`, then `tail`, written into `buffer`.
@@ -728,6 +733,100 @@ test "response language expectation keeps English that has Unicode spaces" {
     );
 }
 
+test "response language expectation ends a clause at every line break" {
+    const requests = [_][2][]const u8{
+        .{ "Terjemahkan ke bahasa Korea", "Why is the lockfile broken again?" },
+        // English first, with no full stop before the break.
+        .{ "Why is the lockfile broken again", "Terjemahkan ke bahasa Korea" },
+        .{ "Tolong terjemahkan teks ini", "Please check the lockfile." },
+    };
+    for (line_breaks) |line_break| {
+        for (requests) |request| {
+            var buffer: [128]u8 = undefined;
+            const prompt = try joined_request(&buffer, &request, line_break, "");
+            errdefer std.debug.print("expected no expectation for U+{X:0>4}: {s}\n", .{ line_break, prompt });
+            try std.testing.expect(infer_expectation(prompt) == null);
+        }
+    }
+}
+
+test "response language expectation ends a clause at a line break beside other separators" {
+    const requests = [_][]const u8{
+        // At both ends of the request.
+        "\rTerjemahkan ke bahasa Korea\rWhy is the lockfile broken again?\r",
+        "\u{2028}\u{2029}Terjemahkan ke bahasa Korea\u{85}Why is the lockfile broken again?",
+        // Doubled, in a pair, beside spaces, and after a full stop.
+        "Terjemahkan ke bahasa Korea\r\rWhy is the lockfile broken again?",
+        "Terjemahkan ke bahasa Korea\r\nWhy is the lockfile broken again?",
+        "Terjemahkan ke bahasa Korea\u{A0}\u{2028}\u{A0}Why is the lockfile broken again?",
+        "Terjemahkan ke bahasa Korea \x0b \x0c Why is the lockfile broken again?",
+        "Terjemahkan ke bahasa Korea.\rWhy is the lockfile broken again?",
+    };
+    for (requests) |prompt| {
+        errdefer std.debug.print("expected no expectation for: {s}\n", .{prompt});
+        try std.testing.expect(infer_expectation(prompt) == null);
+    }
+}
+
+test "response language expectation keeps English that has line breaks" {
+    const requests = [_][2][]const u8{
+        .{ "Please check the lockfile", "Why does it break again?" },
+        .{ "Why does the parser fail", "Please read the log." },
+    };
+    for (line_breaks) |line_break| {
+        for (requests) |request| {
+            var buffer: [128]u8 = undefined;
+            const prompt = try joined_request(&buffer, &request, line_break, "");
+            errdefer std.debug.print("expected a Latin expectation for U+{X:0>4}: {s}\n", .{ line_break, prompt });
+            try std.testing.expectEqual(Script.latin, infer_expectation(prompt).?);
+        }
+    }
+}
+
+test "response language expectation ends a clause only at a line break" {
+    const words = [_][]const u8{ "Terjemahkan ke bahasa Korea", "Why is the lockfile broken again?" };
+    // A space, or a character that is not a separator, joins the two lines
+    // into one clause, which has English words.
+    for (not_line_breaks) |character| {
+        var buffer: [128]u8 = undefined;
+        const prompt = try joined_request(&buffer, &words, character, "");
+        errdefer std.debug.print("expected a Latin expectation for U+{X:0>4}: {s}\n", .{ character, prompt });
+        try std.testing.expectEqual(Script.latin, infer_expectation(prompt).?);
+    }
+    // A lone continuation byte or a cut-short lead is not a line break.
+    const lone_bytes = [_][]const u8{ "\x85", "\xA8", "\xA9", "\xC2", "\xE2\x80" };
+    for (lone_bytes) |bytes| {
+        var buffer: [128]u8 = undefined;
+        const prompt = try std.mem.print(&buffer, "{s}{s}{s}", .{ words[0], bytes, words[1] });
+        errdefer std.debug.print("expected a Latin expectation for: {s}\n", .{prompt});
+        try std.testing.expectEqual(Script.latin, infer_expectation(prompt).?);
+    }
+    // A clause of two words is too short to judge, before a break as before a
+    // full stop.
+    try std.testing.expectEqual(
+        Script.latin,
+        infer_expectation("Tolong terjemahkan\rWhy is the lockfile broken again?").?,
+    );
+    // Each clause counts its own words: two clauses of two words are not one
+    // clause of four.
+    for (line_breaks) |line_break| {
+        var buffer: [128]u8 = undefined;
+        const short_clauses = [_][]const u8{ "Tolong terjemahkan", "teks ini", "Why is the lockfile broken again?" };
+        const prompt = try joined_request(&buffer, &short_clauses, line_break, "");
+        errdefer std.debug.print("expected a Latin expectation for U+{X:0>4}: {s}\n", .{ line_break, prompt });
+        try std.testing.expectEqual(Script.latin, infer_expectation(prompt).?);
+    }
+    // A break inside a code span ends nothing and counts no word.
+    try std.testing.expectEqual(
+        Script.latin,
+        infer_expectation("the `a\rb` Terjemahkan ke bahasa Korea.").?,
+    );
+    try std.testing.expectEqual(
+        Script.latin,
+        infer_expectation("the `a\u{2028}b` Terjemahkan ke bahasa Korea.").?,
+    );
+}
+
 const fuzz_prompt_capacity = 512;
 
 fn fuzzInferExpectation(_: void, smith: *std.testing.Smith) anyerror!void {
@@ -736,12 +835,19 @@ fn fuzzInferExpectation(_: void, smith: *std.testing.Smith) anyerror!void {
     // the end of the random bytes can claim more bytes than remain.
     const accents = [_][]const u8{ " \u{1ECB}", "\u{E9}", "e\u{301}" };
     // Clauses of three words with no English function word: with ASCII spaces,
-    // with Unicode spaces, and with a name that has a Turkish ending.
+    // with Unicode spaces, with a name that has a Turkish ending, and ending at
+    // a line break other than LF.
     const bare_clauses = [_][]const u8{
         "Tolong terjemahkan ini.\n",
         "Tolong\u{A0}terjemahkan\u{202F}ini.\n",
         "Tolong\u{3000}terjemahkan\u{2003}ini.\n",
         "Bunu Can'a Korece yaz.\n",
+        "Tolong terjemahkan ini\r",
+        "Tolong terjemahkan ini\x0b",
+        "Tolong terjemahkan ini\x0c",
+        "Tolong terjemahkan ini\u{85}",
+        "Tolong\u{A0}terjemahkan\u{202F}ini\u{2028}",
+        "Tolong terjemahkan ini\u{2029}",
     };
     var random: [fuzz_prompt_capacity]u8 = undefined;
     const len: usize = @intCast(smith.slice(&random));
@@ -770,6 +876,8 @@ test "response language expectation stays conservative on fuzzed prompts" {
             "The lockfile is broken again.",
             "Dịch nội dung sau sang tiếng Hàn. The lockfile is broken again.",
             "Terjemahkan ke bahasa Korea. The lockfile is broken again.",
+            // English words straight after a line break.
+            "Why is the lockfile broken again?",
             "Why does `zig build test` fail?\n```\nconst x = 1;\n```\nPlease check.",
             "The lockfile is broken \xf0\x9f",
             // A 4-byte lead at the end that the appended "é" cannot complete.

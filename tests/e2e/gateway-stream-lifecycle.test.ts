@@ -4309,6 +4309,9 @@ describe("gateway stream lifecycle", () => {
       ["turkish-name", "Bunu Can'a Korece yaz. The lockfile is broken again."],
       // A no-break space between words, written as an escape.
       ["indonesian-no-break-spaces", "Terjemahkan\u00a0ke\u00a0bahasa\u00a0Korea. The lockfile is broken again."],
+      // A line break other than LF ends the request's own clause.
+      ["indonesian-carriage-return", "Terjemahkan ke bahasa Korea\rThe lockfile is broken again."],
+      ["indonesian-line-separator", "Terjemahkan ke bahasa Korea\u2028Why is the lockfile broken again?"],
     ] as const) {
       const root = createFixtureRoot(`response-language-${label}`);
       const gateway = startGateway(() => fakeGatewayFinalText(translated));

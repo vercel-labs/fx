@@ -31,6 +31,8 @@
 (*           ("can" is English only in "can't")                            *)
 (*   space   a bare clause has its words split by a Unicode space, such    *)
 (*           as U+00A0, U+202F, or U+3000, not by an ASCII one             *)
+(*   eol     a bare clause ends at a line break other than LF: CR, VT,     *)
+(*           FF, U+0085, U+2028, or U+2029                                 *)
 (*                                                                         *)
 (* Prompts holds what a person can write. A request in another Latin-      *)
 (* script language either names its language in English, has an accented   *)
@@ -53,7 +55,8 @@
 (* defects cut_hides, marks_ignored, and shared_hides are the three flaws  *)
 (* of the first fix of #809, and first_cut has all three. The defects      *)
 (* stem_hides and space_hides are the two flaws of the second fix, and     *)
-(* second_cut has both.                                                    *)
+(* second_cut has both. The defect break_hides is the flaw of the third    *)
+(* fix: only LF ended a clause.                                            *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences
 
@@ -64,12 +67,13 @@ PromptScripts == {"latin", "nonlatin", "none"}
 AllPrompts == [lang : Langs, script : PromptScripts, word : BOOLEAN,
                switch : BOOLEAN, accent : BOOLEAN, mark : BOOLEAN,
                cut : BOOLEAN, bare : BOOLEAN, shared : BOOLEAN,
-               stem : BOOLEAN, space : BOOLEAN]
+               stem : BOOLEAN, space : BOOLEAN, eol : BOOLEAN]
 Prompts == {p \in AllPrompts :
               /\ p.cut => (p.accent \/ p.mark)
               /\ p.shared => (p.lang = "other" /\ p.bare)
               /\ p.stem => (p.lang = "other" /\ p.bare)
               /\ p.space => (p.lang = "other" /\ p.bare)
+              /\ p.eol => (p.lang = "other" /\ p.bare)
               /\ (p.lang = "other" /\ p.script = "latin" /\ ~p.switch)
                      => (p.accent \/ p.mark \/ p.bare \/ AllowUnmarked)}
 
@@ -107,6 +111,11 @@ StemHides == Bug \in {"stem_hides", "second_cut"}
 \* space_hides: the clause splitter knew only ASCII white space.
 SpaceHides == Bug \in {"space_hides", "second_cut"}
 
+\* The flaw of the third fix of #809.
+\* break_hides: only LF ended a clause, so a line break of another kind left a
+\* clause of another language joined to the English line after it.
+BreakHides == Bug = "break_hides"
+
 \* has_non_ascii_latin_letter: the scan finds an accented letter.
 AccentSeen(p) ==
     /\ ~(CutHides /\ p.cut)
@@ -118,6 +127,7 @@ BareSeen(p) ==
     /\ ~(SharedHides /\ p.shared)
     /\ ~(StemHides /\ p.stem)
     /\ ~(SpaceHides /\ p.space)
+    /\ ~(BreakHides /\ p.eol)
 
 \* infer_expectation: Latin only for a prompt that reads as English.
 Expect(p) ==

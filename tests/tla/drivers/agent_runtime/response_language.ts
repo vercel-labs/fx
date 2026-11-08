@@ -9,7 +9,8 @@
 // Dutch, Polish, Turkish, and Chinese that quote English, some with their
 // accents stored as base letters and combining marks, some with a word that
 // English shares with their language, some with a name that has a Turkish
-// ending after an apostrophe, and some with Unicode spaces between their words.
+// ending after an apostrophe, some with Unicode spaces between their words, and
+// some with a line break other than LF between their own words and an English line.
 // Each prompt's labels say what the model needs to know about it
 // (ResponseLanguage.tla, Prompts). The driver runs every script up to
 // --depth replies for every prompt, then --random seeded longer ones. When fx
@@ -31,8 +32,9 @@
 // output, and how the turn ended. TLC replays the turns through the model's
 // own actions. --self-check also replays them through the model of fx before
 // the fix of #809 (Rule = "today"), through the model of the first fix
-// (Bug = "first_cut"), and through the model of the second fix
-// (Bug = "second_cut"), which must all reject them.
+// (Bug = "first_cut"), through the model of the second fix (Bug = "second_cut"),
+// and through the model of the third fix (Bug = "break_hides"), which must all
+// reject them.
 //
 // Usage (from the repository root, after zig build):
 //   bun tests/tla/drivers/agent_runtime/response_language.ts
@@ -64,6 +66,7 @@ type Labels = {
   shared: boolean;
   stem: boolean;
   space: boolean;
+  eol: boolean;
 };
 type Prompt = { text: string; labels: Labels };
 type Observation = {
@@ -90,14 +93,16 @@ const english = (text: string, labels: Partial<Labels> = {}): Prompt => ({
   text,
   labels: {
     lang: "english", script: "latin", word: true, switch: false,
-    accent: false, mark: false, cut: false, bare: false, shared: false, stem: false, space: false, ...labels,
+    accent: false, mark: false, cut: false, bare: false, shared: false, stem: false, space: false, eol: false,
+    ...labels,
   },
 });
 const other = (text: string, labels: Partial<Labels>): Prompt => ({
   text,
   labels: {
     lang: "other", script: "latin", word: true, switch: false,
-    accent: false, mark: false, cut: false, bare: false, shared: false, stem: false, space: false, ...labels,
+    accent: false, mark: false, cut: false, bare: false, shared: false, stem: false, space: false, eol: false,
+    ...labels,
   },
 });
 
@@ -145,12 +150,17 @@ const PROMPTS: Prompt[] = [
   other("Terjemahkan\u00a0ke\u00a0bahasa\u00a0Korea. The lockfile is broken again.", { bare: true, space: true }),
   other("Terjemahkan\u202fke\u202fbahasa\u202fKorea. The lockfile is broken again.", { bare: true, space: true }),
   other("Terjemahkan\u3000ke\u3000bahasa\u3000Korea. The lockfile is broken again.", { bare: true, space: true }),
-  // English keeps the guard with each ending of a contraction and with a
-  // no-break space between its words.
+  // A line break other than LF ends the clause before the English line.
+  other("Terjemahkan ke bahasa Korea\rThe lockfile is broken again.", { bare: true, eol: true }),
+  other("Terjemahkan ke bahasa Korea\u2028Why is the lockfile broken again?", { bare: true, eol: true }),
+  // English keeps the guard with each ending of a contraction, with a no-break
+  // space between its words, and with a line break between its clauses.
   english("Can't reproduce it locally. Why does it fail?"),
   english("We'll fix parsing first. Why does it break?"),
   english("It\u2019s broken again. Why does it break?"),
   english("The\u00a0lockfile is broken again."),
+  english("Please check the lockfile\rWhy does it break again?"),
+  english("Please check the lockfile\u2028Why does it break again?"),
 ];
 
 // tests/fixtures/response-language/requests.json: realistic short requests, run
@@ -161,7 +171,7 @@ const PROMPTS: Prompt[] = [
 // English word lists counted, "stem" names the contraction stem it has before
 // an ending English does not use, and "form": "decomposed" stores its accents
 // as base letters and combining marks. The labels that the text itself decides
-// (accent, mark, space) come from its characters.
+// (accent, mark, space, eol) come from its characters.
 type FixtureEnglish = string | { text: string; word?: boolean; bare?: boolean; switch?: boolean; form?: "decomposed" };
 type FixtureOther = { lang: string; text: string; shared?: string; stem?: string; form?: "decomposed" };
 type Fixture = { english: FixtureEnglish[]; other: FixtureOther[] };
@@ -188,6 +198,10 @@ function letterLabels(text: string): { accent: boolean; mark: boolean } {
 // U+2000 to U+200A, U+202F, U+205F, or U+3000.
 const hasUnicodeSpace = (text: string): boolean => /[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/.test(text);
 
+// Whether the text has a line break other than LF, which fx also ends a clause
+// at: CR, VT, FF, U+0085, U+2028, or U+2029.
+const hasOtherLineBreak = (text: string): boolean => /[\r\v\f\u0085\u2028\u2029]/.test(text);
+
 function fixtureRequests(): Request[] {
   const fixture = JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as Fixture;
   const requests: Request[] = [];
@@ -212,6 +226,7 @@ function fixtureRequests(): Request[] {
         shared: item.shared !== undefined,
         stem: item.stem !== undefined,
         space: hasUnicodeSpace(text),
+        eol: hasOtherLineBreak(text),
       }),
     });
   }
@@ -401,7 +416,7 @@ function observedModule(observations: Observation[]): string {
     `[lang |-> ${str(l.lang)}, script |-> ${str(l.script)}, word |-> ${bool(l.word)}, ` +
     `switch |-> ${bool(l.switch)}, accent |-> ${bool(l.accent)}, mark |-> ${bool(l.mark)}, ` +
     `cut |-> ${bool(l.cut)}, bare |-> ${bool(l.bare)}, shared |-> ${bool(l.shared)}, ` +
-    `stem |-> ${bool(l.stem)}, space |-> ${bool(l.space)}]`;
+    `stem |-> ${bool(l.stem)}, space |-> ${bool(l.space)}, eol |-> ${bool(l.eol)}]`;
   const replies = (rs: Reply[]) =>
     `<<${rs.map((r) => `[script |-> ${str(r.script)}, tools |-> ${bool(r.tools)}]`).join(", ")}>>`;
   const value = (o: Observation) =>
@@ -542,6 +557,9 @@ async function main(): Promise<number> {
     const secondCut = await runTrace(observations, "fixed", out, "second_cut");
     console.log(`self-check, the model of the second fix of #809: ${secondCut.verdict} (must be REJECTED)`);
     if (secondCut.verdict !== "REJECTED") return secondCut.verdict === "TOOL_ERROR" ? 2 : 1;
+    const thirdCut = await runTrace(observations, "fixed", out, "break_hides");
+    console.log(`self-check, the model of the third fix of #809: ${thirdCut.verdict} (must be REJECTED)`);
+    if (thirdCut.verdict !== "REJECTED") return thirdCut.verdict === "TOOL_ERROR" ? 2 : 1;
   }
   console.log("ACCEPTED");
   return 0;
