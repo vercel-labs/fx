@@ -7,7 +7,7 @@
 //   bun tests/tla/drivers/acp/session_target/driver.ts              # after zig build
 //   bun tests/tla/drivers/acp/session_target/driver.ts --model before
 //
-// Kernel plans run the libfx/* methods through libfx's minimal kernel in the
+// Kernel plans run the SDK's _sh.fx/* methods through libfx's minimal kernel in the
 // native addon (kernel.ts), which needs `zig build libfx-napi
 // -Dnapi-surface=core`; --no-kernel leaves them out.
 //
@@ -106,7 +106,7 @@ function mulberry32(seed: number) {
 
 /// Seeded plans. Each starts with a session, creates at most two, and sends
 /// at most one oversized frame, which takes fx a moment to read. Kernel plans
-/// use the libfx/* methods and session/close, and never restart.
+/// use the SDK's _sh.fx/* methods and session/close, and never restart.
 function randomPlans(count: number, steps: number, seed: number, kind: "acp" | "kernel" = "acp"): Plan[] {
   const ops: readonly NamingOp[] = kind === "kernel" ? KERNEL_OPS : NAMING_OPS;
   const rand = mulberry32(seed);
@@ -147,14 +147,14 @@ let followUps = 0;
 function params(op: NamingOp, sessionId: unknown, workspace: string): [string, Record<string, unknown>] {
   const target = sessionId === undefined ? {} : { sessionId };
   switch (op) {
-    case "snapshot": return ["libfx/snapshot", target];
-    case "checkpoint": return ["libfx/checkpoint", target];
-    case "handoff": return ["libfx/handoff", target];
-    case "withdraw": return ["libfx/withdraw", { ...target, id: "w1" }];
-    case "followup": return ["libfx/follow_up", { ...target, id: `f${(followUps += 1)}`, text: "later" }];
-    case "steer": return ["libfx/steer", { ...target, text: "now" }];
+    case "snapshot": return ["_sh.fx/journal/snapshot", target];
+    case "checkpoint": return ["_sh.fx/session/checkpoint", target];
+    case "handoff": return ["_sh.fx/session/end_turn_for_steer", target];
+    case "withdraw": return ["_sh.fx/session/withdraw_steer", { ...target, id: "w1" }];
+    case "followup": return ["_sh.fx/session/follow_up", { ...target, id: `f${(followUps += 1)}`, text: "later" }];
+    case "steer": return ["_sh.fx/session/steer", { ...target, text: "now" }];
     // An empty checkpoint, which fx refuses for the open session.
-    case "restore": return ["libfx/restore", { ...target, checkpoint: "" }];
+    case "restore": return ["_sh.fx/session/restore", { ...target, checkpoint: "" }];
     case "prompt": return ["session/prompt", { ...target, prompt: [{ type: "text", text: "hello" }] }];
     case "mode": return ["session/set_mode", { ...target, modeId: "auto" }];
     case "config": return ["session/set_config_option", { ...target, configId: "mode", value: "auto" }];
@@ -197,7 +197,7 @@ async function runKernelPlan(plan: Plan, dir: string) {
     for (const step of plan.steps) {
       if (step.op === "new") {
         const label = ids.A === undefined ? "A" : "B";
-        const response = await kernel.call("libfx/new", {});
+        const response = await kernel.call("_sh.fx/session/new", {});
         if (typeof response.result?.sessionId === "string") ids[label] = response.result.sessionId;
         observations.push(observe("new", label, response, undefined));
       } else if (step.op === "restart" || step.op === "oversize") {

@@ -245,9 +245,9 @@ noinline fn parseServerInto(
 
 /// A server the client supplies for a session is relevant to that session, so
 /// its tools stay advertised on every turn unless the client sets
-/// `_meta.fx.alwaysLoaded` to false.
+/// `sh.fx/alwaysLoaded` in the server's `_meta` to false.
 fn alwaysLoadedPreference(object: std.json.ObjectMap) bool {
-    return acp_types.fxMetaBool(object, "alwaysLoaded") orelse true;
+    return acp_types.metaBool(object, "sh.fx/alwaysLoaded") orelse true;
 }
 
 /// MCP over ACP, a draft ACP proposal fx doesn't speak: the server is kept,
@@ -420,9 +420,9 @@ test "ACP MCP parser keeps supplied servers loaded unless meta opts out" {
     var configs = try parse(alloc,
         \\{"mcpServers":[
         \\{"name":"default","command":"/bin/a","args":[],"env":[]},
-        \\{"name":"lazy","command":"/bin/b","args":[],"env":[],"_meta":{"fx":{"alwaysLoaded":false}}},
-        \\{"type":"http","name":"remote","url":"https://example.com/mcp","headers":[],"_meta":{"fx":{"alwaysLoaded":"no"}}},
-        \\{"type":"http","name":"remote_lazy","url":"https://example.com/mcp","headers":[],"_meta":{"fx":{"alwaysLoaded":false}}}
+        \\{"name":"lazy","command":"/bin/b","args":[],"env":[],"_meta":{"sh.fx/alwaysLoaded":false}},
+        \\{"type":"http","name":"remote","url":"https://example.com/mcp","headers":[],"_meta":{"sh.fx/alwaysLoaded":"no"}},
+        \\{"type":"http","name":"remote_lazy","url":"https://example.com/mcp","headers":[],"_meta":{"sh.fx/alwaysLoaded":false}}
         \\]}
     );
     defer configs.deinit(alloc);

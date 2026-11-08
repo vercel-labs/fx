@@ -878,15 +878,15 @@ test("a journal that does not fold is refused", async () => {
   await agent.close();
   const invalid = (pattern) => (error) => pattern.test(error.message) && error.code === "FX_JOURNAL_INVALID";
   const duplicated = eventJournal([...journal.events, journal.events.at(-1)]);
-  await assert.rejects(createFxEngine(options(targetBackend, duplicated)), invalid(/libfx journal events are out of order/));
+  await assert.rejects(createFxEngine(options(targetBackend, duplicated)), invalid(/Journal events are out of order/));
   const newer = eventJournal([{ ...journal.events[0], v: 5 }]);
-  await assert.rejects(createFxEngine(options(targetBackend, newer)), /libfx journal was written by a newer fx/);
+  await assert.rejects(createFxEngine(options(targetBackend, newer)), /Journal was written by a newer fx/);
   const garbled = eventJournal([{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: { kind: "nope" } }]);
-  await assert.rejects(createFxEngine(options(targetBackend, garbled)), invalid(/Invalid libfx journal/));
+  await assert.rejects(createFxEngine(options(targetBackend, garbled)), invalid(/Invalid journal/));
   const huge = eventJournal([{ ...journal.events.at(-1), seq: 1, turn: 1, padding: "x".repeat(4 * 1024 * 1024) }]);
   await assert.rejects(
     createFxEngine(options(targetBackend, huge)),
-    (error) => /libfx journal is too large/.test(error.message) && error.code === "FX_JOURNAL_TOO_LARGE",
+    (error) => /Journal is too large/.test(error.message) && error.code === "FX_JOURNAL_TOO_LARGE",
   );
 });
 
@@ -2051,7 +2051,7 @@ test("a journal past the turn limit is refused by name", async () => {
   const turns = Array.from({ length: 1025 }, (_, index) => ({ ...commit, seq: index + 1, turn: index + 1 }));
   await assert.rejects(
     createFxEngine(options(targetBackend, eventJournal(turns))),
-    (error) => error.message === "libfx journal holds more than 1024 turns" && error.code === "FX_JOURNAL_TOO_LARGE",
+    (error) => error.message === "Journal holds more than 1024 turns" && error.code === "FX_JOURNAL_TOO_LARGE",
   );
 });
 

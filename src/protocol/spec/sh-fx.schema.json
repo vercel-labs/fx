@@ -35,7 +35,13 @@
         "sh.fx/subagentPrompts": { "$ref": "#/$defs/Capability" },
         "sh.fx/fork": { "$ref": "#/$defs/Capability" },
         "sh.fx/rewind": { "$ref": "#/$defs/Capability" },
-        "sh.fx/turnDiff": { "$ref": "#/$defs/Capability" }
+        "sh.fx/turnDiff": { "$ref": "#/$defs/Capability" },
+        "sh.fx/journal": { "$ref": "#/$defs/Capability" },
+        "sh.fx/hooks": { "$ref": "#/$defs/Capability" },
+        "sh.fx/hostTools": { "$ref": "#/$defs/Capability" },
+        "sh.fx/toolCall": { "$ref": "#/$defs/Capability" },
+        "sh.fx/permissionMode": { "$ref": "#/$defs/Capability" },
+        "sh.fx/modelResponseRecovery": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
@@ -53,10 +59,24 @@
         "sh.fx/subagentPrompts": { "$ref": "#/$defs/Capability" },
         "sh.fx/fork": { "$ref": "#/$defs/Capability" },
         "sh.fx/rewind": { "$ref": "#/$defs/Capability" },
-        "sh.fx/turnDiff": { "$ref": "#/$defs/Capability" }
+        "sh.fx/turnDiff": { "$ref": "#/$defs/Capability" },
+        "sh.fx/hostSteering": { "$ref": "#/$defs/Capability" },
+        "sh.fx/journal": { "$ref": "#/$defs/Capability" },
+        "sh.fx/hooks": { "$ref": "#/$defs/Capability" },
+        "sh.fx/hostTools": { "$ref": "#/$defs/HostToolsCapability" },
+        "sh.fx/toolCall": { "$ref": "#/$defs/Capability" },
+        "sh.fx/permissionMode": { "$ref": "#/$defs/Capability" },
+        "sh.fx/modelResponseRecovery": { "$ref": "#/$defs/Capability" }
       },
       "patternProperties": {
         "^sh\\.fx/": { "$ref": "#/$defs/Capability" }
+      }
+    },
+    "HostToolsCapability": {
+      "description": "The value of the sh.fx/hostTools capability that a client lists: the tools it runs for fx when fx sends `_sh.fx/tools/call`.",
+      "type": "object",
+      "properties": {
+        "tools": { "type": "array", "items": { "type": "object" } }
       }
     },
     "PromptDeliveryCapability": {

@@ -9,19 +9,33 @@ const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
+const sh_fx = @import("sh_fx.zig");
 const journal = @import("../core/agent/runtime/journal.zig");
 
 pub const Config = struct { capture_content: bool = false };
 
-pub fn parseConfig(alloc: std.mem.Allocator, raw: ?[]const u8) !?Config {
+/// Reads a session's hook settings: the `hooks` field of
+/// `_sh.fx/session/new`, or `sh.fx/hooks` in the `_meta` of ACP's session
+/// methods. `listed` says whether the client lists `sh.fx/hooks` at
+/// `initialize`; fx sends hook events only to a client that does, so settings
+/// from any other client fail.
+pub fn parseConfig(alloc: std.mem.Allocator, raw: ?[]const u8, listed: bool) !?Config {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw orelse "{}", .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidHooks;
-    const hooks = parsed.value.object.get("hooks") orelse acp_types.fxMetaField(parsed.value.object, "hooks") orelse return null;
+    const hooks = parsed.value.object.get("hooks") orelse acp_types.metaField(parsed.value.object, "sh.fx/hooks") orelse return null;
+    if (!listed) return error.HooksNotListed;
     if (hooks != .object) return error.InvalidHooks;
     const capture = hooks.object.get("captureContent") orelse return Config{};
     if (capture != .bool) return error.InvalidHooks;
     return .{ .capture_content = capture.bool };
+}
+
+pub fn parseErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.HooksNotListed => "Hooks need the sh.fx/hooks capability in clientCapabilities._meta",
+        else => "Invalid hooks",
+    };
 }
 
 pub const Bridge = struct {
@@ -68,6 +82,9 @@ pub const Bridge = struct {
         self.enabled = true;
     }
 
+    /// Sends one observer event, such as the end of a turn, to the client's
+    /// hooks as `_sh.fx/hooks/event`. A failure to encode or send it is logged
+    /// and never fails the turn.
     fn emit(raw: *anyopaque, step: usize, event: observation.Event) void {
         const self: *Bridge = @ptrCast(@alignCast(raw));
         if (!self.enabled) return;
@@ -77,7 +94,7 @@ pub const Bridge = struct {
             debug_trace.logf("hooks", "event encoding failed err={s}", .{@errorName(err)});
             return;
         };
-        self.writer.writeNotification(self.alloc, "libfx/hook", out.written()) catch |err| {
+        self.writer.writeNotification(self.alloc, sh_fx.method.hooks_event, out.written()) catch |err| {
             debug_trace.logf("hooks", "event delivery failed err={s}", .{@errorName(err)});
         };
     }
@@ -575,12 +592,14 @@ test "libfx hook bridge disables observation for overlong identities in every bu
 
 test "libfx hooks are disabled by default and reject invalid capture configuration" {
     const alloc = std.testing.allocator;
-    try std.testing.expect(try parseConfig(alloc, null) == null);
-    try std.testing.expect(try parseConfig(alloc, "{}") == null);
-    try std.testing.expect(!(try parseConfig(alloc, "{\"hooks\":{}}")).?.capture_content);
-    try std.testing.expect((try parseConfig(alloc, "{\"hooks\":{\"captureContent\":true}}")).?.capture_content);
-    try std.testing.expectError(error.InvalidHooks, parseConfig(alloc, "{\"hooks\":true}"));
-    try std.testing.expectError(error.InvalidHooks, parseConfig(alloc, "{\"hooks\":{\"captureContent\":\"true\"}}"));
+    try std.testing.expect(try parseConfig(alloc, null, true) == null);
+    try std.testing.expect(try parseConfig(alloc, "{}", true) == null);
+    try std.testing.expect(!(try parseConfig(alloc, "{\"hooks\":{}}", true)).?.capture_content);
+    try std.testing.expect((try parseConfig(alloc, "{\"hooks\":{\"captureContent\":true}}", true)).?.capture_content);
+    try std.testing.expectError(error.InvalidHooks, parseConfig(alloc, "{\"hooks\":true}", true));
+    try std.testing.expectError(error.HooksNotListed, parseConfig(alloc, "{\"hooks\":{\"captureContent\":true}}", false));
+    try std.testing.expectEqual(@as(?Config, null), try parseConfig(alloc, "{}", false));
+    try std.testing.expectError(error.InvalidHooks, parseConfig(alloc, "{\"hooks\":{\"captureContent\":\"true\"}}", true));
 }
 
 test "libfx hook encoding failure cannot fail the execution callback" {

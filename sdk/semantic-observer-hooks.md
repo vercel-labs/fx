@@ -16,13 +16,14 @@ The existing SDK `onEvent` reports diagnostics, and turn iterators report UI
 output. Neither is a complete semantic execution stream.
 
 `src/core/agent/runtime/observation.zig` defines the optional borrowed typed sink.
-`src/acp/libfx_hooks.zig` projects safe fields onto versioned `libfx/hook`
+`src/acp/libfx_hooks.zig` projects safe fields onto versioned `_sh.fx/hooks/event`
 notifications. Both native and Wasm libfx use that same adapter. The JavaScript
 host dispatches them through `hooks.onEvent`; disabled hooks don't serialize or
 send semantic events. The standalone CLI doesn't install an observer sink.
 An ACP host can opt in on `session/new`, `session/load`, or `session/resume`
-through `_meta.fx.hooks`, with the same capture option and event protocol. The
-response confirms hooks version 1; omitting the option on a new/load/resume
+through `sh.fx/hooks` in the params' `_meta`, after it lists the `sh.fx/hooks`
+capability at `initialize`, with the same capture option and event protocol.
+fx lists `sh.fx/hooks` in its own capabilities; omitting the option on a new/load/resume
 request disables hooks, including a reload of the active session. This doesn't
 change ACP permission policy.
 

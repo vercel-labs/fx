@@ -230,7 +230,7 @@ try {
         apiKey: "stable-cache-key",
         checkpoint: new Uint8Array([1, 2, 3]),
       }),
-      /Invalid or non-fresh libfx checkpoint/,
+      /Invalid or non-fresh checkpoint/,
     );
     assert.equal((await getBackendInfo({ backend: "wasm", wasm: stableWasm })).backend, "wasm-jspi");
     const stableAgent = await createFxEngine({ backend: "wasm", wasm: stableWasm, apiKey: "stable-cache-key" });

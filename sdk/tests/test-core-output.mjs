@@ -78,7 +78,7 @@ for (const cancelAt of ["permission.request", "permission.resolve"]) {
       const message = JSON.parse(data);
       const deliver = (value) => queueMicrotask(() => handler(value));
       if (message.method === "initialize") deliver({ id: message.id, result: {} });
-      if (message.method === "libfx/new") deliver({ id: message.id, result: { sessionId: "session" } });
+      if (message.method === "_sh.fx/session/new") deliver({ id: message.id, result: { sessionId: "session" } });
       if (message.method === "session/prompt") {
         promptId = message.id;
         deliver({ id: 100, method: "session/request_permission", params: { sessionId: "session", options: [] } });

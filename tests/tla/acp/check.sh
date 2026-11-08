@@ -6,7 +6,7 @@
 # /permissions. AcpSpeed: the per-session Standard, Fast, and Ultrafast speed
 # contract. AcpSessionTarget: how a request that names a session is answered,
 # under ACP v1's error rules, in fx acp and in libfx's minimal kernel (the
-# libfx/* methods). AcpSystemPrompt: the client's systemPrompt on session/new,
+# SDK's _sh.fx/* methods). AcpSystemPrompt: the client's systemPrompt on session/new,
 # session/load and session/resume, and the prompt each turn sends.
 # AcpPromptDelivery: steering and queued prompts as the sh.fx spec
 # defines them, which haven't landed in src/acp/ yet. AcpFollow: following a
@@ -73,7 +73,7 @@ MCAcpPromptDelivery MCAcpPromptDelivery -
 MCAcpPromptDelivery MCAcpPromptDeliveryRefusals -
 MCAcpPromptDelivery AcpPromptDeliveryToday-interrupt NoSteerWaitsOnReply
 MCAcpPromptDelivery AcpPromptDeliveryToday-lost NothingLost
-MCAcpPromptDelivery AcpPromptDeliveryToday-dropped DeliveryValues
+MCAcpPromptDelivery AcpPromptDeliveryToday-stopped StopKeepsSteers
 MCAcpPromptDelivery AcpPromptDeliveryToday-late LateRunTogether
 MCAcpFollow MCAcpFollow -
 MCAcpFollow AcpFollowToday-busy JoinWorks

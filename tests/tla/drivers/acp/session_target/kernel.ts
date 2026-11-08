@@ -1,6 +1,6 @@
 // A client of the minimal ACP kernel that libfx runs in the native addon
 // (zig-out/lib/libfx.node, built with `zig build libfx-napi
-// -Dnapi-surface=core`). Only that kernel serves the libfx/* methods; plain
+// -Dnapi-surface=core`). Only that kernel serves the SDK's _sh.fx/* methods; plain
 // `fx acp` answers them with -32601. It sends raw JSON-RPC lines, so a driver
 // can name any session, and it reads the kernel's output with the SDK's own
 // framing. It makes no model requests: a request for one fails the run.
