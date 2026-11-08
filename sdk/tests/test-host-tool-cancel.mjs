@@ -74,7 +74,7 @@ async function exerciseCancellation(settlement, closeBeforeSettle) {
         events.push(event);
         const message = event.message;
         const beforeTool = backend === "native"
-          ? message?.method === "libfx/tool_call"
+          ? message?.method === "_sh.fx/tools/call"
           : message?.method === "session/update" && message.params?.update?.sessionUpdate === "tool_call";
         if (settlement === "before-start" && event.type === "acp.receive" && beforeTool) {
           controller.abort();

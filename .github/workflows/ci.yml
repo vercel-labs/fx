@@ -776,6 +776,22 @@ jobs:
       - name: Restore executable mode
         if: needs.ci-need.outputs.acp == 'true'
         run: chmod +x zig-out/bin/fx
+      # The session-target driver runs its kernel plans through the native
+      # addon. build.zig locates node_api.h through the node on PATH.
+      - name: Setup Node
+        if: needs.ci-need.outputs.acp == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Setup Zig
+        if: needs.ci-need.outputs.acp == 'true'
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.0"
+          cache-key: ci-tla-acp
+      - name: Build the N-API addon
+        if: needs.ci-need.outputs.acp == 'true'
+        run: zig build libfx-napi -Dnapi-surface=core
       - name: Setup Bun
         if: needs.ci-need.outputs.acp == 'true'
         uses: oven-sh/setup-bun@v2

@@ -163,7 +163,7 @@ try {
       checkpoint: new Uint8Array([1, 2, 3]),
       apiKey: "loader-checkpoint-key",
     }),
-    (error) => error.message.includes("Invalid or non-fresh libfx checkpoint"),
+    (error) => error.message.includes("Invalid or non-fresh checkpoint"),
   );
 } finally {
   Object.defineProperty(WebAssembly, "Suspending", { configurable: true, value: savedSuspending });

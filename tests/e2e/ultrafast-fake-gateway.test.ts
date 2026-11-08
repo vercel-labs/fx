@@ -705,7 +705,7 @@ describe("ultrafast fake Gateway", () => {
         expect(rejected.error).toMatchObject({
           code: -32602,
           data: {
-            code: "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST",
+            code: "MODEL_UNSUPPORTED_ULTRAFAST",
             model: SOL_MODEL,
             capability: "ultrafast",
           },
@@ -1398,7 +1398,7 @@ describe("ACP speed options", () => {
         const fast = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "true" }, 3);
         expect(fast.error).toMatchObject({
           code: -32602,
-          data: { code: "LIBFX_MODEL_UNSUPPORTED_FAST", model: PLAIN_MODEL, capability: "fast" },
+          data: { code: "MODEL_UNSUPPORTED_FAST", model: PLAIN_MODEL, capability: "fast" },
         });
         const off = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "false" }, 4);
         expect(off.error).toBeUndefined();

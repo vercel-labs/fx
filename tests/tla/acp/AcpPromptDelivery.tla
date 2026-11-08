@@ -1,16 +1,16 @@
 ------------------------- MODULE AcpPromptDelivery -------------------------
 (***************************************************************************)
 (* Steering and queued prompts in fx's ACP server, as the sh.fx spec's    *)
-(* "Steering and queued prompts" section defines them                      *)
+(* "Steering and queued prompts" section defines them                     *)
 (* (src/protocol/spec/sh-fx.md). The rules have not landed in             *)
 (* src/acp/ yet: `Rules` set to FALSE gives fx's ACP path today, and the  *)
 (* AcpPromptDeliveryToday-*.cfg configs show each rule failing there.     *)
 (* tests/tla/sdk/DurableSteer.tla models the same rules for libfx's host  *)
-(* steering, which the fx CLI follows.                                     *)
-(*                                                                         *)
+(* steering, which the fx CLI follows.                                    *)
+(*                                                                        *)
 (* A client sends prompts while a turn runs, each with a delivery in      *)
-(* `_meta["sh.fx/delivery"]`:                                              *)
-(*                                                                         *)
+(* `_meta["sh.fx/delivery"]`:                                             *)
+(*                                                                        *)
 (*  - A prompt that arrives while no turn runs starts one.                *)
 (*  - A prompt with no delivery that arrives during a turn fails with     *)
 (*    -32600.                                                             *)
@@ -31,20 +31,20 @@
 (*    with -32800; session/close answers each one with -32800.            *)
 (*  - Each prompt gets exactly one answer: a turn's stopReason, and for a *)
 (*    steer the delivery: absorbed into the running turn, or next_turn.   *)
-(*                                                                         *)
+(*                                                                        *)
 (* Today (Rules = FALSE): a steer never cuts a reply short; a steer that  *)
 (* waits when the reply ends goes on in the same turn, as under the rules *)
 (* (tests/tla/drivers/acp/prompt_delivery/driver.ts shows it); one that   *)
-(* arrives while the turn finishes fails with -32600; a stop answers       *)
-(* waiting steers as cancelled and dropped; a late steer runs as its own  *)
-(* next turn; a queued prompt is a prompt during a turn, which fails with *)
-(* -32600; and $/cancel_request ignores a steer.                          *)
-(*                                                                         *)
+(* arrives while the turn finishes fails with -32600; a stop fails the    *)
+(* waiting steers with -32800; a late steer runs as its own               *)
+(* next turn; fx lists only the steer delivery, so a queued prompt        *)
+(* fails with -32602; and $/cancel_request ignores a steer.               *)
+(*                                                                        *)
 (* The phases of the running turn: "gen" while the model streams a reply, *)
 (* "decide" once the reply has streamed and before the turn's next        *)
 (* request, "tool" while a tool runs, "finishing" once the turn has found *)
 (* no steer waiting at the reply's end but still takes input, and         *)
-(* "closing" once it has stopped taking input.                             *)
+(* "closing" once it has stopped taking input.                            *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets
 
@@ -175,8 +175,8 @@ Send(m) ==
                      /\ queue' = Append(queue, m)
                      /\ UNCHANGED <<running, phase, cur, waiting, late, answers, placed, started>>
               [] OTHER ->
-                     \* Today a queued prompt is a prompt during a turn.
-                     /\ answers' = [answers EXCEPT ![m] = Err(-32600)]
+                     \* Today fx lists only the steer delivery and refuses a queued one.
+                     /\ answers' = [answers EXCEPT ![m] = Err(-32602)]
                      /\ UNCHANGED <<running, phase, cur, waiting, late, queue, placed, started>>
 
 \* The model finishes streaming a reply.
@@ -235,8 +235,7 @@ Finish ==
     /\ UNCHANGED <<sent, waiting, tools, cancels, closed>>
 
 \* session/cancel stops the running turn. Under the rules its waiting steers
-\* run next with the late ones (Q39, Q40); today they are answered as
-\* cancelled and dropped.
+\* run next with the late ones (Q39, Q40); today they fail with -32800.
 Cancel ==
     /\ running /\ phase # "closing" /\ cancels < MaxCancels
     /\ cancels' = cancels + 1
@@ -267,7 +266,7 @@ Cancel ==
                         /\ UNCHANGED <<phase, late, queue, placed, started>>
        ELSE /\ answers' = [m \in Msgs |->
                     IF m \in cur.ctx THEN Ok("cancelled", Delivery(cur, m))
-                    ELSE IF m \in Range(waiting) THEN Ok("cancelled", "dropped")
+                    ELSE IF m \in Range(waiting) THEN Err(-32800)
                     ELSE answers[m]]
             /\ StartNext
 
@@ -334,6 +333,10 @@ NothingLost ==
 
 \* A steer's delivery is where it ran; no steer is dropped (Q39).
 DeliveryValues == \A m \in Msgs : answers[m].delivery \in {"", "none", "absorbed", "next_turn"}
+
+\* A stop fails no prompt: the steers it finds waiting run next (Q39).
+StopKeepsSteers ==
+    [][cancels' > cancels => \A m \in Msgs : answers[m].kind = "none" => answers'[m].kind # "err"]_vars
 
 \* Queued prompts start their turns in the order fx received them.
 SentIndex(m) == CHOOSE k \in DOMAIN sent : sent[k] = m

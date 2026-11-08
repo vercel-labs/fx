@@ -55,6 +55,7 @@ const image_attachments = @import("../core/images/image_attachments.zig");
 const libfx_steering = @import("libfx_steering.zig");
 const journal_events = @import("../core/agent/runtime/journal.zig");
 const libfx_journal = @import("libfx_journal.zig");
+const sh_fx = @import("sh_fx.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
 
 const Allocator = std.mem.Allocator;
@@ -75,7 +76,7 @@ const AcpMethod = enum {
     session_resume,
     session_close,
     session_list,
-    session_remove,
+    session_delete,
     session_prompt,
     session_set_config_option,
     session_set_mode,
@@ -101,20 +102,20 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "session/resume")) return .session_resume;
         if (std.mem.eql(u8, method, "session/close")) return .session_close;
         if (std.mem.eql(u8, method, "session/list")) return .session_list;
-        if (std.mem.eql(u8, method, "session/remove")) return .session_remove;
+        if (std.mem.eql(u8, method, "session/delete")) return .session_delete;
         if (std.mem.eql(u8, method, "session/prompt")) return .session_prompt;
         if (std.mem.eql(u8, method, "session/set_config_option")) return .session_set_config_option;
         if (std.mem.eql(u8, method, "session/set_mode")) return .session_set_mode;
-        if (std.mem.eql(u8, method, "libfx/checkpoint")) return .libfx_checkpoint;
-        if (std.mem.eql(u8, method, "libfx/restore")) return .libfx_restore;
-        if (std.mem.eql(u8, method, "libfx/new")) return .libfx_new;
-        if (std.mem.eql(u8, method, "libfx/steer")) return .libfx_steer;
-        if (std.mem.eql(u8, method, "libfx/withdraw")) return .libfx_withdraw;
-        if (std.mem.eql(u8, method, "libfx/handoff")) return .libfx_handoff;
-        if (std.mem.eql(u8, method, "libfx/follow_up")) return .libfx_follow_up;
-        if (std.mem.eql(u8, method, "libfx/snapshot")) return .libfx_snapshot;
-        if (std.mem.eql(u8, method, "libfx/journal_open")) return .libfx_journal_open;
-        if (std.mem.eql(u8, method, "libfx/journal_images")) return .libfx_journal_images;
+        if (std.mem.eql(u8, method, sh_fx.method.session_checkpoint)) return .libfx_checkpoint;
+        if (std.mem.eql(u8, method, sh_fx.method.session_restore)) return .libfx_restore;
+        if (std.mem.eql(u8, method, sh_fx.method.session_new)) return .libfx_new;
+        if (std.mem.eql(u8, method, sh_fx.method.session_steer)) return .libfx_steer;
+        if (std.mem.eql(u8, method, sh_fx.method.session_withdraw_steer)) return .libfx_withdraw;
+        if (std.mem.eql(u8, method, sh_fx.method.session_end_turn_for_steer)) return .libfx_handoff;
+        if (std.mem.eql(u8, method, sh_fx.method.session_follow_up)) return .libfx_follow_up;
+        if (std.mem.eql(u8, method, sh_fx.method.journal_snapshot)) return .libfx_snapshot;
+        if (std.mem.eql(u8, method, sh_fx.method.journal_open)) return .libfx_journal_open;
+        if (std.mem.eql(u8, method, sh_fx.method.journal_stage_images)) return .libfx_journal_images;
         if (std.mem.eql(u8, method, "mcp/message")) return .mcp_message;
         return .unknown;
     }
@@ -136,7 +137,7 @@ const AcpMethod = enum {
             .libfx_follow_up,
             => false,
             .session_list,
-            .session_remove,
+            .session_delete,
             .session_prompt,
             .session_set_config_option,
             .libfx_checkpoint,
@@ -378,13 +379,21 @@ pub const ServerState = struct {
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     host_tools: host_tool_runtime.Runtime = .{},
-    host_instructions: []u8 = &.{},
+    /// The extensions that both fx and the client list at `initialize`. fx
+    /// sends an extension's notifications and `_meta` keys only for these.
+    extensions: sh_fx.Set = .empty,
     outbound_mutex: std.Io.Mutex = .init,
     outbound_cond: std.Io.Condition = .init,
     next_outbound_request_id: u64 = 1,
     pending_outbound: std.AutoHashMapUnmanaged(u64, PendingOutbound) = .empty,
     legacy_url_mutex: std.Io.Mutex = .init,
     pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
+
+    /// Whether steering updates carry `sh.fx/steerInput`: `fx acp`'s clients
+    /// list `sh.fx/promptDelivery`, and a libfx host lists `sh.fx/hostSteering`.
+    pub fn sendsSteerInput(self: *const ServerState) bool {
+        return self.extensions.contains(.prompt_delivery) or self.extensions.contains(.host_steering);
+    }
 
     pub fn deinit(self: *ServerState) void {
         // Terminals end with this process. Ending them first also releases
@@ -421,7 +430,6 @@ pub const ServerState = struct {
         self.web_search_runtime.deinit();
         self.lifecycle_runtime.deinit();
         self.host_tools.deinit();
-        if (self.host_instructions.len > 0) self.alloc.free(self.host_instructions);
         self.capability_resolver.deinit(self.alloc);
         var pending = self.pending_outbound.valueIterator();
         while (pending.next()) |entry| {
@@ -1006,9 +1014,10 @@ pub fn runWithTransport(
         const line_result = reader.readLine(alloc) catch break;
         if (line_result == null) break;
         const line = switch (line_result.?) {
+            // `tests/tla/acp/AcpSessionTarget.tla` OversizeIs32600 and NeverAuthCode.
             .overflow => {
                 state.writer.writeError(alloc, null, .{
-                    .code = ErrorCode.request_frame_too_large,
+                    .code = ErrorCode.invalid_request,
                     .message = "Request frame too large",
                 }) catch break;
                 continue;
@@ -1517,7 +1526,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .session_new => sessions.handleNewWasmSession(state, alloc, msg),
             .session_load => sessions.handleLoadWasmSession(state, alloc, msg),
             .session_list => sessions.handleListWasmSessions(state, alloc, msg),
-            .session_remove => sessions.handleRemoveWasmSession(state, alloc, msg),
+            .session_delete => sessions.handleDeleteWasmSession(state, alloc, msg),
             .session_prompt => startPrompt(state, alloc, msg),
             .session_set_config_option => handleSetConfigOption(state, alloc, msg),
             .session_set_mode => handleSetMode(state, alloc, msg),
@@ -1560,7 +1569,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .initialize,
         .request_cancel,
         .session_cancel,
-        .session_remove,
+        .session_delete,
         .mcp_message,
         .unknown,
         => state.writer.writeError(alloc, msg.id, .{
@@ -1662,14 +1671,11 @@ fn handleKernelWithdraw(
 ) !void {
     var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx withdraw params",
+        .message = "Invalid withdraw params",
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const id = parsed.value.object.get("id") orelse
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
@@ -1698,14 +1704,11 @@ fn handleKernelHandoff(
 ) !void {
     var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx handoff params",
+        .message = "Invalid handoff params",
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     if (active.steering.requestHandoff(&active.cancel_flag)) {
         debug_trace.logf("acp", "libfx handoff interrupts the streaming reply", .{});
     }
@@ -1728,20 +1731,27 @@ fn writePromptInProgress(state: *ServerState, alloc: Allocator, id: ?jsonrpc.Req
     });
 }
 
-/// Joins a `session/prompt` that sets `_meta.fx.steer` to the running turn at
-/// its next safe boundary. The response is deferred until that turn ends. A
+/// Joins a `session/prompt` whose `sh.fx/delivery` is `"steer"` to the running
+/// turn at its next safe boundary. The response is deferred until that turn ends. A
 /// prompt without the opt-in keeps the in-progress rejection. Steering closes
 /// only after the turn has fully returned, so joining the finishing worker
 /// here never waits on work that needs this reader.
 fn handleSteeringPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
-    // libfx kernel hosts steer through `libfx/steer`.
+    // libfx kernel hosts steer through `_sh.fx/session/steer`.
     if (state.cfg.minimal_kernel) return writePromptInProgress(state, alloc, msg.id);
     const params = msg.params_raw orelse return writePromptInProgress(state, alloc, msg.id);
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
         return writePromptInProgress(state, alloc, msg.id);
     defer parsed.deinit();
-    if (parsed.value != .object or !(acp_types.fxMetaBool(parsed.value.object, "steer") orelse false)) {
+    if (parsed.value != .object) return writePromptInProgress(state, alloc, msg.id);
+    const delivery = acp_types.metaField(parsed.value.object, "sh.fx/delivery") orelse
         return writePromptInProgress(state, alloc, msg.id);
+    // fx lists `steer` as its one delivery until queued prompts land.
+    if (delivery != .string or !std.mem.eql(u8, delivery.string, "steer")) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "sh.fx/delivery supports only \"steer\"",
+        });
     }
     if (!try requireParsedActiveSessionTarget(state, alloc, msg.id, parsed.value)) return;
     const text = steeringPromptText(alloc, parsed.value.object) catch |err| switch (err) {
@@ -1810,9 +1820,11 @@ fn checkpointMetaParam(params: std.json.Value) ?agent_checkpoint.Meta {
 
 const invalid_checkpoint_meta: jsonrpc.RpcError = .{
     .code = ErrorCode.invalid_params,
-    .message = "Invalid libfx checkpoint meta",
+    .message = "Invalid checkpoint meta",
 };
 
+/// `_sh.fx/session/checkpoint`: saves the state of a session that has no
+/// running turn as the bytes of one binary attachment, which the host stores.
 fn handleKernelCheckpoint(
     state: *ServerState,
     alloc: Allocator,
@@ -1820,17 +1832,14 @@ fn handleKernelCheckpoint(
 ) !void {
     var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx checkpoint params",
+        .message = "Invalid checkpoint params",
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const unavailable: jsonrpc.RpcError = .{
         .code = ErrorCode.invalid_request,
-        .message = "libfx checkpoint is unavailable",
+        .message = "Checkpoint is unavailable",
     };
     const meta = checkpointMetaParam(parsed.value) orelse return state.writer.writeError(alloc, msg.id, invalid_checkpoint_meta);
     const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, unavailable);
@@ -1847,6 +1856,8 @@ fn handleKernelCheckpoint(
     try state.writer.writeResponse(alloc, msg.id, written);
 }
 
+/// `_sh.fx/session/restore`: loads a session's state from a checkpoint
+/// attachment into the session that `_sh.fx/session/new` created.
 fn handleKernelRestore(
     state: *ServerState,
     alloc: Allocator,
@@ -1854,22 +1865,19 @@ fn handleKernelRestore(
 ) !void {
     var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx restore params",
+        .message = "Invalid restore params",
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const reference = parsed.value.object.get("checkpointAttachment") orelse
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "Missing libfx checkpoint",
+            .message = "Missing checkpoint",
         });
     const invalid: jsonrpc.RpcError = .{
         .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx checkpoint",
+        .message = "Invalid checkpoint",
     };
     const attachment = host_attachments.idFromJson(reference) orelse
         return state.writer.writeError(alloc, msg.id, invalid);
@@ -1879,23 +1887,23 @@ fn handleKernelRestore(
         error.AttachmentUnavailable => return state.writer.writeError(alloc, msg.id, invalid),
         error.AttachmentTooLarge => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "libfx checkpoint is too large",
+            .message = "Checkpoint is too large",
         }),
     };
     defer alloc.free(bytes);
     // A journaled session's history changes only through its journal.
     if (active.journal != null) return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_request,
-        .message = "A journaled libfx session cannot restore a checkpoint",
+        .message = "A journaled session cannot restore a checkpoint",
     });
     const saved = active.session_rt.agent.restoreCheckpoint(alloc, bytes) catch |err|
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             // The host reports a newer checkpoint as it reports a newer journal.
             .message = if (err == error.UnsupportedCheckpointVersion)
-                "libfx checkpoint was written by a newer fx"
+                "Checkpoint was written by a newer fx"
             else
-                "Invalid or non-fresh libfx checkpoint",
+                "Invalid or non-fresh checkpoint",
         });
     defer saved.free(alloc);
     if (saved.isEmpty()) return state.writer.writeResponse(alloc, msg.id, "null");
@@ -1916,23 +1924,26 @@ fn handleKernelJournalOpen(
     alloc: Allocator,
     msg: *const jsonrpc.Message,
 ) !void {
+    // An open journal sends `_sh.fx/journal/append` and `flush`, which go
+    // only to a client that lists `sh.fx/journal`.
+    if (!state.extensions.contains(.journal)) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "The journal needs the sh.fx/journal capability in clientCapabilities._meta",
+    });
     var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx journal params",
+        .message = "Invalid journal params",
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const invalid: jsonrpc.RpcError = .{
         .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx journal",
+        .message = "Invalid journal",
     };
     const too_large: jsonrpc.RpcError = .{
         .code = ErrorCode.invalid_params,
-        .message = "libfx journal is too large",
+        .message = "Journal is too large",
     };
     var events: ?[]u8 = null;
     defer if (events) |bytes| alloc.free(bytes);
@@ -1964,7 +1975,7 @@ fn handleKernelJournalOpen(
     defer active.session_write_mutex.unlock(io_mod.getIo());
     if (active.journal != null) return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_request,
-        .message = "libfx journal is already open",
+        .message = "Journal is already open",
     });
     // A host that stores every input before handing it in, as libfx's
     // session executor does, needs no wait before a request carries one.
@@ -1972,7 +1983,7 @@ fn handleKernelJournalOpen(
         .bool => |durable| durable,
         else => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "Invalid libfx journal params",
+            .message = "Invalid journal params",
         }),
     } else false;
     // A host with an image store stores each prompt image before it sends
@@ -1981,12 +1992,12 @@ fn handleKernelJournalOpen(
         .bool => |enabled| enabled,
         else => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "Invalid libfx journal params",
+            .message = "Invalid journal params",
         }),
     } else false;
     const window = imageWindowParam(parsed.value.object.get("imageWindow")) orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx journal params",
+        .message = "Invalid journal params",
     });
     var images: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &active.staged_images };
     defer images.deinit();
@@ -2015,20 +2026,20 @@ fn handleKernelJournalOpen(
         },
         error.AgentNotFresh => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
-            .message = "A libfx journal opens only on a new session",
+            .message = "A journal opens only on a new session",
         }),
         error.UnsupportedJournalVersion => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "libfx journal was written by a newer fx",
+            .message = "Journal was written by a newer fx",
         }),
         error.OutOfOrderJournalEvent => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "libfx journal events are out of order",
+            .message = "Journal events are out of order",
         }),
         error.JournalTooLarge => return state.writer.writeError(alloc, msg.id, too_large),
         error.JournalTooManyTurns => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = std.fmt.comptimePrint("libfx journal holds more than {d} turns", .{journal_events.max_history_turns}),
+            .message = std.fmt.comptimePrint("Journal holds more than {d} turns", .{journal_events.max_history_turns}),
         }),
         error.InvalidJournal => return state.writer.writeError(alloc, msg.id, invalid),
     };
@@ -2154,19 +2165,16 @@ fn handleKernelJournalImages(
 ) !void {
     const invalid: jsonrpc.RpcError = .{
         .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx journal images",
+        .message = "Invalid journal images",
     };
     const too_large: jsonrpc.RpcError = .{
         .code = ErrorCode.invalid_params,
-        .message = "libfx journal images are too large",
+        .message = "Journal images are too large",
     };
     var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, invalid);
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, invalid);
     const list = parsed.value.object.get("images") orelse return state.writer.writeError(alloc, msg.id, invalid);
     if (list != .array or list.array.items.len == 0) return state.writer.writeError(alloc, msg.id, invalid);
@@ -2175,7 +2183,7 @@ fn handleKernelJournalImages(
     defer active.session_write_mutex.unlock(io_mod.getIo());
     if (active.journal != null) return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_request,
-        .message = "libfx journal is already open",
+        .message = "Journal is already open",
     });
     for (list.array.items) |item| {
         if (item != .object) return state.writer.writeError(alloc, msg.id, invalid);
@@ -2200,7 +2208,7 @@ fn handleKernelJournalImages(
                 error.OutOfMemory => error.OutOfMemory,
                 error.ImageNameMismatch => state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_params,
-                    .message = "libfx image does not match its name",
+                    .message = "Image does not match its name",
                 }),
             };
         };
@@ -2222,17 +2230,14 @@ fn handleKernelSnapshot(
 ) !void {
     var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx snapshot params",
+        .message = "Invalid snapshot params",
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_request,
-        .message = "libfx snapshot is unavailable",
+        .message = "Snapshot is unavailable",
     });
     const meta = checkpointMetaParam(parsed.value) orelse return state.writer.writeError(alloc, msg.id, invalid_checkpoint_meta);
     const none = "{\"snapshotAttachment\":null}";
@@ -2310,14 +2315,11 @@ fn handleKernelFollowUp(
 ) !void {
     var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx follow-up params",
+        .message = "Invalid follow-up params",
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const id = parsed.value.object.get("id");
     const text = parsed.value.object.get("text");
     const valid_id = if (id) |value| value == .string and libfx_steering.validInputId(value.string) else false;
@@ -2338,6 +2340,9 @@ fn handleKernelFollowUp(
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
+/// `_sh.fx/session/steer`: adds a host's text to the running turn, under
+/// the limits of a steer. The optional input id is the host's, and the
+/// steer's `user_message_chunk` carries it in `sh.fx/steerInput`.
 fn handleKernelSteer(
     state: *ServerState,
     alloc: Allocator,
@@ -2345,14 +2350,11 @@ fn handleKernelSteer(
 ) !void {
     var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
-        .message = "Invalid libfx steer params",
+        .message = "Invalid steer params",
     });
     defer parsed.deinit();
     const active = activeLibfxSession(state, parsed.value) orelse
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Unknown libfx session",
-        });
+        return state.writer.writeError(alloc, msg.id, unknownLibfxSession(parsed.value));
     const text = parsed.value.object.get("text") orelse
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
@@ -2379,7 +2381,7 @@ fn handleKernelSteer(
             },
             .message = switch (err) {
                 error.EmptySteeringMessage => "Steering text cannot be empty",
-                error.SteeringMessageTooLarge => "Steering text exceeds the 64 KiB libfx limit",
+                error.SteeringMessageTooLarge => "Steering text exceeds the 64 KiB limit",
                 error.SteeringQueueFull => "Steering queue is full",
                 error.SteeringNotActive => "No prompt is running",
                 error.InvalidInputId => "Invalid or repeated input id",
@@ -2428,22 +2430,65 @@ fn parsedSessionTargetDecision(state: *const ServerState, root: std.json.Value) 
     return decideSessionTarget(active_id, supplied);
 }
 
+/// Answers a request whose `sessionId` is not the open session. A missing or malformed id is
+/// invalid params; an id that names no open session gets ACP's `-32002` with `data.sessionId`.
 fn writeSessionTargetError(
     state: *ServerState,
     alloc: Allocator,
     id: ?jsonrpc.RequestId,
     decision: SessionTargetDecision,
+    root: std.json.Value,
 ) !void {
     const message: []const u8 = switch (decision) {
         .exact => return,
+        .missing => return state.writer.writeError(alloc, id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Missing sessionId",
+        }),
         .inactive => "No active session",
-        .missing => "Missing sessionId",
         .mismatch => "Session is not active",
     };
-    try state.writer.writeError(alloc, id, .{
+    // With no open session, `decideSessionTarget` answers `.inactive` before it looks at the id.
+    const requested = requestedSessionId(root) orelse return state.writer.writeError(alloc, id, .{
         .code = ErrorCode.invalid_params,
         .message = message,
     });
+    try state.writer.writeError(alloc, id, jsonrpc.sessionNotFound(message, requested));
+}
+
+/// Returns the non-empty string `sessionId` of request params, or null.
+fn requestedSessionId(root: std.json.Value) ?[]const u8 {
+    if (root != .object) return null;
+    const value = root.object.get("sessionId") orelse return null;
+    return if (value == .string and value.string.len > 0) value.string else null;
+}
+
+/// The answer to a libfx request whose session is not the open one: ACP's `-32002` with
+/// `data.sessionId` when the request names an id, and invalid params when it names none.
+fn unknownLibfxSession(params: std.json.Value) jsonrpc.RpcError {
+    const requested = requestedSessionId(params) orelse return .{
+        .code = ErrorCode.invalid_params,
+        .message = "Unknown session",
+    };
+    return jsonrpc.sessionNotFound("Unknown session", requested);
+}
+
+test "a libfx request for a session that isn't open names it, and one without an id is invalid" {
+    const alloc = std.testing.allocator;
+    const named = try std.json.parseFromSlice(std.json.Value, alloc, "{\"sessionId\":\"s1\"}", .{});
+    defer named.deinit();
+    const not_found = unknownLibfxSession(named.value);
+    try std.testing.expectEqual(ErrorCode.resource_not_found, not_found.code);
+    try std.testing.expectEqualStrings("s1", not_found.data.?.session.session_id);
+
+    for ([_][]const u8{ "{}", "{\"sessionId\":\"\"}", "{\"sessionId\":3}", "[]" }) |params| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, params, .{});
+        defer parsed.deinit();
+        const invalid = unknownLibfxSession(parsed.value);
+        try std.testing.expectEqual(ErrorCode.invalid_params, invalid.code);
+        try std.testing.expectEqualStrings("Unknown session", invalid.message);
+        try std.testing.expect(invalid.data == null);
+    }
 }
 
 fn requireParsedActiveSessionTarget(
@@ -2454,7 +2499,7 @@ fn requireParsedActiveSessionTarget(
 ) !bool {
     const decision = parsedSessionTargetDecision(state, root);
     if (decision == .exact) return true;
-    try writeSessionTargetError(state, alloc, id, decision);
+    try writeSessionTargetError(state, alloc, id, decision, root);
     return false;
 }
 
@@ -2571,7 +2616,7 @@ pub fn claimHostSteeringInterrupt(state: *ServerState, queued: usize) bool {
 }
 
 /// A handoff a web host holds for the running libfx turn: the turn ends at its
-/// next safe point, as with `libfx/handoff`.
+/// next safe point, as with `_sh.fx/session/end_turn_for_steer`.
 pub fn noteHostSteeringHandoff(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
     _ = active.steering.requestHandoff(&active.cancel_flag);
@@ -2616,19 +2661,24 @@ fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalO
 }
 
 /// Answers steering prompts once the turn that received them has answered.
-/// Delivered steering shares the turn's outcome. Undelivered steering is
-/// reported as cancelled when the turn was cancelled, otherwise as an error
-/// so the client can send it again.
+/// Delivered steering shares the turn's outcome. Undelivered steering fails:
+/// with `-32800` when the client stopped the turn, otherwise with an error so
+/// the client can send it again. Queued prompts bring the spec's `next_turn`
+/// for both (`src/protocol/spec/sh-fx.md`, "Steers").
 fn publishSteeringOutcomes(
     active: *ActivePrompt,
     outcome: prompt_handler.TerminalOutcome,
     finished: libfx_steering.Finished,
 ) !void {
     const cancelled = outcome == .stop_reason and outcome.stop_reason == .cancelled;
-    for (finished.absorbed) |id| try writeSteeringOutcome(active, id, outcome, .absorbed);
+    const delivery: ?acp_types.SteeringDelivery = if (active.state.extensions.contains(.prompt_delivery)) .absorbed else null;
+    for (finished.absorbed) |id| try writeSteeringOutcome(active, id, outcome, delivery);
     for (finished.dropped) |id| {
         if (cancelled) {
-            try writeSteeringOutcome(active, id, outcome, .dropped);
+            try active.state.writer.writeError(active.alloc, id, .{
+                .code = ErrorCode.request_cancelled,
+                .message = "Request cancelled",
+            });
         } else {
             try active.state.writer.writeError(active.alloc, id, .{
                 .code = ErrorCode.invalid_request,
@@ -2642,7 +2692,7 @@ fn writeSteeringOutcome(
     active: *ActivePrompt,
     id: jsonrpc.RequestId,
     outcome: prompt_handler.TerminalOutcome,
-    delivery: acp_types.SteeringDelivery,
+    delivery: ?acp_types.SteeringDelivery,
 ) !void {
     switch (outcome) {
         .stop_reason => |stop_reason| {
@@ -2685,7 +2735,7 @@ fn cloneMessage(alloc: Allocator, msg: *const jsonrpc.Message) !jsonrpc.Message 
 
 const InitializeRequest = struct {
     /// False when the client presents fx inside an application rather than a
-    /// terminal, set through `_meta.fx.terminal`.
+    /// terminal, set through `sh.fx/terminalUi` in the params' `_meta`.
     terminal_ui: bool = true,
     client_fs_read: bool = false,
     client_fs_write: bool = false,
@@ -2694,11 +2744,11 @@ const InitializeRequest = struct {
     client_notices: bool = false,
     client_elicitation: elicitation.Capabilities = .{},
     host_tools: host_tool_runtime.Runtime = .{},
-    host_instructions: []u8 = &.{},
+    /// The extensions the client lists in `clientCapabilities._meta`.
+    client_extensions: sh_fx.Set = .empty,
 
-    fn deinit(self: *InitializeRequest, alloc: Allocator) void {
+    fn deinit(self: *InitializeRequest) void {
         self.host_tools.deinit();
-        if (self.host_instructions.len > 0) alloc.free(self.host_instructions);
         self.* = .{};
     }
 };
@@ -2706,7 +2756,7 @@ const InitializeRequest = struct {
 fn parseInitializeRequest(
     alloc: Allocator,
     params: ?[]const u8,
-    allow_libfx: bool,
+    allow_host_tools: bool,
 ) !InitializeRequest {
     const raw = params orelse return error.InvalidInitializeParams;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
@@ -2721,7 +2771,7 @@ fn parseInitializeRequest(
         return error.InvalidInitializeParams;
 
     var request = InitializeRequest{
-        .terminal_ui = acp_types.fxMetaBool(parsed.value.object, "terminal") orelse true,
+        .terminal_ui = acp_types.metaBool(parsed.value.object, "sh.fx/terminalUi") orelse true,
     };
     const capabilities = parsed.value.object.get("clientCapabilities") orelse
         return request;
@@ -2747,66 +2797,59 @@ fn parseInitializeRequest(
         request.client_terminal = value == .bool and value.bool;
     }
     request.client_elicitation = elicitation.parseAcpCapabilities(capabilities);
-    if (allow_libfx) {
-        if (capabilities.object.get("libfx")) |libfx| {
-            if (libfx != .object) return error.InvalidInitializeParams;
-            request.host_tools = try host_tool_runtime.Runtime.initWithProviderRegistry(
-                alloc,
-                libfx.object.get("tools"),
-                libfx_provider_tool_registry,
-            );
-            errdefer request.host_tools.deinit();
-            if (libfx.object.get("instructions")) |instructions| {
-                if (instructions != .string or instructions.string.len > 64 * 1024) {
-                    return error.InvalidInitializeParams;
-                }
-                request.host_instructions = try alloc.dupe(u8, instructions.string);
-            }
-        }
-    }
+    request.client_extensions = sh_fx.clientList(capabilities.object);
+    // A client lists the tools it runs for fx in its `sh.fx/hostTools` value.
+    if (allow_host_tools) if (sh_fx.clientValue(capabilities.object, .host_tools)) |host_tools| {
+        request.host_tools = try host_tool_runtime.Runtime.initWithProviderRegistry(
+            alloc,
+            host_tools.get("tools"),
+            libfx_provider_tool_registry,
+        );
+    };
     return request;
 }
 
-test "ACP initialize owns libfx tools and instructions" {
+test "ACP initialize owns the tools a host lists in sh.fx/hostTools" {
     const alloc = std.testing.allocator;
     var request = try parseInitializeRequest(
         alloc,
-        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"tools":[{"name":"lookup","description":"Lookup","inputSchema":{"type":"object"}}],"instructions":"Be concise."}}}
+        \\{"protocolVersion":1,"clientCapabilities":{"_meta":{"sh.fx/hostTools":{"tools":[{"name":"lookup","description":"Lookup","inputSchema":{"type":"object"}}]},"sh.fx/journal":{}}}}
     ,
         true,
     );
-    defer request.deinit(alloc);
+    defer request.deinit();
     try std.testing.expectEqual(@as(usize, 1), request.host_tools.tools.len);
     try std.testing.expectEqualStrings("lookup", request.host_tools.tools[0].name);
-    try std.testing.expectEqualStrings("Be concise.", request.host_instructions);
+    try std.testing.expect(request.client_extensions.contains(.host_tools));
+    try std.testing.expect(request.client_extensions.contains(.journal));
 }
 
 test "ACP initialize accepts registered provider-executed libfx tools" {
     const alloc = std.testing.allocator;
     var request = try parseInitializeRequest(
         alloc,
-        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"tools":[{"name":"web_search","providerExecuted":true}]}}}
+        \\{"protocolVersion":1,"clientCapabilities":{"_meta":{"sh.fx/hostTools":{"tools":[{"name":"web_search","providerExecuted":true}]}}}}
     ,
         true,
     );
-    defer request.deinit(alloc);
+    defer request.deinit();
     try std.testing.expectEqual(@as(usize, 1), request.host_tools.tools.len);
     try std.testing.expectEqual(@as(usize, 0), request.host_tools.dynamic_tools.len);
     try std.testing.expect(request.host_tools.tools[0].provider_executed);
     try std.testing.expect(request.host_tools.tools[0].write_provider_advertisement_fn != null);
 }
 
-test "ordinary ACP ignores private libfx capabilities" {
+test "ordinary ACP takes no host tools and ignores the old libfx capability" {
     const alloc = std.testing.allocator;
     var request = try parseInitializeRequest(
         alloc,
-        \\{"protocolVersion":1,"clientCapabilities":{"libfx":"ignored"}}
+        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"tools":[{"name":"lookup"}]},"_meta":{"sh.fx/hostTools":{"tools":[{"name":"lookup"}]}}}}
     ,
         false,
     );
-    defer request.deinit(alloc);
+    defer request.deinit();
     try std.testing.expectEqual(@as(usize, 0), request.host_tools.tools.len);
-    try std.testing.expectEqual(@as(usize, 0), request.host_instructions.len);
+    try std.testing.expect(request.client_extensions.contains(.host_tools));
 }
 
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
@@ -2873,7 +2916,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             .message = "Invalid initialize params",
         });
     };
-    defer request.deinit(alloc);
+    defer request.deinit();
 
     var startup = loadConfiguredStartupState(state, alloc) catch |err| {
         const model_message = config_runtime.modelNotSelectedMessage(err);
@@ -3055,12 +3098,11 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.host_tools.deinit();
     state.host_tools = request.host_tools;
     request.host_tools = .{};
-    if (state.host_instructions.len > 0) alloc.free(state.host_instructions);
-    state.host_instructions = request.host_instructions;
-    request.host_instructions = &.{};
-    debug_trace.logf("acp", "libfx host capabilities tools={d} instructions_bytes={d}", .{
+    const agent_extensions = agentExtensions(state.cfg.minimal_kernel);
+    state.extensions = agent_extensions.intersectWith(request.client_extensions);
+    debug_trace.logf("acp", "initialize host_tools={d} extensions={d}", .{
         state.host_tools.tools.len,
-        state.host_instructions.len,
+        state.extensions.count(),
     });
     state.initialized = true;
 
@@ -3069,7 +3111,8 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     try acp_types.writeInitializeResponse(&out.writer, .{
         .image_prompts = !host_target.is_wasm,
         .mcp_servers = state.cfg.allow_acp_mcp,
-        .steering = !host_target.is_wasm and !state.cfg.minimal_kernel,
+        .extensions = agent_extensions,
+        .session_delete = host_target.is_wasm,
         .system_prompt = !host_target.is_wasm and !state.cfg.minimal_kernel,
         // fx takes only what ACP v1 defines and fx's MCP engine speaks: stdio and
         // HTTP.
@@ -3077,6 +3120,20 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         .mcp_sse = false,
     });
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+}
+
+/// The extensions fx lists at `initialize`. `fx acp` steers through
+/// `session/prompt`; libfx's kernel serves its host's steering, journal, and
+/// tools. Every build sends hooks, tool call identities, permission modes,
+/// and model recovery to a client that lists them.
+fn agentExtensions(minimal_kernel: bool) sh_fx.Set {
+    var set: sh_fx.Set = .initMany(&.{ .hooks, .tool_call, .permission_mode, .model_response_recovery });
+    if (minimal_kernel) {
+        set.setUnion(.initMany(&.{ .host_steering, .journal, .host_tools }));
+    } else if (!host_target.is_wasm) {
+        set.insert(.prompt_delivery);
+    }
+    return set;
 }
 
 /// The selected model's capabilities from `provider`'s catalog, loading it
@@ -3147,11 +3204,11 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
         try state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = message,
-            .data = .{
-                .code = "LIBFX_MODEL_UNSUPPORTED_EFFORT",
+            .data = .{ .model_capability = .{
+                .code = "MODEL_UNSUPPORTED_EFFORT",
                 .model = state.selected_model,
                 .capability = "effort",
-            },
+            } },
         });
         return false;
     }
@@ -3253,11 +3310,11 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
         try state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = message,
-            .data = .{
-                .code = "LIBFX_MODEL_UNSUPPORTED_FAST",
+            .data = .{ .model_capability = .{
+                .code = "MODEL_UNSUPPORTED_FAST",
                 .model = state.selected_model,
                 .capability = "fast",
-            },
+            } },
         });
         return false;
     }
@@ -3320,11 +3377,11 @@ fn writeUltrafastOverrideFailure(state: *ServerState, alloc: Allocator, msg: *js
     try state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
         .message = message,
-        .data = .{
-            .code = "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST",
+        .data = .{ .model_capability = .{
+            .code = "MODEL_UNSUPPORTED_ULTRAFAST",
             .model = state.selected_model,
             .capability = "ultrafast",
-        },
+        } },
     });
     return false;
 }
@@ -3498,6 +3555,9 @@ pub fn cancelAndReapActivePrompt(state: *ServerState) void {
     reapActivePrompt(state, true);
 }
 
+/// Handles `session/close`. Closing the open session closes it, and closing a session that isn't
+/// open succeeds with `{}` and changes nothing (`tests/tla/acp/AcpSessionTarget.tla`
+/// CloseClosesOpen and CloseIdempotent).
 fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
@@ -3521,16 +3581,10 @@ fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messa
             .code = ErrorCode.invalid_params,
             .message = "Missing sessionId",
         });
-    const active = if (state.active_session) |*session| session else return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_params,
-        .message = "Session is not active",
-    });
-    if (!std.mem.eql(u8, active.session_id, session_id)) {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Session is not active",
-        });
-    }
+    // Closing is idempotent in ACP v1: a session that isn't open, or doesn't exist, closes with the
+    // same empty result, and the open session stays open.
+    const active = if (state.active_session) |*session| session else return state.writer.writeResponse(alloc, msg.id, "{}");
+    if (!std.mem.eql(u8, active.session_id, session_id)) return state.writer.writeResponse(alloc, msg.id, "{}");
 
     cancelAndReapActivePrompt(state);
     closeActiveSession(state) catch |err| {
@@ -3867,7 +3921,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         state.capability_resolver.catalogEntries(),
     );
     try out.writer.writeAll(",");
-    try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
+    try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode, state.extensions.contains(.permission_mode));
     if (sessions.effortConfigState(state)) |config| {
         try out.writer.writeAll(",");
         try sessions.writeEffortConfigOption(&out.writer, config.efforts, config.current);
@@ -4016,11 +4070,11 @@ fn applyActiveSessionUltrafast(
             try state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_params,
                 .message = message,
-                .data = .{
-                    .code = "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST",
+                .data = .{ .model_capability = .{
+                    .code = "MODEL_UNSUPPORTED_ULTRAFAST",
                     .model = session.model,
                     .capability = "ultrafast",
-                },
+                } },
             });
             return false;
         }
@@ -4070,11 +4124,11 @@ fn applyActiveSessionFast(
             try state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_params,
                 .message = message,
-                .data = .{
-                    .code = "LIBFX_MODEL_UNSUPPORTED_FAST",
+                .data = .{ .model_capability = .{
+                    .code = "MODEL_UNSUPPORTED_FAST",
                     .model = session.model,
                     .capability = "fast",
-                },
+                } },
             });
             return false;
         }
@@ -4414,11 +4468,20 @@ test "ACP method parser classifies request dispatch methods" {
     try std.testing.expectEqual(AcpMethod.session_prompt, AcpMethod.parse("session/prompt"));
     try std.testing.expectEqual(AcpMethod.session_set_config_option, AcpMethod.parse("session/set_config_option"));
     try std.testing.expectEqual(AcpMethod.session_set_mode, AcpMethod.parse("session/set_mode"));
-    try std.testing.expectEqual(AcpMethod.libfx_checkpoint, AcpMethod.parse("libfx/checkpoint"));
-    try std.testing.expectEqual(AcpMethod.libfx_restore, AcpMethod.parse("libfx/restore"));
-    try std.testing.expectEqual(AcpMethod.libfx_new, AcpMethod.parse("libfx/new"));
-    try std.testing.expectEqual(AcpMethod.libfx_steer, AcpMethod.parse("libfx/steer"));
-    try std.testing.expectEqual(AcpMethod.libfx_handoff, AcpMethod.parse("libfx/handoff"));
+    try std.testing.expectEqual(AcpMethod.libfx_checkpoint, AcpMethod.parse("_sh.fx/session/checkpoint"));
+    try std.testing.expectEqual(AcpMethod.libfx_restore, AcpMethod.parse("_sh.fx/session/restore"));
+    try std.testing.expectEqual(AcpMethod.libfx_new, AcpMethod.parse("_sh.fx/session/new"));
+    try std.testing.expectEqual(AcpMethod.libfx_steer, AcpMethod.parse("_sh.fx/session/steer"));
+    try std.testing.expectEqual(AcpMethod.libfx_withdraw, AcpMethod.parse("_sh.fx/session/withdraw_steer"));
+    try std.testing.expectEqual(AcpMethod.libfx_handoff, AcpMethod.parse("_sh.fx/session/end_turn_for_steer"));
+    try std.testing.expectEqual(AcpMethod.libfx_follow_up, AcpMethod.parse("_sh.fx/session/follow_up"));
+    try std.testing.expectEqual(AcpMethod.libfx_snapshot, AcpMethod.parse("_sh.fx/journal/snapshot"));
+    try std.testing.expectEqual(AcpMethod.libfx_journal_open, AcpMethod.parse("_sh.fx/journal/open"));
+    try std.testing.expectEqual(AcpMethod.libfx_journal_images, AcpMethod.parse("_sh.fx/journal/stage_images"));
+    try std.testing.expectEqual(AcpMethod.session_delete, AcpMethod.parse("session/delete"));
+    // The old names are gone, not aliases.
+    try std.testing.expectEqual(AcpMethod.unknown, AcpMethod.parse("libfx/steer"));
+    try std.testing.expectEqual(AcpMethod.unknown, AcpMethod.parse("session/remove"));
     try std.testing.expectEqual(AcpMethod.unknown, AcpMethod.parse("workspace/unknown"));
     try std.testing.expect(AcpMethod.libfx_checkpoint.isLibfx());
     try std.testing.expect(AcpMethod.libfx_restore.isLibfx());

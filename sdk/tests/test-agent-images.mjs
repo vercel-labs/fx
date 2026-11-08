@@ -191,7 +191,7 @@ for (const [label, toData] of [
   ], label);
   const image = frames[0].params.prompt.find((block) => block.type === "image");
   assert.equal(image.data, undefined, `${label} image bytes must not ride the ACP frame`);
-  assert.ok(Number.isInteger(image._meta?.fx?.attachment), `${label} image must reference an attachment`);
+  assert.ok(Number.isInteger(image._meta?.["sh.fx/attachment"]), `${label} image must reference an attachment`);
   assert.ok(!JSON.stringify(frames[0]).includes(pngData), `${label} frame must not contain base64 image data`);
   await agent.close();
 }
@@ -396,11 +396,11 @@ for (const resizeImage of [undefined, (image) => image]) {
   // Oversized and empty restore checkpoints fail with the same errors on both backends.
   await assert.rejects(
     createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(4 * 1024 * 1024 + 1) }),
-    (error) => error.message === "libfx checkpoint is too large",
+    (error) => error.message === "Checkpoint is too large",
   );
   await assert.rejects(
     createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(0) }),
-    (error) => error.message === "Invalid or non-fresh libfx checkpoint",
+    (error) => error.message === "Invalid or non-fresh checkpoint",
   );
 }
 
@@ -435,7 +435,7 @@ for (const resizeImage of [undefined, (image) => image]) {
   agent = await createAgent(gateway, {
     model: "sdk/vision-model",
     onEvent(event) {
-      if (event.type === "acp.send" && event.message.method === "libfx/checkpoint" && nested.length < 8) {
+      if (event.type === "acp.send" && event.message.method === "_sh.fx/session/checkpoint" && nested.length < 8) {
         nested.push(agent.checkpoint());
       }
     },
@@ -791,11 +791,11 @@ for (const timing of ["during-read", "after-read"]) {
     write(line) {
       const request = JSON.parse(line);
       sentMethods.push(request.method);
-      if (request.method === "initialize" || request.method === "libfx/new") {
+      if (request.method === "initialize" || request.method === "_sh.fx/session/new") {
         queueMicrotask(() => onLine({
           jsonrpc: "2.0",
           id: request.id,
-          result: request.method === "libfx/new" ? { sessionId: "image-exit-test" } : {},
+          result: request.method === "_sh.fx/session/new" ? { sessionId: "image-exit-test" } : {},
         }));
       }
     },
@@ -853,11 +853,11 @@ for (const failure of ["write", "exit"]) {
         finishRuntime(1);
         return;
       }
-      if (request.method === "initialize" || request.method === "libfx/new") {
+      if (request.method === "initialize" || request.method === "_sh.fx/session/new") {
         queueMicrotask(() => onLine({
           jsonrpc: "2.0",
           id: request.id,
-          result: request.method === "libfx/new" ? { sessionId: "image-write-test" } : {},
+          result: request.method === "_sh.fx/session/new" ? { sessionId: "image-write-test" } : {},
         }));
       }
     },
@@ -963,7 +963,7 @@ for (const [index, mimeType] of mediaTypes.entries()) {
   assert.equal(wire[0].mimeType, mimeType);
   assert.equal(wire[0].sourceRef, sourceRef);
   assert.equal(wire[0].data, undefined);
-  assert.ok(Number.isSafeInteger(wire[0]._meta?.fx?.attachment) && wire[0]._meta.fx.attachment > 0);
+  assert.ok(Number.isSafeInteger(wire[0]._meta?.["sh.fx/attachment"]) && wire[0]._meta["sh.fx/attachment"] > 0);
   assert.deepEqual(fileParts(gateway.state.chatBodies[0]), [{ type: "file", mediaType: mimeType, data: { type: "data", data: bytes.toString("base64") } }]);
   assert.equal(gateway.state.chatBodies.length, 1);
   await agent.close();
@@ -989,7 +989,7 @@ for (const resize of [false, true]) {
   assert.equal((await runPrompt(agent, [{ type: "image", data: original, mimeType: "image/png", sourceRef }])).stopReason, "end_turn");
   assert.equal(wire[0].sourceRef, sourceRef);
   assert.equal(wire[0].data, undefined);
-  assert.ok(Number.isSafeInteger(wire[0]._meta?.fx?.attachment));
+  assert.ok(Number.isSafeInteger(wire[0]._meta?.["sh.fx/attachment"]));
   assert.deepEqual(fileParts(gateway.state.chatBodies[0]), [{ type: "file", mediaType: "image/png", data: { type: "data", data: (resize ? prepared : original).toString("base64") } }]);
   assert.equal(resizeCalls, resize ? 1 : 0);
   await agent.close();
@@ -1146,7 +1146,7 @@ for (const [index, mimeType] of mediaTypes.entries()) {
       if (image.sourceRef) assert.deepEqual(wire[index], { type: "image", mimeType: "image/png", sourceRef: image.sourceRef });
       else {
         assert.equal(wire[index].data, undefined);
-        assert.ok(Number.isSafeInteger(wire[index]._meta?.fx?.attachment) && wire[index]._meta.fx.attachment > 0);
+        assert.ok(Number.isSafeInteger(wire[index]._meta?.["sh.fx/attachment"]) && wire[index]._meta["sh.fx/attachment"] > 0);
       }
     }
     const files = images.filter((image) => !image.sourceRef).map((image) => ({ type: "file", mediaType: "image/png", data: { type: "data", data: image.data } }));
@@ -1313,13 +1313,13 @@ for (const referenced of [true, false]) {
       const request = JSON.parse(line);
       if (request.method === "session/prompt") {
         promptId = request.id;
-        queueMicrotask(() => onLine({ jsonrpc: "2.0", id: "outer-image", method: "libfx/tool_call", params: { sessionId: "outer-frame", name: "load_image", input: {} } }));
+        queueMicrotask(() => onLine({ jsonrpc: "2.0", id: "outer-image", method: "_sh.fx/tools/call", params: { sessionId: "outer-frame", name: "load_image", input: {} } }));
       } else if (request.id === "outer-image") {
         toolResult = request.result;
         assert.ok(encoded.encode(line).length <= 8 * 1024 * 1024);
         queueMicrotask(() => onLine({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } }));
       } else {
-        queueMicrotask(() => onLine({ jsonrpc: "2.0", id: request.id, result: request.method === "libfx/new" ? { sessionId: "outer-frame" } : {} }));
+        queueMicrotask(() => onLine({ jsonrpc: "2.0", id: request.id, result: request.method === "_sh.fx/session/new" ? { sessionId: "outer-frame" } : {} }));
       }
     },
     abortHostEffects() {},

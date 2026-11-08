@@ -551,7 +551,7 @@ pub const RouteRecoveryStatus = struct {
     }
 
     /// What `fx ask --json` reports as `recovery` and ACP as
-    /// `_meta.fx.modelResponseRecovery`. Every key is one word, so both
+    /// `sh.fx/modelResponseRecovery`. Every key is one word, so both
     /// spell them the same way, and `need` keeps the module's snake_case
     /// tags.
     pub const Report = struct {

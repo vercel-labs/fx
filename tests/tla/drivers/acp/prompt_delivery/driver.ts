@@ -5,12 +5,12 @@
 //   bun tests/tla/drivers/acp/prompt_delivery/driver.ts                 # after zig build
 //   bun tests/tla/drivers/acp/prompt_delivery/driver.ts --model rules   # the baseline
 //
-// The sh.fx rules have not landed in src/acp/ yet. --model today (the
-// default) checks fx's ACP path now, which sends a steer with
-// `_meta.fx.steer`; every plan must match it. --model rules checks the sh.fx
+// fx's ACP path takes a steer as `sh.fx/delivery` "steer" from a client that
+// lists `sh.fx/promptDelivery`, but the sh.fx rules for steers and queued
+// prompts have not landed in src/acp/ yet. --model today (the default) checks
+// fx's ACP path now; every plan must match it. --model rules checks the sh.fx
 // rules against the same build, and the plans that exercise a rule today's
-// path breaks must fail it. --next sends `_meta["sh.fx/delivery"]` instead,
-// for the change that lands the rules, which removes this flag.
+// path breaks must fail it, until the rules land.
 //
 // The fake Gateway holds every model reply after its first text piece until
 // the driver ends it, with a shell tool call that waits for the driver or with
@@ -56,29 +56,26 @@ const PLANS: Plan[] = [
 const KIND: Record<Label, "plain" | "steer" | "queue"> = { P: "plain", M: "plain", S1: "steer", S2: "steer", I: "steer", Q1: "queue", Q2: "queue" };
 const marker = (label: string) => `${label}-mk7`;
 
-function promptParams(sessionId: string, label: Label, next: boolean): Record<string, unknown> {
+function promptParams(sessionId: string, label: Label): Record<string, unknown> {
   const prompt = label === "I"
     ? [{ type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" }]
     : [{ type: "text", text: `${marker(label)} please` }];
   const kind = KIND[label];
-  const meta = kind === "plain" ? undefined
-    : next ? { "sh.fx/delivery": kind }
-    : kind === "steer" ? { fx: { steer: true } }
-    // Today fx doesn't know a queued delivery, so this is a prompt during a turn.
-    : { "sh.fx/delivery": "queue" };
+  // fx lists only the steer delivery today, so it refuses a queued one.
+  const meta = kind === "plain" ? undefined : { "sh.fx/delivery": kind };
   return { sessionId, prompt, ...(meta ? { _meta: meta } : {}) };
 }
 
-function answerOf(response: any, next: boolean): Answer {
+function answerOf(response: any): Answer {
   if (response?.error) return { kind: "err", stop: "", delivery: "", code: Number(response.error.code) };
   const meta = response?.result?._meta ?? {};
-  const delivery = (next ? meta["sh.fx/steeringDelivery"] : meta?.fx?.steering) ?? "none";
+  const delivery = meta["sh.fx/steeringDelivery"] ?? "none";
   return { kind: "ok", stop: String(response?.result?.stopReason ?? ""), delivery: String(delivery), code: 0 };
 }
 
 // ------------------------------------------------------------------ runs --
 
-async function runPlan(plan: Plan, dir: string, next: boolean) {
+async function runPlan(plan: Plan, dir: string) {
   mkdirSync(dir, { recursive: true });
   const fixture = new Fixture(binary);
   const observations: Observation[] = [];
@@ -114,7 +111,7 @@ async function runPlan(plan: Plan, dir: string, next: boolean) {
 
   try {
     await fixture.init();
-    const acp = await fixture.start();
+    const acp = await fixture.start({ protocolVersion: 1, clientCapabilities: { _meta: { "sh.fx/promptDelivery": {} } } });
     const created = await acp.request("session/new", { cwd: fixture.workspace, mcpServers: [] });
     const sessionId = created.result?.sessionId;
     if (typeof sessionId !== "string") throw new Error(`session/new failed: ${JSON.stringify(created.error)}`);
@@ -124,8 +121,8 @@ async function runPlan(plan: Plan, dir: string, next: boolean) {
         const label = step.msg;
         const queuedBefore = fixture.queuedSteers();
         let settled = false;
-        const pending = acp.request("session/prompt", promptParams(sessionId, label, next)).then((response) => {
-          answers[label] = answerOf(response, next);
+        const pending = acp.request("session/prompt", promptParams(sessionId, label)).then((response) => {
+          answers[label] = answerOf(response);
           settled = true;
         });
         outstanding.set(label, pending);
@@ -262,13 +259,12 @@ async function main() {
   const model = argValue("--model") ?? "today";
   if (model !== "today" && model !== "rules") throw new Error(`--model must be today or rules, not ${model}`);
   const rules = model === "rules";
-  const next = process.argv.includes("--next");
   const only = argValue("--only");
 
-  const reportDir = outDir(`acp-prompt-delivery-${model}${next ? "-next" : ""}`);
+  const reportDir = outDir(`acp-prompt-delivery-${model}`);
   const status = git("status", "--porcelain");
   const manifest = {
-    model, next, worktree, binary, head: git("rev-parse", "HEAD"), dirty: status.length > 0,
+    model, worktree, binary, head: git("rev-parse", "HEAD"), dirty: status.length > 0,
     diff_sha256: status ? sha256Text(git("diff", "HEAD")) : null, fx_binary_sha256: sha256File(binary),
     toolchain: tlcToolchain(), bun: Bun.version, argv: process.argv.slice(1),
   };
@@ -278,7 +274,7 @@ async function main() {
   const results = [];
   for (const plan of plans) {
     const dir = join(reportDir, "traces", plan.name);
-    const run = await runPlan(plan, dir, next);
+    const run = await runPlan(plan, dir);
     const processFailed = run.processes.some((proc) => proc.exit !== 0);
     const checked = run.error ? null : await validate(run.observations, dir, boundsOf(plan, rules));
     const verdict = run.error ? "RUN_ERROR" : processFailed ? "PROCESS_ERROR" : checked!.verdict;

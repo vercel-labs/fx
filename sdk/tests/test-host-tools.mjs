@@ -81,7 +81,7 @@ try {
     }],
   });
   const initialize = sdkEvents.find((event) => event.type === "acp.send" && event.message?.method === "initialize");
-  assert.equal(initialize?.message.params.clientCapabilities.libfx.tools[0].name, "lookup");
+  assert.equal(initialize?.message.params.clientCapabilities._meta["sh.fx/hostTools"].tools[0].name, "lookup");
   const turn = agent.prompt("use lookup");
   let text = "";
   for await (const update of turn) {

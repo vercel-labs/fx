@@ -43,7 +43,7 @@ if (!child) {
     await assert.rejects(
       createFxEngine({ ...options, checkpoint: new Uint8Array([1, 2, 3]) }),
       (error) => {
-        assert.match(error.message, /Invalid or non-fresh libfx checkpoint/);
+        assert.match(error.message, /Invalid or non-fresh checkpoint/);
         return true;
       },
     );

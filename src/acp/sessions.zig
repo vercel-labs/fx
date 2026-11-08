@@ -52,7 +52,7 @@ const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
 
-/// The session id a `libfx/new` request names, or null when it names none.
+/// The session id a `_sh.fx/session/new` request names, or null when it names none.
 /// The id reaches gateway headers, so it must pass the session layout rules.
 /// Caller owns the returned slice.
 fn requestedLibfxSessionId(alloc: Allocator, params_raw: ?[]const u8) error{ InvalidSessionId, OutOfMemory }!?[]u8 {
@@ -115,6 +115,9 @@ test "hook configuration OOM is not converted to an ACP parameter error" {
     }
 }
 
+/// `_sh.fx/session/new`: creates a session for a host that keeps its own
+/// journal, with an id the host may choose, optional hooks, and the host's
+/// instructions as ACP's `systemPrompt`.
 pub fn handleNewLibfxSession(
     state: *server.ServerState,
     alloc: Allocator,
@@ -131,10 +134,19 @@ pub fn handleNewLibfxSession(
     };
     var requested_owned = requested != null;
     defer if (requested_owned) alloc.free(requested.?);
-    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw) catch |err| switch (err) {
+    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw, state.extensions.contains(.hooks)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
+        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = libfx_hooks.parseErrorMessage(err) }),
     };
+    // A host's instructions arrive as ACP's `systemPrompt` in append mode.
+    var client_system_prompt = client_instructions.parse(state.alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = client_instructions.parseErrorMessage(err),
+        }),
+    };
+    defer if (client_system_prompt) |text| state.alloc.free(text);
     try server.releaseActiveSession(state);
     requested_owned = false;
     const session_id = requested orelse try session_store.generateSessionId(alloc);
@@ -169,7 +181,9 @@ pub fn handleNewLibfxSession(
         .session_rt = session_rt,
         .cancel_flag = std.atomic.Value(bool).init(false),
         .pending_prompt_id = null,
+        .client_system_prompt = client_system_prompt orelse &.{},
     };
+    client_system_prompt = null;
     session_id_owned = false;
     model_owned = false;
     session_rt_owned = false;
@@ -177,9 +191,9 @@ pub fn handleNewLibfxSession(
 }
 
 pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw) catch |err| switch (err) {
+    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw, state.extensions.contains(.hooks)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
+        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = libfx_hooks.parseErrorMessage(err) }),
     };
     try server.releaseActiveSession(state);
 
@@ -385,9 +399,9 @@ test "ACP ultrafast WASM saves preserve baselines and failed preference writes r
 }
 
 pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw) catch |err| switch (err) {
+    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw, state.extensions.contains(.hooks)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
+        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = libfx_hooks.parseErrorMessage(err) }),
     };
     // Validate the client system prompt before any session side effect.
     var client_system_prompt = client_instructions.parse(alloc, msg.params_raw) catch |err| switch (err) {
@@ -575,6 +589,7 @@ fn writeNewSessionResponse(
         &out.writer,
         state.cfg.mode_registry,
         state.active_session.?.mode,
+        state.extensions.contains(.permission_mode),
     );
     if (effortConfigState(state)) |config| {
         try out.writer.writeAll(",");
@@ -593,7 +608,6 @@ fn writeNewSessionResponse(
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
     try out.writer.writeByte('}');
-    if (state.active_session.?.observer_hooks != null) try out.writer.writeAll(",\"_meta\":{\"fx\":{\"hooksVersion\":1}}");
     try out.writer.writeByte('}');
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
@@ -602,9 +616,9 @@ fn writeNewSessionResponse(
 }
 
 pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
-    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw) catch |err| switch (err) {
+    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw, state.extensions.contains(.hooks)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
+        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = libfx_hooks.parseErrorMessage(err) }),
     };
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
@@ -633,7 +647,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
 
     var loaded = (js_host_session_store.load(alloc, session_id) catch
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Session could not be loaded" })) orelse
-        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Session not found" });
+        return state.writer.writeError(alloc, msg.id, jsonrpc.sessionNotFound("Session not found", session_id));
     var loaded_owned = true;
     defer if (loaded_owned) loaded.deinit(alloc);
     const sid_copy = try alloc.dupe(u8, loaded.state.id);
@@ -721,7 +735,10 @@ pub fn handleListWasmSessions(state: *server.ServerState, alloc: Allocator, msg:
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
-pub fn handleRemoveWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+/// Deletes a saved session for ACP's `session/delete`. Deleting a session
+/// that doesn't exist succeeds, as ACP v1 says; the host's store removes an
+/// absent id without error.
+pub fn handleDeleteWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing params" });
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid params" });
@@ -732,7 +749,7 @@ pub fn handleRemoveWasmSession(state: *server.ServerState, alloc: Allocator, msg
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) try server.releaseActiveSession(state);
     }
-    try state.writer.writeResponse(alloc, msg.id, "null");
+    try state.writer.writeResponse(alloc, msg.id, "{}");
 }
 
 const RestoreKind = enum {
@@ -758,10 +775,22 @@ fn handleRestoreSession(
     msg: *jsonrpc.Message,
     kind: RestoreKind,
 ) !void {
-    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw) catch |err| switch (err) {
+    const observer_hooks = libfx_hooks.parseConfig(alloc, msg.params_raw, state.extensions.contains(.hooks)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
+        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = libfx_hooks.parseErrorMessage(err) }),
     };
+    // ACP v1: a prompt the session cannot apply fails the request before any
+    // restore side effect. One that differs from the stored prompt replaces it
+    // (`tests/tla/acp/AcpSystemPrompt.tla` RefusalChangesNothing and
+    // LoadAppliesPrompt).
+    var requested_system_prompt = client_instructions.parse(state.alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = client_instructions.parseErrorMessage(err),
+        }),
+    };
+    defer if (requested_system_prompt) |text| state.alloc.free(text);
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
         .message = "Missing params",
@@ -846,6 +875,19 @@ fn handleRestoreSession(
     if (state.active_session) |*active| {
         if (sameSessionId(active.session_id, session_id)) {
             server.cancelAndReapActivePrompt(state);
+            // With the prompt worker reaped, nothing reads the old text.
+            if (requested_system_prompt) |text| if (!std.mem.eql(u8, text, active.client_system_prompt)) {
+                if (active.v2) |session| session.setClientPrompt(text) catch |err| {
+                    debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.internal_error,
+                        .message = "Failed to save the client system prompt",
+                    });
+                };
+                if (active.client_system_prompt.len > 0) state.alloc.free(active.client_system_prompt);
+                active.client_system_prompt = text;
+                requested_system_prompt = null;
+            };
             server.disableSubagentHost(state);
             state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
             const previous_host = active.mcp_host;
@@ -889,9 +931,9 @@ fn handleRestoreSession(
         v2_store.notice = .{ .context = &notice, .emit = ConversionNotice.emit };
         defer v2_store.notice = null;
         v2 = session_adapter.Session.resumeSession(alloc, v2_store, .{ .id = session_id }, workspace_root, .acp) catch |err|
-            return handleLoadFailure(state, alloc, msg, err);
+            return handleLoadFailure(state, alloc, msg, session_id, err);
         v2_resumed = v2.?.durableState(alloc, workspace_root) catch |err|
-            return handleLoadFailure(state, alloc, msg, err);
+            return handleLoadFailure(state, alloc, msg, session_id, err);
     }
     const durable: *const session_codec.DurableSessionState = &v2_resumed.?.state;
 
@@ -939,12 +981,26 @@ fn handleRestoreSession(
     // same-session `cwd` rebind has already released it above.
     var client_system_prompt: ?[]u8 = restoredClientSystemPrompt(state.alloc, v2.?) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.ClientSystemPromptUnreadable => return state.writer.writeError(alloc, msg.id, .{
+        // A supplied prompt replaces one that can't be read.
+        error.ClientSystemPromptUnreadable => if (requested_system_prompt == null) return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
             .message = "Session client system prompt could not be restored",
-        }),
+        }) else null,
     };
     defer if (client_system_prompt) |text| state.alloc.free(text);
+    if (requested_system_prompt) |text| {
+        // The session writes nothing for the prompt it already holds.
+        v2.?.setClientPrompt(text) catch |err| {
+            debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Failed to save the client system prompt",
+            });
+        };
+        if (client_system_prompt) |old| state.alloc.free(old);
+        client_system_prompt = text;
+        requested_system_prompt = null;
+    }
     // The session's downloads are its blobs (D44).
     session_rt.configureWebFetchArtifactBlobs(alloc, try v2.?.childCapability(), v2.?.id());
     server.cancelAndReapActivePrompt(state);
@@ -990,7 +1046,7 @@ fn handleRestoreSession(
 }
 
 /// Adds the user's profile MCP servers after the request's own servers when
-/// the client sets `_meta.fx.profileMcpServers`. ACP sessions otherwise use
+/// the client sets `sh.fx/profileMcpServers` in the params' `_meta`. ACP sessions otherwise use
 /// only client-supplied and approved project servers. Request entries win
 /// name collisions, and profile entries win over project entries.
 fn appendProfileMcpConfigsIfRequested(
@@ -1024,7 +1080,7 @@ fn profileMcpRequested(alloc: Allocator, params_raw: ?[]const u8) bool {
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
-    return acp_types.fxMetaBool(parsed.value.object, "profileMcpServers") orelse false;
+    return acp_types.metaBool(parsed.value.object, "sh.fx/profileMcpServers") orelse false;
 }
 
 fn appendProjectMcpConfigs(
@@ -1117,6 +1173,7 @@ fn writeLoadSessionResponse(
         &out.writer,
         state.cfg.mode_registry,
         state.active_session.?.mode,
+        state.extensions.contains(.permission_mode),
     );
     if (effortConfigState(state)) |config| {
         try out.writer.writeAll(",");
@@ -1135,7 +1192,6 @@ fn writeLoadSessionResponse(
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
     try out.writer.writeByte('}');
-    if (observer_hooks != null) try out.writer.writeAll(",\"_meta\":{\"fx\":{\"hooksVersion\":1}}");
     try out.writer.writeByte('}');
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
@@ -1322,6 +1378,7 @@ fn handleLoadFailure(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
+    session_id: []const u8,
     err: anyerror,
 ) !void {
     debug_trace.logf(
@@ -1380,10 +1437,7 @@ fn handleLoadFailure(
             .message = "Session could not be loaded",
         });
     }
-    return state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_params,
-        .message = "Session not found",
-    });
+    return state.writer.writeError(alloc, msg.id, jsonrpc.sessionNotFound("Session not found", session_id));
 }
 
 pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
@@ -1903,7 +1957,8 @@ fn sendHistoryToolCall(
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeToolCall(&out.writer, call.id, call.name, call.title, call.kind, .pending, call.raw_input, call.meta);
+    const meta: ?acp_types.ToolCallMeta = if (state.extensions.contains(.tool_call)) call.meta else null;
+    try acp_types.writeToolCall(&out.writer, call.id, call.name, call.title, call.kind, .pending, call.raw_input, meta);
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
     if (call.status == .pending) return;
@@ -1931,6 +1986,7 @@ fn sendSteeringHistoryChunk(state: *server.ServerState, alloc: Allocator, sessio
         text,
         null,
         null,
+        state.sendsSteerInput(),
     );
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
@@ -2085,10 +2141,13 @@ pub fn writeProviderConfigOption(
     try w.writeAll("]}");
 }
 
+/// `permission_mode_key` adds `sh.fx/permissionMode` to each value, for a
+/// client that lists it.
 pub fn writeModeConfigOption(
     w: *std.Io.Writer,
     registry: mode_registry.Registry,
     current: []const u8,
+    permission_mode_key: bool,
 ) !void {
     try w.writeAll("{\"id\":\"mode\",\"name\":\"Session Mode\",\"description\":\"Controls how the agent requests permission\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(current, w);
@@ -2101,12 +2160,15 @@ pub fn writeModeConfigOption(
         try writeJsonStr(mode.name, w);
         try w.writeAll(",\"description\":");
         try writeJsonStr(mode.description, w);
-        // ACP leaves extra value fields to `_meta`.
-        try w.writeAll(",\"_meta\":{\"fx\":{\"permissionMode\":");
-        // ACP clients may read this field, so it keeps the original names,
-        // including `yolo` for full access, which settings no longer save.
-        try writeJsonStr(@tagName(mode.permission_mode), w);
-        try w.writeAll("}}}");
+        if (permission_mode_key) {
+            // ACP leaves extra value fields to `_meta`. The key keeps the
+            // original names, including `yolo` for full access, which
+            // settings no longer save.
+            try w.writeAll(",\"_meta\":{\"sh.fx/permissionMode\":");
+            try writeJsonStr(@tagName(mode.permission_mode), w);
+            try w.writeAll("}");
+        }
+        try w.writeAll("}");
     }
     try w.writeAll("]}");
 }
@@ -2347,13 +2409,20 @@ test "writeModeConfigOption produces valid json with all modes" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeModeConfigOption(&out.writer, test_session_mode_registry, "inspect");
+    try writeModeConfigOption(&out.writer, test_session_mode_registry, "inspect", true);
     const items = out.writer.buffered();
     try std.testing.expect(std.mem.find(u8, items, "\"id\":\"mode\"") != null);
     try std.testing.expect(std.mem.find(u8, items, "\"currentValue\":\"inspect\"") != null);
     try std.testing.expect(std.mem.find(u8, items, "\"review\"") != null);
     try std.testing.expect(std.mem.find(u8, items, "\"inspect\"") != null);
-    try std.testing.expect(std.mem.find(u8, items, "\"permissionMode\":\"ask\"") != null);
+    try std.testing.expect(std.mem.find(u8, items, "\"sh.fx/permissionMode\":\"ask\"") != null);
+}
+
+test "writeModeConfigOption leaves out sh.fx/permissionMode for a client that doesn't list it" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeModeConfigOption(&out.writer, test_session_mode_registry, "inspect", false);
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "_meta") == null);
 }
 
 test "writeModesArray preserves supplied registry order" {
@@ -2820,6 +2889,7 @@ test "ACP load maps one-off child denial to invalid params" {
             &state,
             arena,
             &msg,
+            "child-session",
             error.OneOffSessionNotResumable,
         );
         try std.testing.expect(state.active_session == null);
