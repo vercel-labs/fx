@@ -4181,6 +4181,77 @@ function fxLoginEnv(
   };
 }
 
+const FX_TEAMS_UNAVAILABLE_CLI =
+  "fx teams: Your Vercel teams could not be loaded. The current team is unchanged.\n";
+const FX_TEAMS_NO_TEAMS_CLI = "fx teams: No Vercel teams are available for this account.\n";
+
+// `fx teams` lists the teams with the saved sign-in. A list with no usable
+// team is the same problem there as in fx login, /login and the provider
+// picker, and an empty list is an account with no teams.
+for (const unusable of [
+  {
+    name: "only unreadable team entries",
+    response: () => Response.json({ teams: [{ id: 123, slug: "acme" }, "x"] }),
+    stderr: FX_TEAMS_UNAVAILABLE_CLI,
+  },
+  {
+    name: "only teams whose id the gateway rejects",
+    response: () => Response.json({ teams: GATEWAY_REJECTED_TEAMS }),
+    stderr: FX_TEAMS_UNAVAILABLE_CLI,
+  },
+  {
+    name: "a body that is JSON but not a team list",
+    response: () => Response.json({ teams: "none" }),
+    stderr: FX_TEAMS_UNAVAILABLE_CLI,
+  },
+  { name: "an empty list", response: () => Response.json({ teams: [] }), stderr: FX_TEAMS_NO_TEAMS_CLI },
+]) {
+  test(`fx teams reports ${unusable.name} in the words of every other path and keeps the saved team`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-cli-teams-unusable-"));
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+      teamsResponse: unusable.response,
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_old");
+    const authPath = join(home, ".fx", "auth.json");
+    const seeded = readFileSync(authPath);
+
+    const result = await runFx(["teams"], {
+      env: fxLoginEnv(home, oauth.issuerUrl, gateway),
+      timeoutMs: TIMEOUT,
+    });
+
+    expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(1);
+    expect(result.stderr).toBe(unusable.stderr);
+    expect(result.stdout).not.toContain("Selected Vercel team");
+    expect(readFileSync(authPath).equals(seeded)).toBe(true);
+    expect(oauth.requests.map((request) => `${request.method} ${request.path}`)).toEqual(["GET /v2/teams"]);
+    expect(gateway.modelRequests).toHaveLength(0);
+  }, 60_000);
+}
+
+test("fx teams selects only the team the gateway accepts", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-cli-teams-gateway-ids-"));
+  gateway = startFakeGateway([]);
+  oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+    teamsResponse: () => Response.json({
+      teams: [...GATEWAY_REJECTED_TEAMS, { id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+    }),
+  });
+  writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_old");
+
+  const result = await runFx(["teams"], {
+    env: fxLoginEnv(home, oauth.issuerUrl, gateway),
+    timeoutMs: TIMEOUT,
+  });
+
+  expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+  expect(result.stdout).toContain("Selected Vercel team: Vercel Labs (vercel-labs).");
+  for (const rejected of GATEWAY_REJECTED_TEAMS) expect(result.stdout).not.toContain(rejected.slug);
+  const persisted = JSON.parse(readFileSync(join(home, ".fx", "auth.json"), "utf8")) as { team_id?: string };
+  expect(persisted.team_id).toBe("team_123");
+}, 60_000);
+
 test("fx login lists team names without their terminal control characters", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-cli-login-team-controls-"));
   gateway = startFakeGateway([]);

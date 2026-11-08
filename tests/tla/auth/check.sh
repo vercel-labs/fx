@@ -4,7 +4,7 @@
 # require each config's expected verdict.
 #
 # sign-in-teams.cfg and sign-in-teams-deep.cfg are the design and must pass: for
-# `fx login`, the in-app /login, and the picker's team column.
+# `fx login`, the in-app /login, the picker's team column, and `fx teams`.
 # Each sign-in-teams-today-*.cfg is fx before it, and each rule it names must
 # catch it:
 #
@@ -24,6 +24,8 @@
 #   id          a team id the gateway rejects is kept and saved               SavesOnlyUsableTeam
 #   picker      the picker reports a list it cannot read as a credential      SameOutcomeEverywhere
 #               problem
+#   teams       fx teams reports a list it cannot read, or an empty one, as   SameOutcomeEverywhere
+#               a failed switch
 #
 # SignInTeamsTrace.tla checks sign-ins of the built fx binary against the
 # model; tests/tla/drivers/auth/driver.ts runs it.
@@ -55,4 +57,5 @@ SignInTeams sign-in-teams-mutation-unreadable TellsTheTruth
 SignInTeams sign-in-teams-mutation-strict OffersEveryTeam
 SignInTeams sign-in-teams-mutation-id SavesOnlyUsableTeam
 SignInTeams sign-in-teams-mutation-picker SameOutcomeEverywhere
+SignInTeams sign-in-teams-mutation-teams SameOutcomeEverywhere
 VERDICTS

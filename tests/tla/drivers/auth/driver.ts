@@ -12,21 +12,24 @@
 // The picker's team column runs the same way from a profile with a saved
 // sign-in, where /login lists the teams without a new token; it gets bodies
 // that parse as JSON, because the picker reads a body that is not JSON as a
-// credential failure, as it did before this change. `fx login` is also killed
-// with SIGKILL while /v2/teams is held open, from both profiles; --only-kill
-// runs just those two.
+// credential failure, as it did before this change. `fx teams` runs from the
+// same saved-sign-in profile for every response of at most two entries, with
+// the same bodies, and switches the saved sign-in to the first team. `fx
+// login` is also killed with SIGKILL while /v2/teams is held open, from both
+// profiles, and `fx teams` from the saved one; --only-kill runs just those
+// three.
 //
 // For each run it records what the person was told, what the saved sign-in
 // holds after (compared byte for byte with what it held before), which kind of
 // entry it saved as the team, how many teams fx login listed, whether fx wrote
 // a control character, and whether fx was still running. TLC replays the runs
 // through the model (Rule = "design"). --self-check also replays them through
-// the model of fx before the change (Rule = "today") and through the two
-// planted defects of the repair (Rule = "mut_id", "mut_picker"), which must
-// each reject them; --rule today checks them against the model of fx before
-// the change alone, which accepts a run of fx from before it (it leaves out
-// the picker runs and the in-app runs with an id the gateway rejects, which
-// that model does not cover). --stress N adds fx login runs whose list holds N
+// the model of fx before the change (Rule = "today") and through the three
+// planted defects of the repair (Rule = "mut_id", "mut_picker", "mut_teams"),
+// which must each reject them; --rule today checks them against the model of
+// fx before the change alone, which accepts a run of fx from before it (it
+// leaves out the picker and `fx teams` runs and the in-app runs with an id the
+// gateway rejects, which that model does not cover). --stress N adds fx login runs whose list holds N
 // teams with control characters in every name, and one list past the 4 MiB
 // response limit, and prints their wall time and the binary's peak memory.
 //
@@ -50,13 +53,13 @@ import { TLA_ROOT, outDir, runTlc, writeJson } from "../lib/tlc";
 type Entry = "plain" | "ctl_name" | "ctl_only" | "ctl_slug" | "bad_id" | "unreadable";
 type Status = "error" | "garbage" | "ok" | "none";
 type Resp = { status: Status; entries: Entry[] };
-type Surface = "cli" | "app" | "picker";
+type Surface = "cli" | "app" | "picker" | "teams";
 type Prior = "none" | "teamed";
 type Saved = Prior | "new_teamless" | "new_teamed" | "reteamed" | "unknown";
 type Team = Entry | "none" | "unknown";
 type Outcome =
   | "signed_in" | "teams_unavailable" | "no_teams" | "gateway_missing" | "notice_saved" | "credential_failure"
-  | "crashed" | "killed" | "unknown";
+  | "switch_failed" | "crashed" | "killed" | "unknown";
 type Observation = {
   id: string;
   surface: Surface;
@@ -310,13 +313,36 @@ function cliOutcome(alive: boolean, exit: number | null, stdout: string, stderr:
   return "unknown";
 }
 
-async function runCli(helpers: any, id: string, prior: Prior, resp: Resp, variant: number, scratch: string, body?: () => Response): Promise<Observation> {
-  const issuer = startIssuer(body ?? (() => teamsResponse(resp, variant)));
+// What `fx teams` ends in: it lists the teams with the saved sign-in and
+// switches it to one. A failed request keeps its older words.
+function teamsOutcome(alive: boolean, exit: number | null, stdout: string, stderr: string): Outcome {
+  if (!alive) return "crashed";
+  if (stderr.includes("Your Vercel teams could not be loaded")) return "teams_unavailable";
+  if (stderr.includes("failed to list Vercel teams")) return "teams_unavailable";
+  if (stderr.includes("No Vercel teams are available")) return "no_teams";
+  if (stderr.includes("failed to switch team")) return "switch_failed";
+  if (exit === 0 && stdout.includes("Selected Vercel team:")) return "signed_in";
+  return "unknown";
+}
+
+// `command` is `fx login`, or `fx teams` from a profile with a saved sign-in,
+// which gets only garbage that parses as JSON.
+async function runCli(
+  helpers: any,
+  id: string,
+  prior: Prior,
+  resp: Resp,
+  variant: number,
+  scratch: string,
+  body?: () => Response,
+  command: "login" | "teams" = "login",
+): Promise<Observation> {
+  const issuer = startIssuer(body ?? (() => teamsResponse(resp, variant, command === "teams")));
   const gateway = helpers.startFakeGateway([]);
   const profile = makeProfile(scratch, id, prior, issuer.url);
   try {
     const started = performance.now();
-    const child = Bun.spawn([binary, "login"], {
+    const child = Bun.spawn([binary, command], {
       cwd: profile.root,
       env: fxEnv(helpers, profile, issuer.url, gateway),
       stdin: "ignore",
@@ -333,7 +359,7 @@ async function runCli(helpers: any, id: string, prior: Prior, resp: Resp, varian
     const seconds = Number(((performance.now() - started) / 1000).toFixed(2));
     const maxRss = child.resourceUsage()?.maxRSS ?? null;
     const alive = child.signalCode === null && exit < 128;
-    const outcome = cliOutcome(alive, exit, stdout, stderr);
+    const outcome = command === "login" ? cliOutcome(alive, exit, stdout, stderr) : teamsOutcome(alive, exit, stdout, stderr);
     const listed = stdout.split("\n").filter((line) => /^ {2}\d+\. /.test(line)).length;
     // A single team is not listed, and a sign-in that ends in gateway_missing
     // saved either no team (an empty list) or the team it could not use, so
@@ -341,7 +367,7 @@ async function runCli(helpers: any, id: string, prior: Prior, resp: Resp, varian
     const offered = outcome === "gateway_missing" ? -1 : listed > 0 ? listed : outcome === "signed_in" ? 1 : 0;
     return {
       id,
-      surface: "cli",
+      surface: command === "login" ? "cli" : "teams",
       prior,
       resp,
       outcome,
@@ -368,14 +394,14 @@ async function runCli(helpers: any, id: string, prior: Prior, resp: Resp, varian
 
 // `fx login` killed with SIGKILL while /v2/teams is held open: nothing was
 // saved yet, so the store must be byte for byte what it was.
-async function runKill(helpers: any, id: string, prior: Prior, scratch: string): Promise<Observation> {
+async function runKill(helpers: any, id: string, prior: Prior, scratch: string, command: "login" | "teams" = "login"): Promise<Observation> {
   const issuer = startIssuer(() => new Promise<Response>(() => {}));
   const gateway = helpers.startFakeGateway([]);
   const profile = makeProfile(scratch, id, prior, issuer.url);
   const resp: Resp = { status: "none", entries: [] };
   try {
     const started = performance.now();
-    const child = Bun.spawn([binary, "login"], {
+    const child = Bun.spawn([binary, command], {
       cwd: profile.root,
       env: fxEnv(helpers, profile, issuer.url, gateway),
       stdin: "ignore",
@@ -392,7 +418,7 @@ async function runKill(helpers: any, id: string, prior: Prior, scratch: string):
     ]);
     return {
       id,
-      surface: "cli",
+      surface: command === "login" ? "cli" : "teams",
       prior,
       resp,
       outcome: child.signalCode === "SIGKILL" ? "killed" : "unknown",
@@ -584,9 +610,10 @@ async function main(): Promise<number> {
   });
 
   // fx login killed while the list is held: from a fresh profile and from one
-  // with a saved sign-in.
+  // with a saved sign-in; fx teams from the saved one.
   const kills: Observation[] = [];
   for (const prior of ["none", "teamed"] as Prior[]) kills.push(await runKill(helpers, `kill-${prior}`, prior, scratch));
+  if (!beforeTheChange) kills.push(await runKill(helpers, "kill-teams", "teamed", scratch, "teams"));
 
   const appCases: Resp[] = options.app && !options.onlyKill
     ? [
@@ -618,6 +645,20 @@ async function main(): Promise<number> {
   const picker = await pool(pickerCases.length, options.appJobs, (index) =>
     runApp(helpers, `picker${index}`, "picker", pickerCases[index]!.resp, pickerCases[index]!.variant, scratch));
 
+  // fx teams, from the saved sign-in: each failure the issuer can give three
+  // ways, then every list of up to --depth entries.
+  const teamsCases: { resp: Resp; variant: number }[] = options.onlyKill || beforeTheChange
+    ? []
+    : [
+      ...[0, 1, 2].flatMap((variant) => [
+        { resp: { status: "error", entries: [] } as Resp, variant },
+        { resp: { status: "garbage", entries: [] } as Resp, variant },
+      ]),
+      ...lists(options.depth).map((entries) => ({ resp: { status: "ok", entries } as Resp, variant: 0 })),
+    ];
+  const teams = await pool(teamsCases.length, options.jobs, (index) =>
+    runCli(helpers, `teams${index}`, "teamed", teamsCases[index]!.resp, teamsCases[index]!.variant, scratch, undefined, "teams"));
+
   const stress: Observation[] = [];
   if (options.stress > 0) {
     const within = stressBody(options.stress);
@@ -627,17 +668,17 @@ async function main(): Promise<number> {
     stress.push(await runCli(helpers, "stress-past-limit", "teamed", { status: "error", entries: [] }, 0, scratch, past));
   }
 
-  const observations = [...cli, ...kills, ...app, ...picker];
+  const observations = [...cli, ...kills, ...app, ...picker, ...teams];
   const all = [...observations, ...stress];
   writeJson(join(out, "observations.json"), all);
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
   const counts: Record<string, number> = {};
   for (const o of all) counts[`${o.surface}:${o.outcome}`] = (counts[`${o.surface}:${o.outcome}`] ?? 0) + 1;
-  console.log(`${cli.length} fx login, ${kills.length} killed fx login, ${app.length} in-app sign-in and ${picker.length} picker runs of ${binary} in ${seconds}s, outcomes ${JSON.stringify(counts)}`);
+  console.log(`${cli.length} fx login, ${kills.length} killed, ${app.length} in-app sign-in, ${picker.length} picker and ${teams.length} fx teams runs of ${binary} in ${seconds}s, outcomes ${JSON.stringify(counts)}`);
   console.log(`observations: ${join(out, "observations.json")}`);
 
   // A run that never asked for the team list says nothing about it.
-  const expectedRequests = (o: Observation) => (o.surface === "picker" ? PICKER_REQUESTS : SIGN_IN_REQUESTS).join("\n");
+  const expectedRequests = (o: Observation) => (o.surface === "picker" || o.surface === "teams" ? PICKER_REQUESTS : SIGN_IN_REQUESTS).join("\n");
   const unreached = all.find((o) => o.evidence.requests.join("\n") !== expectedRequests(o));
   if (unreached) {
     console.log(`TOOL_ERROR: ${unreached.id} made other issuer requests than a sign-in: ${JSON.stringify(unreached.evidence)}`);
@@ -681,7 +722,7 @@ async function main(): Promise<number> {
   if (options.selfCheck) {
     // Each of these is fx as it was: before the change, and with one of the
     // defects the repair fixed. The runs of the fixed binary must not fit any.
-    for (const rule of ["today", "mut_id", "mut_picker"]) {
+    for (const rule of ["today", "mut_id", "mut_picker", "mut_teams"]) {
       const earlier = await runTrace(observations, rule, out);
       console.log(`self-check, ${rule}: ${earlier.verdict} (must be REJECTED)`);
       if (earlier.verdict !== "REJECTED") return earlier.verdict === "TOOL_ERROR" ? 2 : 1;

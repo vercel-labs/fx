@@ -6,15 +6,19 @@
 (* completeSignIn, then collectSignInFacts in                              *)
 (* src/core/app/app_auth_runtime.zig), and the team column of the in-app   *)
 (* /login and /provider picker, which lists the teams with a saved         *)
-(* sign-in and asks for no new token (finishTeamsForProviderPicker).       *)
+(* sign-in and asks for no new token (finishTeamsForProviderPicker), and   *)
+(* `fx teams`, which lists them the same way in a shell and switches the   *)
+(* saved sign-in to one (runTeams, and the catch in src/core/cli/          *)
+(* cli_surface.zig).                                                       *)
 (*                                                                         *)
 (* /v2/teams answers with one of:                                          *)
 (*   status "error"    a non-2xx status, a transport failure, or a body    *)
 (*                     past the size limit                                 *)
-(*   status "garbage"  a 2xx body that is not a team list. The picker      *)
-(*                     reads a body that is not even JSON as a credential  *)
-(*                     failure, as it did before this change; the driver   *)
-(*                     sends the picker only garbage that parses as JSON.  *)
+(*   status "garbage"  a 2xx body that is not a team list. The picker and  *)
+(*                     `fx teams` read a body that is not even JSON as a   *)
+(*                     credential or switch failure, as they did before    *)
+(*                     this change; the driver sends them only garbage     *)
+(*                     that parses as JSON.                                *)
 (*   status "ok"       a list of entries, each one of:                     *)
 (*     "plain"       a readable team with a printable name                 *)
 (*     "ctl_name"    a readable team whose name mixes control characters   *)
@@ -31,17 +35,20 @@
 (* saved is what the session store holds: "none", "teamed" (the session    *)
 (* from before this sign-in), "new_teamless" (the new token with no team), *)
 (* "new_teamed", or "reteamed" (the saved session, with the team the       *)
-(* picker chose). prior is what it held at the start. The in-app sign-in   *)
-(* saves the new session before its team picker opens, and the picker's    *)
-(* choice adds the team; `fx login` picks the team first and saves once;   *)
-(* the picker path saves nothing until the person chooses a team. team is  *)
-(* the kind of entry saved as the team, or "none".                         *)
+(* picker or `fx teams` chose). prior is what it held at the start. The    *)
+(* in-app sign-in saves the new session before its team picker opens, and  *)
+(* the picker's choice adds the team; `fx login` picks the team first and  *)
+(* saves once; the picker path saves nothing until the person chooses a    *)
+(* team; `fx teams` takes the default team, the first of a list that does  *)
+(* not hold the saved one, and saves it. team is the kind of entry saved   *)
+(* as the team, or "none".                                                 *)
 (*                                                                         *)
 (* Rule picks the code: "design" is the fix, "today" is fx before it, and  *)
 (* each "mut_*" plants one defect; check.sh names the rule that catches    *)
-(* it. The picker path is modeled for the fix only: "today" has no picker  *)
-(* runs. SignInTeamsTrace.tla replays runs of the built fx against this    *)
-(* model; tests/tla/drivers/auth/driver.ts makes them.                     *)
+(* it. The picker path and `fx teams` are modeled for the fix only:       *)
+(* "today" has no runs of either. SignInTeamsTrace.tla replays runs of the *)
+(* built fx against this model; tests/tla/drivers/auth/driver.ts makes     *)
+(* them.                                                                   *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -56,12 +63,13 @@ NoResponse == [status |-> "none", entries |-> <<>>]
 
 Outcomes == {"none", "signed_in", "picking", "picker_closed", "teams_unavailable",
              "no_teams", "gateway_missing", "notice_saved", "credential_failure",
-             "crashed", "killed", "cancelled"}
+             "switch_failed", "crashed", "killed", "cancelled"}
 Saves == {"none", "teamed", "new_teamless", "new_teamed", "reteamed"}
 Teams == {"none"} \cup Entries
 
 VARIABLES
-    surface,  \* "cli" (fx login), "app" (the in-app /login), or "picker" (its team column)
+    surface,  \* "cli" (fx login), "app" (the in-app /login), "picker" (its team column),
+              \* or "teams" (fx teams)
     prior,    \* what the session store held before the sign-in
     phase,    \* "waiting" for the token, "fetching" the teams, "picking", "done"
     resp,     \* what /v2/teams answered
@@ -127,14 +135,24 @@ PickerFailure(r) ==
         THEN "credential_failure"
         ELSE "teams_unavailable"
 
+\* What `fx teams` says when the list is unavailable. A failed request always
+\* said so. "mut_teams" is the catch in the teams command without cases for
+\* InvalidTeamsResponse and NoTeams: a list that could not be read, held no
+\* usable team, or was empty ended in the general failure line.
+TeamsFailure(r) ==
+    IF Rule = "mut_teams" /\ r.status # "error"
+        THEN "switch_failed"
+        ELSE "teams_unavailable"
+
 -----------------------------------------------------------------------------
 
-\* The picker path starts from a saved sign-in and asks for the teams at once.
+\* The picker path and `fx teams` start from a saved sign-in and ask for the
+\* teams at once.
 Starts(s, p) ==
-    /\ s = "picker" => (p = "teamed" /\ Rule # "today")
+    /\ s \in {"picker", "teams"} => (p = "teamed" /\ Rule # "today")
     /\ surface' = s
     /\ prior' = p
-    /\ phase' = IF s = "picker" THEN "fetching" ELSE "waiting"
+    /\ phase' = IF s \in {"picker", "teams"} THEN "fetching" ELSE "waiting"
     /\ resp' = NoResponse
     /\ saved' = p
     /\ team' = "none"
@@ -144,10 +162,10 @@ Starts(s, p) ==
     /\ alive' = TRUE
 
 InitWith(s, p) ==
-    /\ s = "picker" => (p = "teamed" /\ Rule # "today")
+    /\ s \in {"picker", "teams"} => (p = "teamed" /\ Rule # "today")
     /\ surface = s
     /\ prior = p
-    /\ phase = IF s = "picker" THEN "fetching" ELSE "waiting"
+    /\ phase = IF s \in {"picker", "teams"} THEN "fetching" ELSE "waiting"
     /\ resp = NoResponse
     /\ saved = p
     /\ team = "none"
@@ -215,17 +233,33 @@ PickerTeams(k) ==
     /\ phase' = "picking"
     /\ UNCHANGED <<saved, team, rawOut, alive>>
 
+\* `fx teams` takes the default team and saves it on the session it listed
+\* the teams with.
+TeamsCommand(k) ==
+    /\ offered' = Len(k)
+    /\ rawOut' = (Len(k) >= 2 /\ \E i \in DOMAIN k : RawName(k[i]) \/ RawSlug(k[i]))
+    /\ saved' = "reteamed"
+    /\ team' = k[1]
+    /\ outcome' = "signed_in"
+    /\ phase' = "done"
+    /\ UNCHANGED alive
+
 Answer(r) ==
     /\ phase = "fetching"
     /\ resp' = r
     /\ UNCHANGED <<surface, prior>>
     /\ CASE Result(r) = "unavailable" ->
-               Fail(IF surface = "picker" THEN PickerFailure(r) ELSE "teams_unavailable")
-         [] Result(r) = "empty" -> IF Rule = "today" THEN SaveTeamless ELSE Fail("no_teams")
+               Fail(IF surface = "picker" THEN PickerFailure(r)
+                    ELSE IF surface = "teams" THEN TeamsFailure(r)
+                    ELSE "teams_unavailable")
+         [] Result(r) = "empty" ->
+               IF Rule = "today" THEN SaveTeamless
+               ELSE Fail(IF surface = "teams" /\ Rule = "mut_teams" THEN "switch_failed" ELSE "no_teams")
          [] Result(r) = "teams" ->
                IF surface = "cli" THEN CliTeams(Kept(r))
                ELSE IF surface = "app" THEN AppTeams(Kept(r))
-               ELSE PickerTeams(Kept(r))
+               ELSE IF surface = "picker" THEN PickerTeams(Kept(r))
+               ELSE TeamsCommand(Kept(r))
 
 \* The person takes the picker's first team, the default. fx saves it, then
 \* says so with the team's name and slug.
@@ -280,9 +314,9 @@ Spec == Init /\ [][Next]_vars
 -----------------------------------------------------------------------------
 
 TypeOK ==
-    /\ surface \in {"cli", "app", "picker"}
+    /\ surface \in {"cli", "app", "picker", "teams"}
     /\ prior \in {"none", "teamed"}
-    /\ surface = "picker" => prior = "teamed"
+    /\ surface \in {"picker", "teams"} => prior = "teamed"
     /\ phase \in {"waiting", "fetching", "picking", "done"}
     /\ resp \in Responses \cup {NoResponse}
     /\ saved \in Saves
@@ -333,9 +367,11 @@ Heard(o) ==
       [] o \in {"signed_in", "picking", "picker_closed"} -> "teams"
       [] OTHER -> "other"
 
-\* fx login, the in-app /login, and the picker's team column tell the same
-\* story for the same list: a list with no usable team is never a credential
-\* problem, a sign-in with no team, or an account with no teams.
+\* fx login, the in-app /login, the picker's team column, and `fx teams` tell
+\* the same story for the same list: a list with no usable team is never a
+\* credential problem, a failed switch, a sign-in with no team, or an account
+\* with no teams, and an empty list is never anything but an account with no
+\* teams.
 SameOutcomeEverywhere ==
     (Answered /\ outcome \notin {"killed", "cancelled", "crashed"}) => Heard(outcome) = Said(resp)
 =============================================================================
