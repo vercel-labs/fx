@@ -9278,7 +9278,7 @@ describe("acp: model-independent", () => {
       const firstMarker = "ACP_CONTEXT_FIRST_SENTINEL";
       const secondMarker = "ACP_CONTEXT_SECOND_SENTINEL";
       const transientMarker =
-        "Runtime context: this is a noninteractive run without live question UI;";
+        "Runtime context: this is a noninteractive run with no question UI.";
       const rulesPath = join(root.workspace, "AGENTS.md");
       writeFileSync(rulesPath, `${firstMarker}\n`);
       const gateway = startFakeGateway([
