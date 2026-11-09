@@ -57,6 +57,7 @@ VERIFICATION_E2E_TESTS = (
     "auto-mode-reliability.test.ts",
     "sessions.test.ts",
     "review-model-override.test.ts",
+    "code-mode-fake-gateway.test.ts",
     "configured-providers.test.ts",
     "oauth-keychain-migration.test.ts",
     "mcp-verbs.test.ts",
@@ -381,7 +382,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(35, len(corpus.scenarios))
-        self.assertEqual(68, len(corpus.candidate_scenarios))
+        self.assertEqual(69, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

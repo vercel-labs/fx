@@ -113,6 +113,7 @@ pub const UserSettingsPatch = struct {
     prompt_history_enabled: ?bool = null,
     statusline_item: ?StatuslineItemPatch = null,
     session_titles: ?bool = null,
+    experimental_code_mode: ?bool = null,
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
@@ -147,6 +148,7 @@ pub const UserSettingsPatch = struct {
             self.prompt_history_enabled == null and
             self.statusline_item == null and
             self.session_titles == null and
+            self.experimental_code_mode == null and
             self.notification_turn_end == null and
             self.notification_attention_required == null and
             self.notification_max == null and
@@ -1276,6 +1278,17 @@ fn applyUserPatchToRoot(
             break :blk root.object.getPtr("prompt_history").?;
         };
         application.changed = try putBool(arena, &prompt_history.object, "enabled", enabled) or application.changed;
+    }
+
+    if (patch.experimental_code_mode) |enabled| {
+        var experimental = if (root.object.getPtr("experimental")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk value;
+        } else blk: {
+            try root.object.put(arena, "experimental", .{ .object = .empty });
+            break :blk root.object.getPtr("experimental").?;
+        };
+        application.changed = try putBool(arena, &experimental.object, "code_mode", enabled) or application.changed;
     }
 
     if (patch.statusline_item) |item_patch| {

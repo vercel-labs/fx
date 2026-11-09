@@ -7,6 +7,7 @@
   { "file": "auth-refresh.test.ts", "weight": 2 },
   { "file": "ci-shards.test.ts", "weight": 15 },
   { "file": "cli.test.ts", "weight": 19 },
+  { "file": "code-mode-fake-gateway.test.ts", "weight": 3 },
   { "file": "compaction-policy.test.ts", "weight": 1 },
   { "file": "config-persistence.test.ts", "weight": 64 },
   { "file": "configured-providers.test.ts", "weight": 3 },

@@ -76,6 +76,8 @@ pub const Settings = struct {
     statusline_session: ?bool = null,
     statusline_workspace: ?bool = null,
     session_titles: ?bool = null,
+    /// `experimental.code_mode`: offer the `execute` tool.
+    experimental_code_mode: ?bool = null,
     /// Ping a waiting Claude conversation's prompt cache so it stays alive.
     cache_warming: ?bool = null,
     notification_turn_end: ?bool = null,
@@ -155,6 +157,7 @@ pub const ConfigSources = struct {
     statusline_context: ConfigSource = .compiled_default,
     statusline_session: ConfigSource = .compiled_default,
     session_titles: ConfigSource = .compiled_default,
+    experimental_code_mode: ConfigSource = .compiled_default,
     cache_warming: ConfigSource = .compiled_default,
     notification_turn_end: ConfigSource = .compiled_default,
     notification_attention_required: ConfigSource = .compiled_default,
@@ -900,6 +903,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
     if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
     if (settings.session_titles != null) sources.session_titles = source;
+    if (settings.experimental_code_mode != null) sources.experimental_code_mode = source;
     if (settings.cache_warming != null) sources.cache_warming = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
@@ -1810,6 +1814,14 @@ fn parseProfileOnlyFields(
         settings.session_titles = value.bool;
     }
 
+    if (root.object.get("experimental")) |experimental_value| {
+        if (experimental_value != .object) return error.InvalidExperimentalType;
+        if (experimental_value.object.get("code_mode")) |enabled| {
+            if (enabled != .bool) return error.InvalidExperimentalCodeModeType;
+            settings.experimental_code_mode = enabled.bool;
+        }
+    }
+
     if (root.object.get("cache_warming")) |value| {
         if (value != .bool) return error.InvalidCacheWarmingType;
         settings.cache_warming = value.bool;
@@ -2049,6 +2061,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
     if (incoming.collapse_tool_calls) |value| target.collapse_tool_calls = value;
     if (incoming.session_titles) |value| target.session_titles = value;
+    if (incoming.experimental_code_mode) |value| target.experimental_code_mode = value;
     if (incoming.cache_warming) |value| target.cache_warming = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;

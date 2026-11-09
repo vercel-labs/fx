@@ -89,6 +89,7 @@ const test_builtin_gateway = if (std_builtin.is_test)
 else
     struct {};
 const types = @import("../core/shared/types.zig");
+const code_mode_sandbox = @import("../core/code_mode/sandbox.zig");
 const history_range = @import("../core/shared/history_range.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
@@ -505,6 +506,7 @@ const AcpContext = struct {
         var tc: tool_runtime.Context = .{
             .observer = self.observer,
             .workspace_root = self.state.workspace_root,
+            .code_mode_enabled = self.state.code_mode_enabled,
             .access_scope = self.state.workspace_access.scope(self.state.workspace_root),
             .ignored_list_entries = self.state.cfg.ignored_list_entries,
             .max_list_entries = self.state.cfg.max_list_entries,
@@ -1084,6 +1086,7 @@ pub fn handlePrompt(
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .subagent_available = state.subagent_host != null,
+        .code_mode_available = state.code_mode_enabled and code_mode_sandbox.available,
     });
     defer tool_projection.deinit(alloc);
 

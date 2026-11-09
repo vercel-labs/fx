@@ -102,6 +102,38 @@ pub const VisionProviderFn = *const fn (
     ToolInput,
 ) DispatchError!ToolResult;
 
+/// What one tool call from an `execute` program returned. `text` is what the
+/// program receives, or the message of the error it throws when the status
+/// isn't `ok`.
+pub const NestedToolResult = struct {
+    text: []const u8,
+    status: Status,
+
+    pub const Status = enum {
+        ok,
+        failed,
+        /// Permission policy or the safety reviewer stopped the call.
+        held,
+    };
+};
+
+/// Runs the tool calls an `execute` program makes, each through the same
+/// validation, permission admission, and authorized execution as a direct
+/// call.
+pub const CodeModeProvider = struct {
+    ctx: *anyopaque,
+    call_fn: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!NestedToolResult,
+    cancelled_fn: *const fn (*anyopaque) bool,
+
+    pub fn call(provider: CodeModeProvider, arena: Allocator, name: []const u8, args_json: []const u8) anyerror!NestedToolResult {
+        return provider.call_fn(provider.ctx, arena, name, args_json);
+    }
+
+    pub fn cancelled(provider: CodeModeProvider) bool {
+        return provider.cancelled_fn(provider.ctx);
+    }
+};
+
 pub const VisionProvider = struct {
     ctx: ?*anyopaque = null,
     execute_fn: VisionProviderFn,
@@ -294,6 +326,7 @@ pub const DispatchContext = struct {
     run_command_backend: ?RunCommandBackend = null,
     subagent_provider: ?subagent_tool_provider.Provider = null,
     vision_provider: ?VisionProvider = null,
+    code_mode_provider: ?CodeModeProvider = null,
     host_tool_provider: ?HostToolProvider = null,
     ask_question_ctx: ?*anyopaque = null,
     observer: ?*observation.Observer = null,
@@ -422,6 +455,7 @@ pub const ExecutorKind = enum {
     mcp_select_tool,
     ask_user_question,
     vision,
+    execute,
     host,
 };
 
@@ -436,12 +470,11 @@ pub const RuntimeProviderKind = enum {
     run_command,
     subagent,
     vision,
+    code_mode,
 };
 
 pub const CapturedCommandFn = *const fn (ToolInput) bool;
-/// Names the action a model call without one means, or null when it is not
-/// exactly one. See `Tool.infer_action_fn`.
-pub const InferActionFn = *const fn (std.json.ObjectMap) ?[]const u8;
+pub const InferActionFn = tool_args.InferActionFn;
 pub const ProcessLocalFn = *const fn (ToolInput) bool;
 
 pub const CallPresentation = struct {
