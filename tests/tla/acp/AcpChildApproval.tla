@@ -30,9 +30,11 @@
 (*  - The card ends once, with the call's real status (FinishCards): the   *)
 (*    child's runtime reports the call's end, and the run's end settles    *)
 (*    a card no call ended. A subagent's call ids carry its child id and   *)
-(*    the call's order in its run ("seq"), since every conversation        *)
-(*    numbers its calls from one, and one run's model can repeat an id     *)
-(*    (PrefixIds, OneRun, UniqueIds).                                      *)
+(*    the call's order ("seq"), since every conversation numbers its       *)
+(*    calls from one, and one run's model can repeat an id (PrefixIds,     *)
+(*    OneRun, UniqueIds). The order is kept for the session, per child,    *)
+(*    not per run ("sessionSeq"): a child's second run (Track "runs")      *)
+(*    repeats its model's ids too.                                         *)
 (*  - The prompt's response is its own step (Track "responses"). A card    *)
 (*    update after it breaks the protocol, so the prompt's end closes     *)
 (*    every card still open, under the lock the children's card updates   *)
@@ -46,6 +48,10 @@
 (*    "gone"). Its wait then ends with a refusal that reads as closed, as  *)
 (*    a subagent's does ("parentRefuses"), and not as the person's denial: *)
 (*    ParentReadsTrue.                                                     *)
+(*  - A request leaves its trace line once, where a cancel or a stop        *)
+(*    settles it (Track "traces"). The cleanup after the failed wait finds *)
+(*    the entry gone and says nothing ("quietDrain"): TraceOnce, and the   *)
+(*    cancel's own line stays (CancelTraced).                              *)
 (*  - The registry holds Capacity entries for every kind of request. A     *)
 (*    subagent's requests count against one fewer (ReserveSlot), so the    *)
 (*    parent's own request always finds a slot. Subagents past the two     *)
@@ -79,9 +85,11 @@ CONSTANTS Children,        \* the subagents modeled one by one
           Capacity,        \* entries the registry holds, for every kind of request
           OneRun,          \* TRUE: the modeled children are calls of one subagent run
           Track,           \* parts modeled, to bound the state space: a subset of
-                           \* {"responses", "causes", "gone"}
-          Fixed,           \* repairs in effect: a subset of {"seq", "closeCards", "cardGate",
-                           \* "carryCause", "stopRefuses", "steerCloses", "parentRefuses"} and of Kinds
+                           \* {"responses", "causes", "gone", "runs", "traces"}
+          Fixed,           \* repairs in effect: a subset of {"seq", "sessionSeq", "closeCards",
+                           \* "cardGate", "carryCause", "stopRefuses", "steerCloses",
+                           \* "parentRefuses", "quietDrain"}, of the wrong repairs
+                           \* {"openSeq", "silentCancel"}, and of Kinds
           Kinds            \* other request kinds modeled one each: a subset of
                            \* {"host_tool", "journal", "elicitation"}
 
@@ -90,15 +98,17 @@ ASSUME AtomicGate \in BOOLEAN /\ StopCancelsWait \in BOOLEAN
 ASSUME FinishCards \in BOOLEAN /\ SpawnClosesGate \in BOOLEAN /\ PrefixIds \in BOOLEAN
 ASSUME ReserveSlot \in BOOLEAN /\ ResendCancel \in BOOLEAN /\ OthersMayAsk \in BOOLEAN
 ASSUME OneRun \in BOOLEAN
-ASSUME Track \subseteq {"responses", "causes", "gone"}
+ASSUME Track \subseteq {"responses", "causes", "gone", "runs", "traces"}
 ASSUME Kinds \subseteq {"host_tool", "journal", "elicitation"}
-ASSUME Fixed \subseteq ({"seq", "closeCards", "cardGate", "carryCause", "stopRefuses", "steerCloses", "parentRefuses"} \cup Kinds)
+ASSUME Fixed \subseteq ({"seq", "sessionSeq", "closeCards", "cardGate", "carryCause", "stopRefuses", "steerCloses", "parentRefuses", "quietDrain", "openSeq", "silentCancel"} \cup Kinds)
 ASSUME MaxPrompts \in Nat \ {0}
 ASSUME Capacity \in Nat \ {0}
 
 Responses == "responses" \in Track
 Causes == "causes" \in Track
 Gone == "gone" \in Track
+Runs == "runs" \in Track
+Lines == "traces" \in Track
 
 Answers == {"allow", "reject", "garbage", "error"}
 Settled == Answers \cup {"cancelled", "stopCancelled"}
@@ -130,11 +140,12 @@ VARIABLES
     truth,     \* why the subagent's request was refused or cancelled
     reads,     \* what the subagent's model reads about it
     steer,     \* "open" | "closed": the session's steering
-    kreq       \* each other kind's request, by Kinds
+    kreq,      \* each other kind's request, by Kinds
+    lines      \* the trace lines each subagent request left for how it ended
 
 oldVars == <<prompt, gate, prompts, child, sawOpen, entry, atClient, wire, sent, stopped, result, allowed, card, others, parent>>
-nv == <<seq, closer, response, truth, reads, steer, kreq>>
-vars == <<prompt, gate, prompts, child, sawOpen, entry, atClient, wire, sent, stopped, result, allowed, card, others, parent, seq, closer, response, truth, reads, steer, kreq>>
+nv == <<seq, closer, response, truth, reads, steer, kreq, lines>>
+vars == <<prompt, gate, prompts, child, sawOpen, entry, atClient, wire, sent, stopped, result, allowed, card, others, parent, seq, closer, response, truth, reads, steer, kreq, lines>>
 
 TypeOK ==
     /\ prompt \in {"open", "closed"}
@@ -159,6 +170,7 @@ TypeOK ==
     /\ reads \in [Children -> {"none"} \cup Reasons]
     /\ steer \in {"open", "closed"}
     /\ kreq \in [Kinds -> KStates]
+    /\ lines \in [Children -> 0..2]
 
 Init ==
     /\ prompt = "open"
@@ -183,6 +195,7 @@ Init ==
     /\ reads = [c \in Children |-> "none"]
     /\ steer = "open"
     /\ kreq = [k \in Kinds |-> "none"]
+    /\ lines = [c \in Children |-> 0]
 
 \* Slots in use: every subagent's entry, the anonymous ones, and the parent's.
 Used ==
@@ -191,13 +204,33 @@ Used ==
 \* How many entries a subagent's request may find before it is refused.
 ChildLimit == IF ReserveSlot THEN Capacity - 1 ELSE Capacity
 
-\* The subagent run a modeled child's call belongs to, and how many of that
-\* run's calls have announced a card.
+\* The subagent child a modeled call belongs to, whose id leads its card's, and
+\* the run it belongs to. With OneRun the modeled children are calls of one run
+\* of one child; with Runs, calls in separate runs of one child.
+ChildOf(c) == IF OneRun \/ Runs THEN "r1" ELSE c
 RunOf(c) == IF OneRun THEN "r1" ELSE c
-Announced(r) == Cardinality({d \in Children : RunOf(d) = r /\ card[d] # "none"})
 
-\* The order the call's card takes in its run.
-Seq(c) == Announced(RunOf(c)) + 1
+\* The calls whose cards an order counts: the run's own, or, kept for the
+\* session ("sessionSeq"), every run of the child. How many of them have
+\* announced a card.
+Scope(c) == IF "sessionSeq" \in Fixed THEN ChildOf(c) ELSE RunOf(c)
+Announced(s) == Cardinality({d \in Children : Scope(d) = s /\ card[d] # "none"})
+
+\* A wrong repair, "openSeq": the order counts the child's cards that are
+\* still open, so a card that ended frees its order.
+OpenCards(c) == Cardinality({d \in Children : ChildOf(d) = ChildOf(c) /\ card[d] = "pending"})
+
+\* The order the call's card takes.
+Seq(c) == IF "openSeq" \in Fixed THEN OpenCards(c) + 1 ELSE Announced(Scope(c)) + 1
+
+\* The trace lines a request leaves where a cancel or a stop settles it: the
+\* registry's cancel and the stop's withdrawal each leave one. "silentCancel",
+\* a wrong repair, silences them with the cleanup's line.
+CancelLine == IF Lines /\ "silentCancel" \notin Fixed THEN 1 ELSE 0
+
+\* The cleanup after a wait that took a cancelled or withdrawn entry drains an
+\* entry that is gone, and leaves a line for it unless "quietDrain".
+DrainLine == IF Lines /\ "quietDrain" \notin Fixed THEN 1 ELSE 0
 
 \* What the model reads when fx refuses with `why`, up front (`when` "begin")
 \* or in answer to a wait that ended ("wait"). A refusal that carries its
@@ -259,7 +292,7 @@ Begin(c) ==
                  IN Deny(c, why, Read(why, "begin"))
               /\ UNCHANGED <<entry, card, seq>>
     /\ UNCHANGED <<prompt, gate, prompts, sawOpen, atClient, wire, sent, stopped, allowed, others, parent>>
-    /\ UNCHANGED <<closer, response, steer, kreq>>
+    /\ UNCHANGED <<closer, response, steer, kreq, lines>>
 
 \* The card, announced under the card lock. Once the prompt's end has closed
 \* the cards, the request is refused (cardGate), cancelled and forgotten as
@@ -277,7 +310,7 @@ Announce(c) ==
               /\ child' = [child EXCEPT ![c] = "sending"]
               /\ UNCHANGED <<entry, result, truth, reads>>
     /\ UNCHANGED <<prompt, gate, prompts, sawOpen, atClient, wire, sent, stopped, allowed, others, parent>>
-    /\ UNCHANGED <<closer, response, steer, kreq>>
+    /\ UNCHANGED <<closer, response, steer, kreq, lines>>
 
 \* A planted bug: the gate is read in one step ...
 CheckGate(c) ==
@@ -290,7 +323,7 @@ CheckGate(c) ==
                  IN Deny(c, why, Read(why, "begin"))
               /\ UNCHANGED sawOpen
     /\ UNCHANGED <<prompt, gate, prompts, entry, atClient, wire, sent, stopped, allowed, card, others, parent>>
-    /\ UNCHANGED <<seq, closer, response, steer, kreq>>
+    /\ UNCHANGED <<seq, closer, response, steer, kreq, lines>>
 
 \* ... and the request inserted in a later one.
 InsertChecked(c) ==
@@ -302,7 +335,7 @@ InsertChecked(c) ==
     /\ seq' = [seq EXCEPT ![c] = Seq(c)]
     /\ child' = [child EXCEPT ![c] = "sending"]
     /\ UNCHANGED <<prompt, gate, prompts, atClient, wire, sent, stopped, result, allowed, others, parent>>
-    /\ UNCHANGED <<closer, response, truth, reads, steer, kreq>>
+    /\ UNCHANGED <<closer, response, truth, reads, steer, kreq, lines>>
 
 \* The write. An entry cancelled since its insert had its $/cancel_request sent
 \* ahead of the request. With ResendCancel the request is withdrawn again after
@@ -333,7 +366,7 @@ NoHost(c) ==
     /\ child[c] = "asking"
     /\ Deny(c, "noninteractive", "noninteractive")
     /\ UNCHANGED <<prompt, gate, prompts, sawOpen, entry, atClient, wire, sent, stopped, allowed, card, others, parent>>
-    /\ UNCHANGED <<seq, closer, response, steer, kreq>>
+    /\ UNCHANGED <<seq, closer, response, steer, kreq, lines>>
 
 \* The waiting subagent reads its settled entry and removes it. An answer is
 \* the client's. A cancel, which the prompt's end or the host made, or a
@@ -350,6 +383,10 @@ Decide(c) ==
                          ELSE IF entry[c] = "cancelled" THEN "closed"
                          ELSE "user_denied"
               IN Cause(c, why, Read(why, "wait"))
+    \* A wait that took a cancelled or withdrawn entry fails, and the cleanup
+    \* after it drains the entry it finds gone.
+    /\ lines' = [lines EXCEPT ![c] = IF entry[c] \in {"cancelled", "stopCancelled"}
+                                      THEN lines[c] + DrainLine ELSE lines[c]]
     /\ UNCHANGED <<prompt, gate, prompts, sawOpen, atClient, wire, sent, stopped, allowed, card, others, parent>>
     /\ UNCHANGED <<seq, closer, response, steer, kreq>>
 
@@ -418,12 +455,14 @@ CloseGate ==
     /\ gate' = "closed"
     /\ entry' = [c \in Children |-> IF entry[c] = "open" THEN "cancelled" ELSE entry[c]]
     /\ atClient' = [c \in Children |-> FALSE]
+    /\ lines' = [c \in Children |-> IF entry[c] = "open" THEN lines[c] + CancelLine ELSE lines[c]]
 
 \* The prompt ends once no subagent is working or waiting and no other request
-\* is open. The steering ends with it.
+\* is open. The steering ends with it. With Runs, a run that has not asked yet
+\* is a later run of the child, which the prompt does not wait for.
 PromptEnd ==
     /\ prompt = "open"
-    /\ \A c \in Children : child[c] = "done"
+    /\ \A c \in Children : child[c] = "done" \/ (Runs /\ child[c] = "working")
     /\ others = 0 /\ parent # "open"
     /\ \A k \in Kinds : kreq[k] \notin {"gap", "shown"}
     /\ prompt' = "closed"
@@ -459,7 +498,7 @@ Reopen ==
     /\ response' = IF Responses THEN "none" ELSE "sent"
     /\ steer' = "open"
     /\ UNCHANGED <<child, sawOpen, entry, atClient, wire, sent, stopped, result, allowed, card, others, parent>>
-    /\ UNCHANGED <<seq, truth, reads, kreq>>
+    /\ UNCHANGED <<seq, truth, reads, kreq, lines>>
 
 \* A later session/prompt whose thread cannot start. The gate and the steering
 \* were opened first; with SpawnClosesGate the gate is shut again and with
@@ -473,7 +512,7 @@ StartFails ==
     /\ closer' = IF Responses /\ SpawnClosesGate THEN "done" ELSE "idle"
     /\ steer' = IF "steerCloses" \in Fixed THEN "closed" ELSE "open"
     /\ UNCHANGED <<prompt, child, sawOpen, entry, atClient, wire, sent, stopped, result, allowed, card, others, parent>>
-    /\ UNCHANGED <<seq, response, truth, reads, kreq>>
+    /\ UNCHANGED <<seq, response, truth, reads, kreq, lines>>
 
 \* The parent stops a subagent, or its host shuts down.
 Stop(c) ==
@@ -489,8 +528,9 @@ StopWait(c) ==
     /\ stopped[c] /\ child[c] = "waiting" /\ entry[c] = "open"
     /\ entry' = [entry EXCEPT ![c] = "stopCancelled"]
     /\ atClient' = [atClient EXCEPT ![c] = FALSE]
+    /\ lines' = [lines EXCEPT ![c] = lines[c] + CancelLine]
     /\ UNCHANGED <<prompt, gate, prompts, child, sawOpen, wire, sent, stopped, result, allowed, card, others, parent>>
-    /\ UNCHANGED nv
+    /\ UNCHANGED <<seq, closer, response, truth, reads, steer, kreq>>
 
 \* Before the change a stop reached the worker's wait (cancelApprovalTurn).
 \* The wait ends with a refusal that names the stop (stopRefuses); it used
@@ -500,7 +540,7 @@ WorkerStop(c) ==
     /\ stopped[c] /\ child[c] = "waiting"
     /\ Deny(c, "stopped", IF "stopRefuses" \in Fixed THEN "stopped" ELSE "user_denied")
     /\ UNCHANGED <<prompt, gate, prompts, sawOpen, entry, atClient, wire, sent, stopped, allowed, card, others, parent>>
-    /\ UNCHANGED <<seq, closer, response, steer, kreq>>
+    /\ UNCHANGED <<seq, closer, response, steer, kreq, lines>>
 
 \* The parent's own permission request, through the same registry. It fails
 \* when no slot is left, which ends the person's whole turn.
@@ -536,7 +576,7 @@ BeginClose ==
     /\ prompt = "closed" /\ response = "none" /\ closer = "idle"
     /\ closer' = "closing"
     /\ UNCHANGED <<prompt, gate, prompts, child, sawOpen, entry, atClient, wire, sent, stopped, result, allowed, card, others, parent>>
-    /\ UNCHANGED <<seq, response, truth, reads, steer, kreq>>
+    /\ UNCHANGED <<seq, response, truth, reads, steer, kreq, lines>>
 
 \* One open card ends, whatever its call was doing: the prompt's end settles it.
 CloseCard(c) ==
@@ -551,7 +591,7 @@ EndClose ==
     /\ closer = "closing" /\ \A c \in Children : card[c] # "pending"
     /\ closer' = "done"
     /\ UNCHANGED <<prompt, gate, prompts, child, sawOpen, entry, atClient, wire, sent, stopped, result, allowed, card, others, parent>>
-    /\ UNCHANGED <<seq, response, truth, reads, steer, kreq>>
+    /\ UNCHANGED <<seq, response, truth, reads, steer, kreq, lines>>
 
 \* The response. With "closeCards" it comes after the closer; without, it
 \* does not wait for an open card.
@@ -561,7 +601,7 @@ Respond ==
     /\ "closeCards" \in Fixed => closer = "done"
     /\ response' = "sent"
     /\ UNCHANGED <<prompt, gate, prompts, child, sawOpen, entry, atClient, wire, sent, stopped, result, allowed, card, others, parent>>
-    /\ UNCHANGED <<seq, closer, truth, reads, steer, kreq>>
+    /\ UNCHANGED <<seq, closer, truth, reads, steer, kreq, lines>>
 
 ----------------------------------------------------------------------------
 (* Other kinds of request: a host tool, a journal flush, an elicitation.  *)
@@ -571,7 +611,7 @@ KInsert(k) ==
     /\ prompt = "open" /\ kreq[k] = "none"
     /\ kreq' = [kreq EXCEPT ![k] = "gap"]
     /\ UNCHANGED <<prompt, gate, prompts, child, sawOpen, entry, atClient, wire, sent, stopped, result, allowed, card, others, parent>>
-    /\ UNCHANGED <<seq, closer, response, truth, reads, steer>>
+    /\ UNCHANGED <<seq, closer, response, truth, reads, steer, lines>>
 
 \* The write. A request cancelled since its insert had its $/cancel_request
 \* sent ahead of it; with the kind in Fixed it is withdrawn again after the
@@ -581,14 +621,14 @@ KWrite(k) ==
     /\ kreq' = [kreq EXCEPT ![k] = IF kreq[k] = "gap" THEN "shown"
                                     ELSE IF k \in Fixed THEN "withdrawn" ELSE "stale"]
     /\ UNCHANGED <<prompt, gate, prompts, child, sawOpen, entry, atClient, wire, sent, stopped, result, allowed, card, others, parent>>
-    /\ UNCHANGED <<seq, closer, response, truth, reads, steer>>
+    /\ UNCHANGED <<seq, closer, response, truth, reads, steer, lines>>
 
 \* The client answers it.
 KAnswer(k) ==
     /\ kreq[k] = "shown"
     /\ kreq' = [kreq EXCEPT ![k] = "answered"]
     /\ UNCHANGED <<prompt, gate, prompts, child, sawOpen, entry, atClient, wire, sent, stopped, result, allowed, card, others, parent>>
-    /\ UNCHANGED <<seq, closer, response, truth, reads, steer>>
+    /\ UNCHANGED <<seq, closer, response, truth, reads, steer, lines>>
 
 ----------------------------------------------------------------------------
 
@@ -676,8 +716,8 @@ CardMatchesResult ==
 IdRule == IF ~PrefixIds THEN "model" ELSE IF "seq" \in Fixed THEN "child_seq" ELSE "child"
 CardId(c) ==
     CASE IdRule = "model" -> <<"call_1">>
-      [] IdRule = "child" -> <<RunOf(c), "call_1">>
-      [] OTHER -> <<RunOf(c), seq[c], "call_1">>
+      [] IdRule = "child" -> <<ChildOf(c), "call_1">>
+      [] OTHER -> <<ChildOf(c), seq[c], "call_1">>
 ParentCardId == <<"call_1">>
 
 \* No two cards in the session share an id.
@@ -709,4 +749,14 @@ NoStaleRequest == \A k \in Kinds : kreq[k] # "stale"
 
 \* No steering stays open with no prompt to end it.
 SteeringEnded == prompt = "closed" => steer = "closed"
+
+\* A request leaves at most one trace line for how it ended: the cleanup after
+\* its failed wait drains an entry that is gone, and says nothing of it.
+TraceOnce == Lines => \A c \in Children : lines[c] <= 1
+
+\* A request that a cancel or a stop settled, and that was written, leaves its
+\* one line.
+CancelTraced ==
+    Lines => \A c \in Children :
+        (child[c] = "done" /\ sent[c] /\ truth[c] \in {"closed", "stopped"}) => lines[c] = 1
 =============================================================================

@@ -14,6 +14,11 @@
 (* id the parent's own cards used (ParentIds) and from every earlier       *)
 (* subagent card's. That is the model's UniqueIds, read off the run.       *)
 (*                                                                         *)
+(* The trace lines each request left for how it ended (a cancel's, a      *)
+(* stop's withdrawal, a wait that found its entry gone) are counted from   *)
+(* the run's trace log and compared with the model's count when the run    *)
+(* ends (TraceOnce, CancelTraced).                                         *)
+(*                                                                         *)
 (* A card's end is observed whoever ended it: the child's runtime, or the  *)
 (* prompt's end closing it. The prompt's response is observed too, and     *)
 (* once it is, no card may change until the next prompt starts             *)
@@ -63,6 +68,7 @@ Observed(o) ==
       [] o.op = "final"        -> /\ UNCHANGED vars
                                   /\ \A c \in Children : child[c] = "done" /\ result[c] = o.results[c]
                                   /\ \A c \in Children : card[c] # "pending"
+                                  /\ Lines => \A c \in Children : lines[c] = o.lines[c]
       [] OTHER                 -> FALSE
 
 TraceInit == Init /\ i = 0

@@ -279,11 +279,12 @@ const AcpContext = struct {
     closed_host_steering: bool = false,
     /// Set for a subagent's turn.
     subagent: ?SubagentAsker = null,
-    /// A subagent's run: how many of its calls announced a card, and, by the
-    /// model's call id (owned), the order of the latest of them. A model
-    /// repeats an id from one reply to the next, so the id alone does not name
-    /// a call (`tests/tla/acp/AcpChildApproval.tla` UniqueIds).
-    announced_calls: u32 = 0,
+    /// A subagent's run: by the model's call id (owned), the order of the
+    /// latest of its calls that announced a card. A model repeats an id from
+    /// one reply to the next, so the id alone does not name a call, and it
+    /// numbers its calls alike in every run, so the order comes from the
+    /// session's count for the child, not from the run
+    /// (`tests/tla/acp/AcpChildApproval.tla` UniqueIds).
     latest_call: std.StringHashMapUnmanaged(u32) = .empty,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
@@ -381,21 +382,23 @@ const AcpContext = struct {
     /// permission request, in the session. The model numbers its calls from
     /// one like every other conversation, and one run's model repeats an id,
     /// so a subagent's card leads with its child id and the order its call
-    /// took among the run's announced calls: `<child id>:<order>:<call id>`.
-    /// It names the run's latest call of that id, and stays the same across
-    /// the card's updates, so every id is unique in the session
-    /// (`tests/tla/acp/AcpChildApproval.tla` UniqueIds). Allocated in `arena`.
+    /// took among the cards the child announced in the session, across its
+    /// runs: `<child id>:<order>:<call id>`. It names the run's latest call of
+    /// that id, and stays the same across the card's updates, so every id is
+    /// unique in the session (`tests/tla/acp/AcpChildApproval.tla` UniqueIds).
+    /// Allocated in `arena`.
     fn cardId(self: *const AcpContext, arena: Allocator, call_id: []const u8) ![]const u8 {
         const asker = self.subagent orelse return call_id;
         const order = self.latest_call.get(call_id) orelse 0;
         return arena.print("{s}:{d}:{s}", .{ asker.child_id, order, call_id });
     }
 
-    /// A subagent's call announces a card: it takes the next order in the
-    /// run, and the model's id names it until a later call reuses the id.
-    /// Returns the card's id, allocated in `arena`.
+    /// A subagent's call announces a card: it takes the child's next order in
+    /// the session, and the model's id names it until a later call reuses the
+    /// id. The caller holds `subagent_cards_mutex`. Returns the card's id,
+    /// allocated in `arena`.
     fn startCall(self: *AcpContext, arena: Allocator, call_id: []const u8) ![]const u8 {
-        const order = self.announced_calls + 1;
+        const order = try server.nextSubagentCardOrderLocked(self.state, self.subagent.?.child_id);
         const slot = try self.latest_call.getOrPut(self.alloc, call_id);
         if (!slot.found_existing) {
             slot.key_ptr.* = self.alloc.dupe(u8, call_id) catch |err| {
@@ -404,7 +407,6 @@ const AcpContext = struct {
             };
         }
         slot.value_ptr.* = order;
-        self.announced_calls = order;
         return self.cardId(arena, call_id);
     }
 
@@ -1538,6 +1540,7 @@ fn recordChildToolActivity(
     const card = ctx.published_tool_calls.getKey(card_id) orelse return;
     if (ctx.finalUpdateSent(card)) return;
     if (!server.subagentCardOpenLocked(state, card)) {
+        debug_trace.logf("acp", "subagent card update dropped card_id={s} phase={s} reason=prompt_closed", .{ card, @tagName(phase) });
         ctx.markCardFinished(card);
         return;
     }
@@ -2654,9 +2657,10 @@ fn requestAcpPermission(
         server.beginPermissionRequest(ctx.state) orelse return error.PermissionRequestAlreadyPending;
     errdefer {
         server.cancelPermissionRequest(ctx.state, request_id);
-        // Drains the cancelled entry. Its decision is moot, and an entry that
-        // is gone was traced where the wait found it.
-        _ = server.awaitPermissionDecision(ctx.state, request_id) catch .deny;
+        // Forgets the cancelled entry, if the failed wait left one. Its decision
+        // is moot, and how the request ended was traced where it was settled: a
+        // wait here would trace an entry gone that the failed wait took itself.
+        server.discardOutboundRequest(ctx.state, request_id);
     }
 
     var pending_arena = std.heap.ArenaAllocator.init(alloc);
@@ -5514,6 +5518,61 @@ const FrameLog = struct {
     }
 };
 
+/// A server state whose client is a `FrameLog`, for the tests that read what a
+/// client is sent. `init` points the state at the log it holds, so set it up in
+/// place (`var logged: LoggedState = undefined; try logged.init();`).
+const LoggedState = struct {
+    frames: FrameLog = .{},
+    state: server.ServerState = undefined,
+
+    fn init(self: *LoggedState) !void {
+        self.* = .{};
+        self.state = try initTestAcpState(std.testing.allocator, "/tmp/workspace", .ask);
+        self.state.writer = jsonrpc.Writer.initCallback(&self.frames, FrameLog.write);
+    }
+
+    fn deinit(self: *LoggedState) void {
+        self.state.deinit();
+        self.frames.deinit();
+    }
+};
+
+/// The `acp` trace of a test, which `debug_trace` writes to a file in a
+/// temporary folder. Set it up in place (`var trace: TraceFile = undefined;
+/// try trace.start(); defer trace.stop();`).
+const TraceFile = struct {
+    tmp: std.testing.TmpDir,
+    path: []u8,
+
+    fn start(self: *TraceFile) !void {
+        const alloc = std.testing.allocator;
+        self.tmp = std.testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+        try self.tmp.dir.createDirPath(io_mod.getIo(), "trace");
+        const root = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, "trace");
+        defer alloc.free(root);
+        self.path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
+        errdefer alloc.free(self.path);
+        debug_trace.resetForTest();
+        try debug_trace.configureForTestWithScopes(alloc, self.path, "acp");
+    }
+
+    fn stop(self: *TraceFile) void {
+        debug_trace.resetForTest();
+        std.testing.allocator.free(self.path);
+        self.tmp.cleanup();
+    }
+
+    /// How often `needle` appears in the trace written so far.
+    fn count(self: *const TraceFile, needle: []const u8) !usize {
+        var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), self.path, .{});
+        defer file.close(io_mod.getIo());
+        const written = try io_mod.readFileToEnd(std.testing.allocator, &file, 256 * 1024);
+        defer std.testing.allocator.free(written);
+        return std.mem.count(u8, written, needle);
+    }
+};
+
 fn childContext(state: *server.ServerState, stop: *const std.atomic.Value(bool)) AcpContext {
     return .{
         .alloc = state.alloc,
@@ -5524,18 +5583,16 @@ fn childContext(state: *server.ServerState, stop: *const std.atomic.Value(bool))
 }
 
 test "a subagent run whose model repeats a call id announces a card for each call" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var frames = FrameLog{};
-    defer frames.deinit();
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    state.writer = jsonrpc.Writer.initCallback(&frames, FrameLog.write);
-    state.subagent_cards_open = true;
+    var logged: LoggedState = undefined;
+    try logged.init();
+    defer logged.deinit();
+    const frames = &logged.frames;
+    logged.state.subagent_cards_open = true;
     var stop = std.atomic.Value(bool).init(false);
-    var ctx = childContext(&state, &stop);
+    var ctx = childContext(&logged.state, &stop);
     defer ctx.deinitPublishedToolCalls();
 
     const first_call: ToolCall = .{ .id = "call_1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"content\":\"a\"}" };
@@ -5563,23 +5620,22 @@ test "a subagent run whose model repeats a call id announces a card for each cal
 }
 
 test "a card the prompt's end closed shows no later update, and no card is announced after it" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var frames = FrameLog{};
-    defer frames.deinit();
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    state.writer = jsonrpc.Writer.initCallback(&frames, FrameLog.write);
+    var logged: LoggedState = undefined;
+    try logged.init();
+    defer logged.deinit();
+    const frames = &logged.frames;
+    const state = &logged.state;
     state.subagent_cards_open = true;
     var stop = std.atomic.Value(bool).init(false);
-    var ctx = childContext(&state, &stop);
+    var ctx = childContext(state, &stop);
     defer ctx.deinitPublishedToolCalls();
 
     const call: ToolCall = .{ .id = "call_1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"content\":\"a\"}" };
     const card = try ctx.announceSubagentCard(arena, call);
-    closeSubagentCards(&state, "Cancelled");
+    closeSubagentCards(state, "Cancelled");
     // The call's own report after the close, and the run's end, add nothing.
     try recordChildToolActivity(&ctx, "call_1", "write_file", .succeeded);
     ctx.finishSubagentCards("Tool failed");
@@ -5592,6 +5648,195 @@ test "a card the prompt's end closed shows no later update, and no card is annou
     try std.testing.expectEqualStrings("child_a:2:call_1", try ctx.announceSubagentCard(arena, call));
 }
 
+test "a subagent's card ids stay unique across its runs" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var logged: LoggedState = undefined;
+    try logged.init();
+    defer logged.deinit();
+    const state = &logged.state;
+    state.subagent_cards_open = true;
+    var stop = std.atomic.Value(bool).init(false);
+    // The model numbers its write call_1 in every run.
+    const call: ToolCall = .{ .id = "call_1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"content\":\"a\"}" };
+
+    var first_run = childContext(state, &stop);
+    defer first_run.deinitPublishedToolCalls();
+    const first = try first_run.announceSubagentCard(arena, call);
+    try recordChildToolActivity(&first_run, "call_1", "write_file", .succeeded);
+    first_run.finishSubagentCards("Tool failed");
+
+    // The same child's next run in the session: its calls go on from where the
+    // first run's left off.
+    var second_run = childContext(state, &stop);
+    defer second_run.deinitPublishedToolCalls();
+    const second = try second_run.announceSubagentCard(arena, call);
+    try recordChildToolActivity(&second_run, "call_1", "write_file", .failed);
+
+    // Another child counts its own calls.
+    var other_run = childContext(state, &stop);
+    defer other_run.deinitPublishedToolCalls();
+    other_run.subagent.?.child_id = "child_b";
+    const beside = try other_run.announceSubagentCard(arena, call);
+
+    try std.testing.expectEqualStrings("child_a:1:call_1", first);
+    try std.testing.expectEqualStrings("child_a:2:call_1", second);
+    try std.testing.expectEqualStrings("child_b:1:call_1", beside);
+    try logged.frames.expectStatuses("child_a:1:call_1", &.{ "pending", "completed" });
+    try logged.frames.expectStatuses("child_a:2:call_1", &.{ "pending", "failed" });
+}
+
+test "a late update for a card the prompt's close ended leaves one trace line" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var logged: LoggedState = undefined;
+    try logged.init();
+    defer logged.deinit();
+    const state = &logged.state;
+    state.subagent_cards_open = true;
+    var stop = std.atomic.Value(bool).init(false);
+    var ctx = childContext(state, &stop);
+    defer ctx.deinitPublishedToolCalls();
+    var trace: TraceFile = undefined;
+    try trace.start();
+    defer trace.stop();
+
+    const call: ToolCall = .{ .id = "call_1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"content\":\"a\"}" };
+    const card = try ctx.announceSubagentCard(arena, call);
+    closeSubagentCards(state, "Cancelled");
+    // The call reports its end after the close: nothing is sent, and the trace
+    // says which card dropped the update and why.
+    try recordChildToolActivity(&ctx, "call_1", "write_file", .succeeded);
+    try logged.frames.expectStatuses(card, &.{ "pending", "failed" });
+    try std.testing.expectEqual(@as(usize, 1), try trace.count("subagent card update dropped card_id=child_a:1:call_1 phase=succeeded reason=prompt_closed"));
+    // A later report for that card, and a call that never had a card, add no line.
+    try recordChildToolActivity(&ctx, "call_1", "write_file", .failed);
+    try recordChildToolActivity(&ctx, "call_2", "read_file", .started);
+    try std.testing.expectEqual(@as(usize, 1), try trace.count("subagent card update dropped"));
+}
+
+test "no two subagent cards share an id, on fuzzed runs, calls, and prompt closes" {
+    try std.testing.fuzz({}, fuzzSubagentCards, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            // Two runs of one child whose model reuses its call id.
+            "\x00\x01\x02\x00\x01\x02",
+            // Two children asking with the same call id.
+            "\x00\x04\x01\x05",
+            // The prompt closes while a card is open, and the call asks again.
+            "\x00\x01\x03\x01\x02",
+            // Several calls, ends, and runs of both children.
+            "\x00\x04\x01\x09\x05\x0d\x02\x00\x01\x06\x03\x01\x05\x00\x04\x01",
+        }) ++ @import("fuzz_corpus").acp_subagent_cards.*),
+    });
+}
+
+/// Each byte is one step on two children. Its low two bits pick the step: 0
+/// starts a new run of a child, 1 asks with a call of its run, 2 ends the
+/// call's card, and 3 closes the prompt's cards and opens them again. The next
+/// bit picks the child, and the one after the call id (`call_1` or `call_2`),
+/// so ids repeat. A card that is new in its run has an id no card has had in the
+/// session; a call asked again while its card is open keeps its card.
+fn fuzzSubagentCards(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buffer: [512]u8 = undefined;
+    const steps = buffer[0..@intCast(smith.slice(&buffer))];
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var logged: LoggedState = undefined;
+    try logged.init();
+    defer logged.deinit();
+    const state = &logged.state;
+    state.subagent_cards_open = true;
+    var stop = std.atomic.Value(bool).init(false);
+    const children = [_][]const u8{ "child_a", "child_b" };
+    var runs: [2]?AcpContext = .{ null, null };
+    defer for (&runs) |*run| if (run.*) |*ctx| ctx.deinitPublishedToolCalls();
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+
+    for (steps) |step| {
+        const child: usize = (step >> 2) & 1;
+        const call_id = if ((step >> 3) & 1 == 0) "call_1" else "call_2";
+        switch (step & 3) {
+            0 => {
+                if (runs[child]) |*ctx| {
+                    ctx.finishSubagentCards("Cancelled");
+                    ctx.deinitPublishedToolCalls();
+                }
+                runs[child] = childContext(state, &stop);
+                runs[child].?.subagent.?.child_id = children[child];
+            },
+            1 => {
+                const ctx = if (runs[child]) |*run| run else continue;
+                const call: ToolCall = .{ .id = call_id, .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"content\":\"a\"}" };
+                const before = ctx.published_tool_calls.count();
+                const card = ctx.announceSubagentCard(arena, call) catch |err| switch (err) {
+                    error.PermissionPromptClosed => continue,
+                    else => return err,
+                };
+                const fresh = ctx.published_tool_calls.count() > before;
+                try std.testing.expect(fresh != seen.contains(card));
+                // The run owns the card's id, and a later run frees it.
+                if (fresh) try seen.put(arena, try arena.dupe(u8, card), {});
+            },
+            2 => if (runs[child]) |*ctx| try recordChildToolActivity(ctx, call_id, "write_file", .succeeded),
+            else => {
+                closeSubagentCards(state, "Cancelled");
+                state.subagent_cards_open = true;
+            },
+        }
+    }
+    for (&runs) |*run| if (run.*) |*ctx| ctx.finishSubagentCards("Cancelled");
+}
+
+var stop_in_gap: ?*std.atomic.Value(bool) = null;
+
+/// Stands in for the parent stopping a subagent while its request waits
+/// between its insert and its write.
+fn stopInGap(_: []const u8, _: u64) void {
+    if (stop_in_gap) |flag| flag.store(true, .seq_cst);
+}
+
+test "a subagent's request that the prompt's close or a stop ended leaves no gone line" {
+    const alloc = std.testing.allocator;
+    var logged: LoggedState = undefined;
+    try logged.init();
+    defer logged.deinit();
+    const state = &logged.state;
+    state.subagent_asks_open = true;
+    state.subagent_cards_open = true;
+    var stop = std.atomic.Value(bool).init(false);
+    var ctx = childContext(state, &stop);
+    defer ctx.deinitPublishedToolCalls();
+    var trace: TraceFile = undefined;
+    try trace.start();
+    defer trace.stop();
+    defer prompt_test_controls.before_request_write_hook = null;
+    const request: permission_request.PermissionRequest = .{ .label = "Allow write?" };
+    const call: ToolCall = .{ .id = "call_1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"content\":\"a\"}" };
+
+    // The prompt closes, and the registry cancels the request, in its gap. The
+    // wait takes the cancelled entry, so the cleanup after the failed wait
+    // finds nothing to drain and says nothing.
+    gap_state = state;
+    prompt_test_controls.before_request_write_hook = cancelInGap;
+    try std.testing.expectError(error.PermissionPromptClosed, requestAcpPermission(&ctx, alloc, request, call, null, null));
+    gap_state = null;
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+    try std.testing.expectEqual(@as(usize, 0), try trace.count("permission request gone"));
+
+    // The parent stops the subagent in the gap: the wait withdraws the request
+    // and leaves its one line, and the cleanup adds none.
+    stop_in_gap = &stop;
+    defer stop_in_gap = null;
+    prompt_test_controls.before_request_write_hook = stopInGap;
+    try std.testing.expectError(error.PermissionPromptStopped, requestAcpPermission(&ctx, alloc, request, call, null, null));
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+    try std.testing.expectEqual(@as(usize, 1), try trace.count("subagent permission request withdrawn id=2 reason=stopped"));
+    try std.testing.expectEqual(@as(usize, 0), try trace.count("permission request gone"));
+}
+
 test "the text a card the prompt's end closes carries follows the prompt's outcome" {
     try std.testing.expectEqualStrings("Cancelled", subagentCardText(.{ .stop_reason = .cancelled }));
     try std.testing.expectEqualStrings("Tool completion was not reported", subagentCardText(.{ .stop_reason = .end_turn }));
@@ -5600,13 +5845,13 @@ test "the text a card the prompt's end closes carries follows the prompt's outco
 
 test "a subagent that cannot be asked fails with the error that names why" {
     const alloc = std.testing.allocator;
-    var frames = FrameLog{};
-    defer frames.deinit();
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    state.writer = jsonrpc.Writer.initCallback(&frames, FrameLog.write);
+    var logged: LoggedState = undefined;
+    try logged.init();
+    defer logged.deinit();
+    const frames = &logged.frames;
+    const state = &logged.state;
     var stop = std.atomic.Value(bool).init(false);
-    var ctx = childContext(&state, &stop);
+    var ctx = childContext(state, &stop);
     defer ctx.deinitPublishedToolCalls();
     const request: permission_request.PermissionRequest = .{ .label = "Allow write?" };
     const call: ToolCall = .{ .id = "call_1", .name = "write_file", .arguments_json = "{\"path\":\"a.txt\",\"content\":\"a\"}" };
@@ -5636,7 +5881,7 @@ test "a subagent that cannot be asked fails with the error that names why" {
 
     // Too many requests are open.
     var open: usize = 0;
-    while (server.beginSubagentPermissionRequest(&state)) |_| open += 1 else |err| try std.testing.expectEqual(error.RequestsFull, err);
+    while (server.beginSubagentPermissionRequest(state)) |_| open += 1 else |err| try std.testing.expectEqual(error.RequestsFull, err);
     try std.testing.expect(open > 0);
     try std.testing.expectError(error.PermissionPromptFull, requestAcpPermission(&ctx, alloc, request, call, null, null));
 }
@@ -5662,36 +5907,32 @@ fn expectWithdrawnAgain(frames: *const FrameLog, method: []const u8) !void {
 
 test "a host tool request cancelled between its insert and its write is withdrawn again after the write" {
     const alloc = std.testing.allocator;
-    var frames = FrameLog{};
-    defer frames.deinit();
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    state.writer = jsonrpc.Writer.initCallback(&frames, FrameLog.write);
-    gap_state = &state;
+    var logged: LoggedState = undefined;
+    try logged.init();
+    defer logged.deinit();
+    gap_state = &logged.state;
     prompt_test_controls.before_request_write_hook = cancelInGap;
     defer {
         gap_state = null;
         prompt_test_controls.before_request_write_hook = null;
     }
-    try std.testing.expectError(error.Cancelled, callHostTool(&state, alloc, "lookup", "call_1", "{}", 1024, null));
-    try expectWithdrawnAgain(&frames, "libfx/tool_call");
+    try std.testing.expectError(error.Cancelled, callHostTool(&logged.state, alloc, "lookup", "call_1", "{}", 1024, null));
+    try expectWithdrawnAgain(&logged.frames, "libfx/tool_call");
 }
 
 test "a journal flush cancelled between its insert and its write is withdrawn again after the write" {
     const alloc = std.testing.allocator;
-    var frames = FrameLog{};
-    defer frames.deinit();
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    state.writer = jsonrpc.Writer.initCallback(&frames, FrameLog.write);
-    gap_state = &state;
+    var logged: LoggedState = undefined;
+    try logged.init();
+    defer logged.deinit();
+    gap_state = &logged.state;
     prompt_test_controls.before_request_write_hook = cancelInGap;
     defer {
         gap_state = null;
         prompt_test_controls.before_request_write_hook = null;
     }
-    try std.testing.expectError(error.Cancelled, flushJournal(&state, alloc, "session_1"));
-    try expectWithdrawnAgain(&frames, "libfx/journal_flush");
+    try std.testing.expectError(error.Cancelled, flushJournal(&logged.state, alloc, "session_1"));
+    try expectWithdrawnAgain(&logged.frames, "libfx/journal_flush");
 }
 
 test "ACP propagateGrant stores deduped runtime session grants" {

@@ -490,6 +490,11 @@ pub const TurnContext = struct {
     /// client cannot be reached. Admission turns each into an outcome that
     /// says approval was required and could not be asked, where a denial
     /// would say the person refused. Nothing runs, and the trace says why.
+    ///
+    /// The request is already one wait for the subagent's observer: the
+    /// admission prompter that called this began it. The host's prompter is a
+    /// copy that holds the same observer, so the copy forgets it, and an
+    /// approval is one wait, not two nested (`sdk/README.md` hooks).
     fn askHost(
         self: *TurnContext,
         alloc: Allocator,
@@ -500,10 +505,11 @@ pub const TurnContext = struct {
         child_id: []const u8,
         work_id: []const u8,
     ) !permission_request.OwnedPermissionResponse {
-        const host = self.host_prompter orelse {
+        var host = self.host_prompter orelse {
             debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=no_host_prompter", .{ child_id, work_id });
             return error.PermissionPromptUnavailable;
         };
+        host.observer = null;
         self.transitionPhase(work_id, .awaiting_approval) catch |err| {
             debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=phase err={s}", .{ child_id, work_id, @errorName(err) });
             return error.PermissionPromptUnavailable;

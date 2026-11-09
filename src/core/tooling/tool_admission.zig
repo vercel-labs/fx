@@ -1638,15 +1638,7 @@ pub fn revalidateLiveActionPermissionOutcome(
                 permission_mode,
                 revalidation_grants,
             );
-            // An exact approval outlives every later revalidation: an outcome
-            // its grants settled keeps the approved offer, so the next
-            // revalidation is settled the same way instead of asking again.
-            if (human_approval != .none) if (outcome.execution_authority) |*actual| switch (actual.*) {
-                .file_mutation => |*authorization| if (authorization.grant_offer == null) {
-                    authorization.grant_offer = expected.grant_offer;
-                },
-                .ordinary, .run_command, .vision_paths => {},
-            };
+            if (human_approval != .none) keepApprovedOffer(&outcome, expected);
             break :blk outcome;
         },
         .vision_paths => |expected| blk: {
@@ -1683,6 +1675,21 @@ pub fn revalidateLiveActionPermissionOutcome(
         outcome.human_approval = human_approval;
     }
     return outcome;
+}
+
+/// An exact approval outlives every later revalidation: an outcome its grants
+/// settled keeps the approved offer, so the next revalidation is settled the
+/// same way instead of asking again.
+fn keepApprovedOffer(
+    outcome: *command_admission.PermissionOutcome,
+    approved: file_mutation_contract.FileExecutionAuthorization,
+) void {
+    const authority = &(outcome.execution_authority orelse return);
+    const authorization = switch (authority.*) {
+        .file_mutation => |*value| value,
+        .ordinary, .run_command, .vision_paths => return,
+    };
+    if (authorization.grant_offer == null) authorization.grant_offer = approved.grant_offer;
 }
 
 fn commandAuthorityFingerprint(

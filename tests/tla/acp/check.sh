@@ -8,14 +8,15 @@
 # permission request reaches the client through its parent session. Its
 # design configs (MCAcpChildApproval, MCAcpChildApprovalReserve,
 # MCAcpChildApprovalAnswered, MCAcpChildApprovalNoHost, and one per later
-# law: Run, Close, Cause, WorkerStop, Kinds, ParentGone) must pass. The code
-# before the change (MCAcpChildApprovalToday), two planted bugs, and the
-# behavior of the heads the repairs started from, one config per law
-# (StaleCard, SpawnLeak, SharedIds, Starved, CancelGap, RepeatedIds,
-# LateResponse, GuessedCause, StopReads, KindGap, SteerLeak, ParentGoneDeny),
-# and the planted wrong variants NoCardGate and KindGapElicitation must each
-# break the property they name. Track, Fixed, OneRun, and Kinds in a config
-# switch on the parts of the model it checks, so each law has a small config.
+# law: Run, Runs, Close, Cause, Traces, WorkerStop, Kinds, ParentGone) must
+# pass. The code before the change (MCAcpChildApprovalToday), two planted
+# bugs, and the behavior of the heads the repairs started from, one config
+# per law (StaleCard, SpawnLeak, SharedIds, Starved, CancelGap, RepeatedIds,
+# RepeatedRuns, LateResponse, GuessedCause, StopReads, KindGap, SteerLeak,
+# NoisyDrain, ParentGoneDeny), and the planted wrong variants NoCardGate,
+# KindGapElicitation, OpenSeq, and SilentCancel must each break the property
+# they name. Track, Fixed, OneRun, and Kinds in a config switch on the parts
+# of the model it checks, so each law has a small config.
 #
 # The planted bugs and the runs of the real `fx acp` binary are in
 # ../drivers/acp/:
@@ -62,4 +63,10 @@ AcpChildApproval MCAcpChildApprovalKindGapElicitation NoStaleRequest
 AcpChildApproval MCAcpChildApprovalSteerLeak SteeringEnded
 AcpChildApproval MCAcpChildApprovalParentGone -
 AcpChildApproval MCAcpChildApprovalParentGoneDeny ParentReadsTrue
+AcpChildApproval MCAcpChildApprovalRuns -
+AcpChildApproval MCAcpChildApprovalRepeatedRuns UniqueIds
+AcpChildApproval MCAcpChildApprovalOpenSeq UniqueIds
+AcpChildApproval MCAcpChildApprovalTraces -
+AcpChildApproval MCAcpChildApprovalNoisyDrain TraceOnce
+AcpChildApproval MCAcpChildApprovalSilentCancel CancelTraced
 EOF

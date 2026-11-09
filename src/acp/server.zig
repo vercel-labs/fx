@@ -398,6 +398,12 @@ pub const ServerState = struct {
     subagent_cards_mutex: std.Io.Mutex = .init,
     subagent_cards_open: bool = false,
     subagent_cards: std.StringHashMapUnmanaged(void) = .empty,
+    /// How many cards each subagent child has announced in the session, across
+    /// its runs, by child id, owned by `alloc`. A card's id leads with its
+    /// child's count, which only grows, so no two ids repeat even when a
+    /// child's model numbers its calls alike in every run. Guarded by
+    /// `subagent_cards_mutex`, and never reset: a child id is not reused.
+    subagent_card_orders: std.StringHashMapUnmanaged(u32) = .empty,
     next_outbound_request_id: u64 = 1,
     pending_outbound: std.AutoHashMapUnmanaged(u64, PendingOutbound) = .empty,
     legacy_url_mutex: std.Io.Mutex = .init,
@@ -448,6 +454,9 @@ pub const ServerState = struct {
         var cards = self.subagent_cards.keyIterator();
         while (cards.next()) |card| self.alloc.free(card.*);
         self.subagent_cards.deinit(self.alloc);
+        var orders = self.subagent_card_orders.keyIterator();
+        while (orders.next()) |child_id| self.alloc.free(child_id.*);
+        self.subagent_card_orders.deinit(self.alloc);
         clearPendingLegacyUrls(self);
         self.pending_legacy_urls.deinit(self.alloc);
         self.configured_providers.deinit(self.alloc);
@@ -1181,7 +1190,9 @@ pub fn takeCancelledResponse(state: *ServerState, select: anytype) void {
     std.debug.assert(select.cancel() == null);
 }
 
-/// Forgets a request that was never written to the client.
+/// Forgets a request's entry when it is still there, and frees its response.
+/// It traces nothing: it is for a request whose end was traced where it was
+/// settled, or that was never written to the client.
 pub fn discardOutboundRequest(state: *ServerState, id: u64) void {
     state.outbound_mutex.lockUncancelable(io_mod.getIo());
     defer state.outbound_mutex.unlock(io_mod.getIo());
@@ -1209,22 +1220,31 @@ fn cancelOutboundRequestLocked(state: *ServerState, id: u64) bool {
 }
 
 fn cancelPendingOutbound(state: *ServerState, notify_client: bool) void {
-    cancelPendingEntries(state, false, notify_client, "session_cancel");
+    cancelPendingEntries(state, .{ .notify_client = notify_client, .reason = "session_cancel" });
 }
 
-/// Shuts the subagent gate and cancels every unanswered outbound request, or
-/// with `only_subagent` just the subagents' permission requests, in one hold
-/// of the lock, so the client is never left showing one with no prompt to
-/// answer it in. A cancelled prompt takes no more subagent requests. Each
-/// cancelled id is traced with `reason`.
-fn cancelPendingEntries(state: *ServerState, only_subagent: bool, notify_client: bool, reason: []const u8) void {
+/// Which outbound requests a cancel settles, and what it does for each.
+const Cancel = struct {
+    /// Only the subagents' permission requests, not every unanswered one.
+    only_subagent: bool = false,
+    /// Send the client `$/cancel_request` for each.
+    notify_client: bool,
+    /// Why, as each cancelled id is traced.
+    reason: []const u8,
+};
+
+/// Shuts the subagent gate and cancels the unanswered outbound requests `how`
+/// names, in one hold of the lock, so the client is never left showing one
+/// with no prompt to answer it in. A cancelled prompt takes no more subagent
+/// requests. Each cancelled id is traced with `how.reason`.
+fn cancelPendingEntries(state: *ServerState, how: Cancel) void {
     var cancelled_ids: [max_pending_outbound]u64 = undefined;
     var cancelled_count: usize = 0;
     state.outbound_mutex.lockUncancelable(io_mod.getIo());
     state.subagent_asks_open = false;
     var pending = state.pending_outbound.iterator();
     while (pending.next()) |entry| {
-        if (only_subagent and !entry.value_ptr.subagent) continue;
+        if (how.only_subagent and !entry.value_ptr.subagent) continue;
         if (entry.value_ptr.response != null) continue;
         entry.value_ptr.response = .{ .cancelled = true };
         cancelled_ids[cancelled_count] = entry.key_ptr.*;
@@ -1233,8 +1253,8 @@ fn cancelPendingEntries(state: *ServerState, only_subagent: bool, notify_client:
     state.outbound_cond.broadcast(io_mod.getIo());
     state.outbound_mutex.unlock(io_mod.getIo());
     for (cancelled_ids[0..cancelled_count]) |id| {
-        debug_trace.logf("acp", "outbound request cancelled id={d} reason={s}", .{ id, reason });
-        if (notify_client) publishRequestCancellation(state, id);
+        debug_trace.logf("acp", "outbound request cancelled id={d} reason={s}", .{ id, how.reason });
+        if (how.notify_client) publishRequestCancellation(state, id);
     }
 }
 
@@ -1628,7 +1648,7 @@ fn openSubagentAsks(state: *ServerState) void {
 /// ACP's prompt turn (`tests/tla/acp/AcpChildApproval.tla`
 /// NoCardChangeAfterResponse).
 fn closeSubagentAsks(state: *ServerState, notify_client: bool, card_text: []const u8) void {
-    cancelPendingEntries(state, true, notify_client, "prompt_closed");
+    cancelPendingEntries(state, .{ .only_subagent = true, .notify_client = notify_client, .reason = "prompt_closed" });
     prompt_handler.closeSubagentCards(state, card_text);
 }
 
@@ -1639,6 +1659,23 @@ pub fn registerSubagentCardLocked(state: *ServerState, card_id: []const u8) erro
     const owned = try state.alloc.dupe(u8, card_id);
     errdefer state.alloc.free(owned);
     try state.subagent_cards.put(state.alloc, owned, {});
+}
+
+/// The order the next card of subagent `child_id` takes: 1 for its first card
+/// in the session, then one more for each card it announced since, in any run
+/// (`tests/tla/acp/AcpChildApproval.tla` UniqueIds). The caller holds
+/// `subagent_cards_mutex`.
+pub fn nextSubagentCardOrderLocked(state: *ServerState, child_id: []const u8) error{OutOfMemory}!u32 {
+    const slot = try state.subagent_card_orders.getOrPut(state.alloc, child_id);
+    if (!slot.found_existing) {
+        slot.key_ptr.* = state.alloc.dupe(u8, child_id) catch |err| {
+            state.subagent_card_orders.removeByPtr(slot.key_ptr);
+            return err;
+        };
+        slot.value_ptr.* = 0;
+    }
+    slot.value_ptr.* += 1;
+    return slot.value_ptr.*;
 }
 
 /// Whether the card is announced and not ended. The caller holds
