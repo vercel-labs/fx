@@ -16,7 +16,7 @@
 \* below are checked on what the code did.
 EXTENDS Integers, Sequences, FooterTraceData
 
-CONSTANTS MaxRows, Burst, BaseCap, Extra, MaxResizes, Release, SignalExits
+CONSTANTS MaxRows, Burst, BaseCap, Extra, MaxResizes, Release, SignalExits, ExitFrames
 
 VARIABLES rows, hist, top, open, exited, epochFirst, dropTo, freed, resizes, anchor, act, trace, at
 

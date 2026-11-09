@@ -3279,26 +3279,7 @@ const App = struct {
         try self.processNextCooperativePrompt(self.screenAgent());
 
         const cols_before_resize = self.shell.layout.cols;
-        if (self.terminal_input_runtime.native_clear_probe.active() or
-            self.terminal_input_runtime.native_clear_probe.awaitingLateResponse())
-        {
-            try self.collectNativeClearProbeFacts();
-        } else {
-            shell_runtime.collectResizeFacts(
-                self.terminal,
-                &self.shell,
-                &self.metrics,
-                &self.terminal_input_runtime.terminal_cursor_probe,
-                &resize_interlock,
-                footer_rows,
-                resize_debounce_ms,
-                !InputAppRuntime.terminalPasteActive(self) and !self.auth.apiKeyEntryActive(),
-            ) catch |err| {
-                if (err != error.TerminalTooSmall and err != error.UnableToReadTerminalSize) {
-                    return err;
-                }
-            };
-        }
+        try self.collectResizeFactsPass();
         // Terminal width changed with the modal open, so the footer
         // panel needs to re-wrap labels and descriptions.
         if (self.screenAgent().question_prompt.isActive() and cols_before_resize != self.shell.layout.cols) {
@@ -3582,6 +3563,32 @@ const App = struct {
             try SessionAppRuntime.settlePendingLiveSessionTransition(self, self.screenAgent());
             if (try InputAppRuntime.flushDeferredSessionInput(self, input_limits, max_prompt_history)) try self.flushRequestedFrame();
         }
+    }
+
+    /// The resize step of a loop pass, which a settle outside the loop runs
+    /// too (`finishResizeBeforeSettle`). A native clear probe in flight owns
+    /// the cursor probe, so the pass collects its facts instead.
+    pub fn collectResizeFactsPass(self: *App) !void {
+        if (self.terminal_input_runtime.native_clear_probe.active() or
+            self.terminal_input_runtime.native_clear_probe.awaitingLateResponse())
+        {
+            try self.collectNativeClearProbeFacts();
+            return;
+        }
+        shell_runtime.collectResizeFacts(
+            self.terminal,
+            &self.shell,
+            &self.metrics,
+            &self.terminal_input_runtime.terminal_cursor_probe,
+            &resize_interlock,
+            footer_rows,
+            resize_debounce_ms,
+            !InputAppRuntime.terminalPasteActive(self) and !self.auth.apiKeyEntryActive(),
+        ) catch |err| {
+            if (err != error.TerminalTooSmall and err != error.UnableToReadTerminalSize) {
+                return err;
+            }
+        };
     }
 
     pub fn admitPendingApprovalResize(self: *App) bool {

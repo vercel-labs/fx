@@ -57,14 +57,19 @@ current code.
   row to release) and restores the terminal once the frame is drawn, or after a
   bounded wait it logs; a frame that cannot commit is logged with the rows it
   leaves out of scrollback. A window resize starts a debounce during which no
-  frame commits, so a signal can arrive with a resize in flight: the close ends
-  the debounce, lets the loop's own resize steps finish, and draws the exit
-  frame once nothing is in flight. `spec/FooterReclaim.tla` models the main
+  frame commits, so an exit, a suspend, or a signal can arrive with a resize in
+  flight: the settle every one of them runs ends the debounce, runs the loop's
+  own resize steps itself (the loop is over, or paused, when it runs), reading
+  the terminal's cursor reply for the one that waits for it, bounded in time,
+  and draws the exit frame once nothing is in flight. A fresh session also
+  waits for the resize before it settles. `spec/FooterReclaim.tla` models the main
   screen's rows under this rule, with `Release = "current"` as main's rule
   before it, `SignalExits = "erase"` as the signal close before it,
   `SignalExits = "stable_only"` as the signal close that settled only a stable
   anchor, and `SignalExits = "debounce_blocked"` as the one that drew no frame
-  while a resize debounce was pending; `mutations.json` plants
+  while a resize debounce was pending, and `ExitFrames = "signal_only"` as the
+  head where /quit, suspend, and a fresh session drew none either;
+  `mutations.json` plants
   the rule's bugs in the spec, in the transcript runtime
   (`src/ui/transcript/runtime.zig`), and in the signal close's wiring
   (`src/core/app/app_lifecycle.zig`, `app_render_runtime.zig`, `main.zig`).

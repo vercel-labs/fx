@@ -97,14 +97,16 @@ try {
   // the signal repair (SIGTERM and SIGHUP erase the footer without the exit
   // frame) fails ExitKeepsRows, and so do the head before the
   // invalid-anchor repair (the exit frame is drawn only from a stable anchor)
-  // and the head before the debounce repair (no exit frame while a resize
-  // debounce is pending).
+  // the head before the debounce repair (no exit frame while a resize
+  // debounce is pending), and the head before the exit repair (the same for
+  // /quit, suspend, and a fresh session).
   for (const [cfg, expected] of [
     ["MCFooterReclaim", null],
     ["MCFooterReclaimToday", "FooterAtBottom"],
     ["MCFooterReclaimSignalHead", "ExitKeepsRows"],
     ["MCFooterReclaimInvalidAnchorHead", "ExitKeepsRows"],
     ["MCFooterReclaimDebounceHead", "ExitKeepsRows"],
+    ["MCFooterReclaimExitDebounceHead", "ExitKeepsRows"],
   ] as const) {
     const run = await checkTlc(join(out, "model", cfg), "FooterReclaim", `${cfg}.cfg`, specFiles());
     models[cfg] = { verdict: run.verdict, property: run.property, distinct: run.distinct, depth: run.depth, ms: run.durationMs, tlc: run.tlcVersion };

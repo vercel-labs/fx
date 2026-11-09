@@ -14,6 +14,7 @@ test {
     _ = @import("core/cli/cli_flags.zig");
     _ = @import("core/app/app_agents_runtime.zig");
     _ = @import("core/app/app_lifecycle.zig");
+    _ = @import("core/app/app_render_runtime.zig");
     _ = @import("core/app/app_session_runtime.zig");
     _ = @import("core/app/host_record.zig");
     _ = @import("core/images/image_attachments.zig");

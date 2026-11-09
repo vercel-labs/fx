@@ -184,7 +184,7 @@ export async function footerRuntimeToSpec(options: { dir: string; randomTraces: 
   const files = specFiles();
   const cfgText = files["TraceFooterReclaim.cfg"]!.replace(
     /CONSTANTS\n[\s\S]*?\nSPECIFICATION/,
-    `CONSTANTS\n    MaxRows = ${maxRows}\n    Burst = ${burst}\n    BaseCap = ${baseCap}\n    Extra = ${extra}\n    MaxResizes = ${maxResizes}\n    Release = "base"\n    SignalExits = "settle"\nSPECIFICATION`,
+    `CONSTANTS\n    MaxRows = ${maxRows}\n    Burst = ${burst}\n    BaseCap = ${baseCap}\n    Extra = ${extra}\n    MaxResizes = ${maxResizes}\n    Release = "base"\n    SignalExits = "settle"\n    ExitFrames = "settle"\nSPECIFICATION`,
   );
   const tlc = await checkTlc(join(options.dir, "tlc"), "TraceFooterReclaim", "TraceFooterReclaim.cfg", {
     ...files,

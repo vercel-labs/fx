@@ -41,6 +41,14 @@
 \* exit frame before the closer's wait ended. The design ends the debounce: the
 \* main thread lets the pending resize settle without waiting for its deadline
 \* and draws the exit frame once nothing is in flight (`settleForSignalClose`).
+\* ExitFrames = "signal_only" is the head after that one: only the signal close
+\* ended the debounce. /quit, suspend, and a fresh session settle the rows
+\* through the same `settleHeldTranscriptRows`, but nothing ended the debounce
+\* for them, and with the loop over (or, for suspend, paused) no later pass
+\* finished the resize, so a /quit or a Ctrl+Z inside the debounce erased the
+\* footer with the rows still held. The design is ExitFrames = "settle": the
+\* shared settle itself ends the debounce and finishes the resize before it
+\* draws its frame, for every caller.
 \*
 \* `anchor` is the state of the transcript runtime's committed anchor
 \* (`transcript_commit_state` in src/ui/transcript/runtime.zig): "stable" after
@@ -56,7 +64,8 @@ CONSTANTS
     Extra,       \* rows an open surface adds to the footer
     MaxResizes,  \* settled resizes over a run
     Release,     \* "base" (the design) or "current" (main before it)
-    SignalExits  \* "settle" (the design), or "debounce_blocked", "stable_only", "erase" (the heads before it)
+    SignalExits, \* "settle" (the design), or "debounce_blocked", "stable_only", "erase" (the heads before it)
+    ExitFrames   \* "settle" (the design), or "signal_only" (the head before it)
 
 VARIABLES rows, hist, top, open, exited, epochFirst, dropTo, freed, resizes, anchor, act
 
@@ -178,7 +187,28 @@ ExitFrame(name) ==
     /\ act' = name
     /\ UNCHANGED <<rows, open, epochFirst, dropTo, resizes>>
 
-Exited == ExitFrame("Exited")
+\* /quit, suspend, and a fresh session's handoff, with a resize debounce pending
+\* (`resizing`) or not: a window resize arrived less than the debounce ago, and
+\* no frame commits until its settled replay has been drawn. The design ends the
+\* debounce and finishes the resize first (`finishResizeBeforeSettle`), so the
+\* exit frame is drawn whatever is pending. With the head's rule ("signal_only")
+\* the frame is drawn only when no debounce is pending, so the footer is erased
+\* with rows held. (A fresh session also waits for the resize before it settles,
+\* `freshSessionResizeReady`, so the head never lost rows there; the model does
+\* not tell the three apart.)
+ExitSettles(resizing) == ExitFrames = "settle" \/ ~resizing
+
+\* Lines the resume hint /quit prints after the exit frame can take, at most.
+HintLines == 4
+
+Exited ==
+    \E resizing \in BOOLEAN :
+        IF ExitSettles(resizing)
+        THEN ExitFrame("Exited")
+        ELSE /\ ~exited
+             /\ exited' = TRUE
+             /\ act' = "Exited"
+             /\ UNCHANGED <<rows, hist, top, open, epochFirst, dropTo, freed, resizes, anchor>>
 
 \* SIGTERM or SIGHUP, at any step between two frames, with a resize debounce
 \* pending (`resizing`) or not: a window resize arrived less than the debounce
@@ -202,6 +232,29 @@ SignalExit(name) ==
              /\ act' = name
              /\ UNCHANGED <<rows, hist, top, open, epochFirst, dropTo, freed, resizes, anchor>>
 
+\* /quit typed in the composer, whatever is open: Enter submits the command,
+\* which closes the surface, so the exit frame draws the idle footer and paints
+\* the held rows back, and fx then prints its resume hint where the footer was.
+\* The hint's lines that do not fit below the screen's rows scroll it up, so up
+\* to `HintLines` more rows reach history. The signals print nothing, and the
+\* exit frame of an exit with the surface open (`Exited`) leaves it drawn.
+Quit ==
+    \E resizing \in BOOLEAN :
+        /\ ~exited
+        /\ exited' = TRUE
+        /\ open' = FALSE
+        /\ act' = "Quit"
+        /\ UNCHANGED <<rows, epochFirst, dropTo, resizes>>
+        /\ IF ExitSettles(resizing)
+           THEN \E k \in 0..HintLines :
+                    LET to == Max(hist, Natural(rows, FALSE, epochFirst)) + k IN
+                    /\ to <= rows
+                    /\ hist' = to
+                    /\ top' = to
+                    /\ freed' = Freed(dropTo, to)
+                    /\ anchor' \in {"stable", "recovering"}
+           ELSE UNCHANGED <<hist, top, freed, anchor>>
+
 Done == exited /\ UNCHANGED vars
 
 Next ==
@@ -209,7 +262,7 @@ Next ==
     \/ \E k \in 0..Burst : Opened(k)
     \/ Closed
     \/ \E to \in 1..MaxRows : Dropped(to)
-    \/ Resized \/ TookOver \/ Exited \/ Done
+    \/ Resized \/ TookOver \/ Exited \/ Quit \/ Done
     \/ CoveredResize("CoveredResize", FALSE) \/ CoveredResize("ReviewResize", TRUE)
     \/ SignalExit("SigTerm") \/ SignalExit("SigHup")
 
