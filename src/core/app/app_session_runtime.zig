@@ -3809,9 +3809,7 @@ pub fn Runtime(comptime App: type) type {
                 if (steering.assistant_prefix) |prefix| {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
-                if (steering.text.len == 0) continue;
-                // fx's own prompt to a stalled turn was never on screen.
-                if (recovery_prompt.fromSaved(steering.text) != null) continue;
+                if (steering.text.len == 0 or isRecoveryPrompt(steering.text)) continue;
                 try sink.appendUserTurn(savedSteeringTurn(steering.text), true);
             }
         }
@@ -3841,6 +3839,14 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Whether a saved steering entry is fx's own prompt to a stalled turn,
+        /// which was never on screen, so a replay leaves it out.
+        fn isRecoveryPrompt(text: []const u8) bool {
+            if (recovery_prompt.fromSaved(text) == null) return false;
+            debug_trace.logf("session", "replay skipped a recovery prompt bytes={d}", .{text.len});
+            return true;
+        }
+
         /// A saved steering entry as the message it was: the user's update,
         /// or a subagent's report a boundary took, which draws as its card.
         fn savedSteeringTurn(text: []u8) types.UserTurn {
@@ -3861,7 +3867,7 @@ pub fn Runtime(comptime App: type) type {
                 if (item.assistant_prefix) |prefix| {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
-                if (item.text.len > 0 and recovery_prompt.fromSaved(item.text) == null) {
+                if (item.text.len > 0 and !isRecoveryPrompt(item.text)) {
                     try sink.appendUserTurn(savedSteeringTurn(item.text), true);
                 }
                 index.* += 1;

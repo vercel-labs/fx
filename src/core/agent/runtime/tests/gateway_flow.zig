@@ -9118,6 +9118,19 @@ test "the next turn extends a request after the continuation, when tool calls fo
     try expectNextTurnExtendsLastRequest(&completions, 4, continuation_prompt);
 }
 
+test "the next turn extends the request that carried the assistant-prefill recovery" {
+    const calls = [_]ToolCall{toolCall("call_bad_prefill", "read_file", "{\"path\":\"a\",}")};
+    const prefill_rejection =
+        "{\"error\":{\"message\":\"AI_APICallError: This model does not support " ++
+        "assistant message prefill. The conversation must end with a user message.\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .status = .bad_request, .err_body = prefill_rejection },
+        .{ .content = "Recovered after malformed call" },
+    };
+    try expectNextTurnExtendsLastRequest(&completions, 2, "Continue from the preceding tool result.");
+}
+
 test "the next turn extends the request that carried the empty-reply nudge on the first request" {
     const completions = [_]FakeCompletion{
         .{ .finish_reason = .other },

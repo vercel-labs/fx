@@ -8607,6 +8607,7 @@ fn processQueuedPromptLoop(
                 try within_turn_suffix.append(arena, .{
                     .role = .user,
                     .content = assistant_prefill_recovery_prompt,
+                    .recovery_prompt = true,
                 });
                 stream_result.deinit(arena);
                 stream_result_set = false;
