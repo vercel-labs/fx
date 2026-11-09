@@ -1007,12 +1007,13 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
         return 1;
     }
     if (saved != null or was.signed_in) {
-        if (done.revoked) {
-            try c.out.print("Signed out of {s}.\n", .{try safe(arena, name)});
-        } else {
+        const shown = try safe(arena, name);
+        switch (done.revocation) {
+            .confirmed => try c.out.print("Signed out of {s}.\n", .{shown}),
             // The server never hears of a logout it wasn't sent: a copy of
             // the tokens keeps working there.
-            try c.out.print("Signed out of {s} here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n", .{try safe(arena, name)});
+            .none => try c.out.print("Signed out of {s} here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n", .{shown}),
+            .unconfirmed => try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n", .{shown}),
         }
     } else {
         try c.out.print("{s} wasn't signed in.\n", .{try safe(arena, name)});

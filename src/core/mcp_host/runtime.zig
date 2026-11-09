@@ -112,10 +112,20 @@ pub const Logout = struct {
     /// Why the saved login couldn't be removed, if it couldn't: this fx is
     /// signed out, but every other fx, and the next one, still has it.
     kept: ?anyerror = null,
-    /// A revocation went to the server. Without one, as when its
-    /// authorization server takes none, the tokens stay valid until they
-    /// expire.
-    revoked: bool = false,
+    revocation: Revocation = .none,
+
+    /// What the server did with the login's tokens.
+    pub const Revocation = enum {
+        /// No revocation went out, as when its authorization server takes
+        /// none: the tokens stay valid there until they expire.
+        none,
+        /// The server answered the revocation with a 2xx, so the tokens no
+        /// longer work there (RFC 7009 section 2.2).
+        confirmed,
+        /// It answered otherwise, or not within `revoke_wait_ms`: the tokens
+        /// may still work there.
+        unconfirmed,
+    };
 };
 
 pub const ToolsResult = union(enum) {
@@ -235,8 +245,9 @@ const Request = struct {
     question: ?Pending = null,
     /// Set by the owner before a logout ends: why the saved login stayed.
     logout_kept: ?anyerror = null,
-    /// Set by the owner before a logout ends: a revocation went to the server.
-    logout_revoked: bool = false,
+    /// Set by the owner before a logout ends: what the server did with the
+    /// revocation.
+    logout_revocation: Logout.Revocation = .none,
     /// Owner thread only: fx declined the server's question, so the call's
     /// cancellation is fx's answer, not the user's.
     declined: bool = false,
@@ -702,7 +713,7 @@ pub const Runtime = struct {
     pub fn logout(r: *Runtime, server: []const u8) Error!Logout {
         var req: Request = .{ .kind = .{ .logout = server }, .alloc = r.gpa };
         try r.submitOk(&req);
-        return .{ .kept = req.logout_kept, .revoked = req.logout_revoked };
+        return .{ .kept = req.logout_kept, .revocation = req.logout_revocation };
     }
 
     /// Every server that needs a login takes one saved since by another fx,
@@ -1065,10 +1076,11 @@ pub const Runtime = struct {
                     try r.engine.signOut(s.name);
                 };
                 r.flags[i] = .{};
-                req.logout_revoked = r.engine.revoking(s.name);
                 // A program that exits next would lose a revocation still on
-                // its way, so the logout ends when it's answered.
-                if (!req.logout_revoked) return r.finish(req, .ok);
+                // its way, so the logout ends when it's answered. Until then,
+                // whether it worked isn't known.
+                if (!r.engine.revoking(s.name)) return r.finish(req, .ok);
+                req.logout_revocation = .unconfirmed;
                 try r.logouts.append(r.gpa, .{ .server = i, .request = req, .deadline_ms = r.nowMs() + revoke_wait_ms });
             },
         }
@@ -1208,6 +1220,9 @@ pub const Runtime = struct {
                 continue;
             }
             _ = r.logouts.swapRemove(k);
+            if (r.engine.revocationAnswer(r.resolved.servers[l.server].name)) |status| {
+                if (status >= 200 and status < 300) l.request.logout_revocation = .confirmed;
+            }
             r.finish(l.request, .ok);
         }
     }
