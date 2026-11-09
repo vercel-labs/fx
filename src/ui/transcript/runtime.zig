@@ -391,6 +391,78 @@ const TranscriptCommitState = union(enum) {
     }
 };
 
+test "a held-rows settle is asked for by every anchor that may hold rows" {
+    // Exit, suspend, and a signal close ask for the frame that releases the
+    // rows a footer surface holds. A stable anchor knows whether it holds
+    // any. An invalid or recovering one, which a resize or a screen takeover
+    // leaves, has lost that fact, so it asks once a frame has committed: the
+    // frame that recovers the viewport releases what is owed
+    // (`tests/tla/transcript_window/spec/FooterReclaim.tla` ExitKeepsRows).
+    const alloc = testing_allocator.no_resize;
+    var runtime = TranscriptRuntime{ .detached_commit_alloc = alloc };
+    defer runtime.deinit(alloc);
+    runtime.layout.cols = 40;
+
+    // Before the first frame nothing is on the screen to hold.
+    try std.testing.expect(!runtime.requestHeldRowsSettle());
+    try std.testing.expect(!runtime.settle_held_rows);
+
+    runtime.has_committed_frame = true;
+    try std.testing.expect(runtime.requestHeldRowsSettle());
+    try std.testing.expect(runtime.settle_held_rows);
+    runtime.settle_held_rows = false;
+
+    runtime.transcript_commit_state = .{ .stable = .{
+        .flow = try alloc.dupe(u8, "one\ntwo\nthree\nfour\n"),
+        .visual_offset = 3,
+        .history_visual_offset = 3,
+        .total_visual_rows = 4,
+        .selection = .{ .start_line = 0, .top_row = 1, .bottom_row = 4, .partial_skip_rows = 0, .line_count = 4 },
+        .cursor_row = 5,
+        .cursor_col = 1,
+        .occupied_last_row = 4,
+        .occupied_last_row_blank = false,
+        .layout_id = 1,
+    } };
+    // A stable anchor whose history reaches the viewport holds nothing.
+    try std.testing.expect(!runtime.requestHeldRowsSettle());
+    try std.testing.expect(!runtime.settle_held_rows);
+
+    runtime.transcript_commit_state.stable.history_visual_offset = 1;
+    try std.testing.expectEqual(@as(?u32, 2), runtime.heldTranscriptRowCount());
+    try std.testing.expect(!runtime.heldRowsSettleOutstanding());
+    try std.testing.expect(runtime.requestHeldRowsSettle());
+    try std.testing.expect(runtime.settle_held_rows);
+    try std.testing.expect(runtime.heldRowsSettleOutstanding());
+    runtime.settle_held_rows = false;
+
+    runtime.transcript_commit_state.deinit(alloc);
+    runtime.transcript_commit_state = .{ .recovering = .{
+        .flow = try alloc.dupe(u8, "one\ntwo\nthree\nfour\n"),
+        .accepted_visual_offset = 3,
+        .accepted_history_visual_offset = 3,
+        .attempt_visual_offset = 3,
+        .attempt_total_visual_rows = 4,
+        .materialized_visual_offset = 3,
+        .materialized_visual_rows = 1,
+        .materialized_flow_len = 0,
+        .attempt_cols = 40,
+    } };
+    try std.testing.expect(runtime.requestHeldRowsSettle());
+    try std.testing.expect(runtime.settle_held_rows);
+    try std.testing.expectEqual(@as(?u32, 0), runtime.heldTranscriptRowCount());
+    runtime.transcript_commit_state.recovering.accepted_history_visual_offset = 1;
+    try std.testing.expectEqual(@as(?u32, 2), runtime.heldTranscriptRowCount());
+
+    // An invalid anchor has forgotten how many rows it holds, but not that a
+    // settle is owed: the request stands until a frame commits it.
+    runtime.transcript_commit_state.deinit(alloc);
+    try std.testing.expectEqual(@as(?u32, null), runtime.heldTranscriptRowCount());
+    try std.testing.expect(runtime.heldRowsSettleOutstanding());
+    runtime.settle_held_rows = false;
+    try std.testing.expect(!runtime.heldRowsSettleOutstanding());
+}
+
 test "kept presentation states are refused once the bytes before them change" {
     const alloc = testing_allocator.no_resize;
     var runtime = TranscriptRuntime{ .detached_commit_alloc = alloc };
@@ -4911,7 +4983,9 @@ pub const TranscriptRuntime = struct {
     terminal_reset_pending: bool = false,
     /// The next frames release every row a footer surface holds above the
     /// screen into native history, so exit and suspend can erase the footer
-    /// without losing them. Cleared once history reaches the viewport
+    /// without losing them. An invalid or recovering anchor keeps the request,
+    /// which `owedHeldRows` honours when the viewport is recovered. Cleared
+    /// once history reaches the viewport
     /// (`tests/tla/transcript_window/spec/FooterReclaim.tla` ExitKeepsRows).
     settle_held_rows: bool = false,
     /// A committed resize reset established terminal-bottom ownership that
@@ -8028,20 +8102,39 @@ pub const TranscriptRuntime = struct {
 
     /// Asks the next frame to release the rows a footer surface holds above
     /// the screen into native history, as exit and suspend do before they
-    /// erase the footer. False when no row is held.
+    /// erase the footer. A stable anchor knows whether it holds rows. An
+    /// invalid or recovering one, which a resize or a screen takeover leaves,
+    /// has lost that fact, so once a frame has committed it asks anyway: the
+    /// frame that recovers the viewport then releases what is owed
+    /// (`owedHeldRows`), and the request stands until history reaches the
+    /// viewport (`tests/tla/transcript_window/spec/FooterReclaim.tla`
+    /// ExitKeepsRows). False when no row can be held.
     pub fn requestHeldRowsSettle(self: *TranscriptRuntime) bool {
-        if (!self.holdsTranscriptRows()) return false;
+        const may_hold = switch (self.transcript_commit_state) {
+            .stable => |anchor| anchor.visual_offset > anchor.history_visual_offset,
+            .invalid, .recovering => self.has_committed_frame,
+        };
+        if (!may_hold) return false;
         self.settle_held_rows = true;
         self.markTranscriptDirty();
         return true;
     }
 
-    /// Whether rows sit above the viewport that are not in native history
-    /// yet: the rows a footer surface holds.
-    pub fn holdsTranscriptRows(self: *const TranscriptRuntime) bool {
+    /// Whether the settle that `requestHeldRowsSettle` asked for is still
+    /// outstanding: no frame has committed it, or history has not reached the
+    /// viewport yet, so rows may still be held above the screen.
+    pub fn heldRowsSettleOutstanding(self: *const TranscriptRuntime) bool {
+        return self.settle_held_rows;
+    }
+
+    /// The rows above the viewport that native history does not hold yet, as
+    /// far as the anchor knows. Null for an invalid anchor, which has
+    /// forgotten them.
+    pub fn heldTranscriptRowCount(self: *const TranscriptRuntime) ?u32 {
         return switch (self.transcript_commit_state) {
-            .stable => |anchor| anchor.visual_offset > anchor.history_visual_offset,
-            .invalid, .recovering => false,
+            .stable => |anchor| anchor.visual_offset -| anchor.history_visual_offset,
+            .recovering => |receipt| receipt.accepted_visual_offset -| receipt.accepted_history_visual_offset,
+            .invalid => null,
         };
     }
 

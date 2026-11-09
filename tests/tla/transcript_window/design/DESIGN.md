@@ -44,13 +44,23 @@ current code.
   when it closes; output while it is open releases rows in order through the
   history replay, a resize reprint and the recovery after a screen takeover
   keep them held, and exit, suspend, a fresh session's scrollback handoff, and
-  a SIGTERM or SIGHUP close first release every held row. A signal ends fx from
-  the closer thread, which cannot touch the rows the main thread holds, so it
-  asks the main thread for the exit frame (leaving Ctrl+O's full transcript
-  screen first) and restores the terminal once the frame is drawn, or after a
-  bounded wait it logs. `spec/FooterReclaim.tla` models the main screen's
-  rows under this rule, with `Release = "current"` as main's rule before it and
-  `SignalExits = "erase"` as the signal close before it; `mutations.json` plants
+  a SIGTERM or SIGHUP close first release every held row, whatever state the
+  transcript anchor is in. A resize while an alternate screen covers the main
+  one (Ctrl+O's full transcript, the approval review screen an open approval
+  moves to when the window leaves it no room inline) leaves the anchor invalid
+  with no frame to recover it, and an invalid or recovering anchor has lost
+  which rows it holds, so the exit frame releases what is owed, not what the
+  anchor says. A signal ends fx from the closer thread, which cannot touch the
+  rows the main thread holds, so it asks the main thread for the exit frame
+  (leaving the covering screen first, and drawing the idle footer in place of an
+  approval, which at that window size would fill the main screen and leave no
+  row to release) and restores the terminal once the frame is drawn, or after a
+  bounded wait it logs; a frame that cannot commit is logged with the rows it
+  leaves out of scrollback. `spec/FooterReclaim.tla` models the main screen's
+  rows under this rule, with `Release = "current"` as main's rule before it,
+  `SignalExits = "erase"` as the signal close before it, and
+  `SignalExits = "stable_only"` as the signal close that settled only a stable
+  anchor; `mutations.json` plants
   the rule's bugs in the spec, in the transcript runtime
   (`src/ui/transcript/runtime.zig`), and in the signal close's wiring
   (`src/core/app/app_lifecycle.zig`, `app_render_runtime.zig`, `main.zig`).
@@ -212,10 +222,10 @@ maps it onto the TLA+ variables.
 | L19 ScreenHoldsHeld | Outside a reprint, every held block is on the screen. |
 | L20 PaintedOnce | No step paints a block already on the screen in this epoch. |
 | L21 ReadBounded | One log reply moves the window by at most `Step` blocks, so a reply costs a bounded amount of work. |
-| L22 FooterAtBottom | The footer is on the bottom rows: the screen above it is full whenever the transcript has the rows to fill it (TUI-32). |
+| L22 FooterAtBottom | The footer is on the bottom rows: the screen above it is full whenever the transcript has the rows to fill it (TUI-32), except while an invalid anchor leaves the main screen as an alternate screen last drew it. |
 | L23 HistoryOnce | No row in native history is on the screen, so no frame shows a row twice (native-history finality). |
 | L24 OwedRowsHeld | Every row on the screen or held above it is still in memory: the shell frees a dropped entry only once its rows are in history. |
-| L25 ExitKeepsRows | After exit (`/quit`, suspend, a fresh session, SIGTERM, or SIGHUP) no row is held: each one is in native history or on the screen when the footer is erased. |
+| L25 ExitKeepsRows | After exit (`/quit`, suspend, a fresh session, SIGTERM, or SIGHUP), from a stable, invalid, or recovering anchor, no row is held: each one is in native history or on the screen when the footer is erased. |
 | L17 PureCore | `transcript_window.zig` imports only `std` and reads no clock, environment, or global. |
 
 ## Enforcement

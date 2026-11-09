@@ -946,19 +946,26 @@ pub fn Runtime(comptime App: type) type {
         /// Exit, suspend, and a fresh session hand off the screen, so before
         /// they do, one frame (drawn by `flush_frame`, the App's one frame
         /// flush) releases the rows a footer surface holds above the screen
-        /// into native history (`tests/tla/transcript_window/spec/FooterReclaim.tla`
-        /// ExitKeepsRows). Rows still held after it are logged as dropped from
-        /// scrollback; the session log and Ctrl+O keep them.
+        /// into native history, from any anchor state
+        /// (`tests/tla/transcript_window/spec/FooterReclaim.tla` ExitKeepsRows).
+        /// A settle that no frame commits is logged as rows dropped from
+        /// scrollback, with their count when the anchor knows it; the session
+        /// log and Ctrl+O keep them.
         pub fn settleHeldTranscriptRows(app: *App, flush_frame: *const fn (*App) anyerror!void) void {
             if (!app.shell.requestHeldRowsSettle()) return;
             flush_frame(app) catch |err| {
                 debug_trace.logf("render", "held_rows_settle_failed err={s}", .{@errorName(err)});
             };
-            if (app.shell.holdsTranscriptRows()) {
+            if (app.shell.heldRowsSettleOutstanding()) {
+                var count_buf: [16]u8 = undefined;
+                const held_rows = if (app.shell.heldTranscriptRowCount()) |rows|
+                    std.mem.print(&count_buf, "{d}", .{rows}) catch "unknown"
+                else
+                    "unknown";
                 debug_trace.logf(
                     "render",
-                    "held_rows_settle_incomplete dropped=held_transcript_rows_from_scrollback reason=settle_frame_not_committed",
-                    .{},
+                    "held_rows_settle_incomplete dropped=held_transcript_rows_from_scrollback reason=settle_frame_not_committed anchor={s} held_rows={s}",
+                    .{ @tagName(app.shell.transcriptCommitDiagnostic().state), held_rows },
                 );
             }
         }
@@ -967,27 +974,35 @@ pub fn Runtime(comptime App: type) type {
         /// touch the rows the main thread holds: it asks for the exit frame
         /// (`app_lifecycle.signalClosePending`) and restores the terminal once
         /// the main thread answers. The event loop calls this on every pass.
-        /// The settle is the one /quit draws, and a closed terminal logs its
-        /// drop there (`tests/tla/transcript_window/spec/FooterReclaim.tla`
-        /// SignalExit). Ctrl+O's full transcript screen is closed first.
+        /// The settle is the one /quit draws, from any anchor state, and a
+        /// closed terminal logs its drop there
+        /// (`tests/tla/transcript_window/spec/FooterReclaim.tla` SignalExit).
+        /// Ctrl+O's full transcript screen and the approval review screen
+        /// cover the main screen and the rows it holds, and a resize while one
+        /// is open leaves the anchor invalid: they are left first, so the frame
+        /// draws on the main screen, and its recovery from that anchor
+        /// releases the held rows. A recovery request here would repaint a
+        /// restored screen whose anchor is still stable and show rows twice.
         pub fn settleForSignalClose(app: *App, flush_frame: *const fn (*App) anyerror!void) void {
             if (!app_lifecycle.signalClosePending()) return;
             const raw = app.terminal.raw_enabled;
             if (raw) {
-                // Ctrl+O's full transcript screen covers the main screen and
-                // its held rows: leave it, so the frame draws on the main one.
                 _ = app_lifecycle.closeFullTranscriptIfActive(
                     app.alloc,
                     &app.terminal,
                     &app.shell,
                     &app.metrics,
                 ) catch |err| debug_trace.logf("render", "signal_close_full_transcript_failed err={s}", .{@errorName(err)});
+                if (app.terminal.fileApprovalScreenActive()) {
+                    app_lifecycle.leaveApprovalScreen(&app.terminal, &app.shell, &app.metrics) catch |err|
+                        debug_trace.logf("render", "signal_close_review_screen_failed err={s}", .{@errorName(err)});
+                }
                 settleHeldTranscriptRows(app, flush_frame);
             }
             debug_trace.logf(
                 "app",
                 "event=signal_close_settle raw={s} held_rows_left={s}",
-                .{ if (raw) "true" else "false", if (app.shell.holdsTranscriptRows()) "true" else "false" },
+                .{ if (raw) "true" else "false", if (app.shell.heldRowsSettleOutstanding()) "true" else "false" },
             );
             app_lifecycle.answerSignalClose();
         }
@@ -2110,6 +2125,11 @@ pub fn Runtime(comptime App: type) type {
         // returns when the list closes.
         fn shownApproval(app: *const App, agent: *AppAgent) ?approval_prompt.Projection {
             if (agentsMenuActive(app)) return null;
+            // A signal close draws its exit frame with the idle footer. An
+            // approval that a narrow window moved to the review screen would
+            // fill the main screen, leave the transcript no row, and so
+            // release none of the rows it holds.
+            if (app_lifecycle.signalClosePending()) return null;
             return agent.approval_prompt.projection();
         }
 

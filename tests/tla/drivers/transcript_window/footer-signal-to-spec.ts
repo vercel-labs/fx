@@ -1,5 +1,5 @@
 // Footer signal, built binary to spec: runs the built fx in a private tmux
-// server, with the slash picker open over a long transcript, and ends it with
+// server, with a footer surface open over a long transcript, and ends it with
 // a real SIGTERM or SIGHUP. After each step it counts what the terminal holds
 // of the transcript: the rows in native history (above the screen) and the
 // rows on the screen. Those counts are the model's `hist` and `top`
@@ -8,6 +8,18 @@
 // ConformsToSpec for every step, and the laws, ExitKeepsRows among them, on
 // the states the binary produced. The run also fails when a transcript row is
 // in history and on the screen, or twice anywhere.
+//
+// Three kinds of run, by what covers the main screen at the signal:
+//   picker          the slash picker is open on the main screen;
+//   ctrl-o-resize   the picker is open, Ctrl+O's full transcript screen covers
+//                   it, and the window is resized (narrower, as tall) before
+//                   the signal: CoveredResize, then the signal;
+//   review-screen   a command approval is open inline, and a narrower window
+//                   leaves it no room, so it moves to the approval review
+//                   screen: ReviewResize, then the signal.
+// After a covered resize the anchor is invalid and no frame recovers it before
+// the signal, so the exit frame must release the rows from an invalid anchor
+// (the log of the run must show the anchor invalidated after the resize).
 //
 // footer-runtime-to-spec.ts checks the transcript runtime's settle in process.
 // This one checks what ends fx: the closer thread that handles the signal must
@@ -22,21 +34,29 @@
 // screen. Rows then count from the first marker, which only shifts the
 // model's row numbers.
 //
-// Run alone: bun footer-signal-to-spec.ts [--bin PATH] [--rows N [--signal SIGHUP]]
+// Run alone: bun footer-signal-to-spec.ts [--bin PATH] [--rows N [--signal SIGHUP] [--kind picker|ctrl-o-resize|review-screen]]
 // (--rows runs one scenario with an N-row transcript, for a stress run)
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fxBin, outDir } from "../lib/tlc.ts";
-import { TmuxSession, fakeGatewayFinalText, isComposerLine, startFakeGateway } from "../../../e2e/tmux-helpers.ts";
+import { TmuxSession, fakeGatewayFinalText, fakeGatewayToolCall, isComposerLine, startFakeGateway } from "../../../e2e/tmux-helpers.ts";
 import { checkTlc, specFiles, toTla, type CheckedTlc } from "./lib.ts";
 
 const TIMEOUT = 30_000;
 const COLS = 100;
 const SCREEN_ROWS = 24;
+/// The width a covered resize narrows the window to. The marker lines of the
+/// covered runs are short enough to stay one row at every width used, so the
+/// resize leaves the transcript's visual rows as they were.
+const COVERED_COLS = { "ctrl-o-resize": 80, "review-screen": 40 } as const;
+/// A command that fits an inline approval at COLS wide but needs the approval
+/// review screen at COVERED_COLS["review-screen"] wide.
+const LONG_COMMAND = `echo ${"scrollback-accounting-".repeat(6)}done`;
 
-export type SignalScenario = { name: string; rows: number; signal: "SIGTERM" | "SIGHUP" };
+export type SignalKind = "picker" | "ctrl-o-resize" | "review-screen";
+export type SignalScenario = { name: string; rows: number; signal: "SIGTERM" | "SIGHUP"; kind?: SignalKind };
 
 /// Every scenario has a transcript longer than the screen, so the idle and
 /// the open footer both see a full screen above them.
@@ -46,9 +66,13 @@ export const SIGNAL_SCENARIOS: SignalScenario[] = [
   { name: "SIGTERM with the picker open, 82 rows", rows: 82, signal: "SIGTERM" },
   { name: "SIGHUP with the picker open, 200 rows", rows: 200, signal: "SIGHUP" },
   { name: "SIGTERM with the picker open, 200 rows", rows: 200, signal: "SIGTERM" },
+  { name: "SIGTERM after Ctrl+O and a resize over the picker, 82 rows", rows: 82, signal: "SIGTERM", kind: "ctrl-o-resize" },
+  { name: "SIGHUP after Ctrl+O and a resize over the picker, 82 rows", rows: 82, signal: "SIGHUP", kind: "ctrl-o-resize" },
+  { name: "SIGTERM after the approval moved to the review screen, 82 rows", rows: 82, signal: "SIGTERM", kind: "review-screen" },
+  { name: "SIGHUP after the approval moved to the review screen, 82 rows", rows: 82, signal: "SIGHUP", kind: "review-screen" },
 ];
 
-type State = { rows: number; hist: number; top: number; open: boolean; exited: boolean; resizes: number; act: string };
+type State = { rows: number; hist: number; top: number; open: boolean; exited: boolean; resizes: number; anchor: string; act: string };
 type Seen = { hist: number; top: number; tail: number; problems: string[] };
 
 export type SignalResult = {
@@ -60,17 +84,19 @@ export type SignalResult = {
 };
 
 const marker = (row: number) => `SIGNAL_FOOTER_ROW_${String(row + 1).padStart(3, "0")}`;
+const SHORT_FILLER = "scrollback row";
 /// What counts a row: its marker and the space after it, so ROW_100 is not
 /// found in ROW_1000.
 const needle = (row: number) => `${marker(row)} `;
-const replyText = (rows: number) =>
-  Array.from({ length: rows }, (_, row) => `${marker(row)} marker line of filler text for scrollback accounting.`).join("\n");
+const replyText = (rows: number, filler = "marker line of filler text for scrollback accounting.") =>
+  Array.from({ length: rows }, (_, row) => `${marker(row)} ${filler}`).join("\n");
 const count = (text: string, needle: string) => text.split(needle).length - 1;
 
 /// The model's `hist` and `top` in marker rows, from the visible screen and
 /// the full scrollback (history plus screen), and the rows between the last
-/// marker and the composer on the screen.
-function see(visible: string, full: string, rows: number): Seen {
+/// marker and the footer on the screen: the composer line, or the line above
+/// an open approval's header.
+function see(visible: string, full: string, rows: number, approval = false): Seen {
   const problems: string[] = [];
   const inHistory: number[] = [];
   const onScreen: number[] = [];
@@ -87,7 +113,7 @@ function see(visible: string, full: string, rows: number): Seen {
   if (onScreen.some((row, at) => row !== rows - onScreen.length + at)) problems.push(`the rows on the screen are not the last ${onScreen.length}`);
   const lines = visible.split("\n");
   const lastMarker = lines.findLastIndex((line) => line.includes("SIGNAL_FOOTER_ROW_"));
-  const composer = lines.findLastIndex((line) => isComposerLine(line));
+  const composer = approval ? lines.findLastIndex((line) => line.includes("Permission needed")) : lines.findLastIndex((line) => isComposerLine(line));
   const tail = lastMarker >= 0 && composer > lastMarker ? composer - lastMarker - 1 : -1;
   return { hist: inHistory.length, top: rows - onScreen.length, tail, problems };
 }
@@ -108,25 +134,38 @@ async function stablePane(session: TmuxSession, what: string): Promise<void> {
   throw new Error(`the pane never settled: ${what}`);
 }
 
-async function observe(session: TmuxSession, rows: number, dir: string, label: string): Promise<Seen> {
+async function observe(session: TmuxSession, rows: number, dir: string, label: string, approval = false): Promise<Seen> {
   const visible = await session.capturePane();
   const full = await session.captureFullScrollback();
   writeFileSync(join(dir, `${label}.pane.txt`), visible);
   writeFileSync(join(dir, `${label}.scrollback.txt`), full);
-  return see(visible, full, rows);
+  return see(visible, full, rows, approval);
 }
 
-type Run = { scenario: SignalScenario; states: State[]; baseCap: number; extra: number; problems: string[] };
+/// How often the fx trace log of the run says the transcript anchor was
+/// invalidated.
+const invalidations = (tracePath: string) =>
+  (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").split("\n").filter((line) => line.includes("transcript_anchor_invalidate")).length;
+
+type Run = { scenario: SignalScenario; states: State[]; baseCap: number; extra: number; maxResizes: number; problems: string[] };
 
 async function runScenario(scenario: SignalScenario, bin: string, dir: string): Promise<Run> {
   mkdirSync(dir, { recursive: true });
+  const kind = scenario.kind ?? "picker";
+  const covered = kind !== "picker";
   const work = mkdtempSync(join(tmpdir(), "fx-footer-signal-"));
   const home = join(work, "home");
   const workspace = join(work, "workspace");
+  const tracePath = join(work, "trace.log");
   mkdirSync(join(home, ".fx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", permission: {} }));
-  const gateway = startFakeGateway([fakeGatewayFinalText(replyText(scenario.rows))]);
+  const reply = replyText(scenario.rows, covered ? SHORT_FILLER : undefined);
+  const gateway = startFakeGateway(
+    kind === "review-screen"
+      ? [fakeGatewayFinalText(reply), fakeGatewayToolCall("signal_footer_shell", "shell", { request: { yield_time_ms: 30_000, action: "run", command: LONG_COMMAND } })]
+      : [fakeGatewayFinalText(reply)],
+  );
   const socketName = `fx-footer-signal-${process.pid}-${Date.now()}`;
   let session: TmuxSession | null = null;
   try {
@@ -145,6 +184,10 @@ async function runScenario(scenario: SignalScenario, bin: string, dir: string): 
         FX_SOUND: "0",
         FX_DISABLE_KEYCHAIN: "1",
         NO_COLOR: "1",
+        FX_PERMISSION_MODE: "ask",
+        FX_TRACE: "1",
+        FX_TRACE_LOG: tracePath,
+        FX_TRACE_SCOPES: "app,render,scroll",
       },
       stderrPath: join(work, "stderr.log"),
       width: COLS,
@@ -162,34 +205,73 @@ async function runScenario(scenario: SignalScenario, bin: string, dir: string): 
     await session.waitForText(marker(scenario.rows - 1), TIMEOUT);
     await stablePane(session, "after the reply");
     const idle = await observe(session, scenario.rows, dir, "idle");
-    await session.sendLiteralText("/");
-    await session.waitForText("Commands", 5_000);
-    await stablePane(session, "with the picker open");
-    const open = await observe(session, scenario.rows, dir, "open");
+    const problems = [...idle.problems];
+    let open: Seen;
+    if (kind === "review-screen") {
+      await session.sendText("Request the approval fixture.");
+      await session.waitForText("Would you like to run the following command?", TIMEOUT);
+      await stablePane(session, "with the approval open");
+      open = await observe(session, scenario.rows, dir, "open", true);
+    } else {
+      await session.sendLiteralText("/");
+      await session.waitForText("Commands", 5_000);
+      await stablePane(session, "with the picker open");
+      open = await observe(session, scenario.rows, dir, "open");
+    }
+    problems.push(...open.problems);
+
+    // What covers the main screen, and the resize that follows.
+    const invalidatedBefore = invalidations(tracePath);
+    if (kind === "ctrl-o-resize") {
+      await session.sendKeys("C-o");
+      await session.waitForText("esc close · pgup/pgdn scroll", 10_000);
+    }
+    if (covered) {
+      await session.resizeWindow(COVERED_COLS[kind], SCREEN_ROWS);
+      if (kind === "review-screen") await session.waitForText("Permission needed", 15_000);
+      await Bun.sleep(1_000);
+    }
     process.kill(session.processPid(), scenario.signal);
     await session.waitForPane(() => session!.paneStatus().dead, 10_000);
     const ended = await observe(session, scenario.rows, dir, "ended");
+    problems.push(...ended.problems);
+    if (covered && invalidations(tracePath) <= invalidatedBefore) {
+      problems.push("the fx log shows no anchor invalidated after the resize, so the run did not leave the anchor invalid");
+    }
+    const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+    if (!trace.includes("event=signal_close_settle") || /held_rows_settle_(failed|incomplete)|signal_close_settle_unconfirmed/.test(trace)) {
+      problems.push("the fx log of the signal close does not show a settled exit frame");
+    }
 
-    const problems = [...idle.problems, ...open.problems, ...ended.problems].map((problem) => `${scenario.name}: ${problem}`);
-    if (idle.tail < 0 || idle.tail !== open.tail) {
-      problems.push(`${scenario.name}: the rows after the last marker are ${idle.tail} idle and ${open.tail} with the picker open`);
+    const problemsOf = problems.map((problem) => `${scenario.name}: ${problem}`);
+    // The rows after the last marker are those of the idle screen, with the
+    // picker open, and, after an approval, those of the screen it left.
+    const tailAfter = kind === "review-screen" ? ended.tail : idle.tail;
+    if (idle.tail < 0 || ended.tail < 0 || (kind === "picker" && idle.tail !== open.tail) || (kind === "ctrl-o-resize" && idle.tail !== open.tail)) {
+      problemsOf.push(`${scenario.name}: the rows after the last marker are ${idle.tail} idle, ${open.tail} with the surface open, and ${ended.tail} at the end`);
     }
     const tail = Math.max(0, idle.tail);
-    const total = scenario.rows + tail;
+    const idleRows = scenario.rows + tail;
+    const total = scenario.rows + Math.max(0, tailAfter);
     const act = scenario.signal === "SIGTERM" ? "SigTerm" : "SigHup";
-    const state = (seen: Seen, fields: Partial<State>): State => ({ rows: total, hist: seen.hist, top: seen.top, open: false, exited: false, resizes: 0, act: "", ...fields });
-    return {
-      scenario,
-      states: [
-        { rows: 0, hist: 0, top: 0, open: false, exited: false, resizes: 0, act: "Init" },
-        state(idle, { act: "Output" }),
-        state(open, { open: true, act: "Opened" }),
-        state(ended, { open: true, exited: true, act }),
-      ],
-      baseCap: scenario.rows - idle.top + tail,
-      extra: open.top - idle.top,
-      problems,
-    };
+    const state = (seen: Seen, rows: number, fields: Partial<State>): State => ({ rows, hist: seen.hist, top: seen.top, open: false, exited: false, resizes: 0, anchor: "stable", act: "", ...fields });
+    const baseCap = scenario.rows - idle.top + tail;
+    const states: State[] = [
+      { rows: 0, hist: 0, top: 0, open: false, exited: false, resizes: 0, anchor: "invalid", act: "Init" },
+      state(idle, idleRows, { act: "Output" }),
+      state(open, total, { open: true, act: "Opened" }),
+    ];
+    if (covered) {
+      const surfaceLeaves = kind === "review-screen";
+      // No frame draws on the main screen, so history and the screen are as
+      // they were when the surface opened.
+      states.push(state(open, total, { open: !surfaceLeaves, resizes: 1, anchor: "invalid", act: surfaceLeaves ? "ReviewResize" : "CoveredResize" }));
+    }
+    states.push(state(ended, total, { open: kind !== "review-screen", exited: true, resizes: covered ? 1 : 0, anchor: "stable", act }));
+    // The rows the screen showed above the open footer: with the approval they
+    // are the rows between the idle tail and the approval, which `total` holds.
+    const extra = baseCap - (total - open.top);
+    return { scenario, states, baseCap, extra, maxResizes: covered ? 1 : 0, problems: problemsOf };
   } finally {
     await session?.kill();
     gateway.stop();
@@ -219,7 +301,7 @@ export async function footerSignalToSpec(options: { dir: string; bin: string; sc
       problems.push(`${scenario.name}: the screen showed ${run.baseCap} rows above the idle footer and ${run.extra} more with the picker open`);
       continue;
     }
-    const total = run.states[1]!.rows;
+    const total = Math.max(...run.states.map((state) => state.rows));
     const files = specFiles();
     const data = [
       "---- MODULE FooterTraceData ----",
@@ -232,7 +314,7 @@ export async function footerSignalToSpec(options: { dir: string; bin: string; sc
     ].join("\n");
     const cfgText = files["TraceFooterReclaim.cfg"]!.replace(
       /CONSTANTS\n[\s\S]*?\nSPECIFICATION/,
-      `CONSTANTS\n    MaxRows = ${total}\n    Burst = ${total}\n    BaseCap = ${run.baseCap}\n    Extra = ${run.extra}\n    MaxResizes = 0\n    Release = "base"\n    SignalExits = "settle"\nSPECIFICATION`,
+      `CONSTANTS\n    MaxRows = ${total}\n    Burst = ${total}\n    BaseCap = ${run.baseCap}\n    Extra = ${run.extra}\n    MaxResizes = ${run.maxResizes}\n    Release = "base"\n    SignalExits = "settle"\nSPECIFICATION`,
     );
     const checked = await checkTlc(join(options.dir, `run-${index + 1}`, "tlc"), "TraceFooterReclaim", "TraceFooterReclaim.cfg", {
       ...files,
@@ -253,7 +335,8 @@ if (import.meta.main) {
   const bin = argument("--bin") ?? fxBin();
   const rows = argument("--rows");
   const signal = argument("--signal") === "SIGHUP" ? "SIGHUP" : "SIGTERM";
-  const scenarios = rows === undefined ? undefined : [{ name: `${signal} with the picker open, ${rows} rows`, rows: Number(rows), signal } as SignalScenario];
+  const kind = (argument("--kind") ?? "picker") as SignalKind;
+  const scenarios = rows === undefined ? undefined : [{ name: `${signal} with the ${kind} scenario, ${rows} rows`, rows: Number(rows), signal, kind } as SignalScenario];
   const result = await footerSignalToSpec({ dir: join(outDir("footer-signal"), "signal"), bin, scenarios });
   const ok = result.tlc?.verdict === "pass" && result.problems.length === 0;
   console.log(

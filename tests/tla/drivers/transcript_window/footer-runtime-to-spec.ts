@@ -3,9 +3,11 @@
 // src/ui/resize_tests.zig, built from src/footer_reclaim_root.zig) and has
 // TLC check every run against FooterReclaim.tla through
 // TraceFooterReclaim.tla. Each script writes rows, opens and closes the slash
-// picker, resizes the window, takes the screen over and gives it back, and
-// ends with what exit and suspend do before they erase the footer, or with a
-// SIGTERM or SIGHUP close, which asks the main thread for the same frame
+// picker, resizes the window (also while an alternate screen covers the main
+// one, which leaves the anchor invalid with no frame to recover it), takes the
+// screen over and gives it back, and ends with what exit and suspend do before
+// they erase the footer, or with a SIGTERM or SIGHUP close, which asks the
+// main thread for the same frame
 // (footer-signal-to-spec.ts runs the built binary through those two with
 // real signals). Besides TLC, the run fails when a written row is in
 // native history plus the screen other than exactly once after exit, which
@@ -24,6 +26,7 @@ type State = {
   open: boolean;
   exited: boolean;
   resizes: number;
+  anchor: string;
   act: string;
   footer_bottom: number;
   screen_rows: number;
@@ -62,6 +65,12 @@ const SCRIPTED: { name: string; events: string[] }[] = [
   { name: "SIGTERM after the picker closed", events: ["o1", "o29", "open", "close", "sigterm"] },
   { name: "SIGHUP after a resize and a takeover with the picker open", events: ["o1", "o29", "open", "resize", "takeover", "o1", "sighup"] },
   { name: "SIGTERM on a transcript shorter than the screen with the picker open", events: ["o1", "o3", "open", "sigterm"] },
+  { name: "SIGTERM after a resize while a screen covers the picker", events: ["o1", "o29", "open", "covered", "sigterm"] },
+  { name: "SIGHUP after output and a resize while a screen covers the picker", events: ["o1", "o29", "open", "o2", "covered", "sighup"] },
+  { name: "exit after a resize while a screen covers the picker", events: ["o1", "o29", "open", "covered", "exit"] },
+  { name: "SIGTERM after a resize while a screen covers the idle footer", events: ["o1", "o29", "covered", "sigterm"] },
+  { name: "the picker closed and reopened after a covered resize, then SIGHUP", events: ["o1", "o29", "open", "covered", "close", "open", "sighup"] },
+  { name: "two covered resizes with the picker open, then SIGTERM", events: ["o1", "o29", "open", "covered", "covered", "sigterm"] },
 ];
 
 function randomScript(next: () => number, length: number): string[] {
@@ -73,6 +82,7 @@ function randomScript(next: () => number, length: number): string[] {
     else if (roll < 0.5) events.push("resize");
     else if (roll < 0.53) events.push("takeover");
     else if (roll < 0.56) events.push("invalidate");
+    else if (roll < 0.6) events.push("covered");
     else if (!open) {
       events.push("open");
       open = true;
@@ -91,7 +101,7 @@ function fullCaps(runs: Run[], open: boolean): Set<number> {
   const caps = new Set<number>();
   for (const run of runs) {
     for (const state of run.states) {
-      if (state.act === "Init" || state.exited || state.open !== open) continue;
+      if (state.act === "Init" || state.exited || state.open !== open || state.anchor === "invalid") continue;
       if (state.footer_bottom === state.screen_rows && state.rows - state.top === state.cap && state.top > 0) caps.add(state.cap);
     }
   }
@@ -159,7 +169,7 @@ export async function footerRuntimeToSpec(options: { dir: string; randomTraces: 
   const maxResizes = Math.max(0, ...runs.flatMap((run) => run.states.map((state) => state.resizes)));
 
   const modelStates = runs.map((run) =>
-    run.states.map((state) => ({ rows: state.rows, hist: state.hist, top: state.top, open: state.open, exited: state.exited, resizes: state.resizes, act: state.act })),
+    run.states.map((state) => ({ rows: state.rows, hist: state.hist, top: state.top, open: state.open, exited: state.exited, resizes: state.resizes, anchor: state.anchor, act: state.act })),
   );
   writeFileSync(join(options.dir, "traces.json"), `${JSON.stringify(modelStates, null, 1)}\n`);
   const data = [

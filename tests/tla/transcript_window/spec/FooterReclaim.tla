@@ -29,6 +29,18 @@
 \* src/core/app/app_lifecycle.zig). SignalExits = "settle" is that design;
 \* SignalExits = "erase" is the head before it, where the closer restored the
 \* terminal at once and the held rows never reached the terminal's scrollback.
+\* SignalExits = "stable_only" is the head after that repair: the closer asked
+\* for the exit frame, but the main thread drew it only when the transcript
+\* anchor was stable. A resize while an alternate screen covers the main one
+\* (Ctrl+O's full transcript, the approval review screen) leaves the anchor
+\* invalid with no frame to recover it, and an invalid or recovering anchor has
+\* lost which rows it holds, so the signal ended fx with them still held.
+\*
+\* `anchor` is the state of the transcript runtime's committed anchor
+\* (`transcript_commit_state` in src/ui/transcript/runtime.zig): "stable" after
+\* a frame that released all it owed, "recovering" after one that released
+\* less, and "invalid" before the first frame and after a resize or takeover,
+\* until a frame recovers it.
 EXTENDS Integers
 
 CONSTANTS
@@ -38,11 +50,11 @@ CONSTANTS
     Extra,       \* rows an open surface adds to the footer
     MaxResizes,  \* settled resizes over a run
     Release,     \* "base" (the design) or "current" (main before it)
-    SignalExits  \* "settle" (the design) or "erase" (the head before it)
+    SignalExits  \* "settle" (the design), "stable_only", or "erase" (the heads before it)
 
-VARIABLES rows, hist, top, open, exited, epochFirst, dropTo, freed, resizes, act
+VARIABLES rows, hist, top, open, exited, epochFirst, dropTo, freed, resizes, anchor, act
 
-vars == <<rows, hist, top, open, exited, epochFirst, dropTo, freed, resizes, act>>
+vars == <<rows, hist, top, open, exited, epochFirst, dropTo, freed, resizes, anchor, act>>
 
 Max(a, b) == IF a > b THEN a ELSE b
 Min(a, b) == IF a < b THEN a ELSE b
@@ -58,17 +70,20 @@ Freed(to, h) == Max(freed, Min(to, h))
 
 Init ==
     /\ rows = 0 /\ hist = 0 /\ top = 0 /\ open = FALSE /\ exited = FALSE
-    /\ epochFirst = 0 /\ dropTo = 0 /\ freed = 0 /\ resizes = 0 /\ act = "Init"
+    /\ epochFirst = 0 /\ dropTo = 0 /\ freed = 0 /\ resizes = 0
+    /\ anchor = "invalid" /\ act = "Init"
 
 \* One committed frame at `n` rows under a footer of `o`. History advances
 \* toward the release target and never moves back; a frame may release less
 \* than the target (a deferred materialization) and a later one catches up.
-\* The screen follows the tail but never shows a row already in history.
+\* The screen follows the tail but never shows a row already in history. The
+\* frame recovers an invalid anchor, and leaves it stable or recovering.
 Frame(n, o, name) ==
     \E h \in hist..Max(hist, ReleaseTarget(n, o, epochFirst)) :
         /\ hist' = h
         /\ top' = Max(h, Natural(n, o, epochFirst))
         /\ freed' = Freed(dropTo, h)
+        /\ anchor' \in {"stable", "recovering"}
         /\ act' = name
 
 Output(k) ==
@@ -77,11 +92,14 @@ Output(k) ==
     /\ Frame(rows + k, open, "Output")
     /\ UNCHANGED <<open, exited, epochFirst, dropTo, resizes>>
 
-Opened ==
-    /\ ~exited /\ ~open
+\* A surface opens, in the same frame as the `k` rows that arrive with it (an
+\* approval comes with the rows of its tool call).
+Opened(k) ==
+    /\ ~exited /\ ~open /\ rows + k <= MaxRows
     /\ open' = TRUE
-    /\ Frame(rows, TRUE, "Opened")
-    /\ UNCHANGED <<rows, exited, epochFirst, dropTo, resizes>>
+    /\ rows' = rows + k
+    /\ Frame(rows + k, TRUE, "Opened")
+    /\ UNCHANGED <<exited, epochFirst, dropTo, resizes>>
 
 Closed ==
     /\ ~exited /\ open
@@ -96,7 +114,7 @@ Dropped(to) ==
     /\ dropTo' = to
     /\ freed' = Freed(to, hist)
     /\ act' = "Dropped"
-    /\ UNCHANGED <<rows, hist, top, open, exited, epochFirst, resizes>>
+    /\ UNCHANGED <<rows, hist, top, open, exited, epochFirst, resizes, anchor>>
 
 \* A settled resize clears the screen and its scrollback and reprints the
 \* held entries (transcriptWindowScreenCleared frees the held drops first);
@@ -108,8 +126,26 @@ Resized ==
     /\ epochFirst' = dropTo
     /\ hist' = ReleaseTarget(rows, open, dropTo)
     /\ top' = Natural(rows, open, dropTo)
+    /\ anchor' \in {"stable", "recovering"}
     /\ act' = "Resized"
     /\ UNCHANGED <<rows, open, exited, dropTo>>
+
+\* A settled resize while an alternate screen covers the main one: Ctrl+O's
+\* full transcript, or the approval review screen, which an open approval moves
+\* to when the narrower window leaves it no room inline (`surfaceLeaves`: the
+\* surface is no longer an open footer of the main screen). Nothing draws on
+\* the main screen, so no frame recovers the anchor: it is invalid, and the
+\* rows, history, and screen stay as they were, the held rows still held. The
+\* reprint the resize owes is the next frame's, which releases rows by the
+\* same rule as any frame.
+CoveredResize(name, surfaceLeaves) ==
+    /\ ~exited /\ resizes < MaxResizes
+    /\ surfaceLeaves => open
+    /\ resizes' = resizes + 1
+    /\ anchor' = "invalid"
+    /\ open' = IF surfaceLeaves THEN FALSE ELSE open
+    /\ act' = name
+    /\ UNCHANGED <<rows, hist, top, exited, epochFirst, dropTo, freed>>
 
 \* A screen takeover (Ctrl+O's full transcript, external damage) gives the
 \* screen back with the same rows and footer; the frame after it releases
@@ -123,10 +159,13 @@ TookOver ==
 
 \* The exit frame: exit, suspend, and a fresh session's scrollback handoff
 \* first draw one frame that releases every held row, so erasing the footer
-\* leaves each row in history or on the screen.
+\* leaves each row in history or on the screen. It does so from any anchor: an
+\* invalid or recovering one has lost which rows it holds, so the frame
+\* releases what is owed rather than what the anchor says.
 ExitFrame(name) ==
     /\ ~exited
     /\ exited' = TRUE
+    /\ anchor' \in {"stable", "recovering"}
     /\ hist' = Max(hist, Natural(rows, open, epochFirst))
     /\ top' = Max(hist, Natural(rows, open, epochFirst))
     /\ freed' = Freed(dropTo, Max(hist, Natural(rows, open, epochFirst)))
@@ -136,9 +175,11 @@ ExitFrame(name) ==
 Exited == ExitFrame("Exited")
 
 \* SIGTERM or SIGHUP, at any step between two frames. With the design the
-\* closer waits for the main thread's exit frame; with the head's rule it
-\* restores the terminal at once, so the footer is erased with rows held.
-SignalSettles(name) == SignalExits = "settle"
+\* closer waits for the main thread's exit frame, whatever the anchor; with the
+\* head's rules it restores the terminal at once ("erase"), or the main thread
+\* draws the frame only from a stable anchor ("stable_only"), so the footer is
+\* erased with rows held.
+SignalSettles(name) == SignalExits = "settle" \/ (SignalExits = "stable_only" /\ anchor = "stable")
 
 SignalExit(name) ==
     IF SignalSettles(name)
@@ -146,15 +187,17 @@ SignalExit(name) ==
     ELSE /\ ~exited
          /\ exited' = TRUE
          /\ act' = name
-         /\ UNCHANGED <<rows, hist, top, open, epochFirst, dropTo, freed, resizes>>
+         /\ UNCHANGED <<rows, hist, top, open, epochFirst, dropTo, freed, resizes, anchor>>
 
 Done == exited /\ UNCHANGED vars
 
 Next ==
     \/ \E k \in 1..Burst : Output(k)
-    \/ Opened \/ Closed
+    \/ \E k \in 0..Burst : Opened(k)
+    \/ Closed
     \/ \E to \in 1..MaxRows : Dropped(to)
     \/ Resized \/ TookOver \/ Exited \/ Done
+    \/ CoveredResize("CoveredResize", FALSE) \/ CoveredResize("ReviewResize", TRUE)
     \/ SignalExit("SigTerm") \/ SignalExit("SigHup")
 
 Spec == Init /\ [][Next]_vars
@@ -167,10 +210,12 @@ TypeOK ==
     /\ open \in BOOLEAN /\ exited \in BOOLEAN
     /\ epochFirst \in 0..MaxRows /\ dropTo \in 0..MaxRows /\ freed \in 0..MaxRows
     /\ resizes \in 0..MaxResizes
+    /\ anchor \in {"stable", "invalid", "recovering"}
 
 \* L22 (TUI-32): the footer is on the bottom rows: the screen above it is full
-\* whenever the transcript has the rows to fill it.
-FooterAtBottom == ~exited => rows - top = Min(Cap(open), rows - epochFirst)
+\* whenever the transcript has the rows to fill it, except while an invalid
+\* anchor leaves the main screen as an alternate screen last drew it.
+FooterAtBottom == (~exited /\ anchor /= "invalid") => rows - top = Min(Cap(open), rows - epochFirst)
 
 \* L23 (native-history finality): no row in native history is on the screen,
 \* so no frame shows a row twice.
@@ -179,8 +224,8 @@ HistoryOnce == hist <= top
 \* L24: every row on the screen or held is still in memory.
 OwedRowsHeld == freed <= Min(hist, top)
 
-\* L25: after exit, by /quit, suspend, a fresh session, SIGTERM or SIGHUP, no row
-\* is held: each one is in history or was on the screen when the footer was
-\* erased.
+\* L25: after exit, by /quit, suspend, a fresh session, SIGTERM or SIGHUP, from
+\* any anchor, no row is held: each one is in history or was on the screen when
+\* the footer was erased.
 ExitKeepsRows == exited => top = hist
 ====

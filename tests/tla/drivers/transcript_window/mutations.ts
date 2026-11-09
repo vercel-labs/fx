@@ -37,6 +37,9 @@ const FOOTER_RECLAIM_TESTS = [
   "resize with the slash picker open keeps the covered rows held",
   "takeover with the slash picker open recovers only the rows it displaced",
   "recovery from an invalid anchor with the slash picker open keeps the held rows owed",
+  "exit after a resize while a screen covers the slash picker leaves every row",
+  "exit after output and a resize while a screen covers the slash picker repeats no row",
+  "a held-rows settle is asked for by every anchor that may hold rows",
   "footer reclaim keeps every row once on seeded random event scripts",
 ];
 

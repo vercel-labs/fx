@@ -229,7 +229,11 @@ fn startCloser(tmux: bool) bool {
     close_pipe = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch return false;
     closer_tmux = tmux;
     const thread = std.Thread.spawn(.{}, closerMain, .{}) catch |err| {
-        debug_trace.logf("app", "closer unavailable err={s}", .{@errorName(err)});
+        debug_trace.logf(
+            "app",
+            "closer unavailable err={s} dropped=held_transcript_rows_from_scrollback_on_signal reason=fallback_handlers_cannot_settle",
+            .{@errorName(err)},
+        );
         _ = std.c.close(close_pipe[0]);
         _ = std.c.close(close_pipe[1]);
         close_pipe = .{ -1, -1 };

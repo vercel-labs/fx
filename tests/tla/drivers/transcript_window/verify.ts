@@ -25,9 +25,10 @@
 //      Ctrl+O, and a resume, its traced window steps replayed on the core and
 //      checked by TLC (binary-to-spec.ts). FX_BIN picks the binary.
 //  15. footer signal to spec: the built fx with the slash picker open over a
-//      long transcript, ended by a real SIGTERM or SIGHUP, the rows its
-//      history and screen hold checked by TLC against FooterReclaim.tla
-//      (footer-signal-to-spec.ts);
+//      long transcript, also after Ctrl+O and a resize, and with an approval
+//      that a narrower window moved to the review screen, ended by a real
+//      SIGTERM or SIGHUP, the rows its history and screen hold checked by TLC
+//      against FooterReclaim.tla (footer-signal-to-spec.ts);
 //  16. every planted bug in the signal close's wiring (a copy of src/ built and
 //      run by the signal driver or a tmux test) caught.
 //
@@ -91,10 +92,16 @@ try {
     stage(`model ${cfg}`, run.verdict === "pass" && pinned, `${run.verdict}${run.property ? ` (${run.property})` : ""}, ${run.distinct} distinct states, depth ${run.depth}${pinned ? "" : `, TLC is ${run.tlcVersion}`}`);
   }
   // The footer: the design's config passes, main's rule before it (history
-  // follows the footer on the screen) fails FooterAtBottom, and the head
-  // before the signal repair (SIGTERM and SIGHUP erase the footer without
-  // the exit frame) fails ExitKeepsRows.
-  for (const [cfg, expected] of [["MCFooterReclaim", null], ["MCFooterReclaimToday", "FooterAtBottom"], ["MCFooterReclaimSignalHead", "ExitKeepsRows"]] as const) {
+  // follows the footer on the screen) fails FooterAtBottom, the head before
+  // the signal repair (SIGTERM and SIGHUP erase the footer without the exit
+  // frame) fails ExitKeepsRows, and so does the head before the
+  // invalid-anchor repair (the exit frame is drawn only from a stable anchor).
+  for (const [cfg, expected] of [
+    ["MCFooterReclaim", null],
+    ["MCFooterReclaimToday", "FooterAtBottom"],
+    ["MCFooterReclaimSignalHead", "ExitKeepsRows"],
+    ["MCFooterReclaimInvalidAnchorHead", "ExitKeepsRows"],
+  ] as const) {
     const run = await checkTlc(join(out, "model", cfg), "FooterReclaim", `${cfg}.cfg`, specFiles());
     models[cfg] = { verdict: run.verdict, property: run.property, distinct: run.distinct, depth: run.depth, ms: run.durationMs, tlc: run.tlcVersion };
     const ok = expected === null ? run.verdict === "pass" : run.verdict === "violated" && run.property === expected;
@@ -190,7 +197,7 @@ try {
     const signal = await footerSignalToSpec({ dir: join(out, "footer-signal"), bin: fx });
     report.footerSignalToSpec = { scenarios: signal.scenarios, steps: signal.steps, problems: signal.problems, tlc: signal.tlc ? { verdict: signal.tlc.verdict, property: signal.tlc.property, distinct: signal.tlc.distinct } : null };
     stage("footer signal to spec", signal.tlc?.verdict === "pass" && signal.problems.length === 0,
-      `${signal.scenarios} runs of the built binary ended by SIGTERM or SIGHUP with the picker open, ${signal.steps} steps; TLC ${signal.tlc?.verdict ?? "not run"}${signal.tlc?.property ? ` (${signal.tlc.property})` : ""}${signal.problems.length ? `; ${signal.problems.join("; ")}` : ""}`);
+      `${signal.scenarios} runs of the built binary ended by SIGTERM or SIGHUP with the picker open, after Ctrl+O and a resize, or after the approval moved to the review screen, ${signal.steps} steps; TLC ${signal.tlc?.verdict ?? "not run"}${signal.tlc?.property ? ` (${signal.tlc.property})` : ""}${signal.problems.length ? `; ${signal.problems.join("; ")}` : ""}`);
     console.log(`  footer signal to spec: ${elapsed(at)}`);
   }
 } catch (error) {

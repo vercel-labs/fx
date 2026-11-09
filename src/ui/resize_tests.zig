@@ -9496,6 +9496,23 @@ const FooterReclaimRun = struct {
         try self.frame();
     }
 
+    /// A window resize while an alternate screen covers the main one (Ctrl+O's
+    /// full transcript, the approval review screen): the settled resize
+    /// invalidates the anchor and asks for a terminal reset, and no frame
+    /// draws on the main screen to recover from either.
+    fn resizeWhileCovered(self: *FooterReclaimRun) !void {
+        const cols = self.h.shell.layout.cols;
+        const rows = self.h.shell.layout.rows;
+        for ([_]u16{ cols + 1, cols }) |width| {
+            for ([_]bool{ false, true }) |settled| {
+                try self.h.vt.resize(width, rows);
+                try self.probe.grid.resize(width, rows);
+                try shell_runtime.applyResizeWithLayout(&self.h.shell, &self.h.metrics, layoutFor(width, rows, 4), settled);
+            }
+        }
+        self.resizes += 1;
+    }
+
     /// What exit, suspend, and a SIGTERM or SIGHUP close do before they erase
     /// the footer: one frame that settles the held rows. A signal close asks
     /// the main thread for it (`app_lifecycle.signalClosePending`), which
@@ -9682,6 +9699,48 @@ test "recovery from an invalid anchor with the slash picker open keeps the held 
     try run.expectEveryRowOnce();
 }
 
+test "exit after a resize while a screen covers the slash picker leaves every row" {
+    // A resize while an alternate screen covers the main one (Ctrl+O, the
+    // approval review screen) leaves the anchor invalid with no frame to
+    // recover it, and a signal close asks for its exit frame from there. The
+    // invalid anchor has forgotten the rows the picker holds, so the settle
+    // must still release them
+    // (`tests/tla/transcript_window/spec/FooterReclaim.tla` ExitKeepsRows).
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.output(1);
+    try run.output(29);
+    try run.openPicker();
+    try run.resizeWhileCovered();
+    try std.testing.expectEqual(.invalid, run.h.shell.transcriptCommitDiagnostic().state);
+    try run.exit();
+    const diagnostic = run.h.shell.transcriptCommitDiagnostic();
+    try std.testing.expectEqual(diagnostic.visual_offset, diagnostic.history_visual_offset);
+    try run.expectEveryRowOnce();
+}
+
+test "exit after output and a resize while a screen covers the slash picker repeats no row" {
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.output(1);
+    try run.output(29);
+    try run.openPicker();
+    try run.output(3);
+    try run.resizeWhileCovered();
+    try run.exit();
+    try run.expectEveryRowOnce();
+}
+
+test "exit after a resize while a screen covers the idle footer repeats no row" {
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.output(1);
+    try run.output(29);
+    try run.resizeWhileCovered();
+    try run.exit();
+    try run.expectEveryRowOnce();
+}
+
 test "a resize with the slash picker open keeps the covered rows held for the close" {
     var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
     defer run.deinit();
@@ -9727,23 +9786,25 @@ const FooterReclaimSeededDraws = struct {
     }
 };
 
-/// Output, slash picker open and close, resizes, and screen takeovers (Ctrl+O
-/// recovery and an invalid anchor) in a drawn order on a drawn screen height,
-/// then exit. After every step no row is in history
-/// and on the screen twice; whenever the picker is closed the footer is on
-/// the bottom row and every row is there once; after exit every row is.
+/// Output, slash picker open and close, resizes, screen takeovers (Ctrl+O
+/// recovery and an invalid anchor), and resizes while a screen covers the main
+/// one, in a drawn order on a drawn screen height, then exit. After every step
+/// no row is in history and on the screen twice; whenever the picker is closed
+/// the footer is on the bottom row and every row is there once; after exit
+/// every row is.
 fn driveFooterReclaim(draws: anytype) !void {
     var run = try FooterReclaimRun.init(std.testing.allocator, 100, draws.range(u16, 16, 40));
     defer run.deinit();
     try run.output(1);
     try run.output(draws.range(u32, 1, 60));
     for (0..draws.range(u8, 0, 16)) |_| {
-        switch (draws.range(u8, 0, 6)) {
+        switch (draws.range(u8, 0, 7)) {
             0, 1 => try run.output(draws.range(u32, 1, 4)),
             2, 3 => if (run.open) try run.closePicker() else try run.openPicker(),
             4 => try run.resize(),
             5 => try run.ctrlOTakeover(),
-            else => try run.invalidAnchorTakeover(),
+            6 => try run.invalidAnchorTakeover(),
+            else => try run.resizeWhileCovered(),
         }
         try run.expectNoRowTwice();
         if (!run.open) {
@@ -9771,23 +9832,29 @@ const FooterReclaimState = struct {
     open: bool,
     exited: bool,
     resizes: u32,
+    anchor: []const u8,
     act: []const u8,
     footer_bottom: u16,
     screen_rows: u16,
     cap: u16,
 };
 
-fn footerReclaimState(run: *FooterReclaimRun, act: []const u8) FooterReclaimState {
+/// What the runtime committed, as the model's variables. An invalid anchor
+/// holds no offsets, so the screen and history stay as `previous` left them:
+/// no frame drew since.
+fn footerReclaimState(run: *FooterReclaimRun, act: []const u8, previous: ?FooterReclaimState) FooterReclaimState {
     const diagnostic = run.h.shell.transcriptCommitDiagnostic();
     const layout = run.h.shell.committed_frame_layout;
+    const kept = if (diagnostic.state == .invalid) previous else null;
     return .{
-        .rows = diagnostic.total_visual_rows,
+        .rows = if (kept) |state| state.rows else diagnostic.total_visual_rows,
         .written = run.written,
-        .hist = diagnostic.history_visual_offset,
-        .top = diagnostic.visual_offset,
+        .hist = if (kept) |state| state.hist else diagnostic.history_visual_offset,
+        .top = if (kept) |state| state.top else diagnostic.visual_offset,
         .open = run.open,
         .exited = run.exited,
         .resizes = run.resizes,
+        .anchor = @tagName(diagnostic.state),
         .act = act,
         .footer_bottom = layout.footer_area.bottom,
         .screen_rows = run.h.shell.layout.rows,
@@ -9808,9 +9875,11 @@ const FooterReclaimTraceResult = struct {
 // after each step to $FX_FOOTER_RECLAIM_TRACE. Without those variables it does
 // nothing. Events: "o<k>" writes k rows, "open" and "close" the slash picker,
 // "resize" a window resize away and back, "takeover" a Ctrl+O takeover and
-// "invalidate" an invalid anchor as a takeover leaves them, and "exit" what
-// exit and suspend do before they erase the footer; "sigterm" and "sighup"
-// are the same frame, which a signal close asks the main thread for.
+// "invalidate" an invalid anchor as a takeover leaves them, "covered" a resize
+// while an alternate screen covers the main one (the anchor stays invalid and
+// no frame follows), and "exit" what exit and suspend do before they erase the
+// footer; "sigterm" and "sighup" are the same frame, which a signal close asks
+// the main thread for.
 test "footer reclaim runtime trace driver" {
     io_mod.setLibcEnviron();
     defer io_mod.resetEnvironForTest();
@@ -9832,7 +9901,7 @@ test "footer reclaim runtime trace driver" {
         var run = try FooterReclaimRun.init(alloc, input.cols, input.rows);
         defer run.deinit();
         var states: std.ArrayList(FooterReclaimState) = .empty;
-        try states.append(arena, footerReclaimState(&run, "Init"));
+        try states.append(arena, footerReclaimState(&run, "Init", null));
         for (events) |event| {
             const act: []const u8 = if (std.mem.eql(u8, event, "open")) blk: {
                 try run.openPicker();
@@ -9849,6 +9918,9 @@ test "footer reclaim runtime trace driver" {
             } else if (std.mem.eql(u8, event, "invalidate")) blk: {
                 try run.invalidAnchorTakeover();
                 break :blk "TookOver";
+            } else if (std.mem.eql(u8, event, "covered")) blk: {
+                try run.resizeWhileCovered();
+                break :blk "CoveredResize";
             } else if (footerReclaimExitAct(event)) |exit_act| blk: {
                 try run.exit();
                 break :blk exit_act;
@@ -9856,7 +9928,7 @@ test "footer reclaim runtime trace driver" {
                 try run.output(try std.fmt.parseInt(u32, event[1..], 10));
                 break :blk "Output";
             } else return error.UnknownFooterReclaimEvent;
-            try states.append(arena, footerReclaimState(&run, act));
+            try states.append(arena, footerReclaimState(&run, act, states.items[states.items.len - 1]));
             if (run.exited) break;
         }
         var wrong: std.ArrayList(u32) = .empty;

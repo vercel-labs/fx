@@ -648,7 +648,12 @@ const SIGNAL_EXIT_STABLE_MS = 20_000;
 /// fx with the 82-row reply in scrollback, `FX_PERMISSION_MODE=ask` and a
 /// trace log of the app and render scopes, for the tests that end it with a
 /// signal. The second scripted reply is a shell command that waits for approval.
-async function startSignalExitSession(): Promise<{ workDir: string; stderrPath: string; tracePath: string }> {
+/// `width` and `height` size the terminal, and `command` is the shell command
+/// the approval asks about.
+async function startSignalExitSession(
+  options: { width?: number; height?: number; command?: string } = {},
+): Promise<{ workDir: string; stderrPath: string; tracePath: string }> {
+  const { width = 100, height = 24, command = "touch signal-exit.txt" } = options;
   const workDir = mkdtempSync(join(tmpdir(), "fx-footer-reclaim-signal-e2e-"));
   workDirs.push(workDir);
   const home = join(workDir, "home");
@@ -661,7 +666,7 @@ async function startSignalExitSession(): Promise<{ workDir: string; stderrPath: 
   gateway = startFakeGateway([
     fakeGatewayFinalText(longAssistantResponse()),
     fakeGatewayToolCall("signal_exit_shell", "shell", {
-      request: { yield_time_ms: 30_000, action: "run", command: "touch signal-exit.txt" },
+      request: { yield_time_ms: 30_000, action: "run", command },
     }),
   ]);
   session = await TmuxSession.create({
@@ -675,8 +680,8 @@ async function startSignalExitSession(): Promise<{ workDir: string; stderrPath: 
       FX_TRACE_SCOPES: "app,render",
     },
     stderrPath,
-    width: 100,
-    height: 24,
+    width,
+    height,
     isolated: true,
     remainOnExit: true,
     minimumHistoryLines: 500,
@@ -2046,6 +2051,99 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       session = null;
     },
     90_000,
+  );
+
+  // A resize can leave the transcript anchor invalid while a screen covers
+  // the main one: the approval moves to the review screen, or Ctrl+O's
+  // full transcript is open. The signal still ends fx with every held row in
+  // scrollback once (`tests/tla/transcript_window/spec/FooterReclaim.tla`
+  // ExitKeepsRows, SignalExit with an invalid anchor).
+  for (const { signal, number } of [{ signal: "SIGTERM", number: 15 }, { signal: "SIGHUP", number: 1 }] as const) {
+    test(
+      `${signal} after a resize moved the command approval to the review screen leaves every row in scrollback once`,
+      async () => {
+        // At 72x20 the approval fits inline and holds the rows it covers;
+        // at 40x13 it needs the review screen, and the resize leaves the
+        // anchor invalid while that screen owns the terminal.
+        const run = await startSignalExitSession({
+          width: 72,
+          height: 20,
+          command: `grep -rn "render" src/components/menu/ 2>/dev/null | head -20; echo '==='; ls src/components/menu/ 2>/dev/null`,
+        });
+        await session!.sendText("Run the signal exit command.");
+        await session!.waitForText("Would you like to run the following command?", 20_000);
+        await stableFooterGrid(session!, run.workDir, "approval-inline", SIGNAL_EXIT_STABLE_MS);
+        await session!.resizeWindow(40, 13);
+        await session!.waitForText("Permission needed", 15_000);
+        await stableFooterGrid(session!, run.workDir, "approval-review-screen", SIGNAL_EXIT_STABLE_MS);
+
+        const afterExit = await endBySignal(session!, signal, run.workDir, "after-signal");
+        expect(footerMarkerCopies(afterExit), `${signal} over the review screen`).toEqual(longAssistantLines().map(() => 1));
+        expectSignalCloseTrace(run.tracePath, number);
+        expect(gateway!.requests).toHaveLength(2);
+        expect(readFileSync(run.stderrPath, "utf8")).toBe("");
+        await session!.kill();
+        session = null;
+      },
+      150_000,
+    );
+
+    test(
+      `${signal} after a resize with the full transcript screen open over the slash picker leaves every row in scrollback once`,
+      async () => {
+        // Ctrl+O's screen is open when the terminal is resized, so closing it
+        // restores the main screen with an invalid anchor.
+        const run = await startSignalExitSession();
+        await session!.sendLiteralText("/");
+        await session!.waitForText("Commands", 5_000);
+        await stableFooterGrid(session!, run.workDir, "picker-open", SIGNAL_EXIT_STABLE_MS);
+        await session!.sendKeys("C-o");
+        await session!.waitForText("esc close · pgup/pgdn scroll", 10_000);
+        await session!.resizeWindow(80, 20);
+        await stableFooterGrid(session!, run.workDir, "full-transcript-resized", SIGNAL_EXIT_STABLE_MS);
+
+        const afterExit = await endBySignal(session!, signal, run.workDir, "after-signal");
+        expect(footerMarkerCopies(afterExit), `${signal} over the resized full transcript screen`).toEqual(longAssistantLines().map(() => 1));
+        expectSignalCloseTrace(run.tracePath, number);
+        expect(gateway!.requests).toHaveLength(1);
+        expect(readFileSync(run.stderrPath, "utf8")).toBe("");
+        await session!.kill();
+        session = null;
+      },
+      150_000,
+    );
+  }
+
+  test(
+    "SIGTERM then SIGHUP after a resize with the full transcript screen open leaves every row once",
+    async () => {
+      // The first signal closes fx from an invalid anchor; the second changes
+      // nothing, and no row is drawn twice.
+      const run = await startSignalExitSession();
+      await session!.sendLiteralText("/");
+      await session!.waitForText("Commands", 5_000);
+      await stableFooterGrid(session!, run.workDir, "picker-open", SIGNAL_EXIT_STABLE_MS);
+      await session!.sendKeys("C-o");
+      await session!.waitForText("esc close · pgup/pgdn scroll", 10_000);
+      await session!.resizeWindow(80, 20);
+      await stableFooterGrid(session!, run.workDir, "full-transcript-resized", SIGNAL_EXIT_STABLE_MS);
+
+      const pid = session!.processPid();
+      process.kill(pid, "SIGTERM");
+      try {
+        process.kill(pid, "SIGHUP");
+      } catch {
+        // fx already ended.
+      }
+      await session!.waitForPane(() => session!.paneStatus().dead, 10_000);
+      const afterExit = stripAnsi(await session!.captureFullScrollback());
+      writeFileSync(join(run.workDir, "after-signals.txt"), afterExit);
+      expect(footerMarkerCopies(afterExit)).toEqual(longAssistantLines().map(() => 1));
+      expect(gateway!.requests).toHaveLength(1);
+      await session!.kill();
+      session = null;
+    },
+    150_000,
   );
 
   test(

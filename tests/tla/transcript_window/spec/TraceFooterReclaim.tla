@@ -7,8 +7,9 @@
 \* TranscriptRuntime in the resize harness ("footer reclaim runtime trace
 \* driver" in src/ui/resize_tests.zig) and writes each run as a sequence of
 \* states into FooterTraceData.tla: the committed anchor's total visual rows,
-\* history_visual_offset and visual_offset, whether the picker is open, and
-\* how many window resizes the script made.
+\* history_visual_offset and visual_offset (an invalid anchor keeps those of
+\* the last frame), its state, whether the picker is open, and how many window
+\* resizes the script made.
 \* The driver sets BaseCap and Extra from the rows the screen showed above
 \* the idle and the open footer. TLC walks every trace: ConformsToSpec holds
 \* when each recorded step is a step of FooterReclaim's Next, and the laws
@@ -17,20 +18,20 @@ EXTENDS Integers, Sequences, FooterTraceData
 
 CONSTANTS MaxRows, Burst, BaseCap, Extra, MaxResizes, Release, SignalExits
 
-VARIABLES rows, hist, top, open, exited, epochFirst, dropTo, freed, resizes, act, trace, at
+VARIABLES rows, hist, top, open, exited, epochFirst, dropTo, freed, resizes, anchor, act, trace, at
 
 FR == INSTANCE FooterReclaim
 
-vars == <<rows, hist, top, open, exited, epochFirst, dropTo, freed, resizes, act>>
+vars == <<rows, hist, top, open, exited, epochFirst, dropTo, freed, resizes, anchor, act>>
 
 Load(s) ==
     /\ rows = s.rows /\ hist = s.hist /\ top = s.top /\ open = s.open
-    /\ exited = s.exited /\ act = s.act /\ resizes = s.resizes
+    /\ exited = s.exited /\ act = s.act /\ resizes = s.resizes /\ anchor = s.anchor
     /\ epochFirst = 0 /\ dropTo = 0 /\ freed = 0
 
 LoadNext(s) ==
     /\ rows' = s.rows /\ hist' = s.hist /\ top' = s.top /\ open' = s.open
-    /\ exited' = s.exited /\ act' = s.act /\ resizes' = s.resizes
+    /\ exited' = s.exited /\ act' = s.act /\ resizes' = s.resizes /\ anchor' = s.anchor
     /\ epochFirst' = 0 /\ dropTo' = 0 /\ freed' = 0
 
 TraceInit == trace \in 1..Len(Traces) /\ at = 1 /\ Load(Traces[trace][1])
