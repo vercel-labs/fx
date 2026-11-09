@@ -71,7 +71,6 @@ fn isRetryableAgentNetworkError(err: anyerror) bool {
         err == error.NoAddressReturned or
         err == error.DetectingNetworkConfigurationFailed or
         err == error.AddressUnavailable or
-        err == error.ConnectionPending or
         err == error.ConnectionRefused or
         err == error.HostUnreachable or
         err == error.NetworkUnreachable or
@@ -141,7 +140,6 @@ test "native network failure evidence covers setup send read and resume failures
         .{ .err = error.NoAddressReturned, .cause = .connectivity_lost },
         .{ .err = error.DetectingNetworkConfigurationFailed, .cause = .connectivity_lost },
         .{ .err = error.AddressUnavailable, .cause = .connectivity_lost },
-        .{ .err = error.ConnectionPending },
         .{ .err = error.ConnectionRefused, .cause = .connectivity_lost },
         .{ .err = error.ConnectionResetByPeer },
         .{ .err = error.ConnectionTimedOut, .cause = .connectivity_lost },

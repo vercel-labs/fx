@@ -74,7 +74,7 @@ fn connect(
     try io.checkCancel();
     const fd = try openSocket(Threaded.posixAddressFamily(address), options);
     errdefer Threaded.closeFd(fd);
-    try setNonblocking(fd, true);
+    try setNonblocking(fd);
     var storage: Threaded.PosixAddress = undefined;
     const length = Threaded.addressToPosix(address, &storage);
     switch (posix.errno(posix.system.connect(fd, &storage.any, length))) {
@@ -83,7 +83,7 @@ fn connect(
         .INPROGRESS, .INTR => try awaitConnected(io, fd),
         else => |err| return connectError(err),
     }
-    try setNonblocking(fd, false);
+    try setBlocking(fd);
     return .{ .handle = fd, .address = try localAddress(fd) };
 }
 
@@ -158,30 +158,32 @@ fn openSocket(family: posix.sa_family_t, options: net.IpAddress.ConnectOptions) 
     }
 }
 
+const nonblock_flag: usize = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
+
 fn setCloexec(fd: posix.fd_t) error{Unexpected}!void {
-    while (true) switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => |err| return posix.unexpectedErrno(err),
-    };
+    _ = try fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC);
 }
 
-fn setNonblocking(fd: posix.fd_t, on: bool) error{Unexpected}!void {
-    const current: usize = while (true) {
-        const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+fn setNonblocking(fd: posix.fd_t) error{Unexpected}!void {
+    const flags = try fcntl(fd, posix.F.GETFL, 0);
+    _ = try fcntl(fd, posix.F.SETFL, flags | nonblock_flag);
+}
+
+fn setBlocking(fd: posix.fd_t) error{Unexpected}!void {
+    const flags = try fcntl(fd, posix.F.GETFL, 0);
+    _ = try fcntl(fd, posix.F.SETFL, flags & ~nonblock_flag);
+}
+
+/// fcntl(2), called again when a signal interrupts it.
+fn fcntl(fd: posix.fd_t, command: c_int, arg: usize) error{Unexpected}!usize {
+    while (true) {
+        const rc = posix.system.fcntl(fd, command, arg);
         switch (posix.errno(rc)) {
-            .SUCCESS => break @intCast(rc),
+            .SUCCESS => return @intCast(rc),
             .INTR => continue,
             else => |err| return posix.unexpectedErrno(err),
         }
-    };
-    const nonblock: usize = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
-    const next = if (on) current | nonblock else current & ~nonblock;
-    while (true) switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, next))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => |err| return posix.unexpectedErrno(err),
-    };
+    }
 }
 
 fn localAddress(fd: posix.fd_t) error{Unexpected}!net.IpAddress {
@@ -201,10 +203,7 @@ fn loopback(port: u16) net.IpAddress {
 }
 
 fn isNonblocking(fd: posix.fd_t) !bool {
-    const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
-    if (posix.errno(rc) != .SUCCESS) return error.Unexpected;
-    const flags: usize = @intCast(rc);
-    return flags & (@as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK")) != 0;
+    return try fcntl(fd, posix.F.GETFL, 0) & nonblock_flag != 0;
 }
 
 /// Closes with a reset, so a test that connects many times leaves no
@@ -228,16 +227,23 @@ fn waitForClose(fd: posix.fd_t) void {
     }
 }
 
-fn ignoreSignal(_: posix.SIG) callconv(.c) void {}
+/// The SIGIO signals that reached any thread since `SigioHandler.install`.
+var sigio_count: std.atomic.Value(u32) = .init(0);
+
+fn countSignal(_: posix.SIG) callconv(.c) void {
+    _ = sigio_count.fetchAdd(1, .monotonic);
+}
 
 /// Makes SIGIO interrupt blocking calls without killing the process, as
-/// `std.Io.Threaded` does, until `restore`.
+/// `std.Io.Threaded` does, and counts each one in `sigio_count`, until
+/// `restore`.
 const SigioHandler = struct {
     previous: posix.Sigaction,
 
     fn install() SigioHandler {
+        sigio_count.store(0, .monotonic);
         const action: posix.Sigaction = .{
-            .handler = .{ .handler = ignoreSignal },
+            .handler = .{ .handler = countSignal },
             .mask = posix.sigemptyset(),
             .flags = 0,
         };
@@ -251,44 +257,40 @@ const SigioHandler = struct {
     }
 };
 
-/// A listener whose accept queue is full, so the next connect to it waits in
-/// the kernel until the queue has room. Null when the kernel would not hold a
-/// connect pending.
-const FullListener = struct {
-    server: net.Server,
-    queued: [64]posix.fd_t = undefined,
-    queued_len: usize = 0,
+/// A connected socket pair whose `fds[0]` is not writable because its peer
+/// reads nothing: a stand-in for a socket whose connect is still going on.
+/// `drain` makes it writable, as the connect finishing does.
+const StalledPair = struct {
+    fds: [2]posix.fd_t,
 
-    fn open(io: std.Io) !?FullListener {
-        const any_port = loopback(0);
-        var l: FullListener = .{ .server = try any_port.listen(io, .{ .kernel_backlog = 0 }) };
-        errdefer l.close(io);
-        while (l.queued_len < l.queued.len) {
-            const fd = try openSocket(posix.AF.INET, .{ .mode = .stream });
-            l.queued[l.queued_len] = fd;
-            l.queued_len += 1;
-            try setNonblocking(fd, true);
-            var storage: Threaded.PosixAddress = undefined;
-            const length = Threaded.addressToPosix(&l.server.socket.address, &storage);
-            switch (posix.errno(posix.system.connect(fd, &storage.any, length))) {
-                .SUCCESS => continue,
-                .INPROGRESS => {},
+    fn open() !StalledPair {
+        var fds: [2]posix.fd_t = undefined;
+        if (posix.errno(posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.Unexpected;
+        errdefer for (fds) |fd| Threaded.closeFd(fd);
+        for (fds) |fd| try setNonblocking(fd);
+        const chunk: [4096]u8 = @splat(0);
+        for ([_]usize{ chunk.len, 1 }) |size| {
+            while (posix.errno(posix.system.write(fds[0], &chunk, size)) == .SUCCESS) {}
+        }
+        return .{ .fds = fds };
+    }
+
+    /// Reads everything `fds[0]` sent, so it is writable again.
+    fn drain(p: StalledPair) !void {
+        var buffer: [4096]u8 = undefined;
+        while (true) {
+            const rc = posix.system.read(p.fds[1], &buffer, buffer.len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => if (rc == 0) return error.Unexpected,
+                .INTR => {},
+                .AGAIN => return,
                 else => return error.Unexpected,
             }
-            var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-            if (posix.system.poll(&fds, fds.len, 200) == 0) return l;
         }
-        l.close(io);
-        return null;
     }
 
-    fn address(l: *const FullListener) net.IpAddress {
-        return l.server.socket.address;
-    }
-
-    fn close(l: *FullListener, io: std.Io) void {
-        for (l.queued[0..l.queued_len]) |fd| closeWithReset(fd);
-        l.server.deinit(io);
+    fn close(p: StalledPair) void {
+        for (p.fds) |fd| Threaded.closeFd(fd);
     }
 };
 
@@ -346,34 +348,46 @@ test "connect reports a port nobody listens on as refused" {
 
 test "a connect that SIGIO interrupts while it waits still connects" {
     const io = testing.io;
-    var listener = (try FullListener.open(io)) orelse return error.SkipZigTest;
-    defer listener.close(io);
+    const pair = try StalledPair.open();
+    defer pair.close();
     const handler = SigioHandler.install();
     defer handler.restore();
 
-    const Attempt = struct {
-        address: net.IpAddress,
-        result: net.IpAddress.ConnectError!net.Socket = error.Unexpected,
-        fn run(a: *@This()) void {
-            a.result = connect(testing.io, &a.address, .{ .mode = .stream });
+    // This drives the wait that `connect` runs after connect(2), on a stand-in
+    // for a pending connect: macOS resets a loopback connect past a full
+    // accept queue instead of holding it pending, so a real one cannot be set
+    // up on every host. The SIGIO test below covers `connect` itself.
+    // `fds[0]` is connected already, as a socket is once the kernel finishes
+    // an interrupted connect, so a wait that called connect(2) again, as std
+    // does after EINTR, would fail with EISCONN.
+    const Wait = struct {
+        fd: posix.fd_t,
+        result: net.IpAddress.ConnectError!void = error.Unexpected,
+        finished: std.atomic.Value(bool) = .init(false),
+
+        fn run(w: *@This()) void {
+            w.result = awaitConnected(testing.io, w.fd);
+            w.finished.store(true, .release);
         }
     };
-    var attempt: Attempt = .{ .address = listener.address() };
-    const thread = try std.Thread.spawn(.{}, Attempt.run, .{&attempt});
-    // The connect waits for room in the queue while these signals arrive.
-    for (0..5) |_| {
-        try io.sleep(.fromMilliseconds(20), .awake);
+    var wait: Wait = .{ .fd = pair.fds[0] };
+    const thread = try std.Thread.spawn(.{}, Wait.run, .{&wait});
+    // Each signal reaches the waiting thread before the next one is sent.
+    for (1..6) |sent| {
+        if (wait.finished.load(.acquire)) break;
         _ = std.c.pthread_kill(thread.getHandle(), .IO);
+        for (0..1000) |_| {
+            if (sigio_count.load(.monotonic) >= sent) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        } else return error.SignalNotDelivered;
+        try io.sleep(.fromMilliseconds(5), .awake);
     }
-    // Makes room; the waiting connect lands when the kernel retries its
-    // handshake.
-    var acceptor: Acceptor = .{ .server = &listener.server };
-    try acceptor.start();
+    const waited_through_signals = !wait.finished.load(.acquire);
+    try pair.drain();
     thread.join();
-    acceptor.stop();
 
-    const socket = try attempt.result;
-    Threaded.closeFd(socket.handle);
+    try testing.expect(waited_through_signals);
+    try wait.result;
 }
 
 test "connects on worker threads all succeed while another thread sends SIGIO" {
@@ -424,25 +438,17 @@ test "connects on worker threads all succeed while another thread sends SIGIO" {
 
     try testing.expect(signals > 0);
     const first_error = shared.first_error.load(.monotonic);
-    if (first_error != 0) std.debug.print("first connect error: {t}\n", .{@errorFromInt(first_error)});
+    if (first_error != 0) return @errorFromInt(first_error);
     try testing.expectEqual(@as(u32, 0), shared.failed.load(.monotonic));
     try testing.expectEqual(@as(u32, workers * connects_per_worker), shared.connected.load(.monotonic));
 }
 
 test "waiting for a connect ends promptly when its task is canceled" {
     const io = testing.io;
-    var pair: [2]posix.fd_t = undefined;
-    if (posix.errno(posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair)) != .SUCCESS) return error.Unexpected;
-    defer for (pair) |fd| Threaded.closeFd(fd);
-    // A socket whose peer reads nothing stops being writable, as a connect
-    // that never finishes does.
-    try setNonblocking(pair[0], true);
-    const chunk: [4096]u8 = @splat(0);
-    for ([_]usize{ chunk.len, 1 }) |size| {
-        while (posix.errno(posix.system.write(pair[0], &chunk, size)) == .SUCCESS) {}
-    }
+    const pair = try StalledPair.open();
+    defer pair.close();
 
-    var task = try io.concurrent(awaitConnected, .{ io, pair[0] });
+    var task = try io.concurrent(awaitConnected, .{ io, pair.fds[0] });
     try io.sleep(.fromMilliseconds(100), .awake);
     const started = std.Io.Clock.Timestamp.now(io, .awake);
     const result = task.cancel(io);
