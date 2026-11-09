@@ -1,16 +1,25 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   applyVariant,
+  armKey,
+  bodyOnlyVariant,
   callFailure,
   extractToolCalls,
   isRemoteCommand,
   numberIn,
   parseStreamUsage,
+  rescoreResults,
+  reusableRun,
   rootRequest,
+  startProxy,
   summarize,
   transformStream,
   type RecordedRequest,
   type RunResult,
+  type Task,
 } from "./tool-schema-ab";
 
 const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
@@ -165,6 +174,77 @@ describe("tool schema A/B helpers", () => {
     }
     for (const command of ["ls -la && git log --oneline -5", "pwd; git status --short", "git log origin/main", "find . -name '*.md'", "grep -rn curl src"]) {
       expect(isRemoteCommand(command)).toBe(false);
+    }
+  });
+
+  test("rescore keeps a run whose transform failed marked failed", () => {
+    const task = { id: "t", tool: "read_file", check: () => ({ pass: true, reason: "ok" }) } as unknown as Task;
+    const run = (transformErrors: string[]) =>
+      ({ task: "t", pass: false, reason: "before", output: "", calls: [], stderrTail: "", transformErrors }) as unknown as RunResult;
+    const results = [run(["request() failed: Error: boom"]), run([])];
+    expect(rescoreResults(results, new Set(["t"]), [task])).toBe(1);
+    expect(results[0]).toMatchObject({ pass: false, reason: "before" });
+    expect(results[1]).toMatchObject({ pass: true, reason: "ok" });
+  });
+
+  test("the proxy answers 501 to a failed request transform and to every request after it", async () => {
+    const proxy = startProxy({}, "key", { request: () => { throw new Error("boom"); } });
+    const agentBody = JSON.stringify({ tools: [{ type: "function", name: "read_file", inputSchema: {} }], prompt: [] });
+    const send = (body?: string) =>
+      fetch(`${proxy.url}/v1/ai/language-model`, { method: body ? "POST" : "GET", headers: { authorization: "Bearer key" }, body });
+    const first = await send(agentBody);
+    expect(first.status).toBe(501);
+    expect(await first.text()).toContain("request() failed: Error: boom");
+    const later = await send();
+    expect(later.status).toBe(501);
+    expect(proxy.transformErrors).toEqual(["request() failed: Error: boom"]);
+    await proxy.stop();
+  });
+
+  test("an arm key changes when the binary, the variant, or its transform changes", () => {
+    const dir = mkdtempSync(join(tmpdir(), "fx-arm-key-"));
+    try {
+      const bin = join(dir, "fx");
+      writeFileSync(bin, "build one");
+      writeFileSync(join(dir, "t.ts"), "export function request() {}\n");
+      const arm = { bin, variant: {}, variantPath: "none" };
+      const plain = armKey(arm);
+      expect(armKey(arm)).toBe(plain);
+      const withTransform = { bin, variant: { transform: "./t.ts" }, variantPath: join(dir, "v.json") };
+      const transformed = armKey(withTransform);
+      expect(transformed).not.toBe(plain);
+      writeFileSync(join(dir, "t.ts"), "export function request() { return; }\n");
+      expect(armKey(withTransform)).not.toBe(transformed);
+      writeFileSync(bin, "build two");
+      expect(armKey(arm)).not.toBe(plain);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("resume reuses only a run with the same arm key and names each run it drops", () => {
+    const lines: string[] = [];
+    const log = (line: string) => lines.push(line);
+    const stored = (key?: string) => ({ task: "t", armKey: key }) as unknown as RunResult;
+    const same = stored("abc");
+    expect(reusableRun(same, "abc", "a.json", log)).toBe(same);
+    expect(reusableRun(stored("old"), "abc", "b.json", log)).toBeNull();
+    expect(reusableRun(stored(), "abc", "c.json", log)).toBeNull();
+    expect(lines).toEqual([
+      "resume: rerunning b.json; it ran with arm key old, not abc",
+      "resume: rerunning c.json; it ran with arm key none, not abc",
+    ]);
+  });
+
+  test("tokens and probe refuse a variant that names a transform", () => {
+    const dir = mkdtempSync(join(tmpdir(), "fx-body-variant-"));
+    try {
+      const path = join(dir, "v.json");
+      writeFileSync(path, JSON.stringify({ transform: "./t.ts" }));
+      expect(() => bodyOnlyVariant(path, "probe")).toThrow("probe runs no transform");
+      expect(bodyOnlyVariant("none", "tokens")).toEqual({});
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });
