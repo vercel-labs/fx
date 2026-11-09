@@ -18,7 +18,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const UPSTREAM = "https://ai-gateway.vercel.sh";
 
@@ -30,11 +30,106 @@ export interface Variant {
   tools?: Record<string, { description?: string; inputSchema?: unknown }>;
   /** Text replaced once in each system message that contains it, such as provider-tool guidance or a system prompt line. */
   system?: Array<{ from: string; to: string }>;
+  /** Module path for a Transform, which rewrites what the model sees and the calls fx gets back. */
+  transform?: string;
+}
+
+/**
+ * Prototypes a request-format change without changing fx. request() edits a
+ * body after the proxy records fx's own view of it; event() edits each parsed
+ * stream event before fx reads it. model is the ai-language-model-id header.
+ */
+export interface Transform {
+  request?(body: Record<string, unknown>, model: string): void;
+  event?(part: Record<string, unknown>, model: string): Record<string, unknown>;
+}
+
+/**
+ * Rewrites each `data: {json}` line of an SSE stream with one Transform. A line
+ * that is not JSON, such as `[DONE]`, passes through. When the transform throws,
+ * `onError` gets the message and the stream fails, so the run cannot score an
+ * unchanged stream as the transformed one.
+ */
+export function transformStream(
+  transform: Transform,
+  model: string,
+  onError: (message: string) => void = () => {},
+): TransformStream<Uint8Array, Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffered = "";
+  const rewrite = (line: string) => {
+    if (!line.startsWith("data: ") || !transform.event) return line;
+    let part: Record<string, unknown>;
+    try {
+      part = JSON.parse(line.slice(6)) as Record<string, unknown>;
+    } catch {
+      return line;
+    }
+    try {
+      return `data: ${JSON.stringify(transform.event(part, model))}`;
+    } catch (error) {
+      onError(`event() threw: ${error}`);
+      throw error;
+    }
+  };
+  return new TransformStream({
+    transform(chunk, controller) {
+      buffered += decoder.decode(chunk, { stream: true });
+      const lines = buffered.split("\n");
+      buffered = lines.pop() ?? "";
+      if (lines.length) controller.enqueue(encoder.encode(lines.map(rewrite).join("\n") + "\n"));
+    },
+    flush(controller) {
+      buffered += decoder.decode();
+      if (buffered) controller.enqueue(encoder.encode(rewrite(buffered)));
+    },
+  });
 }
 
 export function loadVariant(path: string | undefined): Variant {
   if (!path || path === "none") return {};
   return JSON.parse(readFileSync(path, "utf8")) as Variant;
+}
+
+/**
+ * A variant for `tokens` or `probe`, which rewrite a captured body and run no
+ * transform: one that names a transform is refused rather than measured as if
+ * it had none.
+ */
+export function bodyOnlyVariant(path: string, command: string): Variant {
+  const variant = loadVariant(path);
+  if (variant.transform) throw new Error(`${command} runs no transform, but ${path} names one; try it with run`);
+  return variant;
+}
+
+/**
+ * Identifies what an arm runs: the binary's bytes, the variant, and its
+ * transform's source. `run --resume` reuses a stored run only when its arm
+ * key matches, so a rebuilt binary or an edited variant runs again.
+ */
+export function armKey(arm: Pick<Arm, "bin" | "variant" | "variantPath">): string {
+  const hash = createHash("sha256");
+  hash.update(readFileSync(arm.bin));
+  hash.update(JSON.stringify(arm.variant));
+  if (arm.variant.transform) hash.update(readFileSync(resolve(dirname(arm.variantPath), arm.variant.transform)));
+  return hash.digest("hex").slice(0, 16);
+}
+
+/**
+ * The stored run `run --resume` may reuse: only one that ran with this arm
+ * key. A run stored with another key, or before arm keys existed, is dropped
+ * and runs again, and `log` gets one line that names its file and both keys.
+ */
+export function reusableRun(
+  stored: RunResult,
+  key: string | undefined,
+  file: string,
+  log: (line: string) => void = console.log,
+): RunResult | null {
+  if (stored.armKey === key) return stored;
+  log(`resume: rerunning ${file}; it ran with arm key ${stored.armKey ?? "none"}, not ${key}`);
+  return null;
 }
 
 /** Applies a variant to one gateway request body in place. */
@@ -104,9 +199,17 @@ export function parseStreamUsage(stream: string): Usage | null {
   return usage;
 }
 
-function startProxy(variant: Variant, testKey: string) {
+export function startProxy(variant: Variant, testKey: string, transform?: Transform) {
   const requests: RecordedRequest[] = [];
   const pending: Promise<void>[] = [];
+  // A transform that throws fails its run: the request gets a 501, which fx
+  // does not retry, or the stream ends with an error, and runOne marks the run
+  // failed with the message.
+  const transformErrors: string[] = [];
+  const transformFailed = (message: string) => {
+    transformErrors.push(message);
+    console.error(`tool-schema-ab: transform ${message}`);
+  };
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -116,8 +219,14 @@ function startProxy(variant: Variant, testKey: string) {
       if ((req.headers.get("authorization") ?? "") !== `Bearer ${testKey}`) {
         return new Response("tool-schema-ab: refusing a key other than AI_GATEWAY_TEST_API_KEY", { status: 401 });
       }
+      // After a transform fails, end the run at once: fx does not retry a 501.
+      if (transformErrors.length) {
+        return new Response(`tool-schema-ab: transform ${transformErrors[0]}`, { status: 501 });
+      }
       let raw = req.method === "GET" || req.method === "HEAD" ? undefined : await req.text();
+      const model = req.headers.get("ai-language-model-id") ?? "";
       const record: RecordedRequest = { seq: requests.length + 1, agent: false, toolsHash: null, toolsBytes: 0, toolProps: {}, prompt: null, usage: null, providerSearch: false, status: 0 };
+      let requestTransformError: string | null = null;
       if (raw) {
         try {
           const body = JSON.parse(raw) as Record<string, unknown>;
@@ -125,18 +234,31 @@ function startProxy(variant: Variant, testKey: string) {
           record.agent = Array.isArray(tools) && tools.some((t) => t.name === "read_file");
           if (record.agent) {
             applyVariant(body, variant);
-            raw = JSON.stringify(body);
-            const toolsJson = JSON.stringify(body.tools);
-            record.toolsBytes = toolsJson.length;
-            record.toolsHash = createHash("sha256").update(toolsJson).digest("hex").slice(0, 12);
+            // Score fx's own view of tools and calls; size what the model receives.
             for (const tool of body.tools as Array<Record<string, unknown>>) {
               const schema = tool.inputSchema as { properties?: Record<string, unknown> } | undefined;
               if (tool.type === "function" && typeof tool.name === "string") record.toolProps[tool.name] = Object.keys(schema?.properties ?? {});
             }
-            record.prompt = body.prompt as Array<Record<string, unknown>>;
+            record.prompt = transform?.request ? structuredClone(body.prompt as Array<Record<string, unknown>>) : (body.prompt as Array<Record<string, unknown>>);
+            // The body is serialized inside the same try, so a transform that
+            // leaves a body that cannot be sent fails the run as well.
+            try {
+              transform?.request?.(body, model);
+              raw = JSON.stringify(body);
+            } catch (error) {
+              requestTransformError = `request() failed: ${error}`;
+            }
+            const toolsJson = JSON.stringify(body.tools);
+            record.toolsBytes = toolsJson.length;
+            record.toolsHash = createHash("sha256").update(toolsJson).digest("hex").slice(0, 12);
           }
         } catch {}
         requests.push(record);
+      }
+      if (requestTransformError) {
+        transformFailed(requestTransformError);
+        record.status = 501;
+        return new Response(`tool-schema-ab: transform ${requestTransformError}`, { status: 501 });
       }
       const headers = new Headers(req.headers);
       for (const name of ["host", "content-length", "accept-encoding"]) headers.delete(name);
@@ -145,7 +267,8 @@ function startProxy(variant: Variant, testKey: string) {
       const outHeaders = new Headers(response.headers);
       for (const name of ["content-encoding", "content-length"]) outHeaders.delete(name);
       if (!response.body) return new Response(null, { status: response.status, headers: outHeaders });
-      const [toClient, toRecord] = response.body.tee();
+      const stream = transform?.event && record.agent ? response.body.pipeThrough(transformStream(transform, model, transformFailed)) : response.body;
+      const [toClient, toRecord] = stream.tee();
       pending.push(
         new Response(toRecord)
           .text()
@@ -161,6 +284,7 @@ function startProxy(variant: Variant, testKey: string) {
   return {
     url: `http://127.0.0.1:${server.port}`,
     requests,
+    transformErrors,
     async stop() {
       await Promise.allSettled(pending);
       server.stop(true);
@@ -181,6 +305,38 @@ const INVENTORY_LINES = (() => {
   }
   return lines;
 })();
+
+const STALE_SETTINGS = '"""Runtime settings."""\n\nTIMEOUT = 30 # secs\nRETRIES = 3\n';
+const STALE_LOADER = [
+  '"""File loading."""',
+  "",
+  "import os",
+  "",
+  "",
+  "def load(path):",
+  "    with open(path) as handle:",
+  "        data = handle.read()",
+  "    return data.strip()",
+  "",
+  "",
+  "def exists(path):",
+  "    return os.path.exists(path)",
+  "",
+].join("\n");
+const DUPLICATE_TOTALS = [
+  '"""Totals."""',
+  "",
+  "",
+  "def invoice_total(items):",
+  "    total = sum(items)",
+  "    return round(total, 2)",
+  "",
+  "",
+  "def refund_total(items):",
+  "    total = sum(items)",
+  "    return round(total, 2)",
+  "",
+].join("\n");
 
 export const FIXTURE_FILES: Record<string, string> = {
   "README.md": "# ledger\n\nSmall bookkeeping toolkit. See docs/design.md for the module layout.\n",
@@ -572,6 +728,18 @@ export function extractToolCalls(prompt: Array<Record<string, unknown>>): ToolCa
   return calls;
 }
 
+/**
+ * Why a call failed: fx refused or could not carry it out ("rejected"), or a
+ * shell command started and then failed ("exited"): it exited nonzero, timed
+ * out, was stopped, or lost its process. A shell result that reports a command
+ * state means the command started. The flag on the record counts both, but only
+ * a rejection is a tool-call mistake.
+ */
+export function callFailure(call: ToolCallRecord): "rejected" | "exited" | null {
+  if (!call.error) return null;
+  return call.name === "shell" && /"state":"(running|completed|stopped|lost)"/.test(call.resultText) ? "exited" : "rejected";
+}
+
 function userText(message: Record<string, unknown>): string {
   if (typeof message.content === "string") return message.content;
   if (!Array.isArray(message.content)) return "";
@@ -781,6 +949,43 @@ export const TASKS: Task[] = [
       return ok(file(c, "src/ledger/pricing.py") === expected, "only TAX_RATE changed");
     },
   },
+  // The next three start from text that does not match the file, as a pasted
+  // or remembered snippet would, so the first edit fails and the run measures
+  // how the model recovers.
+  {
+    id: "edit-stale-line",
+    tool: "edit_file",
+    setup: (repo) => writeFileSync(join(repo, "src/ledger/settings.py"), STALE_SETTINGS),
+    prompt: () =>
+      "A teammate pasted this line from src/ledger/settings.py: `TIMEOUT = 30  # seconds`. Use edit_file right away, without reading the file first, to make that timeout 45. Keep everything else as it is.",
+    check: (c) => {
+      const lines = (file(c, "src/ledger/settings.py") ?? "").split("\n");
+      const expected = STALE_SETTINGS.split("\n");
+      const rest = lines.length === expected.length && lines.every((line, i) => i === 2 || line === expected[i]);
+      return ok(rest && /^TIMEOUT = 45\b/.test(lines[2] ?? ""), "timeout 45, rest unchanged");
+    },
+  },
+  {
+    id: "edit-stale-block",
+    tool: "edit_file",
+    setup: (repo) => writeFileSync(join(repo, "src/ledger/loader.py"), STALE_LOADER),
+    prompt: () =>
+      "A teammate pasted this function from src/ledger/loader.py:\n\ndef load(path):\n    with open(path) as f:\n        text = f.read()\n    return text.strip()\n\nUse edit_file right away, without reading the file first, so that load returns the text without calling strip(). Keep everything else as it is.",
+    check: (c) =>
+      ok(file(c, "src/ledger/loader.py") === STALE_LOADER.replace("    return data.strip()", "    return data"), "strip dropped, rest unchanged"),
+  },
+  {
+    id: "edit-duplicate",
+    tool: "edit_file",
+    setup: (repo) => writeFileSync(join(repo, "src/ledger/totals.py"), DUPLICATE_TOTALS),
+    prompt: () =>
+      "In src/ledger/totals.py, make refund_total round to 0 decimal places instead of 2. Use edit_file right away, without reading the file first, with old_string `    return round(total, 2)`. invoice_total must keep rounding to 2.",
+    check: (c) => {
+      const at = DUPLICATE_TOTALS.lastIndexOf("    return round(total, 2)");
+      const expected = DUPLICATE_TOTALS.slice(0, at) + "    return round(total, 0)" + DUPLICATE_TOTALS.slice(at + "    return round(total, 2)".length);
+      return ok(file(c, "src/ledger/totals.py") === expected, "only refund_total changed");
+    },
+  },
   {
     id: "edit-rename",
     tool: "edit_file",
@@ -808,6 +1013,46 @@ export const TASKS: Task[] = [
         return ok(false, "invalid JSON");
       }
     },
+  },
+  // Long turns: many steps, so calls late in a growing history show whether
+  // the model still uses each tool correctly.
+  {
+    id: "long-refactor",
+    tool: "multi",
+    prompt: () =>
+      "Make these changes, then run `python3 -m unittest discover -s tests` and fix anything that fails until it passes:\n" +
+      "1. Rename apply_discount to discount_price everywhere it is defined, called, or imported, including the tests.\n" +
+      "2. Make discount_price raise ValueError when percent is below 0 or above 100, and add a test for that.\n" +
+      "3. Add with_regional_tax(amount, rate) to src/ledger/pricing.py that returns round(amount * (1 + rate), 2), with a test.\n" +
+      "4. Delete the deprecated print_summary function from src/ledger/reports.py.\n" +
+      "Tell me how many tests ran at the end.",
+    timeoutSec: 600,
+    check: (c) => {
+      const run = spawnSync("python3", ["-m", "unittest", "discover", "-s", "tests"], { cwd: c.repo, encoding: "utf8" });
+      const ran = Number(/Ran (\d+) test/.exec(run.stderr ?? "")?.[1] ?? 0);
+      const source = ["src/ledger/pricing.py", "src/ledger/reports.py", "tests/test_pricing.py"].map((path) => file(c, path) ?? "").join("\n");
+      const tests = file(c, "tests/test_pricing.py") ?? "";
+      const done =
+        run.status === 0 &&
+        ran >= 5 &&
+        !/\bapply_discount\b/.test(source) &&
+        /def discount_price/.test(source) &&
+        /ValueError/.test(tests) &&
+        /with_regional_tax/.test(tests) &&
+        !/def print_summary/.test(source);
+      return ok(done, `tests pass (ran ${ran}, exit ${run.status}) with the rename, guard, new function, and deletion`);
+    },
+  },
+  {
+    id: "long-audit",
+    tool: "multi",
+    prompt: () =>
+      "List every TODO in this repository, in code and docs, as a table with the file, the line number, and the TODO text. Then tell me which function each code TODO sits in.",
+    check: (c) =>
+      ok(
+        has(c.output, "per-region", "legacy discount", "CSV exporter", "warehouse code", "report format", "with_tax") && numberIn(c.output, 13),
+        "all five TODOs, and pricing.py line 13 in with_tax",
+      ),
   },
   {
     id: "shell-tests",
@@ -949,6 +1194,9 @@ export interface Arm {
   bin: string;
   variant: Variant;
   variantPath: string;
+  transform?: Transform;
+  /** `armKey` of this arm, computed once when the run starts. */
+  key?: string;
 }
 
 export interface RunResult {
@@ -968,16 +1216,31 @@ export interface RunResult {
   targetCalls: number;
   targetErrors: number;
   allErrors: number;
+  /** Calls after the first ten, and how many of them fx answered with an error. */
+  lateCalls: number;
+  lateErrors: number;
+  rejectedCalls: number;
+  exitedCalls: number;
   offSchemaFields: string[];
   agentRequests: number;
   inputTokens: number;
+  /** Input tokens the provider reported reading from or writing to its prompt cache. */
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
   outputTokens: number;
   toolsBytes: number;
   toolsHash: string | null;
   usageMissing: number;
   durationMs: number;
   stderrTail: string;
+  /** Errors a variant's transform threw; any of them fails the run. */
+  transformErrors: string[];
+  /** The arm's `armKey` when this run ran; runs stored before it was added have none. */
+  armKey?: string;
 }
+
+/** Calls from this index on count as late in a long turn. */
+const LATE_CALL_INDEX = 10;
 
 let nextPort = 18700 + Math.floor(Math.random() * 500);
 
@@ -986,7 +1249,7 @@ export async function runOne(arm: Arm, model: string, task: Task, trial: number,
   const { repo, home, trackerLog } = writeFixture(root);
   const port = nextPort++;
   task.setup?.(repo);
-  const proxy = startProxy(arm.variant, testKey);
+  const proxy = startProxy(arm.variant, testKey, arm.transform);
   const prompt = task.prompt({ port });
   const timeoutSec = task.timeoutSec ?? 300;
   const started = Date.now();
@@ -1039,6 +1302,7 @@ export async function runOne(arm: Arm, model: string, task: Task, trial: number,
   } catch (error) {
     check = { pass: false, reason: `oracle threw: ${error}` };
   }
+  if (proxy.transformErrors.length) check = { pass: false, reason: `transform failed: ${proxy.transformErrors[0]}` };
   task.cleanup?.({ port });
   const agent = proxy.requests.filter((r) => r.agent);
   const props = root_request?.toolProps ?? agent[0]?.toolProps ?? {};
@@ -1047,7 +1311,13 @@ export async function runOne(arm: Arm, model: string, task: Task, trial: number,
     if (!call.input || call.providerExecuted || !props[call.name]) continue;
     for (const key of Object.keys(call.input)) if (!props[call.name].includes(key)) offSchema.add(`${call.name}.${key}`);
   }
-  const targetCalls = task.tool === "web_search" ? (proxy.requests.some((r) => r.providerSearch) ? [{ error: false }] : []) : calls.filter((c) => c.name === task.tool);
+  const targetCalls =
+    task.tool === "web_search"
+      ? proxy.requests.some((r) => r.providerSearch)
+        ? [{ error: false }]
+        : []
+      : // A long turn exercises every tool it calls.
+        calls.filter((c) => (task.tool === "multi" ? !c.providerExecuted : c.name === task.tool));
   const result: RunResult = {
     arm: arm.name,
     model,
@@ -1065,15 +1335,23 @@ export async function runOne(arm: Arm, model: string, task: Task, trial: number,
     targetCalls: targetCalls.length,
     targetErrors: targetCalls.filter((c) => c.error).length,
     allErrors: calls.filter((c) => c.error).length,
+    lateCalls: calls.slice(LATE_CALL_INDEX).filter((c) => !c.providerExecuted).length,
+    lateErrors: calls.slice(LATE_CALL_INDEX).filter((c) => c.error).length,
+    rejectedCalls: calls.filter((c) => callFailure(c) === "rejected").length,
+    exitedCalls: calls.filter((c) => callFailure(c) === "exited").length,
     offSchemaFields: [...offSchema],
     agentRequests: agent.length,
     inputTokens: agent.reduce((sum, r) => sum + (r.usage?.input ?? 0), 0),
+    cacheReadTokens: agent.reduce((sum, r) => sum + (r.usage?.cacheRead ?? 0), 0),
+    cacheWriteTokens: agent.reduce((sum, r) => sum + (r.usage?.cacheWrite ?? 0), 0),
     outputTokens: agent.reduce((sum, r) => sum + (r.usage?.output ?? 0), 0),
     toolsBytes: agent[0]?.toolsBytes ?? 0,
     toolsHash: agent[0]?.toolsHash ?? null,
     usageMissing: agent.filter((r) => r.usage === null).length,
     durationMs: Date.now() - started,
     stderrTail: stderr.slice(-600),
+    transformErrors: proxy.transformErrors,
+    armKey: arm.key,
   };
   rmSync(root, { recursive: true, force: true });
   return result;
@@ -1094,6 +1372,37 @@ export async function pool<T>(items: Array<() => Promise<T>>, size: number): Pro
 }
 
 // ---------------------------------------------------------------------------
+// Rescore
+
+/**
+ * Re-judges the stored runs of the wanted tasks from their output and tool
+ * calls, after an oracle fix, and returns how many verdicts changed. A run
+ * whose transform failed stays failed: no oracle judged a transformed run.
+ */
+export function rescoreResults(results: RunResult[], wanted: Set<string>, tasks: readonly Task[] = TASKS): number {
+  let changed = 0;
+  for (const r of results) {
+    const task = tasks.find((t) => t.id === r.task);
+    if (!task || !wanted.has(r.task) || r.transformErrors?.length) continue;
+    const verdict = task.check({
+      output: r.output,
+      calls: r.calls,
+      fxToolCalls: r.fxToolCalls ?? [],
+      stderr: r.stderrTail,
+      webSearched: r.webSearched ?? false,
+      repo: "/nonexistent",
+      home: "/nonexistent",
+      trackerLog: "/dev/null",
+      port: 0,
+    });
+    if (verdict.pass !== r.pass) changed++;
+    r.pass = verdict.pass;
+    r.reason = verdict.reason;
+  }
+  return changed;
+}
+
+// ---------------------------------------------------------------------------
 // Summary
 
 export interface GroupSummary {
@@ -1103,9 +1412,15 @@ export interface GroupSummary {
   targetCalls: number;
   targetErrors: number;
   allErrors: number;
+  lateCalls: number;
+  lateErrors: number;
+  rejectedCalls: number;
+  exitedCalls: number;
   missedTarget: number;
   offSchema: number;
   meanInputTokens: number;
+  meanCacheReadTokens: number;
+  meanCacheWriteTokens: number;
   meanOutputTokens: number;
   meanRequests: number;
   toolsBytes: number;
@@ -1125,9 +1440,15 @@ export function summarize(results: RunResult[], key: (r: RunResult) => string): 
       targetCalls: rs.reduce((s, r) => s + r.targetCalls, 0),
       targetErrors: rs.reduce((s, r) => s + r.targetErrors, 0),
       allErrors: rs.reduce((s, r) => s + r.allErrors, 0),
+      lateCalls: rs.reduce((s, r) => s + (r.lateCalls ?? 0), 0),
+      lateErrors: rs.reduce((s, r) => s + (r.lateErrors ?? 0), 0),
+      rejectedCalls: rs.reduce((s, r) => s + (r.rejectedCalls ?? 0), 0),
+      exitedCalls: rs.reduce((s, r) => s + (r.exitedCalls ?? 0), 0),
       missedTarget: rs.filter((r) => r.targetCalls === 0).length,
       offSchema: rs.reduce((s, r) => s + r.offSchemaFields.length, 0),
       meanInputTokens: mean((r) => r.inputTokens),
+      meanCacheReadTokens: mean((r) => r.cacheReadTokens ?? 0),
+      meanCacheWriteTokens: mean((r) => r.cacheWriteTokens ?? 0),
       meanOutputTokens: mean((r) => r.outputTokens),
       meanRequests: Math.round((rs.reduce((s, r) => s + r.agentRequests, 0) / rs.length) * 10) / 10,
       toolsBytes: Math.max(...rs.map((r) => r.toolsBytes)),
@@ -1137,11 +1458,11 @@ export function summarize(results: RunResult[], key: (r: RunResult) => string): 
 }
 
 export function table(rows: Record<string, GroupSummary>): string {
-  const header = "| group | runs | pass | target calls | target errors | all errors | missed target | off-schema | mean input tok | mean output tok | mean requests | tools bytes |";
-  const rule = "|" + " --- |".repeat(12);
+  const header = "| group | runs | pass | target calls | target errors | all errors | rejected | exited | late calls | late errors | missed target | off-schema | mean input tok | mean cache read tok | mean cache write tok | mean output tok | mean requests | tools bytes |";
+  const rule = "|" + " --- |".repeat(18);
   const lines = Object.values(rows).map(
     (s) =>
-      `| ${[s.group, s.runs, s.pass, s.targetCalls, s.targetErrors, s.allErrors, s.missedTarget, s.offSchema, s.meanInputTokens, s.meanOutputTokens, s.meanRequests, s.toolsBytes].join(" | ")} |`,
+      `| ${[s.group, s.runs, s.pass, s.targetCalls, s.targetErrors, s.allErrors, s.rejectedCalls, s.exitedCalls, s.lateCalls, s.lateErrors, s.missedTarget, s.offSchema, s.meanInputTokens, s.meanCacheReadTokens, s.meanCacheWriteTokens, s.meanOutputTokens, s.meanRequests, s.toolsBytes].join(" | ")} |`,
   );
   return [header, rule, ...lines].join("\n");
 }
@@ -1324,7 +1645,7 @@ async function main(): Promise<void> {
     const report: Record<string, unknown> = {};
     for (const path of list(arg("variants", "none"))) {
       const body = structuredClone(base);
-      applyVariant(body, loadVariant(path));
+      applyVariant(body, bodyOnlyVariant(path, "tokens"));
       const counts = await measureTokens(body, models, testKey);
       report[path] = { bytes: JSON.stringify(body.tools).length, counts };
       console.log(path, JSON.stringify(report[path]));
@@ -1340,6 +1661,10 @@ async function main(): Promise<void> {
       const [bin, variantPath = "none"] = rest.split("@");
       return { name, bin: resolve(bin), variant: loadVariant(variantPath), variantPath };
     });
+    for (const arm of arms) {
+      if (arm.variant.transform) arm.transform = (await import(resolve(dirname(arm.variantPath), arm.variant.transform))) as Transform;
+      arm.key = armKey(arm);
+    }
     const models = list(arg("models"));
     const toolFilter = list(arg("tools", ""));
     const taskFilter = list(arg("tasks", ""));
@@ -1349,10 +1674,13 @@ async function main(): Promise<void> {
     const outDir = arg("out");
     const concurrency = Number(arg("concurrency", "8"));
     const noSave = process.argv.includes("--no-save");
+    // --resume reuses each run whose result file a stopped run already wrote,
+    // when that run's arm key matches the arm now; any other run runs again.
+    const resume = process.argv.includes("--resume");
     mkdirSync(outDir, { recursive: true });
     writeFileSync(
       join(outDir, "config.json"),
-      JSON.stringify({ arms: arms.map((a) => ({ name: a.name, bin: a.bin, variantPath: a.variantPath, variant: a.variant })), models, tasks: tasks.map((t) => t.id), trials }, null, 2),
+      JSON.stringify({ arms: arms.map((a) => ({ name: a.name, bin: a.bin, key: a.key, variantPath: a.variantPath, variant: a.variant })), models, tasks: tasks.map((t) => t.id), trials }, null, 2),
     );
 
     const jobs: Array<() => Promise<RunResult>> = [];
@@ -1363,8 +1691,19 @@ async function main(): Promise<void> {
           const order = trial % 2 === 0 ? arms : [...arms].reverse();
           for (const arm of order) {
             jobs.push(async () => {
+              const file = join(outDir, `${model.replaceAll("/", "_")}-${task.id}-${arm.name}-${trial}.json`);
+              if (resume && existsSync(file)) {
+                let stored: RunResult | null = null;
+                try {
+                  stored = JSON.parse(readFileSync(file, "utf8")) as RunResult;
+                } catch (error) {
+                  console.log(`resume: rerunning ${file}; it could not be read: ${error}`);
+                }
+                const reused = stored && reusableRun(stored, arm.key, file);
+                if (reused) return reused;
+              }
               const result = await runOne(arm, model, task, trial, testKey, noSave);
-              writeFileSync(join(outDir, `${model.replaceAll("/", "_")}-${task.id}-${arm.name}-${trial}.json`), JSON.stringify(result, null, 2));
+              writeFileSync(file, JSON.stringify(result, null, 2));
               const calls = result.calls.map((c) => c.name + (c.error ? "!" : "")).join(",");
               console.log(
                 `${result.pass ? "PASS" : "FAIL"} ${arm.name.padEnd(9)} ${model.padEnd(28)} ${task.id.padEnd(18)} t${trial} in=${result.inputTokens} calls=${calls} ${result.pass ? "" : result.reason}`,
@@ -1399,25 +1738,7 @@ async function main(): Promise<void> {
     const outDir = arg("out");
     const wanted = new Set(list(arg("tasks")));
     const results = JSON.parse(readFileSync(join(outDir, "results.json"), "utf8")) as RunResult[];
-    let changed = 0;
-    for (const r of results) {
-      const task = TASKS.find((t) => t.id === r.task);
-      if (!task || !wanted.has(r.task)) continue;
-      const verdict = task.check({
-        output: r.output,
-        calls: r.calls,
-        fxToolCalls: r.fxToolCalls ?? [],
-        stderr: r.stderrTail,
-        webSearched: r.webSearched ?? false,
-        repo: "/nonexistent",
-        home: "/nonexistent",
-        trackerLog: "/dev/null",
-        port: 0,
-      });
-      if (verdict.pass !== r.pass) changed++;
-      r.pass = verdict.pass;
-      r.reason = verdict.reason;
-    }
+    const changed = rescoreResults(results, wanted);
     writeFileSync(join(outDir, "results.json"), JSON.stringify(results, null, 2));
     const report = [
       "## By arm",
@@ -1442,7 +1763,7 @@ async function main(): Promise<void> {
     const arms = list(arg("arms")).map((spec) => {
       const [name, path] = spec.split("=");
       const body = structuredClone(base);
-      applyVariant(body, loadVariant(path));
+      applyVariant(body, bodyOnlyVariant(path, "probe"));
       return { name, body };
     });
     const models = list(arg("models"));

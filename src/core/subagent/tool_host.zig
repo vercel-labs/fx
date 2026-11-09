@@ -531,73 +531,96 @@ pub const Runtime = struct {
         var admission_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer admission_arena.deinit();
         const admission_alloc = admission_arena.allocator();
-        var admitted = try self.admitAndStartManagedWork(admission_alloc, request.*, operation_id, profiled, resolved_model);
-        defer admitted.deinit(admission_alloc);
         const agent = request.message.agent;
-        switch (admitted) {
-            .feedback => |target| {
-                const delivery = steer: {
-                    self.admission_mutex.lockUncancelable(io_mod.getIo());
-                    defer self.admission_mutex.unlock(io_mod.getIo());
-                    // Older messages for this child wait their turn; a new one
-                    // never joins the running turn past them. A turn the user
-                    // started has no slot to join, so they wait for it too.
-                    if (!self.hasPendingLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) {
-                        const result = try self.managed.steer(target.child_id, target.work_id, operation_id, fingerprint, request.message.message);
-                        switch (result) {
-                            .receipt => |delivery| break :steer delivery,
-                            .waiting => {},
-                            .unavailable, .cancelled, .conflict, .capacity => return self.encodeManaged(alloc, .{
-                                .ok = false,
-                                .error_code = switch (result) {
-                                    .unavailable => "state_unavailable",
-                                    .cancelled => "child_cancelled",
-                                    .conflict => "operation_conflict",
-                                    .capacity => "feedback_capacity",
-                                    else => unreachable,
+        // A second pass runs only when the child went idle while this
+        // message waited for the admission lock (the `.feedback` arm).
+        admit: for (0..2) |pass| {
+            var admitted = try self.admitAndStartManagedWork(admission_alloc, request.*, operation_id, profiled, resolved_model);
+            defer admitted.deinit(admission_alloc);
+            switch (admitted) {
+                .feedback => |target| {
+                    const delivery = steer: {
+                        self.admission_mutex.lockUncancelable(io_mod.getIo());
+                        defer self.admission_mutex.unlock(io_mod.getIo());
+                        // Older messages for this child wait their turn; a new one
+                        // never joins the running turn past them. A turn the user
+                        // started has no slot to join, so they wait for it too.
+                        // A child being closed takes no next turn, and what
+                        // waits for it goes with the close, so it refuses the
+                        // message as admission does
+                        // (`tests/tla/subagent/StopMessage.tla`
+                        // RefusedOnlyWhenClosing).
+                        if (self.closingIndexLocked(target.child_id) != null) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_closing" });
+                        var turned_away = false;
+                        if (!self.hasPendingLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) {
+                            const result = try self.managed.steer(target.child_id, target.work_id, operation_id, fingerprint, request.message.message);
+                            switch (result) {
+                                .receipt => |delivery| break :steer delivery,
+                                // An ended work, or one a stop is ending, takes the
+                                // message as its next turn: the stop told the
+                                // parent the turn ended.
+                                .waiting, .stopping => turned_away = true,
+                                .capacity => {
+                                    var buf: [sent_result_bytes]u8 = undefined;
+                                    return self.encodeManaged(alloc, .{ .ok = false, .error_code = "feedback_capacity", .result = capacityResult(&buf, agent) });
                                 },
-                            }),
+                                .unavailable, .cancelled, .conflict => return self.encodeManaged(alloc, .{
+                                    .ok = false,
+                                    .error_code = switch (result) {
+                                        .unavailable => "state_unavailable",
+                                        .cancelled => "child_cancelled",
+                                        .conflict => "operation_conflict",
+                                        else => unreachable,
+                                    },
+                                }),
+                            }
                         }
-                    }
-                    // It waits, and starts the child's next turn.
-                    self.queuePendingLocked(target.child_id, agent, operation_id, fingerprint, request.*, profiled, resolved_model) catch |err| {
-                        if (err == error.QueueFull) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "queue_full" });
-                        return err;
+                        // The work ended while this message waited for the lock,
+                        // and nothing keeps the child busy any more: admit the
+                        // message again, so it starts a work rather than waiting
+                        // for a turn no end will start.
+                        if (turned_away and pass == 0 and !self.isBusyLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) continue :admit;
+                        // It waits, and starts the child's next turn.
+                        self.queuePendingLocked(target.child_id, agent, operation_id, fingerprint, request.*, profiled, resolved_model) catch |err| {
+                            if (err == error.QueueFull) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "queue_full" });
+                            return err;
+                        };
+                        keep_call = true;
+                        if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = target.child_id, .work_id = operation_id, .phase = .dispatched } });
+                        var buf: [sent_result_bytes]u8 = undefined;
+                        return self.encodeManaged(alloc, .{ .ok = true, .result = queuedResult(&buf, agent) });
                     };
+                    debug_trace.eventf("mailbox", "message", .{}, "child={s} work_id={s} delivery=joined receipt={s}", .{ target.child_id, target.work_id, @tagName(delivery) });
+                    if (options.observer) |observer| observer.emit(.{ .delegation = .{
+                        .call_id = options.invocation_id,
+                        .child_id = target.child_id,
+                        .work_id = target.work_id,
+                        .operation_id = operation_id,
+                        .phase = switch (delivery) {
+                            .queued => .feedback_queued,
+                            .applied => .feedback_applied,
+                            .not_applied => .feedback_not_applied,
+                        },
+                    } });
+                    return self.encodeManaged(alloc, model_contract.feedbackResult(delivery));
+                },
+                .rejected => |failure| return self.encodeManaged(alloc, .{
+                    .ok = false,
+                    .error_code = failure.code,
+                }),
+                .ready => |ready| {
                     keep_call = true;
-                    if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = target.child_id, .work_id = operation_id, .phase = .dispatched } });
+                    if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
                     var buf: [sent_result_bytes]u8 = undefined;
-                    return self.encodeManaged(alloc, .{ .ok = true, .result = queuedResult(&buf, agent) });
-                };
-                debug_trace.eventf("mailbox", "message", .{}, "child={s} work_id={s} delivery=joined receipt={s}", .{ target.child_id, target.work_id, @tagName(delivery) });
-                if (options.observer) |observer| observer.emit(.{ .delegation = .{
-                    .call_id = options.invocation_id,
-                    .child_id = target.child_id,
-                    .work_id = target.work_id,
-                    .operation_id = operation_id,
-                    .phase = switch (delivery) {
-                        .queued => .feedback_queued,
-                        .applied => .feedback_applied,
-                        .not_applied => .feedback_not_applied,
-                    },
-                } });
-                return self.encodeManaged(alloc, model_contract.feedbackResult(delivery));
-            },
-            .rejected => |failure| return self.encodeManaged(alloc, .{
-                .ok = false,
-                .error_code = failure.code,
-            }),
-            .ready => |ready| {
-                keep_call = true;
-                if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
-                var buf: [sent_result_bytes]u8 = undefined;
-                return self.encodeManaged(alloc, .{ .ok = true, .result = sentResult(&buf, agent) });
-            },
-            .completed => |completed| {
-                if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = completed.child_id, .work_id = operation_id, .phase = .replayed } });
-                return self.encodeManaged(alloc, .{ .ok = true, .result = "This message was sent earlier, and the subagent's work on it has ended. Its report went to you then." });
-            },
+                    return self.encodeManaged(alloc, .{ .ok = true, .result = sentResult(&buf, agent) });
+                },
+                .completed => |completed| {
+                    if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = completed.child_id, .work_id = operation_id, .phase = .replayed } });
+                    return self.encodeManaged(alloc, .{ .ok = true, .result = "This message was sent earlier, and the subagent's work on it has ended. Its report went to you then." });
+                },
+            }
         }
+        unreachable;
     }
 
     const WorkCall = struct {
@@ -1027,10 +1050,12 @@ pub const Runtime = struct {
     /// What a report says about the work: the child's reply, or how it
     /// ended, with any text it had written.
     fn reportOutput(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) ![]const u8 {
-        const text = if (end.reply) |reply|
-            (if (reply.len > 0) reply else null)
+        const saved = if (end.reply) |reply|
+            reply
         else
             self.managedResultText(a, end.child_id, end.work_id) catch null;
+        // An empty reply says nothing, so the report reads as if it had none.
+        const text = if (saved) |value| (if (value.len > 0) value else null) else null;
         return switch (end.outcome) {
             .completed => text orelse "The subagent ended its turn without a reply.",
             .failed => formatFailedResult(a, if (end.failure) |*failure| failure.view() else null, text),
@@ -1374,8 +1399,11 @@ pub const Runtime = struct {
         const dropped, const stopped = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
-            const dropped = self.dropPendingLocked(child_id, "stopped");
-            break :blk .{ dropped, self.managed.stop(child_id) or self.stopTurnWorkLocked(child_id) };
+            const waiting = self.dropPendingLocked(child_id, "stopped");
+            // The stopped turn's unread messages go with it, so they count
+            // too (`tests/tla/subagent/StopMessage.tla` NoSilentLoss).
+            if (self.managed.stop(child_id)) |unread| break :blk .{ waiting + unread, true };
+            break :blk .{ waiting, self.stopTurnWorkLocked(child_id) };
         };
         debug_trace.eventf("mailbox", "stop", .{}, "target={s} by=parent running={} dropped={d}", .{ child_id, stopped, dropped });
         const dropped_text = switch (dropped) {
@@ -1436,15 +1464,21 @@ pub const Runtime = struct {
             const dropped = self.dropPendingLocked(child_id, "closed");
             // A user's close tells the parent what it dropped, as a stop does.
             if (by == .user) self.noteUserDropLocked(child_id, dropped, true);
+            // The parent's close drops the closed turn's unread messages
+            // and counts them, as its stop does.
+            var unread: usize = 0;
             const stopped = switch (by) {
-                .parent => self.managed.stop(child_id),
+                .parent => if (self.managed.stop(child_id)) |count| ended: {
+                    unread = count;
+                    break :ended true;
+                } else false,
                 .user => self.managed.closeByUser(child_id),
             } or self.stopTurnWorkLocked(child_id);
             self.closing.appendAssumeCapacity(owned);
             self.closed_unseen.appendAssumeCapacity(unseen);
             self.closed_waiting.store(true, .release);
-            debug_trace.eventf("mailbox", "close", .{}, "target={s} by={s} running={} dropped={d}", .{ child_id, @tagName(by), stopped, dropped });
-            break :blk .{ .{ .stopped = stopped, .dropped = dropped }, !self.isBusyLocked(child_id) and !self.inTurnWorkLocked(child_id) };
+            debug_trace.eventf("mailbox", "close", .{}, "target={s} by={s} running={} dropped={d}", .{ child_id, @tagName(by), stopped, dropped + unread });
+            break :blk .{ .{ .stopped = stopped, .dropped = dropped + unread }, !self.isBusyLocked(child_id) and !self.inTurnWorkLocked(child_id) };
         };
         if (settle_now and !self.settleClose(child_id)) return error.CloseNotSaved;
         return result;
@@ -1554,6 +1588,7 @@ pub const Runtime = struct {
         };
         if (failure) |err| return self.closeNotWritten(owned, err);
         debug_trace.eventf("mailbox", "closed", .{}, "child={s}", .{owned});
+        self.managed.forgetFeedback(owned);
         return true;
     }
 
@@ -2033,6 +2068,8 @@ const MailboxFixture = struct {
     steerable: bool = false,
     /// While set, the first run fails once released.
     fail_first: bool = false,
+    /// While set, each run saves an empty reply.
+    empty_reply: bool = false,
     release: std.Io.Event = .unset,
     runs: std.atomic.Value(usize) = .init(0),
     mutex: std.Io.Mutex = .init,
@@ -2064,7 +2101,10 @@ const MailboxFixture = struct {
         while (self.hold and !self.release.isSet() and !cancel.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
         if (cancel.load(.seq_cst)) return error.Cancelled;
         if (self.fail_first and run_number == 1) return error.ProviderFailed;
-        const reply = std.testing.allocator.print("DONE {s}", .{message.content}) catch return error.ProviderFailed;
+        const reply = if (self.empty_reply)
+            std.testing.allocator.dupe(u8, "") catch return error.ProviderFailed
+        else
+            std.testing.allocator.print("DONE {s}", .{message.content}) catch return error.ProviderFailed;
         defer std.testing.allocator.free(reply);
         turn.commit(turn.active_work_id.?, .{ .assistant = .{
             .user = .{ .text = message.content },
@@ -2164,6 +2204,25 @@ test "a message returns at once, and the subagent's report reaches its parent on
 
     const status = try callTool(runtime, arena, .{ .status = .{} }, "call-2", null);
     try std.testing.expect(std.mem.find(u8, status, "reviewer: idle, last work completed, reports final") != null);
+}
+
+test "a work that saves an empty reply reports that it ended without one" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .empty_reply = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "check" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], " completed The subagent ended its turn without a reply."));
 }
 
 test "a message to a busy subagent waits and runs as its next work, in order" {
@@ -3163,6 +3222,12 @@ const sent_result_bytes = 256 + domain.max_agent_name_bytes;
 /// `message`'s answer when the child takes it now.
 fn sentResult(buf: []u8, agent: []const u8) []const u8 {
     return std.mem.print(buf, "Sent to {s}, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.", .{agent}) catch "Sent.";
+}
+
+/// `message`'s refusal when the child's running turn already holds as many
+/// unread messages as it takes.
+fn capacityResult(buf: []u8, agent: []const u8) []const u8 {
+    return std.mem.print(buf, "{s} already has {d} unread messages from you. Its next step reads them; send this one again after that, or wait for its report.", .{ agent, managed_owner.max_unread_feedback }) catch "The subagent already has too many unread messages from you.";
 }
 
 /// `message`'s answer when the child is busy and the message waits.

@@ -136,15 +136,18 @@ export function interpret(body: string, sid: string | null): Pick<ObservedCall, 
 
 function sessionResults(home: string): Map<string, string> {
   const results = new Map<string, string>();
-  const root = join(home, ".fx", "sessions");
+  const root = join(home, ".fx", "sessions", "v2");
   for (const id of existsSync(root) ? readdirSync(root) : []) {
-    const events = join(root, id, "events.jsonl");
-    if (!existsSync(events)) continue;
-    for (const line of readFileSync(events, "utf8").split("\n").filter(Boolean)) {
-      const result = JSON.parse(line).event?.tool_result;
-      if (!result?.call_id) continue;
-      const artifact = result.artifact_ref ? join(root, id, "tool-results", result.artifact_ref) : "";
-      results.set(result.call_id, artifact && existsSync(artifact) ? readFileSync(artifact, "utf8") : String(result.preview ?? ""));
+    const log = join(root, id, "log.jsonl");
+    if (!existsSync(log)) continue;
+    for (const line of readFileSync(log, "utf8").split("\n").filter(Boolean)) {
+      const record = JSON.parse(line);
+      if (record.type !== "tool_result" || !record.data?.call_id) continue;
+      // A v2 session keeps each tool output in blobs/<hash>, named by its
+      // artifact_ref "result-<hash>.txt".
+      const hash = /^result-([0-9a-f]+)\.txt$/.exec(record.data.artifact_ref ?? "")?.[1];
+      const blob = hash ? join(root, id, "blobs", hash) : "";
+      results.set(record.data.call_id, blob && existsSync(blob) ? readFileSync(blob, "utf8") : String(record.data.preview ?? ""));
     }
   }
   return results;

@@ -3009,6 +3009,16 @@ fn writeStyledSourceLabel(writer: *std.Io.Writer, styles: SkillSummaryStyles, la
     try writer.print("{s}[{s}]{s}", .{ styles.source_label_style, label, styles.reset_style });
 }
 
+/// Whether `listed` holds a copy of `skill`: one with its name and
+/// description. A list for the model shows such a copy once, the first in
+/// discovery order, since it gives the model nothing to choose between.
+pub fn listsSameSkill(listed: []const Skill, skill: Skill) bool {
+    for (listed) |other| {
+        if (std.mem.eql(u8, other.name, skill.name) and std.mem.eql(u8, other.description, skill.description)) return true;
+    }
+    return false;
+}
+
 fn buildSkillsSystemPromptSectionWithLimits(
     alloc: Allocator,
     all_skills: []const Skill,
@@ -3033,9 +3043,25 @@ pub fn buildSkillPrompt(
     defer visible.deinit(alloc);
     var identity_scratch = std.heap.ArenaAllocator.init(alloc);
     defer identity_scratch.deinit();
+    var withheld: usize = 0;
     for (skills) |skill| {
         if (!try tool_result_limits.modelProjectionPreservesText(identity_scratch.allocator(), skill.name) or
-            !try tool_result_limits.modelProjectionPreservesText(identity_scratch.allocator(), skill.path)) continue;
+            !try tool_result_limits.modelProjectionPreservesText(identity_scratch.allocator(), skill.path))
+        {
+            withheld += 1;
+            continue;
+        }
+        // A copy with the same name and description as one already listed
+        // gives the model nothing to choose between, so only the first copy
+        // in discovery order is listed.
+        if (listsSameSkill(visible.items, skill)) {
+            debug_trace.logf(
+                "skills",
+                "catalog omitted identical copy name=\"{f}\" path=\"{f}\": an earlier copy with the same name and description is listed",
+                .{ std.zig.fmtString(skill.name), std.zig.fmtString(skill.path) },
+            );
+            continue;
+        }
         try visible.append(alloc, skill);
     }
     var section = renderSkillPrompt(alloc, visible.items, limits, context_window, catalog_namespace(visible.items, workspace_root), workspace_root) catch |err| {
@@ -3046,9 +3072,9 @@ pub fn buildSkillPrompt(
     section.locations.diagnostics = diagnostics;
     {
         errdefer section.deinit(alloc);
-        if (visible.items.len < skills.len) {
+        if (withheld > 0) {
             const notice = try alloc.print("{s}[context] {d} skill identities withheld because they cannot be safely represented to the model.\n", .{
-                section.notice orelse "", skills.len - visible.items.len,
+                section.notice orelse "", withheld,
             });
             if (section.notice) |previous| alloc.free(previous);
             section.notice = notice;
@@ -3188,9 +3214,10 @@ fn renderSkillPrompt(
         defer alloc.free(safe_description);
         var description_limited = false;
         if (limits.skill_description_bytes.source == .compiled_default) {
-            const end = skillDescriptionPrefix(safe_description, 1024);
-            try model_context_encoding.writeScalar(&description.writer, safe_description[0..end]);
-            description_limited = end < safe_description.len;
+            const cut = catalogDescriptionCut(safe_description, context_limits.catalog_skill_description_characters);
+            try model_context_encoding.writeScalar(&description.writer, safe_description[0..cut.end]);
+            if (cut.shortened) try description.writer.writeAll(description_cut_marker);
+            description_limited = cut.shortened;
         } else {
             const observed = try writeBoundedEncodedScalar(
                 alloc,
@@ -3360,14 +3387,16 @@ pub const LimitedDescription = struct {
 
 /// A skill's description for a list that encodes it for the model itself,
 /// such as the toolbox menu: sanitized and cut as the skill catalog cuts it,
-/// to the compiled default's 1024 characters or to `skill_description_bytes`
-/// counted in encoded bytes, so its encoding is the catalog's.
+/// by `catalogDescriptionCut` (a whole word and the marker, within the
+/// catalog's default characters) or to `skill_description_bytes` counted in
+/// encoded bytes, so its encoding is the catalog's.
 pub fn limitedSkillDescription(alloc: Allocator, description: []const u8, limits: context_limits.Values) !LimitedDescription {
     const safe = try tool_result_limits.prepareSanitizedOutput(alloc, description);
     defer alloc.free(safe);
     if (limits.skill_description_bytes.source == .compiled_default) {
-        const end = skillDescriptionPrefix(safe, 1024);
-        return .{ .text = try alloc.dupe(u8, safe[0..end]), .limited = end < safe.len };
+        const cut = catalogDescriptionCut(safe, context_limits.catalog_skill_description_characters);
+        if (!cut.shortened) return .{ .text = try alloc.dupe(u8, safe), .limited = false };
+        return .{ .text = try std.mem.concat(alloc, u8, &.{ safe[0..cut.end], description_cut_marker }), .limited = true };
     }
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
@@ -3399,6 +3428,68 @@ test "a limited skill description encodes to the catalog's cut" {
     defer alloc.free(whole.text);
     try std.testing.expect(!whole.limited);
     try std.testing.expectEqualStrings("Short.", whole.text);
+}
+
+test "an unconfigured skill description is cut to the catalog's default characters" {
+    const alloc = std.testing.allocator;
+    const long = text_utils.repeat("é", 300);
+    const cut = try limitedSkillDescription(alloc, long, .{});
+    defer alloc.free(cut.text);
+    try std.testing.expect(cut.limited);
+    try std.testing.expectEqual(@as(usize, context_limits.catalog_skill_description_characters), try std.unicode.utf8CountCodepoints(cut.text));
+
+    // A configured limit replaces the default, and counts bytes.
+    var configured: context_limits.Values = .{};
+    configured.skill_description_bytes = .{ .value = .{ .bytes = 250 }, .source = .user_global };
+    const kept = try limitedSkillDescription(alloc, text_utils.repeat("x", 300), configured);
+    defer alloc.free(kept.text);
+    try std.testing.expect(kept.limited);
+    try std.testing.expectEqual(@as(usize, 250), kept.text.len);
+}
+
+test "a menu description ends at a whole word and marks the cut, as the catalog's does" {
+    const alloc = std.testing.allocator;
+    const description = text_utils.repeat("Draft release notes from merged pull requests. ", 8);
+    const cut = try limitedSkillDescription(alloc, description, .{});
+    defer alloc.free(cut.text);
+    try std.testing.expect(cut.limited);
+    try std.testing.expect(std.mem.endsWith(u8, cut.text, "pull requests. Draft..."));
+    try std.testing.expect(try std.unicode.utf8CountCodepoints(cut.text) <= context_limits.catalog_skill_description_characters);
+
+    // The catalog shows the same text for the same skill.
+    const skills = [_]Skill{.{ .name = "notes", .description = description, .path = "/workspace/.agents/skills/notes", .source = .workspace_agents }};
+    var catalog = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
+    defer catalog.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, catalog.text, cut.text) != null);
+}
+
+/// Ends a description the catalog shortened, as `writeBoundedSkillName` ends
+/// a shortened name.
+const description_cut_marker = "...";
+
+const DescriptionCut = struct {
+    /// Byte length of the text to show.
+    end: usize,
+    /// The text goes on past `end`, so the marker follows it.
+    shortened: bool,
+};
+
+/// The catalog's default cut: at most `max_characters` characters, the marker
+/// included. A longer description ends after the last whole word that fits
+/// before the marker, so the model reads no broken word and can tell that the
+/// description goes on. Text whose only space falls in the first half of the
+/// room, such as a long path, is cut at the character limit instead.
+fn catalogDescriptionCut(text: []const u8, max_characters: usize) DescriptionCut {
+    const whole = skillDescriptionPrefix(text, max_characters);
+    if (whole == text.len) return .{ .end = whole, .shortened = false };
+    const room = skillDescriptionPrefix(text, max_characters - description_cut_marker.len);
+    var end = room;
+    if (text[room] != ' ') {
+        if (std.mem.findScalarLast(u8, text[0..room], ' ')) |space| {
+            if (space >= room / 2) end = space;
+        }
+    }
+    return .{ .end = std.mem.trimEnd(u8, text[0..end], " ,;:").len, .shortened = true };
 }
 
 fn skillDescriptionPrefix(text: []const u8, max_characters: usize) usize {
@@ -4589,8 +4680,10 @@ test "buildSkillsSystemPromptSection includes all visible skills without active 
 
 test "skill catalog uses model capacity and preserves explicit byte overrides" {
     const alloc = std.testing.allocator;
-    var storage: [16][24]u8 = undefined;
-    var skills: [16]Skill = undefined;
+    // Enough skills that both budgets bind with each description at the
+    // catalog's default length.
+    var storage: [64][24]u8 = undefined;
+    var skills: [64]Skill = undefined;
     for (&skills, 0..) |*skill, index| {
         const name = try std.mem.print(&storage[index], "entry-{d}", .{index});
         skill.* = .{ .name = name, .description = text_utils.repeat("useful instructions ", 80), .path = name, .source = .global_fx };
@@ -4610,6 +4703,76 @@ test "skill catalog uses model capacity and preserves explicit byte overrides" {
     defer same.deinit(alloc);
     try std.testing.expectEqualStrings(small.text, same.text);
     try std.testing.expect(small.text.len <= 1600);
+}
+
+test "catalog descriptions end at a whole word and mark the cut" {
+    const limit = context_limits.catalog_skill_description_characters;
+    // A description that fits is shown whole, with no marker.
+    const short = "Review a change.";
+    try std.testing.expectEqual(DescriptionCut{ .end = short.len, .shortened = false }, catalogDescriptionCut(short, limit));
+    const exact = text_utils.repeat("a", limit);
+    try std.testing.expectEqual(DescriptionCut{ .end = limit, .shortened = false }, catalogDescriptionCut(exact, limit));
+
+    // A longer one ends at the end of a whole word that fits before the
+    // marker, with no separator left before the marker.
+    const room = limit - description_cut_marker.len;
+    const words = text_utils.repeat("Draft release notes, ", 20);
+    const cut = catalogDescriptionCut(words, limit);
+    try std.testing.expect(cut.shortened);
+    try std.testing.expect(cut.end <= room);
+    try std.testing.expect(words[cut.end] == ' ' or words[cut.end] == ',');
+    try std.testing.expect(std.mem.trimEnd(u8, words[0..cut.end], " ,;:").len == cut.end);
+
+    // A word that ends exactly where the room ends is kept, without the comma
+    // after it.
+    const fitted = text_utils.repeat("x", room - 7) ++ " notes, and more";
+    try std.testing.expectEqual(DescriptionCut{ .end = room - 1, .shortened = true }, catalogDescriptionCut(fitted, limit));
+
+    // One long token, such as a path, is cut at the limit.
+    const token = text_utils.repeat("p", 300);
+    try std.testing.expectEqual(DescriptionCut{ .end = room, .shortened = true }, catalogDescriptionCut(token, limit));
+
+    // The cut counts characters, so a multibyte word stays whole.
+    const accented = text_utils.repeat("café ", 60);
+    const accented_cut = catalogDescriptionCut(accented, limit);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(accented[0..accented_cut.end]));
+    try std.testing.expect(std.mem.endsWith(u8, accented[0..accented_cut.end], "café"));
+}
+
+test "skill catalog marks a description it shortened" {
+    const alloc = std.testing.allocator;
+    const skills = [_]Skill{
+        .{ .name = "notes", .description = text_utils.repeat("Draft release notes from merged pull requests. ", 8), .path = "/workspace/.agents/skills/notes", .source = .workspace_agents },
+        .{ .name = "review", .description = "Review a change.", .path = "/workspace/.agents/skills/review", .source = .workspace_agents },
+    };
+    var result = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
+    defer result.deinit(alloc);
+    // Four repetitions are 188 characters; the cut ends after the next whole word.
+    try std.testing.expect(std.mem.find(u8, result.text, "pull requests. Draft... (location:") != null);
+    try std.testing.expect(std.mem.find(u8, result.text, "- review: Review a change. (location:") != null);
+}
+
+test "skill catalog lists one entry for copies with the same name and description" {
+    const alloc = std.testing.allocator;
+    const skills = [_]Skill{
+        .{ .name = "review", .description = "Review a change.", .path = "/workspace/.agents/skills/review", .source = .workspace_agents },
+        .{ .name = "review", .description = "Review a change.", .path = "/home/.fx/skills/review", .source = .global_fx },
+        .{ .name = "review", .description = "Review a pull request as an exam.", .path = "/home/.agents/skills/review", .source = .global_agents },
+    };
+    var result = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
+    defer result.deinit(alloc);
+
+    // The identical copy from the later root is not listed, and its root
+    // gets no index; the copy with its own description stays.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, result.text, "\n- review: "));
+    try std.testing.expect(std.mem.find(u8, result.text, "/home/.fx/skills") == null);
+    try std.testing.expect(std.mem.find(u8, result.text, "Review a pull request as an exam.") != null);
+    try std.testing.expect(result.notice == null);
+    const listed = try alloc.print("skill:{x:0>16}:0/review", .{result.locations.namespace});
+    defer alloc.free(listed);
+    const resolved = try result.locations.resolve(alloc, listed);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings("/workspace/.agents/skills/review", resolved);
 }
 
 test "skill catalog locations reject a changed identity mapping" {
@@ -4795,8 +4958,10 @@ test "skill catalog one-byte overflow reports every omitted name in stable order
 test "skill catalog omission notices bound hostile names and list length" {
     const alloc = std.testing.allocator;
     const huge_name = text_utils.repeat("n", 4096);
+    var descriptions: [20][8]u8 = undefined;
     var skills: [20]Skill = undefined;
-    for (&skills) |*skill| skill.* = staticSkill(huge_name, "", .workspace_shared);
+    // Distinct descriptions keep the same-name copies from being listed once.
+    for (&skills, 0..) |*skill, index| skill.* = staticSkill(huge_name, try std.mem.print(&descriptions[index], "copy {d}", .{index}), .workspace_shared);
     var limits = context_limits.Values{};
     limits.skill_catalog_bytes = .{ .value = .{ .bytes = 0 }, .source = .command_line };
 

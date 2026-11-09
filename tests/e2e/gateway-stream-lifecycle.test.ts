@@ -95,6 +95,177 @@ function createFixtureRoot(label: string): FixtureRoot {
   return { root, home, workspace: realpathSync(workspace) };
 }
 
+// Main compacts its turn while a subagent finishes. Both write main's
+// session at once: the compaction line, and the subagent's finish line.
+// Main's turn grows with large reasoning until fx compacts it mid-turn, and
+// its first step messages subagent `racer`, whose turn the gateway holds
+// until the test lets it finish. The session's write control
+// (src/core/session/write_test_controls.zig) holds every write that took due
+// compactor records, writing `<heldMarker>.<n>`, until `release` exists. On
+// old builds a second write took the same records during that hold, and its
+// clear of them panicked.
+function compactionRaceFixture(label: string) {
+  const root = createFixtureRoot(label);
+  writeFileSync(join(root.workspace, "notes.txt"), "RACE_READ_SENTINEL\n");
+  const heldMarker = join(root.root, "write-held");
+  const release = join(root.root, "write-release");
+  const held = heldFakeGatewayFinalText();
+  const counts = { childRequests: 0, mainSteps: 0, summaries: 0 };
+  const gateway = startDynamicFakeGateway(raw => {
+    if (isSummaryRequest(raw)) {
+      counts.summaries++;
+      return fakeGatewayFinalText("Main read notes.txt several times and messaged racer. Continue the turn.");
+    }
+    const body = JSON.parse(raw);
+    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+    if (latest.includes("RACE_CHILD_TASK")) {
+      counts.childRequests++;
+      return counts.childRequests === 1 ? held.response : fakeGatewayFinalText("RACE_CHILD_AGAIN");
+    }
+    if (latest.includes(REPORT_HEADER)) return fakeGatewayFinalText("REPORT_SEEN");
+    if (latest.includes("RACE_RESUME")) return fakeGatewayFinalText("RACE_RESUMED");
+    counts.mainSteps++;
+    if (counts.summaries > 0 || counts.mainSteps > 14) return fakeGatewayFinalText("RACE_MAIN_DONE");
+    // Each step's large reasoning fills main's context until fx compacts the
+    // turn, and each read becomes a compactor record.
+    return fakeGatewaySse([
+      { type: "reasoning-start", id: `race-reasoning-${counts.mainSteps}` },
+      { type: "reasoning-end", id: `race-reasoning-${counts.mainSteps}`, providerMetadata: { openai: { reasoningEncryptedContent: `RACE_REASONING_${counts.mainSteps}` + "a".repeat(80_000) } } },
+      ...(counts.mainSteps === 1
+        ? [{ type: "tool-call", toolCallId: "race-child", toolName: "subagent", input: { request: { action: "message", agent: "racer", message: "RACE_CHILD_TASK keep working" } } }]
+        : []),
+      { type: "tool-call", toolCallId: `read-${counts.mainSteps}`, toolName: "read_file", input: { path: "notes.txt" } },
+      { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+    ]);
+  }, { models: [{ id: MODEL, type: "language", tags: ["tool-use", "reasoning"], context_window: 128_000, max_tokens: 8192 }] });
+  const env = {
+    ...fixtureEnv(root, gateway, join(root.root, "trace.log")),
+    FX_SOUND: "0",
+    FX_TEST_SESSION_WRITE_HELD: heldMarker,
+    FX_TEST_SESSION_WRITE_RELEASE: release,
+  };
+  const waitFor = async (done: () => boolean, ms: number) => {
+    const deadline = Date.now() + ms;
+    while (!done() && Date.now() < deadline) await Bun.sleep(20);
+    return done();
+  };
+  return {
+    root, heldMarker, release, held, counts, gateway, env, waitFor,
+    parent: () => rootSessionIds(root.home)[0]!,
+    /// Whether `racer`'s own log has committed its turn: its finish line to
+    /// main's session comes next.
+    childCommitted: () => savedSessionIds(root.home).some((id) => {
+      const log = readFileSync(join(sessionDir(root.home, id), "log.jsonl"), "utf8");
+      return JSON.parse(log.split("\n", 1)[0]!).role === "child" && log.includes('"kind":"turn_committed"');
+    }),
+    dispose: () => {
+      held.dispose();
+      if (!existsSync(release)) writeFileSync(release, "");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    },
+  };
+}
+
+const RACE_PROMPT = "Read notes.txt until told to stop. RACE_MAIN_PROMPT";
+
+/// The records the `compaction_records` lines of session `id` list, besides
+/// each line's own map, which every such line lists too (D50). The log is
+/// read raw: the mid-turn compaction makes fx write the turn afresh as
+/// superseded, which logLines refuses.
+function listedRecords(home: string, id: string): string[] {
+  const lines = readFileSync(join(sessionDir(home, id), "log.jsonl"), "utf8")
+    .split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  const listed: string[] = [];
+  for (const line of lines) {
+    if (line.kind !== "set" || line.key !== "compaction_records") continue;
+    expect(line.blobs).toContain(line.value.map);
+    listed.push(...(line.blobs as string[]).filter((hash) => hash !== line.value.map));
+  }
+  return listed;
+}
+
+test("a compaction commit while a subagent finishes lists each record once", async () => {
+  const f = compactionRaceFixture("compaction-commit-race");
+  try {
+    const run = runFx(["ask", "--full-access", "--json", RACE_PROMPT], { cwd: f.root.workspace, env: f.env, timeoutMs: 60_000 });
+    // Main's compaction commit holds its due records.
+    expect(await f.waitFor(() => existsSync(`${f.heldMarker}.1`), 40_000)).toBe(true);
+    expect(f.counts.summaries).toBeGreaterThan(0);
+    // The subagent finishes now, so its finish line reaches main's session
+    // while the compaction's write still holds the records.
+    f.held.release("RACE_CHILD_DONE");
+    await f.waitFor(() => existsSync(`${f.heldMarker}.2`), 3_000);
+    writeFileSync(f.release, "");
+    const result = await run;
+    expect(result.stderr).not.toContain("panic");
+    expect(result.code).toBe(0);
+    expect(parseAskJson(result.stdout).exit_code).toBe(0);
+    // Only the compaction's write took the records.
+    expect(existsSync(`${f.heldMarker}.2`)).toBe(false);
+    expect(childWork(f.root.home, f.parent()).outcome).not.toBeNull();
+    // Every record is listed by exactly one line.
+    const listed = listedRecords(f.root.home, f.parent());
+    expect(listed.length).toBeGreaterThan(0);
+    expect(new Set(listed).size).toBe(listed.length);
+  } finally {
+    f.dispose();
+  }
+}, 90_000);
+
+test("fx killed while a compaction's write holds its records resumes the session", async () => {
+  const f = compactionRaceFixture("compaction-commit-kill");
+  try {
+    const proc = Bun.spawn([FX_BIN, "ask", "--full-access", "--json", RACE_PROMPT], {
+      cwd: f.root.workspace, env: { ...process.env, ...f.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    });
+    expect(await f.waitFor(() => existsSync(`${f.heldMarker}.1`), 40_000)).toBe(true);
+    // fx dies while the compaction's write holds its records: neither the
+    // records line nor the compaction line it was writing ever lands.
+    proc.kill("SIGKILL");
+    await proc.exited;
+    const parent = f.parent();
+    writeFileSync(f.release, "");
+    const resumed = await runFx(["ask", "--full-access", "--json", "--resume", parent, "RACE_RESUME continue after the crash"], {
+      cwd: f.root.workspace, env: f.env, timeoutMs: 60_000,
+    });
+    expect(resumed.stderr).not.toContain("panic");
+    expect(resumed.code).toBe(0);
+    expect(parseAskJson(resumed.stdout).exit_code).toBe(0);
+    const listed = listedRecords(f.root.home, parent);
+    expect(new Set(listed).size).toBe(listed.length);
+  } finally {
+    f.dispose();
+  }
+}, 120_000);
+
+test("fx told to quit while a compaction's write is held and a subagent's waits behind it exits without a panic", async () => {
+  const f = compactionRaceFixture("compaction-commit-term");
+  const proc = Bun.spawn([FX_BIN, "ask", "--full-access", "--json", RACE_PROMPT], {
+    cwd: f.root.workspace, env: { ...process.env, ...f.env }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+  });
+  const stderr = new Response(proc.stderr).text();
+  try {
+    expect(await f.waitFor(() => existsSync(`${f.heldMarker}.1`), 40_000)).toBe(true);
+    // The subagent finishes; its finish line to main's session waits behind
+    // the held write.
+    f.held.release("RACE_CHILD_DONE");
+    expect(await f.waitFor(() => f.childCommitted(), 10_000)).toBe(true);
+    proc.kill("SIGTERM");
+    writeFileSync(f.release, "");
+    const exitCode = await Promise.race([proc.exited, Bun.sleep(20_000).then(() => "hung" as const)]);
+    expect(exitCode).not.toBe("hung");
+    expect(await stderr).not.toContain("panic");
+    expect(exitCode).toBe(143);
+    expect(existsSync(`${f.heldMarker}.2`)).toBe(false);
+    const listed = listedRecords(f.root.home, f.parent());
+    expect(new Set(listed).size).toBe(listed.length);
+  } finally {
+    if (proc.exitCode === null) proc.kill("SIGKILL");
+    f.dispose();
+  }
+}, 90_000);
+
 // `sessions.test.ts` covers a child that finishes while the user talks to its
 // parent; this one stops it.
 test("the user talks to the parent while its subagent works, and a stop ends the subagent's turn without a report", async () => {
@@ -1992,6 +2163,72 @@ describe("gateway stream lifecycle", () => {
       expect(advertisedSkillOpenKeys(gateway.requests[0]!.body, "linked-skill")).toEqual(["linked-skill"]);
       expect(prompt).not.toContain("symlinked rule file");
       expect(result.stderr).not.toContain("symlinked rule file");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("a skill copied into two workspace skill folders is listed once in the toolbox menu and found once by a search", async () => {
+    const root = createFixtureRoot("skill-identical-copies");
+    const tracePath = join(root.root, "trace.log");
+    const copies = [
+      join(root.workspace, ".codex", "skills", "release-notes"),
+      join(root.workspace, ".agents", "skills", "release-notes"),
+    ];
+    for (const directory of copies) {
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(
+        join(directory, "SKILL.md"),
+        "---\nname: release-notes\ndescription: Draft release notes from merged pull requests.\n---\n\nRELEASE_NOTES_BODY\n",
+      );
+    }
+    let index = 0;
+    let listed = "";
+    let found = "";
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (index++) {
+        case 0: {
+          // The two copies share a name, so the menu lists the one copy by
+          // the location it opens as.
+          const keys = advertisedSkillOpenKeys(body, "release-notes");
+          expect(keys).toHaveLength(1);
+          expect(keys[0]).toStartWith("skill:");
+          listed = keys[0]!;
+          return fakeGatewayToolCall("copies_search", "toolbox", { search: "release notes" });
+        }
+        case 1: {
+          const search = toolboxSkillSearch(toolResultOutput(body, "copies_search"));
+          expect(search.skills).toHaveLength(1);
+          found = search.skills[0]!.location;
+          expect(copies).toContain(found);
+          return fakeGatewayToolCall("copies_open", "toolbox", { open: listed });
+        }
+        case 2:
+          expect(toolResultOutput(body, "copies_open")).toContain("RELEASE_NOTES_BODY");
+          return fakeGatewayFinalText("COPIES_COMPLETE");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Find the release notes skill and read it."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "skills" },
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(gateway.requestCount()).toBe(3);
+      const output = parseAskJson(result.stdout);
+      expect(output.tool_calls).toEqual([
+        { name: "toolbox", status: "success" },
+        { name: "toolbox", status: "success" },
+      ]);
+      // The copy the search left out is the one the catalog's trace names.
+      const omitted = copies.find((directory) => directory !== found)!;
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        `catalog omitted identical copy name="release-notes" path="${omitted}`,
+      );
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -5112,7 +5349,8 @@ describe("gateway stream lifecycle", () => {
         env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,tool,permission" },
         timeoutMs: 15_000,
       });
-      expect(result.code).toBe(0);
+      // The stop fails the turn, as fx's other loop stops do.
+      expect(result.code).toBe(1);
       expect(gateway.requestCount()).toBe(2);
       expect(existsSync(marker)).toBe(false);
       const json = parseAskJson(result.stdout);
@@ -9125,7 +9363,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const root = createFixtureRoot("subagent-persistent-resume");
     const resumedWorkspace = join(root.root, "resumed-workspace");
     const smallModel = "fixture/small-context";
-    const skillNames = ["alpha-check", "beta-check", "gamma-check", "delta-check"];
+    // Enough skills that the small model's catalog budget binds even with
+    // each description at the catalog's default length.
+    const skillNames = ["alpha-check", "beta-check", "gamma-check", "delta-check", "epsilon-check", "zeta-check", "eta-check", "theta-check"];
     for (const name of skillNames) {
       const directory = join(resumedWorkspace, ".agents", "skills", name);
       mkdirSync(directory, { recursive: true });
@@ -11956,3 +12196,174 @@ describe("request recovery across statuses and garbled streams", () => {
     }
   });
 });
+
+// Main stops its subagent `worker` and messages it. The subagent's first turn
+// is held until main stops it, and the end of the stopped turn is held through
+// FX_TEST_SUBAGENT_END_HELD until main's next request, so a message can land
+// while the stopped turn is still ending.
+type StopMessageState = {
+  childRequests: number;
+  secondTurns: number;
+  unreadTurns: number;
+  afterStop: string[];
+  heldMarker: string;
+  release: string;
+};
+
+// The text of tool call `id`'s result in a request body.
+function toolResultText(raw: string, id: string): string {
+  const body = JSON.parse(raw);
+  for (const message of body.prompt ?? []) {
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type !== "tool-result" || part.toolCallId !== id) continue;
+      const value = part.output?.value ?? part.output;
+      return typeof value === "string" ? value : JSON.stringify(value);
+    }
+  }
+  return "<no result>";
+}
+
+async function waitUntil(done: () => boolean, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (!done() && Date.now() < deadline) await Bun.sleep(5);
+  return done();
+}
+
+function stopCall(id: string) {
+  return { type: "tool-call", toolCallId: id, toolName: "subagent", input: { request: { action: "stop", agent: "worker" } } };
+}
+
+function messageCall(id: string, message: string) {
+  return { type: "tool-call", toolCallId: id, toolName: "subagent", input: { request: { action: "message", agent: "worker", message } } };
+}
+
+const toolCallsFinish = { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } };
+
+async function runStopMessage(
+  label: string,
+  main: (raw: string, state: StopMessageState) => Promise<Response | undefined>,
+) {
+  const root = createFixtureRoot(label);
+  const held = heldFakeGatewayFinalText();
+  const state: StopMessageState = {
+    childRequests: 0,
+    secondTurns: 0,
+    unreadTurns: 0,
+    afterStop: [],
+    heldMarker: join(root.root, "end-held"),
+    release: join(root.root, "end-release"),
+  };
+  const gateway = startDynamicFakeGateway(async raw => {
+    const body = JSON.parse(raw);
+    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+    if (latest.includes(REPORT_HEADER)) return fakeGatewayFinalText("STOPMSG_REPORT_SEEN");
+    if (latest.includes("STOPMSG_UNREAD")) {
+      state.unreadTurns++;
+      return fakeGatewayFinalText("STOPMSG_UNREAD_DONE");
+    }
+    if (latest.includes("STOPMSG_NEXT")) {
+      state.secondTurns++;
+      return fakeGatewayFinalText("STOPMSG_SECOND_DONE");
+    }
+    if (latest.includes("STOPMSG_FIRST")) {
+      state.childRequests++;
+      return held.response;
+    }
+    const reply = await main(raw, state);
+    if (reply) return reply;
+    return fakeGatewayToolCall("stopmsg-start", "subagent", { request: { action: "message", agent: "worker", message: "STOPMSG_FIRST" } });
+  }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+  try {
+    const result = await runFx(["ask", "--json", "--full-access", "Stop the worker and give it new work."], {
+      cwd: root.workspace,
+      env: {
+        ...fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        FX_SOUND: "0",
+        FX_TRACE_SCOPES: "mailbox,subagent,tool",
+        FX_TEST_SUBAGENT_END_HELD: state.heldMarker,
+        FX_TEST_SUBAGENT_END_RELEASE: state.release,
+      },
+      timeoutMs: 60_000,
+    });
+    return { result, state };
+  } finally {
+    writeFileSync(state.release, "");
+    held.release("STOPMSG_FIRST_LATE");
+    gateway.stop();
+  }
+}
+
+test("a message right after a stop starts the subagent's next turn", async () => {
+  const { result, state } = await runStopMessage("stop-then-message", async (raw, state) => {
+    if (raw.includes("stopmsg-redirect")) {
+      state.afterStop.push(raw);
+      writeFileSync(state.release, "");
+      return fakeGatewayFinalText("STOPMSG_MAIN_DONE");
+    }
+    if (raw.includes("stopmsg-stop")) {
+      // The stop has answered, and the stopped turn is still ending.
+      await waitUntil(() => existsSync(`${state.heldMarker}.1`), 20_000);
+      return fakeGatewayToolCall("stopmsg-redirect", "subagent", { request: { action: "message", agent: "worker", message: "STOPMSG_NEXT" } });
+    }
+    if (raw.includes("stopmsg-start")) {
+      await waitUntil(() => state.childRequests > 0, 20_000);
+      return fakeGatewaySse([stopCall("stopmsg-stop"), toolCallsFinish]);
+    }
+    return undefined;
+  });
+  expect(state.afterStop.length).toBe(1);
+  expect(readFileSync(`${state.heldMarker}.1`, "utf8")).toContain("by=parent");
+  expect(toolResultText(state.afterStop[0]!, "stopmsg-stop")).toContain("Stopped worker: its turn ended");
+  const message = toolResultText(state.afterStop[0]!, "stopmsg-redirect");
+  expect(message).not.toContain("child_cancelled");
+  expect(message).toContain("\"ok\":true");
+  expect(result.code).toBe(0);
+  expect(state.secondTurns).toBe(1);
+}, 90_000);
+
+test("a stop and a message to one subagent in one step run in order", async () => {
+  const { result, state } = await runStopMessage("stop-message-one-step", async (raw, state) => {
+    if (raw.includes("stopmsg-redirect")) {
+      state.afterStop.push(raw);
+      writeFileSync(state.release, "");
+      return fakeGatewayFinalText("STOPMSG_MAIN_DONE");
+    }
+    if (raw.includes("stopmsg-start")) {
+      await waitUntil(() => state.childRequests > 0, 20_000);
+      return fakeGatewaySse([stopCall("stopmsg-stop"), messageCall("stopmsg-redirect", "STOPMSG_NEXT"), toolCallsFinish]);
+    }
+    return undefined;
+  });
+  expect(state.afterStop.length).toBe(1);
+  expect(toolResultText(state.afterStop[0]!, "stopmsg-stop")).toContain("Stopped worker: its turn ended");
+  const message = toolResultText(state.afterStop[0]!, "stopmsg-redirect");
+  expect(message).not.toContain("child_cancelled");
+  expect(message).toContain("\"ok\":true");
+  expect(result.code).toBe(0);
+  // The message reached the subagent's next turn, and was not dropped with
+  // the stopped one.
+  expect(state.secondTurns).toBe(1);
+}, 90_000);
+
+test("a stop that drops an unread message says so", async () => {
+  const { result, state } = await runStopMessage("stop-drops-unread", async (raw, state) => {
+    if (raw.includes("stopmsg-stop")) {
+      state.afterStop.push(raw);
+      writeFileSync(state.release, "");
+      return fakeGatewayFinalText("STOPMSG_MAIN_DONE");
+    }
+    if (raw.includes("stopmsg-unread")) return fakeGatewaySse([stopCall("stopmsg-stop"), toolCallsFinish]);
+    if (raw.includes("stopmsg-start")) {
+      // The subagent's turn waits on its model, so the message stays unread.
+      await waitUntil(() => state.childRequests > 0, 20_000);
+      return fakeGatewaySse([messageCall("stopmsg-unread", "STOPMSG_UNREAD"), toolCallsFinish]);
+    }
+    return undefined;
+  });
+  expect(state.afterStop.length).toBe(1);
+  expect(toolResultText(state.afterStop[0]!, "stopmsg-unread")).toContain("\"delivery\":\"queued\"");
+  expect(toolResultText(state.afterStop[0]!, "stopmsg-stop")).toContain("the message waiting for it was dropped");
+  expect(state.unreadTurns).toBe(0);
+  expect(result.code).toBe(0);
+}, 90_000);

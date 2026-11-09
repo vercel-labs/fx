@@ -1071,6 +1071,9 @@ Settled after main's new compactor landed (2026-10-01):
   a side folder kept only for records, which D48 rules out. `Fork.tla`
   `SetBlob` now lists a blob inside a turn as well as outside it, since
   compaction runs mid-turn; such a setting is checked as an item is.
+  Writes of one session run one at a time, so a subagent's finish line
+  written during main's compaction never lists the same records again
+  (`tests/tla/session/SessionWrite.tla`).
 
 Settled after the first dogfood finding (2026-10-01):
 - **D51 Decision:** the message that issues running calls keeps its text

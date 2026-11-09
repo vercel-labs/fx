@@ -174,6 +174,22 @@ const InstanceState = enum {
 /// first. A finished turn counts as idle.
 pub const Busiest = enum { needs_approval, has_question, needs_you, working, idle };
 
+/// An agent that restarting fx, as an upgrade does, would stop, and what it
+/// is doing (`Runtime.busyAgentElsewhere`). `doing` is never `.idle`.
+pub const BusyAgent = struct { name: []const u8, doing: Busiest };
+
+/// What an agent in `state` is doing for a state that stands for others,
+/// or null when it is idle. A finished turn counts as idle.
+fn busyAs(state: InstanceState) ?Busiest {
+    return switch (state) {
+        .needs_approval => .needs_approval,
+        .has_question => .has_question,
+        .needs_you => .needs_you,
+        .working => .working,
+        .finished, .idle => null,
+    };
+}
+
 /// The more urgent of `a` and `b`; `InstanceState` lists the most urgent
 /// first.
 fn moreUrgent(a: InstanceState, b: InstanceState) InstanceState {
@@ -1055,13 +1071,27 @@ pub fn Runtime(comptime App: type) type {
             for (app.child_agents.items) |child| {
                 most = moreUrgent(most, instanceState(&child.agent, requestWaitsForUser(app, child)));
             }
-            return switch (most) {
-                .needs_approval => .needs_approval,
-                .has_question => .has_question,
-                .needs_you => .needs_you,
-                .working => .working,
-                .finished, .idle => .idle,
-            };
+            return busyAs(most) orelse .idle;
+        }
+
+        /// The first open agent other than the one on screen that is busy:
+        /// a turn going or queued, an approval or a question open, or a
+        /// request only the user can continue. Restarting fx would stop it.
+        /// Null when every other agent is idle. Its name may use `buf`.
+        /// Main loop only: it reads every agent's prompts.
+        pub fn busyAgentElsewhere(app: *App, buf: []u8) ?BusyAgent {
+            if (app.agent_on_screen != null and firstOpen(app)) {
+                if (busyAs(instanceState(&app.main_agent, requestWaitsForUser(app, null)))) |doing| {
+                    return .{ .name = noteName(app, null, buf), .doing = doing };
+                }
+            }
+            for (app.child_agents.items) |child| {
+                if (child == app.agent_on_screen) continue;
+                if (busyAs(instanceState(&child.agent, requestWaitsForUser(app, child)))) |doing| {
+                    return .{ .name = noteName(app, child, buf), .doing = doing };
+                }
+            }
+            return null;
         }
 
         fn targetAgent(app: *App, target: ?*ChildAgent) *AppAgent {
