@@ -2,6 +2,7 @@ const std = @import("std");
 const question_state = @import("../../core/agent/question_prompt.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const permission_request = @import("../../core/permissions/permission_request.zig");
 const approval_prompt = @import("../../core/permissions/approval_prompt.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
@@ -1570,11 +1571,8 @@ test "composer cursor follows Thai clusters on the VT grid" {
         try std.testing.expectEqual(draft.input_row, draft.frame.cursor.row);
         try std.testing.expectEqual(case.cursor_col, draft.frame.cursor.col);
 
-        var grid = try vt_emulator.Grid.init(alloc, 40, 1);
+        var grid = try paintedRowGrid(alloc, &draft, draft.input_row, 40);
         defer grid.deinit();
-        for (draft.frame.rows.items) |row| {
-            if (row.row == draft.input_row) try grid.feed(row.text.items);
-        }
         for (case.cells, 0..) |codepoint, index| {
             const cell = grid.cellAt(1, @intCast(3 + index)) orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(codepoint, cell.codepoint);
@@ -1599,16 +1597,8 @@ test "composer keeps the marks of a Thai cluster in the last column" {
     // The cursor sits after ง on the second row; the full row is above it.
     try std.testing.expectEqual(draft.input_row, draft.frame.cursor.row);
     try std.testing.expectEqual(@as(u16, 4), draft.frame.cursor.col);
-    const full_row = draft.frame.cursor.row - 1;
-    var grid = try vt_emulator.Grid.init(alloc, 40, 1);
+    var grid = try paintedRowGrid(alloc, &draft, draft.frame.cursor.row - 1, 40);
     defer grid.deinit();
-    var fed = false;
-    for (draft.frame.rows.items) |row| {
-        if (row.row != full_row) continue;
-        try grid.feed(row.text.items);
-        fed = true;
-    }
-    try std.testing.expect(fed);
     const before = grid.cellAt(1, 39) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u21, 'a'), before.codepoint);
     try std.testing.expectEqual(@as(u32, 0), before.combining_suffix_id);
@@ -1707,6 +1697,57 @@ test "composer with one content cell keeps the marks of the character it draws" 
             try std.testing.expectEqualStrings(expected.marks, marks);
         }
     }
+}
+
+test "composer paints a mark with no base on a dotted circle and leaves the prefix cell bare" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    // "┃ ": the bar is column 1 and the prompt's space cell column 2. The mark
+    // at the start of the draft gets the circle in column 3, the letter after
+    // it sits in column 4, and the cursor after it in column 5.
+    var drawn = try composeDraftFrame(alloc, "\u{0E49}a", 40);
+    defer drawn.deinit(alloc);
+    try std.testing.expectEqual(drawn.input_row, drawn.frame.cursor.row);
+    try std.testing.expectEqual(@as(u16, 5), drawn.frame.cursor.col);
+
+    var grid = try paintedRowGrid(alloc, &drawn, drawn.input_row, 40);
+    defer grid.deinit();
+    const space = grid.cellAt(1, 2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, ' '), space.codepoint);
+    try std.testing.expectEqual(@as(u32, 0), space.combining_suffix_id);
+    const circle = grid.cellAt(1, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, 0x25CC), circle.codepoint);
+    try std.testing.expectEqualStrings("\u{0E49}", grid.combiningSuffix(circle.combining_suffix_id) orelse "");
+    const letter = grid.cellAt(1, 4) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, 'a'), letter.codepoint);
+    try std.testing.expectEqual(@as(u32, 0), letter.combining_suffix_id);
+}
+
+test "composer paints a long run of marks with no base on one circle within the cell's limit" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    // 3,000 marks have no base. The first takes the circle's cell, the rest
+    // stack on it, the cell keeps at most 64 bytes of text, and painting it
+    // does not fail.
+    const marks = text_utils.repeat("\u{0E49}", 3_000);
+    var drawn = try composeDraftFrame(alloc, marks, 60);
+    defer drawn.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 4), drawn.frame.cursor.col);
+
+    var grid = try paintedRowGrid(alloc, &drawn, drawn.input_row, 60);
+    defer grid.deinit();
+    const space = grid.cellAt(1, 2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 0), space.combining_suffix_id);
+    const circle = grid.cellAt(1, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, 0x25CC), circle.codepoint);
+    try std.testing.expectEqualStrings(
+        text_utils.repeat("\u{0E49}", 20),
+        grid.combiningSuffix(circle.combining_suffix_id) orelse "",
+    );
 }
 
 test "steering banner keeps two clean lines and a composer gap in both delivery modes" {

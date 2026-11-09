@@ -1114,6 +1114,15 @@ fn appendLayoutUnitContent(
                 omitted_positive_unit.* = true;
             }
         },
+        .bare_mark => {
+            // The mark has no base to sit on, so it gets the circle and one
+            // cell, and the marks after it stack there. A full row never gets
+            // here: appendLayoutUnit returns first and flags the omission.
+            try row.appendSlice(alloc, visual_layout.bare_mark_base);
+            try row.appendSlice(alloc, source.input[unit.raw_start..unit.raw_end]);
+            remaining_cells.* -= unit.cell_width;
+            omitted_positive_unit.* = false;
+        },
         .paste_placeholder => {
             const emit_cells = @min(unit.cell_width, remaining_cells.*);
             try row_text.appendClipped(
@@ -1344,11 +1353,26 @@ test "composer row with no content cells holds no mark of an undrawn character" 
 
 test "composer row with one content cell keeps the marks of the character it draws" {
     // Three columns leave one cell after "┃ ": กั้ takes it and ง wraps to the
-    // next row. A mark with no base still shows at the start of a row that has
-    // a cell. 界 needs two cells, so it is not drawn and its accent goes with it.
+    // next row. A mark with no base takes that cell on a dotted circle, and the
+    // letter after it wraps. 界 needs two cells, so it is not drawn and its
+    // accent goes with it.
     try expectComposedRows("\u{0E01}\u{0E31}\u{0E49}\u{0E07}", 3, &.{ "┃ \u{0E01}\u{0E31}\u{0E49}", "┃ \u{0E07}" });
-    try expectComposedRows("\u{0E31}\u{0E01}\u{0E49}", 3, &.{"┃ \u{0E31}\u{0E01}\u{0E49}"});
+    try expectComposedRows("\u{0E31}\u{0E01}\u{0E49}", 3, &.{ "┃ \u{25CC}\u{0E31}", "┃ \u{0E01}\u{0E49}" });
     try expectComposedRows("\u{754C}\u{0301}\u{0E01}", 3, &.{ "┃ ", "┃ \u{0E01}" });
+}
+
+test "composer row draws a mark with no base on a dotted circle of its own cell" {
+    // A mark at the start of the draft, or after a newline, has no character
+    // to sit on, and the prompt's space cell is not one. It takes a cell on
+    // U+25CC, and the marks after it stack on that cell.
+    try expectComposedRows("\u{0E49}a", 60, &.{"┃ \u{25CC}\u{0E49}a"});
+    try expectComposedRows("\u{0301}a", 60, &.{"┃ \u{25CC}\u{0301}a"});
+    try expectComposedRows("\u{0E31}\u{0E49}a", 60, &.{"┃ \u{25CC}\u{0E31}\u{0E49}a"});
+    try expectComposedRows("a\n\u{0E49}b", 60, &.{ "┃ a", "┃ \u{25CC}\u{0E49}b" });
+    // After a base, a mark takes no cell.
+    try expectComposedRows("a\u{0E49}b", 60, &.{"┃ a\u{0E49}b"});
+    // Three columns leave one cell: the circle takes it and the letter wraps.
+    try expectComposedRows("\u{0E49}a", 3, &.{ "┃ \u{25CC}\u{0E49}", "┃ a" });
 }
 
 test "composer row drops the marks after a unit that does not fit a full row" {

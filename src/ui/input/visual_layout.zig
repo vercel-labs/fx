@@ -15,6 +15,11 @@ pub const InputPrefix = struct {
 };
 pub const UnitKind = union(enum) {
     text,
+    /// A nonspacing mark with no base character before it: the first unit of
+    /// the draft or of a line after a newline. The prompt's space cell is not a
+    /// base, so the mark takes one cell of its own, which the painter draws on
+    /// `bare_mark_base`, and the marks after it stack there.
+    bare_mark,
     tab,
     paste_placeholder,
     skill_token: usize,
@@ -22,6 +27,9 @@ pub const UnitKind = union(enum) {
         attachment_index: usize,
     },
 };
+
+/// What the painter draws under a `bare_mark` unit: U+25CC DOTTED CIRCLE.
+pub const bare_mark_base = "\u{25CC}";
 
 pub const SkillTokenSpan = registered_entities.SkillTokenSpan;
 
@@ -223,6 +231,17 @@ pub const Iterator = struct {
         }
 
         const display_unit = display_width.displayUnitAt(input, start);
+        if (display_unit.cell_width == 0 and
+            (start == 0 or input[start - 1] == '\n') and
+            display_width.isNonspacingMarkAt(input, start))
+        {
+            return .{
+                .raw_start = start,
+                .raw_end = start + display_unit.byte_len,
+                .cell_width = 1,
+                .kind = .bare_mark,
+            };
+        }
         return .{
             .raw_start = start,
             .raw_end = start + display_unit.byte_len,
@@ -246,6 +265,7 @@ pub const Iterator = struct {
         self.last_cursor_offset = raw.raw_end;
         self.at_word_start = switch (raw.kind) {
             .text => isWordBreakByte(self.source.input[raw.raw_start]),
+            .bare_mark => false,
             .tab, .paste_placeholder, .skill_token, .image_badge => true,
         };
         const available = self.availableContentCells();
@@ -1344,4 +1364,92 @@ test "skill token width ignores internal source metadata" {
 
     try std.testing.expectEqual(@as(usize, "review".len), skillTokenVisibleWidth(unique));
     try std.testing.expectEqual(@as(usize, "review".len), skillTokenVisibleWidth(ambiguous));
+}
+
+/// The kind and cells of the unit that starts at `raw_start`.
+fn unitAt(source: Source, raw_start: usize) ?Unit {
+    var it = iterator(source);
+    while (it.next()) |event| switch (event) {
+        .unit => |unit| if (unit.raw_start == raw_start) return unit,
+        .row_end => {},
+    };
+    return null;
+}
+
+test "a nonspacing mark with no base takes one cell and the marks after it none" {
+    // Two Thai marks, a letter, a newline, a Latin accent and a letter.
+    const input = "\u{0E49}\u{0E48}a\n\u{0301}b";
+    const source = testSource(input, input.len, 80);
+
+    const first = unitAt(source, 0).?;
+    try std.testing.expectEqual(UnitKind.bare_mark, first.kind);
+    try std.testing.expectEqual(@as(usize, 1), first.cell_width);
+    try std.testing.expectEqual(@as(usize, 3), first.raw_end - first.raw_start);
+
+    // The mark after it stacks on the circle and takes no cell.
+    const stacked = unitAt(source, 3).?;
+    try std.testing.expectEqual(UnitKind.text, stacked.kind);
+    try std.testing.expectEqual(@as(usize, 0), stacked.cell_width);
+    try std.testing.expectEqual(@as(usize, 1), stacked.content_column);
+    try std.testing.expectEqual(@as(usize, 1), unitAt(source, 6).?.content_column);
+
+    // A mark after a newline starts its line the same way.
+    const after_newline = unitAt(source, 8).?;
+    try std.testing.expectEqual(UnitKind.bare_mark, after_newline.kind);
+    try std.testing.expectEqual(@as(usize, 1), after_newline.cell_width);
+    try std.testing.expectEqual(@as(usize, 1), after_newline.row_index);
+    try std.testing.expectEqual(@as(usize, 0), after_newline.content_column);
+
+    // The circle's cell moves the cursor: marks, then a, is two cells.
+    try expectCursor(input, 7, 80, 0, 2);
+    try expectCursor(input, 3, 80, 0, 1);
+    try expectCursor(input, 0, 80, 0, 0);
+    try expectCursor(input, input.len, 80, 1, 2);
+}
+
+test "a mark that has a base, or is not a nonspacing mark, takes no cell of its own" {
+    // After a base character, a tab, or a space, a mark sits on what is there.
+    for ([_][]const u8{ "a\u{0E49}", "\t\u{0E49}", " \u{0E49}" }) |input| {
+        const mark_start = input.len - 3;
+        const unit = unitAt(testSource(input, input.len, 80), mark_start).?;
+        try std.testing.expectEqual(UnitKind.text, unit.kind);
+        try std.testing.expectEqual(@as(usize, 0), unit.cell_width);
+    }
+    // Zero-width characters that are not marks are left as they were: a
+    // control, a zero-width space, a joiner, and a byte order mark.
+    for ([_][]const u8{ "\x01a", "\u{200B}a", "\u{200D}a", "\u{FEFF}a" }) |input| {
+        const unit = unitAt(testSource(input, input.len, 80), 0).?;
+        try std.testing.expectEqual(UnitKind.text, unit.kind);
+        try std.testing.expectEqual(@as(usize, 0), unit.cell_width);
+    }
+}
+
+test "a row with one content cell holds a bare mark's circle and wraps the letter after it" {
+    const input = "\u{0E49}a";
+    const first = rowAt(testSource(input, input.len, 3), 0).?;
+    try std.testing.expectEqual(@as(usize, 1), first.content_width);
+    try std.testing.expectEqual(BreakKind.soft_wrap, first.break_kind);
+    try std.testing.expectEqual(@as(usize, 3), first.raw_end);
+    try expectCursor(input, input.len, 3, 1, 1);
+}
+
+test "the word after a bare mark stays on the row of the mark as a word that starts a row does" {
+    // Six columns leave four content cells. The circle takes one, so "abcd"
+    // does not fit the three left, but it fits a row of its own. The mark
+    // starts the word and the row, so the word is split by cell like any word
+    // that starts a row, and the circle is not left alone on its row.
+    const input = "\u{0E49}abcd";
+    const first = rowAt(testSource(input, input.len, 6), 0).?;
+    try std.testing.expectEqual(@as(usize, 4), first.content_width);
+    try std.testing.expectEqual(@as(usize, 6), first.raw_end);
+    try std.testing.expectEqual(BreakKind.soft_wrap, first.break_kind);
+    try expectCursor(input, input.len, 6, 1, 1);
+}
+
+test "a long run of marks with no base is one circle, one cell wide, however long" {
+    const input = text_utils.repeat("\u{0E49}", 3_000);
+    const source = testSource(input, input.len, 60);
+    try std.testing.expectEqual(@as(usize, 1), summarize(source, null).total_rows);
+    try std.testing.expectEqual(@as(usize, 1), rowAt(source, 0).?.content_width);
+    try expectCursor(input, input.len, 60, 0, 1);
 }

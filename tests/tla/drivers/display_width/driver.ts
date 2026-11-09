@@ -2,18 +2,21 @@
 // and has TLC check every walk it observes (DisplayWidthTrace.tla).
 //
 // Each walk starts by clearing the composer (End, then Ctrl+U) and sends one
-// key at a time: a code point of one of the model's classes, Left, Right,
-// Backspace, Home, or End. After every key the driver waits until the pane
-// and the cursor stop changing, then records the cursor column tmux reports,
-// counted from the first cell after "┃ ", and the class of every code point
-// tmux shows on the composer's rows, with "gap" for a blank cell. TLC requires
-// both to match the model, so a misplaced cursor, a gap, a mark left over
-// from an earlier repaint, and a mark lost at the right margin each reject a
-// walk. The edge walks come first: the P267 repro (กั้งabc, then ที่นี่ok),
-// น้ำ, every Thai nonspacing mark on a base, the spacing Thai code points next
-// to them, marks with no base, stacked marks, Thai mixed with a Latin mark and
-// a wide character, and marks on a Thai, Latin, and wide character in the
-// last column of a row. Seeded random walks follow.
+// key at a time: a code point of one of the model's classes, a run of them
+// sent together, Left, Right, Backspace, Home, or End. After every key the
+// driver waits until the pane and the cursor stop changing, then records the
+// cursor column tmux reports, counted from the first cell after "┃ ", and the
+// class of every code point tmux shows on the composer's rows, with "gap" for
+// a blank cell and "circle" for the dotted circle. TLC requires both to match
+// the model, and fx to still be running, so a misplaced cursor, a gap, a mark
+// left over from an earlier repaint, a mark lost at the right margin, a mark
+// with no base left on the prompt's cell, and a cell that fails the step each
+// reject a walk. The edge walks come first: the P267 repro (กั้งabc, then
+// ที่นี่ok), น้ำ, every Thai nonspacing mark on a base, the spacing Thai code
+// points next to them, marks with no base, one and 22 stacked on a base or
+// on the circle, a mark typed in front of text that is already there, Thai
+// mixed with a Latin mark and a wide character, and marks on a Thai, Latin,
+// and wide character in the last column of a row. Seeded random walks follow.
 //
 // A second session is two columns wide, where the composer row has no content
 // cells (Cols 0 in the model). Its walks type the same kinds of text, among
@@ -24,11 +27,17 @@
 // --narrow N sets the number of seeded random walks in that session, and
 // --only W runs just the pane W columns wide (60 or 2).
 //
-// TLC replays the walks through the model's own actions under Rule "fixed".
-// --self-check also replays them under Rule "today", fx before the Thai
-// change, which must reject the 60-column walks, and the 2-column walks under
-// Margin "cell-less-keeps", a row builder that puts the marks of undrawn
-// characters on the prefix cell, which must reject them too.
+// TLC replays the walks through the model's own actions under the change
+// (FIXED). --self-check also replays the 60-column walks under three models
+// of fx before it, each of which must reject them: Rule "today", Thai marks
+// that measure one cell, Bare "joins-prefix", a mark with no base left on the
+// prompt's cell, and Limit "refuse", a cell with no room that fails the step.
+// The 2-column walks are replayed under Margin "cell-less-keeps", a row
+// builder that puts the marks of undrawn characters on the prefix cell, which
+// must reject them too. The model's cell limit is fx's 64 bytes (CELL_BYTES),
+// and a run of marks on one cell is compared up to VIEW_MARKS of them, since
+// tmux keeps fewer than fx draws; fx's exact count is read through fx replay in
+// tests/e2e/tui-input-navigation.test.ts.
 //
 // fx runs with FX_SOUND=0, FX_DISABLE_KEYCHAIN=1, a temporary HOME and
 // FX_HOME, a fake key, and a local fake gateway. The driver fails if fx sends
@@ -49,13 +58,17 @@ import { binary, hashFile, targetHelpers } from "../lib/context";
 import { TLA_ROOT, outDir, runTlc, writeJson } from "../lib/tlc";
 
 type Class = "base" | "mark" | "am" | "ascii" | "wide" | "latin_mark";
-type Key = "clear" | "type" | "left" | "right" | "backspace" | "home" | "end";
-type Send = { key: Key; text?: string; cls?: Class };
+// What one cell of the composer's rows shows: a class, a blank cell, or the
+// dotted circle fx draws under a mark with no base.
+type Seen = Class | "gap" | "circle";
+type Key = "clear" | "type" | "type_run" | "left" | "right" | "backspace" | "home" | "end";
+type Send = { key: Key; text?: string; cls?: Class; n?: number };
 type Step = {
   key: Key;
   cls: Class | "none";
+  n: number;
   col: number;
-  row: Array<Class | "gap">;
+  row: Seen[];
   codepoint?: string;
   row_text: string;
 };
@@ -63,6 +76,8 @@ type Walk = { id: string; steps: Step[] };
 type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 
 const PROMPT = "┃ ";
+// What fx draws under a nonspacing mark that has no base character before it.
+const DOTTED_CIRCLE = "\u25cc";
 const PANE_WIDTH = 60;
 // Two columns leave no content cells after the prompt.
 const NARROW_WIDTH = 2;
@@ -70,6 +85,13 @@ const NARROW_WIDTH = 2;
 const NO_COLUMN = -1;
 // A column no cursor can have: the cursor left the composer's first row.
 const OFF_ROW = 999;
+// fx's limit of text on one cell, in bytes. tmux, which the driver reads, keeps
+// fewer marks on a cell than fx draws and not always the same number (nine and
+// ten were seen), so the trace compares a run of marks only up to VIEW_MARKS
+// of them. fx's exact count is read through fx replay in
+// tests/e2e/tui-input-navigation.test.ts.
+const CELL_BYTES = 64;
+const VIEW_MARKS = 6;
 const tlaDir = join(TLA_ROOT, "display_width");
 
 // Thai's nonspacing marks (general category Mn).
@@ -104,6 +126,11 @@ function typed(text: string): Send[] {
 
 const keys = (...names: Key[]): Send[] => names.map((key) => ({ key }));
 
+/// `n` copies of the code point `text`, sent together as one step.
+function run(text: string, n: number): Send[] {
+  return [{ key: "type_run", text: text.repeat(n), cls: classOf(text.codePointAt(0)!), n }];
+}
+
 function edgeWalks(): Array<{ id: string; sends: Send[] }> {
   const walks: Array<{ id: string; sends: Send[] }> = [
     {
@@ -115,7 +142,21 @@ function edgeWalks(): Array<{ id: string; sends: Send[] }> {
       ],
     },
     { id: "sara-am", sends: [...typed("\u0E19\u0E49\u0E33"), ...keys("left", "left", "right", "right", "backspace")] },
+    // A mark with no base is drawn on a dotted circle in a cell of its own,
+    // and the marks after it stack on the circle: one cell, one cursor stop.
     { id: "bare-marks", sends: [...typed("\u0E49\u0E48a"), ...keys("home", "right", "right", "end", "backspace", "backspace")] },
+    { id: "bare-mark", sends: [...typed("\u0E49a"), ...keys("left", "left", "right", "end", "backspace", "backspace")] },
+    { id: "bare-latin", sends: [...typed("\u0301b"), ...keys("home", "right", "end", "backspace")] },
+    // A mark typed in front of text that is already there becomes a bare mark.
+    { id: "bare-in-front", sends: [...typed("ab"), ...keys("home"), ...typed("\u0E49"), ...keys("right", "left", "end")] },
+    { id: "bare-wide-latin", sends: [...typed("\u0301\u754C\u0E01\u0E31"), ...keys("home", "right", "right", "end", "left")] },
+    // Marks past what one cell holds: a base and 22 marks of three bytes each
+    // are 69 bytes, past fx's 64, so the cell drops the last two.
+    {
+      id: "stacked-22",
+      sends: [...typed("\u0E01"), ...run("\u0E49", 22), ...typed("b"), ...keys("left", "left", "right", "end")],
+    },
+    { id: "bare-stacked-22", sends: [...run("\u0E49", 22), ...typed("a"), ...keys("left", "end", "backspace")] },
     {
       id: "stacked",
       sends: [...typed("\u0E01\u0E38\u0E49\u0E4C\u0E4D\u0E4E\u0E07"), ...keys("left", "left", "right", "home", "right", "backspace")],
@@ -176,6 +217,8 @@ function narrowWalks(): Array<{ id: string; sends: Send[] }> {
     { id: "narrow-bare-marks", sends: [...typed("\u0E31\u0E49\u0E01\u0E31"), ...keys("home", "backspace", "end")] },
     { id: "narrow-latin", sends: [...typed("e\u0301\u0300a"), ...keys("left", "backspace")] },
     { id: "narrow-wide", sends: [...typed("\u754C\u0301"), ...keys("left")] },
+    // A run of marks with no base: the circle has no cell either.
+    { id: "narrow-bare-run", sends: [...run("\u0E49", 30), ...typed("a"), ...keys("left", "end", "backspace")] },
     {
       id: "narrow-many-clusters",
       sends: [...typed("\u0E01\u0E31\u0E49".repeat(12)), ...keys("left", "left", "end", "backspace")],
@@ -268,11 +311,13 @@ async function settled(session: Session, steadyMs = 200, timeoutMs = 10_000) {
 }
 
 /// The classes of the code points tmux shows after the composer's prefix.
-function rowClasses(rowText: string): Array<Class | "gap"> {
+function rowClasses(rowText: string): Seen[] {
   // The row is trimmed, so an empty composer row reads as the bar alone.
   if (rowText === PROMPT.trimEnd()) return [];
   if (!rowText.startsWith(PROMPT)) return ["gap"];
-  return Array.from(rowText.slice(PROMPT.length), (ch) => (ch === " " ? "gap" : classOf(ch.codePointAt(0)!)));
+  return Array.from(rowText.slice(PROMPT.length), (ch): Seen =>
+    ch === " " ? "gap" : ch === DOTTED_CIRCLE ? "circle" : classOf(ch.codePointAt(0)!),
+  );
 }
 
 /// The cells a composer row's text takes after the prefix, by the
@@ -311,7 +356,7 @@ async function runWalks(
         if (send.key === "clear") {
           await session.sendKeys("End");
           await session.sendKeys("C-u");
-        } else if (send.key === "type") {
+        } else if (send.key === "type" || send.key === "type_run") {
           await session.sendLiteralText(send.text!);
         } else {
           await session.sendKeys(TMUX_KEY[send.key]);
@@ -329,6 +374,7 @@ async function runWalks(
         steps.push({
           key: send.key,
           cls: send.cls ?? "none",
+          n: send.n ?? 1,
           col,
           row: rows.flatMap((row) => rowClasses(row.text)),
           ...(send.text ? { codepoint: `U+${send.text.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}` } : {}),
@@ -347,7 +393,7 @@ async function runWalks(
 
 function observedModule(walks: Walk[]): string {
   const row = (s: Step) => `<<${s.row.map((cls) => `"${cls}"`).join(", ")}>>`;
-  const step = (s: Step) => `[key |-> "${s.key}", cls |-> "${s.cls}", col |-> ${s.col}, row |-> ${row(s)}]`;
+  const step = (s: Step) => `[key |-> "${s.key}", cls |-> "${s.cls}", n |-> ${s.n}, col |-> ${s.col}, row |-> ${row(s)}]`;
   const walk = (w: Walk) => `<< ${w.steps.map(step).join(", ")} >>`;
   return [
     "------------------------ MODULE DisplayWidthObserved ------------------------",
@@ -359,19 +405,35 @@ function observedModule(walks: Walk[]): string {
   ].join("\n");
 }
 
-type Margin = "fixed" | "row-drops" | "cell-less-keeps";
+/// One model of the composer: the rules the walks are checked against.
+type Variant = {
+  rule: "fixed" | "today";
+  margin: "fixed" | "row-drops" | "cell-less-keeps";
+  bare: "dotted" | "joins-prefix";
+  limit: "drop" | "refuse";
+};
+
+/// The change.
+const FIXED: Variant = { rule: "fixed", margin: "fixed", bare: "dotted", limit: "drop" };
+
+const describe = (variant: Variant) =>
+  `Rule "${variant.rule}", Margin "${variant.margin}", Bare "${variant.bare}", Limit "${variant.limit}"`;
 
 /// `cols` is the model's Cols: the cells a composer row has after its prefix.
-async function judge(dir: string, walks: Walk[], rule: "fixed" | "today", margin: Margin, cols: number) {
+async function judge(dir: string, walks: Walk[], variant: Variant, cols: number) {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "DisplayWidthObserved.tla"), observedModule(walks));
   writeFileSync(join(dir, "trace.cfg"), [
     "SPECIFICATION TraceSpec",
     "CONSTANTS",
-    `    Rule = "${rule}"`,
+    `    Rule = "${variant.rule}"`,
     "    MaxLen = 0",
     `    Cols = ${cols}`,
-    `    Margin = "${margin}"`,
+    `    Margin = "${variant.margin}"`,
+    `    Bare = "${variant.bare}"`,
+    `    Limit = "${variant.limit}"`,
+    `    Cap = ${CELL_BYTES}`,
+    `    ViewMarks = ${VIEW_MARKS}`,
     "INVARIANT NotAllMatched",
     "",
   ].join("\n"));
@@ -391,22 +453,24 @@ async function judge(dir: string, walks: Walk[], rule: "fixed" | "today", margin
 async function rejectedWalks(dir: string, walks: Walk[], cols: number): Promise<string[]> {
   const rejected: string[] = [];
   for (const [index, walk] of walks.entries()) {
-    const alone = await judge(join(dir, `walk-${index + 1}`), [walk], "fixed", "fixed", cols);
+    const alone = await judge(join(dir, `walk-${index + 1}`), [walk], FIXED, cols);
     if (alone.verdict !== "ACCEPTED") rejected.push(walk.id);
   }
   return rejected;
 }
 
 /// One pane width and the walks run in it. The model's Cols is the cells
-/// after the prompt, and the self-check names the model of the fx that must
-/// reject the walks: fx before the Thai change at 60 columns, and a row
-/// builder that puts the marks of undrawn characters on the prefix cell at 2.
+/// after the prompt, and each self-check names a model of an fx that must
+/// reject the walks: at 60 columns fx before the Thai change, an fx that left
+/// a mark with no base on the prompt's cell, and an fx that fails the step at
+/// a full cell; at 2, a row builder that puts the marks of undrawn characters
+/// on the prefix cell.
 type Batch = {
   name: string;
   width: number;
   walks: Array<{ id: string; sends: Send[] }>;
   observeCursor: boolean;
-  selfCheck: { rule: "fixed" | "today"; margin: Margin };
+  selfChecks: Variant[];
 };
 
 async function main(): Promise<number> {
@@ -428,14 +492,18 @@ async function main(): Promise<number> {
       width: PANE_WIDTH,
       walks: [...edgeWalks(), ...randomWalks(seed, randomCount)],
       observeCursor: true,
-      selfCheck: { rule: "today", margin: "row-drops" },
+      selfChecks: [
+        { ...FIXED, rule: "today", margin: "row-drops" },
+        { ...FIXED, bare: "joins-prefix" },
+        { ...FIXED, limit: "refuse" },
+      ],
     },
     {
       name: `${NARROW_WIDTH}-column`,
       width: NARROW_WIDTH,
       walks: [...narrowWalks(), ...randomWalks(seed, narrowCount, "narrow-random")],
       observeCursor: false,
-      selfCheck: { rule: "fixed", margin: "cell-less-keeps" },
+      selfChecks: [{ ...FIXED, margin: "cell-less-keeps" }],
     },
   ];
   const selected = only === 0 ? batches : batches.filter((batch) => batch.width === only);
@@ -473,19 +541,22 @@ async function main(): Promise<number> {
       const { walks: observed, died } = await runWalks(session, batch.walks, batch.observeCursor, stderrPath);
       const steps = observed.reduce((sum, walk) => sum + walk.steps.length, 0);
       const cols = Math.max(0, batch.width - PROMPT.length);
-      const fixed = observed.length > 0 ? await judge(join(out, `tlc-fixed-${batch.width}`), observed, "fixed", "fixed", cols) : null;
-      const check = selfCheck && observed.length > 0 && !died
-        ? await judge(join(out, `tlc-self-check-${batch.width}`), observed, batch.selfCheck.rule, batch.selfCheck.margin, cols)
-        : null;
+      const fixed = observed.length > 0 ? await judge(join(out, `tlc-fixed-${batch.width}`), observed, FIXED, cols) : null;
+      const checks = [];
+      if (selfCheck && observed.length > 0 && !died) {
+        for (const [index, variant] of batch.selfChecks.entries()) {
+          checks.push({ variant, ...(await judge(join(out, `tlc-self-check-${batch.width}-${index + 1}`), observed, variant, cols)) });
+        }
+      }
       const rejected = fixed?.verdict === "REJECTED"
         ? await rejectedWalks(join(out, `tlc-walks-${batch.width}`), observed, cols)
         : [];
       console.log(`-- ${batch.name} pane (Cols ${cols}): walks ${observed.length} of ${batch.walks.length}, steps ${steps}, seed ${seed}`);
       if (fixed) {
-        console.log(`TLC (Rule "fixed"): ${fixed.verdict}, ${fixed.distinctStates} distinct states, ${fixed.durationMs} ms`);
+        console.log(`TLC (${describe(FIXED)}): ${fixed.verdict}, ${fixed.distinctStates} distinct states, ${fixed.durationMs} ms`);
       }
-      if (check) {
-        console.log(`TLC self-check (Rule "${batch.selfCheck.rule}", Margin "${batch.selfCheck.margin}"): ${check.verdict}, ${check.distinctStates} distinct states`);
+      for (const check of checks) {
+        console.log(`TLC self-check (${describe(check.variant)}): ${check.verdict}, ${check.distinctStates} distinct states`);
       }
       if (rejected.length > 0) {
         console.log(`walks TLC rejects alone (${rejected.length} of ${observed.length}): ${rejected.join(", ")}`);
@@ -498,10 +569,11 @@ async function main(): Promise<number> {
         console.log(`FAIL: fx exited during walk ${died.walk} in the ${batch.name} pane, stderr [${died.stderr}]`);
         failed = true;
       }
-      if (fixed?.verdict === "TOOL_ERROR" || check?.verdict === "TOOL_ERROR") toolError = true;
+      if (fixed?.verdict === "TOOL_ERROR" || checks.some((check) => check.verdict === "TOOL_ERROR")) toolError = true;
       if (fixed && fixed.verdict !== "ACCEPTED") failed = true;
-      if (check && check.verdict !== "REJECTED") {
-        console.log(`FAIL: the model of fx with the bug accepted the ${batch.name} walks, so they do not test it`);
+      for (const check of checks) {
+        if (check.verdict === "REJECTED") continue;
+        console.log(`FAIL: the model of fx with the bug (${describe(check.variant)}) accepted the ${batch.name} walks, so they do not test it`);
         failed = true;
       }
       reports.push({
@@ -512,9 +584,7 @@ async function main(): Promise<number> {
         verdict: fixed?.verdict ?? "NO_WALKS",
         tlc_distinct_states: fixed?.distinctStates,
         tlc_ms: fixed?.durationMs,
-        self_check: check
-          ? { ...batch.selfCheck, verdict: check.verdict, distinct_states: check.distinctStates }
-          : null,
+        self_checks: checks.map((check) => ({ ...check.variant, verdict: check.verdict, distinct_states: check.distinctStates })),
         died,
         rejected_walks: rejected,
         observed,

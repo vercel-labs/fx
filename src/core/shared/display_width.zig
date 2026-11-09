@@ -398,6 +398,15 @@ pub noinline fn trimBreakWhitespace(text: []const u8) []const u8 {
     return text[index..];
 }
 
+/// Whether the code point at `index` is a nonspacing mark: a combining mark,
+/// a variation selector, or a Thai vowel or tone mark, which a terminal draws
+/// on the cell before it. Controls and the other zero-width characters, such
+/// as a zero-width space, a joiner, or a byte order mark, are not.
+pub fn isNonspacingMarkAt(text: []const u8, index: usize) bool {
+    if (index >= text.len or text[index] < 0x80) return false;
+    return isCombining(decodeNextRune(text, index).codepoint);
+}
+
 fn isCombining(codepoint: u21) bool {
     return (codepoint >= 0x0300 and codepoint <= 0x036f) or
         (codepoint >= 0x1ab0 and codepoint <= 0x1aff) or
@@ -671,7 +680,8 @@ test "Thai nonspacing marks join their base in visibleWidth" {
     // กั้งabc and ที่นี่ok, as typed in the composer.
     try std.testing.expectEqual(@as(usize, 5), visibleWidth("\u{0E01}\u{0E31}\u{0E49}\u{0E07}abc"));
     try std.testing.expectEqual(@as(usize, 4), visibleWidth("\u{0E17}\u{0E35}\u{0E48}\u{0E19}\u{0E35}\u{0E48}ok"));
-    // A mark with no base takes no cell.
+    // A mark with no base measures no cell here. The composer gives it one of
+    // its own on a dotted circle (`peekRawUnit` in src/ui/input/visual_layout.zig).
     try std.testing.expectEqual(@as(usize, 0), visibleWidth("\u{0E49}"));
     // Stacked marks stay on their base however many there are.
     const mark = "\u{0E49}";
@@ -681,6 +691,29 @@ test "Thai nonspacing marks join their base in visibleWidth" {
     try std.testing.expectEqual(@as(usize, 1), visibleWidth(&stacked));
     // Mixed with a Latin combining mark and a wide character.
     try std.testing.expectEqual(@as(usize, 5), visibleWidth("e\u{0301}\u{754C}\u{0E01}\u{0E31}\u{0E49}a"));
+}
+
+test "isNonspacingMarkAt finds combining marks and Thai marks and nothing else" {
+    const marks = [_][]const u8{ "\u{0301}", "\u{0E31}", "\u{0E49}", "\u{0E4E}", "\u{1AB0}", "\u{20D0}", "\u{FE0F}", "\u{FE22}" };
+    for (marks) |mark| try std.testing.expect(isNonspacingMarkAt(mark, 0));
+    // Found in the middle of a text, and only at the start of its code point.
+    try std.testing.expect(isNonspacingMarkAt("a\u{0E49}b", 1));
+    try std.testing.expect(!isNonspacingMarkAt("a\u{0E49}b", 2));
+    try std.testing.expect(!isNonspacingMarkAt("a\u{0E49}b", 0));
+
+    const others = [_][]const u8{
+        "a",        "\u{0E01}", "\u{0E33}",  "\u{754C}",  "\u{1F600}",
+        // Zero-width, but not marks.
+        "\x01",     "\x7f",     "\u{0085}",  "\u{200B}",  "\u{200D}",
+        "\u{FEFF}", "\u{202E}", "\u{E0061}", "\u{1F3FD}",
+        // Not valid UTF-8.
+        "\xff",
+        "\xe0\xb9",
+    };
+    for (others) |text| try std.testing.expect(!isNonspacingMarkAt(text, 0));
+    try std.testing.expect(!isNonspacingMarkAt("", 0));
+    try std.testing.expect(!isNonspacingMarkAt("\u{0301}", 2));
+    try std.testing.expect(!isNonspacingMarkAt("\u{0301}", 100));
 }
 
 test "Thai nonspacing marks are zero-width display units" {

@@ -8,6 +8,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
@@ -563,6 +564,12 @@ const THAI_KAN = "\u0E01\u0E31\u0E49";
 const THAI_THI = "\u0E17\u0E35\u0E48";
 const THAI_NI = "\u0E19\u0E35\u0E48";
 const THAI_MAI_THO = "\u0E49";
+// A nonspacing mark with no base character before it in the draft is drawn on
+// U+25CC DOTTED CIRCLE, in a cell of its own.
+const DOTTED_CIRCLE = "\u25CC";
+// One terminal cell holds at most 64 bytes of text, its base included: a
+// three-byte base takes 20 three-byte marks, 63 bytes, and a 21st would make 66.
+const CELL_MARKS = 20;
 
 tmuxTest(
   "Thai nonspacing marks keep the composer cursor and repaint on the terminal's columns",
@@ -601,28 +608,42 @@ tmuxTest(
       READY_TIMEOUT,
     );
 
-    // A mark with no base takes no cell.
+    // A mark with no base has no character to sit on, and the prompt's space
+    // cell is not one. It is drawn on a dotted circle in a cell of its own, so
+    // the cursor after "a" is one cell further than it is for "a" alone.
     await active.sendKeys("C-u");
     await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
     await typeLiteral(active, `${THAI_MAI_THO}a`);
-    await waitForExactComposerRow(active, `┃ ${THAI_MAI_THO}a`);
-    await active.waitForCursor(
-      (position) => position.row === start.row && position.col === 3,
-      READY_TIMEOUT,
-    );
-
-    // Twenty-one marks stacked on one base, 63 bytes after it, still take
-    // one cell.
-    await active.sendKeys("C-u");
-    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
-    await typeLiteral(active, `\u0E01${THAI_MAI_THO.repeat(21)}b`);
+    await waitForExactComposerRow(active, `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}a`);
     await active.waitForCursor(
       (position) => position.row === start.row && position.col === 4,
       READY_TIMEOUT,
     );
-    const stacked = (await active.capturePaneGrid())[start.row]!.trimEnd();
-    expect(stacked.startsWith("┃ \u0E01")).toBe(true);
-    expect(stacked.endsWith(`${THAI_MAI_THO}b`)).toBe(true);
+
+    // Marks after a bare mark stack on its circle: one cell, one cursor stop.
+    await active.sendKeys("C-u");
+    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
+    await typeLiteral(active, `${THAI_MAI_THO}\u0E31\u0E48a`);
+    await waitForExactComposerRow(active, `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}\u0E31\u0E48a`);
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 4,
+      READY_TIMEOUT,
+    );
+    await active.sendKeys("Left Left");
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 2,
+      READY_TIMEOUT,
+    );
+    await active.sendKeys("End BSpace BSpace");
+    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
+
+    // A mark after a base still takes no cell.
+    await typeLiteral(active, `a${THAI_MAI_THO}b`);
+    await waitForExactComposerRow(active, `┃ a${THAI_MAI_THO}b`);
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 4,
+      READY_TIMEOUT,
+    );
 
     // A cluster in the last cell of a row wraps the character after it, not
     // the cluster: "┃ " leaves 58 cells, 57 of them "a".
@@ -686,6 +707,136 @@ tmuxTest(
     expect(active.isAlive()).toBe(true);
   },
   120_000,
+);
+
+/**
+ * Waits for `work`. When it fails because fx exited, the error says so and
+ * quotes what fx wrote to stderr.
+ */
+async function failIfExited<T>(active: TmuxSession, work: Promise<T>): Promise<T> {
+  return work.catch((error: unknown) => {
+    if (active.isAlive()) throw error;
+    throw new Error(`fx exited; stderr: ${readFileSync(stderrPath!, "utf8").trim()}`);
+  });
+}
+
+/**
+ * The composer row fx drew last, read back from its own recording. tmux keeps
+ * about 21 bytes of text per cell, so only fx's replay shows how many marks fx
+ * kept on a cell.
+ */
+function replayedComposerRow(active: TmuxSession, prefix: string): Promise<string> {
+  return active.kill().then(() => {
+    const tape = join(testHome!, "session.fxtape");
+    const golden = join(testHome!, "golden.txt");
+    const replay = spawnSync(FX_BIN, ["replay", tape, "--golden", golden], {
+      encoding: "utf8",
+      env: {
+        HOME: testHome!,
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        FX_SOUND: "0",
+        FX_DISABLE_KEYCHAIN: "1",
+      },
+    });
+    expect(replay.status).toBe(0);
+    // The golden file frames each screen row between two "|".
+    const rows = readFileSync(golden, "utf8")
+      .split("\n")
+      .map((row) => row.replace(/^\|/, "").replace(/\|$/, "").trimEnd())
+      .filter((row) => row.startsWith(prefix));
+    expect(rows).toHaveLength(1);
+    return rows[0]!;
+  });
+}
+
+// A cell keeps at most 64 bytes of text and drops the marks past that instead
+// of ending fx. 22 marks on one base ended fx before the drop existed, and 100
+// are far past it.
+for (const count of [CELL_MARKS, CELL_MARKS + 1, 22, 100]) {
+  tmuxTest(
+    `one base with ${count} stacked Thai marks keeps fx alive and the cell within 64 bytes`,
+    async () => {
+      const active = await startFx(60, 24, false, true);
+      await typeLiteral(active, `\u0E01${THAI_MAI_THO.repeat(count)}b`);
+      // "┃ " is two cells, then the base and b: the marks take no cell.
+      const at = await failIfExited(
+        active,
+        active.waitForCursor((position) => position.col === 4, READY_TIMEOUT),
+      );
+      const stacked = (await active.capturePaneGrid())[at.row]!.trimEnd();
+      expect(stacked.startsWith("┃ \u0E01")).toBe(true);
+      expect(stacked.endsWith(`${THAI_MAI_THO}b`)).toBe(true);
+      expect(active.isAlive()).toBe(true);
+      expectCleanStderr();
+      expect(await replayedComposerRow(active, "┃ \u0E01")).toBe(
+        `┃ \u0E01${THAI_MAI_THO.repeat(CELL_MARKS)}b`,
+      );
+    },
+    TIMEOUT,
+  );
+}
+
+tmuxTest(
+  "3,000 marks with no base arriving at once draw one circle, one cell wide, and keep fx alive",
+  async () => {
+    // Raw text, as `tmux paste-buffer` sends it, so the marks reach the
+    // composer instead of collapsing to a pasted-text placeholder. The bare
+    // marks stack on one circle: its 3 bytes and 20 marks fill 63 of the 64
+    // bytes, and the rest are dropped.
+    const active = await startFx(60, 24, false, true);
+    await typeLiteral(active, THAI_MAI_THO.repeat(3_000));
+    const { grid, cursor } = await failIfExited(active, waitForSettledPane(active));
+    expect(cursor.col).toBe(3);
+    const rows = grid.map((line) => line.trimEnd()).filter((line) => line.startsWith("┃"));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.startsWith(`┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}`)).toBe(true);
+    expect(active.isAlive()).toBe(true);
+    expectCleanStderr();
+    expect(await replayedComposerRow(active, `┃ ${DOTTED_CIRCLE}`)).toBe(
+      `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO.repeat(CELL_MARKS)}`,
+    );
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "a mark after a newline is drawn on its own circle and a mark after a base takes no cell",
+  async () => {
+    const active = await startFx(60, 24);
+    await active.pasteText(`a\n${THAI_MAI_THO}b\nc${THAI_MAI_THO}`);
+    await waitForExactComposerRow(active, "┃ a");
+    await waitForExactComposerRow(active, `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}b`);
+    await waitForExactComposerRow(active, `┃ c${THAI_MAI_THO}`);
+    // The cursor is after the mark on c: "┃ " and c.
+    await active.waitForCursor((position) => position.col === 3, READY_TIMEOUT);
+
+    // Up twice reaches the circle's row at the column of its cell.
+    await active.sendKeys("Home Up");
+    await active.waitForCursor((position) => position.col === 2, READY_TIMEOUT);
+    await active.sendKeys("Right");
+    await active.waitForCursor((position) => position.col === 3, READY_TIMEOUT);
+
+    expectCleanStderr();
+    expect(active.isAlive()).toBe(true);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "in a window three columns wide the one content cell holds a bare mark's circle and the letter wraps",
+  async () => {
+    const active = await startFx(3, 24);
+    await typeLiteral(active, `${THAI_MAI_THO}a`);
+    await waitForExactComposerRow(active, `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}`);
+    await waitForExactComposerRow(active, "┃ a");
+    // The text ends at the right margin, where fx keeps the cursor on the last
+    // cell, column 2 of three.
+    await active.waitForCursor((position) => position.col === 2, READY_TIMEOUT);
+
+    expectCleanStderr();
+    expect(active.isAlive()).toBe(true);
+  },
+  TIMEOUT,
 );
 
 tmuxTest(
