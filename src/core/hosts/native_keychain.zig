@@ -839,10 +839,18 @@ fn deleteServiceItem(
     return error.KeychainDeleteFailed;
 }
 
-const test_service_name = "FX_TEST_AI_GATEWAY_API_KEY";
+/// Holds a test Keychain service name, such as `FX_TEST_AI_GATEWAY_API_KEY_4242`.
+const TestServiceBuffer = [64]u8;
 
-fn deleteTestServiceItem(alloc: std.mem.Allocator) void {
-    _ = deleteServiceItem(alloc, test_service_name) catch {};
+/// Names a test Keychain item for this process only. Test runs from two
+/// checkouts at once share one login Keychain, and with a fixed name one run
+/// could delete or rewrite the other's item between its store and its load.
+fn testServiceName(buf: *TestServiceBuffer, base: []const u8) ![]const u8 {
+    return std.mem.print(buf, "{s}_{d}", .{ base, std.c.getpid() });
+}
+
+fn deleteTestServiceItem(alloc: std.mem.Allocator, service: []const u8) void {
+    _ = deleteServiceItem(alloc, service) catch {};
 }
 
 test "account name resolves from the operating system when USER is unset" {
@@ -862,18 +870,20 @@ test "stored key round-trips byte-identically with USER unset" {
 
     const alloc = std.testing.allocator;
     const written = "vt1-round-trip-value";
+    var service_buf: TestServiceBuffer = undefined;
+    const service = try testServiceName(&service_buf, "FX_TEST_AI_GATEWAY_API_KEY");
 
-    storeValueMac(test_service_name, written) catch return error.SkipZigTest;
-    defer deleteTestServiceItem(alloc);
+    storeValueMac(service, written) catch return error.SkipZigTest;
+    defer deleteTestServiceItem(alloc, service);
 
-    const read_back = (try loadFromService(alloc, test_service_name)) orelse
+    const read_back = (try loadFromService(alloc, service)) orelse
         return error.KeychainItemNotFound;
     defer secret.zeroAndFree(alloc, read_back);
     try std.testing.expectEqualStrings(written, read_back);
-    try std.testing.expect(try deleteServiceItem(alloc, test_service_name));
+    try std.testing.expect(try deleteServiceItem(alloc, service));
     try std.testing.expectError(
         error.KeychainItemNotFound,
-        loadFromService(alloc, test_service_name),
+        loadFromService(alloc, service),
     );
 }
 
@@ -882,7 +892,8 @@ test "MCP Keychain storage round-trips values beyond the security prompt limit" 
     if (isDisabled()) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    const test_mcp_service = "FX_TEST_MCP_OAUTH_CREDENTIALS_V1";
+    var service_buf: TestServiceBuffer = undefined;
+    const test_mcp_service = try testServiceName(&service_buf, "FX_TEST_MCP_OAUTH_CREDENTIALS_V1");
     const written = text_utils.repeat("mcp-credential-section-", 32);
 
     storeMcpValueMac(test_mcp_service, written) catch return error.SkipZigTest;
