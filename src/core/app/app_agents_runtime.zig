@@ -2170,6 +2170,38 @@ pub fn Runtime(comptime App: type) type {
             dropSet(app, tree.items);
         }
 
+        /// Stops and drops the subagents in `root`'s tree before a session
+        /// switch closes `root`'s session, as `/close` stops an instance's
+        /// tree, so the subagent host never joins a slot thread that waits
+        /// for this loop (`tests/tla/session_manager/Wiring.tla` SwitchEnds,
+        /// D97). Nothing is closed for good: the session's log keeps them,
+        /// so its next open lists them again, and only the work they had
+        /// running ends, as cancelled, owing no report. When one of them is
+        /// on screen, `root` takes its place. Returns how many had work
+        /// running.
+        pub fn stopSubagentsForSwitch(app: *App, root: *AppAgent) !usize {
+            var tree: std.ArrayList(*ChildAgent) = .empty;
+            defer tree.deinit(app.alloc);
+            var working: usize = 0;
+            for (app.child_agents.items) |entry| {
+                if (entry.agent.role != .subagent or rootInstance(app, entry) != root) continue;
+                try tree.append(app.alloc, entry);
+                if (entry.agent.child_run) |*run| {
+                    if (run.inFlight()) working += 1;
+                }
+            }
+            if (tree.items.len == 0) return 0;
+            const hosted = hostedOf(app, root);
+            if (inBranch(tree.items, app.agent_on_screen)) try show(app, hosted);
+            // The root's host stops first, so no work the switch ends owes
+            // a report into the tree.
+            const root_host: ?*subagent_tool_host.Runtime = if (comptime agents.hasAgentField(App, "session_persistence")) root.session_persistence.subagent_host else null;
+            stopSet(app, tree.items, root_host);
+            debug_trace.eventf("host", "switch_stopped_subagents", .{}, "subagents={d} working={d}", .{ tree.items.len, working });
+            dropSet(app, tree.items);
+            return working;
+        }
+
         /// The open instance after `child` in launch order, wrapping to the
         /// first open one; null is the first instance in `main_agent`.
         fn nextInstanceAfter(app: *App, child: *const ChildAgent) ?*ChildAgent {

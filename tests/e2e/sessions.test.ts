@@ -1474,6 +1474,642 @@ test.skipIf(!tmuxAvailable())(forkTest, async () => {
   }
 }, TIMEOUT * 4);
 
+const forkBusyChildTest = "/fork switches to the fork while a subagent of the source is still working";
+test.skipIf(!tmuxAvailable())(forkBusyChildTest, async () => {
+  const fixture = createFixture("fx-v2-app-fork-busy-child-");
+  const trace = join(fixture.root, "fork-busy.trace.log");
+  const typed = ["Fork busy prompt one.", "Fork busy prompt two."];
+  const releases: Array<() => void> = [];
+  let childHeld = false;
+  const gateway = startDynamicFakeGateway((body) => {
+    // The subagent's request waits until the test ends, so it still works
+    // when the fork switches away from its parent.
+    if (isAppChildRequest(body, typed)) {
+      childHeld = true;
+      return new Promise<Response>((resolve) => releases.push(() => resolve(fakeGatewayFinalText("BUSY_CHILD_DONE"))));
+    }
+    if (isReportTurn(body)) return fakeGatewayFinalText("BUSY_PARENT_REPORTED");
+    if (body.includes("busy-delegate")) return fakeGatewayFinalText("BUSY_PARENT_SENT");
+    if (body.includes("Fork busy prompt two.")) {
+      return fakeGatewayToolCall("busy-delegate", "subagent", { request: { action: "message", agent: "sleeper", message: "Keep working on BUSY_TASK." } });
+    }
+    if (body.includes("Fork busy prompt one.")) return fakeGatewayFinalText("BUSY_ONE");
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access", FX_TRACE: "1", FX_TRACE_LOG: trace });
+    await app.session.sendText("Fork busy prompt one.");
+    await app.session.waitForText("BUSY_ONE", TIMEOUT);
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Fork busy prompt two.");
+    await scrollbackContains(app.session, "BUSY_PARENT_SENT");
+    await app.session.waitForPane(() => childHeld, TIMEOUT);
+    await app.session.waitForStableComposer();
+    const source = rootSessionIds(fixture.home)[0]!;
+
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await app.session.sendKeys("Enter");
+    try {
+      await waitForForkNotice(app.session, source, "Fork busy prompt two.");
+    } catch (error) {
+      console.log(`<timeout> the fork never switched while the subagent worked; screen:\n${await app.session.capturePane()}`);
+      console.log(`trace tail:\n${existsSync(trace) ? readFileSync(trace, "utf8").split("\n").slice(-12).join("\n") : "(no trace)"}`);
+      throw error;
+    }
+  } finally {
+    for (const release of releases) release();
+    await app?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+/// Starts the app on a session whose subagent's request never answers, for
+/// `switchAway` to leave while the subagent still works. `after` is typed in
+/// the session the switch opens, and its answer shows the app still runs.
+async function switchAwayFromBusyChild(prefix: string, setup: string[], switchAway: (session: TmuxSession) => Promise<void>) {
+  const fixture = createFixture(prefix);
+  const after = "Busy sibling prompt after the switch.";
+  const typed = [...setup, "Busy sibling prompt delegate.", after];
+  const releases: Array<() => void> = [];
+  let childHeld = false;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, typed)) {
+      childHeld = true;
+      return new Promise<Response>((resolve) => releases.push(() => resolve(fakeGatewayFinalText("BUSY_CHILD_DONE"))));
+    }
+    if (isReportTurn(body)) return fakeGatewayFinalText("BUSY_PARENT_REPORTED");
+    if (body.includes(after)) return fakeGatewayFinalText("BUSY_AFTER_SWITCH");
+    if (body.includes("busy-sibling-delegate")) return fakeGatewayFinalText("BUSY_SIBLING_SENT");
+    if (body.includes("Busy sibling prompt delegate.")) {
+      return fakeGatewayToolCall("busy-sibling-delegate", "subagent", { request: { action: "message", agent: "sleeper", message: "Keep working on BUSY_TASK." } });
+    }
+    return fakeGatewayFinalText("BUSY_SETUP_ANSWER");
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
+    for (const line of setup) {
+      await app.session.sendText(line);
+      await app.session.waitForStableComposer();
+    }
+    await app.session.sendText("Busy sibling prompt delegate.");
+    await scrollbackContains(app.session, "BUSY_SIBLING_SENT");
+    await app.session.waitForPane(() => childHeld, TIMEOUT);
+    await app.session.waitForStableComposer();
+    await switchAway(app.session);
+    await app.session.sendKeys("C-u");
+    await app.session.sendText(after);
+    try {
+      await scrollbackContains(app.session, "BUSY_AFTER_SWITCH");
+    } catch (error) {
+      console.log(`<timeout> the switch never finished while the subagent worked; screen:\n${await app.session.capturePane()}`);
+      throw error;
+    }
+  } finally {
+    for (const release of releases) release();
+    await app?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}
+
+test.skipIf(!tmuxAvailable())("/new starts a fresh session while a subagent of the old one is still working", async () => {
+  await switchAwayFromBusyChild("fx-v2-app-new-busy-child-", ["Busy sibling prompt one."], async (session) => {
+    await session.sendText("/new");
+  });
+}, TIMEOUT * 4);
+
+test.skipIf(!tmuxAvailable())("/resume opens another session while a subagent of the current one is still working", async () => {
+  await switchAwayFromBusyChild("fx-v2-app-resume-busy-child-", ["Busy sibling prompt one.", "/rename Busy resume target", "/new"], async (session) => {
+    await session.sendText("/resume");
+    await session.waitForPane((pane) => pane.includes("Busy resume target") && pane.includes("enter resume"), TIMEOUT);
+    await session.sendLiteralText("Busy resume");
+    await session.waitForPane((pane) => pane.includes("Busy resume target"), TIMEOUT);
+    await session.sendKeys("Enter");
+  });
+}, TIMEOUT * 4);
+
+/// The newest shell session id a request body names, from the shell tool's
+/// result of a command that was still running.
+function lastShellSessionId(body: string) {
+  return body.match(/shell-\d+/g)?.at(-1);
+}
+
+function processRunning(pattern: string) {
+  return Bun.spawnSync(["pgrep", "-f", pattern]).exitCode === 0;
+}
+
+test.skipIf(!tmuxAvailable())("/fork stops a subagent waiting on a long shell command and ends that command", async () => {
+  const fixture = createFixture("fx-v2-app-fork-shell-child-");
+  const command = "sleep 613";
+  const typed = ["Fork shell prompt one.", "Fork shell prompt two."];
+  let interactSent = false;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, typed)) {
+      if (body.includes("child-interact")) return fakeGatewayFinalText("SHELL_CHILD_DONE");
+      const session = body.includes("child-run") ? lastShellSessionId(body) : undefined;
+      if (session) {
+        interactSent = true;
+        return fakeGatewayToolCall("child-interact", "shell", { request: { action: "interact", session_id: session, yield_time_ms: 300_000 } });
+      }
+      return fakeShellRun("child-run", command, { yield_time_ms: 500 });
+    }
+    if (isReportTurn(body)) return fakeGatewayFinalText("SHELL_PARENT_REPORTED");
+    if (body.includes("shell-delegate")) return fakeGatewayFinalText("SHELL_PARENT_SENT");
+    if (body.includes("Fork shell prompt two.")) {
+      return fakeGatewayToolCall("shell-delegate", "subagent", { request: { action: "message", agent: "waiter", message: "Run the long command and wait for it." } });
+    }
+    if (body.includes("Fork shell prompt one.")) return fakeGatewayFinalText("SHELL_ONE");
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
+    await app.session.sendText("Fork shell prompt one.");
+    await app.session.waitForText("SHELL_ONE", TIMEOUT);
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Fork shell prompt two.");
+    await scrollbackContains(app.session, "SHELL_PARENT_SENT");
+    await app.session.waitForPane(() => interactSent && processRunning(command), TIMEOUT);
+    // Paces the switch so the interact call is inside its wait.
+    await Bun.sleep(1000);
+    await app.session.waitForStableComposer();
+    const source = rootSessionIds(fixture.home)[0]!;
+
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    const started = Date.now();
+    await app.session.sendKeys("Enter");
+    try {
+      await app.session.waitForPane((pane) => {
+        const lines = pane.split("\n");
+        const label = lines.lastIndexOf(FORK_RESUME_LABEL);
+        return label >= 0 && lines[label + 1] === `fx --resume ${source}` && composerContains(pane, "Fork shell prompt two.");
+      }, 10_000);
+    } catch (error) {
+      console.log(`<timeout> the fork did not switch within 10 s while the subagent waited on its shell; screen:\n${await app.session.capturePane()}`);
+      throw error;
+    }
+    console.log(`METRIC switch_ms=${Date.now() - started}`);
+    await app.session.waitForPane(() => !processRunning(command), 10_000);
+  } finally {
+    await app?.session.kill();
+    Bun.spawnSync(["pkill", "-f", command]);
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
+test.skipIf(!tmuxAvailable())("a fork that stopped a working subagent leaves its source closed, resumable, and with no report turn", async () => {
+  const fixture = createFixture("fx-v2-app-fork-stopped-child-");
+  const typed = ["Fork stop prompt one.", "Fork stop prompt two.", "Back in the stopped source."];
+  const releases: Array<() => void> = [];
+  let childHeld = false;
+  let reportTurns = 0;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, typed)) {
+      childHeld = true;
+      return new Promise<Response>((resolve) => releases.push(() => resolve(fakeGatewayFinalText("STOP_CHILD_DONE"))));
+    }
+    if (isReportTurn(body)) {
+      reportTurns += 1;
+      return fakeGatewayFinalText("STOP_PARENT_REPORTED");
+    }
+    if (body.includes("Back in the stopped source.")) return fakeGatewayFinalText("STOP_SOURCE_ANSWER");
+    if (body.includes("stop-delegate")) return fakeGatewayFinalText("STOP_PARENT_SENT");
+    if (body.includes("Fork stop prompt two.")) {
+      return fakeGatewayToolCall("stop-delegate", "subagent", { request: { action: "message", agent: "sleeper", message: "Keep working on STOP_TASK." } });
+    }
+    if (body.includes("Fork stop prompt one.")) return fakeGatewayFinalText("STOP_ONE");
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
+    await app.session.sendText("Fork stop prompt one.");
+    await app.session.waitForText("STOP_ONE", TIMEOUT);
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Fork stop prompt two.");
+    await scrollbackContains(app.session, "STOP_PARENT_SENT");
+    await app.session.waitForPane(() => childHeld, TIMEOUT);
+    await app.session.waitForStableComposer();
+    const source = rootSessionIds(fixture.home)[0]!;
+
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await app.session.sendKeys("Enter");
+    try {
+      await waitForForkNotice(app.session, source, "Fork stop prompt two.");
+    } catch (error) {
+      console.log(`<timeout> the fork never switched while the subagent worked; screen:\n${await app.session.capturePane()}`);
+      throw error;
+    }
+    // The fork put the prompt back in the input box.
+    await app.session.sendKeys("C-u");
+    await quitApp(app);
+    app = undefined;
+
+    // The stopped work ends cancelled, and the source ends with its close.
+    const finishes = childLines(fixture.home, source).filter((line) => line.kind === "child_finished");
+    expect(finishes.map((line) => line.outcome)).toEqual(["cancelled"]);
+    expect(logLines(fixture.home, source).at(-1)!.kind).toBe("closed");
+
+    // The source resumes, answers, and starts no report turn.
+    app = await startApp(fixture, gateway, ["--resume", source]);
+    expect(await scrollbackContains(app.session, "STOP_PARENT_SENT")).toContain("STOP_PARENT_SENT");
+    await app.session.sendText("Back in the stopped source.");
+    await scrollbackContains(app.session, "STOP_SOURCE_ANSWER");
+    await app.session.waitForStableComposer();
+    await quitApp(app);
+    app = undefined;
+    expect(reportTurns).toBe(0);
+  } finally {
+    for (const release of releases) release();
+    await app?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
+
+/// The newest message of a request.
+function lastMessage(body: string): any {
+  return (JSON.parse(body).prompt ?? []).at(-1);
+}
+
+/// The call a request answers, when its newest message is a tool result.
+function answeredCall(body: string): string | undefined {
+  const last = lastMessage(body);
+  if (last?.role !== "tool") return undefined;
+  return (last.content ?? []).find((part: any) => part.type === "tool-result")?.toolCallId;
+}
+
+/// The text of a request's newest user message.
+function latestUserText(body: string): string {
+  const latest = (JSON.parse(body).prompt ?? []).filter((item: any) => item.role === "user").at(-1)?.content ?? "";
+  return typeof latest === "string" ? latest : JSON.stringify(latest);
+}
+
+function delegate(call: string, agent: string, message: string) {
+  return fakeGatewayToolCall(call, "subagent", { request: { action: "message", agent, message } });
+}
+
+/// The fork menu's selected row, the first line of the selected prompt.
+async function forkMenuSelected(session: TmuxSession) {
+  const lines = (await session.capturePaneEscapes()).split("\n");
+  const plain = lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const composer = plain.findLastIndex(isComposerLine);
+  for (let index = composer + 1; index < lines.length; index += 1) {
+    if (lines[index]!.includes("\x1b[1m")) return plain[index]!.trim();
+  }
+  return "";
+}
+
+/// Moves the fork menu up to the prompt that starts with `prefix`.
+async function selectForkPrompt(session: TmuxSession, prefix: string) {
+  for (let moves = 0; moves < 30; moves += 1) {
+    const selected = await forkMenuSelected(session);
+    if (selected.startsWith(prefix)) return;
+    await session.sendKeys("Up");
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && (await forkMenuSelected(session)) === selected) await Bun.sleep(25);
+  }
+  throw new Error(`the fork menu never selected ${prefix}`);
+}
+
+const FORK_QUESTION = /Bring (\d+) subagents? into the fork\?/;
+const FORK_QUESTION_HINT = "enter yes     n or esc no";
+
+/// The child lines a session wrote itself: a fork's copied lines name its
+/// source's children.
+function ownChildLines(home: string, id: string) {
+  const lines = logLines(home, id) as any[];
+  const after = lines[0]?.forked_from?.seq ?? 0;
+  return childLines(home, id).filter((line) => line.seq > after);
+}
+
+/// Each saved session's log bytes, by id.
+function logBytes(fixture: Fixture) {
+  return new Map(savedSessionIds(fixture.home).map((id) => [id, readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"))]));
+}
+
+test.skipIf(!tmuxAvailable())("a switch stops only a working subagent's task: back in its chat it is listed and takes new work with its old history", async () => {
+  const fixture = createFixture("fx-v2-app-switch-keeps-child-");
+  const typed = ["Keep prompt one.", "Keep prompt two.", "Keep prompt fresh.", "Keep prompt three."];
+  const releases: Array<() => void> = [];
+  const childBodies: string[] = [];
+  let held = false;
+  let reports = 0;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, typed)) {
+      childBodies.push(body);
+      const latest = latestUserText(body);
+      if (latest.includes("KEEPER_SECOND")) {
+        held = true;
+        return new Promise<Response>((resolve) => releases.push(() => resolve(fakeGatewayFinalText("KEEPER_SECOND_DONE"))));
+      }
+      if (latest.includes("KEEPER_THIRD")) return fakeGatewayFinalText("KEEPER_THIRD_DONE");
+      return fakeGatewayFinalText("KEEPER_FIRST_DONE");
+    }
+    if (isReportTurn(body)) {
+      reports += 1;
+      return fakeGatewayFinalText(`KEEP_REPORT_${reports}`);
+    }
+    const answered = answeredCall(body);
+    if (answered === "keep-one") return fakeGatewayFinalText("KEEP_PARENT_ONE");
+    if (answered === "keep-two") return fakeGatewayFinalText("KEEP_PARENT_TWO");
+    if (answered === "keep-three") return fakeGatewayFinalText("KEEP_PARENT_THREE");
+    const latest = latestUserText(body);
+    if (latest.includes("Keep prompt one.")) return delegate("keep-one", "keeper", "Work on KEEPER_FIRST.");
+    if (latest.includes("Keep prompt two.")) return delegate("keep-two", "keeper", "Work on KEEPER_SECOND.");
+    if (latest.includes("Keep prompt three.")) return delegate("keep-three", "keeper", "Work on KEEPER_THIRD.");
+    if (latest.includes("Keep prompt fresh.")) return fakeGatewayFinalText("KEEP_FRESH");
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
+    await app.session.sendText("Keep prompt one.");
+    await scrollbackContains(app.session, "KEEP_REPORT_1");
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Keep prompt two.");
+    await scrollbackContains(app.session, "KEEP_PARENT_TWO");
+    await app.session.waitForPane(() => held, TIMEOUT);
+    await app.session.waitForStableComposer();
+    const source = rootSessionIds(fixture.home)[0]!;
+
+    await app.session.sendText("/new");
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Keep prompt fresh.");
+    try {
+      await scrollbackContains(app.session, "KEEP_FRESH");
+    } catch (error) {
+      console.log(`<timeout> /new never finished while the subagent worked; screen:\n${await app.session.capturePane()}`);
+      throw error;
+    }
+    await app.session.waitForStableComposer();
+    await quitApp(app);
+    app = undefined;
+    // Only the running task stopped.
+    expect(childLines(fixture.home, source).filter((line) => line.kind === "child_finished").map((line) => line.outcome)).toEqual(["ok", "cancelled"]);
+
+    app = await startApp(fixture, gateway, ["--resume", source]);
+    await scrollbackContains(app.session, "KEEP_PARENT_TWO");
+    await app.session.sendText("/agents");
+    await app.session.waitForPane((pane) => pane.includes("keeper"), TIMEOUT);
+    await app.session.sendKeys("Escape");
+    await app.session.waitForStableComposer();
+    const before = reports;
+    await app.session.sendText("Keep prompt three.");
+    await scrollbackContains(app.session, "KEEP_PARENT_THREE");
+    // The same subagent took the new work, with its old history.
+    expect(childBodies.at(-1)).toContain("KEEPER_FIRST_DONE");
+    expect(new Set(childLines(fixture.home, source).map((line) => line.child)).size).toBe(1);
+    await scrollbackContains(app.session, `KEEP_REPORT_${before + 1}`);
+    await app.session.waitForStableComposer();
+    await quitApp(app);
+    app = undefined;
+  } finally {
+    for (const release of releases) release();
+    await app?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
+
+/// A chat with subagent `helper` made in its first turn and `late` made in its
+/// third, each with finished work, and a plain fourth prompt last.
+async function startChatWithSubagents(prefix: string) {
+  const fixture = createFixture(prefix);
+  const typed = ["Copy prompt one.", "Copy prompt two.", "Copy prompt three.", "Copy prompt four.", "Use the helper in the fork."];
+  const childBodies: string[] = [];
+  let reports = 0;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, typed)) {
+      childBodies.push(body);
+      const latest = latestUserText(body);
+      if (latest.includes("HELPER_FORK")) return fakeGatewayFinalText("HELPER_FORK_DONE");
+      if (latest.includes("HELPER_THREE")) return fakeGatewayFinalText("HELPER_THREE_DONE");
+      if (latest.includes("LATE_TASK")) return fakeGatewayFinalText("LATE_DONE");
+      return fakeGatewayFinalText("HELPER_ONE_DONE");
+    }
+    if (isReportTurn(body)) {
+      reports += 1;
+      return fakeGatewayFinalText(`COPY_REPORT_${reports}`);
+    }
+    const answered = answeredCall(body);
+    if (answered === "copy-one") return fakeGatewayFinalText("COPY_PARENT_ONE");
+    if (answered === "copy-three") return delegate("copy-late", "late", "Work on LATE_TASK.");
+    if (answered === "copy-late") return fakeGatewayFinalText("COPY_PARENT_THREE");
+    if (answered === "copy-fork") return fakeGatewayFinalText("COPY_PARENT_FORK");
+    const latest = latestUserText(body);
+    if (latest.includes("Copy prompt one.")) return delegate("copy-one", "helper", "Work on HELPER_ONE.");
+    if (latest.includes("Copy prompt two.")) return fakeGatewayFinalText("COPY_PARENT_TWO");
+    if (latest.includes("Copy prompt three.")) return delegate("copy-three", "helper", "Work on HELPER_THREE.");
+    if (latest.includes("Copy prompt four.")) return fakeGatewayFinalText("COPY_PARENT_FOUR");
+    if (latest.includes("Use the helper in the fork.")) return delegate("copy-fork", "helper", "Work on HELPER_FORK.");
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  }, { classifierDecision: "clear" });
+  const app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
+  await app.session.sendText("Copy prompt one.");
+  await scrollbackContains(app.session, "COPY_REPORT_1");
+  await app.session.waitForStableComposer();
+  await app.session.sendText("Copy prompt two.");
+  await scrollbackContains(app.session, "COPY_PARENT_TWO");
+  await app.session.waitForStableComposer();
+  await app.session.sendText("Copy prompt three.");
+  await scrollbackContains(app.session, "COPY_PARENT_THREE");
+  const source = rootSessionIds(fixture.home)[0]!;
+  // Reports of work that ends together share one turn, so wait for the work.
+  await app.session.waitForPane(() => childLines(fixture.home, source).filter((line) => line.kind === "child_finished").length >= 3, TIMEOUT);
+  for (let seen = -1; seen !== reports; ) {
+    seen = reports;
+    await scrollbackContains(app.session, `COPY_REPORT_${seen}`);
+    await app.session.waitForStableComposer();
+  }
+  await app.session.sendText("Copy prompt four.");
+  await scrollbackContains(app.session, "COPY_PARENT_FOUR");
+  await app.session.waitForStableComposer();
+  return { fixture, gateway, app, source, childBodies };
+}
+
+test.skipIf(!tmuxAvailable())("/fork asks once and copies the subagents made before the fork point, with their history up to it", async () => {
+  const { fixture, gateway, app, source, childBodies } = await startChatWithSubagents("fx-v2-app-fork-copies-");
+  let open: { session: TmuxSession; stderrPath: string } | undefined = app;
+  try {
+    const sourceChildren = childLines(fixture.home, source).filter((line) => line.kind === "child_spawned").map((line) => line.child);
+    const helper = sourceChildren[0]!;
+    const before = logBytes(fixture);
+
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await selectForkPrompt(app.session, "Copy prompt three.");
+    await app.session.sendKeys("Enter");
+    // Only helper existed before that prompt.
+    const asked = await app.session.waitForPane((pane) => FORK_QUESTION.test(pane) && pane.includes(FORK_QUESTION_HINT), TIMEOUT);
+    expect(asked.match(FORK_QUESTION)![1]).toBe("1");
+    expect(asked).toContain("Bring 1 subagent into the fork?");
+    await app.session.sendKeys("Enter");
+    await waitForForkNotice(app.session, source, "Copy prompt three.");
+
+    const fork = rootSessionIds(fixture.home).find((id) => id !== source)!;
+    const copies = ownChildLines(fixture.home, fork).filter((line) => line.kind === "child_spawned").map((line) => line.child);
+    expect(copies).toHaveLength(1);
+    const copy = copies[0]!;
+    expect(copy).not.toBe(helper);
+    const copyLog = logLines(fixture.home, copy) as any[];
+    expect(copyLog[0].role).toBe("child");
+    expect(copyLog[0].parent).toBe(fork);
+    expect(copyLog[0].forked_from.id).toBe(helper);
+    const copyText = readFileSync(join(storeRoot(fixture.home), copy, "log.jsonl"), "utf8");
+    expect(copyText).toContain("HELPER_ONE_DONE");
+    expect(copyText).not.toContain("HELPER_THREE_DONE");
+
+    // The copy takes new work with its history up to the fork point.
+    await app.session.sendKeys("C-u");
+    await app.session.sendText("Use the helper in the fork.");
+    await scrollbackContains(app.session, "COPY_PARENT_FORK");
+    expect(childBodies.at(-1)).toContain("HELPER_ONE_DONE");
+    expect(childBodies.at(-1)).not.toContain("HELPER_THREE_DONE");
+    await app.session.waitForStableComposer();
+    await quitApp(app);
+    open = undefined;
+
+    // The source and its subagents kept every line they had.
+    for (const [id, bytes] of before) {
+      const after = readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"));
+      expect(after.subarray(0, bytes.length).equals(bytes)).toBe(true);
+    }
+    expect(childLines(fixture.home, source).filter((line) => line.kind === "child_spawned").map((line) => line.child)).toEqual(sourceChildren);
+    for (const id of savedSessionIds(fixture.home)) expectWholeLog(fixture, id);
+  } finally {
+    await open?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
+
+for (const [label, key] of [["n", "n"], ["Esc", "Escape"]] as const) {
+  test.skipIf(!tmuxAvailable())(`/fork forks without the subagents when the answer is ${label}`, async () => {
+    const { fixture, gateway, app, source } = await startChatWithSubagents(`fx-v2-app-fork-no-copies-${label.toLowerCase()}-`);
+    let open: { session: TmuxSession; stderrPath: string } | undefined = app;
+    try {
+      const sessions = savedSessionIds(fixture.home).length;
+      await app.session.sendText("/fork");
+      await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+      await app.session.sendKeys("Enter");
+      // The newest prompt, the fourth, comes after both subagents were made.
+      const asked = await app.session.waitForPane((pane) => FORK_QUESTION.test(pane), TIMEOUT);
+      expect(asked.match(FORK_QUESTION)![1]).toBe("2");
+      await app.session.sendKeys(key);
+      await waitForForkNotice(app.session, source, "Copy prompt four.");
+      const fork = rootSessionIds(fixture.home).find((id) => id !== source)!;
+      expect(ownChildLines(fixture.home, fork)).toEqual([]);
+      // Only the fork itself is new.
+      expect(savedSessionIds(fixture.home)).toHaveLength(sessions + 1);
+      await app.session.sendKeys("C-u");
+      await quitApp(app);
+      open = undefined;
+    } finally {
+      await open?.session.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 6);
+}
+
+test.skipIf(!tmuxAvailable())("/fork asks nothing when no subagent existed at the fork point", async () => {
+  const { fixture, gateway, app, source } = await startChatWithSubagents("fx-v2-app-fork-before-children-");
+  let open: { session: TmuxSession; stderrPath: string } | undefined = app;
+  try {
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await selectForkPrompt(app.session, "Copy prompt one.");
+    await app.session.sendKeys("Enter");
+    const pane = await waitForForkNotice(app.session, source, "Copy prompt one.");
+    expect(pane).not.toMatch(FORK_QUESTION);
+    const fork = rootSessionIds(fixture.home).find((id) => id !== source)!;
+    expect(ownChildLines(fixture.home, fork)).toEqual([]);
+    await app.session.sendKeys("C-u");
+    await quitApp(app);
+    open = undefined;
+  } finally {
+    await open?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
+
+test.skipIf(!tmuxAvailable())("a copy of a subagent whose turn runs across the fork point ends that turn there as cancelled", async () => {
+  const fixture = createFixture("fx-v2-app-fork-mid-turn-");
+  const typed = ["Long prompt one.", "Long prompt two."];
+  const releases: Array<() => void> = [];
+  let held = false;
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, typed)) {
+      held = true;
+      return new Promise<Response>((resolve) => releases.push(() => resolve(fakeGatewayFinalText("LONG_CHILD_DONE"))));
+    }
+    if (isReportTurn(body)) return fakeGatewayFinalText("LONG_REPORT");
+    // The first turn ends once runner's turn is open, so the fork point
+    // falls inside it.
+    if (answeredCall(body) === "long-one") {
+      return (async () => {
+        while (!held) await Bun.sleep(10);
+        return fakeGatewayFinalText("LONG_PARENT_ONE");
+      })();
+    }
+    const latest = latestUserText(body);
+    if (latest.includes("Long prompt one.")) return delegate("long-one", "runner", "Work on LONG_TASK for a long time.");
+    if (latest.includes("Long prompt two.")) return fakeGatewayFinalText("LONG_PARENT_TWO");
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
+    await app.session.sendText("Long prompt one.");
+    await scrollbackContains(app.session, "LONG_PARENT_ONE");
+    await app.session.waitForPane(() => held, TIMEOUT);
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Long prompt two.");
+    await scrollbackContains(app.session, "LONG_PARENT_TWO");
+    await app.session.waitForStableComposer();
+    const source = rootSessionIds(fixture.home)[0]!;
+    const runner = childLines(fixture.home, source)[0].child;
+
+    // The fork point ends the first turn, while runner's turn is open.
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await selectForkPrompt(app.session, "Long prompt two.");
+    await app.session.sendKeys("Enter");
+    await app.session.waitForPane((pane) => pane.includes("Bring 1 subagent into the fork?"), TIMEOUT);
+    await app.session.sendKeys("y");
+    await waitForForkNotice(app.session, source, "Long prompt two.");
+
+    const fork = rootSessionIds(fixture.home).find((id) => id !== source)!;
+    const copy = ownChildLines(fixture.home, fork).find((line) => line.kind === "child_spawned")!.child;
+    const lines = logLines(fixture.home, copy) as any[];
+    expect(lines[0].forked_from.id).toBe(runner);
+    expect(JSON.stringify(lines)).toContain("LONG_TASK");
+    // The copy's open turn ends where the fork point cut it, then the copy closes.
+    expect(lines.slice(-2).map((line) => [line.kind, line.reason ?? null])).toEqual([["turn_interrupted", "cancel"], ["closed", null]]);
+    expect(lines.filter((line) => line.kind === "turn_started")).toHaveLength(1);
+    // The work the copy's turn had open ends in the fork as cancelled too.
+    expect(ownChildLines(fixture.home, fork).map((line) => [line.kind, line.outcome ?? null])).toEqual([["child_spawned", null], ["child_finished", "cancelled"]]);
+    await app.session.sendKeys("C-u");
+    await quitApp(app);
+    app = undefined;
+    for (const id of savedSessionIds(fixture.home)) expectWholeLog(fixture, id);
+  } finally {
+    for (const release of releases) release();
+    await app?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
+
 test.skipIf(!tmuxAvailable())("a fork of a long session ends with its notice and the source's resume command, in view", async () => {
   const fixture = createFixture("fx-v2-app-long-fork-");
   let longAnswer = "";

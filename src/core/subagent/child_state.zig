@@ -858,6 +858,34 @@ pub fn finishEndFacts(data: ?[]const u8) EndFacts {
     return endFactsOf(wire.by, wire.cause);
 }
 
+/// Pure: whether a fork can take a copy of folded child `entry`: every
+/// child not closed for good (D97).
+pub fn copyableAtFork(entry: session_adapter.Child) bool {
+    return !foldedClosed(entry);
+}
+
+/// Pure: how a fork registers its copy of folded child `entry` (D97): one
+/// finished work item under its newest work id and spawn data. Work still
+/// open at the fork point reads as cancelled, as the copy's log ends it,
+/// and the copy owes no report, so the fork never wakes for work its
+/// source ran. Borrows `entry`; the finish data is in `arena`.
+pub fn forkCopy(arena: Allocator, entry: session_adapter.Child) !session_adapter.Session.ChildCopy {
+    const outcome: session_adapter.ChildOutcome = if (entry.open) .cancelled else entry.outcome orelse .cancelled;
+    var failure: ?[]const u8 = null;
+    if (outcome == .failed) if (entry.finish_data) |raw| {
+        const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+        const finish = json_decode.parseFromSliceLeaky(FinishData, arena, raw, options) catch FinishData{};
+        failure = finish.failure;
+    };
+    return .{
+        .id = entry.id,
+        .work_id = entry.work_id,
+        .outcome = outcome,
+        .spawn_data = entry.spawn_data,
+        .finish_data = try finishData(arena, failure, false, .{}),
+    };
+}
+
 /// The data for a finish with `failure` and `report_owed`, or null when it
 /// has neither, so a finish that owes nothing is written as before.
 fn finishData(arena: Allocator, failure: ?[]const u8, report_owed: bool, end: EndFacts) !?[]const u8 {
@@ -891,6 +919,60 @@ test "a finish that owes a report saves who started its work and why it was canc
     try std.testing.expectEqual(EndFacts{}, finishEndFacts("{\"report\":true}"));
     try std.testing.expectEqual(EndFacts{}, finishEndFacts("{\"report\":true,\"by\":\"robot\",\"cause\":\"meteor\"}"));
     try std.testing.expectEqual(EndFacts{}, finishEndFacts(null));
+}
+
+test "a fork's copy of a child owes no report, keeps a failure, and ends open work as cancelled (D97)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const spawn = @constCast("{\"agent\":\"helper\",\"fingerprint\":\"ab\",\"report\":\"final\"}");
+    var entry: session_adapter.Child = .{
+        .id = @constCast("kid"),
+        .work_id = @constCast("w1"),
+        .open = false,
+        .outcome = .ok,
+        .spawn_data = spawn,
+        .finish_data = @constCast("{\"report\":true,\"by\":\"user\"}"),
+        .seq = 9,
+    };
+    var copy = try forkCopy(arena, entry);
+    try std.testing.expectEqualStrings("kid", copy.id);
+    try std.testing.expectEqualStrings("w1", copy.work_id);
+    try std.testing.expectEqual(session_adapter.ChildOutcome.ok, copy.outcome);
+    try std.testing.expectEqualStrings(spawn, copy.spawn_data.?);
+    // A report the source owes stays the source's.
+    try std.testing.expectEqual(@as(?[]const u8, null), copy.finish_data);
+
+    entry.outcome = .failed;
+    entry.finish_data = @constCast("{\"failure\":\"model refused\",\"report\":true}");
+    copy = try forkCopy(arena, entry);
+    try std.testing.expectEqualStrings("{\"failure\":\"model refused\"}", copy.finish_data.?);
+
+    // Work still open at the fork point ends in the copy's log, as cancelled.
+    entry.open = true;
+    entry.outcome = null;
+    entry.finish_data = null;
+    copy = try forkCopy(arena, entry);
+    try std.testing.expectEqual(session_adapter.ChildOutcome.cancelled, copy.outcome);
+    try std.testing.expectEqual(@as(?[]const u8, null), copy.finish_data);
+}
+
+test "a fork offers every child but one closed for good (D97)" {
+    var entry: session_adapter.Child = .{
+        .id = @constCast("kid"),
+        .work_id = @constCast("w1"),
+        .open = false,
+        .outcome = .cancelled,
+        .spawn_data = null,
+        .finish_data = null,
+        .seq = 3,
+    };
+    try std.testing.expect(copyableAtFork(entry));
+    entry.finish_data = @constCast("{\"closed\":true}");
+    try std.testing.expect(!copyableAtFork(entry));
+    // A child whose work runs is open, never closed.
+    entry.open = true;
+    try std.testing.expect(copyableAtFork(entry));
 }
 
 test "a spawn saves who started a work its parent didn't" {

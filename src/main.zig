@@ -1528,8 +1528,8 @@ const App = struct {
         return resumed;
     }
 
-    pub fn forkBeforeSelectedPrompt(self: *App, agent: *agents.Agent) ![]u8 {
-        return SessionAppRuntime.forkBeforeSelectedPrompt(self, agent);
+    pub fn submitForkMenu(self: *App, agent: *agents.Agent, bring: ?bool) !?[]u8 {
+        return SessionAppRuntime.submitForkMenu(self, agent, bring);
     }
 
     pub fn loadMoreSessionPicker(self: *App, agent: *agents.Agent) !bool {

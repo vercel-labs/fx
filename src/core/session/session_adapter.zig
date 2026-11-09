@@ -2297,6 +2297,20 @@ pub const Session = struct {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const state = try self.handle.state(scratch.allocator());
+        return childrenOf(alloc, &state);
+    }
+
+    /// The children this session had at the end of the turn before
+    /// `before_turn`, a `ForkPoint.turn`, each as its newest work stood
+    /// then: what `fork` can copy (D97). Free with `freeChildren`.
+    pub fn forkChildren(self: *Session, alloc: Allocator, before_turn: u64) ![]Child {
+        if (before_turn == 0) return error.InvalidForkPoint;
+        var state = try self.store.manager.stateAt(self.id(), .{ .turn = before_turn - 1 });
+        defer state.deinit(self.store.manager.gpa);
+        return childrenOf(alloc, &state);
+    }
+
+    fn childrenOf(alloc: Allocator, state: *const sm.State) ![]Child {
         const out = try alloc.alloc(Child, state.children.items.len);
         var built: usize = 0;
         errdefer {
@@ -2723,7 +2737,11 @@ pub const Session = struct {
         host: Host,
         /// The title the source shows; the fork gets it marked as a fork.
         title: ?[]const u8 = null,
+        /// The children the fork takes a copy of, from `forkChildren` (D97).
+        children: []const ChildCopy = &.{},
     };
+
+    pub const ChildCopy = sm.ChildCopy;
 
     /// A new session holding this one's log up to the end of the turn before
     /// `options.before_turn`, under a new id (D58). The manager copies the
@@ -2737,6 +2755,7 @@ pub const Session = struct {
             .at = .{ .turn = options.before_turn - 1 },
             .workspace = options.workspace,
             .host = options.host,
+            .children = options.children,
         });
         errdefer handle.release();
         const copy = try init(alloc, self.store, handle, false);

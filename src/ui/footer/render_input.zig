@@ -136,6 +136,9 @@ pub const ForkMenuProjection = struct {
     points: []const session_adapter.Session.ForkPoint = &.{},
     selected: usize = 0,
     window_start: usize = 0,
+    /// While the menu asks whether the fork takes copies of the session's
+    /// subagents: how many it can copy (D97).
+    question: ?usize = null,
 
     pub fn active(self: ForkMenuProjection) bool {
         return self.points.len > 0;
