@@ -4569,18 +4569,16 @@ test "detached session preserves replacement failure with a zero output budget" 
     );
 }
 
+const long_script_filler_line =
+    "# long script transport filler ............................................................................................................................\n";
+
 test "raw process execution transports long scripts without exposing stdin" {
     if (builtin.target.os.tag == .windows) return;
 
     const alloc = std.testing.allocator;
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(alloc);
-    for (0..160) |_| {
-        try script.appendSlice(
-            alloc,
-            "# long script transport filler ............................................................................................................................\n",
-        );
-    }
+    for (0..160) |_| try script.appendSlice(alloc, long_script_filler_line);
     try script.appendSlice(
         alloc,
         "if IFS= read -r value; then printf 'stdin=pipe:%s\\n' \"$value\"; else printf 'stdin=eof\\n'; fi\nprintf 'long-script-ok\\n'\n",
@@ -4600,20 +4598,14 @@ test "raw process execution transports long scripts without exposing stdin" {
 test "raw process execution transports a script larger than any pipe buffer" {
     if (builtin.target.os.tag == .windows) return;
 
-    // On macOS the target starts suspended, so a supervisor that writes the
-    // script before the target can read it hangs once the script outgrows the
-    // pipe. The existing long-script test is 24 KiB, which an idle macOS pipe
-    // (64 KiB) holds whole. This one exceeds every pipe buffer, so it hangs on
-    // any Mac if that write moves back inline.
+    // On macOS the target starts suspended, so a helper that writes the script
+    // before the target reads it hangs once the script outgrows the pipe. The
+    // test above fits an idle 64 KiB pipe whole; this one exceeds every pipe
+    // buffer.
     const alloc = std.testing.allocator;
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(alloc);
-    for (0..2048) |_| {
-        try script.appendSlice(
-            alloc,
-            "# long script transport filler ............................................................................................................................\n",
-        );
-    }
+    for (0..2048) |_| try script.appendSlice(alloc, long_script_filler_line);
     try script.appendSlice(alloc, "printf 'huge-script-ok\\n'\n");
     try std.testing.expect(script.items.len > 256 * 1024);
 
