@@ -704,6 +704,39 @@ async function endBySignal(tui: TmuxSession, signal: NodeJS.Signals, workDir: st
   return text;
 }
 
+/// Opens the slash picker, or the command approval, over the long reply and
+/// waits for the viewport to hold still.
+async function openSurfaceBeforeSignal(tui: TmuxSession, surface: "slash picker" | "command approval", workDir: string): Promise<void> {
+  if (surface === "slash picker") {
+    await tui.sendLiteralText("/");
+    await tui.waitForText("Commands", 5_000);
+  } else {
+    await tui.sendText("Run the signal exit command.");
+    await tui.waitForText("Would you like to run the following command?", 20_000);
+  }
+  await stableFooterGrid(tui, workDir, "surface-open", SIGNAL_EXIT_STABLE_MS);
+}
+
+/// Resizes the window, sends `signal` to fx `delayMs` after the resize, waits
+/// for the pane to end, and returns its scrollback.
+async function endBySignalAfterResize(
+  tui: TmuxSession,
+  signal: NodeJS.Signals,
+  cols: number,
+  rows: number,
+  delayMs: number,
+  workDir: string,
+  label: string,
+): Promise<string> {
+  const pid = tui.processPid();
+  await tui.resizeWindow(cols, rows, delayMs);
+  process.kill(pid, signal);
+  await tui.waitForPane(() => tui.paneStatus().dead, 10_000);
+  const text = stripAnsi(await tui.captureFullScrollback());
+  writeFileSync(join(workDir, `${label}.txt`), text);
+  return text;
+}
+
 /// The closer saw the signal, the main thread answered its settle request,
 /// and no row was reported as dropped.
 function expectSignalCloseTrace(tracePath: string, signalNumber: number): void {
@@ -2144,6 +2177,53 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       session = null;
     },
     150_000,
+  );
+
+  // A window resize starts a debounce, and no frame commits until the resize
+  // has settled. A close inside it still ends fx with every held row in
+  // scrollback once: the exit frame does not wait for the debounce but ends it
+  // (`tests/tla/transcript_window/spec/FooterReclaim.tla` ExitKeepsRows,
+  // SignalExit with a resize debounce pending). The window grows, which main
+  // also keeps exactly once at every delay.
+  const RESIZE_SIGNAL_DELAYS_MS = [0, 50, 100];
+  for (const surface of ["slash picker", "command approval"] as const) {
+    for (const { signal, number } of [{ signal: "SIGTERM", number: 15 }, { signal: "SIGHUP", number: 1 }] as const) {
+      for (const delayMs of RESIZE_SIGNAL_DELAYS_MS) {
+        test(
+          `${signal} ${delayMs} ms after a resize with the ${surface} open leaves every row in scrollback once`,
+          async () => {
+            const run = await startSignalExitSession();
+            await openSurfaceBeforeSignal(session!, surface, run.workDir);
+            const afterExit = await endBySignalAfterResize(session!, signal, 120, 24, delayMs, run.workDir, "after-signal");
+            expect(footerMarkerCopies(afterExit), `${signal} ${delayMs} ms after a resize with the ${surface} open`).toEqual(longAssistantLines().map(() => 1));
+            expectSignalCloseTrace(run.tracePath, number);
+            expect(gateway!.requests).toHaveLength(surface === "slash picker" ? 1 : 2);
+            expect(readFileSync(run.stderrPath, "utf8")).toBe("");
+            await session!.kill();
+            session = null;
+          },
+          90_000,
+        );
+      }
+    }
+  }
+
+  test(
+    "SIGTERM after two resizes inside one debounce with the slash picker open leaves every row in scrollback once",
+    async () => {
+      // The second resize re-arms the debounce; the close ends it.
+      const run = await startSignalExitSession();
+      await openSurfaceBeforeSignal(session!, "slash picker", run.workDir);
+      await session!.resizeWindow(110, 24, 10);
+      const afterExit = await endBySignalAfterResize(session!, "SIGTERM", 120, 24, 0, run.workDir, "after-signal");
+      expect(footerMarkerCopies(afterExit), "SIGTERM after two resizes").toEqual(longAssistantLines().map(() => 1));
+      expectSignalCloseTrace(run.tracePath, 15);
+      expect(gateway!.requests).toHaveLength(1);
+      expect(readFileSync(run.stderrPath, "utf8")).toBe("");
+      await session!.kill();
+      session = null;
+    },
+    90_000,
   );
 
   test(

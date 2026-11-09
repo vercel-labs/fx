@@ -25,10 +25,11 @@
 //      Ctrl+O, and a resume, its traced window steps replayed on the core and
 //      checked by TLC (binary-to-spec.ts). FX_BIN picks the binary.
 //  15. footer signal to spec: the built fx with the slash picker open over a
-//      long transcript, also after Ctrl+O and a resize, and with an approval
-//      that a narrower window moved to the review screen, ended by a real
-//      SIGTERM or SIGHUP, the rows its history and screen hold checked by TLC
-//      against FooterReclaim.tla (footer-signal-to-spec.ts);
+//      long transcript, also after Ctrl+O and a resize, with an approval
+//      that a narrower window moved to the review screen, and right after a
+//      resize, ended by a real SIGTERM or SIGHUP, the rows its history and
+//      screen hold checked by TLC against FooterReclaim.tla
+//      (footer-signal-to-spec.ts);
 //  16. every planted bug in the signal close's wiring (a copy of src/ built and
 //      run by the signal driver or a tmux test) caught.
 //
@@ -94,13 +95,16 @@ try {
   // The footer: the design's config passes, main's rule before it (history
   // follows the footer on the screen) fails FooterAtBottom, the head before
   // the signal repair (SIGTERM and SIGHUP erase the footer without the exit
-  // frame) fails ExitKeepsRows, and so does the head before the
-  // invalid-anchor repair (the exit frame is drawn only from a stable anchor).
+  // frame) fails ExitKeepsRows, and so do the head before the
+  // invalid-anchor repair (the exit frame is drawn only from a stable anchor)
+  // and the head before the debounce repair (no exit frame while a resize
+  // debounce is pending).
   for (const [cfg, expected] of [
     ["MCFooterReclaim", null],
     ["MCFooterReclaimToday", "FooterAtBottom"],
     ["MCFooterReclaimSignalHead", "ExitKeepsRows"],
     ["MCFooterReclaimInvalidAnchorHead", "ExitKeepsRows"],
+    ["MCFooterReclaimDebounceHead", "ExitKeepsRows"],
   ] as const) {
     const run = await checkTlc(join(out, "model", cfg), "FooterReclaim", `${cfg}.cfg`, specFiles());
     models[cfg] = { verdict: run.verdict, property: run.property, distinct: run.distinct, depth: run.depth, ms: run.durationMs, tlc: run.tlcVersion };
@@ -197,7 +201,7 @@ try {
     const signal = await footerSignalToSpec({ dir: join(out, "footer-signal"), bin: fx });
     report.footerSignalToSpec = { scenarios: signal.scenarios, steps: signal.steps, problems: signal.problems, tlc: signal.tlc ? { verdict: signal.tlc.verdict, property: signal.tlc.property, distinct: signal.tlc.distinct } : null };
     stage("footer signal to spec", signal.tlc?.verdict === "pass" && signal.problems.length === 0,
-      `${signal.scenarios} runs of the built binary ended by SIGTERM or SIGHUP with the picker open, after Ctrl+O and a resize, or after the approval moved to the review screen, ${signal.steps} steps; TLC ${signal.tlc?.verdict ?? "not run"}${signal.tlc?.property ? ` (${signal.tlc.property})` : ""}${signal.problems.length ? `; ${signal.problems.join("; ")}` : ""}`);
+      `${signal.scenarios} runs of the built binary ended by SIGTERM or SIGHUP with the picker open, after Ctrl+O and a resize, after the approval moved to the review screen, or right after a resize, ${signal.steps} steps; TLC ${signal.tlc?.verdict ?? "not run"}${signal.tlc?.property ? ` (${signal.tlc.property})` : ""}${signal.problems.length ? `; ${signal.problems.join("; ")}` : ""}`);
     console.log(`  footer signal to spec: ${elapsed(at)}`);
   }
 } catch (error) {

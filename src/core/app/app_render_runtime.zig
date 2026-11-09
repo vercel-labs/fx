@@ -983,6 +983,11 @@ pub fn Runtime(comptime App: type) type {
         /// draws on the main screen, and its recovery from that anchor
         /// releases the held rows. A recovery request here would repaint a
         /// restored screen whose anchor is still stable and show rows twice.
+        /// A resize signalled shortly before the close holds every frame back
+        /// until its settled replay is drawn, so the close ends that debounce
+        /// and lets the loop's own resize steps finish: the pass that finds no
+        /// resize in flight draws the exit frame and answers, within the
+        /// closer's wait (`closeWaitsForResize`).
         pub fn settleForSignalClose(app: *App, flush_frame: *const fn (*App) anyerror!void) void {
             if (!app_lifecycle.signalClosePending()) return;
             const raw = app.terminal.raw_enabled;
@@ -997,6 +1002,7 @@ pub fn Runtime(comptime App: type) type {
                     app_lifecycle.leaveApprovalScreen(&app.terminal, &app.shell, &app.metrics) catch |err|
                         debug_trace.logf("render", "signal_close_review_screen_failed err={s}", .{@errorName(err)});
                 }
+                if (closeWaitsForResize(app)) return;
                 settleHeldTranscriptRows(app, flush_frame);
             }
             debug_trace.logf(
@@ -1005,6 +1011,25 @@ pub fn Runtime(comptime App: type) type {
                 .{ if (raw) "true" else "false", if (app.shell.heldRowsSettleOutstanding()) "true" else "false" },
             );
             app_lifecycle.answerSignalClose();
+        }
+
+        /// Whether the exit frame of a signal close must wait for a window
+        /// resize that is still moving toward its settled frame. A resize
+        /// signal the loop has not admitted yet is admitted first, and the
+        /// debounce, which only lets a window drag settle, ends now. The loop
+        /// then runs the resize's steps on its next passes (observe, light
+        /// frame, settled reset) and asks again; nothing in flight means the
+        /// exit frame can commit. The closer's 500 ms wait bounds all of it.
+        /// (`tests/tla/transcript_window/spec/FooterReclaim.tla` ExitKeepsRows,
+        /// SignalExit with a resize debounce pending.)
+        fn closeWaitsForResize(app: *App) bool {
+            if (comptime @hasDecl(App, "admitPendingResizeSignal")) {
+                _ = app.admitPendingResizeSignal("signal_close");
+            }
+            shell_runtime.skipResizeDebounce(&app.shell, io_mod.milliTimestamp());
+            if (!shell_runtime.resizeInFlight(&app.shell)) return false;
+            debug_trace.logf("app", "event=signal_close_resize_wait reason=resize_in_flight", .{});
+            return true;
         }
 
         pub fn flushRequestedFrame(app: *App, agent: *AppAgent) !void {

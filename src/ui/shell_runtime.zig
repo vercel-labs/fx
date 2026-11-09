@@ -497,6 +497,14 @@ pub fn resizeLifecycleIdle(shell: anytype) bool {
     return resize_runtime.lifecycleIdle(shell);
 }
 
+pub fn resizeInFlight(shell: anytype) bool {
+    return resize_runtime.lifecycleInFlight(shell);
+}
+
+pub fn skipResizeDebounce(shell: anytype, now_ms: i64) void {
+    resize_runtime.skipDebounce(shell, now_ms);
+}
+
 pub fn resizeBlocksFrameCommit(shell: anytype) bool {
     return resize_runtime.blocksFrameCommit(shell);
 }

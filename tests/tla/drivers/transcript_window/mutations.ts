@@ -24,7 +24,8 @@ import { specToCode } from "./spec-to-code.ts";
 type SpecMutation = { id: string; bug: string; law: string; constants: string; find: string; replace: string; spec?: string };
 type CoreMutation = { id: string; bug: string; sweep: string; find: string; replace: string };
 type RuntimeMutation = { id: string; bug: string; file: string; find: string; replace: string };
-/// `proof` is "driver" (the built-binary signal driver) or "e2e:<test name>".
+/// `proof` is "driver" (the built-binary signal driver, on its third scenario),
+/// "driver:<n>" (on scenario n of SIGNAL_SCENARIOS), or "e2e:<test name>".
 type WiringMutation = RuntimeMutation & { proof: string };
 
 /// The footer reclaim tests in src/ui/resize_tests.zig that a runtime bug runs
@@ -198,8 +199,10 @@ export async function wiringMutations(out: string): Promise<MutationResult[]> {
       continue;
     }
     const bin = join(root, "zig-out", "bin", "fx");
-    if (mutation.proof === "driver") {
-      const run = await footerSignalToSpec({ dir: join(out, mutation.id, "driver"), bin, scenarios: [SIGNAL_SCENARIOS[2]!] });
+    if (mutation.proof === "driver" || mutation.proof.startsWith("driver:")) {
+      const scenario = SIGNAL_SCENARIOS[mutation.proof === "driver" ? 2 : Number(mutation.proof.slice("driver:".length))];
+      if (scenario === undefined) throw new Error(`mutation ${mutation.id}: no signal scenario for proof ${mutation.proof}`);
+      const run = await footerSignalToSpec({ dir: join(out, mutation.id, "driver"), bin, scenarios: [scenario] });
       const caught = run.tlc?.verdict !== "pass" || run.problems.length > 0;
       results.push({
         id: mutation.id,

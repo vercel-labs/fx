@@ -202,8 +202,8 @@
       "law": "ExitKeepsRows",
       "spec": "FooterReclaim",
       "constants": "MCFooterReclaim",
-      "find": "SignalSettles(name) == SignalExits = \"settle\" \\/ (SignalExits = \"stable_only\" /\\ anchor = \"stable\")",
-      "replace": "SignalSettles(name) == (SignalExits = \"settle\" /\\ name /= \"SigHup\") \\/ (SignalExits = \"stable_only\" /\\ anchor = \"stable\")"
+      "find": "    \\/ SignalExits = \"settle\"\n",
+      "replace": "    \\/ (SignalExits = \"settle\" /\\ name /= \"SigHup\")\n"
     },
     {
       "id": "footer-exit-forgets-owed-rows",
@@ -213,6 +213,15 @@
       "constants": "MCFooterReclaim",
       "find": "    /\\ hist' = Max(hist, Natural(rows, open, epochFirst))\n",
       "replace": "    /\\ hist' = IF anchor = \"invalid\" THEN hist ELSE Max(hist, Natural(rows, open, epochFirst))\n"
+    },
+    {
+      "id": "footer-sighup-waits-for-debounce",
+      "bug": "SIGHUP's exit frame waits for a pending resize debounce, during which no frame commits, so a hang-up right after a resize ends fx with the rows a surface holds still held while SIGTERM keeps them.",
+      "law": "ExitKeepsRows",
+      "spec": "FooterReclaim",
+      "constants": "MCFooterReclaim",
+      "find": "    \\/ SignalExits = \"settle\"\n",
+      "replace": "    \\/ (SignalExits = \"settle\" /\\ ~(resizing /\\ name = \"SigHup\"))\n"
     }
   ],
   "core": [
@@ -421,6 +430,22 @@
       "find": "            if (app_lifecycle.signalClosePending()) return null;\n",
       "replace": "",
       "proof": "e2e:after a resize moved the command approval to the review screen"
+    },
+    {
+      "id": "signal-close-answers-during-resize",
+      "bug": "The signal close draws the exit frame and answers the closer while a resize is still in flight, when no frame can commit, so the closer restores the terminal with the rows a footer surface holds still held (the head before the debounce repair).",
+      "file": "src/core/app/app_render_runtime.zig",
+      "find": "                if (closeWaitsForResize(app)) return;\n",
+      "replace": "                _ = closeWaitsForResize(app);\n",
+      "proof": "e2e:SIGTERM 0 ms after a resize with the slash picker"
+    },
+    {
+      "id": "signal-close-keeps-the-debounce",
+      "bug": "The signal close waits out the resize debounce instead of ending it, so a drag that keeps re-arming the deadline holds the exit frame back until the closer's wait ends.",
+      "file": "src/core/app/app_render_runtime.zig",
+      "find": "            shell_runtime.skipResizeDebounce(&app.shell, io_mod.milliTimestamp());\n",
+      "replace": "",
+      "proof": "driver:9"
     }
   ]
 }

@@ -56,11 +56,15 @@ current code.
   approval, which at that window size would fill the main screen and leave no
   row to release) and restores the terminal once the frame is drawn, or after a
   bounded wait it logs; a frame that cannot commit is logged with the rows it
-  leaves out of scrollback. `spec/FooterReclaim.tla` models the main screen's
-  rows under this rule, with `Release = "current"` as main's rule before it,
-  `SignalExits = "erase"` as the signal close before it, and
+  leaves out of scrollback. A window resize starts a debounce during which no
+  frame commits, so a signal can arrive with a resize in flight: the close ends
+  the debounce, lets the loop's own resize steps finish, and draws the exit
+  frame once nothing is in flight. `spec/FooterReclaim.tla` models the main
+  screen's rows under this rule, with `Release = "current"` as main's rule
+  before it, `SignalExits = "erase"` as the signal close before it,
   `SignalExits = "stable_only"` as the signal close that settled only a stable
-  anchor; `mutations.json` plants
+  anchor, and `SignalExits = "debounce_blocked"` as the one that drew no frame
+  while a resize debounce was pending; `mutations.json` plants
   the rule's bugs in the spec, in the transcript runtime
   (`src/ui/transcript/runtime.zig`), and in the signal close's wiring
   (`src/core/app/app_lifecycle.zig`, `app_render_runtime.zig`, `main.zig`).
@@ -225,7 +229,7 @@ maps it onto the TLA+ variables.
 | L22 FooterAtBottom | The footer is on the bottom rows: the screen above it is full whenever the transcript has the rows to fill it (TUI-32), except while an invalid anchor leaves the main screen as an alternate screen last drew it. |
 | L23 HistoryOnce | No row in native history is on the screen, so no frame shows a row twice (native-history finality). |
 | L24 OwedRowsHeld | Every row on the screen or held above it is still in memory: the shell frees a dropped entry only once its rows are in history. |
-| L25 ExitKeepsRows | After exit (`/quit`, suspend, a fresh session, SIGTERM, or SIGHUP), from a stable, invalid, or recovering anchor, no row is held: each one is in native history or on the screen when the footer is erased. |
+| L25 ExitKeepsRows | After exit (`/quit`, suspend, a fresh session, SIGTERM, or SIGHUP), from a stable, invalid, or recovering anchor, no row is held: each one is in native history or on the screen when the footer is erased. A SIGTERM or SIGHUP that arrives with a resize debounce pending draws the exit frame too. |
 | L17 PureCore | `transcript_window.zig` imports only `std` and reads no clock, environment, or global. |
 
 ## Enforcement

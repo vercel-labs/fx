@@ -35,6 +35,12 @@
 \* (Ctrl+O's full transcript, the approval review screen) leaves the anchor
 \* invalid with no frame to recover it, and an invalid or recovering anchor has
 \* lost which rows it holds, so the signal ended fx with them still held.
+\* SignalExits = "debounce_blocked" is the head after that one: a window
+\* resize starts a debounce during which no frame commits (`blocksFrameCommit`
+\* in src/ui/render_request.zig), so a signal that arrived inside it got no
+\* exit frame before the closer's wait ended. The design ends the debounce: the
+\* main thread lets the pending resize settle without waiting for its deadline
+\* and draws the exit frame once nothing is in flight (`settleForSignalClose`).
 \*
 \* `anchor` is the state of the transcript runtime's committed anchor
 \* (`transcript_commit_state` in src/ui/transcript/runtime.zig): "stable" after
@@ -50,7 +56,7 @@ CONSTANTS
     Extra,       \* rows an open surface adds to the footer
     MaxResizes,  \* settled resizes over a run
     Release,     \* "base" (the design) or "current" (main before it)
-    SignalExits  \* "settle" (the design), "stable_only", or "erase" (the heads before it)
+    SignalExits  \* "settle" (the design), or "debounce_blocked", "stable_only", "erase" (the heads before it)
 
 VARIABLES rows, hist, top, open, exited, epochFirst, dropTo, freed, resizes, anchor, act
 
@@ -174,20 +180,27 @@ ExitFrame(name) ==
 
 Exited == ExitFrame("Exited")
 
-\* SIGTERM or SIGHUP, at any step between two frames. With the design the
-\* closer waits for the main thread's exit frame, whatever the anchor; with the
-\* head's rules it restores the terminal at once ("erase"), or the main thread
-\* draws the frame only from a stable anchor ("stable_only"), so the footer is
-\* erased with rows held.
-SignalSettles(name) == SignalExits = "settle" \/ (SignalExits = "stable_only" /\ anchor = "stable")
+\* SIGTERM or SIGHUP, at any step between two frames, with a resize debounce
+\* pending (`resizing`) or not: a window resize arrived less than the debounce
+\* ago, and no frame commits until its settled replay has been drawn. With the
+\* design the closer waits for the main thread's exit frame, whatever the
+\* anchor and whatever is pending; with the head's rules it restores the
+\* terminal at once ("erase"), or the main thread draws the frame only from a
+\* stable anchor ("stable_only") or only when no debounce is pending
+\* ("debounce_blocked"), so the footer is erased with rows held.
+SignalSettles(name, resizing) ==
+    \/ SignalExits = "settle"
+    \/ (SignalExits = "stable_only" /\ anchor = "stable")
+    \/ (SignalExits = "debounce_blocked" /\ ~resizing)
 
 SignalExit(name) ==
-    IF SignalSettles(name)
-    THEN ExitFrame(name)
-    ELSE /\ ~exited
-         /\ exited' = TRUE
-         /\ act' = name
-         /\ UNCHANGED <<rows, hist, top, open, epochFirst, dropTo, freed, resizes, anchor>>
+    \E resizing \in BOOLEAN :
+        IF SignalSettles(name, resizing)
+        THEN ExitFrame(name)
+        ELSE /\ ~exited
+             /\ exited' = TRUE
+             /\ act' = name
+             /\ UNCHANGED <<rows, hist, top, open, epochFirst, dropTo, freed, resizes, anchor>>
 
 Done == exited /\ UNCHANGED vars
 

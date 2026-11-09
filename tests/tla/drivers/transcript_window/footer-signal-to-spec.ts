@@ -9,8 +9,12 @@
 // the states the binary produced. The run also fails when a transcript row is
 // in history and on the screen, or twice anywhere.
 //
-// Three kinds of run, by what covers the main screen at the signal:
+// Four kinds of run, by what covers the main screen at the signal:
 //   picker          the slash picker is open on the main screen;
+//   resize-picker   the slash picker is open and the window is resized (wider,
+//                   as tall) a few milliseconds before the signal, so the
+//                   resize debounce is still pending when the signal arrives
+//                   and no frame can commit until the close ends it;
 //   ctrl-o-resize   the picker is open, Ctrl+O's full transcript screen covers
 //                   it, and the window is resized (narrower, as tall) before
 //                   the signal: CoveredResize, then the signal;
@@ -19,7 +23,9 @@
 //                   screen: ReviewResize, then the signal.
 // After a covered resize the anchor is invalid and no frame recovers it before
 // the signal, so the exit frame must release the rows from an invalid anchor
-// (the log of the run must show the anchor invalidated after the resize).
+// (the log of the run must show the anchor invalidated after the resize). After
+// a resize-picker resize the close must end the debounce and draw the frame
+// (the log of the run must show the close waiting for the resize in flight).
 //
 // footer-runtime-to-spec.ts checks the transcript runtime's settle in process.
 // This one checks what ends fx: the closer thread that handles the signal must
@@ -34,8 +40,9 @@
 // screen. Rows then count from the first marker, which only shifts the
 // model's row numbers.
 //
-// Run alone: bun footer-signal-to-spec.ts [--bin PATH] [--rows N [--signal SIGHUP] [--kind picker|ctrl-o-resize|review-screen]]
-// (--rows runs one scenario with an N-row transcript, for a stress run)
+// Run alone: bun footer-signal-to-spec.ts [--bin PATH] [--rows N [--signal SIGHUP] [--kind picker|ctrl-o-resize|review-screen|resize-picker] [--delay MS]]
+// (--rows runs one scenario with an N-row transcript, for a stress run; --delay
+// is how many milliseconds a resize-picker signal follows the resize)
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -51,12 +58,15 @@ const SCREEN_ROWS = 24;
 /// covered runs are short enough to stay one row at every width used, so the
 /// resize leaves the transcript's visual rows as they were.
 const COVERED_COLS = { "ctrl-o-resize": 80, "review-screen": 40 } as const;
+/// The width a resize-picker run widens the window to: the marker lines stay
+/// one row, and the screen keeps its height.
+const WIDE_COLS = 120;
 /// A command that fits an inline approval at COLS wide but needs the approval
 /// review screen at COVERED_COLS["review-screen"] wide.
 const LONG_COMMAND = `echo ${"scrollback-accounting-".repeat(6)}done`;
 
-export type SignalKind = "picker" | "ctrl-o-resize" | "review-screen";
-export type SignalScenario = { name: string; rows: number; signal: "SIGTERM" | "SIGHUP"; kind?: SignalKind };
+export type SignalKind = "picker" | "ctrl-o-resize" | "review-screen" | "resize-picker";
+export type SignalScenario = { name: string; rows: number; signal: "SIGTERM" | "SIGHUP"; kind?: SignalKind; delayMs?: number };
 
 /// Every scenario has a transcript longer than the screen, so the idle and
 /// the open footer both see a full screen above them.
@@ -70,6 +80,9 @@ export const SIGNAL_SCENARIOS: SignalScenario[] = [
   { name: "SIGHUP after Ctrl+O and a resize over the picker, 82 rows", rows: 82, signal: "SIGHUP", kind: "ctrl-o-resize" },
   { name: "SIGTERM after the approval moved to the review screen, 82 rows", rows: 82, signal: "SIGTERM", kind: "review-screen" },
   { name: "SIGHUP after the approval moved to the review screen, 82 rows", rows: 82, signal: "SIGHUP", kind: "review-screen" },
+  { name: "SIGTERM right after a resize with the picker open, 82 rows", rows: 82, signal: "SIGTERM", kind: "resize-picker" },
+  { name: "SIGHUP right after a resize with the picker open, 82 rows", rows: 82, signal: "SIGHUP", kind: "resize-picker" },
+  { name: "SIGTERM 50 ms after a resize with the picker open, 82 rows", rows: 82, signal: "SIGTERM", kind: "resize-picker", delayMs: 50 },
 ];
 
 type State = { rows: number; hist: number; top: number; open: boolean; exited: boolean; resizes: number; anchor: string; act: string };
@@ -152,7 +165,7 @@ type Run = { scenario: SignalScenario; states: State[]; baseCap: number; extra: 
 async function runScenario(scenario: SignalScenario, bin: string, dir: string): Promise<Run> {
   mkdirSync(dir, { recursive: true });
   const kind = scenario.kind ?? "picker";
-  const covered = kind !== "picker";
+  const covered = kind === "ctrl-o-resize" || kind === "review-screen";
   const work = mkdtempSync(join(tmpdir(), "fx-footer-signal-"));
   const home = join(work, "home");
   const workspace = join(work, "workspace");
@@ -187,7 +200,7 @@ async function runScenario(scenario: SignalScenario, bin: string, dir: string): 
         FX_PERMISSION_MODE: "ask",
         FX_TRACE: "1",
         FX_TRACE_LOG: tracePath,
-        FX_TRACE_SCOPES: "app,render,scroll",
+        FX_TRACE_SCOPES: "app,render,scroll,resize",
       },
       stderrPath: join(work, "stderr.log"),
       width: COLS,
@@ -220,7 +233,8 @@ async function runScenario(scenario: SignalScenario, bin: string, dir: string): 
     }
     problems.push(...open.problems);
 
-    // What covers the main screen, and the resize that follows.
+    // What covers the main screen, and the resize that follows. A resize-picker
+    // run resizes with nothing covering the screen and signals at once.
     const invalidatedBefore = invalidations(tracePath);
     if (kind === "ctrl-o-resize") {
       await session.sendKeys("C-o");
@@ -231,7 +245,9 @@ async function runScenario(scenario: SignalScenario, bin: string, dir: string): 
       if (kind === "review-screen") await session.waitForText("Permission needed", 15_000);
       await Bun.sleep(1_000);
     }
-    process.kill(session.processPid(), scenario.signal);
+    const pid = session.processPid();
+    if (kind === "resize-picker") await session.resizeWindow(WIDE_COLS, SCREEN_ROWS, scenario.delayMs ?? 0);
+    process.kill(pid, scenario.signal);
     await session.waitForPane(() => session!.paneStatus().dead, 10_000);
     const ended = await observe(session, scenario.rows, dir, "ended");
     problems.push(...ended.problems);
@@ -239,6 +255,12 @@ async function runScenario(scenario: SignalScenario, bin: string, dir: string): 
       problems.push("the fx log shows no anchor invalidated after the resize, so the run did not leave the anchor invalid");
     }
     const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+    if (kind === "resize-picker" && !trace.includes("event=signal_close_resize_wait")) {
+      problems.push("the fx log shows no resize in flight when the signal closed fx, so the run did not cover the resize debounce");
+    }
+    if (kind === "resize-picker" && !trace.includes("debounce_skipped reason=close")) {
+      problems.push("the fx log shows the close did not end the resize debounce");
+    }
     if (!trace.includes("event=signal_close_settle") || /held_rows_settle_(failed|incomplete)|signal_close_settle_unconfirmed/.test(trace)) {
       problems.push("the fx log of the signal close does not show a settled exit frame");
     }
@@ -247,7 +269,7 @@ async function runScenario(scenario: SignalScenario, bin: string, dir: string): 
     // The rows after the last marker are those of the idle screen, with the
     // picker open, and, after an approval, those of the screen it left.
     const tailAfter = kind === "review-screen" ? ended.tail : idle.tail;
-    if (idle.tail < 0 || ended.tail < 0 || (kind === "picker" && idle.tail !== open.tail) || (kind === "ctrl-o-resize" && idle.tail !== open.tail)) {
+    if (idle.tail < 0 || ended.tail < 0 || (kind !== "review-screen" && idle.tail !== open.tail)) {
       problemsOf.push(`${scenario.name}: the rows after the last marker are ${idle.tail} idle, ${open.tail} with the surface open, and ${ended.tail} at the end`);
     }
     const tail = Math.max(0, idle.tail);
@@ -336,7 +358,11 @@ if (import.meta.main) {
   const rows = argument("--rows");
   const signal = argument("--signal") === "SIGHUP" ? "SIGHUP" : "SIGTERM";
   const kind = (argument("--kind") ?? "picker") as SignalKind;
-  const scenarios = rows === undefined ? undefined : [{ name: `${signal} with the ${kind} scenario, ${rows} rows`, rows: Number(rows), signal, kind } as SignalScenario];
+  const delay = argument("--delay");
+  const scenarios =
+    rows === undefined
+      ? undefined
+      : [{ name: `${signal} with the ${kind} scenario, ${rows} rows`, rows: Number(rows), signal, kind, ...(delay === undefined ? {} : { delayMs: Number(delay) }) } as SignalScenario];
   const result = await footerSignalToSpec({ dir: join(outDir("footer-signal"), "signal"), bin, scenarios });
   const ok = result.tlc?.verdict === "pass" && result.problems.length === 0;
   console.log(
