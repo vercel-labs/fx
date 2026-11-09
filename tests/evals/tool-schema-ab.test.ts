@@ -12,6 +12,7 @@ import {
   numberIn,
   parseStreamUsage,
   rescoreResults,
+  reusableRun,
   rootRequest,
   startProxy,
   summarize,
@@ -219,6 +220,20 @@ describe("tool schema A/B helpers", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test("resume reuses only a run with the same arm key and names each run it drops", () => {
+    const lines: string[] = [];
+    const log = (line: string) => lines.push(line);
+    const stored = (key?: string) => ({ task: "t", armKey: key }) as unknown as RunResult;
+    const same = stored("abc");
+    expect(reusableRun(same, "abc", "a.json", log)).toBe(same);
+    expect(reusableRun(stored("old"), "abc", "b.json", log)).toBeNull();
+    expect(reusableRun(stored(), "abc", "c.json", log)).toBeNull();
+    expect(lines).toEqual([
+      "resume: rerunning b.json; it ran with arm key old, not abc",
+      "resume: rerunning c.json; it ran with arm key none, not abc",
+    ]);
   });
 
   test("tokens and probe refuse a variant that names a transform", () => {

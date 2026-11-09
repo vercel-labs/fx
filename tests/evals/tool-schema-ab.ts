@@ -116,6 +116,22 @@ export function armKey(arm: Pick<Arm, "bin" | "variant" | "variantPath">): strin
   return hash.digest("hex").slice(0, 16);
 }
 
+/**
+ * The stored run `run --resume` may reuse: only one that ran with this arm
+ * key. A run stored with another key, or before arm keys existed, is dropped
+ * and runs again, and `log` gets one line that names its file and both keys.
+ */
+export function reusableRun(
+  stored: RunResult,
+  key: string | undefined,
+  file: string,
+  log: (line: string) => void = console.log,
+): RunResult | null {
+  if (stored.armKey === key) return stored;
+  log(`resume: rerunning ${file}; it ran with arm key ${stored.armKey ?? "none"}, not ${key}`);
+  return null;
+}
+
 /** Applies a variant to one gateway request body in place. */
 export function applyVariant(body: Record<string, unknown>, variant: Variant): void {
   if (Array.isArray(body.tools) && variant.tools) {
@@ -1677,10 +1693,14 @@ async function main(): Promise<void> {
             jobs.push(async () => {
               const file = join(outDir, `${model.replaceAll("/", "_")}-${task.id}-${arm.name}-${trial}.json`);
               if (resume && existsSync(file)) {
+                let stored: RunResult | null = null;
                 try {
-                  const stored = JSON.parse(readFileSync(file, "utf8")) as RunResult;
-                  if (stored.armKey === arm.key) return stored;
-                } catch {}
+                  stored = JSON.parse(readFileSync(file, "utf8")) as RunResult;
+                } catch (error) {
+                  console.log(`resume: rerunning ${file}; it could not be read: ${error}`);
+                }
+                const reused = stored && reusableRun(stored, arm.key, file);
+                if (reused) return reused;
               }
               const result = await runOne(arm, model, task, trial, testKey, noSave);
               writeFileSync(file, JSON.stringify(result, null, 2));
