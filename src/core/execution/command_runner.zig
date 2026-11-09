@@ -4597,6 +4597,33 @@ test "raw process execution transports long scripts without exposing stdin" {
     try std.testing.expect(std.mem.find(u8, result.output, "long-script-ok\n") != null);
 }
 
+test "raw process execution transports a script larger than any pipe buffer" {
+    if (builtin.target.os.tag == .windows) return;
+
+    // The existing long-script test is 24 KiB, which an idle macOS pipe holds
+    // whole (64 KiB). This one exceeds every pipe buffer, so a supervisor that
+    // writes the script before its target can read it hangs on any machine.
+    const alloc = std.testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(alloc);
+    for (0..2048) |_| {
+        try script.appendSlice(
+            alloc,
+            "# long script transport filler ............................................................................................................................\n",
+        );
+    }
+    try script.appendSlice(alloc, "printf 'huge-script-ok\\n'\n");
+    try std.testing.expect(script.items.len > 256 * 1024);
+
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 4096,
+    }, alloc, script.items, "/tmp");
+    defer alloc.free(result.output);
+
+    try std.testing.expect(std.mem.find(u8, result.output, "exit_code=0\n") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "huge-script-ok\n") != null);
+}
+
 test "large stdout writes command artifact and returns bounded preview" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
