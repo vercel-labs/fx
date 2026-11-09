@@ -59,7 +59,9 @@ pub fn nextLine(buffer: []const u8, start: usize, content_width: usize) Line {
     const newline = std.mem.findScalar(u8, buffer[start..], '\n');
     const segment_end = if (newline) |relative| start + relative else buffer.len;
     const segment = buffer[start..segment_end];
-    const prefix = display_width.prefixByWidth(segment, content_width);
+    // A line starts a row of cells, so a bare mark at its start takes the
+    // cell of its circle.
+    const prefix = display_width.rowPrefixByWidth(segment, content_width);
     if (prefix.len < segment.len) {
         if (prefix.len > 0) {
             const end = start + prefix.len;
@@ -100,7 +102,7 @@ pub fn lineCount(buffer: []const u8, cursor: usize, content_width: usize) usize 
     while (start < buffer.len) {
         const line = nextLine(buffer, start, content_width);
         count += 1;
-        last_width = display_width.visibleWidth(buffer[line.start..line.content_end]);
+        last_width = display_width.rowWidth(buffer[line.start..line.content_end]);
         trailing_hard_break = line.hard_break and line.next_start == buffer.len;
         start = line.next_start;
     }
@@ -166,7 +168,7 @@ fn advanceLine(buffer: []const u8, line: Line, content_width: usize) ?Line {
     }
     if (!line.hard_break and
         line.content_end == buffer.len and
-        display_width.visibleWidth(buffer[line.start..line.content_end]) == content_width)
+        display_width.rowWidth(buffer[line.start..line.content_end]) == content_width)
     {
         return nextLine(buffer, buffer.len, content_width);
     }
@@ -188,7 +190,7 @@ fn lineOwnsCursor(
 
 fn cursorColumn(buffer: []const u8, line: Line, cursor: usize) usize {
     if (line.synthetic) return 0;
-    return display_width.visibleWidth(buffer[line.start..cursor]);
+    return display_width.rowWidth(buffer[line.start..cursor]);
 }
 
 fn cursorAtColumn(
@@ -203,7 +205,7 @@ fn cursorAtColumn(
     var column: usize = 0;
     var last_owned = line.start;
     while (cursor < line.content_end) {
-        const unit = display_width.displayUnitAt(buffer, cursor);
+        const unit = display_width.rowUnitAt(buffer, cursor, column);
         if (column + unit.cell_width > target_column) break;
         cursor += unit.byte_len;
         column += unit.cell_width;
@@ -269,4 +271,40 @@ test "vertical movement is inert beyond the first and last row" {
 test "line count includes trailing and exact-width cursor rows" {
     try std.testing.expectEqual(@as(usize, 2), lineCount("one\n", 4, 20));
     try std.testing.expectEqual(@as(usize, 2), lineCount("four", 4, 4));
+}
+
+test "a bare mark takes a cell of its own in every line measure" {
+    // The mark has no base, so it is drawn on a circle in one cell: the
+    // circle and "abc" fill four content cells, and the cursor after them
+    // needs a row of its own.
+    const buffer = "\u{0E49}abc";
+    try std.testing.expectEqual(@as(usize, 2), lineCount(buffer, buffer.len, 4));
+    try std.testing.expectEqual(@as(usize, 1), lineCount(buffer, buffer.len, 5));
+
+    // Three cells hold the circle and "ab", and "c" starts the next line.
+    const first = nextLine(buffer, 0, 3);
+    try std.testing.expectEqual(@as(usize, 3 + 2), first.content_end);
+    try std.testing.expectEqual(first.content_end, first.next_start);
+
+    // Zero-width characters before the mark change nothing.
+    const spaced = "\u{200B}\u{0E49}abc";
+    try std.testing.expectEqual(@as(usize, 3 + 3 + 2), nextLine(spaced, 0, 3).content_end);
+
+    // After a base, a mark takes no cell.
+    const based = "a\u{0E49}bc";
+    try std.testing.expectEqual(@as(usize, 1 + 3 + 1), nextLine(based, 0, 2).content_end);
+}
+
+test "vertical movement counts the circle of a bare mark" {
+    // The second line is the circle with its mark in column 0 and d in
+    // column 1.
+    const buffer = "abc\n\u{0E49}d";
+
+    const up = moveCursor(buffer, buffer.len, 20, .up, null);
+    try std.testing.expectEqual(@as(usize, 2), up.preferred_column);
+    try std.testing.expectEqual(@as(usize, 2), up.cursor);
+
+    // Column 1 is right after the circle, before d.
+    const down = moveCursor(buffer, 1, 20, .down, null);
+    try std.testing.expectEqual(@as(usize, 4 + 3), down.cursor);
 }

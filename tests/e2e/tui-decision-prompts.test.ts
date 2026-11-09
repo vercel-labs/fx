@@ -2193,6 +2193,32 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "approval amendment draws a bare mark on a dotted circle in a cell of its own",
+    async () => {
+      const ctx = await openApprovalPrompt("approval bare mark");
+
+      // The mark has no base: the space after "Yes," is not one, so the mark
+      // is drawn on a circle that takes a cell of its own.
+      const feedback = "\u0E49abc";
+      await ctx.session.sendKeys("Tab");
+      await ctx.session.sendLiteralText(feedback);
+      await waitForGridState(ctx.session, "approval bare mark circle", (grid) =>
+        grid.some((line) => line.includes("Yes, \u25CC\u0E49abc")),
+      );
+      expect(ctx.gateway.requests).toHaveLength(1);
+
+      // The circle is only drawn: the model gets the bytes that were typed.
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.waitForText("approval bare mark handled", TIMEOUT);
+      const body = ctx.gateway.requests[1]?.body ?? "";
+      expect(requestContainsExactString(body, feedback)).toBe(true);
+      expect(body.includes("\u25CC")).toBe(false);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "approval prompt discards bracketed paste controls and nested markers",
     async () => {
       const ctx = await openApprovalPrompt("approval paste");
@@ -2980,6 +3006,35 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.waitForText("question freeform digits handled", TIMEOUT);
       const body = ctx.gateway.requests[1]?.body ?? "";
       expect(requestContainsExactString(body, "42")).toBe(true);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "question freeform answer draws a bare mark on a dotted circle in a cell of its own",
+    async () => {
+      const ctx = await openQuestionPrompt("question bare mark");
+
+      await ctx.session.sendLiteralText("3");
+      await waitForQuestionPane(ctx.session, "question bare mark selected", (value) =>
+        hasQuestionSelection(value, 3, ""),
+      );
+      // The mark has no base: the space after "3)" is not one, so the mark
+      // is drawn on a circle that takes a cell of its own.
+      const answer = "\u0E49abc";
+      await ctx.session.sendLiteralText(answer);
+      const row = "    3) \u25CC\u0E49abc";
+      await waitForGridState(ctx.session, "question bare mark circle", (grid) =>
+        grid.some((line) => line.trimEnd() === row),
+      );
+
+      // The circle is only drawn: the model gets the bytes that were typed.
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.waitForText("question bare mark handled", TIMEOUT);
+      const body = ctx.gateway.requests[1]?.body ?? "";
+      expect(requestContainsExactString(body, answer)).toBe(true);
+      expect(body.includes("\u25CC")).toBe(false);
       await assertProcessAliveAndClean(ctx);
     },
     TIMEOUT,

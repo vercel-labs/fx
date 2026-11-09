@@ -564,8 +564,9 @@ const THAI_KAN = "\u0E01\u0E31\u0E49";
 const THAI_THI = "\u0E17\u0E35\u0E48";
 const THAI_NI = "\u0E19\u0E35\u0E48";
 const THAI_MAI_THO = "\u0E49";
-// A nonspacing mark with no base character before it in the draft is drawn on
-// U+25CC DOTTED CIRCLE, in a cell of its own.
+// A nonspacing mark with no base character before it, at the start of its row
+// or after nothing but zero-width characters, is drawn on U+25CC DOTTED
+// CIRCLE, in a cell of its own.
 const DOTTED_CIRCLE = "\u25CC";
 // One terminal cell holds at most 64 bytes of text, its base included: a
 // three-byte base takes 20 three-byte marks, 63 bytes, and a 21st would make 66.
@@ -815,6 +816,95 @@ tmuxTest(
     await active.waitForCursor((position) => position.col === 2, READY_TIMEOUT);
     await active.sendKeys("Right");
     await active.waitForCursor((position) => position.col === 3, READY_TIMEOUT);
+
+    expectCleanStderr();
+    expect(active.isAlive()).toBe(true);
+  },
+  TIMEOUT,
+);
+
+// U+200B ZERO WIDTH SPACE takes no cell and is no base for a mark.
+const ZERO_WIDTH_SPACE = "\u200B";
+
+tmuxTest(
+  "a mark after a zero-width space gets its own circle, and a sent message keeps its bare mark on a circle in its card",
+  async () => {
+    const active = await startFx(60, 24, true, false, 2);
+
+    // The mark follows only a zero-width character, so it has no base: it is
+    // drawn on a circle in a cell of its own, as a mark alone is, and the
+    // cursor after "a" is one cell further than it is for "a" alone.
+    await typeLiteral(active, `${ZERO_WIDTH_SPACE}${THAI_MAI_THO}a`);
+    await waitForExactComposerRow(
+      active,
+      `┃ ${ZERO_WIDTH_SPACE}${DOTTED_CIRCLE}${THAI_MAI_THO}a`,
+    );
+    const start = await active.waitForCursor((position) => position.col === 4, READY_TIMEOUT);
+
+    // The zero-width space, the mark, and the circle are one cursor stop.
+    await active.sendKeys("Left Left");
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 2,
+      READY_TIMEOUT,
+    );
+    await active.sendKeys("Right");
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 3,
+      READY_TIMEOUT,
+    );
+
+    // A variation selector has no glyph of its own: it is not drawn on a
+    // circle and takes no cell, so the cursor after "a" is in column 3.
+    await active.sendKeys("End C-u");
+    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
+    await typeLiteral(active, `\uFE0Fa`);
+    await active.waitForPane(
+      (pane) =>
+        pane.split("\n").some((line) => line.replaceAll("\uFE0F", "").trimEnd() === "┃ a"),
+      READY_TIMEOUT,
+    );
+    await active.waitForCursor((position) => position.col === 3, READY_TIMEOUT);
+    expect(await active.capturePane()).not.toContain(DOTTED_CIRCLE);
+
+    // A sent message that starts with a bare mark keeps it, on a circle, in
+    // its card: the rail's space cell is not a base.
+    await active.sendKeys("End C-u");
+    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
+    await typeLiteral(active, `${THAI_MAI_THO}abc`);
+    await waitForExactComposerRow(active, `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}abc`);
+    await active.sendKeys("Enter");
+    await active.waitForText("history prompt complete", READY_TIMEOUT);
+    const card = `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}abc`;
+    const first = await active.waitForPane(
+      (pane) => pane.split("\n").some((line) => line.trimEnd() === card),
+      READY_TIMEOUT,
+    );
+    expect(first.split("\n").filter((line) => line.trimEnd() === card)).toHaveLength(1);
+
+    // The same after a zero-width space. tmux does not keep the space in its
+    // capture of the card, so the row is read without it.
+    await typeLiteral(active, `${ZERO_WIDTH_SPACE}${THAI_MAI_THO}xyz`);
+    await active.sendKeys("Enter");
+    const zeroWidthCard = `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}xyz`;
+    await active.waitForPane(
+      (pane) =>
+        pane.split("\n").some((line) =>
+          line.replaceAll(ZERO_WIDTH_SPACE, "").trimEnd() === zeroWidthCard
+        ),
+      READY_TIMEOUT,
+    );
+
+    // The circle is only drawn: the model gets the bytes that were typed.
+    expect(gateway?.requests).toHaveLength(2);
+    const sent = (index: number): string => {
+      const messages = JSON.parse(gateway!.requests[index]!.body).prompt as Array<{
+        role: string;
+        content: Array<{ type: string; text?: string }>;
+      }>;
+      return messages[messages.length - 1]!.content[0]!.text!;
+    };
+    expect(sent(0)).toBe(`${THAI_MAI_THO}abc`);
+    expect(sent(1)).toBe(`${ZERO_WIDTH_SPACE}${THAI_MAI_THO}xyz`);
 
     expectCleanStderr();
     expect(active.isAlive()).toBe(true);

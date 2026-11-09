@@ -3,6 +3,7 @@ const diff_mod = @import("../../core/output/diff.zig");
 const approval_decision = @import("../../core/permissions/approval_decision.zig");
 const approval_prompt = @import("../../core/permissions/approval_prompt.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const text_boundaries = @import("../../core/input/text_boundaries.zig");
 const permission_request = @import("../../core/permissions/permission_request.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const ui_render = @import("../render.zig");
@@ -1613,7 +1614,10 @@ fn approvalDraftWindow(
         };
     }
 
-    const unit = display_width.displayUnitAt(draft, safe_cursor);
+    // The window starts a row of cells, so a mark at its start with no base
+    // before it is drawn on a circle that takes a cell of its own.
+    var before_width = display_width.rowWidth(draft[0..safe_cursor]);
+    const unit = display_width.rowUnitAt(draft, safe_cursor, before_width);
     const show_cursor_unit =
         unit.byte_len > 0 and unit.cell_width > 0 and
         unit.cell_width <= max_width;
@@ -1623,14 +1627,16 @@ fn approvalDraftWindow(
     else
         safe_cursor;
 
+    // The window scrolls by character, so the marks on a character that
+    // scrolls out go with it and never start the window on a mark whose base
+    // was cut.
     var before_start: usize = 0;
-    var before_width = display_width.visibleWidth(draft[0..safe_cursor]);
     while (before_start < safe_cursor and
         before_width + cursor_width > max_width)
     {
-        const leading_unit = display_width.displayUnitAt(draft, before_start);
-        before_width -|= leading_unit.cell_width;
-        before_start += leading_unit.byte_len;
+        const leading_end = @min(text_boundaries.nextCharacterEnd(draft, before_start), safe_cursor);
+        before_width -|= display_width.rowWidth(draft[before_start..leading_end]);
+        before_start = leading_end;
     }
 
     const after_width = max_width -| (before_width + cursor_width);
@@ -1658,17 +1664,19 @@ fn writeApprovalDraft(
     const window = approvalDraftWindow(draft, cursor, max_width);
     if (!window.cursor_visible) return;
 
-    try writer.writeAll(window.before);
+    var at_row_start = true;
+    try display_width.writeRowPart(writer, window.before, &at_row_start);
     try writer.writeAll("\x1b[7m");
     if (window.cursor_unit.len > 0) {
-        try writer.writeAll(window.cursor_unit);
+        try display_width.writeRowPart(writer, window.cursor_unit, &at_row_start);
     } else {
         try writer.writeByte(' ');
+        at_row_start = false;
     }
     try writer.writeAll(ui_render.reset_style);
     if (window.after.len > 0) {
         try writer.writeAll(ui_render.tag_style);
-        try writer.writeAll(window.after);
+        try display_width.writeRowPart(writer, window.after, &at_row_start);
     }
 }
 
@@ -2695,6 +2703,47 @@ test "approval amendment window follows the cursor by display units" {
 
     const hidden = approvalDraftWindow("abc", 1, 0);
     try std.testing.expect(!hidden.cursor_visible);
+}
+
+test "approval amendment draws a bare mark on a dotted circle in a cell of its own" {
+    // A mark that starts the draft has no base: the choice prefix is not one,
+    // so the mark is drawn on a circle that takes a cell of its own.
+    var plain: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer plain.deinit();
+    try writeApprovalDraft(&plain.writer, "\u{0E49}ab", 3 + 2, 20);
+    try std.testing.expect(std.mem.startsWith(u8, plain.written(), "\u{25CC}\u{0E49}ab"));
+
+    // A zero-width character before the mark leaves it bare.
+    var spaced: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer spaced.deinit();
+    try writeApprovalDraft(&spaced.writer, "\u{200B}\u{0E49}ab", 3 + 3 + 2, 20);
+    try std.testing.expect(std.mem.startsWith(u8, spaced.written(), "\u{200B}\u{25CC}\u{0E49}ab"));
+
+    // The cursor on the mark highlights the circle and the mark together.
+    const on_mark = approvalDraftWindow("\u{0E49}ab", 0, 20);
+    try std.testing.expectEqualStrings("\u{0E49}", on_mark.cursor_unit);
+    var cursor: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer cursor.deinit();
+    try writeApprovalDraft(&cursor.writer, "\u{0E49}ab", 0, 20);
+    try std.testing.expect(std.mem.startsWith(u8, cursor.written(), "\x1b[7m\u{25CC}\u{0E49}"));
+
+    // After a base a mark takes no cell and no circle.
+    var based: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer based.deinit();
+    try writeApprovalDraft(&based.writer, "a\u{0E49}b", 1 + 3 + 1, 20);
+    try std.testing.expect(std.mem.find(u8, based.written(), "\u{25CC}") == null);
+}
+
+test "approval amendment window counts the circle of a bare mark and scrolls by character" {
+    // The circle and "ab" take three cells and the cursor one more, so a
+    // window three cells wide scrolls the circle with its mark out.
+    const scrolled = approvalDraftWindow("\u{0E49}ab", 3 + 2, 3);
+    try std.testing.expectEqualStrings("ab", scrolled.before);
+
+    // A cluster that scrolls out takes its marks with it: the window never
+    // starts on a mark whose base was cut.
+    const cluster = approvalDraftWindow("\u{0E01}\u{0E31}\u{0E49}ab", 3 + 3 + 3 + 2, 3);
+    try std.testing.expectEqualStrings("ab", cluster.before);
 }
 
 test "approval panel amendment starts with a dim placeholder and cursor" {

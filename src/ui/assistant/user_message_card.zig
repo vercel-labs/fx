@@ -57,7 +57,12 @@ const WrapCut = struct { keep_bytes: usize, skip_bytes: usize };
 
 fn wrapCut(text: []const u8, row_budget: usize) WrapCut {
     if (row_budget == 0) return .{ .keep_bytes = 0, .skip_bytes = 0 };
-    const prefix = display_width.prefixByWidthIgnoringAnsi(text, row_budget);
+    // A row that starts with a bare mark spends one cell on its circle, and
+    // keeps the mark and the marks stacked on it however narrow it is.
+    const head = if (display_width.bareMarkInRow(text)) |bare| bare.end else 0;
+    const cells = row_budget - @intFromBool(head > 0);
+    const tail = display_width.prefixByWidthIgnoringAnsi(text[head..], cells);
+    const prefix = text[0 .. head + tail.len];
     if (prefix.len == text.len) return .{ .keep_bytes = prefix.len, .skip_bytes = prefix.len };
 
     if (lastSpaceIn(prefix)) |sp| {
@@ -425,7 +430,10 @@ fn collectLogicalLinesWithFirstPrefix(
             row_buf.clearRetainingCapacity();
             try writeRowPrefix(&row_buf.writer);
             if (active_hyperlink) |opener| try row_buf.writer.writeAll(opener);
-            try row_buf.writer.writeAll(fragment);
+            // The rail's space cell is no base for a mark: a mark that starts
+            // the row is drawn on a circle of its own.
+            var at_row_start = true;
+            try display_width.writeRowPart(&row_buf.writer, fragment, &at_row_start);
             active_hyperlink = hyperlinkStateAfter(fragment, active_hyperlink);
             if (active_hyperlink != null) try row_buf.writer.writeAll(osc8_close);
             try appendVisibleRow(alloc, rows, row_buf.written(), max_rows);
@@ -926,4 +934,113 @@ test "pending terminal card keeps only the visible tail rows" {
     try std.testing.expect(std.mem.find(u8, card, "row2") == null);
     try std.testing.expect(std.mem.find(u8, card, "row3") != null);
     try std.testing.expect(std.mem.find(u8, card, "row4") != null);
+}
+
+/// The `index`th row of `card`, without its newline.
+fn cardRow(card: []const u8, index: usize) ![]const u8 {
+    var rows = std.mem.splitScalar(u8, card, '\n');
+    var at: usize = 0;
+    while (rows.next()) |row| : (at += 1) {
+        if (at == index) return row;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "a message that starts with a bare mark draws it on a dotted circle in a cell of its own" {
+    setStyle(false, null);
+    const alloc = std.testing.allocator;
+
+    // A mark that starts the message has no base: the rail's space cell is
+    // not one, so the mark is drawn on a circle of its own.
+    const card = try buildUserPromptCard(alloc, "\u{0E49}abc", &.{}, 80);
+    defer alloc.free(card);
+    try assertRowStructure(card);
+    try std.testing.expect(std.mem.find(u8, card, "\x1b[1m\u{25CC}\u{0E49}abc") != null);
+
+    // Painted: the rail is column 1, the space column 2, the circle with the
+    // mark column 3, and a column 4. The space cell holds no mark.
+    var grid = try vt_emulator.Grid.init(alloc, 80, 1);
+    defer grid.deinit();
+    try grid.feed(try cardRow(card, 0));
+    const space = grid.cellAt(1, 2).?;
+    try std.testing.expectEqual(@as(u32, 0), space.combining_suffix_id);
+    const circle = grid.cellAt(1, 3).?;
+    try std.testing.expectEqual(@as(u21, 0x25CC), circle.codepoint);
+    try std.testing.expectEqualStrings("\u{0E49}", grid.combiningSuffix(circle.combining_suffix_id).?);
+    try std.testing.expectEqual(@as(u21, 'a'), grid.cellAt(1, 4).?.codepoint);
+
+    // A zero-width character before the mark leaves it bare, and so does a
+    // line break before it. Marks stacked on the mark share the circle.
+    inline for ([_][]const u8{ "\u{200B}", "\u{200D}", "\u{FEFF}" }) |zero_width| {
+        const spaced = try buildUserPromptCard(alloc, zero_width ++ "\u{0E49}\u{0E48}abc", &.{}, 80);
+        defer alloc.free(spaced);
+        try std.testing.expect(std.mem.find(u8, spaced, zero_width ++ "\u{25CC}\u{0E49}\u{0E48}abc") != null);
+    }
+    const lines = try buildUserPromptCard(alloc, "x\n\u{0E49}y", &.{}, 80);
+    defer alloc.free(lines);
+    try std.testing.expect(std.mem.find(u8, lines, "\x1b[1mx") != null);
+    try std.testing.expect(std.mem.find(u8, lines, "\x1b[1m\u{25CC}\u{0E49}y") != null);
+
+    // After a base the mark takes no cell and no circle.
+    const based = try buildUserPromptCard(alloc, "a\u{0E49}b", &.{}, 80);
+    defer alloc.free(based);
+    try std.testing.expect(std.mem.find(u8, based, "\u{25CC}") == null);
+}
+
+test "a card counts a bare mark's circle in its width and still ends in a one-cell window" {
+    setStyle(false, null);
+    const alloc = std.testing.allocator;
+
+    // Seven columns leave five cells after the rail: the circle takes one,
+    // so "abcd" fits the first row and "ef" wraps.
+    const card = try buildUserPromptCard(alloc, "\u{0E49}abcdef", &.{}, 7);
+    defer alloc.free(card);
+    try assertRowStructure(card);
+    try std.testing.expectEqual(@as(usize, 2), countRows(card));
+    try std.testing.expect(std.mem.find(u8, card, "\u{25CC}\u{0E49}abcd\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, card, "\x1b[1mef") != null);
+    var rows = std.mem.splitScalar(u8, card, '\n');
+    while (rows.next()) |row| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row) <= 7);
+    }
+
+    // Three columns leave one cell: the circle and the marks stacked on it
+    // fill the first row, and each letter wraps onto a row of its own.
+    const narrow = try buildUserPromptCard(alloc, "\u{0E49}\u{0E49}\u{0E49}abc", &.{}, 3);
+    defer alloc.free(narrow);
+    try assertRowStructure(narrow);
+    try std.testing.expectEqual(@as(usize, 4), countRows(narrow));
+    try std.testing.expect(std.mem.find(u8, narrow, "\x1b[1m\u{25CC}\u{0E49}\u{0E49}\u{0E49}\x1b[0m") != null);
+    var narrow_rows = std.mem.splitScalar(u8, narrow, '\n');
+    while (narrow_rows.next()) |row| {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row) <= 3);
+    }
+}
+
+test "a card of thousands of bare marks and zero-width spaces draws one circle" {
+    setStyle(false, null);
+    const alloc = std.testing.allocator;
+
+    // 3,000 marks have no base: the first takes the circle's cell, and the
+    // rest stack on it. Zero-width spaces before the mark do not change that,
+    // and the letter after it wraps only when the window has no cell for it.
+    const marks = text_utils.repeat("\u{0E49}", 3_000);
+    const spaced = text_utils.repeat("\u{200B}", 3_000) ++ "\u{0E49}a";
+    const cases = [_]struct { text: []const u8, cols: u16, rows: usize }{
+        .{ .text = marks, .cols = 80, .rows = 1 },
+        .{ .text = marks, .cols = 3, .rows = 1 },
+        .{ .text = spaced, .cols = 80, .rows = 1 },
+        .{ .text = spaced, .cols = 3, .rows = 2 },
+    };
+    for (cases) |case| {
+        const card = try buildUserPromptCard(alloc, case.text, &.{}, case.cols);
+        defer alloc.free(card);
+        try assertRowStructure(card);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, card, "\u{25CC}"));
+        try std.testing.expectEqual(case.rows, countRows(card));
+        var rows = std.mem.splitScalar(u8, card, '\n');
+        while (rows.next()) |row| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row) <= case.cols);
+        }
+    }
 }

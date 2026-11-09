@@ -15,10 +15,12 @@ pub const InputPrefix = struct {
 };
 pub const UnitKind = union(enum) {
     text,
-    /// A nonspacing mark with no base character before it: the first unit of
-    /// the draft or of a line after a newline. The prompt's space cell is not a
-    /// base, so the mark takes one cell of its own, which the painter draws on
-    /// `bare_mark_base`, and the marks after it stack there.
+    /// A nonspacing mark with no base character before it: it is at content
+    /// column 0 of its row, so nothing but zero-width characters, such as a
+    /// zero-width space, comes before it on the row. The prompt's space cell is
+    /// not a base, so the mark takes one cell of its own, which the painter
+    /// draws on `display_width.bare_mark_base`, and the marks after it stack
+    /// there.
     bare_mark,
     tab,
     paste_placeholder,
@@ -27,9 +29,6 @@ pub const UnitKind = union(enum) {
         attachment_index: usize,
     },
 };
-
-/// What the painter draws under a `bare_mark` unit: U+25CC DOTTED CIRCLE.
-pub const bare_mark_base = "\u{25CC}";
 
 pub const SkillTokenSpan = registered_entities.SkillTokenSpan;
 
@@ -230,18 +229,17 @@ pub const Iterator = struct {
             };
         }
 
-        const display_unit = display_width.displayUnitAt(input, start);
-        if (display_unit.cell_width == 0 and
-            (start == 0 or input[start - 1] == '\n') and
-            display_width.isNonspacingMarkAt(input, start))
-        {
-            return .{
-                .raw_start = start,
-                .raw_end = start + display_unit.byte_len,
-                .cell_width = 1,
-                .kind = .bare_mark,
-            };
+        if (self.content_column == 0) {
+            if (display_width.bareMarkUnitAt(input, start)) |bare| {
+                return .{
+                    .raw_start = start,
+                    .raw_end = start + bare.byte_len,
+                    .cell_width = bare.cell_width,
+                    .kind = .bare_mark,
+                };
+            }
         }
+        const display_unit = display_width.displayUnitAt(input, start);
         return .{
             .raw_start = start,
             .raw_end = start + display_unit.byte_len,
@@ -1422,6 +1420,67 @@ test "a mark that has a base, or is not a nonspacing mark, takes no cell of its 
         try std.testing.expectEqual(UnitKind.text, unit.kind);
         try std.testing.expectEqual(@as(usize, 0), unit.cell_width);
     }
+}
+
+test "a mark after only zero-width characters starts its row and takes a cell of its own" {
+    // A zero-width space, a joiner, and a byte order mark take no cell, so the
+    // mark after them still has no base and no cell before it on its row.
+    inline for ([_][]const u8{ "\u{200B}", "\u{200D}", "\u{FEFF}" }) |zero_width| {
+        const input = zero_width ++ "\u{0E49}\u{0E48}a";
+        const source = testSource(input, input.len, 80);
+
+        const lead = unitAt(source, 0).?;
+        try std.testing.expectEqual(UnitKind.text, lead.kind);
+        try std.testing.expectEqual(@as(usize, 0), lead.cell_width);
+
+        const mark = unitAt(source, zero_width.len).?;
+        try std.testing.expectEqual(UnitKind.bare_mark, mark.kind);
+        try std.testing.expectEqual(@as(usize, 1), mark.cell_width);
+        try std.testing.expectEqual(@as(usize, 0), mark.content_column);
+
+        // The next mark stacks on the circle and takes no cell.
+        const stacked = unitAt(source, zero_width.len + 3).?;
+        try std.testing.expectEqual(UnitKind.text, stacked.kind);
+        try std.testing.expectEqual(@as(usize, 1), stacked.content_column);
+
+        // The circle's cell moves the cursor, as it does for a mark alone.
+        try expectCursor(input, zero_width.len, 80, 0, 0);
+        try expectCursor(input, zero_width.len + 6, 80, 0, 1);
+        try expectCursor(input, input.len, 80, 0, 2);
+
+        // After a newline the row starts again, and so does the rule.
+        const second = "x\n" ++ input;
+        const after_newline = unitAt(testSource(second, second.len, 80), 2 + zero_width.len).?;
+        try std.testing.expectEqual(UnitKind.bare_mark, after_newline.kind);
+        try std.testing.expectEqual(@as(usize, 1), after_newline.row_index);
+        try std.testing.expectEqual(@as(usize, 0), after_newline.content_column);
+    }
+
+    // Two zero-width characters before the mark change nothing.
+    const two = "\u{200B}\u{FEFF}\u{0E49}a";
+    try std.testing.expectEqual(UnitKind.bare_mark, unitAt(testSource(two, two.len, 80), 6).?.kind);
+    try expectCursor(two, two.len, 80, 0, 2);
+
+    // A base before the zero-width character gives the mark a cell to sit on.
+    inline for ([_][]const u8{ "a\u{200B}\u{0E49}", " \u{200D}\u{0E49}" }) |based| {
+        const mark = unitAt(testSource(based, based.len, 80), based.len - 3).?;
+        try std.testing.expectEqual(UnitKind.text, mark.kind);
+        try std.testing.expectEqual(@as(usize, 0), mark.cell_width);
+    }
+}
+
+test "a variation selector with no base is not drawn on a circle" {
+    // It has no glyph of its own, so it stays zero-width where it is, and a
+    // mark after it is the one that has no base.
+    for ([_][]const u8{ "\u{FE0F}a", "\u{FE0E}a", "\u{FE00}a" }) |input| {
+        const source = testSource(input, input.len, 80);
+        const selector = unitAt(source, 0).?;
+        try std.testing.expectEqual(UnitKind.text, selector.kind);
+        try std.testing.expectEqual(@as(usize, 0), selector.cell_width);
+        try expectCursor(input, input.len, 80, 0, 1);
+    }
+    const marked = "\u{FE0F}\u{0E49}a";
+    try std.testing.expectEqual(UnitKind.bare_mark, unitAt(testSource(marked, marked.len, 80), 3).?.kind);
 }
 
 test "a row with one content cell holds a bare mark's circle and wraps the letter after it" {

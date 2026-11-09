@@ -353,7 +353,7 @@ fn writeSelectedFreeformOptionLines(
     while (start < buffer.len) {
         const line = question_freeform_layout.nextLine(buffer, start, content_width);
         const end = line.content_end;
-        last_width = display_width.visibleWidth(buffer[start..end]);
+        last_width = display_width.rowWidth(buffer[start..end]);
         trailing_hard_break = line.hard_break and line.next_start == buffer.len;
 
         if (first) {
@@ -365,20 +365,28 @@ fn writeSelectedFreeformOptionLines(
             try writer.writeAll(ui_render.selected_completion_style);
         }
 
+        // The line starts a row of cells, so a mark at its start with no base
+        // before it is drawn on a circle of its own, which the cursor on the
+        // mark highlights with it.
+        var at_row_start = true;
         if (cursor >= start and cursor < end) {
-            try writer.writeAll(buffer[start..cursor]);
+            try display_width.writeRowPart(writer, buffer[start..cursor], &at_row_start);
             try writer.writeAll(ui_render.reset_style);
             try writer.writeAll(reverse);
-            const cursor_unit = display_width.displayUnitAt(buffer, cursor);
+            const cursor_unit = display_width.rowUnitAt(
+                buffer,
+                cursor,
+                display_width.rowWidth(buffer[start..cursor]),
+            );
             const cursor_end = @min(cursor + cursor_unit.byte_len, end);
-            try writer.writeAll(buffer[cursor..cursor_end]);
+            try display_width.writeRowPart(writer, buffer[cursor..cursor_end], &at_row_start);
             try writer.writeAll(ui_render.reset_style);
             if (cursor_end < end) {
                 try writer.writeAll(ui_render.selected_completion_style);
-                try writer.writeAll(buffer[cursor_end..end]);
+                try display_width.writeRowPart(writer, buffer[cursor_end..end], &at_row_start);
             }
         } else {
-            try writer.writeAll(buffer[start..end]);
+            try display_width.writeRowPart(writer, buffer[start..end], &at_row_start);
         }
 
         if (cursor == end and line.hard_break) {
@@ -898,6 +906,81 @@ test "compose question panel renders typed buffer in place of placeholder" {
 
     try std.testing.expect(std.mem.find(u8, text, "hi") != null);
     try std.testing.expect(std.mem.find(u8, text, "\x1b[7m") != null);
+}
+
+test "selected freeform answer draws a bare mark on a dotted circle in a cell of its own" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Yes", .description = null },
+        .{ .label = "No", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Should we proceed?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+    prompt.moveChoice(-1);
+
+    // A mark that starts the answer has no base: the prompt's space cell is
+    // not one, so the mark is drawn on a circle of its own.
+    try std.testing.expectEqual(
+        question_prompt.FreeformInsertResult.inserted,
+        try prompt.insertFreeformSlice(std.testing.allocator, "\u{0E49}abc", 128),
+    );
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, 40);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "3) \u{25CC}\u{0E49}abc") != null);
+
+    // The cursor on the mark highlights the circle and the mark together.
+    _ = try prompt.apply(std.testing.allocator, .{ .edit_freeform = .cursor_home });
+    const on_mark = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, 40);
+    defer std.testing.allocator.free(on_mark);
+    try std.testing.expect(std.mem.find(u8, on_mark, "\x1b[7m\u{25CC}\u{0E49}") != null);
+
+    // A zero-width character before the mark leaves it bare.
+    _ = try prompt.apply(std.testing.allocator, .{ .edit_freeform = .cursor_end });
+    for (0..4) |_| _ = try prompt.apply(std.testing.allocator, .backspace);
+    try std.testing.expectEqual(
+        question_prompt.FreeformInsertResult.inserted,
+        try prompt.insertFreeformSlice(std.testing.allocator, "\u{200B}\u{0E49}abc", 128),
+    );
+    const spaced = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, 40);
+    defer std.testing.allocator.free(spaced);
+    try std.testing.expect(std.mem.find(u8, spaced, "3) \u{200B}\u{25CC}\u{0E49}abc") != null);
+}
+
+test "selected freeform answer counts a bare mark's circle in its rows at every width" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Yes", .description = null },
+        .{ .label = "No", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Should we proceed?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+    prompt.moveChoice(-1);
+    try std.testing.expectEqual(
+        question_prompt.FreeformInsertResult.inserted,
+        try prompt.insertFreeformSlice(std.testing.allocator, "\u{0E49}abcdefghijklmnop", 128),
+    );
+
+    // The circle takes the first cell of the first row, so each row keeps
+    // inside the width, and the measured rows match the composed ones.
+    var width: u16 = 16;
+    while (width <= 30) : (width += 1) {
+        const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, width);
+        defer std.testing.allocator.free(text);
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= width);
+        }
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\u{25CC}"));
+        try expectQuestionPanelRowsMatch(&prompt, width);
+    }
 }
 
 test "selected freeform answer wraps into measured continuation rows" {

@@ -19,6 +19,8 @@
 (*   ascii       a printable ASCII character                               *)
 (*   wide        an East Asian wide character                              *)
 (*   latin_mark  a Latin combining mark, such as U+0301                    *)
+(*   zw          a zero-width character that is not a mark: U+200B, U+200D *)
+(*               or U+FEFF, which draw no cell and are no base for a mark  *)
 (* and a drawn U+25CC DOTTED CIRCLE, class "circle", which only the        *)
 (* painter writes.                                                         *)
 (*                                                                         *)
@@ -30,18 +32,30 @@
 (*   "split-cluster"  planted bug: nextCharacterEnd stops after one unit   *)
 (*                                                                         *)
 (* A nonspacing mark with no base character before it has nothing to sit   *)
-(* on. It comes first in the draft, or first after a newline; the model    *)
-(* has one line, so it is the first unit of the text (BareAt). The prompt's *)
-(* space cell is not a base. Bare picks what fx does with it                *)
-(* (src/ui/input/visual_layout.zig peekRawUnit, src/ui/footer/              *)
-(* input_presentation.zig appendLayoutUnitContent):                         *)
+(* on. It starts its row: nothing but zero-width characters comes before it *)
+(* on the row, so it sits at content column 0 (BareCol0). The model has one *)
+(* line, so the row is the whole text. The prompt's space cell is not a     *)
+(* base. A surface that draws text after a prefix cell, which is the        *)
+(* composer, the question prompt's free-text answer, the approval feedback  *)
+(* draft, and the card of a sent message, applies the rule once, in         *)
+(* src/core/shared/display_width.zig bareMarkUnitAt. Bare picks what fx     *)
+(* does with such a mark (src/ui/input/visual_layout.zig peekRawUnit,       *)
+(* src/ui/footer/input_presentation.zig appendLayoutUnitContent):           *)
 (*   "dotted"            the change: the layout gives the mark one cell and *)
 (*                       the painter writes U+25CC before it, so the mark   *)
 (*                       and the marks after it stack on the circle         *)
 (*   "joins-prefix"      fx before it: the mark measures 0 cells and lands  *)
 (*                       on the prompt's space cell                         *)
+(*   "first-unit"        fx before the repair of this change: only the      *)
+(*                       first unit of the draft, or of a line, is bare, so *)
+(*                       a mark after a zero-width character is not and     *)
+(*                       lands on the prompt's space cell                   *)
 (*   "dotted-uncounted"  planted bug: the painter writes the circle but the *)
 (*                       layout still counts 0 cells for the mark           *)
+(*   "after-zero-width"  planted bug: a mark is bare when the unit before   *)
+(*                       it is a zero-width character, whatever comes       *)
+(*                       before that, so a mark that sits on a base through *)
+(*                       a zero-width character gets a circle mid-row       *)
 (*                                                                         *)
 (* A terminal cell holds at most Cap bytes of text, its base character and  *)
 (* the marks on it together. The model scales Cap down so TLC reaches it;   *)
@@ -88,7 +102,7 @@ EXTENDS Integers, Sequences
 
 CONSTANTS Rule, MaxLen, Cols, Margin, Bare, Limit, Cap
 
-Classes == {"base", "mark", "am", "ascii", "wide", "latin_mark"}
+Classes == {"base", "mark", "am", "ascii", "wide", "latin_mark", "zw"}
 
 IsMark(c) == c \in {"mark", "latin_mark"}
 
@@ -104,24 +118,40 @@ CircleBytes == 3
 VARIABLES text, cursor, col
 vars == <<text, cursor, col>>
 
-\* A nonspacing mark with no base character before it: the first unit of the
-\* draft, as a mark.
-BareAt(t, i) == i = 1 /\ IsMark(t[1])
+\* A nonspacing mark with no base character before it: a mark at content
+\* column 0, with nothing but zero-width characters before it on its row. This
+\* is the rule, whatever fx does.
+BareCol0(t, i) == IsMark(t[i]) /\ \A j \in 1..(i - 1) : t[j] = "zw"
+
+\* The marks fx draws on a circle in a cell of its own, under Bare.
+CodeBare(t, i) ==
+    CASE Bare = "joins-prefix" -> FALSE
+      [] Bare = "first-unit" -> i = 1 /\ IsMark(t[1])
+      [] Bare = "after-zero-width" -> IsMark(t[i]) /\ (i = 1 \/ t[i - 1] = "zw")
+      [] OTHER -> BareCol0(t, i)
 
 \* The cells fx's runeWidth and layout give t[i].
 FxWidth(t, i) ==
     CASE t[i] = "mark" /\ Rule = "today" -> 1
-      [] BareAt(t, i) -> IF Bare = "dotted" THEN 1 ELSE 0
+      [] CodeBare(t, i) -> IF Bare = "dotted-uncounted" THEN 0 ELSE 1
       [] IsMark(t[i]) -> 0
+      [] t[i] = "zw" -> 0
       [] t[i] = "am" -> IF Rule = "sara-am" THEN 0 ELSE 1
       [] t[i] = "wide" -> 2
       [] OTHER -> 1
 
+\* What the character boundaries see: a bare mark is a zero-width unit to
+\* them, as to runeWidth, whatever cell the layout gives its circle. So the
+\* cursor steps over a zero-width character, a bare mark, and the marks on it
+\* as one character (src/core/input/text_boundaries.zig nextCharacterEnd).
+BoundaryWidth(t, i) == IF CodeBare(t, i) THEN 0 ELSE FxWidth(t, i)
+
 \* The cells the terminal gives t[i]: a bare mark has a cell exactly when the
 \* painter writes the circle for it.
 TermWidth(t, i) ==
-    CASE BareAt(t, i) -> IF Bare = "joins-prefix" THEN 0 ELSE 1
+    CASE CodeBare(t, i) -> 1
       [] IsMark(t[i]) -> 0
+      [] t[i] = "zw" -> 0
       [] t[i] = "wide" -> 2
       [] OTHER -> 1
 
@@ -135,7 +165,7 @@ TermCol(t, i) == IF i = 0 THEN 0 ELSE TermCol(t, i - 1) + TermWidth(t, i)
 
 \* nextCharacterEnd: one unit, then every unit fx measures as zero cells.
 RECURSIVE SkipZero(_, _)
-SkipZero(t, j) == IF j < Len(t) /\ FxWidth(t, j + 1) = 0 THEN SkipZero(t, j + 1) ELSE j
+SkipZero(t, j) == IF j < Len(t) /\ BoundaryWidth(t, j + 1) = 0 THEN SkipZero(t, j + 1) ELSE j
 
 NextEnd(t, i) ==
     IF i >= Len(t) THEN Len(t)
@@ -181,11 +211,16 @@ RowStartUndrawn == Cols = 0 /\ Margin # "cell-less-keeps"
 AfterCells(undrawn, w) ==
     IF Cols = 0 /\ Margin = "cell-less-keeps" THEN undrawn ELSE ~Drawn(w)
 
-\* The picture of a unit with cells: a bare mark comes with its circle.
-Picture(t, i) == IF BareAt(t, i) THEN <<"circle", t[i]>> ELSE <<t[i]>>
+\* The picture fx draws for a unit with cells: a bare mark comes with its
+\* circle.
+Picture(t, i) == IF CodeBare(t, i) THEN <<"circle", t[i]>> ELSE <<t[i]>>
 
-\* The bytes a unit with cells puts on its cell.
-CellBytes(t, i) == IF BareAt(t, i) THEN CircleBytes + Bytes(t[i]) ELSE Bytes(t[i])
+\* The bytes fx puts on the cell of a unit with cells.
+CellBytes(t, i) == IF CodeBare(t, i) THEN CircleBytes + Bytes(t[i]) ELSE Bytes(t[i])
+
+\* The picture and the bytes the rule asks for.
+WantedPicture(t, i) == IF BareCol0(t, i) THEN <<"circle", t[i]>> ELSE <<t[i]>>
+WantedBytes(t, i) == IF BareCol0(t, i) THEN CircleBytes + Bytes(t[i]) ELSE Bytes(t[i])
 
 \* The sequence shown, whether the engine failed a step, whether a cell holds
 \* more than Cap, and how many marks the limit dropped.
@@ -217,7 +252,7 @@ Shown(t) == ShownFrom(t, 1, 0, 0, RowStartUndrawn, Cap - 1)
 
 \* The cells a unit takes in what the terminal must show: a mark with no base
 \* always takes one, whatever Bare says.
-WantedWidth(t, i) == IF BareAt(t, i) THEN 1 ELSE FxWidth(t, i)
+WantedWidth(t, i) == IF BareCol0(t, i) THEN 1 ELSE FxWidth(t, i)
 
 \* What the terminal must show of t: a unit with cells when a row has the
 \* cells for it, a bare mark on its circle, a mark when its base is drawn and
@@ -232,8 +267,8 @@ WantedFrom(t, i, ok, room) ==
          IN (IF kept THEN <<t[i]>> ELSE <<>>)
             \o WantedFrom(t, i + 1, ok, IF kept THEN room - Bytes(t[i]) ELSE room)
     ELSE LET d == Drawn(WantedWidth(t, i))
-         IN (IF d THEN Picture(t, i) ELSE <<>>)
-            \o WantedFrom(t, i + 1, d, Cap - CellBytes(t, i))
+         IN (IF d THEN WantedPicture(t, i) ELSE <<>>)
+            \o WantedFrom(t, i + 1, d, Cap - WantedBytes(t, i))
 
 Wanted(t) == WantedFrom(t, 1, Cols > 0, Cap - 1)
 
@@ -320,8 +355,19 @@ NoCapDrop == Shown(text).dropped = 0
 \* the cursor at the end.
 NoBareCircle ==
     ~(/\ Len(text) >= 2
-      /\ BareAt(text, 1)
+      /\ CodeBare(text, 1)
       /\ cursor = Len(text)
       /\ Len(Shown(text).seq) > 0
       /\ Shown(text).seq[1] = "circle")
+
+\* Witness: a mark after a zero-width character is drawn on its circle, with
+\* the cursor after it and the zero-width character kept before the circle.
+NoBareAfterZeroWidth ==
+    ~(/\ Len(text) >= 2
+      /\ text[1] = "zw"
+      /\ CodeBare(text, 2)
+      /\ cursor = Len(text)
+      /\ Len(Shown(text).seq) >= 3
+      /\ Shown(text).seq[1] = "zw"
+      /\ Shown(text).seq[2] = "circle")
 =============================================================================

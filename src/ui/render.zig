@@ -514,7 +514,7 @@ fn copyVisualRowToBuffer(source: visual_layout.Source, target_row: usize, out: [
                 },
                 .bare_mark => {
                     // A full row never gets here: it continued above.
-                    appendBytesToBuffer(out, &len, visual_layout.bare_mark_base);
+                    appendBytesToBuffer(out, &len, display_width.bare_mark_base);
                     appendBytesToBuffer(out, &len, source.input[unit.raw_start..unit.raw_end]);
                     remaining_cells -= unit.cell_width;
                     omitted_positive_unit = false;
@@ -648,6 +648,23 @@ test "input line draws a mark with no base on a dotted circle in a cell of its o
     // One content cell: the circle takes it, and nothing else fits.
     const narrow = buildInputLineForRow(bare, bare.len, 0, 2, 3, &buf);
     try std.testing.expectEqualStrings("❯ \u{25CC}\u{0E49}\u{0E48}", narrow.line);
+}
+
+test "input line draws a mark after a zero-width space on a dotted circle in a cell of its own" {
+    var buf: [64]u8 = undefined;
+    // The zero-width space takes no cell, so the mark after it has no base:
+    // "❯ ", the space, the circle with the marks, and a, so the cursor is in
+    // column 5.
+    const bare = "\u{200B}\u{0E49}\u{0E48}a";
+    const view = buildInputLine(bare, bare.len, 20, &buf);
+    try std.testing.expectEqualStrings("❯ \u{200B}\u{25CC}\u{0E49}\u{0E48}a", view.line);
+    try std.testing.expectEqual(@as(u16, 5), view.cursor_col);
+
+    // After a base the same character leaves the mark on that base.
+    const based = "a\u{200B}\u{0E49}";
+    const kept = buildInputLine(based, based.len, 20, &buf);
+    try std.testing.expectEqualStrings("❯ a\u{200B}\u{0E49}", kept.line);
+    try std.testing.expectEqual(@as(u16, 4), kept.cursor_col);
 }
 
 test "input line wraps without cutting emoji bytes" {

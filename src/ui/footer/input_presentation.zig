@@ -1118,7 +1118,7 @@ fn appendLayoutUnitContent(
             // The mark has no base to sit on, so it gets the circle and one
             // cell, and the marks after it stack there. A full row never gets
             // here: appendLayoutUnit returns first and flags the omission.
-            try row.appendSlice(alloc, visual_layout.bare_mark_base);
+            try row.appendSlice(alloc, display_width.bare_mark_base);
             try row.appendSlice(alloc, source.input[unit.raw_start..unit.raw_end]);
             remaining_cells.* -= unit.cell_width;
             omitted_positive_unit.* = false;
@@ -1373,6 +1373,21 @@ test "composer row draws a mark with no base on a dotted circle of its own cell"
     try expectComposedRows("a\u{0E49}b", 60, &.{"┃ a\u{0E49}b"});
     // Three columns leave one cell: the circle takes it and the letter wraps.
     try expectComposedRows("\u{0E49}a", 3, &.{ "┃ \u{25CC}\u{0E49}", "┃ a" });
+}
+
+test "composer row draws a mark after zero-width characters on a circle of its own cell" {
+    // A zero-width space, a joiner, and a byte order mark take no cell, so the
+    // mark after them has no base: it gets the circle, as a mark alone does.
+    try expectComposedRows("\u{200B}\u{0E49}a", 60, &.{"┃ \u{200B}\u{25CC}\u{0E49}a"});
+    try expectComposedRows("\u{200D}\u{0E49}\u{0E48}a", 60, &.{"┃ \u{200D}\u{25CC}\u{0E49}\u{0E48}a"});
+    try expectComposedRows("\u{FEFF}\u{0301}a", 60, &.{"┃ \u{FEFF}\u{25CC}\u{0301}a"});
+    try expectComposedRows("a\n\u{200B}\u{0E49}b", 60, &.{ "┃ a", "┃ \u{200B}\u{25CC}\u{0E49}b" });
+    // After a base, the same zero-width character leaves the mark on that base.
+    try expectComposedRows("a\u{200B}\u{0E49}b", 60, &.{"┃ a\u{200B}\u{0E49}b"});
+    // A variation selector has no glyph of its own: it gets no circle.
+    try expectComposedRows("\u{FE0F}a", 60, &.{"┃ \u{FE0F}a"});
+    // Three columns leave one cell: the circle takes it and the letter wraps.
+    try expectComposedRows("\u{200B}\u{0E49}a", 3, &.{ "┃ \u{200B}\u{25CC}\u{0E49}", "┃ a" });
 }
 
 test "composer row drops the marks after a unit that does not fit a full row" {

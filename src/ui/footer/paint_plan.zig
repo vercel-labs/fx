@@ -1725,6 +1725,31 @@ test "composer paints a mark with no base on a dotted circle and leaves the pref
     try std.testing.expectEqual(@as(u32, 0), letter.combining_suffix_id);
 }
 
+test "composer paints a mark after a zero-width space on a dotted circle and keeps it off the prefix cell" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    // The zero-width space takes no cell, so the mark after it has no base:
+    // the circle is in column 3, the letter in column 4, and the cursor
+    // after it in column 5, exactly as for a mark alone.
+    var drawn = try composeDraftFrame(alloc, "\u{200B}\u{0E49}a", 40);
+    defer drawn.deinit(alloc);
+    try std.testing.expectEqual(drawn.input_row, drawn.frame.cursor.row);
+    try std.testing.expectEqual(@as(u16, 5), drawn.frame.cursor.col);
+
+    var grid = try paintedRowGrid(alloc, &drawn, drawn.input_row, 40);
+    defer grid.deinit();
+    const space = grid.cellAt(1, 2) orelse return error.TestUnexpectedResult;
+    const space_text = if (space.combining_suffix_id == 0) "" else grid.combiningSuffix(space.combining_suffix_id) orelse "";
+    try std.testing.expect(std.mem.find(u8, space_text, "\u{0E49}") == null);
+    const circle = grid.cellAt(1, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, 0x25CC), circle.codepoint);
+    try std.testing.expectEqualStrings("\u{0E49}", grid.combiningSuffix(circle.combining_suffix_id) orelse "");
+    const letter = grid.cellAt(1, 4) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, 'a'), letter.codepoint);
+}
+
 test "composer paints a long run of marks with no base on one circle within the cell's limit" {
     const alloc = std.testing.allocator;
     ui_render.initTheme(false, null);

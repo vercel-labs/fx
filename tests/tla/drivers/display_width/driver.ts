@@ -14,9 +14,12 @@
 // reject a walk. The edge walks come first: the P267 repro (กั้งabc, then
 // ที่นี่ok), น้ำ, every Thai nonspacing mark on a base, the spacing Thai code
 // points next to them, marks with no base, one and 22 stacked on a base or
-// on the circle, a mark typed in front of text that is already there, Thai
-// mixed with a Latin mark and a wide character, and marks on a Thai, Latin,
-// and wide character in the last column of a row. Seeded random walks follow.
+// on the circle, a mark with no base after a zero-width space (a mark that
+// starts its row, whatever zero-width characters come before it, is bare, and
+// one after a base is not), a mark typed in
+// front of text that is already there, Thai mixed with a Latin mark and a
+// wide character, and marks on a Thai, Latin, and wide character in the last
+// column of a row. Seeded random walks follow.
 //
 // A second session is two columns wide, where the composer row has no content
 // cells (Cols 0 in the model). Its walks type the same kinds of text, among
@@ -28,10 +31,13 @@
 // --only W runs just the pane W columns wide (60 or 2).
 //
 // TLC replays the walks through the model's own actions under the change
-// (FIXED). --self-check also replays the 60-column walks under three models
+// (FIXED). --self-check also replays the 60-column walks under four models
 // of fx before it, each of which must reject them: Rule "today", Thai marks
 // that measure one cell, Bare "joins-prefix", a mark with no base left on the
-// prompt's cell, and Limit "refuse", a cell with no room that fails the step.
+// prompt's cell, Bare "first-unit", this change before its repair, which drew
+// only the first unit of a draft on a circle, so a mark after a zero-width
+// space joined the prompt's cell, and Limit "refuse", a cell with no room
+// that fails the step.
 // The 2-column walks are replayed under Margin "cell-less-keeps", a row
 // builder that puts the marks of undrawn characters on the prefix cell, which
 // must reject them too. The model's cell limit is fx's 64 bytes (CELL_BYTES),
@@ -57,7 +63,7 @@ import { join } from "node:path";
 import { binary, hashFile, targetHelpers } from "../lib/context";
 import { TLA_ROOT, outDir, runTlc, writeJson } from "../lib/tlc";
 
-type Class = "base" | "mark" | "am" | "ascii" | "wide" | "latin_mark";
+type Class = "base" | "mark" | "am" | "ascii" | "wide" | "latin_mark" | "zw";
 // What one cell of the composer's rows shows: a class, a blank cell, or the
 // dotted circle fx draws under a mark with no base.
 type Seen = Class | "gap" | "circle";
@@ -108,10 +114,17 @@ const MEMBERS: Record<Class, number[]> = {
   ascii: [0x61, 0x62, 0x6b, 0x6f, 0x7a],
   wide: [0x754c, 0x6f22],
   latin_mark: [0x0300, 0x0301],
+  // A zero-width character that is not a mark. The walks use the zero-width
+  // space: tmux, which the driver reads, shows the other two by its own rules
+  // (it drops a lone byte order mark, and it puts the character after a joiner
+  // on the joiner's cell), so the Zig tests cover the byte order mark and the
+  // joiner.
+  zw: [0x200b],
 };
 
 /// The abstraction function: the model's class of one code point.
 function classOf(codepoint: number): Class {
+  if (codepoint === 0x200b || codepoint === 0x200d || codepoint === 0xfeff) return "zw";
   if (THAI_MARKS.includes(codepoint)) return "mark";
   if (codepoint === 0x0e33) return "am";
   if (codepoint >= 0x0e00 && codepoint <= 0x0e7f) return "base";
@@ -147,6 +160,27 @@ function edgeWalks(): Array<{ id: string; sends: Send[] }> {
     { id: "bare-marks", sends: [...typed("\u0E49\u0E48a"), ...keys("home", "right", "right", "end", "backspace", "backspace")] },
     { id: "bare-mark", sends: [...typed("\u0E49a"), ...keys("left", "left", "right", "end", "backspace", "backspace")] },
     { id: "bare-latin", sends: [...typed("\u0301b"), ...keys("home", "right", "end", "backspace")] },
+    // A mark after only zero-width characters starts its row and has no base
+    // either: it takes the circle's cell, after the zero-width characters,
+    // and the cursor steps over the characters and the mark as one.
+    {
+      id: "bare-after-zero-width-space",
+      sends: [...typed("\u200B\u0E49a"), ...keys("left", "left", "right", "right", "end", "backspace", "backspace")],
+    },
+    {
+      id: "bare-latin-after-zero-width-space",
+      sends: [...typed("\u200B\u200B\u0301c"), ...keys("home", "right", "end", "left", "backspace")],
+    },
+    // After a base, the same zero-width character leaves the mark on its base.
+    {
+      id: "mark-on-base-through-zero-width",
+      sends: [...typed("a\u200B\u0E49b"), ...keys("left", "left", "right", "end", "backspace", "backspace")],
+    },
+    // A mark typed in front of a zero-width character and text that are
+    // already there starts the row, and a zero-width character typed in
+    // front of a bare mark does not change that.
+    { id: "zero-width-in-front", sends: [...typed("\u0E49a"), ...keys("home"), ...typed("\u200B"), ...keys("right", "end")] },
+    { id: "zero-width-run-then-mark", sends: [...run("\u200B", 3), ...typed("\u0E49a"), ...keys("left", "left", "end", "backspace")] },
     // A mark typed in front of text that is already there becomes a bare mark.
     { id: "bare-in-front", sends: [...typed("ab"), ...keys("home"), ...typed("\u0E49"), ...keys("right", "left", "end")] },
     { id: "bare-wide-latin", sends: [...typed("\u0301\u754C\u0E01\u0E31"), ...keys("home", "right", "right", "end", "left")] },
@@ -216,6 +250,8 @@ function narrowWalks(): Array<{ id: string; sends: Send[] }> {
     // Marks with no base come before the first character on the row.
     { id: "narrow-bare-marks", sends: [...typed("\u0E31\u0E49\u0E01\u0E31"), ...keys("home", "backspace", "end")] },
     { id: "narrow-latin", sends: [...typed("e\u0301\u0300a"), ...keys("left", "backspace")] },
+    // A mark after a zero-width space has no base, and the circle has no cell.
+    { id: "narrow-bare-after-zero-width", sends: [...typed("\u200B\u0E49a"), ...keys("left", "left", "end", "backspace")] },
     { id: "narrow-wide", sends: [...typed("\u754C\u0301"), ...keys("left")] },
     // A run of marks with no base: the circle has no cell either.
     { id: "narrow-bare-run", sends: [...run("\u0E49", 30), ...typed("a"), ...keys("left", "end", "backspace")] },
@@ -324,7 +360,7 @@ function rowClasses(rowText: string): Seen[] {
 /// terminal's width of each class (DisplayWidth.tla TermWidth).
 function rowCells(rowText: string): number {
   return rowClasses(rowText).reduce(
-    (sum, cls) => sum + (cls === "mark" || cls === "latin_mark" ? 0 : cls === "wide" ? 2 : 1),
+    (sum, cls) => sum + (cls === "mark" || cls === "latin_mark" || cls === "zw" ? 0 : cls === "wide" ? 2 : 1),
     0,
   );
 }
@@ -409,7 +445,7 @@ function observedModule(walks: Walk[]): string {
 type Variant = {
   rule: "fixed" | "today";
   margin: "fixed" | "row-drops" | "cell-less-keeps";
-  bare: "dotted" | "joins-prefix";
+  bare: "dotted" | "joins-prefix" | "first-unit";
   limit: "drop" | "refuse";
 };
 
@@ -462,9 +498,10 @@ async function rejectedWalks(dir: string, walks: Walk[], cols: number): Promise<
 /// One pane width and the walks run in it. The model's Cols is the cells
 /// after the prompt, and each self-check names a model of an fx that must
 /// reject the walks: at 60 columns fx before the Thai change, an fx that left
-/// a mark with no base on the prompt's cell, and an fx that fails the step at
-/// a full cell; at 2, a row builder that puts the marks of undrawn characters
-/// on the prefix cell.
+/// a mark with no base on the prompt's cell, an fx that drew only the first
+/// unit of a draft on a circle, and an fx that fails the step at a full cell;
+/// at 2, a row builder that puts the marks of undrawn characters on the
+/// prefix cell.
 type Batch = {
   name: string;
   width: number;
@@ -495,6 +532,7 @@ async function main(): Promise<number> {
       selfChecks: [
         { ...FIXED, rule: "today", margin: "row-drops" },
         { ...FIXED, bare: "joins-prefix" },
+        { ...FIXED, bare: "first-unit" },
         { ...FIXED, limit: "refuse" },
       ],
     },
