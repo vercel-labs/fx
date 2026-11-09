@@ -37,6 +37,9 @@ class FencedError extends Error {
 }
 
 const durabilityTag = Symbol.for("libfx.durability");
+// Set by `local()` through `world()` (sdk/durable/world.mjs): the World lands a
+// call's chunks in any order, so `ui.write` gives it one chunk at a time.
+const writeUiInOrder = Symbol.for("libfx.durability.writeUiInOrder");
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -949,6 +952,7 @@ function claimName(name, member) {
 // app passed in stays the app's.
 function createWorldBackend(world, durability) {
   const { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, maxDurationMs, owned = true } = durability;
+  const oneChunkAtATime = durability[writeUiInOrder] === true;
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
   const created = new Set();
   // Runs being created now: writes that go out together create a run once.
@@ -1377,7 +1381,10 @@ function createWorldBackend(world, durability) {
           async write(lines) {
             await ensureRun();
             const chunks = lines.map((line) => `${line}\n`);
-            if (typeof world.streams.writeMulti === "function" && chunks.length > 1) await world.streams.writeMulti(runId, uiStreamOf(runId), chunks);
+            // A World that lands a call's chunks in order takes the batch in one
+            // call; one that does not takes it chunk by chunk, so no chunk shows
+            // before the ones before it (`tests/tla/sdk/UiStreamOrder.tla`).
+            if (!oneChunkAtATime && typeof world.streams.writeMulti === "function" && chunks.length > 1) await world.streams.writeMulti(runId, uiStreamOf(runId), chunks);
             else for (const chunk of chunks) await world.streams.write(runId, uiStreamOf(runId), chunk);
           },
           async length() {
