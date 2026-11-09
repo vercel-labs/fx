@@ -194,7 +194,7 @@ pub const Generation = struct {
 };
 
 /// What the snapshot shows about the words of a routine command.
-pub const NameCheck = union(enum) {
+const NameCheck = union(enum) {
     /// No snapshot describes the startup files: the capture or its replay
     /// failed, so they run in full for every command.
     unknown,
@@ -1276,8 +1276,8 @@ fn fuzzNameCheckLaws(_: void, smith: *std.testing.Smith) !void {
                 var words: [6][]const u8 = undefined;
                 for (input[index + 1 ..][0..word_count], 0..) |choice, position| {
                     words[position] = fuzz_words[choice % fuzz_words.len];
-                    command.appendSliceBounded(words[position]) catch unreachable;
-                    command.appendSliceBounded(fuzz_separators[(choice >> 3) % fuzz_separators.len]) catch unreachable;
+                    try command.appendSliceBounded(words[position]);
+                    try command.appendSliceBounded(fuzz_separators[(choice >> 3) % fuzz_separators.len]);
                 }
                 index += word_count;
 

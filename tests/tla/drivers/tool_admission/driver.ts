@@ -14,9 +14,15 @@
 // For each call the driver records whether fx reviewed it and what happened:
 // held, refused with the stale-approval result, ran with the alias, or ran
 // for real. A capture fails only in a turn whose startup files plant the
-// guard, so the model may fail at most that one. TLC replays the turn
+// guard, so the model may fail at most that one. A turn may also break every
+// snapshot replay (the startup files define a global alias for `setopt`, so the
+// replayed option lines do not parse) and move ZDOTDIR: ~/.zshenv sets it to a
+// folder that fx's own environment does not name, and the startup files live
+// there. Those turns need zsh as the login shell. TLC replays the turn
 // through the model's own actions with the fixed rule (Design "fixed"). --self-check also replays each turn that fx
-// before the fix gets wrong through Design "main", which must reject it.
+// before the fix gets wrong through Design "main", which must reject it, and each
+// turn that fx before the moved-ZDOTDIR repair gets wrong through Design
+// "late_check", which must reject it.
 // --random N adds N seeded turns, and --stress N one turn with N calls.
 //
 // Usage (from the repository root, after zig build):
@@ -28,7 +34,7 @@
 //
 // Exit codes: 0 every turn accepted (and the self-check rejected), 1 a turn the
 // model cannot produce, 2 a toolchain, build, or harness failure.
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { binary, targetHelpers } from "../lib/context";
 import { TLA_ROOT, outDir, runTlc, tlcToolchain, writeJson } from "../lib/tlc";
@@ -39,9 +45,15 @@ type Turn = {
   id: string;
   startAliased: boolean;
   failFirstCapture: boolean;
+  // The startup files set ZDOTDIR to a folder fx's own environment does not name.
+  moved?: boolean;
+  // Every snapshot replay fails before its command starts.
+  brokenReplay?: boolean;
   steps: Plan[];
   // fx before the fix gets this turn wrong, so Design "main" must reject it.
   fixedByChange: boolean;
+  // fx before the moved-ZDOTDIR repair gets this turn wrong, so Design "late_check" must reject it.
+  lateCheckRejects?: boolean;
 };
 type Outcome = "alias" | "real" | "refused" | "held";
 type ObservedStep = {
@@ -57,10 +69,15 @@ const MODEL = "openai/gpt-5";
 const ALIAS_OUTPUT = "fx-alias-ran";
 const ALIAS_LINE = `alias git='echo ${ALIAS_OUTPUT}'`;
 const NO_ALIAS = "# no aliases\n";
+// A global alias for the word `setopt` makes the replayed `\builtin setopt ...`
+// option lines a parse error, so the replay stops before the command starts.
+// The capture shell prints those lines inside quotes and still succeeds.
+const BREAK_REPLAY = "alias -g setopt=';;'\n";
 const STALE_APPROVAL = "the shell startup files changed after it was approved";
 const CAPTURE_GUARD =
   'if [ ! -e "$HOME/.fx-driver-capture-failed" ]; then : > "$HOME/.fx-driver-capture-failed"; exit 7; fi\n';
 const tlaDir = join(TLA_ROOT, "tool_admission");
+const zshAvailable = existsSync("/bin/zsh");
 
 function option(name: string, fallback: number): number {
   const at = process.argv.indexOf(name);
@@ -124,6 +141,33 @@ function namedTurns(): Turn[] {
     },
     { id: "capture-fails", startAliased: true, failFirstCapture: true, steps: [step("git"), step("git", true)], fixedByChange: true },
     { id: "no-alias", startAliased: false, failFirstCapture: false, steps: [step("git"), step("git"), step("warm")], fixedByChange: false },
+    // A moved ZDOTDIR changes nothing while the replay works.
+    { id: "moved-zdotdir", startAliased: false, failFirstCapture: false, moved: true, steps: [step("git"), step("git")], fixedByChange: false },
+    // Every replay fails: the first command reruns with full startup, and the failed state sends the next one to review.
+    { id: "broken-replay", startAliased: false, failFirstCapture: false, brokenReplay: true, steps: [step("git"), step("git")], fixedByChange: false },
+    // The same with ZDOTDIR moved (the examiner's run r8 on #1748): nothing changed, so no
+    // routine command is refused, and each one that follows recaptures and runs.
+    {
+      id: "broken-replay-moved",
+      startAliased: false,
+      failFirstCapture: false,
+      moved: true,
+      brokenReplay: true,
+      steps: [step("git"), step("git"), step("git")],
+      fixedByChange: false,
+      lateCheckRejects: true,
+    },
+    // An edit to the moved startup files after a failed replay still reaches review.
+    {
+      id: "broken-replay-moved-edit",
+      startAliased: false,
+      failFirstCapture: false,
+      moved: true,
+      brokenReplay: true,
+      steps: [step("git"), step("alias_on"), step("git", true)],
+      fixedByChange: false,
+      lateCheckRejects: true,
+    },
   ];
 }
 
@@ -137,7 +181,8 @@ function randomSteps(next: () => number, length: number): Plan[] {
 }
 
 function turns(): Turn[] {
-  const result = namedTurns();
+  // The moved and broken-replay turns need zsh as the login shell.
+  const result = namedTurns().filter((turn) => zshAvailable || !(turn.moved || turn.brokenReplay));
   const next = generator(options.seed);
   for (let i = 0; i < options.random; i++) {
     result.push({
@@ -146,6 +191,8 @@ function turns(): Turn[] {
       failFirstCapture: next() < 0.15,
       steps: randomSteps(next, 1 + Math.floor(next() * 6)),
       fixedByChange: false,
+      moved: zshAvailable && next() < 0.3,
+      brokenReplay: zshAvailable && next() < 0.25,
     });
   }
   if (options.stress > 0) {
@@ -153,6 +200,8 @@ function turns(): Turn[] {
       id: `stress-${options.stress}`,
       startAliased: false,
       failFirstCapture: false,
+      moved: zshAvailable,
+      brokenReplay: zshAvailable,
       steps: randomSteps(generator(options.seed + 1), options.stress),
       fixedByChange: false,
     });
@@ -164,7 +213,7 @@ function shellWord(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-function command(plan: Plan, index: number, startupFiles: string[]): string {
+function command(plan: Plan, index: number, startupFiles: string[], noAlias: string): string {
   const tag = `step-${index}`;
   switch (plan.kind) {
     case "git":
@@ -175,7 +224,7 @@ function command(plan: Plan, index: number, startupFiles: string[]): string {
     case "alias_on":
       return [`: ${tag}`, ...startupFiles.map((file) => `printf '%s\\n' ${shellWord(ALIAS_LINE)} >> ${shellWord(file)}`)].join(" && ");
     case "alias_off":
-      return [`: ${tag}`, ...startupFiles.map((file) => `printf '%s' ${shellWord(NO_ALIAS)} > ${shellWord(file)}`)].join(" && ");
+      return [`: ${tag}`, ...startupFiles.map((file) => `printf '%s' ${shellWord(noAlias)} > ${shellWord(file)}`)].join(" && ");
   }
 }
 
@@ -207,9 +256,20 @@ function toolResult(body: string, toolCallId: string): { type: string; text: str
   return null;
 }
 
+// The shell tool's result is JSON text. A refusal carries exit code 126 and,
+// depending on the call, the stale-approval message.
+function exitCodeOf(text: string): number | null {
+  try {
+    const code = (JSON.parse(text) as { exit_code?: unknown }).exit_code;
+    return typeof code === "number" ? code : null;
+  } catch {
+    return null;
+  }
+}
+
 function classify(result: { type: string; text: string }): Outcome {
   if (result.type === "execution-denied") return "held";
-  if (result.text.includes(STALE_APPROVAL)) return "refused";
+  if (result.text.includes(STALE_APPROVAL) || exitCodeOf(result.text) === 126) return "refused";
   if (result.text.includes(ALIAS_OUTPUT)) return "alias";
   return "real";
 }
@@ -224,9 +284,19 @@ async function runTurn(helpers: any, turn: Turn, scratch: string): Promise<{ obs
   const tmp = join(root, "tmp");
   for (const dir of [home, fxHome, workspace, tmp]) mkdirSync(dir, { recursive: true });
   writeFileSync(join(fxHome, "settings.json"), JSON.stringify({ sandbox: "none", permission: {} }));
-  const startupFiles = [join(home, ".zshrc"), join(home, ".bash_profile")];
-  const startup = (turn.failFirstCapture ? CAPTURE_GUARD : "") + (turn.startAliased ? `${ALIAS_LINE}\n` : NO_ALIAS);
-  for (const file of startupFiles) writeFileSync(file, startup);
+  // A moved ZDOTDIR: fx's own environment names `home`, and ~/.zshenv moves it.
+  const zshDir = turn.moved ? join(home, "moved-zdotdir") : home;
+  if (turn.moved) {
+    mkdirSync(zshDir, { recursive: true });
+    writeFileSync(join(home, ".zshenv"), 'export ZDOTDIR="$HOME/moved-zdotdir"\n');
+  }
+  const startupFiles = [join(zshDir, ".zshrc"), join(home, ".bash_profile")];
+  const noAlias = NO_ALIAS + (turn.brokenReplay ? BREAK_REPLAY : "");
+  const guard = turn.failFirstCapture ? CAPTURE_GUARD : "";
+  const base = turn.startAliased ? `${ALIAS_LINE}\n` : NO_ALIAS;
+  writeFileSync(startupFiles[0]!, guard + base + (turn.brokenReplay ? BREAK_REPLAY : ""));
+  // bash has no global aliases, and the broken-replay turns need zsh as the login shell.
+  writeFileSync(startupFiles[1]!, guard + base);
   const init = Bun.spawnSync(["/usr/bin/git", "init", "--quiet"], {
     cwd: workspace,
     env: { HOME: home, PATH: "/usr/bin:/bin" },
@@ -249,7 +319,7 @@ async function runTurn(helpers: any, turn: Turn, scratch: string): Promise<{ obs
         return helpers.fakeGatewayToolCall(callId(index), "shell", {
           request: {
             action: "run",
-            command: command(plan, index, startupFiles),
+            command: command(plan, index, startupFiles, noAlias),
             yield_time_ms: 30_000,
             ...(plan.kind === "git_reload" ? { reload: true } : {}),
           },
@@ -341,12 +411,12 @@ function tlaValue(value: unknown): string {
   return `[${entries.map(([key, entry]) => `${key} |-> ${tlaValue(entry)}`).join(", ")}]`;
 }
 
-async function check(dir: string, turn: Turn, observed: ObservedStep[], design: "fixed" | "main"): Promise<Verdict> {
+async function check(dir: string, turn: Turn, observed: ObservedStep[], design: "fixed" | "main" | "late_check"): Promise<Verdict> {
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, "RoutineNamesObserved.tla"),
     "---- MODULE RoutineNamesObserved ----\n" +
-      `Observed == ${tlaValue({ start: turn.startAliased, steps: observed })}\n` +
+      `Observed == ${tlaValue({ start: turn.startAliased, moved: !!turn.moved, brokenReplay: !!turn.brokenReplay, failFirstCapture: turn.failFirstCapture, steps: observed })}\n` +
       "====\n",
   );
   writeFileSync(
@@ -358,8 +428,9 @@ async function check(dir: string, turn: Turn, observed: ObservedStep[], design: 
       "    MaxReloads = 0",
       // The startup files make a capture fail only in a turn that plants
       // the guard, and then only the first one, so failures are observed too.
-      `    MaxFails = ${turn.failFirstCapture ? 1 : 0}`,
-      `    MaxGen = ${2 * observed.length + 2}`,
+      // A broken replay fails once per call at most.
+      `    MaxFails = ${(turn.failFirstCapture ? 1 : 0) + (turn.brokenReplay ? observed.length : 0)}`,
+      `    MaxGen = ${(turn.brokenReplay ? 3 : 2) * observed.length + 2}`,
       `    Design = "${design}"`,
       "INIT TraceInit",
       "NEXT TraceNext",
@@ -407,11 +478,15 @@ async function main(): Promise<number> {
         options.selfCheck && turn.fixedByChange
           ? await check(join(out, "tlc", turn.id, "main"), turn, observed, "main")
           : null;
-      return { id: turn.id, turn, observed, seconds, fixed, main };
+      const late =
+        options.selfCheck && turn.lateCheckRejects
+          ? await check(join(out, "tlc", turn.id, "late_check"), turn, observed, "late_check")
+          : null;
+      return { id: turn.id, turn, observed, seconds, fixed, main, late };
     } catch (error) {
       if (!(error instanceof HarnessError)) throw error;
       harnessFailed = true;
-      return { id: turn.id, turn, observed: [], seconds: 0, fixed: "TOOL_ERROR" as Verdict, main: null, error: error.message };
+      return { id: turn.id, turn, observed: [], seconds: 0, fixed: "TOOL_ERROR" as Verdict, main: null, late: null, error: error.message };
     }
   });
 
@@ -419,13 +494,15 @@ async function main(): Promise<number> {
   for (const report of reports) {
     const summary = report.observed.map((s) => `${s.kind}${s.reload ? "+reload" : ""}${s.effect === "none" ? "" : `:${s.effect}`}=${s.reviewed ? "reviewed/" : ""}${s.outcome}`).join(" ");
     const mainNote = report.main ? ` main=${report.main}` : "";
-    console.log(`${report.fixed.padEnd(10)} ${report.id} (${report.seconds}s)${mainNote}  ${summary}${"error" in report ? `  ${report.error}` : ""}`);
+    const lateNote = report.late ? ` late_check=${report.late}` : "";
+    console.log(`${report.fixed.padEnd(10)} ${report.id} (${report.seconds}s)${mainNote}${lateNote}  ${summary}${"error" in report ? `  ${report.error}` : ""}`);
     if (report.fixed !== "ACCEPTED") failed = true;
     if (report.main && report.main !== "REJECTED") failed = true;
+    if (report.late && report.late !== "REJECTED") failed = true;
   }
   writeJson(join(out, "report.json"), { binary, toolchain, options, reports });
   console.log(`report: ${join(out, "report.json")}`);
-  if (harnessFailed || reports.some((r) => r.fixed === "TOOL_ERROR" || r.main === "TOOL_ERROR")) return 2;
+  if (harnessFailed || reports.some((r) => r.fixed === "TOOL_ERROR" || r.main === "TOOL_ERROR" || r.late === "TOOL_ERROR")) return 2;
   return failed ? 1 : 0;
 }
 

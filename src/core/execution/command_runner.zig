@@ -883,35 +883,52 @@ fn executeWithSnapshot(
         return err;
     };
     if (snapshotReplayFailed(result, failure_marker)) {
-        // The replay stopped before the command started, so the command has
-        // not run. Fail this snapshot and let the caller run it once with
-        // full startup.
-        owner.markReplayFailed(generation);
-        // Full startup reads the startup files again, so an approval bound
-        // to this generation's epoch runs only if they have not changed
-        // since its capture (`tests/tla/tool_admission/RoutineNames.tla`
-        // ReplayFail).
-        if (cfg.shell_grant_epoch) |epoch| {
-            owner.checkStartupFiles();
-            if (epoch != owner.approvalEpoch()) {
-                debug_trace.logf(
-                    "core",
-                    "command runner snapshot replay failed generation={d}; dropped its failure marker from the live output; startup files changed, not rerunning",
-                    .{generation.id},
-                );
-                return try approvalResetResult(arena, command, cwd);
-            }
-        }
-        debug_trace.logf(
-            "core",
-            "command runner snapshot replay failed generation={d}; dropped its failure marker from the live output; rerunning with full startup",
-            .{generation.id},
-        );
-        return null;
+        return try afterFailedReplay(arena, owner, generation, cfg.shell_grant_epoch, command, cwd);
     }
     if (presented) |*filter| filter.finishOrLog();
     if (accepted) |*filter| try filter.finish();
     return try formatCollectedOutput(arena, command, cwd, result);
+}
+
+/// Decides what a snapshot run does after its replay stopped before the
+/// command started, so the command has not run. Fails the generation, and
+/// returns null so the caller runs the command once with full startup. An
+/// approval bound to the generation's epoch gets the stale-approval result
+/// instead when the startup files changed since the capture, because full
+/// startup would read the changed files
+/// (`tests/tla/tool_admission/RoutineNames.tla` ReplayFail).
+///
+/// The files are checked before the generation fails. Its fingerprint holds
+/// the stamps of a ZDOTDIR the startup files moved, and the failed state
+/// compares without them, so a check made after would see a change that no
+/// edit made and refuse an approval whose files are unchanged
+/// (`NoFalseRefusal`).
+fn afterFailedReplay(
+    arena: Allocator,
+    owner: *shell_snapshot.Owner,
+    generation: *shell_snapshot.Generation,
+    approval_epoch: ?u64,
+    command: []const u8,
+    cwd: []const u8,
+) !?command_contract.RunCommandResult {
+    if (approval_epoch != null) owner.checkStartupFiles();
+    owner.markReplayFailed(generation);
+    if (approval_epoch) |epoch| {
+        if (epoch != owner.approvalEpoch()) {
+            debug_trace.logf(
+                "core",
+                "command runner snapshot replay failed generation={d}; dropped its failure marker from the live output; startup files changed, not rerunning",
+                .{generation.id},
+            );
+            return try approvalResetResult(arena, command, cwd);
+        }
+    }
+    debug_trace.logf(
+        "core",
+        "command runner snapshot replay failed generation={d}; dropped its failure marker from the live output; rerunning with full startup",
+        .{generation.id},
+    );
+    return null;
 }
 
 /// Passes a snapshot run's output on to one of the caller's callbacks without
@@ -2675,6 +2692,119 @@ test "an approval bound to a snapshot epoch reruns with full startup after a fai
     );
     try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
     try std.testing.expectEqualStrings("ran\n", try readAbsoluteFile(arena, marker_path, 4096));
+}
+
+/// A capture whose startup files moved ZDOTDIR to `zdotdir`, a folder fx's own
+/// environment does not name, and whose replay cannot be restored. When
+/// `edit_path` is set the replay first appends to that startup file, so the
+/// files change while the snapshot runs.
+const MovedZdotdirCapture = struct {
+    var zdotdir: []const u8 = "";
+    var edit_path: ?[]const u8 = null;
+
+    fn capture(request: shell_snapshot.CaptureRequest) shell_snapshot.CaptureOutcome {
+        const generation = shell_snapshot.Generation.create() catch return .{ .failed = .out_of_memory };
+        const alloc = generation.arena.allocator();
+        generation.shell_path = alloc.dupe(u8, request.shell_path) catch {
+            generation.destroy();
+            return .{ .failed = .out_of_memory };
+        };
+        generation.zdotdir = alloc.dupe(u8, zdotdir) catch {
+            generation.destroy();
+            return .{ .failed = .out_of_memory };
+        };
+        generation.replay = if (edit_path) |path|
+            alloc.print("print -r -- '# edited' >> {s}\nfxsnap_broken() {{\n", .{path}) catch {
+                generation.destroy();
+                return .{ .failed = .out_of_memory };
+            }
+        else
+            "fxsnap_broken() {\n";
+        generation.environ.put("PATH", "/usr/bin:/bin") catch {};
+        return .{ .ready = generation };
+    }
+};
+
+/// Gives the test a ZDOTDIR with a startup file that fx's own environment
+/// (the test home) does not name, and installs `MovedZdotdirCapture`.
+fn installMovedZdotdirCapture(arena: Allocator, tmp: *std.testing.TmpDir, edit_path: ?[]const u8) !void {
+    try tmp.dir.createDirPath(io_mod.getIo(), "moved-zdotdir");
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "moved-zdotdir/.zshrc", .data = "# moved startup\n" });
+    MovedZdotdirCapture.zdotdir = try io_mod.dirRealpathAlloc(arena, tmp.dir, "moved-zdotdir");
+    MovedZdotdirCapture.edit_path = edit_path;
+    shell_snapshot.resetProcessOwnerForTest(MovedZdotdirCapture.capture);
+}
+
+test "an approval bound to a snapshot epoch reruns with full startup after a failed replay when the startup files moved ZDOTDIR" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShell(arena, &tmp, "# startup\n");
+    _ = try installSnapshotTestEnvironment(arena, paths);
+    defer io_mod.resetEnvironForTest();
+    try installMovedZdotdirCapture(arena, &tmp, null);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    // Nothing changed, so the rerun with full startup reads the same files the
+    // approval checked. The agent's request again after it gets the same.
+    const marker_path = try std.Io.Dir.path.join(arena, &.{ paths.workspace, "ran.log" });
+    const command = try arena.print("print -r -- ran >> {s}", .{try shellQuote(arena, marker_path)});
+    for ([_][]const u8{ "ran\n", "ran\nran\n" }) |expected_log| {
+        const epoch = switch (try shell_snapshot.processOwner().checkCommandNames(paths.shell, paths.workspace, command, null)) {
+            .clear => |value| value,
+            else => return error.TestUnexpectedResult,
+        };
+        const result = try executeCommandInEnvironment(
+            .{ .max_command_output_bytes = 16 * 1024, .shell_grant_epoch = epoch },
+            arena,
+            command,
+            paths.workspace,
+            .{ .user = paths.shell },
+        );
+        try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+        try std.testing.expectEqualStrings(expected_log, try readAbsoluteFile(arena, marker_path, 4096));
+    }
+}
+
+test "an approval bound to a snapshot epoch does not rerun with full startup after the files changed when the startup files moved ZDOTDIR" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShell(arena, &tmp, "# startup\n");
+    _ = try installSnapshotTestEnvironment(arena, paths);
+    defer io_mod.resetEnvironForTest();
+    const startup_path = try shellQuote(arena, try std.Io.Dir.path.join(arena, &.{ paths.home, ".zshrc" }));
+    try installMovedZdotdirCapture(arena, &tmp, startup_path);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    // The moved ZDOTDIR must not hide a real edit: the full-startup rerun
+    // would read the edited files, so the approval is refused.
+    const marker_path = try std.Io.Dir.path.join(arena, &.{ paths.workspace, "ran.log" });
+    const command = try arena.print("print -r -- ran >> {s}", .{try shellQuote(arena, marker_path)});
+    const epoch = switch (try shell_snapshot.processOwner().checkCommandNames(paths.shell, paths.workspace, command, null)) {
+        .clear => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    const result = try executeCommandInEnvironment(
+        .{ .max_command_output_bytes = 16 * 1024, .shell_grant_epoch = epoch },
+        arena,
+        command,
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    try std.testing.expectEqual(@as(?i64, 126), result.command_result.?.exit_code);
+    try std.testing.expect(std.mem.find(u8, result.output, "changed after it was approved") != null);
+    try expectAbsent(marker_path);
 }
 
 test "bash user profile command hides a failed replay from its output" {
