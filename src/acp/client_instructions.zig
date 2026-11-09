@@ -1,10 +1,9 @@
-//! Client-provided system prompt for ACP sessions, following the ACP
-//! client system prompt RFD in append mode. The prompt is validated before a
-//! session exists, persisted with the session, restored on load and resume,
-//! and delivered in the system slot after fx's own instructions.
+//! Client-provided system prompt for ACP sessions: ACP v1's `systemPrompt` in
+//! `append` mode. The prompt is validated before a session exists, persisted
+//! with the session, restored on load and resume, and delivered in the system
+//! slot after fx's own instructions.
 
 const std = @import("std");
-const acp_types = @import("types.zig");
 const io_mod = @import("../core/shared/io.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
 
@@ -23,14 +22,15 @@ pub const ParseError = Allocator.Error || error{
     UnsupportedSystemPromptBlock,
     SystemPromptTooLarge,
     InvalidSystemPromptText,
-    DuplicateSystemPrompt,
-    SystemPromptModeWithoutPrompt,
+    MissingSystemPromptMode,
     UnsupportedSystemPromptMode,
 };
 
-/// Returns the owned prompt from `session/new` params, or null when absent.
-/// `systemPrompt` is the RFD field. `_meta.fx.systemPrompt` carries the same
-/// content for clients whose SDK drops unknown request fields.
+/// Returns the owned prompt from `session/new` params, or null when the params
+/// omit `systemPrompt` or set it to null. ACP v1's `systemPrompt` is
+/// `{"mode": ..., "content": [...]}`; fx supports the `append` mode, which every
+/// Agent that advertises the capability must, and text content blocks
+/// (`tests/tla/acp/AcpSystemPrompt.tla` V1Accepted and OtherShapesRefused).
 pub fn parse(alloc: Allocator, params_raw: ?[]const u8) ParseError!?[]u8 {
     const raw = params_raw orelse return null;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
@@ -41,33 +41,26 @@ pub fn parse(alloc: Allocator, params_raw: ?[]const u8) ParseError!?[]u8 {
     if (parsed.value != .object) return error.InvalidParams;
     const params = parsed.value.object;
 
-    const standard = params.get("systemPrompt");
-    const extension = acp_types.fxMetaField(params, "systemPrompt");
-    if (standard != null and extension != null) return error.DuplicateSystemPrompt;
-    const blocks = standard orelse extension;
-
-    if (params.get("systemPromptMode")) |mode| {
-        if (blocks == null) return error.SystemPromptModeWithoutPrompt;
-        if (mode != .string or !std.mem.eql(u8, mode.string, "append")) {
-            return error.UnsupportedSystemPromptMode;
-        }
-    }
-    return try joinTextBlocks(alloc, blocks orelse return null);
+    const prompt = params.get("systemPrompt") orelse return null;
+    if (prompt == .null) return null;
+    if (prompt != .object) return error.InvalidSystemPrompt;
+    const mode = prompt.object.get("mode") orelse return error.MissingSystemPromptMode;
+    if (mode != .string or !std.mem.eql(u8, mode.string, "append")) return error.UnsupportedSystemPromptMode;
+    return try joinTextBlocks(alloc, prompt.object.get("content") orelse return error.InvalidSystemPrompt);
 }
 
 pub fn parseErrorMessage(err: ParseError) []const u8 {
     return switch (err) {
         error.OutOfMemory => "Out of memory",
         error.InvalidParams => "Invalid params",
-        error.InvalidSystemPrompt => "systemPrompt must be an array of content blocks",
-        error.EmptySystemPrompt => "systemPrompt must contain at least one content block",
+        error.InvalidSystemPrompt => "systemPrompt must be an object with a mode and a content array",
+        error.EmptySystemPrompt => "systemPrompt.content must contain at least one content block",
         error.BlankSystemPrompt => "systemPrompt text cannot be empty",
         error.UnsupportedSystemPromptBlock => "systemPrompt supports text content blocks only",
         error.SystemPromptTooLarge => "systemPrompt exceeds the 64 KiB limit",
         error.InvalidSystemPromptText => "systemPrompt text must be valid UTF-8 without NUL bytes",
-        error.DuplicateSystemPrompt => "Send systemPrompt or _meta.fx.systemPrompt, not both",
-        error.SystemPromptModeWithoutPrompt => "systemPromptMode requires systemPrompt",
-        error.UnsupportedSystemPromptMode => "systemPromptMode supports only \"append\"",
+        error.MissingSystemPromptMode => "systemPrompt.mode is required",
+        error.UnsupportedSystemPromptMode => "systemPrompt.mode supports only \"append\"",
     };
 }
 
@@ -141,34 +134,37 @@ pub fn compose(alloc: Allocator, host_instructions: []const u8, client_prompt: [
     });
 }
 
-test "client system prompt parses RFD text blocks in append mode" {
+test "client system prompt parses ACP v1 text blocks in append mode" {
     const alloc = std.testing.allocator;
     const text = (try parse(alloc,
-        \\{"cwd":"/tmp","systemPrompt":[{"type":"text","text":"You run inside Mini."},{"type":"text","text":"Use browser tools."}],"systemPromptMode":"append"}
+        \\{"cwd":"/tmp","systemPrompt":{"mode":"append","content":[{"type":"text","text":"You run inside Mini."},{"type":"text","text":"Use browser tools."}]}}
     )).?;
     defer alloc.free(text);
     try std.testing.expectEqualStrings("You run inside Mini.\n\nUse browser tools.", text);
 
-    const meta = (try parse(alloc,
-        \\{"_meta":{"fx":{"systemPrompt":[{"type":"text","text":"From meta."}]}}}
-    )).?;
-    defer alloc.free(meta);
-    try std.testing.expectEqualStrings("From meta.", meta);
-
     try std.testing.expect((try parse(alloc, "{\"cwd\":\"/tmp\"}")) == null);
+    try std.testing.expect((try parse(alloc, "{\"cwd\":\"/tmp\",\"systemPrompt\":null}")) == null);
+    // The removed forms are no longer read: a `_meta.fx` copy and a root mode.
+    try std.testing.expect((try parse(alloc,
+        \\{"_meta":{"fx":{"systemPrompt":[{"type":"text","text":"From meta."}]}},"systemPromptMode":"append"}
+    )) == null);
 }
 
 test "client system prompt rejects invalid combinations before a session exists" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { json: []const u8, expected: ParseError }{
-        .{ .json = "{\"systemPrompt\":[]}", .expected = error.EmptySystemPrompt },
-        .{ .json = "{\"systemPrompt\":[{\"type\":\"text\",\"text\":\" \"}]}", .expected = error.BlankSystemPrompt },
+        .{ .json = "{\"systemPrompt\":{\"mode\":\"append\",\"content\":[]}}", .expected = error.EmptySystemPrompt },
+        .{ .json = "{\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"text\":\" \"}]}}", .expected = error.BlankSystemPrompt },
         .{ .json = "{\"systemPrompt\":\"text\"}", .expected = error.InvalidSystemPrompt },
-        .{ .json = "{\"systemPrompt\":[{\"type\":\"image\",\"data\":\"x\"}]}", .expected = error.UnsupportedSystemPromptBlock },
-        .{ .json = "{\"systemPromptMode\":\"append\"}", .expected = error.SystemPromptModeWithoutPrompt },
-        .{ .json = "{\"systemPrompt\":[{\"type\":\"text\",\"text\":\"x\"}],\"systemPromptMode\":\"override\"}", .expected = error.UnsupportedSystemPromptMode },
-        .{ .json = "{\"systemPrompt\":[{\"type\":\"text\",\"text\":\"a\"}],\"_meta\":{\"fx\":{\"systemPrompt\":[{\"type\":\"text\",\"text\":\"b\"}]}}}", .expected = error.DuplicateSystemPrompt },
-        .{ .json = "{\"systemPrompt\":[{\"type\":\"text\",\"text\":\"a\\u0000b\"}]}", .expected = error.InvalidSystemPromptText },
+        // The older RFD shape, a bare array of blocks.
+        .{ .json = "{\"systemPrompt\":[{\"type\":\"text\",\"text\":\"x\"}]}", .expected = error.InvalidSystemPrompt },
+        .{ .json = "{\"systemPrompt\":{\"mode\":\"append\"}}", .expected = error.InvalidSystemPrompt },
+        .{ .json = "{\"systemPrompt\":{\"mode\":\"append\",\"content\":\"x\"}}", .expected = error.InvalidSystemPrompt },
+        .{ .json = "{\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"image\",\"data\":\"x\"}]}}", .expected = error.UnsupportedSystemPromptBlock },
+        .{ .json = "{\"systemPrompt\":{\"content\":[{\"type\":\"text\",\"text\":\"x\"}]}}", .expected = error.MissingSystemPromptMode },
+        .{ .json = "{\"systemPrompt\":{\"mode\":\"override\",\"content\":[{\"type\":\"text\",\"text\":\"x\"}]}}", .expected = error.UnsupportedSystemPromptMode },
+        .{ .json = "{\"systemPrompt\":{\"mode\":\"_fx\",\"content\":[{\"type\":\"text\",\"text\":\"x\"}]}}", .expected = error.UnsupportedSystemPromptMode },
+        .{ .json = "{\"systemPrompt\":{\"mode\":\"append\",\"content\":[{\"type\":\"text\",\"text\":\"a\\u0000b\"}]}}", .expected = error.InvalidSystemPromptText },
     };
     for (cases) |case| {
         try std.testing.expectError(case.expected, parse(alloc, case.json));
@@ -177,7 +173,7 @@ test "client system prompt rejects invalid combinations before a session exists"
     const oversized = try alloc.alloc(u8, max_bytes + 1);
     defer alloc.free(oversized);
     @memset(oversized, 'x');
-    const json = try alloc.print("{{\"systemPrompt\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{oversized});
+    const json = try alloc.print("{{\"systemPrompt\":{{\"mode\":\"append\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}}}", .{oversized});
     defer alloc.free(json);
     try std.testing.expectError(error.SystemPromptTooLarge, parse(alloc, json));
 }
