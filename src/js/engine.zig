@@ -655,9 +655,120 @@ test "built-ins that call back into JavaScript fit in the default stack" {
     , .{depth}), .{});
 }
 
+test "built-ins that grow buffers through QuickJS's allocator keep the function-type check" {
+    // `normalize` and `localeCompare` reach `unicode_normalize`, whose
+    // realloc callback the fork wraps (see quickjs/FORK.md).
+    try expectReturned("[2,1,-1,0]",
+        \\return [
+        \\  "\u00e9".normalize("NFD").length,
+        \\  "e\u0301".normalize("NFC").length,
+        \\  "a".localeCompare("b"),
+        \\  "\u00e9".localeCompare("e\u0301"),
+        \\];
+    , .{});
+}
+
 test "import() is refused with an error that says so" {
     try expectThrew("TypeError: import() is not available in code mode", "return await import('fs');", .{});
     try expectThrew("SyntaxError", "import fs from 'fs';", .{});
+}
+
+/// Tight enough that a fuzz round spends its time on new inputs, not on
+/// programs that loop until the deadline.
+const fuzz_limits: Limits = .{ .heap_bytes = 8 * 1024 * 1024, .time_ms = 50 };
+
+test "fuzzed programs end in an outcome and free every byte" {
+    try testing.fuzz({}, fuzzProgram, .{ .corpus = &(.{""} ++ @import("build_options").fuzz_corpus_js_program.*) });
+}
+
+fn fuzzProgram(_: void, smith: *testing.Smith) anyerror!void {
+    var buffer: [4096]u8 = undefined;
+    const source = buffer[0..smith.slice(&buffer)];
+    const outcome = try run(testing.allocator, testing.io, source, fuzz_limits);
+    outcome.deinit(testing.allocator);
+}
+
+test "fuzzed regular expressions end in an outcome and free every byte" {
+    try testing.fuzz({}, fuzzRegExp, .{ .corpus = &(.{""} ++ @import("build_options").fuzz_corpus_js_regexp.*) });
+}
+
+/// The input is one flags byte, then the pattern, a 0 byte, and the subject.
+fn fuzzRegExp(_: void, smith: *testing.Smith) anyerror!void {
+    var buffer: [1024]u8 = undefined;
+    const input = buffer[0..smith.slice(&buffer)];
+    if (input.len == 0) return;
+    const rest = input[1..];
+    const split = std.mem.findScalar(u8, rest, 0) orelse rest.len;
+    const subject = if (split < rest.len) rest[split + 1 ..] else "";
+
+    var program: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer program.deinit();
+    const w = &program.writer;
+    try w.writeAll("const re = new RegExp(");
+    try writeJsString(w, rest[0..split]);
+    try w.writeAll(", \"");
+    // Bit i turns on the i-th flag. "u" and "v" together are a SyntaxError,
+    // which is an outcome like any other.
+    for ("dgimsuyv", 0..) |flag, bit| {
+        if (input[0] & (@as(u8, 1) << @intCast(bit)) != 0) try w.writeByte(flag);
+    }
+    try w.writeAll("\");\nconst s = ");
+    try writeJsString(w, subject);
+    try w.writeAll(";\nreturn [re.exec(s), s.replace(re, \"<$&>\"), s.split(re).length, re.test(s)];");
+
+    const outcome = try run(testing.allocator, testing.io, program.written(), fuzz_limits);
+    outcome.deinit(testing.allocator);
+}
+
+test "fuzzed JSON prints back to text that parses to the same value" {
+    try testing.fuzz({}, fuzzJson, .{ .corpus = &(.{""} ++ @import("build_options").fuzz_corpus_js_json.*) });
+}
+
+fn fuzzJson(_: void, smith: *testing.Smith) anyerror!void {
+    var buffer: [1024]u8 = undefined;
+    const text = buffer[0..smith.slice(&buffer)];
+
+    var program: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer program.deinit();
+    const w = &program.writer;
+    try w.writeAll("const text = ");
+    try writeJsString(w, text);
+    try w.writeAll(
+        \\;
+        \\let value;
+        \\try { value = JSON.parse(text); } catch (e) { return "rejected"; }
+        \\const printed = JSON.stringify(value);
+        \\return printed === JSON.stringify(JSON.parse(printed)) ? "stable" : "unstable: " + printed;
+    );
+
+    const outcome = try run(testing.allocator, testing.io, program.written(), fuzz_limits);
+    defer outcome.deinit(testing.allocator);
+    switch (outcome) {
+        .returned => |json| {
+            const result = json orelse return error.TestUnexpectedResult;
+            if (!std.mem.eql(u8, result, "\"stable\"") and !std.mem.eql(u8, result, "\"rejected\"")) {
+                std.debug.print("JSON did not survive a round trip: {s}\n", .{result});
+                return error.TestUnexpectedResult;
+            }
+        },
+        // Nesting deeper than the stack, or a value larger than the heap.
+        .threw => |message| if (std.mem.find(u8, message, "Maximum call stack size exceeded") == null and
+            std.mem.find(u8, message, "out of memory") == null)
+        {
+            std.debug.print("JSON round trip threw: {s}\n", .{message});
+            return error.TestUnexpectedResult;
+        },
+        .timed_out => {},
+        .unsettled => return error.TestUnexpectedResult,
+    }
+}
+
+/// `bytes` as a JavaScript string literal of one `\xHH` code unit per byte,
+/// so arbitrary input can't end the literal or break the program around it.
+fn writeJsString(w: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
+    try w.writeByte('"');
+    for (bytes) |byte| try w.print("\\x{x:0>2}", .{byte});
+    try w.writeByte('"');
 }
 
 test "each run starts from a fresh runtime" {
