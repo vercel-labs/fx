@@ -6,12 +6,14 @@ const host_contract = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const io_mod = @import("../shared/io.zig");
+const keychain_lock = @import("../shared/keychain_lock.zig");
 const leased_lock = @import("../shared/leased_lock.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const secret = @import("secret.zig");
 const session_presence = @import("session_presence.zig");
+const lock_fixtures = @import("../shared/lock_fixtures.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -805,56 +807,39 @@ fn beginMutation() !Mutation {
     return lockMutation(fx_dir);
 }
 
-/// Takes the login's lock for the profile `open_fx_dir`. The Keychain login
-/// is one for the user, whatever the profile, so with `FX_HOME` set the lock
-/// is `~/.fx/auth.lock`: the one the default profile takes, older fx builds
-/// included. Otherwise it stays in the profile
+/// The Keychain login is one for the user, whatever the profile, so its lock
+/// is not kept in each profile (`keychain_lock.zig`).
+const lock_item: keychain_lock.Item = .{ .scope = "auth", .label = "fx login" };
+
+/// Takes the login's lock for the profile `open_fx_dir`. With `FX_HOME` set
+/// the Keychain login's lock is `~/.fx/auth.lock`: the one the default profile
+/// takes, older fx builds included. Otherwise it stays in the profile
 /// (`tests/tla/oauth_session/KeychainLock.tla` OneRefresher).
 fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
-    const backend = storageBackend();
-    var shared: ?io_mod.VerifiedDir = if (sharedLockParent(backend, profile_paths.fxHomeActive(), io_mod.getenv("HOME"))) |parent|
-        openSharedLockDir(parent)
-    else
-        null;
-    defer if (shared) |*dir| dir.close();
-
     var probe = MutationLockProbe{ .fx_dir = open_fx_dir.dir };
-    return lockMutationWithBackend(open_fx_dir, if (shared) |*dir| dir else null, mutation_lock_wait_ms, .{
+    return lockMutationFor(open_fx_dir, storageBackend(), keychain_lock.Environment.current(), mutation_lock_wait_ms, .{
         .ctx = &probe,
         .try_lock = MutationLockProbe.tryLock,
-    }, backend, native_keychain_backend);
+    }, native_keychain_backend);
 }
 
-/// The folder whose `.fx` holds the login's lock for every profile, or null
-/// to keep it in the profile: the profile-file backend saves a login per
-/// profile, without `FX_HOME` the profile is `~/.fx` already, and a `HOME`
-/// that isn't absolute names no `~/.fx`.
-fn sharedLockParent(backend: StorageBackend, fx_home_active: bool, home: ?[]const u8) ?[]const u8 {
-    if (backend != .macos_keychain or !fx_home_active) return null;
-    const path = home orelse return null;
-    if (!std.Io.Dir.path.isAbsolute(path)) return null;
-    return path;
-}
-
-/// `parent`'s `.fx`, made private if it is missing, or null when it can't be
-/// opened: the lock then stays in the profile, as before `FX_HOME` profiles
-/// shared it (`tests/tla/oauth_session/KeychainLock.tla`, keychain-lock-fallback.cfg).
-fn openSharedLockDir(parent: []const u8) ?io_mod.VerifiedDir {
-    var parent_dir = io_mod.VerifiedDir{
-        .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent, .{ .iterate = true }) catch |err| {
-            debug_trace.logf("auth", "fx login lock kept in the profile step=open_home err={s}", .{@errorName(err)});
-            return null;
-        },
-    };
-    defer parent_dir.close();
-    return io_mod.openOrCreateVerifiedPrivateDir(&parent_dir, profile_paths.root_dir_name) catch |err| {
-        debug_trace.logf("auth", "fx login lock kept in the profile step=open_shared err={s}", .{@errorName(err)});
-        return null;
-    };
+/// `lockMutation` with what it reads from the process given as values.
+fn lockMutationFor(
+    open_fx_dir: io_mod.VerifiedDir,
+    backend: StorageBackend,
+    env: keychain_lock.Environment,
+    wait_ms: i64,
+    ops: io_mod.LockOps,
+    keychain: KeychainBackend,
+) !Mutation {
+    var shared = keychain_lock.open(backend == .macos_keychain, env, lock_item);
+    defer if (shared) |*dir| dir.close();
+    return lockMutationWithBackend(open_fx_dir, if (shared) |*dir| dir else null, wait_ms, ops, backend, keychain);
 }
 
 /// Locks `auth.lock` in `lock_dir`, or in the profile `open_fx_dir` when it
-/// is null. The mutation keeps the profile for its `auth.json`.
+/// is null or the lock can't be taken there (`keychain_lock.zig`). The
+/// mutation keeps the profile for its `auth.json`.
 fn lockMutationWithBackend(
     open_fx_dir: io_mod.VerifiedDir,
     lock_dir: ?*io_mod.VerifiedDir,
@@ -866,14 +851,14 @@ fn lockMutationWithBackend(
     var fx_dir = open_fx_dir;
     errdefer fx_dir.close();
 
-    const taken = leased_lock.acquire(
-        lock_dir orelse &fx_dir,
+    const taken = keychain_lock.acquireLeased(
+        &fx_dir,
+        lock_dir,
         mutation_lock_file_name,
         io_mod.awakeMilliTimestamp(),
         wait_ms,
         ops,
-        "auth",
-        "fx login",
+        lock_item,
     ) catch |err| return session_presence.storageError(auth_file_name, err);
     var lock = taken.lock;
     errdefer lock.release();
@@ -1796,36 +1781,116 @@ test "fx login lock across profiles: a waiter in another profile times the lease
     try std.testing.expectEqual(@as(?i64, holder.stamp_ms), leased_lock.readStamp(&shared, mutation_lock_file_name));
 }
 
-test "fx login lock across profiles: only the Keychain login under FX_HOME with an absolute HOME moves the lock" {
-    try std.testing.expectEqualStrings("/Users/example", sharedLockParent(.macos_keychain, true, "/Users/example").?);
-    // No FX_HOME: the profile is ~/.fx already.
-    try std.testing.expect(sharedLockParent(.macos_keychain, false, "/Users/example") == null);
-    // The profile-file backend saves a login per profile, so it locks there.
-    try std.testing.expect(sharedLockParent(.profile_file, true, "/Users/example") == null);
-    // A HOME fx can't build ~/.fx from keeps the lock in the profile.
-    try std.testing.expect(sharedLockParent(.macos_keychain, true, null) == null);
-    try std.testing.expect(sharedLockParent(.macos_keychain, true, "") == null);
-    try std.testing.expect(sharedLockParent(.macos_keychain, true, "relative/home") == null);
-}
-
-test "fx login lock across profiles: a ~/.fx that can't hold the lock leaves it in the profile" {
+test "fx login lock across profiles: only the Keychain login under FX_HOME with an absolute HOME takes ~/.fx/auth.lock" {
+    const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "");
-    defer std.testing.allocator.free(home);
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var keychain = FakeOAuthKeychain{ .alloc = alloc };
+    defer keychain.deinit();
+    const moved: keychain_lock.Environment = .{ .fx_home_active = true, .home = home };
+
+    // Two profiles FX_HOME moved, with the Keychain: the lock is in ~/.fx, in neither profile.
+    var first = try lockMutationFor(try testProfileDir(tmp, "profile-a"), .macos_keychain, moved, 0, .{}, keychain.backend());
+    defer first.deinit();
+    try std.testing.expectError(
+        error.LockBusy,
+        lockMutationFor(try testProfileDir(tmp, "profile-b"), .macos_keychain, moved, 0, .{}, keychain.backend()),
+    );
+    _ = try tmp.dir.statFile(std.testing.io, "home/.fx/" ++ mutation_lock_file_name, .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "profile-a/" ++ mutation_lock_file_name, .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "profile-b/" ++ mutation_lock_file_name, .{}));
+
+    // Each of these keeps the lock in the profile, so two profiles take theirs together.
+    const stays: [4]struct { backend: StorageBackend, env: keychain_lock.Environment } = .{
+        // The profile-file backend saves a login per profile.
+        .{ .backend = .profile_file, .env = moved },
+        // No FX_HOME: the profile is ~/.fx already.
+        .{ .backend = .macos_keychain, .env = .{ .fx_home_active = false, .home = home } },
+        // A HOME fx can't build ~/.fx from.
+        .{ .backend = .macos_keychain, .env = .{ .fx_home_active = true, .home = null } },
+        .{ .backend = .macos_keychain, .env = .{ .fx_home_active = true, .home = "relative/home" } },
+    };
+    for (stays, 0..) |case, i| {
+        const name_a = try alloc.print("stay-{d}-a", .{i});
+        defer alloc.free(name_a);
+        const name_b = try alloc.print("stay-{d}-b", .{i});
+        defer alloc.free(name_b);
+        var a = try lockMutationFor(try testProfileDir(tmp, name_a), case.backend, case.env, 0, .{}, keychain.backend());
+        defer a.deinit();
+        var b = try lockMutationFor(try testProfileDir(tmp, name_b), case.backend, case.env, 0, .{}, keychain.backend());
+        defer b.deinit();
+    }
+}
+
+test "fx login lock across profiles: a ~/.fx that can't be opened leaves the lock in the profile" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var keychain = FakeOAuthKeychain{ .alloc = alloc };
+    defer keychain.deinit();
+    const env: keychain_lock.Environment = .{ .fx_home_active = true, .home = home };
 
     // Missing: made private, then used.
-    var made = openSharedLockDir(home) orelse return error.TestExpectedSharedLockDir;
-    made.close();
+    var made = try lockMutationFor(try testProfileDir(tmp, "profile-a"), .macos_keychain, env, 0, .{}, keychain.backend());
+    made.deinit();
     const stat = try tmp.dir.statFile(std.testing.io, profile_paths.root_dir_name, .{});
     try std.testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 
-    // A file where the folder should be: none, so the caller locks the profile.
-    try tmp.dir.deleteDir(std.testing.io, profile_paths.root_dir_name);
+    // A file where the folder should be: the profile's lock, in both profiles at once.
+    try tmp.dir.deleteTree(std.testing.io, profile_paths.root_dir_name);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = profile_paths.root_dir_name, .data = "" });
-    try std.testing.expect(openSharedLockDir(home) == null);
-    // A home folder that isn't there.
-    try std.testing.expect(openSharedLockDir("/nonexistent-fx-home-for-test") == null);
+    var first = try lockMutationFor(try testProfileDir(tmp, "profile-a"), .macos_keychain, env, 0, .{}, keychain.backend());
+    defer first.deinit();
+    var second = try lockMutationFor(try testProfileDir(tmp, "profile-b"), .macos_keychain, env, 0, .{}, keychain.backend());
+    defer second.deinit();
+}
+
+/// `~/.fx` opens but its `auth.lock` is in `state`: a profile takes the lock
+/// in its own folder, whatever another profile does, and one profile's lock
+/// still keeps its own processes apart.
+fn expectLoginLockKeptInProfile(state: lock_fixtures.State) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var shared = try testProfileDir(tmp, "home/.fx");
+    defer shared.close();
+    try lock_fixtures.plant(tmp.dir, "home/.fx/" ++ mutation_lock_file_name, state);
+    var keychain = FakeOAuthKeychain{ .alloc = alloc };
+    defer keychain.deinit();
+
+    var first = try lockMutationWithBackend(try testProfileDir(tmp, "profile-a"), &shared, 0, .{}, .macos_keychain, keychain.backend());
+    defer first.deinit();
+    _ = try tmp.dir.statFile(std.testing.io, "profile-a/" ++ mutation_lock_file_name, .{});
+    // Another profile is not kept out by it, and takes its own.
+    var second = try lockMutationWithBackend(try testProfileDir(tmp, "profile-b"), &shared, 0, .{}, .macos_keychain, keychain.backend());
+    defer second.deinit();
+    _ = try tmp.dir.statFile(std.testing.io, "profile-b/" ++ mutation_lock_file_name, .{});
+    // Two fx in one profile still are.
+    try std.testing.expectError(
+        error.LockBusy,
+        lockMutationWithBackend(try testProfileDir(tmp, "profile-a"), &shared, 0, .{}, .macos_keychain, keychain.backend()),
+    );
+}
+
+test "fx login lock across profiles: a symlinked ~/.fx/auth.lock leaves the lock in the profile" {
+    try expectLoginLockKeptInProfile(.symlink);
+}
+
+test "fx login lock across profiles: a ~/.fx/auth.lock of mode 644 leaves the lock in the profile" {
+    try expectLoginLockKeptInProfile(.mode_644);
+}
+
+test "fx login lock across profiles: a ~/.fx/auth.lock that is a folder leaves the lock in the profile" {
+    try expectLoginLockKeptInProfile(.folder);
+}
+
+test "fx login lock across profiles: a ~/.fx/auth.lock that is a fifo leaves the lock in the profile" {
+    try expectLoginLockKeptInProfile(.fifo);
 }
 
 test "fx login lock across profiles: FX_HOME naming ~/.fx itself takes one lock once" {

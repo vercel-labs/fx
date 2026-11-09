@@ -1,17 +1,24 @@
-// Drives the fx login's refresh lock across fx profiles
-// (src/core/auth/oauth_session.zig lockMutation) in real processes and has TLC
+// Drives the refresh lock of the Keychain items that are one for the user,
+// whatever the profile, across fx profiles, in real processes, and has TLC
 // check every run against tests/tla/oauth_session/KeychainLockTrace.tla, the
-// rules of KeychainLock.tla.
+// rules of KeychainLock.tla. The items are the fx login (src/core/auth/
+// oauth_session.zig lockMutation) and an MCP credential (src/core/mcp_host/
+// credentials.zig), whose locks both come from src/core/shared/keychain_lock.zig.
 //
-// On macOS the fx login is one Keychain item for the user, and no test may
-// touch the Keychain. So the driver copies src/ into a scratch folder, puts
+// On macOS each is one Keychain item for the user, and no test may touch the
+// Keychain. So the driver copies src/ into a scratch folder, puts
 // fake_keychain.zig in place of src/core/hosts/native_keychain.zig, and builds
 // lab.zig there: the real oauth_session.zig takes the lock and loads the
-// login, and the real credentials.refreshFxSession refreshes it, in as many
-// processes as a scenario starts, each with its own FX_HOME and one shared
-// HOME. A local issuer rotates refresh tokens and refuses a used one with
-// invalid_grant. The Keychain scenarios need macOS, where fx uses the
-// Keychain; elsewhere they are skipped.
+// login, and the real credentials.refreshFxSession refreshes it; with
+// FX_TLA_ITEM=mcp the real mcp_host/credentials.zig Store does the same for an
+// MCP credential. As many processes as a scenario starts, each with its own
+// FX_HOME and one shared HOME. A local issuer rotates refresh tokens and
+// refuses a used one with invalid_grant. The Keychain scenarios need macOS,
+// where fx uses the Keychain; elsewhere they are skipped.
+//
+// The bad-lock scenarios plant a lock file fx can't take (a symlink, a mode
+// 644 file, a folder, a fifo) in ~/.fx before the run: each process must take
+// its profile's lock instead and say so in one trace line.
 //
 // The profile-file path (FX_DISABLE_KEYCHAIN=1) runs on the built
 // zig-out/bin/fx with --binary, on every platform.
@@ -23,17 +30,20 @@
 // Usage, from the repository root:
 //   bun tests/tla/drivers/oauth_session/driver.ts             scenarios and saved fuzz seeds
 //   ... --rev <rev>         build the lab from that revision's src/ (origin/main must fail)
+//                           the MCP and bad-lock scenarios, as the earlier ones
 //   ... --fuzz N [--seed S] N random schedules from seed S; a failing seed is printed
-//   ... --stress            16 processes in 8 profiles refresh one login
+//   ... --stress            16 processes in 8 profiles refresh one login, and one MCP credential
 //   ... --crash             kill the lock's holder before it sends, after the issuer
-//                           rotated its token, and after it saved
+//                           rotated its token, and after it saved; for each item
 //   ... --repeat N          the two-profile race N times
-//   ... --mutants           plant bugs in a copy of oauth_session.zig; each must be caught
+//   ... --mutants           plant bugs in copies of keychain_lock.zig, oauth_session.zig and
+//                           credentials.zig; each must be caught
 //   ... --binary            the built fx on the profile-file path in two FX_HOME profiles
 //   ... --only a,b          only the named scenarios, from the default and crash sets
 // Exit: 0 every check passed, 1 a check failed, 2 a toolchain or build failure.
 import { dlopen, FFIType } from "bun:ffi";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { REPO_ROOT, TLA_ROOT, outDir, runTlc } from "../lib/tlc";
@@ -59,9 +69,10 @@ function awakeNs(): number {
 
 // ---- The lab ----
 
-type Patch = { target: string; planted: string };
+/** `file` is under src/core/, oauth_session.zig's by default. */
+type Patch = { file?: string; target: string; planted: string };
 
-/** Builds lab.zig against src/ from the worktree, or from `rev`, with `patch` planted in oauth_session.zig. */
+/** Builds lab.zig against src/ from the worktree, or from `rev`, with `patch` planted in one of its files. */
 function buildLab(name: string, rev: string | null, patch: Patch | null = null): string {
   const root = mkdtempSync(join(out, `lab-${name}-`));
   if (rev) {
@@ -73,10 +84,11 @@ function buildLab(name: string, rev: string | null, patch: Patch | null = null):
     cpSync(join(REPO_ROOT, "src"), join(root, "src"), { recursive: true });
   }
   if (patch) {
-    const path = join(root, "src", "core", "auth", "oauth_session.zig");
+    const file = patch.file ?? "auth/oauth_session.zig";
+    const path = join(root, "src", "core", ...file.split("/"));
     const source = readFileSync(path, "utf8");
-    if (!source.includes(patch.target)) fail(2, `mutant ${name}: its target is gone from oauth_session.zig`);
-    writeFileSync(path, source.replace(patch.target, patch.planted));
+    if (!source.includes(patch.target)) fail(2, `mutant ${name}: its target is gone from ${file}`);
+    writeFileSync(path, source.replaceAll(patch.target, patch.planted));
   }
   cpSync(join(HERE, "fake_keychain.zig"), join(root, "src", "core", "hosts", "native_keychain.zig"));
   cpSync(join(HERE, "lab.zig"), join(root, "lab.zig"));
@@ -170,6 +182,60 @@ function savedToken(path: string): string {
   try { return JSON.parse(readFileSync(path, "utf8")).refresh_token ?? ""; } catch { return "<unreadable>"; }
 }
 
+// ---- The MCP credential: one login of the MCP credential store, as the lab saves it ----
+
+const MCP_NAME = "plain";
+const MCP_URL = "https://mcp.plain.com/mcp";
+
+/** The store's document with one credential, which has run out, whose refresh token is `refresh`. */
+function mcpDocument(refresh: string): string {
+  const credential = JSON.stringify({ refresh_token: refresh, expires_at_ms: Date.now() - 60_000 });
+  return JSON.stringify({ version: 2, servers: [{ name: MCP_NAME, url: MCP_URL, credential }] });
+}
+
+/** The saved credential's refresh token in a store file or Keychain item; "" for none. */
+function savedMcpToken(path: string): string {
+  if (!existsSync(path)) return "";
+  try {
+    const entry = (JSON.parse(readFileSync(path, "utf8")).servers as { name: string; credential: string }[]).find((e) => e.name === MCP_NAME);
+    return entry ? JSON.parse(entry.credential).refresh_token ?? "" : "";
+  } catch { return "<unreadable>"; }
+}
+
+/** The name of the credential's refresh lock: src/core/mcp_host/credentials.zig refreshLockName. */
+function mcpRefreshLockName(): string {
+  const digest = createHash("sha256").update(`${MCP_NAME}\0${MCP_URL}\0\0`).digest("hex");
+  return `refresh-v3-${digest.slice(0, 16)}.lock`;
+}
+
+const MCP_STORE_LOCK = "credentials-v3.lock";
+
+// ---- Lock files fx can't take ----
+
+type BadLock = "symlink" | "mode-644" | "folder" | "fifo";
+const badLocks: BadLock[] = ["symlink", "mode-644", "folder", "fifo"];
+
+function plantBad(path: string, state: BadLock) {
+  if (state === "symlink") symlinkSync("no-such-file", path);
+  else if (state === "mode-644") { writeFileSync(path, "", { mode: 0o644 }); chmodSync(path, 0o644); }
+  else if (state === "folder") mkdirSync(path, { mode: 0o700 });
+  else {
+    const made = Bun.spawnSync(["/usr/bin/mkfifo", path]);
+    if (made.exitCode !== 0) fail(2, `mkfifo ${path} failed`);
+  }
+}
+
+/** Whether the file at `path` is still as `plantBad` left it. */
+function stillBad(path: string, state: BadLock): boolean {
+  try {
+    const st = lstatSync(path);
+    if (state === "symlink") return st.isSymbolicLink();
+    if (state === "mode-644") return st.isFile() && (st.mode & 0o777) === 0o644;
+    if (state === "folder") return st.isDirectory();
+    return st.isFIFO();
+  } catch { return false; }
+}
+
 // ---- Scenarios ----
 
 type ProcSpec = {
@@ -184,7 +250,12 @@ type ProcSpec = {
   failStore?: boolean;
   /** Build the process from the older lab (origin/main). */
   older?: boolean;
+  /** HOME as given, in place of the scenario's own: a relative path is not one fx can build ~/.fx from. */
+  home?: string;
 };
+
+/** What a process refreshes: the fx login, or an MCP credential. */
+type Item = "login" | "mcp";
 
 type Scenario = {
   name: string;
@@ -196,6 +267,17 @@ type Scenario = {
   crash?: "before-send" | "after-rotate" | "after-save";
   /** The login is still saved at the end (false: a dead one was deleted; null: either, as the schedule decides). */
   loginKept: boolean | null;
+  /** What each process refreshes; the fx login by default. */
+  item?: Item;
+  /** Plant this state at the item's lock files in ~/.fx before the run: each process takes its profile's lock. */
+  badLock?: BadLock;
+  /** Every lab process's trace holds each of these. */
+  expectTrace?: string[];
+  /**
+   * With the Keychain, the locks are ~/.fx's, and no profile that FX_HOME moved holds one. The
+   * default, unless a lock file is planted or a process has a HOME of its own.
+   */
+  sharedLocks?: boolean;
 };
 
 type Proc = { spec: ProcSpec; child: ReturnType<typeof Bun.spawn>; events: Ev[]; exit: Promise<number>; stderr: Promise<string> };
@@ -230,6 +312,8 @@ async function runScenario(labs: Labs, sc: Scenario): Promise<{ ok: boolean; why
   const home = join(dir, "home");
   mkdirSync(home, { recursive: true, mode: 0o700 });
   const keychain = join(dir, "keychain-item");
+  const mcpKeychain = join(dir, "mcp-keychain-item");
+  const item: Item = sc.item ?? "login";
   const procs: Proc[] = [];
   const crashes: Ev[] = [];
   const holder = () => procs.find((p) => p.events.some((e) => e.ev === "take") && !p.events.some((e) => e.ev === "release"));
@@ -251,24 +335,48 @@ async function runScenario(labs: Labs, sc: Scenario): Promise<{ ok: boolean; why
       for (const spec of sc.procs) {
         const folder = spec.profile ? profileDir(spec.profile) : join(home, ".fx");
         mkdirSync(folder, { recursive: true, mode: 0o700 });
-        const auth = join(folder, "auth.json");
-        if (!existsSync(auth)) writeFileSync(auth, sessionJson(issuer.url, `${spec.profile ?? "default"}-r0`), { mode: 0o600 });
+        if (item === "mcp") {
+          const store = join(folder, "mcp-credentials");
+          mkdirSync(store, { recursive: true, mode: 0o700 });
+          const file = join(store, "credentials-v3.json");
+          if (!existsSync(file)) writeFileSync(file, mcpDocument(`${spec.profile ?? "default"}-r0`), { mode: 0o600 });
+        } else {
+          const auth = join(folder, "auth.json");
+          if (!existsSync(auth)) writeFileSync(auth, sessionJson(issuer.url, `${spec.profile ?? "default"}-r0`), { mode: 0o600 });
+        }
       }
+    } else if (item === "mcp") {
+      writeFileSync(mcpKeychain, mcpDocument("r0"), { mode: 0o600 });
     } else {
       writeFileSync(keychain, sessionJson(issuer.url, "r0"), { mode: 0o600 });
+    }
+    if (sc.badLock) {
+      // ~/.fx as a stale root-owned file would leave it, private, with the locks fx takes unusable.
+      const fx = join(home, ".fx");
+      mkdirSync(fx, { recursive: true, mode: 0o700 });
+      if (item === "mcp") {
+        const store = join(fx, "mcp-credentials");
+        mkdirSync(store, { recursive: true, mode: 0o700 });
+        plantBad(join(store, MCP_STORE_LOCK), sc.badLock);
+        plantBad(join(store, mcpRefreshLockName()), sc.badLock);
+      } else {
+        plantBad(join(fx, "auth.lock"), sc.badLock);
+      }
     }
     for (const spec of sc.procs) {
       if (spec.startDelay) await Bun.sleep(spec.startDelay);
       const env: Record<string, string> = {
         PATH: "/usr/bin:/bin",
-        HOME: home,
+        HOME: spec.home ?? home,
         FX_SOUND: "0",
         FX_DISABLE_KEYCHAIN: "1",
         FX_TEST_OAUTH_ISSUER_URL: issuer.url,
         FX_TLA_KEYCHAIN_FILE: keychain,
+        FX_TLA_MCP_KEYCHAIN_FILE: mcpKeychain,
+        FX_TLA_ITEM: item,
         FX_TLA_LABEL: spec.label,
         FX_TRACE_LOG: join(dir, `${spec.label}.trace`),
-        FX_TRACE_SCOPES: "auth",
+        FX_TRACE_SCOPES: "auth,mcp",
       };
       const fxHome = spec.fxHome === "" ? join(home, ".fx") : spec.fxHome ?? (spec.profile ? profileDir(spec.profile) : null);
       if (fxHome) { mkdirSync(fxHome, { recursive: true, mode: 0o700 }); env.FX_HOME = fxHome; }
@@ -305,30 +413,81 @@ async function runScenario(labs: Labs, sc: Scenario): Promise<{ ok: boolean; why
       if (existsSync(join(home, ".fx"))) why.push("the profile-file backend made ~/.fx");
       for (const spec of sc.procs) {
         const folder = spec.profile ? profileDir(spec.profile) : join(home, ".fx");
-        if (!existsSync(join(folder, "auth.lock"))) why.push(`no auth.lock in ${spec.profile ?? "~/.fx"}`);
+        const lock = item === "mcp" ? join(folder, "mcp-credentials", mcpRefreshLockName()) : join(folder, "auth.lock");
+        if (!existsSync(lock)) why.push(`no ${item === "mcp" ? "refresh lock" : "auth.lock"} in ${spec.profile ?? "~/.fx"}`);
       }
       for (const name of new Set(sc.procs.map((s) => s.profile))) {
         const mine = procs.filter((p) => p.spec.profile === name);
         const chain = `${name ?? "default"}-r0`;
         const events = mergeEvents(mine.flatMap((p) => p.events), crashes, issuer.log.filter((r) => r.token === chain || r.token?.startsWith(`${chain}-r`)));
-        const auth = join(name ? profileDir(name) : join(home, ".fx"), "auth.json");
-        const verdict = await checkTrace(join(dir, `tlc-${name ?? "default"}`), chain, events, savedToken(auth));
+        const folder = name ? profileDir(name) : join(home, ".fx");
+        const saved = item === "mcp" ? savedMcpToken(join(folder, "mcp-credentials", "credentials-v3.json")) : savedToken(join(folder, "auth.json"));
+        const verdict = await checkTrace(join(dir, `tlc-${name ?? "default"}`), chain, events, saved);
         if (!verdict.accepted) why.push(`profile ${name}: ${verdict.detail}`);
       }
     } else {
+      const saved = item === "mcp" ? savedMcpToken(mcpKeychain) : savedToken(keychain);
       const events = mergeEvents(procs.flatMap((p) => p.events), crashes, issuer.log);
-      const verdict = await checkTrace(join(dir, "tlc"), "r0", events, savedToken(keychain));
+      const verdict = await checkTrace(join(dir, "tlc"), "r0", events, saved);
       if (!verdict.accepted) why.push(verdict.detail);
       const refused = issuer.log.filter((r) => r.ev === "recv" && !r.ok).length;
-      if (!sc.crash && refused > 0) why.push(`the issuer refused ${refused} used refresh token(s)`);
+      // A Keychain write that fails after the issuer rotated the token leaves a retired one saved, whatever the lock.
+      const writeFails = sc.procs.some((p) => p.failStore);
+      if (!sc.crash && !writeFails && refused > 0) why.push(`the issuer refused ${refused} used refresh token(s)`);
       if (sc.crash && crashes.length === 0) why.push("no process was killed");
-      if (sc.loginKept === true && savedToken(keychain) === "") why.push("the shared login was deleted");
-      if (sc.loginKept === false && savedToken(keychain) !== "") why.push("the dead login was kept");
+      if (sc.loginKept === true && saved === "") why.push("the shared login was deleted");
+      if (sc.loginKept === false && saved !== "") why.push("the dead login was kept");
+      const expectShared = sc.sharedLocks ?? (!sc.badLock && !sc.procs.some((p) => p.home !== undefined));
+      if (expectShared) why.push(...sharedLockProblems(item, home, sc, profileDir));
+      if (sc.badLock) why.push(...badLockProblems(item, sc.badLock, home, sc, profileDir));
+    }
+    for (const line of sc.expectTrace ?? []) {
+      for (const p of procs) {
+        const trace = existsSync(join(dir, `${p.spec.label}.trace`)) ? readFileSync(join(dir, `${p.spec.label}.trace`), "utf8") : "";
+        if (!p.spec.older && !trace.includes(line)) why.push(`${p.spec.label}'s trace has no "${line}"`);
+      }
     }
     return { ok: why.length === 0, why, dir };
   } finally {
     issuer.stop();
   }
+}
+
+/** The profiles of a scenario that FX_HOME moved, as folders. */
+function movedFolders(sc: Scenario, profileDir: (name: string) => string): string[] {
+  return [...new Set(sc.procs.filter((p) => p.profile && !p.older).map((p) => p.profile!))].map(profileDir);
+}
+
+/** The lock files in a folder: every one of them. */
+function lockFiles(folder: string): string[] {
+  return existsSync(folder) ? readdirSync(folder).filter((f) => f.endsWith(".lock")) : [];
+}
+
+/** With the Keychain the locks are ~/.fx's: there, and in no profile FX_HOME moved. */
+function sharedLockProblems(item: Item, home: string, sc: Scenario, profileDir: (name: string) => string): string[] {
+  const why: string[] = [];
+  const shared = item === "mcp" ? join(home, ".fx", "mcp-credentials") : join(home, ".fx");
+  const wanted = item === "mcp" ? [MCP_STORE_LOCK, mcpRefreshLockName()] : ["auth.lock"];
+  for (const name of wanted) if (!existsSync(join(shared, name))) why.push(`no ${name} in ~/.fx${item === "mcp" ? "/mcp-credentials" : ""}`);
+  for (const folder of movedFolders(sc, profileDir)) {
+    const held = lockFiles(item === "mcp" ? join(folder, "mcp-credentials") : folder);
+    if (held.length > 0) why.push(`${folder} holds ${held.join(", ")}`);
+  }
+  return why;
+}
+
+/** With a lock file fx can't take in ~/.fx: the file is as it was, and each profile holds its own lock. */
+function badLockProblems(item: Item, state: BadLock, home: string, sc: Scenario, profileDir: (name: string) => string): string[] {
+  const why: string[] = [];
+  const shared = item === "mcp" ? join(home, ".fx", "mcp-credentials") : join(home, ".fx");
+  for (const name of item === "mcp" ? [MCP_STORE_LOCK, mcpRefreshLockName()] : ["auth.lock"]) {
+    if (!stillBad(join(shared, name), state)) why.push(`~/.fx's ${name} is no longer a ${state}`);
+  }
+  for (const folder of movedFolders(sc, profileDir)) {
+    const held = item === "mcp" ? join(folder, "mcp-credentials", mcpRefreshLockName()) : join(folder, "auth.lock");
+    if (!existsSync(held)) why.push(`no lock in ${folder}`);
+  }
+  return why;
 }
 
 /** Every step of a run, on the awake clock; at one instant a lock is let go before it is taken. */
@@ -367,7 +526,7 @@ async function checkTrace(dir: string, initToken: string, events: Ev[], finalTok
 
 const race: IssuerOpts = { acceptDelay: 300, refuseDelay: 1_200, barrier: { count: 2, waitMs: 1_500 } };
 
-function scenarios(withOlder: boolean): Scenario[] {
+function loginScenarios(withOlder: boolean): Scenario[] {
   const list: Scenario[] = [
     { name: "two-profiles", issuer: race, loginKept: true, procs: [{ label: "a", profile: "pa" }, { label: "b", profile: "pb" }] },
     { name: "default-and-moved", issuer: race, loginKept: true, procs: [{ label: "a", profile: null }, { label: "b", profile: "pb" }] },
@@ -396,19 +555,72 @@ function scenarios(withOlder: boolean): Scenario[] {
   return list;
 }
 
+/** The MCP credential, refreshed as the fx login is, under its refresh lock. */
+function mcpScenarios(withOlder: boolean): Scenario[] {
+  const list: Scenario[] = [
+    { name: "mcp-two-profiles", item: "mcp", issuer: race, loginKept: true, procs: [{ label: "a", profile: "pa" }, { label: "b", profile: "pb" }] },
+    { name: "mcp-default-and-moved", item: "mcp", issuer: race, loginKept: true, procs: [{ label: "a", profile: null }, { label: "b", profile: "pb" }] },
+    { name: "mcp-same-profile", item: "mcp", issuer: race, loginKept: true, procs: [{ label: "a", profile: "pa" }, { label: "b", profile: "pa" }] },
+    {
+      name: "mcp-forced-after", item: "mcp", issuer: { acceptDelay: 50, refuseDelay: 50 }, loginKept: true,
+      procs: [{ label: "a", profile: "pa" }, { label: "b", profile: "pb", force: true, startDelay: 1_500 }],
+    },
+    { name: "mcp-fx-home-is-dot-fx", item: "mcp", issuer: race, loginKept: true, procs: [{ label: "a", profile: null, fxHome: "" }, { label: "b", profile: null }] },
+    { name: "mcp-profile-file", item: "mcp", issuer: race, profileFile: true, loginKept: true, procs: [{ label: "a", profile: "pa" }, { label: "b", profile: "pb" }] },
+  ];
+  if (withOlder) {
+    list.push({
+      name: "mcp-older-fx-in-default", item: "mcp", issuer: race, loginKept: true,
+      procs: [{ label: "old", profile: null, older: true }, { label: "b", profile: "pb" }],
+    });
+  }
+  return list;
+}
+
+/**
+ * A lock fx can't take in ~/.fx, or a HOME it can't build ~/.fx from: two fx in one profile
+ * each take that profile's lock, say so in one trace line, and keep each other apart.
+ */
+function badLockScenarios(): Scenario[] {
+  const pair: ProcSpec[] = [{ label: "a1", profile: "pa" }, { label: "a2", profile: "pa" }];
+  const loginTrace = "fx login lock kept in the profile step=take_shared path=~/.fx/auth.lock err=";
+  const mcpTrace = [
+    `MCP store lock kept in the profile step=take_shared path=~/.fx/mcp-credentials/${MCP_STORE_LOCK} err=`,
+    "MCP refresh lock kept in the profile step=take_shared path=~/.fx/mcp-credentials/refresh-v3-",
+  ];
+  const list: Scenario[] = [];
+  for (const state of badLocks) {
+    list.push({ name: `bad-lock-${state}`, badLock: state, issuer: race, loginKept: true, procs: pair, expectTrace: [loginTrace] });
+    list.push({ name: `mcp-bad-lock-${state}`, item: "mcp", badLock: state, issuer: race, loginKept: true, procs: pair, expectTrace: mcpTrace });
+  }
+  const relative: ProcSpec[] = pair.map((p) => ({ ...p, home: "relative/home" }));
+  list.push({ name: "home-not-absolute", issuer: race, loginKept: true, procs: relative, expectTrace: ["fx login lock kept in the profile step=home err=HomeNotAbsolute"] });
+  list.push({
+    name: "mcp-home-not-absolute", item: "mcp", issuer: race, loginKept: true, procs: relative,
+    expectTrace: ["MCP store lock kept in the profile step=home err=HomeNotAbsolute", "MCP refresh lock kept in the profile step=home err=HomeNotAbsolute"],
+  });
+  return list;
+}
+
+function scenarios(withOlder: boolean): Scenario[] {
+  return [...loginScenarios(withOlder), ...mcpScenarios(withOlder), ...badLockScenarios()];
+}
+
 function crashScenarios(): Scenario[] {
   const procs: ProcSpec[] = [{ label: "a", profile: "pa" }, { label: "b", profile: "pb", startDelay: 100 }];
-  return [
+  const login: Scenario[] = [
     { name: "crash-before-send", crash: "before-send", issuer: { acceptDelay: 100, refuseDelay: 100 }, loginKept: true, procs },
     { name: "crash-after-rotate", crash: "after-rotate", issuer: { acceptDelay: 500, refuseDelay: 100 }, loginKept: false, procs },
     { name: "crash-after-save", crash: "after-save", issuer: { acceptDelay: 100, refuseDelay: 100 }, loginKept: true, procs },
   ];
+  return [...login, ...login.map((sc): Scenario => ({ ...sc, name: `mcp-${sc.name}`, item: "mcp" }))];
 }
 
-function stressScenario(): Scenario {
+function stressScenarios(): Scenario[] {
   const procs: ProcSpec[] = [];
   for (let i = 0; i < 16; i++) procs.push({ label: `s${i}`, profile: i % 8 === 0 ? null : `p${i % 8}`, force: true });
-  return { name: "stress-16", issuer: { acceptDelay: 20, refuseDelay: 20 }, loginKept: true, procs };
+  const login: Scenario = { name: "stress-16", issuer: { acceptDelay: 20, refuseDelay: 20 }, loginKept: true, procs };
+  return [login, { ...login, name: "stress-mcp-16", item: "mcp" }];
 }
 
 /** A small seeded generator (mulberry32), so a failing schedule replays from its seed. */
@@ -434,8 +646,16 @@ function fuzzScenario(seed: number): Scenario {
     procs.push({ label: `f${i}`, profile: profiles[int(0, profiles.length - 1)]!, startDelay: int(0, 120), force: r() < 0.3, failStore: i === failStoreAt });
   }
   const issuer: IssuerOpts = { acceptDelay: int(0, 300), refuseDelay: int(0, 800), fail5xx: r() < 0.2 ? 1 : 0 };
+  // These come last, so a seed saved before them keeps its schedule.
+  const item: Item = r() < 0.4 ? "mcp" : "login";
+  const badLock = r() < 0.2 ? badLocks[int(0, badLocks.length - 1)] : undefined;
+  // Profiles that each take their own lock may race, which is the finding the model keeps: one profile does not.
+  if (badLock) for (const p of procs) p.profile = "pa";
+  const expectTrace = !badLock ? undefined : item === "mcp"
+    ? [`MCP store lock kept in the profile step=take_shared path=~/.fx/mcp-credentials/${MCP_STORE_LOCK} err=`, "MCP refresh lock kept in the profile step=take_shared path=~/.fx/mcp-credentials/refresh-v3-"]
+    : ["fx login lock kept in the profile step=take_shared path=~/.fx/auth.lock err="];
   // A process whose Keychain write fails deletes the login only if it refreshed it.
-  return { name: `fuzz-${seed}`, issuer, loginKept: failStoreAt < 0 ? true : null, procs };
+  return { name: `fuzz-${seed}`, issuer, item, badLock, expectTrace, loginKept: failStoreAt < 0 ? true : null, procs };
 }
 
 // ---- The built binary on the profile-file path ----
@@ -502,27 +722,75 @@ async function binaryCheck(): Promise<string[]> {
 
 // ---- Mutants ----
 
-// Planted bugs in the fixed oauth_session.zig. Each must make a scenario fail.
+// Planted bugs in the fixed code, one in a copy of src/ each. Each must make a scenario fail.
+const KEYCHAIN_LOCK = "shared/keychain_lock.zig";
+const MCP_CREDENTIALS = "mcp_host/credentials.zig";
+const choosesShared = "if (!keychain or !env.fx_home_active) return .profile;";
+const fallbackRule = "error.LockBusy, error.OutOfMemory, error.Cancelled => return err,\n        else => {},";
 const mutants: { name: string; patch: Patch; scenarios: string[] }[] = [
   {
     name: "lock-in-profile",
-    patch: { target: "lockMutationWithBackend(open_fx_dir, if (shared) |*dir| dir else null,", planted: "lockMutationWithBackend(open_fx_dir, null," },
+    patch: { target: "return lockMutationWithBackend(open_fx_dir, if (shared) |*dir| dir else null, wait_ms, ops, backend, keychain);", planted: "return lockMutationWithBackend(open_fx_dir, null, wait_ms, ops, backend, keychain);" },
     scenarios: ["two-profiles", "default-and-moved"],
   },
   {
     name: "shared-without-fx-home-only",
-    patch: { target: "if (backend != .macos_keychain or !fx_home_active) return null;", planted: "if (backend != .macos_keychain or fx_home_active) return null;" },
-    scenarios: ["two-profiles", "default-and-moved"],
+    patch: { file: KEYCHAIN_LOCK, target: choosesShared, planted: "if (!keychain or env.fx_home_active) return .profile;" },
+    scenarios: ["two-profiles", "default-and-moved", "mcp-two-profiles"],
   },
   {
     name: "profile-file-shares",
-    patch: { target: "if (backend != .macos_keychain or !fx_home_active) return null;", planted: "_ = backend;\n    if (!fx_home_active) return null;" },
-    scenarios: ["profile-file"],
+    patch: { file: KEYCHAIN_LOCK, target: choosesShared, planted: "_ = keychain;\n    if (!env.fx_home_active) return .profile;" },
+    scenarios: ["profile-file", "mcp-profile-file"],
   },
   {
     name: "shared-folder-not-home",
-    patch: { target: "return io_mod.openOrCreateVerifiedPrivateDir(&parent_dir, profile_paths.root_dir_name)", planted: "return io_mod.openOrCreateVerifiedPrivateDir(&parent_dir, \"fx-runtime\")" },
-    scenarios: ["older-fx-in-default"],
+    patch: { file: KEYCHAIN_LOCK, target: "io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name)", planted: "io_mod.openOrCreateVerifiedPrivateDir(&home, \"fx-runtime\")" },
+    scenarios: ["older-fx-in-default", "mcp-older-fx-in-default"],
+  },
+  {
+    name: "no-fallback",
+    patch: { file: KEYCHAIN_LOCK, target: fallbackRule, planted: "error.LockBusy, error.OutOfMemory, error.Cancelled => return err,\n        else => return err," },
+    scenarios: ["bad-lock-symlink", "mcp-bad-lock-folder"],
+  },
+  {
+    name: "fall-back-on-busy",
+    patch: { file: KEYCHAIN_LOCK, target: fallbackRule, planted: "error.OutOfMemory, error.Cancelled => return err,\n        else => {}," },
+    scenarios: ["two-profiles", "mcp-two-profiles"],
+  },
+  {
+    name: "silent-fallback",
+    patch: { file: KEYCHAIN_LOCK, target: "lock kept in the profile step=take_shared", planted: "lock stays step=take_shared" },
+    scenarios: ["bad-lock-fifo", "mcp-bad-lock-mode-644"],
+  },
+  {
+    name: "no-fallback-for-the-refresh-lock",
+    patch: {
+      file: KEYCHAIN_LOCK,
+      target: "return .{ .lock = lock, .in_shared = true };\n        } else |err| try keepInProfile(err, item, name);",
+      planted: "return .{ .lock = lock, .in_shared = true };\n        } else |err| {\n            _ = item;\n            return err;\n        }",
+    },
+    scenarios: ["mcp-bad-lock-symlink"],
+  },
+  {
+    name: "no-trace-for-a-relative-home",
+    patch: { file: KEYCHAIN_LOCK, target: "lock kept in the profile step=home err=HomeNotAbsolute", planted: "lock kept in the profile step=none err=HomeNotAbsolute" },
+    scenarios: ["home-not-absolute", "mcp-home-not-absolute"],
+  },
+  {
+    name: "mcp-locks-in-profile",
+    patch: { file: MCP_CREDENTIALS, target: "return keychain_lock.open(s.backend == .keychain, env, item);", planted: "_ = s;\n        _ = env;\n        _ = item;\n        return null;" },
+    scenarios: ["mcp-two-profiles", "mcp-default-and-moved"],
+  },
+  {
+    name: "mcp-refresh-lock-in-profile",
+    patch: { file: MCP_CREDENTIALS, target: "var shared = s.openSharedDir(env, refresh_item);", planted: "_ = env;\n        var shared: ?io_mod.VerifiedDir = null;" },
+    scenarios: ["mcp-two-profiles"],
+  },
+  {
+    name: "mcp-file-store-shares",
+    patch: { file: MCP_CREDENTIALS, target: "return keychain_lock.open(s.backend == .keychain, env, item);", planted: "_ = s;\n        return keychain_lock.open(true, env, item);" },
+    scenarios: ["mcp-profile-file"],
   },
 ];
 
@@ -555,7 +823,7 @@ async function main() {
   let list: Scenario[];
   if (has("--only")) {
     const names = (value("--only") ?? "").split(",");
-    const all = [...scenarios(!rev), ...crashScenarios()];
+    const all = [...scenarios(!rev), ...crashScenarios(), ...stressScenarios()];
     list = names.map((name) => all.find((s) => s.name === name) ?? fail(2, `no scenario named ${name}`));
   } else if (has("--fuzz")) {
     const n = Number(value("--fuzz") ?? "10");
@@ -563,12 +831,13 @@ async function main() {
     console.log(`fuzz: ${n} schedules from seed ${seed}`);
     list = Array.from({ length: n }, (_, i) => fuzzScenario(seed + i));
   } else if (has("--stress")) {
-    list = [stressScenario()];
+    list = stressScenarios();
   } else if (has("--crash")) {
     list = crashScenarios();
   } else if (has("--repeat")) {
     const n = Number(value("--repeat") ?? "10");
-    list = Array.from({ length: n }, (_, i) => ({ ...scenarios(false)[i % 2]!, name: `race-${i}`, procs: scenarios(false)[i % 2]!.procs.map((p, k) => ({ ...p, startDelay: k * ((i * 7) % 40) })) }));
+    const pool = ["two-profiles", "default-and-moved", "mcp-two-profiles", "mcp-default-and-moved"].map((name) => scenarios(false).find((s) => s.name === name)!);
+    list = Array.from({ length: n }, (_, i) => ({ ...pool[i % pool.length]!, name: `race-${i}`, procs: pool[i % pool.length]!.procs.map((p, k) => ({ ...p, startDelay: k * ((i * 7) % 40) })) }));
   } else if (has("--mutants")) {
     const base = scenarios(true);
     let missed = 0;

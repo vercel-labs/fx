@@ -3,7 +3,9 @@
 \* rules. tests/tla/drivers/oauth_session/driver.ts generates
 \* KeychainLockObs.tla from one run: the steps its lab processes printed
 \* (lab.zig, which runs the real src/core/auth/oauth_session.zig and
-\* credentials.zig refresh) and its local issuer's, merged on the awake clock.
+\* credentials.zig refresh for the fx login, or the real
+\* src/core/mcp_host/credentials.zig store for an MCP credential) and its
+\* local issuer's, merged on the awake clock.
 \* Every record has every field; the ones a step doesn't use are empty.
 \*   init {token}               the saved login's refresh token, which the issuer takes
 \*   take {p}                   p took the login's lock

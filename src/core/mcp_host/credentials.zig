@@ -5,7 +5,10 @@
 //! and rewritten, so two fx processes don't overwrite each other's entries.
 //! A store this fx can't read, damaged or saved by a newer fx, is never
 //! written over. One fx refreshes a login at a time, under that login's
-//! refresh lock.
+//! refresh lock. The Keychain item is one for the user, whatever the profile,
+//! so with `FX_HOME` set the locks are in `~/.fx/mcp-credentials` for every
+//! profile (`shared/keychain_lock.zig`, `tests/tla/oauth_session/KeychainLock.tla`);
+//! the file store is one per profile and locks there.
 //!
 //! Older stores are never read or taken over: v1's `credentials.json`, and
 //! `credentials-v2.json` (Keychain item `FX_MCP_OAUTH_CREDENTIALS_V2`). Builds
@@ -29,6 +32,7 @@ const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
+const keychain_lock = @import("../shared/keychain_lock.zig");
 const leased_lock = @import("../shared/leased_lock.zig");
 const secret = @import("../auth/secret.zig");
 const json_decode = @import("../shared/json_decode.zig");
@@ -48,6 +52,12 @@ const lock_deadline_ms: u64 = 2_000;
 const call_budget_ms: i64 = native_keychain.keychain_call_ms;
 const hold_slack_ms: i64 = leased_lock.slack_ms;
 const max_store_bytes: usize = 1024 * 1024;
+/// The Keychain item is one for the user, whatever the profile, so the locks
+/// of the store and of each login's refresh are not kept in each profile
+/// (`shared/keychain_lock.zig`). The labels are the ones their trace lines
+/// carry (`tests/tla/drivers/mcp_host/`).
+const store_item: keychain_lock.Item = .{ .scope = "mcp", .label = "MCP store", .folder = profile_paths.mcp_credentials_dir_name };
+const refresh_item: keychain_lock.Item = .{ .scope = "mcp", .label = "MCP refresh", .folder = profile_paths.mcp_credentials_dir_name };
 
 pub const Backend = enum { keychain, file };
 
@@ -196,20 +206,23 @@ pub const Store = struct {
     /// is leased: its holder stamps it now, and again with `restamp` before
     /// each step of the refresh (`refreshHolderStopped`).
     pub fn tryRefreshLock(s: Store, key: Key) !?Locked {
+        return s.tryRefreshLockFor(key, keychain_lock.Environment.current());
+    }
+
+    /// `tryRefreshLock`, with what it reads from the process given as values.
+    fn tryRefreshLockFor(s: Store, key: Key, env: keychain_lock.Environment) !?Locked {
         var dir = try s.openDir();
-        errdefer dir.close();
+        var shared = s.openSharedDir(env, refresh_item);
         const name = refreshLockName(key);
-        const advisory = io_mod.acquireTimedAdvisoryLock(&dir, &name, 0) catch |err| switch (err) {
-            error.LockBusy => {
-                dir.close();
-                return null;
-            },
-            else => return err,
+        const held = keychain_lock.acquireOnce(&dir, if (shared) |*d| d else null, &name, refresh_item) catch |err| {
+            dir.close();
+            if (shared) |*d| d.close();
+            return if (err == error.LockBusy) null else err;
         };
         const now = io_mod.awakeMilliTimestamp();
-        leased_lock.writeStamp(advisory.file, now, "mcp");
+        leased_lock.writeStamp(held.lock.file, now, "mcp");
         debug_trace.logf("mcp", "MCP refresh lock taken stamp={d}", .{now});
-        return .{ .dir = dir, .lock = advisory, .lease = .{ .kind = .refresh, .stamp_ms = now } };
+        return .{ .dir = keychain_lock.keepFolder(held, dir, shared), .lock = held.lock, .lease = .{ .kind = .refresh, .stamp_ms = now } };
     }
 
     /// Whether an fx that began waiting at `started_ms` for the refresh lock
@@ -220,10 +233,36 @@ pub const Store = struct {
     /// the store stamps the refresh lock before the slack is over
     /// (`tests/tla/mcp_host/RefreshLease.tla` NoGoAheadPastLiveRefresher).
     pub fn refreshHolderStopped(s: Store, key: Key, started_ms: i64, step_ms: i64) bool {
-        var dir = s.openDir() catch return true;
-        defer dir.close();
-        const name = refreshLockName(key);
-        return refreshWaitExpired(leased_lock.readStamp(&dir, &name), leased_lock.readStamp(&dir, lock_file_name), started_ms, io_mod.awakeMilliTimestamp(), step_ms);
+        return s.refreshHolderStoppedFor(key, started_ms, step_ms, keychain_lock.Environment.current());
+    }
+
+    /// `refreshHolderStopped`, with what it reads from the process given as values.
+    fn refreshHolderStoppedFor(s: Store, key: Key, started_ms: i64, step_ms: i64, env: keychain_lock.Environment) bool {
+        // The stamps are where the locks are held: in the shared folder, or in
+        // the profile when a lock couldn't be taken there. This can't tell
+        // which, so it reads both and takes the later: a folder that holds no
+        // lock has none, or one an earlier holder left.
+        const now_ms = io_mod.awakeMilliTimestamp();
+        const refresh_name = refreshLockName(key);
+        var refresh_ms = started_ms;
+        var store_ms = started_ms;
+        var seen = false;
+        if (s.openSharedDir(env, refresh_item)) |opened| {
+            var dir = opened;
+            defer dir.close();
+            refresh_ms = @max(refresh_ms, leased_lock.stampFrom(leased_lock.readStamp(&dir, &refresh_name), started_ms, now_ms));
+            store_ms = @max(store_ms, leased_lock.stampFrom(leased_lock.readStamp(&dir, lock_file_name), started_ms, now_ms));
+            seen = true;
+        }
+        if (s.openDir()) |opened| {
+            var dir = opened;
+            defer dir.close();
+            refresh_ms = @max(refresh_ms, leased_lock.stampFrom(leased_lock.readStamp(&dir, &refresh_name), started_ms, now_ms));
+            store_ms = @max(store_ms, leased_lock.stampFrom(leased_lock.readStamp(&dir, lock_file_name), started_ms, now_ms));
+            seen = true;
+        } else |_| {}
+        if (!seen) return true;
+        return refreshWaitExpired(refresh_ms, store_ms, started_ms, now_ms, step_ms);
     }
 
     pub const Locked = struct {
@@ -276,14 +315,32 @@ pub const Store = struct {
     /// future, a damaged one, or none, as from an older fx, counts as the
     /// waiter's start.
     fn lock(s: Store) !Locked {
+        return s.lockFor(keychain_lock.Environment.current());
+    }
+
+    /// `lock`, with what it reads from the process given as values.
+    fn lockFor(s: Store, env: keychain_lock.Environment) !Locked {
         var dir = try s.openDir();
-        errdefer dir.close();
-        if (s.backend == .file) return .{
-            .dir = dir,
-            .lock = try io_mod.acquireTimedAdvisoryLock(&dir, lock_file_name, lock_deadline_ms),
+        if (s.backend == .file) {
+            errdefer dir.close();
+            return .{
+                .dir = dir,
+                .lock = try io_mod.acquireTimedAdvisoryLock(&dir, lock_file_name, lock_deadline_ms),
+            };
+        }
+        var shared = s.openSharedDir(env, store_item);
+        const held = keychain_lock.acquireLeased(&dir, if (shared) |*d| d else null, lock_file_name, io_mod.awakeMilliTimestamp(), call_budget_ms + hold_slack_ms, .{}, store_item) catch |err| {
+            dir.close();
+            if (shared) |*d| d.close();
+            return err;
         };
-        const taken = try leased_lock.acquire(&dir, lock_file_name, io_mod.awakeMilliTimestamp(), call_budget_ms + hold_slack_ms, .{}, "mcp", "MCP store");
-        return .{ .dir = dir, .lock = taken.lock, .lease = .{ .kind = .store, .stamp_ms = taken.stamp_ms } };
+        return .{ .dir = keychain_lock.keepFolder(held, dir, shared), .lock = held.lock, .lease = .{ .kind = .store, .stamp_ms = held.stamp_ms } };
+    }
+
+    /// The folder with the Keychain store's locks for every profile, or null
+    /// where they are the profile's: the file store, and the cases `keychain_lock.open` says.
+    fn openSharedDir(s: Store, env: keychain_lock.Environment, item: keychain_lock.Item) ?io_mod.VerifiedDir {
+        return keychain_lock.open(s.backend == .keychain, env, item);
     }
 
     /// The store as saved, empty when there is none. One that doesn't parse or
@@ -464,6 +521,7 @@ const Doc = struct {
 };
 
 const testing = std.testing;
+const lock_fixtures = @import("../shared/lock_fixtures.zig");
 
 fn testHome(tmp: *testing.TmpDir) ![]u8 {
     return io_mod.dirRealpathAlloc(testing.allocator, tmp.dir, ".");
@@ -950,4 +1008,190 @@ test "a refused login removes only its own: one another fx saved since stays" {
     try testing.expectEqualStrings("{\"access\":\"theirs\"}", kept);
     try testing.expect(try store.removeIfSame(testing.allocator, .{ .name = "linear", .url = url }, digest("{\"access\":\"theirs\"}")));
     try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, .{ .name = "linear", .url = url }));
+}
+
+const test_key: Key = .{ .name = "plain", .url = "https://mcp.plain.com/mcp" };
+
+/// Two profiles, A and B, and the user's home, as folders under a temporary
+/// one. Each profile's `Store.home` is a folder of its own, so its `.fx` stands
+/// for a profile `FX_HOME` moved; `~/.fx` is `user/.fx`.
+const TestProfiles = struct {
+    a: []u8,
+    b: []u8,
+    user: []u8,
+
+    fn init(tmp: *testing.TmpDir) !TestProfiles {
+        for ([_][]const u8{ "a", "b", "user" }) |name| try tmp.dir.createDirPath(testing.io, name);
+        const a = try io_mod.dirRealpathAlloc(testing.allocator, tmp.dir, "a");
+        errdefer testing.allocator.free(a);
+        const b = try io_mod.dirRealpathAlloc(testing.allocator, tmp.dir, "b");
+        errdefer testing.allocator.free(b);
+        return .{ .a = a, .b = b, .user = try io_mod.dirRealpathAlloc(testing.allocator, tmp.dir, "user") };
+    }
+
+    fn deinit(p: TestProfiles) void {
+        testing.allocator.free(p.a);
+        testing.allocator.free(p.b);
+        testing.allocator.free(p.user);
+    }
+
+    /// What `FX_HOME` and `HOME` say to each profile.
+    fn env(p: TestProfiles) keychain_lock.Environment {
+        return .{ .fx_home_active = true, .home = p.user };
+    }
+
+    fn storeA(p: TestProfiles) Store {
+        return .{ .home = p.a, .backend = .keychain };
+    }
+
+    fn storeB(p: TestProfiles) Store {
+        return .{ .home = p.b, .backend = .keychain };
+    }
+};
+
+const shared_folder = "user/.fx/" ++ profile_paths.mcp_credentials_dir_name ++ "/";
+
+test "MCP locks across profiles: with the Keychain every profile takes the store lock and each refresh lock in ~/.fx/mcp-credentials" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const p = try TestProfiles.init(&tmp);
+    defer p.deinit();
+    const refresh_name = refreshLockName(test_key);
+    const shared_refresh = try testing.allocator.print("{s}{s}", .{ shared_folder, &refresh_name });
+    defer testing.allocator.free(shared_refresh);
+
+    // One fx refreshes a login at a time, whatever its profile, and each login has its own lock.
+    var held = (try p.storeA().tryRefreshLockFor(test_key, p.env())) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(?Store.Locked, null), try p.storeB().tryRefreshLockFor(test_key, p.env()));
+    var other = (try p.storeB().tryRefreshLockFor(.{ .name = "linear", .url = "https://mcp.linear.app/mcp" }, p.env())) orelse return error.TestUnexpectedResult;
+    other.release();
+    _ = try tmp.dir.statFile(testing.io, shared_refresh, .{});
+    for ([_][]const u8{ "a", "b" }) |profile| {
+        const path = try testing.allocator.print("{s}/.fx/mcp-credentials/{s}", .{ profile, &refresh_name });
+        defer testing.allocator.free(path);
+        try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, path, .{}));
+    }
+
+    // Profile B reads the stamps A wrote, in the user's folder, to time the holder.
+    const before = io_mod.awakeMilliTimestamp();
+    leased_lock.writeStamp(held.lock.file, before - 40_000, "mcp");
+    try testing.expect(p.storeB().refreshHolderStoppedFor(test_key, before - 40_000, 30_000, p.env()));
+    held.restamp();
+    try testing.expect(!p.storeB().refreshHolderStoppedFor(test_key, before - 40_000, 30_000, p.env()));
+    held.release();
+    var next = (try p.storeB().tryRefreshLockFor(test_key, p.env())) orelse return error.TestUnexpectedResult;
+    next.release();
+
+    // The store lock is the user's, in neither profile, stamped there.
+    var store_lock = try p.storeA().lockFor(p.env());
+    try testing.expectEqual(@as(?i64, store_lock.lease.?.stamp_ms), leased_lock.readStamp(&store_lock.dir, lock_file_name));
+    _ = try tmp.dir.statFile(testing.io, shared_folder ++ lock_file_name, .{});
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "a/.fx/mcp-credentials/" ++ lock_file_name, .{}));
+    store_lock.release();
+}
+
+/// The store lock and a login's refresh lock in `~/.fx/mcp-credentials` are in
+/// `state`: each profile takes them in its own folder, whatever the other
+/// does, and one trace line for each names its path and the error.
+fn expectMcpLocksKeptInProfile(state: lock_fixtures.State) !void {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try lock_fixtures.traceTo(tmp);
+    defer debug_trace.resetForTest();
+    const p = try TestProfiles.init(&tmp);
+    defer p.deinit();
+    const refresh_name = refreshLockName(test_key);
+    try tmp.dir.createDirPath(testing.io, shared_folder);
+    try lock_fixtures.plant(tmp.dir, shared_folder ++ lock_file_name, state);
+    const shared_refresh = try testing.allocator.print("{s}{s}", .{ shared_folder, &refresh_name });
+    defer testing.allocator.free(shared_refresh);
+    try lock_fixtures.plant(tmp.dir, shared_refresh, state);
+
+    // The refresh lock is each profile's own, kept apart within the profile and not between profiles.
+    var first = (try p.storeA().tryRefreshLockFor(test_key, p.env())) orelse return error.TestUnexpectedResult;
+    defer first.release();
+    try testing.expectEqual(@as(?Store.Locked, null), try p.storeA().tryRefreshLockFor(test_key, p.env()));
+    var second = (try p.storeB().tryRefreshLockFor(test_key, p.env())) orelse return error.TestUnexpectedResult;
+    defer second.release();
+    // A waiter in the profile reads the stamps there, whatever is in the user's folder, and never waits on it.
+    const before = io_mod.awakeMilliTimestamp();
+    leased_lock.writeStamp(first.lock.file, before - 40_000, "mcp");
+    try testing.expect(p.storeA().refreshHolderStoppedFor(test_key, before - 40_000, 30_000, p.env()));
+    first.restamp();
+    try testing.expect(!p.storeA().refreshHolderStoppedFor(test_key, before - 40_000, 30_000, p.env()));
+
+    // So is the store lock.
+    var store_lock = try p.storeA().lockFor(p.env());
+    store_lock.release();
+    _ = try tmp.dir.statFile(testing.io, "a/.fx/mcp-credentials/" ++ lock_file_name, .{});
+
+    const trace = try lock_fixtures.readTrace(tmp);
+    defer testing.allocator.free(trace);
+    try testing.expect(std.mem.find(u8, trace, "MCP store lock kept in the profile step=take_shared path=~/.fx/mcp-credentials/credentials-v3.lock err=") != null);
+    try testing.expect(std.mem.find(u8, trace, "MCP refresh lock kept in the profile step=take_shared path=~/.fx/mcp-credentials/refresh-v3-") != null);
+}
+
+test "MCP locks across profiles: a symlinked lock in ~/.fx/mcp-credentials leaves the locks in the profile" {
+    try expectMcpLocksKeptInProfile(.symlink);
+}
+
+test "MCP locks across profiles: a lock of mode 644 in ~/.fx/mcp-credentials leaves the locks in the profile" {
+    try expectMcpLocksKeptInProfile(.mode_644);
+}
+
+test "MCP locks across profiles: a lock that is a folder in ~/.fx/mcp-credentials leaves the locks in the profile" {
+    try expectMcpLocksKeptInProfile(.folder);
+}
+
+test "MCP locks across profiles: a lock that is a fifo in ~/.fx/mcp-credentials leaves the locks in the profile" {
+    try expectMcpLocksKeptInProfile(.fifo);
+}
+
+test "MCP locks across profiles: the file store, no FX_HOME, and a HOME that is not absolute keep every lock in the profile" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try lock_fixtures.traceTo(tmp);
+    defer debug_trace.resetForTest();
+    const p = try TestProfiles.init(&tmp);
+    defer p.deinit();
+
+    // The file store is one per profile, and `~/.fx` is never made for it.
+    const file_store: Store = .{ .home = p.a, .backend = .file };
+    var file_lock = try file_store.lockFor(p.env());
+    file_lock.release();
+    var file_refresh = (try file_store.tryRefreshLockFor(test_key, p.env())) orelse return error.TestUnexpectedResult;
+    file_refresh.release();
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "user/.fx", .{}));
+    // Nor without FX_HOME: the profile is `~/.fx` already.
+    var plain = (try p.storeA().tryRefreshLockFor(test_key, .{ .fx_home_active = false, .home = p.user })) orelse return error.TestUnexpectedResult;
+    plain.release();
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "user/.fx", .{}));
+
+    // A HOME that isn't absolute: each profile's own lock, and a trace line for it.
+    const relative: keychain_lock.Environment = .{ .fx_home_active = true, .home = "relative/home" };
+    var first = (try p.storeA().tryRefreshLockFor(test_key, relative)) orelse return error.TestUnexpectedResult;
+    defer first.release();
+    var second = (try p.storeB().tryRefreshLockFor(test_key, relative)) orelse return error.TestUnexpectedResult;
+    defer second.release();
+    var store_lock = try p.storeA().lockFor(.{ .fx_home_active = true, .home = null });
+    store_lock.release();
+    const trace = try lock_fixtures.readTrace(tmp);
+    defer testing.allocator.free(trace);
+    try testing.expect(std.mem.find(u8, trace, "MCP refresh lock kept in the profile step=home err=HomeNotAbsolute") != null);
+    try testing.expect(std.mem.find(u8, trace, "MCP store lock kept in the profile step=home err=HomeNotAbsolute") != null);
+}
+
+test "MCP locks across profiles: FX_HOME naming ~/.fx itself takes each lock once" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const p = try TestProfiles.init(&tmp);
+    defer p.deinit();
+    // The profile and the shared folder are one folder: taking a lock must
+    // not lock its file twice, which would wait on itself.
+    const store: Store = .{ .home = p.user, .backend = .keychain };
+    var store_lock = try store.lockFor(p.env());
+    store_lock.release();
+    var held = (try store.tryRefreshLockFor(test_key, p.env())) orelse return error.TestUnexpectedResult;
+    defer held.release();
+    try testing.expectEqual(@as(?Store.Locked, null), try store.tryRefreshLockFor(test_key, p.env()));
 }
