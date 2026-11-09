@@ -3250,15 +3250,7 @@ const App = struct {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         try app_commands.Handlers(App).collectMcpHostFacts(self, self.screenAgent());
-        const seed = &self.instances.seed;
-        if (self.launch_completion.refresh(self.alloc, self.input_runtime.edit_state.input.items, io_mod.homeDir(), self.workspace_root, .{
-            .model = seed.selected_model,
-            .effort = seed.agent_effort,
-            // As a launched instance's session pins it (`initializePersistence`).
-            .model_override = if (seed.model_source == .process_override or seed.provider_process_override != null) seed.selected_model else null,
-            .effort_override = seed.effort_process_override,
-            .profile_name = seed.profile_name orelse profiles.main_name,
-        })) {
+        if (self.launch_completion.refresh(self.alloc, self.input_runtime.edit_state.input.items, io_mod.homeDir(), self.workspace_root, self.instances.seed.launchDefaults())) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         try app_commands.Handlers(App).collectShellSnapshotFacts(self);

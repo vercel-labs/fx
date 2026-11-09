@@ -476,6 +476,8 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("BSpace");
         const closed = await session.waitForPane((pane) => shownAnswers(pane).length === 0 && pane.includes("esc back"), 15_000);
         expect(closed).not.toContain("delete close");
+        // The instance left is the one the list goes back to.
+        expect(closed).toContain("(on screen)");
         // Esc keeps the instance that took over, not the closed one the list opened on.
         await session.sendKeys("Escape");
         const after = await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
