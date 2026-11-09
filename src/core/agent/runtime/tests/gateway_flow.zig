@@ -9030,6 +9030,112 @@ test "processQueuedPrompt preserves provider state during silent-tool continuati
     try std.testing.expectEqualStrings(StateObserver.state, steps[2].provider_replay.?.parts_json);
 }
 
+// A model that takes no cache markers, so request bodies compare as sent.
+const unmarked_model = "openai/gpt-oss-120b";
+const continuation_prompt = "Summarize what you just did.";
+const empty_reply_prompt = "Your last reply had no text and no tool call.";
+const reasoning_only_state =
+    "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"opaque\"}}}]";
+
+/// Runs a turn on `completions`, whose request number `last_request` ends it
+/// and carries `prompt`. Then runs a second turn over the history the first
+/// saved, and fails unless the second turn's first request opens with all of
+/// that request: the provider's prompt cache still covers it.
+fn expectNextTurnExtendsLastRequest(
+    completions: []const FakeCompletion,
+    last_request: usize,
+    prompt: []const u8,
+) !void {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(unmarked_model);
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(last_request + 1, gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, last_request, prompt);
+
+    const next_completions = [_]FakeCompletion{.{ .content = "Second answer" }};
+    var next_gateway = FakeGateway.init(alloc, &next_completions);
+    defer next_gateway.deinit();
+    var next_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer next_hooks.deinit();
+    var next_fixture = PromptFixture{};
+    var next_job = next_fixture.job();
+    next_job.model = @constCast(unmarked_model);
+    next_job.prompt = @constCast("second prompt");
+    next_job.history = hooks.history_turns.items;
+
+    try runFakePrompt(&next_gateway, &next_hooks, next_fixture.config(), next_job);
+
+    try std.testing.expectEqual(@as(usize, 1), next_gateway.request_bodies.items.len);
+    try test_support.expectPromptExtends(
+        gateway.request_bodies.items[last_request],
+        next_gateway.request_bodies.items[0],
+    );
+}
+
+test "the next turn extends the request that carried the continuation after a blank reply" {
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .tool_calls = &call_two },
+        .{ .content = " \n" },
+        .{ .content = "Summary" },
+    };
+    try expectNextTurnExtendsLastRequest(&completions, 3, continuation_prompt);
+}
+
+test "the next turn extends the request that carried the continuation after a reasoning-only reply" {
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .tool_calls = &call_two },
+        .{ .content = " \n", .provider_state_json = reasoning_only_state },
+        .{ .content = "Summary" },
+    };
+    try expectNextTurnExtendsLastRequest(&completions, 3, continuation_prompt);
+}
+
+test "the next turn extends a request after the continuation, when tool calls followed it" {
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const call_three = [_]ToolCall{toolCall("call_3", "read_file", "{\"path\":\"c\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .tool_calls = &call_two },
+        .{ .content = " \n" },
+        .{ .tool_calls = &call_three },
+        .{ .content = "Summary" },
+    };
+    try expectNextTurnExtendsLastRequest(&completions, 4, continuation_prompt);
+}
+
+test "the next turn extends the request that carried the empty-reply nudge on the first request" {
+    const completions = [_]FakeCompletion{
+        .{ .finish_reason = .other },
+        .{ .content = "Answer" },
+    };
+    try expectNextTurnExtendsLastRequest(&completions, 1, empty_reply_prompt);
+}
+
+test "the next turn extends the request that carried the empty-reply nudge after a tool step" {
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .finish_reason = .other },
+        .{ .content = "Answer" },
+    };
+    try expectNextTurnExtendsLastRequest(&completions, 2, empty_reply_prompt);
+}
+
 test "completed assistant provider replay survives turn materialization" {
     const alloc = std.testing.allocator;
     const state = "[{\"type\":\"reasoning\",\"text\":\"Kept reasoning\"}]";

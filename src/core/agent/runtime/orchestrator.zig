@@ -125,7 +125,9 @@ test "empty reply notice names the provider's reason and the next step" {
 
 /// Asks the model to go on after a step with no tool call: the reply's
 /// provider state, when it has any, stays in the turn so the provider can
-/// resume from it, then `prompt` follows as the next user message.
+/// resume from it, then `prompt` follows as the next user message. A save of
+/// the turn keeps `prompt` where it was sent (`recovery_prompt`), so a later
+/// request starts with this one.
 fn appendContinuationPrompt(
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
@@ -140,7 +142,7 @@ fn appendContinuationPrompt(
             .provider_replay = state,
         });
     }
-    try within_turn_suffix.append(arena, .{ .role = .user, .content = prompt });
+    try within_turn_suffix.append(arena, .{ .role = .user, .content = prompt, .recovery_prompt = true });
 }
 
 fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent_frame = @import("../shared/agent_frame.zig");
+const recovery_prompt = @import("../shared/recovery_prompt.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const kernel_agent = @import("../agent/runtime/agent.zig");
 const cache_warmer = @import("../agent/runtime/cache_warmer.zig");
@@ -2482,11 +2483,15 @@ pub fn appendExecutionMemoryChatMessages(
     // Notes after the last step follow its results, as the turn sent them,
     // and come before the file context a saved turn adds.
     try appendContextNoteChatMessages(alloc, messages, execution.context_notes, &note_index, null);
-    if (execution.files.len > 0) {
-        const text = try formatExecutionFileContext(alloc, execution.files);
-        errdefer alloc.free(text);
-        try messages.append(alloc, .{ .role = .user, .content = text });
-    }
+    // A turn that sent fx's own prompt to a stalled turn after its last step
+    // ended its last request with that prompt, so the next request must start
+    // with it and with the steering around it, and the file context follows
+    // them all. A turn without one keeps the order it has, the file context
+    // first.
+    const prompt_last = for (execution.steering[steering_index..]) |steering| {
+        if (recovery_prompt.fromSaved(steering.text) != null) break true;
+    } else false;
+    if (!prompt_last) try appendExecutionFileEvidence(alloc, messages, execution);
     while (steering_index < execution.steering.len) : (steering_index += 1) {
         const steering = execution.steering[steering_index];
         if (steering.assistant_prefix) |prefix| {
@@ -2496,6 +2501,19 @@ pub fn appendExecutionMemoryChatMessages(
         }
         try messages.append(alloc, restoredSteeringChatMessage(steering.text));
     }
+    if (prompt_last) try appendExecutionFileEvidence(alloc, messages, execution);
+}
+
+/// The file context a saved turn adds after its steps, when it touched files.
+fn appendExecutionFileEvidence(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    execution: core_types.ExecutionMemory,
+) !void {
+    if (execution.files.len == 0) return;
+    const text = try formatExecutionFileContext(alloc, execution.files);
+    errdefer alloc.free(text);
+    try messages.append(alloc, .{ .role = .user, .content = text });
 }
 
 /// Appends, as flagged system messages, the notes saved after `step_index`
@@ -2517,14 +2535,67 @@ fn appendContextNoteChatMessages(
 /// Steering comes from whoever drives this session, so compaction keeps it as
 /// user text rather than a generated notice. A subagent's report or message
 /// a boundary took is not the user's, so it stays ordinary text in its own
-/// frame. Empty entries only mark a checkpoint boundary. Borrows `text`.
+/// frame. fx's own prompt to a stalled turn is steering the user never typed:
+/// it comes back as the plain user text the turn sent, never as the user's
+/// words. Empty entries only mark a checkpoint boundary. Borrows `text`.
 fn restoredSteeringChatMessage(text: []const u8) core_types.ChatMessage {
+    if (recovery_prompt.fromSaved(text)) |prompt| {
+        return .{ .role = .user, .content = prompt, .recovery_prompt = true };
+    }
     return .{
         .role = .user,
         .content = text,
         .restored_steering = true,
         .context_origin = if (text.len > 0 and !agent_frame.isFrame(text)) .user_turn else .ordinary,
     };
+}
+
+test "a recovery prompt a turn sent after its last step comes before the file evidence a saved turn adds" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var calls = [_]core_types.ToolCall{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" }};
+    var results = [_]core_types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_1"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("a"),
+        .output_bytes = 1,
+        .stored_output_bytes = 1,
+    }};
+    var steps = [_]core_types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    var files = [_]core_types.FileEvidence{.{
+        .path = @constCast("a"),
+        .tool_call_id = @constCast("call_1"),
+        .tool_name = @constCast("read_file"),
+        .action = .read,
+    }};
+    const prompt = try recovery_prompt.saved(arena, "Summarize what you just did.");
+    var steering = [_]core_types.PersistedSteering{
+        .{ .text = prompt, .after_tool_step_count = 1 },
+        .{ .text = @constCast("later update"), .after_tool_step_count = 1 },
+    };
+
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendExecutionMemoryChatMessages(arena, &messages, .{ .tool_steps = &steps, .files = &files, .steering = &steering });
+
+    // The turn's last request ended with the prompt and the update, so the
+    // next request must start with both, and the evidence follows them. Without
+    // the prompt the evidence keeps its place before the steering (see
+    // "resume history keeps context notes between tool episodes").
+    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
+    try std.testing.expect(messages.items[2].recovery_prompt);
+    try std.testing.expectEqualStrings("Summarize what you just did.", messages.items[2].content.?);
+    try std.testing.expect(messages.items[3].restored_steering);
+    try std.testing.expectEqualStrings("later update", messages.items[3].content.?);
+    try std.testing.expect(std.mem.startsWith(u8, messages.items[4].content.?, "Session file evidence"));
+
+    var user_only: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendExecutionMemoryChatMessages(arena, &user_only, .{ .tool_steps = &steps, .files = &files, .steering = steering[1..] });
+    try std.testing.expectEqual(@as(usize, 4), user_only.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, user_only.items[2].content.?, "Session file evidence"));
+    try std.testing.expectEqualStrings("later update", user_only.items[3].content.?);
 }
 
 test "a restored subagent frame is never the user's text" {

@@ -1440,6 +1440,18 @@ function expectSavedOriginal(home: string, sessionId: string, body: string, orig
   expect(saved).not.toContain(original.toString("base64"));
 }
 
+// A provider's prompt cache covers a request only up to the first message that
+// differs from the request before it, so the next request must open with every
+// message the last one carried, byte for byte.
+function expectPromptExtends(previousBody: string, nextBody: string) {
+  const previous = JSON.parse(previousBody).prompt as unknown[];
+  const next = JSON.parse(nextBody).prompt as unknown[];
+  expect(next.length).toBeGreaterThanOrEqual(previous.length);
+  previous.forEach((message, index) => {
+    expect(JSON.stringify(next[index])).toBe(JSON.stringify(message));
+  });
+}
+
 async function startAutoSession(client: AcpClient, hooks = false) {
   await client.request("initialize", { protocolVersion: 1 }, 1);
   const created = await client.request("session/new", { mcpServers: [], ...(hooks ? { _meta: { fx: { hooks: { captureContent: true } } } } : {}) }, 2) as any;
@@ -8979,6 +8991,70 @@ describe("acp: model-independent", () => {
         expect(gateway.requests.some(({ body }) =>
           body.includes("Summarize what you just did.")
         )).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP keeps the continuation for the next prompt and replays no prompt fx wrote",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-continuation-kept-");
+      writeFileSync(join(root.workspace, "a.txt"), "a\n");
+      writeFileSync(join(root.workspace, "b.txt"), "b\n");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("read_1", "read_file", { path: "a.txt" }),
+        fakeGatewayToolCall("read_2", "read_file", { path: "b.txt" }),
+        finalText(" \n"),
+        finalText("ACP_CONTINUATION_SUMMARY"),
+        finalText("ACP_SECOND_ANSWER"),
+      ]);
+      let client: AcpClient | undefined;
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const sessionId = await startAutoSession(client);
+        const first = await runPrompt(client, "Read both fixture files.", TIMEOUT);
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(4);
+        expect(gateway.requests[3]!.body).toContain("Summarize what you just did.");
+
+        const second = await runPrompt(client, "And once more.", TIMEOUT);
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(5);
+        expectPromptExtends(gateway.requests[3]!.body, gateway.requests[4]!.body);
+        await client.close();
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        client.send({
+          jsonrpc: "2.0",
+          id: 91,
+          method: "session/load",
+          params: { sessionId, cwd: root.workspace, mcpServers: [] },
+        });
+        const replay: any[] = [];
+        while (true) {
+          const message = await client.readLine() as any;
+          if (message.id === 91) break;
+          replay.push(message);
+        }
+        const replayed = JSON.stringify(replay);
+        expect(replayed).toContain("Read both fixture files.");
+        expect(replayed).toContain("ACP_CONTINUATION_SUMMARY");
+        expect(replayed).toContain("ACP_SECOND_ANSWER");
+        expect(replayed).not.toContain("Summarize what you just did.");
+        expect(replayed).not.toContain("fx_recovery_prompt");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

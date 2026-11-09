@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent_frame = @import("../../shared/agent_frame.zig");
+const recovery_prompt = @import("../../shared/recovery_prompt.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const types = @import("../../shared/types.zig");
 const image_data = @import("../../images/image_data.zig");
@@ -424,14 +425,20 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
         }
         if (message.role != .user) continue;
         const content = message.content orelse continue;
-        const text = if (message.restored_steering)
-            content
-        else
-            steeringText(content) orelse {
-                assistant_prefix = null;
-                continue;
-            };
-        const copy = try alloc.dupe(u8, text);
+        const copy = if (message.recovery_prompt)
+            // fx's own prompt to a stalled turn is steering the user never
+            // typed, so it is saved inside its marker.
+            try recovery_prompt.saved(alloc, content)
+        else copy: {
+            const text = if (message.restored_steering)
+                content
+            else
+                steeringText(content) orelse {
+                    assistant_prefix = null;
+                    continue;
+                };
+            break :copy try alloc.dupe(u8, text);
+        };
         const prefix_copy = if (assistant_prefix) |prefix|
             alloc.dupe(u8, prefix) catch |err| {
                 alloc.free(copy);
@@ -489,7 +496,7 @@ pub fn retainedMessageOffset(messages: []const ChatMessage, cut: CompactedExecut
             // Keep following continuation prompts, but not the completed reply.
             if (message.tool_calls.len == 0) prefix_start = index + 1;
         } else if (message.role == .user and message.content != null and
-            (message.restored_steering or steeringText(message.content.?) != null))
+            (message.restored_steering or message.recovery_prompt or steeringText(message.content.?) != null))
         {
             if (steps == cut.tool_steps and steering == cut.steering) return prefix_start;
             steering += 1;
@@ -2581,6 +2588,56 @@ test "restored context notes survive execution memory round trips (D93)" {
     try std.testing.expectEqual(@as(usize, 1), retained.context_notes.len);
     try std.testing.expectEqualStrings("end note", retained.context_notes[0].text);
     try std.testing.expectEqual(@as(usize, 0), retained.context_notes[0].after_tool_step_count);
+}
+
+test "fx's prompt to a stalled turn is saved as steering and comes back as the plain prompt" {
+    const alloc = std.testing.allocator;
+    const session = @import("../../session/session.zig");
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const prompt = "Summarize what you just did.";
+    var calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const live = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "a", .tool_call_id = "call_1", .tool_name = "read_file", .tool_result_status = .success },
+        .{ .role = .user, .content = prompt, .recovery_prompt = true },
+    };
+
+    const saved = try buildExecutionMemory(alloc, &live);
+    defer types.freeExecutionMemory(alloc, saved);
+    try std.testing.expectEqual(@as(usize, 1), saved.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.steering.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.steering[0].after_tool_step_count);
+    try std.testing.expectEqualStrings(prompt, recovery_prompt.fromSaved(saved.steering[0].text).?);
+
+    // It comes back as the text the turn sent, never in the steering envelope
+    // and never as the user's words.
+    var restored: std.ArrayList(ChatMessage) = .empty;
+    try session.appendExecutionMemoryChatMessages(arena, &restored, saved);
+    // The turn read a file, so the saved turn adds its file evidence last.
+    try std.testing.expectEqual(live.len + 1, restored.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, restored.items[3].content.?, "Session file evidence"));
+    const back = restored.items[2];
+    try std.testing.expectEqual(types.ChatRole.user, back.role);
+    try std.testing.expectEqualStrings(prompt, back.content.?);
+    try std.testing.expect(back.recovery_prompt and !back.restored_steering);
+    try std.testing.expect(back.context_origin == .ordinary);
+    const sent = try rewrapRestoredSteering(arena, restored.items);
+    try std.testing.expectEqualStrings(prompt, sent[2].content.?);
+
+    // Saving what was restored saves the same turn, and a cut counts the
+    // prompt as steering on both sides.
+    const rebuilt = try buildExecutionMemory(alloc, restored.items);
+    defer types.freeExecutionMemory(alloc, rebuilt);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt.steering.len);
+    try std.testing.expectEqualStrings(saved.steering[0].text, rebuilt.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 2), try retainedMessageOffset(&live, .{ .tool_steps = 1 }));
+    try std.testing.expectEqual(@as(usize, 3), try retainedMessageOffset(&live, .{ .tool_steps = 1, .steering = 1 }));
+    const after_cut = try buildExecutionMemory(alloc, live[try retainedMessageOffset(&live, .{ .tool_steps = 1 })..]);
+    defer types.freeExecutionMemory(alloc, after_cut);
+    try std.testing.expectEqual(@as(usize, 1), after_cut.steering.len);
+    try std.testing.expectEqual(@as(usize, 0), after_cut.steering[0].after_tool_step_count);
 }
 
 test "a context note between steps keeps every tool result and its feedback (D93)" {

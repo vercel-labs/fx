@@ -54,6 +54,7 @@ const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
 const subagent_reports = @import("../subagent/reports.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
+const recovery_prompt = @import("../shared/recovery_prompt.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const builtin_tools = @import("../../builtins/tools.zig");
@@ -3809,6 +3810,8 @@ pub fn Runtime(comptime App: type) type {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
                 if (steering.text.len == 0) continue;
+                // fx's own prompt to a stalled turn was never on screen.
+                if (recovery_prompt.fromSaved(steering.text) != null) continue;
                 try sink.appendUserTurn(savedSteeringTurn(steering.text), true);
             }
         }
@@ -3858,7 +3861,7 @@ pub fn Runtime(comptime App: type) type {
                 if (item.assistant_prefix) |prefix| {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
-                if (item.text.len > 0) {
+                if (item.text.len > 0 and recovery_prompt.fromSaved(item.text) == null) {
                     try sink.appendUserTurn(savedSteeringTurn(item.text), true);
                 }
                 index.* += 1;
@@ -6792,6 +6795,30 @@ test "execution replay keeps an inline command preview when its stored output is
     try std.testing.expectEqualStrings("/workspace", app.command_stdout.items);
     try std.testing.expectEqualStrings("warning", app.command_stderr.items);
     try std.testing.expectEqual(@as(usize, 1), app.command_output_flush_count);
+}
+
+test "execution replay shows the user's steering and not fx's own recovery prompt" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    const inside = try recovery_prompt.saved(alloc, "Summarize what you just did.");
+    defer alloc.free(inside);
+    const trailing = try recovery_prompt.saved(alloc, "Your last reply had no text and no tool call.");
+    defer alloc.free(trailing);
+    var steps = [_]types.ToolExecutionStep{.{}};
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast("focus on rendering"), .after_tool_step_count = 0 },
+        .{ .text = inside, .after_tool_step_count = 0 },
+        .{ .text = trailing, .after_tool_step_count = 1 },
+        .{ .text = @constCast("later update"), .after_tool_step_count = 1 },
+    };
+
+    try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), .{ .tool_steps = steps[0..], .steering = steering[0..] });
+
+    try std.testing.expectEqual(@as(usize, 2), app.cards.items.len);
+    try std.testing.expectEqualStrings("focus on rendering", app.cards.items[0].text);
+    try std.testing.expectEqualStrings("later update", app.cards.items[1].text);
 }
 
 test "execution replay labels shell session interactions with their launch command" {

@@ -774,6 +774,18 @@ function turnContextWorkspaceRoot(body: string): string {
   return match[1]!;
 }
 
+// A provider's prompt cache covers a request only up to the first message that
+// differs from the request before it, so the next request must open with every
+// message the last one carried, byte for byte.
+function expectPromptExtends(previousBody: string, nextBody: string) {
+  const previous = gatewayRequest(previousBody).prompt;
+  const next = gatewayRequest(nextBody).prompt;
+  expect(next.length).toBeGreaterThanOrEqual(previous.length);
+  previous.forEach((message, index) => {
+    expect(JSON.stringify(next[index])).toBe(JSON.stringify(message));
+  });
+}
+
 function toolResultOutput(body: string, callId: string): string {
   const parts = gatewayRequest(body).prompt.flatMap((message) =>
     Array.isArray(message.content) ? message.content : []
@@ -10107,6 +10119,42 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     expect(trace).toContain("event=empty_reply_nudge");
   }, 40_000);
 
+  test("a resumed session's next request starts with the request that carried the nudge", async () => {
+    const root = createFixtureRoot("empty-other-resume");
+    const tracePath = join(root.root, "trace.log");
+    const replies = [
+      emptyOtherReply(),
+      () => fakeGatewayFinalText("continued after the nudge"),
+      () => fakeGatewayFinalText("second turn answered"),
+    ];
+    let index = 0;
+    const gateway = startDynamicFakeGateway(
+      () => (replies[index++] ?? (() => new Response("unexpected request", { status: 500 })))(),
+      { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] },
+    );
+    try {
+      const env = fixtureEnv(root, gateway, tracePath);
+      const first = await runFx(["ask", "--json", "--auto", "Answer briefly."], {
+        cwd: root.workspace, env, timeoutMs: 30_000,
+      });
+      expect(first.code).toBe(0);
+      expect(gateway.requests).toHaveLength(2);
+      expect(lastPrompt(JSON.parse(gateway.requests[1]!.body)).text).toContain(EMPTY_REPLY_NUDGE);
+
+      const resumed = await runFx(
+        ["ask", "--json", "--auto", "--resume", parseAskJson(first.stdout).session_id, "And once more."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(resumed.code).toBe(0);
+      expect(parseAskJson(resumed.stdout).final_output).toContain("second turn answered");
+      expect(gateway.requests).toHaveLength(3);
+      expectPromptExtends(gateway.requests[1]!.body, gateway.requests[2]!.body);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("a second empty reply in a row that stops for another reason says so instead of Done.", async () => {
     const { result, bodies } = await askWithReplies("empty-other-twice", [
       emptyOtherReply(),
@@ -11034,6 +11082,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       for (const id of ["read_1", "read_2"]) {
         expect(toolResultOutput(gateway.requests[4]!.body, id)).toContain("settled evidence");
       }
+      // The saved turn keeps the continuation where the request sent it.
+      expectPromptExtends(gateway.requests[3]!.body, gateway.requests[4]!.body);
       expect(readFileSync(tracePath, "utf8")).toContain("injecting continuation after 2 silent tool steps");
     } finally {
       gateway.stop();

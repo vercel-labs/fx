@@ -2176,6 +2176,29 @@ pub fn expectGatewayPromptFinalUserText(gateway: *const FakeGateway, index: usiz
     return error.TestExpectedPromptMessageMissing;
 }
 
+/// Fails unless every message of `previous_body`'s prompt opens `next_body`'s
+/// prompt, byte for byte and in order: the next request extends the previous
+/// one, so the provider's prompt cache still covers all of it.
+pub fn expectPromptExtends(previous_body: []const u8, next_body: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var previous = try std.json.parseFromSlice(std.json.Value, alloc, previous_body, .{});
+    defer previous.deinit();
+    var next = try std.json.parseFromSlice(std.json.Value, alloc, next_body, .{});
+    defer next.deinit();
+    const previous_prompt = previous.value.object.get("prompt").?.array.items;
+    const next_prompt = next.value.object.get("prompt").?.array.items;
+    try std.testing.expect(next_prompt.len >= previous_prompt.len);
+    for (previous_prompt, next_prompt[0..previous_prompt.len]) |earlier, later| {
+        var earlier_bytes: std.Io.Writer.Allocating = .init(alloc);
+        defer earlier_bytes.deinit();
+        try std.json.Stringify.value(earlier, .{}, &earlier_bytes.writer);
+        var later_bytes: std.Io.Writer.Allocating = .init(alloc);
+        defer later_bytes.deinit();
+        try std.json.Stringify.value(later, .{}, &later_bytes.writer);
+        try std.testing.expectEqualStrings(earlier_bytes.written(), later_bytes.written());
+    }
+}
+
 pub fn countText(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) usize {
     var count: usize = 0;
     for (hooks.texts.items) |text| {
