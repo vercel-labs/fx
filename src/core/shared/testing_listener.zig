@@ -1,6 +1,7 @@
 //! Accepting on a test server's listener so its thread can always be stopped.
 
 const std = @import("std");
+const io_mod = @import("io.zig");
 
 /// How long one wait for a connection lasts before the stop flag is read
 /// again.
@@ -33,21 +34,52 @@ pub fn acceptUnlessStopping(
     return null;
 }
 
-/// A thread waiting in `acceptUnlessStopping`, for the tests below.
+/// Joins a test server's thread, which sets `done` as it returns, and fails
+/// instead of hanging when the thread is still waiting after `limit_ms`. In
+/// that case it first connects once to `server`, only so that a thread stuck
+/// in `accept` returns and the join ends, then returns
+/// `error.TestThreadStillWaiting` after the join.
+pub fn joinWithin(
+    thread: std.Thread,
+    server: *std.Io.net.Server,
+    done: *const std.atomic.Value(bool),
+    limit_ms: u32,
+) error{TestThreadStillWaiting}!void {
+    var waited_ms: u32 = 0;
+    while (!done.load(.seq_cst) and waited_ms < limit_ms) : (waited_ms += 1) io_mod.sleep(std.time.ns_per_ms);
+    const finished = done.load(.seq_cst);
+    if (!finished) connectOnce(server) catch {};
+    thread.join();
+    if (!finished) return error.TestThreadStillWaiting;
+}
+
+/// A loopback listener with a thread waiting on it in `acceptUnlessStopping`,
+/// for the tests below.
 const Waiter = struct {
     backend: std.Io.Threaded = .init_single_threaded,
-    server: *std.Io.net.Server,
+    server: std.Io.net.Server = undefined,
+    thread: std.Thread = undefined,
     stopping: std.atomic.Value(bool) = .init(false),
     started: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     accepted: bool = false,
     failure: ?AcceptError = null,
 
+    /// Listens on a free loopback port and starts the waiting thread. The
+    /// waiter must not move until `finish` returns.
+    fn start(self: *Waiter) !void {
+        const zio = self.backend.io();
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.server = try address.listen(zio, .{ .reuse_address = true });
+        errdefer self.server.deinit(zio);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
     fn run(self: *Waiter) void {
         defer self.done.store(true, .seq_cst);
         const zio = self.backend.io();
         self.started.store(true, .seq_cst);
-        const stream = acceptUnlessStopping(self.server, zio, &self.stopping) catch |err| {
+        const stream = acceptUnlessStopping(&self.server, zio, &self.stopping) catch |err| {
             self.failure = err;
             return;
         };
@@ -57,23 +89,12 @@ const Waiter = struct {
         }
     }
 
-    /// Gives the thread at least `limit_ms` to finish. When it does not,
-    /// connects once so a wait that ignored the stop flag still ends and the
-    /// test fails instead of hanging. Returns whether it finished in time.
-    fn finish(self: *Waiter, thread: std.Thread, limit_ms: u32) bool {
-        var waited_ms: u32 = 0;
-        while (!self.done.load(.seq_cst) and waited_ms < limit_ms) : (waited_ms += 1) sleepMs(1);
-        const finished = self.done.load(.seq_cst);
-        if (!finished) connectOnce(self.server) catch {};
-        thread.join();
-        return finished;
+    /// Joins the thread through `joinWithin`, then closes the listener.
+    fn finish(self: *Waiter, limit_ms: u32) !void {
+        defer self.server.deinit(self.backend.io());
+        try joinWithin(self.thread, &self.server, &self.done, limit_ms);
     }
 };
-
-fn sleepMs(ms: u64) void {
-    var backend: std.Io.Threaded = .init_single_threaded;
-    backend.io().sleep(.fromMilliseconds(@intCast(ms)), .real) catch {};
-}
 
 fn connectOnce(server: *std.Io.net.Server) !void {
     var backend: std.Io.Threaded = .init_single_threaded;
@@ -83,40 +104,27 @@ fn connectOnce(server: *std.Io.net.Server) !void {
     stream.close(zio);
 }
 
-fn listenOnLoopback(zio: std.Io) !std.Io.net.Server {
-    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    return address.listen(zio, .{ .reuse_address = true });
-}
-
 test "a waiting accept ends when it is stopped though no client connects" {
-    var backend: std.Io.Threaded = .init_single_threaded;
-    const zio = backend.io();
-    var server = try listenOnLoopback(zio);
-    defer server.deinit(zio);
-    var waiter: Waiter = .{ .server = &server };
-    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
-    while (!waiter.started.load(.seq_cst)) sleepMs(1);
+    var waiter: Waiter = .{};
+    try waiter.start();
+    while (!waiter.started.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
     // Give the thread time to settle into its wait before stopping it.
-    sleepMs(50);
+    io_mod.sleep(50 * std.time.ns_per_ms);
     waiter.stopping.store(true, .seq_cst);
-    if (!waiter.finish(thread, 5_000)) return error.TestAcceptIgnoredStop;
+    try waiter.finish(5_000);
     try std.testing.expect(!waiter.accepted);
     try std.testing.expectEqual(@as(?AcceptError, null), waiter.failure);
 }
 
 test "a waiting accept returns the client that connects" {
-    var backend: std.Io.Threaded = .init_single_threaded;
-    const zio = backend.io();
-    var server = try listenOnLoopback(zio);
-    defer server.deinit(zio);
-    var waiter: Waiter = .{ .server = &server };
-    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
-    connectOnce(&server) catch |err| {
+    var waiter: Waiter = .{};
+    try waiter.start();
+    connectOnce(&waiter.server) catch |err| {
         waiter.stopping.store(true, .seq_cst);
-        _ = waiter.finish(thread, 5_000);
+        waiter.finish(5_000) catch {};
         return err;
     };
-    if (!waiter.finish(thread, 5_000)) return error.TestAcceptMissedClient;
+    try waiter.finish(5_000);
     try std.testing.expect(waiter.accepted);
     try std.testing.expectEqual(@as(?AcceptError, null), waiter.failure);
 }

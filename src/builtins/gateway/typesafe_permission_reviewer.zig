@@ -12,6 +12,7 @@ const std = @import("std");
 const permission_auto_classifier = @import("../../core/permissions/auto_classifier.zig");
 const types = @import("../../core/shared/types.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const testing_listener = @import("../../core/shared/testing_listener.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
@@ -540,6 +541,16 @@ test "transport maps a loopback 500 to transient failure and cancel to cancelled
     );
 }
 
+test "the fake jev server stops when no client connects" {
+    var server = try FakeJevServer.init(.ok);
+    defer server.deinit();
+    try server.start();
+    // Stop it once its thread is waiting for the client that never comes.
+    io_mod.sleep(50 * std.time.ns_per_ms);
+    try server.stop(5_000);
+    try std.testing.expectEqual(@as(usize, 0), server.captured_len);
+}
+
 const FakeJevServer = struct {
     const Mode = enum { ok, internal_error };
     const ok_body =
@@ -552,6 +563,8 @@ const FakeJevServer = struct {
     mode: Mode,
     path: []const u8 = "/v1/systemone",
     thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
     failure: ?anyerror = null,
     captured_head: [4096]u8 = undefined,
     captured_len: usize = 0,
@@ -583,15 +596,28 @@ const FakeJevServer = struct {
         self.thread = try std.Thread.spawn(.{}, serveOne, .{self});
     }
 
+    /// Stops the thread and joins it, whether or not a client connected.
+    /// Fails within `limit_ms` instead of hanging when the thread ignores the
+    /// stop.
+    fn stop(self: *FakeJevServer, limit_ms: u32) !void {
+        self.stopping.store(true, .seq_cst);
+        const thread = self.thread orelse return;
+        self.thread = null;
+        try testing_listener.joinWithin(thread, &self.server, &self.done, limit_ms);
+    }
+
     fn deinit(self: *FakeJevServer) void {
         const zio = self.io_backend.io();
-        if (self.thread) |thread| thread.join();
+        self.stop(5_000) catch |err| {
+            if (self.failure == null) self.failure = err;
+        };
         self.server.deinit(zio);
         std.testing.allocator.free(self.url);
         if (self.failure) |err| std.debug.panic("fake jev server failed: {s}", .{@errorName(err)});
     }
 
     fn serveOne(self: *FakeJevServer) void {
+        defer self.done.store(true, .seq_cst);
         self.serveOneFallible() catch |err| {
             self.failure = err;
         };
@@ -599,8 +625,9 @@ const FakeJevServer = struct {
 
     fn serveOneFallible(self: *FakeJevServer) !void {
         const zio = self.io_backend.io();
-        var stream = try self.server.accept(zio);
+        var stream = (try testing_listener.acceptUnlessStopping(&self.server, zio, &self.stopping)) orelse return;
         defer stream.close(zio);
+        if (self.stopping.load(.seq_cst)) return;
         // Read the request head (captured for assertions) and discard the body.
         var socket_buffer: [4096]u8 = undefined;
         var reader = stream.reader(zio, &socket_buffer);

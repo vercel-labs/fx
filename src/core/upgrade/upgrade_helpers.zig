@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const testing_listener = @import("../shared/testing_listener.zig");
 const update_target = @import("update_target.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -175,6 +176,45 @@ fn clearConnection(control: TransferControl) void {
     slot.clear();
 }
 
+/// A test server whose thread accepts one connection, publishes it to `slot`,
+/// and reads from it until the slot's interrupt shuts it down.
+const InterruptedReadServer = struct {
+    server: *std.Io.net.Server,
+    slot: *TransferInterrupt,
+    thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    woke_ms: std.atomic.Value(i64) = .init(0),
+
+    fn start(self: *InterruptedReadServer) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    /// Stops the thread and joins it, whether or not a client connected.
+    /// Fails within `limit_ms` instead of hanging when the thread ignores the
+    /// stop.
+    fn stop(self: *InterruptedReadServer, limit_ms: u32) !void {
+        self.stopping.store(true, .seq_cst);
+        const thread = self.thread orelse return;
+        self.thread = null;
+        try testing_listener.joinWithin(thread, self.server, &self.done, limit_ms);
+    }
+
+    fn run(self: *InterruptedReadServer) void {
+        defer self.done.store(true, .seq_cst);
+        const z = io_mod.getIo();
+        const conn = (testing_listener.acceptUnlessStopping(self.server, z, &self.stopping) catch return) orelse return;
+        defer conn.close(z);
+        self.slot.publish(conn.socket.handle);
+        defer self.slot.clear();
+        var buf: [16]u8 = undefined;
+        var stream_reader = conn.reader(z, &buf);
+        // Blocks until the interrupt shuts the socket down.
+        _ = stream_reader.interface.takeByte() catch {};
+        self.woke_ms.store(io_mod.milliTimestamp(), .release);
+    }
+};
+
 test "transfer interrupt wakes a blocked socket read" {
     if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
     const zio = io_mod.getIo();
@@ -182,27 +222,10 @@ test "transfer interrupt wakes a blocked socket read" {
     var server = try addr.listen(zio, .{});
     defer server.deinit(zio);
 
-    const Ctx = struct {
-        server: *std.Io.net.Server,
-        slot: *TransferInterrupt,
-        woke_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
-    };
     var slot: TransferInterrupt = .{};
-    var ctx: Ctx = .{ .server = &server, .slot = &slot };
-    const reader = try std.Thread.spawn(.{}, struct {
-        fn run(c: *Ctx) void {
-            const z = io_mod.getIo();
-            const conn = c.server.accept(z) catch return;
-            defer conn.close(z);
-            c.slot.publish(conn.socket.handle);
-            defer c.slot.clear();
-            var buf: [16]u8 = undefined;
-            var stream_reader = conn.reader(z, &buf);
-            // Blocks until the interrupt shuts the socket down.
-            _ = stream_reader.interface.takeByte() catch {};
-            c.woke_ms.store(io_mod.milliTimestamp(), .release);
-        }
-    }.run, .{&ctx});
+    var reader: InterruptedReadServer = .{ .server = &server, .slot = &slot };
+    try reader.start();
+    defer reader.stop(5_000) catch {};
 
     const client = try server.socket.address.connect(zio, .{ .mode = .stream });
     defer client.close(zio);
@@ -210,13 +233,29 @@ test "transfer interrupt wakes a blocked socket read" {
     const started_ms = io_mod.milliTimestamp();
     io_mod.sleep(100 * std.time.ns_per_ms);
     slot.interrupt();
-    reader.join();
-    const woke_ms = ctx.woke_ms.load(.acquire);
+    try reader.stop(5_000);
+    const woke_ms = reader.woke_ms.load(.acquire);
     try std.testing.expect(woke_ms != 0);
     try std.testing.expect(woke_ms - started_ms < 2000);
 
     // Interrupting an idle slot is a no-op.
     slot.interrupt();
+}
+
+test "the interrupted read server stops when no client connects" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    const zio = io_mod.getIo();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(zio, .{});
+    defer server.deinit(zio);
+
+    var slot: TransferInterrupt = .{};
+    var reader: InterruptedReadServer = .{ .server = &server, .slot = &slot };
+    try reader.start();
+    // Stop it once its thread is waiting for the client that never comes.
+    io_mod.sleep(50 * std.time.ns_per_ms);
+    try reader.stop(5_000);
+    try std.testing.expectEqual(@as(i64, 0), reader.woke_ms.load(.acquire));
 }
 
 fn fetchTextBounded(
