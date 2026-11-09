@@ -3387,14 +3387,16 @@ pub const LimitedDescription = struct {
 
 /// A skill's description for a list that encodes it for the model itself,
 /// such as the toolbox menu: sanitized and cut as the skill catalog cuts it,
-/// to the catalog's default characters or to `skill_description_bytes`
-/// counted in encoded bytes, so its encoding is the catalog's.
+/// by `catalogDescriptionCut` (a whole word and the marker, within the
+/// catalog's default characters) or to `skill_description_bytes` counted in
+/// encoded bytes, so its encoding is the catalog's.
 pub fn limitedSkillDescription(alloc: Allocator, description: []const u8, limits: context_limits.Values) !LimitedDescription {
     const safe = try tool_result_limits.prepareSanitizedOutput(alloc, description);
     defer alloc.free(safe);
     if (limits.skill_description_bytes.source == .compiled_default) {
-        const end = skillDescriptionPrefix(safe, context_limits.catalog_skill_description_characters);
-        return .{ .text = try alloc.dupe(u8, safe[0..end]), .limited = end < safe.len };
+        const cut = catalogDescriptionCut(safe, context_limits.catalog_skill_description_characters);
+        if (!cut.shortened) return .{ .text = try alloc.dupe(u8, safe), .limited = false };
+        return .{ .text = try std.mem.concat(alloc, u8, &.{ safe[0..cut.end], description_cut_marker }), .limited = true };
     }
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
@@ -3443,6 +3445,22 @@ test "an unconfigured skill description is cut to the catalog's default characte
     defer alloc.free(kept.text);
     try std.testing.expect(kept.limited);
     try std.testing.expectEqual(@as(usize, 250), kept.text.len);
+}
+
+test "a menu description ends at a whole word and marks the cut, as the catalog's does" {
+    const alloc = std.testing.allocator;
+    const description = text_utils.repeat("Draft release notes from merged pull requests. ", 8);
+    const cut = try limitedSkillDescription(alloc, description, .{});
+    defer alloc.free(cut.text);
+    try std.testing.expect(cut.limited);
+    try std.testing.expect(std.mem.endsWith(u8, cut.text, "pull requests. Draft..."));
+    try std.testing.expect(try std.unicode.utf8CountCodepoints(cut.text) <= context_limits.catalog_skill_description_characters);
+
+    // The catalog shows the same text for the same skill.
+    const skills = [_]Skill{.{ .name = "notes", .description = description, .path = "/workspace/.agents/skills/notes", .source = .workspace_agents }};
+    var catalog = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
+    defer catalog.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, catalog.text, cut.text) != null);
 }
 
 /// Ends a description the catalog shortened, as `writeBoundedSkillName` ends
