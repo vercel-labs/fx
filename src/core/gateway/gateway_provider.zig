@@ -307,7 +307,9 @@ pub const CapabilityResolver = struct {
     /// within its own deadline, so a slow link still gets the catalog. A
     /// provider that does not report its connection loads inline, as
     /// `refreshIfDue` does. A cancelled wait leaves the load running for the
-    /// next call.
+    /// next call. A cancelled load's request walks away from a lookup that
+    /// still hangs (`gateway_client.openRequestOnJob`), so freeing the load
+    /// at shutdown does not wait the lookup out.
     fn loadWithin(
         self: *CapabilityResolver,
         alloc: Allocator,
