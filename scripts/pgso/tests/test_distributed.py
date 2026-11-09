@@ -15,6 +15,7 @@ import types
 from scripts.pgso.corpus import Corpus, Scenario
 from scripts.pgso import linux, macos
 from scripts.pgso.distributed import (
+    _copy_control_link,
     _load_documents,
     _require_distributed_support,
     aggregate_measurement_shards,
@@ -26,7 +27,8 @@ from scripts.pgso.distributed import (
     validate_seed_identity,
 )
 from scripts.pgso.model import BuildIdentity, PgsoError
-from scripts.pgso.pipeline import GENERATION_FLAGS
+from scripts.pgso.pipeline import GENERATION_FLAGS, PipelinePaths
+from scripts.pgso.runner import CommandResult
 
 
 class RetriedArtifactTests(unittest.TestCase):
@@ -135,6 +137,30 @@ def scenario(name: str, timeout_seconds: float) -> Scenario:
         allow_keychain=False,
         test_file=None,
     )
+
+
+class ControlLinkCarryTests(unittest.TestCase):
+    def test_candidate_links_the_objects_the_seed_control_linked(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fx-pgso-carry-") as temporary:
+            root = pathlib.Path(temporary)
+            c_object = root / "cache" / "o" / "c0ffee" / "quickjs.o"
+            c_object.parent.mkdir(parents=True)
+            c_object.write_bytes(b"engine")
+            seed = PipelinePaths.create(root / "seed")
+            macos.record_control_build(
+                types.SimpleNamespace(),
+                CommandResult(("zig",), 0, "", f"zig ld /c/fx_zcu.o {c_object} -o /c/fx -lSystem\n", 1.0),
+                seed,
+            )
+            # The candidate runs on another runner, after the cache is gone.
+            c_object.unlink()
+            candidate = PipelinePaths.create(root / "candidate")
+            _copy_control_link(seed, candidate)
+            inputs = macos.control_link_inputs(candidate)
+            self.assertEqual((candidate.control_link_inputs / "c0ffee-quickjs.o",), inputs)
+            self.assertEqual(b"engine", inputs[0].read_bytes())
+            with self.assertRaisesRegex(PgsoError, "seed has no control link record"):
+                _copy_control_link(PipelinePaths.create(root / "old-seed"), PipelinePaths.create(root / "other"))
 
 
 class WorkflowContractTests(unittest.TestCase):
