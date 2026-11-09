@@ -4600,9 +4600,11 @@ test "raw process execution transports long scripts without exposing stdin" {
 test "raw process execution transports a script larger than any pipe buffer" {
     if (builtin.target.os.tag == .windows) return;
 
-    // The existing long-script test is 24 KiB, which an idle macOS pipe holds
-    // whole (64 KiB). This one exceeds every pipe buffer, so a supervisor that
-    // writes the script before its target can read it hangs on any machine.
+    // On macOS the target starts suspended, so a supervisor that writes the
+    // script before the target can read it hangs once the script outgrows the
+    // pipe. The existing long-script test is 24 KiB, which an idle macOS pipe
+    // (64 KiB) holds whole. This one exceeds every pipe buffer, so it hangs on
+    // any Mac if that write moves back inline.
     const alloc = std.testing.allocator;
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(alloc);
