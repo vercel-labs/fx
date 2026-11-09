@@ -28,16 +28,17 @@
 (*   eio      the run answered reads on a revoked terminal with EIO        *)
 (*   stops    SIGTTIN and SIGTTOU kept their default action                *)
 (*   site     who ran: "shell" (fx's interactive shell), "team_picker"     *)
-(*            (fx teams), "masked_key" (the key prompt), or "sign_in" (the *)
-(*            wait of fx login vercel for browser authorization)           *)
+(*            (fx teams), "masked_key" (the key prompt), "sign_in" (the    *)
+(*            wait of fx login vercel for browser authorization), or       *)
+(*            "mcp_login" (the paste wait of fx mcp login --no-browser)    *)
 (*                                                                         *)
 (* fx's own steps (Poll, Drain, PromptReturns, PromptRead, SignInWait,     *)
-(* SignInEnds, Restore) run freely between the driver's events; a read of  *)
-(* typed input asks fx to quit exactly when the driver typed /quit. The    *)
-(* run index k advances only when the model has used all of a run's events *)
-(* and ended in exactly the observed way. The trace is ACCEPTED when TLC   *)
-(* violates NotAllMatched, which is reachable only after every run         *)
-(* matched. A completed search means REJECTED.                             *)
+(* McpLoginWait, SignInEnds, Restore) run freely between the driver's      *)
+(* events; a read of typed input asks fx to quit exactly when the driver   *)
+(* typed /quit. The run index k advances only when the model has used all  *)
+(* of a run's events and ended in exactly the observed way. The trace is   *)
+(* ACCEPTED when TLC violates NotAllMatched, which is reachable only after *)
+(* every run matched. A completed search means REJECTED.                   *)
 (***************************************************************************)
 EXTENDS TerminalRevoke, TerminalRevokeObserved
 
@@ -96,6 +97,7 @@ FxStep ==
        \/ PromptReturns
        \/ PromptRead
        \/ SignInWait
+       \/ McpLoginWait
        \/ SignInEnds
        \/ Restore
     /\ UNCHANGED <<k, j, typed>>
@@ -114,7 +116,7 @@ Matches(o) ==
                                   /\ cause \in {"requested", "input_closed"}
                                   /\ restore \in RestoreSeen(o.restore)
          [] o.end = "failed"   -> /\ phase = "exited"
-                                  /\ cause \in {"write_failed", "read_failed", "prompt_failed"}
+                                  /\ cause \in {"write_failed", "read_failed", "prompt_failed", "login_stopped"}
                                   /\ restore \in RestoreSeen(o.restore)
          [] o.end = "crashed"  -> phase = "crashed"
          [] o.end = "spinning" -> phase = "loop" /\ Gone /\ spins = MaxSpins

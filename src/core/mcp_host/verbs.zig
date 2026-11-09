@@ -1146,8 +1146,18 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
             return 1;
         }
         if (!open and waiter.shown) {
-            if (try readPasted(arena, &line)) |pasted| {
-                host.runtime.finishLogin(name, pasted) catch |err| switch (err) {
+            const pasted = readPasted(arena, &line) catch |err| switch (err) {
+                // Nothing more can be pasted. The login ends here and saves
+                // nothing. stderr may be the terminal that went, so the
+                // message is best effort.
+                error.TerminalGone => {
+                    c.err.print("Couldn't sign in to {s}: the terminal is gone.\n", .{try safe(arena, name)}) catch {};
+                    return 1;
+                },
+                else => return err,
+            };
+            if (pasted) |address| {
+                host.runtime.finishLogin(name, address) catch |err| switch (err) {
                     error.NotSigningIn => {},
                     else => return err,
                 };
@@ -1157,15 +1167,58 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
     }
 }
 
-/// A complete line from stdin, waiting at most 100 ms for one.
+/// stdin as the paste wait uses it. The tests hand `readPastedFrom` another
+/// source with the same four methods.
+const PasteStdin = struct {
+    fd: std.posix.fd_t = std.posix.STDIN_FILENO,
+
+    fn poll(self: *PasteStdin, timeout_ms: i32) !usize {
+        var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        return std.posix.poll(&fds, timeout_ms);
+    }
+
+    fn read(self: *PasteStdin, buffer: []u8) !usize {
+        return std.posix.read(self.fd, buffer);
+    }
+
+    fn gone(self: *PasteStdin) bool {
+        return io_mod.terminalGone(self.fd);
+    }
+
+    fn sleep(_: *PasteStdin, ns: u64) void {
+        io_mod.sleep(ns);
+    }
+};
+
+/// A complete line from stdin, waiting at most 100 ms for one. Fails with
+/// `error.TerminalGone` when a read failed on a terminal that is gone.
 fn readPasted(arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
-    var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
-    if (try std.posix.poll(&fds, 100) == 0) return null;
+    var stdin: PasteStdin = .{};
+    return readPastedFrom(&stdin, arena, line);
+}
+
+/// One pass of the paste wait: every pass ends the wait, takes input, or takes
+/// its 100 ms, so the loop never goes round again with no time passing
+/// (`tests/tla/shell_runtime/TerminalRevoke.tla` NoBusyLoop). A failed read is
+/// the end of input only on a terminal that is gone, which macOS 15 polls as
+/// readable for a revoked one and fails every read on with EIO
+/// (GoneReadStopsLogin). On a terminal that is still there, as a background
+/// read that SIGTTIN did not stop, or a read that would block, the wait sleeps
+/// its slice as it does for a read of 0.
+fn readPastedFrom(source: anytype, arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
+    if (try source.poll(100) == 0) return null;
     var buffer: [1024]u8 = undefined;
-    const n = std.posix.read(std.posix.STDIN_FILENO, &buffer) catch return null;
+    const n = source.read(&buffer) catch |err| {
+        if (err != error.WouldBlock and source.gone()) {
+            debug_trace.logf("mcp", "login paste wait: stdin is gone (read failed err={s}); ending the login", .{@errorName(err)});
+            return error.TerminalGone;
+        }
+        source.sleep(100 * std.time.ns_per_ms);
+        return null;
+    };
     if (n == 0) {
         // stdin closed: wait for the browser instead.
-        io_mod.sleep(100 * std.time.ns_per_ms);
+        source.sleep(100 * std.time.ns_per_ms);
         return null;
     }
     try line.appendSlice(arena, buffer[0..n]);
@@ -1424,4 +1477,258 @@ test "an MCP file fx can't read gets fx's words, and only mcp.json's own errors 
     try testing.expectEqualStrings("an MCP config file is over 1 MB, the most fx reads; make it smaller", describe(error.StreamTooLong));
     try testing.expectEqualStrings("it is a link that loops or passes through too many links; replace it with a plain file", try whyNot(a, error.SymLinkLoop, "/example/.mcp.json"));
     try testing.expectEqualStrings("it is over 1 MB, the most fx reads; make it smaller", try whyNot(a, error.StreamTooLong, "/example/.mcp.json"));
+}
+
+// The paste wait of `fx mcp login --no-browser` and `fx mcp login` over SSH
+// or with no display (`tests/tla/shell_runtime/TerminalRevoke.tla` site
+// mcp_login). Each pass polls stdin for 100 ms and reads what is there. A pass
+// that neither takes its slice, nor takes input, nor ends the wait would send
+// the loop round again with no time passing: NoBusyLoop.
+
+const paste_slice_ns: u64 = 100 * std.time.ns_per_ms;
+
+/// stdin as a script for the paste wait: what poll says, what each read
+/// gives, and whether the terminal is gone. It records the time the wait
+/// spent asleep and how often the wait asked whether the terminal was gone,
+/// and it never really sleeps.
+const ScriptedStdin = struct {
+    ready: usize = 1,
+    reads: []const Read,
+    next: usize = 0,
+    terminal_gone: bool = false,
+    slept_ns: u64 = 0,
+    gone_asked: usize = 0,
+
+    const Read = union(enum) { bytes: []const u8, fail: anyerror };
+
+    fn poll(self: *ScriptedStdin, _: i32) !usize {
+        return self.ready;
+    }
+
+    fn read(self: *ScriptedStdin, buffer: []u8) !usize {
+        const answer = self.reads[self.next];
+        self.next += 1;
+        switch (answer) {
+            .bytes => |bytes| {
+                @memcpy(buffer[0..bytes.len], bytes);
+                return bytes.len;
+            },
+            .fail => |err| return err,
+        }
+    }
+
+    fn gone(self: *ScriptedStdin) bool {
+        self.gone_asked += 1;
+        return self.terminal_gone;
+    }
+
+    fn sleep(self: *ScriptedStdin, ns: u64) void {
+        self.slept_ns += ns;
+    }
+};
+
+/// The real stdin source on any descriptor, with sleeps counted, not taken.
+const CountedStdin = struct {
+    stdin: PasteStdin,
+    slept_ns: u64 = 0,
+
+    fn poll(self: *CountedStdin, timeout_ms: i32) !usize {
+        return self.stdin.poll(timeout_ms);
+    }
+
+    fn read(self: *CountedStdin, buffer: []u8) !usize {
+        return self.stdin.read(buffer);
+    }
+
+    fn gone(self: *CountedStdin) bool {
+        return self.stdin.gone();
+    }
+
+    fn sleep(self: *CountedStdin, ns: u64) void {
+        self.slept_ns += ns;
+    }
+};
+
+/// One paste wait: its arena, and the buffer that keeps a partial line from
+/// one pass to the next.
+const PasteRun = struct {
+    arena_state: std.heap.ArenaAllocator,
+    line: std.ArrayList(u8) = .empty,
+
+    fn init() PasteRun {
+        return .{ .arena_state = .init(testing.allocator) };
+    }
+
+    fn deinit(paste: *PasteRun) void {
+        paste.arena_state.deinit();
+    }
+
+    fn pass(paste: *PasteRun, source: anytype) !?[]const u8 {
+        return readPastedFrom(source, paste.arena_state.allocator(), &paste.line);
+    }
+};
+
+/// A pass on a real descriptor either ends the wait or takes its slice; the
+/// system's answer for a hung-up or revoked terminal differs by OS (EIO on
+/// Linux and macOS 15, a read of 0 on macOS 27), and each is fine.
+fn expectPassEndsOrSleeps(source: *CountedStdin) !void {
+    var paste = PasteRun.init();
+    defer paste.deinit();
+    if (paste.pass(source)) |pasted| {
+        try testing.expect(pasted == null);
+        try testing.expect(source.slept_ns >= paste_slice_ns);
+    } else |err| {
+        try testing.expectEqual(error.TerminalGone, err);
+        try testing.expectEqual(@as(u64, 0), source.slept_ns);
+    }
+}
+
+test "mcp login paste wait: a failed read on a terminal that is gone ends the wait" {
+    var source: ScriptedStdin = .{ .reads = &.{.{ .fail = error.InputOutput }}, .terminal_gone = true };
+    var paste = PasteRun.init();
+    defer paste.deinit();
+    try testing.expectError(error.TerminalGone, paste.pass(&source));
+    try testing.expectEqual(@as(u64, 0), source.slept_ns);
+}
+
+test "mcp login paste wait: a failed read on a terminal that is still there sleeps the slice" {
+    // A background read that SIGTTIN did not stop fails with EIO on a live terminal.
+    var source: ScriptedStdin = .{ .reads = &.{.{ .fail = error.InputOutput }} };
+    var paste = PasteRun.init();
+    defer paste.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), try paste.pass(&source));
+    try testing.expectEqual(paste_slice_ns, source.slept_ns);
+    try testing.expectEqual(@as(usize, 1), source.gone_asked);
+}
+
+test "mcp login paste wait: a read that would block sleeps the slice and never asks whether the terminal is gone" {
+    var source: ScriptedStdin = .{ .reads = &.{.{ .fail = error.WouldBlock }}, .terminal_gone = true };
+    var paste = PasteRun.init();
+    defer paste.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), try paste.pass(&source));
+    try testing.expectEqual(paste_slice_ns, source.slept_ns);
+    try testing.expectEqual(@as(usize, 0), source.gone_asked);
+}
+
+test "mcp login paste wait: a read of 0 sleeps the slice and waits for the browser" {
+    var source: ScriptedStdin = .{ .reads = &.{.{ .bytes = "" }}, .terminal_gone = true };
+    var paste = PasteRun.init();
+    defer paste.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), try paste.pass(&source));
+    try testing.expectEqual(paste_slice_ns, source.slept_ns);
+    try testing.expectEqual(@as(usize, 0), source.gone_asked);
+}
+
+test "mcp login paste wait: a poll that finds nothing reads nothing and sleeps nothing" {
+    var source: ScriptedStdin = .{ .ready = 0, .reads = &.{} };
+    var paste = PasteRun.init();
+    defer paste.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), try paste.pass(&source));
+    try testing.expectEqual(@as(usize, 0), source.next);
+    try testing.expectEqual(@as(u64, 0), source.slept_ns);
+}
+
+test "mcp login paste wait: a pasted address comes back whole or in pieces, and an empty line is ignored" {
+    var source: ScriptedStdin = .{ .reads = &.{
+        .{ .bytes = "\n" },
+        .{ .bytes = "  http://127.0.0.1:9/cb?co" },
+        .{ .bytes = "de=1\r\nnext" },
+    } };
+    var paste = PasteRun.init();
+    defer paste.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), try paste.pass(&source));
+    try testing.expectEqual(@as(?[]const u8, null), try paste.pass(&source));
+    const pasted = (try paste.pass(&source)).?;
+    try testing.expectEqualStrings("http://127.0.0.1:9/cb?code=1", pasted);
+    try testing.expectEqualStrings("next", paste.line.items);
+    try testing.expectEqual(@as(u64, 0), source.slept_ns);
+}
+
+test "mcp login paste wait: every answer ends the wait, takes the slice, or takes input" {
+    const answers = [_]ScriptedStdin.Read{
+        .{ .bytes = "" },
+        .{ .bytes = "x" },
+        .{ .bytes = "\n" },
+        .{ .bytes = "address\n" },
+        .{ .fail = error.InputOutput },
+        .{ .fail = error.WouldBlock },
+        .{ .fail = error.Unexpected },
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .fail = error.SocketUnconnected },
+        .{ .fail = error.IsDir },
+        .{ .fail = error.SystemResources },
+    };
+    for ([_]usize{ 0, 1 }) |ready| for ([_]bool{ false, true }) |terminal_gone| for (answers) |answer| {
+        const script = [_]ScriptedStdin.Read{answer};
+        var source: ScriptedStdin = .{ .ready = ready, .reads = &script, .terminal_gone = terminal_gone };
+        var paste = PasteRun.init();
+        defer paste.deinit();
+        errdefer std.debug.print("poll ready={d} gone={} read={any}\n", .{ ready, terminal_gone, answer });
+        const result = paste.pass(&source);
+        const took_slice = ready == 0 or source.slept_ns >= paste_slice_ns;
+        const took_input = switch (answer) {
+            .bytes => |bytes| ready != 0 and bytes.len > 0,
+            .fail => false,
+        };
+        const ended = if (result) |_| false else |_| true;
+        try testing.expect(took_slice or took_input or ended);
+        // Only a failed read on a terminal that is gone ends the wait, and a
+        // read that would block never does.
+        if (ended) {
+            try testing.expect(ready != 0 and terminal_gone);
+            try testing.expect(answer == .fail and answer.fail != error.WouldBlock);
+        }
+    };
+}
+
+test "mcp login paste wait: a descriptor that is not open ends the wait" {
+    const testing_pty = @import("../shared/testing_pty.zig");
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    // Poll answers POLLNVAL alone and the read fails with EBADF.
+    var source: CountedStdin = .{ .stdin = .{ .fd = testing_pty.closed_fd } };
+    var paste = PasteRun.init();
+    defer paste.deinit();
+    try testing.expectError(error.TerminalGone, paste.pass(&source));
+    try testing.expectEqual(@as(u64, 0), source.slept_ns);
+}
+
+test "mcp login paste wait: a terminal whose other side closed never returns at once" {
+    const testing_pty = @import("../shared/testing_pty.zig");
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    testing_pty.closeFd(pty.master);
+    defer testing_pty.closeFd(pty.slave);
+    var source: CountedStdin = .{ .stdin = .{ .fd = pty.slave } };
+    try expectPassEndsOrSleeps(&source);
+}
+
+test "mcp login paste wait: a revoked terminal never returns at once" {
+    if (comptime !@import("builtin").target.os.tag.isDarwin()) return error.SkipZigTest;
+    const testing_pty = @import("../shared/testing_pty.zig");
+
+    const pty = try testing_pty.TestPty.open();
+    defer pty.close();
+    try pty.revokeSlave();
+    var source: CountedStdin = .{ .stdin = .{ .fd = pty.slave } };
+    try expectPassEndsOrSleeps(&source);
+}
+
+test "mcp login paste wait: a live terminal takes a typed address and otherwise waits its poll" {
+    const testing_pty = @import("../shared/testing_pty.zig");
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    defer pty.close();
+    var source: CountedStdin = .{ .stdin = .{ .fd = pty.slave } };
+    var paste = PasteRun.init();
+    defer paste.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), try paste.pass(&source));
+
+    const typed = "http://127.0.0.1:9/cb?code=1&state=2\n";
+    try testing.expectEqual(@as(isize, typed.len), std.c.write(pty.master, typed.ptr, typed.len));
+    const pasted = (try paste.pass(&source)).?;
+    try testing.expectEqualStrings("http://127.0.0.1:9/cb?code=1&state=2", pasted);
+    try testing.expectEqual(@as(u64, 0), source.slept_ns);
 }

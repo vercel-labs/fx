@@ -57,6 +57,26 @@
 (* device code is approved, refused, or expires (SignInEnds), so a gone    *)
 (* terminal does not end it sooner.                                        *)
 (*                                                                         *)
+(* The fifth site, "mcp_login", is the wait of fx mcp login for an         *)
+(* authorization, with no browser to open (waitForLogin and readPasted in  *)
+(* src/core/mcp_host/verbs.zig). It sets no raw mode either. Each pass     *)
+(* polls stdin for 100 ms and, when the poll answers anything, reads once. *)
+(* A pass that ends the wait, reads what was pasted, or sleeps its slice   *)
+(* takes time or makes progress. A read that failed used to return at once *)
+(* with nothing done, so the loop went round again with no time passing: a *)
+(* spin, as in Poll (Bug = "mcp_login_spins"). It now asks the shell's     *)
+(* second check, terminalGone: a failed read on a terminal that is gone    *)
+(* (the poll answers HUP, ERR, or NVAL, or tcgetattr fails) ends the wait  *)
+(* with status 1 and saves nothing (cause "login_stopped"), and a failed   *)
+(* read on a terminal that is still there, as a background read that       *)
+(* SIGTTIN did not stop gives, sleeps the slice. A read of 0 is the end of *)
+(* input and keeps the wait going until the browser comes back or the      *)
+(* login's own deadline (SignInEnds): stdin closed means wait for the      *)
+(* browser. Bug = "mcp_login_ends_always" ends on every failed read        *)
+(* without the second check, and Bug = "mcp_login_sleeps" sleeps on every  *)
+(* one and never ends the wait, which is no spin but breaks                *)
+(* GoneReadStopsLogin.                                                     *)
+(*                                                                         *)
 (* Job control moves fx between the foreground ("fg"), stopped, and the    *)
 (* background ("bg"). Ctrl+Z (Suspend) stops fx. With SIGTTIN and SIGTTOU  *)
 (* at their default (stops), a background fx stops at its first terminal   *)
@@ -93,9 +113,9 @@ CONSTANTS MaxSpins, MaxIntr, Bug
 
 Bugs == {"none", "today", "prompts_strict", "picker_ignores_eof", "nval_ignored", "badf_unreachable",
          "enoent_unexpected", "no_eintr_retry", "eio_always_eof", "eio_poll_only",
-         "sign_in_spins", "sign_in_nval"}
+         "sign_in_spins", "sign_in_nval", "mcp_login_spins", "mcp_login_ends_always", "mcp_login_sleeps"}
 Prompts == {"team_picker", "masked_key"}
-Sites == {"shell", "sign_in"} \cup Prompts
+Sites == {"shell", "sign_in", "mcp_login"} \cup Prompts
 ASSUME Bug \in Bugs
 
 VARIABLES
@@ -105,17 +125,19 @@ VARIABLES
     dirty,    \* fx read input it has not drawn yet
     phase,    \* "loop", "cleanup", "exited", or "crashed"
     cause,    \* why the loop ended: "none", "requested", "input_closed",
-              \* "write_failed", "read_failed", or "prompt_failed"
+              \* "write_failed", "read_failed", "prompt_failed", or, for the
+              \* login waits, "sign_in_ended" and "login_stopped"
     spins,    \* passes of the loop that returned at once with nothing to do
     intr,     \* EINTRs the environment can still deliver to the restore
     restore,  \* "pending", "restored", "gone", "error", or "lost"
     job,      \* "fg", "stopped", or "bg"
     eio,      \* a revoked terminal polls as readable and fails reads with EIO
     stops,    \* SIGTTIN and SIGTTOU keep their default action
-    site,     \* "shell", "team_picker", "masked_key", or "sign_in": who runs, and
-              \* for the first three, restores the terminal
-    eof       \* stdin reached its end for the code that reads it: a prompt's read
-              \* returned 0, or the sign-in wait found stdin gone
+    site,     \* "shell", "team_picker", "masked_key", "sign_in", or "mcp_login":
+              \* who runs, and for the first three, restores the terminal
+    eof       \* stdin reached its end for the code that reads it: a prompt's or
+              \* the paste wait's read returned 0, or the sign-in wait found stdin
+              \* gone
 
 vars == <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
 
@@ -308,16 +330,78 @@ SignInWait ==
             /\ eof' = (eof \/ Gone)
     /\ UNCHANGED <<tty, queued, dirty, phase, cause, intr, restore, job, eio, stops, site>>
 
-\* The device code is approved, refused, or expires, whatever the terminal
-\* is doing. The wait changed no terminal setting, so nothing is left to
-\* restore.
+\* The device code or the login is approved, refused, or expires, whatever the
+\* terminal is doing (the login's own deadline is five minutes). A login wait
+\* changed no terminal setting, so nothing is left to restore.
 SignInEnds ==
-    /\ site = "sign_in"
+    /\ site \in {"sign_in", "mcp_login"}
     /\ phase = "loop"
     /\ phase' = "exited"
     /\ cause' = "sign_in_ended"
     /\ restore' = "gone"
     /\ UNCHANGED <<tty, waking, queued, dirty, spins, intr, job, eio, stops, site, eof>>
+
+\* A read the paste wait makes that fails: EIO, from a revoked terminal where
+\* eio holds or a background read that SIGTTIN did not stop, or EBADF, from a
+\* descriptor that is closed. std.posix.read maps both to an error.
+McpReadFails == ReadFails \/ tty = "closed"
+
+\* The second check after a failed read (io_mod.terminalGone, which
+\* TerminalState.inputGone shares): a poll that answers HUP, ERR, or NVAL, or
+\* a tcgetattr that fails.
+McpGone == PollShowsGone \/ TcgetattrFails
+
+\* Whether the paste wait ends on a failed read (readPastedFrom).
+McpEndsOnFailedRead ==
+    CASE Bug \in {"today", "mcp_login_spins", "mcp_login_sleeps"} -> FALSE
+      [] Bug = "mcp_login_ends_always"                              -> TRUE
+      [] OTHER                                                      -> McpGone
+
+\* Before the fix a failed read returned at once: no end, no sleep.
+McpReturnsAtOnce == Bug \in {"today", "mcp_login_spins"}
+
+\* One pass of the paste wait (readPastedFrom): poll for up to 100 ms, then
+\* read once if the poll answered anything. A pass that returns at once with
+\* nothing done is a spin.
+McpLoginWait ==
+    /\ site = "mcp_login"
+    /\ phase = "loop"
+    /\ waking' = FALSE
+    /\ LET r == Revents IN
+       IF r = {}
+       \* Nothing to read: the poll waited its 100 ms.
+       THEN UNCHANGED <<queued, phase, cause, spins, restore, eof>>
+       ELSE IF McpReadFails
+            THEN IF McpEndsOnFailedRead
+                 \* A failed read on a terminal that is gone: the wait ends
+                 \* with a short message and status 1, and saves nothing.
+                 THEN /\ phase' = "exited"
+                      /\ cause' = "login_stopped"
+                      /\ restore' = "gone"
+                      /\ UNCHANGED <<queued, spins, eof>>
+                 ELSE IF McpReturnsAtOnce
+                      THEN /\ spins < MaxSpins
+                           /\ spins' = spins + 1
+                           /\ UNCHANGED <<queued, phase, cause, restore, eof>>
+                      \* Any other failed read sleeps the slice.
+                      ELSE UNCHANGED <<queued, phase, cause, spins, restore, eof>>
+            \* What was typed or pasted is read.
+            ELSE IF queued
+                 THEN /\ queued' = FALSE
+                      /\ UNCHANGED <<phase, cause, spins, restore, eof>>
+                 \* A read of 0, the end of input: the wait sleeps its slice and
+                 \* goes on waiting for the browser.
+                 ELSE /\ eof' = TRUE
+                      /\ UNCHANGED <<queued, phase, cause, spins, restore>>
+    /\ UNCHANGED <<tty, dirty, intr, job, eio, stops, site>>
+
+\* The pass that finds a read failing on a terminal that is gone.
+McpGoneReadFailure ==
+    /\ site = "mcp_login"
+    /\ phase = "loop"
+    /\ Revents # {}
+    /\ McpReadFails
+    /\ McpGone
 
 -----------------------------------------------------------------------------
 (* The restore (TerminalState.disableRawMode, TeamPickerRawMode.disable,   *)
@@ -366,7 +450,7 @@ Restore ==
 
 \* The person types; the bytes wait until the loop reads them.
 Type ==
-    /\ site = "shell"
+    /\ site \in {"shell", "mcp_login"}
     /\ phase = "loop"
     /\ tty = "live"
     /\ ~queued
@@ -387,7 +471,7 @@ Revoke ==
 \* revoke(2) while fx waits in its poll, which wakes with POLLHUP, or with
 \* POLLIN where eio holds.
 RevokeInPoll ==
-    /\ site \in {"shell", "sign_in"}
+    /\ site \in {"shell", "sign_in", "mcp_login"}
     /\ phase = "loop"
     /\ job = "fg"
     /\ tty = "live"
@@ -447,7 +531,7 @@ Fg ==
 \* Another job takes the terminal while fx keeps running, which only a
 \* parent that ignores SIGTTIN and SIGTTOU allows.
 Background ==
-    /\ site = "shell"
+    /\ site \in {"shell", "mcp_login"}
     /\ phase = "loop"
     /\ job = "fg"
     /\ tty = "live"
@@ -462,7 +546,8 @@ Ended ==
 Environment ==
     Type \/ Revoke \/ RevokeInPoll \/ Hangup \/ CloseFd \/ Suspend \/ Bg \/ Fg \/ Background
 
-Next == Poll \/ Drain \/ PromptReturns \/ PromptRead \/ SignInWait \/ SignInEnds \/ Restore \/ Environment \/ Ended
+Next == Poll \/ Drain \/ PromptReturns \/ PromptRead \/ SignInWait \/ McpLoginWait \/ SignInEnds \/ Restore
+        \/ Environment \/ Ended
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Poll) /\ WF_vars(Drain) /\ WF_vars(PromptRead) /\ WF_vars(SignInEnds)
         /\ WF_vars(Restore)
@@ -475,7 +560,7 @@ TypeOK ==
     /\ queued \in BOOLEAN
     /\ dirty \in BOOLEAN
     /\ phase \in {"loop", "cleanup", "exited", "crashed"}
-    /\ cause \in {"none", "requested", "input_closed", "write_failed", "read_failed", "prompt_failed", "sign_in_ended"}
+    /\ cause \in {"none", "requested", "input_closed", "write_failed", "read_failed", "prompt_failed", "sign_in_ended", "login_stopped"}
     /\ spins \in 0..MaxSpins
     /\ intr \in 0..MaxIntr
     /\ restore \in {"pending", "restored", "gone", "error", "lost"}
@@ -495,14 +580,14 @@ CleanupNeverCrashes == phase # "crashed"
 
 \* A terminal that is still there gets its original settings back, even
 \* when signals interrupt the restore. The sign-in wait changes none.
-RestoredWhenLive == (phase = "exited" /\ tty = "live" /\ site # "sign_in") => restore = "restored"
+RestoredWhenLive == (phase = "exited" /\ tty = "live" /\ site \notin {"sign_in", "mcp_login"}) => restore = "restored"
 
 \* The cleanup of a terminal that is gone stays quiet: no unexpected errno.
 GoneQuietly == restore # "error"
 
-\* The loop ends for closed input or a failed write only when the terminal
-\* is gone.
-InputClosedOnlyWhenGone == cause \in {"input_closed", "write_failed"} => Gone
+\* The loop ends for closed input or a failed write, and the paste wait for a
+\* failed read, only when the terminal is gone.
+InputClosedOnlyWhenGone == cause \in {"input_closed", "write_failed", "login_stopped"} => Gone
 
 \* fx reports a read error only on a terminal that is still there: a
 \* background read that SIGTTIN did not stop. A read that fails on a
@@ -521,4 +606,10 @@ GoneEndsLoop == Gone ~> (phase \in {"exited", "crashed"})
 
 \* A prompt never reads again after a read of 0, the end of input.
 NoReadAfterEof == [][~(PromptRead /\ eof)]_vars
+
+\* The end-of-input law of the paste wait: a pass that finds its read failing
+\* on a terminal that is gone ends the wait. It does not go round at once
+\* (NoBusyLoop), and it does not sleep and poll on until the login's own
+\* deadline.
+GoneReadStopsLogin == [][(McpLoginWait /\ McpGoneReadFailure) => phase' = "exited"]_vars
 =============================================================================

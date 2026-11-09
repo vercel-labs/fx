@@ -52,6 +52,24 @@
 //
 // A fake open on PATH records the browser launches, so none starts.
 //
+// Three more runs start fx mcp login --no-browser web on the PTY, against the
+// fake OAuth server that tests/tla/drivers/mcp/fakes/http.ts serves, and take
+// the terminal away while the login waits for a pasted address. Nothing ever
+// approves the login, so only the terminal can end it:
+//
+//   mcp-login-revoke-eio  stdin-eio.c gives the revoked stdin the macOS 15
+//                         answer (polled readable, every read fails with EIO).
+//                         The paste wait went round its loop at once, at full
+//                         CPU, and never ended; it must stop with status 1 and
+//                         a short message, save nothing, and redeem no code
+//                         (NoBusyLoop, GoneReadStopsLogin)
+//   mcp-login-revoke      the same revoke with no interposer: this machine
+//                         answers POLLNVAL and a read of 0, the end of input,
+//                         and the wait keeps waiting for the browser, asleep
+//                         between its polls (no spin)
+//   mcp-login-hangup      close the other side: POLLHUP and a read of 0, the
+//                         same wait
+//
 // Two more runs start fx from an interactive bash in tmux and take it through
 // Ctrl+Z, bg, fg, and /quit: job-control with SIGTTIN and SIGTTOU at their
 // default, and job-control-signals-ignored with fx started with both ignored.
@@ -74,7 +92,9 @@
 // which must reject them too, and the sign-in run that revoked the terminal in
 // a request through the model of fx before the sign-in wait's fix (Bug =
 // "sign_in_spins") and through the model of a fix that misses POLLNVAL alone
-// (Bug = "sign_in_nval").
+// (Bug = "sign_in_nval"), and the fx mcp login run that ended through the
+// model of fx before the paste wait's fix (Bug = "mcp_login_spins") and
+// through the model of a fix that only sleeps (Bug = "mcp_login_sleeps").
 //
 // revoke(2) exists only on macOS here, so the driver runs only there.
 //
@@ -89,13 +109,14 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { binary, targetHelpers, targetModule } from "../lib/context";
+import { binary, targetHelpers, targetModule, worktree } from "../lib/context";
 import { TLA_ROOT, outDir, runTlc, writeJson } from "../lib/tlc";
+import { fixture, redemptions, startFake, writeProfile } from "../mcp_host/driver";
 
 type Event = "Type" | "Quit" | "Revoke" | "RevokeStopped" | "Hangup" | "Suspend" | "Bg" | "Fg" | "Background";
 type End = "exited" | "failed" | "crashed" | "spinning" | "waiting" | "other";
 type Restore = "restored" | "quiet" | "clean" | "error" | "lost" | "none";
-type Site = "shell" | "team_picker" | "sign_in";
+type Site = "shell" | "team_picker" | "sign_in" | "mcp_login";
 type Scenario =
   | "quit"
   | "hangup"
@@ -112,6 +133,9 @@ type Scenario =
   | "sign-in-revoke-stopped"
   | "sign-in-revoke-idle"
   | "sign-in-hangup"
+  | "mcp-login-revoke-eio"
+  | "mcp-login-revoke"
+  | "mcp-login-hangup"
   | "job-control"
   | "job-control-signals-ignored";
 type Observation = {
@@ -154,6 +178,9 @@ const SCENARIOS: Scenario[] = [
   "sign-in-revoke-stopped",
   "sign-in-revoke-idle",
   "sign-in-hangup",
+  "mcp-login-revoke-eio",
+  "mcp-login-revoke",
+  "mcp-login-hangup",
   "job-control",
   "job-control-signals-ignored",
 ];
@@ -170,17 +197,23 @@ const EIO_MODE: Partial<Record<Scenario, "revoked" | "live">> = {
   "revoke-stopped-eio": "revoked",
   "live-eio": "live",
   "team-picker-revoke-eio": "revoked",
+  "mcp-login-revoke-eio": "revoked",
 };
 // The team picker's run must end this fast, and not burn CPU while it waits.
 const PICKER_EXIT_WAIT_MS = 2_000;
 const tlaDir = join(TLA_ROOT, "shell_runtime");
 // An fx error line on stderr: `fx: ...`, or `fx <command>: ...`.
 const FX_ERROR = /^fx(?: [\w-]+)?: /m;
+// What fx mcp login says when its terminal is gone.
+const MCP_LOGIN_STOPPED = /^Couldn't sign in to web: the terminal is gone\.$/m;
 // How long fx has to exit after its terminal goes away, and how long a run that
 // is still going is watched for CPU use before it counts as spinning.
 const EXIT_WAIT_MS = 3_000;
 const SPIN_WINDOW_MS = 1_000;
 const SPIN_CPU_SECONDS = 0.5;
+// A wait that sleeps its 100 ms slice polls ten times a second; one that spins
+// makes tens of thousands of passes.
+const SPIN_PASSES = 100;
 
 function option(name: string, fallback: number): number {
   const at = process.argv.indexOf(name);
@@ -222,11 +255,11 @@ function sameFlags(a: Record<string, number>, b: Record<string, number>): boolea
 }
 
 let stdinEio: string | null = null;
-// stdin-eio.c, built once per run.
+// tests/e2e/fixtures/stdin-eio.c, built once per run.
 function stdinEioLibrary(out: string): string {
   if (stdinEio) return stdinEio;
   const library = join(out, "stdin-eio.dylib");
-  const source = join(import.meta.dirname, "stdin-eio.c");
+  const source = join(worktree, "tests", "e2e", "fixtures", "stdin-eio.c");
   const built = Bun.spawnSync(["clang", "-dynamiclib", "-O2", "-Wall", "-Wextra", source, "-o", library]);
   if (built.exitCode !== 0) throw new Error(`building stdin-eio.c failed: ${built.stderr.toString()}`);
   return (stdinEio = library);
@@ -731,6 +764,120 @@ async function runSignIn(
   }
 }
 
+// fx mcp login --no-browser web on the PTY, waiting for a pasted address. The
+// fake OAuth server answers discovery and registration, so fx shows the
+// address and waits, and nothing approves it. The driver revokes the terminal,
+// or hangs it up. With `mcp-login-revoke-eio`, stdin-eio.c gives the revoked
+// stdin the macos-15-arm64 answer: it polls readable and every read fails with
+// EIO. The wait must stop with status 1 and a short message, redeem no code,
+// and not spin. Without it this machine answers a read of 0, the end of input,
+// for a revoked terminal and for a hung-up one, and the wait goes on asleep
+// between its polls, waiting for the browser. A fake open first on PATH means
+// no browser starts.
+async function runMcpLogin(
+  helpers: any,
+  pty: any,
+  gateway: any,
+  id: string,
+  scenario: Scenario,
+  scratch: string,
+  out: string,
+): Promise<Observation> {
+  const emulateEio = scenario === "mcp-login-revoke-eio";
+  const f = fixture(scratch, id);
+  for (const dir of ["pty", "bin"]) mkdirSync(join(f.base, dir));
+  writeFileSync(join(f.base, "bin", "open"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const modelsBefore = gateway.modelRequests.length;
+  const chatBefore = gateway.requests.length;
+  const fake = await startFake(f);
+  writeProfile(f, { web: { type: "http", url: fake.url } });
+  const eioRecord = join(f.base, "stdin-eio.record");
+  const session = await pty.PtySession.launch({
+    bin: binary,
+    args: ["mcp", "login", "--no-browser", "web"],
+    cwd: f.workspace,
+    dir: join(f.base, "pty"),
+    env: {
+      ...fxEnv(helpers, gateway, f.base),
+      FX_HOME: join(f.home, ".fx"),
+      PATH: `${join(f.base, "bin")}:/usr/bin:/bin`,
+      ...(emulateEio
+        ? {
+            DYLD_INSERT_LIBRARIES: stdinEioLibrary(out),
+            FX_STDIN_EIO_MODE: "revoked",
+            FX_STDIN_EIO_RECORD: eioRecord,
+          }
+        : {}),
+    },
+  });
+  try {
+    if (!(await session.waitForOutput((text: string) => text.includes("paste the address"), 15_000))) {
+      throw new Error(`${id}: fx mcp login never showed its address; stderr: ${session.stderr()}`);
+    }
+    // The wait is polling stdin for a pasted address.
+    await session.waitForQuietOutput(300, 15_000);
+    if (scenario === "mcp-login-hangup") session.hangUp();
+    else session.revoke();
+    const started = performance.now();
+    const exit = await session.waitForExit(EXIT_WAIT_MS);
+    const exitedAfter = exit ? Math.round(performance.now() - started) : null;
+    const stderr = session.stderr();
+    let end: End;
+    let restore: Restore = "none";
+    let cpuAfter: number | null = null;
+    if (exit) {
+      if (exit.code === 0) end = "exited";
+      else if (exit.signal === "SIGABRT" || /panic/.test(stderr)) end = "crashed";
+      else if (exit.code === 1 && MCP_LOGIN_STOPPED.test(stderr)) end = "failed";
+      else end = "other";
+      if (end === "exited" || end === "failed") restore = /unexpected errno/.test(stderr) ? "error" : "quiet";
+    } else {
+      // A spin shows in CPU, and, because stdin-eio.c appends to its record on
+      // every call and a slow disk throttles that, in how many passes fx made.
+      const before = session.cpuSeconds();
+      const passesBefore = readLines(eioRecord).length;
+      await Bun.sleep(SPIN_WINDOW_MS);
+      cpuAfter = session.cpuSeconds();
+      const burned = before !== null && cpuAfter !== null ? cpuAfter - before : 0;
+      const passes = readLines(eioRecord).length - passesBefore;
+      end = burned >= SPIN_CPU_SECONDS || passes >= SPIN_PASSES ? "spinning" : "waiting";
+    }
+    const interposer = readLines(eioRecord);
+    if (emulateEio && !interposer.some((line) => line.startsWith("read-eio"))) {
+      throw new Error(`${id}: stdin-eio.c never failed a read, so the run did not reach the EIO path`);
+    }
+    return {
+      id,
+      scenario,
+      delay_ms: 0,
+      events: [scenario === "mcp-login-hangup" ? "Hangup" : "Revoke"],
+      end,
+      restore,
+      eio: emulateEio,
+      stops: true,
+      site: "mcp_login",
+      evidence: {
+        exit,
+        exited_after_ms: exitedAfter,
+        cpu_seconds_after: cpuAfter,
+        stderr: stderr.slice(0, 2_000),
+        gateway: {
+          models: gateway.modelRequests.length - modelsBefore,
+          chat: gateway.requests.length - chatBefore,
+        },
+        issuer: [`token_exchanges=${redemptions(fake.entries()).length}`],
+        interposer: [...new Set(interposer)],
+        job_states: [],
+        trace_errors: [],
+      },
+    };
+  } finally {
+    await session.dispose();
+    fake.stop();
+    rmSync(f.base, { recursive: true, force: true });
+  }
+}
+
 // fx from an interactive bash in tmux, through Ctrl+Z, bg, fg, and /quit.
 async function runJobControl(
   helpers: any,
@@ -924,6 +1071,8 @@ async function main(): Promise<number> {
         ? await runTeamPicker(helpers, pty, gateway, id, run.scenario === "team-picker-revoke-eio", scratch, out)
         : run.scenario.startsWith("sign-in-")
         ? await runSignIn(helpers, pty, gateway, id, run.scenario, scratch)
+        : run.scenario.startsWith("mcp-login-")
+        ? await runMcpLogin(helpers, pty, gateway, id, run.scenario, scratch, out)
         : await runScenario(helpers, pty, gateway, id, run.scenario, run.delay, scratch, out);
       observations.push(observation);
       const { gateway: counted, issuer, exited_after_ms, cpu_seconds_after, interposer, job_states, trace_errors } = observation.evidence;
@@ -941,6 +1090,10 @@ async function main(): Promise<number> {
       const expectedModels = observation.site === "shell" ? 1 : 0;
       if (counted.models !== expectedModels || counted.chat !== 0) {
         console.error(`${observation.id}: expected the fake gateway to count ${expectedModels} models request and no chat request`);
+        return 2;
+      }
+      if (observation.site === "mcp_login" && issuer.join(",") !== "token_exchanges=0") {
+        console.error(`${observation.id}: expected the fake OAuth server to redeem no code, saw ${issuer.join(",") || "none"}`);
         return 2;
       }
       if (observation.site === "team_picker" && issuer.join(",") !== "GET /v2/teams") {
@@ -983,6 +1136,17 @@ async function main(): Promise<number> {
       if (signIn.length === 0) break;
       const replay = await check(join(out, name!), signIn, bug!);
       console.log(`TLC TerminalRevokeTrace Bug=${bug} (sign-in revoke run only): ${replay.verdict} (must be REJECTED)`);
+      if (replay.verdict === "TOOL_ERROR") status = 2;
+      else if (replay.verdict !== "REJECTED" && status === 0) status = 1;
+    }
+    // The paste wait. The run that ended must not fit fx before the wait's fix,
+    // which went round again at once on a failed read, nor a fix that only
+    // sleeps, which never ends the wait on a gone terminal.
+    const mcpLogin = observations.filter((o) => o.site === "mcp_login" && o.end === "failed");
+    for (const [name, bug] of [["mcp-login-spins", "mcp_login_spins"], ["mcp-login-sleeps", "mcp_login_sleeps"]]) {
+      if (mcpLogin.length === 0) break;
+      const replay = await check(join(out, name!), mcpLogin, bug!);
+      console.log(`TLC TerminalRevokeTrace Bug=${bug} (fx mcp login run that ended only): ${replay.verdict} (must be REJECTED)`);
       if (replay.verdict === "TOOL_ERROR") status = 2;
       else if (replay.verdict !== "REJECTED" && status === 0) status = 1;
     }

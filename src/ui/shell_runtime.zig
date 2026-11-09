@@ -240,18 +240,10 @@ pub const TerminalState = struct {
     }
 
     /// Whether the terminal behind stdin is gone, asked after a read on it
-    /// failed with EIO. A terminal that was revoked, closed, or hung up polls
-    /// as closed or is no longer a terminal; macOS 15 can report a revoked
-    /// controlling terminal as readable, so only the second check shows it.
-    /// A background read that SIGTTIN did not stop fails with the same errno
-    /// on a terminal that passes both checks.
+    /// failed with EIO: `io_mod.terminalGone` on stdin.
     pub fn inputGone(self: TerminalState) bool {
         if (comptime builtin.target.os.tag == .wasi) return false;
-        if (self.pollInput(0)) |poll| {
-            if (poll.closed()) return true;
-        } else |_| {}
-        const stdin_file = std.Io.File{ .handle = self.stdin_fd, .flags = .{ .nonblocking = false } };
-        return !(stdin_file.isTty(io_mod.getIo()) catch true);
+        return io_mod.terminalGone(self.stdin_fd);
     }
 
     pub fn pollInput(self: TerminalState, timeout_ms: i32) !PollResult {

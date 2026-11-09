@@ -30,16 +30,26 @@
 # POLLNVAL alone, sent it round its loop at full CPU. The
 # terminal-revoke-today-sign-in config is fx with every other fix and without
 # that one (NoBusyLoop); the fixed wait sleeps out its slice and the sign-in
-# goes on polling the issuer. Each terminal-revoke-mutation-*.cfg plants one
-# defect, and the rule it names must catch it:
+# goes on polling the issuer. The paste wait of fx mcp login --no-browser is
+# the fifth site. A read of stdin that failed returned at once, so a terminal
+# that polled readable and failed every read, as macOS 15 answers for a
+# revoked one, sent the wait round its loop at full CPU until the login's own
+# deadline. The terminal-revoke-today-mcp-login config is fx with every other
+# fix and without that one (NoBusyLoop), and terminal-revoke-today-mcp-login-eof
+# holds the same fx to the end-of-input law (GoneReadStopsLogin): a failed read
+# on a terminal that is gone ends the wait with status 1. Each
+# terminal-revoke-mutation-*.cfg plants one defect, and the rule it names must
+# catch it:
 #
-#   nval-ignored       POLLNVAL is not counted as closed input        NoBusyLoop
-#   badf-unreachable   EBADF from the restore aborts fx                CleanupNeverCrashes
-#   enoent-unexpected  ENOENT from a revoked terminal is an error      GoneQuietly
-#   no-eintr-retry     a restore that EINTR interrupts is not retried  RestoredWhenLive
-#   eio-always-eof     every EIO read ends input, without the check    InputClosedOnlyWhenGone
-#   eio-poll-only      the check asks poll and not tcgetattr           ReadErrorOnlyWhenLive
-#   sign-in-nval       the sign-in wait misses POLLNVAL alone         NoBusyLoop
+#   nval-ignored           POLLNVAL is not counted as closed input          NoBusyLoop
+#   badf-unreachable       EBADF from the restore aborts fx                 CleanupNeverCrashes
+#   enoent-unexpected      ENOENT from a revoked terminal is an error       GoneQuietly
+#   no-eintr-retry         a restore that EINTR interrupts is not retried   RestoredWhenLive
+#   eio-always-eof         every EIO read ends input, without the check     InputClosedOnlyWhenGone
+#   eio-poll-only          the check asks poll and not tcgetattr            ReadErrorOnlyWhenLive
+#   sign-in-nval           the sign-in wait misses POLLNVAL alone           NoBusyLoop
+#   mcp-login-ends-always  every failed read ends the paste wait            InputClosedOnlyWhenGone
+#   mcp-login-sleeps       a failed read on a gone terminal only sleeps     GoneReadStopsLogin
 #
 # TerminalRevokeTrace.tla checks runs of the built fx binary against the
 # model; tests/tla/drivers/shell_runtime/driver.ts runs it.
@@ -67,6 +77,8 @@ TerminalRevoke terminal-revoke-today-prompts-errno GoneQuietly
 TerminalRevoke terminal-revoke-today-picker NoReadAfterEof
 TerminalRevoke terminal-revoke-today-picker-liveness temporal
 TerminalRevoke terminal-revoke-today-sign-in NoBusyLoop
+TerminalRevoke terminal-revoke-today-mcp-login NoBusyLoop
+TerminalRevoke terminal-revoke-today-mcp-login-eof GoneReadStopsLogin
 TerminalRevoke terminal-revoke-mutation-nval-ignored NoBusyLoop
 TerminalRevoke terminal-revoke-mutation-badf-unreachable CleanupNeverCrashes
 TerminalRevoke terminal-revoke-mutation-enoent-unexpected GoneQuietly
@@ -74,4 +86,6 @@ TerminalRevoke terminal-revoke-mutation-no-eintr-retry RestoredWhenLive
 TerminalRevoke terminal-revoke-mutation-eio-always-eof InputClosedOnlyWhenGone
 TerminalRevoke terminal-revoke-mutation-eio-poll-only ReadErrorOnlyWhenLive
 TerminalRevoke terminal-revoke-mutation-sign-in-nval NoBusyLoop
+TerminalRevoke terminal-revoke-mutation-mcp-login-ends-always InputClosedOnlyWhenGone
+TerminalRevoke terminal-revoke-mutation-mcp-login-sleeps GoneReadStopsLogin
 VERDICTS
