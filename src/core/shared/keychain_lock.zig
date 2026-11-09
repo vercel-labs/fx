@@ -234,7 +234,8 @@ test "~/.fx and the item's folder are made private, and one that can't be opened
     }
     // An existing ~/.fx other users could write is made private, as the default profile does.
     {
-        var fx_dir = try tmp.dir.openDir(testing.io, ".fx", .{});
+        // Iterating, so Linux gives a descriptor `fchmod` accepts.
+        var fx_dir = try tmp.dir.openDir(testing.io, ".fx", .{ .iterate = true });
         defer fx_dir.close(testing.io);
         try fx_dir.setPermissions(testing.io, std.Io.File.Permissions.fromMode(0o777));
     }
