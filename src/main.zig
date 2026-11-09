@@ -743,6 +743,7 @@ const App = struct {
                 .provider_order = launch.modifiers.provider_order_override,
                 .provider_strict = launch.modifiers.provider_strict_override,
                 .permission_mode = launch.modifiers.permission_override,
+                .upgrade_relaunch = launch.upgrade_relaunch != null,
             },
         );
         errdefer app.deinit();
@@ -889,6 +890,12 @@ const App = struct {
     /// What the busiest open agent is doing, for herdr's pane state.
     pub fn agentsBusiest(self: *App) app_agents_runtime.Busiest {
         return AgentsAppRuntime.busiest(self);
+    }
+
+    /// An agent other than the one on screen that an upgrade's restart
+    /// would stop. Its name may use `buf`.
+    pub fn busyAgentElsewhere(self: *App, buf: []u8) ?app_agents_runtime.BusyAgent {
+        return AgentsAppRuntime.busyAgentElsewhere(self, buf);
     }
 
     /// `agent`'s turn needs the user: an approval or a question.
@@ -2375,6 +2382,10 @@ const App = struct {
         return self.model_cache.isFailed();
     }
 
+    pub fn modelCacheFailure(self: *App) ?model_catalog.FailureCategory {
+        return self.model_cache.downFailure();
+    }
+
     pub fn snapshotCachedModelIds(self: *App, alloc: Allocator) !?std.ArrayList([]u8) {
         return self.model_cache.snapshotCachedModelIds(alloc);
     }
@@ -2928,12 +2939,24 @@ const App = struct {
         return result;
     }
 
+    /// Writes a call's Ctrl+O line that the pacer held until its text was
+    /// shown.
+    pub fn pacerModelCall(ctx: *anyopaque, record: types.ModelCallRecord) anyerror!void {
+        try app_worker_runtime.writeModelCallNotice(ctx, App.pacerNotice, record);
+    }
+
+    fn pacerNotice(ctx: *anyopaque, notice: types.SemanticNotice) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        try self.writeDomainNotice(notice, true);
+    }
+
     pub fn pacerCallbacks(self: *App) assistant_pacer.TickCallbacks {
         return .{
             .emit_ctx = self,
             .emit_fn = App.pacerEmit,
             .finish_ctx = self,
             .finish_fn = App.pacerFinish,
+            .model_call_fn = App.pacerModelCall,
         };
     }
 
@@ -3739,6 +3762,7 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
 }
 
 pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) callconv(.c) c_int {
+    io_mod.reserveClosedStandardStreams();
     mainC(c_argc, c_argv, c_envp) catch return 1;
     return 0;
 }
@@ -5341,6 +5365,7 @@ test {
     _ = @import("ui/transcript/transcript_window_shell.zig");
     _ = @import("ui/transcript/transcript_window_runtime_tests.zig");
     _ = @import("ui/transcript/frozen_prefix.zig");
+    _ = @import("ui/assistant/pacer.zig");
     _ = @import("ui/render_engine/assistant_wrap.zig");
     _ = @import("ui/render_engine/transcript_blocks.zig");
     _ = @import("ui/render_engine/transcript_measure.zig");
@@ -5366,8 +5391,10 @@ test {
     _ = @import("builtins/gateway.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
+    _ = @import("core/output/full_transcript_metadata.zig");
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/shared/gateway_error_format.zig");
+    _ = @import("core/shared/history_range.zig");
     _ = @import("core/cli/doctor_runtime.zig");
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/chatgpt_oauth.zig");
@@ -5379,6 +5406,7 @@ test {
     _ = @import("core/auth/grok_session.zig");
     _ = @import("core/auth/grok_oauth.zig");
     _ = @import("gateway/xai_grok_models.zig");
+    _ = @import("gateway/provider_versions.zig");
     _ = @import("gateway/xai_grok.zig");
     _ = @import("gateway/xai_grok_permission_reviewer.zig");
     _ = credentials;
@@ -5568,6 +5596,47 @@ test "the busiest agent wins herdr's state: an approval over work, work over idl
     app.instances.first_open = false;
     try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
     app.main_agent.worker.worker_processing = false;
+}
+
+test "an upgrade sees the agents its restart would stop, but not the one on screen" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const Busiest = app_agents_runtime.Busiest;
+    var buf: [32]u8 = undefined;
+    const reviewer = try addTestChildAgent(&app, "reviewer");
+    try std.testing.expect(runtime.busyAgentElsewhere(&app, &buf) == null);
+
+    // Main is on screen, so the upgrade's own checks cover its turn.
+    app.main_agent.worker.worker_processing = true;
+    try std.testing.expect(runtime.busyAgentElsewhere(&app, &buf) == null);
+    app.main_agent.worker.worker_processing = false;
+
+    reviewer.agent.worker.worker_processing = true;
+    const working = runtime.busyAgentElsewhere(&app, &buf).?;
+    try std.testing.expectEqualStrings("reviewer", working.name);
+    try std.testing.expectEqual(Busiest.working, working.doing);
+    reviewer.agent.worker.worker_processing = false;
+
+    try std.testing.expect(try reviewer.agent.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
+    try std.testing.expectEqual(Busiest.needs_approval, runtime.busyAgentElsewhere(&app, &buf).?.doing);
+    reviewer.agent.approval_prompt.clear(alloc);
+
+    // On the reviewer's screen, main's turn counts and the reviewer's own
+    // does not.
+    app.agent_on_screen = reviewer;
+    defer app.agent_on_screen = null;
+    reviewer.agent.worker.worker_processing = true;
+    try std.testing.expect(runtime.busyAgentElsewhere(&app, &buf) == null);
+    app.main_agent.worker.worker_processing = true;
+    try std.testing.expectEqualStrings("main", runtime.busyAgentElsewhere(&app, &buf).?.name);
+    app.main_agent.worker.worker_processing = false;
+    reviewer.agent.worker.worker_processing = false;
 }
 
 fn addTestChildAgent(app: *App, id: []const u8) !*app_agents_runtime.ChildAgent {

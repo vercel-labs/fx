@@ -3081,7 +3081,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
 /// The selected model's capabilities from `provider`'s catalog, loading it
 /// first if needed. A first load whose request cannot connect gives up after
-/// `gateway_provider.catalog_first_load_wait_ms`, as `fx ask`'s does, so a
+/// `gateway_provider.catalog_connect_wait_ms`, as `fx ask`'s does, so a
 /// dead network doesn't hold up the reply for the 20 to 30 seconds its DNS
 /// lookup or connect takes to fail (`CapabilityResolver.resolveWithin`).
 fn resolveSelectedModelCapabilities(
@@ -3107,7 +3107,7 @@ fn resolveSelectedModelCapabilities(
         },
         state.selected_model,
         state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
-        gateway_provider.catalog_first_load_wait_ms,
+        gateway_provider.catalog_connect_wait_ms,
     );
 }
 
@@ -3405,6 +3405,78 @@ test "ACP answers an ultrafast override without waiting out a model catalog that
     try std.testing.expect(elapsed_ms < 5_000);
     try std.testing.expect(capture.saw_catalog_failure);
     try std.testing.expect(!state.ultrafast_mode);
+}
+
+test "ACP keeps its model catalog when a due refresh cannot connect" {
+    // A Gateway catalog that answers, then goes behind a dead network: its
+    // request never connects, and it fails only when cancelled or once a
+    // stalled DNS lookup would give up.
+    const RefreshingCatalog = struct {
+        answers: std.atomic.Value(bool) = .init(true),
+        give_up_ms: i64 = 6_000,
+
+        fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.answers.load(.seq_cst)) {
+                if (input.connected) |connected| connected.store(true, .release);
+                var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+                errdefer model_catalog.freeModelCatalog(alloc, &entries);
+                const id = try alloc.dupe(u8, "openai/gpt-5.5");
+                errdefer alloc.free(id);
+                const model_type = try alloc.dupe(u8, "language");
+                errdefer alloc.free(model_type);
+                try entries.append(alloc, .{ .id = id, .model_type = model_type });
+                return .{ .catalog = entries };
+            }
+            const started_ms = model_catalog.clockMs();
+            while (model_catalog.clockMs() - started_ms < self.give_up_ms) {
+                if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) {
+                    return .{ .failure = .{ .category = .cancellation } };
+                };
+                io_mod.sleep(std.time.ns_per_ms);
+            }
+            return .{ .failure = .{ .category = .transport } };
+        }
+    };
+    var catalog = RefreshingCatalog{};
+    var model = "openai/gpt-5.5".*;
+    var state = ServerState{
+        .alloc = std.testing.allocator,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.init(),
+        .selected_model = &model,
+    };
+    defer state.capability_resolver.deinit(state.alloc);
+    state.cfg.minimal_kernel = false;
+    state.cfg.auth_mode = .host_managed;
+    state.cfg.gateway_models_path = "/v1/models";
+    state.cfg.provider_set = @import("../core/gateway/provider_set.zig").gateway_only(.{
+        .model_catalog = .{
+            .context = &catalog,
+            .fetch_fn = RefreshingCatalog.fetch,
+            .reports_connection = true,
+            .refresh_interval_ms = 60_000,
+        },
+    });
+    var active: ActiveSessionState = undefined;
+    active.provider = .gateway;
+    state.active_session = active;
+
+    try refreshModelCatalogForOptions(&state);
+    try std.testing.expectEqual(@as(usize, 1), state.capability_resolver.catalogEntries().?.len);
+
+    // The refresh interval passes while the network is down.
+    state.capability_resolver.last_attempt_ms -= 60_000;
+    catalog.answers.store(false, .seq_cst);
+    const started_ms = model_catalog.clockMs();
+    try refreshModelCatalogForOptions(&state);
+    const elapsed_ms = model_catalog.clockMs() - started_ms;
+
+    // The refresh fails as on any catalog outage, after the wait for its
+    // connection rather than after the lookup gives up, and the models the
+    // catalog already listed stay in use.
+    try std.testing.expect(elapsed_ms < 5_000);
+    try std.testing.expectEqualStrings("openai/gpt-5.5", state.capability_resolver.catalogEntries().?[0].id);
 }
 
 fn handleCancel(state: *ServerState, notify_client: bool) void {
@@ -3812,6 +3884,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
+/// Loads the catalog when it is due, before a reply that lists its models. A
+/// due load whose request cannot connect gives up after
+/// `gateway_provider.catalog_connect_wait_ms` and keeps the catalog fx
+/// already has (`CapabilityResolver.refreshWithin`), so a dead network does
+/// not hold up the reply, or the prompt sent after it, for the 20 to 30
+/// seconds its DNS lookup or connect takes to fail.
 pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
     if (comptime host_target.is_wasm) return;
     if (state.cfg.minimal_kernel) return;
@@ -3820,7 +3898,7 @@ pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
     std.debug.assert(state.active_prompt == null);
     // Restoring the same session can leave its previous cancellation flag set.
     var cancel_flag = std.atomic.Value(bool).init(false);
-    try state.capability_resolver.refreshIfDue(state.alloc, provider, .{
+    try state.capability_resolver.refreshWithin(state.alloc, provider, .{
         .access = if (state.cfg.auth_mode == .host_managed)
             .host_managed
         else
@@ -3832,7 +3910,7 @@ pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
             ),
         .endpoint = state.cfg.gateway_models_path,
         .cancel_flag = &cancel_flag,
-    });
+    }, gateway_provider.catalog_connect_wait_ms);
 }
 
 fn commitActiveSessionProvider(

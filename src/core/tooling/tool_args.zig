@@ -62,6 +62,18 @@ pub fn isNullPlaceholderText(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, text, &std.ascii.whitespace), "null");
 }
 
+/// A known field set to an empty string or false asks for nothing, so for an
+/// action that does not take the field it means the same as leaving it out.
+/// Some models fill every advertised field this way. Any other value can carry
+/// intent, so decoders still check it.
+pub fn isEmptyArgumentValue(value: std.json.Value) bool {
+    return switch (value) {
+        .bool => |flag| !flag,
+        .string => |text| text.len == 0,
+        else => false,
+    };
+}
+
 /// Reads an optional string argument from a schema whose unused fields arrive as
 /// nulls, so textual null placeholders read as absent instead of as a value.
 pub fn nullablePlaceholderStringArg(args: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -210,6 +222,21 @@ test "null placeholder reads treat textual nulls as absent" {
     try std.testing.expectEqualStrings("echo null", nullablePlaceholderStringArg(args, "command").?);
     try std.testing.expectEqualStrings("nullify", nullablePlaceholderStringArg(args, "dir").?);
     try std.testing.expectEqualStrings("null", optionalStringArg(args, "cwd").?);
+}
+
+test "only an empty string or false counts as an empty argument value" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const args = try parseToolArgsObject(
+        arena_state.allocator(),
+        "{\"empty\":\"\",\"off\":false,\"space\":\" \",\"on\":true,\"zero\":0,\"none\":null,\"list\":[],\"object\":{}}",
+    );
+
+    try std.testing.expect(isEmptyArgumentValue(args.get("empty").?));
+    try std.testing.expect(isEmptyArgumentValue(args.get("off").?));
+    for ([_][]const u8{ "space", "on", "zero", "none", "list", "object" }) |name| {
+        try std.testing.expect(!isEmptyArgumentValue(args.get(name).?));
+    }
 }
 
 test "composite object normalization preserves objects and decodes JSON strings" {

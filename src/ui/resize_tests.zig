@@ -4748,8 +4748,9 @@ test "runtime decomposition preserves command output state and replaceable paint
     try h.flush();
 
     try expectGridContains(&h, "Tests passed");
-    try expectGridContains(&h, "│ visible");
-    try expectGridContains(&h, "│ hidden");
+    // Ctrl+O shows output under the tool at the detail indent, no rail.
+    try expectGridContains(&h, "    visible");
+    try expectGridContains(&h, "    hidden");
     try expectGridNotContains(&h, "command lines folded");
 
     try h.driveResize(72, 24, 4, false);
@@ -4759,8 +4760,9 @@ test "runtime decomposition preserves command output state and replaceable paint
     try h.flush();
 
     try expectGridContains(&h, "Tests passed");
-    try expectGridContains(&h, "│ visible");
-    try expectGridContains(&h, "│ hidden");
+    // Ctrl+O shows output under the tool at the detail indent, no rail.
+    try expectGridContains(&h, "    visible");
+    try expectGridContains(&h, "    hidden");
     try expectGridNotContains(&h, "command lines folded");
 
     try std.testing.expect(try h.shell.setTranscriptPresentationDepth(h.alloc, .inline_mode));

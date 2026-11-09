@@ -180,7 +180,7 @@ test "current composer suppresses top chrome" {
 }
 
 fn plannerFooterReservedBaseRows(input: FooterPlannerInput) u16 {
-    return footer_layout.reservedBaseRows(input.input_visible, input.composer_top_chrome_rows);
+    return footer_layout.surfaceBaseRows(input.ctx.transcript_depth.active(), input.input_visible, input.composer_top_chrome_rows);
 }
 
 fn maxFooterTopForExtra(shell: *const TranscriptRuntime, input: FooterPlannerInput, extra: u16) u16 {
@@ -1053,49 +1053,27 @@ fn composeTranscriptViewerFooterFrame(
             // fits 80 columns.
             "part of older history couldn't be read · fx doctor · esc close"
         else
-            "full detail · ctrl+o close · pgup/pgdn scroll · esc close",
+            "esc close · pgup/pgdn scroll",
         .inline_mode => unreachable,
     };
 
-    var navigation_row: std.ArrayList(u8) = .empty;
-    try navigation_row.appendSlice(alloc, user_message_card.promptMarkerStyle());
-    try row_text.appendClipped(alloc, &navigation_row, "┃", width);
-    try navigation_row.appendSlice(alloc, ui_render.reset_style);
-    if (width > 1) {
-        try navigation_row.append(alloc, ' ');
-        try navigation_row.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendSingleLineEllipsized(alloc, &navigation_row, navigation, width - 2);
-        try navigation_row.appendSlice(alloc, ui_render.reset_style);
+    // The footer is the keys alone, on the bottom row, under the
+    // transcript's own indent, gray, with no bar: the bar belongs to the
+    // composer and to prompts. An armed Ctrl+C says so in their place.
+    const keys = if (input.ctx.ctrl_c_pending) "press ctrl+c again to exit" else navigation;
+    var keys_row: std.ArrayList(u8) = .empty;
+    if (width > 2) {
+        try keys_row.appendSlice(alloc, "  ");
+        try keys_row.appendSlice(alloc, ui_render.statusline_style);
+        try row_text.appendSingleLineEllipsized(alloc, &keys_row, keys, width - 2);
+        try keys_row.appendSlice(alloc, ui_render.reset_style);
     }
     try pushFooterBandRow(
         alloc,
         &frame,
         plan,
-        plan.footer.top_divider,
-        &navigation_row,
-    );
-
-    var gap_row: std.ArrayList(u8) = .empty;
-    try pushFooterBandRow(
-        alloc,
-        &frame,
-        plan,
-        plan.footer.bottom_divider,
-        &gap_row,
-    );
-
-    var status_row = try input_presentation.composeHintRow(
-        alloc,
-        false,
-        input.ctx,
-        width,
-    );
-    try pushFooterBandRow(
-        alloc,
-        &frame,
-        plan,
         plan.footer.hint,
-        &status_row,
+        &keys_row,
     );
 
     frame.cursor = .{ .row = plan.footer.hint, .col = 1 };
@@ -1306,7 +1284,7 @@ fn expectFrameCellForeground(frame: *const footer_viewport.ComposedFooterFrame, 
     return error.TestUnexpectedResult;
 }
 
-test "transcript viewer footer keeps navigation blank row and aligns main status" {
+test "transcript viewer footer is its keys alone on one row" {
     const alloc = std.testing.allocator;
     var input = InputRuntime{};
     defer input.deinit(alloc);
@@ -1328,7 +1306,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
     defer shell.deinit(alloc);
     var ctx = testContext(&input);
     ctx.transcript_depth = .full;
-    const planner_input: FooterPlannerInput = .{
+    var planner_input: FooterPlannerInput = .{
         .active_label = null,
         .ctx = ctx,
         .place_mid_line_active = false,
@@ -1337,50 +1315,34 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
         .composer_top_chrome_rows = 0,
         .picker_rows = 0,
         .banner_active = false,
+        .allocated_rows = footer_layout.transcript_viewer_rows,
     };
     const frame_plan = planFooterPaint(&shell, planner_input);
+    try std.testing.expectEqual(@as(u16, 1), frame_plan.paint.footer.total_rows);
     var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
     defer frame.deinit(alloc);
 
-    try expectFrameRowTextTrimmed(
-        &frame,
-        frame_plan.paint.footer.top_divider,
-        shell.layout.cols,
-        "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close",
-    );
-    try expectFrameRowTextTrimmed(
-        &frame,
-        frame_plan.paint.footer.bottom_divider,
-        shell.layout.cols,
-        "",
-    );
+    // The keys take the status row's place; the mode and model stay off it.
+    try std.testing.expectEqual(@as(usize, 1), frame.rows.items.len);
     try expectFrameRowTextTrimmed(
         &frame,
         frame_plan.paint.footer.hint,
         shell.layout.cols,
-        "ask · gpt-5.1",
+        "  esc close · pgup/pgdn scroll",
     );
     try std.testing.expect(!frame.cursor_visible);
 
-    ctx.transcript_depth = .full;
-    const full_input = FooterPlannerInput{
-        .active_label = null,
-        .ctx = ctx,
-        .place_mid_line_active = false,
-        .input_extra = 0,
-        .input_visible = false,
-        .composer_top_chrome_rows = 0,
-        .picker_rows = 0,
-        .banner_active = false,
-    };
-    const full_plan = planFooterPaint(&shell, full_input);
-    var full_frame = try composeFooterFrame(alloc, &shell, full_input, full_plan.paint);
-    defer full_frame.deinit(alloc);
+    // An armed Ctrl+C says so on that row instead.
+    planner_input.ctx.ctrl_c_pending = true;
+    const armed_plan = planFooterPaint(&shell, planner_input);
+    var armed_frame = try composeFooterFrame(alloc, &shell, planner_input, armed_plan.paint);
+    defer armed_frame.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), armed_frame.rows.items.len);
     try expectFrameRowTextTrimmed(
-        &full_frame,
-        full_plan.paint.footer.top_divider,
+        &armed_frame,
+        armed_plan.paint.footer.hint,
         shell.layout.cols,
-        "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close",
+        "  press ctrl+c again to exit",
     );
 }
 
@@ -1415,20 +1377,21 @@ test "transcript viewer footer says when older history could not load or is dama
         .composer_top_chrome_rows = 0,
         .picker_rows = 0,
         .banner_active = false,
+        .allocated_rows = footer_layout.transcript_viewer_rows,
     };
     for ([_]struct { failed: bool, damaged: bool, text: []const u8 }{
-        .{ .failed = true, .damaged = false, .text = "┃ couldn't load older history · pgup to retry · esc close" },
+        .{ .failed = true, .damaged = false, .text = "  couldn't load older history · pgup to retry · esc close" },
         // A failed read says to retry even when an earlier read hit damage.
-        .{ .failed = true, .damaged = true, .text = "┃ couldn't load older history · pgup to retry · esc close" },
-        .{ .failed = false, .damaged = true, .text = "┃ part of older history couldn't be read · fx doctor · esc close" },
-        .{ .failed = false, .damaged = false, .text = "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close" },
+        .{ .failed = true, .damaged = true, .text = "  couldn't load older history · pgup to retry · esc close" },
+        .{ .failed = false, .damaged = true, .text = "  part of older history couldn't be read · fx doctor · esc close" },
+        .{ .failed = false, .damaged = false, .text = "  esc close · pgup/pgdn scroll" },
     }) |case| {
         shell.transcript_archive_failed = case.failed;
         shell.transcript_archive_damaged = case.damaged;
         const frame_plan = planFooterPaint(&shell, planner_input);
         var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
         defer frame.deinit(alloc);
-        try expectFrameRowTextTrimmed(&frame, frame_plan.paint.footer.top_divider, shell.layout.cols, case.text);
+        try expectFrameRowTextTrimmed(&frame, frame_plan.paint.footer.hint, shell.layout.cols, case.text);
     }
 }
 
