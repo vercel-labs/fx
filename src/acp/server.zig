@@ -1483,8 +1483,15 @@ pub fn beginPermissionRequest(state: *ServerState) ?u64 {
     return beginOutboundRequest(state, .permission) catch null;
 }
 
-pub fn awaitPermissionDecision(state: *ServerState, id: u64) types.ToolPermissionDecision {
-    const response = awaitOutboundResponse(state, id, .permission) orelse return .deny;
+/// The parent's own wait for the client's answer to permission request `id`.
+/// A request no longer in the registry settled nothing and nobody denied it,
+/// so the wait fails with `error.PermissionPromptClosed`, as a subagent's wait
+/// does (`tests/tla/acp/AcpChildApproval.tla` ParentReadsTrue).
+pub fn awaitPermissionDecision(state: *ServerState, id: u64) error{PermissionPromptClosed}!types.ToolPermissionDecision {
+    const response = awaitOutboundResponse(state, id, .permission) orelse {
+        debug_trace.logf("acp", "parent permission request gone id={d}", .{id});
+        return error.PermissionPromptClosed;
+    };
     return takePermissionDecision(state.alloc, id, response);
 }
 
@@ -4827,14 +4834,14 @@ test "ACP outbound waiters resolve to deny on cancellation" {
     const concurrent = beginPermissionRequest(&state) orelse return error.TestExpectedEqual;
 
     cancelPendingOutbound(&state, false);
-    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, id));
-    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, concurrent));
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, try awaitPermissionDecision(&state, id));
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, try awaitPermissionDecision(&state, concurrent));
     try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
 
     const second = beginPermissionRequest(&state) orelse return error.TestExpectedEqual;
     try std.testing.expect(second != id);
     cancelPermissionRequest(&state, second);
-    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, second));
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, try awaitPermissionDecision(&state, second));
     try std.testing.expect(capture.saw_request_cancellation);
 }
 
@@ -4873,12 +4880,12 @@ test "closing the subagent gate cancels subagent requests and no other kind's" {
     closeSubagentAsks(&state, false, "Cancelled");
     try std.testing.expect(!state.subagent_asks_open);
     try std.testing.expectError(error.PromptClosed, beginSubagentPermissionRequest(&state));
-    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, subagent));
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, try awaitPermissionDecision(&state, subagent));
     try std.testing.expect(state.pending_outbound.getPtr(own).?.response == null);
 
     // A session/cancel cancels every kind.
     cancelPendingOutbound(&state, false);
-    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, own));
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, try awaitPermissionDecision(&state, own));
     try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
 }
 
@@ -4910,7 +4917,7 @@ test "a request cancelled before it was written is withdrawn again after the wri
     withdrawIfCancelled(&state, id);
     try std.testing.expectEqual(@as(usize, 2), capture.withdrawals);
     // A request fx has forgotten is not withdrawn again.
-    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, id));
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, try awaitPermissionDecision(&state, id));
     withdrawIfCancelled(&state, id);
     try std.testing.expectEqual(@as(usize, 2), capture.withdrawals);
 }
@@ -5093,6 +5100,37 @@ test "a subagent's wait that the prompt's close or its stop ended says which" {
         .result_raw = "{\"outcome\":{\"outcome\":\"cancelled\"}}",
     });
     try std.testing.expectEqual(types.ToolPermissionDecision.deny, try awaitPermissionDecisionOrStop(&state, refused, &no_stop));
+    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
+}
+
+test "the parent's own wait for a request gone from the registry is no denial" {
+    const alloc = std.testing.allocator;
+    var state = ServerState{ .alloc = alloc, .cfg = undefined, .writer = jsonrpc.Writer.init() };
+    defer state.pending_outbound.deinit(alloc);
+
+    // No entry: nothing settled the request, and nobody denied it. The wait
+    // refuses as closed, as a subagent's wait does.
+    try std.testing.expectError(error.PermissionPromptClosed, awaitPermissionDecision(&state, 9999));
+
+    // An entry of another kind is not this request's: it stays where it is.
+    const foreign = (try beginOutboundRequest(&state, .elicitation)) orelse return error.TestExpectedEqual;
+    try std.testing.expectError(error.PermissionPromptClosed, awaitPermissionDecision(&state, foreign));
+    try std.testing.expectEqual(@as(usize, 1), state.pending_outbound.count());
+    discardOutboundRequest(&state, foreign);
+
+    // A settled request keeps its decisions: only an allow allows.
+    const allowed = beginPermissionRequest(&state) orelse return error.TestExpectedEqual;
+    handleClientResponse(&state, alloc, &.{
+        .id = .{ .integer = @intCast(allowed) },
+        .result_raw = "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_once\"}}",
+    });
+    try std.testing.expectEqual(types.ToolPermissionDecision.once, try awaitPermissionDecision(&state, allowed));
+    const refused = beginPermissionRequest(&state) orelse return error.TestExpectedEqual;
+    handleClientResponse(&state, alloc, &.{
+        .id = .{ .integer = @intCast(refused) },
+        .result_raw = "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"reject_once\"}}",
+    });
+    try std.testing.expectEqual(types.ToolPermissionDecision.deny, try awaitPermissionDecision(&state, refused));
     try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
 }
 

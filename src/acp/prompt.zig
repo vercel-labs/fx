@@ -2654,7 +2654,9 @@ fn requestAcpPermission(
         server.beginPermissionRequest(ctx.state) orelse return error.PermissionRequestAlreadyPending;
     errdefer {
         server.cancelPermissionRequest(ctx.state, request_id);
-        _ = server.awaitPermissionDecision(ctx.state, request_id);
+        // Drains the cancelled entry. Its decision is moot, and an entry that
+        // is gone was traced where the wait found it.
+        _ = server.awaitPermissionDecision(ctx.state, request_id) catch .deny;
     }
 
     var pending_arena = std.heap.ArenaAllocator.init(alloc);
@@ -2705,7 +2707,7 @@ fn requestAcpPermission(
     const decision = if (ctx.subagent) |asker|
         try server.awaitPermissionDecisionOrStop(ctx.state, request_id, asker.stop)
     else
-        server.awaitPermissionDecision(ctx.state, request_id);
+        try server.awaitPermissionDecision(ctx.state, request_id);
     return permission_request.OwnedPermissionResponse.init(alloc, decision, null);
 }
 
