@@ -19,6 +19,17 @@ pub inline fn hasAgentField(comptime Host: type, comptime name: []const u8) bool
     return @hasField(@FieldType(Host, "main_agent"), name);
 }
 
+/// Whether `agent`'s conversation has nothing in it yet: no turn in its
+/// history, no turn running, and no prompt on its way. A resumed session
+/// restores its history, so it is not empty. Main loop only, which is where
+/// history turns are appended.
+pub fn conversationIsEmpty(agent: *const Agent) bool {
+    return agent.session.historyLen() == 0 and
+        !agent.stream.active and
+        agent.submission.pending == null and
+        agent.submission.launch_prompt == null;
+}
+
 threadlocal var on_loop_thread: bool = false;
 var loop_started = std.atomic.Value(bool).init(false);
 
@@ -78,6 +89,22 @@ pub fn screenAgentOf(app: anytype) @TypeOf(&app.main_agent) {
 test {
     _ = @import("agent.zig");
     _ = @import("child_run.zig");
+}
+
+test "a conversation is empty until a prompt is on its way or a turn runs" {
+    var agent: Agent = .{};
+    try std.testing.expect(conversationIsEmpty(&agent));
+
+    agent.stream.active = true;
+    try std.testing.expect(!conversationIsEmpty(&agent));
+    agent.stream.active = false;
+
+    var launch_prompt = "hello".*;
+    agent.submission.launch_prompt = &launch_prompt;
+    try std.testing.expect(!conversationIsEmpty(&agent));
+    agent.submission.launch_prompt = null;
+
+    try std.testing.expect(conversationIsEmpty(&agent));
 }
 
 test "an agent's totals are stored, loaded, and added to saturating" {

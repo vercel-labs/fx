@@ -462,7 +462,11 @@ const App = struct {
     }
 
     pub fn slashRegistry(self: *const Self) command_specs.SlashRegistry {
-        var registry = builtin_commands.slash_registry;
+        // A subagent's screen refuses `/resume`, so only an instance's empty
+        // session offers it first.
+        const screen_agent = agents.screenAgentOf(self);
+        const empty_session = screen_agent.role == .instance and agents.conversationIsEmpty(screen_agent);
+        var registry = builtin_commands.slashRegistryFor(empty_session);
         registry.arguments = self.mcp.host_completion;
         return registry;
     }
