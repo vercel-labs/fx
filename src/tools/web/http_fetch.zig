@@ -566,6 +566,7 @@ fn isRetryableConnectError(err: anyerror) bool {
 fn connectDefault(_: *anyopaque, alloc: Allocator, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
     const effective = normalizedOptions(options);
     var tunnel: ProxyTunnel = undefined;
+    var via_proxy = false;
     const scheme: net_proxy.Scheme = switch (target.url.scheme) {
         .http => .http,
         .https => .https,
@@ -574,6 +575,7 @@ fn connectDefault(_: *anyopaque, alloc: Allocator, target: PinnedTarget, options
         .direct => .{ .ctx = @ptrCast(&default_connector_ctx), .connect_fn = connectDefaultDialer },
         .tunnel => |proxy| blk: {
             tunnel = .{ .alloc = alloc, .proxy = proxy, .host = target.url.canonical_host };
+            via_proxy = true;
             break :blk .{ .ctx = @ptrCast(&tunnel), .connect_fn = connectThroughProxy };
         },
         .refuse => |refusal| {
@@ -586,6 +588,14 @@ fn connectDefault(_: *anyopaque, alloc: Allocator, target: PinnedTarget, options
     };
     const fd = connectAdmitted(target.admitted_addresses, effective, dialer) catch |err| {
         traceFailure(.connect, err);
+        // A dial through a proxy ends only at the proxy (connectThroughProxy
+        // returns a socket once the tunnel is open), and holds the sentence for
+        // it. The error that reaches the model must be one `takeRequestFailure`
+        // accepts, whatever name the platform gave the failed step: macOS polls
+        // a refused connect as UnexpectedClose, and a proxy host that does not
+        // resolve ends in a lookup error everywhere (`tests/tla/net_proxy/NetProxyCallers.tla`
+        // FetchNamesProxy). The retry decisions above were made on the raw names.
+        if (via_proxy and err != error.Canceled and err != error.Cancelled) return net_proxy.proxyFailureError(err);
         return err;
     };
     defer closeFd(fd);
@@ -4313,6 +4323,124 @@ test "web_fetch names the proxy when it refuses CONNECT" {
     var expected_buf: [160]u8 = undefined;
     const expected = try std.mem.print(&expected_buf, "proxy 127.0.0.1:{d} refused CONNECT to 93.184.216.34:443: 407 Proxy Authentication Required", .{proxy.server.socket.address.getPort()});
     try std.testing.expectEqualStrings(expected, net_proxy_io.takeRequestFailure(error.AccessDenied, &buf).?);
+}
+
+/// A loopback port nothing listens on: a proxy that is down. macOS polls a
+/// refused non-blocking connect as HUP alone, which the dialer reads as
+/// error.UnexpectedClose; Linux reads the refusal itself.
+fn closedLoopbackPort() !u16 {
+    const io = std.testing.io;
+    const loopback: IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try loopback.listen(io, .{ .reuse_address = true });
+    const port = listener.socket.address.getPort();
+    listener.deinit(io);
+    return port;
+}
+
+/// The error a fetch ends with, or null when it succeeded.
+fn failedFetchError(alloc: Allocator, target: url_policy.ValidatedUrl, options: FetchOptions, transport: Transport) ?anyerror {
+    if (fetch(alloc, target, options, transport)) |result| {
+        var owned = result;
+        owned.deinit(alloc);
+        return null;
+    } else |err| return err;
+}
+
+/// A dial that failed at the proxy ends with an error `takeRequestFailure`
+/// accepts, and the sentence it then gives names the proxy. Returns the
+/// sentence, in `buf`.
+fn proxySentence(err: anyerror, proxy_port: u16, buf: []u8) ![]const u8 {
+    try std.testing.expect(net_proxy.isProxyFailureError(err));
+    var prefix_buf: [96]u8 = undefined;
+    const prefix = try std.mem.print(&prefix_buf, "could not connect to proxy 127.0.0.1:{d} (", .{proxy_port});
+    const shown = net_proxy_io.takeRequestFailure(err, buf) orelse return error.TestExpectedProxySentence;
+    try std.testing.expect(std.mem.startsWith(u8, shown, prefix));
+    return shown;
+}
+
+fn useDownProxy(url_buf: []u8, port: u16) !void {
+    net_proxy_io.clearRequestFailure();
+    net_proxy_io.useSnapshotForTest(TestProxyEnv{ .proxy = try std.mem.print(url_buf, "http://127.0.0.1:{d}", .{port}) });
+}
+
+test "web_fetch behind a proxy that is down names the proxy, whatever name the platform gives the refused connect" {
+    const alloc = std.testing.allocator;
+    const port = try closedLoopbackPort();
+    var url_buf: [48]u8 = undefined;
+    try useDownProxy(&url_buf, port);
+    defer net_proxy_io.resetSnapshotForTest();
+    defer net_proxy_io.clearRequestFailure();
+    var target = try url_policy.normalize(alloc, "https://public.example/docs");
+    defer target.deinit(alloc);
+    const transport = testTunnelTransport(.{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } });
+    var buf: [256]u8 = undefined;
+    _ = try proxySentence(failedFetchError(alloc, target, testTunnelOptions(), transport) orelse return error.TestExpectedFetchToFail, port, &buf);
+}
+
+test "web_fetch behind a proxy that is down keeps Canceled and Timeout as they are, and names no proxy for them" {
+    const alloc = std.testing.allocator;
+    const port = try closedLoopbackPort();
+    var url_buf: [48]u8 = undefined;
+    try useDownProxy(&url_buf, port);
+    defer net_proxy_io.resetSnapshotForTest();
+    defer net_proxy_io.clearRequestFailure();
+    var target = try url_policy.normalize(alloc, "https://public.example/docs");
+    defer target.deinit(alloc);
+    const transport = testTunnelTransport(.{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } });
+    var buf: [256]u8 = undefined;
+
+    // A cancel set before the dial.
+    var cancel: std.atomic.Value(bool) = .init(true);
+    const cancelled = failedFetchError(alloc, target, .{ .cancel_flag = &cancel, .deadline = testTunnelOptions().deadline }, transport) orelse return error.TestExpectedFetchToFail;
+    try std.testing.expect(cancelled == error.Canceled or cancelled == error.Cancelled);
+    try std.testing.expect(net_proxy_io.takeRequestFailure(cancelled, &buf) == null);
+
+    // A deadline already past when the dial starts: nothing was held for it.
+    const expired = failedFetchError(alloc, target, .{ .deadline = .{ .deadline_ms = monotonicMillis() - 1 } }, transport) orelse return error.TestExpectedFetchToFail;
+    try std.testing.expect(expired == error.Timeout);
+    try std.testing.expect(net_proxy_io.takeRequestFailure(expired, &buf) == null);
+}
+
+test "web_fetch dials a proxy that is down 3000 times with 256 open files allowed, names it every time, and leaks no socket" {
+    const alloc = std.testing.allocator;
+    // A socket a failed dial left open ends a later dial in ProcessFdQuotaExceeded
+    // within 256 dials, whatever limit the machine runs the tests under.
+    const old_limit = try std.posix.getrlimit(.NOFILE);
+    try std.posix.setrlimit(.NOFILE, .{ .cur = @min(old_limit.cur, 256), .max = old_limit.max });
+    defer std.posix.setrlimit(.NOFILE, old_limit) catch {};
+    const port = try closedLoopbackPort();
+    var url_buf: [48]u8 = undefined;
+    try useDownProxy(&url_buf, port);
+    defer net_proxy_io.resetSnapshotForTest();
+    defer net_proxy_io.clearRequestFailure();
+    var host = "public.example".*;
+    var path = "/docs".*;
+    var retrieval = "https://public.example/docs".*;
+    const admitted = [_]IpAddress{.{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 443 } }};
+    // The first sentence is the reference: a socket that leaks would turn the
+    // reason into a descriptor-limit one long before the 3000th dial.
+    var reference_buf: [256]u8 = undefined;
+    var reference_len: usize = 0;
+    for (0..3000) |index| {
+        net_proxy_io.clearRequestFailure();
+        const err = if (defaultTransport().connector.get(@ptrCast(&default_connector_ctx), alloc, .{
+            .url = .{ .scheme = .https, .canonical_host = &host, .port = 443, .explicit_port = null, .path_query = &path, .retrieval_url = &retrieval },
+            .admitted_addresses = &admitted,
+            .tls_server_name = "public.example",
+            .host_header = "public.example",
+        }, testTunnelOptions())) |response| {
+            var owned = response;
+            owned.deinit(alloc);
+            return error.TestExpectedDialToFail;
+        } else |e| e;
+        var buf: [256]u8 = undefined;
+        const shown = try proxySentence(err, port, &buf);
+        if (index == 0) {
+            reference_len = shown.len;
+            @memcpy(reference_buf[0..shown.len], shown);
+        }
+        try std.testing.expectEqualStrings(reference_buf[0..reference_len], shown);
+    }
 }
 
 test "web_fetch behind a proxy that never answers CONNECT ends at the hop deadline" {

@@ -18,6 +18,14 @@
 // proxy (NetProxyCallers.tla: a caller names the proxy for its own failure at
 // the proxy, and never otherwise).
 //
+// The fourth kind is web_fetch, which dials the proxy itself: a model call to
+// web_fetch behind a proxy that is down, a proxy host that never resolves, a
+// proxy that refuses CONNECT, and a relay that closes after the tunnel opens. The
+// driver reads whether the tool's error, in the model's next request, names the
+// proxy, and which error the dial returned, from the sentence fx traces for it
+// (the platform's own name: macOS polls a refused connect as HUP alone, which
+// web_fetch's dialer reads as error.UnexpectedClose).
+//
 // With --self-check every observation is also checked against two models of
 // older connectors. The connector as first written refuses interim heads, says
 // only that the network is down when it retries, keeps slices of the
@@ -25,7 +33,9 @@
 // notice puts the whole sentence into the retry notice, which leaves no room for
 // the wait when the sentence is long. A third model is fx before the callers took
 // the proxy's sentence, which shows fixed text for the version lookup and for
-// fx upgrade. Each must reject what the repaired fx did in every scenario where
+// fx upgrade. Two more models are web_fetch before its dial mapped every failure
+// to a name the claim lists, and the same with the list grown by the one name
+// macOS gave. Each must reject what the repaired fx did in every scenario where
 // the two differ, and accept the rest, so the check cannot pass for any fx.
 //
 // Everything is local: loopback proxies, a loopback provider, a fake AI Gateway,
@@ -55,10 +65,17 @@ const ENV_FIRST = {
   Guard: "\"none\"", BorrowHost: "TRUE", BorrowNoProxy: "TRUE", AcceptsUnderscore: "FALSE", AcceptsBang: "FALSE", NamesReasons: "FALSE",
 };
 
-/** The callers' design: the version lookup and fx upgrade take the proxy's sentence. */
-const CALLERS_DESIGN = { VersionClaims: "TRUE", UpgradeClaims: "TRUE", ClearsAtStart: "TRUE", NamesWithoutFailure: "FALSE" };
+/** The callers' design: the version lookup, fx upgrade, and web_fetch take the proxy's sentence. */
+const CALLERS_DESIGN = {
+  VersionClaims: "TRUE", UpgradeClaims: "TRUE", FetchStepNames: "TRUE", ListsUnexpectedClose: "FALSE",
+  ClearsAtStart: "TRUE", NamesWithoutFailure: "FALSE",
+};
 /** fx before they did: both show fixed text. */
 const CALLERS_HEAD = { ...CALLERS_DESIGN, VersionClaims: "FALSE", UpgradeClaims: "FALSE" };
+/** web_fetch before its dial mapped a failure at the proxy to a name the claim lists. */
+const CALLERS_FETCH_HEAD = { ...CALLERS_DESIGN, FetchStepNames: "FALSE" };
+/** The same, with the claim's list grown by error.UnexpectedClose: a fix by name. */
+const CALLERS_FETCH_BY_NAME = { ...CALLERS_FETCH_HEAD, ListsUnexpectedClose: "TRUE" };
 
 type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 type Run = { code: number | null; stdout: string; stderr: string; ms: number };
@@ -118,6 +135,27 @@ type CallerScenario = {
   /** Whether fx before the callers took the sentence showed the same text, so that model must accept the observation. */
   sameAsHead: boolean;
 };
+
+/** A web_fetch call, in NetProxyCallers.tla's words. */
+type FetchScenario = {
+  name: string;
+  cause: "at_proxy" | "elsewhere";
+  /** The proxy the run has: down, a name that never resolves, refusing CONNECT, or relaying to a server that closes. */
+  via: "down" | "unresolved" | "refuses" | "relay_closes";
+};
+
+const fetchScenarios: FetchScenario[] = [
+  { name: "web_fetch behind a proxy that is down", cause: "at_proxy", via: "down" },
+  { name: "web_fetch behind a proxy host that never resolves", cause: "at_proxy", via: "unresolved" },
+  { name: "web_fetch behind a proxy that refuses CONNECT", cause: "at_proxy", via: "refuses" },
+  { name: "web_fetch whose relay closes after the tunnel opens", cause: "elsewhere", via: "relay_closes" },
+];
+
+/** web_fetch's target: an address literal its public-address rule admits without DNS. */
+const FETCH_ADDRESS = "93.184.216.34";
+const FETCH_URL = `https://${FETCH_ADDRESS}/docs`;
+/** A proxy host that never resolves, with a port nothing needs to listen on. */
+const UNRESOLVED_PROXY = "never-resolves-proxy.invalid";
 
 const callerScenarios: CallerScenario[] = [
   { name: "a Grok version lookup behind a proxy that is down", caller: "version", proxy: "set", cause: "at_proxy", via: "down", sameAsHead: false },
@@ -238,7 +276,7 @@ const retryNotices = (stderr: string) =>
 
 type ConnObservation = { target: string; answer: string; phase: string; shown: string; notice: string };
 type EnvObservation = { cls: string; accepted: boolean; reason: string };
-type CallerObservation = { caller: string; proxy: string; cause: string; text: string };
+type CallerObservation = { caller: string; proxy: string; cause: string; name: string; text: string };
 
 async function observeConnection(root: string, scenario: Connection): Promise<{ observation: ConnObservation; evidence: string }> {
   const gateway = serveGateway();
@@ -370,12 +408,86 @@ async function observeCaller(root: string, scenario: CallerScenario): Promise<{ 
     // describes.
     const text = ended(run) && namesProxy ? "proxy" : ended(run) && fixed.includes(shown) ? "default" : "unread";
     return {
-      observation: { caller: scenario.caller, proxy: scenario.proxy, cause: scenario.cause, text },
+      observation: { caller: scenario.caller, proxy: scenario.proxy, cause: scenario.cause, name: "any", text },
       evidence: `exit ${run.code} after ${Math.round(run.ms)} ms; shown ${JSON.stringify(shown)}; stderr ${JSON.stringify(run.stderr.slice(-200))}`,
     };
   } finally {
     proxy?.close();
     server.stop();
+  }
+}
+
+/**
+ * A fake AI Gateway whose first completion is a web_fetch call and whose second
+ * ends the turn; `bodies` holds the requests, the second with the tool's result.
+ */
+function serveFetchGateway() {
+  const bodies: string[] = [];
+  const gateway = serveLocal(async (request, path) => {
+    if (path === "/coding-agent/v1/models") return Response.json({ data: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    if (request.method !== "POST") return new Response("not found", { status: 404 });
+    bodies.push(await request.text());
+    const events = bodies.length === 1
+      ? [{ type: "tool-call", toolCallId: "fetch_1", toolName: "web_fetch", input: { url: FETCH_URL } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } }]
+      : [{ type: "text-delta", id: "t", delta: "DONE_AFTER_FETCH" },
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: { inputTokens: { total: 3 }, outputTokens: { total: 2 } } }];
+    return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+  });
+  return { ...gateway, bodies, env: { FX_GATEWAY_BASE_URL: gateway.base, FX_GATEWAY_CHAT_URL: `${gateway.base}/v4/ai/language-model` } };
+}
+
+/** What the platform called the failed dial, read from the sentence fx traced for it. */
+function dialName(trace: string): string {
+  const failed = trace.split("\n").filter(line => line.includes("[net_proxy] result=failed"));
+  if (failed.length === 0) return "any";
+  const line = failed[failed.length - 1]!;
+  if (/proxy \S+ (refused|answered) CONNECT|did not answer CONNECT/.test(line)) return "answered";
+  if (/could not connect to proxy \S+ \(connection refused\)/.test(line)) return "refused";
+  if (/could not connect to proxy \S+ \(unexpected close\)/.test(line)) return "unexpected_close";
+  return "other";
+}
+
+async function observeFetch(root: string, scenario: FetchScenario): Promise<{ observation: CallerObservation; evidence: string }> {
+  const gateway = serveFetchGateway();
+  // The relay's far side takes a connection and closes it, so the TLS handshake fails after the tunnel opened.
+  const closer = net.createServer(socket => socket.destroy());
+  if (scenario.via === "relay_closes") await new Promise<void>(resolve => closer.listen(0, "127.0.0.1", resolve));
+  const dead = scenario.via === "down" ? await closedPort() : 0;
+  const proxy = scenario.via === "refuses" ? await startConnectProxy({ status: 407 })
+    : scenario.via === "relay_closes" ? await startConnectProxy({ routes: { [`${FETCH_ADDRESS}:443`]: (closer.address() as net.AddressInfo).port } })
+    : null;
+  const label = scenario.via === "unresolved" ? `${UNRESOLVED_PROXY}:3128` : `127.0.0.1:${proxy ? proxy.port : dead}`;
+  try {
+    const home = mkdtempSync(join(root, "fetch-"));
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+      auto_upgrade: false,
+      permission: { web_fetch: { [`domain:${FETCH_ADDRESS}`]: "allow" } },
+    }), { mode: 0o600 });
+    const tracePath = join(home, "trace.log");
+    const env = environment(home, gateway.env, {
+      FX_MODEL: "openai/gpt-5",
+      HTTPS_PROXY: `http://${label}`,
+      FX_TRACE_LOG: tracePath,
+      FX_TRACE_SCOPES: "net_proxy",
+    });
+    const run = await runFx(env, null, 40_000, ["ask", "--auto", "--json", "--no-save", "Fetch the page."]);
+    const second = gateway.bodies[1] ?? "";
+    const trace = await Bun.file(tracePath).text().catch(() => "");
+    const names = second.includes(`proxy ${label}`);
+    // "proxy" when the tool's error names the proxy; "default" only when it is
+    // the tool's own transport error without it; anything else is not a run the
+    // model describes.
+    const text = run.code === 0 && names ? "proxy" : run.code === 0 && second.includes("web_fetch transport failed") ? "default" : "unread";
+    return {
+      observation: { caller: "fetch", proxy: "set", cause: scenario.cause, name: scenario.cause === "at_proxy" ? dialName(trace) : "any", text },
+      evidence: `exit ${run.code} after ${Math.round(run.ms)} ms; requests ${gateway.bodies.length}; tool error ${JSON.stringify(/web_fetch transport failed.{0,260}/.exec(second)?.[0] ?? "")}; trace ${JSON.stringify(trace.slice(-300))}; stderr ${JSON.stringify(run.stderr.slice(-200))}`,
+    };
+  } finally {
+    proxy?.close();
+    closer.close();
+    gateway.stop();
   }
 }
 
@@ -411,7 +523,7 @@ async function trace(dir: string, module: "NetProxyTrace" | "NetProxyEnvTrace" |
 const connRecord = (o: ConnObservation) =>
   `Observed == [target |-> ${quote(o.target)}, answer |-> ${quote(o.answer)}, phase |-> ${quote(o.phase)}, shown |-> ${quote(o.shown)}, notice |-> ${quote(o.notice)}]`;
 const callerRecord = (o: CallerObservation) =>
-  `ObservedCallers == [caller |-> ${quote(o.caller)}, proxy |-> ${quote(o.proxy)}, cause |-> ${quote(o.cause)}, text |-> ${quote(o.text)}]`;
+  `ObservedCallers == [caller |-> ${quote(o.caller)}, proxy |-> ${quote(o.proxy)}, cause |-> ${quote(o.cause)}, name |-> ${quote(o.name)}, text |-> ${quote(o.text)}]`;
 const envRecord = (o: EnvObservation) =>
   `ObservedEnv == [cls |-> ${quote(o.cls)}, accepted |-> ${o.accepted ? "TRUE" : "FALSE"}, reason |-> ${quote(o.reason)}]`;
 
@@ -472,6 +584,31 @@ export async function runBinaryScenarios(out: string, selfCheck: boolean): Promi
       const want: Verdict = scenario.sameAsHead ? "ACCEPTED" : "REJECTED";
       say(`  self-check: fx before the callers took the proxy's sentence ${head} (must be ${want})`);
       if (head !== want) ok = false;
+    }
+  }
+  for (const [index, scenario] of fetchScenarios.entries()) {
+    const { observation, evidence } = await observeFetch(root, scenario);
+    const dir = join(out, `binary-fetch-${index}`);
+    const verdict = await trace(join(dir, "design"), "NetProxyCallersTrace", "NetProxyCallersObserved", callerRecord(observation), CALLERS_DESIGN);
+    say(`binary ${scenario.name}: ${JSON.stringify(observation)} -> design ${verdict}`);
+    if (verdict !== "ACCEPTED") {
+      say(`  evidence: ${evidence}`);
+      ok = false;
+    }
+    if (selfCheck) {
+      // The run showed the sentence for a dial whose error the claim may not list. A
+      // model of web_fetch that returns the platform's name cannot produce that,
+      // and one with the list grown by UnexpectedClose cannot for any other name.
+      const listedHead = ["any", "answered", "refused"].includes(observation.name);
+      const head = await trace(join(dir, "head"), "NetProxyCallersTrace", "NetProxyCallersObserved", callerRecord(observation), CALLERS_FETCH_HEAD);
+      const wantHead: Verdict = listedHead ? "ACCEPTED" : "REJECTED";
+      say(`  self-check: web_fetch before its dial mapped a failure ${head} (must be ${wantHead})`);
+      if (head !== wantHead) ok = false;
+      const listedByName = listedHead || observation.name === "unexpected_close";
+      const byName = await trace(join(dir, "by-name"), "NetProxyCallersTrace", "NetProxyCallersObserved", callerRecord(observation), CALLERS_FETCH_BY_NAME);
+      const wantByName: Verdict = listedByName ? "ACCEPTED" : "REJECTED";
+      say(`  self-check: a fix that lists only UnexpectedClose ${byName} (must be ${wantByName})`);
+      if (byName !== wantByName) ok = false;
     }
   }
   return ok;

@@ -23,7 +23,7 @@ import { FX_BIN } from "../evals/eval-helpers";
 import { completion } from "./fixtures/chat-completions";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
 import { startConnectProxy } from "./fixtures/net-proxy/proxy";
-import { TmuxSession, fakeGatewayFinalText, fakeShellRun, startFakeGateway, tmuxAvailable } from "./tmux-helpers";
+import { TmuxSession, fakeGatewayFinalText, fakeGatewayToolCall, fakeShellRun, startFakeGateway, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 60_000;
 const TARGET = "proxy-target.test";
@@ -1020,4 +1020,96 @@ describe("net proxy failures in version lookups, fx upgrade, and reviewer traces
       gateway.stop();
     }
   }, 90_000);
+});
+
+/** web_fetch's target: an address literal its public-address rule admits without DNS. */
+const FETCH_ADDRESS = "93.184.216.34";
+
+/**
+ * Runs `fx ask` with a fake model that calls web_fetch on FETCH_ADDRESS, behind
+ * the proxy at `proxyUrl`, and returns the model's next request, which carries
+ * web_fetch's result. web_fetch dials the proxy itself, not through the process
+ * Io that model requests use.
+ */
+async function fetchBehind(proxyUrl: string): Promise<{ run: Run; toolResult: string; requests: number }> {
+  const gateway = startFakeGateway([
+    fakeGatewayToolCall("fetch_1", "web_fetch", { url: `https://${FETCH_ADDRESS}/docs` }),
+    fakeGatewayFinalText("DONE_AFTER_FETCH"),
+  ]);
+  const home = newHome("web-fetch");
+  try {
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+      auto_upgrade: false,
+      permission: { web_fetch: { [`domain:${FETCH_ADDRESS}`]: "allow" } },
+    }), { mode: 0o600 });
+    const run = await runFx(["ask", "--auto", "--json", "--no-save", "Fetch the page."], baseEnv(home, {
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_MODEL: "openai/gpt-5",
+      HTTPS_PROXY: proxyUrl,
+    }), { timeoutMs: 40_000 });
+    // Only the tool messages of the second request: the rest is the prompt and the tool list.
+    const second = gateway.requests[1]?.body ?? "";
+    let toolResult: string;
+    try {
+      toolResult = JSON.stringify((JSON.parse(second).prompt as Array<{ role: string }>).filter(message => message.role === "tool"));
+    } catch {
+      toolResult = second.slice(-2_000);
+    }
+    return { run, toolResult, requests: gateway.requests.length };
+  } finally {
+    gateway.stop();
+  }
+}
+
+describe("web_fetch behind a proxy fx cannot use names the proxy to the model", () => {
+  test("a proxy at a closed port is named, whatever name the platform gives the refused connect", async () => {
+    // macOS polls a refused non-blocking connect as HUP alone, which web_fetch's
+    // own dialer used to hand to the model as a bare UnexpectedClose.
+    const dead = await closedPort();
+    const { run, toolResult, requests } = await fetchBehind(`http://127.0.0.1:${dead}`);
+    expect(run.code, show(run)).toBe(0);
+    expect(requests, show(run)).toBe(2);
+    expect(toolResult, show(run)).toContain("web_fetch transport failed");
+    expect(toolResult, show(run)).toContain(`could not connect to proxy 127.0.0.1:${dead} (`);
+  }, TIMEOUT);
+
+  test("a proxy host that never resolves is named", async () => {
+    // The dialer's own error for a name that does not resolve is on no platform's list.
+    const { run, toolResult, requests } = await fetchBehind("http://never-resolves-proxy.invalid:3128");
+    expect(run.code, show(run)).toBe(0);
+    expect(requests, show(run)).toBe(2);
+    expect(toolResult, show(run)).toContain("could not connect to proxy never-resolves-proxy.invalid:3128 (");
+  }, TIMEOUT);
+
+  test("a proxy that answers 407 is named with its answer, and the CONNECT names the checked address", async () => {
+    const proxy = await startConnectProxy({ status: 407 });
+    try {
+      const { run, toolResult } = await fetchBehind(proxy.url());
+      expect(run.code, show(run)).toBe(0);
+      expect(toolResult, show(run)).toContain(`proxy 127.0.0.1:${proxy.port} refused CONNECT to ${FETCH_ADDRESS}:443: 407 Proxy Authentication Required`);
+      expect(proxy.log.map(entry => entry.requestLine)).toEqual([`CONNECT ${FETCH_ADDRESS}:443 HTTP/1.1`]);
+    } finally {
+      proxy.close();
+    }
+  }, TIMEOUT);
+
+  test("a relay that closes after the tunnel opens is not blamed on the proxy", async () => {
+    // The proxy did its part: the far side takes the connection and closes it,
+    // so TLS fails inside an open tunnel.
+    const closer = net.createServer(socket => socket.destroy());
+    await new Promise<void>(resolve => closer.listen(0, "127.0.0.1", resolve));
+    const proxy = await startConnectProxy({ routes: { [`${FETCH_ADDRESS}:443`]: (closer.address() as net.AddressInfo).port } });
+    try {
+      const { run, toolResult } = await fetchBehind(proxy.url());
+      expect(run.code, show(run)).toBe(0);
+      expect(proxy.log.map(entry => entry.requestLine), show(run)).toEqual([`CONNECT ${FETCH_ADDRESS}:443 HTTP/1.1`]);
+      expect(toolResult, show(run)).toContain("web_fetch transport failed");
+      expect(toolResult).not.toContain("could not connect to proxy");
+      expect(toolResult).not.toContain(`proxy 127.0.0.1:${proxy.port}`);
+    } finally {
+      proxy.close();
+      closer.close();
+    }
+  }, TIMEOUT);
 });

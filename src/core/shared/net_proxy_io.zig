@@ -332,11 +332,7 @@ fn connectIp(
     const stream = connectProxy(io, proxy, options) catch |err| {
         if (err == error.Canceled) return error.Canceled;
         recordFailure(io, unreachableProxyFailure(proxy, target.name(), target.port, err));
-        return switch (err) {
-            error.Canceled => unreachable,
-            error.ConnectionRefused, error.HostUnreachable, error.NetworkUnreachable, error.NetworkDown, error.Timeout, error.AccessDenied, error.ConnectionResetByPeer => |e| e,
-            else => error.HostUnreachable,
-        };
+        return net_proxy.proxyFailureError(err);
     };
     errdefer stream.close(io);
 

@@ -15,8 +15,8 @@ const IpAddress = std.Io.net.IpAddress;
 const HostName = std.Io.net.HostName;
 const basic = std.http.Client.basic_authorization;
 
-pub const max_no_proxy_entries = 1000;
-pub const max_answer_head_bytes = 8192;
+const max_no_proxy_entries = 1000;
+const max_answer_head_bytes = 8192;
 const max_proxy_url_bytes = 1024;
 /// Room for the NO_PROXY domains the snapshot copies out of the environment.
 /// An entry that does not fit counts as past the limit.
@@ -303,7 +303,7 @@ fn trimDot(name: []const u8) []const u8 {
     return if (name.len > 1 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
 }
 
-pub fn isLoopback(host: []const u8) bool {
+fn isLoopback(host: []const u8) bool {
     const name = trimDot(host);
     if (std.ascii.eqlIgnoreCase(name, "localhost")) return true;
     if (endsWithIgnoreCase(name, ".localhost")) return true;
@@ -532,13 +532,13 @@ pub const Failure = struct {
         return f.variable_buf[0..f.variable_len];
     }
 
-    pub fn targetIs(f: *const Failure, host: []const u8, port: u16) bool {
+    fn targetIs(f: *const Failure, host: []const u8, port: u16) bool {
         return f.target_port == port and std.ascii.eqlIgnoreCase(f.target(), host);
     }
 
     /// The sentence fx shows for the failure. It names the proxy and the
     /// reason and never the proxy's credentials.
-    pub fn write(f: *const Failure, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    fn write(f: *const Failure, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (f.kind) {
             .refused => {
                 try w.writeAll("proxy ");
@@ -719,6 +719,72 @@ pub fn isProxyFailureError(err: anyerror) bool {
     };
 }
 
+/// What a failure toward the proxy ends with: errors `isProxyFailureError` lists.
+const ProxyFailureError = error{
+    ConnectionRefused,
+    HostUnreachable,
+    NetworkUnreachable,
+    NetworkDown,
+    Timeout,
+    AccessDenied,
+    ConnectionResetByPeer,
+};
+
+/// The error a connection that failed at the proxy ends with, chosen by the
+/// step that failed and not by the name the platform gave the failure. macOS
+/// polls a refused non-blocking connect as HUP alone, which web_fetch's own
+/// dialer reads as error.UnexpectedClose, and a proxy host that does not
+/// resolve ends in a lookup error on every platform; neither name is one
+/// `isProxyFailureError` lists, so the request would drop the sentence it holds
+/// for the proxy (`tests/tla/net_proxy/NetProxyCallers.tla` FetchNamesProxy).
+/// A listed name passes unchanged and any other becomes HostUnreachable. A
+/// cancellation is not a failure of the proxy: callers keep it as it is.
+pub fn proxyFailureError(err: anyerror) ProxyFailureError {
+    return switch (err) {
+        error.ConnectionRefused,
+        error.HostUnreachable,
+        error.NetworkUnreachable,
+        error.NetworkDown,
+        error.Timeout,
+        error.AccessDenied,
+        error.ConnectionResetByPeer,
+        => |e| e,
+        else => error.HostUnreachable,
+    };
+}
+
+/// Names a dial toward the proxy can return, from each platform's connect and
+/// poll, the resolver, and the socket calls, for the tests and the fuzz oracle
+/// that check `proxyFailureError` maps every one to a listed name.
+const dial_error_names = [_]anyerror{
+    error.ConnectionRefused,
+    error.ConnectionResetByPeer,
+    error.NetworkUnreachable,
+    error.HostUnreachable,
+    error.NetworkDown,
+    error.Timeout,
+    error.AccessDenied,
+    error.UnexpectedClose,
+    error.ConnectionFailed,
+    error.UnknownHostName,
+    error.NameServerFailure,
+    error.NoAddressReturned,
+    error.SystemResources,
+    error.ProcessFdQuotaExceeded,
+    error.SystemFdQuotaExceeded,
+    error.AddressFamilyUnsupported,
+    error.SocketOpenFailed,
+    error.SocketOptionFailed,
+    error.InvalidDescriptor,
+    error.InputOutput,
+    error.BrokenPipe,
+    error.SocketUnconnected,
+    error.WriteFailed,
+    error.ReadFailed,
+    error.EndOfStream,
+    error.Unexpected,
+};
+
 /// What separates the parts of a status line, as src/core/recovery/recovery.zig
 /// writes them.
 const status_separator = " \u{b7} ";
@@ -769,7 +835,7 @@ pub fn statusWithProxy(out: []u8, status: []const u8, sentence: []const u8) []co
 /// failures for the requests that started later. Not thread-safe; the caller
 /// holds a lock.
 pub const FailureLog = struct {
-    pub const capacity = 32;
+    const capacity = 32;
 
     entries: [capacity]Entry = undefined,
     filled: usize = 0,
@@ -1084,6 +1150,29 @@ test "a failure names the proxy and the reason, and maps to an error fx acts on"
     try std.testing.expect(isProxyFailureError(error.ConnectionSetupTimedOut));
     try std.testing.expect(!isProxyFailureError(error.TlsInitializationFailed));
     try std.testing.expect(!isProxyFailureError(error.Cancelled));
+}
+
+test "a failure toward the proxy ends with a name the claim lists, whatever name the platform gave it" {
+    // The step decides, not the name: macOS polls a refused connect as
+    // UnexpectedClose and an unresolvable proxy host is a lookup error.
+    for (dial_error_names) |name| {
+        try std.testing.expect(isProxyFailureError(proxyFailureError(name)));
+    }
+    // A name the claim already lists passes unchanged.
+    for ([_]anyerror{
+        error.ConnectionRefused,
+        error.HostUnreachable,
+        error.NetworkUnreachable,
+        error.NetworkDown,
+        error.Timeout,
+        error.AccessDenied,
+        error.ConnectionResetByPeer,
+    }) |name| {
+        try std.testing.expect(proxyFailureError(name) == name);
+    }
+    // The names the platforms disagree on become one that retries like a refusal.
+    try std.testing.expect(proxyFailureError(error.UnexpectedClose) == error.HostUnreachable);
+    try std.testing.expect(proxyFailureError(error.UnknownHostName) == error.HostUnreachable);
 }
 
 test "a version lookup that failed at the proxy may claim its failure, and the lookup's other errors may not" {
@@ -1612,6 +1701,7 @@ fn fuzzEnvironment(_: void, smith: *std.testing.Smith) !void {
     const port = smith.value(u16);
     // Read after the others, so inputs saved before it still replay.
     const cgi = smith.value(bool);
+    const dial_error = dial_error_names[smith.value(u8) % dial_error_names.len];
     var s: Snapshot = undefined;
     setTest(&s, &.{ .{ "https_proxy", proxy }, .{ "no_proxy", no_proxy } });
     var text_buf: [1024]u8 = undefined;
@@ -1672,6 +1762,10 @@ fn fuzzEnvironment(_: void, smith: *std.testing.Smith) !void {
     const again = route(&s, host, port, .https);
     try std.testing.expectEqual(std.meta.activeTag(first), std.meta.activeTag(again));
     if (again == .tunnel) try std.testing.expectEqualStrings(kept_host, again.tunnel.host);
+
+    // A failure toward the proxy ends with a name the claim lists, whatever
+    // name the platform gave the dial.
+    try std.testing.expect(isProxyFailureError(proxyFailureError(dial_error)));
 
     // With REQUEST_METHOD set, an uppercase HTTP_PROXY alone proxies nothing.
     var cgi_env: Snapshot = undefined;

@@ -21,7 +21,11 @@
 // fx did against the design. It also runs a Grok client version lookup and
 // `fx upgrade` behind a proxy that is down, one that refuses CONNECT, one that
 // works while the server fails, and none, and has TLC check, against
-// tests/tla/net_proxy/NetProxyCallers.tla, which of them name the proxy.
+// tests/tla/net_proxy/NetProxyCallers.tla, which of them name the proxy. A
+// web_fetch call goes behind a proxy that is down, one whose host never
+// resolves, one that refuses CONNECT, and a relay that closes after the tunnel
+// opens, and TLC checks the same law with the error name the platform gave the
+// failed dial.
 //
 // Usage (from the repository root):
 //   bun tests/tla/drivers/net_proxy/driver.ts

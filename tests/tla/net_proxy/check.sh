@@ -44,21 +44,29 @@
 #
 # NetProxyCallers.tla, who names a proxy failure in the text it shows.
 # net-proxy-callers.cfg is the design and must pass: the model request, a Grok
-# version lookup, and a request of fx upgrade each name the proxy whose failure
-# ended them, and no caller names a proxy when none is set. The configs
-# without a mutation name are fx before the callers took the sentence, one law
-# each: error.ProviderVersionUnavailable is not an error the claim accepts, so
-# the version lookup shows fixed text (VersionNamesProxy); fx upgrade turns
-# every request error into fixed text (UpgradeNamesProxy).
+# version lookup, a request of fx upgrade, and a web_fetch call each name the
+# proxy whose failure ended them, and no caller names a proxy when none is set.
+# The configs without a mutation name are fx before the callers took the
+# sentence, one law each: error.ProviderVersionUnavailable is not an error the
+# claim accepts, so the version lookup shows fixed text (VersionNamesProxy); fx
+# upgrade turns every request error into fixed text (UpgradeNamesProxy);
+# web_fetch's own dialer returns the name the platform gave a failed dial, such
+# as error.UnexpectedClose, which macOS's poll answers a refused connect with, or
+# a lookup failure for a proxy host that does not resolve, and the claim lists
+# neither (FetchNamesProxy). The design maps every failure at the proxy to an
+# error the claim lists, by the step and not by the name.
 #
+#   no-step               web_fetch returns the platform's name for a failed dial  FetchNamesProxy
 #   mutation-stale        a request does not clear what an earlier one left      OwnFailureOnly
 #   mutation-fixed-text   a caller prints a proxy sentence with no proxy set     NoProxyKeepsDefault
+#   mutation-by-name      the claim's list grows by UnexpectedClose, the one name  FetchNamesProxy
+#                         macOS gave, and any other name still drops the sentence
 #
 # tests/tla/drivers/net_proxy/driver.ts walks net_proxy.zig along the first two
 # models' state graphs, and runs the built fx through a proxy that sends 102
 # before its 200, a proxy that is down, a proxy host with an underscore, a Grok
-# version lookup, and fx upgrade, with TLC checking what it saw against the
-# design.
+# version lookup, fx upgrade, and web_fetch, with TLC checking what it saw against
+# the design.
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 set -eu
@@ -90,6 +98,8 @@ NetProxyEnv net-proxy-env-mutation-accept-bang BadInputRefused
 NetProxyCallers net-proxy-callers -
 NetProxyCallers net-proxy-callers-no-version VersionNamesProxy
 NetProxyCallers net-proxy-callers-no-upgrade UpgradeNamesProxy
+NetProxyCallers net-proxy-callers-no-step FetchNamesProxy
 NetProxyCallers net-proxy-callers-mutation-stale OwnFailureOnly
 NetProxyCallers net-proxy-callers-mutation-fixed-text NoProxyKeepsDefault
+NetProxyCallers net-proxy-callers-mutation-by-name FetchNamesProxy
 VERDICTS
