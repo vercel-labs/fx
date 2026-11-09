@@ -773,7 +773,7 @@ test("wrapped semantic rows join descriptions across full-transcript pages", () 
     "  ├───────────┼────────┼─────────────────┤",
     `  │ VS15      │ ${vs15.symbol}      │ Text            │`,
     "",
-    "┃ full detail · ctrl+o close · pgup/pgdn …",
+    "  esc close · pgup/pgdn scroll",
     "",
     "  │           │        │ presentation    │",
     "  ├───────────┼────────┼─────────────────┤",
@@ -936,7 +936,7 @@ test.skipIf(!tmuxAvailable())(
         expectInternal(resumed);
 
         await active.sendKeys("C-o");
-        await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+        await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
         const full = await collectFullTranscriptPages(active, 40);
         expect(full).toContain("ARCHIVED_VISIBLE_REPLY");
         expect(full).toContain("VISIBLE_TOOL_RESULT");
@@ -1040,9 +1040,8 @@ test.skipIf(!tmuxAvailable())(
         await active.sendKeys("C-o");
         const full = await active.waitForPane(
           (pane) =>
-            pane.includes("full detail · ctrl+o close") &&
-            pane.includes("IST · Usage") &&
-            /\(↑\d+ ↓5\)/.test(pane),
+            pane.includes("esc close · pgup/pgdn scroll") &&
+            /Turn · .*\(↑\d+ ↓5\)/.test(pane),
           TIMEOUT,
         );
         expect(full).toContain(prompt);
@@ -1270,7 +1269,7 @@ printf '${trailingMarker}   '
         .toBe(false);
 
       await active.sendKeys("C-o");
-      await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+      await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await active.sendHexBytes(
         Array.from({ length: 80 }, () => ["1b", "5b", "36", "7e"]).flat(),
       );
@@ -1335,7 +1334,7 @@ printf '${trailingMarker}   '
       });
       await active.waitForText(doneMarker, TIMEOUT);
       await active.sendKeys("C-o");
-      await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+      await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await active.sendHexBytes(
         Array.from({ length: 80 }, () => ["1b", "5b", "36", "7e"]).flat(),
       );
@@ -1867,7 +1866,7 @@ test.skipIf(!tmuxAvailable())(
       const compactGrid = await active.capturePaneGrid();
 
       await active.sendKeys("C-o");
-      await active.waitForText("full detail · ctrl+o close · pgup/pgdn scroll · esc close", TIMEOUT);
+      await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       const expandedAtTail = await active.waitForText(tailMarker, TIMEOUT);
       expect(expandedAtTail).toContain(tailMarker);
       expect(expandedAtTail).not.toContain("FULL_CTRL_O_LINE_0001");
@@ -1886,7 +1885,8 @@ test.skipIf(!tmuxAvailable())(
           // The head of a 100-line output never shares a viewport with its tail.
           expect(before).not.toContain(tailMarker);
         }
-        if (/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} IST · Tool/.test(before)) sawToolHeader = true;
+        // A tool's detail opens with the time it ran.
+        if (/^ {4}\d{2}:\d{2}:\d{2}\b/m.test(before)) sawToolHeader = true;
         if (before.includes(commandArgumentTail)) sawCommandArgument = true;
         if (sawLineOne && sawToolHeader && sawCommandArgument) break;
         await active.sendKeys("PPage");
@@ -1907,7 +1907,7 @@ test.skipIf(!tmuxAvailable())(
       const full = await active.capturePane();
       expect(full).toContain(tailMarker);
       expect(full).not.toContain("lines more (ctrl+o");
-      expect(full).toContain("full detail · ctrl+o close · pgup/pgdn scroll · esc close");
+      expect(full).toContain("esc close · pgup/pgdn scroll");
 
       await active.sendHexBytes(["1b", "5b", "35", "7e"]);
       const afterPageUp = await active.waitForPane(
@@ -2085,7 +2085,7 @@ test.skipIf(!tmuxAvailable())(
     const continuedMarker = "ACTIVE_OVERFLOW_LIVE_CONTINUATION";
     const tailMarker = "ACTIVE_OVERFLOW_TAIL";
     const doneMarker = "ACTIVE_OVERFLOW_DONE";
-    const futureMarker = "│ … full output available when command finishes";
+    const futureMarker = "    … full output available when command finishes";
     mkdirSync(join(home, ".fx"), { recursive: true });
     mkdirSync(workspace);
     writeFileSync(
@@ -2390,7 +2390,7 @@ while :; do :; done
       expect(replayBytes.byteLength).toBeGreaterThan(1024 * 1024);
 
       await active.sendKeys("C-o");
-      await active.waitForText("┃ full detail · ctrl+o close", timeout);
+      await active.waitForText("esc close · pgup/pgdn scroll", timeout);
       await active.waitForText(tailMarker, timeout);
       writeFileSync(ctrlOPath, await active.capturePane());
       await active.sendKeys("C-o");
@@ -3046,7 +3046,7 @@ test.skipIf(!tmuxAvailable())(
       const fullView = await active.capturePane();
       expect(fullView).toContain(firstDone);
       expect(fullView).not.toContain(fullViewDraft);
-      expect(fullView).toContain("┃ full detail · ctrl+o close");
+      expect(fullView).toContain("esc close · pgup/pgdn scroll");
       await active.sendKeys("Escape");
       await active.waitForText(fullViewDraft, TIMEOUT);
       await active.sendKeys("Enter");
@@ -3120,7 +3120,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(streamMarker, TIMEOUT);
 
       await active.sendKeys("C-o");
-      await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+      await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       const enterAlternate = Buffer.from("\x1b[?1049h");
       const leaveAlternate = Buffer.from("\x1b[?1049l");
       const tapeBeforeCancel = readFileSync(tapePath);
@@ -3275,18 +3275,18 @@ test.skipIf(!tmuxAvailable())(
       await active.sendHexBytes(stressBytes);
       await Bun.sleep(250);
       const inlineAfterWheel = (await active.capturePaneGrid()).join("\n");
-      expect(inlineAfterWheel).not.toContain("full detail · ctrl+o close");
+      expect(inlineAfterWheel).not.toContain("esc close · pgup/pgdn scroll");
       expect(readFileSync(tapePath)).not.toContain(Buffer.from("\x1b[?1000h\x1b[?1006h"));
       expect(readFileSync(tracePath, "utf8")).not.toContain(
         "depth_transition from=inline to=full",
       );
 
       await active.sendKeys("C-o");
-      await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+      await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await active.sendKeys("Left");
-      await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+      await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await active.sendKeys("Right");
-      await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+      await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       expect(readFileSync(tapePath)).not.toContain(Buffer.from("\x1b[?1000h\x1b[?1006h"));
       const alternateScrollTraceStart = statSync(tracePath).size;
       await active.sendHexBytes(["1b", "5b", "41"]);
@@ -3307,9 +3307,9 @@ test.skipIf(!tmuxAvailable())(
         "viewer page trace",
       );
       const readingBefore = await active.capturePaneGrid();
-      expect(readingBefore.join("\n")).toContain("full detail · ctrl+o close");
+      expect(readingBefore.join("\n")).toContain("esc close · pgup/pgdn scroll");
       expect(readingBefore.join("\n")).toMatch(
-        new RegExp(`│ ${lineMarker} \\d{3}`),
+        new RegExp(`^ {4}${lineMarker} \\d{3}`, "m"),
       );
       expect(readingBefore.join("\n")).not.toContain("ctrl+o to view");
 
@@ -3317,9 +3317,9 @@ test.skipIf(!tmuxAvailable())(
       await waitForCondition(() => gateway.requests.length >= 2, "post-command gateway request");
       const readingAfter = await active.capturePaneGrid();
       const normalizeLiveMetadata = (grid: string[]) => grid.map((row) => {
-        if (/^└ (?:Running|Ran) /.test(row)) return "<command status>";
-        if (/^│  \d+ output lines$/.test(row)) return "<output count>";
-        if (/^│  \d+ more lines · → to expand$/.test(row)) return "<fold count>";
+        if (/^(?:└ | {2})(?:Running|Ran) /.test(row)) return "<command status>";
+        if (/^(?:│ | {3})\s*\d+ output lines$/.test(row)) return "<output count>";
+        if (/^(?:│ | {3})\s*\d+ more lines · → to expand$/.test(row)) return "<fold count>";
         if (/^(?:auto · )?gpt-5$/.test(row)) return "<status line>";
         return row;
       });
@@ -3329,7 +3329,7 @@ test.skipIf(!tmuxAvailable())(
         if (row !== "") expect(normalizedAfter[rowIndex]).toBe(row);
       }
       const visibleOutputRows = readingBefore.filter((row) =>
-        row.includes(`│ ${lineMarker} `)
+        row.startsWith(`    ${lineMarker} `)
       );
       expect(visibleOutputRows.length).toBeGreaterThan(0);
       for (const marker of visibleOutputRows.slice(0, 3)) {
@@ -3338,7 +3338,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendKeys("Escape");
       await active.waitForPane(
-        (pane) => pane.includes(doneMarker) && !pane.includes("┃ full detail · ctrl+o close"),
+        (pane) => pane.includes(doneMarker) && !pane.includes("esc close · pgup/pgdn scroll"),
         TIMEOUT,
       );
       const scrollback = await waitForScrollback(active, doneMarker);
@@ -3439,12 +3439,12 @@ test.skipIf(!tmuxAvailable())(
 
       const scrollback = await waitForScrollback(active, doneMarker);
       for (let index = 1; index <= 5; index += 1) {
-        const line = `│ ${commandMarker} ${String(index).padStart(5, "0")}`;
+        const line = `    ${commandMarker} ${String(index).padStart(5, "0")}`;
         expect(countOccurrences(scrollback, line)).toBe(0);
       }
-      expect(scrollback).not.toContain(`│ ${commandMarker} 00006`);
+      expect(scrollback).not.toContain(`    ${commandMarker} 00006`);
       expect(scrollback).not.toContain(
-        `│ ${commandMarker} ${String(lineCount).padStart(5, "0")}`,
+        `    ${commandMarker} ${String(lineCount).padStart(5, "0")}`,
       );
       expect(scrollback).not.toContain("lines more (ctrl+o to view)");
       expect(readFileSync(stderrPath, "utf8")).not.toContain("AnsiBandOverflow");
@@ -3602,44 +3602,38 @@ test.skipIf(!tmuxAvailable())(
       const fullTranscript = await active.waitForPane(
         (pane) =>
           pane.includes(beforeMarker) &&
-          pane.includes("1 tool call") &&
           pane.includes("Ran ") &&
           pane.includes(outputMarker) &&
           pane.includes(afterMarker),
         TIMEOUT,
       );
       const grid = fullTranscript.replace(/\n$/, "").split("\n");
+      // A model call's line: its time, the model and the call's details.
+      const callLine = /^  \d{2}:\d{2}:\d{2} · gpt-5 · /;
       const before = grid.findIndex((line) => line.includes(beforeMarker));
-      const toolTimestamp = grid.findIndex(
-        (line, index) => index > before && line.includes("IST · Tool"),
-      );
-      const header = grid.findIndex((line) => line.includes("1 tool call"));
       const tool = grid.findIndex((line) => line.includes("Ran "));
-      const output = grid.findIndex((line) => line.trimStart().startsWith(`│ ${outputMarker}`));
-      const afterTimestamp = grid.findIndex(
-        (line, index) => index > output && line.includes("IST · Response"),
-      );
+      const output = grid.findIndex((line) => line === `    ${outputMarker}`);
       const after = grid.findIndex((line) => line.includes(afterMarker));
-      if (
-        before < 0 || toolTimestamp < 0 || header < 0 || tool < 0 ||
-        output < 0 || afterTimestamp < 0 || after < 0
-      ) {
+      if (before < 0 || tool < 0 || output < 0 || after < 0) {
         throw new Error(`missing full transcript rows:\n${grid.join("\n")}`);
       }
+      const layout = `full transcript rows:\n${grid.join("\n")}`;
       expect(fullTranscript).not.toContain(
         "Permissions: Auto agent approved this request",
       );
-      expect(grid[before + 1]).toBe("");
-      expect(toolTimestamp).toBe(before + 2);
-      expect(header).toBe(toolTimestamp + 1);
-      expect(tool).toBe(header + 1);
+      // The response, the call that wrote it, a blank row, then the tool.
+      expect(grid[before + 1], layout).toMatch(callLine);
+      expect(grid[before + 2], layout).toBe("");
+      expect(tool, layout).toBe(before + 3);
+      // The arguments the tool's line doesn't show, when it ran, its output.
       expect(grid[tool + 1]).toContain("action: run");
       expect(grid[tool + 2]).toContain("yield_time_ms: 30000");
       expect(grid[tool + 3]).toContain("timeout_ms: 600000");
-      expect(output).toBe(tool + 4);
+      expect(grid[tool + 4], layout).toMatch(/^ {4}\d{2}:\d{2}:\d{2}\b/);
+      expect(output, layout).toBe(tool + 5);
       expect(grid[output + 1]).toBe("");
-      expect(afterTimestamp).toBe(output + 2);
-      expect(after).toBe(afterTimestamp + 1);
+      expect(after, layout).toBe(output + 2);
+      expect(grid[after + 1], layout).toMatch(callLine);
 
       await active.sendKeys("Escape");
       await active.waitForComposer(TIMEOUT);
@@ -3772,11 +3766,11 @@ test.skipIf(!tmuxAvailable())(
           const historyBefore = await active.captureFullScrollback();
 
           await active.sendKeys("C-o");
-          await active.waitForText("full detail · ctrl+o close", TIMEOUT);
+          await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
           if (width === 120) {
             await active.resizeWindow(88, 24, 500);
             await active.sendKeys("Escape C-o");
-            await active.waitForText("full detail · ctrl+o close", TIMEOUT);
+            await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
           }
           await active.sendKeys("Escape");
           const restored = await active.waitForStableGrid(
@@ -3862,7 +3856,7 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("C-o");
       await active.waitForText("READ_RESULT_MARKER", TIMEOUT);
       const full = await active.capturePane();
-      expect(full).toContain("full detail · ctrl+o close · pgup/pgdn scroll · esc close");
+      expect(full).toContain("esc close · pgup/pgdn scroll");
       expect(full).toContain("READ_RESULT_MARKER");
       expect(full).not.toContain("<path>");
       expect(full).not.toContain("<content>");
@@ -3926,7 +3920,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("LIST_FULL_DETAIL_MARKER", TIMEOUT);
       const firstDetail = await active.capturePane();
       expect(firstDetail).toContain("LIST_FULL_DETAIL_MARKER");
-      expect(firstDetail).toContain("full detail · ctrl+o close · pgup/pgdn scroll · esc close");
+      expect(firstDetail).toContain("esc close · pgup/pgdn scroll");
       expect(firstDetail).not.toMatch(/^\s*input\s*$/m);
 
       await active.waitForText("READ_FULL_DETAIL_MARKER", TIMEOUT);
@@ -4271,7 +4265,7 @@ test.skipIf(!tmuxAvailable())(
 
       await active.sendKeys("C-o");
       await Bun.sleep(150);
-      await active.waitForText("┃ full detail · ctrl+o close", actionTimeout);
+      await active.waitForText("esc close · pgup/pgdn scroll", actionTimeout);
       await active.sendHexBytes(
         Array.from({ length: 20 }, () => ["1b", "5b", "36", "7e"]).flat(),
       );
@@ -4488,7 +4482,7 @@ test.skipIf(!tmuxAvailable())(
         () => alternateDepthAt(tapeText()) === 1,
         "Ctrl-O to enter the alternate screen",
       );
-      await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+      await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await active.sendHexBytes(["1b", "5b", "36", "7e"]);
       const tailViewport = await active.waitForText(streamGate, TIMEOUT);
       expect(tailViewport).toContain(streamGate);
@@ -4545,7 +4539,7 @@ test.skipIf(!tmuxAvailable())(
         () => alternateDepthAt(tapeText()) === 1,
         "the repeated Ctrl-O entry",
       );
-      await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+      await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await active.sendKeys("C-o");
       await waitForCondition(
         () => alternateDepthAt(tapeText()) === 0,
@@ -5129,7 +5123,8 @@ test.skipIf(!tmuxAvailable())(
       expect(detail).toContain(failureCommand);
       expect(detail).not.toContain("command not run");
       expect(detail).not.toContain("1 deferred");
-      expect(detail).toContain("1 failed");
+      // Ctrl+O has no group summary; the failed command's own line says so.
+      expect(detail).toMatch(/^● Exited 7 /m);
       expect(readFileSync(resumeStderrPath, "utf8")).toBe("");
 
       await active.sendKeys("Escape");
@@ -5853,7 +5848,7 @@ test.skipIf(!tmuxAvailable())(
         expectNoRawToolReplay(resumedToolScrollback);
         if (index === 0) {
           await active.sendKeys("C-o");
-          await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+          await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
           await active.waitForText(toolWorkspaceMarker, TIMEOUT);
           const full = await active.capturePane();
           expect(full).toContain("Ran pwd");
@@ -6182,6 +6177,352 @@ test.skipIf(!tmuxAvailable())(
       await active.kill();
       active = null;
     } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+/// The screen the pane bytes draw, rebuilt on fx's own terminal engine
+/// through `fx replay`, one row per string with trailing blanks removed.
+function replayPaneBytes(
+  root: string,
+  home: string,
+  name: string,
+  size: { cols: number; rows: number },
+  bytes: Buffer,
+): string[] {
+  // A tape header (src/core/workspace/record_tape.zig buildHeader) and one
+  // stdout frame holding every byte.
+  const header = Buffer.alloc(18);
+  header.write("FXTP\x01", 0, "binary");
+  header.writeUInt16LE(size.cols, 5);
+  header.writeUInt16LE(size.rows, 7);
+  header.writeBigInt64LE(0n, 9);
+  header.writeUInt8(0, 17);
+  const frame = Buffer.alloc(9);
+  frame.writeInt32LE(0, 0);
+  frame.writeUInt8(1, 4);
+  frame.writeUInt32LE(bytes.length, 5);
+  const tapePath = join(root, `${name}.fxtape`);
+  const gridPath = join(root, `${name}.grid.txt`);
+  writeFileSync(tapePath, Buffer.concat([header, frame, bytes]));
+  const replay = Bun.spawnSync([FX_BIN, "replay", tapePath, "--golden", gridPath], {
+    env: { ...process.env, HOME: home, FX_AUTO_UPGRADE: "0", FX_SOUND: "0" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (replay.exitCode !== 0) {
+    throw new Error(`fx replay ${name} failed: ${replay.stderr.toString()}`);
+  }
+  const rows = readFileSync(gridPath, "utf8").split("\n")
+    .filter((line) => line.startsWith("|") && line.endsWith("|"))
+    .map((line) => line.slice(1, -1).trimEnd());
+  expect(rows.length).toBe(size.rows);
+  return rows;
+}
+
+/// The capture file's length once fx has stopped writing to the pane.
+async function settledCaptureLength(path: string, stableMs = 300): Promise<number> {
+  const deadline = Date.now() + TIMEOUT;
+  let length = -1;
+  let stableSince = Date.now();
+  while (Date.now() < deadline) {
+    const current = existsSync(path) ? statSync(path).size : 0;
+    if (current !== length) {
+      length = current;
+      stableSince = Date.now();
+    } else if (Date.now() - stableSince >= stableMs) {
+      return length;
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error(`pane output in ${path} did not settle`);
+}
+
+type CtrlGScreens = {
+  /// The screen just before ctrl+g.
+  before: string[];
+  /// The screen after the old build exits and the new build starts, just
+  /// before the new build's first frame clears the terminal.
+  gap: string[];
+  /// The scrollback once the new build has drawn the conversation again.
+  redrawn: string;
+};
+
+/// Presses ctrl+g on a ready update and returns the screens around the
+/// relaunch. Every byte the pane receives, from the first one the old build
+/// writes, is captured, so the gap screen is rebuilt exactly as the terminal
+/// showed it.
+async function captureCtrlGRelaunch(options: {
+  label: string;
+  reply: string | null;
+  startupScrollback?: boolean;
+  cols?: number;
+  rows?: number;
+}): Promise<CtrlGScreens> {
+  const size = { cols: options.cols ?? 110, rows: options.rows ?? 32 };
+  const root = realpathSync(mkdtempSync(join(tmpdir(), `fx-tui-upgrade-ctrl-g-${options.label}-`)));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const installDir = join(root, "install");
+  const stderrPath = join(root, "stderr.log");
+  const argvLogPath = join(root, "upgrade-argv.log");
+  const capturePath = join(root, "pane-output.bin");
+  const launchGate = join(root, "launch-gate");
+  mkdirSync(home);
+  mkdirSync(workspace);
+  mkdirSync(installDir);
+  if (options.startupScrollback !== undefined) {
+    mkdirSync(join(home, ".fx"), { mode: 0o700 });
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ startup_scrollback: options.startupScrollback }) + "\n",
+      { mode: 0o600 },
+    );
+  }
+  const workspaceRoot = realpathSync(workspace);
+  const installedFx = join(installDir, "fx");
+  copyFileSync(FX_BIN, installedFx);
+  chmodSync(installedFx, 0o755);
+
+  const prompt = `Fill the screen before the ${options.label} relaunch.`;
+  const gateway = startFakeGateway(options.reply === null ? [] : [fakeGatewayFinalText(options.reply)]);
+  const release = startUpgradeServer(root, argvLogPath);
+  let active: TmuxSession | null = null;
+  try {
+    writeFileSync(stderrPath, "");
+    // fx waits for the gate, so the capture holds every byte it writes.
+    const gatedLaunch = `while [ ! -e ${shellQuote(launchGate)} ]; do sleep 0.02; done; exec ${shellQuote(installedFx)}`;
+    active = await TmuxSession.create({
+      cmd: `/bin/sh -c ${shellQuote(gatedLaunch)}`,
+      cwd: workspaceRoot,
+      env: {
+        ...gatewayEnv(home, gateway),
+        FX_AUTO_UPGRADE: "1",
+        FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+      },
+      stderrPath,
+      width: size.cols,
+      height: size.rows,
+      startupWaitMs: 0,
+    });
+    active.startPaneOutputCapture(capturePath);
+    writeFileSync(launchGate, "");
+    await active.waitForComposer(TIMEOUT);
+    if (options.reply !== null) {
+      await active.sendText(prompt);
+      await active.waitForText(options.reply.split("\n").at(-1)!, TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+    }
+    await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+    await active.waitForStableComposer(TIMEOUT, 250);
+    const beforeLength = await settledCaptureLength(capturePath);
+
+    const version = (await runFx(["--version"])).stdout.trim();
+    const updatedNotice = `✓ fx has been updated to v${version} (notes)`;
+    await active.sendHexBytes(["07"]);
+    await waitForScrollback(active, updatedNotice);
+    await active.waitForComposer(TIMEOUT);
+    const redrawn = await active.waitForStableScrollback(
+      (scrollback) => scrollback.includes(updatedNotice),
+      TIMEOUT,
+      250,
+    );
+    await settledCaptureLength(capturePath);
+    expect(
+      readFileSync(argvLogPath, "utf8").trim().split("\n")
+        .some((line) => line.startsWith(`${installedFx}\tresume\t`) && line.includes("\t--upgrade-relaunch")),
+    ).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).not.toContain("relaunch failed");
+
+    const bytes = readFileSync(capturePath);
+    // The new build's first frame starts by clearing the screen and its
+    // scrollback, or with RIS where the terminal needs it; the old build's
+    // exit sends neither.
+    const relaunchBytes = bytes.subarray(beforeLength);
+    const resets = [Buffer.from("\x1b[2J"), Buffer.from("\x1bc")]
+      .map((sequence) => relaunchBytes.indexOf(sequence))
+      .filter((index) => index >= 0);
+    expect(resets.length).toBeGreaterThan(0);
+    const gapLength = beforeLength + Math.min(...resets);
+
+    const screens: CtrlGScreens = {
+      before: replayPaneBytes(root, home, "before", size, bytes.subarray(0, beforeLength)),
+      gap: replayPaneBytes(root, home, "gap", size, bytes.subarray(0, gapLength)),
+      redrawn,
+    };
+
+    await active.sendText("/quit");
+    expect(await active.waitForSessionEnd()).toBe(true);
+    await active.kill();
+    active = null;
+    return screens;
+  } finally {
+    if (active) {
+      try {
+        await active.sendText("/quit");
+      } catch {}
+      await active.kill();
+    }
+    release.stop();
+    gateway.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/// The old build erases its footer as it exits. Every other row stays where
+/// it was until the new build's first frame clears the terminal, so the
+/// conversation does not jump before it is drawn again.
+function expectGapKeepsScreen(screens: CtrlGScreens, marker: string): void {
+  const markerRow = screens.before.findIndex((row) => row.includes(marker));
+  expect(markerRow).toBeGreaterThanOrEqual(0);
+  const moved = screens.gap.flatMap((row, index) =>
+    row.trim() !== "" && row !== screens.before[index]
+      ? [`row ${index + 1}: ${JSON.stringify(row)}, was ${JSON.stringify(screens.before[index])}`]
+      : []
+  );
+  expect(moved).toEqual([]);
+  expect(screens.gap[markerRow]).toBe(screens.before[markerRow]);
+}
+
+const CTRL_G_SCREEN_REPLY = [
+  "CTRL_G_SCREEN_FIRST_LINE",
+  ...Array.from({ length: 24 }, (_, index) => `screen filler paragraph ${index + 1}`),
+  "CTRL_G_SCREEN_LAST_LINE",
+].join("\n\n");
+
+for (const startupScrollback of [undefined, false] as const) {
+  const setting = startupScrollback === undefined ? "startup_scrollback on by default" : "startup_scrollback off";
+  test.skipIf(!tmuxAvailable())(
+    `upgrade ctrl-g keeps the old screen in place until the new build redraws it (${setting})`,
+    async () => {
+      const screens = await captureCtrlGRelaunch({
+        label: startupScrollback === undefined ? "default" : "no-scrollback",
+        reply: CTRL_G_SCREEN_REPLY,
+        startupScrollback,
+      });
+      expectGapKeepsScreen(screens, "CTRL_G_SCREEN_LAST_LINE");
+      expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_FIRST_LINE")).toBe(1);
+      expect(countOccurrences(screens.redrawn, "CTRL_G_SCREEN_LAST_LINE")).toBe(1);
+    },
+    UPGRADE_TIMEOUT * 2,
+  );
+}
+
+for (const startupScrollback of [undefined, false] as const) {
+  const setting = startupScrollback === undefined ? "startup_scrollback on by default" : "startup_scrollback off";
+  test.skipIf(!tmuxAvailable())(
+    `upgrade ctrl-g without a saved turn keeps the old screen in place until the new build redraws it (${setting})`,
+    async () => {
+      // The session saved nothing, so the new build starts twice: once for
+      // the session it cannot find and once for a fresh one (D81). With
+      // startup scrollback off, the short screen leaves the cursor above the
+      // rows a launch keeps free, so no launch moves it.
+      const screens = await captureCtrlGRelaunch({
+        label: startupScrollback === undefined ? "fresh-default" : "fresh-no-scrollback",
+        reply: null,
+        startupScrollback,
+      });
+      expectGapKeepsScreen(screens, "Run /help for commands");
+      expect(countOccurrences(screens.redrawn, "Run /help for commands")).toBe(1);
+    },
+    UPGRADE_TIMEOUT * 2,
+  );
+}
+
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g waits while a subagent works, then upgrades once it is done",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-subagent-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    let active: TmuxSession | null = null;
+    let soloAsked = false;
+    let releaseSolo = () => {};
+    const soloReleased = new Promise<void>((resolve) => { releaseSolo = resolve; });
+    const gateway = startDynamicFakeGateway(async (body) => {
+      // The subagent's own requests carry its task but not main's call.
+      if (body.includes("SOLO_TASK") && !body.includes('"main_solo"')) {
+        soloAsked = true;
+        await soloReleased;
+        return fakeGatewayFinalText("SOLO_DONE");
+      }
+      // Only main's turn for the subagent's report holds its reply.
+      if (body.includes("SOLO_DONE")) return fakeGatewayFinalText("MAIN_SAW_REPORT");
+      if (!body.includes('"main_solo"')) {
+        return fakeGatewayToolCall("main_solo", "subagent", { request: { action: "message", agent: "solo", message: "SOLO_TASK" } });
+      }
+      return fakeGatewayFinalText("MAIN_DONE");
+    });
+    const release = startUpgradeServer(root, argvLogPath);
+    const relaunched = () => existsSync(argvLogPath) && readFileSync(argvLogPath, "utf8").includes("\t--upgrade-relaunch");
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+          FX_PERMISSION_MODE: "full-access",
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+
+      // Main's turn ends while its subagent still works.
+      await active.sendText("UPGRADE_MAIN start solo");
+      await active.waitForText("MAIN_DONE", TIMEOUT);
+      for (const deadline = Date.now() + TIMEOUT; !soloAsked; await Bun.sleep(50)) {
+        if (Date.now() > deadline) throw new Error("the subagent never asked the model");
+      }
+      await active.waitForComposer(TIMEOUT);
+      await active.sendHexBytes(["07"]);
+      await active.waitForText("upgrade is unavailable while solo is working", TIMEOUT);
+      expect(relaunched()).toBe(false);
+
+      // Once the subagent is done, the same key upgrades.
+      releaseSolo();
+      await active.waitForText("MAIN_SAW_REPORT", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      const version = (await runFx(["--version"])).stdout.trim();
+      await active.sendHexBytes(["07"]);
+      await active.waitForText(`✓ fx has been updated to v${version} (notes)`, TIMEOUT);
+      expect(relaunched()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).not.toContain("relaunch failed");
+
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      releaseSolo();
       if (active) {
         try {
           await active.sendText("/quit");
@@ -6651,7 +6992,7 @@ test.skipIf(!tmuxAvailable())(
       expect(resumed).not.toContain("RESUMED_SECOND_FILE_LINE_001");
 
       await active.sendKeys("C-o");
-      await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+      await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await active.sendHexBytes(
         Array.from({ length: 10 }, () => ["1b", "5b", "36", "7e"]).flat(),
       );
@@ -6775,7 +7116,7 @@ test.skipIf(!tmuxAvailable())(
         expect(resumed).not.toContain("SPILLED_DIFF_LINE_001_");
 
         await active.sendKeys("C-o");
-        await active.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+        await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
         await active.waitForText("SPILLED_DIFF_LINE_400", TIMEOUT);
         const full = await active.capturePane();
         expect(full).toContain("SPILLED_DIFF_LINE_400");
@@ -6864,7 +7205,7 @@ printf '${stdoutTail2}\\n'
 
     async function expectRestoredViewerOutput(session: TmuxSession): Promise<void> {
       await session.sendKeys("C-o");
-      await session.waitForText("┃ full detail · ctrl+o close", TIMEOUT);
+      await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       const tail = await session.capturePane();
       expect(tail).toContain(stdoutTail2);
       expect(tail).not.toContain(firstMarker);
@@ -6877,10 +7218,11 @@ printf '${stdoutTail2}\\n'
         pages.push(next);
       }
       const head = pages.at(-1)!;
-      expect(head).toContain(`│ ${firstMarker}`);
+      // Output rows sit under the tool at the detail indent.
+      expect(head).toMatch(new RegExp(`^ {4}${firstMarker}`, "m"));
       expect(countOccurrences(head, firstMarker)).toBe(1);
       const output = [...pages].reverse().join("\n").split("\n").filter((line) =>
-        line.trimStart().startsWith("│ ") && !line.includes("command:")
+        /^ {4}\S/.test(line) && !line.includes("command:")
       ).join("\n");
       for (const marker of orderedTailMarkers) {
         expect(output).toContain(marker);
@@ -8098,7 +8440,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["0f"]);
-      await active.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       await active.sendKeys("Home");
       const pane = await active.waitForText("EARLIER_VISIBLE_RESPONSE", 5_000);
       expect(pane).toContain("Earlier visible request");
@@ -8147,7 +8489,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(tail, TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       await active.sendHexBytes(["0f"]);
-      await active.waitForPane((pane) => pane.includes("full detail · ctrl+o close") && pane.includes(tail), TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("esc close · pgup/pgdn scroll") && pane.includes(tail), TIMEOUT);
       // The full result is the blob its `artifact_ref` names; hide it.
       const sessionId = sessionIdFromHome(home);
       const ref = savedItems(home, sessionId).find((item) => item.tool_result)!.tool_result.artifact_ref as string;
@@ -8157,7 +8499,7 @@ test.skipIf(!tmuxAvailable())(
       const recovered = await active.waitForPane((pane) =>
         pane.includes("Full saved result unavailable.") && pane.includes(tail),
       TIMEOUT);
-      expect(recovered).toContain("full detail · ctrl+o close");
+      expect(recovered).toContain("esc close · pgup/pgdn scroll");
       expect(active.isPaneAlive()).toBe(true);
       expect(gateway.requests).toHaveLength(2);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -8231,7 +8573,7 @@ for (const inspectDetails of [false, true]) {
         await assertHistory();
         if (inspectDetails) {
           await active.sendKeys("C-o");
-          await active.waitForText("full detail", TIMEOUT);
+          await active.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
           await active.sendKeys("PPage");
           await active.resizeWindow(60, 18);
           await Bun.sleep(350);
@@ -8239,7 +8581,7 @@ for (const inspectDetails of [false, true]) {
           await active.resizeWindow(88, 24);
           await Bun.sleep(350);
           await active.sendKeys("Escape");
-          await active.waitForPane(pane => !pane.includes("full detail"), TIMEOUT);
+          await active.waitForPane(pane => !pane.includes("esc close · pgup/pgdn scroll"), TIMEOUT);
           await Bun.sleep(150);
         }
         await prompt("In one sentence, confirm which file you created. Do not use tools.");

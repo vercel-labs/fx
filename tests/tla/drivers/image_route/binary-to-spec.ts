@@ -33,7 +33,10 @@ const IMAGE = join(REPO_ROOT, "tests", "e2e", "fixtures", "placeholder-logo.png"
 // What the binary prints, matched by stable prefixes of its own text.
 const UNKNOWN_NOTE = "was not sent with this request: fx could not confirm image input support";
 const DEAD_END_NOTE = "was not sent with this request: this model does not accept inline images";
-const CATALOG_DOWN_NOTICE = "aren't reaching the model right now";
+// Both catalog-down notices say it: the one for a catalog that answered with a
+// failure, and the one for a catalog fx could not connect to, which the "down"
+// view below is (`catalogDownNotice` in src/core/agent/runtime/orchestrator.zig).
+const CATALOG_DOWN_NOTICE = "aren't reaching the model";
 
 export type ViewName = "vision" | "no_vision" | "missing" | "down";
 export const VIEW_NAMES: ViewName[] = ["vision", "no_vision", "missing", "down"];

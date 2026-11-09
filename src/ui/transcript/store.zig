@@ -2841,6 +2841,16 @@ fn rebaseTranscriptRewrite(self: anytype, next: anytype, alloc: Allocator, check
     for (self.notebook.entries.items, 0..) |entry, index| {
         if (committed_texts.getPtr(entry.id())) |text| text.index = index;
     }
+    // A notice the inline transcript never draws, such as a model call's
+    // full-detail line, has no committed lines but is kept anyway. It adds no
+    // bytes, and without it this copy's finished turns differ from the live
+    // transcript's, so preparing the copy would evict the live frozen prefix
+    // and the next frame would render every entry again.
+    for (next.notebook.entries.items) |entry| {
+        if (entry == .semantic_notice and !transcript_blocks.isEntryVisibleInCompactPresentation(entry)) {
+            try previous_ids.put(alloc, entry.id(), {});
+        }
+    }
     compactEntriesToRetainedSet(&retained, alloc, &previous_ids);
     for (retained.notebook.entries.items) |*entry| {
         try build_checkpoint.consume(checkpoint, entryRetainedBytes(entry.*));

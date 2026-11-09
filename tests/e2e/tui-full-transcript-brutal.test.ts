@@ -32,7 +32,7 @@ import { logLines, savedSessionIds, storeRoot } from "./saved-sessions";
 const TIMEOUT = 30_000;
 const INPUT_SANITY_BUDGET_MS = 5_000;
 const BURST_NAVIGATION_EVENTS = 2_048;
-const FULL_FOOTER = "full detail · ctrl+o close";
+const FULL_FOOTER = "esc close · pgup/pgdn scroll";
 const HISTORY_DONE = "CTRL_O_BRUTAL_HISTORY_DONE";
 const LIVE_START = "CTRL_O_BRUTAL_LIVE_0001";
 const LIVE_DONE = "CTRL_O_BRUTAL_LIVE_DONE";

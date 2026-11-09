@@ -302,21 +302,14 @@ const KeychainObservation = union(enum) {
 };
 
 fn observeAuthFile(alloc: Allocator, fx_dir: *std.Io.Dir) !FileObservation {
-    // A path that isn't a regular file, such as a fifo, is unusable without
-    // waiting for a writer.
-    var file = io_mod.openExistingReadOnlyRegularFile(fx_dir.*, auth_file_name, .no_follow) catch |err| switch (err) {
-        error.FileNotFound => return .absent,
-        else => {
-            debug_trace.logf("auth", "session load failed source=file step=open err={s}", .{@errorName(err)});
-            return .unusable;
-        },
-    };
-    defer file.close(io_mod.getIo());
-
-    const stat = file.stat(io_mod.getIo()) catch |err| {
-        debug_trace.logf("auth", "session load failed source=file step=stat err={s}", .{@errorName(err)});
+    var current = (session_presence.openCurrent(fx_dir.*, auth_file_name) catch |err| {
+        debug_trace.logf("auth", "session load failed source=file step=open err={s}", .{@errorName(err)});
         return .unusable;
-    };
+    }) orelse return .absent;
+    defer current.file.close(io_mod.getIo());
+    var file = current.file;
+
+    const stat = current.stat;
     if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
         debug_trace.logf("auth", "session load failed source=file step=permissions err=InsecureAuthFile", .{});
         return .unusable;
@@ -720,24 +713,19 @@ fn loadFromHost(alloc: Allocator, store: js_host_auth.SessionStore) !?Session {
 }
 
 fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) !?Session {
-    // A path that isn't a regular file, such as a fifo, fails without
-    // waiting for a writer.
-    var file = io_mod.openExistingReadOnlyRegularFile(fx_dir.*, auth_file_name, .no_follow) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => {
-            debug_trace.logf("auth", "session load failed step=open_file err={s}", .{@errorName(err)});
-            return session_presence.storageError(auth_file_name, err);
-        },
-    };
-    defer file.close(io_mod.getIo());
+    var current = (session_presence.openCurrent(fx_dir.*, auth_file_name) catch |err| {
+        debug_trace.logf("auth", "session load failed step=open_file err={s}", .{@errorName(err)});
+        return session_presence.storageError(auth_file_name, err);
+    }) orelse return null;
+    defer current.file.close(io_mod.getIo());
 
-    const stat = file.stat(io_mod.getIo()) catch |err| return session_presence.storageError(auth_file_name, err);
+    const stat = current.stat;
     if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
         debug_trace.logf("auth", "session load failed step=permissions err=InsecureAuthFile", .{});
         return error.InsecureAuthFile;
     }
 
-    const bytes = io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes) catch |err| return session_presence.storageError(auth_file_name, err);
+    const bytes = io_mod.readFileToEnd(alloc, &current.file, max_auth_file_bytes) catch |err| return session_presence.storageError(auth_file_name, err);
     defer secret.zeroAndFree(alloc, bytes);
     return try parseStoredSession(alloc, bytes);
 }

@@ -1867,25 +1867,6 @@ fn appendDimmedCommandRows(
     styles: Styles,
     bytes: []const u8,
 ) !void {
-    return appendDimmedCommandRowsWithGutterStyle(out, alloc, styles, bytes, false);
-}
-
-fn appendDimmedCommandRowsWithPrimaryGutter(
-    out: *std.ArrayList(u8),
-    alloc: Allocator,
-    styles: Styles,
-    bytes: []const u8,
-) !void {
-    return appendDimmedCommandRowsWithGutterStyle(out, alloc, styles, bytes, true);
-}
-
-fn appendDimmedCommandRowsWithGutterStyle(
-    out: *std.ArrayList(u8),
-    alloc: Allocator,
-    styles: Styles,
-    bytes: []const u8,
-    primary_gutter: bool,
-) !void {
     if (bytes.len == 0) return;
 
     var row_start: usize = 0;
@@ -1893,15 +1874,8 @@ fn appendDimmedCommandRowsWithGutterStyle(
         const newline_offset = std.mem.findScalar(u8, bytes[row_start..], '\n');
         const row_end = if (newline_offset) |offset| row_start + offset else bytes.len;
         const row = bytes[row_start..row_end];
-        if (primary_gutter and std.mem.startsWith(u8, row, "│")) {
-            try out.appendSlice(alloc, styles.reset_style);
-            try out.appendSlice(alloc, "│");
-            try out.appendSlice(alloc, styles.dim_style);
-            try out.appendSlice(alloc, row["│".len..]);
-        } else {
-            try out.appendSlice(alloc, styles.dim_style);
-            try out.appendSlice(alloc, row);
-        }
+        try out.appendSlice(alloc, styles.dim_style);
+        try out.appendSlice(alloc, row);
         try out.appendSlice(alloc, styles.reset_style);
         if (newline_offset == null) break;
         try out.append(alloc, '\n');
@@ -1988,18 +1962,20 @@ pub fn renderFullCommandOutputRecord(
     return out.toOwnedSlice(alloc);
 }
 
-pub fn renderCommandOutputRecordWithPrimaryGutter(
+/// One retained command record as Ctrl+O shows it: every row dimmed under
+/// the blank tool detail indent, with no rail.
+pub fn renderFullDetailCommandOutputRecord(
     alloc: Allocator,
     styles: Styles,
     text: []const u8,
     cols: u16,
 ) ![]u8 {
-    const wrapped = try assistant_wrap.wrapLiteralCommandOutput(alloc, text, cols);
+    const wrapped = try assistant_wrap.wrapLiteralToolOutput(alloc, text, cols);
     defer alloc.free(wrapped);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
-    try appendDimmedCommandRowsWithPrimaryGutter(&out, alloc, styles, wrapped);
+    try appendDimmedCommandRows(&out, alloc, styles, wrapped);
     try out.append(alloc, '\n');
     return out.toOwnedSlice(alloc);
 }
@@ -2039,19 +2015,16 @@ test "compact and full command output style every wrapped row" {
     defer alloc.free(full);
     try std.testing.expectEqualStrings(expected_rows ++ "\n", full);
 
-    const primary_gutter = try renderCommandOutputRecordWithPrimaryGutter(
-        alloc,
-        styles,
-        text,
-        16,
-    );
-    defer alloc.free(primary_gutter);
+    // Ctrl+O's rows have no rail, only the detail indent; the tab still
+    // stops at the eighth column.
+    const full_detail = try renderFullDetailCommandOutputRecord(alloc, styles, text, 16);
+    defer alloc.free(full_detail);
     try std.testing.expectEqualStrings(
-        "<reset>│<dim> paragraph<reset>\n" ++
-            "<reset>│<dim> words<reset>\n" ++
-            "<reset>│<dim> <reset>\n" ++
-            "<reset>│<dim>       value<reset>\n",
-        primary_gutter,
+        "<dim>    paragraph<reset>\n" ++
+            "<dim>    words<reset>\n" ++
+            "<dim>    <reset>\n" ++
+            "<dim>        value<reset>\n",
+        full_detail,
     );
 }
 

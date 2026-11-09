@@ -32,7 +32,7 @@ import {
   fakeGatewaySse,
   startFakeGateway,
 } from "./tmux-helpers";
-import { savedSession, sessionDir } from "./saved-sessions";
+import { onlySessionId, savedSession, savedText, sessionDir } from "./saved-sessions";
 import {
   codexBreakdownBody,
   codexProfileBody,
@@ -612,6 +612,180 @@ describe("cli: version", () => {
         expect(r.code).toBe(0);
         expect(r.stdout).toBe(`${sourceVersion()}\n`);
         expect(r.stderr).toBe("");
+      },
+      TIMEOUT,
+    );
+  }
+});
+
+describe("cli: output errors", () => {
+  test(
+    "a command that can't write its output says so instead of naming a dropped connection",
+    () => {
+      const home = createIsolatedTestHome();
+      const tracePath = join(home, "trace.log");
+      try {
+        for (const args of [["--version"], ["status"]]) {
+          // `>&-` closes stdout, so every write to it fails.
+          const result = spawnSync("sh", ["-c", 'exec "$0" "$@" >&-', FX_BIN, ...args], {
+            encoding: "utf8",
+            env: {
+              PATH: process.env.PATH,
+              HOME: home,
+              FX_SOUND: "0",
+              FX_AUTO_UPGRADE: "0",
+              FX_DISABLE_KEYCHAIN: "1",
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "core",
+            },
+          });
+          expect(result.status, args.join(" ")).toBe(1);
+          expect(result.stderr).toBe("fx: couldn't write the output\n");
+        }
+        // The raw name stays in the trace.
+        const trace = readFileSync(tracePath, "utf8");
+        expect(trace).toContain("command output write failed err=WriteFailed");
+        expect(trace).toContain("command error err=OutputWriteFailed");
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  for (const [label, flags] of [["text", []], ["--json", ["--json"]]] as const) {
+    test(
+      `fx ask ${label} that can't write its answer fails and keeps the answer in the session`,
+      async () => {
+        const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-ask-closed-stdout-")));
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const tracePath = join(root, "trace.log");
+        mkdirSync(home);
+        mkdirSync(workspace);
+        const gateway = startFakeGateway([fakeGatewayFinalText("ANSWER_KEPT_IN_SESSION")]);
+        try {
+          // `>&-` closes stdout, so the answer can't be written. The fake
+          // gateway answers from this process, so fx runs asynchronously.
+          const proc = Bun.spawn(["sh", "-c", 'exec "$0" "$@" >&-', FX_BIN, "ask", ...flags, "--auto", "Say the answer."], {
+            cwd: workspace,
+            stdin: "ignore",
+            stdout: "ignore",
+            stderr: "pipe",
+            env: {
+              PATH: process.env.PATH,
+              HOME: home,
+              AI_GATEWAY_API_KEY: "closed-stdout-key",
+              FX_MODEL: FAKE_GATEWAY_MODEL,
+              FX_DISABLE_KEYCHAIN: "1",
+              FX_AUTO_UPGRADE: "0",
+              FX_SOUND: "0",
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "core",
+            },
+          });
+          const stderr = await new Response(proc.stderr).text();
+          expect(await proc.exited, stderr).toBe(1);
+          expect(stderr).toBe("fx: couldn't write the output\n");
+          const trace = readFileSync(tracePath, "utf8");
+          expect(trace).toContain("ask output write failed err=");
+          expect(trace).toContain("command error err=OutputWriteFailed");
+
+          // No file fx opened took stdout's place, such as the store's lock.
+          const lock = join(home, ".fx", "sessions", "v2", "index.lock");
+          if (existsSync(lock)) expect(readFileSync(lock, "utf8")).not.toContain("ANSWER_KEPT_IN_SESSION");
+
+          // The turn is saved, so the answer can still be read.
+          const sessionId = onlySessionId(home);
+          expect(savedText(home, sessionId)).toContain("ANSWER_KEPT_IN_SESSION");
+          const detail = await runFx(["session", "--id", sessionId, "--json"], { cwd: workspace, env: { HOME: home } });
+          expect(detail.code, detail.stderr).toBe(0);
+          expect(JSON.parse(detail.stdout).history_len).toBe(1);
+        } finally {
+          gateway.stop();
+          rmSync(root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
+});
+
+describe("cli: closed output pipe", () => {
+  // The reader exits at once, and the short sleep lets it go before fx
+  // writes, as `| head` leaves a pipe once it has read enough.
+  async function runWithReaderGone(args: string[], env: Record<string, string | undefined>, cwd?: string) {
+    const statusPath = join(env.HOME!, "fx.status");
+    const proc = Bun.spawn(["sh", "-c", '(sleep 0.2; "$0" "$@"; echo $? > "$FX_STATUS_PATH") | true', FX_BIN, ...args], {
+      cwd,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+      env: { ...env, FX_STATUS_PATH: statusPath },
+    });
+    const stderr = await new Response(proc.stderr).text();
+    await proc.exited;
+    return { status: Number(readFileSync(statusPath, "utf8").trim()), stderr };
+  }
+
+  test(
+    "a command whose output reader went away ends quietly with SIGPIPE's status",
+    async () => {
+      const home = createIsolatedTestHome();
+      try {
+        const env = { PATH: process.env.PATH, HOME: home, FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1" };
+        // `fx --version` ends before fx's I/O starts, so SIGPIPE ends it;
+        // `fx status` gets the closed pipe as a failed write.
+        for (const args of [["--version"], ["status"]]) {
+          const result = await runWithReaderGone(args, env);
+          expect(result.status, args.join(" ")).toBe(141);
+          expect(result.stderr, args.join(" ")).toBe("");
+        }
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  for (const [label, flags] of [["text", []], ["--json", ["--json"]]] as const) {
+    test(
+      `fx ask ${label} whose reader went away ends quietly and still saves the answer`,
+      async () => {
+        const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-ask-reader-gone-")));
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(home);
+        mkdirSync(workspace);
+        const gateway = startFakeGateway([fakeGatewayFinalText("ANSWER_SAVED_AFTER_READER_LEFT")]);
+        try {
+          const result = await runWithReaderGone(["ask", ...flags, "--auto", "Say the answer."], {
+            PATH: process.env.PATH,
+            HOME: home,
+            AI_GATEWAY_API_KEY: "reader-gone-key",
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_SOUND: "0",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          }, workspace);
+          expect(result.status, result.stderr).toBe(141);
+          expect(result.stderr).toBe("");
+          // The turn finished and was saved, so a resume sees it whole.
+          const sessionId = onlySessionId(home);
+          expect(savedText(home, sessionId)).toContain("ANSWER_SAVED_AFTER_READER_LEFT");
+          const detail = await runFx(["session", "--id", sessionId, "--json"], { cwd: workspace, env: { HOME: home } });
+          expect(detail.code, detail.stderr).toBe(0);
+          expect(JSON.parse(detail.stdout).history_len).toBe(1);
+        } finally {
+          gateway.stop();
+          rmSync(root, { recursive: true, force: true });
+        }
       },
       TIMEOUT,
     );
@@ -1349,9 +1523,13 @@ describe("cli: status", () => {
   test(
     "fx status --json returns valid status JSON",
     async () => {
+      // A fresh profile, so a developer's own settings can't leak in,
+      // including through FX_HOME.
       const home = createIsolatedTestHome();
       try {
-        const r = await runFx(["status", "--json"], { env: { ...NO_GATEWAY_AUTH, HOME: home } });
+        const r = await runFx(["status", "--json"], {
+          env: { ...NO_GATEWAY_AUTH, HOME: home, FX_HOME: undefined },
+        });
         expect(r.code).toBe(0);
         const json = JSON.parse(r.stdout.trim());
         expect(json.kind).toBe("status");
@@ -3870,6 +4048,8 @@ describe("cli: models", () => {
         expect(result.code).not.toBe(0);
         expect(result.stderr).toBe("");
         expect(JSON.parse(result.stdout.trim()).code).toBe("GatewayUnavailable");
+        // The catalog answered, so the message does not blame the connection.
+        expect(JSON.parse(result.stdout.trim()).error).toBe("could not list models: Unavailable");
         expect(gateway.modelRequests).toHaveLength(1);
       } finally {
         gateway.stop();
@@ -3889,13 +4069,33 @@ describe("cli: models", () => {
       try {
         const address = server.address();
         if (address === null || typeof address === "string") throw new Error("missing server address");
-        const result = await runFx(["models", "--json"], {
-          env: modelsGatewayEnv(home, `http://127.0.0.1:${address.port}/v1/models`),
-        });
+        const env = modelsGatewayEnv(home, `http://127.0.0.1:${address.port}/v1/models`);
+        const result = await runFx(["models", "--json"], { env });
         expect(result.code).not.toBe(0);
         expect(result.stderr).toBe("");
         expect(JSON.parse(result.stdout.trim()).code).toBe("TransportFailure");
+        expect(JSON.parse(result.stdout.trim()).error).toBe(
+          "could not list models: couldn't connect to AI Gateway; check your network connection or firewall",
+        );
         expect(connections).toBe(1);
+
+        const text = await runFx(["models"], { env });
+        expect(text.code).not.toBe(0);
+        expect(text.stderr).toBe(
+          "fx models: could not list models: couldn't connect to AI Gateway; check your network connection or firewall\n",
+        );
+
+        // Switching to the Gateway from another provider loads its catalog
+        // the same way, and a failed switch keeps the saved provider.
+        const settingsPath = join(home, ".fx", "settings.json");
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        writeFileSync(settingsPath, JSON.stringify({ provider: "codex" }));
+        const selection = await runFx(["provider", "gateway"], { env });
+        expect(selection.code).not.toBe(0);
+        expect(selection.stderr).toBe(
+          "fx provider: couldn't connect to AI Gateway to load the target model catalog; check your network connection or firewall\n",
+        );
+        expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("codex");
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
         cleanupIsolatedTestHome(home);

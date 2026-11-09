@@ -23,13 +23,42 @@ import {
 const TIMEOUT = 90_000;
 const LIST_HINT = "enter switch";
 
-// Shows the agent `rows` rows below the one on screen, or above it when
-// negative, through the agent list: Ctrl+X opens it whatever the composer
-// holds, each arrow shows the next row, and Enter keeps it.
-async function moveAgent(session: TmuxSession, rows: number) {
+// The agent list's rows, top to bottom, from a capture with its escapes: each
+// one's name, "fx 1" for main or the subagent's own, and whether it is the
+// selected row, which the list draws bold and the others dim.
+function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean }> {
+  const rows: Array<{ name: string; selected: boolean }> = [];
+  for (const line of paneEscapes.split("\n")) {
+    const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
+    const row = /^ {2}(fx \d+| {2}\S+)(?: \(on screen\))? \u00b7 /.exec(plain);
+    if (row) rows.push({ name: row[1]!.trim(), selected: line.includes("\x1b[1m") });
+  }
+  return rows;
+}
+
+// Shows `agent`, "fx 1" for main or a subagent's name, through the agent
+// list: Ctrl+X opens it whatever the composer holds, each arrow shows the
+// next row, and Enter keeps it. The list puts working agents first and the
+// rest by their latest reply, and its rows can move while it is open, so each
+// step reads the rows again instead of counting them.
+async function showAgent(session: TmuxSession, agent: string) {
   await session.sendKeys("C-x");
   await session.waitForText(LIST_HINT, 10_000);
-  for (let step = 0; step < Math.abs(rows); step += 1) await session.sendKeys(rows > 0 ? "Down" : "Up");
+  const deadline = Date.now() + 15_000;
+  let rows = agentRows(await session.capturePaneEscapes());
+  for (;;) {
+    const target = rows.findIndex((row) => row.name === agent);
+    const selected = rows.findIndex((row) => row.selected);
+    if (target !== -1 && target === selected) break;
+    if (Date.now() > deadline) throw new Error(`the agent list never selected ${agent}: ${JSON.stringify(rows)}`);
+    const before = JSON.stringify(rows);
+    if (target !== -1 && selected !== -1) await session.sendKeys(target > selected ? "Down" : "Up");
+    const step = Math.min(deadline, Date.now() + 2_000);
+    do {
+      await Bun.sleep(25);
+      rows = agentRows(await session.capturePaneEscapes());
+    } while (JSON.stringify(rows) === before && Date.now() < step);
+  }
   await session.sendKeys("Enter");
   await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
 }
@@ -107,12 +136,75 @@ function latestUserText(body: string): string {
   return userTexts(body).at(-1) ?? "";
 }
 
+// The text of the tool result `id` in a request body, or "" when it has none.
+function toolResultText(body: string, id: string): string {
+  const texts = (value: unknown, out: string[] = []): string[] => {
+    if (typeof value === "string") out.push(value);
+    else if (Array.isArray(value)) for (const item of value) texts(item, out);
+    else if (value && typeof value === "object") for (const item of Object.values(value)) texts(item, out);
+    return out;
+  };
+  let found = "";
+  const walk = (value: any) => {
+    if (found) return;
+    if (Array.isArray(value)) value.forEach(walk);
+    else if (value && typeof value === "object") {
+      if (value.type === "tool-result" && value.toolCallId === id) found = texts(value.output).join("");
+      else Object.values(value).forEach(walk);
+    }
+  };
+  walk(JSON.parse(body));
+  return found;
+}
+
+// One model step that calls the subagent tool once per message, in order.
+function messageSteps(calls: Array<{ id: string; agent: string; message: string }>): Response {
+  return fakeGatewaySse([
+    ...calls.map((call) => ({ type: "tool-call", toolCallId: call.id, toolName: "subagent", input: { request: { action: "message", agent: call.agent, message: call.message } } })),
+    { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+  ]);
+}
+
 async function until(what: string, done: () => boolean, ms = 30_000) {
   const deadline = Date.now() + ms;
   while (!done()) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
     await Bun.sleep(50);
   }
+}
+
+// Whether the trace log at `path` holds `text` yet.
+function traceHas(path: string, text: string): boolean {
+  return existsSync(path) && readFileSync(path, "utf8").includes(text);
+}
+
+// The newest saved request-recovery record of the main session and of its
+// subagent in `home`: its phase (1 is a send in flight) and whether it is
+// marked as a clean close.
+function lastRecoveryRecords(home: string) {
+  const sessions = join(home, ".fx", "sessions", "v2");
+  const found: { rootId: string; root: object | null; child: object | null } = { rootId: "", root: null, child: null };
+  for (const id of readdirSync(sessions)) {
+    const log = join(sessions, id, "log.jsonl");
+    if (!existsSync(log)) continue;
+    const lines = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const saved = lines.filter((line) => line.kind === "item" && line.type === "recovery" && line.data?.record).at(-1);
+    const record = saved ? { phase: Number.parseInt(saved.data.record.slice(2, 4), 16), clean: (Number.parseInt(saved.data.record.slice(4, 6), 16) & 1) === 1 } : null;
+    if (lines[0].role === "root") {
+      found.rootId = id;
+      found.root = record;
+    } else {
+      found.child = record;
+    }
+  }
+  return found;
+}
+
+// Every frame of the tape at `path`, as text.
+function tapeFrames(path: string): string {
+  const replay = Bun.spawnSync([FX_BIN, "replay", path, "--frames"], { stdout: "pipe", stderr: "pipe" });
+  expect(replay.exitCode).toBe(0);
+  return new TextDecoder().decode(replay.stdout);
 }
 
 // A provider outage fx waits out and then sends the request again.
@@ -238,7 +330,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForComposer(15_000);
 
         // The subagent's conversation replaces main's, and the footer names it.
-        await moveAgent(session, 1);
+        await showAgent(session, "reviewer");
         const subagent = await session.waitForPane((pane) =>
           pane.includes("SWITCH_CHILD_ANSWER") && pane.includes("reviewer \u00b7 "), 15_000);
         expect(subagent).toContain("SWITCH_TASK look for nothing");
@@ -259,8 +351,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         }
         expect(await session.capturePane()).toContain("SWITCH_CHILD_REPLY");
 
-        // Main's row is above it, and main is as it was.
-        await moveAgent(session, -1);
+        // Main is as it was.
+        await showAgent(session, "fx 1");
         const main = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_FINAL"), 15_000);
         expect(main).toContain("SWITCH_USER");
         expect(main).not.toContain("SWITCH_CHILD_REPLY");
@@ -310,7 +402,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
 
         // Ctrl+X opens the list over the draft. The subagent's screen has its
         // own composer, and a draft typed there stays there.
-        await moveAgent(session, 1);
+        await showAgent(session, "reviewer");
         const child = await session.waitForPane((pane) => pane.includes("reviewer \u00b7 "), 15_000);
         expect(child).not.toContain("SWITCH_MAIN_DRAFT");
         expect(child).not.toContain("Image 1");
@@ -318,13 +410,13 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForText("SWITCH_CHILD_DRAFT", 15_000);
 
         // Back on main, its draft and image are as it left them.
-        await moveAgent(session, -1);
+        await showAgent(session, "fx 1");
         const main = await session.waitForPane(
           (pane) => pane.includes("SWITCH_MAIN_DRAFT") && pane.includes("Image 1"), 15_000);
         expect(main).not.toContain("SWITCH_CHILD_DRAFT");
 
         // So is the subagent's.
-        await moveAgent(session, 1);
+        await showAgent(session, "reviewer");
         const again = await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_DRAFT"), 15_000);
         expect(again).not.toContain("SWITCH_MAIN_DRAFT");
 
@@ -356,7 +448,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER");
         await session.waitForText("SWITCH_MAIN_FINAL", 30_000);
         await session.waitForComposer(15_000);
-        await moveAgent(session, 1);
+        await showAgent(session, "reviewer");
         await session.waitForPane((pane) => pane.includes("reviewer \u00b7 "), 15_000);
         // Shutdown is main's own: quitting here used to stop the subagent in
         // main's place and then wait forever for main's worker.
@@ -404,14 +496,14 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER");
         await session.waitForText("SWITCH_MAIN_DONE", 30_000);
         expect(childCalls).toBe(1);
-        await moveAgent(session, 1);
+        await showAgent(session, "worker");
         await session.waitForPane((pane) => pane.includes("SWITCH_STOP_TASK") && pane.includes("worker \u2193"), 15_000);
         await session.sendKeys("Escape");
         await session.waitForText("esc again to interrupt", 10_000);
         await session.sendKeys("Escape");
         // The stop shows before the next key, which must not join the Esc.
         await session.waitForText("What can fx do differently?", 15_000);
-        await moveAgent(session, -1);
+        await showAgent(session, "fx 1");
         // Main hears of the dropped message from the stopped work's report.
         await session.waitForText("SWITCH_MAIN_SAW_DROP", 30_000);
         first.release();
@@ -497,12 +589,12 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER");
         await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
         await session.waitForComposer(15_000);
-        await moveAgent(session, 1);
+        await showAgent(session, "reviewer");
         await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("SWITCH_TYPED_ON_CHILD please");
         await session.waitForText("SWITCH_CHILD_ANSWERED_TYPED", 30_000);
-        await moveAgent(session, -1);
+        await showAgent(session, "fx 1");
         // The turn typed there was the subagent's work too, and reported.
         await session.waitForText("SWITCH_MAIN_SAW_TYPED", 30_000);
       });
@@ -545,12 +637,12 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER");
         await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
         await session.waitForComposer(15_000);
-        await moveAgent(session, 1);
+        await showAgent(session, "reviewer");
         await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("SWITCH_TELL_MAIN tell main I said hi");
         await session.waitForText("SWITCH_CHILD_TOLD_MAIN", 30_000);
-        await moveAgent(session, -1);
+        await showAgent(session, "fx 1");
         await session.waitForText("SWITCH_MAIN_GOT_HI", 30_000);
       });
       expect(markedByUser).toBe(true);
@@ -574,12 +666,12 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER");
         await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
         await session.waitForComposer(15_000);
-        await moveAgent(session, 1);
+        await showAgent(session, "reviewer");
         const pane = await session.waitForPane((value) => value.includes("SWITCH_CHILD_FIRST"), 15_000);
         // The subagent's screen shows the task with its escapes as text.
         expect(pane).toContain("SWITCH_TASK \\x1b]2;pwned\\x07 \\x1b[31mred\\x1b[0m \\u{009b}2J tail");
         expect(await session.paneTitle()).not.toBe("pwned");
-        await moveAgent(session, -1);
+        await showAgent(session, "fx 1");
         await session.waitForComposer(15_000);
         // fx never wrote the sequences themselves to the terminal.
         const written = readFileSync(tape).toString("latin1");
@@ -609,10 +701,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // The subagent's title arrived after main's, and main is still on screen.
         const mainTitle = await stablePaneTitle(session);
         expect(mainTitle).not.toBe("");
-        await moveAgent(session, 1);
+        await showAgent(session, "reviewer");
         await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
         const childTitle = await waitForPaneTitle(session, (title) => title !== "" && title !== mainTitle);
-        await moveAgent(session, -1);
+        await showAgent(session, "fx 1");
         await waitForPaneTitle(session, (title) => title === mainTitle);
         expect(childTitle).not.toBe(mainTitle);
       });
@@ -639,7 +731,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER");
         await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
         await session.waitForComposer(15_000);
-        await moveAgent(session, 1);
+        await showAgent(session, "reviewer");
         await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendKeys("Enter");
@@ -684,7 +776,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.sendText("SWITCH_USER");
           await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
           await session.waitForComposer(15_000);
-          await moveAgent(session, 1);
+          await showAgent(session, "reviewer");
           await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
           await session.waitForComposer(15_000);
           await session.sendText("SWITCH_TYPED a turn the crash cuts off");
@@ -852,12 +944,12 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER");
         await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
         await session.waitForComposer(15_000);
-        await moveAgent(session, 1);
+        await showAgent(session, "reviewer");
         await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("SWITCH_TYPED_SLOW please");
         await until("the typed turn", () => typedAsked);
-        await moveAgent(session, -1);
+        await showAgent(session, "fx 1");
         await session.waitForComposer(15_000);
         await session.sendText("SWITCH_USER_STOP stop the reviewer");
         await session.waitForText("SWITCH_MAIN_STOPPED", 30_000);
@@ -910,15 +1002,15 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(existsSync(join(workspace, "switch-child.txt"))).toBe(false);
 
         // Ctrl+X opens the list while main shows the lent prompt.
-        await moveAgent(session, 1);
+        await showAgent(session, "writer");
         await session.waitForPane((pane) =>
           pane.includes("SWITCH_WRITE_TASK") && pane.includes("Subagent writer needs permission"), 15_000);
         await session.sendKeys("1");
         await session.waitForText("SWITCH_WRITER_DONE", 30_000);
         expect(readFileSync(join(workspace, "switch-child.txt"), "utf8")).toBe("SWITCH_WROTE\n");
 
-        // Main's row is above the only subagent's, its prompt gone.
-        await moveAgent(session, -1);
+        // Main's screen no longer shows the prompt.
+        await showAgent(session, "fx 1");
         const main = await session.waitForPane((pane) => pane.includes("SWITCH_MAIN_DONE"), 30_000);
         expect(main).not.toContain("needs permission");
       }, (home) => {
@@ -967,7 +1059,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(answer).toContain("SWITCH_ALPHA");
 
         // The question and its answer belong to the subagent's conversation.
-        await moveAgent(session, 1);
+        await showAgent(session, "asker");
         await session.waitForPane((pane) => pane.includes("SWITCH_ASKER_DONE"), 15_000);
       });
     },
@@ -1013,15 +1105,15 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(await session.captureFullScrollback()).not.toContain("needs permission");
 
         // Its footer shows the mode it follows.
-        await moveAgent(session, 1);
+        await showAgent(session, "follower");
         await session.waitForPane((pane) => pane.includes("SWITCH_FOLLOWER_DONE") && pane.includes("auto ·"), 15_000);
 
         // Tightening main tightens it: back in ask, a write the user asks of
         // it on its own screen waits for an answer.
-        await moveAgent(session, -1);
+        await showAgent(session, "fx 1");
         await session.sendText("/permissions ask");
         await session.waitForText("mode set to ask", 10_000);
-        await moveAgent(session, 1);
+        await showAgent(session, "follower");
         await session.waitForPane((pane) => pane.includes("ask ·"), 15_000);
         await session.sendText("SWITCH_TYPED write again");
         await session.waitForText("Apply this change?", 30_000);
@@ -1070,14 +1162,14 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await until("the second subagent's request", () => seen.second === 1);
 
         // On the first subagent's screen, the second asks, then the first.
-        await moveAgent(session, 1);
+        await showAgent(session, "first");
         gates.second.release();
         await session.waitForText("second needs approval", 30_000);
         gates.first.release();
         await session.waitForText("Subagent first needs permission", 30_000);
 
         // Back on main, the second's prompt shows first, then the first's.
-        await moveAgent(session, -1);
+        await showAgent(session, "fx 1");
         const oldest = await session.waitForText("Subagent second needs permission", 15_000);
         expect(oldest).not.toContain("Subagent first needs permission");
         await session.sendKeys("1");
@@ -1122,13 +1214,13 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         const parent = readdirSync(sessions).find((id) => !id.startsWith(".") && statSync(join(sessions, id)).isDirectory() && holds(join(sessions, id)));
         expect(parent).toBeDefined();
         const resumed = await launch(`--resume ${parent}`);
-        await moveAgent(resumed, 1);
+        await showAgent(resumed, "reviewer");
         const subagent = await resumed.waitForPane((pane) =>
           pane.includes("SWITCH_SAVED_ANSWER") && pane.includes("reviewer \u00b7 done"), 15_000);
         expect(subagent).toContain("SWITCH_SAVED_TASK");
         // One with a saved conversation shows it instead, as a resumed fx does.
         expect(subagent).not.toContain("Run /help for commands");
-        await moveAgent(resumed, -1);
+        await showAgent(resumed, "fx 1");
         await resumed.waitForPane((pane) => pane.includes("SWITCH_MAIN_FINAL"), 15_000);
       });
     },
@@ -1174,7 +1266,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER");
         await session.waitForText("SWITCH_MAIN_FINAL", 30_000);
         await session.waitForComposer(15_000);
-        await moveAgent(session, 1);
+        await showAgent(session, "reader");
         await session.waitForPane((pane) => pane.includes("reader \u00b7 "), 15_000);
         await session.sendText("/compact");
         const deadline = Date.now() + 30_000;
@@ -1196,7 +1288,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
 
         // A restart restores the subagent's compacted conversation.
         const resumed = await launch(`--resume ${parents[0]}`);
-        await moveAgent(resumed, 1);
+        await showAgent(resumed, "reader");
         await resumed.waitForPane((pane) => pane.includes("reader \u00b7 "), 15_000);
         await resumed.sendText("SWITCH_AFTER_RESUME");
         await resumed.waitForText("SWITCH_CHILD_RESUMED", 30_000);
@@ -1350,7 +1442,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(child).not.toContain("EDGE_KEEP_ME");
 
         // Back on main, the draft is as it was typed.
-        await moveAgent(session, -1);
+        await showAgent(session, "fx 1");
         const main = await session.waitForPane((pane) => pane.includes("\u2503 EDGE_KEEP_ME"), 10_000);
         expect(main).not.toContain("EDGE_KEEP_MEq");
         expect(main).toContain("main \u00b7 ctrl+x");
@@ -1383,7 +1475,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // The reviewer's title is the title model's, from its task, as main's is.
         const list = await session.waitForPane((pane) => / {4}reviewer \u00b7 Review the parser \u00b7 main \u00b7 working \u00b7 \S/.test(pane), 15_000);
         expect(list).toMatch(/fx 1 \(on screen\) \u00b7 Plan the parser work \u00b7 main \u00b7 idle \u00b7 \S/);
+        // Opening the list keeps main selected, even below a working child.
         expect(list).toContain("\u2191\u2193 preview     enter switch     esc back");
+        expect(list).not.toContain("delete close");
         await session.sendKeys("Escape");
         reviewer.release();
         await session.waitForPane((pane) => !pane.includes("subagent working"), 30_000);
@@ -1393,7 +1487,112 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "x, then x again, in the agent list closes a working subagent for good: main hears the user closed it, and a resume doesn't bring it back",
+    "the agent list keeps working order, sorts idle responses newest first through resume, and preserves selection",
+    async () => {
+      const gates = { reviewer: held(), tester: held() };
+      const started = { reviewer: false, tester: false };
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            const who = userTexts(body).some((value) => value.includes("ORDER_TEST_TASK")) ? "tester" : "reviewer";
+            started[who] = true;
+            await gates[who].promise;
+            return text(`order_${who}_done`, `ORDER_${who.toUpperCase()}_DONE`);
+          }
+          if (!body.includes('"order_review"')) {
+            return toolCall("order_review", "subagent", {
+              request: { action: "message", agent: "reviewer", message: "ORDER_REVIEW_TASK check the parser", report: "never" },
+            });
+          }
+          if (!body.includes('"order_test"')) {
+            return toolCall("order_test", "subagent", {
+              request: { action: "message", agent: "tester", message: "ORDER_TEST_TASK check the tests", report: "never" },
+            });
+          }
+          if (latestUserText(body).includes("ORDER_MAIN_NEW_REPLY")) return text("order_main_new", "ORDER_MAIN_NEWEST");
+          return text("order_main_idle", "ORDER_MAIN_IDLE");
+        }, async (session, { home, launch }) => {
+          await session.sendText("SWITCH_USER start both workers");
+          await session.waitForText("ORDER_MAIN_IDLE", 30_000);
+          await until("both workers' requests", () => started.reviewer && started.tester);
+          await session.waitForText("2 subagents working", 15_000);
+          await session.sendKeys("Down");
+          const initial = await session.waitForPane((pane) =>
+            /^ {4}reviewer \u00b7 .* \u00b7 working \u00b7 /m.test(pane)
+            && /^ {4}tester \u00b7 .* \u00b7 working \u00b7 /m.test(pane)
+            && /fx 1 \(on screen\) \u00b7 .* \u00b7 idle \u00b7 /.test(pane), 15_000);
+          // Creation order is retained among workers, but even main's row
+          // moves below them: all rows participate in the partition.
+          expect(initial.indexOf("    reviewer \u00b7 ")).toBeLessThan(initial.indexOf("    tester \u00b7 "));
+          expect(initial.indexOf("    tester \u00b7 ")).toBeLessThan(initial.indexOf("  fx 1 (on screen)"));
+          await session.sendKeys("Up");
+          const preview = await session.waitForText("ORDER_TEST_TASK check the tests", 10_000);
+          expect(preview).toContain("ORDER_TEST_TASK check the tests");
+          expect(preview).toContain("enter switch     delete close     esc back");
+
+          gates.reviewer.release();
+          const reordered = await session.waitForPane((pane) =>
+            pane.includes("ORDER_TEST_TASK check the tests")
+            && /^ {4}tester \u00b7 .* \u00b7 working \u00b7 /m.test(pane)
+            && /^ {4}reviewer \u00b7 /m.test(pane)
+            && !/^ {4}reviewer \u00b7 .* \u00b7 working \u00b7 /m.test(pane)
+            && /fx 1 \(on screen\) \u00b7 .* \u00b7 (?:idle|finished) \u00b7 /.test(pane), 30_000);
+          expect(reordered.indexOf("    tester \u00b7 ")).toBeLessThan(reordered.indexOf("    reviewer \u00b7 "));
+          // Reports are disabled, so reviewer has the newest idle response.
+          expect(reordered.indexOf("    reviewer \u00b7 ")).toBeLessThan(reordered.indexOf("  fx 1 (on screen) \u00b7 "));
+          gates.tester.release();
+          const idle = await session.waitForPane((pane) => pane.includes("ORDER_TESTER_DONE")
+            && /^ {4}tester \u00b7 /m.test(pane) && /^ {4}reviewer \u00b7 /m.test(pane)
+            && /fx 1 \(on screen\) \u00b7 .* \u00b7 idle \u00b7 /.test(pane)
+            && pane.includes(LIST_HINT) && !/\u00b7 working \u00b7 /.test(pane), 30_000);
+          expect(idle.indexOf("    tester \u00b7 ")).toBeLessThan(idle.indexOf("    reviewer \u00b7 "));
+          expect(idle.indexOf("    reviewer \u00b7 ")).toBeLessThan(idle.indexOf("  fx 1 (on screen) \u00b7 "));
+          await session.sendKeys("Enter");
+          const kept = await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+          expect(kept).toContain("ORDER_TESTER_DONE");
+          expect(kept).toContain("tester \u00b7 done \u2193");
+          expect(kept).not.toContain("ORDER_MAIN_IDLE");
+
+          await showAgent(session, "fx 1");
+          await session.waitForText("ORDER_MAIN_IDLE", 10_000);
+          await session.sendText("SWITCH_USER ORDER_MAIN_NEW_REPLY");
+          await session.waitForText("ORDER_MAIN_NEWEST", 30_000);
+          await session.sendKeys("C-x");
+          const mainNewest = await session.waitForPane((pane) => pane.includes(LIST_HINT)
+            && /fx 1 \(on screen\) \u00b7 .* \u00b7 idle \u00b7 /.test(pane), 15_000);
+          expect(mainNewest.indexOf("  fx 1 (on screen) \u00b7 ")).toBeLessThan(mainNewest.indexOf("    tester \u00b7 "));
+          expect(mainNewest.indexOf("    tester \u00b7 ")).toBeLessThan(mainNewest.indexOf("    reviewer \u00b7 "));
+          expect(mainNewest).not.toContain("delete close");
+          await session.sendKeys("Enter");
+          await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+          expect(await session.captureFullScrollback()).toContain("ORDER_MAIN_NEWEST");
+          await session.sendText("/quit");
+          expect(await session.waitForSessionEnd(15_000)).toBe(true);
+
+          const parents = sessionsHolding(home, "ORDER_MAIN_NEWEST");
+          expect(parents).toHaveLength(1);
+          const resumed = await launch(`--resume ${parents[0]}`);
+          await resumed.waitForText("ORDER_MAIN_NEWEST", 30_000);
+          await resumed.sendKeys("C-x");
+          const restored = await resumed.waitForPane((pane) => pane.includes(LIST_HINT)
+            && /^ {4}tester \u00b7 /m.test(pane) && /^ {4}reviewer \u00b7 /m.test(pane), 15_000);
+          expect(restored.indexOf("  fx 1 (on screen) \u00b7 ")).toBeLessThan(restored.indexOf("    tester \u00b7 "));
+          expect(restored.indexOf("    tester \u00b7 ")).toBeLessThan(restored.indexOf("    reviewer \u00b7 "));
+          expect(restored).not.toContain("delete close");
+          await resumed.sendKeys("Enter");
+          await resumed.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+          expect(await resumed.capturePane()).toContain("ORDER_MAIN_NEWEST");
+        });
+      } finally {
+        gates.reviewer.release();
+        gates.tester.release();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "Delete, then Delete again, in the agent list closes a working subagent for good: main hears the user closed it, and a resume doesn't bring it back",
     async () => {
       const reviewer = held();
       let childCalls = 0;
@@ -1417,23 +1616,27 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await until("the reviewer's turn", () => childCalls >= 1);
         await session.sendKeys("Down");
         await session.waitForText("esc back", 10_000);
-        // On main's row, x does nothing: an instance closes with /close. The
+        // On main's row, Delete does nothing: an instance closes with /close. The
         // next key is handled once the hint changes, so by then the trace
-        // shows whether x armed anything.
-        await session.sendKeys("x");
-        await session.sendKeys("Down");
-        await session.waitForText("enter switch     x close     esc back", 10_000);
-        expect(readFileSync(tracePath, "utf8")).not.toContain("agents_menu_close_armed");
-        await session.sendKeys("x");
-        await session.waitForText("x again to close it for good", 10_000);
-        expect(readFileSync(tracePath, "utf8")).toContain("agents_menu_close_armed");
-        // Any other key keeps it.
+        // shows whether Delete armed anything.
+        await session.sendKeys("BSpace");
         await session.sendKeys("Up");
-        await session.waitForPane((pane) => !pane.includes("x again to close"), 10_000);
+        const working = await session.waitForText("enter switch     delete close     esc back", 10_000);
+        expect(working).toContain("Review src/parser.zig for bugs");
+        expect(working.indexOf("    reviewer \u00b7 ")).toBeLessThan(working.indexOf("  fx 1 (on screen) \u00b7 "));
+        expect(readFileSync(tracePath, "utf8")).not.toContain("agents_menu_close_armed");
+        await session.sendKeys("BSpace");
+        const warning = await session.waitForText("press delete again to close this subagent", 10_000);
+        expect(warning).not.toContain("any other key");
+        expect(readFileSync(tracePath, "utf8")).toContain("agents_menu_close_armed");
+        // Any other key keeps it. Main's idle row is below the worker.
         await session.sendKeys("Down");
-        await session.sendKeys("x");
-        await session.waitForText("x again to close it for good", 10_000);
-        await session.sendKeys("x");
+        await session.waitForPane((pane) => !pane.includes("press delete again to close this subagent")
+          && pane.includes("fx 1 (on screen)"), 10_000);
+        await session.sendKeys("Up");
+        await session.sendKeys("BSpace");
+        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.sendKeys("BSpace");
         const closed = await session.waitForPane((pane) => !/^ {4}reviewer \u00b7 /m.test(pane) && pane.includes("esc back"), 15_000);
         // Main is on screen again, and the reviewer's turn ended with the close.
         expect(closed).toContain("SWITCH_USER review it");
@@ -1467,41 +1670,56 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "closing the middle row of the agent list keeps the highlight on the agent shown, and the first x warns at once",
+    "closing the middle row of the agent list keeps the highlight on the agent shown, and the first Delete warns at once",
     async () => {
+      let reviewerReported = false;
       await withFx(async (body) => {
-        if (!isMainRequest(body)) return text("child_done", "MIDDLE_CHILD_DONE");
+        if (!isMainRequest(body)) {
+          if (userTexts(body).some((value) => value.includes("MIDDLE_TEST"))) {
+            await until("the reviewer's report", () => reviewerReported);
+            return text("tester_done", "MIDDLE_TESTER_DONE");
+          }
+          return text("reviewer_done", "MIDDLE_REVIEWER_DONE");
+        }
+        reviewerReported ||= body.includes("MIDDLE_REVIEWER_DONE");
         if (!body.includes('"main_r"')) {
           return toolCall("main_r", "subagent", { request: { action: "message", agent: "reviewer", message: "MIDDLE_REVIEW" } });
         }
         if (!body.includes('"main_t"')) {
           return toolCall("main_t", "subagent", { request: { action: "message", agent: "tester", message: "MIDDLE_TEST" } });
         }
-        return text("main_done", "MIDDLE_MAIN_DONE");
+        return body.includes("MIDDLE_TESTER_DONE")
+          ? text("main_done", "MIDDLE_MAIN_DONE")
+          : text("main_wait", "MIDDLE_MAIN_WAITING");
       }, async (session) => {
         await session.sendText("SWITCH_USER start them");
         await session.waitForText("MIDDLE_MAIN_DONE", 30_000);
         await session.waitForPane((pane) => !pane.includes("subagent working"), 30_000);
-        // Rows: fx 1, reviewer, tester. Both subagents are idle, so nothing
-        // on screen animates.
+        // Responses finish reviewer, tester, main: the idle middle row is tester.
+        // Both subagents are idle, so nothing on screen animates.
         await session.sendKeys("Down");
         await session.waitForText(LIST_HINT, 10_000);
         await session.sendKeys("Down");
-        await session.waitForText("enter switch     x close     esc back", 10_000);
-        await session.sendKeys("x");
-        await session.waitForText("x again to close it for good", 10_000);
+        await session.waitForText("enter switch     delete close     esc back", 10_000);
+        await session.sendKeys("BSpace");
+        await session.waitForText("press delete again to close this subagent", 10_000);
         // Any other key keeps it, and its warning goes at once.
         await session.sendKeys("a");
-        await session.waitForText("enter switch     x close     esc back", 10_000);
-        // X closes too, so Caps Lock doesn't get in the way.
-        await session.sendKeys("X");
-        await session.waitForText("x again to close it for good", 10_000);
+        await session.waitForText("enter switch     delete close     esc back", 10_000);
+        // The old letter shortcuts no longer arm deletion.
         await session.sendKeys("x");
-        // Main is shown, and the highlight is on its row, not on tester's.
-        const closed = await session.waitForPane((pane) => !/^ {4}reviewer \u00b7 /m.test(pane) && pane.includes("esc back"), 15_000);
-        expect(closed).toMatch(/^ {4}tester \u00b7 /m);
+        await session.sendKeys("X");
+        expect(await session.capturePane()).not.toContain("press delete again to close this subagent");
+        // Kitty-encoded Backspace also preserves the two-press confirmation.
+        await session.sendLiteral("\x1b[127u");
+        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.sendLiteral("\x1b[127;1u");
+        // Main is shown, and the highlight is on its row, not on reviewer's.
+        const closed = await session.waitForPane((pane) => !/^ {4}tester \u00b7 /m.test(pane) && pane.includes("esc back"), 15_000);
+        expect(closed).toMatch(/^ {4}reviewer \u00b7 /m);
         expect(closed).toContain("\u2191\u2193 preview     enter switch     esc back");
-        expect(closed).not.toContain("x close");
+        expect(closed).not.toContain("delete close");
+        expect(await session.captureFullScrollback()).not.toContain("for good");
         await session.sendKeys("Enter");
         const kept = await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
         expect(kept).toContain("MIDDLE_MAIN_DONE");
@@ -1534,6 +1752,317 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         const typed = await session.waitForPane((pane) => composerContains(pane, "z"), 10_000);
         expect(typed).not.toContain("esc back");
       });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent fx stops for repeated invalid shell calls reports to main that it failed, and why",
+    async () => {
+      const env: Record<string, string> = {};
+      let tracePath = "";
+      let report = "";
+      let laneSteps = 0;
+      // The same invalid call each step: fx validates it, runs nothing, and
+      // stops the subagent's tool loop after the second identical failure.
+      const invalidShell = (id: string) => toolCall(id, "shell", {
+        request: { command: "printf unexpected > must-not-run.txt", tty: true, shell: { kind: "executable", path: "/bin/bash" } },
+        yield_time_ms: "1000",
+      });
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          laneSteps += 1;
+          if (laneSteps > 2) return text("lane4_extra", "LANE4_ASKED_AGAIN");
+          return invalidShell(`lane4_bad_${laneSteps}`);
+        }
+        if (latestUserText(body).includes('"child_id"')) {
+          report = latestUserText(body);
+          return text("main_report", "MAIN_SAW_REPORT");
+        }
+        if (!body.includes('"main_lane4"')) {
+          return toolCall("main_lane4", "subagent", { request: { action: "message", agent: "lane4", message: "LANE4_TASK run the bench" } });
+        }
+        return text("main_waiting", "MAIN_WAITING");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER start lane4");
+        await session.waitForText("MAIN_SAW_REPORT", 60_000);
+        await session.waitForComposer(30_000);
+        expect(traceHas(tracePath, "terminal_validation_retry")).toBe(true);
+        // The subagent asked the model only for its two invalid calls.
+        expect(laneSteps).toBe(2);
+        const screen = await session.captureFullScrollback();
+        expect(screen).toContain("lane4 failed");
+        expect(screen).not.toContain("lane4 completed");
+        // Main's model hears that lane4 failed and why, so it can recover
+        // or tell the user.
+        const fields = JSON.parse(report.slice(report.indexOf("{")));
+        expect(fields.outcome).toBe("failed");
+        expect(fields.output).toContain("Repeated shell validation failures stopped the tool loop.");
+        // lane4's own screen still says why it stopped.
+        await showAgent(session, "lane4");
+        await session.waitForText("Repeated shell validation failures stopped the tool loop.", 10_000);
+      }, (home) => {
+        tracePath = join(home, "fx-trace.log");
+        env.FX_TRACE_LOG = tracePath;
+      }, false, env);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main can still steer a working subagent after it has read 64 earlier messages",
+    async () => {
+      const env: Record<string, string> = { FX_PERMISSION_MODE: "full-access" };
+      let lastResult = "";
+      let laneRequests = 0;
+      const laneStep = held(), laneRead = held(), laneDone = held();
+      const steers = Array.from({ length: 64 }, (_, i) => ({ id: `steer_${i + 1}`, agent: "lane", message: `STEER_${String(i + 1).padStart(3, "0")} note` }));
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          laneRequests += 1;
+          if (laneRequests === 1) {
+            await laneStep.promise;
+            return toolCall("lane_t1", "shell", { action: "run", command: "true" });
+          }
+          // The lane reads every waiting message at this step.
+          if (body.includes("STEER_064")) laneRead.release();
+          await laneDone.promise;
+          return text("lane_done", "LANE_DONE");
+        }
+        if (latestUserText(body).includes('"child_id"')) return text("main_report", "MAIN_SAW_REPORT");
+        if (body.includes('"steer_last"')) {
+          lastResult = toolResultText(body, "steer_last");
+          laneDone.release();
+          return text("main_done", "MAIN_DONE");
+        }
+        if (body.includes('"steer_64"')) {
+          laneStep.release();
+          await laneRead.promise;
+          return toolCall("steer_last", "subagent", { request: { action: "message", agent: "lane", message: "STEER_LAST one more" } });
+        }
+        if (body.includes('"main_start"')) return messageSteps(steers);
+        return toolCall("main_start", "subagent", { request: { action: "message", agent: "lane", message: "LANE_TASK keep working" } });
+      }, async (session) => {
+        await session.sendText("SWITCH_USER steer the lane");
+        await session.waitForText("MAIN_DONE", 120_000);
+        console.log(`STEER_LAST_RESULT: ${lastResult}`);
+        // None of the 64 was waiting any more, so the limit doesn't apply.
+        expect(lastResult).toContain("Sent into the subagent's running turn");
+      }, () => {}, false, env);
+    },
+    180_000,
+  );
+
+  test(
+    "a subagent with 64 unread messages refuses one more and says why, while another working subagent still takes messages",
+    async () => {
+      const env: Record<string, string> = { FX_PERMISSION_MODE: "full-access" };
+      let fullResult = "";
+      let otherResult = "";
+      const lanesDone = held();
+      const steers = Array.from({ length: 64 }, (_, i) => ({ id: `steer_a_${i + 1}`, agent: "lane-a", message: `A_STEER_${String(i + 1).padStart(3, "0")} note` }));
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          // Neither lane reaches a step boundary until the checks are done,
+          // so every message to lane-a stays unread.
+          await lanesDone.promise;
+          return text("lane_done", "LANE_DONE");
+        }
+        if (latestUserText(body).includes('"child_id"')) return text("main_report", "MAIN_SAW_REPORT");
+        if (body.includes('"steer_b"')) {
+          fullResult = toolResultText(body, "steer_a_65");
+          otherResult = toolResultText(body, "steer_b");
+          lanesDone.release();
+          return text("main_done", "MAIN_DONE");
+        }
+        if (body.includes('"steer_a_64"')) {
+          return messageSteps([
+            { id: "steer_a_65", agent: "lane-a", message: "A_STEER_065 one too many" },
+            { id: "steer_b", agent: "lane-b", message: "B_STEER_001 note" },
+          ]);
+        }
+        if (body.includes('"start_b"')) return messageSteps(steers);
+        return messageSteps([
+          { id: "start_a", agent: "lane-a", message: "LANE_A_TASK keep working" },
+          { id: "start_b", agent: "lane-b", message: "LANE_B_TASK keep working" },
+        ]);
+      }, async (session) => {
+        await session.sendText("SWITCH_USER fill lane-a");
+        await session.waitForText("MAIN_DONE", 120_000);
+        console.log(`FULL_RESULT: ${fullResult}`);
+        console.log(`OTHER_RESULT: ${otherResult}`);
+        const full = JSON.parse(fullResult.slice(fullResult.indexOf("{")));
+        expect(full.ok).toBe(false);
+        expect(full.result).toContain("lane-a already has 64 unread messages");
+        expect(otherResult).toContain("Sent into the subagent's running turn");
+      }, () => {}, false, env);
+    },
+    180_000,
+  );
+
+  test(
+    "a subagent's report that waits for main's running turn never shows as a message the user queued",
+    async () => {
+      const env: Record<string, string> = {};
+      let tapePath = "";
+      let tracePath = "";
+      let mainWaiting = () => {};
+      const mainWaits = new Promise<void>((resolve) => { mainWaiting = resolve; });
+      let releaseMain = () => {};
+      const mainReleased = new Promise<void>((resolve) => { releaseMain = resolve; });
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          // The report reaches main only while main waits on the model.
+          await mainWaits;
+          return text("solo_reply", "SOLO_DONE");
+        }
+        if (latestUserText(body).includes('"child_id"')) return text("main_report", "MAIN_SAW_REPORT");
+        if (!body.includes('"main_solo"')) {
+          return toolCall("main_solo", "subagent", { request: { action: "message", agent: "solo", message: "SOLO_TASK answer at once" } });
+        }
+        mainWaiting();
+        await mainReleased;
+        return text("main_done", "MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER go");
+        // The report joins main's turn as steering while main's model call
+        // is still out.
+        await until("the report to reach main", () => traceHas(tracePath, "event=child_delivery_posted"), 30_000);
+        // Give the screen time to draw what main's queue holds.
+        await Bun.sleep(1_000);
+        releaseMain();
+        await session.waitForText("MAIN_SAW_REPORT", 60_000);
+        await session.waitForComposer(30_000);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+        // No frame drew the report's raw text as the user's message.
+        const frames = tapeFrames(tapePath);
+        expect(frames).toContain("MAIN_SAW_REPORT");
+        expect(frames).not.toContain("untrusted agent output");
+      }, (home) => {
+        tapePath = join(home, "report.fxtape");
+        tracePath = join(home, "fx-trace.log");
+        env.FX_RECORD = tapePath;
+        env.FX_TRACE_LOG = tracePath;
+      }, false, env);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "\u2191 takes back the user's own queued message, never a subagent's report waiting behind a tool",
+    async () => {
+      // Full access runs main's waiting command without a review.
+      const env: Record<string, string> = { FX_PERMISSION_MODE: "full-access" };
+      let tapePath = "";
+      let tracePath = "";
+      let started = "";
+      let gate = "";
+      let releaseSolo = () => {};
+      const soloReleased = new Promise<void>((resolve) => { releaseSolo = resolve; });
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          await soloReleased;
+          return text("solo_reply", "SOLO_DONE");
+        }
+        if (latestUserText(body).includes('"child_id"')) return text("main_report", "MAIN_SAW_REPORT");
+        if (!body.includes('"main_solo"')) {
+          // A step's tools run in order: the message, then a command that
+          // runs until the test opens its gate, which the report waits for.
+          const command = `touch ${started}; i=0; while [ ! -f ${gate} ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done; echo MAIN_WAITED`;
+          return fakeGatewaySse([
+            { type: "tool-call", toolCallId: "main_solo", toolName: "subagent", input: { request: { action: "message", agent: "solo", message: "SOLO_TASK answer at once" } } },
+            { type: "tool-call", toolCallId: "main_wait", toolName: "shell", input: { action: "run", command } },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]);
+        }
+        return text("main_done", "MAIN_DONE");
+      }, async (session, { workspace }) => {
+        started = join(workspace, "command-started");
+        gate = join(workspace, "command-gate");
+        await session.sendText("SWITCH_USER go");
+        await until("main's command to start", () => existsSync(started), 30_000);
+        // The user's own message waits for main's command, in the footer.
+        await session.sendText("MY_STEER");
+        await session.waitForPane((pane) => pane.includes("\u250b MY_STEER"), 10_000);
+        releaseSolo();
+        await until("the report to reach main", () => traceHas(tracePath, "event=child_delivery_posted"), 30_000);
+        // The report is now the newest steering, but ↑ brings back the
+        // user's: MY_STEER's 8 bytes, not the report's.
+        await session.sendKeys("Up");
+        await until("\u2191 to take a message back", () => traceHas(tracePath, "event=queued_steer_restored"), 10_000);
+        expect(readFileSync(tracePath, "utf8")).toMatch(/event=queued_steer_restored bytes=8\b/);
+        const restored = await session.waitForPane((pane) => composerContains(pane, "MY_STEER"), 10_000);
+        expect(restored).not.toContain("Subagent report");
+        await session.sendKeys("C-u");
+        // Main still gets the report once its command ends.
+        writeFileSync(gate, "");
+        await session.waitForText("MAIN_SAW_REPORT", 60_000);
+        await session.waitForComposer(30_000);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+        // Neither the footer nor a card drew the report's raw text.
+        expect(tapeFrames(tapePath)).not.toContain("untrusted agent output");
+      }, (home) => {
+        tapePath = join(home, "steer.fxtape");
+        tracePath = join(home, "fx-trace.log");
+        env.FX_RECORD = tapePath;
+        env.FX_TRACE_LOG = tracePath;
+      }, false, env);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "closing the window while main and a subagent wait on the model resumes main without a crash question",
+    async () => {
+      // Full access runs the subagent's command without a review.
+      const env: Record<string, string> = { FX_PERMISSION_MODE: "full-access" };
+      let home = "";
+      let mainSends = 0;
+      let subagentSends = 0;
+      const never = new Promise<Response>(() => {});
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          // A short command first, so the subagent's next request starts
+          // after main's.
+          if (!body.includes('"solo_sleep"')) return toolCall("solo_sleep", "shell", { action: "run", command: "sleep 1" });
+          subagentSends += 1;
+          return never;
+        }
+        if (!body.includes('"main_solo"')) {
+          return toolCall("main_solo", "subagent", { request: { action: "message", agent: "solo", message: "SOLO_TASK" } });
+        }
+        mainSends += 1;
+        return never;
+      }, async (session, context) => {
+        await session.sendText("SWITCH_USER go");
+        await until("main's request", () => mainSends === 1, 30_000);
+        await until("the subagent's later request", () => subagentSends === 1, 30_000);
+        process.kill(session.processPid(), "SIGHUP");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+        // Both requests in flight are saved as a clean close.
+        const records = lastRecoveryRecords(home);
+        expect(records.root).toEqual({ phase: 1, clean: true });
+        expect(records.child).toEqual({ phase: 1, clean: true });
+
+        // The window closes the same way again, while main's resumed request
+        // and a new subagent request wait.
+        const second = await context.launch(`--resume ${records.rootId}`);
+        await until("main's resumed request", () => mainSends === 2, 30_000);
+        await showAgent(second, "solo");
+        await second.sendText("SOLO_AGAIN");
+        await until("the subagent's request after main's", () => subagentSends === 2, 30_000);
+        process.kill(second.processPid(), "SIGHUP");
+        expect(await second.waitForSessionEnd(15_000)).toBe(true);
+
+        // fx never crashed, so main's request goes out again without asking.
+        const third = await context.launch(`--resume ${records.rootId}`);
+        await until("main's request to resume again", () => mainSends === 3, 30_000);
+        expect(await third.capturePane()).not.toContain("crashed fx twice");
+      }, (dir) => {
+        home = dir;
+      }, false, env);
     },
     TIMEOUT,
   );

@@ -41,6 +41,7 @@ const sm = @import("session_manager");
 /// A line boundary in a session log, for hosts that walk it.
 pub const LogCursor = sm.Cursor;
 const debug_trace = @import("../shared/debug_trace.zig");
+const write_test_controls = @import("write_test_controls.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
@@ -927,6 +928,13 @@ const BlobHost = struct {
     /// The open session; null once it closed.
     session: ?sm.Session,
     mutex: std.Io.Mutex = .init,
+    /// One write of the session at a time. `Session.write` holds it from
+    /// taking the due records until it clears them, so two writes on
+    /// different threads, such as main's compaction line and a subagent's
+    /// finish line, never take the same records
+    /// (`tests/tla/session/SessionWrite.tla` NoStaleRemoval, ListedOnce).
+    /// Taken before `life` and `mutex`, and never while holding either.
+    write_lock: std.Io.Mutex = .init,
     refs: usize = 1,
     /// Blobs stored since the last item that lists them (D44).
     pending: std.ArrayList(Hash) = .empty,
@@ -1487,12 +1495,16 @@ pub const Session = struct {
     /// stores kept since the last such line, so verify and recover see a
     /// lost one as damage (D39, D44). Compactor records kept since the last
     /// `compaction_records` line get a new one first, so the line that
-    /// cites them never lands without them (D50).
+    /// cites them never lands without them (D50). Writes of the session run
+    /// one at a time (`BlobHost.write_lock`).
     fn write(self: *Session, events: []const sm.Event) sm.AppendError!u64 {
+        self.host.write_lock.lockUncancelable(io_mod.getIo());
+        defer self.host.write_lock.unlock(io_mod.getIo());
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
         const a = scratch.allocator();
         const due = try self.host.recordsDue(a);
+        if (due) |records| write_test_controls.holdDueRecords(records.added.len);
         const with_records = if (due) |records| try std.mem.concat(a, sm.Event, &.{ try self.recordLines(a, records), events }) else events;
         const pending = try self.host.pendingCopy(a);
         const batch = try listPending(a, with_records, pending);
@@ -4649,11 +4661,25 @@ noinline fn replay(
                     // reader, so strings may point into the page.
                     if (kind == .user) {
                         try builder.begin(try src.withMovedImages(pa, try src.decodeUser(pa, data)));
+                        // Its line says when it was sent, for Ctrl+O.
+                        builder.user.?.sent_at_ms = std.math.cast(i64, entry.ts_ms) orelse 0;
+                        continue;
+                    }
+                    // A call record only shows in Ctrl+O, so one fx can't
+                    // read costs that record, never the session.
+                    if (kind == .model_call) {
+                        if (decodeModelCall(pa, data)) |record| {
+                            try builder.appendModelCall(record);
+                        } else {
+                            debug_trace.logf("session", "event=sessions_v2_model_call_unreadable session={s} dropped=call_record", .{src.id});
+                        }
                         continue;
                     }
                     switch (try decodePiece(pa, kind, data, .alloc_if_needed)) {
                         // Read above, with its images' blobs.
                         .user => unreachable,
+                        // Read above, leaving out one that fails its checks.
+                        .model_call => unreachable,
                         .assistant => |value| {
                             running_text = null;
                             try builder.appendAssistant(value);
@@ -5212,6 +5238,7 @@ fn itemType(kind: PieceKind) ?[]const u8 {
         // An older fx leaves out an item type it does not know (D17, D93, D94).
         .context_note => "context_note",
         .runtime_context => "runtime_context",
+        .model_call => "model_call",
     };
 }
 
@@ -5279,6 +5306,17 @@ fn encodePiece(alloc: Allocator, event: Event) ![]u8 {
     return out.toOwnedSlice();
 }
 
+/// A call record from the log, or null when it can't be parsed or fails its
+/// checks. A newer fx's extra fields are ignored. Strings are in `arena`.
+fn decodeModelCall(arena: Allocator, data: []const u8) ?types.ModelCallRecord {
+    const record = json_decode.parseFromSliceLeaky(types.ModelCallRecord, arena, data, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    session_event.validateConversationEventShape(.{ .model_call = record }, session_event.conversation_schema_version) catch return null;
+    return record;
+}
+
 /// Payload slices point into `arena` or `data`.
 /// With `.alloc_if_needed`, strings may point into `data`.
 fn decodePiece(arena: Allocator, kind: PieceKind, data: []const u8, allocate: std.json.AllocWhen) !Event {
@@ -5306,6 +5344,12 @@ test "v2 conversation pieces stay bounded under fuzzed bytes" {
             "{\"text\":\"n\",\"sources\":[{\"path\":\"\",\"stamp\":0}]}",
             "{\"messages\":[\"<fx-turn-context>\\ngit_branch: main\\n</fx-turn-context>\",\"Runtime context: permission mode is auto.\"]}",
             "{\"messages\":[]}",
+            // Model call records: as fx writes one, one with a newer fx's
+            // extra field, and ones whose provider text must be refused.
+            "{\"at_ms\":1762300000000,\"elapsed_ms\":2140,\"purpose\":\"turn\",\"outcome\":\"completed\",\"provider\":\"gateway\",\"model\":\"anthropic/claude-opus-4.8\",\"served_by\":null,\"generation_id\":\"gen_01JC7P5XQ2M8VZ000000000001\",\"finish\":\"stop\",\"failure\":null,\"retry_after_s\":null,\"input_tokens\":1204,\"output_tokens\":188,\"after_tool_step_count\":0}",
+            "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"cost_usd\":0.01}",
+            "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"generation_id\":\"gen_\\u001b[2J\"}",
+            "{\"at_ms\":-5,\"provider\":\"\",\"model\":\"m\",\"outcome\":\"exploded\"}",
         }) ++ @import("fuzz_corpus").session_conversation_piece.*),
     });
 }
@@ -5318,6 +5362,16 @@ fn fuzzConversationPiece(_: void, smith: *std.testing.Smith) !void {
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena_state.deinit();
         _ = decodePiece(arena_state.allocator(), @field(PieceKind, name), buffer[0..len], .alloc_always) catch {};
+    }
+    // Replay reads a model call record this way instead, and keeps one only
+    // when every string is one Ctrl+O may show.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    if (decodeModelCall(arena_state.allocator(), buffer[0..len])) |record| {
+        try std.testing.expect(types.validModelCallText(record.provider) and types.validModelCallText(record.model));
+        inline for (.{ record.served_by, record.generation_id, record.finish, record.failure }) |text| {
+            if (text) |value| try std.testing.expect(types.validModelCallText(value));
+        }
     }
 }
 
@@ -7345,6 +7399,123 @@ test "a turn's runtime context comes back on resume, saved once right after its 
     try testing.expect(restored.history[1].assistant.execution.runtime_context == null);
 }
 
+test "a turn's model call records come back on resume at their steps, each saved once" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var fixture: NoteTestSteps = .{};
+    fixture.init();
+    var calls = [_]types.ModelCallRecord{
+        .{ .at_ms = 1_000, .outcome = .failed, .provider = "gateway", .model = "m", .failure = "rate_limited", .retry_after_s = 4 },
+        .{ .at_ms = 2_000, .provider = "gateway", .model = "m", .generation_id = "gen_01JC7P5XQ2M8VZ000000000001", .input_tokens = 10 },
+        .{ .at_ms = 3_000, .provider = "gateway", .model = "m", .generation_id = "gen_01JC7P5XQ2M8VZ000000000002", .after_tool_step_count = 1 },
+        .{ .at_ms = 4_000, .provider = "gateway", .model = "m", .generation_id = "gen_01JC7P5XQ2M8VZ000000000003", .after_tool_step_count = 2 },
+    };
+    const user: types.UserTurn = .{ .text = @constCast("two steps") };
+    // The write before the second step's send holds the calls so far, the
+    // one for the step it's about to send last; the commit adds the rest.
+    try s.appendProgress(user, .{ .tool_steps = fixture.steps[0..1], .model_calls = calls[0..3] }, .{});
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = fixture.steps[0..2], .model_calls = &calls },
+    } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    // Every write only added to the turn, so none was superseded, and each
+    // record is on one line.
+    try testing.expect(std.mem.find(u8, bytes, superseded_type) == null);
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, bytes, "\"model_call\""));
+    for (calls[1..]) |call| try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, call.generation_id.?));
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const saved = restored.history[0].assistant.execution.model_calls;
+    try testing.expectEqual(calls.len, saved.len);
+    for (calls, saved) |want, got| {
+        try testing.expectEqual(want.at_ms, got.at_ms);
+        try testing.expectEqual(want.outcome, got.outcome);
+        try testing.expectEqual(want.after_tool_step_count, got.after_tool_step_count);
+        if (want.generation_id) |gen| try testing.expectEqualStrings(gen, got.generation_id.?);
+    }
+    try testing.expectEqualStrings("rate_limited", saved[0].failure.?);
+    try testing.expectEqual(@as(?u32, 4), saved[0].retry_after_s);
+}
+
+test "steering delivered after a saved call at the same step goes after it, so the turn is never rewritten" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    // An empty reply's call is saved, then a report arrives as steering at
+    // the same boundary, then the next call answers.
+    var first = [_]types.ModelCallRecord{
+        .{ .at_ms = 1_000, .provider = "gateway", .model = "m", .generation_id = "gen_01JC7P5XQ2M8VZ000000000001" },
+    };
+    var both = [_]types.ModelCallRecord{
+        first[0],
+        .{ .at_ms = 2_000, .provider = "gateway", .model = "m", .generation_id = "gen_01JC7P5XQ2M8VZ000000000002", .after_steering_count = 1 },
+    };
+    var steering = [_]types.PersistedSteering{.{ .text = @constCast("CHILD_REPORT_TEXT"), .after_tool_step_count = 0 }};
+    const user: types.UserTurn = .{ .text = @constCast("wait for the report") };
+    try s.appendProgress(user, .{ .model_calls = &first }, .{});
+    try s.appendProgress(user, .{ .steering = &steering, .model_calls = &both }, .{});
+    try s.commitTurn(.{ .assistant = .{
+        .user = user,
+        .assistant = @constCast("done"),
+        .execution = .{ .steering = &steering, .model_calls = &both },
+    } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.find(u8, bytes, superseded_type) == null);
+    // In the order they happened, each once.
+    const call_one = std.mem.find(u8, bytes, first[0].generation_id.?).?;
+    const report = std.mem.find(u8, bytes, "CHILD_REPORT_TEXT").?;
+    const call_two = std.mem.find(u8, bytes, both[1].generation_id.?).?;
+    try testing.expect(call_one < report and report < call_two);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, bytes, "\"model_call\""));
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const saved = restored.history[0].assistant.execution.model_calls;
+    try testing.expectEqual(@as(usize, 2), saved.len);
+    try testing.expectEqual(@as(usize, 0), saved[0].after_steering_count);
+    try testing.expectEqual(@as(usize, 1), saved[1].after_steering_count);
+}
+
+test "replay keeps a model call record a newer fx wrote and leaves out one it can't show" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const newer = decodeModelCall(a, "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"cost_usd\":0.01}").?;
+    try testing.expectEqualStrings("gateway", newer.provider);
+    // Escape bytes from a provider, an outcome this fx doesn't know, a
+    // negative time, and bytes that aren't JSON.
+    try testing.expect(decodeModelCall(a, "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"generation_id\":\"gen_\\u001b[2J\"}") == null);
+    try testing.expect(decodeModelCall(a, "{\"at_ms\":1,\"provider\":\"gateway\",\"model\":\"m\",\"outcome\":\"exploded\"}") == null);
+    try testing.expect(decodeModelCall(a, "{\"at_ms\":-1,\"provider\":\"gateway\",\"model\":\"m\"}") == null);
+    try testing.expect(decodeModelCall(a, "not json") == null);
+}
+
 test "a compaction inside a turn drops the context notes it covers and keeps the later ones on resume (D93)" {
     var t: TestHome = undefined;
     try t.init();
@@ -7970,6 +8141,208 @@ test "an older session moves off its side folder on its first writable open, and
     try testing.expectEqual(@as(?[]u8, null), lost.inline_data);
     try testing.expectEqual(@as(?[]u8, null), lost.blob_path);
     try testing.expect(std.mem.endsWith(u8, lost.snapshot_path.?, "images/" ++ OldSideFolder.image_name));
+}
+
+/// Every `compaction_records` setting in session `id`'s log, as the count
+/// of records each lists besides its own map, and how many records they
+/// list in all. Fails when a setting leaves out its map or two list the same
+/// record (D50). In `arena`.
+fn recordListings(arena: Allocator, manager: *sm.Manager, id: []const u8) !struct { counts: []usize, records: usize } {
+    var page = try manager.read(testing.allocator, id, .start, .forward, 10_000);
+    defer page.deinit();
+    var counts: std.ArrayList(usize) = .empty;
+    var listed: std.array_hash_map.String(void) = .empty;
+    for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        if (body != .set or body.set.key != .compaction_records) continue;
+        const value = try std.json.parseFromSliceLeaky(struct { map: []const u8 }, arena, body.set.value, .{ .allocate = .alloc_always });
+        var lists_map = false;
+        var count: usize = 0;
+        for (body.set.blobs) |hash| {
+            if (std.mem.eql(u8, hash, value.map)) {
+                lists_map = true;
+                continue;
+            }
+            const slot = try listed.getOrPut(arena, try arena.dupe(u8, hash));
+            try testing.expect(!slot.found_existing);
+            count += 1;
+        }
+        try testing.expect(lists_map);
+        try counts.append(arena, count);
+    }
+    return .{ .counts = counts.items, .records = listed.count() };
+}
+
+/// Holds the first write that takes due records until `go` is set, so a
+/// test can run another write of the session, or keep a record, meanwhile.
+const HeldWrite = struct {
+    var held: std.Io.Event = .unset;
+    var go: std.Io.Event = .unset;
+    var calls = std.atomic.Value(u32).init(0);
+
+    fn arm() void {
+        held = .unset;
+        go = .unset;
+        calls.store(0, .seq_cst);
+        write_test_controls.test_hold = hold;
+    }
+
+    fn disarm() void {
+        write_test_controls.test_hold = null;
+    }
+
+    fn hold(_: usize) void {
+        if (calls.fetchAdd(1, .seq_cst) != 0) return;
+        held.set(io_mod.getIo());
+        go.waitUncancelable(io_mod.getIo());
+    }
+
+    fn write(session: *Session, text: []const u8, done: *std.atomic.Value(bool), failed: *std.atomic.Value(bool)) void {
+        session.setClientPrompt(text) catch failed.store(true, .seq_cst);
+        done.store(true, .seq_cst);
+    }
+
+    /// A subagent's line, as when one is spawned or finishes: unlike
+    /// `setClientPrompt`, it doesn't take `Session.mutex`, so only the write
+    /// lock makes it wait.
+    fn childLine(session: *Session, child: []const u8, done: *std.atomic.Value(bool), failed: *std.atomic.Value(bool)) void {
+        session.appendChildLines(&.{.{ .spawned = .{ .child = child, .work_id = "w1", .data = "{\"kind\":\"persistent\"}" } }}) catch failed.store(true, .seq_cst);
+        done.store(true, .seq_cst);
+    }
+};
+
+test "a write that took due records makes the session's other writes wait, and a record kept meanwhile stays due (D50)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    try s.beginTurn();
+    const records = result_store.compactorStore(try s.childCapability());
+    try records.write(testing.allocator, "compacted-T1.txt", "T1 first\n");
+    try records.write(testing.allocator, "compacted-T2.txt", "T2 second\n");
+    HeldWrite.arm();
+    defer HeldWrite.disarm();
+    var first_done = std.atomic.Value(bool).init(false);
+    var second_done = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    const first = try std.Thread.spawn(.{}, HeldWrite.write, .{ s, "first", &first_done, &failed });
+    HeldWrite.held.waitUncancelable(io_mod.getIo());
+    // The first write holds T1 and T2. A subagent's line from another
+    // thread, as during main's compaction, waits for it.
+    const second = try std.Thread.spawn(.{}, HeldWrite.childLine, .{ s, "1786460757754-kid", &second_done, &failed });
+    // The compactor keeps a record meanwhile, after the first write took
+    // its records.
+    try records.write(testing.allocator, "compacted-T3.txt", "T3 third\n");
+    io_mod.sleep(50 * std.time.ns_per_ms);
+    try testing.expect(!first_done.load(.seq_cst));
+    try testing.expect(!second_done.load(.seq_cst));
+    HeldWrite.go.set(io_mod.getIo());
+    first.join();
+    second.join();
+    try testing.expect(!failed.load(.seq_cst));
+    // The first write lists T1 and T2, and the second the T3 it found due.
+    const listings = try recordListings(arena_state.allocator(), t.store.manager, s.id());
+    try testing.expectEqualSlices(usize, &.{ 2, 1 }, listings.counts);
+}
+
+test "a write whose append fails keeps its records due and lets the next write go (D50)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    try s.beginTurn();
+    const records = result_store.compactorStore(try s.childCapability());
+    try records.write(testing.allocator, "compacted-T1.txt", "T1 first\n");
+    // The manager refuses a finish line for a child the session never
+    // spawned, so nothing of that batch lands, its records line included.
+    if (s.appendChildLines(&.{.{ .finished = .{ .child = "never-spawned", .work_id = "w", .outcome = .ok } }})) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try testing.expectEqual(@as(usize, 0), try countSettings(t.store.manager, s.id(), .compaction_records));
+    // The record is still due, and the write after the failure lists it.
+    try s.setClientPrompt("after the failure");
+    const listings = try recordListings(arena_state.allocator(), t.store.manager, s.id());
+    try testing.expectEqualSlices(usize, &.{1}, listings.counts);
+}
+
+test "fuzzed puts and writes list each compactor record once (D50)" {
+    try std.testing.fuzz({}, fuzzRecordsListing, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "\x00",
+            "\x00\x02\x00\x03\x01",
+            "\x00\x01\x05\x02\x00\x00\x03\x02\x09",
+            "\x03\x00\x04\x00\x02\x01\x02\x03\x00\x0d",
+        }) ++ @import("fuzz_corpus").session_records_listing.*),
+    });
+}
+
+/// Each byte is one step: keep a new record (0), keep a record again under
+/// a name already kept (1), save a setting that cites nothing (2), or end
+/// the turn and start the next (3). Every record kept must then be listed
+/// by exactly one `compaction_records` setting, each setting lists its own
+/// map too, and the session resumes with every name kept (D50).
+fn fuzzRecordsListing(_: void, smith: *std.testing.Smith) !void {
+    var steps: [24]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&steps));
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var open = true;
+    defer if (open) s.close();
+    try s.beginTurn();
+    const records = result_store.compactorStore(try s.childCapability());
+    var kept: usize = 0;
+    var puts: usize = 0;
+    var name_buf: [32]u8 = undefined;
+    var body_buf: [48]u8 = undefined;
+    for (steps[0..len], 0..) |step, index| {
+        switch (step % 4) {
+            0, 1 => {
+                const slot = if (step % 4 == 1 and kept > 0) (step / 4) % kept else blk: {
+                    kept += 1;
+                    break :blk kept - 1;
+                };
+                puts += 1;
+                const name = try std.mem.print(&name_buf, "compacted-T{d}.txt", .{slot});
+                const body = try std.mem.print(&body_buf, "T{d} result {d}\n", .{ slot, puts });
+                try records.write(testing.allocator, name, body);
+            },
+            2 => try s.setClientPrompt(try std.mem.print(&body_buf, "prompt {d}", .{index})),
+            else => {
+                try s.commitTurn(assistantTurn("step", "done"), types.ConversationLanguage.default());
+                try s.beginTurn();
+            },
+        }
+    }
+    try s.commitTurn(assistantTurn("last", "done"), types.ConversationLanguage.default());
+
+    var listings_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer listings_arena.deinit();
+    const listings = try recordListings(listings_arena.allocator(), t.store.manager, s.id());
+    // Each put kept new bytes, so each is its own record.
+    try testing.expectEqual(puts, listings.records);
+
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+    open = false;
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const names = try result_store.compactorStore(try r.childCapability()).list(arena_state.allocator());
+    try testing.expectEqual(kept, names.len);
 }
 
 test "compactor records on v2 are recorded by one setting with the next write, and come back on resume and in a fork (D50)" {
@@ -10360,12 +10733,18 @@ test "a v1 side file larger than one v2 blob is left out and named, its v1 folde
     }
     var told: std.ArrayList(u8) = .empty;
     defer told.deinit(alloc);
-    t.store.notice = .{ .context = &told, .emit = struct {
-        fn emit(context: ?*anyopaque, text: []const u8) void {
-            const out: *std.ArrayList(u8) = @ptrCast(@alignCast(context.?));
-            out.appendSlice(testing.allocator, text) catch {};
-        }
-    }.emit };
+    t.store.notice = .{
+        .context = &told,
+        .emit = struct {
+            fn emit(context: ?*anyopaque, text: []const u8) void {
+                // On a busy machine the conversion can pass its slow mark and
+                // say so too; this test is about the other notice.
+                if (std.mem.eql(u8, text, slow_conversion_text)) return;
+                const out: *std.ArrayList(u8) = @ptrCast(@alignCast(context.?));
+                out.appendSlice(testing.allocator, text) catch {};
+            }
+        }.emit,
+    };
 
     // Opened: the host is told what was left out.
     const s = try openConverted(&t, roots[0]);

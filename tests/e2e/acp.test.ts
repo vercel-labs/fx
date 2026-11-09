@@ -1589,6 +1589,48 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP replies to the first prompt soon after its answer while the title request never answers",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-title-hang-");
+      const gateway = startDynamicFakeGateway(_raw => finalText("ACP_MAIN_ANSWER_OK"), {
+        titleResponses: [() => new Promise<Response>(() => {})],
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...fakeGatewayEnv(root, gateway), FX_SOUND: "0" },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        const started = Date.now();
+        const result = await runPrompt(client, "Name this conversation for me.", TIMEOUT);
+        const elapsedMs = Date.now() - started;
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(result.messages)).toContain("ACP_MAIN_ANSWER_OK");
+        expect(gateway.titleRequests).toHaveLength(1);
+        // The title call's own deadline is 15 s; fx gives it a short grace
+        // after the answer and then replies.
+        expect(elapsedMs).toBeLessThan(8_000);
+
+        // The session keeps the title derived from its first prompt.
+        const titles = savedSessionIds(root.home).flatMap((id) => logLines(root.home, id)
+          .filter((line: any) => line.kind === "set" && line.key === "title")
+          .map((line: any) => JSON.stringify(line.value)));
+        expect(titles).toHaveLength(1);
+        expect(titles[0]).toContain("Name this conversation");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP cancel on the first prompt does not wait for a title request that never answers",
     async () => {
       const root = createIsolatedRoot("fx-acp-title-cancel-");

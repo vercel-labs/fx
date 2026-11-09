@@ -1891,3 +1891,23 @@ test "timed advisory lock reports unsupported without unlocked fallback" {
         acquireTimedAdvisoryLockWithOps(&dir, "settings.lock", 25, ops),
     );
 }
+
+/// Holds each standard stream the parent left closed open on /dev/null,
+/// read-only, so no file fx opens later takes its number. A write meant for a
+/// closed stdout then fails, instead of landing in that file, such as the
+/// session store's lock, and a read of a closed stdin ends at once. Call it
+/// before fx opens anything.
+pub fn reserveClosedStandardStreams() void {
+    if (comptime !builtin.link_libc or builtin.target.os.tag == .windows) return;
+    for ([_]std.c.fd_t{ 0, 1, 2 }) |fd| {
+        if (std.c.fcntl(fd, std.c.F.GETFD) != -1) continue;
+        // `open` returns the lowest free number, which is `fd` once the
+        // closed streams below it are held.
+        const held = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY });
+        if (held < 0) return;
+        if (held != fd) {
+            _ = std.c.dup2(held, fd);
+            _ = std.c.close(held);
+        }
+    }
+}

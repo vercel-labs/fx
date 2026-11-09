@@ -307,7 +307,7 @@ manager:
   `data` comes from v1's piece codec (`encodeConversationFrame`,
   `src/core/session/session_event.zig` lines 439 to 482). The types are
   `user`, `assistant`, `tool_call`, `tool_result`, `steering`,
-  `context_note` (D93), `runtime_context` (D94), `turn_end` (files and
+  `context_note` (D93), `runtime_context` (D94), `model_call` (D96), `turn_end` (files and
   turn summary), `interruption` (reason detail, partial text, command
   refs, origin), `recovery` and `continues`.
 - **Recovery:** the agent loop's checkpoint becomes a small `recovery` item
@@ -1071,6 +1071,9 @@ Settled after main's new compactor landed (2026-10-01):
   a side folder kept only for records, which D48 rules out. `Fork.tla`
   `SetBlob` now lists a blob inside a turn as well as outside it, since
   compaction runs mid-turn; such a setting is checked as an item is.
+  Writes of one session run one at a time, so a subagent's finish line
+  written during main's compaction never lists the same records again
+  (`tests/tla/session/SessionWrite.tla`).
 
 Settled after the first dogfood finding (2026-10-01):
 - **D51 Decision:** the message that issues running calls keeps its text
@@ -1739,6 +1742,42 @@ cached prompt prefix):
   earlier reply on the next turn, saying it had never loaded the skill.
   **Alternative:** keep the full text in the conversation, which every
   later request pays for, or keep it in the instructions.
+- **D96 Decision:** every model call a turn's agent loop makes, its
+  retries, replays after a refreshed login, failed attempts and compactions
+  included, is saved with the turn as a `model_call`
+  item: when it settled, how long it took, what it was for, how it ended,
+  the provider, model and serving provider, the gateway's generation id or
+  the provider's response id, the finish or failure kind, a retry wait, and
+  the tokens. Ctrl+O shows each where it happened, live and after a resume.
+  The model never sees one.
+  - **Place:** a record keeps the tool step boundary of the call
+    (`after_tool_step_count`) and how many of the turn's steering messages
+    came before it (`after_steering_count`), both taken from the first save
+    after the call settles and kept from then on. A write puts a boundary's
+    records after its notes, before each steering message they don't
+    count, and before the step's pieces, so every write of a turn only adds
+    to the end and a streamed turn keeps its prefix, also when a message
+    such as a subagent's report arrives after a saved call
+    (`tests/tla/full_detail/FullDetailLog.tla` AppendOnly). A replay shows
+    a step's failed attempts before its text and the call that wrote it
+    after (`FullDetailOrder.tla` ReplayMatchesSaved).
+  - **Compaction:** an in-turn cut, and a resume's view after one, leaves
+    out the records of the steps it covers and counts the rest from the
+    cut, as it does steering (`history_range.rebasedModelCalls`).
+  - **Reading:** a record is read with its unknown fields ignored, and one
+    whose strings aren't short, valid UTF-8 without control characters, or
+    whose numbers are out of range, is left out with a trace line, so a
+    record never fails a session. A v1 log never holds one.
+  - **Older fx:** an fx from before D96 leaves the item out (D17).
+  - **Not yet:** calls made inside tools, such as web search and image
+    descriptions, and the permission reviewer's calls have no record.
+
+  **Why:** the generation id is what support and billing ask for, and a call
+  record kept only in memory was gone after a restart, so Ctrl+O showed
+  ids only for the session's newest live calls, all at the top of its first
+  page. Saving them with the turn costs one short line per call.
+  **Alternative:** keep records in memory only, or in a separate file,
+  which a resume and a fork would have to join back to their turns.
 
 ## Design Risks And Failure Behavior
 

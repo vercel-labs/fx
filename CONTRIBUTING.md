@@ -54,6 +54,17 @@ These rules apply to every change:
 
 If a coding agent helps with your change, point it at AGENTS.md. Any prose the agent writes for your contribution, including pull request titles and descriptions, commit messages, documentation, and issues, must follow the `technical-writer` skill in `.fx/skills/technical-writer/`.
 
+### Add or change a command, flag, or setting
+
+Commands, flags, settings, environment variables, slash commands, and `--json` output are what people and scripts rely on, so fx gives them all one shape. Someone who knows git and the Unix command line should be able to guess what a control is called, where it goes, and which source wins when two disagree:
+
+- Each concept has one name, written in each surface's case: `permission_mode` in settings and JSON, `--permission-mode` as a flag, and `FX_PERMISSION_MODE` as an environment variable.
+- A subcommand is an action, a flag changes one run and never saves, a setting persists, and an environment variable carries context from CI, a wrapper script, or a test.
+- Results go to stdout and diagnostics to stderr, `--json` fields are only added, and a usage error exits with 2.
+- A rename keeps the old spelling working with a warning that names its replacement and the release that drops it.
+
+The `fx-cli-shape` skill in `.fx/skills/fx-cli-shape/` has the full rules, the names that are already decided, and a script that lists the controls a diff adds or removes. Read it before you add, rename, or remove a control, and point your coding agent at it too. CI's `python3 -m scripts.check_cli_shape` fails when code reads an `FX_*` variable, compares a flag by hand, or parses a setting that its registries don't list. A new top-level command, a new stable environment variable, or a new project-safe setting needs a maintainer's approval in the pull request.
+
 ## Test your change
 
 Run the tests that cover your change, build fx, and then use `./zig-out/bin/fx` to exercise the change yourself. Tests don't always start the full runtime, attach a terminal, or spawn background threads, so a passing suite can still miss a startup crash or a rendering regression. Confirm that fx didn't abort, that stderr is clean, and that the behavior matches what you'll describe in the pull request.

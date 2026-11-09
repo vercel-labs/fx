@@ -1042,8 +1042,62 @@ fn topLevelHelpRequest(command_catalog: CommandCatalog, args: []const [:0]const 
     return null;
 }
 
+/// Runs the command `args` name. A command that ends because fx couldn't
+/// write its own output, stdout or stderr, returns `error.OutputWriteFailed`
+/// in place of the `error.WriteFailed` a failed write gives, which on its own
+/// reads as a dropped connection, and one whose output reader went away, as
+/// `head` does, returns `error.OutputReaderGone`.
 pub fn runIfRequested(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !RunResult {
-    return runIfRequestedWithDeps(alloc, args, cfg, .{});
+    var output: OwnOutput = .{};
+    return runIfRequestedWithDeps(alloc, args, cfg, .{ .stdout_ctx = &output, .stderr_ctx = &output }) catch |err| {
+        return output.commandError(err);
+    };
+}
+
+/// Whether a write to fx's own stdout or stderr failed during a command, or
+/// found its reader gone.
+const OwnOutput = struct {
+    failed: std.atomic.Value(bool) = .init(false),
+    reader_gone: std.atomic.Value(bool) = .init(false),
+
+    fn noteFailure(ctx: ?*anyopaque, err: anyerror) void {
+        const self: *OwnOutput = @ptrCast(@alignCast(ctx orelse return));
+        if (err == error.BrokenPipe) {
+            self.reader_gone.store(true, .release);
+        } else {
+            self.failed.store(true, .release);
+        }
+    }
+
+    /// The error the command reports for `err`.
+    fn commandError(self: *const OwnOutput, err: anyerror) anyerror {
+        if (err != error.WriteFailed and err != error.BrokenPipe) return err;
+        if (self.reader_gone.load(.acquire)) {
+            debug_trace.logf("core", "command output reader went away err={s}", .{@errorName(err)});
+            return error.OutputReaderGone;
+        }
+        if (err != error.WriteFailed or !self.failed.load(.acquire)) return err;
+        debug_trace.logf("core", "command output write failed err={s}", .{@errorName(err)});
+        return error.OutputWriteFailed;
+    }
+};
+
+test "a command that ends because fx couldn't write its output reports that write" {
+    var output: OwnOutput = .{};
+    // A failed write elsewhere, such as to the network, keeps its name.
+    try std.testing.expectEqual(@as(anyerror, error.WriteFailed), output.commandError(error.WriteFailed));
+    OwnOutput.noteFailure(&output, error.WriteFailed);
+    try std.testing.expectEqual(@as(anyerror, error.OutputWriteFailed), output.commandError(error.WriteFailed));
+    try std.testing.expectEqual(@as(anyerror, error.NoSpaceLeft), output.commandError(error.NoSpaceLeft));
+}
+
+test "a command whose output reader went away reports that, however the write failed" {
+    var output: OwnOutput = .{};
+    OwnOutput.noteFailure(&output, error.BrokenPipe);
+    // A writer that only reports `WriteFailed`, such as `DepsWriter`, too.
+    try std.testing.expectEqual(@as(anyerror, error.OutputReaderGone), output.commandError(error.WriteFailed));
+    try std.testing.expectEqual(@as(anyerror, error.OutputReaderGone), output.commandError(error.BrokenPipe));
+    try std.testing.expectEqual(@as(anyerror, error.NoSpaceLeft), output.commandError(error.NoSpaceLeft));
 }
 
 fn runNoConfigIfRequestedWithDeps(
@@ -1311,10 +1365,16 @@ fn activateProviderSelectionFallible(
         },
         .failed => |failure| {
             debug_trace.logf("catalog", "provider selection catalog failed provider={s} category={s}", .{ @tagName(target), @tagName(failure.failure.category) });
-            const detail = try alloc.print(
-                "could not load the target model catalog ({s})",
-                .{@tagName(failure.failure.category)},
-            );
+            const detail = if (failure.failure.category == .transport)
+                try alloc.print(
+                    "couldn't connect to {s} to load the target model catalog; check your network connection or firewall",
+                    .{model_catalog.serviceName(target)},
+                )
+            else
+                try alloc.print(
+                    "could not load the target model catalog ({s})",
+                    .{@tagName(failure.failure.category)},
+                );
             defer alloc.free(detail);
             try writeProviderActivationError(alloc, deps, caller, detail);
             return false;
@@ -1872,10 +1932,7 @@ fn runNonInteractiveWithDeps(
                 .loaded => |loaded| loaded,
                 .failure => |failure| {
                     const error_name = @errorName(failure.failure.asError());
-                    const message = try alloc.print(
-                        "could not list models: {s}",
-                        .{catalogFailureDetail(failure.failure)},
-                    );
+                    const message = try modelListFailureMessage(alloc, failure.failure, startup.provider);
                     defer alloc.free(message);
                     if (opts.format == .json) {
                         try writeJsonCommandFailureCode(
@@ -2681,18 +2738,26 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
     };
 }
 
-fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
-    if (comptime builtin.target.os.tag != .windows) {
-        return writeFdAll(std.posix.STDOUT_FILENO, text);
-    }
-    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+fn writeRealStdout(ctx: ?*anyopaque, text: []const u8) !void {
+    const written = if (comptime builtin.target.os.tag != .windows)
+        writeFdAll(std.posix.STDOUT_FILENO, text)
+    else
+        std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+    written catch |err| {
+        OwnOutput.noteFailure(ctx, err);
+        return err;
+    };
 }
 
-fn writeRealStderr(_: ?*anyopaque, text: []const u8) !void {
-    if (comptime builtin.target.os.tag != .windows) {
-        return writeFdAll(std.posix.STDERR_FILENO, text);
-    }
-    try std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
+fn writeRealStderr(ctx: ?*anyopaque, text: []const u8) !void {
+    const written = if (comptime builtin.target.os.tag != .windows)
+        writeFdAll(std.posix.STDERR_FILENO, text)
+    else
+        std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
+    written catch |err| {
+        OwnOutput.noteFailure(ctx, err);
+        return err;
+    };
 }
 
 fn writeFdAll(fd: std.posix.fd_t, text: []const u8) !void {
@@ -2700,7 +2765,11 @@ fn writeFdAll(fd: std.posix.fd_t, text: []const u8) !void {
     var remaining = text;
     while (remaining.len > 0) {
         const written = std.c.write(fd, remaining.ptr, remaining.len);
-        if (written <= 0) return error.WriteFailed;
+        if (written <= 0) {
+            // A reader that went away, as `head` does, is told apart.
+            if (written < 0 and std.posix.errno(written) == .PIPE) return error.BrokenPipe;
+            return error.WriteFailed;
+        }
         remaining = remaining[@intCast(written)..];
     }
 }
@@ -3137,6 +3206,18 @@ fn modelDetails(
         };
     }
     return details;
+}
+
+/// What `fx models` says when it could not load the catalog. A connection fx
+/// could not make is named as one. The caller owns the text.
+fn modelListFailureMessage(alloc: Allocator, failure: model_catalog.Failure, provider: model_provider.ProviderId) Allocator.Error![]u8 {
+    if (failure.category == .transport) {
+        return alloc.print(
+            "could not list models: couldn't connect to {s}; check your network connection or firewall",
+            .{model_catalog.serviceName(provider)},
+        );
+    }
+    return alloc.print("could not list models: {s}", .{catalogFailureDetail(failure)});
 }
 
 fn catalogFailureDetail(failure: model_catalog.Failure) []const u8 {

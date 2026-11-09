@@ -530,9 +530,9 @@ pub const WorkerEvent = union(enum) {
     question_requested,
     open_model_picker,
     semantic_notice: types.SemanticNotice,
-    /// A full-only observability record (network call outcome) for the ctrl+o
-    /// full transcript's detail section. Never enters the transcript store.
-    full_detail_record: types.SemanticNotice,
+    /// One settled model call, which Ctrl+O shows where it happened. Its
+    /// strings are owned like the rest of the event.
+    model_call: types.ModelCallRecord,
     route_recovery_status: types.RouteRecoveryStatus,
     clear_route_recovery_status,
     /// The gateway provider that served a request in this turn (display-only,
@@ -1341,6 +1341,15 @@ pub const WorkerRuntime = struct {
         }
     }
 
+    /// Whether the steering preview shows `prompt` while it waits for the
+    /// running turn. A subagent's report or message joins the turn as
+    /// steering too, but once the turn takes it the transcript shows it as
+    /// that subagent's row (`subagent/reports.zig`), so the preview never
+    /// draws it as a message the user typed.
+    fn previewsAsSteering(prompt: QueuedPrompt) bool {
+        return prompt.delivery.isSteering() and prompt.author != .child;
+    }
+
     fn sameTurnSteeringEligible(prompt: QueuedPrompt) bool {
         return prompt.images.len == 0 and
             prompt.skill_bindings.len == 0 and
@@ -1705,8 +1714,8 @@ pub const WorkerRuntime = struct {
     /// text so the composer can restore it for editing. Returns null when
     /// nothing is safely retractable: no active turn, no wait boundary (an
     /// immediate steer is already committed to its interrupt), a cancel
-    /// already in flight, or only handoff-class steers with images or skill
-    /// bindings.
+    /// already in flight, only handoff-class steers with images or skill
+    /// bindings, or only steers the user didn't write.
     pub fn popQueuedSteerForEdit(self: *WorkerRuntime, alloc: std.mem.Allocator) !?[]u8 {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -1721,6 +1730,9 @@ pub const WorkerRuntime = struct {
             const prompt = self.queued_prompts.items[index];
             if (prompt.delivery.activeTurnId() != self.active_turn_id) continue;
             if (!sameTurnSteeringEligible(prompt)) continue;
+            // A subagent's report or the parent's message isn't the user's to
+            // edit, and taking it back would keep it from the turn.
+            if (prompt.author != .user) continue;
             retractable = index;
             break;
         }
@@ -2151,13 +2163,14 @@ pub const WorkerRuntime = struct {
     }
 
     /// Returns one coherent, allocator-owned steering presentation snapshot.
+    /// Its messages are the steering `previewsAsSteering` shows.
     pub fn snapshotSteeringPresentation(self: *WorkerRuntime, alloc: std.mem.Allocator) !SteeringPresentationSnapshot {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
         var steering_count: usize = 0;
         for (self.queued_prompts.items) |prompt| {
-            if (prompt.delivery.isSteering()) steering_count += 1;
+            if (previewsAsSteering(prompt)) steering_count += 1;
         }
         var snapshot: SteeringPresentationSnapshot = .{
             .waits_for_boundary = steering_count > 0 and self.hasSteeringWaitBoundaryLocked(),
@@ -2190,7 +2203,7 @@ pub const WorkerRuntime = struct {
             alloc.free(messages);
         }
         for (self.queued_prompts.items) |prompt| {
-            if (!prompt.delivery.isSteering()) continue;
+            if (!previewsAsSteering(prompt)) continue;
             messages[copied] = try alloc.dupe(u8, prompt.prompt);
             copied += 1;
         }
@@ -4382,7 +4395,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .question_requested => .question_requested,
         .open_model_picker => .open_model_picker,
         .semantic_notice => |notice| .{ .semantic_notice = try types.dupeSemanticNotice(alloc, notice) },
-        .full_detail_record => |notice| .{ .full_detail_record = try types.dupeSemanticNotice(alloc, notice) },
+        .model_call => |record| .{ .model_call = try types.dupeModelCallRecord(alloc, record) },
         .route_recovery_status => |status| .{ .route_recovery_status = status },
         .clear_route_recovery_status => .clear_route_recovery_status,
         .provider_resolved => |slug| .{ .provider_resolved = try alloc.dupe(u8, slug) },
@@ -4477,7 +4490,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .notification => {},
         .open_model_picker => {},
         .semantic_notice => |notice| types.freeSemanticNotice(alloc, notice),
-        .full_detail_record => |notice| types.freeSemanticNotice(alloc, notice),
+        .model_call => |record| types.freeModelCallRecordStrings(alloc, record),
         .route_recovery_status => {},
         .clear_route_recovery_status => {},
         .provider_resolved => |slug| alloc.free(slug),
@@ -5362,6 +5375,41 @@ test "steer retraction skips handoff prompts and takes the newest text steer" {
     try std.testing.expect(boundary == .handoff);
 }
 
+test "steer retraction takes back only the user's own steer" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+    try runtime.pushEvent(alloc, .{ .tool_lifecycle = .{ .authoritative_started = .{
+        .id = .{ .turn_id = 41, .call_id = "call_running" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "terminal",
+        .activity_kind = .command,
+    } } });
+
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "my steer", "model"));
+    try runtime.postMail(alloc, try makePrompt(alloc, "from main", "model"));
+    runtime.queued_prompts.items[1].author = .parent;
+    try runtime.postMail(alloc, try makePrompt(alloc, "a report", "model"));
+    runtime.queued_prompts.items[2].author = .child;
+
+    // The report is the newest, but only the user's steer comes back.
+    const text = (try runtime.popQueuedSteerForEdit(alloc)).?;
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("my steer", text);
+    try std.testing.expect(try runtime.popQueuedSteerForEdit(alloc) == null);
+    try std.testing.expectEqual(@as(usize, 2), runtime.queuedPromptCount());
+
+    // While the tool runs, the preview shows the parent's message and not
+    // the report.
+    var snapshot = try runtime.snapshotSteeringPresentation(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.messages.len);
+    try std.testing.expectEqualStrings("from main", snapshot.messages[0]);
+    try std.testing.expect(snapshot.waits_for_boundary);
+}
+
 test "steer retraction requires an active processing turn" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
@@ -5491,6 +5539,57 @@ test "tool-blocked steering snapshot owns visible messages in admission order" {
     try std.testing.expectEqualStrings("first", snapshot.messages[0]);
     try std.testing.expectEqualStrings("second", snapshot.messages[1]);
     try std.testing.expect(snapshot.waits_for_boundary);
+}
+
+test "the steering preview leaves out a subagent's mail and keeps the user's steer" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    try runtime.postMail(alloc, try makePrompt(alloc, "a report", "model"));
+    runtime.queued_prompts.items[0].author = .child;
+    {
+        var snapshot = try runtime.snapshotSteeringPresentation(alloc);
+        defer snapshot.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.messages.len);
+        try std.testing.expect(!snapshot.waits_for_boundary);
+    }
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "a steer", "model"));
+    runtime.queued_prompts.items[1].delivery = .{ .active_turn = 9 };
+    var snapshot = try runtime.snapshotSteeringPresentation(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.messages.len);
+    try std.testing.expectEqualStrings("a steer", snapshot.messages[0]);
+
+    // The turn still takes the report, as the subagent's.
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 9, .model));
+    defer freeSteeringMessages(alloc, guidance);
+    try std.testing.expectEqual(@as(usize, 2), guidance.len);
+    try std.testing.expectEqual(types.MessageAuthor.child, guidance[0].author);
+    try std.testing.expectEqualStrings("a report", guidance[0].text);
+}
+
+test "a subagent's mail that waits for the next turn stays out of the steering preview" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    runtime.requestCancel();
+
+    // During a cancel the report can't join the turn, so it waits for the
+    // next one, which is steering the preview draws as well.
+    try runtime.postMail(alloc, try makePrompt(alloc, "a report", "model"));
+    runtime.queued_prompts.items[0].author = .child;
+    try std.testing.expect(runtime.queued_prompts.items[0].delivery.isContinuation());
+
+    var snapshot = try runtime.snapshotSteeringPresentation(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.messages.len);
+    try std.testing.expect(!snapshot.waits_for_boundary);
 }
 
 test "late steering keeps admission order when demoted on finish" {

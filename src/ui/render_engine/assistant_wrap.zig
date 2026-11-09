@@ -59,8 +59,14 @@ const AssistantContinuation = union(enum) {
 /// Pre-existing hard newlines in `text` are honoured. The returned slice is
 /// owned by the caller and freed with `alloc`.
 pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
-    return wrapAssistantTextWithBaseGutter(alloc, text, cols, 0, false, false, null, null, null);
+    return wrapAssistantTextWithBaseGutter(alloc, text, cols, 0, false, .prose, null, null, null);
 }
+
+/// How rows are laid out. Prose reflows at word breaks under its markers.
+/// Literal text keeps every byte where it is and breaks only at the row's
+/// width: `railed` draws the main screen's command rail in the gutter,
+/// `plain` leaves the gutter blank, as Ctrl+O does.
+const Literal = enum { prose, railed, plain };
 
 fn wrapAssistantTextWithBaseGutter(
     alloc: Allocator,
@@ -68,11 +74,12 @@ fn wrapAssistantTextWithBaseGutter(
     cols: u16,
     base_gutter: u16,
     replace_wide_runes_at_one_content_col: bool,
-    literal_command: bool,
+    literal: Literal,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
     finalized_prefix_bytes: ?*usize,
     source_map: ?*RetentionSourceMap,
 ) ![]u8 {
+    const literal_command = literal != .prose;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     if (finalized_prefix_bytes) |bytes| bytes.* = 0;
@@ -94,7 +101,7 @@ fn wrapAssistantTextWithBaseGutter(
                 base_gutter,
                 .{},
                 null,
-                true,
+                literal,
             );
         }
         return out.toOwnedSlice(alloc);
@@ -143,7 +150,7 @@ fn wrapAssistantTextWithBaseGutter(
 
         if (ch == '\r' or ch == '\n') {
             if (literal_command and !row_has_content) {
-                try appendAssistantRowStart(alloc, &out, base_gutter, sgr, hyperlink, true);
+                try appendAssistantRowStart(alloc, &out, base_gutter, sgr, hyperlink, literal);
             }
             if (base_gutter > 0 and row_has_content) try closeAssistantRowStyles(alloc, &out, sgr, hyperlink);
             try out.append(alloc, ch);
@@ -162,7 +169,7 @@ fn wrapAssistantTextWithBaseGutter(
         }
         if (ch == '\t') {
             if (base_gutter > 0 and !row_has_content) {
-                try appendAssistantRowStart(alloc, &out, base_gutter, sgr, hyperlink, literal_command);
+                try appendAssistantRowStart(alloc, &out, base_gutter, sgr, hyperlink, literal);
                 row_has_content = true;
             }
             const next_col = display_width.nextTabStopColumn(col, cols);
@@ -193,7 +200,7 @@ fn wrapAssistantTextWithBaseGutter(
                     cols,
                     base_gutter,
                     1,
-                    true,
+                    literal,
                 );
                 word_breaks = .{};
                 has_word_on_row = false;
@@ -202,7 +209,7 @@ fn wrapAssistantTextWithBaseGutter(
                 if (source_map) |map| try map.rows.append(alloc, i);
             }
             if (base_gutter > 0 and !row_has_content) {
-                try appendAssistantRowStart(alloc, &out, base_gutter, sgr, hyperlink, literal_command);
+                try appendAssistantRowStart(alloc, &out, base_gutter, sgr, hyperlink, literal);
                 row_has_content = true;
             }
             if (source_map) |map| try map.record(alloc, i, out.items.len);
@@ -233,7 +240,7 @@ fn wrapAssistantTextWithBaseGutter(
                         cols,
                         base_gutter,
                         next_width,
-                        literal_command,
+                        literal,
                         source_map,
                     )) |reflowed_col| {
                         col = reflowed_col;
@@ -255,7 +262,7 @@ fn wrapAssistantTextWithBaseGutter(
                     cols,
                     base_gutter,
                     w,
-                    literal_command,
+                    literal,
                 );
                 word_breaks = .{};
                 has_word_on_row = false;
@@ -286,7 +293,7 @@ fn wrapAssistantTextWithBaseGutter(
                     cols,
                     base_gutter,
                     w,
-                    literal_command,
+                    literal,
                     source_map,
                 )) |reflowed_col| {
                     col = reflowed_col;
@@ -307,7 +314,7 @@ fn wrapAssistantTextWithBaseGutter(
                 cols,
                 base_gutter,
                 w,
-                literal_command,
+                literal,
             );
             word_breaks = .{};
             has_word_on_row = false;
@@ -316,7 +323,7 @@ fn wrapAssistantTextWithBaseGutter(
         }
 
         if (base_gutter > 0 and !row_has_content) {
-            try appendAssistantRowStart(alloc, &out, base_gutter, sgr, hyperlink, literal_command);
+            try appendAssistantRowStart(alloc, &out, base_gutter, sgr, hyperlink, literal);
             row_has_content = true;
         }
 
@@ -345,7 +352,7 @@ fn wrapAssistantTextWithBaseGutter(
 
     if (source_map) |map| try map.record(alloc, text.len, out.items.len);
     if (literal_command and !row_has_content) {
-        try appendAssistantRowStart(alloc, &out, base_gutter, sgr, hyperlink, true);
+        try appendAssistantRowStart(alloc, &out, base_gutter, sgr, hyperlink, literal);
     }
 
     return out.toOwnedSlice(alloc);
@@ -367,9 +374,9 @@ fn appendAssistantRowStart(
     base_gutter: u16,
     sgr: assistant_pacer.SgrState,
     hyperlink: ?[]const u8,
-    literal_command: bool,
+    literal: Literal,
 ) !void {
-    if (literal_command and base_gutter >= 2) {
+    if (literal == .railed and base_gutter >= 2) {
         try out.appendSlice(alloc, "│ ");
         try out.appendNTimes(alloc, ' ', base_gutter - 2);
     } else {
@@ -418,7 +425,7 @@ pub fn wrapTranscriptAssistantTextInterruptible(
         cols,
         gutterWidth(cols),
         true,
-        false,
+        .prose,
         checkpoint,
         null,
         null,
@@ -445,7 +452,7 @@ pub fn wrapTranscriptAssistantTextWithFinalityInterruptible(
         cols,
         gutterWidth(cols),
         true,
-        false,
+        .prose,
         checkpoint,
         &finalized_prefix_bytes,
         null,
@@ -500,7 +507,7 @@ pub fn retentionSourceMap(alloc: Allocator, text: []const u8, cols: u16) !Retent
         cols,
         gutterWidth(cols),
         true,
-        false,
+        .prose,
         null,
         null,
         &map,
@@ -538,14 +545,18 @@ pub fn wrapLiteralCommandOutput(
         cols,
         gutter,
         true,
-        true,
+        .railed,
         null,
         null,
         null,
     );
 }
 
-/// Reflows literal tool detail with the three-cell rail used by Ctrl-O.
+/// Columns of blank indent before every row of tool detail in Ctrl+O, past
+/// the two of the tool's own line.
+pub const full_detail_indent: u16 = 4;
+
+/// Reflows literal tool detail for Ctrl+O under a blank four-column indent.
 pub fn wrapLiteralToolOutput(
     alloc: Allocator,
     text: []const u8,
@@ -564,14 +575,15 @@ pub fn wrapLiteralToolOutputInterruptible(
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) ![]u8 {
     if (cols == 0) return alloc.alloc(u8, 0);
-    const gutter = if (cols >= 4) @as(u16, 3) else if (cols >= 3) @as(u16, 2) else @as(u16, 0);
+    // A screen too narrow for the indent and some text drops it.
+    const gutter: u16 = if (cols > full_detail_indent + 1) full_detail_indent else 0;
     return wrapAssistantTextWithBaseGutter(
         alloc,
         text,
         cols,
         gutter,
         true,
-        true,
+        .plain,
         checkpoint,
         null,
         null,
@@ -688,12 +700,12 @@ fn appendAssistantContinuation(
     cols: u16,
     base_gutter: u16,
     next_width: u16,
-    literal_command: bool,
+    literal: Literal,
 ) !u16 {
     try closeAssistantRowStyles(alloc, out, sgr, hyperlink);
     try out.append(alloc, '\n');
 
-    if (literal_command and base_gutter >= 2) {
+    if (literal == .railed and base_gutter >= 2) {
         try out.appendSlice(alloc, "│ ");
         try out.appendNTimes(alloc, ' ', base_gutter - 2);
     } else {
@@ -734,7 +746,7 @@ fn reflowAtWordBreak(
     cols: u16,
     base_gutter: u16,
     next_width: u16,
-    literal_command: bool,
+    literal: Literal,
     source_map: ?*RetentionSourceMap,
 ) !?u16 {
     const suffix = out.items[word_break.end..];
@@ -755,7 +767,7 @@ fn reflowAtWordBreak(
         cols,
         base_gutter,
         first_width,
-        literal_command,
+        literal,
     );
     try out.replaceRange(alloc, word_break.start, word_break.end - word_break.start, replacement.items);
     if (source_map) |map| {
@@ -1722,7 +1734,7 @@ test "wrapLiteralCommandOutput repeats gutters and uses absolute tab stops" {
     );
 }
 
-test "wrapLiteralToolOutput repeats the tool detail rail on physical rows" {
+test "wrapLiteralToolOutput indents every physical row of tool detail, with no rail" {
     const alloc = std.testing.allocator;
     const out = try wrapLiteralToolOutput(
         alloc,
@@ -1732,7 +1744,7 @@ test "wrapLiteralToolOutput repeats the tool detail rail on physical rows" {
     defer alloc.free(out);
 
     try std.testing.expectEqualStrings(
-        "│  alpha beta\n│  gamma delta",
+        "    alpha beta\n    gamma delta",
         out,
     );
 }
@@ -1771,7 +1783,7 @@ test "a link opening a guttered row keeps its theme color" {
     const link_style = shared_theme.current().link_style;
     const input = try alloc.print("\x1b]8;id=fx-1;https://example.com\x1b\\{s}\x1b[4mdocs\x1b[24m\x1b[39m\x1b]8;;\x1b\\", .{link_style});
     defer alloc.free(input);
-    const out = try wrapAssistantTextWithBaseGutter(alloc, input, 40, 2, false, false, null, null, null);
+    const out = try wrapAssistantTextWithBaseGutter(alloc, input, 40, 2, false, .prose, null, null, null);
     defer alloc.free(out);
     // Pre-content escapes are not copied verbatim into a guttered row; the
     // row-start restore must re-emit the link color with the underline.

@@ -907,7 +907,7 @@ tmuxTest(
     await typeLiteral(active, draft);
     await waitForActiveFooter(active, (footer) => footer === `┃ ${draft}`);
 
-    const fullFooter = "full detail · ctrl+o close";
+    const fullFooter = "esc close · pgup/pgdn scroll";
     const response = "history prompt complete";
     const openRetainedTranscript = async () => {
       await active.sendKeys("C-o");
@@ -989,20 +989,22 @@ tmuxTest(
 );
 
 tmuxTest(
-  "ctrl+o opens with a session assembly record and per-request network record",
+  "ctrl+o opens with a session assembly record and each request's call line under its response",
   async () => {
     const active = await startFx(80, 24, true, false, 1);
     await active.sendText("hello");
     await active.waitForText("history prompt complete", READY_TIMEOUT);
+    // A model call's line: its time, the model, then tokens and the gen ID.
+    const callLine = /^  \d{2}:\d{2}:\d{2} · gpt-5 · .*in 3 · out 5 · /m;
 
     // The records never appear in the inline transcript.
     const inline = await active.capturePane();
     expect(inline).not.toContain("session: provider:");
-    expect(inline).not.toContain("network: provider:");
+    expect(inline).not.toMatch(callLine);
 
     await active.sendKeys("C-o");
-    await active.waitForText("full detail · ctrl+o close", READY_TIMEOUT);
-    // The records block sits at the top of the full transcript.
+    await active.waitForText("esc close · pgup/pgdn scroll", READY_TIMEOUT);
+    // The session's assembly opens the full transcript.
     let top = await active.capturePane();
     for (let page = 0; page < 10 && !top.includes("session: provider:"); page += 1) {
       await active.sendKeys("PPage");
@@ -1012,9 +1014,18 @@ tmuxTest(
     expect(top).toContain("session: provider:");
     expect(top).toContain("system prompt: ready");
     expect(top).toContain("tools:");
-    expect(top).toContain("network: provider:");
-    expect(top).toContain("finish: stop");
-    expect(top).toContain("tokens: 3 in · 5 out");
+    // The request's line sits under the response it wrote.
+    let view = top;
+    for (let page = 0; page < 10 && !callLine.test(view); page += 1) {
+      await active.sendKeys("NPage");
+      await Bun.sleep(50);
+      view = await active.capturePane();
+    }
+    const rows = view.split("\n");
+    const response = rows.findIndex((row) => row.includes("history prompt complete"));
+    const call = rows.findIndex((row) => callLine.test(row));
+    expect(response, view).toBeGreaterThanOrEqual(0);
+    expect(call, view).toBe(response + 1);
     await active.sendKeys("C-o");
     await active.waitForComposer(READY_TIMEOUT);
     expectCleanStderr();

@@ -307,10 +307,11 @@ pub fn CompletionRuntime(comptime App: type) type {
             return runtime.composerIdle(app) and runtime.hasAnotherAgent(app);
         }
 
-        /// Pulls the newest queued steering prompt that still waits for a
-        /// boundary back into the empty composer for editing. Returns false when
-        /// no steer is retractable, leaving history navigation to run unchanged.
-        /// An active history episode keeps its stashed draft untouched.
+        /// Pulls the newest queued steering prompt the user wrote that still
+        /// waits for a boundary back into the empty composer for editing.
+        /// Returns false when no steer is retractable, leaving history
+        /// navigation to run unchanged. An active history episode keeps its
+        /// stashed draft untouched.
         fn restoreQueuedSteerToComposer(app: *App, agent: *AppAgent) !bool {
             if (comptime !agents.hasAgentField(App, "worker")) return false;
             if (comptime !@hasDecl(@TypeOf(agent.worker), "popQueuedSteerForEdit")) return false;

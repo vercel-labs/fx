@@ -144,6 +144,69 @@ test("fx ask keeps the derived title when the title model output is unusable", a
   }
 });
 
+test("fx ask exits soon after its answer while the title request never answers", async () => {
+  const root = createFixtureRoot("title-hang");
+  let titleArrived = false;
+  const gateway = startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
+    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
+    titleResponses: [() => {
+      titleArrived = true;
+      return new Promise<Response>(() => {});
+    }],
+  });
+  try {
+    const started = Date.now();
+    const result = await runFx(["ask", "refactor the renderer loop to fix the crash"], {
+      cwd: root.workspace,
+      env: baseEnv(root, gateway),
+      timeoutMs: 30_000,
+    });
+    const elapsedMs = Date.now() - started;
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("MAIN_ANSWER_OK");
+    expect(titleArrived).toBe(true);
+    // The title call's own deadline is 15 s; fx gives it a short grace after
+    // the answer and then leaves.
+    expect(elapsedMs).toBeLessThan(8_000);
+
+    // The session keeps the title derived from its first prompt.
+    const titles = sessionTitles(root);
+    expect(titles).toHaveLength(1);
+    expect(titles[0]).toContain("refactor the renderer loop");
+    const list = await runFx(["sessions", "--json"], {
+      cwd: root.workspace,
+      env: baseEnv(root, gateway),
+      timeoutMs: 15_000,
+    });
+    expect(list.code).toBe(0);
+    expect(list.stdout).toContain(titles[0]);
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45_000);
+
+test("fx ask keeps a generated title that arrives soon after its answer", async () => {
+  const root = createFixtureRoot("title-late");
+  const gateway = startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
+    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
+    titleResponses: [() => Bun.sleep(1_000).then(() => fakeGatewayFinalText(GENERATED_TITLE))],
+  });
+  try {
+    const result = await runFx(["ask", "refactor the renderer loop to fix the crash"], {
+      cwd: root.workspace,
+      env: baseEnv(root, gateway),
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("MAIN_ANSWER_OK");
+    expect(sessionTitles(root)).toContain(GENERATED_TITLE);
+  } finally {
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45_000);
+
 test("fx ask exits promptly on SIGINT while its title request never answers", async () => {
   const root = createFixtureRoot("interrupt");
   let chatArrived!: () => void;

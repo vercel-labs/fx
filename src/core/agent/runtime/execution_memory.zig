@@ -375,6 +375,7 @@ pub const CompactedExecutionBoundary = struct {
                 item.after_tool_step_count -= self.tool_steps;
             }
         }
+        projected.model_calls = try history_range.rebasedModelCalls(arena, execution.model_calls, self.tool_steps, self.steering, std.math.maxInt(usize));
         return projected;
     }
 };

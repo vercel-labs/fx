@@ -32,6 +32,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const sort_utils = @import("../shared/sort_utils.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -73,6 +74,9 @@ pub const ChildAgent = struct {
     /// Whether this agent holds its own session, opened on its first run in
     /// this process and kept until main's session ends.
     session_attached: bool = false,
+    /// Last reply in a lazily restored child's saved history. Live turns use
+    /// the agent's history; this cache avoids reading disk on every redraw.
+    saved_reply_at_ms: i64 = 0,
     /// The host that started it: main's, or its parent subagent's own.
     /// Its session opens through it, and its own subagents'
     /// authority comes from that host's resolver. Written on the main loop
@@ -169,6 +173,22 @@ const InstanceState = enum {
 /// What the busiest open agent is doing (`Runtime.busiest`), most urgent
 /// first. A finished turn counts as idle.
 pub const Busiest = enum { needs_approval, has_question, needs_you, working, idle };
+
+/// An agent that restarting fx, as an upgrade does, would stop, and what it
+/// is doing (`Runtime.busyAgentElsewhere`). `doing` is never `.idle`.
+pub const BusyAgent = struct { name: []const u8, doing: Busiest };
+
+/// What an agent in `state` is doing for a state that stands for others,
+/// or null when it is idle. A finished turn counts as idle.
+fn busyAs(state: InstanceState) ?Busiest {
+    return switch (state) {
+        .needs_approval => .needs_approval,
+        .has_question => .has_question,
+        .needs_you => .needs_you,
+        .working => .working,
+        .finished, .idle => null,
+    };
+}
 
 /// The more urgent of `a` and `b`; `InstanceState` lists the most urgent
 /// first.
@@ -414,7 +434,31 @@ pub fn appOf(comptime App: type, agent: *@FieldType(App, "main_agent")) *App {
 /// One hosted agent as the switch order sees it: an instance, or a subagent
 /// in the tree of instance `root`, where 0 is the first instance and k the
 /// k-th later one in launch order.
-const OrderEntry = struct { role: agents.Role, root: usize = 0 };
+const OrderEntry = struct {
+    role: agents.Role,
+    root: usize = 0,
+    working: bool = false,
+    reply_at_ms: i64 = 0,
+};
+
+/// The newest completed reply with a saved timestamp. Stops and failures do
+/// not count as a new reply, nor does merely opening an agent's conversation.
+fn latestReplyAt(history: []const types.HistoryTurn) i64 {
+    var index = history.len;
+    while (index > 0) {
+        index -= 1;
+        switch (history[index]) {
+            .assistant => |entry| {
+                if (entry.assistant.len == 0) continue;
+                if (entry.execution.turn_summary) |summary| {
+                    if (summary.completed_at_ms > 0) return summary.completed_at_ms;
+                }
+            },
+            .interrupted, .compacted_summary => {},
+        }
+    }
+    return 0;
+}
 
 /// The switch order over the first instance and `entries`, written to
 /// `out` as positions: 0 for the first instance, k + 1 for `entries[k]`. The
@@ -436,6 +480,23 @@ fn switchOrder(entries: []const OrderEntry, out: []usize) void {
         appendGroup(entries, ordinal, out, &next);
     }
     std.debug.assert(next == out.len);
+}
+
+/// Working agents retain their existing order; other agents show the newest
+/// reply first. Equal timestamps keep the original instance/tree order.
+fn sortMenuOrder(entries: []const OrderEntry, first: OrderEntry, order: []usize) void {
+    const Context = struct {
+        entries: []const OrderEntry,
+        first: OrderEntry,
+
+        fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+            const left = if (a == 0) ctx.first else ctx.entries[a - 1];
+            const right = if (b == 0) ctx.first else ctx.entries[b - 1];
+            if (left.working != right.working) return left.working;
+            return !left.working and left.reply_at_ms > right.reply_at_ms;
+        }
+    };
+    sort_utils.sort(usize, order, Context{ .entries = entries, .first = first }, Context.lessThan);
 }
 
 fn appendGroup(entries: []const OrderEntry, root: usize, out: []usize, next: *usize) void {
@@ -822,7 +883,16 @@ pub fn Runtime(comptime App: type) type {
                     return err;
                 };
                 for (listing) |entry| {
-                    const child = findChild(app, entry.id) orelse try addChild(app, entry.id);
+                    const child = findChild(app, entry.id) orelse restored: {
+                        const history = host.childHistory(app.alloc, entry.id) catch |err| {
+                            debug_trace.logf("host", "saved reply time unavailable agent={s} err={s}", .{ entry.id, @errorName(err) });
+                            break :restored try addChild(app, entry.id);
+                        };
+                        defer types.freeHistoryTurnSlice(app.alloc, history);
+                        const restored_child = try addChild(app, entry.id);
+                        restored_child.saved_reply_at_ms = latestReplyAt(history);
+                        break :restored restored_child;
+                    };
                     if (child.name.len == 0 and entry.name.len > 0) child.name = try app.alloc.dupe(u8, entry.name);
                     if (child.profile.len == 0) child.profile = try app.alloc.dupe(u8, entry.profile);
                     if (child.parent_host == null) setParentHost(app, child, host);
@@ -832,25 +902,35 @@ pub fn Runtime(comptime App: type) type {
             orderByListing(app.child_agents.items, order.items);
         }
 
-        /// The agent list's rows, in order: the instances in launch order,
-        /// the first one as null, each followed by the subagents in its tree
-        /// in the order they started. With one instance this is main, then
-        /// every subagent in start order, as before instances existed.
+        /// Working agents first in the existing instance/tree order, then
+        /// inactive agents by their most recent reply.
         pub fn switchList(app: *App, out: *std.ArrayList(?*ChildAgent)) !void {
             const hosted = app.child_agents.items;
             const entries = try app.alloc.alloc(OrderEntry, hosted.len);
             defer app.alloc.free(entries);
-            for (hosted, entries) |child, *entry| entry.* = switch (child.agent.role) {
-                .instance => .{ .role = .instance },
-                .subagent => .{ .role = .subagent, .root = instanceOrdinal(app, rootInstance(app, child)) },
+            for (hosted, entries) |child, *entry| entry.* = .{
+                .role = child.agent.role,
+                .root = if (child.agent.role == .subagent) instanceOrdinal(app, rootInstance(app, child)) else 0,
+                .working = instanceState(&child.agent, requestWaitsForUser(app, child)) == .working,
+                .reply_at_ms = @max(child.saved_reply_at_ms, latestReplyAt(child.agent.session.agent.history.items)),
             };
             const order = try app.alloc.alloc(usize, hosted.len + 1);
             defer app.alloc.free(order);
             switchOrder(entries, order);
+            sortMenuOrder(entries, .{
+                .role = .instance,
+                .working = firstOpen(app) and instanceState(&app.main_agent, requestWaitsForUser(app, null)) == .working,
+                .reply_at_ms = if (firstOpen(app)) latestReplyAt(app.main_agent.session.agent.history.items) else 0,
+            }, order);
             try out.ensureUnusedCapacity(app.alloc, order.len);
             for (order) |position| {
                 if (position == 0 and !firstOpen(app)) continue;
                 out.appendAssumeCapacity(if (position == 0) null else hosted[position - 1]);
+            }
+            // Activity can change while the menu is open. Keep the highlighted
+            // agent, not its previous row, for navigation, Enter, and Delete.
+            if (menuActive(app)) {
+                app.instances.agents_menu.selected = positionIn(out.items, app.agent_on_screen) orelse 0;
             }
         }
 
@@ -991,13 +1071,27 @@ pub fn Runtime(comptime App: type) type {
             for (app.child_agents.items) |child| {
                 most = moreUrgent(most, instanceState(&child.agent, requestWaitsForUser(app, child)));
             }
-            return switch (most) {
-                .needs_approval => .needs_approval,
-                .has_question => .has_question,
-                .needs_you => .needs_you,
-                .working => .working,
-                .finished, .idle => .idle,
-            };
+            return busyAs(most) orelse .idle;
+        }
+
+        /// The first open agent other than the one on screen that is busy:
+        /// a turn going or queued, an approval or a question open, or a
+        /// request only the user can continue. Restarting fx would stop it.
+        /// Null when every other agent is idle. Its name may use `buf`.
+        /// Main loop only: it reads every agent's prompts.
+        pub fn busyAgentElsewhere(app: *App, buf: []u8) ?BusyAgent {
+            if (app.agent_on_screen != null and firstOpen(app)) {
+                if (busyAs(instanceState(&app.main_agent, requestWaitsForUser(app, null)))) |doing| {
+                    return .{ .name = noteName(app, null, buf), .doing = doing };
+                }
+            }
+            for (app.child_agents.items) |child| {
+                if (child == app.agent_on_screen) continue;
+                if (busyAs(instanceState(&child.agent, requestWaitsForUser(app, child)))) |doing| {
+                    return .{ .name = noteName(app, child, buf), .doing = doing };
+                }
+            }
+            return null;
         }
 
         fn targetAgent(app: *App, target: ?*ChildAgent) *AppAgent {
@@ -1143,11 +1237,10 @@ pub fn Runtime(comptime App: type) type {
             const last: i64 = @intCast(order.items.len - 1);
             const current: i64 = @intCast(@min(menu.selected, order.items.len - 1));
             menu.selected = @intCast(std.math.clamp(current + delta, 0, last));
+            const target = order.items[menu.selected];
+            if (target != app.agent_on_screen) try show(app, target);
             menu.window_start = agents_menu_presentation.windowStart(menuProjection(app), row_budget);
             app.shell.render_requests.request(.footer);
-            const target = order.items[menu.selected];
-            if (target == app.agent_on_screen) return true;
-            try show(app, target);
             debug_trace.eventf("host", "agents_menu_previewed", .{}, "position={d} agent={s}", .{ menu.selected + 1, nameOf(target) });
             return true;
         }
@@ -1179,16 +1272,12 @@ pub fn Runtime(comptime App: type) type {
             switchList(app, &order) catch return .{};
             menu.rows.clearRetainingCapacity();
             menu.rows.ensureTotalCapacity(app.alloc, order.items.len) catch return .{};
-            // Instances come in launch order, so each one's number is the
-            // count of instance rows so far.
-            var number: usize = 0;
             for (order.items) |target| {
                 const agent = targetAgent(app, target);
                 const subagent: ?*ChildAgent = if (target) |child| (if (child.agent.role == .subagent) child else null) else null;
-                if (subagent == null) number += 1;
                 const model = provider_runtime.modelOf(app, agent);
                 menu.rows.appendAssumeCapacity(.{
-                    .number = if (subagent == null) number else 0,
+                    .number = if (subagent == null) instanceNumber(app, target) orelse 0 else 0,
                     .subagent_name = if (subagent) |child| child.displayName() else "",
                     .title = agent.session_title.items,
                     // A subagent's own agent never loads its profile; its
@@ -1212,9 +1301,9 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
-        /// x in the agent list: the first press on a subagent's row arms its
+        /// Delete in the agent list: the first press on a subagent's row arms its
         /// close, and the second closes it for good (`closeSubagent`).
-        /// Instances close with /close, so x on one does nothing.
+        /// Instances close with /close, so Delete on one does nothing.
         pub fn pressCloseKey(app: *App) !bool {
             if (!menuActive(app)) return false;
             var order: std.ArrayList(?*ChildAgent) = .empty;
@@ -1236,7 +1325,7 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// Any key but x disarms a close the first x armed, and its warning
+        /// Any key but Delete disarms a close the first Delete armed, and its warning
         /// goes at once.
         pub fn disarmClose(app: *App) void {
             if (comptime !@hasField(App, "instances")) return;
@@ -2547,4 +2636,52 @@ fn fuzzSwitchOrder(_: void, smith: *std.testing.Smith) !void {
     var order: [buf.len + 1]usize = undefined;
     switchOrder(buf[0..len], order[0 .. len + 1]);
     try expectSwitchOrder(buf[0..len], order[0 .. len + 1]);
+}
+
+test "working agents come first without changing the existing order within either group" {
+    const entries = [_]OrderEntry{
+        .{ .role = .subagent, .working = false },
+        .{ .role = .instance, .working = true },
+        .{ .role = .subagent, .root = 1, .working = true },
+        .{ .role = .subagent, .working = true },
+    };
+    var order: [entries.len + 1]usize = undefined;
+    switchOrder(&entries, &order);
+    // Existing tree order: main, first child, last child, fx 2, its child.
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4, 2, 3 }, &order);
+    sortMenuOrder(&entries, .{ .role = .instance }, &order);
+    try std.testing.expectEqualSlices(usize, &.{ 4, 2, 3, 0, 1 }, &order);
+
+    switchOrder(&entries, &order);
+    sortMenuOrder(&entries, .{ .role = .instance, .working = true }, &order);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 4, 2, 3, 1 }, &order);
+}
+
+test "inactive agents sort by latest reply while working agents and ties keep their order" {
+    const entries = [_]OrderEntry{
+        .{ .role = .subagent, .reply_at_ms = 100 },
+        .{ .role = .subagent, .working = true, .reply_at_ms = 1 },
+        .{ .role = .subagent, .reply_at_ms = 300 },
+        .{ .role = .subagent, .working = true, .reply_at_ms = 900 },
+        .{ .role = .subagent, .reply_at_ms = 300 },
+        .{ .role = .subagent },
+    };
+    var order: [entries.len + 1]usize = undefined;
+    switchOrder(&entries, &order);
+    sortMenuOrder(&entries, .{ .role = .instance, .reply_at_ms = 200 }, &order);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 4, 3, 5, 0, 1, 6 }, &order);
+}
+
+test "latest reply timestamp ignores interrupted turns and empty or untimed replies" {
+    const user: types.UserTurn = .{ .text = @constCast("task") };
+    const history = [_]types.HistoryTurn{
+        .{ .assistant = .{ .user = user, .assistant = @constCast("older"), .execution = .{ .turn_summary = .{ .completed_at_ms = 100 } } } },
+        .{ .assistant = .{ .user = user, .assistant = @constCast("newest reply"), .execution = .{ .turn_summary = .{ .completed_at_ms = 200 } } } },
+        .{ .interrupted = .{ .user = user, .assistant = @constCast("stopped"), .execution = .{ .turn_summary = .{ .completed_at_ms = 900 } } } },
+        .{ .assistant = .{ .user = user, .assistant = @constCast(""), .execution = .{ .turn_summary = .{ .completed_at_ms = 1000 } } } },
+        .{ .assistant = .{ .user = user, .assistant = @constCast("no timestamp") } },
+    };
+    try std.testing.expectEqual(@as(i64, 200), latestReplyAt(&history));
+    try std.testing.expectEqual(@as(i64, 0), latestReplyAt(&.{}));
+    try std.testing.expectEqual(@as(i64, 0), latestReplyAt(history[2..]));
 }
