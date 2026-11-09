@@ -9496,8 +9496,10 @@ const FooterReclaimRun = struct {
         try self.frame();
     }
 
-    /// What exit and suspend do before they erase the footer: one frame
-    /// that settles the held rows.
+    /// What exit, suspend, and a SIGTERM or SIGHUP close do before they erase
+    /// the footer: one frame that settles the held rows. A signal close asks
+    /// the main thread for it (`app_lifecycle.signalClosePending`), which
+    /// runs the same settle.
     fn exit(self: *FooterReclaimRun) !void {
         if (self.h.shell.requestHeldRowsSettle()) try self.frame();
         self.exited = true;
@@ -9753,6 +9755,14 @@ fn driveFooterReclaim(draws: anytype) !void {
     try run.expectEveryRowOnce();
 }
 
+/// The model's action for an event that ends fx, or null for any other event.
+fn footerReclaimExitAct(event: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, event, "exit")) return "Exited";
+    if (std.mem.eql(u8, event, "sigterm")) return "SigTerm";
+    if (std.mem.eql(u8, event, "sighup")) return "SigHup";
+    return null;
+}
+
 const FooterReclaimState = struct {
     rows: u32,
     written: u32,
@@ -9799,7 +9809,8 @@ const FooterReclaimTraceResult = struct {
 // nothing. Events: "o<k>" writes k rows, "open" and "close" the slash picker,
 // "resize" a window resize away and back, "takeover" a Ctrl+O takeover and
 // "invalidate" an invalid anchor as a takeover leaves them, and "exit" what
-// exit and suspend do before they erase the footer.
+// exit and suspend do before they erase the footer; "sigterm" and "sighup"
+// are the same frame, which a signal close asks the main thread for.
 test "footer reclaim runtime trace driver" {
     io_mod.setLibcEnviron();
     defer io_mod.resetEnvironForTest();
@@ -9838,9 +9849,9 @@ test "footer reclaim runtime trace driver" {
             } else if (std.mem.eql(u8, event, "invalidate")) blk: {
                 try run.invalidAnchorTakeover();
                 break :blk "TookOver";
-            } else if (std.mem.eql(u8, event, "exit")) blk: {
+            } else if (footerReclaimExitAct(event)) |exit_act| blk: {
                 try run.exit();
-                break :blk "Exited";
+                break :blk exit_act;
             } else if (event.len > 1 and event[0] == 'o') blk: {
                 try run.output(try std.fmt.parseInt(u32, event[1..], 10));
                 break :blk "Output";

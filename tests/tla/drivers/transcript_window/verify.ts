@@ -24,10 +24,16 @@
 //  14. binary to spec: the built fx binary through three compaction cycles,
 //      Ctrl+O, and a resume, its traced window steps replayed on the core and
 //      checked by TLC (binary-to-spec.ts). FX_BIN picks the binary.
+//  15. footer signal to spec: the built fx with the slash picker open over a
+//      long transcript, ended by a real SIGTERM or SIGHUP, the rows its
+//      history and screen hold checked by TLC against FooterReclaim.tla
+//      (footer-signal-to-spec.ts);
+//  16. every planted bug in the signal close's wiring (a copy of src/ built and
+//      run by the signal driver or a tmux test) caught.
 //
-// With --ci, CI's TLA+ transcript window job leaves out steps 10, 11, 12, and
-// 14: the planted bugs measure the checks rather than the code, and the binary
-// run needs a built fx and tmux.
+// With --ci, CI's TLA+ transcript window job leaves out steps 10, 11, 12, 14,
+// 15, and 16: the planted bugs measure the checks rather than the code, and
+// the binary runs need a built fx and tmux.
 //
 // Settings: FX_TRANSCRIPT_WINDOW_SEED (default 20261030),
 // FX_TRANSCRIPT_WINDOW_TRACES (random traces per session kind, default 200),
@@ -40,7 +46,8 @@ import { binaryToSpec } from "./binary-to-spec.ts";
 import { codeToSpec } from "./code-to-spec.ts";
 import { footerRuntimeToSpec } from "./footer-runtime-to-spec.ts";
 import { CORE_SOURCE, PINNED_TLC_VERSION, buildHarness, checkTlc, configConstants, pinnedToolchain, specFiles, type Config } from "./lib.ts";
-import { coreMutations, runtimeMutations, specMutations } from "./mutations.ts";
+import { coreMutations, runtimeMutations, specMutations, wiringMutations } from "./mutations.ts";
+import { footerSignalToSpec } from "./footer-signal-to-spec.ts";
 import { specToCode } from "./spec-to-code.ts";
 import { checkTraceability } from "./traceability.ts";
 
@@ -83,9 +90,11 @@ try {
     const pinned = run.tlcVersion === PINNED_TLC_VERSION;
     stage(`model ${cfg}`, run.verdict === "pass" && pinned, `${run.verdict}${run.property ? ` (${run.property})` : ""}, ${run.distinct} distinct states, depth ${run.depth}${pinned ? "" : `, TLC is ${run.tlcVersion}`}`);
   }
-  // The footer: the design's config passes, and main's rule before it
-  // (history follows the footer on the screen) fails FooterAtBottom.
-  for (const [cfg, expected] of [["MCFooterReclaim", null], ["MCFooterReclaimToday", "FooterAtBottom"]] as const) {
+  // The footer: the design's config passes, main's rule before it (history
+  // follows the footer on the screen) fails FooterAtBottom, and the head
+  // before the signal repair (SIGTERM and SIGHUP erase the footer without
+  // the exit frame) fails ExitKeepsRows.
+  for (const [cfg, expected] of [["MCFooterReclaim", null], ["MCFooterReclaimToday", "FooterAtBottom"], ["MCFooterReclaimSignalHead", "ExitKeepsRows"]] as const) {
     const run = await checkTlc(join(out, "model", cfg), "FooterReclaim", `${cfg}.cfg`, specFiles());
     models[cfg] = { verdict: run.verdict, property: run.property, distinct: run.distinct, depth: run.depth, ms: run.durationMs, tlc: run.tlcVersion };
     const ok = expected === null ? run.verdict === "pass" : run.verdict === "violated" && run.property === expected;
@@ -156,7 +165,10 @@ try {
     const runtimeResults = await runtimeMutations(join(out, "mutations", "runtime"));
     const missedRuntime = runtimeResults.filter((result) => !result.caught);
     stage("runtime mutations", missedRuntime.length === 0, `${runtimeResults.length - missedRuntime.length} of ${runtimeResults.length} caught${missedRuntime.length ? `; missed ${missedRuntime.map((result) => `${result.id} (${result.detail})`).join(", ")}` : ""}`);
-    report.mutations = { spec, core: coreResults, runtime: runtimeResults };
+    const wiringResults = await wiringMutations(join(out, "mutations", "wiring"));
+    const missedWiring = wiringResults.filter((result) => !result.caught);
+    stage("signal wiring mutations", missedWiring.length === 0, `${wiringResults.length - missedWiring.length} of ${wiringResults.length} caught${missedWiring.length ? `; missed ${missedWiring.map((result) => `${result.id} (${result.detail})`).join(", ")}` : ""}`);
+    report.mutations = { spec, core: coreResults, runtime: runtimeResults, wiring: wiringResults };
     console.log(`  mutations: ${elapsed(at)}`);
   }
 
@@ -173,6 +185,13 @@ try {
     stage("binary to spec", binary.problem === null,
       `${binary.windows} windows, ${binary.steps} steps, ${binary.rejected} rejected, ${binary.archiveLoads} archive loads; TLC ${binary.tlc?.verdict ?? "not run"}${binary.problem ? `; ${binary.problem}` : ""}`);
     console.log(`  binary to spec: ${elapsed(at)}`);
+
+    at = performance.now();
+    const signal = await footerSignalToSpec({ dir: join(out, "footer-signal"), bin: fx });
+    report.footerSignalToSpec = { scenarios: signal.scenarios, steps: signal.steps, problems: signal.problems, tlc: signal.tlc ? { verdict: signal.tlc.verdict, property: signal.tlc.property, distinct: signal.tlc.distinct } : null };
+    stage("footer signal to spec", signal.tlc?.verdict === "pass" && signal.problems.length === 0,
+      `${signal.scenarios} runs of the built binary ended by SIGTERM or SIGHUP with the picker open, ${signal.steps} steps; TLC ${signal.tlc?.verdict ?? "not run"}${signal.tlc?.property ? ` (${signal.tlc.property})` : ""}${signal.problems.length ? `; ${signal.problems.join("; ")}` : ""}`);
+    console.log(`  footer signal to spec: ${elapsed(at)}`);
   }
 } catch (error) {
   stage("verify", false, error instanceof Error ? error.stack ?? error.message : String(error));

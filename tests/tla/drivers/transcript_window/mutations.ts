@@ -8,18 +8,24 @@
 // bug counts as missed only when both pass. A runtime bug is planted in a copy
 // of src/ (the transcript runtime's footer reclaim rule) and must compile; the
 // footer reclaim tests in src/ui/resize_tests.zig must then fail, or else the
-// footer runtime driver must fail TLC or count a row other than once.
+// footer runtime driver must fail TLC or count a row other than once. A wiring
+// bug is planted in a copy of the checkout (the signal close's hand-off between
+// its closer thread and the main thread) and the copy is built; the built
+// binary must then fail the signal driver or the named tmux test.
 import { cpSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { REPO_ROOT } from "../lib/tlc.ts";
 import { codeToSpec } from "./code-to-spec.ts";
 import { footerRuntimeToSpec } from "./footer-runtime-to-spec.ts";
+import { SIGNAL_SCENARIOS, footerSignalToSpec } from "./footer-signal-to-spec.ts";
 import { CORE_SOURCE, MODEL_DIR, buildHarness, checkTlc, configConstants, configNames, specFiles, type Config } from "./lib.ts";
 import { specToCode } from "./spec-to-code.ts";
 
 type SpecMutation = { id: string; bug: string; law: string; constants: string; find: string; replace: string; spec?: string };
 type CoreMutation = { id: string; bug: string; sweep: string; find: string; replace: string };
 type RuntimeMutation = { id: string; bug: string; file: string; find: string; replace: string };
+/// `proof` is "driver" (the built-binary signal driver) or "e2e:<test name>".
+type WiringMutation = RuntimeMutation & { proof: string };
 
 /// The footer reclaim tests in src/ui/resize_tests.zig that a runtime bug runs
 /// first; the fuzz target needs `zig build`, so the seeded walk stands in.
@@ -36,7 +42,7 @@ const FOOTER_RECLAIM_TESTS = [
 
 export type MutationResult = { id: string; caught: boolean; by: string; detail: string; ms: number };
 
-export function loadMutations(): { spec: SpecMutation[]; core: CoreMutation[]; runtime: RuntimeMutation[] } {
+export function loadMutations(): { spec: SpecMutation[]; core: CoreMutation[]; runtime: RuntimeMutation[]; wiring: WiringMutation[] } {
   return JSON.parse(readFileSync(join(MODEL_DIR, "mutations.json"), "utf8"));
 }
 
@@ -169,13 +175,66 @@ export async function runtimeMutations(out: string): Promise<MutationResult[]> {
   return results;
 }
 
-// `bun mutations.ts --runtime` runs the runtime bugs on their own; verify.ts
-// runs every kind as stages of check.sh.
-if (import.meta.main && process.argv.includes("--runtime")) {
+/// The files a build of the checkout needs, and the E2E tests that run it.
+const WIRING_COPY = ["build.zig", "build.zig.zon", "src", "tests"];
+
+export async function wiringMutations(out: string): Promise<MutationResult[]> {
+  const results: MutationResult[] = [];
+  for (const mutation of loadMutations().wiring) {
+    const started = performance.now();
+    const root = join(out, mutation.id, "repo");
+    mkdirSync(root, { recursive: true });
+    for (const name of WIRING_COPY) {
+      cpSync(join(REPO_ROOT, name), join(root, name), { recursive: true, filter: (path) => !path.includes("node_modules") });
+    }
+    const source = join(root, mutation.file);
+    writeFileSync(source, replaceOnce(readFileSync(source, "utf8"), mutation.find, mutation.replace, mutation.id));
+    const build = Bun.spawnSync(["zig", "build", "--cache-dir", join(out, "zig-cache")], { cwd: root, stdout: "pipe", stderr: "pipe" });
+    if (build.exitCode !== 0) {
+      results.push({ id: mutation.id, caught: false, by: "none", detail: `does not compile: ${build.stderr.toString().slice(0, 300)}`, ms: Math.round(performance.now() - started) });
+      continue;
+    }
+    const bin = join(root, "zig-out", "bin", "fx");
+    if (mutation.proof === "driver") {
+      const run = await footerSignalToSpec({ dir: join(out, mutation.id, "driver"), bin, scenarios: [SIGNAL_SCENARIOS[2]!] });
+      const caught = run.tlc?.verdict !== "pass" || run.problems.length > 0;
+      results.push({
+        id: mutation.id,
+        caught,
+        by: caught ? "footer signal to spec" : "none",
+        detail: caught ? `TLC ${run.tlc?.verdict ?? "not run"} ${run.tlc?.property ?? ""}`.trim() : "the driver passes",
+        ms: Math.round(performance.now() - started),
+      });
+      continue;
+    }
+    const filter = mutation.proof.replace(/^e2e:/, "");
+    const env = { ...process.env, FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1" };
+    delete env.AI_GATEWAY_API_KEY;
+    const test = Bun.spawnSync(["bun", "test", "tests/e2e/tui-slash-menu.test.ts", "-t", filter], { cwd: root, env, stdout: "pipe", stderr: "pipe" });
+    const output = `${test.stdout.toString()}${test.stderr.toString()}`;
+    const ran = /\(pass\)|\(fail\)/.test(output);
+    const caught = test.exitCode !== 0 && ran;
+    results.push({
+      id: mutation.id,
+      caught,
+      by: caught ? "tmux test" : "none",
+      detail: caught ? (/\(fail\) (.+?) \[/.exec(output)?.[1] ?? filter) : ran ? "the test passes" : `the test did not run: ${output.slice(-300)}`,
+      ms: Math.round(performance.now() - started),
+    });
+  }
+  return results;
+}
+
+// `bun mutations.ts --runtime` or `--wiring` runs the runtime or the signal
+// wiring bugs on their own; verify.ts runs every kind as stages of check.sh.
+if (import.meta.main && (process.argv.includes("--runtime") || process.argv.includes("--wiring"))) {
   const { outDir } = await import("../lib/tlc.ts");
-  const results = await runtimeMutations(join(outDir("footer-reclaim-mutations"), "runtime"));
+  const wiring = process.argv.includes("--wiring");
+  const results = wiring
+    ? await wiringMutations(join(outDir("footer-signal-mutations"), "wiring"))
+    : await runtimeMutations(join(outDir("footer-reclaim-mutations"), "runtime"));
   for (const result of results) console.log(`${result.caught ? "CAUGHT" : "MISSED"} ${result.id}: ${result.by}; ${result.detail} (${result.ms} ms)`);
   const missed = results.filter((result) => !result.caught);
-  console.log(`${missed.length === 0 ? "PASS" : "FAIL"} runtime mutations: ${results.length - missed.length} of ${results.length} caught`);
+  console.log(`${missed.length === 0 ? "PASS" : "FAIL"} ${wiring ? "wiring" : "runtime"} mutations: ${results.length - missed.length} of ${results.length} caught`);
   process.exit(missed.length === 0 ? 0 : 1);
 }

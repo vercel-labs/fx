@@ -3,7 +3,7 @@
 \*
 \* tests/tla/drivers/transcript_window/footer-runtime-to-spec.ts runs event
 \* scripts (output, slash picker open and close, resizes, screen takeovers,
-\* exit) through
+\* exit, SIGTERM, SIGHUP) through
 \* TranscriptRuntime in the resize harness ("footer reclaim runtime trace
 \* driver" in src/ui/resize_tests.zig) and writes each run as a sequence of
 \* states into FooterTraceData.tla: the committed anchor's total visual rows,
@@ -15,7 +15,7 @@
 \* below are checked on what the code did.
 EXTENDS Integers, Sequences, FooterTraceData
 
-CONSTANTS MaxRows, Burst, BaseCap, Extra, MaxResizes, Release
+CONSTANTS MaxRows, Burst, BaseCap, Extra, MaxResizes, Release, SignalExits
 
 VARIABLES rows, hist, top, open, exited, epochFirst, dropTo, freed, resizes, act, trace, at
 

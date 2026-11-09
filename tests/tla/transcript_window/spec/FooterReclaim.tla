@@ -19,6 +19,16 @@
 \* surface adds are held (release_offset in planTranscriptScrollForFrame).
 \* Release = "current" is main before it: history follows the footer on the
 \* screen, so opening a surface pushes the rows it covers into history.
+\*
+\* fx ends three ways with the footer erased. /quit (and the terminal closing
+\* on end of input) draws the exit frame from the main thread. Suspend and a
+\* fresh session draw it too, then go on. SIGTERM and SIGHUP end fx from the
+\* closer thread, which cannot touch the rows the main thread holds: it asks
+\* the main thread for the exit frame and restores the terminal only once the
+\* frame is drawn (`closerMain` and `signalClosePending` in
+\* src/core/app/app_lifecycle.zig). SignalExits = "settle" is that design;
+\* SignalExits = "erase" is the head before it, where the closer restored the
+\* terminal at once and the held rows never reached the terminal's scrollback.
 EXTENDS Integers
 
 CONSTANTS
@@ -27,7 +37,8 @@ CONSTANTS
     BaseCap,     \* screen rows above the base footer (composer and status line)
     Extra,       \* rows an open surface adds to the footer
     MaxResizes,  \* settled resizes over a run
-    Release      \* "base" (the design) or "current" (main before it)
+    Release,     \* "base" (the design) or "current" (main before it)
+    SignalExits  \* "settle" (the design) or "erase" (the head before it)
 
 VARIABLES rows, hist, top, open, exited, epochFirst, dropTo, freed, resizes, act
 
@@ -110,17 +121,32 @@ TookOver ==
     /\ Frame(rows, open, "TookOver")
     /\ UNCHANGED <<rows, open, exited, epochFirst, dropTo, resizes>>
 
-\* Exit, suspend, and a fresh session's scrollback handoff first draw one
-\* frame that releases every held row, so erasing the footer leaves each row
-\* in history or on the screen.
-Exited ==
+\* The exit frame: exit, suspend, and a fresh session's scrollback handoff
+\* first draw one frame that releases every held row, so erasing the footer
+\* leaves each row in history or on the screen.
+ExitFrame(name) ==
     /\ ~exited
     /\ exited' = TRUE
     /\ hist' = Max(hist, Natural(rows, open, epochFirst))
     /\ top' = Max(hist, Natural(rows, open, epochFirst))
     /\ freed' = Freed(dropTo, Max(hist, Natural(rows, open, epochFirst)))
-    /\ act' = "Exited"
+    /\ act' = name
     /\ UNCHANGED <<rows, open, epochFirst, dropTo, resizes>>
+
+Exited == ExitFrame("Exited")
+
+\* SIGTERM or SIGHUP, at any step between two frames. With the design the
+\* closer waits for the main thread's exit frame; with the head's rule it
+\* restores the terminal at once, so the footer is erased with rows held.
+SignalSettles(name) == SignalExits = "settle"
+
+SignalExit(name) ==
+    IF SignalSettles(name)
+    THEN ExitFrame(name)
+    ELSE /\ ~exited
+         /\ exited' = TRUE
+         /\ act' = name
+         /\ UNCHANGED <<rows, hist, top, open, epochFirst, dropTo, freed, resizes>>
 
 Done == exited /\ UNCHANGED vars
 
@@ -129,6 +155,7 @@ Next ==
     \/ Opened \/ Closed
     \/ \E to \in 1..MaxRows : Dropped(to)
     \/ Resized \/ TookOver \/ Exited \/ Done
+    \/ SignalExit("SigTerm") \/ SignalExit("SigHup")
 
 Spec == Init /\ [][Next]_vars
 
@@ -152,7 +179,8 @@ HistoryOnce == hist <= top
 \* L24: every row on the screen or held is still in memory.
 OwedRowsHeld == freed <= Min(hist, top)
 
-\* L25: after exit no row is held: each one is in history or was on the screen
-\* when the footer was erased.
+\* L25: after exit, by /quit, suspend, a fresh session, SIGTERM or SIGHUP, no row
+\* is held: each one is in history or was on the screen when the footer was
+\* erased.
 ExitKeepsRows == exited => top = hist
 ====

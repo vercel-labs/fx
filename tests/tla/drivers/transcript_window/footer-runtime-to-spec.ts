@@ -4,7 +4,10 @@
 // TLC check every run against FooterReclaim.tla through
 // TraceFooterReclaim.tla. Each script writes rows, opens and closes the slash
 // picker, resizes the window, takes the screen over and gives it back, and
-// ends with what exit and suspend do before they erase the footer. Besides TLC, the run fails when a written row is in
+// ends with what exit and suspend do before they erase the footer, or with a
+// SIGTERM or SIGHUP close, which asks the main thread for the same frame
+// (footer-signal-to-spec.ts runs the built binary through those two with
+// real signals). Besides TLC, the run fails when a written row is in
 // native history plus the screen other than exactly once after exit, which
 // the resize harness's physical history probe counts from the bytes fx wrote.
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -54,6 +57,11 @@ const SCRIPTED: { name: string; events: string[] }[] = [
   { name: "a resize with the picker closed between two opens", events: ["o1", "o29", "open", "close", "resize", "open", "close", "exit"] },
   { name: "a takeover with the picker open, output, then close", events: ["o1", "o29", "open", "takeover", "o2", "o2", "close", "o1", "exit"] },
   { name: "an invalid anchor with the picker open, output, then close", events: ["o1", "o29", "open", "invalidate", "o2", "o2", "close", "o1", "exit"] },
+  { name: "SIGTERM with the picker open", events: ["o1", "o29", "open", "sigterm"] },
+  { name: "SIGHUP with the picker open after output", events: ["o1", "o29", "open", "o2", "sighup"] },
+  { name: "SIGTERM after the picker closed", events: ["o1", "o29", "open", "close", "sigterm"] },
+  { name: "SIGHUP after a resize and a takeover with the picker open", events: ["o1", "o29", "open", "resize", "takeover", "o1", "sighup"] },
+  { name: "SIGTERM on a transcript shorter than the screen with the picker open", events: ["o1", "o3", "open", "sigterm"] },
 ];
 
 function randomScript(next: () => number, length: number): string[] {
@@ -73,7 +81,7 @@ function randomScript(next: () => number, length: number): string[] {
       open = false;
     }
   }
-  events.push("exit");
+  events.push(["exit", "sigterm", "sighup"][Math.floor(next() * 3)]!);
   return events;
 }
 
@@ -166,7 +174,7 @@ export async function footerRuntimeToSpec(options: { dir: string; randomTraces: 
   const files = specFiles();
   const cfgText = files["TraceFooterReclaim.cfg"]!.replace(
     /CONSTANTS\n[\s\S]*?\nSPECIFICATION/,
-    `CONSTANTS\n    MaxRows = ${maxRows}\n    Burst = ${burst}\n    BaseCap = ${baseCap}\n    Extra = ${extra}\n    MaxResizes = ${maxResizes}\n    Release = "base"\nSPECIFICATION`,
+    `CONSTANTS\n    MaxRows = ${maxRows}\n    Burst = ${burst}\n    BaseCap = ${baseCap}\n    Extra = ${extra}\n    MaxResizes = ${maxResizes}\n    Release = "base"\n    SignalExits = "settle"\nSPECIFICATION`,
   );
   const tlc = await checkTlc(join(options.dir, "tlc"), "TraceFooterReclaim", "TraceFooterReclaim.cfg", {
     ...files,

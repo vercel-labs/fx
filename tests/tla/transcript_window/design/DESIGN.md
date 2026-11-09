@@ -43,11 +43,17 @@ current code.
   multi-line draft) pushes off the top are held, not released, and come back
   when it closes; output while it is open releases rows in order through the
   history replay, a resize reprint and the recovery after a screen takeover
-  keep them held, and exit, suspend, and a fresh session's scrollback handoff
-  first release every held row. `spec/FooterReclaim.tla` models the main screen's
-  rows under this rule, with `Release = "current"` as main's rule before it;
-  `mutations.json` plants the rule's bugs in both the spec and the transcript
-  runtime (`src/ui/transcript/runtime.zig`).
+  keep them held, and exit, suspend, a fresh session's scrollback handoff, and
+  a SIGTERM or SIGHUP close first release every held row. A signal ends fx from
+  the closer thread, which cannot touch the rows the main thread holds, so it
+  asks the main thread for the exit frame (leaving Ctrl+O's full transcript
+  screen first) and restores the terminal once the frame is drawn, or after a
+  bounded wait it logs. `spec/FooterReclaim.tla` models the main screen's
+  rows under this rule, with `Release = "current"` as main's rule before it and
+  `SignalExits = "erase"` as the signal close before it; `mutations.json` plants
+  the rule's bugs in the spec, in the transcript runtime
+  (`src/ui/transcript/runtime.zig`), and in the signal close's wiring
+  (`src/core/app/app_lifecycle.zig`, `app_render_runtime.zig`, `main.zig`).
 
 ## In fx
 
@@ -209,7 +215,7 @@ maps it onto the TLA+ variables.
 | L22 FooterAtBottom | The footer is on the bottom rows: the screen above it is full whenever the transcript has the rows to fill it (TUI-32). |
 | L23 HistoryOnce | No row in native history is on the screen, so no frame shows a row twice (native-history finality). |
 | L24 OwedRowsHeld | Every row on the screen or held above it is still in memory: the shell frees a dropped entry only once its rows are in history. |
-| L25 ExitKeepsRows | After exit no row is held: each one is in native history or on the screen when the footer is erased. |
+| L25 ExitKeepsRows | After exit (`/quit`, suspend, a fresh session, SIGTERM, or SIGHUP) no row is held: each one is in native history or on the screen when the footer is erased. |
 | L17 PureCore | `transcript_window.zig` imports only `std` and reads no clock, environment, or global. |
 
 ## Enforcement

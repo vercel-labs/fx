@@ -195,6 +195,15 @@
       "constants": "MCFooterReclaim",
       "find": "    /\\ hist' = Max(hist, Natural(rows, open, epochFirst))\n    /\\ top' = Max(hist, Natural(rows, open, epochFirst))\n    /\\ freed' = Freed(dropTo, Max(hist, Natural(rows, open, epochFirst)))",
       "replace": "    /\\ UNCHANGED <<hist, top, freed>>"
+    },
+    {
+      "id": "footer-sighup-exit-unsettled",
+      "bug": "SIGHUP restores the terminal at once instead of waiting for the main thread's exit frame (closeOnHangup, or the closer thread, ends fx first), so a closed window loses the rows a surface holds while SIGTERM keeps them.",
+      "law": "ExitKeepsRows",
+      "spec": "FooterReclaim",
+      "constants": "MCFooterReclaim",
+      "find": "SignalSettles(name) == SignalExits = \"settle\"",
+      "replace": "SignalSettles(name) == SignalExits = \"settle\" /\\ name /= \"SigHup\""
     }
   ],
   "core": [
@@ -323,8 +332,8 @@
       "id": "footer-runtime-reset-holds-nothing",
       "bug": "A resize reprint with a surface open releases the rows it covers, so its close leaves the footer above the bottom rows.",
       "file": "src/ui/transcript/runtime.zig",
-      "find": "                @intCast(@min(held_footer_rows, target_offset));\n",
-      "replace": "                0;\n"
+      "find": "            const reset_held_rows = self.owedHeldRows(held_footer_rows, target_offset);\n",
+      "replace": "            const reset_held_rows: u16 = 0;\n"
     },
     {
       "id": "footer-runtime-held-debt-unmarked",
@@ -344,8 +353,50 @@
       "id": "footer-runtime-invalid-recovery-counts-held",
       "bug": "Recovery from an invalid anchor counts every row above the viewport as history, so the rows a surface holds never reach scrollback.",
       "file": "src/ui/transcript/runtime.zig",
-      "find": "                    .reset_held_rows = if (self.settle_held_rows)\n",
-      "replace": "                    .reset_held_rows = if (true)\n"
+      "find": "                    .reset_held_rows = self.owedHeldRows(held_footer_rows, target_offset),\n",
+      "replace": "                    .reset_held_rows = 0,\n"
+    }
+  ],
+  "wiring": [
+    {
+      "id": "signal-close-never-asks",
+      "bug": "closerMain restores the terminal without asking the main thread for the exit frame, so SIGTERM and SIGHUP end fx with the rows a footer surface holds still held (the head before the repair).",
+      "file": "src/core/app/app_lifecycle.zig",
+      "find": "    signal_close.ask();\n",
+      "replace": "",
+      "proof": "driver"
+    },
+    {
+      "id": "signal-close-main-answers-unsettled",
+      "bug": "The main thread answers the closer's request without drawing the exit frame, so the closer restores the terminal with the held rows still held.",
+      "file": "src/core/app/app_render_runtime.zig",
+      "find": "                settleHeldTranscriptRows(app, flush_frame);\n            }\n            debug_trace.logf(\n                \"app\",\n                \"event=signal_close_settle",
+      "replace": "                _ = flush_frame;\n            }\n            debug_trace.logf(\n                \"app\",\n                \"event=signal_close_settle",
+      "proof": "driver"
+    },
+    {
+      "id": "signal-close-does-not-wait",
+      "bug": "closerMain does not wait for the main thread's answer, so it restores the terminal and ends fx before the exit frame is drawn.",
+      "file": "src/core/app/app_lifecycle.zig",
+      "find": "signal_close.awaitAnswer(CloserClock{}, close_settle_wait_ms)",
+      "replace": "signal_close.awaitAnswer(CloserClock{}, 0)",
+      "proof": "driver"
+    },
+    {
+      "id": "signal-close-keeps-full-transcript-open",
+      "bug": "The signal close draws the exit frame while Ctrl+O's full transcript screen is open, so the frame goes to the alternate screen and the held rows never reach scrollback.",
+      "file": "src/core/app/app_render_runtime.zig",
+      "find": "                _ = app_lifecycle.closeFullTranscriptIfActive(\n                    app.alloc,\n                    &app.terminal,\n                    &app.shell,\n                    &app.metrics,\n                ) catch |err| debug_trace.logf(\"render\", \"signal_close_full_transcript_failed err={s}\", .{@errorName(err)});\n",
+      "replace": "",
+      "proof": "e2e:SIGTERM with the full transcript screen"
+    },
+    {
+      "id": "hangup-close-does-not-settle",
+      "bug": "A hang-up with a turn running ends fx without drawing the exit frame (closeOnHangup skips releaseTerminal, which settles otherwise).",
+      "file": "src/main.zig",
+      "find": "        if (turn_running) self.settleHeldTranscriptRows();\n",
+      "replace": "",
+      "proof": "e2e:a terminal that hangs up"
     }
   ]
 }

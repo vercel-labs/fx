@@ -963,6 +963,35 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// SIGTERM and SIGHUP end fx from the closer thread, which cannot
+        /// touch the rows the main thread holds: it asks for the exit frame
+        /// (`app_lifecycle.signalClosePending`) and restores the terminal once
+        /// the main thread answers. The event loop calls this on every pass.
+        /// The settle is the one /quit draws, and a closed terminal logs its
+        /// drop there (`tests/tla/transcript_window/spec/FooterReclaim.tla`
+        /// SignalExit). Ctrl+O's full transcript screen is closed first.
+        pub fn settleForSignalClose(app: *App, flush_frame: *const fn (*App) anyerror!void) void {
+            if (!app_lifecycle.signalClosePending()) return;
+            const raw = app.terminal.raw_enabled;
+            if (raw) {
+                // Ctrl+O's full transcript screen covers the main screen and
+                // its held rows: leave it, so the frame draws on the main one.
+                _ = app_lifecycle.closeFullTranscriptIfActive(
+                    app.alloc,
+                    &app.terminal,
+                    &app.shell,
+                    &app.metrics,
+                ) catch |err| debug_trace.logf("render", "signal_close_full_transcript_failed err={s}", .{@errorName(err)});
+                settleHeldTranscriptRows(app, flush_frame);
+            }
+            debug_trace.logf(
+                "app",
+                "event=signal_close_settle raw={s} held_rows_left={s}",
+                .{ if (raw) "true" else "false", if (app.shell.holdsTranscriptRows()) "true" else "false" },
+            );
+            app_lifecycle.answerSignalClose();
+        }
+
         pub fn flushRequestedFrame(app: *App, agent: *AppAgent) !void {
             if (comptime @hasDecl(@TypeOf(app.shell), "sessionScrollbackHandoffPending")) {
                 if (app.shell.sessionScrollbackHandoffPending()) return;
@@ -4781,9 +4810,13 @@ test "core.app_render_runtime paints a rebased terminal status after cancellatio
     try std.testing.expectEqualStrings(finished, quiet);
 }
 
+/// The screen width at which `checkRebasedNoticePublication` also holds a
+/// multi-line draft in the composer.
+const draft_publication_cols: u16 = 24;
+
 test "core.app_render_runtime rebased notice preserves the pin and publishes the finished result" {
     try checkRebasedNoticePublication(80, 12);
-    try checkRebasedNoticePublication(24, 10);
+    try checkRebasedNoticePublication(draft_publication_cols, 10);
 }
 
 fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
@@ -4806,7 +4839,7 @@ fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
     var history: std.ArrayList(u8) = .empty;
     defer history.deinit(alloc);
     var offset: u64 = 0;
-    if (cols == 24) try app.input_runtime.textReplacementState().replace(alloc, "draft one\ndraft two\ndraft three\ndraft four");
+    if (cols == draft_publication_cols) try app.input_runtime.textReplacementState().replace(alloc, "draft one\ndraft two\ndraft three\ndraft four");
     for (0..4) |index| {
         var line: [48]u8 = undefined;
         _ = try app.shell.appendRawTranscriptEntry(alloc, try std.mem.print(&line, "NOTICE_HISTORY_{d:0>2}\n", .{index}));
@@ -4849,7 +4882,7 @@ fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
     try std.testing.expect(finished.finality.mutation_pin_start == null);
     // The draft holds the transcript rows it covers until it clears
     // (`tests/tla/transcript_window/spec/FooterReclaim.tla` FooterAtBottom).
-    if (cols == 24) app.input_runtime.inputResetState().clearCurrent(alloc);
+    if (cols == draft_publication_cols) app.input_runtime.inputResetState().clearCurrent(alloc);
     var released: u32 = 0;
     for (0..4) |_| released += try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
     try std.testing.expect(released > 0);

@@ -39,6 +39,7 @@
     {"name": "terminal_grid", "module": "fx", "test": "terminal grid state survives fragmented feeds, checkpoints, and repaints", "iterations": 50000},
     {"name": "transcript_paint", "module": "fx", "test": "transcript painting keeps the shadow terminal in step with the screen", "iterations": 8000},
     {"name": "footer_reclaim", "module": "fx", "test": "footer reclaim keeps every row once on fuzzed event scripts", "iterations": 25},
+    {"name": "signal_close", "module": "fx", "test": "the signal close wait holds its laws for fuzzed answers, bounds and clocks", "iterations": 400000},
     {"name": "markdown_lists", "module": "fx", "test": "Markdown lists render the same however assistant text is split", "iterations": 900000},
     {"name": "url_policy", "module": "fx", "test": "url policy admits only URLs it reads back the same way", "iterations": 2400000},
     {"name": "http_response", "module": "fx", "test": "web_fetch response parser reads a response the same however it is split", "iterations": 1500000},

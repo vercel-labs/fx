@@ -641,13 +641,129 @@ function footerReclaimEnv(home: string, server: ReturnType<typeof startFakeGatew
   };
 }
 
+/// How long the signal tests wait for a viewport to hold still: they run next to
+/// many tmux servers in CI, where a settled footer can take longer than 5 s.
+const SIGNAL_EXIT_STABLE_MS = 20_000;
+
+/// fx with the 82-row reply in scrollback, `FX_PERMISSION_MODE=ask` and a
+/// trace log of the app and render scopes, for the tests that end it with a
+/// signal. The second scripted reply is a shell command that waits for approval.
+async function startSignalExitSession(): Promise<{ workDir: string; stderrPath: string; tracePath: string }> {
+  const workDir = mkdtempSync(join(tmpdir(), "fx-footer-reclaim-signal-e2e-"));
+  workDirs.push(workDir);
+  const home = join(workDir, "home");
+  const workspace = join(workDir, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", permission: {} }));
+  const stderrPath = join(workDir, "stderr.log");
+  const tracePath = join(workDir, "trace.log");
+  gateway = startFakeGateway([
+    fakeGatewayFinalText(longAssistantResponse()),
+    fakeGatewayToolCall("signal_exit_shell", "shell", {
+      request: { yield_time_ms: 30_000, action: "run", command: "touch signal-exit.txt" },
+    }),
+  ]);
+  session = await TmuxSession.create({
+    cmd: FX_BIN,
+    cwd: workspace,
+    env: {
+      ...footerReclaimEnv(home, gateway),
+      FX_PERMISSION_MODE: "ask",
+      FX_TRACE: "1",
+      FX_TRACE_LOG: tracePath,
+      FX_TRACE_SCOPES: "app,render",
+    },
+    stderrPath,
+    width: 100,
+    height: 24,
+    isolated: true,
+    remainOnExit: true,
+    minimumHistoryLines: 500,
+  });
+  await session.waitForComposer(10_000);
+  await session.sendText("Print the deterministic slash footer transcript fixture.");
+  await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
+  await waitForTurnEnd(session);
+  await stableFooterGrid(session, workDir, "idle", SIGNAL_EXIT_STABLE_MS);
+  expect(footerMarkerCopies(stripAnsi(await session.captureFullScrollback()))).toEqual(longAssistantLines().map(() => 1));
+  return { workDir, stderrPath, tracePath };
+}
+
+/// Sends `signal` to fx, waits for the pane to end, and returns its scrollback.
+async function endBySignal(tui: TmuxSession, signal: NodeJS.Signals, workDir: string, label: string): Promise<string> {
+  process.kill(tui.processPid(), signal);
+  await tui.waitForPane(() => tui.paneStatus().dead, 10_000);
+  const text = stripAnsi(await tui.captureFullScrollback());
+  writeFileSync(join(workDir, `${label}.txt`), text);
+  return text;
+}
+
+/// The closer saw the signal, the main thread answered its settle request,
+/// and no row was reported as dropped.
+function expectSignalCloseTrace(tracePath: string, signalNumber: number): void {
+  const trace = readFileSync(tracePath, "utf8");
+  expect(trace).toContain(`event=closing signal=${signalNumber}`);
+  expect(trace).toContain("event=signal_close_settle");
+  expect(trace).not.toContain("held_rows_settle_failed");
+  expect(trace).not.toContain("held_rows_settle_incomplete");
+  expect(trace).not.toContain("signal_close_settle_unconfirmed");
+}
+
+/// Hangs up the terminal of fx with a turn running and the slash picker open
+/// over a long transcript, and returns the app and held-row lines of its trace.
+async function hangUpWithTurnRunning(): Promise<string[]> {
+  const workDir = mkdtempSync(join(tmpdir(), "fx-footer-reclaim-hangup-e2e-"));
+  workDirs.push(workDir);
+  const home = join(workDir, "home");
+  const workspace = join(workDir, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", permission: {} }));
+  const tracePath = join(workDir, "trace.log");
+  const late = heldFakeGatewayFinalText();
+  gateway = startFakeGateway([fakeGatewayFinalText(longAssistantResponse()), () => late.response]);
+  session = await TmuxSession.create({
+    cmd: `perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' ${FX_BIN}`,
+    cwd: workspace,
+    env: { ...footerReclaimEnv(home, gateway), FX_TRACE: "1", FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "app,render" },
+    width: 100,
+    height: 24,
+    isolated: true,
+    minimumHistoryLines: 500,
+  });
+  await session.waitForComposer(10_000);
+  await session.sendText("Print the deterministic slash footer transcript fixture.");
+  await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
+  await waitForTurnEnd(session);
+  await session.sendText("Print the late rows.");
+  await session.waitForPane(() => gateway!.requests.length === 2, 10_000);
+  await session.sendLiteralText("/");
+  await session.waitForText("Commands", 5_000);
+  await Bun.sleep(300);
+
+  await session.kill();
+  session = null;
+  const deadline = Date.now() + 10_000;
+  let trace = "";
+  while (Date.now() < deadline) {
+    trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+    if (trace.includes("event=closing")) break;
+    await Bun.sleep(100);
+  }
+  late.release("late");
+  gateway.stop();
+  gateway = null;
+  return trace.split("\n").filter((line) => /\[app\]|held_rows/.test(line));
+}
+
 async function waitForTurnEnd(tui: TmuxSession): Promise<void> {
   await tui.waitForPane((pane) => !pane.includes("esc interrupt") && !pane.includes("Thinking"), 10_000);
 }
 
 /// The pane once five captures 50 ms apart agree, saved under `label`.
-async function stableFooterGrid(tui: TmuxSession, workDir: string, label: string): Promise<string[]> {
-  const deadline = Date.now() + 5_000;
+async function stableFooterGrid(tui: TmuxSession, workDir: string, label: string, timeoutMs = 5_000): Promise<string[]> {
+  const deadline = Date.now() + timeoutMs;
   let previous = "";
   let stableSamples = 0;
   let pane = "";
@@ -1819,6 +1935,141 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     90_000,
+  );
+
+  // SIGTERM and SIGHUP end fx like a closed window or a logout. Like /quit,
+  // they first hand the rows a footer surface holds to scrollback, so every
+  // transcript row is there exactly once afterwards
+  // (`tests/tla/transcript_window/spec/FooterReclaim.tla` ExitKeepsRows).
+  for (const { signal, number } of [{ signal: "SIGTERM", number: 15 }, { signal: "SIGHUP", number: 1 }] as const) {
+    test(
+      `${signal} with the slash picker open leaves every row in scrollback once`,
+      async () => {
+        const run = await startSignalExitSession();
+        await session!.sendLiteralText("/");
+        await session!.waitForText("Commands", 5_000);
+        await stableFooterGrid(session!, run.workDir, "picker-open", SIGNAL_EXIT_STABLE_MS);
+        const duringPicker = stripAnsi(await session!.captureFullScrollback());
+        for (const copies of footerMarkerCopies(duringPicker)) expect(copies).toBeLessThanOrEqual(1);
+
+        const afterExit = await endBySignal(session!, signal, run.workDir, "after-signal");
+        expect(footerMarkerCopies(afterExit), `${signal} with the picker open`).toEqual(longAssistantLines().map(() => 1));
+        expectSignalCloseTrace(run.tracePath, number);
+        expect(gateway!.requests).toHaveLength(1);
+        expect(readFileSync(run.stderrPath, "utf8")).toBe("");
+        await session!.kill();
+        session = null;
+      },
+      90_000,
+    );
+  }
+
+  test(
+    "SIGTERM with a command approval open leaves every row in scrollback once",
+    async () => {
+      const run = await startSignalExitSession();
+      await session!.sendText("Run the signal exit command.");
+      await session!.waitForText("Would you like to run the following command?", 20_000);
+      await stableFooterGrid(session!, run.workDir, "approval-open", SIGNAL_EXIT_STABLE_MS);
+
+      const afterExit = await endBySignal(session!, "SIGTERM", run.workDir, "after-signal");
+      expect(footerMarkerCopies(afterExit), "SIGTERM with an approval open").toEqual(longAssistantLines().map(() => 1));
+      expectSignalCloseTrace(run.tracePath, 15);
+      expect(gateway!.requests).toHaveLength(2);
+      expect(readFileSync(run.stderrPath, "utf8")).toBe("");
+      await session!.kill();
+      session = null;
+    },
+    90_000,
+  );
+
+  test(
+    "SIGTERM with no surface open leaves every row in scrollback once",
+    async () => {
+      const run = await startSignalExitSession();
+      await stableFooterGrid(session!, run.workDir, "idle", SIGNAL_EXIT_STABLE_MS);
+
+      const afterExit = await endBySignal(session!, "SIGTERM", run.workDir, "after-signal");
+      expect(footerMarkerCopies(afterExit)).toEqual(longAssistantLines().map(() => 1));
+      expectSignalCloseTrace(run.tracePath, 15);
+      expect(readFileSync(run.stderrPath, "utf8")).toBe("");
+      await session!.kill();
+      session = null;
+    },
+    90_000,
+  );
+
+  test(
+    "SIGTERM then SIGHUP with the slash picker open leaves every row once",
+    async () => {
+      // The first signal closes fx; the second changes nothing.
+      const run = await startSignalExitSession();
+      await session!.sendLiteralText("/");
+      await session!.waitForText("Commands", 5_000);
+      await stableFooterGrid(session!, run.workDir, "picker-open", SIGNAL_EXIT_STABLE_MS);
+
+      const pid = session!.processPid();
+      process.kill(pid, "SIGTERM");
+      try {
+        process.kill(pid, "SIGHUP");
+      } catch {
+        // fx already ended.
+      }
+      await session!.waitForPane(() => session!.paneStatus().dead, 10_000);
+      const afterExit = stripAnsi(await session!.captureFullScrollback());
+      writeFileSync(join(run.workDir, "after-signals.txt"), afterExit);
+      expect(footerMarkerCopies(afterExit)).toEqual(longAssistantLines().map(() => 1));
+      expect(gateway!.requests).toHaveLength(1);
+      await session!.kill();
+      session = null;
+    },
+    90_000,
+  );
+
+  test(
+    "SIGTERM with the full transcript screen open over the slash picker leaves every row in scrollback once",
+    async () => {
+      // Ctrl+O takes the alternate screen while the picker holds the rows it
+      // covers. The signal ends fx there; the held rows still reach scrollback.
+      const run = await startSignalExitSession();
+      await session!.sendLiteralText("/");
+      await session!.waitForText("Commands", 5_000);
+      await stableFooterGrid(session!, run.workDir, "picker-open", SIGNAL_EXIT_STABLE_MS);
+      await session!.sendKeys("C-o");
+      await session!.waitForText("esc close · pgup/pgdn scroll", 10_000);
+
+      const afterExit = await endBySignal(session!, "SIGTERM", run.workDir, "after-signal");
+      expect(footerMarkerCopies(afterExit), "SIGTERM over the full transcript screen").toEqual(longAssistantLines().map(() => 1));
+      expectSignalCloseTrace(run.tracePath, 15);
+      expect(readFileSync(run.stderrPath, "utf8")).toBe("");
+      await session!.kill();
+      session = null;
+    },
+    90_000,
+  );
+
+  test(
+    "a terminal that hangs up with a turn running and the picker open settles the held rows before fx ends",
+    async () => {
+      // The terminal is gone, so the exit frame cannot reach scrollback. fx
+      // still tries to draw it before it ends, and logs the rows it could not
+      // place. fx runs in a session of its own, so the closed terminal reaches
+      // it as end of input and not as SIGHUP, which takes the other path.
+      // A frame being written as the terminal closes can fail first. That ends
+      // fx with an error instead, cancels the turn, and never reaches this
+      // path, so such an attempt is tried again.
+      let lines: string[] = [];
+      let closing = -1;
+      for (let attempt = 1; attempt <= 5 && closing < 0; attempt += 1) {
+        lines = await hangUpWithTurnRunning();
+        closing = lines.findIndex((line) => line.includes("event=closing cause=hangup"));
+      }
+      const settled = lines.findIndex((line) => line.includes("held_rows_settle_incomplete dropped=held_transcript_rows_from_scrollback"));
+      expect(closing, `fx never closed on the hang-up:\n${lines.join("\n")}`).toBeGreaterThanOrEqual(0);
+      expect(settled, `fx ended without settling the held rows:\n${lines.join("\n")}`).toBeGreaterThanOrEqual(0);
+      expect(settled).toBeLessThan(closing);
+    },
+    180_000,
   );
 
   test(

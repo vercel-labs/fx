@@ -28,6 +28,7 @@ export const SPEC_FILES = [
   "FooterReclaim.tla",
   "MCFooterReclaim.cfg",
   "MCFooterReclaimToday.cfg",
+  "MCFooterReclaimSignalHead.cfg",
   "TraceFooterReclaim.tla",
   "TraceFooterReclaim.cfg",
 ];

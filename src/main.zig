@@ -1123,13 +1123,21 @@ const App = struct {
     /// Ends fx as a closed window while the main conversation's turn runs
     /// (`app_lifecycle.closeOnHangup`); returns when no turn is running.
     pub fn closeOnHangup(self: *App) void {
-        app_lifecycle.closeOnHangup(self.main_agent.worker.isProcessing());
+        const turn_running = self.main_agent.worker.isProcessing();
+        // Ending fx here skips `releaseTerminal`, which settles otherwise.
+        if (turn_running) self.settleHeldTranscriptRows();
+        app_lifecycle.closeOnHangup(turn_running);
     }
 
     /// Puts the rows a footer surface holds into native history before the
     /// screen is handed off: exit, suspend, or a fresh session.
     pub fn settleHeldTranscriptRows(self: *App) void {
         RenderAppRuntime.settleHeldTranscriptRows(self, flushRequestedFrame);
+    }
+
+    /// Draws the exit frame a SIGTERM or SIGHUP close waits for.
+    pub fn settleForSignalClose(self: *App) void {
+        RenderAppRuntime.settleForSignalClose(self, flushRequestedFrame);
     }
 
     pub fn releaseTerminal(self: *App) void {
@@ -3212,6 +3220,7 @@ const App = struct {
 
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        if (comptime !host_target.is_wasm) self.settleForSignalClose();
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self, self.screenAgent())) return;
 
         if (comptime !host_target.is_wasm) {

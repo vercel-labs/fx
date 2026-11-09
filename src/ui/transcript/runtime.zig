@@ -8045,6 +8045,14 @@ pub const TranscriptRuntime = struct {
         };
     }
 
+    /// The rows a reprint or a recovery leaves owed rather than releasing
+    /// them: the ones a footer surface covers, none when the frame settles
+    /// them for exit.
+    fn owedHeldRows(self: *const TranscriptRuntime, held_footer_rows: u16, target_offset: u32) u16 {
+        if (self.settle_held_rows) return 0;
+        return @intCast(@min(held_footer_rows, target_offset));
+    }
+
     pub fn historyCatchupPending(self: *const TranscriptRuntime) bool {
         return switch (self.transcript_commit_state) {
             .invalid, .recovering => false,
@@ -8664,10 +8672,7 @@ pub const TranscriptRuntime = struct {
         if (self.terminal_reset_pending) {
             // The reprint releases rows by the same rule as any frame: the
             // rows a footer surface covers stay out of native history.
-            const reset_held_rows: u16 = if (self.settle_held_rows)
-                0
-            else
-                @intCast(@min(held_footer_rows, target_offset));
+            const reset_held_rows = self.owedHeldRows(held_footer_rows, target_offset);
             debug_trace.logf(
                 "scroll",
                 "transcript_transition_plan source_state=reset target_visual_offset={d} target_total_visual_rows={d} held_footer_rows={d} planned_rows=0",
@@ -8838,10 +8843,7 @@ pub const TranscriptRuntime = struct {
                 return .{
                     .target_visual_offset = target_offset,
                     .recovery_rebase = true,
-                    .reset_held_rows = if (self.settle_held_rows)
-                        0
-                    else
-                        @intCast(@min(held_footer_rows, target_offset)),
+                    .reset_held_rows = self.owedHeldRows(held_footer_rows, target_offset),
                 };
             },
         };
