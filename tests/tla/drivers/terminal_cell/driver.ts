@@ -16,6 +16,15 @@
 // and a smaller one after it fits) and seeded random streams, for a one-,
 // three- and four-byte base.
 //
+// The pool cases first fill the grid's suffix pool with characters that carry
+// different marks, so that exactly `room` of its 65,535 entries are free, clear
+// the screen (which frees no entry), and then write the base and the units. A
+// kept unit takes one entry, so a stream with more units than `room` meets the
+// full pool part of the way. The marks of the fill are not the marks of the
+// units, so no unit finds its suffix already in the pool (the model leaves
+// that out). fx before the pool change exits at the first unit the pool has no
+// entry for, which the run records as a process that did not stay alive.
+//
 // Usage:
 //   bun tests/tla/drivers/terminal_cell/driver.ts [--self-check] [--seed N]
 //
@@ -31,6 +40,10 @@ import { spawnSync } from "node:child_process";
 import { TLA_ROOT, fxBin, outDir, runTlc, sha256File, writeJson } from "../lib/tlc";
 
 const CAP = 64;
+// The most entries the grid's combining pool holds (`max_pool_entries`).
+const POOL_ENTRIES = 65_535;
+// A pool with far more room than any cell can take: a cell keeps at most 32 units.
+const UNBOUNDED_ROOM = 100;
 const SPEC_DIR = join(TLA_ROOT, "terminal_cell");
 const COLS = 80;
 const ROWS = 4;
@@ -48,6 +61,7 @@ const BASES = [
 type Observation = {
   base: number;
   units: number[];
+  room: number;
   alive: boolean;
   aused: number;
   acol: number;
@@ -120,6 +134,66 @@ function randomStreams(seed: number, count: number): number[][] {
   return streams;
 }
 
+/// The marks of the fill: U+0300 to U+036F without U+0301, which the units use.
+const FILL_MARKS = Array.from({ length: 0x70 }, (_, index) => 0x300 + index)
+  .filter((codepoint) => codepoint !== 0x301)
+  .map((codepoint) => String.fromCodePoint(codepoint));
+
+const fillCache = new Map<number, string>();
+
+/// Characters with three different marks each, then characters that add one
+/// mark to the first of them, written so the pool ends with `room` free entries.
+/// Each prefix of a character's marks is one pool entry, shared with every
+/// character that starts with the same marks.
+function fillText(room: number): string {
+  const cached = fillCache.get(room);
+  if (cached !== undefined) return cached;
+  const target = POOL_ENTRIES - room;
+  const n = FILL_MARKS.length;
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  for (let index = 0; ; index++) {
+    const a = index % n;
+    const b = Math.floor(index / n) % n;
+    const c = Math.floor(index / (n * n)) % n;
+    const keys = [`${a}`, `${a},${b}`, `${a},${b},${c}`];
+    if (seen.size + keys.filter((key) => !seen.has(key)).length > target) break;
+    for (const key of keys) seen.add(key);
+    parts.push(`x${FILL_MARKS[a]}${FILL_MARKS[b]}${FILL_MARKS[c]} `);
+  }
+  // At most two entries are left to add. The first character's three marks and
+  // a fourth that no character has used are one new entry each.
+  for (let extra = 0; seen.size < target; extra++) {
+    seen.add(`0,0,0,${extra}`);
+    parts.push(`x${FILL_MARKS[0]}${FILL_MARKS[0]}${FILL_MARKS[0]}${FILL_MARKS[extra]} `);
+  }
+  if (seen.size !== target) throw new Error(`the fill has ${seen.size} entries, not ${target}`);
+  const text = parts.join("");
+  fillCache.set(room, text);
+  return text;
+}
+
+/// A pool with `room` free entries, a stream, and what fills it. Rooms of 0, 1,
+/// and 2 are the pool full before, at, and just after the first kept unit; a
+/// room of 31 is the pool and the cell both full after the same unit.
+type PoolCase = { room: number; units: number[] };
+
+function poolCases(): PoolCase[] {
+  return [
+    { room: 0, units: [2, 3, 4] },
+    { room: 0, units: repeat(2, 5) },
+    { room: 1, units: [2, 3, 4] },
+    { room: 1, units: [4, 2, 2] },
+    { room: 2, units: [3, 3, 3, 3] },
+    { room: 2, units: [2, 3, 4, 2, 2] },
+    { room: 2, units: repeat(2, 40) },
+    // The cell fills before the pool does, at the pool's last entry, and past it.
+    { room: 40, units: repeat(2, 40) },
+    { room: 31, units: repeat(2, 40) },
+    { room: 30, units: repeat(2, 40) },
+  ];
+}
+
 function tapeBytes(frames: string[]): Buffer {
   const version = Buffer.from("terminal-cell-driver");
   const head = Buffer.alloc(5 + 2 + 2 + 8 + 1);
@@ -184,10 +258,20 @@ function replay(work: string, bin: string, base: string, frames: string[]): Repl
   return { alive: true, used, col: 2 + spaces };
 }
 
-function observe(work: string, bin: string, base: { bytes: number; text: string }, units: number[]): Observation {
+/// `room` is the free entries of the pool when the cell starts. UNBOUNDED_ROOM
+/// leaves the pool alone; any other value fills it first and then clears the
+/// screen, which frees no entry.
+function observe(
+  work: string,
+  bin: string,
+  base: { bytes: number; text: string },
+  units: number[],
+  room: number = UNBOUNDED_ROOM,
+): Observation {
   const texts = units.map((size) => UNIT_TEXT[size]!);
-  const oneAtATime = [base.text, ...texts, TERMINATOR];
-  const twoAtATime: string[] = [base.text];
+  const before = room === UNBOUNDED_ROOM ? [] : [fillText(room), "\x1b[2J\x1b[H"];
+  const oneAtATime = [...before, base.text, ...texts, TERMINATOR];
+  const twoAtATime: string[] = [...before, base.text];
   for (let index = 0; index < texts.length; index += 2) twoAtATime.push(texts.slice(index, index + 2).join(""));
   twoAtATime.push(TERMINATOR);
   const a = replay(work, bin, base.text, oneAtATime);
@@ -195,6 +279,7 @@ function observe(work: string, bin: string, base: { bytes: number; text: string 
   return {
     base: base.bytes,
     units,
+    room,
     alive: a.alive && b.alive,
     aused: a.used,
     acol: a.col,
@@ -206,7 +291,7 @@ function observe(work: string, bin: string, base: { bytes: number; text: string 
 function observedModule(observations: Observation[]): string {
   const records = observations.map(
     (o) =>
-      `    [base |-> ${o.base}, units |-> <<${o.units.join(", ")}>>, alive |-> ${o.alive ? "TRUE" : "FALSE"}, ` +
+      `    [base |-> ${o.base}, units |-> <<${o.units.join(", ")}>>, room |-> ${o.room}, alive |-> ${o.alive ? "TRUE" : "FALSE"}, ` +
       `aused |-> ${o.aused}, acol |-> ${o.acol}, bused |-> ${o.bused}, bcol |-> ${o.bcol}]`,
   );
   return [
@@ -220,16 +305,19 @@ function observedModule(observations: Observation[]): string {
   ].join("\n");
 }
 
-type Variant = { name: string; rule: string; capIncludesBase: boolean; bug: string };
+type Variant = { name: string; rule: string; poolRule: string; capIncludesBase: boolean; bug: string };
 
-const DESIGN: Variant = { name: "design", rule: "drop", capIncludesBase: true, bug: "none" };
+const DESIGN: Variant = { name: "design", rule: "drop", poolRule: "drop", capIncludesBase: true, bug: "none" };
 const REJECTED_MODELS: Variant[] = [
-  { name: "fx before the change", rule: "fail", capIncludesBase: false, bug: "none" },
-  { name: "cap on the suffix alone", rule: "drop", capIncludesBase: false, bug: "none" },
-  { name: "dropped unit moves the cursor", rule: "drop", capIncludesBase: true, bug: "drop-moves-cursor" },
-  { name: "read dropped whole", rule: "drop", capIncludesBase: true, bug: "call-atomic" },
-  { name: "drop everything after the first drop", rule: "drop", capIncludesBase: true, bug: "stop-at-first" },
-  { name: "unit that does not fit evicts earlier ones", rule: "drop", capIncludesBase: true, bug: "evict-earlier" },
+  { name: "fx before the change", rule: "fail", poolRule: "fail", capIncludesBase: false, bug: "none" },
+  { name: "fx before the pool change", rule: "drop", poolRule: "fail", capIncludesBase: true, bug: "none" },
+  { name: "cap on the suffix alone", rule: "drop", poolRule: "drop", capIncludesBase: false, bug: "none" },
+  { name: "dropped unit moves the cursor", rule: "drop", poolRule: "drop", capIncludesBase: true, bug: "drop-moves-cursor" },
+  { name: "read dropped whole", rule: "drop", poolRule: "drop", capIncludesBase: true, bug: "call-atomic" },
+  { name: "drop everything after the first drop", rule: "drop", poolRule: "drop", capIncludesBase: true, bug: "stop-at-first" },
+  { name: "unit that does not fit evicts earlier ones", rule: "drop", poolRule: "drop", capIncludesBase: true, bug: "evict-earlier" },
+  { name: "unit the full pool drops evicts earlier ones", rule: "drop", poolRule: "drop", capIncludesBase: true, bug: "pool-evicts-earlier" },
+  { name: "unit the full pool drops moves the cursor", rule: "drop", poolRule: "drop", capIncludesBase: true, bug: "pool-drop-moves-cursor" },
 ];
 
 type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
@@ -252,6 +340,8 @@ async function check(
       "    N = 1",
       `    Cap = ${CAP}`,
       `    Rule = "${variant.rule}"`,
+      `    PoolRule = "${variant.poolRule}"`,
+      "    PoolRooms = {0, 1, 2, 5}",
       `    CapIncludesBase = ${variant.capIncludesBase ? "TRUE" : "FALSE"}`,
       `    Bug = "${variant.bug}"`,
       "INVARIANT NotAllMatched",
@@ -293,6 +383,9 @@ async function main(): Promise<number> {
     for (const units of [...edgeStreams(base.bytes), ...randomStreams(seed + base.bytes, 24)]) {
       observations.push(observe(work, bin, base, units));
     }
+  }
+  for (const { room, units } of poolCases()) {
+    observations.push(observe(work, bin, BASES[0]!, units, room));
   }
   const crashed = observations.filter((o) => !o.alive).length;
   console.log(`observed ${observations.length} runs of the built fx; ${crashed} did not stay alive`);

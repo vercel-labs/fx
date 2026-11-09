@@ -273,7 +273,7 @@ test "grid failures preserve exact error types and identities" {
 }
 
 /// What writing printable text can fail with.
-const PrintError = Allocator.Error || error{CombiningPoolCapacityExceeded};
+const PrintError = Allocator.Error;
 
 /// The cells a one-cell character in the last column wrote over. If a later
 /// read widens the character to two cells, they are put back, so it wraps or
@@ -355,11 +355,14 @@ pub const Grid = struct {
     /// `Cell.combining_suffix_id`. IDs are grid-local.
     combining_suffix_pool: std.ArrayList([]u8) = .empty,
     combining_pool_bytes: usize = 0,
-    /// Zero-width units the current feed dropped because the cell they belong
-    /// to already held `contracts.max_cell_text_bytes`, and their bytes. A feed
-    /// resets them and logs them once. Checkpoints do not save them.
+    /// Zero-width units the current feed dropped, and their bytes: because the
+    /// cell they belong to already held `contracts.max_cell_text_bytes`, or
+    /// because the combining pool had no room for the suffix they make.
+    /// `suffix_pool_dropped_units` is the part the pool dropped. A feed resets
+    /// them and logs them once. Checkpoints do not save them.
     suffix_dropped_units: u32 = 0,
     suffix_dropped_bytes: usize = 0,
+    suffix_pool_dropped_units: u32 = 0,
     /// Exact OSC 8 parameter bytes for the currently active hyperlink.
     /// Cell resources retain their own copy after the active link closes.
     active_hyperlink_params: []const u8 = &.{},
@@ -588,6 +591,7 @@ pub const Grid = struct {
     fn feedBytes(self: *Grid, bytes: []const u8) !void {
         self.suffix_dropped_units = 0;
         self.suffix_dropped_bytes = 0;
+        self.suffix_pool_dropped_units = 0;
         defer self.logDroppedSuffix();
         var remaining: []const u8 = bytes;
         while (remaining.len > 0) {
@@ -626,14 +630,30 @@ pub const Grid = struct {
         }
     }
 
-    /// Logs what this feed dropped from full cells, once however many units
-    /// that was: a long run is repainted every frame.
+    /// Logs what this feed dropped from full cells and from a full pool, once
+    /// however many units that was: a long run is repainted every frame.
     fn logDroppedSuffix(self: *const Grid) void {
         if (self.suffix_dropped_units == 0) return;
+        if (self.suffix_pool_dropped_units == 0) {
+            debug_trace.logf(
+                "terminal",
+                "dropped {d} zero-width units ({d} bytes) that would take a cell over {d} bytes of text",
+                .{ self.suffix_dropped_units, self.suffix_dropped_bytes, contracts.max_cell_text_bytes },
+            );
+            return;
+        }
         debug_trace.logf(
             "terminal",
-            "dropped {d} zero-width units ({d} bytes) that would take a cell over {d} bytes of text",
-            .{ self.suffix_dropped_units, self.suffix_dropped_bytes, contracts.max_cell_text_bytes },
+            "dropped {d} zero-width units ({d} bytes): {d} because the combining pool is full ({d} entries, {d} bytes), {d} would take a cell over {d} bytes of text",
+            .{
+                self.suffix_dropped_units,
+                self.suffix_dropped_bytes,
+                self.suffix_pool_dropped_units,
+                self.combining_suffix_pool.items.len,
+                self.combining_pool_bytes,
+                self.suffix_dropped_units - self.suffix_pool_dropped_units,
+                contracts.max_cell_text_bytes,
+            },
         );
     }
 
@@ -1070,21 +1090,35 @@ pub const Grid = struct {
         return self.combining_suffix_pool.items[id - 1];
     }
 
+    /// Counts a unit dropped from a cell or by the pool.
+    fn dropSuffixUnit(self: *Grid, bytes: []const u8, reason: enum { cell_full, pool_full }) void {
+        self.suffix_dropped_units +|= 1;
+        self.suffix_dropped_bytes +|= bytes.len;
+        if (reason == .pool_full) self.suffix_pool_dropped_units +|= 1;
+    }
+
     /// Adds the display unit `bytes` to the suffix of the cell at `cell_idx`.
     /// A cell holds at most `contracts.max_cell_text_bytes` of text, its base
     /// codepoint and its suffix together, the size a render snapshot accepts.
     /// A unit that would pass it is dropped whole, and the units before it stay,
-    /// so the cell is the same however the bytes are split across reads. Only
-    /// zero-width units can reach the cap: a unit that widens a cell is one
-    /// emoji sequence, far under it. So a dropped unit leaves the cell's width
-    /// and the cursor as they were (`tests/tla/terminal_cell/TerminalCell.tla`
-    /// `CursorAligned`).
+    /// so the cell is the same however the bytes are split across reads. A
+    /// unit that fits the cell but makes a suffix the full pool has no entry
+    /// for is dropped the same way (`tests/tla/terminal_cell/TerminalCell.tla`
+    /// `StaysRunning`, `KeepsEarlier`). The pool is full at `max_pool_entries`
+    /// entries or `max_combining_pool_bytes` bytes, and only a terminal reset
+    /// frees it: a clear or a scroll does not. A suffix the pool already holds
+    /// costs no entry and is kept.
+    ///
+    /// A unit the cell cap drops is always zero-width: a unit that widens a
+    /// cell is one emoji sequence, far under the cap. So it leaves the cell's
+    /// width and the cursor as they were (`CursorAligned`). The pool can drop
+    /// the selector of such a sequence: the cell keeps the width the whole
+    /// sequence gives, as one read writes it, and shows its base alone.
     fn appendCombiningSuffix(self: *Grid, cell_idx: usize, bytes: []const u8) !void {
         const existing = self.combiningSuffix(self.cells[cell_idx].combining_suffix_id) orelse &.{};
         const base_len = std.unicode.utf8CodepointSequenceLength(self.cells[cell_idx].codepoint) catch 4;
         if (bytes.len > contracts.max_cell_text_bytes -| (base_len + existing.len)) {
-            self.suffix_dropped_units +|= 1;
-            self.suffix_dropped_bytes +|= bytes.len;
+            self.dropSuffixUnit(bytes, .cell_full);
             return;
         }
         const combined_len = existing.len + bytes.len;
@@ -1100,7 +1134,8 @@ pub const Grid = struct {
         if (self.combining_suffix_pool.items.len >= max_pool_entries or
             self.combining_pool_bytes > max_combining_pool_bytes - combined_len)
         {
-            return error.CombiningPoolCapacityExceeded;
+            self.dropSuffixUnit(bytes, .pool_full);
+            return;
         }
 
         const combined = try self.alloc.alloc(u8, combined_len);
@@ -5517,11 +5552,7 @@ fn fuzzGridFeed(_: void, smith: *std.testing.Smith) !void {
     var pieces = try Grid.init(alloc, cols, rows);
     defer pieces.deinit();
     const pieces_fed = feedFuzzFragments(&pieces, bytes.items, smith);
-    whole.feed(bytes.items) catch |err| {
-        // A cell over its cap drops the extra marks and never fails the feed.
-        try testing.expect(err != error.CombiningPoolCapacityExceeded);
-        return testing.expectError(err, pieces_fed);
-    };
+    whole.feed(bytes.items) catch |err| return testing.expectError(err, pieces_fed);
     try pieces_fed;
     const state = whole.checkpointPayload(alloc) catch |err| return testing.expectError(err, pieces.checkpointPayload(alloc));
     defer alloc.free(state);
@@ -5893,4 +5924,270 @@ test "a feed that drops units from full cells logs one line with their counts" {
         trace,
         "dropped 9 zero-width units (18 bytes) that would take a cell over 64 bytes of text",
     ) != null);
+}
+
+// A full combining pool (`max_pool_entries` entries or `max_combining_pool_bytes`
+// bytes) drops a new suffix the way the cell cap does: the unit is counted, the
+// cell keeps its base and its earlier marks, and the feed does not fail.
+
+/// Adds `count` suffixes no cell uses, so the pool has `max_pool_entries - count`
+/// entries left. Each is four bytes with a zero byte, which no real suffix has.
+fn fillCombiningPool(grid: *Grid, count: usize) !void {
+    try grid.combining_suffix_pool.ensureUnusedCapacity(testing.allocator, count);
+    for (0..count) |index| {
+        const entry = try testing.allocator.alloc(u8, 4);
+        std.mem.writeInt(u32, entry[0..4], @intCast(index + 1), .little);
+        grid.combining_suffix_pool.appendAssumeCapacity(entry);
+        grid.combining_pool_bytes += entry.len;
+    }
+}
+
+test "a full combining pool drops the unit, counts it, and keeps the cell's base and earlier marks" {
+    var grid = try Grid.init(testing.allocator, 20, 2);
+    defer grid.deinit();
+    // One entry is free: the first mark takes it, and the next two need a new one.
+    try fillCombiningPool(&grid, max_pool_entries - 1);
+    try grid.feed("e\u{301}\u{200b}\u{e0061}b");
+    try testing.expectEqual(@as(u21, 'e'), grid.cellAt(1, 1).?.codepoint);
+    try testing.expectEqualStrings("\u{301}", cellSuffix(grid, 1, 1));
+    try testing.expectEqual(max_pool_entries, grid.combining_suffix_pool.items.len);
+    try testing.expectEqual(@as(u32, 2), grid.suffix_dropped_units);
+    try testing.expectEqual(@as(usize, 7), grid.suffix_dropped_bytes);
+    // The dropped units did not move the cursor: `b` sits right after `e`.
+    try testing.expectEqual(@as(u21, 'b'), grid.cellAt(1, 2).?.codepoint);
+    try testing.expectEqual(@as(u16, 3), grid.cursor_col);
+
+    // A later feed drops too, and counts only its own units.
+    try grid.feed("f\u{200b}");
+    try testing.expectEqualStrings("", cellSuffix(grid, 1, 3));
+    try testing.expectEqual(@as(u32, 1), grid.suffix_dropped_units);
+    try testing.expectEqual(@as(usize, 3), grid.suffix_dropped_bytes);
+    try testing.expectEqual(max_pool_entries, grid.combining_suffix_pool.items.len);
+}
+
+test "a full combining pool still gives a cell a suffix that is already in the pool" {
+    var grid = try Grid.init(testing.allocator, 20, 2);
+    defer grid.deinit();
+    try grid.feed("e\u{301}");
+    try fillCombiningPool(&grid, max_pool_entries - 1);
+    try testing.expectEqual(max_pool_entries, grid.combining_suffix_pool.items.len);
+
+    // `x` takes the suffix `e` has, which costs no entry. The mark after it would
+    // make a new suffix, and the pool is full.
+    try grid.feed("x\u{301}\u{200b}y");
+    try testing.expectEqualStrings("\u{301}", cellSuffix(grid, 1, 2));
+    try testing.expectEqual(@as(u21, 'y'), grid.cellAt(1, 3).?.codepoint);
+    try testing.expectEqual(@as(u32, 1), grid.suffix_dropped_units);
+    try testing.expectEqual(@as(usize, 3), grid.suffix_dropped_bytes);
+    try testing.expectEqual(max_pool_entries, grid.combining_suffix_pool.items.len);
+}
+
+test "a combining pool at its byte bound drops a unit that would pass it and keeps one that fits" {
+    // A cell holds at most 64 bytes, so feeding cannot reach the byte bound
+    // before the entry bound. A checkpoint with longer entries can, so the
+    // bound is set the way such a checkpoint leaves it.
+    var grid = try Grid.init(testing.allocator, 20, 2);
+    defer grid.deinit();
+    try grid.feed("ab");
+    grid.combining_pool_bytes = max_combining_pool_bytes - 2;
+
+    // A mark that fills the last two free bytes exactly is kept.
+    try grid.feed("\u{301}");
+    try testing.expectEqualStrings("\u{301}", cellSuffix(grid, 1, 2));
+    try testing.expectEqual(max_combining_pool_bytes, grid.combining_pool_bytes);
+
+    // A suffix already in the pool costs no bytes and is kept. A new one is dropped.
+    try grid.feed("c\u{301}\u{200b}d");
+    try testing.expectEqualStrings("\u{301}", cellSuffix(grid, 1, 3));
+    try testing.expectEqual(@as(u21, 'd'), grid.cellAt(1, 4).?.codepoint);
+    try testing.expectEqual(@as(u32, 1), grid.suffix_dropped_units);
+    try testing.expectEqual(@as(usize, 3), grid.suffix_dropped_bytes);
+    try testing.expectEqual(max_combining_pool_bytes, grid.combining_pool_bytes);
+
+    // One byte short is a drop: two bytes do not fit in one.
+    var tight = try Grid.init(testing.allocator, 20, 2);
+    defer tight.deinit();
+    try tight.feed("ab");
+    tight.combining_pool_bytes = max_combining_pool_bytes - 1;
+    try tight.feed("\u{301}c");
+    try testing.expectEqualStrings("", cellSuffix(tight, 1, 2));
+    try testing.expectEqual(@as(u21, 'c'), tight.cellAt(1, 3).?.codepoint);
+    try testing.expectEqual(@as(u32, 1), tight.suffix_dropped_units);
+    try testing.expectEqual(max_combining_pool_bytes - 1, tight.combining_pool_bytes);
+}
+
+test "a pool-full drop is the same however the bytes are split across reads" {
+    // Each mark is one codepoint, so each takes one entry however it arrives. A
+    // sequence of several codepoints that arrives in pieces takes an entry for
+    // each prefix, so only the single selector after `\u{2600}` is here.
+    const streams = [_][]const u8{
+        "e\u{301}\u{200b}\u{e0061}\u{301}b",
+        "\u{2600}\u{fe0f}b",
+        "x\u{301}\u{2600}\u{fe0f}b",
+        "x\u{301}\u{200b}\u{2600}\u{fe0f}\u{301}b",
+    };
+    // Two entries, one, and none are free.
+    for ([_]usize{ 2, 1, 0 }) |free| {
+        for (streams) |stream| {
+            var whole = try Grid.init(testing.allocator, 20, 2);
+            defer whole.deinit();
+            try fillCombiningPool(&whole, max_pool_entries - free);
+            try whole.feed(stream);
+
+            var bytewise = try Grid.init(testing.allocator, 20, 2);
+            defer bytewise.deinit();
+            try fillCombiningPool(&bytewise, max_pool_entries - free);
+            for (stream) |byte| try bytewise.feed(&.{byte});
+            try expectSameScreen(whole, bytewise);
+
+            for (0..stream.len + 1) |cut| {
+                var split = try Grid.init(testing.allocator, 20, 2);
+                defer split.deinit();
+                try fillCombiningPool(&split, max_pool_entries - free);
+                try split.feed(stream[0..cut]);
+                try split.feed(stream[cut..]);
+                try expectSameScreen(whole, split);
+            }
+        }
+    }
+}
+
+test "a selector dropped by a full pool leaves the width one read gives" {
+    // A single read gives the character the width of the whole unit, two cells,
+    // and the selector is then dropped. Two reads must end the same way.
+    var one = try Grid.init(testing.allocator, 20, 2);
+    defer one.deinit();
+    try fillCombiningPool(&one, max_pool_entries);
+    try one.feed("\u{2600}\u{fe0f}b");
+    try testing.expectEqual(@as(u8, 2), one.cellAt(1, 1).?.width);
+    try testing.expectEqualStrings("", cellSuffix(one, 1, 1));
+    try testing.expectEqual(@as(u21, 'b'), one.cellAt(1, 3).?.codepoint);
+    try testing.expectEqual(@as(u32, 1), one.suffix_dropped_units);
+
+    var two = try Grid.init(testing.allocator, 20, 2);
+    defer two.deinit();
+    try fillCombiningPool(&two, max_pool_entries);
+    try two.feed("\u{2600}");
+    try two.feed("\u{fe0f}b");
+    try expectSameScreen(one, two);
+}
+
+test "a full pool stays full after a clear and a scroll, and a terminal reset frees it" {
+    var grid = try Grid.init(testing.allocator, 20, 2);
+    defer grid.deinit();
+    try fillCombiningPool(&grid, max_pool_entries - 1);
+    try grid.feed("e\u{301}");
+    try testing.expectEqual(max_pool_entries, grid.combining_suffix_pool.items.len);
+
+    // Clearing the screen and scrolling the first row away free no entry.
+    try grid.feed("\x1b[2J\x1b[Hx\u{200b}");
+    try testing.expectEqualStrings("", cellSuffix(grid, 1, 1));
+    try grid.feed("\r\n\r\n\r\ny\u{200b}");
+    try testing.expectEqual(max_pool_entries, grid.combining_suffix_pool.items.len);
+    try testing.expectEqual(@as(u32, 1), grid.suffix_dropped_units);
+
+    // ESC c resets the terminal, which frees the whole pool.
+    try grid.feed("\x1bc");
+    try testing.expectEqual(@as(usize, 0), grid.combining_suffix_pool.items.len);
+    try testing.expectEqual(@as(usize, 0), grid.combining_pool_bytes);
+    try grid.feed("z\u{200b}");
+    try testing.expectEqualStrings("\u{200b}", cellSuffix(grid, 1, 1));
+    try testing.expectEqual(@as(usize, 1), grid.combining_suffix_pool.items.len);
+    try testing.expectEqual(@as(u32, 0), grid.suffix_dropped_units);
+}
+
+test "a checkpoint of a full pool restores, and the restored grid drops new suffixes without failing" {
+    var grid = try Grid.init(testing.allocator, 20, 2);
+    defer grid.deinit();
+    try fillCombiningPool(&grid, max_pool_entries - 1);
+    try grid.feed("e\u{301}");
+    const payload = try grid.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+
+    var restored = try Grid.restoreCheckpoint(testing.allocator, payload);
+    defer restored.deinit();
+    try testing.expectEqual(max_pool_entries, restored.combining_suffix_pool.items.len);
+    try restored.feed("x\u{200b}y");
+    try testing.expectEqualStrings("", cellSuffix(restored, 1, 2));
+    try testing.expectEqual(@as(u21, 'y'), restored.cellAt(1, 3).?.codepoint);
+    try testing.expectEqual(@as(u32, 1), restored.suffix_dropped_units);
+
+    // The render snapshot of a full pool is the cells it holds.
+    var snapshot = try restored.renderSnapshot(testing.allocator);
+    defer snapshot.deinit(testing.allocator);
+    try testing.expectEqualStrings("e\u{301}", snapshot.view().cells[0].text);
+}
+
+test "stress: thousands of new suffixes against a full pool are all dropped and counted" {
+    var grid = try Grid.init(testing.allocator, 80, 4);
+    defer grid.deinit();
+    try fillCombiningPool(&grid, max_pool_entries);
+    var unit_count: u32 = 0;
+    var byte_count: usize = 0;
+    var run: std.ArrayList(u8) = .empty;
+    defer run.deinit(testing.allocator);
+    // Marks U+0300 to U+036F, three on each of 700 characters.
+    for (0..700) |index| {
+        try run.append(testing.allocator, 'x');
+        for (0..3) |offset| {
+            const mark: u21 = 0x300 + @as(u21, @intCast((index + offset * 7) % 0x70));
+            var encoded: [4]u8 = undefined;
+            const length = try std.unicode.utf8Encode(mark, &encoded);
+            try run.appendSlice(testing.allocator, encoded[0..length]);
+            unit_count += 1;
+            byte_count += length;
+        }
+    }
+    try grid.feed(run.items);
+    try testing.expectEqual(unit_count, grid.suffix_dropped_units);
+    try testing.expectEqual(byte_count, grid.suffix_dropped_bytes);
+    try testing.expectEqual(max_pool_entries, grid.combining_suffix_pool.items.len);
+}
+
+test "a feed that drops units for a full pool logs one line that names the pool" {
+    const alloc = testing.allocator;
+    const io_mod = @import("../shared/io.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "cell-pool.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "terminal");
+
+    var grid = try Grid.init(alloc, 20, 4);
+    defer grid.deinit();
+    // The first row holds a full cell, so its 31 suffixes are in the pool. One
+    // entry is left after them.
+    try grid.feed("e" ++ text_utils.repeat("\u{301}", 31));
+    try fillCombiningPool(&grid, max_pool_entries - 32);
+
+    // The pool takes the first mark and drops the next two.
+    try grid.feed("\x1b[2;1Hg\u{200b}\u{e0061}\u{200b}");
+    // A cell takes the 31 marks that are in the pool and drops 9 over the cap,
+    // and the pool drops a new suffix on the next character, in the same feed.
+    try grid.feed("\x1b[3;1Hx" ++ text_utils.repeat("\u{301}", 40) ++ "y\u{e0061}");
+    // A feed that drops nothing logs nothing.
+    try grid.feed("abc");
+
+    debug_trace.shutdown();
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 8192);
+    defer alloc.free(trace);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, trace, "dropped "));
+    try testing.expect(std.mem.find(
+        u8,
+        trace,
+        "dropped 2 zero-width units (7 bytes): 2 because the combining pool is full (65535 entries, ",
+    ) != null);
+    try testing.expect(std.mem.find(
+        u8,
+        trace,
+        "dropped 10 zero-width units (22 bytes): 1 because the combining pool is full (65535 entries, ",
+    ) != null);
+    try testing.expect(std.mem.find(u8, trace, "), 9 would take a cell over 64 bytes of text") != null);
 }
