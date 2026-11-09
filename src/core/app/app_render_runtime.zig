@@ -439,130 +439,6 @@ fn waitForResize(lifecycle: anytype, clock: anytype, wait_ms: u64) ResizeWaitOut
     return .finished;
 }
 
-/// A resize that finishes after `finish_after` steps (never when null), and a
-/// step that fails at `fail_at`.
-const FakeResizeLifecycle = struct {
-    finish_after: ?u32 = null,
-    fail_at: ?u32 = null,
-    steps: u32 = 0,
-
-    fn inFlight(self: *FakeResizeLifecycle) bool {
-        return if (self.finish_after) |after| self.steps < after else true;
-    }
-
-    fn step(self: *FakeResizeLifecycle) !void {
-        self.steps += 1;
-        if (self.fail_at == self.steps) return error.FakeStepFailed;
-    }
-};
-
-/// A clock the test controls: `pause` moves it by what was asked, or by a
-/// fixed step.
-const FakeWaitClock = struct {
-    step_ms: ?u64 = null,
-    now_ms: u64 = 0,
-    counted_ms: u64 = 0,
-    pauses: u32 = 0,
-
-    fn pause(self: *FakeWaitClock, ms: u64) u64 {
-        self.pauses += 1;
-        const elapsed = self.step_ms orelse ms;
-        self.now_ms +|= elapsed;
-        self.counted_ms +|= @max(1, elapsed);
-        return elapsed;
-    }
-};
-
-test "the settle's wait for a resize ends as soon as the resize finishes" {
-    var lifecycle: FakeResizeLifecycle = .{ .finish_after = 3 };
-    var clock: FakeWaitClock = .{};
-    try std.testing.expectEqual(ResizeWaitOutcome.finished, waitForResize(&lifecycle, &clock, settle_resize_wait_ms));
-    try std.testing.expectEqual(@as(u32, 3), lifecycle.steps);
-    try std.testing.expectEqual(@as(u32, 3), clock.pauses);
-
-    // A resize that is not in flight takes no step and no pause.
-    var idle: FakeResizeLifecycle = .{ .finish_after = 0 };
-    var idle_clock: FakeWaitClock = .{};
-    try std.testing.expectEqual(ResizeWaitOutcome.finished, waitForResize(&idle, &idle_clock, settle_resize_wait_ms));
-    try std.testing.expectEqual(@as(u32, 0), idle.steps);
-    try std.testing.expectEqual(@as(u32, 0), idle_clock.pauses);
-}
-
-test "the settle's wait for a resize gives up at its bound, not before" {
-    // 300 ms in pauses of 5 ms is 60 steps: a resize that finishes by then is
-    // seen, and one that needs a 61st step is left unfinished.
-    const steps_in_wait: u32 = settle_resize_wait_ms / settle_resize_poll_ms;
-    var in_time: FakeResizeLifecycle = .{ .finish_after = steps_in_wait };
-    var in_time_clock: FakeWaitClock = .{};
-    try std.testing.expectEqual(ResizeWaitOutcome.finished, waitForResize(&in_time, &in_time_clock, settle_resize_wait_ms));
-    try std.testing.expectEqual(settle_resize_wait_ms, in_time_clock.now_ms);
-
-    var late: FakeResizeLifecycle = .{ .finish_after = steps_in_wait + 1 };
-    var late_clock: FakeWaitClock = .{};
-    try std.testing.expectEqual(ResizeWaitOutcome.timed_out, waitForResize(&late, &late_clock, settle_resize_wait_ms));
-    try std.testing.expectEqual(steps_in_wait, late.steps);
-    try std.testing.expectEqual(settle_resize_wait_ms, late_clock.counted_ms);
-
-    // A resize that never finishes ends the wait too, with a clock that stands
-    // still and with one that jumps far past the bound.
-    var never: FakeResizeLifecycle = .{};
-    var still: FakeWaitClock = .{ .step_ms = 0 };
-    try std.testing.expectEqual(ResizeWaitOutcome.timed_out, waitForResize(&never, &still, settle_resize_wait_ms));
-    try std.testing.expectEqual(@as(u32, settle_resize_wait_ms), still.pauses);
-    var stuck: FakeResizeLifecycle = .{};
-    var jump: FakeWaitClock = .{ .step_ms = 10_000 };
-    try std.testing.expectEqual(ResizeWaitOutcome.timed_out, waitForResize(&stuck, &jump, settle_resize_wait_ms));
-    try std.testing.expectEqual(@as(u32, 1), jump.pauses);
-}
-
-test "the settle's wait for a resize ends at a step that fails" {
-    var lifecycle: FakeResizeLifecycle = .{ .fail_at = 2 };
-    var clock: FakeWaitClock = .{};
-    try std.testing.expectEqual(ResizeWaitOutcome.failed, waitForResize(&lifecycle, &clock, settle_resize_wait_ms));
-    try std.testing.expectEqual(@as(u32, 2), lifecycle.steps);
-    try std.testing.expectEqual(@as(u32, 1), clock.pauses);
-}
-
-test "the settle's wait for a resize holds its laws for fuzzed progress, bounds and clocks" {
-    try std.testing.fuzz({}, fuzzResizeWait, .{
-        .corpus = &(.{""} ++ @import("fuzz_corpus").settle_resize_wait.*),
-    });
-}
-
-fn fuzzResizeWait(_: void, smith: *std.testing.Smith) !void {
-    const wait_ms = smith.valueRangeAtMost(u64, 0, 1_500);
-    var lifecycle: FakeResizeLifecycle = .{
-        .finish_after = if (smith.value(bool)) smith.valueRangeAtMost(u32, 0, 400) else null,
-        .fail_at = if (smith.value(bool)) smith.valueRangeAtMost(u32, 1, 400) else null,
-    };
-    const step_ms: ?u64 = if (smith.value(bool)) smith.valueRangeAtMost(u64, 0, 3_000) else null;
-    var clock: FakeWaitClock = .{ .step_ms = step_ms };
-    const outcome = waitForResize(&lifecycle, &clock, wait_ms);
-
-    // Each pause follows a step and counts at least 1 ms, so the wait is
-    // bounded by its length, and a wait that gives up counted all of it.
-    try std.testing.expectEqual(lifecycle.steps - @intFromBool(outcome == .failed), clock.pauses);
-    try std.testing.expect(clock.pauses <= wait_ms);
-    switch (outcome) {
-        // It ends finished only on a resize that is not in flight.
-        .finished => try std.testing.expect(!lifecycle.inFlight()),
-        .timed_out => {
-            try std.testing.expect(lifecycle.inFlight());
-            try std.testing.expect(clock.counted_ms >= wait_ms);
-        },
-        .failed => try std.testing.expectEqual(@as(?u32, lifecycle.steps), lifecycle.fail_at),
-    }
-    // With a clock that moves as asked, a resize due within the wait is seen,
-    // unless a step fails first.
-    if (step_ms == null) {
-        if (lifecycle.finish_after) |after| {
-            const steps_in_wait: u64 = wait_ms / settle_resize_poll_ms + @intFromBool(wait_ms % settle_resize_poll_ms != 0);
-            const fails_first = if (lifecycle.fail_at) |at| at <= after else false;
-            if (after <= steps_in_wait and !fails_first) try std.testing.expectEqual(ResizeWaitOutcome.finished, outcome);
-        }
-    }
-}
-
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
@@ -2862,6 +2738,130 @@ fn solveFixedPointForTest(
         FixedPointTestContext.prepareCandidate,
         FixedPointTestContext.resolveCandidate,
     );
+}
+
+/// A resize that finishes after `finish_after` steps (never when null), and a
+/// step that fails at `fail_at`.
+const FakeResizeLifecycle = struct {
+    finish_after: ?u32 = null,
+    fail_at: ?u32 = null,
+    steps: u32 = 0,
+
+    fn inFlight(self: *FakeResizeLifecycle) bool {
+        return if (self.finish_after) |after| self.steps < after else true;
+    }
+
+    fn step(self: *FakeResizeLifecycle) !void {
+        self.steps += 1;
+        if (self.fail_at == self.steps) return error.FakeStepFailed;
+    }
+};
+
+/// A clock the test controls: `pause` moves it by what was asked, or by a
+/// fixed step.
+const FakeWaitClock = struct {
+    step_ms: ?u64 = null,
+    now_ms: u64 = 0,
+    counted_ms: u64 = 0,
+    pauses: u32 = 0,
+
+    fn pause(self: *FakeWaitClock, ms: u64) u64 {
+        self.pauses += 1;
+        const elapsed = self.step_ms orelse ms;
+        self.now_ms +|= elapsed;
+        self.counted_ms +|= @max(1, elapsed);
+        return elapsed;
+    }
+};
+
+test "the settle's wait for a resize ends as soon as the resize finishes" {
+    var lifecycle: FakeResizeLifecycle = .{ .finish_after = 3 };
+    var clock: FakeWaitClock = .{};
+    try std.testing.expectEqual(ResizeWaitOutcome.finished, waitForResize(&lifecycle, &clock, settle_resize_wait_ms));
+    try std.testing.expectEqual(@as(u32, 3), lifecycle.steps);
+    try std.testing.expectEqual(@as(u32, 3), clock.pauses);
+
+    // A resize that is not in flight takes no step and no pause.
+    var idle: FakeResizeLifecycle = .{ .finish_after = 0 };
+    var idle_clock: FakeWaitClock = .{};
+    try std.testing.expectEqual(ResizeWaitOutcome.finished, waitForResize(&idle, &idle_clock, settle_resize_wait_ms));
+    try std.testing.expectEqual(@as(u32, 0), idle.steps);
+    try std.testing.expectEqual(@as(u32, 0), idle_clock.pauses);
+}
+
+test "the settle's wait for a resize gives up at its bound, not before" {
+    // 300 ms in pauses of 5 ms is 60 steps: a resize that finishes by then is
+    // seen, and one that needs a 61st step is left unfinished.
+    const steps_in_wait: u32 = settle_resize_wait_ms / settle_resize_poll_ms;
+    var in_time: FakeResizeLifecycle = .{ .finish_after = steps_in_wait };
+    var in_time_clock: FakeWaitClock = .{};
+    try std.testing.expectEqual(ResizeWaitOutcome.finished, waitForResize(&in_time, &in_time_clock, settle_resize_wait_ms));
+    try std.testing.expectEqual(settle_resize_wait_ms, in_time_clock.now_ms);
+
+    var late: FakeResizeLifecycle = .{ .finish_after = steps_in_wait + 1 };
+    var late_clock: FakeWaitClock = .{};
+    try std.testing.expectEqual(ResizeWaitOutcome.timed_out, waitForResize(&late, &late_clock, settle_resize_wait_ms));
+    try std.testing.expectEqual(steps_in_wait, late.steps);
+    try std.testing.expectEqual(settle_resize_wait_ms, late_clock.counted_ms);
+
+    // A resize that never finishes ends the wait too, with a clock that stands
+    // still and with one that jumps far past the bound.
+    var never: FakeResizeLifecycle = .{};
+    var still: FakeWaitClock = .{ .step_ms = 0 };
+    try std.testing.expectEqual(ResizeWaitOutcome.timed_out, waitForResize(&never, &still, settle_resize_wait_ms));
+    try std.testing.expectEqual(@as(u32, settle_resize_wait_ms), still.pauses);
+    var stuck: FakeResizeLifecycle = .{};
+    var jump: FakeWaitClock = .{ .step_ms = 10_000 };
+    try std.testing.expectEqual(ResizeWaitOutcome.timed_out, waitForResize(&stuck, &jump, settle_resize_wait_ms));
+    try std.testing.expectEqual(@as(u32, 1), jump.pauses);
+}
+
+test "the settle's wait for a resize ends at a step that fails" {
+    var lifecycle: FakeResizeLifecycle = .{ .fail_at = 2 };
+    var clock: FakeWaitClock = .{};
+    try std.testing.expectEqual(ResizeWaitOutcome.failed, waitForResize(&lifecycle, &clock, settle_resize_wait_ms));
+    try std.testing.expectEqual(@as(u32, 2), lifecycle.steps);
+    try std.testing.expectEqual(@as(u32, 1), clock.pauses);
+}
+
+test "the settle's wait for a resize holds its laws for fuzzed progress, bounds and clocks" {
+    try std.testing.fuzz({}, fuzzResizeWait, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").settle_resize_wait.*),
+    });
+}
+
+fn fuzzResizeWait(_: void, smith: *std.testing.Smith) !void {
+    const wait_ms = smith.valueRangeAtMost(u64, 0, 1_500);
+    var lifecycle: FakeResizeLifecycle = .{
+        .finish_after = if (smith.value(bool)) smith.valueRangeAtMost(u32, 0, 400) else null,
+        .fail_at = if (smith.value(bool)) smith.valueRangeAtMost(u32, 1, 400) else null,
+    };
+    const step_ms: ?u64 = if (smith.value(bool)) smith.valueRangeAtMost(u64, 0, 3_000) else null;
+    var clock: FakeWaitClock = .{ .step_ms = step_ms };
+    const outcome = waitForResize(&lifecycle, &clock, wait_ms);
+
+    // Each pause follows a step and counts at least 1 ms, so the wait is
+    // bounded by its length, and a wait that gives up counted all of it.
+    try std.testing.expectEqual(lifecycle.steps - @intFromBool(outcome == .failed), clock.pauses);
+    try std.testing.expect(clock.pauses <= wait_ms);
+    switch (outcome) {
+        // It ends finished only on a resize that is not in flight.
+        .finished => try std.testing.expect(!lifecycle.inFlight()),
+        .timed_out => {
+            try std.testing.expect(lifecycle.inFlight());
+            try std.testing.expect(clock.counted_ms >= wait_ms);
+        },
+        .failed => try std.testing.expectEqual(@as(?u32, lifecycle.steps), lifecycle.fail_at),
+    }
+    // With a clock that moves as asked, a resize due within the wait is seen,
+    // unless a step fails first.
+    if (step_ms == null) {
+        if (lifecycle.finish_after) |after| {
+            const steps_in_wait: u64 = wait_ms / settle_resize_poll_ms + @intFromBool(wait_ms % settle_resize_poll_ms != 0);
+            const fails_first = if (lifecycle.fail_at) |at| at <= after else false;
+            if (after <= steps_in_wait and !fails_first) try std.testing.expectEqual(ResizeWaitOutcome.finished, outcome);
+        }
+    }
 }
 
 test "pending prompt projection waits for a paintable terminal width" {
