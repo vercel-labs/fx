@@ -3002,6 +3002,96 @@ test "web_fetch rejects mixed public private dns answers without dialing" {
     try std.testing.expectEqual(@as(usize, 0), connector.calls);
 }
 
+test "web_fetch nat64 dns64 answers for a public host are admitted and pinned" {
+    const alloc = std.testing.allocator;
+
+    // What an IPv6-only network with DNS64 answers for fx.sh.
+    var resolver = FakeResolver{ .addresses = &.{
+        try ip("64:ff9b::40ef:6d41", 443),
+        try ip("64:ff9b::40ef:7b41", 443),
+        try ip("64.239.123.65", 443),
+        try ip("64.239.109.65", 443),
+    } };
+    defer resolver.deinit(alloc);
+    var connector = FakeConnector{ .responses = &.{.{ .status = .ok, .body = "ok" }} };
+    defer connector.deinit(alloc);
+
+    var target = try url_policy.normalize(alloc, "https://fx.sh/llms.txt");
+    defer target.deinit(alloc);
+
+    var result = try fetch(alloc, target, .{}, .{
+        .resolver = resolver.resolver(),
+        .connector = connector.connector(),
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result == .success);
+    try std.testing.expectEqual(@as(usize, 1), connector.calls);
+    try std.testing.expectEqual(@as(usize, 4), connector.last_admitted_len.?);
+    try std.testing.expect(connector.last_first_admitted_address.?.eql(&(try ip("64:ff9b::40ef:6d41", 443))));
+}
+
+test "web_fetch nat64 fault hostile dns answers refuse the hop before any dial" {
+    const alloc = std.testing.allocator;
+
+    var target = try url_policy.normalize(alloc, "https://fx.sh/llms.txt");
+    defer target.deinit(alloc);
+
+    // A public A record does not save an answer set that also wraps a
+    // private address in the NAT64 prefix.
+    const hostile = [_][]const u8{
+        "64:ff9b::7f00:1",
+        "64:ff9b::a9fe:a9fe",
+        "64:ff9b::a00:1",
+        "64:ff9b:1::5db8:d822",
+        "::a9fe:a9fe",
+    };
+    for (hostile) |text| {
+        var resolver = FakeResolver{ .addresses = &.{
+            try ip("64.239.123.65", 443),
+            try ip("64:ff9b::40ef:7b41", 443),
+            try ip(text, 443),
+        } };
+        defer resolver.deinit(alloc);
+        var connector = FakeConnector{};
+        defer connector.deinit(alloc);
+
+        try std.testing.expectError(error.NonPublicDnsAnswer, fetch(alloc, target, .{}, .{
+            .resolver = resolver.resolver(),
+            .connector = connector.connector(),
+        }));
+        try std.testing.expectEqual(@as(usize, 0), connector.calls);
+    }
+
+    {
+        var resolver = FakeResolver{ .addresses = &.{} };
+        defer resolver.deinit(alloc);
+        var connector = FakeConnector{};
+        defer connector.deinit(alloc);
+
+        try std.testing.expectError(error.NoAddressReturned, fetch(alloc, target, .{}, .{
+            .resolver = resolver.resolver(),
+            .connector = connector.connector(),
+        }));
+        try std.testing.expectEqual(@as(usize, 0), connector.calls);
+    }
+
+    // An admitted NAT64 answer reaches the dial, and the dial's failure comes back.
+    {
+        var resolver = FakeResolver{ .addresses = &.{try ip("64:ff9b::40ef:7b41", 443)} };
+        defer resolver.deinit(alloc);
+        var connector = FakeConnector{ .err = error.ConnectionRefused };
+        defer connector.deinit(alloc);
+
+        try std.testing.expectError(error.ConnectionRefused, fetch(alloc, target, .{}, .{
+            .resolver = resolver.resolver(),
+            .connector = connector.connector(),
+        }));
+        try std.testing.expectEqual(@as(usize, 1), connector.calls);
+        try std.testing.expectEqual(@as(usize, 1), connector.last_admitted_len.?);
+    }
+}
+
 test "web_fetch pinned connector never performs a second hostname lookup" {
     const alloc = std.testing.allocator;
 
