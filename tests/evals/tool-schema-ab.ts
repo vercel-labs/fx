@@ -44,17 +44,33 @@ export interface Transform {
   event?(part: Record<string, unknown>, model: string): Record<string, unknown>;
 }
 
-/** Rewrites each `data: {json}` line of an SSE stream with one Transform. */
-export function transformStream(transform: Transform, model: string): TransformStream<Uint8Array, Uint8Array> {
+/**
+ * Rewrites each `data: {json}` line of an SSE stream with one Transform. A line
+ * that is not JSON, such as `[DONE]`, passes through. When the transform throws,
+ * `onError` gets the message and the stream fails, so the run cannot score an
+ * unchanged stream as the transformed one.
+ */
+export function transformStream(
+  transform: Transform,
+  model: string,
+  onError: (message: string) => void = () => {},
+): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffered = "";
   const rewrite = (line: string) => {
     if (!line.startsWith("data: ") || !transform.event) return line;
+    let part: Record<string, unknown>;
     try {
-      return `data: ${JSON.stringify(transform.event(JSON.parse(line.slice(6)), model))}`;
+      part = JSON.parse(line.slice(6)) as Record<string, unknown>;
     } catch {
       return line;
+    }
+    try {
+      return `data: ${JSON.stringify(transform.event(part, model))}`;
+    } catch (error) {
+      onError(`event() threw: ${error}`);
+      throw error;
     }
   };
   return new TransformStream({
@@ -146,6 +162,13 @@ export function parseStreamUsage(stream: string): Usage | null {
 function startProxy(variant: Variant, testKey: string, transform?: Transform) {
   const requests: RecordedRequest[] = [];
   const pending: Promise<void>[] = [];
+  // A transform that throws fails its run: the request gets a 502 and the
+  // stream ends with an error, and runOne marks the run failed with the message.
+  const transformErrors: string[] = [];
+  const transformFailed = (message: string) => {
+    transformErrors.push(message);
+    console.error(`tool-schema-ab: transform ${message}`);
+  };
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -158,6 +181,7 @@ function startProxy(variant: Variant, testKey: string, transform?: Transform) {
       let raw = req.method === "GET" || req.method === "HEAD" ? undefined : await req.text();
       const model = req.headers.get("ai-language-model-id") ?? "";
       const record: RecordedRequest = { seq: requests.length + 1, agent: false, toolsHash: null, toolsBytes: 0, toolProps: {}, prompt: null, usage: null, providerSearch: false, status: 0 };
+      let requestTransformError: string | null = null;
       if (raw) {
         try {
           const body = JSON.parse(raw) as Record<string, unknown>;
@@ -171,7 +195,11 @@ function startProxy(variant: Variant, testKey: string, transform?: Transform) {
               if (tool.type === "function" && typeof tool.name === "string") record.toolProps[tool.name] = Object.keys(schema?.properties ?? {});
             }
             record.prompt = transform?.request ? structuredClone(body.prompt as Array<Record<string, unknown>>) : (body.prompt as Array<Record<string, unknown>>);
-            transform?.request?.(body, model);
+            try {
+              transform?.request?.(body, model);
+            } catch (error) {
+              requestTransformError = `request() threw: ${error}`;
+            }
             raw = JSON.stringify(body);
             const toolsJson = JSON.stringify(body.tools);
             record.toolsBytes = toolsJson.length;
@@ -180,6 +208,11 @@ function startProxy(variant: Variant, testKey: string, transform?: Transform) {
         } catch {}
         requests.push(record);
       }
+      if (requestTransformError) {
+        transformFailed(requestTransformError);
+        record.status = 502;
+        return new Response(`tool-schema-ab: transform ${requestTransformError}`, { status: 502 });
+      }
       const headers = new Headers(req.headers);
       for (const name of ["host", "content-length", "accept-encoding"]) headers.delete(name);
       const response = await fetch(UPSTREAM + url.pathname + url.search, { method: req.method, headers, body: raw });
@@ -187,7 +220,7 @@ function startProxy(variant: Variant, testKey: string, transform?: Transform) {
       const outHeaders = new Headers(response.headers);
       for (const name of ["content-encoding", "content-length"]) outHeaders.delete(name);
       if (!response.body) return new Response(null, { status: response.status, headers: outHeaders });
-      const stream = transform?.event && record.agent ? response.body.pipeThrough(transformStream(transform, model)) : response.body;
+      const stream = transform?.event && record.agent ? response.body.pipeThrough(transformStream(transform, model, transformFailed)) : response.body;
       const [toClient, toRecord] = stream.tee();
       pending.push(
         new Response(toRecord)
@@ -204,6 +237,7 @@ function startProxy(variant: Variant, testKey: string, transform?: Transform) {
   return {
     url: `http://127.0.0.1:${server.port}`,
     requests,
+    transformErrors,
     async stop() {
       await Promise.allSettled(pending);
       server.stop(true);
@@ -649,12 +683,14 @@ export function extractToolCalls(prompt: Array<Record<string, unknown>>): ToolCa
 
 /**
  * Why a call failed: fx refused or could not carry it out ("rejected"), or a
- * shell command ran and exited nonzero ("exited"). The flag on the record
- * counts both, but only a rejection is a tool-call mistake.
+ * shell command started and then failed ("exited"): it exited nonzero, timed
+ * out, was stopped, or lost its process. A shell result that reports a command
+ * state means the command started. The flag on the record counts both, but only
+ * a rejection is a tool-call mistake.
  */
 export function callFailure(call: ToolCallRecord): "rejected" | "exited" | null {
   if (!call.error) return null;
-  return call.name === "shell" && /"state":"completed"/.test(call.resultText) ? "exited" : "rejected";
+  return call.name === "shell" && /"state":"(running|completed|stopped|lost)"/.test(call.resultText) ? "exited" : "rejected";
 }
 
 function userText(message: Record<string, unknown>): string {
@@ -1148,6 +1184,8 @@ export interface RunResult {
   usageMissing: number;
   durationMs: number;
   stderrTail: string;
+  /** Errors a variant's transform threw; any of them fails the run. */
+  transformErrors: string[];
 }
 
 /** Calls from this index on count as late in a long turn. */
@@ -1213,6 +1251,7 @@ export async function runOne(arm: Arm, model: string, task: Task, trial: number,
   } catch (error) {
     check = { pass: false, reason: `oracle threw: ${error}` };
   }
+  if (proxy.transformErrors.length) check = { pass: false, reason: `transform failed: ${proxy.transformErrors[0]}` };
   task.cleanup?.({ port });
   const agent = proxy.requests.filter((r) => r.agent);
   const props = root_request?.toolProps ?? agent[0]?.toolProps ?? {};
@@ -1260,6 +1299,7 @@ export async function runOne(arm: Arm, model: string, task: Task, trial: number,
     usageMissing: agent.filter((r) => r.usage === null).length,
     durationMs: Date.now() - started,
     stderrTail: stderr.slice(-600),
+    transformErrors: proxy.transformErrors,
   };
   rmSync(root, { recursive: true, force: true });
   return result;
@@ -1297,6 +1337,7 @@ export interface GroupSummary {
   offSchema: number;
   meanInputTokens: number;
   meanCacheReadTokens: number;
+  meanCacheWriteTokens: number;
   meanOutputTokens: number;
   meanRequests: number;
   toolsBytes: number;
@@ -1324,6 +1365,7 @@ export function summarize(results: RunResult[], key: (r: RunResult) => string): 
       offSchema: rs.reduce((s, r) => s + r.offSchemaFields.length, 0),
       meanInputTokens: mean((r) => r.inputTokens),
       meanCacheReadTokens: mean((r) => r.cacheReadTokens ?? 0),
+      meanCacheWriteTokens: mean((r) => r.cacheWriteTokens ?? 0),
       meanOutputTokens: mean((r) => r.outputTokens),
       meanRequests: Math.round((rs.reduce((s, r) => s + r.agentRequests, 0) / rs.length) * 10) / 10,
       toolsBytes: Math.max(...rs.map((r) => r.toolsBytes)),
@@ -1333,11 +1375,11 @@ export function summarize(results: RunResult[], key: (r: RunResult) => string): 
 }
 
 export function table(rows: Record<string, GroupSummary>): string {
-  const header = "| group | runs | pass | target calls | target errors | all errors | rejected | exited | late calls | late errors | missed target | off-schema | mean input tok | mean cache read tok | mean output tok | mean requests | tools bytes |";
-  const rule = "|" + " --- |".repeat(17);
+  const header = "| group | runs | pass | target calls | target errors | all errors | rejected | exited | late calls | late errors | missed target | off-schema | mean input tok | mean cache read tok | mean cache write tok | mean output tok | mean requests | tools bytes |";
+  const rule = "|" + " --- |".repeat(18);
   const lines = Object.values(rows).map(
     (s) =>
-      `| ${[s.group, s.runs, s.pass, s.targetCalls, s.targetErrors, s.allErrors, s.rejectedCalls, s.exitedCalls, s.lateCalls, s.lateErrors, s.missedTarget, s.offSchema, s.meanInputTokens, s.meanCacheReadTokens, s.meanOutputTokens, s.meanRequests, s.toolsBytes].join(" | ")} |`,
+      `| ${[s.group, s.runs, s.pass, s.targetCalls, s.targetErrors, s.allErrors, s.rejectedCalls, s.exitedCalls, s.lateCalls, s.lateErrors, s.missedTarget, s.offSchema, s.meanInputTokens, s.meanCacheReadTokens, s.meanCacheWriteTokens, s.meanOutputTokens, s.meanRequests, s.toolsBytes].join(" | ")} |`,
   );
   return [header, rule, ...lines].join("\n");
 }

@@ -8,6 +8,7 @@ import {
   parseStreamUsage,
   rootRequest,
   summarize,
+  transformStream,
   type RecordedRequest,
   type RunResult,
 } from "./tool-schema-ab";
@@ -22,6 +23,23 @@ describe("tool schema A/B helpers", () => {
     expect(callFailure(call("shell", true, '{"error":{"code":"invalid_shell_request","executed":false}}'))).toBe("rejected");
     expect(callFailure(call("subagent", true, '{"ok":false,"result":"message needs agent and message."}'))).toBe("rejected");
     expect(callFailure(call("shell", false, '{"state":"completed","exit_code":0}'))).toBe(null);
+    // A command that started counts as run even when it timed out or lost its process.
+    expect(callFailure(call("shell", true, '{"state":"stopped","timed_out":true,"duration_ms":120000}'))).toBe("exited");
+    expect(callFailure(call("shell", true, '{"state":"lost","duration_ms":5}'))).toBe("exited");
+    expect(callFailure(call("shell", true, "shell run cwd is invalid: FileNotFound"))).toBe("rejected");
+  });
+
+  test("a transform that throws fails the stream and reports why", async () => {
+    const errors: string[] = [];
+    const source = new Response('data: {"type":"text-delta"}\ndata: [DONE]\n').body!;
+    const rewritten = source.pipeThrough(
+      transformStream({ event: () => { throw new Error("bad part"); } }, "m", (message) => errors.push(message)),
+    );
+    await expect(new Response(rewritten).text()).rejects.toThrow("bad part");
+    expect(errors).toEqual(["event() threw: Error: bad part"]);
+
+    const passthrough = new Response("data: [DONE]\n").body!.pipeThrough(transformStream({ event: (part) => part }, "m"));
+    expect(await new Response(passthrough).text()).toBe("data: [DONE]\n");
   });
 
   test("a variant replaces only the named function tools and text in system messages", () => {
@@ -110,9 +128,9 @@ describe("tool schema A/B helpers", () => {
 
   test("a summary counts passes, errors, and missed target tools per group", () => {
     const run = (arm: string, pass: boolean, targetCalls: number, inputTokens: number) =>
-      ({ arm, pass, targetCalls, targetErrors: 0, allErrors: pass ? 0 : 1, offSchemaFields: [], inputTokens, outputTokens: 0, agentRequests: 2, toolsBytes: 100 }) as unknown as RunResult;
+      ({ arm, pass, targetCalls, targetErrors: 0, allErrors: pass ? 0 : 1, offSchemaFields: [], inputTokens, cacheReadTokens: inputTokens / 2, cacheWriteTokens: inputTokens / 4, outputTokens: 0, agentRequests: 2, toolsBytes: 100 }) as unknown as RunResult;
     const rows = summarize([run("A", true, 1, 100), run("A", false, 0, 300), run("B", true, 2, 50)], (r) => r.arm);
-    expect(rows.A).toMatchObject({ runs: 2, pass: 1, allErrors: 1, missedTarget: 1, meanInputTokens: 200, meanRequests: 2 });
+    expect(rows.A).toMatchObject({ runs: 2, pass: 1, allErrors: 1, missedTarget: 1, meanInputTokens: 200, meanCacheReadTokens: 100, meanCacheWriteTokens: 50, meanRequests: 2 });
     expect(rows.B).toMatchObject({ runs: 1, pass: 1, missedTarget: 0, meanInputTokens: 50 });
   });
 
