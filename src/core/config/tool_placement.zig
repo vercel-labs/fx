@@ -229,6 +229,7 @@ test "overrides and settings name a movable tool and a placement" {
 
 const fuzz_names = [_][]const u8{ "shell", "install_skill", "read_tool_result", " web_search\t", "Shell", "toolbox", "skill", "vision", "mcp_x", "" };
 const fuzz_values = [_][]const u8{ "toolbox", "direct", "DIRECT", " Toolbox\n", "toolboxx", "", "\"direct\"", "true" };
+const fuzz_separators = [_][]const u8{ "=", " = ", "==", "" };
 
 /// Byte triples pick a tool name, a separator, and a value, built into one
 /// `--tool-placement` value and a settings object; a first byte of 0xff
@@ -249,7 +250,7 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) anyerror!void {
         while (index + 2 < bytes.len) : (index += 3) {
             const name = fuzz_names[bytes[index] % fuzz_names.len];
             const value = fuzz_values[bytes[index + 2] % fuzz_values.len];
-            if (index == 0) try flag.writer.print("{s}{s}{s}", .{ name, ([_][]const u8{ "=", " = ", "==", "" })[bytes[index + 1] % 4], value });
+            if (index == 0) try flag.writer.print("{s}{s}{s}", .{ name, fuzz_separators[bytes[index + 1] % fuzz_separators.len], value });
             if (index > 0) try object.writer.writeByte(',');
             try std.json.Stringify.value(name, .{}, &object.writer);
             try object.writer.writeByte(':');
