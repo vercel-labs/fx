@@ -273,6 +273,23 @@ pub fn expandPendingToolReviewMessages(
     return expanded;
 }
 
+/// Returns the review messages without the pending assistant call, after the
+/// checks `expandPendingToolReviewMessages` runs. The result borrows
+/// `messages`. The exact action and its call ID still reach the reviewer as
+/// text in the review instruction.
+pub fn pendingToolReviewContext(
+    alloc: std.mem.Allocator,
+    messages: []const ChatMessage,
+    target_call_id: []const u8,
+    deadline: std.Io.Clock.Timestamp,
+    cancel_flag: *std.atomic.Value(bool),
+) ![]const ChatMessage {
+    const budget = BuildBudget{ .deadline = deadline, .cancel_flag = cancel_flag };
+    try validatePendingToolReviewMessages(alloc, messages, target_call_id, budget);
+    try budget.check();
+    return messages[0 .. messages.len - 1];
+}
+
 fn buildGatewayRequestBodyWithSettings(
     alloc: std.mem.Allocator,
     tools_json: []const u8,
@@ -1819,6 +1836,67 @@ test "pending tool review rejects missing or duplicate target ids" {
             &cancel,
         ),
     );
+}
+
+test "pending tool review context leaves out the pending call and keeps its shape checks" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1000),
+    });
+    const user = ChatMessage{ .role = .user, .content = "Install dependencies." };
+    const messages = [_]ChatMessage{
+        user,
+        .{ .role = .assistant, .tool_calls = &.{
+            .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"package.json\"}" },
+            .{ .id = "install", .name = "run_command", .arguments_json = "{\"command\":\"pnpm install\"}" },
+        } },
+    };
+    const context = try pendingToolReviewContext(std.testing.allocator, &messages, "install", deadline, &cancel);
+    try std.testing.expectEqual(@as(usize, 1), context.len);
+    try std.testing.expectEqual(ChatRole.user, context[0].role);
+    try std.testing.expect(context[0].content.?.ptr == user.content.?.ptr);
+
+    const call = [_]ToolCall{.{ .id = "run", .name = "run_command", .arguments_json = "{}" }};
+    const no_pending = [_]ChatMessage{ user, .{ .role = .user, .content = "Run it." } };
+    const no_calls = [_]ChatMessage{ user, .{ .role = .assistant, .content = "I will run it." } };
+    const one_call = [_]ChatMessage{ user, .{ .role = .assistant, .tool_calls = &call } };
+    const shared = [_]ChatMessage{ user, .{ .role = .assistant, .tool_calls = &.{
+        .{ .id = "run", .name = "run_command", .arguments_json = "{}" },
+        .{ .id = "run", .name = "read_file", .arguments_json = "{}" },
+    } } };
+    const cases = [_]struct { messages: []const ChatMessage, target: []const u8 }{
+        .{ .messages = &.{}, .target = "run" },
+        .{ .messages = &no_pending, .target = "run" },
+        .{ .messages = &no_calls, .target = "run" },
+        .{ .messages = &one_call, .target = "missing" },
+        .{ .messages = &one_call, .target = "" },
+        .{ .messages = &shared, .target = "run" },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(
+            error.InvalidGatewayHistory,
+            pendingToolReviewContext(std.testing.allocator, case.messages, case.target, deadline, &cancel),
+        );
+        try std.testing.expectError(
+            error.InvalidGatewayHistory,
+            expandPendingToolReviewMessages(std.testing.allocator, case.messages, case.target, deadline, &cancel),
+        );
+    }
+}
+
+test "pending tool review context stops at its deadline and on cancel" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "Run this." },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "run", .name = "run_command", .arguments_json = "{}" }} },
+    };
+    const ahead = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(60_000) });
+    const reached = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(0) });
+    try std.testing.expectEqual(@as(usize, 1), (try pendingToolReviewContext(std.testing.allocator, &messages, "run", ahead, &cancel)).len);
+    try std.testing.expectError(error.TimedOut, pendingToolReviewContext(std.testing.allocator, &messages, "run", reached, &cancel));
+    cancel.store(true, .seq_cst);
+    try std.testing.expectError(error.Cancelled, pendingToolReviewContext(std.testing.allocator, &messages, "run", ahead, &cancel));
 }
 
 test "buildGatewayRequestBodyWithOptions serializes Gateway Fast provider options" {
