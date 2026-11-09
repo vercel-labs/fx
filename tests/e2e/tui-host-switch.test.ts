@@ -515,6 +515,71 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "a message main sends while a user's stop is ending the subagent's turn starts its next turn",
+    async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "fx-user-stop-end-")));
+      const endHeld = join(dir, "end-held");
+      const endRelease = join(dir, "end-release");
+      let childCalls = 0;
+      let answer = "";
+      let nextTurnRead = false;
+      const first = held();
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            childCalls += 1;
+            // The subagent's first turn waits here until the user's stop.
+            if (childCalls === 1) await first.promise;
+            if (body.includes("SWITCH_AFTER_STOP")) nextTurnRead = true;
+            return text("child_answer", "SWITCH_CHILD_RAN");
+          }
+          if (body.includes("main_after")) {
+            if (!answer) answer = body.includes("is busy, so the message waits") ? "waits" : body.includes("Sent into the subagent's running turn") ? "joined" : "other";
+            return text("main_after_done", "SWITCH_MAIN_AFTER_DONE");
+          }
+          if (body.includes("SWITCH_SEND_NOW")) {
+            return toolCall("main_after", "subagent", {
+              request: { action: "message", agent: "worker", message: "SWITCH_AFTER_STOP check this instead" },
+            });
+          }
+          if (!body.includes("main_sub")) {
+            return toolCall("main_sub", "subagent", {
+              request: { action: "message", agent: "worker", message: "SWITCH_HALTED_TASK work slowly" },
+            });
+          }
+          return text("main_done", "SWITCH_MAIN_DONE");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+          await until("the subagent's turn", () => childCalls >= 1);
+          await showAgent(session, "worker");
+          await session.waitForPane((pane) => pane.includes("SWITCH_HALTED_TASK") && pane.includes("worker \u2193"), 15_000);
+          await session.sendKeys("Escape");
+          await session.waitForText("esc again to interrupt", 10_000);
+          await session.sendKeys("Escape");
+          await session.waitForText("What can fx do differently?", 15_000);
+          // The stopped turn is ending, held before its end is handled.
+          await until("the stopped turn's held end", () => existsSync(`${endHeld}.1`), 15_000);
+          expect(readFileSync(`${endHeld}.1`, "utf8")).toContain("by=user");
+          await showAgent(session, "fx 1");
+          await session.sendText("SWITCH_SEND_NOW");
+          await session.waitForText("SWITCH_MAIN_AFTER_DONE", 30_000);
+          // The stop ended the turn, so the message waits for the next one
+          // rather than joining the turn that ends.
+          expect(answer).toBe("waits");
+          writeFileSync(endRelease, "");
+          await until("the subagent's next turn", () => nextTurnRead, 30_000);
+          expect(childCalls).toBe(2);
+        }, () => {}, false, { FX_TEST_SUBAGENT_END_HELD: endHeld, FX_TEST_SUBAGENT_END_RELEASE: endRelease });
+      } finally {
+        first.release();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a subagent's work that /quit cuts short reports after a resume, saying fx quit",
     async () => {
       let mainCalls = 0;

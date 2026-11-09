@@ -10033,6 +10033,7 @@ fn processQueuedPromptLoop(
                 !context_delta and
                 deps.live_tool_authority == null)
                 runtime_parallel_execution.leadingParallelGroup(
+                    arena,
                     deps.tool_registry,
                     effective_tool_calls[tool_call_index..],
                 )
