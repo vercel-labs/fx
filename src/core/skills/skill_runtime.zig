@@ -3009,7 +3009,10 @@ fn writeStyledSourceLabel(writer: *std.Io.Writer, styles: SkillSummaryStyles, la
     try writer.print("{s}[{s}]{s}", .{ styles.source_label_style, label, styles.reset_style });
 }
 
-fn listsSameSkill(listed: []const Skill, skill: Skill) bool {
+/// Whether `listed` holds a copy of `skill`: one with its name and
+/// description. A list for the model shows such a copy once, the first in
+/// discovery order, since it gives the model nothing to choose between.
+pub fn listsSameSkill(listed: []const Skill, skill: Skill) bool {
     for (listed) |other| {
         if (std.mem.eql(u8, other.name, skill.name) and std.mem.eql(u8, other.description, skill.description)) return true;
     }
@@ -3383,13 +3386,13 @@ pub const LimitedDescription = struct {
 
 /// A skill's description for a list that encodes it for the model itself,
 /// such as the toolbox menu: sanitized and cut as the skill catalog cuts it,
-/// to the compiled default's 1024 characters or to `skill_description_bytes`
+/// to the catalog's default characters or to `skill_description_bytes`
 /// counted in encoded bytes, so its encoding is the catalog's.
 pub fn limitedSkillDescription(alloc: Allocator, description: []const u8, limits: context_limits.Values) !LimitedDescription {
     const safe = try tool_result_limits.prepareSanitizedOutput(alloc, description);
     defer alloc.free(safe);
     if (limits.skill_description_bytes.source == .compiled_default) {
-        const end = skillDescriptionPrefix(safe, 1024);
+        const end = skillDescriptionPrefix(safe, context_limits.catalog_skill_description_characters);
         return .{ .text = try alloc.dupe(u8, safe[0..end]), .limited = end < safe.len };
     }
     var encoded: std.Io.Writer.Allocating = .init(alloc);
@@ -3422,6 +3425,23 @@ test "a limited skill description encodes to the catalog's cut" {
     defer alloc.free(whole.text);
     try std.testing.expect(!whole.limited);
     try std.testing.expectEqualStrings("Short.", whole.text);
+}
+
+test "an unconfigured skill description is cut to the catalog's default characters" {
+    const alloc = std.testing.allocator;
+    const long = text_utils.repeat("é", 300);
+    const cut = try limitedSkillDescription(alloc, long, .{});
+    defer alloc.free(cut.text);
+    try std.testing.expect(cut.limited);
+    try std.testing.expectEqual(@as(usize, context_limits.catalog_skill_description_characters), try std.unicode.utf8CountCodepoints(cut.text));
+
+    // A configured limit replaces the default, and counts bytes.
+    var configured: context_limits.Values = .{};
+    configured.skill_description_bytes = .{ .value = .{ .bytes = 250 }, .source = .user_global };
+    const kept = try limitedSkillDescription(alloc, text_utils.repeat("x", 300), configured);
+    defer alloc.free(kept.text);
+    try std.testing.expect(kept.limited);
+    try std.testing.expectEqual(@as(usize, 250), kept.text.len);
 }
 
 fn skillDescriptionPrefix(text: []const u8, max_characters: usize) usize {

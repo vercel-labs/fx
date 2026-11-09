@@ -2169,7 +2169,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 60_000);
 
-  test("a skill copied into two workspace skill folders is listed once and the trace names the copy left out", async () => {
+  test("a skill copied into two workspace skill folders is listed once in the toolbox menu and found once by a search", async () => {
     const root = createFixtureRoot("skill-identical-copies");
     const tracePath = join(root.root, "trace.log");
     const copies = [
@@ -2183,20 +2183,49 @@ describe("gateway stream lifecycle", () => {
         "---\nname: release-notes\ndescription: Draft release notes from merged pull requests.\n---\n\nRELEASE_NOTES_BODY\n",
       );
     }
-    const gateway = startGateway(() => fakeGatewayFinalText("COPIES_COMPLETE"));
+    let index = 0;
+    let listed = "";
+    let found = "";
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (index++) {
+        case 0: {
+          // The two copies share a name, so the menu lists the one copy by
+          // the location it opens as.
+          const keys = advertisedSkillOpenKeys(body, "release-notes");
+          expect(keys).toHaveLength(1);
+          expect(keys[0]).toStartWith("skill:");
+          listed = keys[0]!;
+          return fakeGatewayToolCall("copies_search", "toolbox", { search: "release notes" });
+        }
+        case 1: {
+          const search = toolboxSkillSearch(toolResultOutput(body, "copies_search"));
+          expect(search.skills).toHaveLength(1);
+          found = search.skills[0]!.location;
+          expect(copies).toContain(found);
+          return fakeGatewayToolCall("copies_open", "toolbox", { open: listed });
+        }
+        case 2:
+          expect(toolResultOutput(body, "copies_open")).toContain("RELEASE_NOTES_BODY");
+          return fakeGatewayFinalText("COPIES_COMPLETE");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
     try {
-      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Say done."], {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Find the release notes skill and read it."], {
         cwd: root.workspace,
         env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "skills" },
         timeoutMs: 30_000,
       });
       expect(result.code).toBe(0);
-      const body = gateway.requests[0]!.body;
-      const locations = advertisedSkillLocations(body, "release-notes");
-      expect(locations).toHaveLength(1);
-      const listed = advertisedSkillPath(body, locations[0]!);
-      expect(copies).toContain(listed);
-      const omitted = copies.find((directory) => directory !== listed)!;
+      expect(gateway.requestCount()).toBe(3);
+      const output = parseAskJson(result.stdout);
+      expect(output.tool_calls).toEqual([
+        { name: "toolbox", status: "success" },
+        { name: "toolbox", status: "success" },
+      ]);
+      // The copy the search left out is the one the catalog's trace names.
+      const omitted = copies.find((directory) => directory !== found)!;
       expect(readFileSync(tracePath, "utf8")).toContain(
         `catalog omitted identical copy name="release-notes" path="${omitted}`,
       );

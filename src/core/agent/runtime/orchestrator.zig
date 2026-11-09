@@ -7,6 +7,7 @@ const skill_contract = @import("../../skills/skill_contract.zig");
 const skill_invocation = @import("../../skills/skill_invocation.zig");
 const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
+const context_limits = @import("../../config/context_limits.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const model_catalog = @import("../../gateway/model_catalog.zig");
@@ -5748,23 +5749,7 @@ fn toolboxMenu(
     // those, so the descriptions and the shared-name scan are skipped.
     const kept = agent.toolbox_menu.get() != null;
     var entries: std.ArrayList(toolbox.Entry) = .empty;
-    const skills = if (skill_section) |section| section.locations.skills else &.{};
-    var descriptions_limited: usize = 0;
-    for (skills) |skill| {
-        if (kept) {
-            try entries.append(arena, .{ .kind = .skill, .name = skill.name });
-            continue;
-        }
-        // A name two skills share opens by location, as the catalog has it.
-        const shared = for (skills) |other| {
-            if (other.path.ptr != skill.path.ptr and std.mem.eql(u8, other.name, skill.name)) break true;
-        } else false;
-        const open_as = if (shared) try skill_section.?.locations.locationOf(arena, skill.path) else null;
-        // Sanitized and within skill_description_bytes, as the catalog shows it.
-        const description = try skill_runtime.limitedSkillDescription(arena, skill.description, config.context_limits);
-        if (description.limited) descriptions_limited += 1;
-        try entries.append(arena, .{ .kind = .skill, .name = skill.name, .description = description.text, .open_as = open_as });
-    }
+    const descriptions_limited = try appendSkillEntries(arena, &entries, skill_section, config.context_limits, kept);
     if (descriptions_limited > 0) {
         var notice: std.Io.Writer.Allocating = .init(arena);
         skill_runtime.writeDescriptionsShortened(&notice.writer, descriptions_limited, config.context_limits) catch return error.OutOfMemory;
@@ -5796,6 +5781,43 @@ fn toolboxMenu(
         debug_trace.logf("toolbox", "change noted entries={d} bytes={d}", .{ entries.items.len, note.len });
     }
     return decided.menu;
+}
+
+/// Adds the skills of `skill_section` to `entries` in discovery order, and
+/// returns how many descriptions `limits` cut. A kept menu needs only each
+/// entry's kind and name, so its descriptions and open-as locations are left
+/// out, but it lists the same skills as a new one, or the change hash would
+/// differ between the first request and the rest.
+fn appendSkillEntries(
+    arena: Allocator,
+    entries: *std.ArrayList(toolbox.Entry),
+    skill_section: ?*const skill_runtime.BoundedPromptSection,
+    limits: context_limits.Values,
+    kept: bool,
+) !usize {
+    const skills = if (skill_section) |section| section.locations.skills else &.{};
+    var listed: std.ArrayList(skill_runtime.Skill) = .empty;
+    var descriptions_limited: usize = 0;
+    for (skills) |skill| {
+        // Listed once, as in the skill catalog the menu replaces, though the
+        // copies still share their name, so that name opens by location.
+        if (skill_runtime.listsSameSkill(listed.items, skill)) continue;
+        try listed.append(arena, skill);
+        if (kept) {
+            try entries.append(arena, .{ .kind = .skill, .name = skill.name });
+            continue;
+        }
+        // A name two skills share opens by location, as the catalog has it.
+        const shared = for (skills) |other| {
+            if (other.path.ptr != skill.path.ptr and std.mem.eql(u8, other.name, skill.name)) break true;
+        } else false;
+        const open_as = if (shared) try skill_section.?.locations.locationOf(arena, skill.path) else null;
+        // Sanitized and within skill_description_bytes, as the catalog shows it.
+        const description = try skill_runtime.limitedSkillDescription(arena, skill.description, limits);
+        if (description.limited) descriptions_limited += 1;
+        try entries.append(arena, .{ .kind = .skill, .name = skill.name, .description = description.text, .open_as = open_as });
+    }
+    return descriptions_limited;
 }
 
 /// The menu a request sends, and the note to push when the toolbox holds
@@ -5849,6 +5871,74 @@ test "the toolbox menu stays as first sent, and each change is noted once" {
     const back = try keptToolboxMenu(arena, &kept, &first, "", .{});
     try std.testing.expectEqualStrings(menu, back.menu);
     try std.testing.expect(back.note != null);
+}
+
+test "the toolbox menu lists a skill copied into two folders once" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "review", .description = "Review a change.", .path = "/workspace/.agents/skills/review", .source = .workspace_agents },
+        .{ .name = "review", .description = "Review a change.", .path = "/home/.fx/skills/review", .source = .global_fx },
+        .{ .name = "review", .description = "Review a pull request as an exam.", .path = "/home/.agents/skills/review", .source = .global_agents },
+        .{ .name = "deploy", .description = "Deploy a release.", .path = "/workspace/.agents/skills/deploy", .source = .workspace_agents },
+    };
+    var section = try skill_runtime.buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
+    defer section.deinit(alloc);
+
+    var entries: std.ArrayList(toolbox.Entry) = .empty;
+    _ = try appendSkillEntries(arena, &entries, &section, .{}, false);
+
+    // The identical copy from the lower-precedence folder is left out; the
+    // copy with its own description stays.
+    try std.testing.expectEqual(@as(usize, 3), entries.items.len);
+    try std.testing.expectEqualStrings("Review a change.", entries.items[0].description);
+    try std.testing.expectEqualStrings("Review a pull request as an exam.", entries.items[1].description);
+    try std.testing.expectEqualStrings("deploy", entries.items[2].name);
+    const menu = try toolbox.render(arena, entries.items, .{});
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, menu, "- review (open as "));
+    try std.testing.expect(std.mem.find(u8, menu, "Review a change.") != null);
+    // The listed copy still opens by the location the catalog gives it.
+    const resolved = try section.locations.resolve(arena, entries.items[0].open_as.?);
+    try std.testing.expectEqualStrings("/workspace/.agents/skills/review", resolved);
+
+    // A conversation that keeps its menu lists the same skills, so the change
+    // hash doesn't differ between its first request and the rest.
+    var kept_entries: std.ArrayList(toolbox.Entry) = .empty;
+    _ = try appendSkillEntries(arena, &kept_entries, &section, .{}, true);
+    try std.testing.expectEqual(toolbox.entriesHash(entries.items), toolbox.entriesHash(kept_entries.items));
+}
+
+test "an unconfigured skill description is cut to the catalog's 200 characters in the menu" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "long", .description = text_utils.repeat("x", 300), .path = "/workspace/.agents/skills/long", .source = .workspace_agents },
+        .{ .name = "short", .description = "Fits as it is.", .path = "/workspace/.agents/skills/short", .source = .workspace_agents },
+    };
+    var section = try skill_runtime.buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
+    defer section.deinit(alloc);
+
+    var entries: std.ArrayList(toolbox.Entry) = .empty;
+    const limited = try appendSkillEntries(arena, &entries, &section, .{}, false);
+    try std.testing.expectEqual(@as(usize, 1), limited);
+    try std.testing.expectEqual(@as(usize, context_limits.catalog_skill_description_characters), entries.items[0].description.len);
+    try std.testing.expectEqualStrings("Fits as it is.", entries.items[1].description);
+    // The menu still cuts each line to its own 100 bytes.
+    const menu = try toolbox.render(arena, entries.items, .{});
+    const line_start = std.mem.find(u8, menu, "- long: ").?;
+    const line_end = std.mem.findScalarPos(u8, menu, line_start, '\n').?;
+    try std.testing.expectEqual(@as(usize, 100), std.mem.count(u8, menu[line_start..line_end], "x"));
+
+    // A configured limit replaces the default.
+    var configured: context_limits.Values = .{};
+    configured.skill_description_bytes = .{ .value = .{ .bytes = 50 }, .source = .user_workspace };
+    var configured_entries: std.ArrayList(toolbox.Entry) = .empty;
+    try std.testing.expectEqual(@as(usize, 1), try appendSkillEntries(arena, &configured_entries, &section, configured, false));
+    try std.testing.expectEqual(@as(usize, 50), configured_entries.items[0].description.len);
 }
 
 fn processQueuedPromptInner(
