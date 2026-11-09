@@ -71,7 +71,7 @@ class DetectCiNeedTests(unittest.TestCase):
         return result.returncode, outputs, result.stdout + result.stderr
 
     def assert_needs(
-        self, *, libfx: bool, mcp: bool, transcript_window: bool = False, **env: str,
+        self, *, libfx: bool, mcp: bool, transcript_window: bool = False, subagent: bool = False, **env: str,
     ) -> str:
         code, outputs, text = self.detect(**env)
         self.assertEqual(0, code, text)
@@ -80,6 +80,7 @@ class DetectCiNeedTests(unittest.TestCase):
                 "libfx": str(libfx).lower(),
                 "mcp": str(mcp).lower(),
                 "transcript_window": str(transcript_window).lower(),
+                "subagent": str(subagent).lower(),
             },
             outputs,
             text,
@@ -87,13 +88,13 @@ class DetectCiNeedTests(unittest.TestCase):
         return text
 
     def commit_each(
-        self, paths: tuple[str, ...], *, libfx: bool, mcp: bool, transcript_window: bool = False,
+        self, paths: tuple[str, ...], *, libfx: bool, mcp: bool, transcript_window: bool = False, subagent: bool = False,
     ) -> None:
         for path in paths:
             with self.subTest(path=path):
                 self.write(path, f"// {path}\n")
                 self.commit(path)
-                text = self.assert_needs(libfx=libfx, mcp=mcp, transcript_window=transcript_window)
+                text = self.assert_needs(libfx=libfx, mcp=mcp, transcript_window=transcript_window, subagent=subagent)
                 self.assertIn(path, text)
                 self.base = self.git("rev-parse", "HEAD")
 
@@ -134,10 +135,38 @@ class DetectCiNeedTests(unittest.TestCase):
             "tests/tla/drivers/mcp/driver.ts",
             "tests/tla/drivers/mcp_host/sign-in.test.ts",
             "tests/e2e/fixtures/mcp-legacy-stdio.mjs",
-            "tests/e2e/tmux-helpers.ts",
-            "tests/evals/eval-helpers.ts",
             "tests/e2e/render-lab/tape.ts",
         ), libfx=False, mcp=True)
+
+    def test_helpers_both_driver_sets_load_need_both_checks(self) -> None:
+        self.commit_each((
+            "tests/e2e/tmux-helpers.ts",
+            "tests/evals/eval-helpers.ts",
+        ), libfx=False, mcp=True, subagent=True)
+
+    def test_subagent_and_session_write_paths_need_only_that_check(self) -> None:
+        self.commit_each((
+            "src/core/subagent/managed_owner.zig",
+            "src/core/subagent/tool_host.zig",
+            "src/core/session/session_adapter.zig",
+            "src/core/agent/worker_runtime.zig",
+            "src/core/agent/runtime/parallel_execution.zig",
+            "tests/tla/subagent/StopMessage.tla",
+            "tests/tla/subagent/check.sh",
+            "tests/tla/session/SessionWrite.tla",
+            "tests/tla/session/session-write.cfg",
+            "tests/tla/drivers/subagent/stop-message.test.ts",
+            "tests/tla/drivers/session/write.test.ts",
+            "tests/tla/lib/tlc.sh",
+        ), libfx=False, mcp=False, subagent=True)
+
+    def test_other_session_and_agent_files_need_no_subagent_check(self) -> None:
+        self.write("tests/tla/session/ShellSession.tla", "---- MODULE ShellSession ----\n")
+        self.write("tests/tla/drivers/session/stream.test.ts", "test\n")
+        self.write("src/core/agent/runtime/orchestrator.zig", "pub fn run() void {}\n")
+        self.commit("head")
+
+        self.assert_needs(libfx=False, mcp=False, subagent=False)
 
     def test_transcript_window_paths_need_only_that_check(self) -> None:
         self.commit_each((
@@ -156,7 +185,7 @@ class DetectCiNeedTests(unittest.TestCase):
         self.assert_needs(libfx=False, mcp=False, transcript_window=False)
 
     def test_shared_driver_code_needs_each_check_that_loads_it(self) -> None:
-        self.commit_each(("tests/tla/drivers/lib/context.ts",), libfx=False, mcp=True, transcript_window=True)
+        self.commit_each(("tests/tla/drivers/lib/context.ts",), libfx=False, mcp=True, transcript_window=True, subagent=True)
         self.commit_each(("tests/tla/drivers/graph.mjs",), libfx=True, mcp=False, transcript_window=True)
 
     def test_build_and_check_inputs_need_every_check(self) -> None:
@@ -165,7 +194,7 @@ class DetectCiNeedTests(unittest.TestCase):
             "build.zig.zon",
             ".github/workflows/ci.yml",
             "scripts/detect-ci-need.sh",
-        ), libfx=True, mcp=True, transcript_window=True)
+        ), libfx=True, mcp=True, transcript_window=True, subagent=True)
 
     def test_mcp_driver_folders_do_not_need_the_libfx_check(self) -> None:
         self.write("tests/tla/drivers/mcp/scenarios/u01-wire.mjs", "export {};\n")
@@ -189,7 +218,7 @@ class DetectCiNeedTests(unittest.TestCase):
         self.assertIn("src/mcp/engine.zig", text)
 
     def test_request_forces_every_check(self) -> None:
-        text = self.assert_needs(libfx=True, mcp=True, transcript_window=True, CI_NEED_REQUESTED="push to main")
+        text = self.assert_needs(libfx=True, mcp=True, transcript_window=True, subagent=True, CI_NEED_REQUESTED="push to main")
         self.assertIn("push to main", text)
 
     def test_unreadable_revision_fails_instead_of_skipping(self) -> None:

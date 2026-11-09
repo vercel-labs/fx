@@ -232,7 +232,7 @@ CI retries a failed end-to-end file once. A file that passes only on the retry g
 
 When the detector can't read the change, the `macOS arm64` check fails instead of passing.
 
-`scripts/detect-ci-need.sh` decides whether a pull request runs CI's three model checks. The libfx durable-session model check takes about 40 minutes and runs when the change touches:
+`scripts/detect-ci-need.sh` decides whether a pull request runs CI's four model checks. The libfx durable-session model check takes about 40 minutes and runs when the change touches:
 
 - `sdk/`
 - The SDK models in `tests/tla/sdk/` or their drivers in `tests/tla/drivers/*.mjs`
@@ -251,7 +251,13 @@ The `TLA+ transcript window model` job takes about 4 minutes and runs its checks
 - The model in `tests/tla/transcript_window/` or its drivers in `tests/tla/drivers/transcript_window/`
 - The driver code those drivers share: `tests/tla/drivers/lib/` and `tests/tla/drivers/graph.mjs`
 
-All three run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
+The `TLA+ subagent and session-write models` job takes a few minutes and runs its checks when the change touches:
+
+- `src/core/subagent/`, `src/core/session/`, `src/core/agent/worker_runtime.zig`, or `src/core/agent/runtime/parallel_execution.zig`
+- The models in `tests/tla/subagent/`, the session-write model in `tests/tla/session/`, or their drivers in `tests/tla/drivers/subagent/` and `tests/tla/drivers/session/write.test.ts`
+- The shared code in `tests/tla/lib/` and `tests/tla/drivers/lib/`, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`
+
+All four run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
 
 Other workflows and benchmark jobs also report on pull requests, such as the `Examples` workflow when `examples/` changes and the `Shell command overhead` benchmark. Only the five checks above are required to merge, but look into any check that fails. Two of the others need more explanation:
 
