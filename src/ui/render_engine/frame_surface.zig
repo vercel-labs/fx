@@ -885,6 +885,39 @@ test "frame surface writeAnsiBand fits decomposed text in its display width" {
     );
 }
 
+test "frame surface writeAnsiBand keeps a cell that gets more marks than it can hold" {
+    var shadow = try shadowGrid(std.testing.allocator, 20, 6);
+    defer shadow.deinit();
+    var plan = testPlan(.transcript);
+    plan.layout.cols = 20;
+    var surface = try FrameSurface.initFromShadow(std.testing.allocator, plan, shadow);
+    defer surface.deinit();
+
+    // `e` and 31 U+0301 marks make 63 of the 64 bytes a cell may hold.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(std.testing.allocator);
+    try text.append(std.testing.allocator, 'e');
+    try expected.append(std.testing.allocator, 'e');
+    for (0..200) |index| {
+        try text.appendSlice(std.testing.allocator, "\u{0301}");
+        if (index < 31) try expected.appendSlice(std.testing.allocator, "\u{0301}");
+    }
+    try text.append(std.testing.allocator, 'b');
+    try expected.append(std.testing.allocator, 'b');
+
+    const result = try surface.writeAnsiBand(2, 1, text.items, .transcript, .same_owner);
+    try std.testing.expectEqual(@as(u16, 1), result.rows_touched);
+
+    var target = try surface.copyToTargetGrid(std.testing.allocator);
+    defer target.deinit();
+    var row_text: std.ArrayList(u8) = .empty;
+    defer row_text.deinit(std.testing.allocator);
+    try target.rowTextTrimmed(2, &row_text);
+    try std.testing.expectEqualStrings(expected.items, row_text.items);
+}
+
 test "frame surface preserves Unicode display-unit suffix bytes" {
     var shadow = try shadowGrid(std.testing.allocator, 10, 6);
     defer shadow.deinit();
