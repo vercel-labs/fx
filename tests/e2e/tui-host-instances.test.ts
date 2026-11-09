@@ -408,12 +408,15 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       await withHost(answerByLetter, {}, async ({ home, session }) => {
         // Saved after fx started: the list reads the profiles when it opens.
         writeProfile(home, "reviewer", { description: "Reviews code for bugs", model: "anthropic/claude-opus-4-7", effort: "high", tools: ["*"] });
+        writeProfile(home, "installer", { description: "Installs skills", tools: ["install_skill"] });
         await session.sendLiteral("/launch ");
         // Each row shows the model and effort the instance would start with, as the agent list does, not its
         // description. FX_MODEL wins over the profile's model, as it does at launch; the effort stays the profile's.
         const listed = await session.waitForPane((pane) => /reviewer\s+gpt-5\s+high/.test(pane), 15_000);
         expect(listed).not.toContain("Reviews code for bugs");
         expect(listed).toMatch(/^\s*main\b/m);
+        expect(listed).toMatch(/installer\s+gpt-5\s+default\s+custom/);
+        expect(listed).not.toContain("read-only");
         await session.sendLiteral("rev");
         await session.waitForPane((pane) => /reviewer\s+gpt-5\s+high/.test(pane) && !/^\s*main\b/m.test(pane), 10_000);
         await session.sendKeys("Enter");
