@@ -9480,3 +9480,73 @@ test.skipIf(!tmuxAvailable())(
   },
   TIMEOUT * 3,
 );
+
+// A resume publishes the saved transcript into native scrollback over many
+// frames. A prompt submitted while it still publishes adds its turn to the
+// live flow, which the screen shows only after the publication hands over. The
+// first frame after that handoff must scroll the rows the turn covers into
+// scrollback; if it paints in place they are lost. The terminal is tall enough
+// (80x73) that one publication frame, 64 rows, fits in the transcript area.
+// A frame can also paint the tail of the transcript in place of one
+// publication frame's rows where the prompt was submitted, long before the
+// handoff, whatever the build. So the rows are checked by their final run: the
+// consecutive rows that end the scrollback must reach back past the last 200
+// resumed rows, six publication frames, which the handoff covers.
+const PUBLISHING_ROWS = 8000;
+const PUBLISHING_CHECKED_ROWS = 200;
+const PUBLISHING_TURN_ROWS = ["PUBLISHING_TURN_ROW_1", "PUBLISHING_TURN_ROW_2", "PUBLISHING_TURN_ROW_3"];
+
+test.skipIf(!tmuxAvailable())(
+  "a prompt submitted while a resume still publishes keeps every earlier row in scrollback once",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-publishing-submit-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sound: false, permission_mode: "auto", sandbox: "none" }));
+    const rowText = (index: number) => `row ${String(index).padStart(5, "0")}`;
+    let reply = Array.from({ length: PUBLISHING_ROWS }, (_, index) => rowText(index + 1)).join("\n\n");
+    const gateway = startDynamicFakeGateway(async () => fakeGatewayFinalText(reply));
+    const env = { ...gatewayEnv(home, gateway), FX_SOUND: "0" };
+    let active: TmuxSession | null = null;
+    try {
+      const seeded = await runFx(["ask", "--json", "Save a long reply."], { cwd: workspace, env, timeoutMs: 60_000 });
+      expect(seeded.code).toBe(0);
+      const id = sessionIdFromHome(home);
+      reply = PUBLISHING_TURN_ROWS.join("\n\n");
+
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume ${id}`, cwd: workspace, env, stderrPath, isolated: true, width: 80, height: 73,
+      });
+      const composer = await active.waitForComposer(TIMEOUT);
+      // The last resumed row is not on the screen yet: the resume still publishes.
+      expect(composer).not.toContain(rowText(PUBLISHING_ROWS));
+      await active.sendText("hello");
+      await active.waitForText(PUBLISHING_TURN_ROWS[PUBLISHING_TURN_ROWS.length - 1]!, TIMEOUT * 2);
+      await active.waitForStableComposer(TIMEOUT, 500);
+
+      // Scrollback and screen, as numbers: the rows that end the scrollback
+      // are consecutive up to the last resumed one, from before the handoff,
+      // then the turn follows once each.
+      const full = await active.captureFullScrollback();
+      const shown = [...full.matchAll(/^\s*row (\d{5})\s*$/gm)].map((match) => Number(match[1]));
+      expect(shown.length).toBeGreaterThan(PUBLISHING_CHECKED_ROWS);
+      let runStart = shown.length - 1;
+      while (runStart > 0 && shown[runStart - 1] === shown[runStart]! - 1) runStart--;
+      expect(shown[shown.length - 1]).toBe(PUBLISHING_ROWS);
+      expect(shown[runStart]!).toBeLessThanOrEqual(PUBLISHING_ROWS - PUBLISHING_CHECKED_ROWS + 1);
+      expect([...full.matchAll(/PUBLISHING_TURN_ROW_\d/g)].map((match) => match[0])).toEqual(PUBLISHING_TURN_ROWS);
+      expect(gateway.requests.length).toBeGreaterThanOrEqual(2);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
+);

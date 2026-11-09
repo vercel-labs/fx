@@ -376,6 +376,28 @@ const TranscriptRecoveryReceipt = struct {
     }
 };
 
+/// What the screen held when a resume's publication handed over to the live
+/// flow. The handoff throws the committed anchor away, because the live flow
+/// is a new source, so the first live frame has nothing to compare with. If
+/// the user submitted a prompt during the publication, that frame also shows
+/// the rows of its turn, and without this mark it paints them in place over
+/// rows that never reached scrollback. The planner of the first `invalid`
+/// frame reads the mark, and the commit of the next frame clears it. See
+/// `tests/tla/transcript_scrollback/TranscriptScrollback.tla` `NothingAbove`,
+/// `InOrderOnce` and `MarkHonest`.
+const ResumeHandoffMark = struct {
+    /// The first entry id that the published flow does not carry.
+    entry_floor: u32,
+    /// Rows of the transcript area that the last published frame painted.
+    area_rows: u16,
+    /// Where the terminal's cursor stood after that frame.
+    cursor_row: u16,
+    cursor_col: u16,
+    /// The published flow ended with a newline. When it did not, the newline
+    /// that ends its last row is the first byte of what follows it.
+    flow_ends_with_newline: bool,
+};
+
 const TranscriptCommitState = union(enum) {
     invalid,
     stable: CommittedTranscriptAnchor,
@@ -651,6 +673,9 @@ pub const TranscriptTransition = struct {
     /// Owns `document_append.bytes` when append preparation allocates wire bytes.
     document_append_bytes: []u8 = &.{},
     resize_reflow_rows: u16 = 0,
+    /// Where the planned rows start. An `invalid` anchor has no offset of its
+    /// own, so a commit that accepts only some of the rows counts from here.
+    source_visual_offset: u32 = 0,
     semantic_rows: u32 = 0,
     semantic_progress_rows: u32 = 0,
     recovery_rebase: bool = false,
@@ -4680,6 +4705,11 @@ pub const TranscriptNotebook = struct {
     /// Complete historical flow and its immutable line index, retained until
     /// the first successful terminal publication.
     pending_resume_source: ?TranscriptPreparationSource = null,
+    /// The first entry id that the pending resume flow does not carry. Entries
+    /// from here on were added while the resume published, and the live flow
+    /// shows them only after the handoff. Set with the pending source and
+    /// cleared with it.
+    pending_resume_entry_floor: ?u32 = null,
     folded_command_blocks: std.ArrayList(FoldedCommandBlock) = .empty,
     command_output_blocks: std.ArrayList(CommandOutputBlock) = .empty,
     full_transcript_content_revision: u64 = 0,
@@ -4732,6 +4762,7 @@ const transcript_slot_fields = [_][:0]const u8{
     "cursor_row",
     "cursor_col",
     "transcript_commit_state",
+    "resume_handoff",
     "publication_projection_invalid",
     "transcript_band_dirty",
     "has_painted_transcript",
@@ -4908,6 +4939,10 @@ pub const TranscriptRuntime = struct {
     has_committed_frame: bool = false,
     committed_frame_layout: render_engine.frame_layout.CommittedLayoutSnapshot = .{},
     transcript_commit_state: TranscriptCommitState = .invalid,
+    /// Set by the commit that hands a resume's publication over to the live
+    /// flow, used by the planner of the next frame while the state is
+    /// `invalid`, and cleared by the commit of that frame.
+    resume_handoff: ?ResumeHandoffMark = null,
     /// A partial scroll may have moved rows into terminal history already.
     /// No ordinary repaint may run until the remaining rows are committed.
     pending_session_scrollback_handoff: ?struct {
@@ -5101,6 +5136,7 @@ pub const TranscriptRuntime = struct {
     }
 
     fn releasePendingResumeSource(self: *TranscriptRuntime, alloc: Allocator) usize {
+        self.notebook.pending_resume_entry_floor = null;
         var source = self.notebook.pending_resume_source orelse return 0;
         const released_bytes = source.bytes.len;
         source.deinit(alloc);
@@ -8123,6 +8159,10 @@ pub const TranscriptRuntime = struct {
 
     pub fn resetTranscriptAnchor(self: *TranscriptRuntime, reason: []const u8) void {
         self.publication_projection_invalid = false;
+        if (self.resume_handoff != null) {
+            self.resume_handoff = null;
+            debug_trace.logf("scroll", "resume_handoff_mark_dropped reason={s}", .{reason});
+        }
         const diagnostic = self.transcriptCommitDiagnostic();
         if (diagnostic.state != .invalid) {
             diagnostics.recordRenderEvent(
@@ -8545,6 +8585,82 @@ pub const TranscriptRuntime = struct {
         return self.planTranscriptScrollForFrame(prepared, false, false);
     }
 
+    const ResumeHandoffScroll = struct {
+        /// Where the screen's top was before the frame, in the live flow.
+        source_offset: u32,
+        /// The rows between there and the frame's new top.
+        rows: u32,
+        /// Where the rows that were on the screen end: the first new row.
+        before: u32,
+    };
+
+    /// Where the first frame of the live flow after a resume handoff appends
+    /// from: the end of the rows that were on the screen, with the cursor where
+    /// the last published frame left it. The rows the new top passes that were
+    /// never on the screen are printed from here, and the terminal scrolls the
+    /// old rows into history as they print, as it does for growth on a stable
+    /// anchor.
+    fn resumeHandoffAppendBase(
+        self: *const TranscriptRuntime,
+        prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+        target_offset: u32,
+        target_flow: []const u8,
+    ) ?TransitionAppendBase {
+        const mark = self.resume_handoff orelse return null;
+        const handoff = self.resumeHandoffScroll(prepared, target_offset) orelse return null;
+        var flow_len = transcript_painter.preparedTranscriptFlowOffsetForVisualOffset(
+            prepared,
+            self.layout.cols,
+            handoff.before,
+        ) orelse return null;
+        if (flow_len > target_flow.len) return null;
+        // The cursor stands after the last published byte. A row boundary is
+        // after the newline of the row, which the published flow may lack.
+        if (!mark.flow_ends_with_newline and flow_len > 0 and target_flow[flow_len - 1] == '\n') {
+            flow_len -= 1;
+        }
+        return .{
+            .flow_len = flow_len,
+            .visual_offset = handoff.source_offset,
+            .visual_rows = @intCast(handoff.before - handoff.source_offset),
+            .cursor_row = mark.cursor_row,
+            .cursor_col = mark.cursor_col,
+        };
+    }
+
+    /// The rows the first frame of the live flow must scroll into history
+    /// after a resume handoff, or null when it has none to add and takes the
+    /// path of an `invalid` anchor. The last published frame left the last
+    /// `area_rows` rows of the published flow on the screen. The live flow is
+    /// that flow, or its tail, followed by the entries added during the
+    /// publication, so those rows end where the first such entry begins. A new
+    /// top below their old top has passed rows that are on the screen and in
+    /// no scrollback yet. A resize, the full transcript screen, or a
+    /// source without line provenance keeps the path of an `invalid` anchor.
+    fn resumeHandoffScroll(
+        self: *const TranscriptRuntime,
+        prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+        target_offset: u32,
+    ) ?ResumeHandoffScroll {
+        const mark = self.resume_handoff orelse return null;
+        if (self.terminal_reset_pending or
+            self.fullTranscriptActive() or
+            self.resize_history_row_delta != null or
+            self.committed_frame_layout.terminal_cols != self.layout.cols or
+            self.committed_frame_layout.terminal_rows != self.layout.rows)
+        {
+            debug_trace.logf("scroll", "resume_handoff_mark_unused reason=reset_resize_or_full_transcript", .{});
+            return null;
+        }
+        const before = visualRowsBeforeEntry(prepared, mark.entry_floor) orelse {
+            debug_trace.logf("scroll", "resume_handoff_mark_unused reason=no_new_entry_or_provenance", .{});
+            return null;
+        };
+        const old_top = before -| mark.area_rows;
+        if (target_offset <= old_top) return null;
+        return .{ .source_offset = old_top, .rows = target_offset - old_top, .before = before };
+    }
+
     /// Selects the finality floor in flow bytes from the prepared paint's
     /// activity-independent candidates plus the frame-fresh producer facts
     /// (lifecycle watermark, assistant-tail writability, replaceable tail).
@@ -8785,6 +8901,33 @@ pub const TranscriptRuntime = struct {
                             semantic_rows,
                             semantic_rows,
                         ),
+                        .source_compatible = true,
+                        .recovery_progress_compatible = true,
+                        .recovery_tracks_semantic_progress = true,
+                    };
+                }
+                // The first frame of the live flow after a resume handoff:
+                // the rows that the new entries cover were on the screen and
+                // must scroll into history, not be painted over.
+                if (self.resumeHandoffScroll(prepared, target_offset)) |handoff| {
+                    const planned_rows = self.plannedTranscriptRows(
+                        prepared,
+                        handoff.source_offset,
+                        0,
+                        handoff.rows,
+                        handoff.rows,
+                    );
+                    debug_trace.logf(
+                        "scroll",
+                        "transcript_transition_plan source_state=invalid resume_handoff source_visual_offset={d} target_visual_offset={d} semantic_rows={d} planned_rows={d}",
+                        .{ handoff.source_offset, target_offset, handoff.rows, planned_rows },
+                    );
+                    return .{
+                        .source_visual_offset = handoff.source_offset,
+                        .target_visual_offset = target_offset,
+                        .semantic_rows = handoff.rows,
+                        .semantic_progress_rows = handoff.rows,
+                        .planned_rows = planned_rows,
                         .source_compatible = true,
                         .recovery_progress_compatible = true,
                         .recovery_tracks_semantic_progress = true,
@@ -9473,7 +9616,7 @@ pub const TranscriptRuntime = struct {
                     self.layout,
                     prepared,
                     projection_area,
-                    accepted_semantic_progress_rows,
+                    scroll_facts.source_visual_offset + accepted_semantic_progress_rows,
                 );
             },
         }
@@ -9734,16 +9877,21 @@ pub const TranscriptRuntime = struct {
                     }
                 }
             },
-            .invalid => if (self.pendingResumeFlow().len > 0 and
-                !destructive_invalidation)
-            {
-                return .{
-                    .flow_len = 0,
-                    .visual_offset = 0,
-                    .visual_rows = 0,
-                    .cursor_row = prior_owned_top,
-                    .cursor_col = 1,
-                };
+            .invalid => {
+                if (self.pendingResumeFlow().len > 0 and !destructive_invalidation) {
+                    return .{
+                        .flow_len = 0,
+                        .visual_offset = 0,
+                        .visual_rows = 0,
+                        .cursor_row = prior_owned_top,
+                        .cursor_col = 1,
+                    };
+                }
+                if (!destructive_invalidation) {
+                    if (self.resumeHandoffAppendBase(prepared, scroll_facts.target_visual_offset, target_flow)) |base| {
+                        return base;
+                    }
+                }
             },
         }
         return null;
@@ -9859,6 +10007,30 @@ pub const TranscriptRuntime = struct {
             endpoint.cursor_col = base.cursor_col;
         }
         return endpoint;
+    }
+
+    /// `materializedEndpointWithoutAppend`, except that an `invalid` anchor
+    /// whose frame appends from a base holds the base's state, so a frame that
+    /// the terminal accepts in part resumes from where the screen really is.
+    fn materializedEndpointBeforeAppend(
+        self: *const TranscriptRuntime,
+        document_append: render_engine.frame_scroll_plan.FrameDocumentAppend,
+        planned: MaterializedEndpoint,
+        append_base: ?TransitionAppendBase,
+    ) MaterializedEndpoint {
+        switch (self.transcript_commit_state) {
+            .invalid => if (!document_append.isEmpty()) {
+                if (append_base) |base| return .{
+                    .visual_offset = base.visual_offset,
+                    .visual_rows = base.visual_rows,
+                    .flow_len = base.flow_len,
+                    .cursor_row = base.cursor_row,
+                    .cursor_col = base.cursor_col,
+                };
+            },
+            .stable, .recovering => {},
+        }
+        return self.materializedEndpointWithoutAppend(document_append, planned);
     }
 
     fn materializedEndpointWithoutAppend(
@@ -10544,6 +10716,7 @@ pub const TranscriptRuntime = struct {
                     scroll_facts.target_visual_offset,
                 ) > target.history_visual_offset,
             .resize_reflow_rows = scroll_facts.resize_reflow_rows,
+            .source_visual_offset = scroll_facts.source_visual_offset,
             .semantic_rows = scroll_facts.semantic_rows,
             .semantic_progress_rows = scroll_facts.semantic_progress_rows,
             .recovery_rebase = scroll_facts.recovery_rebase,
@@ -10571,9 +10744,10 @@ pub const TranscriptRuntime = struct {
             .source_endpoint_visual_offset = target.source_endpoint_visual_offset,
             .total_visual_rows = target.total_visual_rows,
             .materialized = materialized,
-            .materialized_without_append = self.materializedEndpointWithoutAppend(
+            .materialized_without_append = self.materializedEndpointBeforeAppend(
                 document_append,
                 materialized,
+                append_base,
             ),
             .cursor_row = target.cursor_row,
             .cursor_col = target.cursor_col,
@@ -10695,6 +10869,12 @@ pub const TranscriptRuntime = struct {
 
         if (result.is_committed()) {
             self.committed_frame_layout = transition.target_layout;
+            // The handoff mark serves one frame: the first one that commits
+            // after the handoff. The handoff's own commit sets it below.
+            if (self.resume_handoff != null) {
+                self.resume_handoff = null;
+                debug_trace.logf("scroll", "resume_handoff_mark_cleared", .{});
+            }
         }
 
         if (transition.borrows_full_page) {
@@ -10750,6 +10930,14 @@ pub const TranscriptRuntime = struct {
             }
 
             const stable_flow = transition.target_flow;
+            const resume_entry_floor = self.notebook.pending_resume_entry_floor;
+            // The frame painted the published flow itself, borrowed or as an
+            // exact copy, and not a live flow that already holds the entries
+            // added during the publication.
+            const committed_published_flow = if (self.notebook.pending_resume_source) |pending|
+                !transition.target_flow_owned or std.mem.eql(u8, pending.bytes, stable_flow)
+            else
+                false;
             const pending_resume_bytes = if (transition.target_flow_owned)
                 self.releasePendingResumeSource(alloc)
             else blk: {
@@ -10789,10 +10977,31 @@ pub const TranscriptRuntime = struct {
             } };
             transition.row_provenance = &.{};
             transition.retention_identity = .{};
+            const published_flow_ends_with_newline =
+                stable_flow.len > 0 and stable_flow[stable_flow.len - 1] == '\n';
 
             self.notebook.last_rendered_cols = transition.target_layout.terminal_cols;
             if (pending_resume_bytes > 0) {
                 self.invalidateTranscriptAnchor("resume publication retained source handoff");
+                // The published flow was painted, so the entries added while it
+                // published are still to come: remember what is on the screen.
+                if (committed_published_flow) {
+                    if (resume_entry_floor) |floor| {
+                        const area = transition.target_layout.transcript_area;
+                        self.resume_handoff = .{
+                            .entry_floor = floor,
+                            .area_rows = if (area.isEmpty()) 0 else area.height(),
+                            .cursor_row = transition.cursor_row,
+                            .cursor_col = transition.cursor_col,
+                            .flow_ends_with_newline = published_flow_ends_with_newline,
+                        };
+                        debug_trace.logf(
+                            "scroll",
+                            "resume_handoff_mark entry_floor={d} area_rows={d} history_visual_offset={d}",
+                            .{ floor, self.resume_handoff.?.area_rows, transition.history_visual_offset },
+                        );
+                    }
+                }
                 if (transition.target_flow_owned) {
                     debug_trace.logf(
                         "session",
@@ -13033,12 +13242,12 @@ fn resolveTranscriptRecoveryCommit(
     const source_offset = switch (runtime.transcript_commit_state) {
         .stable => |anchor| committedProjectionVisualOffset(anchor),
         .recovering => |receipt| receipt.accepted_visual_offset,
-        .invalid => 0,
+        .invalid => transition.source_visual_offset,
     };
     const source_history_offset = switch (runtime.transcript_commit_state) {
         .stable => |anchor| anchor.history_visual_offset,
         .recovering => |receipt| receipt.accepted_history_visual_offset,
-        .invalid => 0,
+        .invalid => transition.source_visual_offset,
     };
     const projection_base_offset = if (transition.recovery_rebase and
         !transition.recovery_progress_compatible)
@@ -14151,6 +14360,107 @@ test "transition commit keeps unplanned physical scroll as recovery debt" {
     const diagnostic = runtime.transcriptCommitDiagnostic();
     try std.testing.expectEqual(TranscriptCommitDiagnosticState.recovering, diagnostic.state);
     try std.testing.expectEqual(@as(u16, 1), diagnostic.remaining_unplanned_scroll_rows);
+}
+
+/// Visual rows of the source's lines before the first line of an entry with
+/// an id at or above `entry_floor`, not counting the separator rows that join
+/// that entry to the one before it. Null when no line belongs to such an
+/// entry, or when the source carries no line provenance.
+fn visualRowsBeforeEntry(
+    prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+    entry_floor: u32,
+) ?u32 {
+    const provenance = if (prepared.source_line_provenance.len > 0)
+        prepared.source_line_provenance
+    else
+        prepared.line_provenance.items;
+    const rows = prepared.sourceVisualRows();
+    if (provenance.len == 0 or provenance.len != rows.len) return null;
+    var end: usize = 0;
+    for (provenance, 0..) |line, index| {
+        const id: ?u32 = switch (line) {
+            .entry => |entry| entry.entry_id,
+            .folded_command_output => |folded| folded.entry_id,
+            else => null,
+        };
+        if (id) |value| {
+            if (value >= entry_floor) {
+                end = index;
+                break;
+            }
+        }
+    } else return null;
+    while (end > 0 and (provenance[end - 1] == .block_separator or provenance[end - 1] == .boundary_blank)) end -= 1;
+    var total: u32 = 0;
+    for (rows[0..end]) |line_rows| total += line_rows;
+    return total;
+}
+
+const handoff_test_lines = [_]transcript_blocks.LineProvenance{
+    .{ .entry = .{ .entry_id = 3, .entry_class = .unknown_raw } },
+    .{ .entry = .{ .entry_id = 3, .entry_class = .unknown_raw } },
+    .block_separator,
+    .{ .entry = .{ .entry_id = 7, .entry_class = .unknown_raw } },
+    .{ .entry = .{ .entry_id = 8, .entry_class = .unknown_raw } },
+};
+const handoff_test_rows = [_]u16{ 1, 2, 1, 1, 3 };
+
+fn handoffTestPrepared() transcript_painter.PreparedTranscriptSurfacePaint {
+    return .{
+        .selection = .{ .top_row = 1, .bottom_row = 1, .start_line = 0, .partial_skip_rows = 0, .line_count = 5 },
+        .source_line_provenance = &handoff_test_lines,
+        .source_line_visual_rows = &handoff_test_rows,
+    };
+}
+
+test "visual rows before an entry stop short of the separators that join it" {
+    const prepared = handoffTestPrepared();
+    // Entry 3 takes 3 rows. The separator before entry 7 belongs to the growth.
+    try std.testing.expectEqual(@as(?u32, 3), visualRowsBeforeEntry(&prepared, 7));
+    // Entry 7 is old for a floor of 8, so it counts, and no separator follows it.
+    try std.testing.expectEqual(@as(?u32, 5), visualRowsBeforeEntry(&prepared, 8));
+    try std.testing.expectEqual(@as(?u32, 0), visualRowsBeforeEntry(&prepared, 0));
+    // No line belongs to an entry that new.
+    try std.testing.expectEqual(@as(?u32, null), visualRowsBeforeEntry(&prepared, 9));
+    // Without line provenance there is nothing to read.
+    var bare = handoffTestPrepared();
+    bare.source_line_provenance = &.{};
+    try std.testing.expectEqual(@as(?u32, null), visualRowsBeforeEntry(&bare, 7));
+}
+
+test "the handoff mark adds the rows its growth covers and nothing else" {
+    const prepared = handoffTestPrepared();
+    var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
+    runtime.committed_frame_layout = .{ .terminal_cols = runtime.layout.cols, .terminal_rows = runtime.layout.rows };
+
+    // No mark: no rows, and the same for an entry id that no line carries.
+    try std.testing.expectEqual(@as(?TranscriptRuntime.ResumeHandoffScroll, null), runtime.resumeHandoffScroll(&prepared, 6));
+    runtime.resume_handoff = .{ .entry_floor = 9, .area_rows = 2, .cursor_row = 1, .cursor_col = 1, .flow_ends_with_newline = true };
+    try std.testing.expectEqual(@as(?TranscriptRuntime.ResumeHandoffScroll, null), runtime.resumeHandoffScroll(&prepared, 6));
+
+    // The old screen held the last 2 of the 3 rows before the growth, so its
+    // top was row 1. A new top at row 6 passed 5 rows.
+    runtime.resume_handoff = .{ .entry_floor = 7, .area_rows = 2, .cursor_row = 1, .cursor_col = 1, .flow_ends_with_newline = true };
+    const scroll = runtime.resumeHandoffScroll(&prepared, 6).?;
+    try std.testing.expectEqual(@as(u32, 1), scroll.source_offset);
+    try std.testing.expectEqual(@as(u32, 5), scroll.rows);
+    try std.testing.expectEqual(@as(u32, 3), scroll.before);
+    // A top that did not pass the old one adds nothing.
+    try std.testing.expectEqual(@as(?TranscriptRuntime.ResumeHandoffScroll, null), runtime.resumeHandoffScroll(&prepared, 1));
+
+    // A resize, a reset, or the full transcript keeps the path of an invalid anchor.
+    runtime.layout.cols += 1;
+    try std.testing.expectEqual(@as(?TranscriptRuntime.ResumeHandoffScroll, null), runtime.resumeHandoffScroll(&prepared, 6));
+    runtime.layout.cols -= 1;
+    runtime.terminal_reset_pending = true;
+    try std.testing.expectEqual(@as(?TranscriptRuntime.ResumeHandoffScroll, null), runtime.resumeHandoffScroll(&prepared, 6));
+}
+
+test "resetting the anchor drops the handoff mark" {
+    var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
+    runtime.resume_handoff = .{ .entry_floor = 7, .area_rows = 2, .cursor_row = 1, .cursor_col = 1, .flow_ends_with_newline = true };
+    runtime.resetTranscriptAnchor("test");
+    try std.testing.expectEqual(@as(?ResumeHandoffMark, null), runtime.resume_handoff);
 }
 
 fn frameInlineScrollBudget(resize_reflow_rows: u16, semantic_rows: u32) u16 {

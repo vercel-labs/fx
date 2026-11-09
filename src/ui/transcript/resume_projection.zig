@@ -436,6 +436,7 @@ pub const ResumeProjection = struct {
         target.replaceable_row = self.runtime.replaceable_row;
         target.notebook.replaceable_start = self.runtime.notebook.replaceable_start;
         target.notebook.pending_resume_source = self.publication_source;
+        target.notebook.pending_resume_entry_floor = target.notebook.next_entry_id;
         self.publication_source = null;
         target.recomputeCursorFromTranscript();
         target.reconcileDetachedInstallSource(target.pendingResumeFlow());
@@ -467,6 +468,7 @@ pub const ResumeProjection = struct {
         std.debug.assert(self.runtime.notebook.pending_resume_source == null);
 
         self.runtime.notebook.pending_resume_source = self.publication_source;
+        self.runtime.notebook.pending_resume_entry_floor = self.runtime.notebook.next_entry_id;
         self.publication_source = null;
         self.runtime.reconcileDetachedInstallSource(
             self.runtime.pendingResumeFlow(),
