@@ -2411,6 +2411,39 @@ test "user profile commands reuse one startup-file snapshot" {
     try std.testing.expectEqualStrings("loaded\n", loads);
 }
 
+test "bash user profile snapshot restores a replay larger than the pipe buffer" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // bash 3.2, macOS's /bin/bash, sources a pipe only as far as the bytes
+    // it holds at that moment. Thousands of functions push the replay well
+    // past that, so a partial read would lose the last ones and the command.
+    const paths = try writeSnapshotTestShellFor(
+        arena,
+        &tmp,
+        "bash",
+        ".bash_profile",
+        "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
+            "for i in {1..3000}; do eval \"fxsnap_bulk_$i() { printf 'bulk-$i\\n'; }\"; done\n",
+    );
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    for (0..2) |_| {
+        const result = try executeCommandInEnvironment(config, arena, "fxsnap_bulk_2999", paths.workspace, .{ .user = paths.shell });
+        try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nbulk-2999\n</stdout>\n", result.output);
+    }
+    // Both commands ran from the snapshot, so startup ran only for its capture.
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+}
+
 test "zsh user profile snapshot restores a function that replaces a default alias" {
     if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch

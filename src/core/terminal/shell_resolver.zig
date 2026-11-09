@@ -276,10 +276,20 @@ pub fn snapshotInvocation(
         .zsh => .{ "\\builtin exec 9>&2 2>/dev/null; ", "\\builtin exec 2>&9 9>&-; " },
         .bash => .{ "exec 9>&2 2>/dev/null; ", "\\builtin unset -f exec; exec 2>&9 9>&-; " },
     };
+    // bash 3.2, macOS's /bin/bash, sources a pipe only as far as the bytes it
+    // holds at that moment, about 64 KB, so a larger replay would lose its
+    // end. That bash reads the whole script with a command substitution and
+    // evaluates it. bash 4 and later read a pipe to its end.
+    const load_replay: []const u8 = switch (kind) {
+        .zsh => "\\builtin source /dev/fd/0; ",
+        .bash => "if (( BASH_VERSINFO[0] < 4 )); then \\builtin eval -- \"$(< /dev/fd/0)\"; " ++
+            "else \\builtin source /dev/fd/0; fi; ",
+    };
     var bootstrap: std.ArrayList(u8) = .empty;
     errdefer bootstrap.deinit(alloc);
     try bootstrap.appendSlice(alloc, park_stderr);
-    try bootstrap.appendSlice(alloc, "\\builtin source /dev/fd/0; __fx_snapshot_status=$?; ");
+    try bootstrap.appendSlice(alloc, load_replay);
+    try bootstrap.appendSlice(alloc, "__fx_snapshot_status=$?; ");
     try bootstrap.appendSlice(alloc, restore_stderr);
     try bootstrap.appendSlice(
         alloc,
@@ -702,7 +712,8 @@ test "snapshot bootstrap hides replay errors and restores stderr afterwards" {
 
     const bash = try snapshotInvocation(arena, "/bin/bash", "marker");
     try std.testing.expectEqualStrings(
-        "exec 9>&2 2>/dev/null; \\builtin source /dev/fd/0; __fx_snapshot_status=$?; " ++
+        "exec 9>&2 2>/dev/null; if (( BASH_VERSINFO[0] < 4 )); then \\builtin eval -- \"$(< /dev/fd/0)\"; " ++
+            "else \\builtin source /dev/fd/0; fi; __fx_snapshot_status=$?; " ++
             "\\builtin unset -f exec; exec 2>&9 9>&-; " ++ tail,
         bash.argv()[bash.argv().len - 1],
     );
