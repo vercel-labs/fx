@@ -7002,6 +7002,7 @@ test "MCP unadvertised dynamic names stay unsupported without a runtime call" {
 test "a toolbox run of an MCP tool the server removed says it is no longer available" {
     var marker: u8 = 0;
     const advertised = [_][]const u8{ "mcp_fixture\x07echo", "mcp_fixture_echo" };
+    // The host no longer has an admitted tool, so its call comes back empty.
     var gone_rt = TestRuntime{
         .mcp_ctx = @ptrCast(&marker),
         .mcp_has_tool = McpFixture.hasTrue,
@@ -7009,43 +7010,31 @@ test "a toolbox run of an MCP tool the server removed says it is no longer avail
         .advertised_dynamic_tool_names = &advertised,
     };
     defer gone_rt.deinit(std.testing.allocator);
+    // Without an MCP runtime the call is unsupported before it dispatches.
     var no_rt = TestRuntime{};
     defer no_rt.deinit(std.testing.allocator);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const message = "mcp_fixture&#x07;echo is no longer available. Use toolbox search to find current tools.";
-    // The host no longer has an admitted tool, so its call comes back empty.
-    const gone = try executeToolCall(gone_rt.context(), arena, .{
-        .id = "1",
-        .name = "mcp_fixture\x07echo",
-        .arguments_json = "{}",
-        .carried_by = "toolbox",
-    });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, gone.status);
-    try std.testing.expectEqualStrings(message, gone.model_output);
-    // Without an MCP runtime the call is unsupported before it dispatches.
-    const unsupported = try executeToolCall(no_rt.context(), arena, .{
-        .id = "2",
-        .name = "mcp_fixture\x07echo",
-        .arguments_json = "{}",
-        .carried_by = "toolbox",
-    });
-    try std.testing.expectEqualStrings(message, unsupported.model_output);
-    // A direct call of the same tool keeps the generic message on both paths.
-    const direct_gone = try executeToolCall(gone_rt.context(), arena, .{
-        .id = "3",
-        .name = "mcp_fixture_echo",
-        .arguments_json = "{}",
-    });
-    try std.testing.expectEqualStrings("Unsupported tool: mcp_fixture_echo", direct_gone.model_output);
-    const direct_unsupported = try executeToolCall(no_rt.context(), arena, .{
-        .id = "4",
-        .name = "mcp_fixture_echo",
-        .arguments_json = "{}",
-    });
-    try std.testing.expectEqualStrings("Unsupported tool: mcp_fixture_echo", direct_unsupported.model_output);
+    const run_message = "mcp_fixture&#x07;echo is no longer available. Use toolbox search to find current tools.";
+    const cases = [_]struct { rt: *TestRuntime, name: []const u8, carried_by: ?[]const u8, message: []const u8 }{
+        .{ .rt = &gone_rt, .name = "mcp_fixture\x07echo", .carried_by = "toolbox", .message = run_message },
+        .{ .rt = &no_rt, .name = "mcp_fixture\x07echo", .carried_by = "toolbox", .message = run_message },
+        // A direct call of the same tool keeps the generic message on both paths.
+        .{ .rt = &gone_rt, .name = "mcp_fixture_echo", .carried_by = null, .message = "Unsupported tool: mcp_fixture_echo" },
+        .{ .rt = &no_rt, .name = "mcp_fixture_echo", .carried_by = null, .message = "Unsupported tool: mcp_fixture_echo" },
+    };
+    for (cases) |case| {
+        const result = try executeToolCall(case.rt.context(), arena, .{
+            .id = "1",
+            .name = case.name,
+            .arguments_json = "{}",
+            .carried_by = case.carried_by,
+        });
+        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+        try std.testing.expectEqualStrings(case.message, result.model_output);
+    }
 }
 
 test "MCP dynamic tool executes after its schema was advertised" {
