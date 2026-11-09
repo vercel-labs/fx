@@ -92,6 +92,46 @@ export function loadVariant(path: string | undefined): Variant {
   return JSON.parse(readFileSync(path, "utf8")) as Variant;
 }
 
+/**
+ * A variant for `tokens` or `probe`, which rewrite a captured body and run no
+ * transform: one that names a transform is refused rather than measured as if
+ * it had none.
+ */
+export function bodyOnlyVariant(path: string, command: string): Variant {
+  const variant = loadVariant(path);
+  if (variant.transform) throw new Error(`${command} runs no transform, but ${path} names one; try it with run`);
+  return variant;
+}
+
+/**
+ * Identifies what an arm runs: the binary's bytes, the variant, and its
+ * transform's source. `run --resume` reuses a stored run only when its arm
+ * key matches, so a rebuilt binary or an edited variant runs again.
+ */
+export function armKey(arm: Pick<Arm, "bin" | "variant" | "variantPath">): string {
+  const hash = createHash("sha256");
+  hash.update(readFileSync(arm.bin));
+  hash.update(JSON.stringify(arm.variant));
+  if (arm.variant.transform) hash.update(readFileSync(resolve(dirname(arm.variantPath), arm.variant.transform)));
+  return hash.digest("hex").slice(0, 16);
+}
+
+/**
+ * The stored run `run --resume` may reuse: only one that ran with this arm
+ * key. A run stored with another key, or before arm keys existed, is dropped
+ * and runs again, and `log` gets one line that names its file and both keys.
+ */
+export function reusableRun(
+  stored: RunResult,
+  key: string | undefined,
+  file: string,
+  log: (line: string) => void = console.log,
+): RunResult | null {
+  if (stored.armKey === key) return stored;
+  log(`resume: rerunning ${file}; it ran with arm key ${stored.armKey ?? "none"}, not ${key}`);
+  return null;
+}
+
 /** Applies a variant to one gateway request body in place. */
 export function applyVariant(body: Record<string, unknown>, variant: Variant): void {
   if (Array.isArray(body.tools) && variant.tools) {
@@ -159,7 +199,7 @@ export function parseStreamUsage(stream: string): Usage | null {
   return usage;
 }
 
-function startProxy(variant: Variant, testKey: string, transform?: Transform) {
+export function startProxy(variant: Variant, testKey: string, transform?: Transform) {
   const requests: RecordedRequest[] = [];
   const pending: Promise<void>[] = [];
   // A transform that throws fails its run: the request gets a 501, which fx
@@ -1155,6 +1195,8 @@ export interface Arm {
   variant: Variant;
   variantPath: string;
   transform?: Transform;
+  /** `armKey` of this arm, computed once when the run starts. */
+  key?: string;
 }
 
 export interface RunResult {
@@ -1193,6 +1235,8 @@ export interface RunResult {
   stderrTail: string;
   /** Errors a variant's transform threw; any of them fails the run. */
   transformErrors: string[];
+  /** The arm's `armKey` when this run ran; runs stored before it was added have none. */
+  armKey?: string;
 }
 
 /** Calls from this index on count as late in a long turn. */
@@ -1307,6 +1351,7 @@ export async function runOne(arm: Arm, model: string, task: Task, trial: number,
     durationMs: Date.now() - started,
     stderrTail: stderr.slice(-600),
     transformErrors: proxy.transformErrors,
+    armKey: arm.key,
   };
   rmSync(root, { recursive: true, force: true });
   return result;
@@ -1324,6 +1369,37 @@ export async function pool<T>(items: Array<() => Promise<T>>, size: number): Pro
     }),
   );
   return results;
+}
+
+// ---------------------------------------------------------------------------
+// Rescore
+
+/**
+ * Re-judges the stored runs of the wanted tasks from their output and tool
+ * calls, after an oracle fix, and returns how many verdicts changed. A run
+ * whose transform failed stays failed: no oracle judged a transformed run.
+ */
+export function rescoreResults(results: RunResult[], wanted: Set<string>, tasks: readonly Task[] = TASKS): number {
+  let changed = 0;
+  for (const r of results) {
+    const task = tasks.find((t) => t.id === r.task);
+    if (!task || !wanted.has(r.task) || r.transformErrors?.length) continue;
+    const verdict = task.check({
+      output: r.output,
+      calls: r.calls,
+      fxToolCalls: r.fxToolCalls ?? [],
+      stderr: r.stderrTail,
+      webSearched: r.webSearched ?? false,
+      repo: "/nonexistent",
+      home: "/nonexistent",
+      trackerLog: "/dev/null",
+      port: 0,
+    });
+    if (verdict.pass !== r.pass) changed++;
+    r.pass = verdict.pass;
+    r.reason = verdict.reason;
+  }
+  return changed;
 }
 
 // ---------------------------------------------------------------------------
@@ -1569,7 +1645,7 @@ async function main(): Promise<void> {
     const report: Record<string, unknown> = {};
     for (const path of list(arg("variants", "none"))) {
       const body = structuredClone(base);
-      applyVariant(body, loadVariant(path));
+      applyVariant(body, bodyOnlyVariant(path, "tokens"));
       const counts = await measureTokens(body, models, testKey);
       report[path] = { bytes: JSON.stringify(body.tools).length, counts };
       console.log(path, JSON.stringify(report[path]));
@@ -1587,6 +1663,7 @@ async function main(): Promise<void> {
     });
     for (const arm of arms) {
       if (arm.variant.transform) arm.transform = (await import(resolve(dirname(arm.variantPath), arm.variant.transform))) as Transform;
+      arm.key = armKey(arm);
     }
     const models = list(arg("models"));
     const toolFilter = list(arg("tools", ""));
@@ -1597,12 +1674,13 @@ async function main(): Promise<void> {
     const outDir = arg("out");
     const concurrency = Number(arg("concurrency", "8"));
     const noSave = process.argv.includes("--no-save");
-    // --resume reuses each run whose result file a stopped run already wrote.
+    // --resume reuses each run whose result file a stopped run already wrote,
+    // when that run's arm key matches the arm now; any other run runs again.
     const resume = process.argv.includes("--resume");
     mkdirSync(outDir, { recursive: true });
     writeFileSync(
       join(outDir, "config.json"),
-      JSON.stringify({ arms: arms.map((a) => ({ name: a.name, bin: a.bin, variantPath: a.variantPath, variant: a.variant })), models, tasks: tasks.map((t) => t.id), trials }, null, 2),
+      JSON.stringify({ arms: arms.map((a) => ({ name: a.name, bin: a.bin, key: a.key, variantPath: a.variantPath, variant: a.variant })), models, tasks: tasks.map((t) => t.id), trials }, null, 2),
     );
 
     const jobs: Array<() => Promise<RunResult>> = [];
@@ -1615,9 +1693,14 @@ async function main(): Promise<void> {
             jobs.push(async () => {
               const file = join(outDir, `${model.replaceAll("/", "_")}-${task.id}-${arm.name}-${trial}.json`);
               if (resume && existsSync(file)) {
+                let stored: RunResult | null = null;
                 try {
-                  return JSON.parse(readFileSync(file, "utf8")) as RunResult;
-                } catch {}
+                  stored = JSON.parse(readFileSync(file, "utf8")) as RunResult;
+                } catch (error) {
+                  console.log(`resume: rerunning ${file}; it could not be read: ${error}`);
+                }
+                const reused = stored && reusableRun(stored, arm.key, file);
+                if (reused) return reused;
               }
               const result = await runOne(arm, model, task, trial, testKey, noSave);
               writeFileSync(file, JSON.stringify(result, null, 2));
@@ -1655,26 +1738,7 @@ async function main(): Promise<void> {
     const outDir = arg("out");
     const wanted = new Set(list(arg("tasks")));
     const results = JSON.parse(readFileSync(join(outDir, "results.json"), "utf8")) as RunResult[];
-    let changed = 0;
-    for (const r of results) {
-      const task = TASKS.find((t) => t.id === r.task);
-      // A run whose transform failed stays failed; its oracle never judged a transformed run.
-      if (!task || !wanted.has(r.task) || r.transformErrors?.length) continue;
-      const verdict = task.check({
-        output: r.output,
-        calls: r.calls,
-        fxToolCalls: r.fxToolCalls ?? [],
-        stderr: r.stderrTail,
-        webSearched: r.webSearched ?? false,
-        repo: "/nonexistent",
-        home: "/nonexistent",
-        trackerLog: "/dev/null",
-        port: 0,
-      });
-      if (verdict.pass !== r.pass) changed++;
-      r.pass = verdict.pass;
-      r.reason = verdict.reason;
-    }
+    const changed = rescoreResults(results, wanted);
     writeFileSync(join(outDir, "results.json"), JSON.stringify(results, null, 2));
     const report = [
       "## By arm",
@@ -1699,7 +1763,7 @@ async function main(): Promise<void> {
     const arms = list(arg("arms")).map((spec) => {
       const [name, path] = spec.split("=");
       const body = structuredClone(base);
-      applyVariant(body, loadVariant(path));
+      applyVariant(body, bodyOnlyVariant(path, "probe"));
       return { name, body };
     });
     const models = list(arg("models"));

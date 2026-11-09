@@ -1,6 +1,6 @@
 # TLA+ models
 
-TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK, MCP, and transcript window models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides; the `fx mcp call` model on `main` and on pull requests labeled `ci:tla-mcp-call`; and the recovery, gateway_open, and agent_runtime models, each with its driver, on every pull request. Run the others when you change the behavior they describe.
+TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK, MCP, transcript window, subagent, and session-write models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides; the `fx mcp call` model on `main` and on pull requests labeled `ci:tla-mcp-call`; and the recovery, gateway_open, and agent_runtime models, each with its driver, on every pull request. Run the others when you change the behavior they describe.
 
 | Folder | What it models | Checker |
 |---|---|---|
@@ -69,6 +69,10 @@ CI's `TLA+ MCP models and drivers` job runs each engine model's smoke config (`m
 ## Transcript window in CI
 
 CI's `TLA+ transcript window model` job runs `transcript_window/check.sh --ci` on `main` and on pull requests that change the window's code, its model, its drivers, or the driver code they share. `--ci` leaves out the planted bugs and the run of a built fx along the model, which run only by hand with `transcript_window/check.sh`.
+
+## Subagent and session-write models in CI
+
+CI's `TLA+ subagent and session-write models` job runs the design configs of `subagent/check.sh` (`steer-queue`, `steer-queue-deep`, `stop-message`, and `stop-message-deep`) and the session-write configs of `session/check.sh` (`session-write` and its three witnesses), then the drivers `drivers/subagent/driver.ts`, `drivers/subagent/stop-message.test.ts`, and `drivers/session/write.test.ts` against the built fx. It runs on `main` and on pull requests that change the subagent or session-write code, these models, their drivers, or the files the drivers load. The planted bugs and the configs of fx's old defects run only by hand, with both `check.sh` scripts and no arguments.
 
 ## MCP models without a driver here
 

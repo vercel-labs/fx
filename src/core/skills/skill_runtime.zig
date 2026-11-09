@@ -3214,9 +3214,10 @@ fn renderSkillPrompt(
         defer alloc.free(safe_description);
         var description_limited = false;
         if (limits.skill_description_bytes.source == .compiled_default) {
-            const end = skillDescriptionPrefix(safe_description, context_limits.catalog_skill_description_characters);
-            try model_context_encoding.writeScalar(&description.writer, safe_description[0..end]);
-            description_limited = end < safe_description.len;
+            const cut = catalogDescriptionCut(safe_description, context_limits.catalog_skill_description_characters);
+            try model_context_encoding.writeScalar(&description.writer, safe_description[0..cut.end]);
+            if (cut.shortened) try description.writer.writeAll(description_cut_marker);
+            description_limited = cut.shortened;
         } else {
             const observed = try writeBoundedEncodedScalar(
                 alloc,
@@ -3442,6 +3443,35 @@ test "an unconfigured skill description is cut to the catalog's default characte
     defer alloc.free(kept.text);
     try std.testing.expect(kept.limited);
     try std.testing.expectEqual(@as(usize, 250), kept.text.len);
+}
+
+/// Ends a description the catalog shortened, as `writeBoundedSkillName` ends
+/// a shortened name.
+const description_cut_marker = "...";
+
+const DescriptionCut = struct {
+    /// Byte length of the text to show.
+    end: usize,
+    /// The text goes on past `end`, so the marker follows it.
+    shortened: bool,
+};
+
+/// The catalog's default cut: at most `max_characters` characters, the marker
+/// included. A longer description ends after the last whole word that fits
+/// before the marker, so the model reads no broken word and can tell that the
+/// description goes on. Text whose only space falls in the first half of the
+/// room, such as a long path, is cut at the character limit instead.
+fn catalogDescriptionCut(text: []const u8, max_characters: usize) DescriptionCut {
+    const whole = skillDescriptionPrefix(text, max_characters);
+    if (whole == text.len) return .{ .end = whole, .shortened = false };
+    const room = skillDescriptionPrefix(text, max_characters - description_cut_marker.len);
+    var end = room;
+    if (text[room] != ' ') {
+        if (std.mem.findScalarLast(u8, text[0..room], ' ')) |space| {
+            if (space >= room / 2) end = space;
+        }
+    }
+    return .{ .end = std.mem.trimEnd(u8, text[0..end], " ,;:").len, .shortened = true };
 }
 
 fn skillDescriptionPrefix(text: []const u8, max_characters: usize) usize {
@@ -4655,6 +4685,53 @@ test "skill catalog uses model capacity and preserves explicit byte overrides" {
     defer same.deinit(alloc);
     try std.testing.expectEqualStrings(small.text, same.text);
     try std.testing.expect(small.text.len <= 1600);
+}
+
+test "catalog descriptions end at a whole word and mark the cut" {
+    const limit = context_limits.catalog_skill_description_characters;
+    // A description that fits is shown whole, with no marker.
+    const short = "Review a change.";
+    try std.testing.expectEqual(DescriptionCut{ .end = short.len, .shortened = false }, catalogDescriptionCut(short, limit));
+    const exact = text_utils.repeat("a", limit);
+    try std.testing.expectEqual(DescriptionCut{ .end = limit, .shortened = false }, catalogDescriptionCut(exact, limit));
+
+    // A longer one ends at the end of a whole word that fits before the
+    // marker, with no separator left before the marker.
+    const room = limit - description_cut_marker.len;
+    const words = text_utils.repeat("Draft release notes, ", 20);
+    const cut = catalogDescriptionCut(words, limit);
+    try std.testing.expect(cut.shortened);
+    try std.testing.expect(cut.end <= room);
+    try std.testing.expect(words[cut.end] == ' ' or words[cut.end] == ',');
+    try std.testing.expect(std.mem.trimEnd(u8, words[0..cut.end], " ,;:").len == cut.end);
+
+    // A word that ends exactly where the room ends is kept, without the comma
+    // after it.
+    const fitted = text_utils.repeat("x", room - 7) ++ " notes, and more";
+    try std.testing.expectEqual(DescriptionCut{ .end = room - 1, .shortened = true }, catalogDescriptionCut(fitted, limit));
+
+    // One long token, such as a path, is cut at the limit.
+    const token = text_utils.repeat("p", 300);
+    try std.testing.expectEqual(DescriptionCut{ .end = room, .shortened = true }, catalogDescriptionCut(token, limit));
+
+    // The cut counts characters, so a multibyte word stays whole.
+    const accented = text_utils.repeat("café ", 60);
+    const accented_cut = catalogDescriptionCut(accented, limit);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(accented[0..accented_cut.end]));
+    try std.testing.expect(std.mem.endsWith(u8, accented[0..accented_cut.end], "café"));
+}
+
+test "skill catalog marks a description it shortened" {
+    const alloc = std.testing.allocator;
+    const skills = [_]Skill{
+        .{ .name = "notes", .description = text_utils.repeat("Draft release notes from merged pull requests. ", 8), .path = "/workspace/.agents/skills/notes", .source = .workspace_agents },
+        .{ .name = "review", .description = "Review a change.", .path = "/workspace/.agents/skills/review", .source = .workspace_agents },
+    };
+    var result = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
+    defer result.deinit(alloc);
+    // Four repetitions are 188 characters; the cut ends after the next whole word.
+    try std.testing.expect(std.mem.find(u8, result.text, "pull requests. Draft... (location:") != null);
+    try std.testing.expect(std.mem.find(u8, result.text, "- review: Review a change. (location:") != null);
 }
 
 test "skill catalog lists one entry for copies with the same name and description" {

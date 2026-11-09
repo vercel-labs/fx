@@ -1547,6 +1547,10 @@ const context_lines_before = 2;
 /// Bounds the line comparison on large files; a longer old_string still
 /// places its window by its first lines.
 const max_compared_lines = 256;
+/// Finding the closest window compares every file line with old_string's
+/// lines, so past this many lines the hint would cost more time and memory
+/// than re-reading the file, and the message stays the plain advice.
+const max_hint_file_lines = 100_000;
 
 /// The failure for an old_string found zero or several times. `.file_lines`
 /// quotes the lines the edit most likely meant; `.plain` keeps the recovery
@@ -1726,11 +1730,16 @@ fn closestLines(alloc: Allocator, content: []const u8, old_string: []const u8) e
     }
     if (old_lines.items.len == 0) return null;
 
+    // A final line ending does not start another line.
+    const ends_with_newline = content.len > 0 and content[content.len - 1] == '\n';
+    const line_count = 1 + std.mem.count(u8, content, "\n") - @intFromBool(ends_with_newline);
+    if (line_count > max_hint_file_lines) return null;
     var starts: std.ArrayList(usize) = .empty;
     defer starts.deinit(alloc);
-    try starts.append(alloc, 0);
+    try starts.ensureTotalCapacityPrecise(alloc, line_count);
+    starts.appendAssumeCapacity(0);
     for (content, 0..) |byte, i| {
-        if (byte == '\n' and i + 1 < content.len) try starts.append(alloc, i + 1);
+        if (byte == '\n' and i + 1 < content.len) starts.appendAssumeCapacity(i + 1);
     }
     const first = (try votedWindowStart(alloc, content, starts.items, old_lines.items)) orelse
         loneLineWindowStart(content, starts.items, old_lines.items) orelse
@@ -2374,6 +2383,23 @@ test "a failed edit shows at most the lines a hint allows" {
     try std.testing.expect(std.mem.startsWith(u8, message, "edit_file failed: old_string not found in file; the closest match is lines 1-40.\n"));
     try std.testing.expect(std.mem.find(u8, message, "value_39 = 39\nIf the change") != null);
     try std.testing.expect(std.mem.find(u8, message, "value_40") == null);
+}
+
+test "a failed edit of a file past the hint's line limit keeps the plain advice" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const remembered = "timeout = 25 # seconds\nretries = 2\n";
+    var content: std.ArrayList(u8) = .empty;
+    try content.appendSlice(arena, "timeout = 30 # seconds\nretries = 2\n");
+    // The two lines above and these empty lines fill the file to the limit
+    // exactly; the final line ending starts no line.
+    try content.appendNTimes(arena, '\n', max_hint_file_lines - 2);
+    const at_limit = try notFoundMessage(arena, content.items, remembered);
+    try std.testing.expect(std.mem.startsWith(u8, at_limit, "edit_file failed: old_string not found in file; the closest match is lines 1-2."));
+
+    try content.append(arena, '\n');
+    try std.testing.expectEqualStrings(not_found_message, try notFoundMessage(arena, content.items, remembered));
 }
 
 test "a not-unique edit names the lines of its occurrences" {
