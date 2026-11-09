@@ -8,14 +8,14 @@
 # permission request reaches the client through its parent session. Its
 # design configs (MCAcpChildApproval, MCAcpChildApprovalReserve,
 # MCAcpChildApprovalAnswered, MCAcpChildApprovalNoHost, and one per later
-# law: Run, Close, Cause, WorkerStop, Kinds) must pass. The code before the
-# change (MCAcpChildApprovalToday), two planted bugs, and the behavior of the
-# heads the repairs started from, one config per law (StaleCard, SpawnLeak,
-# SharedIds, Starved, CancelGap, RepeatedIds, LateResponse, GuessedCause,
-# StopReads, KindGap, SteerLeak), and the planted wrong variants NoCardGate
-# and KindGapElicitation must each break the property they name. Track, Fixed,
-# OneRun, and Kinds in a config switch on the parts of the model it checks, so
-# each law has a small config.
+# law: Run, Close, Cause, WorkerStop, Kinds, ParentGone) must pass. The code
+# before the change (MCAcpChildApprovalToday), two planted bugs, and the
+# behavior of the heads the repairs started from, one config per law
+# (StaleCard, SpawnLeak, SharedIds, Starved, CancelGap, RepeatedIds,
+# LateResponse, GuessedCause, StopReads, KindGap, SteerLeak, ParentGoneDeny),
+# and the planted wrong variants NoCardGate and KindGapElicitation must each
+# break the property they name. Track, Fixed, OneRun, and Kinds in a config
+# switch on the parts of the model it checks, so each law has a small config.
 #
 # AcpStopReasons: ACP v1 stop reasons for fx acp, fx's own names for libfx, and
 # a stop reason that agrees with what the next prompt holds, for every cause: a
@@ -104,4 +104,6 @@ AcpChildApproval MCAcpChildApprovalStopReads ReadsTrue
 AcpChildApproval MCAcpChildApprovalKindGap NoStaleRequest
 AcpChildApproval MCAcpChildApprovalKindGapElicitation NoStaleRequest
 AcpChildApproval MCAcpChildApprovalSteerLeak SteeringEnded
+AcpChildApproval MCAcpChildApprovalParentGone -
+AcpChildApproval MCAcpChildApprovalParentGoneDeny ParentReadsTrue
 EOF

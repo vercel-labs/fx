@@ -42,6 +42,10 @@
 (*    prompt is closed, the subagent was stopped, or the registry is full, *)
 (*    not as noninteractive mode, and not as the person's denial. A        *)
 (*    stopped worker's wait refuses too ("stopRefuses"): ReadsTrue.        *)
+(*  - The parent's own request can find its registry entry gone (Track     *)
+(*    "gone"). Its wait then ends with a refusal that reads as closed, as  *)
+(*    a subagent's does ("parentRefuses"), and not as the person's denial: *)
+(*    ParentReadsTrue.                                                     *)
 (*  - The registry holds Capacity entries for every kind of request. A     *)
 (*    subagent's requests count against one fewer (ReserveSlot), so the    *)
 (*    parent's own request always finds a slot. Subagents past the two     *)
@@ -74,9 +78,10 @@ CONSTANTS Children,        \* the subagents modeled one by one
           OthersMayAsk,    \* TRUE: subagents past the modeled ones may ask (off to check liveness)
           Capacity,        \* entries the registry holds, for every kind of request
           OneRun,          \* TRUE: the modeled children are calls of one subagent run
-          Track,           \* parts modeled, to bound the state space: a subset of {"responses", "causes"}
+          Track,           \* parts modeled, to bound the state space: a subset of
+                           \* {"responses", "causes", "gone"}
           Fixed,           \* repairs in effect: a subset of {"seq", "closeCards", "cardGate",
-                           \* "carryCause", "stopRefuses", "steerCloses"} and of Kinds
+                           \* "carryCause", "stopRefuses", "steerCloses", "parentRefuses"} and of Kinds
           Kinds            \* other request kinds modeled one each: a subset of
                            \* {"host_tool", "journal", "elicitation"}
 
@@ -85,14 +90,15 @@ ASSUME AtomicGate \in BOOLEAN /\ StopCancelsWait \in BOOLEAN
 ASSUME FinishCards \in BOOLEAN /\ SpawnClosesGate \in BOOLEAN /\ PrefixIds \in BOOLEAN
 ASSUME ReserveSlot \in BOOLEAN /\ ResendCancel \in BOOLEAN /\ OthersMayAsk \in BOOLEAN
 ASSUME OneRun \in BOOLEAN
-ASSUME Track \subseteq {"responses", "causes"}
+ASSUME Track \subseteq {"responses", "causes", "gone"}
 ASSUME Kinds \subseteq {"host_tool", "journal", "elicitation"}
-ASSUME Fixed \subseteq ({"seq", "closeCards", "cardGate", "carryCause", "stopRefuses", "steerCloses"} \cup Kinds)
+ASSUME Fixed \subseteq ({"seq", "closeCards", "cardGate", "carryCause", "stopRefuses", "steerCloses", "parentRefuses"} \cup Kinds)
 ASSUME MaxPrompts \in Nat \ {0}
 ASSUME Capacity \in Nat \ {0}
 
 Responses == "responses" \in Track
 Causes == "causes" \in Track
+Gone == "gone" \in Track
 
 Answers == {"allow", "reject", "garbage", "error"}
 Settled == Answers \cup {"cancelled", "stopCancelled"}
@@ -116,7 +122,8 @@ VARIABLES
     allowed,   \* history: an allow reached this subagent's open entry
     card,      \* the call's card: "none" | "pending" | "completed" | "failed"
     others,    \* open requests of subagents that are not modeled one by one
-    parent,    \* the parent's own request: "none" | "open" | "done" | "failed"
+    parent,    \* the parent's own request: "none" | "open" | "done" | "failed", or
+               \* "goneClosed" | "goneDenied": its entry was gone, and what its model reads
     seq,       \* the call's order among its run's announced calls, set with its card
     closer,    \* the prompt's end closing cards: "idle" | "closing" (holds the card lock) | "done"
     response,  \* the current prompt's response: "none" | "sent"
@@ -144,7 +151,7 @@ TypeOK ==
     /\ allowed \in [Children -> BOOLEAN]
     /\ card \in [Children -> {"none", "pending"} \cup FinalCards]
     /\ others \in 0..Capacity
-    /\ parent \in {"none", "open", "done", "failed"}
+    /\ parent \in {"none", "open", "done", "failed", "goneClosed", "goneDenied"}
     /\ seq \in [Children -> 0..Cardinality(Children)]
     /\ closer \in {"idle", "closing", "done"}
     /\ response \in {"none", "sent"}
@@ -510,6 +517,15 @@ ParentAnswer ==
     /\ UNCHANGED <<prompt, gate, prompts, child, sawOpen, entry, atClient, wire, sent, stopped, result, allowed, card, others>>
     /\ UNCHANGED nv
 
+\* The parent's request finds no entry in the registry: nothing settled it. Its
+\* wait ends with a refusal that reads as closed ("parentRefuses"); it used to
+\* return a plain deny, which reads as the person's denial. The slot is free.
+ParentGone ==
+    /\ Gone /\ parent = "open"
+    /\ parent' = IF "parentRefuses" \in Fixed THEN "goneClosed" ELSE "goneDenied"
+    /\ UNCHANGED <<prompt, gate, prompts, child, sawOpen, entry, atClient, wire, sent, stopped, result, allowed, card, others>>
+    /\ UNCHANGED nv
+
 ----------------------------------------------------------------------------
 (* The prompt thread's end: the closer, then the response.                *)
 
@@ -587,7 +603,7 @@ Next ==
     \/ \E c \in Children : Stop(c) \/ CloseCard(c)
     \/ PromptEnd \/ Cancel \/ Reopen \/ StartFails
     \/ BeginClose \/ EndClose \/ Respond
-    \/ OtherAsk \/ OtherAnswer \/ ParentAsk \/ ParentAnswer
+    \/ OtherAsk \/ OtherAnswer \/ ParentAsk \/ ParentAnswer \/ ParentGone
     \/ \E k \in Kinds : KInsert(k) \/ KWrite(k) \/ KAnswer(k)
 
 \* fx's own steps are fair; the user, the parent's stop, and the client are
@@ -672,6 +688,9 @@ UniqueIds ==
 
 \* The parent's own request always finds a slot.
 ParentNeverStarved == parent # "failed"
+
+\* A parent's request whose entry is gone is not read as the person's denial.
+ParentReadsTrue == parent # "goneDenied"
 
 \* No card changes once the prompt has answered: an update after the response
 \* breaks ACP's prompt turn.
