@@ -20,6 +20,9 @@ import {
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 120_000;
+// Filling the whole combining pool takes about two billion steps of fx's
+// scan for an equal suffix, so the cases that do it get much longer.
+const POOL_TIMEOUT = 900_000;
 const READY_TIMEOUT = 15_000;
 
 // A terminal cell holds at most 64 bytes of text: its base character and the
@@ -41,6 +44,64 @@ const cases: Case[] = [
 function keptMarks(mark: string): number {
   const markBytes = new TextEncoder().encode(mark).length;
   return Math.floor((CELL_BYTES - BASE.length) / markBytes);
+}
+
+// fx keeps the text a cell shows in a pool of at most 65,535 distinct suffixes.
+// A character with three marks puts up to three suffixes in it, one for each
+// prefix of its marks, so a few tens of thousands of characters with different
+// marks fill it. fx then drops the marks it has no room for and keeps running.
+const POOL_ENTRIES = 65_535;
+const POOL_MARKS = Array.from({ length: 112 }, (_, index) =>
+  String.fromCodePoint(0x300 + index),
+);
+
+/** `count` characters, each `x`, three marks, and a space; no two share all three marks. */
+function poolFillingText(count: number): string {
+  const n = POOL_MARKS.length;
+  const parts: string[] = [];
+  for (let index = 0; index < count; index++) {
+    const a = index % n;
+    const b = Math.floor(index / n) % n;
+    const c = Math.floor(index / (n * n)) % n;
+    parts.push(`x${POOL_MARKS[a]}${POOL_MARKS[b]}${POOL_MARKS[c]} `);
+  }
+  return parts.join("");
+}
+
+/** The index of the first character whose third mark has no room, from the suffixes the text adds. */
+function firstDroppedCharacter(): number {
+  const n = POOL_MARKS.length;
+  const seen = new Set<string>();
+  for (let index = 0; ; index++) {
+    const a = index % n;
+    const b = Math.floor(index / n) % n;
+    const c = Math.floor(index / (n * n)) % n;
+    seen.add(`${a}`);
+    seen.add(`${a},${b}`);
+    seen.add(`${a},${b},${c}`);
+    if (seen.size >= POOL_ENTRIES) return index + 1;
+  }
+}
+
+/** An fx tape of `frames`, each one write to a terminal of `cols` by `rows` cells. */
+function tapeBytes(cols: number, rows: number, frames: string[]): Buffer {
+  const version = Buffer.from("cell-suffix-pool");
+  const head = Buffer.alloc(5 + 2 + 2 + 8 + 1);
+  head.write("FXTP\x01", 0, "binary");
+  head.writeUInt16LE(cols, 5);
+  head.writeUInt16LE(rows, 7);
+  head.writeBigUInt64LE(0n, 9);
+  head.writeUInt8(version.length, 17);
+  const parts: Buffer[] = [head, version];
+  for (const text of frames) {
+    const payload = Buffer.from(text, "utf8");
+    const header = Buffer.alloc(9);
+    header.writeInt32LE(0, 0);
+    header.writeUInt8(1, 4);
+    header.writeUInt32LE(payload.length, 5);
+    parts.push(header, payload);
+  }
+  return Buffer.concat(parts);
 }
 
 type Fx = {
@@ -87,6 +148,7 @@ async function startFx(replies: Response[]): Promise<Fx> {
     width: 60,
     height: 20,
     stderrPath,
+    isolated: true,
   });
   const fx = { session, gateway, home, stderrPath, tape };
   running.push(fx);
@@ -94,15 +156,23 @@ async function startFx(replies: Response[]): Promise<Fx> {
   return fx;
 }
 
-/** Waits for `text` on screen. A timeout says whether fx is still alive and what it wrote to stderr. */
-async function waitFor(fx: Fx, text: string): Promise<void> {
-  try {
-    await fx.session.waitForText(text, READY_TIMEOUT);
-  } catch (error) {
-    const stderr = readFileSync(fx.stderrPath, "utf8");
-    throw new Error(
-      `${JSON.stringify(text)} never showed; fx alive: ${fx.session.isAlive()}; stderr: ${JSON.stringify(stderr)}\n${String(error)}`,
-    );
+/**
+ * Waits for `text` on screen, and gives up at once when fx has exited. A
+ * failure says whether fx is still alive and what it wrote to stderr.
+ */
+async function waitFor(fx: Fx, text: string, timeout = READY_TIMEOUT): Promise<void> {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    try {
+      await fx.session.waitForText(text, Math.max(1, Math.min(5_000, deadline - Date.now())));
+      return;
+    } catch (error) {
+      if (fx.session.isAlive() && Date.now() < deadline) continue;
+      const stderr = readFileSync(fx.stderrPath, "utf8");
+      throw new Error(
+        `${JSON.stringify(text)} never showed; fx alive: ${fx.session.isAlive()}; stderr: ${JSON.stringify(stderr)}\n${String(error)}`,
+      );
+    }
   }
 }
 
@@ -238,5 +308,72 @@ describe.skipIf(SKIP)("tui: a cell that gets more marks than it can hold", () =>
       expectKeptMarks(await replayedRows(reply, "END"), hugeCase);
     },
     TIMEOUT,
+  );
+
+  test(
+    "stress: a model reply that fills the whole combining pool does not end fx",
+    async () => {
+      const characters = firstDroppedCharacter() + 3_000;
+      const fx = await startFx([
+        fakeGatewayFinalText(`start ${poolFillingText(characters)}END`),
+      ]);
+      await fx.session.sendText("hello");
+      await waitFor(fx, "END", POOL_TIMEOUT);
+      expectRunning(fx);
+      expect(fx.gateway.requests.length).toBe(1);
+      // The composer still takes input after the reply. fx keeps drawing the
+      // long reply for a while, so the typed text can take that long to show.
+      await fx.session.sendLiteralText("after");
+      await waitFor(fx, "after", POOL_TIMEOUT);
+      expectRunning(fx);
+      // fx's own recording of the whole reply replays to the end.
+      expect((await replayedRows(fx, "after")).length).toBeGreaterThan(0);
+    },
+    POOL_TIMEOUT,
+  );
+});
+
+describe("fx replay: a tape whose characters fill the whole combining pool", () => {
+  test(
+    "plays to the end, keeps the marks the pool has room for, and drops the rest",
+    () => {
+      const characters = 54_000;
+      const home = mkdtempSync(join(tmpdir(), "fx-cell-suffix-pool-"));
+      try {
+        const tape = join(home, "pool.fxtape");
+        const golden = join(home, "golden.txt");
+        writeFileSync(tape, tapeBytes(200, 50, [poolFillingText(characters)]));
+        const replay = spawnSync(FX_BIN, ["replay", tape, "--golden", golden], {
+          encoding: "utf8",
+          timeout: POOL_TIMEOUT - 60_000,
+          env: {
+            HOME: home,
+            FX_HOME: join(home, "fx"),
+            PATH: process.env.PATH ?? "/usr/bin:/bin",
+            FX_SOUND: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+          },
+        });
+        expect(replay.stderr).toBe("");
+        expect(replay.status).toBe(0);
+
+        // The characters before the pool filled keep all three marks. Each one
+        // after it keeps the two marks whose suffixes were already in the pool
+        // and loses the third, which would need an entry of its own.
+        const screen = readFileSync(golden, "utf8");
+        const counts = [...screen.matchAll(/x([\u0300-\u036f]*)/g)].map(
+          (match) => match[1]!.length,
+        );
+        const withTwo = counts.filter((count) => count === 2).length;
+        const withThree = counts.filter((count) => count === 3).length;
+        expect(withTwo + withThree).toBe(counts.length);
+        expect(withTwo).toBe(characters - firstDroppedCharacter());
+        expect(withThree).toBeGreaterThan(0);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    POOL_TIMEOUT,
   );
 });

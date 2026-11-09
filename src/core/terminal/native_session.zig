@@ -2971,7 +2971,6 @@ fn replayEngine(
 
 fn replay_feed_error_is_corrupt(err: anyerror) bool {
     return switch (err) {
-        error.CombiningPoolCapacityExceeded,
         error.ControlStringTooLarge,
         error.HyperlinkPoolCapacityExceeded,
         error.InvalidFeedMode,
