@@ -431,10 +431,12 @@ test "agent request builder sends stable cache markers in each family's syntax" 
         .{ .role = .system, .content = "turn context" },
     };
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
-    for ([_]struct { model: []const u8, anthropic: usize, openai: usize }{
+    for ([_]struct { model: []const u8, anthropic: usize, openai: usize, bedrock: usize = 0 }{
         .{ .model = "anthropic/claude-sonnet-5.5", .anthropic = 1, .openai = 0 },
         .{ .model = "openai/gpt-6.1-sol", .anthropic = 0, .openai = 1 },
         .{ .model = "openai/gpt-5.6-luna", .anthropic = 0, .openai = 1 },
+        .{ .model = "amazon/nova-pro", .anthropic = 0, .openai = 0, .bedrock = 1 },
+        .{ .model = "amazon/nova-2-lite", .anthropic = 0, .openai = 0, .bedrock = 1 },
         .{ .model = "openai/gpt-5", .anthropic = 0, .openai = 0 },
         .{ .model = "google/gemini-3-flash", .anthropic = 0, .openai = 0 },
     }) |case| {
@@ -450,6 +452,7 @@ test "agent request builder sends stable cache markers in each family's syntax" 
         defer alloc.free(body);
         try std.testing.expectEqual(case.anthropic, std.mem.count(u8, body, "\"cacheControl\""));
         try std.testing.expectEqual(case.openai, std.mem.count(u8, body, "\"promptCacheBreakpoint\""));
+        try std.testing.expectEqual(case.bedrock, std.mem.count(u8, body, "\"cachePoint\""));
         // The caller's instructions are not modified.
         try std.testing.expect(instructions[0].cache_breakpoint);
     }
@@ -478,6 +481,7 @@ test "agent requests carry delivered rules in the tool result for every family, 
         "moonshotai/kimi-k3",
         "alibaba/qwen3.8-max",
         "meta/llama-4-maverick",
+        "amazon/nova-pro",
     }) |model| {
         var options = resolveGatewayProviderOptions(model, .auto, false);
         options.prompt_caching = true;
@@ -494,7 +498,7 @@ test "agent requests carry delivered rules in the tool result for every family, 
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"role\":\"system\""));
         // Only the stable instructions carry a marker, for the families fx marks.
         const markers: usize = @intFromBool(vercel_model_policy.cacheMarkers(model) != .none);
-        try std.testing.expectEqual(markers, std.mem.count(u8, body, "\"cacheControl\"") + std.mem.count(u8, body, "\"promptCacheBreakpoint\""));
+        try std.testing.expectEqual(markers, std.mem.count(u8, body, "\"cacheControl\"") + std.mem.count(u8, body, "\"promptCacheBreakpoint\"") + std.mem.count(u8, body, "\"cachePoint\""));
     }
 }
 
