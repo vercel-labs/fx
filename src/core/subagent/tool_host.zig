@@ -546,13 +546,16 @@ pub const Runtime = struct {
                         switch (result) {
                             .receipt => |delivery| break :steer delivery,
                             .waiting => {},
-                            .unavailable, .cancelled, .conflict, .capacity => return self.encodeManaged(alloc, .{
+                            .capacity => {
+                                var buf: [sent_result_bytes]u8 = undefined;
+                                return self.encodeManaged(alloc, .{ .ok = false, .error_code = "feedback_capacity", .result = capacityResult(&buf, agent) });
+                            },
+                            .unavailable, .cancelled, .conflict => return self.encodeManaged(alloc, .{
                                 .ok = false,
                                 .error_code = switch (result) {
                                     .unavailable => "state_unavailable",
                                     .cancelled => "child_cancelled",
                                     .conflict => "operation_conflict",
-                                    .capacity => "feedback_capacity",
                                     else => unreachable,
                                 },
                             }),
@@ -1555,6 +1558,7 @@ pub const Runtime = struct {
         };
         if (failure) |err| return self.closeNotWritten(owned, err);
         debug_trace.eventf("mailbox", "closed", .{}, "child={s}", .{owned});
+        self.managed.forgetFeedback(owned);
         return true;
     }
 
@@ -3188,6 +3192,12 @@ const sent_result_bytes = 256 + domain.max_agent_name_bytes;
 /// `message`'s answer when the child takes it now.
 fn sentResult(buf: []u8, agent: []const u8) []const u8 {
     return std.mem.print(buf, "Sent to {s}, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.", .{agent}) catch "Sent.";
+}
+
+/// `message`'s refusal when the child's running turn already holds as many
+/// unread messages as it takes.
+fn capacityResult(buf: []u8, agent: []const u8) []const u8 {
+    return std.mem.print(buf, "{s} already has {d} unread messages from you. Its next step reads them; send this one again after that, or wait for its report.", .{ agent, managed_owner.max_unread_feedback }) catch "The subagent already has too many unread messages from you.";
 }
 
 /// `message`'s answer when the child is busy and the message waits.
