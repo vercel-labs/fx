@@ -10331,6 +10331,12 @@ describe("acp: subagent permission requests", () => {
   const withdrawn = (messages: any[], requestId: number) => messages.some((message) => message.method === "$/cancel_request" && message.params?.requestId === requestId);
   const answer = (requestId: number, optionId: string) => client!.send({ jsonrpc: "2.0", id: requestId, result: { outcome: { outcome: "selected", optionId } } });
 
+  /// Whether a trace line tells how request `id` ended without an answer: a
+  /// cancel settled it, a stop withdrew it, or its entry was gone. The line
+  /// that says it was withdrawn again after its write is not one of these.
+  const settlesRequest = (line: string, id: number) =>
+    new RegExp(`(outbound request cancelled|subagent permission request withdrawn|(subagent|parent) permission request gone) id=${id}( |$)`).test(line);
+
   /// What a client shows for one call card: its `session/update`s, in order.
   const cardUpdates = (messages: any[], toolCallId: string) => messages
     .filter((message) => message.method === "session/update" && message.params?.update?.toolCallId === toolCallId)
@@ -10736,14 +10742,8 @@ describe("acp: subagent permission requests", () => {
         expect(trace).toContain(`outbound request cancelled id=${request.id} reason=session_cancel`);
         // The cancel is the request's one settling line: the cleanup after
         // the failed wait finds no entry and says nothing of one gone.
-        const settled = trace.split("\n").filter((line) => line.includes(`id=${request.id}`) && /request (cancelled|withdrawn|gone)/.test(line));
-        expect(settled).toHaveLength(1);
+        expect(trace.split("\n").filter((line) => settlesRequest(line, request.id))).toHaveLength(1);
         expect(trace).not.toContain("permission request gone");
-        // The subagent's own end report for the card the cancel closed is
-        // dropped, and the trace names the card.
-        const dropped = trace.split("\n").filter((line) => line.includes("subagent card update dropped"));
-        expect(dropped).toHaveLength(1);
-        expect(dropped[0]).toContain(`card_id=${request.params.toolCall.toolCallId} `);
         expect(client!.stderr).toBe("");
       } finally {
         await client?.close();
@@ -10951,10 +10951,13 @@ describe("acp: subagent permission requests", () => {
       // written (src/acp/prompt_test_controls.zig).
       const inserted = join(root.root, "request-inserted");
       const release = join(root.root, "request-release");
+      const tracePath = join(root.root, "trace.log");
       try {
         await startAskSession(root, fixture.gateway, false, {
           FX_TEST_ACP_REQUEST_INSERTED: inserted,
           FX_TEST_ACP_REQUEST_RELEASE: release,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "acp",
         });
         client!.setPermissionOption(null);
         const messages: any[] = [];
@@ -10979,6 +10982,15 @@ describe("acp: subagent permission requests", () => {
             message.method === "$/cancel_request" && message.params?.requestId === request.id)).toBe(true);
         }
         expect(existsSync(join(root.workspace, "alpha.txt"))).toBe(false);
+        // The card closed with the prompt before alpha could report its call's
+        // end, so that report is dropped, and the trace names the card. The
+        // cancel is the request's one settling line.
+        const request = permissionRequests(all)[0];
+        const trace = readFileSync(tracePath, "utf8");
+        const dropped = trace.split("\n").filter((line) => line.includes("subagent card update dropped"));
+        expect(dropped).toHaveLength(1);
+        expect(dropped[0]).toContain(`card_id=${request.params.toolCall.toolCallId} `);
+        expect(trace.split("\n").filter((line) => settlesRequest(line, request.id))).toHaveLength(1);
         expect(client!.stderr).toBe("");
       } finally {
         writeFileSync(release, "");
