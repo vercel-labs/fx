@@ -403,7 +403,7 @@ Startup latency benchmarks live in `benchmarks/` and run in CI via `.github/work
 ./benchmarks/startup.sh --quick    # quick run (20 iterations)
 ```
 
-The `Startup Latency` job builds a ReleaseSafe binary, measures six CLI paths with hyperfine, and enforces per-command latency budgets. The same job runs `tests/e2e/tui-performance.test.ts` as the interactive terminal performance gate. A PR that exceeds either fails the check.
+The `Startup Latency` job builds a ReleaseSafe binary, measures six CLI paths with hyperfine, and enforces per-command latency budgets. The same job runs `tests/e2e/tui-performance.test.ts` as the interactive terminal performance gate, then `benchmarks/startup_fixture.test.ts` and the `--self-check` of `tests/tla/drivers/benchmarks/driver.ts`, which check that `startup.sh` removes only the fixture folder it made. A PR that exceeds the latency budgets or fails the performance gate, the fixture test, or the self-check fails the check.
 
 The long-turn memory and libfx runtime benchmarks run only on request. Start them with `gh workflow run bench.yml --ref <branch> -f long_turn_memory=true` or `-f libfx_runtime=true`.
 
