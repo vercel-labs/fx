@@ -2238,6 +2238,60 @@ test("fx ask runs a subagent as a v2 child with its own log, recorded in the par
   }
 }, TIMEOUT * 2);
 
+test("fx ask denies a subagent's gated write at once in ask mode", async () => {
+  // fx ask has no way to ask the person for a subagent, so the subagent's
+  // write is refused at once instead of waiting forever, and its model reads
+  // why: nobody was asked, which is not a refusal by the person.
+  const fixture = createFixture("fx-v2-subagent-ask-deny-");
+  const seen: string[] = [];
+  let afterDenial = "";
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isChildRequest(body)) {
+      if (body.includes("w_child")) {
+        seen.push("child-after");
+        afterDenial = body;
+        return fakeGatewayFinalText("CHILD_SAW_THE_DENIAL");
+      }
+      seen.push("child-first");
+      return fakeGatewayToolCall("w_child", "write_file", { path: "child.txt", content: "child wrote this\n" });
+    }
+    if (isReportTurn(body)) {
+      seen.push("parent-report");
+      return fakeGatewayFinalText("PARENT_REPORT_DONE");
+    }
+    if (body.includes("delegate-write")) {
+      seen.push("parent-after-call");
+      return fakeGatewayFinalText("PARENT_SENT");
+    }
+    seen.push("parent-call");
+    return fakeGatewayToolCall("delegate-write", "subagent", { request: { action: "message", agent: "writer", message: "Write child.txt." } });
+  });
+  try {
+    const result = await runFx(["ask", "--json", "--ask", "Delegate the write."], {
+      cwd: fixture.workspace,
+      env: env(fixture, gateway),
+      timeoutMs: 20_000,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr).not.toContain("panic");
+    expect(existsSync(join(fixture.workspace, "child.txt"))).toBe(false);
+    expect(seen.filter((kind) => kind === "child-first")).toHaveLength(1);
+    expect(seen.filter((kind) => kind === "child-after")).toHaveLength(1);
+    expect(afterDenial).toContain("permission_required");
+    expect(afterDenial).toContain("The tool did not run");
+    // fx ask is noninteractive, so its text stays; the causes fx acp names
+    // (a closed prompt, a stop, a full registry) do not apply to it.
+    expect(afterDenial).toContain("Noninteractive mode cannot show an approval prompt");
+    expect(afterDenial).not.toContain("fx could not ask because");
+    expect(afterDenial).not.toContain("user_denied");
+    expect(afterDenial).not.toContain("Permission denied by user");
+    expect(JSON.parse(result.stdout).output).toContain("PARENT_REPORT_DONE");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT);
+
 test("a named subagent keeps its id, history and instructions across fx ask runs", async () => {
   const fixture = createFixture("fx-v2-subagent-named-");
   const childBodies: string[] = [];

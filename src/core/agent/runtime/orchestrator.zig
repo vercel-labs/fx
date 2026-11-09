@@ -6155,7 +6155,13 @@ fn permissionDeniedModelOutput(
             if (outcome.auto_review_result) |result| result.rationale else null,
             outcome.auto_review_failure,
         ),
-        .user_denied, .auto_denied, .policy_denied, .permission_required => tool_result_errors.toolPermissionDeniedJson(
+        // An approval a prompter could not ask for says why, where the plain
+        // refusal says noninteractive mode.
+        .permission_required => if (outcome.approval_unavailable) |cause|
+            tool_result_errors.toolApprovalUnavailableJson(alloc, tool_name, cause)
+        else
+            tool_result_errors.toolPermissionDeniedJson(alloc, tool_name, reason),
+        .user_denied, .auto_denied, .policy_denied => tool_result_errors.toolPermissionDeniedJson(
             alloc,
             tool_name,
             reason,

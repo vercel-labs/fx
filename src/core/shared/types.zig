@@ -2752,6 +2752,21 @@ pub const ToolPermissionDenialReason = enum {
     permission_required,
 };
 
+/// Why a tool's approval was needed and could not be asked for. A prompter
+/// that cannot ask fails with `error.PermissionPromptUnavailable`, or, when it
+/// knows why, with the error `permission_prompter.unavailableCause` maps back
+/// to one of these. A refusal without a cause says noninteractive mode.
+pub const ApprovalUnavailableCause = enum {
+    /// The prompt the request belongs to ended or was cancelled.
+    prompt_closed,
+    /// The agent that asked was stopped.
+    stopped,
+    /// Too many approval requests are open.
+    requests_full,
+    /// The client cannot show approval prompts.
+    client_unavailable,
+};
+
 pub const ToolPermissionDecision = enum {
     once,
     always,

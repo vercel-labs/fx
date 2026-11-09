@@ -21,6 +21,28 @@ pub fn pauseAfterTerminalWrite() void {
     }
 }
 
+/// What a Zig test runs after a request's registry entry is inserted and
+/// before the request is written, with the kind of request and its id. A test
+/// sets it to cancel in that gap, and puts it back.
+pub var before_request_write_hook: ?*const fn (kind: []const u8, request_id: u64) void = null;
+
+/// Holds a request after its registry entry is inserted and before the request
+/// is written, so a test can cancel in that gap. Every kind of request passes
+/// here: a permission request, an elicitation, a host tool call, and a journal
+/// flush. The two paths are set only by the tests of one fx process that sends
+/// one request at a time (`tests/e2e/acp.test.ts`,
+/// `tests/tla/drivers/acp/child_approval/driver.ts`). The marker names the kind.
+pub fn pauseBeforeRequestWrite(kind: []const u8, request_id: u64) void {
+    if (before_request_write_hook) |hook| hook(kind, request_id);
+    if (comptime build_options.libfx) return;
+    const inserted_path = io_mod.getenv("FX_TEST_ACP_REQUEST_INSERTED") orelse return;
+    const release_path = io_mod.getenv("FX_TEST_ACP_REQUEST_RELEASE") orelse return;
+    writeMarker(inserted_path, kind) catch return;
+    while (!pathExists(release_path)) {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
 pub fn noteReapBeforeJoin() void {
     if (comptime build_options.libfx) return;
     const control = controls() orelse return;

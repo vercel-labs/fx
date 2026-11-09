@@ -1635,13 +1635,17 @@ pub fn revalidateLiveActionPermissionOutcome(
             }
             break :blk outcome;
         },
-        .file_mutation => try requestPermissionOutcome(
-            input,
-            arena,
-            call,
-            permission_mode,
-            revalidation_grants,
-        ),
+        .file_mutation => |expected| blk: {
+            var outcome = try requestPermissionOutcome(
+                input,
+                arena,
+                call,
+                permission_mode,
+                revalidation_grants,
+            );
+            if (human_approval != .none) keepApprovedOffer(&outcome, expected);
+            break :blk outcome;
+        },
         .vision_paths => |expected| blk: {
             const canonical_call = try canonicalVisionPathCall(arena, call, expected);
             const refreshed = try requestPermissionOutcome(
@@ -1676,6 +1680,21 @@ pub fn revalidateLiveActionPermissionOutcome(
         outcome.human_approval = human_approval;
     }
     return outcome;
+}
+
+/// An exact approval outlives every later revalidation: an outcome its grants
+/// settled keeps the approved offer, so the next revalidation is settled the
+/// same way instead of asking again.
+fn keepApprovedOffer(
+    outcome: *command_admission.PermissionOutcome,
+    approved: file_mutation_contract.FileExecutionAuthorization,
+) void {
+    const authority = &(outcome.execution_authority orelse return);
+    const authorization = switch (authority.*) {
+        .file_mutation => |*value| value,
+        .ordinary, .run_command, .vision_paths => return,
+    };
+    if (authorization.grant_offer == null) authorization.grant_offer = approved.grant_offer;
 }
 
 fn commandAuthorityFingerprint(
@@ -1820,9 +1839,9 @@ fn requestFileMutationPermissionOutcomeFromAdmission(
                 call,
                 review,
                 authorization.grant_offer.?.grants,
-            ) catch |err| switch (err) {
-                error.PermissionPromptUnavailable => break :blk unavailable,
-                else => return err,
+            ) catch |err| {
+                if (!permission_prompter.isUnavailable(err)) return err;
+                break :blk approvalUnavailableOutcome(unavailable, err);
             };
             defer response.deinit();
             var outcome: command_admission.PermissionOutcome = .{
@@ -2037,6 +2056,53 @@ fn permissionOutcomeForResponse(
     return outcome;
 }
 
+/// `unavailable` with the cause the prompter's failure `err` names, when it
+/// names one. The model reads that approval was needed and could not be
+/// asked, and why, rather than that the person refused.
+fn approvalUnavailableOutcome(
+    unavailable: command_admission.PermissionOutcome,
+    err: anyerror,
+) command_admission.PermissionOutcome {
+    var outcome = unavailable;
+    outcome.approval_unavailable = permission_prompter.unavailableCause(err);
+    return outcome;
+}
+
+test "an approval that could not be asked carries the cause its prompter named" {
+    const unavailable: command_admission.PermissionOutcome = .{
+        .decision = .permission_required,
+        .denial_reason = .permission_required,
+        .requirement = .approval_required,
+    };
+    const named = [_]struct { err: anyerror, cause: types.ApprovalUnavailableCause }{
+        .{ .err = error.PermissionPromptClosed, .cause = .prompt_closed },
+        .{ .err = error.PermissionPromptStopped, .cause = .stopped },
+        .{ .err = error.PermissionPromptFull, .cause = .requests_full },
+        .{ .err = error.PermissionPromptClientUnavailable, .cause = .client_unavailable },
+    };
+    for (named) |case| {
+        const outcome = approvalUnavailableOutcome(unavailable, case.err);
+        try std.testing.expectEqual(case.cause, outcome.approval_unavailable.?);
+        try std.testing.expectEqual(types.ToolPermissionDecision.permission_required, outcome.decision);
+        try std.testing.expectEqual(types.ToolPermissionDenialReason.permission_required, outcome.denial_reason.?);
+    }
+    // A prompter that names no cause leaves it null: noninteractive mode.
+    try std.testing.expect(approvalUnavailableOutcome(unavailable, error.PermissionPromptUnavailable).approval_unavailable == null);
+
+    // Only a failure that means approval could not be asked is a refusal;
+    // any other failure is not turned into one.
+    for ([_]anyerror{
+        error.PermissionPromptUnavailable,
+        error.PermissionPromptClosed,
+        error.PermissionPromptStopped,
+        error.PermissionPromptFull,
+        error.PermissionPromptClientUnavailable,
+    }) |err| try std.testing.expect(permission_prompter.isUnavailable(err));
+    try std.testing.expect(!permission_prompter.isUnavailable(error.OutOfMemory));
+    try std.testing.expect(!permission_prompter.isUnavailable(error.Cancelled));
+    try std.testing.expect(permission_prompter.unavailableCause(error.OutOfMemory) == null);
+}
+
 fn humanApprovalProvenance(
     decision: ToolPermissionDecision,
 ) command_admission.HumanApprovalProvenance {
@@ -2075,9 +2141,9 @@ fn promptPermissionOutcome(
         call,
         null,
         grant_offer,
-    ) catch |err| switch (err) {
-        error.PermissionPromptUnavailable => return unavailable,
-        else => return err,
+    ) catch |err| {
+        if (!permission_prompter.isUnavailable(err)) return err;
+        return approvalUnavailableOutcome(unavailable, err);
     };
     defer response.deinit();
     var outcome = try permissionOutcomeForResponse(
@@ -4183,6 +4249,63 @@ test "interactive file admission passes its canonical grant offer to the prompte
             observed_grant.target_path,
         );
     }
+}
+
+test "an approved file write survives two live authority revalidations without asking again" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.disabled(),
+    );
+    input.workspace_root = workspace;
+    input.permission_prompter = recording.prompter();
+    const call: ToolCall = .{
+        .id = "write",
+        .name = "write_file",
+        .arguments_json = try arena.print(
+            "{{\"path\":\"{s}/note.txt\",\"content\":\"hello\\n\"}}",
+            .{workspace},
+        ),
+    };
+
+    const approved = try requestPermissionOutcome(input, arena, call, .ask, &.{});
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    // The live authority changes twice before the write, as when another
+    // subagent moves through its phases: each revalidation starts from the
+    // outcome the one before it returned.
+    const first = try revalidateLiveActionPermissionOutcome(
+        input,
+        arena,
+        call,
+        .ask,
+        &.{},
+        approved.execution_authority.?,
+        .once,
+    );
+    const second = try revalidateLiveActionPermissionOutcome(
+        input,
+        arena,
+        call,
+        .ask,
+        &.{},
+        first.execution_authority.?,
+        .once,
+    );
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+    try std.testing.expectEqual(ToolPermissionDecision.once, second.decision);
+    try std.testing.expect(second.execution_authority.? == .file_mutation);
 }
 
 test "automatic non-allow is recoverable regardless tool approval policy" {

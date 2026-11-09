@@ -133,6 +133,14 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_ACP_REQUEST_INSERTED": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_ACP_REQUEST_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_AUTH_LOCK_CONTENTION": {
       "job": "test",
       "stability": "internal"

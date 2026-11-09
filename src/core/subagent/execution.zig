@@ -298,6 +298,16 @@ pub const TurnContext = struct {
     live_authority: ?*authority_mod.Resolver = null,
     approval_registry: ?*approval_registry_mod.Registry = null,
     approval_worker_route: ?approval_registry_mod.WorkerRoute = null,
+    /// For a turn no screen shows, in fx acp and fx ask: the prompter its
+    /// host handed the run. A permission request goes to it on this turn's
+    /// thread; with none, the request fails at once with
+    /// `error.PermissionPromptUnavailable` rather than waiting on a worker
+    /// nobody reads.
+    host_prompter: ?permission_prompter.Prompter = null,
+    /// Where the host hears each of this turn's calls start and end, when it
+    /// shows them: fx acp ends the card a permission request announced with
+    /// the call's real status. Set for the length of one run.
+    tool_activity_sink: ?runtime_deps.ToolActivityRecorder = null,
     child_id: ?[]const u8 = null,
     /// The name the parent gave the child, such as `reviewer`, or null for a
     /// one-off. Borrowed for the turn.
@@ -449,6 +459,7 @@ pub const TurnContext = struct {
         const self: *TurnContext = @ptrCast(@alignCast(raw));
         const child_id = self.child_id orelse return error.ChildNotAttached;
         const work_id = self.active_work_id orelse return error.StaleRequest;
+        if (self.hosted_worker == null) return self.askHost(alloc, request, call, review, grant_offer, child_id, work_id);
         const prepared = approval_registry_mod.preparedRequestFingerprint(request);
         const grant = types.PermissionGrant{
             .tool_name = @constCast(call.name),
@@ -469,6 +480,49 @@ pub const TurnContext = struct {
             review,
             .{ .context = &context, .observe_fn = PermissionObservation.observe },
         );
+    }
+
+    /// Asks the host's prompter, which answers on this thread. A subagent that
+    /// cannot be asked fails with `error.PermissionPromptUnavailable`, which
+    /// says noninteractive mode (fx ask gives subagents no prompter), or with
+    /// the error that names why when the host's prompter knows: the prompt is
+    /// closed, the subagent was stopped, too many requests are open, or the
+    /// client cannot be reached. Admission turns each into an outcome that
+    /// says approval was required and could not be asked, where a denial
+    /// would say the person refused. Nothing runs, and the trace says why.
+    ///
+    /// The request is already one wait for the subagent's observer: the
+    /// admission prompter that called this began it. The host's prompter is a
+    /// copy that holds the same observer, so the copy forgets it, and an
+    /// approval is one wait, not two nested (`sdk/README.md` hooks).
+    fn askHost(
+        self: *TurnContext,
+        alloc: Allocator,
+        request: permission_request.PermissionRequest,
+        call: types.ToolCall,
+        review: ?*const @import("../output/diff.zig").FileReview,
+        grant_offer: ?[]const types.PermissionGrant,
+        child_id: []const u8,
+        work_id: []const u8,
+    ) !permission_request.OwnedPermissionResponse {
+        var host = self.host_prompter orelse {
+            debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=no_host_prompter", .{ child_id, work_id });
+            return error.PermissionPromptUnavailable;
+        };
+        host.observer = null;
+        self.transitionPhase(work_id, .awaiting_approval) catch |err| {
+            debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=phase err={s}", .{ child_id, work_id, @errorName(err) });
+            return error.PermissionPromptUnavailable;
+        };
+        defer self.transitionPhase(work_id, .running) catch |err| {
+            debug_trace.logf("subagent", "approval phase not restored child_id={s} work_id={s} err={s}", .{ child_id, work_id, @errorName(err) });
+        };
+        return host.request(alloc, request, call, review, grant_offer) catch |err| {
+            debug_trace.logf("subagent", "approval unavailable child_id={s} work_id={s} reason=host err={s}", .{ child_id, work_id, @errorName(err) });
+            // The error that names the cause passes through; any other
+            // failure of the host's prompter names none.
+            return if (permission_prompter.unavailableCause(err) != null) err else error.PermissionPromptUnavailable;
+        };
     }
 
     const PermissionObservation = struct {
@@ -522,11 +576,15 @@ pub const TurnContext = struct {
     }
 
     fn recordToolActivity(
-        _: *anyopaque,
-        _: []const u8,
-        _: []const u8,
-        _: runtime_deps.ToolActivityPhase,
-    ) !void {}
+        raw: *anyopaque,
+        call_id: []const u8,
+        tool_name: []const u8,
+        phase: runtime_deps.ToolActivityPhase,
+    ) !void {
+        const self: *TurnContext = @ptrCast(@alignCast(raw));
+        const sink = self.tool_activity_sink orelse return;
+        try sink.record(call_id, tool_name, phase);
+    }
 
     pub fn registerApproval(
         self: *TurnContext,
