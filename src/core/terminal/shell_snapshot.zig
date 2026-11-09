@@ -11,7 +11,9 @@
 //! Snapshot contents stay in memory. They reach a command only through its
 //! environment and the supervisor's stdin script, and are never logged.
 //!
-//! TLA+ model: `tests/tla/terminal/ShellSnapshot.tla`.
+//! TLA+ models: `tests/tla/terminal/ShellSnapshot.tla` for the owner, and
+//! `tests/tla/terminal/ShellSnapshotCapture.tla` for what one capture keeps and
+//! which startup-file edits, including one made while it runs, make it stale.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -134,14 +136,76 @@ fn fingerprintFor(kind: shell_resolver.ShellKind, user_dirs: []const ?[]const u8
     return result;
 }
 
-/// Adds the stamps of a ZDOTDIR the startup files set to the stamps taken
-/// before the capture. The earlier stamps stay, so an edit made while the
-/// capture ran still marks the snapshot dirty.
-fn withMovedZdotdir(before: Fingerprint, extended: Fingerprint) Fingerprint {
-    if (extended.len <= before.len) return before;
-    var result = extended;
-    @memcpy(result.stamps[0..before.len], before.stamps[0..before.len]);
-    return result;
+/// What fx knows when a capture starts.
+const CaptureStart = struct {
+    /// Stamps taken before the shell starts: the files fx always watches, in
+    /// the first `base_len` places, and on a recapture the files of the ZDOTDIR
+    /// the previous capture found.
+    fingerprint: Fingerprint,
+    base_len: usize,
+    /// When the capture started, on the clock that stamps files.
+    time_ns: i128,
+
+    /// The stamps of the files fx always watches, in the layout
+    /// `currentFingerprint(shell, null)` gives.
+    fn base(self: CaptureStart) Fingerprint {
+        var result = self.fingerprint;
+        result.len = self.base_len;
+        return result;
+    }
+};
+
+/// Stamps the files a capture of `shell_path` can read, before it starts.
+/// `previous_zdotdir` is the folder the previous capture found, if any.
+fn captureStart(shell_path: []const u8, previous_zdotdir: ?[]const u8, time_ns: i128) CaptureStart {
+    const base = currentFingerprint(shell_path, null);
+    return .{
+        .fingerprint = if (previous_zdotdir) |dir| currentFingerprint(shell_path, dir) else base,
+        .base_len = base.len,
+        .time_ns = time_ns,
+    };
+}
+
+/// What a finished capture is compared against from now on.
+const Watch = struct {
+    /// In the layout `currentFingerprint` gives for the generation's ZDOTDIR.
+    fingerprint: Fingerprint,
+    /// A file in the folder the startup files moved ZDOTDIR to changed at or
+    /// after the capture started, so the shell may have read an older version.
+    changed_during_capture: bool,
+};
+
+/// Works out what to watch after a capture whose startup files set ZDOTDIR to
+/// `zdotdir`. `moved` holds the stamps of the files fx reads once that folder is
+/// known. A file fx stamped before the capture keeps its earlier stamp. A folder
+/// that was not stamped, because it is new, takes its stamps as they are now,
+/// and since fx cannot tell when the shell read it, a file there whose time is
+/// at or after the capture start counts as changed
+/// (`tests/tla/terminal/ShellSnapshotCapture.tla` CurrentIsFresh).
+fn watchMovedZdotdir(
+    start: CaptureStart,
+    previous_zdotdir: ?[]const u8,
+    zdotdir: []const u8,
+    moved: Fingerprint,
+) Watch {
+    var result = moved;
+    const base_len = @min(start.base_len, moved.len);
+    @memcpy(result.stamps[0..base_len], start.fingerprint.stamps[0..base_len]);
+    // The folder is HOME or the inherited ZDOTDIR: its files are in the base.
+    if (moved.len <= start.base_len) return .{ .fingerprint = result, .changed_during_capture = false };
+    if (previous_zdotdir) |previous| {
+        if (std.mem.eql(u8, previous, zdotdir) and start.fingerprint.len == moved.len) {
+            // The previous capture's folder was stamped before this one began.
+            @memcpy(result.stamps[base_len..moved.len], start.fingerprint.stamps[base_len..moved.len]);
+            return .{ .fingerprint = result, .changed_during_capture = false };
+        }
+    }
+    var changed = false;
+    for (moved.stamps[base_len..moved.len]) |stamp| {
+        if (!stamp.present) continue;
+        if (stamp.mtime_ns >= start.time_ns or stamp.ctime_ns >= start.time_ns) changed = true;
+    }
+    return .{ .fingerprint = result, .changed_during_capture = changed };
 }
 
 /// One immutable captured state. Its arena owns every field; the owner frees
@@ -246,6 +310,8 @@ pub const CaptureOutcome = union(enum) {
 };
 
 const CaptureFn = *const fn (request: CaptureRequest) CaptureOutcome;
+/// Nanoseconds on the clock that stamps files; tests replace it.
+const ClockFn = *const fn () i128;
 
 const DirtyReason = enum { startup_files_changed, user_reload, agent_reload };
 
@@ -291,7 +357,7 @@ const PendingCapture = struct {
     shell_path: []u8,
     cwd: []u8,
     epoch: u64,
-    fingerprint: Fingerprint,
+    start: CaptureStart,
 };
 
 /// Owns the snapshot state machine. One instance serves the whole process;
@@ -307,9 +373,15 @@ pub const Owner = struct {
     next_id: u64 = 1,
     capture_thread: ?std.Thread = null,
     capture_fn: CaptureFn = captureWithShell,
+    clock_fn: ClockFn = io_mod.nanoTimestamp,
     capture_environ: ?*const Environ.Map = null,
     failed_shell: [std.Io.Dir.max_path_bytes]u8 = undefined,
     failed_shell_len: usize = 0,
+    /// The ZDOTDIR the failed generation's startup files set, so the failure
+    /// watches the same files the generation did
+    /// (`tests/tla/terminal/ShellSnapshotCapture.tla` FailedChangeIsReal).
+    failed_zdotdir: [std.Io.Dir.max_path_bytes]u8 = undefined,
+    failed_zdotdir_len: ?usize = null,
     failed_fingerprint: Fingerprint = .{},
     notice: Notice = .{},
     /// Epoch each remembered shell command grant was made under, keyed by
@@ -365,7 +437,7 @@ pub const Owner = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.state != .ready or self.active != generation) return;
-        self.recordFailureLocked(generation.shell_path, &generation.fingerprint, .replay_failed);
+        self.recordFailureLocked(generation.shell_path, generation.zdotdir, &generation.fingerprint, .replay_failed);
     }
 
     /// Current approval epoch. Remembered shell approvals made under an
@@ -518,7 +590,7 @@ pub const Owner = struct {
         self.startCaptureLocked(shell_path, cwd) catch |err| {
             debug_trace.logf("core", "shell snapshot capture could not start err={s}", .{@errorName(err)});
             const fingerprint = currentFingerprint(shell_path, null);
-            self.recordFailureLocked(shell_path, &fingerprint, .spawn_failed);
+            self.recordFailureLocked(shell_path, null, &fingerprint, .spawn_failed);
             return .full_startup;
         };
         return .wait;
@@ -538,7 +610,8 @@ pub const Owner = struct {
             },
             .failed => {
                 const failed_shell = self.failed_shell[0..self.failed_shell_len];
-                const fingerprint = currentFingerprint(failed_shell, null);
+                const failed_zdotdir = if (self.failed_zdotdir_len) |len| self.failed_zdotdir[0..len] else null;
+                const fingerprint = currentFingerprint(failed_shell, failed_zdotdir);
                 if (!std.mem.eql(u8, failed_shell, shell_path) or
                     !fingerprint.eql(&self.failed_fingerprint))
                 {
@@ -572,14 +645,18 @@ pub const Owner = struct {
         errdefer std.heap.page_allocator.free(owned_shell);
         const owned_cwd = try std.heap.page_allocator.dupe(u8, cwd);
         errdefer std.heap.page_allocator.free(owned_cwd);
+        // The clock is read first, so a file written before the shell can read
+        // it is never older than the start.
+        const started_ns = self.clock_fn();
         pending.* = .{
             .owner = self,
             .shell_path = owned_shell,
             .cwd = owned_cwd,
             .epoch = self.epoch,
             // Taken before the shell reads the files, so an edit during the
-            // capture still marks the result dirty.
-            .fingerprint = currentFingerprint(shell_path, null),
+            // capture still marks the result dirty. On a recapture the folder
+            // the previous capture found is stamped too.
+            .start = captureStart(shell_path, if (self.active) |previous| previous.zdotdir else null, started_ns),
         };
         self.capture_thread = try std.Thread.spawn(.{}, runPendingCapture, .{pending});
         self.state = .capturing;
@@ -593,14 +670,17 @@ pub const Owner = struct {
                 generation.id = self.next_id;
                 self.next_id += 1;
                 generation.epoch = pending.epoch;
-                generation.fingerprint = pending.fingerprint;
-                if (generation.zdotdir) |zdotdir| {
+                const watch: Watch = if (generation.zdotdir) |zdotdir|
                     // The startup files moved ZDOTDIR; watch its files too.
-                    generation.fingerprint = withMovedZdotdir(
-                        pending.fingerprint,
+                    watchMovedZdotdir(
+                        pending.start,
+                        if (self.active) |previous| previous.zdotdir else null,
+                        zdotdir,
                         currentFingerprint(pending.shell_path, zdotdir),
-                    );
-                }
+                    )
+                else
+                    .{ .fingerprint = pending.start.base(), .changed_during_capture = false };
+                generation.fingerprint = watch.fingerprint;
                 self.retireLocked(self.active);
                 self.active = generation;
                 self.state = .ready;
@@ -611,24 +691,42 @@ pub const Owner = struct {
                     "shell snapshot ready generation={d} epoch={d} env_entries={d} names={d} replay_bytes={d}",
                     .{ generation.id, generation.epoch, generation.environ.count(), generation.names.count(), generation.replay.len },
                 );
+                if (watch.changed_during_capture) {
+                    // A file the shell may have read an older version of: the
+                    // next command captures again.
+                    self.markDirtyLocked(.startup_files_changed);
+                }
             },
-            .failed => |reason| self.recordFailureLocked(pending.shell_path, &pending.fingerprint, reason),
+            .failed => |reason| {
+                const base = pending.start.base();
+                self.recordFailureLocked(pending.shell_path, null, &base, reason);
+            },
         }
     }
 
+    /// Starts a failure episode. `zdotdir` and `fingerprint` come from the same
+    /// capture, so later checks compare like with like.
     fn recordFailureLocked(
         self: *Owner,
         shell_path: []const u8,
+        zdotdir: ?[]const u8,
         fingerprint: *const Fingerprint,
         reason: CaptureFailure,
     ) void {
-        self.retireLocked(self.active);
-        self.active = null;
-        self.state = .failed;
+        // Copied before the generation that owns `zdotdir` can be freed.
+        self.failed_fingerprint = fingerprint.*;
+        self.failed_zdotdir_len = null;
+        if (zdotdir) |dir| {
+            const dir_len = @min(dir.len, self.failed_zdotdir.len);
+            @memcpy(self.failed_zdotdir[0..dir_len], dir[0..dir_len]);
+            self.failed_zdotdir_len = dir_len;
+        }
         const len = @min(shell_path.len, self.failed_shell.len);
         @memcpy(self.failed_shell[0..len], shell_path[0..len]);
         self.failed_shell_len = len;
-        self.failed_fingerprint = fingerprint.*;
+        self.retireLocked(self.active);
+        self.active = null;
+        self.state = .failed;
         const text = std.mem.print(
             &self.notice.text,
             "shell snapshot unavailable ({s}); startup files run for every command",
@@ -715,13 +813,16 @@ pub const ParseError = error{ MissingSection, InvalidEntry } || Allocator.Error;
 pub fn parsePayload(generation: *Generation, payload: []const u8, nonce: []const u8) ParseError!void {
     const alloc = generation.arena.allocator();
     const env_marker = try markerText(alloc, nonce, "ENV", "", "\x00");
+    const zdotdir_marker = try markerText(alloc, nonce, "ZDOTDIR", "", "");
     const names_marker = try markerText(alloc, nonce, "NAMES", "", "");
     const replay_marker = try markerText(alloc, nonce, "REPLAY", "", "");
     const end_marker = try markerText(alloc, nonce, "END", "\x00", "\x00");
 
     const env_start = (std.mem.find(u8, payload, env_marker) orelse return error.MissingSection) + env_marker.len;
     var cursor = env_start;
-    var section: enum { env, names } = .env;
+    // A zsh payload has a ZDOTDIR section with one value between the
+    // environment and the names; a bash payload has none.
+    var section: enum { env, zdotdir, after_zdotdir, names } = .env;
     const replay_start = while (cursor < payload.len) {
         const terminator = std.mem.findScalarPos(u8, payload, cursor, 0) orelse return error.MissingSection;
         const entry = payload[cursor..terminator];
@@ -732,15 +833,25 @@ pub fn parsePayload(generation: *Generation, payload: []const u8, nonce: []const
                     section = .names;
                     continue;
                 }
+                if (std.mem.eql(u8, entry, zdotdir_marker)) {
+                    section = .zdotdir;
+                    continue;
+                }
                 const separator = std.mem.findScalar(u8, entry, '=') orelse return error.InvalidEntry;
                 if (separator == 0) return error.InvalidEntry;
                 const key = entry[0..separator];
                 const value = entry[separator + 1 ..];
                 if (isShellOwned(key)) continue;
-                if (std.mem.eql(u8, key, "ZDOTDIR") and value.len != 0) {
-                    generation.zdotdir = try alloc.dupe(u8, value);
-                }
                 try generation.environ.put(key, value);
+            },
+            .zdotdir => {
+                // An empty value is an unset or empty ZDOTDIR: no folder.
+                if (entry.len != 0) generation.zdotdir = try alloc.dupe(u8, entry);
+                section = .after_zdotdir;
+            },
+            .after_zdotdir => {
+                if (!std.mem.eql(u8, entry, names_marker)) return error.InvalidEntry;
+                section = .names;
             },
             .names => {
                 if (std.mem.eql(u8, entry, replay_marker)) break cursor;
@@ -950,6 +1061,10 @@ fn testPayload(alloc: Allocator, nonce: []const u8, chatter: []const u8) ![]u8 {
         "ZDOTDIR=/home/user/.config/zsh\x00",
         "FXSNAP:",
         nonce,
+        ":ZDOTDIR\x00",
+        "/home/user/.config/zsh\x00",
+        "FXSNAP:",
+        nonce,
         ":NAMES\x00",
         "ll\x00fx_function\x00\x00",
         "FXSNAP:",
@@ -1003,6 +1118,146 @@ test "snapshot payload parsing rejects truncated or malformed payloads" {
     const third = try Generation.create();
     defer third.destroy();
     try testing.expectError(error.MissingSection, parsePayload(third, "no markers here", nonce));
+}
+
+/// A payload with the given environment entries and ZDOTDIR section, and no
+/// names or replay. bash payloads have no ZDOTDIR section.
+fn zdotdirPayload(alloc: Allocator, nonce: []const u8, env: []const u8, zdotdir_entries: ?[]const u8) ![]u8 {
+    const section = if (zdotdir_entries) |entries|
+        try alloc.print("FXSNAP:{s}:ZDOTDIR\x00{s}", .{ nonce, entries })
+    else
+        "";
+    return alloc.print(
+        "FXSNAP:{0s}:ENV\x00{1s}{2s}FXSNAP:{0s}:NAMES\x00FXSNAP:{0s}:REPLAY\x00\x00FXSNAP:{0s}:END\x00",
+        .{ nonce, env, section },
+    );
+}
+
+test "snapshot payload parsing reads ZDOTDIR from its own section whether or not it is exported" {
+    const nonce = "00112233445566778899aabbccddeeff";
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    // Set in ~/.zshenv without export: only the section has it.
+    const unexported = try Generation.create();
+    defer unexported.destroy();
+    try parsePayload(unexported, try zdotdirPayload(scratch, nonce, "PATH=/usr/bin\x00", "/Users/example/.config/zsh\x00"), nonce);
+    try testing.expectEqualStrings("/Users/example/.config/zsh", unexported.zdotdir.?);
+    try testing.expect(unexported.environ.get("ZDOTDIR") == null);
+
+    const exported = try Generation.create();
+    defer exported.destroy();
+    try parsePayload(exported, try zdotdirPayload(
+        scratch,
+        nonce,
+        "ZDOTDIR=/Users/example/zsh\x00",
+        "/Users/example/zsh\x00",
+    ), nonce);
+    try testing.expectEqualStrings("/Users/example/zsh", exported.zdotdir.?);
+    try testing.expectEqualStrings("/Users/example/zsh", exported.environ.get("ZDOTDIR").?);
+
+    // An empty ZDOTDIR names no folder.
+    const empty = try Generation.create();
+    defer empty.destroy();
+    try parsePayload(empty, try zdotdirPayload(scratch, nonce, "", "\x00"), nonce);
+    try testing.expect(empty.zdotdir == null);
+
+    // bash has no ZDOTDIR section; an exported value there means nothing.
+    const bash = try Generation.create();
+    defer bash.destroy();
+    try parsePayload(bash, try zdotdirPayload(scratch, nonce, "ZDOTDIR=/Users/example/zsh\x00", null), nonce);
+    try testing.expect(bash.zdotdir == null);
+    try testing.expectEqualStrings("/Users/example/zsh", bash.environ.get("ZDOTDIR").?);
+
+    const two_values = try Generation.create();
+    defer two_values.destroy();
+    try testing.expectError(error.InvalidEntry, parsePayload(
+        two_values,
+        try zdotdirPayload(scratch, nonce, "", "/Users/example/a\x00/Users/example/b\x00"),
+        nonce,
+    ));
+
+    const cut = try Generation.create();
+    defer cut.destroy();
+    const cut_payload = try std.mem.concat(scratch, u8, &.{ "FXSNAP:", nonce, ":ENV\x00FXSNAP:", nonce, ":ZDOTDIR\x00/Users/example/zsh\x00" });
+    try testing.expectError(error.MissingSection, parsePayload(cut, cut_payload, nonce));
+}
+
+const fuzz_payload_nonce = "00112233445566778899aabbccddeeff";
+const fuzz_payload_markers = [_][]const u8{
+    "FXSNAP:" ++ fuzz_payload_nonce ++ ":ENV\x00",
+    "FXSNAP:" ++ fuzz_payload_nonce ++ ":ZDOTDIR",
+    "FXSNAP:" ++ fuzz_payload_nonce ++ ":NAMES",
+    "FXSNAP:" ++ fuzz_payload_nonce ++ ":REPLAY",
+    "\x00FXSNAP:" ++ fuzz_payload_nonce ++ ":END\x00",
+};
+
+/// Expands a fuzz input into a payload. Byte 0x01 and the byte after it
+/// insert one of the section markers, so the fuzzer reaches every section
+/// in any order; every other byte, NUL included, is copied.
+fn fuzzPayload(alloc: Allocator, input: []const u8) Allocator.Error![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    var index: usize = 0;
+    while (index < input.len) : (index += 1) {
+        if (input[index] == 0x01 and index + 1 < input.len) {
+            index += 1;
+            try output.appendSlice(alloc, fuzz_payload_markers[input[index] % fuzz_payload_markers.len]);
+        } else {
+            try output.append(alloc, input[index]);
+        }
+    }
+    return output.toOwnedSlice(alloc);
+}
+
+fn fuzzSnapshotPayload(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [4096]u8 = undefined;
+    const input = input_buffer[0..smith.slice(&input_buffer)];
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const payload = try fuzzPayload(scratch, input);
+
+    const generation = try Generation.create();
+    defer generation.destroy();
+    parsePayload(generation, payload, fuzz_payload_nonce) catch |err| switch (err) {
+        error.MissingSection, error.InvalidEntry => return,
+        error.OutOfMemory => return err,
+    };
+
+    // The replay ends at the first end marker, so it never holds one.
+    try testing.expect(std.mem.find(u8, generation.replay, fuzz_payload_markers[4]) == null);
+    var entries = generation.environ.iterator();
+    while (entries.next()) |entry| {
+        const key = entry.key_ptr.*;
+        try testing.expect(key.len != 0);
+        try testing.expect(std.mem.findAny(u8, key, "=\x00") == null);
+        try testing.expect(std.mem.findScalar(u8, entry.value_ptr.*, 0) == null);
+        try testing.expect(!isShellOwned(key));
+    }
+    var names = generation.names.keyIterator();
+    while (names.next()) |name| {
+        try testing.expect(name.len != 0);
+        try testing.expect(std.mem.findScalar(u8, name.*, 0) == null);
+    }
+    // A ZDOTDIR comes only from the entry right after its section marker.
+    if (generation.zdotdir) |zdotdir| {
+        try testing.expect(zdotdir.len != 0);
+        const entry = try std.mem.concat(scratch, u8, &.{ fuzz_payload_markers[1], "\x00", zdotdir, "\x00" });
+        try testing.expect(std.mem.find(u8, payload, entry) != null);
+    }
+}
+
+test "snapshot payload parsing keeps its laws on fuzzed sections" {
+    try std.testing.fuzz({}, fuzzSnapshotPayload, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "\x01\x00PATH=/usr/bin\x00\x01\x01\x00/Users/example/.config/zsh\x00\x01\x02\x00ll\x00\x01\x03\x00alias ll='ls -l'\n\x01\x04",
+            "\x01\x00ZDOTDIR=/Users/example/zsh\x00\x01\x02\x00\x01\x03\x00fx () { :; }\n\x01\x04",
+            "\x01\x01\x00/Users/example/zsh\x00\x01\x00\x01\x02\x00\x01\x03\x00\x01\x04",
+            "\x01\x00\x01\x01\x00\x00\x01\x02\x00\x01\x03\x00\x01\x04",
+            "",
+        }) ++ @import("fuzz_corpus").shell_snapshot_payload.*),
+    });
 }
 
 const FakeCapture = struct {
@@ -1371,6 +1626,74 @@ test "snapshot owner fails the active generation after a replay failure" {
     try testing.expect(std.mem.find(u8, notice, "could not be restored") != null);
 }
 
+/// A fake capture whose startup files moved ZDOTDIR to `folder`, or set none
+/// when `folder` is empty.
+const MovedZdotdirCapture = struct {
+    var calls: std.atomic.Value(u32) = .init(0);
+    var folder: []const u8 = "";
+    /// While the capture with index `edit_call` runs, a user rewrites
+    /// `moved/.zshrc` in this directory.
+    var edit_dir: ?std.Io.Dir = null;
+    var edit_call: u32 = 0;
+    /// The capture with this index fails.
+    var fail_call: ?u32 = null;
+
+    fn reset(moved_folder: []const u8) void {
+        calls.store(0, .seq_cst);
+        folder = moved_folder;
+        edit_dir = null;
+        edit_call = 0;
+        fail_call = null;
+    }
+
+    fn capture(request: CaptureRequest) CaptureOutcome {
+        const call = calls.fetchAdd(1, .seq_cst);
+        if (edit_dir) |dir| {
+            if (call == edit_call) writeTestFile(dir, "moved/.zshrc", "alias ll='ls -l'\nalias lx='ls -x'\n") catch {};
+        }
+        if (fail_call == call) return .{ .failed = .timed_out };
+        const generation = Generation.create() catch return .{ .failed = .out_of_memory };
+        const alloc = generation.arena.allocator();
+        generation.shell_path = alloc.dupe(u8, request.shell_path) catch {
+            generation.destroy();
+            return .{ .failed = .out_of_memory };
+        };
+        if (folder.len != 0) {
+            generation.zdotdir = alloc.dupe(u8, folder) catch {
+                generation.destroy();
+                return .{ .failed = .out_of_memory };
+            };
+        }
+        generation.replay = "alias ll='ls -l'\n";
+        return .{ .ready = generation };
+    }
+};
+
+test "a replay failure with a moved ZDOTDIR keeps later commands on full startup" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    try tmp.dir.createDir(io_mod.getIo(), "moved", .default_dir);
+    try writeTestFile(tmp.dir, "moved/.zshrc", "alias ll='ls -l'\n");
+    MovedZdotdirCapture.reset(try io_mod.dirRealpathAlloc(scratch_state.allocator(), tmp.dir, "moved"));
+    var owner: Owner = .{ .capture_fn = MovedZdotdirCapture.capture };
+    defer owner.deinit();
+
+    const lease = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
+    owner.markReplayFailed(lease.generation);
+    lease.release();
+    // Nothing changed since the failure: every later command runs the startup
+    // files itself, and none of them captures again.
+    for (0..2) |_| {
+        const acquired = try owner.acquire("/bin/zsh", "/tmp", .{});
+        const full_startup = acquired == .full_startup;
+        if (acquired == .snapshot) acquired.snapshot.release();
+        try testing.expect(full_startup);
+    }
+    try testing.expectEqual(@as(u32, 1), MovedZdotdirCapture.calls.load(.seq_cst));
+}
+
 test "snapshot fingerprint changes when a startup file changes" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1407,33 +1730,301 @@ test "snapshot fingerprint stamps every startup directory zsh can read" {
     try testing.expect(!before.eql(&fingerprintFor(.zsh, &dirs)));
 }
 
+/// Folders for the tests of a capture that finds a moved ZDOTDIR: `home`, and
+/// `moved` and `other` for a ZDOTDIR the startup files set.
+const MovedFolders = struct {
+    tmp: std.testing.TmpDir,
+    home: []const u8,
+    moved: []const u8,
+    other: []const u8,
+
+    fn init(scratch: Allocator) !MovedFolders {
+        var result: MovedFolders = .{ .tmp = testing.tmpDir(.{}), .home = "", .moved = "", .other = "" };
+        errdefer result.tmp.cleanup();
+        for ([_][]const u8{ "home", "moved", "other" }) |name| {
+            try result.tmp.dir.createDir(io_mod.getIo(), name, .default_dir);
+        }
+        result.home = try io_mod.dirRealpathAlloc(scratch, result.tmp.dir, "home");
+        result.moved = try io_mod.dirRealpathAlloc(scratch, result.tmp.dir, "moved");
+        result.other = try io_mod.dirRealpathAlloc(scratch, result.tmp.dir, "other");
+        return result;
+    }
+
+    /// The stamps a capture takes before it starts, for HOME and `previous`.
+    fn start(self: MovedFolders, previous: ?[]const u8, time_ns: i128) CaptureStart {
+        const base = fingerprintFor(.zsh, &[_]?[]const u8{ null, self.home, null });
+        return .{
+            .fingerprint = fingerprintFor(.zsh, &[_]?[]const u8{ null, self.home, previous }),
+            .base_len = base.len,
+            .time_ns = time_ns,
+        };
+    }
+
+    /// The stamps `currentFingerprint` gives once the startup files set `zdotdir`.
+    fn found(self: MovedFolders, zdotdir: ?[]const u8) Fingerprint {
+        return fingerprintFor(.zsh, &[_]?[]const u8{ null, self.home, zdotdir });
+    }
+};
+
+/// The time of the newest stamp in a file, as the capture start compares it.
+fn fileTimeNs(dir: std.Io.Dir, sub_path: []const u8) !i128 {
+    const stat = try dir.statFile(io_mod.getIo(), sub_path, .{});
+    return @max(stat.mtime.nanoseconds, stat.ctime.nanoseconds);
+}
+
 test "a moved ZDOTDIR keeps the stamps taken before the capture" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
     var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer scratch_state.deinit();
-    const scratch = scratch_state.allocator();
-    for ([_][]const u8{ "home", "moved" }) |name| try tmp.dir.createDir(io_mod.getIo(), name, .default_dir);
-    const home = try io_mod.dirRealpathAlloc(scratch, tmp.dir, "home");
-    const moved = try io_mod.dirRealpathAlloc(scratch, tmp.dir, "moved");
-    const now = [_]?[]const u8{ null, home, moved };
+    var folders = try MovedFolders.init(scratch_state.allocator());
+    defer folders.tmp.cleanup();
 
-    const before_capture = fingerprintFor(.zsh, &[_]?[]const u8{ null, home, null });
+    // The capture starts far in the future of every file, so only the stamps
+    // taken before it can tell that a file changed.
+    const start = folders.start(null, std.math.maxInt(i96));
     // An edit while the capture runs, then the capture reports the move.
-    try writeTestFile(tmp.dir, "home/.zshrc", "export ZDOTDIR=moved\n");
-    const merged = withMovedZdotdir(before_capture, fingerprintFor(.zsh, &now));
-    try testing.expectEqual(before_capture.len + zsh_user_files.len, merged.len);
-    try testing.expect(!merged.eql(&fingerprintFor(.zsh, &now)));
+    try writeTestFile(folders.tmp.dir, "home/.zshrc", "export ZDOTDIR=moved\n");
+    const watch = watchMovedZdotdir(start, null, folders.moved, folders.found(folders.moved));
+    try testing.expectEqual(start.base_len + zsh_user_files.len, watch.fingerprint.len);
+    try testing.expect(!watch.fingerprint.eql(&folders.found(folders.moved)));
+    try testing.expect(!watch.changed_during_capture);
 
-    // Without an edit during the capture, the merged stamps match.
-    const after_edit = fingerprintFor(.zsh, &[_]?[]const u8{ null, home, null });
-    const clean = withMovedZdotdir(after_edit, fingerprintFor(.zsh, &now));
-    try testing.expect(clean.eql(&fingerprintFor(.zsh, &now)));
+    // Without an edit during the capture, the stamps match.
+    const clean_start = folders.start(null, std.math.maxInt(i96));
+    const clean = watchMovedZdotdir(clean_start, null, folders.moved, folders.found(folders.moved));
+    try testing.expect(clean.fingerprint.eql(&folders.found(folders.moved)));
+}
+
+test "a file in a newly found ZDOTDIR that changed at or after the capture start counts as changed" {
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    var folders = try MovedFolders.init(scratch_state.allocator());
+    defer folders.tmp.cleanup();
+
+    // The folder has no startup file yet: nothing there can have changed.
+    const empty = watchMovedZdotdir(folders.start(null, 0), null, folders.moved, folders.found(folders.moved));
+    try testing.expect(!empty.changed_during_capture);
+
+    try writeTestFile(folders.tmp.dir, "moved/.zshrc", "alias ll='ls -l'\n");
+    const written_ns = try fileTimeNs(folders.tmp.dir, "moved/.zshrc");
+    const found = folders.found(folders.moved);
+    // The file was written after the capture started.
+    try testing.expect(watchMovedZdotdir(folders.start(null, written_ns - 1), null, folders.moved, found).changed_during_capture);
+    // At the start itself still counts: file times are no finer than the clock.
+    try testing.expect(watchMovedZdotdir(folders.start(null, written_ns), null, folders.moved, found).changed_during_capture);
+    // The file was written before the capture started.
+    const before = watchMovedZdotdir(folders.start(null, written_ns + 1), null, folders.moved, found);
+    try testing.expect(!before.changed_during_capture);
+    try testing.expectEqual(found.len, before.fingerprint.len);
+    // Whatever the verdict, the stamps are those of the folder as it is now,
+    // so the next check does not see a change that was already handled.
+    try testing.expect(before.fingerprint.eql(&found));
+}
+
+test "a recapture keeps the previous ZDOTDIR's stamps and checks a different new one" {
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    var folders = try MovedFolders.init(scratch_state.allocator());
+    defer folders.tmp.cleanup();
+    try writeTestFile(folders.tmp.dir, "moved/.zshrc", "alias ll='ls -l'\n");
+    try writeTestFile(folders.tmp.dir, "other/.zshrc", "alias la='ls -a'\n");
+
+    // The previous capture found `moved`, so this capture stamps it first.
+    const start = folders.start(folders.moved, 0);
+    try testing.expectEqual(start.base_len + zsh_user_files.len, start.fingerprint.len);
+    try writeTestFile(folders.tmp.dir, "moved/.zshrc", "alias ll='ls -l'\nalias lx='ls -x'\n");
+    // The same folder again: its stamps are those from before the capture, and
+    // file times are not checked, because the stamps already tell.
+    const same = watchMovedZdotdir(start, folders.moved, folders.moved, folders.found(folders.moved));
+    try testing.expect(!same.changed_during_capture);
+    try testing.expect(!same.fingerprint.eql(&folders.found(folders.moved)));
+
+    // A different folder is added: it is stamped as it is now and its file
+    // times are checked, and the previous folder's stamps are dropped.
+    const moved_on = watchMovedZdotdir(start, folders.moved, folders.other, folders.found(folders.other));
+    try testing.expect(moved_on.changed_during_capture);
+    try testing.expectEqual(folders.found(folders.other).len, moved_on.fingerprint.len);
+    try testing.expect(moved_on.fingerprint.eql(&folders.found(folders.other)));
+    const later = watchMovedZdotdir(folders.start(folders.moved, std.math.maxInt(i96)), folders.moved, folders.other, folders.found(folders.other));
+    try testing.expect(!later.changed_during_capture);
+}
+
+test "a moved ZDOTDIR that is HOME adds no stamps and no change" {
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    var folders = try MovedFolders.init(scratch_state.allocator());
+    defer folders.tmp.cleanup();
+    try writeTestFile(folders.tmp.dir, "home/.zshrc", "alias ll='ls -l'\n");
+
+    // HOME is already in the base, and its files are stamped before the start.
+    const watch = watchMovedZdotdir(folders.start(null, 0), null, folders.home, folders.found(folders.home));
+    try testing.expect(!watch.changed_during_capture);
+    try testing.expectEqual(folders.start(null, 0).base_len, watch.fingerprint.len);
+    try testing.expect(watch.fingerprint.eql(&folders.found(null)));
+}
+
+test "a capture start keeps the base stamps apart from the previous folder's" {
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    var folders = try MovedFolders.init(scratch_state.allocator());
+    defer folders.tmp.cleanup();
+
+    const start = folders.start(folders.moved, 0);
+    // What a failed capture or a capture that finds no moved folder records is
+    // the layout `currentFingerprint(shell, null)` recomputes.
+    try testing.expect(start.base().eql(&folders.found(null)));
+    try testing.expect(start.fingerprint.len > start.base().len);
+}
+
+/// A clock the tests set.
+const FakeClock = struct {
+    var now_ns: i128 = 0;
+
+    fn read() i128 {
+        return now_ns;
+    }
+};
+
+test "an edit in the moved ZDOTDIR while the capture runs makes the next command capture again" {
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    var folders = try MovedFolders.init(scratch_state.allocator());
+    defer folders.tmp.cleanup();
+    try writeTestFile(folders.tmp.dir, "moved/.zshrc", "alias ll='ls -l'\n");
+    MovedZdotdirCapture.reset(folders.moved);
+    // The first capture's shell has read the file when the user edits it.
+    MovedZdotdirCapture.edit_dir = folders.tmp.dir;
+    MovedZdotdirCapture.edit_call = 0;
+    defer MovedZdotdirCapture.edit_dir = null;
+    // The capture started before the edit.
+    FakeClock.now_ns = 0;
+    var owner: Owner = .{ .capture_fn = MovedZdotdirCapture.capture, .clock_fn = FakeClock.read };
+    defer owner.deinit();
+
+    // One command waits for the capture that missed the edit and the one after.
+    const lease = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
+    lease.release();
+    try testing.expectEqual(@as(u32, 2), MovedZdotdirCapture.calls.load(.seq_cst));
+    try testing.expectEqual(@as(u64, 2), lease.generation.id);
+    // The second capture found nothing new.
+    const again = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
+    again.release();
+    try testing.expectEqual(@as(u32, 2), MovedZdotdirCapture.calls.load(.seq_cst));
+}
+
+test "a file in the moved ZDOTDIR written before the capture started does not make it capture again" {
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    var folders = try MovedFolders.init(scratch_state.allocator());
+    defer folders.tmp.cleanup();
+    try writeTestFile(folders.tmp.dir, "moved/.zshrc", "alias ll='ls -l'\n");
+    MovedZdotdirCapture.reset(folders.moved);
+    // An hour after every file in the folder was written.
+    FakeClock.now_ns = io_mod.nanoTimestamp() + std.time.ns_per_hour;
+    var owner: Owner = .{ .capture_fn = MovedZdotdirCapture.capture, .clock_fn = FakeClock.read };
+    defer owner.deinit();
+
+    for (0..2) |_| {
+        const lease = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
+        lease.release();
+    }
+    try testing.expectEqual(@as(u32, 1), MovedZdotdirCapture.calls.load(.seq_cst));
+}
+
+test "an edit in the same moved ZDOTDIR while a recapture runs is noticed" {
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    var folders = try MovedFolders.init(scratch_state.allocator());
+    defer folders.tmp.cleanup();
+    try writeTestFile(folders.tmp.dir, "moved/.zshrc", "alias ll='ls -l'\n");
+    MovedZdotdirCapture.reset(folders.moved);
+    // The second capture, the recapture, is the one the user edits during.
+    MovedZdotdirCapture.edit_dir = folders.tmp.dir;
+    MovedZdotdirCapture.edit_call = 1;
+    defer MovedZdotdirCapture.edit_dir = null;
+    FakeClock.now_ns = io_mod.nanoTimestamp() + std.time.ns_per_hour;
+    var owner: Owner = .{ .capture_fn = MovedZdotdirCapture.capture, .clock_fn = FakeClock.read };
+    defer owner.deinit();
+
+    const first = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
+    first.release();
+    owner.markDirty(.user_reload);
+    // The recapture's own stamps of the folder came before the edit.
+    const second = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
+    second.release();
+    try testing.expectEqual(@as(u32, 3), MovedZdotdirCapture.calls.load(.seq_cst));
+    try testing.expectEqual(@as(u64, 3), second.generation.id);
+}
+
+test "a recapture that finds no moved ZDOTDIR is not marked changed for the folder the last one found" {
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    var folders = try MovedFolders.init(scratch_state.allocator());
+    defer folders.tmp.cleanup();
+    try writeTestFile(folders.tmp.dir, "moved/.zshrc", "alias ll='ls -l'\n");
+    MovedZdotdirCapture.reset(folders.moved);
+    FakeClock.now_ns = io_mod.nanoTimestamp() + std.time.ns_per_hour;
+    var owner: Owner = .{ .capture_fn = MovedZdotdirCapture.capture, .clock_fn = FakeClock.read };
+    defer owner.deinit();
+
+    const first = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
+    first.release();
+    // The startup files stop moving ZDOTDIR.
+    MovedZdotdirCapture.folder = "";
+    owner.markDirty(.user_reload);
+    for (0..2) |_| {
+        const lease = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
+        lease.release();
+    }
+    try testing.expectEqual(@as(u32, 2), MovedZdotdirCapture.calls.load(.seq_cst));
+}
+
+test "a failed recapture keeps stamps the next check can compare" {
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    var folders = try MovedFolders.init(scratch_state.allocator());
+    defer folders.tmp.cleanup();
+    try writeTestFile(folders.tmp.dir, "moved/.zshrc", "alias ll='ls -l'\n");
+    MovedZdotdirCapture.reset(folders.moved);
+    MovedZdotdirCapture.fail_call = 1;
+    defer MovedZdotdirCapture.fail_call = null;
+    FakeClock.now_ns = io_mod.nanoTimestamp() + std.time.ns_per_hour;
+    var owner: Owner = .{ .capture_fn = MovedZdotdirCapture.capture, .clock_fn = FakeClock.read };
+    defer owner.deinit();
+
+    const first = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
+    first.release();
+    owner.markDirty(.user_reload);
+    // The recapture fails; nothing changed since, so no command captures again.
+    for (0..2) |_| try testing.expect((try owner.acquire("/bin/zsh", "/tmp", .{})) == .full_startup);
+    try testing.expectEqual(@as(u32, 2), MovedZdotdirCapture.calls.load(.seq_cst));
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
     try dir.writeFile(io_mod.getIo(), .{ .sub_path = path, .data = data });
 }
+
+/// Runs the real capture for `shell_path` with `environ`. Caller destroys the
+/// generation.
+fn captureForTest(shell_path: []const u8, cwd: []const u8, environ: *const Environ.Map) !*Generation {
+    const outcome = captureWithShell(.{ .shell_path = shell_path, .cwd = cwd, .environ = environ });
+    return switch (outcome) {
+        .ready => |value| value,
+        .failed => |reason| {
+            // Names the failure in the test output without a direct write.
+            try testing.expectEqualStrings("ready", @tagName(reason));
+            unreachable;
+        },
+    };
+}
+
+/// Startup-file helpers every real capture replays: loaded `_` and `__`
+/// functions, and one whose body reads like an autoload stub. fx's own
+/// `__fx_snapshot_` names stay out.
+const real_capture_helpers =
+    "_fx_snapshot_helper() { printf 'helper-ok\\n'; }\n" ++
+    "__fxsnap_dunder() { printf 'dunder-ok\\n'; }\n" ++
+    "_fx_snapshot_literal() { printf 'builtin autoload -XU\\n'; }\n" ++
+    "__fx_snapshot_private() { :; }\n";
 
 fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []const u8) !void {
     std.Io.Dir.accessAbsolute(io_mod.getIo(), shell_path, .{}) catch return error.SkipZigTest;
@@ -1443,8 +2034,13 @@ fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
     const home = try io_mod.dirRealpathAlloc(scratch, tmp.dir, ".");
-    try writeTestFile(tmp.dir, file_name, contents);
-    if (std.mem.eql(u8, file_name, ".bashrc")) {
+    try writeTestFile(tmp.dir, file_name, try std.mem.concat(scratch, u8, &.{ contents, real_capture_helpers }));
+    const zsh = std.mem.eql(u8, file_name, ".zshrc");
+    if (zsh) {
+        // An autoloaded completion function that the startup files call.
+        try tmp.dir.createDirPath(io_mod.getIo(), "fn");
+        try writeTestFile(tmp.dir, "fn/_fx_loaded_later", "print -r -- loaded-later\n");
+    } else {
         try writeTestFile(tmp.dir, ".bash_profile", ". \"$HOME/.bashrc\"\n");
     }
 
@@ -1454,15 +2050,7 @@ fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []
     try environ.put("PATH", "/usr/bin:/bin");
     try environ.put("TERM", "dumb");
 
-    const outcome = captureWithShell(.{ .shell_path = shell_path, .cwd = home, .environ = &environ });
-    const generation = switch (outcome) {
-        .ready => |value| value,
-        .failed => |reason| {
-            // Names the failure in the test output without a direct write.
-            try testing.expectEqualStrings("ready", @tagName(reason));
-            unreachable;
-        },
-    };
+    const generation = try captureForTest(shell_path, home, &environ);
     defer generation.destroy();
     try testing.expectEqualStrings("captured-from-startup", generation.environ.get("FX_TEST_SNAPSHOT_MARKER").?);
     try testing.expect(std.mem.startsWith(u8, generation.environ.get("PATH").?, "/opt/fx-snapshot-marker/bin:"));
@@ -1472,6 +2060,22 @@ fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []
     try testing.expect(std.mem.find(u8, generation.replay, "fx_snapshot_function") != null);
     try testing.expect(std.mem.find(u8, generation.replay, "fxll") != null);
     try testing.expect(std.mem.find(u8, generation.replay, "startup chatter") == null);
+    inline for (.{ "_fx_snapshot_helper", "__fxsnap_dunder", "_fx_snapshot_literal" }) |name| {
+        try testing.expect(std.mem.find(u8, generation.replay, name ++ " ()") != null);
+    }
+    try testing.expect(std.mem.find(u8, generation.replay, "__fx_snapshot_private") == null);
+    if (zsh) {
+        // An exported ZDOTDIR is still watched.
+        try testing.expectEqualStrings(home, generation.zdotdir orelse "");
+        // Unloaded completion stubs stay out of the replay but count as
+        // defined names; public stubs and loaded `_` functions are replayed.
+        try testing.expect(generation.defines("_fx_unloaded"));
+        try testing.expect(std.mem.find(u8, generation.replay, "_fx_unloaded") == null);
+        try testing.expect(std.mem.find(u8, generation.replay, "fx_public_unloaded ()") != null);
+        try testing.expect(std.mem.find(u8, generation.replay, "_fx_loaded_later ()") != null);
+    } else {
+        try testing.expect(generation.zdotdir == null);
+    }
 }
 
 test "snapshot capture reads a real zsh login shell" {
@@ -1483,8 +2087,48 @@ test "snapshot capture reads a real zsh login shell" {
             "export PATH=\"/opt/fx-snapshot-marker/bin:$PATH\"\n" ++
             "alias fxll='print -r -- alias-ok'\n" ++
             "fx_snapshot_function() { print -r -- function-ok; }\n" ++
-            "_fx_completion_helper() { :; }\n",
+            "fpath=(\"$HOME/fn\" $fpath)\n" ++
+            "autoload -Uz _fx_unloaded fx_public_unloaded _fx_loaded_later\n" ++
+            "_fx_loaded_later >/dev/null\n",
     );
+}
+
+test "snapshot capture records a ZDOTDIR the startup files set without exporting it" {
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const home = try io_mod.dirRealpathAlloc(scratch, tmp.dir, ".");
+    // A folder name that needs quoting in the replay.
+    const folder = "zd it's\nhere";
+    try tmp.dir.createDirPath(io_mod.getIo(), folder);
+    try writeTestFile(tmp.dir, ".zshenv", "ZDOTDIR=\"$HOME/zd it's\n" ++ "here\"\n");
+    try writeTestFile(tmp.dir, folder ++ "/.zshrc", "export FX_TEST_ZDOTDIR_MARKER=read-from-zdotdir\n");
+
+    var environ = Environ.Map.init(scratch);
+    try environ.put("HOME", home);
+    try environ.put("PATH", "/usr/bin:/bin");
+    try environ.put("TERM", "dumb");
+    const generation = try captureForTest("/bin/zsh", home, &environ);
+    defer generation.destroy();
+    try testing.expectEqualStrings("read-from-zdotdir", generation.environ.get("FX_TEST_ZDOTDIR_MARKER").?);
+    try testing.expectEqualStrings(try std.mem.concat(scratch, u8, &.{ home, "/", folder }), generation.zdotdir orelse "");
+    // It stays out of the environment, and the replay assigns it as a plain
+    // parameter, never exported, as the login shell left it.
+    try testing.expect(generation.environ.get("ZDOTDIR") == null);
+    try testing.expect(std.mem.startsWith(u8, generation.replay, "ZDOTDIR='") or
+        std.mem.find(u8, generation.replay, "\nZDOTDIR='") != null);
+    try testing.expect(std.mem.find(u8, generation.replay, "export ZDOTDIR") == null);
+    try testing.expect(std.mem.find(u8, generation.replay, "typeset -x ZDOTDIR") == null);
+
+    // Without a ZDOTDIR the replay sets none.
+    try tmp.dir.deleteFile(io_mod.getIo(), ".zshenv");
+    const unset = try captureForTest("/bin/zsh", home, &environ);
+    defer unset.destroy();
+    try testing.expect(unset.zdotdir == null);
+    try testing.expect(std.mem.find(u8, unset.replay, "ZDOTDIR=") == null);
 }
 
 test "snapshot capture reads a real bash login shell" {

@@ -2342,7 +2342,9 @@ test "bash user profile commands reuse one startup-file snapshot" {
         ".bash_profile",
         "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
             "alias fxsnap_alias='printf alias-ok'\n" ++
-            "fxsnap_fn() { printf function-ok; }\n" ++
+            "fxsnap_fn() { _fxsnap_helper; }\n" ++
+            "_fxsnap_helper() { __fxsnap_helper; }\n" ++
+            "__fxsnap_helper() { printf function-ok; }\n" ++
             "export PATH=\"$HOME/marker-bin:$PATH\"\n" ++
             "export FXSNAP_EXPORT=exported\n",
     );
@@ -2396,7 +2398,9 @@ test "user profile commands reuse one startup-file snapshot" {
         &tmp,
         "print -r -- loaded >> \"$HOME/rc-loads.log\"\n" ++
             "alias fxsnap_alias='print -r -- alias-ok'\n" ++
-            "fxsnap_fn() { print -r -- function-ok; }\n" ++
+            "fxsnap_fn() { _fxsnap_helper; }\n" ++
+            "_fxsnap_helper() { __fxsnap_helper; }\n" ++
+            "__fxsnap_helper() { print -r -- function-ok; }\n" ++
             "export PATH=\"$HOME/marker-bin:$PATH\"\n" ++
             "export FXSNAP_EXPORT=exported\n" ++
             "for i in {1..3000}; do eval \"fxsnap_bulk_$i() { print -r -- bulk-$i; }\"; done\n",
@@ -2473,6 +2477,50 @@ test "zsh user profile snapshot restores a function that replaces a default alia
     // Both commands ran from the snapshot, so startup ran only for its capture.
     const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
     try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+}
+
+test "zsh user profile snapshot watches and restores a ZDOTDIR the startup files set without exporting it" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The wrapper exports ZDOTDIR as HOME; ~/.zshenv moves it without export.
+    const paths = try writeSnapshotTestShellFor(arena, &tmp, "zsh", ".zshenv", "unset ZDOTDIR\nZDOTDIR=\"$HOME/zd\"\n");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/zd");
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "home/zd/.zshrc",
+        .data = "print -r -- loaded >> \"$HOME/rc-loads.log\"\nexport FXSNAP_ZDOT=v1\n",
+    });
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    // The wrapper runs the snapshot shell too and exports ZDOTDIR as HOME
+    // there, so only the replay can set it to the moved folder. Whether it
+    // stays unexported is checked through the built binary in
+    // tests/e2e/ask-presentation.test.ts, where no wrapper exports it.
+    const probe = "print -r -- \"mark=$FXSNAP_ZDOT zdotdir=$ZDOTDIR\"";
+    const expected_zdotdir = try std.Io.Dir.path.join(arena, &.{ paths.home, "zd" });
+
+    const before = try executeCommandInEnvironment(config, arena, probe, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expect(std.mem.find(u8, before.output, try arena.print("mark=v1 zdotdir={s}\n", .{expected_zdotdir})) != null);
+    _ = try executeCommandInEnvironment(
+        config,
+        arena,
+        "print -r -- 'export FXSNAP_ZDOT=v2' >> \"$HOME/zd/.zshrc\"",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    const after = try executeCommandInEnvironment(config, arena, probe, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expect(std.mem.find(u8, after.output, try arena.print("mark=v2 zdotdir={s}\n", .{expected_zdotdir})) != null);
+
+    // One capture, and one more after the edit.
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\nloaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
 test "user profile command with an approval from an earlier shell epoch does not run" {

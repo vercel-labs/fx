@@ -7,6 +7,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -993,6 +994,13 @@ function writeStartupFiles(home: string, body: string): void {
   writeFileSync(join(home, ".bash_profile"), body);
 }
 
+// The login shell fx runs: the passwd entry's (configuredLoginShellInto in
+// src/core/terminal/shell_resolver.zig). Bun's userInfo().shell reports $SHELL.
+function passwdShell(): string {
+  const result = Bun.spawnSync(["python3", "-c", "import os, pwd; print(pwd.getpwuid(os.getuid()).pw_shell)"]);
+  return result.exitCode === 0 ? result.stdout.toString().trim() : "";
+}
+
 function startupLoads(home: string): number {
   const log = join(home, "rc.log");
   return existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).length : 0;
@@ -1052,6 +1060,135 @@ describe("fx ask shell startup files", () => {
     expect(startupLoads(root.home)).toBe(2);
     expect(result.stderr).not.toContain("shell snapshot unavailable");
   }, TIMEOUT);
+
+  test("user-profile commands call startup-file helpers whose names start with an underscore", async () => {
+    const root = createRoot();
+    // Tools such as zoxide define a public wrapper that calls `__` helpers.
+    writeStartupFiles(
+      root.home,
+      "printf 'loaded\\n' >> \"$HOME/rc.log\"\n" +
+        "_fxgreet_helper() { printf 'FX_HELPER_%s\\n' ok; }\n" +
+        "__fxgreet_dunder() { printf 'FX_DUNDER_%s\\n' ok; }\n" +
+        "fxgreet() { _fxgreet_helper && __fxgreet_dunder; }\n",
+    );
+    const gateway = startFakeGateway([
+      userShellRun("greet", "fxgreet; echo \"FX_STATUS_$?\""),
+      fakeGatewayFinalText("Helpers checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "Check the helpers."],
+      { cwd: root.workspace, env: { ...gatewayEnv(root.home, gateway), FX_SOUND: "0" }, timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    const body = gateway.requests[1]!.body;
+    expect(body).toContain("FX_HELPER_ok");
+    expect(body).toContain("FX_DUNDER_ok");
+    expect(body).toContain("FX_STATUS_0");
+    // The command ran from the snapshot: startup ran only for the capture.
+    expect(startupLoads(root.home)).toBe(1);
+    expect(result.stderr).not.toContain("shell snapshot unavailable");
+  }, TIMEOUT);
+
+  test.skipIf(!passwdShell().endsWith("/zsh"))(
+    "an edit in a ZDOTDIR that startup files set without exporting it reaches the next command",
+    async () => {
+      const root = createRoot();
+      const zdotdir = join(root.home, "zd");
+      mkdirSync(zdotdir);
+      // As with `ZDOTDIR=~/.config/zsh` in ~/.zshenv: set, never exported.
+      writeFileSync(join(root.home, ".zshenv"), "ZDOTDIR=\"$HOME/zd\"\n");
+      writeFileSync(
+        join(zdotdir, ".zshrc"),
+        "printf 'loaded\\n' >> \"$HOME/rc.log\"\nexport FX_ZDOT_MARK=v1\n",
+      );
+      const probe = "echo \"mark=$FX_ZDOT_MARK zdotdir=${ZDOTDIR-unset} exported=$(printenv ZDOTDIR | wc -l | tr -d ' ')\"";
+      const gateway = startFakeGateway([
+        userShellRun("before", probe),
+        userShellRun("edit", "printf '%s\\n' 'export FX_ZDOT_MARK=v2' >> \"$HOME/zd/.zshrc\""),
+        userShellRun("after", probe),
+        fakeGatewayFinalText("ZDOTDIR checked.\n"),
+      ]);
+      gateways.push(gateway);
+
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Check ZDOTDIR."],
+        {
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root.home, gateway), FX_SOUND: "0", ZDOTDIR: undefined },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      // Commands see ZDOTDIR as a login zsh does: set, but not exported.
+      expect(gateway.requests[1]!.body).toContain(`mark=v1 zdotdir=${zdotdir} exported=0`);
+      expect(gateway.requests[3]!.body).toContain(`mark=v2 zdotdir=${zdotdir} exported=0`);
+      // One capture, and one more after the edit.
+      expect(startupLoads(root.home)).toBe(2);
+      expect(result.stderr).not.toContain("shell snapshot unavailable");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!passwdShell().endsWith("/zsh"))(
+    "an edit in the moved ZDOTDIR while the capture runs reaches the next command",
+    async () => {
+      const root = createRoot();
+      const zdotdir = join(root.home, "zd");
+      mkdirSync(zdotdir);
+      writeFileSync(join(root.home, ".zshenv"), "ZDOTDIR=\"$HOME/zd\"\n");
+      // The capture shell reads this file, says so, and waits until the test
+      // has edited it. A later capture finds the release file and runs on.
+      const rc = (mark: string) =>
+        "printf 'loaded\\n' >> \"$HOME/rc.log\"\n" +
+        `export FX_ZDOT_MARK=${mark}\n` +
+        "if [ ! -e \"$HOME/release\" ]; then\n" +
+        "  : > \"$HOME/reached\"\n" +
+        "  i=0\n" +
+        "  while [ ! -e \"$HOME/release\" ] && [ \"$i\" -lt 100 ]; do sleep 0.05; i=$((i + 1)); done\n" +
+        "fi\n";
+      writeFileSync(join(zdotdir, ".zshrc"), rc("v1"));
+      const probe = "echo \"mark=$FX_ZDOT_MARK zdotdir=${ZDOTDIR-unset} exported=$(printenv ZDOTDIR | wc -l | tr -d ' ')\"";
+      const gateway = startFakeGateway([
+        userShellRun("first", probe),
+        userShellRun("second", probe),
+        fakeGatewayFinalText("ZDOTDIR race checked.\n"),
+      ]);
+      gateways.push(gateway);
+
+      const running = runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Check the ZDOTDIR race."],
+        {
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root.home, gateway), FX_SOUND: "0", ZDOTDIR: undefined },
+          timeoutMs: TIMEOUT,
+        },
+      );
+      const reached = join(root.home, "reached");
+      const deadline = Date.now() + 20_000;
+      while (!existsSync(reached) && Date.now() < deadline) await Bun.sleep(20);
+      expect(existsSync(reached)).toBe(true);
+      // The capture has read the file: this edit lands inside the capture.
+      const replacement = join(zdotdir, ".zshrc.next");
+      writeFileSync(replacement, rc("v2"));
+      renameSync(replacement, join(zdotdir, ".zshrc"));
+      writeFileSync(join(root.home, "release"), "");
+      const result = await running;
+
+      expect(result.code).toBe(0);
+      expect(gateway.requests.length).toBe(3);
+      // Neither command runs from the capture that missed the edit.
+      expect(gateway.requests[1]!.body).toContain(`mark=v2 zdotdir=${zdotdir} exported=0`);
+      expect(gateway.requests[2]!.body).toContain(`mark=v2 zdotdir=${zdotdir} exported=0`);
+      // The capture, and one more for the edit made inside it.
+      expect(startupLoads(root.home)).toBe(2);
+      expect(result.stderr).not.toContain("shell snapshot unavailable");
+    },
+    TIMEOUT,
+  );
 
   test("a user-profile command with a quoting error carries rewrite guidance", async () => {
     const root = createRoot();
