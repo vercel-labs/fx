@@ -418,10 +418,12 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => /reviewer\s+gpt-5\s+high/.test(pane) && !/^\s*main\b/m.test(pane), 10_000);
         await session.sendKeys("Enter");
         await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
-        // The agent list names each instance's profile.
+        // The agent list names each instance's profile, and opens on the
+        // launched one, which is on screen.
         await session.sendKeys("C-x");
         const list = await session.waitForText(LIST_HINT, 10_000);
-        expect(list).toMatch(/fx 2 \(on screen\).*reviewer/);
+        expect(list).toMatch(/^ {2}fx 2 {2,}.* {2,}reviewer(?: {2,}|$)/m);
+        expect(agentRows(await session.capturePaneEscapes()).find((row) => row.selected)?.name).toBe("fx 2");
       });
     },
     TIMEOUT,
@@ -476,8 +478,9 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("BSpace");
         const closed = await session.waitForPane((pane) => shownAnswers(pane).length === 0 && pane.includes("esc back"), 15_000);
         expect(closed).not.toContain("delete close");
-        // The instance left is the one the list goes back to.
-        expect(closed).toContain("(on screen)");
+        // The instance left is the one the list goes back to: its row is
+        // selected and, as the only instance open, named main.
+        expect(agentRows(await session.capturePaneEscapes())).toEqual([{ name: "main", selected: true }]);
         // Esc keeps the instance that took over, not the closed one the list opened on.
         await session.sendKeys("Escape");
         const after = await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
