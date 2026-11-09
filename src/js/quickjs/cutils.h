@@ -26,6 +26,7 @@
 #define CUTILS_H
 
 #include <assert.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <time.h>
