@@ -609,9 +609,10 @@ test "restored steering reaches the request in the envelope the model saw" {
     try std.testing.expect((try rewrapRestoredSteering(arena, &unchanged)).ptr == (&unchanged).ptr);
 }
 
-/// Steering the user typed during the turn, which a cancelled turn keeps.
+/// Steering the user typed during the turn, and fx's own prompt to a stalled
+/// turn, which a cancelled turn keeps: its last request ended with them.
 fn isSteering(message: ChatMessage) bool {
-    if (message.restored_steering) return true;
+    if (message.restored_steering or message.recovery_prompt) return true;
     const content = message.content orelse return false;
     return steeringText(content) != null;
 }
@@ -863,6 +864,24 @@ test "interrupted execution memory keeps steering typed right after a tool resul
     try std.testing.expectEqual(@as(usize, 1), memory.steering.len);
     try std.testing.expectEqualStrings("check the tests too", memory.steering[0].text);
     try std.testing.expectEqual(@as(usize, 1), memory.steering[0].after_tool_step_count);
+}
+
+test "interrupted execution memory keeps fx's prompt to a stalled turn" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{toolCall("call_done", "read_file", "{\"path\":\"a.txt\"}")};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "a", .tool_call_id = "call_done", .tool_name = "read_file", .tool_result_status = .success },
+        .{ .role = .user, .content = "Summarize what you just did.", .recovery_prompt = true },
+    };
+
+    const memory = try buildInterruptedExecutionMemory(alloc, &messages, null);
+    defer types.freeExecutionMemory(alloc, memory);
+
+    try std.testing.expectEqual(@as(usize, 1), memory.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), memory.steering.len);
+    try std.testing.expectEqual(@as(usize, 1), memory.steering[0].after_tool_step_count);
+    try std.testing.expectEqualStrings("Summarize what you just did.", recovery_prompt.fromSaved(memory.steering[0].text).?);
 }
 
 fn hasToolResultForCall(
