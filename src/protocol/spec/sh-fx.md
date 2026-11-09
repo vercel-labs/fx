@@ -98,7 +98,7 @@ fx lists the `sh.fx/promptDelivery` capability with the deliveries it supports:
 { "sh.fx/promptDelivery": { "steer": {}, "queue": {} } }
 ```
 
-A client lists `sh.fx/promptDelivery` to receive the `sh.fx/steerInput` and `sh.fx/steeringDelivery` keys that this section describes. Until fx queues prompts, it lists `steer` alone, and a prompt with `"queue"` that arrives while a turn runs fails with `-32602`.
+A client lists `sh.fx/promptDelivery` to receive the `sh.fx/steerInput` and `sh.fx/steeringDelivery` keys that this section describes.
 
 #### Deliveries
 
@@ -159,7 +159,7 @@ The response to a steer arrives when the turn that took it ends. It carries that
 
 ACP v2's rule for [prompts during active work](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle) differs on one point: there, `session/cancel` also answers the prompts that haven't run with `-32800`. ACP v1 has no such rule. fx revisits this point when it moves to ACP v2.
 
-`tests/tla/acp/AcpPromptDelivery.tla` models these rules, and TLC checks them in every order of steers, queued prompts, stops, withdrawals, and closing. Its `Today` configs show where fx's ACP path breaks them now, and `tests/tla/drivers/acp/prompt_delivery/driver.ts` runs `fx acp` along the model.
+`tests/tla/acp/AcpPromptDelivery.tla` models these rules, and TLC checks them in every order of steers, queued prompts, stops, withdrawals, and closing. Its `Today` configs show where fx's ACP path broke them before it followed them, and `tests/tla/drivers/acp/prompt_delivery/driver.ts` runs `fx acp` along the model.
 
 #### Host steering
 

@@ -2,8 +2,8 @@
 (***************************************************************************)
 (* Steering and queued prompts in fx's ACP server, as the sh.fx spec's    *)
 (* "Steering and queued prompts" section defines them                     *)
-(* (src/protocol/spec/sh-fx.md). The rules have not landed in             *)
-(* src/acp/ yet: `Rules` set to FALSE gives fx's ACP path today, and the  *)
+(* (src/protocol/spec/sh-fx.md), which fx's ACP path follows.            *)
+(* `Rules` set to FALSE gives the path before it followed them, and the   *)
 (* AcpPromptDeliveryToday-*.cfg configs show each rule failing there.     *)
 (* tests/tla/sdk/DurableSteer.tla models the same rules for libfx's host  *)
 (* steering, which the fx CLI follows.                                    *)
@@ -32,13 +32,12 @@
 (*  - Each prompt gets exactly one answer: a turn's stopReason, and for a *)
 (*    steer the delivery: absorbed into the running turn, or next_turn.   *)
 (*                                                                        *)
-(* Today (Rules = FALSE): a steer never cuts a reply short; a steer that  *)
-(* waits when the reply ends goes on in the same turn, as under the rules *)
-(* (tests/tla/drivers/acp/prompt_delivery/driver.ts shows it); one that   *)
-(* arrives while the turn finishes fails with -32600; a stop fails the    *)
-(* waiting steers with -32800; a late steer runs as its own               *)
-(* next turn; fx lists only the steer delivery, so a queued prompt        *)
-(* fails with -32602; and $/cancel_request ignores a steer.               *)
+(* Before (Rules = FALSE): a steer never cut a reply short; a steer that  *)
+(* waited when the reply ended went on in the same turn, as under the     *)
+(* rules; one that arrived while the turn finished failed with -32600; a  *)
+(* stop failed the waiting steers with -32800; a late steer ran as its    *)
+(* own next turn; fx listed only the steer delivery, so a queued prompt   *)
+(* failed with -32602; and $/cancel_request ignored a steer.              *)
 (*                                                                        *)
 (* The phases of the running turn: "gen" while the model streams a reply, *)
 (* "decide" once the reply has streamed and before the turn's next        *)
@@ -175,7 +174,7 @@ Send(m) ==
                      /\ queue' = Append(queue, m)
                      /\ UNCHANGED <<running, phase, cur, waiting, late, answers, placed, started>>
               [] OTHER ->
-                     \* Today fx lists only the steer delivery and refuses a queued one.
+                     \* Before the rules, fx listed only the steer delivery and refused a queued one.
                      /\ answers' = [answers EXCEPT ![m] = Err(-32602)]
                      /\ UNCHANGED <<running, phase, cur, waiting, late, queue, placed, started>>
 
