@@ -626,6 +626,59 @@ describe("configured providers", () => {
     }
   }, 12000);
 
+  // A cold local model can take minutes before its first byte. An agent
+  // request waits for it, as it does on the AI Gateway, instead of giving up
+  // at 120 s and sending the request again.
+  test("a cold local model that sends its first byte after two minutes is answered without a resend", async () => {
+    let calls = 0;
+    const f = fixture(async body => {
+      if (++calls === 1) await Bun.sleep(125_000);
+      return completion(body.model, "answer from a cold model");
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "Say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 180_000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).final_output).toBe("answer from a cold model");
+      expect(f.requests).toHaveLength(1);
+      expect(result.stderr).not.toContain("Connection lost");
+    } finally { f.close(); }
+  }, 200_000);
+
+  // The patient wait still ends at once when the server closes the socket
+  // before its head, and the request is sent again on a new connection.
+  test("a connection the server closes before its head is sent again once", async () => {
+    const requests: any[] = [];
+    const listener = Bun.listen<{ received: string; answered: boolean }>({
+      hostname: "127.0.0.1", port: 0,
+      socket: {
+        open(socket) { socket.data = { received: "", answered: false }; },
+        async data(socket, chunk) {
+          socket.data.received += chunk.toString();
+          const split = socket.data.received.indexOf("\r\n\r\n");
+          if (split < 0 || socket.data.answered) return;
+          const length = Number(/content-length: *(\d+)/i.exec(socket.data.received.slice(0, split))?.[1] ?? 0);
+          if (socket.data.received.length < split + 4 + length) return;
+          socket.data.answered = true;
+          const body = JSON.parse(socket.data.received.slice(split + 4, split + 4 + length));
+          requests.push(body);
+          if (requests.length === 1) { setTimeout(() => socket.end(), 200); return; }
+          const sse = await completion(body.model, "answer after the server closed").text();
+          socket.end(`HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: ${Buffer.byteLength(sse)}\r\nconnection: close\r\n\r\n${sse}`);
+        },
+      },
+    });
+    const f = fixture();
+    try {
+      f.settings.providers.local.base_url = `http://127.0.0.1:${listener.port}/v1`;
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "Say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20_000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).final_output).toBe("answer after the server closed");
+      expect(requests).toHaveLength(2);
+      expect(requests[1]).toEqual(requests[0]);
+    } finally { listener.stop(true); f.close(); }
+  }, 25_000);
+
   test("a connection without a saved model runs from --model or FX_MODEL and rejects a blank FX_MODEL", async () => {
     const f = fixture();
     try {
