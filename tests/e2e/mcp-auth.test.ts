@@ -663,11 +663,12 @@ function startToolGateway() {
   });
 }
 
-function startDelayedToolGateway(delayMs: number, finalText: string) {
+/// Holds the call to the protected tool until `callAt`, a wall-clock time in ms.
+function startDelayedToolGateway(callAt: number, finalText: string) {
   return startFakeGateway([
     fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
     async () => {
-      await Bun.sleep(delayMs);
+      await Bun.sleep(Math.max(0, callAt - Date.now()));
       return fakeGatewayToolCall("call_mcp", TOOL_NAME, {
         text: "authenticated",
       });
@@ -678,13 +679,15 @@ function startDelayedToolGateway(delayMs: number, finalText: string) {
   });
 }
 
-function startRefreshRecoveryGateway(delayMs: number) {
+/// Holds the first call to the protected tool until `callAt()`, a wall-clock
+/// time in ms.
+function startRefreshRecoveryGateway(callAt: () => number) {
   return startFakeGateway([
     fakeGatewayToolCall("select_cancel", "mcp_select_tool", {
       name: TOOL_NAME,
     }),
     async () => {
-      await Bun.sleep(delayMs);
+      await Bun.sleep(Math.max(0, callAt() - Date.now()));
       return fakeGatewayToolCall("call_cancel", TOOL_NAME, {
         text: "cancelled",
       });
@@ -2474,14 +2477,16 @@ describe("MCP login", () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
     const root = createRoot(auth);
-    // Renewed 6 s before it expires, 10 s from now: the first use is outside
-    // that window, and the call 6 s later inside it.
-    seedV2Credential(root, auth, { expires_at_ms: Date.now() + 10_000, skew_ms: 6_000 });
-    gateway = startDelayedToolGateway(6_000, "Renewed call complete.");
+    // Renewed 6 s before it expires, 21 s from now: the first use is well
+    // before that window, even when fx starts slowly on a busy machine, and
+    // the call, held until 16 s from now, inside it.
+    const savedAt = Date.now();
+    seedV2Credential(root, auth, { expires_at_ms: savedAt + 21_000, skew_ms: 6_000 });
+    gateway = startDelayedToolGateway(savedAt + 16_000, "Renewed call complete.");
     const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture."], {
       cwd: root.workspace,
       env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
-      timeoutMs: 30_000,
+      timeoutMs: 45_000,
     });
     expect(result.code).toBe(0);
     expect(auth.refreshes).toBe(1);
@@ -2492,7 +2497,7 @@ describe("MCP login", () => {
     const call = sent.find((request) => request.body.includes('"tools/call"'));
     expect(call?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
     expect(auth.protectedToolCalls).toBe(1);
-  }, 40_000);
+  }, 60_000);
 
   // Before, a shell that started before another terminal signed in logged out
   // without that login, which stayed valid at the server for every other fx.
@@ -2645,7 +2650,9 @@ describe("MCP login", () => {
     // The first renewal never answers.
     auth = startAuthFixture(upstream.url, { stallRefresh: true });
     const root = createRoot(auth);
-    gateway = startRefreshRecoveryGateway(6_000);
+    // Times from the moment the login is saved, below.
+    let savedAt = 0;
+    gateway = startRefreshRecoveryGateway(() => savedAt + 16_000);
     tui = await TmuxSession.create({
       isolated: true,
       cwd: root.workspace,
@@ -2654,11 +2661,13 @@ describe("MCP login", () => {
       env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
     });
     await tui.waitForComposer(15_000);
-    // Renewed 6 s before it expires, 12 s from now: the tool is found
-    // outside that window, and called 6 s later inside it.
-    const store = seedV2Credential(root, auth, { expires_at_ms: Date.now() + 12_000, skew_ms: 6_000 });
+    // Renewed 6 s before it expires, 21 s from now: the tool is found well
+    // before that window, even on a slow machine, and called inside it, 16 s
+    // from now.
+    savedAt = Date.now();
+    const store = seedV2Credential(root, auth, { expires_at_ms: savedAt + 21_000, skew_ms: 6_000 });
     await tui.sendText("Call the protected MCP fixture.");
-    const refreshDeadline = Date.now() + 20_000;
+    const refreshDeadline = Date.now() + 40_000;
     while (auth.refreshes === 0 && Date.now() < refreshDeadline) await Bun.sleep(25);
     expect(auth.refreshes).toBe(1);
 

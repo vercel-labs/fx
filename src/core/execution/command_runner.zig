@@ -6584,11 +6584,12 @@ test "natural completion marks output incomplete when the deadline cuts leftover
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
     // The command exits at once, but delivering its 200 lines takes about
-    // four seconds, so the deadline lands while its output is still unread.
-    var consumer = SlowOutputConsumer{ .delay_ms = 20 };
+    // eight seconds, so the deadline lands while its output is still unread.
+    // The 3 s give a slow Python start on a busy machine time to exit first.
+    var consumer = SlowOutputConsumer{ .delay_ms = 40 };
     const result = try executeCommand(.{
         .max_command_output_bytes = 1024,
-        .timeout_ms = 1_000,
+        .timeout_ms = 3_000,
         .output_chunk_ctx = @ptrCast(&consumer),
         .on_output_chunk = SlowOutputConsumer.onChunk,
     }, alloc, "python3 -c 'import sys; sys.stdout.write((\"y\"*99+\"\\n\")*200)'", workspace);

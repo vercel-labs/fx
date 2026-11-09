@@ -1,5 +1,5 @@
-//! The agent list ↓, Ctrl+X, and `/agents` open: one row per open agent, the
-//! instances in launch order, each followed by the subagents it started,
+//! The agent list ↓, Ctrl+X, and `/agents` open: one row per open agent,
+//! working agents first, then the most recently answered conversations,
 //! such as "fx 3 · Fix the login bug · reviewer · needs approval · opus 4-7".
 
 const std = @import("std");
@@ -94,20 +94,17 @@ const hint_variants = [_][]const u8{
 };
 
 const closable_hint_variants = [_][]const u8{
-    "↑↓ preview     enter switch     x close     esc back",
-    "↑↓ preview  enter switch  x close  esc back",
-    "↑↓ preview  enter  x close  esc",
+    "↑↓ preview     enter switch     delete close     esc back",
+    "↑↓ preview  enter switch  delete close  esc back",
+    "↑↓ preview  enter  delete close  esc",
     "enter switch  esc back",
 };
 
 const armed_hint_variants = [_][]const u8{
-    "x again to close it for good     any other key keeps it",
-    "x again to close it for good  any other key keeps it",
-    "x again to close",
+    "press delete again to close this subagent",
 };
 
-/// The hint row under the list: x closes a subagent's row, and once the
-/// first x armed that close, the row says what the second does.
+/// Delete closes a subagent's row after a second press confirms it.
 pub fn hintVariants(projection: AgentsMenuProjection) []const []const u8 {
     if (projection.close_armed) return &armed_hint_variants;
     if (projection.selected_closable) return &closable_hint_variants;

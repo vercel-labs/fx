@@ -12,6 +12,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const composer_stash = @import("../input/composer_stash.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
@@ -376,7 +377,7 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .available_model_capabilities = agentAvailableModelCapabilities,
                 .resolve_model_capabilities = agentResolveModelCapabilities,
-                .model_catalog_unavailable = agentModelCatalogUnavailable,
+                .model_catalog_failure = agentModelCatalogFailure,
                 .format_tool_execution_error = agentFormatToolExecutionError,
                 .record_tool_call_rejected = agentRecordToolCallRejected,
                 .record_tool_call_failed = agentRecordToolCallFailed,
@@ -470,6 +471,7 @@ pub fn Bindings(comptime App: type) type {
                 .append_code_block = workerBridgeAppendCodeBlock,
                 .append_thematic_rule = workerBridgeAppendThematicRule,
                 .drain_assistant_text = workerBridgeDrainAssistantText,
+                .hold_model_call = workerBridgeHoldModelCall,
                 .open_model_picker = workerBridgeOpenModelPicker,
                 .semantic_notice = workerBridgeSemanticNotice,
                 .credential_refreshed = workerBridgeCredentialRefreshed,
@@ -851,13 +853,13 @@ pub fn Bindings(comptime App: type) type {
             }
         }
 
-        fn agentModelCatalogUnavailable(ctx: *anyopaque) bool {
+        fn agentModelCatalogFailure(ctx: *anyopaque) ?model_catalog.FailureCategory {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            if (comptime @hasDecl(App, "isModelCacheFailed")) {
-                return app.isModelCacheFailed();
+            if (comptime @hasDecl(App, "modelCacheFailure")) {
+                return app.modelCacheFailure();
             }
-            return false;
+            return null;
         }
 
         fn resolveSubagentModelOverride(ctx: ?*anyopaque, alloc: Allocator, raw_model: []const u8) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
@@ -1501,6 +1503,15 @@ pub fn Bindings(comptime App: type) type {
                 app.pacerCallbacks(),
             );
             return .drained;
+        }
+
+        fn workerBridgeHoldModelCall(ctx: *anyopaque, record: types.ModelCallRecord) !bool {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            if (comptime @hasDecl(@TypeOf(app.pacer), "holdModelCall")) {
+                return app.pacer.holdModelCall(app.alloc, record);
+            }
+            return false;
         }
 
         fn workerBridgeOpenModelPicker(ctx: *anyopaque) !void {

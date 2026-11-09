@@ -63,6 +63,7 @@ VERIFICATION_E2E_TESTS = (
     "tui-auth-source-selection.test.ts",
     "tui-compaction-activity.test.ts",
     "tui-transcript-window.test.ts",
+    "tui-full-detail.test.ts",
     "compaction-policy.test.ts",
     "tui-composer-edit-contracts.test.ts",
     "tui-permissions-panel.test.ts",

@@ -10,7 +10,7 @@ const { FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, startFakeGateway,
 
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const TIMEOUT = 30_000;
-const NAVIGATION = "full detail · ctrl+o close";
+const NAVIGATION = "esc close · pgup/pgdn scroll";
 const marker = (n: number) => `WINDOW_C${String(n).padStart(2, "0")}`;
 const markers = (count: number) => Array.from({ length: count }, (_, n) => marker(n));
 /// About `bytes` of words that never repeat, so every screen of it differs and

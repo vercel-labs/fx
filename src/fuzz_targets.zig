@@ -9,6 +9,7 @@ test {
     _ = @import("acp/mcp_servers.zig");
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/agent/runtime/execution_memory.zig");
+    _ = @import("core/agent/runtime/parallel_execution.zig");
     _ = @import("core/agent/runtime/vision_contracts.zig");
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("core/cli/cli_flags.zig");
@@ -39,6 +40,7 @@ test {
     _ = @import("core/subagent/reports.zig");
     _ = @import("core/terminal/engine.zig");
     _ = @import("core/tooling/command_output_content.zig");
+    _ = @import("core/tooling/file_mutation.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/client.zig");

@@ -30,6 +30,7 @@
     {"name": "skill_file", "module": "fx", "test": "parseSkillFile keeps fuzzed borrowed slices inside the input", "iterations": 5000000},
     {"name": "skill_display_name", "module": "fx", "test": "skill display name parsing stays bounded", "iterations": 5000000},
     {"name": "command_output_content", "module": "fx", "test": "fuzz command output content", "iterations": 160000},
+    {"name": "edit_failure_hints", "module": "fx", "test": "edit failure hints stay within their bounds for any file and old_string", "iterations": 900000},
     {"name": "file_index", "module": "fx", "test": "file index raw-list and Unicode query bytes remain bounded", "iterations": 620000},
     {"name": "responses_text", "module": "fx", "test": "Responses text finalization fuzzes chunking and capture boundaries", "iterations": 430000},
     {"name": "sse_framing", "module": "fx", "test": "provider framing fuzzes chunk-invariant event data", "iterations": 1300000},
@@ -51,6 +52,8 @@
     {"name": "ask_questions_text", "module": "fx", "test": "ask_user_question questions sent as JSON text decode or refuse arbitrary bytes", "iterations": 250000},
     {"name": "transcript_window", "module": "fx", "test": "the transcript window keeps the model's laws on arbitrary event sequences", "iterations": 2000000},
     {"name": "frozen_prefix", "module": "fx", "test": "a runtime resuming after its frozen prefix matches a full render on arbitrary edits", "iterations": 1500},
-    {"name": "session_title", "module": "fx", "test": "session titles keep their rules on fuzzed input", "iterations": 5000000}
+    {"name": "session_title", "module": "fx", "test": "session titles keep their rules on fuzzed input", "iterations": 5000000},
+    {"name": "session_records_listing", "module": "fx", "test": "fuzzed puts and writes list each compactor record once (D50)", "iterations": 2000},
+    {"name": "subagent_parallel_groups", "module": "fx", "test": "fuzzed subagent calls never run two calls to one subagent at once", "iterations": 2000}
   ]
 }

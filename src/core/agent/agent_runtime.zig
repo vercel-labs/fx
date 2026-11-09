@@ -56,6 +56,8 @@ test {
     _ = @import("runtime/agent.zig");
     _ = @import("runtime/cache_warming.zig");
     _ = @import("runtime/cache_warmer.zig");
+    _ = @import("runtime/finalization.zig");
+    _ = @import("runtime/model_call_record.zig");
     _ = @import("runtime/orchestrator.zig");
     _ = @import("runtime/resend_strategy.zig");
     _ = @import("runtime/request_recovery.zig");

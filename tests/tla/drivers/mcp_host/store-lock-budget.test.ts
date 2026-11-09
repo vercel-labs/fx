@@ -315,17 +315,21 @@ for (let rep = 0; rep < Math.max(1, repetitions); rep++) {
   test.skipIf(!darwin)(`holders taking turns outlast a waiter's own 12 s and it still waits (seed ${rep})`, async () => {
     const s = scene(`slb-turns-${rep}`);
     try {
-      // Seeded: each read is slowed 3 to 6 s; five processes queue, about 22 s in all.
+      // The first read slowed is held 8 s, so the processes after it are all
+      // waiting before it ends. On a busy machine the first reads can finish
+      // before they're seen and slowed, and with five processes and no long
+      // first hold the last waiter then waited only about 9 s. Seeded: each
+      // read after it is slowed 3 to 6 s; six processes queue, about 30 s.
       let seed = 0x5eed + rep;
       const next = () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
-      const pauses = Array.from({ length: 5 }, () => 3_000 + Math.floor(next() * 3_000));
+      const pauses = [8_000, ...Array.from({ length: 5 }, () => 3_000 + Math.floor(next() * 3_000))];
       save(join(s.f.base, "pauses.json"), pauses);
       const slow = slowReads(s, (n) => pauses[n] ?? 0);
-      for (const k of [0, 1, 2, 3, 4]) start(s, `p${k}`);
+      for (const k of [0, 1, 2, 3, 4, 5]) start(s, `p${k}`);
       const { verdict, seen: all } = await finish(s);
       slow.stop();
       const t = totals(all);
-      expect(t).toEqual({ takes: 5, releases: 5, giveups: 0 });
+      expect(t).toEqual({ takes: 6, releases: 6, giveups: 0 });
       // The last process waited longer than 12 s from its own start.
       const longest = Math.max(...all.map((v) => (v.takes[0]?.at ?? 0) - (v.takes[0]?.started ?? 0)));
       save(join(s.f.base, "longest-wait.json"), { longest });

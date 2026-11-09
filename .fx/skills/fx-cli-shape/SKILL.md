@@ -1,11 +1,24 @@
 ---
 name: fx-cli-shape
-description: Choose the mechanism and the names for any user-facing control in fx, and check changes against the agreed shape. Covers subcommands, arguments, flags and options, settings keys in settings.json and .fx.json, environment variables (FX_ env vars), slash commands, JSON output, and exit codes. Use when adding, renaming, deprecating, removing, or reviewing one, for example "add a flag", "add an option", "new env var", "make this configurable", "let users turn on X", "add a slash command", "deprecate this flag", "should this be a flag or a setting", or a diff that touches src/builtins/commands.zig, src/core/cli/, src/core/config/, or adds an FX_ env read. Not for parser internals or writing documentation prose.
+description: Choose the mechanism and the names for any user-facing control in fx, and check changes against the agreed shape. Covers subcommands, arguments, flags and options, settings keys in settings.json and .fx.json, environment variables (FX_ env vars), slash commands, JSON output, and exit codes. Use when adding, renaming, deprecating, removing, or reviewing one, for example "add a flag", "add an option", "new env var", "make this configurable", "let users turn on X", "add a slash command", "remove this command", "what should this flag be called", "deprecate this flag", "should this be a flag or a setting", or a diff that touches src/builtins/commands.zig, src/core/cli/, src/core/config/, or adds an FX_ env read. Not for parser internals or writing documentation prose.
 ---
 
 # fx CLI shape
 
 fx follows git and Unix conventions for how people and scripts control it. Each concept gets one mechanism and one name, so anyone who knows git can guess the command, flag, or setting. Use this skill to pick the mechanism for a new control, name it on every surface, and check a change before it lands. The maintainers agreed on these rules; follow them unless a maintainer says otherwise in the conversation.
+
+## Values
+
+Every rule below comes from these values. When a case isn't covered, decide by them, then ask a maintainer.
+
+- **Guessable.** Someone who knows git and the Unix command line should predict what a control is called, where its options go, and which source wins. Follow open standards first, such as `AGENTS.md`, the Agent Skills folders, MCP's `mcp.json`, and `NO_COLOR`; then git; then what other coding agents agree on. When copying a reference would make a command harder to type, the shorter form wins.
+- **One concept, one name.** A setting is spelled the same in settings files, flags, env vars, slash commands, JSON, ACP, and libfx. Only each surface's case changes.
+- **One job per mechanism.** Subcommands act, arguments name what they act on, flags shape one run, settings persist, env vars carry context from the surroundings, and slash commands act inside a session.
+- **Scripts are first-class.** Data goes to stdout and diagnostics to stderr, JSON fields stay stable, exit codes mean something, and fx never prompts without a terminal.
+- **Untrusted input stays limited.** A committed project file or a repository's content never gets the power of the user's own profile.
+- **One source of truth.** Help, parsing, completion, and the CI checks read the same specs and registries, so they can't disagree.
+- **Small surface.** Adding a control takes one change and taking it back takes a deprecation, so a new control has to show why an existing one can't be extended.
+- **Never break users silently.** A rename keeps the old spelling working with a warning that names its replacement and the release that drops it.
 
 ## Current versus target
 
@@ -92,6 +105,10 @@ Ask before inventing a rule for something these rules don't cover: keyboard shor
 - `-c` already means continue, so git's `-c key=value` can't be copied. The one-run override is `fx ask --config key=value`.
 - Full access is saved and printed as `full-access`, and `yolo` is read until fx 0.0.18, with `fx doctor` pointing it out. Only ACP's mode `_meta` and the fx-managed `yolo_acknowledged` key keep the old word.
 - Build a deprecation warning from `command_specs.deprecated_until`, as `/setup` does with `"/setup " ++ command_specs.deprecated_until ++ "; use /login ..."`. Tests pin the full text, and writing the release by hand breaks when it moves.
+- A warning first ships in the first release tagged after it merges, which can be later than planned: check with `git tag --contains <merge commit>`. The current set was first meant to drop in 0.0.17 but merged after v0.0.16 was cut, so 0.0.17 was its first warning release and its version bump failed the shape check until the removal moved to 0.0.18. For the same reason, merge the change that removes old spellings only after the last release that warns about them is tagged.
+- Adding or removing a slash command changes the `/help` catalog count, which tests write as literals: `Commands <n>` in unit and E2E tests, `waitForHelpMenu(session, <n>)` in the E2E tests, and the `helpCatalogCount` assertion in `src/core/slash_commands/command_specs.zig`. Search `src` and `tests` for the old count and update every one; a missed one fails a unit test or a TUI test.
+- Remove a slash command that only prints a placeholder rather than hiding it, since a hidden command must be internal or deprecated. Add its name to the router's `parse rejects removed slash commands` test in `src/core/slash_commands/command_router.zig`, which uses the built-in registry, so the name can't come back by accident.
+- An `FX_*` override listed in `src/core/config/env_settings.zig` shows in `fx config list`, so fx.sh documents it, and the shape check fails unless `scripts/cli_shape_registry.json` marks it `stable`.
 - `fx login vercel --api-key` pastes an AI Gateway API key. `fx setup` and `/setup` still work until fx 0.0.18 but warn: `fx setup` points to `fx login vercel --api-key`, and `/setup`, an alias of `/provider`, points to `/login` and `/provider`. Neither appears in help. Don't give "setup" a new meaning.
 - Resume already has seven kept spellings. Use `--resume last` or `--resume <id>`; never add another form such as `--resume-latest`.
 - Every test hook starts with `FX_TEST_`; CI rejects a test hook with any other prefix.

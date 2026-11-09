@@ -24,6 +24,21 @@ pub fn setIo(zio: std.Io) void {
     real_io = process_io_for(builtin.target.os.tag, zio);
 }
 
+/// Tests only: `getIo` returns `zio`, as given, until `restoreIoForTest`
+/// puts the returned value back. Unlike `setIo`, it skips the Darwin
+/// process selection, so `zio` must come from `getIo` to keep it.
+pub fn replaceIoForTest(zio: std.Io) ?std.Io {
+    comptime std.debug.assert(builtin.is_test);
+    const previous = real_io;
+    real_io = zio;
+    return previous;
+}
+
+pub fn restoreIoForTest(previous: ?std.Io) void {
+    comptime std.debug.assert(builtin.is_test);
+    real_io = previous;
+}
+
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
     return if (os_tag == .macos) darwin_process_spawn.wrap(zio) else zio;
 }
@@ -1890,4 +1905,24 @@ test "timed advisory lock reports unsupported without unlocked fallback" {
         error.LockUnsupported,
         acquireTimedAdvisoryLockWithOps(&dir, "settings.lock", 25, ops),
     );
+}
+
+/// Holds each standard stream the parent left closed open on /dev/null,
+/// read-only, so no file fx opens later takes its number. A write meant for a
+/// closed stdout then fails, instead of landing in that file, such as the
+/// session store's lock, and a read of a closed stdin ends at once. Call it
+/// before fx opens anything.
+pub fn reserveClosedStandardStreams() void {
+    if (comptime !builtin.link_libc or builtin.target.os.tag == .windows) return;
+    for ([_]std.c.fd_t{ 0, 1, 2 }) |fd| {
+        if (std.c.fcntl(fd, std.c.F.GETFD) != -1) continue;
+        // `open` returns the lowest free number, which is `fd` once the
+        // closed streams below it are held.
+        const held = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY });
+        if (held < 0) return;
+        if (held != fd) {
+            _ = std.c.dup2(held, fd);
+            _ = std.c.close(held);
+        }
+    }
 }

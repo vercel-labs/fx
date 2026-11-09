@@ -276,7 +276,7 @@ tmuxTest("typing inside the ctrl+o full transcript never starts the native-clear
     // While the full transcript owns the alternate screen, the terminal cursor
     // no longer reflects the main-grid footer row, so the probe must not begin.
     await session.sendKeys("C-o");
-    await session.waitForText("ctrl+o close", 10_000);
+    await session.waitForText("esc close · pgup/pgdn scroll", 10_000);
     await session.sendLiteral("j");
 
     // The typed byte still reaches the composer through the modal fallthrough.

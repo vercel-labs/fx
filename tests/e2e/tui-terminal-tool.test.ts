@@ -760,17 +760,18 @@ test.skipIf(!tmuxAvailable())(
     expect(mainRows.join("\n")).not.toContain("FULL_LAUNCH_TAIL");
 
     // `interact` carries no command argument, so the Observed heading is the
-    // only place Ctrl-O can show the launch command. It must wrap under the
-    // tree rail instead of trailing. Heading continuations start "│ word";
-    // detail rows start "│  key: value".
+    // only place Ctrl-O can show the launch command. It must wrap instead of
+    // trailing. The heading opens with the tool's mark and ends at a blank
+    // row, an argument row ("    key: value") or the tool's time
+    // ("    12:00:00").
     const fullObservedHeading = (grid: string[]) => {
       const rows = grid.map((line) => line.trimEnd());
-      const start = rows.findIndex((line) => line.startsWith("├ Observed "));
+      const start = rows.findIndex((line) => line.startsWith("● Observed "));
       if (start < 0) return null;
-      const parts = [rows[start]!.slice("├ ".length)];
+      const parts = [rows[start]!.slice("● ".length).trim()];
       for (const line of rows.slice(start + 1)) {
-        if (!line.startsWith("│ ") || line.startsWith("│  ")) break;
-        parts.push(line.slice("│ ".length));
+        if (line.trim() === "" || /^ {4}[a-z_]+: /.test(line) || /^ {4}\d{2}:\d{2}:\d{2}\b/.test(line)) break;
+        parts.push(line.trim());
       }
       return parts.join(" ");
     };
@@ -785,21 +786,21 @@ test.skipIf(!tmuxAvailable())(
       return grid;
     };
     await session.sendKeys("C-o");
-    await session.waitForText("full detail · ctrl+o close", TIMEOUT);
+    await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
     let grid = await settledFullGrid();
-    expect(fullObservedHeading(grid)).toBe(expectedHeading);
+    expect(fullObservedHeading(grid), grid.join("\n")).toBe(expectedHeading);
     expect(grid.join("\n")).toContain("action: interact");
     expect(grid.join("\n")).not.toContain("…");
 
     await session.resizeWindow(60, 72);
     grid = await settledFullGrid();
-    expect(fullObservedHeading(grid)).toBe(expectedHeading);
+    expect(fullObservedHeading(grid), grid.join("\n")).toBe(expectedHeading);
     expect(grid.join("\n")).not.toContain("…");
 
     // Closing Ctrl-O returns to the trailing main view and leaks none of the
     // full-detail rows into scrollback.
     await session.sendKeys("C-o");
-    await session.waitForPane((pane) => !pane.includes("full detail · ctrl+o close"), TIMEOUT);
+    await session.waitForPane((pane) => !pane.includes("esc close · pgup/pgdn scroll"), TIMEOUT);
     const scrollback = await session.captureFullScrollback();
     expect(scrollback).toContain("├ Observed echo word0");
     expect(scrollback).not.toContain("FULL_LAUNCH_TAIL");

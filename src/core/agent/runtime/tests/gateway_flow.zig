@@ -1957,7 +1957,7 @@ test "processQueuedPrompt sends a text-only turn while a down catalog withholds 
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.catalog_unavailable = true;
+    hooks.catalog_failure = .gateway_unavailable;
     hooks.default_model_capabilities = .{ .image_input_support = .unknown, .context_window = 1_000_000 };
     hooks.tool_registry = .{ .tools = test_support.vision_agent_test_tools[0..] };
     defer hooks.deinit();
@@ -4453,7 +4453,7 @@ test "processQueuedPrompt notifies once when fast mode drops on a failed catalog
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.catalog_unavailable = true;
+    hooks.catalog_failure = .gateway_unavailable;
     defer hooks.deinit();
     var fixture = PromptFixture{};
     var config = fixture.config();
@@ -4480,7 +4480,7 @@ test "processQueuedPrompt emits the fast-unavailable notice once across a multi-
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.catalog_unavailable = true;
+    hooks.catalog_failure = .gateway_unavailable;
     defer hooks.deinit();
     const ReadExecution = struct {
         fn execute(_: *anyopaque, _: ToolExecutionRequest) !ToolExecutionResult {
@@ -5212,7 +5212,7 @@ test "explicit skill loads publish one interactive summary without extra tool ca
     try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
 }
 
-test "processQueuedPrompt publishes a full-detail network record per settled provider request" {
+test "processQueuedPrompt shows and saves one call record per settled provider request" {
     const alloc = std.testing.allocator;
     var gateway = FakeGateway.init(alloc, &.{.{ .content = "Plain answer" }});
     defer gateway.deinit();
@@ -5222,17 +5222,22 @@ test "processQueuedPrompt publishes a full-detail network record per settled pro
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 1), hooks.full_detail_records.items.len);
-    const record = hooks.full_detail_records.items[0];
-    try std.testing.expectEqualStrings("network", record.topic);
-    try std.testing.expectEqual(types.NoticeVisibility.full_only, record.visibility);
-    try std.testing.expectEqual(types.NoticeTone.neutral, record.tone);
-    try std.testing.expect(std.mem.find(u8, record.body, "provider: gateway") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "model: ") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "finish: stop") != null);
+    try std.testing.expectEqual(@as(usize, 1), hooks.model_calls.items.len);
+    const live = hooks.model_calls.items[0];
+    try std.testing.expectEqual(types.ModelCallOutcome.completed, live.outcome);
+    try std.testing.expectEqual(types.ModelCallPurpose.turn, live.purpose);
+    try std.testing.expectEqualStrings("gateway", live.provider);
+    try std.testing.expectEqualStrings("stop", live.finish.?);
+    try std.testing.expect(live.at_ms > 0);
+
+    // The finished turn carries the same record, placed with its step.
+    const saved = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant.execution.model_calls;
+    try std.testing.expectEqual(@as(usize, 1), saved.len);
+    try std.testing.expectEqual(live.at_ms, saved[0].at_ms);
+    try std.testing.expectEqual(@as(usize, 0), saved[0].after_tool_step_count);
 }
 
-test "processQueuedPrompt records provider failures in the network record" {
+test "processQueuedPrompt records a failed attempt before the call that answered" {
     const alloc = std.testing.allocator;
     var gateway = FakeGateway.init(alloc, &.{
         .{ .status = .service_unavailable, .retry_after_seconds = 4 },
@@ -5245,13 +5250,18 @@ test "processQueuedPrompt records provider failures in the network record" {
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expect(hooks.full_detail_records.items.len >= 2);
-    const records = hooks.full_detail_records.items;
-    try std.testing.expectEqual(types.NoticeTone.warning, records[0].tone);
-    try std.testing.expect(std.mem.find(u8, records[0].body, "failed: unavailable") != null);
-    try std.testing.expect(std.mem.find(u8, records[0].body, "retry after: 4s") != null);
-    try std.testing.expect(std.mem.find(u8, records[1].body, "finish: stop") != null);
+    const records = hooks.model_calls.items;
+    try std.testing.expectEqual(@as(usize, 2), records.len);
+    try std.testing.expectEqual(types.ModelCallOutcome.failed, records[0].outcome);
+    try std.testing.expectEqualStrings("unavailable", records[0].failure.?);
+    try std.testing.expectEqual(@as(?u32, 4), records[0].retry_after_s);
+    try std.testing.expectEqual(types.ModelCallOutcome.completed, records[1].outcome);
     try std.testing.expectEqualStrings("Recovered answer", hooks.finish_assistant_text.?);
+
+    const saved = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant.execution.model_calls;
+    try std.testing.expectEqual(@as(usize, 2), saved.len);
+    try std.testing.expectEqual(types.ModelCallOutcome.failed, saved[0].outcome);
+    try std.testing.expectEqual(types.ModelCallOutcome.completed, saved[1].outcome);
 }
 
 test "processQueuedPrompt waits out a 503 Retry-After, capped at 30 seconds" {
@@ -5360,8 +5370,10 @@ test "processQueuedPrompt skill catalog is invariant under harmless request expa
 test "processQueuedPrompt prepares each origin skill catalog with its supplied model and workspace" {
     const alloc = std.testing.allocator;
     const Skill = @import("../../../skills/skill_runtime.zig").Skill;
-    const description = text_utils.repeat("Instruction detail. ", 50);
-    const names = [_][]const u8{ "alpha", "beta", "gamma", "delta" };
+    // Short enough for the catalog to show it whole, and enough skills that
+    // only the smaller window's budget has to shorten them.
+    const description = text_utils.repeat("Instruction detail. ", 9);
+    const names = [_][]const u8{ "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta" };
     const cases = [_]struct { model: []const u8, workspace: []const u8, context_window: u32, child: bool }{
         .{ .model = "fixture/parent-model", .workspace = "/tmp/parent-workspace", .context_window = 64_000, .child = false },
         .{ .model = "fixture/child-model", .workspace = "/tmp/child-workspace", .context_window = 16_000, .child = true },

@@ -54,6 +54,17 @@ These rules apply to every change:
 
 If a coding agent helps with your change, point it at AGENTS.md. Any prose the agent writes for your contribution, including pull request titles and descriptions, commit messages, documentation, and issues, must follow the `technical-writer` skill in `.fx/skills/technical-writer/`.
 
+### Add or change a command, flag, or setting
+
+Commands, flags, settings, environment variables, slash commands, and `--json` output are what people and scripts rely on, so fx gives them all one shape. Someone who knows git and the Unix command line should be able to guess what a control is called, where it goes, and which source wins when two disagree:
+
+- Each concept has one name, written in each surface's case: `permission_mode` in settings and JSON, `--permission-mode` as a flag, and `FX_PERMISSION_MODE` as an environment variable.
+- A subcommand is an action, a flag changes one run and never saves, a setting persists, and an environment variable carries context from CI, a wrapper script, or a test.
+- Results go to stdout and diagnostics to stderr, `--json` fields are only added, and a usage error exits with 2.
+- A rename keeps the old spelling working with a warning that names its replacement and the release that drops it.
+
+The `fx-cli-shape` skill in `.fx/skills/fx-cli-shape/` has the full rules, the names that are already decided, and a script that lists the controls a diff adds or removes. Read it before you add, rename, or remove a control, and point your coding agent at it too. CI's `python3 -m scripts.check_cli_shape` fails when code reads an `FX_*` variable, compares a flag by hand, or parses a setting that its registries don't list. A new top-level command, a new stable environment variable, or a new project-safe setting needs a maintainer's approval in the pull request.
+
 ## Test your change
 
 Run the tests that cover your change, build fx, and then use `./zig-out/bin/fx` to exercise the change yourself. Tests don't always start the full runtime, attach a terminal, or spawn background threads, so a passing suite can still miss a startup crash or a rendering regression. Confirm that fx didn't abort, that stderr is clean, and that the behavior matches what you'll describe in the pull request.
@@ -221,7 +232,7 @@ CI retries a failed end-to-end file once. A file that passes only on the retry g
 
 When the detector can't read the change, the `macOS arm64` check fails instead of passing.
 
-`scripts/detect-ci-need.sh` decides whether a pull request runs CI's three model checks. The libfx durable-session model check takes about 40 minutes and runs when the change touches:
+`scripts/detect-ci-need.sh` decides whether a pull request runs CI's four model checks. The libfx durable-session model check takes about 40 minutes and runs when the change touches:
 
 - `sdk/`
 - The SDK models in `tests/tla/sdk/` or their drivers in `tests/tla/drivers/*.mjs`
@@ -240,7 +251,13 @@ The `TLA+ transcript window model` job takes about 4 minutes and runs its checks
 - The model in `tests/tla/transcript_window/` or its drivers in `tests/tla/drivers/transcript_window/`
 - The driver code those drivers share: `tests/tla/drivers/lib/` and `tests/tla/drivers/graph.mjs`
 
-All three run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
+The `TLA+ subagent and session-write models` job takes a few minutes and runs its checks when the change touches:
+
+- `src/core/subagent/`, `src/core/session/`, `src/core/agent/worker_runtime.zig`, or `src/core/agent/runtime/parallel_execution.zig`
+- The models in `tests/tla/subagent/`, the session-write model in `tests/tla/session/`, or their drivers in `tests/tla/drivers/subagent/` and `tests/tla/drivers/session/write.test.ts`
+- The shared code in `tests/tla/lib/` and `tests/tla/drivers/lib/`, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`
+
+All four run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
 
 Other workflows and benchmark jobs also report on pull requests, such as the `Examples` workflow when `examples/` changes and the `Shell command overhead` benchmark. Only the five checks above are required to merge, but look into any check that fails. Two of the others need more explanation:
 
