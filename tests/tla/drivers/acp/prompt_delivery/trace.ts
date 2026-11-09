@@ -23,7 +23,7 @@ const tla = (value: string) => JSON.stringify(value);
 const bool = (value: boolean) => (value ? "TRUE" : "FALSE");
 const answer = (a: Answer) => `[kind |-> ${tla(a.kind)}, stop |-> ${tla(a.stop)}, delivery |-> ${tla(a.delivery)}, code |-> ${a.code}]`;
 
-export type Bounds = { rules: boolean; msgs: string[]; maxTools: number; maxCancels: number };
+export type Bounds = { rules: boolean; msgs: string[]; maxTools: number; maxCancels: number; allowClose: boolean };
 
 export function obsModule(observations: Observation[], bounds: Bounds): string {
   const answers = (record: Record<string, Answer>) =>
@@ -38,6 +38,7 @@ export function obsModule(observations: Observation[], bounds: Bounds): string {
     `TMsgs == {${bounds.msgs.map(tla).join(", ")}}`,
     `TMaxTools == ${bounds.maxTools}`,
     `TMaxCancels == ${bounds.maxCancels}`,
+    `TAllowClose == ${bool(bounds.allowClose)}`,
     "TraceLog == <<",
     observations.map((o) => `  ${record(o)}`).join(",\n"),
     ">>",
@@ -52,7 +53,7 @@ const TRACE_CFG = [
   "    Msgs <- TMsgs",
   "    MaxTools <- TMaxTools",
   "    MaxCancels <- TMaxCancels",
-  "    AllowClose = FALSE",
+  "    AllowClose <- TAllowClose",
   "INIT TraceInit",
   "NEXT TraceNext",
   "INVARIANT NotDone",

@@ -1560,6 +1560,15 @@ function sendSteeringPrompt(client: AcpClient, id: number, text: string): void {
   });
 }
 
+function sendQueuedPrompt(client: AcpClient, id: number, text: string): void {
+  client.send({
+    jsonrpc: "2.0",
+    id,
+    method: "session/prompt",
+    params: { prompt: [{ type: "text", text }], _meta: { "sh.fx/delivery": "queue" } },
+  });
+}
+
 // A withheld image's original: the session's blob, which the notice names
 // (D79) and its saved prompt names by hash, without the image's bytes (D89).
 function expectSavedOriginal(home: string, sessionId: string, body: string, original: Buffer): void {
@@ -3693,7 +3702,7 @@ describe("acp: model-independent", () => {
           env: fakeGatewayEnv(root, gateway),
         });
         const init = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
-        expect(init.result.agentCapabilities._meta["sh.fx/promptDelivery"]).toEqual({ steer: {} });
+        expect(init.result.agentCapabilities._meta["sh.fx/promptDelivery"]).toEqual({ steer: {}, queue: {} });
         const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
         expect(created.error).toBeUndefined();
         await client.readLine();
@@ -3749,7 +3758,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP fails a waiting steer with -32800 when the turn is cancelled",
+    "ACP runs a waiting steer as the next turn when the turn is cancelled",
     async () => {
       const root = createIsolatedRoot("fx-acp-steer-cancel-");
       const firstRequest = deferred<void>();
@@ -3760,6 +3769,7 @@ describe("acp: model-independent", () => {
           await releaseFirst.promise;
           return finalText("too late");
         },
+        finalText("Doing something else."),
       ]);
       try {
         client = await AcpClient.create({
@@ -3773,19 +3783,128 @@ describe("acp: model-independent", () => {
 
         sendPrompt(client, 200, "Start a long task.");
         await firstRequest.promise;
+        // Nothing has streamed, so the steer waits for the turn's next request.
         sendSteeringPrompt(client, 201, "Actually stop and do something else.");
         sendPrompt(client, 202, "Unopted prompt marks steering as queued.");
         expect((await readResponse(client, 202)).error.code).toBe(-32600);
         client.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
 
+        // A stop fails no prompt: the steer it finds waiting runs next
+        // (tests/tla/acp/AcpPromptDelivery.tla, StopKeepsSteers).
         const { responses, messages } = await readUntilResponses(client, [200, 201]);
         expect(responses.get(200)!.result.stopReason).toBe("cancelled");
-        // Until queued prompts land, a stop fails the steers it finds waiting
-        // (tests/tla/acp/AcpPromptDelivery.tla, Today configs).
-        expect(responses.get(201)!.error).toEqual({ code: -32800, message: "Request cancelled" });
-        expect(messages.some((message) =>
-          message.params?.update?.sessionUpdate === "user_message_chunk"
-        )).toBe(false);
+        const steered = responses.get(201)!;
+        expect(steered.error).toBeUndefined();
+        expect(steered.result.stopReason).toBe("end_turn");
+        expect(steered.result._meta["sh.fx/steeringDelivery"]).toBe("next_turn");
+        const shown = messages.find((message) =>
+          message.params?.update?.sessionUpdate === "user_message_chunk" &&
+          message.params.update.content?.text === "Actually stop and do something else."
+        );
+        expect(shown?.params.update._meta["sh.fx/steerInput"].requestId).toBe(201);
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1]!.body).toContain("Actually stop and do something else.");
+        expect(client.stderr).toBe("");
+      } finally {
+        releaseFirst.resolve();
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "ACP runs a queued prompt as a turn of its own, and withdraws one that hasn't run",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-queue-");
+      const firstRequest = deferred<void>();
+      const releaseFirst = deferred<void>();
+      const gateway = startFakeGateway([
+        async () => {
+          firstRequest.resolve();
+          await releaseFirst.promise;
+          return finalText("First task done.");
+        },
+        finalText("Queued task done."),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+
+        sendPrompt(client, 300, "First task.");
+        await firstRequest.promise;
+        sendQueuedPrompt(client, 301, "Queued task.");
+        sendQueuedPrompt(client, 302, "Withdrawn task.");
+        client.send({ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: 302 } });
+        const withdrawn = await readResponse(client, 302);
+        expect(withdrawn.error).toEqual({ code: -32800, message: "Request cancelled" });
+        releaseFirst.resolve();
+
+        const { responses } = await readUntilResponses(client, [300, 301]);
+        expect(responses.get(300)!.result.stopReason).toBe("end_turn");
+        const queued = responses.get(301)!;
+        expect(queued.error).toBeUndefined();
+        expect(queued.result.stopReason).toBe("end_turn");
+        expect(queued.result._meta?.["sh.fx/steeringDelivery"]).toBeUndefined();
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[0]!.body).not.toContain("Queued task.");
+        expect(gateway.requests[1]!.body).toContain("Queued task.");
+        expect(gateway.requests[1]!.body).not.toContain("Withdrawn task.");
+        expect(client.stderr).toBe("");
+      } finally {
+        releaseFirst.resolve();
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
+    "ACP closing a session answers its waiting steer and queued prompt with -32800",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-queue-close-");
+      const firstRequest = deferred<void>();
+      const releaseFirst = deferred<void>();
+      const gateway = startFakeGateway([
+        async () => {
+          firstRequest.resolve();
+          await releaseFirst.promise;
+          return finalText("never shown");
+        },
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+        expect(created.error).toBeUndefined();
+        const sessionId = created.result.sessionId;
+        await client.readLine();
+
+        sendPrompt(client, 400, "Long task.");
+        await firstRequest.promise;
+        sendSteeringPrompt(client, 401, "A steer that never runs.");
+        sendQueuedPrompt(client, 402, "A prompt that never runs.");
+        client.send({ jsonrpc: "2.0", id: 403, method: "session/close", params: { sessionId } });
+
+        const { responses } = await readUntilResponses(client, [400, 401, 402, 403]);
+        expect(responses.get(400)!.result.stopReason).toBe("cancelled");
+        expect(responses.get(401)!.error).toEqual({ code: -32800, message: "Request cancelled" });
+        expect(responses.get(402)!.error).toEqual({ code: -32800, message: "Request cancelled" });
+        expect(responses.get(403)!.result).toEqual({});
+        expect(gateway.requests).toHaveLength(1);
         expect(client.stderr).toBe("");
       } finally {
         releaseFirst.resolve();
@@ -4180,14 +4299,12 @@ describe("acp: model-independent", () => {
     `ACP session/load replays MCP tool calls with their server and title, and absorbed steering`,
     async () => {
       const root = createIsolatedRoot("fx-acp-load-mcp-");
-      const firstRequest = deferred<void>();
-      const releaseFirst = deferred<void>();
+      // The steer arrives while the MCP tool runs, so it waits for the turn's
+      // next request instead of cutting a reply short.
+      const toolCalled = deferred<void>();
+      const releaseTool = deferred<void>();
       const gateway = startFakeGateway([
-        async () => {
-          firstRequest.resolve();
-          await releaseFirst.promise;
-          return fakeGatewayToolCall("load_read", "mcp_mini_browser_read", {});
-        },
+        fakeGatewayToolCall("load_read", "mcp_mini_browser_read", {}),
         finalText("Example Domain"),
       ]);
       const serveMini = (params: any) => {
@@ -4227,6 +4344,10 @@ describe("acp: model-independent", () => {
         async fetch(request) {
           const message = await request.json() as { id?: number; method: string };
           served.push(message.method);
+          if (message.method === "tools/call") {
+            toolCalled.resolve();
+            await releaseTool.promise;
+          }
           if (message.id === undefined) return new Response(null, { status: 202 });
           return Response.json({ jsonrpc: "2.0", id: message.id, ...serveMini(message) });
         },
@@ -4244,9 +4365,9 @@ describe("acp: model-independent", () => {
         client.setPermissionOption("allow_once");
 
         sendPrompt(client, 10, "Read the page.");
-        await firstRequest.promise;
+        await toolCalled.promise;
         sendSteeringPrompt(client, 11, "Just the title.");
-        releaseFirst.resolve();
+        releaseTool.resolve();
         const live = await readUntilResponses(client, [10, 11]);
         expect(live.responses.get(11)!.result._meta["sh.fx/steeringDelivery"]).toBe("absorbed");
         const liveCall = live.messages
@@ -4286,7 +4407,7 @@ describe("acp: model-independent", () => {
         expect(served).toHaveLength(servedBeforeLoad);
         expect(client.stderr).toBe("");
       } finally {
-        releaseFirst.resolve();
+        releaseTool.resolve();
         await client?.close();
         gateway.stop();
         server.stop(true);

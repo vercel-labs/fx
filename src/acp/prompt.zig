@@ -1208,7 +1208,7 @@ pub fn handlePrompt(
     try sessions.sendActiveSessionUsageUpdate(state, alloc);
 
     // A steer's interrupt the turn finished before reaching is not a cancel.
-    if (state.cfg.minimal_kernel) server.releaseSteeringInterrupt(state);
+    server.releaseSteeringInterrupt(state);
     if (session.cancel_flag.load(.seq_cst)) {
         ctx.stop_reason = .cancelled;
     }
@@ -1997,11 +1997,10 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
 
 /// Drains steering at a turn boundary. ACP clients steer by sending
 /// `session/prompt` with `sh.fx/delivery` `"steer"` during a turn; each delivered message
-/// is replayed as a user message where it joined the turn. A cancelled ACP
-/// turn stops instead of continuing with queued steering, and the steering
-/// prompt responses report what was dropped. A libfx turn continues past a
-/// cancel only when a steer interrupted its reply; after a user cancel it
-/// takes nothing, and its end hands back what was still queued.
+/// is replayed as a user message where it joined the turn. A turn continues
+/// past a cancel only when a steer interrupted its reply; after a user cancel
+/// it takes nothing, and its end hands the steers it never took to the next
+/// turn (an ACP turn) or back to its host (a libfx turn).
 fn takeSteeringBoundary(
     raw_ctx: *anyopaque,
     arena: Allocator,
@@ -2044,7 +2043,6 @@ fn takeSteeringBoundary(
         return if (kind == .cancelled) .interrupt else .none;
     }
     const kernel = ctx.state.cfg.minimal_kernel;
-    if (kind == .cancelled and !kernel) return .interrupt;
     if (kind == .cancelled) {
         // A user cancel ends the turn, and so does a handoff's interrupt.
         const interrupt = server.takeSteeringInterrupt(ctx.state) orelse return .interrupt;
@@ -2054,17 +2052,16 @@ fn takeSteeringBoundary(
         // its end hands back the steering it did not take.
         return .handoff;
     }
-    // ACP keeps accepting steering until the turn has fully returned: a
-    // pending subagent can continue a turn past its final boundary, and a
-    // steering prompt that arrives after input closes joins the worker from
-    // the connection reader, which must never wait on work that needs it.
+    // ACP keeps accepting steering until the turn has fully returned, because
+    // a pending subagent can continue a turn past its final boundary. A steer
+    // the turn never takes runs as the next turn.
     const drained = try server.takeSteering(ctx.state, arena, close_if_empty and kernel);
     // A steer's interrupt continues the turn even when the steer was
     // withdrawn meanwhile: the cut-off request goes out again.
     if (drained.texts.len == 0) return if (kind == .cancelled) .{ .continue_turn = &.{} } else .none;
     try noteJournalPlacement(ctx, drained.input_ids);
     // A steer's interrupt that a later boundary beat is spent with its steer.
-    if (kernel and kind != .cancelled) server.releaseSteeringInterrupt(ctx.state);
+    if (kind != .cancelled) server.releaseSteeringInterrupt(ctx.state);
     // Steering shows where it joined the turn, a libfx steer by its input id.
     for (drained.texts, drained.request_ids, 0..) |text, request_id, index| {
         const input_id: ?[]const u8 = if (index < drained.input_ids.len) drained.input_ids[index] else null;
@@ -3276,9 +3273,9 @@ fn pushEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     switch (event) {
         .clear_route_recovery_status => try ctx.clearModelRecoveryStatus(),
-        // A libfx steer cuts a streaming reply short, as in the fx CLI, but
-        // waits once the model streams a tool call's arguments.
-        .turn_phase_update => |update| if (ctx.state.cfg.minimal_kernel) {
+        // A steer cuts a streaming reply short, as in the fx CLI, but waits
+        // once the model streams a tool call's arguments.
+        .turn_phase_update => |update| {
             server.noteSteeringPhase(ctx.state, update.step_id, switch (update.phase) {
                 .thinking, .generating => .reply,
                 .running, .waiting_for_subagent => .tools,
@@ -3326,7 +3323,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
     switch (event) {
         .provisional => |provisional| {
             // A tool call the model announced is no reply a steer cuts short.
-            if (ctx.state.cfg.minimal_kernel) server.noteSteeringToolsPhase(ctx.state);
+            server.noteSteeringToolsPhase(ctx.state);
             const tool_name = provisional.tool_name orelse return;
             if (!tool_presentation.isProviderSearchAlias(tool_name)) return;
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
@@ -3339,7 +3336,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             });
         },
         .authoritative_started => |started| {
-            if (ctx.state.cfg.minimal_kernel) server.noteSteeringTool(ctx.state, started.id.call_id, true);
+            server.noteSteeringTool(ctx.state, started.id.call_id, true);
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
             defer arena_state.deinit();
             _ = try ctx.sendToolCallPending(arena_state.allocator(), .{
@@ -3350,7 +3347,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             });
         },
         .terminal => |terminal| {
-            if (ctx.state.cfg.minimal_kernel) server.noteSteeringTool(ctx.state, terminal.id.call_id, false);
+            server.noteSteeringTool(ctx.state, terminal.id.call_id, false);
             try ctx.sendProviderTerminal(terminal.id.call_id, terminal.outcome, terminal.result);
         },
         .progress, .turn_finished => {},

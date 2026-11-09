@@ -31,7 +31,7 @@
 #   bun ../drivers/acp/system_prompt/check-spec.ts
 #   bun ../drivers/acp/system_prompt/driver.ts
 #   bun ../drivers/acp/prompt_delivery/check-spec.ts
-#   bun ../drivers/acp/prompt_delivery/driver.ts   # today's fx acp; --model rules fails until the rules land
+#   bun ../drivers/acp/prompt_delivery/driver.ts   # the sh.fx rules; --model today is fx acp before them
 #   bun ../drivers/acp/follow/check-spec.ts
 #   bun ../drivers/acp/session_state/check-spec.ts
 #   bun ../drivers/acp/session_state/driver.ts   # today's fx acp; --model rules fails until the rules land
