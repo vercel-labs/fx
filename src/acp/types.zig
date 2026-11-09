@@ -303,8 +303,7 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilitie
 }
 
 /// Writes fx's extensions as `agentCapabilities._meta`, or nothing when fx
-/// lists none. fx's steers are the one delivery it supports until queued
-/// prompts land, so `sh.fx/promptDelivery` names only `steer`.
+/// lists none. `sh.fx/promptDelivery` names both deliveries fx supports.
 fn writeExtensionList(w: *std.Io.Writer, extensions: sh_fx.Set) !void {
     if (extensions.count() == 0) return;
     try w.writeAll(",\"_meta\":{");
@@ -314,7 +313,7 @@ fn writeExtensionList(w: *std.Io.Writer, extensions: sh_fx.Set) !void {
         if (!first) try w.writeByte(',');
         first = false;
         try writeJsonStr(extension.capabilityName(), w);
-        try w.writeAll(if (extension == .prompt_delivery) ":{\"steer\":{}}" else ":{}");
+        try w.writeAll(if (extension == .prompt_delivery) ":{\"steer\":{},\"queue\":{}}" else ":{}");
     }
     try w.writeByte('}');
 }
@@ -325,10 +324,12 @@ pub fn writePromptResponse(w: *std.Io.Writer, reason: StopReason) !void {
     try w.writeAll("}");
 }
 
-/// How a steer ran, as `sh.fx/steeringDelivery`. `next_turn` comes with
-/// queued prompts; until then, a steer that no turn took fails.
+/// How a steer ran, as `sh.fx/steeringDelivery`: the running turn took it,
+/// or it ran in the next turn, because that turn had stopped taking input or
+/// the client stopped it.
 pub const SteeringDelivery = enum {
     absorbed,
+    next_turn,
 };
 
 /// Answers a steering prompt with its receiving turn's stop reason. Usage is
@@ -602,7 +603,7 @@ test "writeInitializeResponse contains required fields" {
     const extensions = agent_capabilities.get("_meta").?.object;
     try std.testing.expectEqual(@as(usize, 2), extensions.count());
     try std.testing.expect(extensions.get("sh.fx/promptDelivery").?.object.get("steer") != null);
-    try std.testing.expect(extensions.get("sh.fx/promptDelivery").?.object.get("queue") == null);
+    try std.testing.expect(extensions.get("sh.fx/promptDelivery").?.object.get("queue") != null);
     try std.testing.expectEqual(@as(usize, 0), extensions.get("sh.fx/toolCall").?.object.count());
 }
 

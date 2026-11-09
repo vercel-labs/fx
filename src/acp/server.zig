@@ -53,6 +53,7 @@ const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
 const host_attachments = @import("../core/hosts/host_attachments.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const libfx_steering = @import("libfx_steering.zig");
+const prompt_line = @import("prompt_line.zig");
 const journal_events = @import("../core/agent/runtime/journal.zig");
 const libfx_journal = @import("libfx_journal.zig");
 const sh_fx = @import("sh_fx.zig");
@@ -267,6 +268,9 @@ pub const ActiveSessionState = struct {
     cancel_flag: std.atomic.Value(bool),
     pending_prompt_id: ?jsonrpc.RequestId,
     steering: libfx_steering.Runtime = .{},
+    /// The steers for the next turn and the queued prompts, which wait for
+    /// the running turn to end.
+    waiting_prompts: prompt_line.Line = .{},
     /// Set when the host passed a journal; every state change is sent to it.
     journal: ?libfx_journal.Journal = null,
     /// Images the host staged from its store for the journal it opens next.
@@ -306,6 +310,11 @@ const ActivePrompt = struct {
     /// Mid-turn mode changes apply to the next prompt, never the running one.
     mode: []const u8,
     permission_mode: types.PermissionMode,
+    /// The request ids of the steers that started the running turn together,
+    /// each answered with `next_turn`. Empty for a turn a prompt started.
+    /// Owned by `alloc`. The worker replaces `msg` and these between turns
+    /// while it holds the session's `waiting_prompts` mutex.
+    group_ids: []jsonrpc.RequestId = &.{},
     thread: if (host_target.is_wasm) void else std.Thread = if (host_target.is_wasm) {} else undefined,
     reapable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
@@ -767,6 +776,17 @@ fn destroyActiveSession(state: *ServerState) void {
     if (active.client_system_prompt.len > 0) state.alloc.free(active.client_system_prompt);
     active.tool_identities.deinit(state.alloc);
     active.steering.deinit(state.alloc);
+    {
+        // Closing answers what waits first, so anything left here is lost.
+        active.waiting_prompts.lock();
+        const late = active.waiting_prompts.late.items.len;
+        const queued = active.waiting_prompts.queue.items.len;
+        active.waiting_prompts.unlock();
+        if (late + queued > 0) {
+            debug_trace.logf("acp", "dropped waiting prompts steers={d} queued={d} reason=session_release", .{ late, queued });
+        }
+    }
+    active.waiting_prompts.deinit(state.alloc);
     if (active.journal) |*journal| journal.deinit(state.alloc);
     active.staged_images.deinit(state.alloc);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
@@ -1514,7 +1534,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
     }
 
     if (method == .session_prompt and state.active_prompt != null) {
-        return handleSteeringPrompt(state, alloc, msg);
+        return handleDeliveryPrompt(state, alloc, msg);
     }
 
     if (method.waitsForActivePrompt() and state.active_prompt != null) {
@@ -1579,19 +1599,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
     };
 }
 
-fn requestIdsEqual(lhs: jsonrpc.RequestId, rhs: jsonrpc.RequestId) bool {
-    return switch (lhs) {
-        .integer => |value| switch (rhs) {
-            .integer => |other| value == other,
-            else => false,
-        },
-        .string => |value| switch (rhs) {
-            .string => |other| std.mem.eql(u8, value, other),
-            else => false,
-        },
-        .null => rhs == .null,
-    };
-}
+const requestIdsEqual = jsonrpc.requestIdsEqual;
 
 fn requestIdFromValue(value: std.json.Value) ?jsonrpc.RequestId {
     return switch (value) {
@@ -1614,9 +1622,30 @@ fn handleRequestCancellation(
     const value = parsed.value.object.get("requestId") orelse return;
     const requested = requestIdFromValue(value) orelse return;
     const active = state.active_prompt orelse return;
-    const active_id = active.msg.id orelse return;
-    if (!requestIdsEqual(active_id, requested)) return;
-    handleCancel(state, true);
+    const session = if (state.active_session) |*session| session else return;
+    // The running turn's own prompt stops the turn. A steer or queued prompt
+    // that hasn't run is withdrawn; one a turn took stays.
+    const outcome: enum { stop_turn, withdrawn, none } = outcome: {
+        session.waiting_prompts.lock();
+        defer session.waiting_prompts.unlock();
+        if (active.group_ids.len == 0) {
+            if (active.msg.id) |active_id| if (requestIdsEqual(active_id, requested)) break :outcome .stop_turn;
+        }
+        if (session.steering.withdrawRequest(state.alloc, requested) or
+            session.waiting_prompts.withdrawLocked(state.alloc, requested)) break :outcome .withdrawn;
+        break :outcome .none;
+    };
+    switch (outcome) {
+        .stop_turn => handleCancel(state, true),
+        .withdrawn => {
+            debug_trace.logf("acp", "withdrew a prompt that hadn't run", .{});
+            state.writer.writeError(alloc, requested, .{
+                .code = ErrorCode.request_cancelled,
+                .message = "Request cancelled",
+            }) catch |err| debug_trace.logf("acp", "failed to answer a withdrawn prompt err={s}", .{@errorName(err)});
+        },
+        .none => {},
+    }
 }
 
 fn libfxSessionId(alloc: Allocator, msg: *const jsonrpc.Message) !std.json.Parsed(std.json.Value) {
@@ -1731,12 +1760,17 @@ fn writePromptInProgress(state: *ServerState, alloc: Allocator, id: ?jsonrpc.Req
     });
 }
 
-/// Joins a `session/prompt` whose `sh.fx/delivery` is `"steer"` to the running
-/// turn at its next safe boundary. The response is deferred until that turn ends. A
-/// prompt without the opt-in keeps the in-progress rejection. Steering closes
-/// only after the turn has fully returned, so joining the finishing worker
-/// here never waits on work that needs this reader.
-fn handleSteeringPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
+/// What a `session/prompt` that arrives while a turn runs asks for, from its
+/// `sh.fx/delivery`.
+const Delivery = enum { none, steer, queue };
+
+/// Handles a `session/prompt` that arrives while a turn runs
+/// (src/protocol/spec/sh-fx.md, "Steering and queued prompts"): a steer joins
+/// the running turn, or the next one once that turn stops taking input; a
+/// queued prompt waits for a turn of its own; and a prompt with no delivery
+/// fails with `-32600`. A prompt that arrives once the worker has found
+/// nothing waiting starts its own turn. Answers come when their turns end.
+fn handleDeliveryPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Message) !void {
     // libfx kernel hosts steer through `_sh.fx/session/steer`.
     if (state.cfg.minimal_kernel) return writePromptInProgress(state, alloc, msg.id);
     const params = msg.params_raw orelse return writePromptInProgress(state, alloc, msg.id);
@@ -1744,48 +1778,102 @@ fn handleSteeringPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonr
         return writePromptInProgress(state, alloc, msg.id);
     defer parsed.deinit();
     if (parsed.value != .object) return writePromptInProgress(state, alloc, msg.id);
-    const delivery = acp_types.metaField(parsed.value.object, "sh.fx/delivery") orelse
-        return writePromptInProgress(state, alloc, msg.id);
-    // fx lists `steer` as its one delivery until queued prompts land.
-    if (delivery != .string or !std.mem.eql(u8, delivery.string, "steer")) {
+    const delivery: Delivery = if (acp_types.metaField(parsed.value.object, "sh.fx/delivery")) |value| delivery: {
+        if (value == .string and std.mem.eql(u8, value.string, "steer")) break :delivery .steer;
+        if (value == .string and std.mem.eql(u8, value.string, "queue")) break :delivery .queue;
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
-            .message = "sh.fx/delivery supports only \"steer\"",
+            .message = "sh.fx/delivery must be \"steer\" or \"queue\"",
         });
-    }
+    } else .none;
     if (!try requireParsedActiveSessionTarget(state, alloc, msg.id, parsed.value)) return;
-    const text = steeringPromptText(alloc, parsed.value.object) catch |err| switch (err) {
+    const session = if (state.active_session) |*active| active else unreachable;
+    const line = &session.waiting_prompts;
+
+    const text: []u8 = if (delivery == .steer) steeringPromptText(alloc, parsed.value.object) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.UnsupportedSteeringContent => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = "Steering prompts accept text content blocks only",
         }),
+    } else &.{};
+    defer if (delivery == .steer) alloc.free(text);
+    var queued: ?jsonrpc.Message = if (delivery == .queue) try cloneMessage(state.alloc, msg) else null;
+    defer if (queued) |*copy| jsonrpc.freeMessage(state.alloc, copy);
+
+    const result: union(enum) {
+        /// The turn ended and the worker takes nothing more: start a turn.
+        start,
+        in_progress,
+        steered: bool,
+        late,
+        queued,
+        failed: jsonrpc.RpcError,
+    } = result: {
+        line.lock();
+        defer line.unlock();
+        if (!line.worker_running) break :result .start;
+        switch (delivery) {
+            .none => break :result .in_progress,
+            .steer => {
+                session.steering.enqueueRequest(state.alloc, text, msg.id) catch |err| switch (err) {
+                    error.SteeringNotActive => {
+                        // The running turn stopped taking input: the steer runs next.
+                        line.addLateLocked(state.alloc, text, msg.id.?) catch |late_err| switch (late_err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            error.SteeringQueueFull => break :result .{ .failed = .{
+                                .code = ErrorCode.invalid_request,
+                                .message = "Steering queue is full",
+                            } },
+                        };
+                        break :result .late;
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.EmptySteeringMessage => break :result .{ .failed = .{
+                        .code = ErrorCode.invalid_params,
+                        .message = "Steering prompt text cannot be empty",
+                    } },
+                    error.SteeringMessageTooLarge => break :result .{ .failed = .{
+                        .code = ErrorCode.invalid_params,
+                        .message = "Steering prompt text exceeds the 64 KiB limit",
+                    } },
+                    error.SteeringQueueFull => break :result .{ .failed = .{
+                        .code = ErrorCode.invalid_request,
+                        .message = "Steering queue is full",
+                    } },
+                };
+                // A steer cuts a streaming reply short, as in the fx CLI.
+                break :result .{ .steered = session.steering.claimInterrupt(&session.cancel_flag) };
+            },
+            .queue => {
+                line.addQueuedLocked(state.alloc, queued.?) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.PromptQueueFull => break :result .{ .failed = .{
+                        .code = ErrorCode.invalid_request,
+                        .message = "Prompt queue is full",
+                    } },
+                };
+                queued = null;
+                break :result .queued;
+            },
+        }
     };
-    defer alloc.free(text);
-    const session = if (state.active_session) |*active| active else unreachable;
-    session.steering.enqueueRequest(state.alloc, text, msg.id) catch |err| switch (err) {
-        error.SteeringNotActive => {
-            // The running turn already stopped taking input. Let it answer,
-            // then run this prompt as the next turn instead of rejecting it.
-            debug_trace.logf("acp", "steering prompt arrived after the turn closed input; starting next turn", .{});
+    switch (result) {
+        .start => {
+            debug_trace.logf("acp", "prompt arrived after the worker found nothing waiting; starting a turn", .{});
             reapActivePrompt(state, true);
             return startPrompt(state, alloc, msg);
         },
-        error.OutOfMemory => return error.OutOfMemory,
-        error.EmptySteeringMessage => return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Steering prompt text cannot be empty",
-        }),
-        error.SteeringMessageTooLarge => return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "Steering prompt text exceeds the 64 KiB limit",
-        }),
-        error.SteeringQueueFull => return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_request,
-            .message = "Steering queue is full",
-        }),
-    };
-    debug_trace.logf("acp", "queued steering prompt bytes={d}", .{text.len});
+        .in_progress => return writePromptInProgress(state, alloc, msg.id),
+        .steered => |interrupted| debug_trace.logf(
+            "acp",
+            "queued steering prompt bytes={d} interrupts_reply={}",
+            .{ text.len, interrupted },
+        ),
+        .late => debug_trace.logf("acp", "steering prompt waits for the next turn bytes={d}", .{text.len}),
+        .queued => debug_trace.logf("acp", "queued prompt for a turn of its own", .{}),
+        .failed => |rpc_error| return state.writer.writeError(alloc, msg.id, rpc_error),
+    }
 }
 
 /// Joins the text blocks of a steering prompt. Caller owns the result.
@@ -2412,14 +2500,23 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
     };
     errdefer jsonrpc.freeMessage(alloc, &active.msg);
 
-    session.cancel_flag.store(false, .seq_cst);
-    session.steering.open(state.alloc);
+    {
+        session.waiting_prompts.lock();
+        defer session.waiting_prompts.unlock();
+        session.cancel_flag.store(false, .seq_cst);
+        session.steering.open(state.alloc);
+        session.waiting_prompts.worker_running = true;
+    }
     if (comptime host_target.is_wasm) {
         promptWorkerMain(active);
-        jsonrpc.freeMessage(active.alloc, &active.msg);
-        active.alloc.destroy(active);
+        freeActivePrompt(active);
     } else {
-        active.thread = try std.Thread.spawn(.{}, promptWorkerMain, .{active});
+        active.thread = std.Thread.spawn(.{}, promptWorkerMain, .{active}) catch |err| {
+            session.waiting_prompts.lock();
+            session.waiting_prompts.worker_running = false;
+            session.waiting_prompts.unlock();
+            return err;
+        };
         state.active_prompt = active;
     }
 }
@@ -2542,35 +2639,188 @@ fn notificationTargetsActiveSession(
     return true;
 }
 
+/// Runs the session's turns: the prompt it started with, then, each time a
+/// turn ends, what waits for it (`prompt_line.zig`): every late steer together
+/// as one turn, else the first queued prompt. Once nothing waits, it marks
+/// itself reapable before it sends the last answers, so a prompt the client
+/// sends after them starts its own turn.
 fn promptWorkerMain(active: *ActivePrompt) void {
-    const outcome: prompt_handler.TerminalOutcome = prompt_handler.handlePrompt(
-        active.state,
-        active.alloc,
-        &active.msg,
-        active.mode,
-        active.permission_mode,
-    ) catch |err| .{
-        .rpc_error = .{
-            .code = ErrorCode.internal_error,
-            // A storage fault is named (D29); the wasm host keeps the error name.
-            .message = if (active.state.sessions_v2 != null)
-                sessions.v2StorageFaultMessage("Session could not be saved", err) orelse @errorName(err)
-            else
-                @errorName(err),
-        },
-    };
-    const finished_steering: ?libfx_steering.Finished = if (active.state.active_session) |*session|
-        session.steering.finishTurn(active.state.alloc, active.alloc, "turn_finished") catch |err| blk: {
-            debug_trace.logf("acp", "failed to collect steering prompts at turn end err={s}", .{@errorName(err)});
-            break :blk null;
+    const state = active.state;
+    var mode = active.mode;
+    var permission_mode = active.permission_mode;
+    while (true) {
+        const outcome: prompt_handler.TerminalOutcome = prompt_handler.handlePrompt(
+            state,
+            active.alloc,
+            &active.msg,
+            mode,
+            permission_mode,
+        ) catch |err| .{
+            .rpc_error = .{
+                .code = ErrorCode.internal_error,
+                // A storage fault is named (D29); the wasm host keeps the error name.
+                .message = if (state.sessions_v2 != null)
+                    sessions.v2StorageFaultMessage("Session could not be saved", err) orelse @errorName(err)
+                else
+                    @errorName(err),
+            },
+        };
+        var finished: ?libfx_steering.Finished = if (state.active_session) |*session|
+            session.steering.finishTurn(state.alloc, state.alloc, "turn_finished") catch |err| blk: {
+                debug_trace.logf("acp", "failed to collect steering prompts at turn end err={s}", .{@errorName(err)});
+                break :blk null;
+            }
+        else
+            null;
+        defer if (finished) |value| value.deinit(state.alloc);
+
+        // The turn that just ended, answered below once the next one is chosen.
+        var ended_msg = active.msg;
+        const ended_group = active.group_ids;
+        defer {
+            jsonrpc.freeMessage(active.alloc, &ended_msg);
+            freeRequestIds(active.alloc, ended_group);
         }
-    else
-        null;
-    defer if (finished_steering) |finished| finished.deinit(active.alloc);
-    active.reapable.store(true, .seq_cst);
-    publishPromptOutcome(active, outcome) catch {};
-    if (finished_steering) |finished| publishSteeringOutcomes(active, outcome, finished) catch {};
+        var cancelled_steers: []const libfx_steering.Steer = &.{};
+        const next = next: {
+            const session = if (state.active_session) |*session| session else {
+                if (finished) |value| cancelled_steers = value.untaken;
+                active.msg = .{};
+                active.group_ids = &.{};
+                active.reapable.store(true, .seq_cst);
+                break :next null;
+            };
+            const line = &session.waiting_prompts;
+            line.lock();
+            defer line.unlock();
+            if (finished) |*value| handBack: {
+                if (line.closing) {
+                    cancelled_steers = value.untaken;
+                    break :handBack;
+                }
+                line.handBackLocked(state.alloc, value.untaken) catch {
+                    debug_trace.logf("acp", "dropped steers the turn never took count={d} reason=out_of_memory", .{value.untaken.len});
+                    cancelled_steers = value.untaken;
+                    break :handBack;
+                };
+                // The line owns the steers now.
+                state.alloc.free(value.untaken);
+                value.untaken = &.{};
+            }
+            if (!line.closing) if (line.takeNextLocked()) |taken| {
+                var waiting = taken;
+                if (startNextTurn(active, session, &waiting)) {
+                    session.cancel_flag.store(false, .seq_cst);
+                    session.steering.open(state.alloc);
+                    mode = session.mode;
+                    permission_mode = session.permission_mode;
+                    break :next waiting;
+                } else |err| {
+                    debug_trace.logf("acp", "failed to start the next waiting turn err={s}", .{@errorName(err)});
+                    waiting.deinit(state.alloc);
+                }
+            };
+            // The turn that ended owned `active.msg`; a withdrawal reads it
+            // under this mutex.
+            active.msg = .{};
+            active.group_ids = &.{};
+            line.worker_running = false;
+            active.reapable.store(true, .seq_cst);
+            break :next null;
+        };
+
+        publishTurnOutcome(active, ended_msg.id, ended_group, outcome, finished);
+        for (cancelled_steers) |steer| answerCancelled(state, steer.request_id);
+        if (next) |taken| {
+            var waiting = taken;
+            defer waiting.deinit(state.alloc);
+            if (waiting == .steers) publishStartingSteers(state, active.alloc, waiting.steers.items);
+            continue;
+        }
+        break;
+    }
     prompt_test_controls.pauseAfterTerminalWrite();
+}
+
+/// Makes what waits the active prompt's next turn: a queued prompt as the
+/// client sent it, or the late steers as one prompt of their text blocks,
+/// answered by request id. On success `waiting` keeps only the steers, which
+/// the caller shows as they start the turn.
+fn startNextTurn(active: *ActivePrompt, session: *ActiveSessionState, waiting: *prompt_line.Next) !void {
+    switch (waiting.*) {
+        .prompt => |queued| {
+            active.msg = try cloneMessage(active.alloc, &queued);
+            active.group_ids = &.{};
+        },
+        .steers => |steers| {
+            var params: std.Io.Writer.Allocating = .init(active.alloc);
+            defer params.deinit();
+            try params.writer.writeAll("{\"sessionId\":");
+            try jsonrpc.writeJsonStr(session.session_id, &params.writer);
+            try params.writer.writeAll(",\"prompt\":[");
+            for (steers.items, 0..) |steer, index| {
+                if (index > 0) try params.writer.writeByte(',');
+                try params.writer.writeAll("{\"type\":\"text\",\"text\":");
+                try jsonrpc.writeJsonStr(steer.text, &params.writer);
+                try params.writer.writeByte('}');
+            }
+            try params.writer.writeAll("]}");
+            const ids = try active.alloc.alloc(jsonrpc.RequestId, steers.items.len);
+            var copied: usize = 0;
+            errdefer {
+                for (ids[0..copied]) |id| jsonrpc.freeRequestId(active.alloc, id);
+                active.alloc.free(ids);
+            }
+            for (steers.items, ids) |steer, *id| {
+                id.* = try jsonrpc.dupeRequestId(active.alloc, steer.request_id);
+                copied += 1;
+            }
+            var msg: jsonrpc.Message = .{ .method = try active.alloc.dupe(u8, "session/prompt") };
+            errdefer jsonrpc.freeMessage(active.alloc, &msg);
+            msg.id = try jsonrpc.dupeRequestId(active.alloc, steers.items[0].request_id);
+            msg.params_raw = try params.toOwnedSlice();
+            active.msg = msg;
+            active.group_ids = ids;
+        },
+    }
+}
+
+fn freeRequestIds(alloc: Allocator, ids: []jsonrpc.RequestId) void {
+    for (ids) |id| jsonrpc.freeRequestId(alloc, id);
+    if (ids.len > 0) alloc.free(ids);
+}
+
+fn freeActivePrompt(active: *ActivePrompt) void {
+    jsonrpc.freeMessage(active.alloc, &active.msg);
+    freeRequestIds(active.alloc, active.group_ids);
+    active.alloc.destroy(active);
+}
+
+/// Shows each steer that starts a turn together with the others, as a
+/// `user_message_chunk` with `sh.fx/steerInput`, as a steer a running turn
+/// takes is shown.
+fn publishStartingSteers(state: *ServerState, alloc: Allocator, steers: []const libfx_steering.Steer) void {
+    const session = if (state.active_session) |*session| session else return;
+    for (steers) |steer| {
+        var message_id_storage: acp_types.MessageIdBuffer = undefined;
+        const message_id = acp_types.generateMessageId(&message_id_storage);
+        var update: std.Io.Writer.Allocating = .init(alloc);
+        defer update.deinit();
+        const written = written: {
+            update.writer.writeAll("{\"sessionId\":") catch break :written false;
+            jsonrpc.writeJsonStr(session.session_id, &update.writer) catch break :written false;
+            update.writer.writeAll(",\"update\":") catch break :written false;
+            acp_types.writeSteeringUserMessageChunk(&update.writer, message_id, steer.text, steer.request_id, null, state.sendsSteerInput()) catch break :written false;
+            update.writer.writeByte('}') catch break :written false;
+            break :written true;
+        };
+        if (!written) {
+            debug_trace.logf("acp", "dropped the update for a steer that starts a turn reason=out_of_memory", .{});
+            continue;
+        }
+        state.writer.writeNotification(alloc, "session/update", update.written()) catch |err|
+            debug_trace.logf("acp", "failed to send the update for a steer that starts a turn err={s}", .{@errorName(err)});
+    }
 }
 
 /// At a cancel boundary of a libfx turn: whether steering, not the user,
@@ -2638,7 +2888,28 @@ pub fn noteSteeringTool(state: *ServerState, call_id: []const u8, started: bool)
     }
 }
 
-fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalOutcome) !void {
+/// Answers a turn that ended: the prompt that started it, or each steer that
+/// started it together (`next_turn`), and each steer it took (`absorbed`).
+fn publishTurnOutcome(
+    active: *ActivePrompt,
+    owner: ?jsonrpc.RequestId,
+    group: []const jsonrpc.RequestId,
+    outcome: prompt_handler.TerminalOutcome,
+    finished: ?libfx_steering.Finished,
+) void {
+    const lists_delivery = active.state.extensions.contains(.prompt_delivery);
+    if (group.len == 0) {
+        publishPromptOutcome(active, owner, outcome) catch |err|
+            debug_trace.logf("acp", "failed to answer a prompt err={s}", .{@errorName(err)});
+    }
+    for (group) |id| writeSteeringOutcome(active, id, outcome, if (lists_delivery) .next_turn else null) catch |err|
+        debug_trace.logf("acp", "failed to answer a steer err={s}", .{@errorName(err)});
+    const value = finished orelse return;
+    for (value.absorbed) |id| writeSteeringOutcome(active, id, outcome, if (lists_delivery) .absorbed else null) catch |err|
+        debug_trace.logf("acp", "failed to answer a steer err={s}", .{@errorName(err)});
+}
+
+fn publishPromptOutcome(active: *ActivePrompt, id: ?jsonrpc.RequestId, outcome: prompt_handler.TerminalOutcome) !void {
     switch (outcome) {
         .stop_reason => |stop_reason| {
             var response: std.Io.Writer.Allocating = .init(active.alloc);
@@ -2652,39 +2923,11 @@ fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalO
                 stop_reason,
                 usage,
             );
-            try active.state.writer.writeResponse(active.alloc, active.msg.id, response.writer.buffered());
+            try active.state.writer.writeResponse(active.alloc, id, response.writer.buffered());
         },
         .rpc_error => |rpc_error| {
-            try active.state.writer.writeError(active.alloc, active.msg.id, rpc_error);
+            try active.state.writer.writeError(active.alloc, id, rpc_error);
         },
-    }
-}
-
-/// Answers steering prompts once the turn that received them has answered.
-/// Delivered steering shares the turn's outcome. Undelivered steering fails:
-/// with `-32800` when the client stopped the turn, otherwise with an error so
-/// the client can send it again. Queued prompts bring the spec's `next_turn`
-/// for both (`src/protocol/spec/sh-fx.md`, "Steers").
-fn publishSteeringOutcomes(
-    active: *ActivePrompt,
-    outcome: prompt_handler.TerminalOutcome,
-    finished: libfx_steering.Finished,
-) !void {
-    const cancelled = outcome == .stop_reason and outcome.stop_reason == .cancelled;
-    const delivery: ?acp_types.SteeringDelivery = if (active.state.extensions.contains(.prompt_delivery)) .absorbed else null;
-    for (finished.absorbed) |id| try writeSteeringOutcome(active, id, outcome, delivery);
-    for (finished.dropped) |id| {
-        if (cancelled) {
-            try active.state.writer.writeError(active.alloc, id, .{
-                .code = ErrorCode.request_cancelled,
-                .message = "Request cancelled",
-            });
-        } else {
-            try active.state.writer.writeError(active.alloc, id, .{
-                .code = ErrorCode.invalid_request,
-                .message = "Steering prompt was not delivered because the turn ended first; send it as a new prompt",
-            });
-        }
     }
 }
 
@@ -2711,8 +2954,7 @@ fn reapActivePrompt(state: *ServerState, wait: bool) void {
         if (!wait and !active.reapable.load(.seq_cst)) return;
         prompt_test_controls.noteReapBeforeJoin();
         active.thread.join();
-        jsonrpc.freeMessage(active.alloc, &active.msg);
-        active.alloc.destroy(active);
+        freeActivePrompt(active);
         state.active_prompt = null;
     }
 }
@@ -3536,23 +3778,53 @@ test "ACP keeps its model catalog when a due refresh cannot connect" {
     try std.testing.expectEqualStrings("openai/gpt-5.5", state.capability_resolver.catalogEntries().?[0].id);
 }
 
+/// Stops the running turn only. It keeps its queued steering until it ends,
+/// which hands the steers it never took to the next turn, or a libfx turn's
+/// inputs back to its host. Queued prompts still run after it. Held under the
+/// waiting prompts' mutex, so a stop never lands on the turn the worker
+/// starts next.
 fn handleCancel(state: *ServerState, notify_client: bool) void {
     if (state.active_session) |*session| {
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
-        session.cancel_flag.store(true, .seq_cst);
+        session.waiting_prompts.lock();
+        session.steering.cancelForUser(&session.cancel_flag);
+        session.waiting_prompts.unlock();
         // A prompt waiting for its subagents' reports stops waiting.
         state.worker.nudgeWaiter();
-        // A libfx turn keeps its queued steering until it ends, which hands
-        // back what never reached the model.
-        if (state.cfg.minimal_kernel) session.steering.cancelForUser(&session.cancel_flag);
     }
     cancelPendingOutbound(state, notify_client);
     clearPendingLegacyUrls(state);
 }
 
+/// Stops the running turn and waits for it, answering every steer and queued
+/// prompt that hasn't run with `-32800`, as `session/close` does.
 pub fn cancelAndReapActivePrompt(state: *ServerState) void {
+    if (state.active_session) |*session| {
+        var drained = drained: {
+            session.waiting_prompts.lock();
+            defer session.waiting_prompts.unlock();
+            session.waiting_prompts.closing = true;
+            break :drained session.waiting_prompts.drainLocked();
+        };
+        defer drained.deinit(state.alloc);
+        for (drained.late.items) |steer| answerCancelled(state, steer.request_id);
+        for (drained.queue.items) |queued| if (queued.id) |id| answerCancelled(state, id);
+    }
     handleCancel(state, true);
     reapActivePrompt(state, true);
+    if (state.active_session) |*session| {
+        session.waiting_prompts.lock();
+        session.waiting_prompts.closing = false;
+        session.waiting_prompts.unlock();
+    }
+}
+
+/// Answers a prompt that never ran with `-32800`.
+fn answerCancelled(state: *ServerState, id: jsonrpc.RequestId) void {
+    state.writer.writeError(state.alloc, id, .{
+        .code = ErrorCode.request_cancelled,
+        .message = "Request cancelled",
+    }) catch |err| debug_trace.logf("acp", "failed to answer a prompt that never ran err={s}", .{@errorName(err)});
 }
 
 /// Handles `session/close`. Closing the open session closes it, and closing a session that isn't

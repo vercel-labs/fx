@@ -51,16 +51,33 @@ pub fn validInputId(id: []const u8) bool {
     return true;
 }
 
+/// An ACP steer: its joined text and the `session/prompt` request that sent it.
+pub const Steer = struct {
+    text: []u8,
+    request_id: RequestId,
+
+    pub fn deinit(self: Steer, alloc: Allocator) void {
+        alloc.free(self.text);
+        freeRequestId(alloc, self.request_id);
+    }
+};
+
+pub fn freeSteers(alloc: Allocator, steers: []const Steer) void {
+    for (steers) |steer| steer.deinit(alloc);
+}
+
 /// Requests to answer when a turn ends. Allocated in the caller's allocator.
 pub const Finished = struct {
     /// Steering the turn delivered to the model.
     absorbed: []RequestId,
-    /// Steering still queued when the turn stopped taking input.
-    dropped: []RequestId,
+    /// ACP steers still queued when the turn stopped taking input. They run
+    /// as the next turn (src/protocol/spec/sh-fx.md, "Steers").
+    untaken: []Steer,
 
     pub fn deinit(self: Finished, alloc: Allocator) void {
         freeRequestIds(alloc, self.absorbed);
-        freeRequestIds(alloc, self.dropped);
+        freeSteers(alloc, self.untaken);
+        alloc.free(self.untaken);
     }
 };
 
@@ -435,8 +452,9 @@ pub const Runtime = struct {
         return .{ .texts = texts, .request_ids = request_ids, .input_ids = input_ids };
     }
 
-    /// Stops accepting steering for the finished turn and reports which
-    /// requests it absorbed or dropped. Dropped text is released.
+    /// Stops accepting steering for the finished turn and reports the
+    /// requests it absorbed and the ACP steers it never took, in order, with
+    /// their text. Other queued steering is released.
     pub fn finishTurn(
         self: *Runtime,
         backing: Allocator,
@@ -447,29 +465,59 @@ pub const Runtime = struct {
         defer self.mutex.unlock(io_mod.getIo());
         self.accepting = false;
 
-        var dropped_count: usize = 0;
+        var untaken_count: usize = 0;
         for (self.messages.items) |entry| {
-            if (entry.request_id != null) dropped_count += 1;
+            if (entry.request_id != null) untaken_count += 1;
         }
         const absorbed = try result_alloc.alloc(RequestId, self.absorbed.items.len);
         errdefer result_alloc.free(absorbed);
-        const dropped = try result_alloc.alloc(RequestId, dropped_count);
-        errdefer result_alloc.free(dropped);
+        const untaken = try result_alloc.alloc(Steer, untaken_count);
+        errdefer result_alloc.free(untaken);
         var copied_absorbed: usize = 0;
         errdefer freeRequestIdItems(result_alloc, absorbed[0..copied_absorbed]);
         for (self.absorbed.items, 0..) |id, index| {
             absorbed[index] = try dupeRequestId(result_alloc, id);
             copied_absorbed += 1;
         }
-        var copied_dropped: usize = 0;
-        errdefer freeRequestIdItems(result_alloc, dropped[0..copied_dropped]);
+        var copied_untaken: usize = 0;
+        errdefer freeSteers(result_alloc, untaken[0..copied_untaken]);
         for (self.messages.items) |entry| {
             const id = entry.request_id orelse continue;
-            dropped[copied_dropped] = try dupeRequestId(result_alloc, id);
-            copied_dropped += 1;
+            const text = try result_alloc.dupe(u8, entry.text);
+            errdefer result_alloc.free(text);
+            untaken[copied_untaken] = .{ .text = text, .request_id = try dupeRequestId(result_alloc, id) };
+            copied_untaken += 1;
+        }
+        // The untaken steers live on in the caller's copies, so only the
+        // steering left after them is dropped.
+        var index: usize = 0;
+        while (index < self.messages.items.len) {
+            if (self.messages.items[index].request_id == null) {
+                index += 1;
+                continue;
+            }
+            const handed_back = self.messages.orderedRemove(index);
+            self.queued_bytes -= handed_back.text.len;
+            freeEntry(backing, handed_back);
         }
         self.clearLocked(backing, reason);
-        return .{ .absorbed = absorbed, .dropped = dropped };
+        return .{ .absorbed = absorbed, .untaken = untaken };
+    }
+
+    /// Removes the queued ACP steer that request `id` sent. False when it is
+    /// not queued: a turn took it, or it never arrived.
+    pub fn withdrawRequest(self: *Runtime, alloc: Allocator, id: RequestId) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.messages.items, 0..) |entry, index| {
+            const queued = entry.request_id orelse continue;
+            if (!jsonrpc.requestIdsEqual(queued, id)) continue;
+            const removed = self.messages.orderedRemove(index);
+            self.queued_bytes -= removed.text.len;
+            freeEntry(alloc, removed);
+            return true;
+        }
+        return false;
     }
 
     pub fn close(self: *Runtime, alloc: Allocator, reason: []const u8) void {
@@ -525,20 +573,8 @@ fn freeEntry(alloc: Allocator, entry: Entry) void {
     if (entry.input_id) |id| alloc.free(id);
 }
 
-fn dupeRequestId(alloc: Allocator, id: RequestId) Allocator.Error!RequestId {
-    return switch (id) {
-        .integer => |value| .{ .integer = value },
-        .string => |value| .{ .string = try alloc.dupe(u8, value) },
-        .null => .null,
-    };
-}
-
-fn freeRequestId(alloc: Allocator, id: RequestId) void {
-    switch (id) {
-        .string => |value| alloc.free(value),
-        .integer, .null => {},
-    }
-}
+const dupeRequestId = jsonrpc.dupeRequestId;
+const freeRequestId = jsonrpc.freeRequestId;
 
 fn freeRequestIdItems(alloc: Allocator, ids: []const RequestId) void {
     for (ids) |id| freeRequestId(alloc, id);
@@ -586,7 +622,7 @@ test "libfx steering runtime bounds each message and total queue" {
     try std.testing.expectEqual(@as(usize, 0), runtime.queued_bytes);
 }
 
-test "steering runtime reports absorbed and dropped prompt requests when a turn ends" {
+test "steering runtime reports absorbed and untaken prompt requests when a turn ends" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -604,10 +640,12 @@ test "steering runtime reports absorbed and dropped prompt requests when a turn 
     defer finished.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), finished.absorbed.len);
     try std.testing.expectEqualStrings("steer-1", finished.absorbed[0].string);
-    try std.testing.expectEqual(@as(usize, 1), finished.dropped.len);
-    try std.testing.expectEqual(@as(i64, 7), finished.dropped[0].integer);
+    try std.testing.expectEqual(@as(usize, 1), finished.untaken.len);
+    try std.testing.expectEqual(@as(i64, 7), finished.untaken[0].request_id.integer);
+    try std.testing.expectEqualStrings("just summarize", finished.untaken[0].text);
     try std.testing.expectError(error.SteeringNotActive, runtime.enqueueRequest(alloc, "late", .{ .integer = 8 }));
     try std.testing.expectEqual(@as(usize, 0), runtime.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queued_bytes);
     try std.testing.expectEqual(@as(usize, 0), runtime.absorbed.items.len);
 }
 
@@ -815,4 +853,40 @@ test "libfx steering withdraws a queued input until the turn takes it" {
     try std.testing.expectEqualStrings("in_3", drained.input_ids[1].?);
     // Taken for a model request: too late to withdraw.
     try std.testing.expect(!runtime.withdraw(alloc, "in_1"));
+}
+
+test "steering runtime withdraws a queued ACP steer by its request id, in order" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.open(alloc);
+    try runtime.enqueueRequest(alloc, "first", .{ .integer = 1 });
+    try runtime.enqueueRequest(alloc, "second", .{ .string = "s2" });
+    try runtime.enqueueRequest(alloc, "third", .{ .integer = 3 });
+
+    try std.testing.expect(runtime.withdrawRequest(alloc, .{ .string = "s2" }));
+    try std.testing.expect(!runtime.withdrawRequest(alloc, .{ .string = "s2" }));
+    try std.testing.expect(!runtime.withdrawRequest(alloc, .{ .integer = 9 }));
+    try std.testing.expectEqual(@as(usize, "first".len + "third".len), runtime.queued_bytes);
+
+    const finished = try runtime.finishTurn(alloc, alloc, "test");
+    defer finished.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), finished.untaken.len);
+    try std.testing.expectEqualStrings("first", finished.untaken[0].text);
+    try std.testing.expectEqualStrings("third", finished.untaken[1].text);
+}
+
+test "steering runtime keeps a libfx input out of the untaken ACP steers" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.open(alloc);
+    try runtime.enqueueInput(alloc, "journaled", "in-1");
+    try runtime.enqueueRequest(alloc, "acp steer", .{ .integer = 2 });
+
+    const finished = try runtime.finishTurn(alloc, alloc, "test");
+    defer finished.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), finished.untaken.len);
+    try std.testing.expectEqualStrings("acp steer", finished.untaken[0].text);
+    try std.testing.expectEqual(@as(usize, 0), runtime.messages.items.len);
 }

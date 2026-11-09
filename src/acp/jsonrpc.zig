@@ -162,6 +162,37 @@ fn stringifyValueAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
     return try out.toOwnedSlice();
 }
 
+/// Copies `id`, duplicating a string id into `alloc`.
+pub fn dupeRequestId(alloc: Allocator, id: RequestId) Allocator.Error!RequestId {
+    return switch (id) {
+        .integer => |value| .{ .integer = value },
+        .string => |value| .{ .string = try alloc.dupe(u8, value) },
+        .null => .null,
+    };
+}
+
+/// Frees an id that `dupeRequestId` copied.
+pub fn freeRequestId(alloc: Allocator, id: RequestId) void {
+    switch (id) {
+        .string => |value| alloc.free(value),
+        .integer, .null => {},
+    }
+}
+
+pub fn requestIdsEqual(lhs: RequestId, rhs: RequestId) bool {
+    return switch (lhs) {
+        .integer => |value| switch (rhs) {
+            .integer => |other| value == other,
+            else => false,
+        },
+        .string => |value| switch (rhs) {
+            .string => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+        .null => rhs == .null,
+    };
+}
+
 pub fn freeMessage(alloc: Allocator, msg: *Message) void {
     if (msg.method.len > 0) alloc.free(msg.method);
     if (msg.params_raw) |p| alloc.free(p);
