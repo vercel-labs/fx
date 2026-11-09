@@ -1048,45 +1048,94 @@ pub fn sleep(ns: u64) void {
     getIo().sleep(.{ .nanoseconds = @intCast(ns) }, .real) catch {};
 }
 
-/// Reads terminal attributes. Linux issues the kernel ioctl directly because
-/// Zig 0.17 sizes `std.posix.termios` to the kernel struct, while
-/// `std.posix.tcgetattr` calls into libc, which writes its larger struct and
-/// overruns the caller's stack.
+/// Reads terminal attributes. Every failure is an error: `std.posix` treats
+/// EBADF here as unreachable, but the descriptor can be closed or revoked
+/// under fx, as when a closed window revokes its terminal, and a panic then
+/// would end fx while it restores the terminal. Linux issues the kernel
+/// ioctl directly because Zig 0.17 sizes `std.posix.termios` to the kernel
+/// struct, while `std.posix.tcgetattr` calls into libc, which writes its
+/// larger struct and overruns the caller's stack.
 pub fn tcgetattr(fd: std.posix.fd_t) std.posix.TermiosGetError!std.posix.termios {
-    if (builtin.target.os.tag != .linux) return std.posix.tcgetattr(fd);
     var term = std.mem.zeroes(std.posix.termios);
-    while (true) switch (std.os.linux.errno(std.os.linux.tcgetattr(fd, &term))) {
+    while (true) switch (tcgetattrErrno(fd, &term)) {
         .SUCCESS => return term,
         .INTR => continue,
-        .BADF => unreachable,
-        .NOTTY => return error.NotATerminal,
+        // A closed or revoked descriptor is no terminal to read.
+        .BADF, .NOTTY => return error.NotATerminal,
         else => |err| return std.posix.unexpectedErrno(err),
     };
 }
 
-/// Sets terminal attributes. See `tcgetattr` for why Linux bypasses libc.
+fn tcgetattrErrno(fd: std.posix.fd_t, term: *std.posix.termios) std.posix.E {
+    if (builtin.target.os.tag == .linux) return std.os.linux.errno(std.os.linux.tcgetattr(fd, term));
+    return std.posix.errno(std.c.tcgetattr(fd, term));
+}
+
+/// Sets terminal attributes. Like `tcgetattr`, every failure is an error,
+/// including the EBADF and EINVAL that `std.posix` treats as unreachable.
 pub fn tcsetattr(
     fd: std.posix.fd_t,
     action: std.posix.TCSA,
     term: std.posix.termios,
 ) std.posix.TermiosSetError!void {
-    if (builtin.target.os.tag != .linux) return std.posix.tcsetattr(fd, action, term);
-    while (true) switch (std.os.linux.errno(std.os.linux.tcsetattr(fd, action, &term))) {
+    while (true) switch (tcsetattrErrno(fd, action, &term)) {
         .SUCCESS => return,
         .INTR => continue,
-        .BADF, .INVAL => unreachable,
-        .NOTTY => return error.NotATerminal,
+        // A closed or revoked descriptor is no terminal to set.
+        .BADF, .NOTTY => return error.NotATerminal,
         .IO => return error.ProcessOrphaned,
+        // The terminal refused the action or the attributes.
+        .INVAL => return error.Unexpected,
         else => |err| return std.posix.unexpectedErrno(err),
     };
 }
 
-test "tcgetattr reports a regular file as not a terminal" {
+fn tcsetattrErrno(fd: std.posix.fd_t, action: std.posix.TCSA, term: *const std.posix.termios) std.posix.E {
+    if (builtin.target.os.tag == .linux) return std.os.linux.errno(std.os.linux.tcsetattr(fd, action, term));
+    return std.posix.errno(std.c.tcsetattr(fd, action, term));
+}
+
+test "terminal attributes of a regular file report not a terminal" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
     defer file.close(std.testing.io);
     try std.testing.expectError(error.NotATerminal, tcgetattr(file.handle));
+    try std.testing.expectError(
+        error.NotATerminal,
+        tcsetattr(file.handle, .FLUSH, std.mem.zeroes(std.posix.termios)),
+    );
+}
+
+test "terminal attributes of a closed descriptor are an error, not a panic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
+    defer file.close(std.testing.io);
+    // A high number that nothing else in the test process opens meanwhile.
+    const closed = std.c.fcntl(file.handle, std.posix.F.DUPFD, @as(c_int, 900));
+    try std.testing.expect(closed >= 900);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.close(closed));
+
+    try std.testing.expectError(error.NotATerminal, tcgetattr(closed));
+    try std.testing.expectError(
+        error.NotATerminal,
+        tcsetattr(closed, .FLUSH, std.mem.zeroes(std.posix.termios)),
+    );
+}
+
+test "terminal attributes with an invalid action are an error, not a panic" {
+    // macOS libc refuses the action with EINVAL before any ioctl. On Linux
+    // the action selects the ioctl itself, so there is no safe invalid one.
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
+    defer file.close(std.testing.io);
+    try std.testing.expectError(
+        error.Unexpected,
+        tcsetattr(file.handle, @fromBackingInt(99), std.mem.zeroes(std.posix.termios)),
+    );
 }
 
 pub fn makeDirRecursive(path: []const u8) !void {
