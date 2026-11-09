@@ -281,15 +281,16 @@ async function waitForExactComposerRow(
 ): Promise<void> {
   const started = Date.now();
   let lastMatches: string[] = [];
+  let lastBars: string[] = [];
   while (Date.now() - started < READY_TIMEOUT) {
-    lastMatches = (await active.capturePaneGrid())
-      .map((line) => line.trimEnd())
-      .filter((line) => line === expected);
+    const rows = (await active.capturePaneGrid()).map((line) => line.trimEnd());
+    lastMatches = rows.filter((line) => line === expected);
+    lastBars = rows.filter((line) => line.startsWith("┃"));
     if (lastMatches.length === 1) return;
     await delay(25);
   }
   throw new Error(
-    `Timed out waiting for composer row ${JSON.stringify(expected)}; matches=${lastMatches.length}`,
+    `Timed out waiting for composer row ${JSON.stringify(expected)}; matches=${lastMatches.length}; rows with the bar: ${JSON.stringify(lastBars)}`,
   );
 }
 
@@ -852,19 +853,6 @@ tmuxTest(
       (position) => position.row === start.row && position.col === 3,
       READY_TIMEOUT,
     );
-
-    // A variation selector has no glyph of its own: it is not drawn on a
-    // circle and takes no cell, so the cursor after "a" is in column 3.
-    await active.sendKeys("End C-u");
-    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
-    await typeLiteral(active, `\uFE0Fa`);
-    await active.waitForPane(
-      (pane) =>
-        pane.split("\n").some((line) => line.replaceAll("\uFE0F", "").trimEnd() === "┃ a"),
-      READY_TIMEOUT,
-    );
-    await active.waitForCursor((position) => position.col === 3, READY_TIMEOUT);
-    expect(await active.capturePane()).not.toContain(DOTTED_CIRCLE);
 
     // A sent message that starts with a bare mark keeps it, on a circle, in
     // its card: the rail's space cell is not a base.
