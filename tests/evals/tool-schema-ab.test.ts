@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   applyVariant,
+  callFailure,
   extractToolCalls,
   isRemoteCommand,
   numberIn,
@@ -14,6 +15,15 @@ import {
 const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
 
 describe("tool schema A/B helpers", () => {
+  test("a failed call is a rejection unless a shell command ran and exited nonzero", () => {
+    const call = (name: string, error: boolean, resultText: string) =>
+      ({ id: "c", name, input: {}, inputRaw: "{}", providerExecuted: false, resultType: error ? "error-json" : "json", resultText, error });
+    expect(callFailure(call("shell", true, '{"state":"completed","exit_code":1}'))).toBe("exited");
+    expect(callFailure(call("shell", true, '{"error":{"code":"invalid_shell_request","executed":false}}'))).toBe("rejected");
+    expect(callFailure(call("subagent", true, '{"ok":false,"result":"message needs agent and message."}'))).toBe("rejected");
+    expect(callFailure(call("shell", false, '{"state":"completed","exit_code":0}'))).toBe(null);
+  });
+
   test("a variant replaces only the named function tools and text in system messages", () => {
     const body: Record<string, unknown> = {
       tools: [

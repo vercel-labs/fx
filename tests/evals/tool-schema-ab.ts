@@ -18,7 +18,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const UPSTREAM = "https://ai-gateway.vercel.sh";
 
@@ -30,6 +30,45 @@ export interface Variant {
   tools?: Record<string, { description?: string; inputSchema?: unknown }>;
   /** Text replaced once in each system message that contains it, such as provider-tool guidance or a system prompt line. */
   system?: Array<{ from: string; to: string }>;
+  /** Module path for a Transform, which rewrites what the model sees and the calls fx gets back. */
+  transform?: string;
+}
+
+/**
+ * Prototypes a request-format change without changing fx. request() edits a
+ * body after the proxy records fx's own view of it; event() edits each parsed
+ * stream event before fx reads it. model is the ai-language-model-id header.
+ */
+export interface Transform {
+  request?(body: Record<string, unknown>, model: string): void;
+  event?(part: Record<string, unknown>, model: string): Record<string, unknown>;
+}
+
+/** Rewrites each `data: {json}` line of an SSE stream with one Transform. */
+export function transformStream(transform: Transform, model: string): TransformStream<Uint8Array, Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffered = "";
+  const rewrite = (line: string) => {
+    if (!line.startsWith("data: ") || !transform.event) return line;
+    try {
+      return `data: ${JSON.stringify(transform.event(JSON.parse(line.slice(6)), model))}`;
+    } catch {
+      return line;
+    }
+  };
+  return new TransformStream({
+    transform(chunk, controller) {
+      buffered += decoder.decode(chunk, { stream: true });
+      const lines = buffered.split("\n");
+      buffered = lines.pop() ?? "";
+      if (lines.length) controller.enqueue(encoder.encode(lines.map(rewrite).join("\n") + "\n"));
+    },
+    flush(controller) {
+      buffered += decoder.decode();
+      if (buffered) controller.enqueue(encoder.encode(rewrite(buffered)));
+    },
+  });
 }
 
 export function loadVariant(path: string | undefined): Variant {
@@ -104,7 +143,7 @@ export function parseStreamUsage(stream: string): Usage | null {
   return usage;
 }
 
-function startProxy(variant: Variant, testKey: string) {
+function startProxy(variant: Variant, testKey: string, transform?: Transform) {
   const requests: RecordedRequest[] = [];
   const pending: Promise<void>[] = [];
   const server = Bun.serve({
@@ -117,6 +156,7 @@ function startProxy(variant: Variant, testKey: string) {
         return new Response("tool-schema-ab: refusing a key other than AI_GATEWAY_TEST_API_KEY", { status: 401 });
       }
       let raw = req.method === "GET" || req.method === "HEAD" ? undefined : await req.text();
+      const model = req.headers.get("ai-language-model-id") ?? "";
       const record: RecordedRequest = { seq: requests.length + 1, agent: false, toolsHash: null, toolsBytes: 0, toolProps: {}, prompt: null, usage: null, providerSearch: false, status: 0 };
       if (raw) {
         try {
@@ -125,15 +165,17 @@ function startProxy(variant: Variant, testKey: string) {
           record.agent = Array.isArray(tools) && tools.some((t) => t.name === "read_file");
           if (record.agent) {
             applyVariant(body, variant);
-            raw = JSON.stringify(body);
-            const toolsJson = JSON.stringify(body.tools);
-            record.toolsBytes = toolsJson.length;
-            record.toolsHash = createHash("sha256").update(toolsJson).digest("hex").slice(0, 12);
+            // Score fx's own view of tools and calls; size what the model receives.
             for (const tool of body.tools as Array<Record<string, unknown>>) {
               const schema = tool.inputSchema as { properties?: Record<string, unknown> } | undefined;
               if (tool.type === "function" && typeof tool.name === "string") record.toolProps[tool.name] = Object.keys(schema?.properties ?? {});
             }
-            record.prompt = body.prompt as Array<Record<string, unknown>>;
+            record.prompt = transform?.request ? structuredClone(body.prompt as Array<Record<string, unknown>>) : (body.prompt as Array<Record<string, unknown>>);
+            transform?.request?.(body, model);
+            raw = JSON.stringify(body);
+            const toolsJson = JSON.stringify(body.tools);
+            record.toolsBytes = toolsJson.length;
+            record.toolsHash = createHash("sha256").update(toolsJson).digest("hex").slice(0, 12);
           }
         } catch {}
         requests.push(record);
@@ -145,7 +187,8 @@ function startProxy(variant: Variant, testKey: string) {
       const outHeaders = new Headers(response.headers);
       for (const name of ["content-encoding", "content-length"]) outHeaders.delete(name);
       if (!response.body) return new Response(null, { status: response.status, headers: outHeaders });
-      const [toClient, toRecord] = response.body.tee();
+      const stream = transform?.event && record.agent ? response.body.pipeThrough(transformStream(transform, model)) : response.body;
+      const [toClient, toRecord] = stream.tee();
       pending.push(
         new Response(toRecord)
           .text()
@@ -181,6 +224,38 @@ const INVENTORY_LINES = (() => {
   }
   return lines;
 })();
+
+const STALE_SETTINGS = '"""Runtime settings."""\n\nTIMEOUT = 30 # secs\nRETRIES = 3\n';
+const STALE_LOADER = [
+  '"""File loading."""',
+  "",
+  "import os",
+  "",
+  "",
+  "def load(path):",
+  "    with open(path) as handle:",
+  "        data = handle.read()",
+  "    return data.strip()",
+  "",
+  "",
+  "def exists(path):",
+  "    return os.path.exists(path)",
+  "",
+].join("\n");
+const DUPLICATE_TOTALS = [
+  '"""Totals."""',
+  "",
+  "",
+  "def invoice_total(items):",
+  "    total = sum(items)",
+  "    return round(total, 2)",
+  "",
+  "",
+  "def refund_total(items):",
+  "    total = sum(items)",
+  "    return round(total, 2)",
+  "",
+].join("\n");
 
 export const FIXTURE_FILES: Record<string, string> = {
   "README.md": "# ledger\n\nSmall bookkeeping toolkit. See docs/design.md for the module layout.\n",
@@ -572,6 +647,16 @@ export function extractToolCalls(prompt: Array<Record<string, unknown>>): ToolCa
   return calls;
 }
 
+/**
+ * Why a call failed: fx refused or could not carry it out ("rejected"), or a
+ * shell command ran and exited nonzero ("exited"). The flag on the record
+ * counts both, but only a rejection is a tool-call mistake.
+ */
+export function callFailure(call: ToolCallRecord): "rejected" | "exited" | null {
+  if (!call.error) return null;
+  return call.name === "shell" && /"state":"completed"/.test(call.resultText) ? "exited" : "rejected";
+}
+
 function userText(message: Record<string, unknown>): string {
   if (typeof message.content === "string") return message.content;
   if (!Array.isArray(message.content)) return "";
@@ -781,6 +866,43 @@ export const TASKS: Task[] = [
       return ok(file(c, "src/ledger/pricing.py") === expected, "only TAX_RATE changed");
     },
   },
+  // The next three start from text that does not match the file, as a pasted
+  // or remembered snippet would, so the first edit fails and the run measures
+  // how the model recovers.
+  {
+    id: "edit-stale-line",
+    tool: "edit_file",
+    setup: (repo) => writeFileSync(join(repo, "src/ledger/settings.py"), STALE_SETTINGS),
+    prompt: () =>
+      "A teammate pasted this line from src/ledger/settings.py: `TIMEOUT = 30  # seconds`. Use edit_file right away, without reading the file first, to make that timeout 45. Keep everything else as it is.",
+    check: (c) => {
+      const lines = (file(c, "src/ledger/settings.py") ?? "").split("\n");
+      const expected = STALE_SETTINGS.split("\n");
+      const rest = lines.length === expected.length && lines.every((line, i) => i === 2 || line === expected[i]);
+      return ok(rest && /^TIMEOUT = 45\b/.test(lines[2] ?? ""), "timeout 45, rest unchanged");
+    },
+  },
+  {
+    id: "edit-stale-block",
+    tool: "edit_file",
+    setup: (repo) => writeFileSync(join(repo, "src/ledger/loader.py"), STALE_LOADER),
+    prompt: () =>
+      "A teammate pasted this function from src/ledger/loader.py:\n\ndef load(path):\n    with open(path) as f:\n        text = f.read()\n    return text.strip()\n\nUse edit_file right away, without reading the file first, so that load returns the text without calling strip(). Keep everything else as it is.",
+    check: (c) =>
+      ok(file(c, "src/ledger/loader.py") === STALE_LOADER.replace("    return data.strip()", "    return data"), "strip dropped, rest unchanged"),
+  },
+  {
+    id: "edit-duplicate",
+    tool: "edit_file",
+    setup: (repo) => writeFileSync(join(repo, "src/ledger/totals.py"), DUPLICATE_TOTALS),
+    prompt: () =>
+      "In src/ledger/totals.py, make refund_total round to 0 decimal places instead of 2. Use edit_file right away, without reading the file first, with old_string `    return round(total, 2)`. invoice_total must keep rounding to 2.",
+    check: (c) => {
+      const at = DUPLICATE_TOTALS.lastIndexOf("    return round(total, 2)");
+      const expected = DUPLICATE_TOTALS.slice(0, at) + "    return round(total, 0)" + DUPLICATE_TOTALS.slice(at + "    return round(total, 2)".length);
+      return ok(file(c, "src/ledger/totals.py") === expected, "only refund_total changed");
+    },
+  },
   {
     id: "edit-rename",
     tool: "edit_file",
@@ -808,6 +930,46 @@ export const TASKS: Task[] = [
         return ok(false, "invalid JSON");
       }
     },
+  },
+  // Long turns: many steps, so calls late in a growing history show whether
+  // the model still uses each tool correctly.
+  {
+    id: "long-refactor",
+    tool: "multi",
+    prompt: () =>
+      "Make these changes, then run `python3 -m unittest discover -s tests` and fix anything that fails until it passes:\n" +
+      "1. Rename apply_discount to discount_price everywhere it is defined, called, or imported, including the tests.\n" +
+      "2. Make discount_price raise ValueError when percent is below 0 or above 100, and add a test for that.\n" +
+      "3. Add with_regional_tax(amount, rate) to src/ledger/pricing.py that returns round(amount * (1 + rate), 2), with a test.\n" +
+      "4. Delete the deprecated print_summary function from src/ledger/reports.py.\n" +
+      "Tell me how many tests ran at the end.",
+    timeoutSec: 600,
+    check: (c) => {
+      const run = spawnSync("python3", ["-m", "unittest", "discover", "-s", "tests"], { cwd: c.repo, encoding: "utf8" });
+      const ran = Number(/Ran (\d+) test/.exec(run.stderr ?? "")?.[1] ?? 0);
+      const source = ["src/ledger/pricing.py", "src/ledger/reports.py", "tests/test_pricing.py"].map((path) => file(c, path) ?? "").join("\n");
+      const tests = file(c, "tests/test_pricing.py") ?? "";
+      const done =
+        run.status === 0 &&
+        ran >= 5 &&
+        !/\bapply_discount\b/.test(source) &&
+        /def discount_price/.test(source) &&
+        /ValueError/.test(tests) &&
+        /with_regional_tax/.test(tests) &&
+        !/def print_summary/.test(source);
+      return ok(done, `tests pass (ran ${ran}, exit ${run.status}) with the rename, guard, new function, and deletion`);
+    },
+  },
+  {
+    id: "long-audit",
+    tool: "multi",
+    prompt: () =>
+      "List every TODO in this repository, in code and docs, as a table with the file, the line number, and the TODO text. Then tell me which function each code TODO sits in.",
+    check: (c) =>
+      ok(
+        has(c.output, "per-region", "legacy discount", "CSV exporter", "warehouse code", "report format", "with_tax") && numberIn(c.output, 13),
+        "all five TODOs, and pricing.py line 13 in with_tax",
+      ),
   },
   {
     id: "shell-tests",
@@ -949,6 +1111,7 @@ export interface Arm {
   bin: string;
   variant: Variant;
   variantPath: string;
+  transform?: Transform;
 }
 
 export interface RunResult {
@@ -968,9 +1131,17 @@ export interface RunResult {
   targetCalls: number;
   targetErrors: number;
   allErrors: number;
+  /** Calls after the first ten, and how many of them fx answered with an error. */
+  lateCalls: number;
+  lateErrors: number;
+  rejectedCalls: number;
+  exitedCalls: number;
   offSchemaFields: string[];
   agentRequests: number;
   inputTokens: number;
+  /** Input tokens the provider reported reading from or writing to its prompt cache. */
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
   outputTokens: number;
   toolsBytes: number;
   toolsHash: string | null;
@@ -979,6 +1150,9 @@ export interface RunResult {
   stderrTail: string;
 }
 
+/** Calls from this index on count as late in a long turn. */
+const LATE_CALL_INDEX = 10;
+
 let nextPort = 18700 + Math.floor(Math.random() * 500);
 
 export async function runOne(arm: Arm, model: string, task: Task, trial: number, testKey: string, noSave = false): Promise<RunResult> {
@@ -986,7 +1160,7 @@ export async function runOne(arm: Arm, model: string, task: Task, trial: number,
   const { repo, home, trackerLog } = writeFixture(root);
   const port = nextPort++;
   task.setup?.(repo);
-  const proxy = startProxy(arm.variant, testKey);
+  const proxy = startProxy(arm.variant, testKey, arm.transform);
   const prompt = task.prompt({ port });
   const timeoutSec = task.timeoutSec ?? 300;
   const started = Date.now();
@@ -1047,7 +1221,13 @@ export async function runOne(arm: Arm, model: string, task: Task, trial: number,
     if (!call.input || call.providerExecuted || !props[call.name]) continue;
     for (const key of Object.keys(call.input)) if (!props[call.name].includes(key)) offSchema.add(`${call.name}.${key}`);
   }
-  const targetCalls = task.tool === "web_search" ? (proxy.requests.some((r) => r.providerSearch) ? [{ error: false }] : []) : calls.filter((c) => c.name === task.tool);
+  const targetCalls =
+    task.tool === "web_search"
+      ? proxy.requests.some((r) => r.providerSearch)
+        ? [{ error: false }]
+        : []
+      : // A long turn exercises every tool it calls.
+        calls.filter((c) => (task.tool === "multi" ? !c.providerExecuted : c.name === task.tool));
   const result: RunResult = {
     arm: arm.name,
     model,
@@ -1065,9 +1245,15 @@ export async function runOne(arm: Arm, model: string, task: Task, trial: number,
     targetCalls: targetCalls.length,
     targetErrors: targetCalls.filter((c) => c.error).length,
     allErrors: calls.filter((c) => c.error).length,
+    lateCalls: calls.slice(LATE_CALL_INDEX).filter((c) => !c.providerExecuted).length,
+    lateErrors: calls.slice(LATE_CALL_INDEX).filter((c) => c.error).length,
+    rejectedCalls: calls.filter((c) => callFailure(c) === "rejected").length,
+    exitedCalls: calls.filter((c) => callFailure(c) === "exited").length,
     offSchemaFields: [...offSchema],
     agentRequests: agent.length,
     inputTokens: agent.reduce((sum, r) => sum + (r.usage?.input ?? 0), 0),
+    cacheReadTokens: agent.reduce((sum, r) => sum + (r.usage?.cacheRead ?? 0), 0),
+    cacheWriteTokens: agent.reduce((sum, r) => sum + (r.usage?.cacheWrite ?? 0), 0),
     outputTokens: agent.reduce((sum, r) => sum + (r.usage?.output ?? 0), 0),
     toolsBytes: agent[0]?.toolsBytes ?? 0,
     toolsHash: agent[0]?.toolsHash ?? null,
@@ -1103,9 +1289,14 @@ export interface GroupSummary {
   targetCalls: number;
   targetErrors: number;
   allErrors: number;
+  lateCalls: number;
+  lateErrors: number;
+  rejectedCalls: number;
+  exitedCalls: number;
   missedTarget: number;
   offSchema: number;
   meanInputTokens: number;
+  meanCacheReadTokens: number;
   meanOutputTokens: number;
   meanRequests: number;
   toolsBytes: number;
@@ -1125,9 +1316,14 @@ export function summarize(results: RunResult[], key: (r: RunResult) => string): 
       targetCalls: rs.reduce((s, r) => s + r.targetCalls, 0),
       targetErrors: rs.reduce((s, r) => s + r.targetErrors, 0),
       allErrors: rs.reduce((s, r) => s + r.allErrors, 0),
+      lateCalls: rs.reduce((s, r) => s + (r.lateCalls ?? 0), 0),
+      lateErrors: rs.reduce((s, r) => s + (r.lateErrors ?? 0), 0),
+      rejectedCalls: rs.reduce((s, r) => s + (r.rejectedCalls ?? 0), 0),
+      exitedCalls: rs.reduce((s, r) => s + (r.exitedCalls ?? 0), 0),
       missedTarget: rs.filter((r) => r.targetCalls === 0).length,
       offSchema: rs.reduce((s, r) => s + r.offSchemaFields.length, 0),
       meanInputTokens: mean((r) => r.inputTokens),
+      meanCacheReadTokens: mean((r) => r.cacheReadTokens ?? 0),
       meanOutputTokens: mean((r) => r.outputTokens),
       meanRequests: Math.round((rs.reduce((s, r) => s + r.agentRequests, 0) / rs.length) * 10) / 10,
       toolsBytes: Math.max(...rs.map((r) => r.toolsBytes)),
@@ -1137,11 +1333,11 @@ export function summarize(results: RunResult[], key: (r: RunResult) => string): 
 }
 
 export function table(rows: Record<string, GroupSummary>): string {
-  const header = "| group | runs | pass | target calls | target errors | all errors | missed target | off-schema | mean input tok | mean output tok | mean requests | tools bytes |";
-  const rule = "|" + " --- |".repeat(12);
+  const header = "| group | runs | pass | target calls | target errors | all errors | rejected | exited | late calls | late errors | missed target | off-schema | mean input tok | mean cache read tok | mean output tok | mean requests | tools bytes |";
+  const rule = "|" + " --- |".repeat(17);
   const lines = Object.values(rows).map(
     (s) =>
-      `| ${[s.group, s.runs, s.pass, s.targetCalls, s.targetErrors, s.allErrors, s.missedTarget, s.offSchema, s.meanInputTokens, s.meanOutputTokens, s.meanRequests, s.toolsBytes].join(" | ")} |`,
+      `| ${[s.group, s.runs, s.pass, s.targetCalls, s.targetErrors, s.allErrors, s.rejectedCalls, s.exitedCalls, s.lateCalls, s.lateErrors, s.missedTarget, s.offSchema, s.meanInputTokens, s.meanCacheReadTokens, s.meanOutputTokens, s.meanRequests, s.toolsBytes].join(" | ")} |`,
   );
   return [header, rule, ...lines].join("\n");
 }
@@ -1340,6 +1536,9 @@ async function main(): Promise<void> {
       const [bin, variantPath = "none"] = rest.split("@");
       return { name, bin: resolve(bin), variant: loadVariant(variantPath), variantPath };
     });
+    for (const arm of arms) {
+      if (arm.variant.transform) arm.transform = (await import(resolve(dirname(arm.variantPath), arm.variant.transform))) as Transform;
+    }
     const models = list(arg("models"));
     const toolFilter = list(arg("tools", ""));
     const taskFilter = list(arg("tasks", ""));
@@ -1349,6 +1548,8 @@ async function main(): Promise<void> {
     const outDir = arg("out");
     const concurrency = Number(arg("concurrency", "8"));
     const noSave = process.argv.includes("--no-save");
+    // --resume reuses each run whose result file a stopped run already wrote.
+    const resume = process.argv.includes("--resume");
     mkdirSync(outDir, { recursive: true });
     writeFileSync(
       join(outDir, "config.json"),
@@ -1363,8 +1564,14 @@ async function main(): Promise<void> {
           const order = trial % 2 === 0 ? arms : [...arms].reverse();
           for (const arm of order) {
             jobs.push(async () => {
+              const file = join(outDir, `${model.replaceAll("/", "_")}-${task.id}-${arm.name}-${trial}.json`);
+              if (resume && existsSync(file)) {
+                try {
+                  return JSON.parse(readFileSync(file, "utf8")) as RunResult;
+                } catch {}
+              }
               const result = await runOne(arm, model, task, trial, testKey, noSave);
-              writeFileSync(join(outDir, `${model.replaceAll("/", "_")}-${task.id}-${arm.name}-${trial}.json`), JSON.stringify(result, null, 2));
+              writeFileSync(file, JSON.stringify(result, null, 2));
               const calls = result.calls.map((c) => c.name + (c.error ? "!" : "")).join(",");
               console.log(
                 `${result.pass ? "PASS" : "FAIL"} ${arm.name.padEnd(9)} ${model.padEnd(28)} ${task.id.padEnd(18)} t${trial} in=${result.inputTokens} calls=${calls} ${result.pass ? "" : result.reason}`,
