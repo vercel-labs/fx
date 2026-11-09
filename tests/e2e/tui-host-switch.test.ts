@@ -136,6 +136,35 @@ function latestUserText(body: string): string {
   return userTexts(body).at(-1) ?? "";
 }
 
+// The text of the tool result `id` in a request body, or "" when it has none.
+function toolResultText(body: string, id: string): string {
+  const texts = (value: unknown, out: string[] = []): string[] => {
+    if (typeof value === "string") out.push(value);
+    else if (Array.isArray(value)) for (const item of value) texts(item, out);
+    else if (value && typeof value === "object") for (const item of Object.values(value)) texts(item, out);
+    return out;
+  };
+  let found = "";
+  const walk = (value: any) => {
+    if (found) return;
+    if (Array.isArray(value)) value.forEach(walk);
+    else if (value && typeof value === "object") {
+      if (value.type === "tool-result" && value.toolCallId === id) found = texts(value.output).join("");
+      else Object.values(value).forEach(walk);
+    }
+  };
+  walk(JSON.parse(body));
+  return found;
+}
+
+// One model step that calls the subagent tool once per message, in order.
+function messageSteps(calls: Array<{ id: string; agent: string; message: string }>): Response {
+  return fakeGatewaySse([
+    ...calls.map((call) => ({ type: "tool-call", toolCallId: call.id, toolName: "subagent", input: { request: { action: "message", agent: call.agent, message: call.message } } })),
+    { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+  ]);
+}
+
 async function until(what: string, done: () => boolean, ms = 30_000) {
   const deadline = Date.now() + ms;
   while (!done()) {
@@ -1778,6 +1807,97 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       }, false, env);
     },
     TIMEOUT,
+  );
+
+  test(
+    "main can still steer a working subagent after it has read 64 earlier messages",
+    async () => {
+      const env: Record<string, string> = { FX_PERMISSION_MODE: "full-access" };
+      let lastResult = "";
+      let laneRequests = 0;
+      const laneStep = held(), laneRead = held(), laneDone = held();
+      const steers = Array.from({ length: 64 }, (_, i) => ({ id: `steer_${i + 1}`, agent: "lane", message: `STEER_${String(i + 1).padStart(3, "0")} note` }));
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          laneRequests += 1;
+          if (laneRequests === 1) {
+            await laneStep.promise;
+            return toolCall("lane_t1", "shell", { action: "run", command: "true" });
+          }
+          // The lane reads every waiting message at this step.
+          if (body.includes("STEER_064")) laneRead.release();
+          await laneDone.promise;
+          return text("lane_done", "LANE_DONE");
+        }
+        if (latestUserText(body).includes('"child_id"')) return text("main_report", "MAIN_SAW_REPORT");
+        if (body.includes('"steer_last"')) {
+          lastResult = toolResultText(body, "steer_last");
+          laneDone.release();
+          return text("main_done", "MAIN_DONE");
+        }
+        if (body.includes('"steer_64"')) {
+          laneStep.release();
+          await laneRead.promise;
+          return toolCall("steer_last", "subagent", { request: { action: "message", agent: "lane", message: "STEER_LAST one more" } });
+        }
+        if (body.includes('"main_start"')) return messageSteps(steers);
+        return toolCall("main_start", "subagent", { request: { action: "message", agent: "lane", message: "LANE_TASK keep working" } });
+      }, async (session) => {
+        await session.sendText("SWITCH_USER steer the lane");
+        await session.waitForText("MAIN_DONE", 120_000);
+        console.log(`STEER_LAST_RESULT: ${lastResult}`);
+        // None of the 64 was waiting any more, so the limit doesn't apply.
+        expect(lastResult).toContain("Sent into the subagent's running turn");
+      }, () => {}, false, env);
+    },
+    180_000,
+  );
+
+  test(
+    "a subagent with 64 unread messages refuses one more and says why, while another working subagent still takes messages",
+    async () => {
+      const env: Record<string, string> = { FX_PERMISSION_MODE: "full-access" };
+      let fullResult = "";
+      let otherResult = "";
+      const lanesDone = held();
+      const steers = Array.from({ length: 64 }, (_, i) => ({ id: `steer_a_${i + 1}`, agent: "lane-a", message: `A_STEER_${String(i + 1).padStart(3, "0")} note` }));
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          // Neither lane reaches a step boundary until the checks are done,
+          // so every message to lane-a stays unread.
+          await lanesDone.promise;
+          return text("lane_done", "LANE_DONE");
+        }
+        if (latestUserText(body).includes('"child_id"')) return text("main_report", "MAIN_SAW_REPORT");
+        if (body.includes('"steer_b"')) {
+          fullResult = toolResultText(body, "steer_a_65");
+          otherResult = toolResultText(body, "steer_b");
+          lanesDone.release();
+          return text("main_done", "MAIN_DONE");
+        }
+        if (body.includes('"steer_a_64"')) {
+          return messageSteps([
+            { id: "steer_a_65", agent: "lane-a", message: "A_STEER_065 one too many" },
+            { id: "steer_b", agent: "lane-b", message: "B_STEER_001 note" },
+          ]);
+        }
+        if (body.includes('"start_b"')) return messageSteps(steers);
+        return messageSteps([
+          { id: "start_a", agent: "lane-a", message: "LANE_A_TASK keep working" },
+          { id: "start_b", agent: "lane-b", message: "LANE_B_TASK keep working" },
+        ]);
+      }, async (session) => {
+        await session.sendText("SWITCH_USER fill lane-a");
+        await session.waitForText("MAIN_DONE", 120_000);
+        console.log(`FULL_RESULT: ${fullResult}`);
+        console.log(`OTHER_RESULT: ${otherResult}`);
+        const full = JSON.parse(fullResult.slice(fullResult.indexOf("{")));
+        expect(full.ok).toBe(false);
+        expect(full.result).toContain("lane-a already has 64 unread messages");
+        expect(otherResult).toContain("Sent into the subagent's running turn");
+      }, () => {}, false, env);
+    },
+    180_000,
   );
 
   test(

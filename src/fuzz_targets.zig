@@ -38,6 +38,7 @@ test {
     _ = @import("core/subagent/reports.zig");
     _ = @import("core/terminal/engine.zig");
     _ = @import("core/tooling/command_output_content.zig");
+    _ = @import("core/tooling/file_mutation.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/client.zig");

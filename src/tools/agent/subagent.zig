@@ -3,6 +3,7 @@ const model_contract = @import("../../core/subagent/model_contract.zig");
 const tool_provider = @import("../../core/subagent/tool_provider.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -26,7 +27,10 @@ const DecodeError = error{
 /// Fields each action takes. The flat model schema for this tool in
 /// src/builtins/tools.zig advertises exactly these, which a test there checks.
 pub const message_fields = [_][]const u8{ "action", "agent", "instructions", "message", "report", "model", "effort", "profile" };
-pub const wait_fields = [_][]const u8{"action"};
+/// wait wakes on the next report or message from any subagent. Models
+/// often name the one they started, so agent is accepted and does not
+/// narrow the wait; the report that arrives names its sender.
+pub const wait_fields = [_][]const u8{ "action", "agent" };
 pub const status_fields = [_][]const u8{ "action", "agent" };
 pub const stop_fields = [_][]const u8{ "action", "agent" };
 pub const close_fields = [_][]const u8{ "action", "agent" };
@@ -92,7 +96,7 @@ fn decodeFailure(
 
 /// Pure: the correction a model sees for a call that failed to decode.
 fn problemText(arena: Allocator, err: DecodeError, problem: Problem) Allocator.Error![]const u8 {
-    const fields = "message takes agent, message, instructions, report, model, effort, and profile; wait takes nothing; status takes an optional agent; stop and close take agent.";
+    const fields = "message takes agent, message, instructions, report, model, effort, and profile; wait and status take an optional agent; stop and close take agent.";
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.InvalidEnum => "action must be \"message\", \"wait\", \"status\", \"stop\", or \"close\".",
@@ -154,7 +158,7 @@ fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contrac
 
     if (std.mem.eql(u8, action, "message")) {
         problem.action = "message";
-        try rejectUnknown(request, &message_fields, problem);
+        try rejectOutsideAction(request, &message_fields, problem);
         return .{ .message = .{
             .agent = try requiredString(request, "agent", problem),
             .instructions = try optionalString(request, "instructions", problem),
@@ -167,22 +171,29 @@ fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contrac
     }
     if (std.mem.eql(u8, action, "wait")) {
         problem.action = "wait";
-        try rejectUnknown(request, &wait_fields, problem);
+        try rejectOutsideAction(request, &wait_fields, problem);
+        if (try optionalString(request, "agent", problem)) |agent| {
+            debug_trace.logf(
+                "subagent",
+                "wait ignored agent=\"{f}\": wait returns the next report from any subagent",
+                .{std.zig.fmtString(agent)},
+            );
+        }
         return .wait;
     }
     if (std.mem.eql(u8, action, "status")) {
         problem.action = "status";
-        try rejectUnknown(request, &status_fields, problem);
+        try rejectOutsideAction(request, &status_fields, problem);
         return .{ .status = .{ .agent = try optionalString(request, "agent", problem) } };
     }
     if (std.mem.eql(u8, action, "stop")) {
         problem.action = "stop";
-        try rejectUnknown(request, &stop_fields, problem);
+        try rejectOutsideAction(request, &stop_fields, problem);
         return .{ .stop = .{ .agent = try requiredString(request, "agent", problem) } };
     }
     if (std.mem.eql(u8, action, "close")) {
         problem.action = "close";
-        try rejectUnknown(request, &close_fields, problem);
+        try rejectOutsideAction(request, &close_fields, problem);
         return .{ .close = .{ .agent = try requiredString(request, "agent", problem) } };
     }
     return error.InvalidEnum;
@@ -223,13 +234,37 @@ fn rejectUnknown(
 ) DecodeError!void {
     var fields = object.iterator();
     while (fields.next()) |entry| {
-        for (allowed) |name| {
-            if (std.mem.eql(u8, entry.key_ptr.*, name)) break;
-        } else {
-            problem.field = entry.key_ptr.*;
-            return error.UnknownField;
-        }
+        if (listsField(allowed, entry.key_ptr.*)) continue;
+        problem.field = entry.key_ptr.*;
+        return error.UnknownField;
     }
+}
+
+/// Rejects the fields `action` does not take, except a known subagent field
+/// set to an empty string or false: it asks for nothing, so it means the same
+/// as leaving it out, as in the shell decoder. Some models fill every
+/// advertised field this way. Unknown names and any other value are still
+/// rejected, since they can carry intent that ignoring them would lose.
+fn rejectOutsideAction(
+    request: std.json.ObjectMap,
+    allowed: []const []const u8,
+    problem: *Problem,
+) DecodeError!void {
+    var fields = request.iterator();
+    while (fields.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (listsField(allowed, name)) continue;
+        if (listsField(message_fields[1..], name) and tool_args.isEmptyArgumentValue(entry.value_ptr.*)) continue;
+        problem.field = name;
+        return error.UnknownField;
+    }
+}
+
+fn listsField(names: []const []const u8, name: []const u8) bool {
+    for (names) |listed| {
+        if (std.mem.eql(u8, listed, name)) return true;
+    }
+    return false;
 }
 
 pub fn validate(
@@ -413,7 +448,9 @@ fn expectCorrection(args_json: []const u8, code: []const u8, correction: []const
 test "decode accepts flat calls and names what a rejected call got wrong" {
     try expectRequestTag("{\"action\":\"message\",\"agent\":\"reviewer\",\"instructions\":\"Review strictly.\",\"message\":\"next\"}", .message);
     try expectCorrection("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"task\":\"x\"}", "unknown_field", "task does not apply to message. message takes agent");
-    try expectCorrection("{\"action\":\"wait\",\"agent\":\"reviewer\"}", "unknown_field", "agent does not apply to wait.");
+    try expectRequestTag("{\"action\":\"wait\",\"agent\":\"reviewer\"}", .wait);
+    try expectCorrection("{\"action\":\"wait\",\"agent\":7}", "invalid_field_type", "agent must be a string.");
+    try expectCorrection("{\"action\":\"wait\",\"message\":\"x\"}", "unknown_field", "message does not apply to wait.");
     try expectCorrection("{\"action\":\"stop\"}", "missing_field", "stop needs agent.");
     try expectCorrection("{\"action\":\"close\"}", "missing_field", "close needs agent.");
     try expectCorrection("{\"action\":\"message\",\"agent\":\"reviewer\"}", "missing_field", "message needs agent and message.");
@@ -423,6 +460,18 @@ test "decode accepts flat calls and names what a rejected call got wrong" {
     try expectCorrection("{\"request\":null}", "invalid_field_type", "request must be an object");
     try expectCorrection("[]", "invalid_field_type", "must be a JSON object");
     try expectCorrection("{\"action\":\"run\"}", "invalid_enum", "action must be \"message\", \"wait\", \"status\", \"stop\", or \"close\"");
+}
+
+test "decode ignores empty fields the action does not take" {
+    try expectRequestTag("{\"action\":\"wait\",\"message\":\"\",\"instructions\":\"\",\"model\":\"\"}", .wait);
+    try expectRequestTag("{\"action\":\"stop\",\"agent\":\"reviewer\",\"message\":\"\",\"report\":false}", .stop);
+    try expectRequestTag("{\"action\":\"status\",\"profile\":\"\"}", .status);
+    // Text, a true flag, or an unknown name still does not belong to the action.
+    try expectCorrection("{\"action\":\"wait\",\"message\":\"x\"}", "unknown_field", "message does not apply to wait.");
+    try expectCorrection("{\"action\":\"close\",\"agent\":\"reviewer\",\"report\":true}", "unknown_field", "report does not apply to close.");
+    try expectCorrection("{\"action\":\"wait\",\"task\":\"\"}", "unknown_field", "task does not apply to wait.");
+    // Fields beside a request wrapper are still rejected.
+    try expectCorrection("{\"request\":{\"action\":\"wait\"},\"message\":\"\"}", "unknown_field", "message cannot sit beside request");
 }
 
 test "decode rejects invalid creation overrides and report rules" {
