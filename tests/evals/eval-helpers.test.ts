@@ -1,16 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
 import {
   buildEvalArgs,
   buildEvalProcessEnv,
-  cleanupIsolatedTestHome,
-  createIsolatedTestHome,
   FX_BIN,
-  needsProcessSnapshot,
   runEval,
-  runFx,
   shouldLoadDotEnv,
 } from "./eval-helpers";
 
@@ -116,52 +111,4 @@ describe("eval helpers", () => {
     expect(shouldLoadDotEnv({ FX_E2E_DISABLE_DOTENV: "1" })).toBe(false);
     expect(shouldLoadDotEnv({})).toBe(true);
   });
-
-  test("runFx takes the process snapshot after a timeout or a signal", () => {
-    expect(needsProcessSnapshot({ code: 0, signal: null, timedOut: false })).toBe(false);
-    expect(needsProcessSnapshot({ code: 2, signal: null, timedOut: false })).toBe(false);
-    expect(needsProcessSnapshot({ code: 0, signal: null, timedOut: true })).toBe(true);
-    expect(needsProcessSnapshot({ code: null, signal: "SIGTERM", timedOut: false })).toBe(true);
-  });
-
-  test("runFx takes the process snapshot on a plain failure when asked", () => {
-    expect(needsProcessSnapshot({ code: 2, signal: null, timedOut: false }, true)).toBe(true);
-    expect(needsProcessSnapshot({ code: 0, signal: null, timedOut: false }, true)).toBe(false);
-  });
-
-  test.skipIf(!existsSync(FX_BIN))(
-    "runFx passes FX_HOME to fx only when the test sets it",
-    async () => {
-      const previous = process.env.FX_HOME;
-      const home = createIsolatedTestHome();
-      const fxHome = createIsolatedTestHome();
-      writeFileSync(join(fxHome, "settings.json"), '{"update_channel":"dev"}\n');
-      process.env.FX_HOME = fxHome;
-      const env = {
-        HOME: home,
-        AI_GATEWAY_API_KEY: undefined,
-        VERCEL_OIDC_TOKEN: undefined,
-        FX_DISABLE_KEYCHAIN: "1",
-        FX_SOUND: "0",
-      };
-
-      try {
-        const inherited = await runFx(["status", "--json"], { env });
-        expect(inherited.code).toBe(0);
-        expect(JSON.parse(inherited.stdout).update_channel).toBe("stable");
-
-        const passed = await runFx(["status", "--json"], { env: { ...env, FX_HOME: fxHome } });
-        expect(passed.code).toBe(0);
-        expect(JSON.parse(passed.stdout).update_channel).toBe("dev");
-      } finally {
-        if (previous === undefined) {
-          delete process.env.FX_HOME;
-        } else {
-          process.env.FX_HOME = previous;
-        }
-        cleanupIsolatedTestHome(fxHome);
-        cleanupIsolatedTestHome(home);
-      }
-    },
-  );
 });

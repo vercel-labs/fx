@@ -21,6 +21,7 @@ import { join, sep } from "node:path";
 import {
   cleanupIsolatedTestHome,
   createIsolatedTestHome,
+  envWithoutFxHome,
   FX_BIN,
   HAS_API_KEY,
   REPO_ROOT,
@@ -1523,13 +1524,10 @@ describe("cli: status", () => {
   test(
     "fx status --json returns valid status JSON",
     async () => {
-      // A fresh profile, so a developer's own settings can't leak in,
-      // including through FX_HOME.
+      // A fresh profile, so a developer's own settings can't leak in.
       const home = createIsolatedTestHome();
       try {
-        const r = await runFx(["status", "--json"], {
-          env: { ...NO_GATEWAY_AUTH, HOME: home, FX_HOME: undefined },
-        });
+        const r = await runFx(["status", "--json"], { env: { ...NO_GATEWAY_AUTH, HOME: home } });
         expect(r.code).toBe(0);
         const json = JSON.parse(r.stdout.trim());
         expect(json.kind).toBe("status");
@@ -4167,7 +4165,7 @@ describe("cli: models", () => {
       const proc = Bun.spawn([FX_BIN, "models", "--json"], {
         cwd: REPO_ROOT,
         env: {
-          ...process.env,
+          ...envWithoutFxHome(),
           ...modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
         },
         stdout: "pipe",

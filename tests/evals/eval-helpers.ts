@@ -163,8 +163,7 @@ export function buildEvalProcessEnv(
   model: string,
 ): Record<string, string | undefined> {
   return {
-    ...dotEnvVars,
-    ...process.env,
+    ...envWithoutFxHome({ ...dotEnvVars, ...process.env }),
     NO_COLOR: "1",
     HOME: home,
     PATH: process.env.PATH ?? "",
@@ -500,6 +499,16 @@ function captureFxProcessState(): string {
   }
 }
 
+// A copy of env without FX_HOME, which moves fx's profile out of HOME, so fx
+// gets a developer's FX_HOME only when a test passes one itself.
+export function envWithoutFxHome(
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string | undefined> {
+  const copy = { ...env };
+  delete copy.FX_HOME;
+  return copy;
+}
+
 export async function runFx(
   args: string[],
   opts: {
@@ -520,15 +529,11 @@ export async function runFx(
 
   return new Promise<FxRunResult>((resolvePromise) => {
     const env: Record<string, string | undefined> = {
-      ...dotEnvVars,
-      ...process.env,
+      ...envWithoutFxHome({ ...dotEnvVars, ...process.env }),
       NO_COLOR: "1",
       HOME: process.env.HOME ?? "",
       PATH: process.env.PATH ?? "",
     };
-    // FX_HOME moves fx's profile out of HOME, so a developer's FX_HOME
-    // reaches fx only when the test passes it in opts.env.
-    delete env.FX_HOME;
     for (const [key, value] of Object.entries(opts.env ?? {})) {
       if (value === undefined) {
         delete env[key];
