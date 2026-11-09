@@ -12149,6 +12149,7 @@ fn processQueuedPromptLoop(
                 try within_turn_suffix.append(arena, .{
                     .role = .user,
                     .content = notice,
+                    .recovery_prompt = true,
                 });
             }
             if (execution.interactive_notice) |notice| {

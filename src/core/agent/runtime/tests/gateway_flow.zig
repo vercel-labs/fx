@@ -9043,6 +9043,7 @@ const reasoning_only_state =
 /// that request: the provider's prompt cache still covers it.
 fn expectNextTurnExtendsLastRequest(
     completions: []const FakeCompletion,
+    exec_plans: []const test_support.FakeExecPlan,
     last_request: usize,
     prompt: []const u8,
 ) !void {
@@ -9051,6 +9052,7 @@ fn expectNextTurnExtendsLastRequest(
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
+    hooks.exec_plans = exec_plans;
     var fixture = PromptFixture{};
     var job = fixture.job();
     job.model = @constCast(unmarked_model);
@@ -9089,7 +9091,7 @@ test "the next turn extends the request that carried the continuation after a bl
         .{ .content = " \n" },
         .{ .content = "Summary" },
     };
-    try expectNextTurnExtendsLastRequest(&completions, 3, continuation_prompt);
+    try expectNextTurnExtendsLastRequest(&completions, &.{}, 3, continuation_prompt);
 }
 
 test "the next turn extends the request that carried the continuation after a reasoning-only reply" {
@@ -9101,7 +9103,7 @@ test "the next turn extends the request that carried the continuation after a re
         .{ .content = " \n", .provider_state_json = reasoning_only_state },
         .{ .content = "Summary" },
     };
-    try expectNextTurnExtendsLastRequest(&completions, 3, continuation_prompt);
+    try expectNextTurnExtendsLastRequest(&completions, &.{}, 3, continuation_prompt);
 }
 
 test "the next turn extends a request after the continuation, when tool calls followed it" {
@@ -9115,7 +9117,7 @@ test "the next turn extends a request after the continuation, when tool calls fo
         .{ .tool_calls = &call_three },
         .{ .content = "Summary" },
     };
-    try expectNextTurnExtendsLastRequest(&completions, 4, continuation_prompt);
+    try expectNextTurnExtendsLastRequest(&completions, &.{}, 4, continuation_prompt);
 }
 
 test "the next turn extends the request that carried the assistant-prefill recovery" {
@@ -9128,7 +9130,20 @@ test "the next turn extends the request that carried the assistant-prefill recov
         .{ .status = .bad_request, .err_body = prefill_rejection },
         .{ .content = "Recovered after malformed call" },
     };
-    try expectNextTurnExtendsLastRequest(&completions, 2, "Continue from the preceding tool result.");
+    try expectNextTurnExtendsLastRequest(&completions, &.{}, 2, "Continue from the preceding tool result.");
+}
+
+test "the next turn extends the request that carried a tool's notice" {
+    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Done reading" },
+    };
+    const plans = [_]test_support.FakeExecPlan{.{ .result = .{
+        .model_output = "tool output",
+        .system_notice = "continue with degraded visual evidence",
+    } }};
+    try expectNextTurnExtendsLastRequest(&completions, &plans, 1, "continue with degraded visual evidence");
 }
 
 test "the next turn extends the request that carried the empty-reply nudge on the first request" {
@@ -9136,7 +9151,7 @@ test "the next turn extends the request that carried the empty-reply nudge on th
         .{ .finish_reason = .other },
         .{ .content = "Answer" },
     };
-    try expectNextTurnExtendsLastRequest(&completions, 1, empty_reply_prompt);
+    try expectNextTurnExtendsLastRequest(&completions, &.{}, 1, empty_reply_prompt);
 }
 
 test "the next turn extends the request that carried the empty-reply nudge after a tool step" {
@@ -9146,7 +9161,7 @@ test "the next turn extends the request that carried the empty-reply nudge after
         .{ .finish_reason = .other },
         .{ .content = "Answer" },
     };
-    try expectNextTurnExtendsLastRequest(&completions, 2, empty_reply_prompt);
+    try expectNextTurnExtendsLastRequest(&completions, &.{}, 2, empty_reply_prompt);
 }
 
 test "completed assistant provider replay survives turn materialization" {

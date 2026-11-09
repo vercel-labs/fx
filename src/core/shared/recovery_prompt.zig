@@ -1,8 +1,9 @@
 //! The prompts fx sends on its own to get a turn going again: "Summarize what
 //! you just did." after silent tool steps, a request to continue after a reply
 //! with no text and no tool call (`src/core/agent/runtime/orchestrator.zig`
-//! `appendContinuationPrompt`), and the request to go on from the last tool
-//! result after a model refuses to continue an assistant message.
+//! `appendContinuationPrompt`), the request to go on from the last tool result
+//! after a model refuses to continue an assistant message, and the notice a
+//! tool hands the model as a user message when it could not deliver.
 //!
 //! A turn saves each one in its steering list at the boundary where it sent
 //! it, so the next turn's request starts with every message the last request
