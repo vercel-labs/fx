@@ -9,6 +9,7 @@ const settings_keys = @import("../config/settings_keys.zig");
 const settings_messages = @import("settings_messages.zig");
 const host = @import("../hosts/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
+const mcp_health = @import("../mcp/health.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -63,9 +64,10 @@ pub const Snapshot = struct {
     }
 };
 
-pub const CollectOptions = struct {
-    /// `fx doctor --fix`: remove old side folders whose session is gone.
-    remove_orphans: bool = false,
+const CollectOptions = struct {
+    /// Old side folders whose session is gone: counted, or removed with
+    /// `fx doctor --fix`.
+    orphans: session_adapter.OrphanSweep = .count,
     version: []const u8 = "",
     channel: []const u8 = "",
     skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
@@ -79,6 +81,7 @@ pub fn collect(
     default_model: []const u8,
     default_agent_step_limit: usize,
     mcp_config_diagnostic: mcp_contract.ProfileConfigDiagnostic,
+    mcp_issues: []const mcp_health.ConfigurationIssue,
     options: CollectOptions,
 ) !Snapshot {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
@@ -118,9 +121,10 @@ pub fn collect(
         snapshot.auth = try auth_runtime.loadStatusSnapshot(alloc, secret_store, null);
         try appendConfigLoadFailureCheck(&checks, alloc, "config", "failed to load config", err);
         try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
+        try appendMcpIssueChecks(&checks, alloc, mcp_issues);
         try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
-        try appendStateChecks(&checks, alloc, options.remove_orphans);
+        try appendStateChecks(&checks, alloc, options.orphans);
         snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
         try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
 
@@ -142,6 +146,7 @@ pub fn collect(
     try appendUnknownSettingChecks(&checks, alloc, paths);
     try appendEnvChecks(&checks, alloc, detailed.settings.permission_mode, detailed.settings.max_agent_steps, default_agent_step_limit);
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
+    try appendMcpIssueChecks(&checks, alloc, mcp_issues);
     try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
     const selection = config_runtime.selectProviderModel(
         default_model,
@@ -153,7 +158,7 @@ pub fn collect(
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
     }, default_agent_step_limit);
-    try appendStateChecks(&checks, alloc, options.remove_orphans);
+    try appendStateChecks(&checks, alloc, options.orphans);
     snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
     try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
 
@@ -384,16 +389,16 @@ fn formatConfigLoadFailure(alloc: Allocator, prefix: []const u8, err: anyerror) 
     return alloc.print("{s}: {s}", .{ prefix, @errorName(err) });
 }
 
-/// Reports damaged sessions and removes side folders whose session is gone
-/// (D36). Rebuilds nothing.
-fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, remove_orphans: bool) !void {
+/// Reports damaged sessions, and counts side folders whose session is gone
+/// or removes them, as `orphans` says (D36). Rebuilds nothing.
+fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, orphans: session_adapter.OrphanSweep) !void {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         const status: CheckStatus = if (err == error.HomeNotSet) .warn else .fail;
         try appendStateFailure(checks, alloc, status, err);
         return;
     };
     defer store.deinit(alloc);
-    var report = session_adapter.doctor(&store, alloc, default_session_diagnostics_limit, io_mod.milliTimestamp(), remove_orphans) catch |err| {
+    var report = session_adapter.doctor(&store, alloc, default_session_diagnostics_limit, io_mod.milliTimestamp(), orphans) catch |err| {
         try appendStateFailure(checks, alloc, .fail, err);
         return;
     };
@@ -701,6 +706,17 @@ fn appendMcpConfigCheck(
     }
 }
 
+/// One failure for each issue the MCP config inspection found, as for a
+/// `~/.fx/mcp.json` fx cannot read. The inspection reads `~/.fx/mcp.json`
+/// whole, so a problem there fails the file (`appendMcpConfigCheck`), and
+/// its issues all come from the project's `.mcp.json`, each one a server
+/// that does not load (`builtin_mcp.inspectLocalConfig`).
+fn appendMcpIssueChecks(checks: *std.ArrayList(Check), alloc: Allocator, issues: []const mcp_health.ConfigurationIssue) !void {
+    for (issues) |issue| {
+        try appendCheckOwnedStaticFix(checks, alloc, "mcp_config", .fail, try alloc.dupe(u8, issue.message), "fix .mcp.json, then run fx doctor again");
+    }
+}
+
 fn formatConfigPresence(alloc: Allocator, user_exists: bool, repo_exists: bool) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -958,4 +974,25 @@ test "has git metadata detects .git file or directory" {
     defer std.testing.allocator.free(workspace_root);
 
     try std.testing.expect(try hasGitMetadata(std.testing.allocator, workspace_root));
+}
+
+test "each MCP config issue is a failure with a fix" {
+    const alloc = std.testing.allocator;
+    var checks: std.ArrayList(Check) = .empty;
+    defer {
+        for (checks.items) |*entry| entry.deinit(alloc);
+        checks.deinit(alloc);
+    }
+    const issues = [_]mcp_health.ConfigurationIssue{
+        .{ .message = @constCast(".mcp.json server 'unknown' was skipped: invalid_json.") },
+        .{ .message = @constCast(".mcp.json server 'odd' was skipped: its \"type\" isn't valid.") },
+    };
+    try appendMcpIssueChecks(&checks, alloc, &issues);
+    try std.testing.expectEqual(issues.len, checks.items.len);
+    for (issues, checks.items) |issue, check| {
+        try std.testing.expectEqualStrings("mcp_config", check.name);
+        try std.testing.expectEqual(CheckStatus.fail, check.status);
+        try std.testing.expectEqualStrings(issue.message, check.detail);
+        try std.testing.expectEqualStrings("fix .mcp.json, then run fx doctor again", check.fix.?);
+    }
 }

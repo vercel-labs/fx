@@ -1,9 +1,11 @@
 // Drives the built fx doctor along tests/tla/doctor/Doctor.tla: each run
 // makes the provider catalog, one MCP server, and gh answer or hang, maps the
 // report to the spec's `report` variable, and has TLC confirm the spec can
-// reach that report. A report the spec cannot produce must be rejected, and
-// neither a child nor a process a child started may outlive doctor
-// (NoChildAfterExit): the hanging gh runs a sleep of its own.
+// reach that report. A report the spec cannot produce must be rejected,
+// doctor must end by the deadline plus its reap grace, which it can only do
+// once it has cancelled and joined every check (NoTaskAfterReport), and
+// neither a child nor a process a child started in its group may outlive
+// doctor (NoChildAfterExit): the hanging gh runs a sleep of its own.
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -104,6 +106,8 @@ async function reachable(observed: Observation, label: string): Promise<boolean>
     "    UseDeadline = TRUE",
     "    UseKill = TRUE",
     "    UseGroupKill = TRUE",
+    "    UseCancel = TRUE",
+    "    UseJoin = TRUE",
     "INVARIANT NotObserved",
     "CHECK_DEADLOCK FALSE",
     "",

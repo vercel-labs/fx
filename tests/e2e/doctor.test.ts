@@ -329,8 +329,21 @@ describe("fx doctor local checks", () => {
     repo(signedOut);
     writeScript(join(signedOut.bin, "gh"), 'echo "You are not logged into any GitHub hosts." >&2; exit 1');
     const out = await doctor(signedOut, env(signedOut, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(out.stdout).toMatch(/^\[warn\] gh: .*not signed in/m);
-    expect(out.stdout).toContain("gh auth login");
+    expect(out.stdout).toMatch(/^\[warn\] gh: GitHub CLI is not signed in to github\.com; /m);
+    expect(out.stdout).toContain("  fix: gh auth login --hostname github.com");
+
+    // gh exits 1 when any host's account fails, unless asked about one host:
+    // signed in to github.com with another host failing is signed in.
+    const otherHost = makeRoot();
+    repo(otherHost);
+    writeScript(join(otherHost.bin, "gh"), [
+      'case " $* " in',
+      '  *" auth status --hostname github.com "*) exit 0 ;;',
+      '  *) echo "ghe.example.com: Failed to log in" >&2; exit 1 ;;',
+      "esac",
+    ].join("\n"));
+    const signedIn = await doctor(otherHost, env(otherHost, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
+    expect(signedIn.stdout).toMatch(/^\[ok\] gh: GitHub CLI is signed in to github\.com$/m);
 
     // gh's own child holds nothing doctor waits for, and dies with it.
     const hanging = makeRoot();
@@ -344,10 +357,11 @@ describe("fx doctor local checks", () => {
   }, TIMEOUT);
 
   test("a signal that ends doctor also ends the checks it started", async () => {
-    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    const markers = { SIGINT: "sleep 56.1234", SIGTERM: "sleep 56.4321", SIGHUP: "sleep 56.5555" } as const;
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
       const r = makeRoot();
       expect(spawnSync("/usr/bin/git", ["init", "-q", r.workspace]).status).toBe(0);
-      const marker = `sleep 56.${signal === "SIGINT" ? "1234" : "4321"}`;
+      const marker = markers[signal];
       writeScript(join(r.bin, "gh"), `/bin/${marker}\nexit 0`);
       const proc = Bun.spawn([FX_BIN, "doctor"], { env: env(r, { FX_TEST_DOCTOR_DEADLINE_MS: "20000" }), cwd: r.workspace, stdout: "ignore", stderr: "ignore" });
       const started = performance.now();
@@ -410,19 +424,77 @@ describe("fx doctor MCP", () => {
     expect(result.code).toBe(1);
   }, TIMEOUT);
 
+  test("each server's row in the report says what doctor found for it", async () => {
+    const r = makeRoot();
+    writeFileSync(join(r.home, ".fx", "mcp.json"), JSON.stringify({
+      mcp: {
+        ready1: { command: [process.execPath, MODERN_FIXTURE] },
+        broken: { command: ["/bin/sh", "-c", "exit 0"] },
+      },
+    }));
+    writeFileSync(join(r.workspace, ".mcp.json"), JSON.stringify({ mcpServers: { project: { command: "/bin/sh", args: ["-c", "exit 0"] } } }));
+    const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key", FX_TEST_DOCTOR_DEADLINE_MS: "3000" }), ["--json"]);
+    const report = JSON.parse(result.stdout);
+    expect(report.mcp.connection_check).toBe("checked");
+    const row = (name: string) => report.mcp.servers.find((s: any) => s.name === name);
+    expect([row("ready1").connection, row("ready1").authentication]).toEqual(["ready", "ok"]);
+    expect([row("broken").connection, row("broken").authentication]).toEqual(["failed", "not_checked"]);
+    // An unapproved server gets no child, so doctor did not check it.
+    expect([row("project").connection, row("project").authentication]).toEqual(["not_checked", "not_checked"]);
+    expect(report.checks.find((c: any) => c.name === "mcp" && c.detail.startsWith("ready1")).status).toBe("ok");
+    expect(report.checks.find((c: any) => c.name === "mcp" && c.detail.startsWith("broken")).status).toBe("fail");
+  }, TIMEOUT);
+
+  test("a server whose name starts with a dash is not checked, and says why and how to fix it", async () => {
+    const r = makeRoot();
+    writeFileSync(join(r.home, ".fx", "mcp.json"), JSON.stringify({
+      mcp: {
+        "--help": { command: [process.execPath, MODERN_FIXTURE] },
+        "-x": { command: [process.execPath, MODERN_FIXTURE] },
+        normal: { command: [process.execPath, MODERN_FIXTURE] },
+      },
+    }));
+    const trace = join(r.root, "trace.log");
+    const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key", FX_TEST_DOCTOR_DEADLINE_MS: "3000", FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "doctor" }));
+    for (const name of ["--help", "-x"]) {
+      expect(result.stdout).toContain(`[warn] mcp: ${name} was not checked: fx mcp show reads a name that starts with "-" as an option\n  fix: rename the server in ~/.fx/mcp.json so its name does not start with "-"\n`);
+      expect(readFileSync(trace, "utf8")).not.toContain(`starting check ${name}`);
+    }
+    expect(result.stdout).toMatch(/^\[ok\] mcp: normal ready, 1 tool$/m);
+    expect(result.code).toBe(0);
+  }, TIMEOUT);
+
+  test("a project .mcp.json that skips servers fails with a fix, as ~/.fx/mcp.json does", async () => {
+    const unreadable = makeRoot();
+    writeFileSync(join(unreadable.workspace, ".mcp.json"), "{not json\n");
+    const whole = await doctor(unreadable, env(unreadable, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
+    expect(whole.stdout).toContain("[fail] mcp_config: .mcp.json server 'unknown' was skipped: invalid_json.\n  fix: fix .mcp.json, then run fx doctor again\n");
+    expect(whole.code).toBe(1);
+
+    const oneBad = makeRoot();
+    writeFileSync(join(oneBad.workspace, ".mcp.json"), JSON.stringify({ mcpServers: { odd: { type: "weird", url: "x" }, docs: { command: "/bin/sh", args: ["-c", "exit 0"] } } }));
+    const entry = await doctor(oneBad, env(oneBad, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
+    expect(entry.stdout).toContain("[fail] mcp_config: .mcp.json server 'odd' was skipped: its \"type\" isn't valid.\n  fix: fix .mcp.json, then run fx doctor again\n");
+    expect(entry.stdout).toMatch(/^\[warn\] mcp: docs is waiting for approval$/m);
+    expect(entry.code).toBe(1);
+  }, TIMEOUT);
+
   test("servers doctor could not start before its deadline each get a line that says so", async () => {
     const r = makeRoot();
     const marker = join(r.root, "late-server-started");
     const late = { command: "/bin/sh", args: ["-c", `: > '${marker}'; /bin/sleep 30`] };
     writeFileSync(join(r.home, ".fx", "mcp.json"), JSON.stringify({ mcp: { late1: late, late2: late } }));
-    // A 1 ms deadline passes while doctor loads its MCP host, before any child.
+    // A 1 ms deadline passes while doctor loads its MCP host or starts its
+    // first child, so at least the later server is never started, and one
+    // that did start was stopped at the deadline.
     const result = await doctor(r, env(r, { FX_TEST_DOCTOR_DEADLINE_MS: "1" }));
     expect(result.code).toBe(1);
-    for (const name of ["late1", "late2"]) {
-      expect(result.stdout).toMatch(new RegExp(`^\\[fail\\] mcp: ${name} was not checked: doctor reached its .* limit`, "m"));
-      expect(result.stdout).toContain(`  fix: fx mcp show ${name}`);
-    }
-    expect(existsSync(marker)).toBe(false);
+    const notChecked = ["late1", "late2"].filter((name) => {
+      expect(result.stdout).toMatch(new RegExp(`^\\[fail\\] mcp: ${name} (was not checked: doctor reached its 1 s limit before it could start the check|did not start in 1 s)\\n  fix: fx mcp show ${name}$`, "m"));
+      return result.stdout.includes(`[fail] mcp: ${name} was not checked`);
+    });
+    expect(notChecked).toContain("late2");
+    if (notChecked.length === 2) expect(existsSync(marker)).toBe(false);
   });
 
   test("a healthy server with thousands of tools is ready, however long its answer", async () => {

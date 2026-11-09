@@ -1808,7 +1808,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, TIMEOUT);
 
   serialTest(
     "concurrent global mutations preserve both values and unknown keys",

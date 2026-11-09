@@ -777,12 +777,31 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
     if (!wrote_provider) try writer.writeAll("none");
 }
 
+/// What `fx doctor` found when it checked one configured MCP server.
+pub const McpServerResult = struct {
+    /// The server's name, as the runtime knows it.
+    name: []const u8,
+    connection: Connection,
+    authentication: Authentication,
+
+    pub const Connection = enum { not_checked, ready, failed, timed_out };
+    pub const Authentication = enum { not_checked, ok, needs_login };
+};
+
 pub const McpLocalSnapshot = struct {
     servers: []const mcp_health.ConfiguredServerSnapshot = &.{},
     configuration_issues: []const mcp_health.ConfigurationIssue = &.{},
     inspection_error: ?[]const u8 = null,
     /// `checked` once doctor has asked each server for its tools.
     connection_check: enum { not_checked, checked } = .not_checked,
+    /// What doctor found for each server it checked. A server with no entry
+    /// reads `not_checked`, as every server does for `fx status`.
+    results: []const McpServerResult = &.{},
+
+    fn resultFor(self: McpLocalSnapshot, name: []const u8) McpServerResult {
+        for (self.results) |result| if (std.mem.eql(u8, result.name, name)) return result;
+        return .{ .name = name, .connection = .not_checked, .authentication = .not_checked };
+    }
 
     fn writeText(self: McpLocalSnapshot, writer: *std.Io.Writer, alloc: Allocator, prefix: []const u8) !void {
         try writer.print("[{s}] mcp_connection_check={s}\n", .{ prefix, @tagName(self.connection_check) });
@@ -791,15 +810,18 @@ pub const McpLocalSnapshot = struct {
             .{ prefix, self.servers.len, self.configuration_issues.len },
         );
         for (self.servers) |server| {
+            const result = self.resultFor(server.configured_name);
             try writer.print("[{s}] mcp_server=", .{prefix});
             try writeTerminalSafe(writer, alloc, server.configured_name);
             try writer.print(
-                " source={s} scope={s} admission={s} transport={s} connection=not_checked authentication=not_checked\n",
+                " source={s} scope={s} admission={s} transport={s} connection={s} authentication={s}\n",
                 .{
                     @tagName(server.source),
                     @tagName(server.scope),
                     if (server.workspace_admission) |admission| @tagName(admission) else "not_applicable",
                     @tagName(server.transport),
+                    @tagName(result.connection),
+                    @tagName(result.authentication),
                 },
             );
         }
@@ -817,6 +839,7 @@ pub const McpLocalSnapshot = struct {
         try writer.print("{{\"connection_check\":\"{s}\",\"servers\":[", .{@tagName(self.connection_check)});
         for (self.servers, 0..) |server, index| {
             if (index > 0) try writer.writeByte(',');
+            const result = self.resultFor(server.configured_name);
             try std.json.Stringify.value(.{
                 .name = server.configured_name,
                 .source = server.source,
@@ -824,8 +847,8 @@ pub const McpLocalSnapshot = struct {
                 .admission = server.workspace_admission,
                 .required = server.required,
                 .transport = server.transport,
-                .connection = "not_checked",
-                .authentication = "not_checked",
+                .connection = result.connection,
+                .authentication = result.authentication,
             }, .{}, writer);
         }
         try writer.writeAll("],\"configuration_issues\":[");
@@ -2834,6 +2857,42 @@ test "status and doctor share a side-effect-free MCP inspection contract" {
         doctor_json,
         "\"mcp\":{\"connection_check\":\"not_checked\"",
     ) != null);
+}
+
+test "doctor's MCP rows say what doctor found for each server it checked" {
+    const servers = [_]mcp_health.ConfiguredServerSnapshot{
+        .{ .configured_name = @constCast("docs"), .source = .profile, .scope = .profile, .required = false, .transport = .stdio },
+        .{ .configured_name = @constCast("slow"), .source = .profile, .scope = .profile, .required = false, .transport = .http },
+        .{ .configured_name = @constCast("unapproved"), .source = .workspace, .scope = .profile, .workspace_admission = .pending, .required = false, .transport = .stdio },
+    };
+    const results = [_]McpServerResult{
+        .{ .name = "docs", .connection = .ready, .authentication = .ok },
+        .{ .name = "slow", .connection = .timed_out, .authentication = .not_checked },
+    };
+    const doctor = DoctorSnapshot{
+        .workspace_root = "/tmp/fx",
+        .model = "alpha",
+        .permission_mode = .auto,
+        .agent_step_limit = 24,
+        .checks = &.{},
+        .mcp = .{ .servers = &servers, .connection_check = .checked, .results = &results },
+    };
+    const text = try doctor.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    for ([_][]const u8{
+        "[doctor] mcp_connection_check=checked\n",
+        "[doctor] mcp_server=docs source=profile scope=profile admission=not_applicable transport=stdio connection=ready authentication=ok\n",
+        "[doctor] mcp_server=slow source=profile scope=profile admission=not_applicable transport=http connection=timed_out authentication=not_checked\n",
+        "[doctor] mcp_server=unapproved source=workspace scope=profile admission=pending transport=stdio connection=not_checked authentication=not_checked\n",
+    }) |line| try std.testing.expect(std.mem.find(u8, text, line) != null);
+    const json = try doctor.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    for ([_][]const u8{
+        "\"connection_check\":\"checked\"",
+        "\"name\":\"docs\",\"source\":\"profile\",\"scope\":\"profile\",\"admission\":null,\"required\":false,\"transport\":\"stdio\",\"connection\":\"ready\",\"authentication\":\"ok\"",
+        "\"name\":\"slow\",\"source\":\"profile\",\"scope\":\"profile\",\"admission\":null,\"required\":false,\"transport\":\"http\",\"connection\":\"timed_out\",\"authentication\":\"not_checked\"",
+        "\"name\":\"unapproved\",\"source\":\"workspace\",\"scope\":\"profile\",\"admission\":\"pending\",\"required\":false,\"transport\":\"stdio\",\"connection\":\"not_checked\",\"authentication\":\"not_checked\"",
+    }) |part| try std.testing.expect(std.mem.find(u8, json, part) != null);
 }
 
 test "core permissions snapshot text and json stay stable" {

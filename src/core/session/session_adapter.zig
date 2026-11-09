@@ -306,13 +306,13 @@ pub const Store = struct {
     }
 
     /// Finds folders outside the manager whose session is gone, except young
-    /// ones (D36, D45), in both roots. Removes them only when `remove` is
-    /// set (`fx doctor --fix`); otherwise counts them as removable.
-    fn sweepFiles(store: *Store, alloc: Allocator, report: *Doctor, now_ms: i64, remove: bool) !void {
-        for (outside_folders) |root_name| try store.sweepRoot(alloc, root_name, report, now_ms, remove);
+    /// ones (D36, D45), in both roots, and counts or removes them as
+    /// `orphans` says.
+    fn sweepFiles(store: *Store, alloc: Allocator, report: *Doctor, now_ms: i64, orphans: OrphanSweep) !void {
+        for (outside_folders) |root_name| try store.sweepRoot(alloc, root_name, report, now_ms, orphans);
     }
 
-    fn sweepRoot(store: *Store, alloc: Allocator, root_name: []const u8, report: *Doctor, now_ms: i64, remove: bool) !void {
+    fn sweepRoot(store: *Store, alloc: Allocator, root_name: []const u8, report: *Doctor, now_ms: i64, orphans: OrphanSweep) !void {
         var files = try store.openProfileFolder(root_name) orelse return;
         defer files.close();
         var it = files.dir.iterate();
@@ -336,7 +336,7 @@ pub const Store = struct {
                 debug_trace.logf("session", "event=sessions_v2_orphan_files_young session={s} root={s}", .{ entry.name, root_name });
                 continue;
             }
-            if (!remove) {
+            if (orphans == .count) {
                 report.removable += 1;
                 continue;
             }
@@ -708,10 +708,18 @@ pub const Doctor = struct {
 /// turn has not created its log yet (D36).
 const orphan_min_age_ms: i64 = 24 * std.time.ms_per_hour;
 
+/// What `fx doctor` does with a side folder whose session is gone.
+pub const OrphanSweep = enum {
+    /// Counts it as removable: plain `fx doctor`.
+    count,
+    /// Removes it: `fx doctor --fix`.
+    remove,
+};
+
 /// `fx doctor` on v2 (D36): verifies up to `limit` sessions and finds side
-/// folders whose session is gone, removing them only when `remove` is set
-/// (`fx doctor --fix`). Rebuilds nothing. Caller owns the report.
-pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64, remove: bool) !Doctor {
+/// folders whose session is gone, counting or removing them as `orphans`
+/// says. Rebuilds nothing. Caller owns the report.
+pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64, orphans: OrphanSweep) !Doctor {
     var report: Doctor = .{};
     errdefer report.deinit(alloc);
     var latest_ms: u64 = 0;
@@ -746,7 +754,7 @@ pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64, remove
     try doctorV1(store, alloc, &report, limit);
     report.kept_children = try keptChildren(store, alloc);
     for (report.kept_children) |child| report.keeps_left_out += @intFromBool(child.keeps);
-    try store.sweepFiles(alloc, &report, now_ms, remove);
+    try store.sweepFiles(alloc, &report, now_ms, orphans);
     return report;
 }
 
@@ -8879,7 +8887,7 @@ test "a v1 session whose hosted terminal state holds an entry the copy can't tak
     var again = try convertAll(&t.store, alloc);
     defer again.deinit(alloc);
     try testing.expect(V1Home.exists(&t, id));
-    var doctor_report = try doctor(&t.store, alloc, 64, 0, false);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 0), doctor_report.stuck.items.len);
     try testing.expectEqual(@as(usize, 0), doctor_report.unconverted);
@@ -9125,7 +9133,7 @@ test "doctor counts sessions an older fx saved and names each that can't be conv
     defer alloc.free(damaged);
     try v1.put(torn, null, "events.jsonl", damaged);
 
-    var report = try doctor(&t.store, alloc, 100, io_mod.milliTimestamp(), false);
+    var report = try doctor(&t.store, alloc, 100, io_mod.milliTimestamp(), .count);
     defer report.deinit(alloc);
     try testing.expectEqual(@as(usize, 0), report.sessions);
     try testing.expectEqual(@as(usize, 5), report.unconverted);
@@ -9662,7 +9670,7 @@ test "fx sessions convert keeps a v1 subagent's own subagent as it is, and fx do
     try testing.expectEqual(before.count(), after.count());
     for (before.keys(), before.values()) |path, bytes| try testing.expectEqualStrings(bytes, after.get(path).?);
 
-    var doctor_report = try doctor(&t.store, alloc, 64, 0, false);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), doctor_report.kept_children.len);
     try testing.expectEqualStrings(family[2], doctor_report.kept_children[0].id);
@@ -9813,7 +9821,7 @@ test "fx doctor counts each v1 folder a family's conversion kept, a subagent's i
     try testing.expectEqual(@as(usize, 1), report.converted);
     try testing.expectEqual(@as(usize, 2), report.left_out.items.len);
     for (family) |id| try testing.expect(V1Home.exists(&t, id));
-    var doctor_report = try doctor(&t.store, alloc, 64, 0, false);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 2), doctor_report.keeps_left_out);
     // Each copy names what it left out and keeps no fingerprint, which an
@@ -10092,7 +10100,7 @@ test "a child an earlier try published keeps its v1 folder when that try left a 
     try testing.expectEqualStrings(child, report.kept_children[0].id);
     try testing.expectEqualStrings("fx converted it already without logs/commands/replay.bin, so this folder keeps it", report.kept_children[0].reason);
     // fx doctor counts that folder, though its root's folder is gone.
-    var doctor_report = try doctor(&t.store, alloc, 64, 0, false);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 1), doctor_report.keeps_left_out);
 }
@@ -10410,7 +10418,7 @@ test "a v1 side file larger than one v2 blob is left out and named, its v1 folde
     defer again.deinit(alloc);
     for (roots) |id| try testing.expect(V1Home.exists(&t, id));
     try testing.expectEqual(@as(u64, sm.max_blob_bytes + 1), (try t.tmp.dir.statFile(io, try v1.sessionPath(roots[1], "logs/commands/replay.bin"), .{})).size);
-    var doctor_report = try doctor(&t.store, alloc, 64, 0, false);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0, .count);
     defer doctor_report.deinit(alloc);
     try testing.expectEqual(@as(usize, 2), doctor_report.keeps_left_out);
 }
