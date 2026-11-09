@@ -1048,24 +1048,19 @@ pub fn sleep(ns: u64) void {
     getIo().sleep(.{ .nanoseconds = @intCast(ns) }, .real) catch {};
 }
 
-/// Reads terminal attributes. Every failure is an error: `std.posix` treats
-/// EBADF here as unreachable, but the descriptor can be closed or revoked
-/// under fx, as when a closed window revokes its terminal, and a panic then
-/// would end fx while it restores the terminal. Linux issues the kernel
-/// ioctl directly because Zig 0.17 sizes `std.posix.termios` to the kernel
-/// struct, while `std.posix.tcgetattr` calls into libc, which writes its
-/// larger struct and overruns the caller's stack.
+/// Reads terminal attributes. Every errno is an error, including the EBADF
+/// that `std.posix.tcgetattr` treats as unreachable.
 pub fn tcgetattr(fd: std.posix.fd_t) std.posix.TermiosGetError!std.posix.termios {
     var term = std.mem.zeroes(std.posix.termios);
     while (true) switch (tcgetattrErrno(fd, &term)) {
         .SUCCESS => return term,
         .INTR => continue,
-        // A closed or revoked descriptor is no terminal to read.
         .BADF, .NOTTY => return error.NotATerminal,
         else => |err| return std.posix.unexpectedErrno(err),
     };
 }
 
+/// Linux issues the kernel ioctl: libc there writes a larger termios than Zig's.
 fn tcgetattrErrno(fd: std.posix.fd_t, term: *std.posix.termios) std.posix.E {
     if (builtin.target.os.tag == .linux) return std.os.linux.errno(std.os.linux.tcgetattr(fd, term));
     return std.posix.errno(std.c.tcgetattr(fd, term));
@@ -1081,10 +1076,8 @@ pub fn tcsetattr(
     while (true) switch (tcsetattrErrno(fd, action, &term)) {
         .SUCCESS => return,
         .INTR => continue,
-        // A closed or revoked descriptor is no terminal to set.
         .BADF, .NOTTY => return error.NotATerminal,
         .IO => return error.ProcessOrphaned,
-        // The terminal refused the action or the attributes.
         .INVAL => return error.Unexpected,
         else => |err| return std.posix.unexpectedErrno(err),
     };
@@ -1112,9 +1105,11 @@ test "terminal attributes of a closed descriptor are an error, not a panic" {
     defer tmp.cleanup();
     var file = try tmp.dir.createFile(std.testing.io, "plain", .{});
     defer file.close(std.testing.io);
-    // A high number that nothing else in the test process opens meanwhile.
-    const closed = std.c.fcntl(file.handle, std.posix.F.DUPFD, @as(c_int, 900));
-    try std.testing.expect(closed >= 900);
+    // Closed, near the top of the file limit where opens rarely land; dup() if F_DUPFD fails.
+    const floor: c_int = @intCast(@min((try std.posix.getrlimit(.NOFILE)).cur -| 1, 900));
+    var closed = std.c.fcntl(file.handle, std.posix.F.DUPFD, floor);
+    if (closed < 0) closed = std.c.dup(file.handle);
+    try std.testing.expect(closed >= 0);
     try std.testing.expectEqual(@as(c_int, 0), std.c.close(closed));
 
     try std.testing.expectError(error.NotATerminal, tcgetattr(closed));
