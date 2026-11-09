@@ -9,6 +9,9 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
 const agents = @import("../agents/agents.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
+const mod_registry = @import("../mods/registry.zig");
+const ui_render = @import("../../ui/render.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 /// Decides tool membership for `tool_set.narrow` from a profile.
 pub const ProfileTools = struct {
@@ -43,6 +46,180 @@ pub fn failureReason(alloc: std.mem.Allocator, name: []const u8) !?[]u8 {
         else => return try alloc.dupe(u8, failure orelse @errorName(err)),
     };
     return null;
+}
+
+/// What `/launch` completes: every profile it can start, read from disk again
+/// at most once a second while the composer holds `/launch `. Each row shows,
+/// in aligned columns as the agent list does, the model and effort the
+/// instance would start with, its tools, and whether the repository saved it. The list is dim, and the selected row bright.
+pub const LaunchCompletion = struct {
+    entries: []const mod_registry.ArgumentCompletion = &.{},
+    arena: ?std.heap.ArenaAllocator = null,
+    at_ms: i64 = 0,
+
+    const refresh_interval_ms = 1000;
+
+    /// What a launched instance takes when its profile leaves a setting
+    /// unset: the settings later instances start from. Borrowed.
+    pub const Defaults = struct {
+        model: []const u8 = "",
+        effort: types.ReasoningEffort = .auto,
+    };
+
+    pub fn deinit(self: *LaunchCompletion) void {
+        if (self.arena) |*arena| arena.deinit();
+        self.* = .{};
+    }
+
+    /// Lists the profiles again when `input` starts `/launch` and the list is
+    /// a second old. A list that fails to load keeps the previous one.
+    /// Returns whether it listed them again, so the footer can show them.
+    pub fn refresh(
+        self: *LaunchCompletion,
+        alloc: std.mem.Allocator,
+        input: []const u8,
+        home: ?[]const u8,
+        workspace_root: ?[]const u8,
+        defaults: Defaults,
+    ) bool {
+        if (!std.mem.startsWith(u8, std.mem.trimStart(u8, input, " \t"), "/launch")) return false;
+        const now = io_mod.milliTimestamp();
+        if (self.arena != null and now - self.at_ms < refresh_interval_ms) return false;
+        self.at_ms = now;
+        var next: std.heap.ArenaAllocator = .init(alloc);
+        const entries = build(next.allocator(), home, workspace_root, defaults) catch {
+            next.deinit();
+            return false;
+        };
+        if (self.arena) |*old| old.deinit();
+        self.arena = next;
+        self.entries = entries;
+        return true;
+    }
+
+    fn build(arena: std.mem.Allocator, home: ?[]const u8, workspace_root: ?[]const u8, defaults: Defaults) ![]const mod_registry.ArgumentCompletion {
+        const roots = try profiles.Roots.init(arena, home, workspace_root);
+        const listed = try profiles.list(arena, roots);
+        const rows = try arena.alloc(Row, listed.len);
+        var widths: Widths = @splat(0);
+        for (listed, rows) |entry, *row| {
+            row.* = try rowOf(arena, entry, defaults);
+            for (row.*, &widths) |cell, *width| width.* = @max(width.*, text_utils.terminalSafeVisibleWidth(cell));
+        }
+        const out = try arena.alloc(mod_registry.ArgumentCompletion, listed.len);
+        for (listed, rows, out) |entry, row, *completion| completion.* = .{
+            .full = try arena.print("/launch {s}", .{entry.name}),
+            .description = try alignedRow(arena, row, widths),
+            .select_description = true,
+        };
+        return out;
+    }
+
+    /// Model, effort, tools, and where it is saved.
+    const column_count = 4;
+    const Row = [column_count][]const u8;
+    const Widths = [column_count]usize;
+    const column_gap = 2;
+
+    /// The values the instance would start with, as the agent list names
+    /// them. The text belongs to `arena`.
+    fn rowOf(arena: std.mem.Allocator, entry: profiles.Entry, defaults: Defaults) !Row {
+        var model_buf: [96]u8 = undefined;
+        const model_id = entry.model orelse defaults.model;
+        const model = if (model_id.len > 0) try arena.dupe(u8, ui_render.compactModelLabel(model_id, &model_buf)) else "";
+        // A named effort keeps its label inline, so it is copied from here.
+        const effort_value = entry.effort orelse defaults.effort;
+        const effort = try arena.dupe(u8, effort_value.displayLabel());
+        return .{
+            model,
+            effort,
+            toolsText(entry),
+            if (entry.source == .project) "project" else "",
+        };
+    }
+
+    /// `row`'s cells padded to `widths`, two columns apart, leaving out a
+    /// column no profile fills; null when the row has nothing to show. The
+    /// result belongs to `arena`.
+    fn alignedRow(arena: std.mem.Allocator, row: Row, widths: Widths) !?[]const u8 {
+        var line: std.ArrayList(u8) = .empty;
+        for (row, widths) |cell, width| {
+            if (width == 0) continue;
+            if (line.items.len > 0) try line.appendNTimes(arena, ' ', column_gap);
+            try line.appendSlice(arena, cell);
+            try line.appendNTimes(arena, ' ', width -| text_utils.terminalSafeVisibleWidth(cell));
+        }
+        const text = std.mem.trimEnd(u8, line.items, " ");
+        return if (text.len == 0) null else text;
+    }
+
+    /// "all tools" for a profile that keeps fx's tools or names only `*`,
+    /// "read-only" for one without the shell or file edits, "no shell" for one
+    /// without the shell, and "custom" for one that leaves out others.
+    fn toolsText(entry: profiles.Entry) []const u8 {
+        const tools = entry.tools orelse return "all tools";
+        if (tools.len == 1 and std.mem.eql(u8, tools[0], "*")) return "all tools";
+        const profile: profiles.Profile = .{ .name = entry.name, .description = entry.description, .source = entry.source, .tools = tools };
+        const edits = profiles.allowsTool(&profile, "edit_file") or profiles.allowsTool(&profile, "write_file");
+        if (profiles.allowsTool(&profile, "shell")) return if (edits) "custom" else "no edits";
+        return if (edits) "no shell" else "read-only";
+    }
+};
+
+test "a launch row shows the model and effort the instance would start with" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const defaults: LaunchCompletion.Defaults = .{ .model = "openai/gpt-5", .effort = .literal("medium") };
+    var reviewer: profiles.Entry = .{ .name = "reviewer", .description = "A long description", .source = .home };
+    reviewer.model = "anthropic/claude-opus-4-7";
+    reviewer.effort = .literal("high");
+    reviewer.tools = &.{ "read_file", "grep_files" };
+    const main_entry: profiles.Entry = .{ .name = "main", .description = "fx itself", .source = .builtin };
+
+    const reviewer_row = try LaunchCompletion.rowOf(arena, reviewer, defaults);
+    const main_row = try LaunchCompletion.rowOf(arena, main_entry, defaults);
+    var widths: LaunchCompletion.Widths = @splat(0);
+    for ([_]LaunchCompletion.Row{ reviewer_row, main_row }) |row| {
+        for (row, &widths) |cell, *width| width.* = @max(width.*, cell.len);
+    }
+
+    try std.testing.expectEqualStrings("opus 4-7  high    read-only", (try LaunchCompletion.alignedRow(arena, reviewer_row, widths)).?);
+    // A profile that sets nothing shows fx's model and effort.
+    try std.testing.expectEqualStrings("gpt-5     medium  all tools", (try LaunchCompletion.alignedRow(arena, main_row, widths)).?);
+    // An effort fx leaves at its default says so, as `/effort` does.
+    const plain = try LaunchCompletion.rowOf(arena, main_entry, .{ .model = "openai/gpt-5" });
+    try std.testing.expectEqualStrings("default", plain[1]);
+}
+
+test "a launch row sums up a profile's tools" {
+    const base: profiles.Entry = .{ .name = "x", .description = "", .source = .home };
+    try std.testing.expectEqualStrings("all tools", LaunchCompletion.toolsText(base));
+    var every = base;
+    every.tools = &.{"*"};
+    try std.testing.expectEqualStrings("all tools", LaunchCompletion.toolsText(every));
+    var custom = base;
+    custom.tools = &.{ "*", "!subagent" };
+    try std.testing.expectEqualStrings("custom", LaunchCompletion.toolsText(custom));
+    var read_only = base;
+    read_only.tools = &.{ "read_file", "grep_files" };
+    try std.testing.expectEqualStrings("read-only", LaunchCompletion.toolsText(read_only));
+    var no_shell = base;
+    no_shell.tools = &.{ "*", "!shell" };
+    try std.testing.expectEqualStrings("no shell", LaunchCompletion.toolsText(no_shell));
+}
+
+test "launch completion lists profiles only while the composer holds /launch" {
+    var completion: LaunchCompletion = .{};
+    defer completion.deinit();
+    try std.testing.expect(!completion.refresh(std.testing.allocator, "/model", null, null, .{}));
+    try std.testing.expectEqual(@as(usize, 0), completion.entries.len);
+    try std.testing.expect(completion.refresh(std.testing.allocator, "/launch ", null, null, .{}));
+    // A second look within the interval keeps the list it has.
+    try std.testing.expect(!completion.refresh(std.testing.allocator, "/launch ", null, null, .{}));
+    var saw_main = false;
+    for (completion.entries) |entry| saw_main = saw_main or std.mem.eql(u8, entry.full, "/launch main");
+    try std.testing.expect(saw_main);
 }
 
 /// The model the first instance starts with: `--model`, else the launch

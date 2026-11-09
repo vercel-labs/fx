@@ -73,6 +73,11 @@ pub const Entry = struct {
     name: []const u8,
     description: []const u8,
     source: Source,
+    /// The profile's own model, effort, and tools; null keeps the ones fx
+    /// runs with.
+    model: ?[]const u8 = null,
+    effort: ?types.ReasoningEffort = null,
+    tools: ?[]const []const u8 = null,
 };
 
 pub const ParseError = error{ OutOfMemory, InvalidProfile };
@@ -325,13 +330,13 @@ pub fn list(arena: Allocator, roots: Roots) ![]Entry {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => continue,
             }) orelse continue;
-            try entries.append(arena, .{ .name = profile.name, .description = profile.description, .source = profile.source });
+            try entries.append(arena, .{ .name = profile.name, .description = profile.description, .source = profile.source, .model = profile.model, .effort = profile.effort, .tools = profile.tools });
         }
     }
     for ([_][]const u8{ main_name, agent_name }) |name| {
         if (hasEntry(entries.items, name)) continue;
         const profile = builtin(name).?;
-        try entries.append(arena, .{ .name = profile.name, .description = profile.description, .source = .builtin });
+        try entries.append(arena, .{ .name = profile.name, .description = profile.description, .source = .builtin, .model = profile.model, .effort = profile.effort, .tools = profile.tools });
     }
     sort_utils.sort(Entry, entries.items, {}, entryLessThan);
     return entries.items;

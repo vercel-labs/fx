@@ -403,6 +403,65 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
+    "/launch lists the profiles it can start, and Enter on one launches it",
+    async () => {
+      await withHost(answerByLetter, {}, async ({ home, session }) => {
+        // Saved after fx started: the list reads the profiles when it opens.
+        writeProfile(home, "reviewer", { description: "Reviews code for bugs", model: "anthropic/claude-opus-4-7", effort: "high", tools: ["*"] });
+        await session.sendLiteral("/launch ");
+        // Each row shows the model and effort the instance would start with, as the agent list does, not its description.
+        const listed = await session.waitForPane((pane) => /reviewer\s+opus 4-7\s+high/.test(pane), 15_000);
+        expect(listed).not.toContain("Reviews code for bugs");
+        expect(listed).toMatch(/^\s*main\b/m);
+        await session.sendLiteral("rev");
+        await session.waitForPane((pane) => /opus 4-7\s+high/.test(pane) && !/^\s*main\b/m.test(pane), 10_000);
+        await session.sendKeys("Enter");
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        // The agent list names each instance's profile.
+        await session.sendKeys("C-x");
+        const list = await session.waitForText(LIST_HINT, 10_000);
+        expect(list).toMatch(/fx 2 \(on screen\).*reviewer/);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "Delete, then Delete again, in the agent list closes an instance, but never the last one",
+    async () => {
+      await withHost(answerByLetter, { instances: 2 }, async ({ session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        await session.sendText("HOST_A first");
+        await session.waitForText("HOST_ANSWER_A", 30_000);
+
+        // The list previews the highlighted row, so fx 2 is on screen.
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendKeys("Down");
+        await session.waitForText("delete close", 10_000);
+        await session.sendKeys("BSpace");
+        await session.waitForText("press delete again to close this instance", 10_000);
+        await session.sendKeys("BSpace");
+        // The list stays open on the instance left, the first.
+        const closed = await session.waitForPane((pane) => !/\bfx 2\b/.test(pane) && pane.includes("esc back"), 15_000);
+        expect(shownAnswers(closed)).toEqual(["HOST_ANSWER_A"]);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+
+        // With one instance open, Delete doesn't close it: that would end fx.
+        await session.sendKeys("C-x");
+        await session.sendKeys("BSpace");
+        await session.sendKeys("BSpace");
+        await session.waitForComposer(10_000);
+        expect(await session.capturePane()).not.toContain("press delete again");
+        await session.sendText("HOST_B still here");
+        await session.waitForText("HOST_ANSWER_B", 30_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
     "/new on a later instance starts its own fresh session and leaves the others",
     async () => {
       const bodies = await withHost(answerByLetter, { instances: 2 }, async ({ session }) => {

@@ -207,9 +207,12 @@ pub const AgentsMenuProjection = struct {
     rows: []const AgentsMenuRow = &.{},
     selected: usize = 0,
     window_start: usize = 0,
-    /// The selected row is a subagent's, which Delete closes.
+    /// Delete closes the selected row: a subagent's, or an instance's while
+    /// another stays open.
     selected_closable: bool = false,
-    /// The first Delete armed the selected subagent's close.
+    /// The selected row is an instance's, not a subagent's.
+    selected_instance: bool = false,
+    /// The first Delete armed the selected row's close.
     close_armed: bool = false,
 
     pub fn active(self: AgentsMenuProjection) bool {
