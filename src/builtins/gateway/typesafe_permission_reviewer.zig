@@ -562,9 +562,7 @@ const FakeJevServer = struct {
     url: []u8,
     mode: Mode,
     path: []const u8 = "/v1/systemone",
-    thread: ?std.Thread = null,
-    stopping: std.atomic.Value(bool) = .init(false),
-    done: std.atomic.Value(bool) = .init(false),
+    serving: testing_listener.ServerThread = .{},
     failure: ?anyerror = null,
     captured_head: [4096]u8 = undefined,
     captured_len: usize = 0,
@@ -592,18 +590,12 @@ const FakeJevServer = struct {
     }
 
     fn start(self: *FakeJevServer) !void {
-        std.debug.assert(self.thread == null);
-        self.thread = try std.Thread.spawn(.{}, serveOne, .{self});
+        std.debug.assert(self.serving.thread == null);
+        self.serving.thread = try std.Thread.spawn(.{}, serveOne, .{self});
     }
 
-    /// Stops the thread and joins it, whether or not a client connected.
-    /// Fails within `limit_ms` instead of hanging when the thread ignores the
-    /// stop.
     fn stop(self: *FakeJevServer, limit_ms: u32) !void {
-        self.stopping.store(true, .seq_cst);
-        const thread = self.thread orelse return;
-        self.thread = null;
-        try testing_listener.joinWithin(thread, &self.server, &self.done, limit_ms);
+        try self.serving.stop(&self.server, limit_ms);
     }
 
     fn deinit(self: *FakeJevServer) void {
@@ -617,7 +609,7 @@ const FakeJevServer = struct {
     }
 
     fn serveOne(self: *FakeJevServer) void {
-        defer self.done.store(true, .seq_cst);
+        defer self.serving.done.store(true, .seq_cst);
         self.serveOneFallible() catch |err| {
             self.failure = err;
         };
@@ -625,9 +617,9 @@ const FakeJevServer = struct {
 
     fn serveOneFallible(self: *FakeJevServer) !void {
         const zio = self.io_backend.io();
-        var stream = (try testing_listener.acceptUnlessStopping(&self.server, zio, &self.stopping)) orelse return;
-        defer stream.close(zio);
-        if (self.stopping.load(.seq_cst)) return;
+        var stream = (try self.serving.accept(&self.server, zio)) orelse return;
+        defer self.serving.close(zio, stream);
+        if (self.serving.stopping.load(.seq_cst)) return;
         // Read the request head (captured for assertions) and discard the body.
         var socket_buffer: [4096]u8 = undefined;
         var reader = stream.reader(zio, &socket_buffer);
