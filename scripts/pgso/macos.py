@@ -11,6 +11,8 @@ import os
 import pathlib
 import platform
 import re
+import shlex
+import shutil
 from collections.abc import Mapping, Sequence
 
 from scripts.pgso.model import PgsoError, sha256_file
@@ -33,8 +35,8 @@ DISPLAY_NAME = "macOS arm64"
 HOST_ARCH = "arm64"
 LIBLLVM_NAME = "libLLVM.dylib"
 SIZE_CEILING_MIB = 6.500
-# The ordinary control build already records everything the links reuse.
-CONTROL_BUILD_FLAGS: tuple[str, ...] = ()
+# The control's link names the C objects the build compiled beside Zig's own.
+CONTROL_BUILD_FLAGS: tuple[str, ...] = ("--verbose-link",)
 # Apple ld's dead-code stripping for `zig cc` links.
 ZIG_CC_LINK_FLAGS = ("-Wl,-dead_strip",)
 STARTUP_SCENARIOS: tuple[str, ...] = ()
@@ -201,6 +203,7 @@ def instrumented_link_argv(
     paths: PipelinePaths,
     compiler_runtime_object: pathlib.Path,
     min_macos: str,
+    inputs: Sequence[pathlib.Path] = (),
 ) -> tuple[str, ...]:
     return (
         str(toolchain.clang),
@@ -212,6 +215,7 @@ def instrumented_link_argv(
         "-Wl,-dead_strip",
         *PROFILE_SECTION_ALIGNMENTS,
         str(paths.instrumented_object),
+        *map(str, inputs),
         str(toolchain.profile_runtime),
         str(compiler_runtime_object),
         "-o",
@@ -223,6 +227,7 @@ def instrumented_link_argv(
 def candidate_link_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
+    inputs: Sequence[pathlib.Path] = (),
 ) -> tuple[str, ...]:
     return (
         str(toolchain.zig),
@@ -233,6 +238,7 @@ def candidate_link_argv(
         *ZIG_CC_LINK_FLAGS,
         "-s",
         str(paths.profile_use_object),
+        *map(str, inputs),
         "-o",
         str(paths.candidate_binary),
         "-lc",
@@ -242,8 +248,10 @@ def candidate_link_argv(
 def candidate_runtime_probe_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
+    inputs: Sequence[pathlib.Path] = (),
 ) -> tuple[str, ...]:
-    command = candidate_link_argv(toolchain, paths)
+    # Zig's `-###` still resolves symbols, so the probe takes the link's inputs.
+    command = candidate_link_argv(toolchain, paths, inputs)
     return (*command[:2], "-###", *command[2:])
 
 
@@ -272,6 +280,7 @@ def temporal_candidate_link_argv(
     compiler_runtime: pathlib.Path,
     contract: MacosLinkContract,
     system_stub: pathlib.Path,
+    inputs: Sequence[pathlib.Path] = (),
 ) -> tuple[str, ...]:
     return (
         str(toolchain.tools.apple_ld),
@@ -297,6 +306,7 @@ def temporal_candidate_link_argv(
         "-map",
         str(paths.logs / "candidate-link.map"),
         str(paths.profile_use_object),
+        *map(str, inputs),
         str(compiler_runtime),
         str(system_stub),
         "-o",
@@ -548,8 +558,9 @@ def _link_temporal_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None
     )
     if _version_tuple(toolchain.tools.zig_sdk_version) != _version_tuple(contract.sdk_version):
         raise PgsoError("control SDK does not match the pinned Zig SDK")
+    inputs = control_link_inputs(paths)
     probe = run_checked(
-        candidate_runtime_probe_argv(toolchain, paths),
+        candidate_runtime_probe_argv(toolchain, paths, inputs),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=120,
@@ -616,7 +627,9 @@ def _link_temporal_candidate(toolchain: Toolchain, paths: PipelinePaths) -> None
         json.dumps(mapping, indent=2) + "\n", encoding="utf-8",
     )
     result = run_checked(
-        temporal_candidate_link_argv(toolchain, paths, runtime_object, contract, linked_stub),
+        temporal_candidate_link_argv(
+            toolchain, paths, runtime_object, contract, linked_stub, inputs,
+        ),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,
@@ -827,7 +840,8 @@ def link_instrumented(
     paths: PipelinePaths,
     control: Mapping[str, str],
 ) -> None:
-    archive = _discover_compiler_runtime(toolchain, paths)
+    inputs = control_link_inputs(paths)
+    archive = _discover_compiler_runtime(toolchain, paths, inputs)
     compiler_runtime_object = _extract_compiler_runtime(toolchain, archive, paths)
     run_checked(
         instrumented_link_argv(
@@ -835,6 +849,7 @@ def link_instrumented(
             paths,
             compiler_runtime_object,
             control["minimum_macos"],
+            inputs,
         ),
         cwd=paths.root,
         env=os.environ.copy(),
@@ -868,8 +883,74 @@ def link_instrumented(
     )
 
 
+def _final_link(text: str) -> list[str]:
+    # Zig prints the link under its build step, sometimes after "error: ".
+    links = [
+        command
+        for command in (line.strip().removeprefix("error: ") for line in text.splitlines())
+        if command.startswith("zig ld ")
+    ]
+    if len(links) != 1:
+        raise PgsoError(f"control build must print one final zig ld link, found {len(links)}")
+    return shlex.split(links[0])
+
+
 def record_control_build(toolchain: Toolchain, result: CommandResult, paths: PipelinePaths) -> None:
-    """Nothing to record: the macOS links rebuild their own commands."""
+    """Keep the objects and archives Zig linked beside its own object, such as
+    the C the build compiled. The macOS links rebuild their own commands, with
+    their own compiler runtime and libSystem, and add these. Each is copied
+    under the control prefix, so a later job that has the run's files can
+    link it, and is recorded by its path in the run and its hash.
+    """
+    if result.stdout_truncated or result.stderr_truncated:
+        raise PgsoError("control build output was truncated before its link command")
+    argv = _final_link(result.stdout + "\n" + result.stderr)
+    objects = [item for item in argv if item.endswith("_zcu.o")]
+    if len(objects) != 1:
+        raise PgsoError(f"control link must name one Zig object, found {objects}")
+    libraries = [
+        item for at, item in enumerate(argv)
+        if item.startswith("-l") or (at > 0 and argv[at - 1] in ("-framework", "-weak_framework"))
+    ]
+    if libraries != ["-lSystem"]:
+        raise PgsoError(f"control link must name only libSystem, found {libraries}")
+    inputs = sorted({
+        pathlib.Path(item) for item in argv[1:]
+        if item.endswith((".o", ".a"))
+        and item != objects[0]
+        and pathlib.Path(item).name != "libcompiler_rt.a"
+    })
+    destination = paths.control_link_inputs
+    destination.mkdir(parents=True, exist_ok=True)
+    recorded: dict[str, str] = {}
+    for source in inputs:
+        # Zig keeps each object in a folder named by its hash.
+        copy = destination / f"{source.parent.name}-{source.name}"
+        shutil.copy2(source, copy)
+        recorded[str(copy.relative_to(paths.root))] = sha256_file(copy)
+    record = {"argv": argv, "zig_object": objects[0], "inputs": recorded}
+    (paths.logs / "control-link.json").write_text(
+        json.dumps(record, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def control_link_inputs(paths: PipelinePaths) -> tuple[pathlib.Path, ...]:
+    """The objects and archives the control linked beside Zig's object,
+    unchanged since it was recorded. The benchmarks link only Zig code, from
+    an external control that records nothing."""
+    if paths.selector != "fx":
+        return ()
+    path = paths.logs / "control-link.json"
+    try:
+        items = sorted(json.loads(path.read_text(encoding="utf-8"))["inputs"].items())
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise PgsoError(f"missing or invalid control link record: {path}") from error
+    for item, digest in items:
+        input_path = paths.root / item
+        if not input_path.is_file() or sha256_file(input_path) != digest:
+            raise PgsoError(f"control link input changed: {item}")
+    return tuple(paths.root / item for item, _ in items)
 
 
 def prepare_candidate_bitcode(toolchain: Toolchain, paths: PipelinePaths) -> None:
@@ -903,7 +984,7 @@ def link_candidate_binary(toolchain: Toolchain, paths: PipelinePaths) -> None:
         _link_temporal_candidate(toolchain, paths)
     else:
         run_checked(
-            candidate_link_argv(toolchain, paths),
+            candidate_link_argv(toolchain, paths, control_link_inputs(paths)),
             cwd=paths.root,
             env=os.environ.copy(),
             timeout_s=900,
