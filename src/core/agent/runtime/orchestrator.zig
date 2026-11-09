@@ -12292,32 +12292,19 @@ fn processQueuedPromptLoop(
                     .continued => continue :agent_steps_loop,
                 }
             }
-            try deps.push_system_notice(
-                deps.ctx,
-                repeated_terminal_validation_notice,
-            );
-            const assistant_text: runtime_finalization.TerminalText = .{ .history = "", .presentation = if (stop_state.retained_candidate != null)
-                try hooks.prompt.joinVisibleSegments(
-                    arena,
-                    stop_state.retained_candidate,
-                    stop_state.latest_partial,
-                )
-            else
-                null };
-            stop_state.terminal_materializing = true;
-            try finishCommonAssistantTerminal(
+            // The turn fails with the notice as its text, as the other
+            // loop stops do, so a parent agent's report says why it ended.
+            try finishFailedTurnWithNotice(
                 deps,
                 finalization,
                 arena,
                 job,
                 within_turn_suffix.items,
                 &summary_accumulator,
-                assistant_text,
-                .completed,
-                null,
+                stop_state,
                 &finish_trace,
+                repeated_terminal_validation_notice,
                 "terminal_validation_retry",
-                null,
             );
             return;
         }
