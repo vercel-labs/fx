@@ -18,16 +18,15 @@
 (*                                                                          *)
 (* A generation whose startup files move ZDOTDIR to a folder that fx's own *)
 (* environment does not name carries that folder's file stamps in its      *)
-(* fingerprint. The owner's failed state compares fingerprints without     *)
-(* them, so after such a generation fails, the failed state reports a      *)
-(* change that no edit made (failedExt). The bound approval re-checks the  *)
-(* startup files after a failed replay, and that check must run while the  *)
-(* owner still holds the generation, or it refuses a command whose files   *)
-(* did not change (NoFalseRefusal). A second command whose replay fails    *)
-(* after the first one failed the generation still meets the failed        *)
-(* state's comparison; the model leaves that case out of NoFalseRefusal,   *)
-(* because only a failed state that compares with the moved ZDOTDIR's      *)
-(* stamps removes it.                                                      *)
+(* fingerprint. The owner's failed state keeps that folder and compares    *)
+(* its stamps too, so it reports only changes the files really had. A      *)
+(* bound approval is refused only after an edit or a reload that came      *)
+(* after it was made: not the command whose replay failed the generation,  *)
+(* and not another approval made under the same epoch that is still        *)
+(* waiting (NoFalseRefusal). Where the failed state compares without the   *)
+(* stamps (UnstampedFailed), it reports a change no edit made after such a *)
+(* generation fails (failedExt), and every later check refuses the         *)
+(* approvals made before it.                                               *)
 (*                                                                          *)
 (* One routine word, git, can be aliased. "nonroutine" commands, such as   *)
 (* `echo warm` or an edit of the startup files, always go to review; an    *)
@@ -40,10 +39,13 @@
 (*   "main"               fx before it: admission reads the generation     *)
 (*                        already there, captured or not, fresh or not,    *)
 (*                        and only a failed capture counts as unknown;     *)
-(*   "late_check"         the fixed rule, except that the rerun after a    *)
+(*   "old_failed"         the fixed rule on a failed state that compares   *)
+(*                        without the moved ZDOTDIR's stamps, as the       *)
+(*                        owner did before the failed state kept the       *)
+(*                        folder;                                          *)
+(*   "late_check"         the same failed state, and the rerun after a     *)
 (*                        failed replay checks the startup files after the *)
-(*                        owner failed the generation, as fx did before    *)
-(*                        the moved-ZDOTDIR repair;                        *)
+(*                        owner failed the generation;                     *)
 (*   "review_unknown"     the alternative: no capture at admission, and    *)
 (*                        an empty or stale snapshot goes to review;       *)
 (* and each planted bug breaks one part of the fixed rule:                 *)
@@ -64,10 +66,15 @@ EXTENDS Integers, FiniteSets, TLC
 
 CONSTANTS Cmds, MaxEdits, MaxReloads, MaxFails, MaxGen, Design
 
-Designs == {"fixed", "main", "review_unknown", "late_check", "unbound", "reload_routine",
-            "failed_clear", "fallback_unchecked", "capture_again", "moved_unchecked"}
+Designs == {"fixed", "main", "review_unknown", "late_check", "old_failed", "unbound",
+            "reload_routine", "failed_clear", "fallback_unchecked", "capture_again",
+            "moved_unchecked"}
 ASSUME Design \in Designs
 ASSUME MaxGen \in Nat \ {0}
+
+\* The failed state compares the startup files without the moved ZDOTDIR's
+\* stamps, which the generation's own fingerprint holds.
+UnstampedFailed == Design \in {"main", "late_check", "old_failed"}
 
 Gens     == 1..MaxGen
 NoGen    == 0
@@ -95,7 +102,7 @@ VARIABLES
     capFver,      \* fingerprint taken when the running capture started
     capAliased,   \* whether the files defined git when it started
     failedFver,   \* fingerprint the failed state compares against
-    failedExt,    \* it holds a moved ZDOTDIR's stamps, which the failed state's comparison drops
+    failedExt,    \* it holds a moved ZDOTDIR's stamps, which an unstamped failed state drops
     captures,     \* captures started: each runs the startup files once
     triggers,     \* refresh triggers accepted
     fails,        \* failed captures and failed replays
@@ -109,16 +116,16 @@ VARIABLES
     cgen,         \* generation a running command leased
     outcome,
     trigAtAdmit,  \* triggers when the routine approval was made
+    fverAtAdmit,  \* the startup files' fingerprint when it was made
     ownTrig,      \* 1 when the command's own reload was a trigger
-    recaptured,   \* capture_again: the run already forced its capture
-    falseAlarm    \* the check after this command's failed replay noted a change no edit made
+    recaptured    \* capture_again: the run already forced its capture
 
 fileVars  == <<aliased, fver, everAliased, edits, moved>>
 ownerVars == <<owner, dirty, epoch, active, capGen, nextGen, genEpoch, genAliased,
                genFver, capFver, capAliased, failedFver, failedExt, captures, triggers, fails,
                reloads>>
 cmdVars   == <<pc, kind, reload, effect, auth, bound, cgen, outcome, trigAtAdmit,
-               ownTrig, recaptured, falseAlarm>>
+               fverAtAdmit, ownTrig, recaptured>>
 vars      == <<fileVars, ownerVars, cmdVars>>
 
 TypeOK ==
@@ -139,9 +146,9 @@ TypeOK ==
     /\ bound \in [Cmds -> {NoBind} \cup Nat]
     /\ cgen \in [Cmds -> 0..MaxGen]
     /\ outcome \in [Cmds -> Outcomes]
-    /\ trigAtAdmit \in [Cmds -> Nat] /\ ownTrig \in [Cmds -> 0..1]
+    /\ trigAtAdmit \in [Cmds -> Nat] /\ fverAtAdmit \in [Cmds -> Nat]
+    /\ ownTrig \in [Cmds -> 0..1]
     /\ recaptured \in [Cmds -> BOOLEAN]
-    /\ falseAlarm \in [Cmds -> BOOLEAN]
 
 \* A process starts with no snapshot; `start` says whether its startup files
 \* already define git, and `move` whether they set ZDOTDIR to a folder fx's
@@ -163,10 +170,9 @@ InitWith(start, move) ==
     /\ bound = [c \in Cmds |-> NoBind]
     /\ cgen = [c \in Cmds |-> NoGen]
     /\ outcome = [c \in Cmds |-> "none"]
-    /\ trigAtAdmit = [c \in Cmds |-> 0]
+    /\ trigAtAdmit = [c \in Cmds |-> 0] /\ fverAtAdmit = [c \in Cmds |-> 0]
     /\ ownTrig = [c \in Cmds |-> 0]
     /\ recaptured = [c \in Cmds |-> FALSE]
-    /\ falseAlarm = [c \in Cmds |-> FALSE]
 
 Init == \E start \in BOOLEAN, move \in BOOLEAN : InitWith(start, move)
 
@@ -178,7 +184,7 @@ Init == \E start \in BOOLEAN, move \in BOOLEAN : InitWith(start, move)
 Changed ==
     /\ ~dirty
     /\ \/ owner = "ready" /\ fver # genFver[active]
-       \/ owner = "failed" /\ (fver # failedFver \/ failedExt)
+       \/ owner = "failed" /\ (fver # failedFver \/ (UnstampedFailed /\ failedExt))
 
 NotedDirty    == dirty \/ Changed
 NotedEpoch    == IF Changed THEN epoch + 1 ELSE epoch
@@ -233,6 +239,7 @@ Routine(c, epochBound) ==
     /\ auth' = [auth EXCEPT ![c] = "routine"]
     /\ bound' = [bound EXCEPT ![c] = epochBound]
     /\ trigAtAdmit' = [trigAtAdmit EXCEPT ![c] = NotedTriggers]
+    /\ fverAtAdmit' = [fverAtAdmit EXCEPT ![c] = fver]
     /\ pc' = [pc EXCEPT ![c] = "approved"]
 
 Admit(c, k, r, e) ==
@@ -244,24 +251,24 @@ Admit(c, k, r, e) ==
     /\ effect' = [effect EXCEPT ![c] = e]
     /\ ApplyNote
     /\ CASE k = "nonroutine" ->
-              Review(c) /\ UNCHANGED <<bound, trigAtAdmit>>
+              Review(c) /\ UNCHANGED <<bound, trigAtAdmit, fverAtAdmit>>
          [] Design = "main" ->
               \* fx before the fix read whatever generation was active and
               \* counted only a failed capture as unknown.
               IF owner = "failed" \/ (active # NoGen /\ genAliased[active])
-              THEN Review(c) /\ UNCHANGED <<bound, trigAtAdmit>>
+              THEN Review(c) /\ UNCHANGED <<bound, trigAtAdmit, fverAtAdmit>>
               ELSE Routine(c, NoBind)
          [] Design = "review_unknown" ->
               IF ~r /\ CanLease /\ ~genAliased[active]
               THEN Routine(c, genEpoch[active])
-              ELSE Review(c) /\ UNCHANGED <<bound, trigAtAdmit>>
+              ELSE Review(c) /\ UNCHANGED <<bound, trigAtAdmit, fverAtAdmit>>
          [] OTHER ->
               IF r /\ Design # "reload_routine"
-              THEN Review(c) /\ UNCHANGED <<bound, trigAtAdmit>>
-              ELSE pc' = [pc EXCEPT ![c] = "admitting"] /\ UNCHANGED <<auth, bound, trigAtAdmit>>
+              THEN Review(c) /\ UNCHANGED <<bound, trigAtAdmit, fverAtAdmit>>
+              ELSE pc' = [pc EXCEPT ![c] = "admitting"] /\ UNCHANGED <<auth, bound, trigAtAdmit, fverAtAdmit>>
     /\ UNCHANGED <<fileVars, owner, active, capGen, nextGen, genEpoch, genAliased, genFver,
                    capFver, capAliased, failedFver, failedExt, captures, fails, reloads,
-                   cgen, outcome, ownTrig, recaptured, falseAlarm>>
+                   cgen, outcome, ownTrig, recaptured>>
 
 \* checkCommandNames: the routine check waits for a capture when there is
 \* no snapshot or the files changed, then reads the generation it leased.
@@ -270,27 +277,27 @@ AdmitDecide(c) ==
     /\ \/ /\ CanLease
           /\ ApplyNote
           /\ IF genAliased[active]
-             THEN Review(c) /\ UNCHANGED <<bound, trigAtAdmit>>
+             THEN Review(c) /\ UNCHANGED <<bound, trigAtAdmit, fverAtAdmit>>
              ELSE Routine(c, IF Design = "unbound" THEN NoBind ELSE genEpoch[active])
           /\ UnchangedCapture
        \/ /\ CanFull
           /\ ApplyNote
           /\ IF Design = "failed_clear"
              THEN Routine(c, NotedEpoch)
-             ELSE Review(c) /\ UNCHANGED <<bound, trigAtAdmit>>
+             ELSE Review(c) /\ UNCHANGED <<bound, trigAtAdmit, fverAtAdmit>>
           /\ UnchangedCapture
        \/ /\ MustCapture
           /\ StartCapture
-          /\ UNCHANGED <<pc, auth, bound, trigAtAdmit>>
+          /\ UNCHANGED <<pc, auth, bound, trigAtAdmit, fverAtAdmit>>
     /\ UNCHANGED <<fileVars, active, genAliased, genFver, failedFver, failedExt, fails, reloads,
-                   kind, reload, effect, cgen, outcome, ownTrig, recaptured, falseAlarm>>
+                   kind, reload, effect, cgen, outcome, ownTrig, recaptured>>
 
 \* The turn is cancelled while admission waits; the shared capture goes on.
 AdmitCancel(c) ==
     /\ pc[c] = "admitting"
     /\ Finish(c, "cancelled")
     /\ UNCHANGED <<fileVars, ownerVars, kind, reload, effect, auth, bound, cgen,
-                   trigAtAdmit, ownTrig, recaptured, falseAlarm>>
+                   trigAtAdmit, fverAtAdmit, ownTrig, recaptured>>
 
 \* The reviewer clears or holds the exact action.
 Reviewed(c, clear) ==
@@ -300,7 +307,7 @@ Reviewed(c, clear) ==
        THEN pc' = [pc EXCEPT ![c] = "approved"] /\ UNCHANGED outcome
        ELSE Finish(c, "held")
     /\ UNCHANGED <<fileVars, ownerVars, kind, reload, effect, auth, bound, cgen,
-                   trigAtAdmit, ownTrig, recaptured, falseAlarm>>
+                   trigAtAdmit, fverAtAdmit, ownTrig, recaptured>>
 
 -----------------------------------------------------------------------------
 (* The run. A reload marks the snapshot dirty first (shell.zig callRun).    *)
@@ -316,8 +323,8 @@ StartRun(c) ==
        ELSE UNCHANGED <<dirty, epoch, triggers, ownTrig>>
     /\ UNCHANGED <<fileVars, owner, active, capGen, nextGen, genEpoch, genAliased, genFver,
                    capFver, capAliased, failedFver, failedExt, captures, fails, reloads,
-                   kind, reload, effect, auth, bound, cgen, outcome, trigAtAdmit, recaptured,
-                   falseAlarm>>
+                   kind, reload, effect, auth, bound, cgen, outcome, trigAtAdmit, fverAtAdmit,
+                   recaptured>>
 
 StaleBinding(c, e) == bound[c] # NoBind /\ bound[c] # e
 
@@ -352,7 +359,7 @@ RunDecide(c) ==
                 /\ UNCHANGED <<fileVars, pc, outcome, cgen>>
           /\ UNCHANGED recaptured
     /\ UNCHANGED <<active, genAliased, genFver, failedFver, failedExt, fails, reloads,
-                   kind, reload, effect, auth, bound, trigAtAdmit, ownTrig, falseAlarm>>
+                   kind, reload, effect, auth, bound, trigAtAdmit, fverAtAdmit, ownTrig>>
 
 \* The restored shell runs the command with the generation's names.
 Replay(c) ==
@@ -360,7 +367,7 @@ Replay(c) ==
     /\ Finish(c, IF kind[c] = "git" /\ genAliased[cgen[c]] THEN "alias" ELSE "real")
     /\ RunEffect(c)
     /\ UNCHANGED <<edits, moved, ownerVars, kind, reload, effect, auth, bound, cgen,
-                   trigAtAdmit, ownTrig, recaptured, falseAlarm>>
+                   trigAtAdmit, fverAtAdmit, ownTrig, recaptured>>
 
 \* The restored shell rejected the replay before the command started. The
 \* owner fails the generation if it still holds it (markReplayFailed); the
@@ -398,14 +405,13 @@ ReplayFail(c) ==
            /\ dirty' = (dirty \/ (check /\ noted))
            /\ epoch' = epoch2
            /\ triggers' = IF check /\ noted THEN triggers + 1 ELSE triggers
-           /\ falseAlarm' = [falseAlarm EXCEPT ![c] = holds /\ check /\ noted /\ ~edited]
            /\ IF check /\ StaleBinding(c, epoch2)
               THEN Finish(c, "refused") /\ UNCHANGED <<aliased, fver, everAliased>>
               ELSE Finish(c, IF kind[c] = "git" /\ aliased THEN "alias" ELSE "real")
                    /\ RunEffect(c)
     /\ UNCHANGED <<edits, moved, capGen, nextGen, genEpoch, genAliased, genFver, capFver, capAliased,
                    captures, reloads, kind, reload, effect, auth, bound, cgen,
-                   trigAtAdmit, ownTrig, recaptured>>
+                   trigAtAdmit, fverAtAdmit, ownTrig, recaptured>>
 
 -----------------------------------------------------------------------------
 (* The capture thread.                                                      *)
@@ -517,10 +523,15 @@ RefusedOnlyAfterRefresh ==
     \A c \in Cmds :
         outcome[c] = "refused" => triggers - ownTrig[c] > trigAtAdmit[c]
 
-\* A failed replay refuses a bound approval only when the startup files
-\* changed, whether or not they set ZDOTDIR to a folder fx's environment does
-\* not name.
-NoFalseRefusal == \A c \in Cmds : outcome[c] = "refused" => ~falseAlarm[c]
+\* Some call reloaded the startup files: the user, or a call that asked for it.
+ReloadSeen == reloads > 0 \/ \E c \in Cmds : ownTrig[c] = 1
+
+\* A bound approval is refused only when the startup files were edited or
+\* reloaded after it was made, whether or not they set ZDOTDIR to a folder fx's
+\* environment does not name, and whether it is the command whose replay
+\* failed the generation or another approval made under the same epoch.
+NoFalseRefusal ==
+    \A c \in Cmds : outcome[c] = "refused" => (fver # fverAtAdmit[c] \/ ReloadSeen)
 
 \* Every command that starts finishes.
 EveryCommandFinishes == \A c \in Cmds : (pc[c] # "idle") ~> (pc[c] = "done")
