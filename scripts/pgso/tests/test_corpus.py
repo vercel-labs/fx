@@ -420,7 +420,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(35, len(corpus.scenarios))
-        self.assertEqual(68, len(corpus.candidate_scenarios))
+        self.assertEqual(69, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,
