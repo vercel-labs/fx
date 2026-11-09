@@ -1209,6 +1209,7 @@ pub fn Runtime(comptime App: type) type {
             menu.selected = positionIn(order.items, app.agent_on_screen) orelse 0;
             menu.window_start = 0;
             menu.origin = app.agent_on_screen;
+            menu.close_armed = null;
             menu.open = true;
             debug_trace.eventf("host", "agents_menu_opened", .{}, "agents={d} position={d} agent={s}", .{
                 order.items.len,
@@ -1231,6 +1232,7 @@ pub fn Runtime(comptime App: type) type {
             const menu = &app.instances.agents_menu;
             menu.open = false;
             menu.origin = null;
+            menu.close_armed = null;
             app.shell.render_requests.request(.footer);
         }
 

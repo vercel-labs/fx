@@ -59,11 +59,20 @@ pub const LaunchCompletion = struct {
 
     const refresh_interval_ms = 1000;
 
-    /// What a launched instance takes when its profile leaves a setting
-    /// unset: the settings later instances start from. Borrowed.
+    /// What a launched instance starts with besides its profile, as
+    /// `app_instances_runtime` applies them: the overrides win over the
+    /// profile, which wins over the settings later instances start from.
+    /// Borrowed.
     pub const Defaults = struct {
         model: []const u8 = "",
         effort: types.ReasoningEffort = .auto,
+        /// `--model`, `--provider`, or `FX_MODEL`.
+        model_override: ?[]const u8 = null,
+        /// `--effort`.
+        effort_override: ?types.ReasoningEffort = null,
+        /// The profile a bare `/launch` starts, listed first so Enter on an
+        /// empty `/launch ` starts it too.
+        profile_name: []const u8 = profiles.main_name,
     };
 
     pub fn deinit(self: *LaunchCompletion) void {
@@ -84,7 +93,7 @@ pub const LaunchCompletion = struct {
     ) bool {
         if (!std.mem.startsWith(u8, std.mem.trimStart(u8, input, " \t"), "/launch")) return false;
         const now = io_mod.milliTimestamp();
-        if (self.arena != null and now - self.at_ms < refresh_interval_ms) return false;
+        if (self.at_ms != 0 and now - self.at_ms < refresh_interval_ms) return false;
         self.at_ms = now;
         var next: std.heap.ArenaAllocator = .init(alloc);
         const entries = build(next.allocator(), home, workspace_root, defaults) catch {
@@ -100,6 +109,10 @@ pub const LaunchCompletion = struct {
     fn build(arena: std.mem.Allocator, home: ?[]const u8, workspace_root: ?[]const u8, defaults: Defaults) ![]const mod_registry.ArgumentCompletion {
         const roots = try profiles.Roots.init(arena, home, workspace_root);
         const listed = try profiles.list(arena, roots);
+        for (listed, 0..) |entry, index| if (std.mem.eql(u8, entry.name, defaults.profile_name)) {
+            std.mem.rotate(profiles.Entry, listed[0 .. index + 1], index);
+            break;
+        };
         const rows = try arena.alloc(Row, listed.len);
         var widths: Widths = @splat(0);
         for (listed, rows) |entry, *row| {
@@ -122,14 +135,16 @@ pub const LaunchCompletion = struct {
     const column_gap = 2;
 
     /// The values the instance would start with, as the agent list names
-    /// them. The text belongs to `arena`.
+    /// them. A profile, the repository's included, may set any model or
+    /// effort, so both show their control bytes as escapes. The text belongs
+    /// to `arena`.
     fn rowOf(arena: std.mem.Allocator, entry: profiles.Entry, defaults: Defaults) !Row {
         var model_buf: [96]u8 = undefined;
-        const model_id = entry.model orelse defaults.model;
-        const model = if (model_id.len > 0) try arena.dupe(u8, ui_render.compactModelLabel(model_id, &model_buf)) else "";
+        const model_id = defaults.model_override orelse entry.model orelse defaults.model;
+        const model = if (model_id.len > 0) try arena.print("{f}", .{text_utils.terminalSafe(ui_render.compactModelLabel(model_id, &model_buf))}) else "";
         // A named effort keeps its label inline, so it is copied from here.
-        const effort_value = entry.effort orelse defaults.effort;
-        const effort = try arena.dupe(u8, effort_value.displayLabel());
+        const effort_value = defaults.effort_override orelse entry.effort orelse defaults.effort;
+        const effort = try arena.print("{f}", .{text_utils.terminalSafe(effort_value.displayLabel())});
         return .{
             model,
             effort,
@@ -155,7 +170,8 @@ pub const LaunchCompletion = struct {
 
     /// "all tools" for a profile that keeps fx's tools or names only `*`,
     /// "read-only" for one without the shell or file edits, "no shell" for one
-    /// without the shell, and "custom" for one that leaves out others.
+    /// without the shell, "no edits" for one without file edits, and "custom"
+    /// for one that leaves out others.
     fn toolsText(entry: profiles.Entry) []const u8 {
         const tools = entry.tools orelse return "all tools";
         if (tools.len == 1 and std.mem.eql(u8, tools[0], "*")) return "all tools";
@@ -207,6 +223,26 @@ test "a launch row sums up a profile's tools" {
     var no_shell = base;
     no_shell.tools = &.{ "*", "!shell" };
     try std.testing.expectEqualStrings("no shell", LaunchCompletion.toolsText(no_shell));
+    var no_edits = base;
+    no_edits.tools = &.{ "*", "!edit_file", "!write_file" };
+    try std.testing.expectEqualStrings("no edits", LaunchCompletion.toolsText(no_edits));
+}
+
+test "a launch row shows the overrides fx started with, and a profile's control bytes as escapes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var entry: profiles.Entry = .{ .name = "x", .description = "", .source = .project };
+    entry.model = "evil\x1b]0;owned\x07";
+    entry.effort = .literal("high");
+    const row = try LaunchCompletion.rowOf(arena, entry, .{ .model = "openai/gpt-5" });
+    try std.testing.expect(std.mem.findScalar(u8, row[0], 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, row[0], 0x07) == null);
+
+    // `--model` and `--effort` win over the profile, as the launch applies them.
+    const overridden = try LaunchCompletion.rowOf(arena, entry, .{ .model = "openai/gpt-5", .model_override = "openai/gpt-5.4-mini", .effort_override = .literal("low") });
+    try std.testing.expectEqualStrings("gpt-5.4-mini", overridden[0]);
+    try std.testing.expectEqualStrings("low", overridden[1]);
 }
 
 test "launch completion lists profiles only while the composer holds /launch" {
@@ -217,9 +253,8 @@ test "launch completion lists profiles only while the composer holds /launch" {
     try std.testing.expect(completion.refresh(std.testing.allocator, "/launch ", null, null, .{}));
     // A second look within the interval keeps the list it has.
     try std.testing.expect(!completion.refresh(std.testing.allocator, "/launch ", null, null, .{}));
-    var saw_main = false;
-    for (completion.entries) |entry| saw_main = saw_main or std.mem.eql(u8, entry.full, "/launch main");
-    try std.testing.expect(saw_main);
+    // The profile a bare `/launch` starts comes first.
+    try std.testing.expectEqualStrings("/launch main", completion.entries[0].full);
 }
 
 /// The model the first instance starts with: `--model`, else the launch

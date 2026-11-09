@@ -2374,3 +2374,25 @@ pub const slack_install_spec: TopLevelSpec = .{
         "Refresh runs only when requested; no background service is installed.",
     },
 };
+
+test "app argument completions route each command to its own group" {
+    const mcp = [_]mod_registry.ArgumentCompletion{ .{ .full = "/mcp list" }, .{ .full = "/mcp show" } };
+    const launch = [_]mod_registry.ArgumentCompletion{
+        .{ .full = "/launch main", .description = "gpt-5", .select_description = true },
+        .{ .full = "/launch scout", .description = "haiku 4-5", .select_description = true },
+    };
+    var registry: SlashRegistry = .{};
+    registry.argument_groups = .{ &mcp, &launch };
+
+    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(registry, "/launch "));
+    try std.testing.expectEqualStrings("main", nthSlashCompletionLabel(registry, "/launch ", 0).?);
+    try std.testing.expectEqualStrings("gpt-5", nthSlashCompletionDescription(registry, "/launch ", 0).?);
+    try std.testing.expect(nthSlashCompletionSelectsDescription(registry, "/launch ", 0));
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/launch sc"));
+    try std.testing.expectEqualStrings("/launch scout", nthSlashCompletion(registry, "/launch sc", 0).?);
+
+    try std.testing.expectEqualStrings("/mcp show", nthSlashCompletion(registry, "/mcp sh", 0).?);
+    try std.testing.expect(!nthSlashCompletionSelectsDescription(registry, "/mcp ", 0));
+    // A command without a group, or without its space, completes nothing from the app.
+    try std.testing.expectEqual(@as(usize, 0), slashCompletionCount(registry, "/launchx "));
+}

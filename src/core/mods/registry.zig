@@ -30,7 +30,7 @@ pub const ArgumentCompletion = struct {
 };
 
 /// How many commands can take argument completions from the running app.
-pub const max_argument_groups = 2;
+const max_argument_groups = 2;
 
 pub fn CommandRegistry(comptime Command: type) type {
     return struct {
