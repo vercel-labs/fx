@@ -5504,6 +5504,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, tracePath),
           timeoutMs: 20_000,
+          processSnapshot: true,
         },
       );
       if (result.code !== 0) {

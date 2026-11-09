@@ -472,8 +472,17 @@ export interface FxRunResult {
   elapsedMs: number;
   pid: number | null;
   processStateAtTimeout: string;
-  // Empty unless fx timed out or a signal ended it.
+  // Empty unless needsProcessSnapshot says to take it.
   processStateAfterClose: string;
+}
+
+// A system-wide ps can take seconds on a busy machine, so a plain nonzero
+// exit, which many tests expect, skips it unless the caller asks for it.
+export function needsProcessSnapshot(
+  close: { code: number | null; signal: NodeJS.Signals | null; timedOut: boolean },
+  requested = false,
+): boolean {
+  return close.timedOut || close.signal !== null || (requested && close.code !== 0);
 }
 
 function captureFxProcessState(): string {
@@ -498,6 +507,9 @@ export async function runFx(
     env?: Record<string, string | undefined>;
     stdin?: string | Uint8Array;
     timeoutMs?: number;
+    // Take the process snapshot on any nonzero exit, for a caller that
+    // prints it when fx fails.
+    processSnapshot?: boolean;
   } = {},
 ): Promise<FxRunResult> {
   if (!existsSync(FX_BIN)) {
@@ -514,6 +526,9 @@ export async function runFx(
       HOME: process.env.HOME ?? "",
       PATH: process.env.PATH ?? "",
     };
+    // FX_HOME moves fx's profile out of HOME, so a developer's FX_HOME
+    // reaches fx only when the test passes it in opts.env.
+    delete env.FX_HOME;
     for (const [key, value] of Object.entries(opts.env ?? {})) {
       if (value === undefined) {
         delete env[key];
@@ -555,9 +570,9 @@ export async function runFx(
         elapsedMs: performance.now() - startedAtMs,
         pid: child.pid ?? null,
         processStateAtTimeout,
-        // A system-wide ps can take seconds on a busy machine, so a plain
-        // nonzero exit, which many tests expect, skips it.
-        processStateAfterClose: timedOut || signal !== null ? captureFxProcessState() : "",
+        processStateAfterClose: needsProcessSnapshot({ code, signal, timedOut }, opts.processSnapshot)
+          ? captureFxProcessState()
+          : "",
       });
     });
   });
