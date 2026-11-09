@@ -2222,7 +2222,6 @@ test "saved inline read retains full file evidence with its external copy" {
 }
 
 test "common execution memory does not mark stored read previews as full" {
-    const session_runtime = @import("../../session/session.zig");
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -2283,10 +2282,6 @@ test "common execution memory does not mark stored read previews as full" {
     try std.testing.expect(execution.tool_steps[0].tool_results[0].truncated);
     try std.testing.expectEqual(@as(usize, 1), execution.files.len);
     try std.testing.expect(!execution.files[0].model_view_covers_full_file);
-
-    const replay = try session_runtime.formatExecutionFileContext(alloc, execution.files);
-    defer alloc.free(replay);
-    try std.testing.expect(std.mem.find(u8, replay, "model_view=full") == null);
 }
 
 test "execution memory persists secret argument values verbatim" {
