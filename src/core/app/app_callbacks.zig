@@ -306,6 +306,7 @@ pub fn Bindings(comptime App: type) type {
                 .tool_registry = if (comptime @hasDecl(App, "toolRegistry")) app.toolRegistry(agent) else .{},
                 .context_registry = if (comptime @hasDecl(App, "contextRegistry")) app.contextRegistry() else null,
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else false,
+                .image_folder_rules = comptime agents.hasAgentField(App, "pending_images"),
                 .snapshot_root_permission_mode = if (comptime @hasField(App, "permission_engine"))
                     agentSnapshotRootPermissionMode
                 else

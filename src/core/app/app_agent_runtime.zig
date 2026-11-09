@@ -1087,7 +1087,11 @@ pub fn Runtime(comptime App: type) type {
             }, arena, messages);
         }
 
-        pub fn refreshProjectContext(app: *App, agent: *AppAgent, targets: []const context_contract.ApplicableTarget) context_contract.ProviderError!void {
+        /// Gathers the instructions' project context for the next turn. It
+        /// names no target: rules for a folder a turn reaches arrive as notes
+        /// in the conversation, never here, so the instructions do not change
+        /// from turn to turn.
+        pub fn refreshProjectContext(app: *App, agent: *AppAgent) context_contract.ProviderError!void {
             agent.context_snapshot.deinit(app.alloc);
             if (!app.context_enabled) return;
 
@@ -1095,7 +1099,6 @@ pub fn Runtime(comptime App: type) type {
             agent.context_snapshot = app.contextRegistry().gatherDefaultSnapshot(app.alloc, .{
                 .workspace_root = workspace.root,
                 .access_scope = workspace.access_scope,
-                .targets = targets,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             }) catch |err| {
                 debug_trace.logf("context", "gather failed err={s}", .{@errorName(err)});
@@ -1871,14 +1874,12 @@ const test_prompt_policy = prompt_policy_contract.Policy{
 };
 
 var refresh_gather_calls: usize = 0;
-var refresh_targets_match: bool = false;
+var refresh_named_target: bool = false;
 var refresh_gather_error: context_contract.ProviderError = error.WriteFailed;
 
 fn gatherFreshProjectContext(alloc: Allocator, input: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
     refresh_gather_calls += 1;
-    refresh_targets_match = input.targets.len == 1 and
-        input.targets[0].kind == .file and
-        std.mem.eql(u8, input.targets[0].path, "/tmp/workspace/images/example.png");
+    refresh_named_target = input.targets.len != 0;
     const content = try alloc.print("fresh:{s}", .{input.workspace_root});
     errdefer alloc.free(content);
     const notices = try alloc.alloc([]u8, 1);
@@ -2871,7 +2872,7 @@ test "subagent labels show named request and reply" {
 test "app agent runtime refreshes enabled project context through registry" {
     const alloc = std.testing.allocator;
     refresh_gather_calls = 0;
-    refresh_targets_match = false;
+    refresh_named_target = true;
     var app = RefreshContextApp{
         .alloc = alloc,
         .context_enabled = true,
@@ -2880,14 +2881,12 @@ test "app agent runtime refreshes enabled project context through registry" {
     };
     defer app.deinit();
 
-    const targets = [_]context_contract.ApplicableTarget{.{
-        .path = "/tmp/workspace/images/example.png",
-        .kind = .file,
-    }};
-    try Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent(), &targets);
+    try Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
-    try std.testing.expect(refresh_targets_match);
+    // The instructions' context never names a target; a turn's folders reach
+    // the model as notes.
+    try std.testing.expect(!refresh_named_target);
     const contribution = app.agent().context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("test.fresh_context", contribution.provider_id);
     try std.testing.expectEqualStrings("fresh:/tmp/workspace", contribution.content);
@@ -2945,7 +2944,7 @@ test "app agent runtime gathers project context from the host workspace root" {
     };
     defer app.deinit();
 
-    try Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent(), &.{});
+    try Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
     const contribution = app.agent().context_snapshot.contribution orelse return error.TestExpectedEqual;
@@ -2963,7 +2962,7 @@ test "app agent runtime clears disabled project context without gathering" {
     };
     defer app.deinit();
 
-    try Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent(), &.{});
+    try Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 0), refresh_gather_calls);
     try std.testing.expect(app.agent().context_snapshot.contribution == null);
@@ -2989,7 +2988,7 @@ test "app agent runtime propagates project context gathering failures" {
 
         try std.testing.expectError(
             expected_error,
-            Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent(), &.{}),
+            Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent()),
         );
 
         try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
