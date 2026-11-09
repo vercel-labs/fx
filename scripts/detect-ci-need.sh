@@ -26,12 +26,23 @@
 # tests/tla/drivers/transcript_window/, or the driver code they share:
 # tests/tla/drivers/lib/ and tests/tla/drivers/graph.mjs.
 #
-# All three run when the change touches build.zig, build.zig.zon,
+# subagent: the TLA+ subagent and session-write models job model-checks the
+# design configs of tests/tla/subagent/ and the session-write model in
+# tests/tla/session/, and drives a built fx along them, which takes a few
+# minutes. A pull request runs it only when it touches src/core/subagent/,
+# src/core/session/, src/core/agent/worker_runtime.zig,
+# src/core/agent/runtime/parallel_execution.zig, those models, their drivers
+# in tests/tla/drivers/subagent/ and tests/tla/drivers/session/write.test.ts,
+# the shared code in tests/tla/lib/ and tests/tla/drivers/lib/, or the
+# helpers the drivers load: tests/e2e/tmux-helpers.ts and
+# tests/evals/eval-helpers.ts.
+#
+# All four run when the change touches build.zig, build.zig.zon,
 # .github/workflows/ci.yml, or this script. A change to shared code the checks
 # also run, such as the agent loop, is checked by the run on main. Set
 # CI_NEED_REQUESTED to a reason to force every check.
 #
-# Writes libfx, mcp, and transcript_window, each true or false, to
+# Writes libfx, mcp, transcript_window, and subagent, each true or false, to
 # $GITHUB_OUTPUT and the reasons to $GITHUB_STEP_SUMMARY when those files are
 # set. Exits non-zero when either revision cannot be read, so the checks fail
 # instead of passing without having looked at the change.
@@ -48,9 +59,11 @@ head="$2"
 libfx=false
 mcp=false
 transcript_window=false
+subagent=false
 libfx_reasons=()
 mcp_reasons=()
 transcript_window_reasons=()
+subagent_reasons=()
 
 require_libfx() {
   libfx=true
@@ -67,10 +80,16 @@ require_transcript_window() {
   transcript_window_reasons+=("$1")
 }
 
+require_subagent() {
+  subagent=true
+  subagent_reasons+=("$1")
+}
+
 require_all() {
   require_libfx "$1"
   require_mcp "$1"
   require_transcript_window "$1"
+  require_subagent "$1"
 }
 
 for revision in "$base" "$head"; do
@@ -106,7 +125,10 @@ while IFS= read -r path; do
       require_mcp "$path: MCP driver changed" ;;
     tests/tla/drivers/lib/*)
       require_mcp "$path: shared driver code changed"
-      require_transcript_window "$path: shared driver code changed" ;;
+      require_transcript_window "$path: shared driver code changed"
+      require_subagent "$path: shared driver code changed" ;;
+    tests/tla/drivers/subagent/* | tests/tla/drivers/session/write.test.ts)
+      require_subagent "$path: subagent or session-write driver changed" ;;
     tests/tla/drivers/transcript_window/*)
       require_transcript_window "$path: transcript window driver changed" ;;
     tests/tla/drivers/graph.mjs)
@@ -129,7 +151,16 @@ while IFS= read -r path; do
       require_transcript_window "$path: transcript window code changed" ;;
     tests/tla/transcript_window/*)
       require_transcript_window "$path: transcript window model changed" ;;
-    tests/e2e/fixtures/mcp-* | tests/e2e/tmux-helpers.ts | tests/evals/eval-helpers.ts | tests/e2e/render-lab/tape.ts)
+    src/core/subagent/* | src/core/session/* | src/core/agent/worker_runtime.zig | src/core/agent/runtime/parallel_execution.zig)
+      require_subagent "$path: subagent or session-write code changed" ;;
+    tests/tla/subagent/* | tests/tla/session/SessionWrite* | tests/tla/session/session-write*)
+      require_subagent "$path: subagent or session-write model changed" ;;
+    tests/tla/lib/*)
+      require_subagent "$path: shared model-check code changed" ;;
+    tests/e2e/tmux-helpers.ts | tests/evals/eval-helpers.ts)
+      require_mcp "$path: a file the MCP drivers load changed"
+      require_subagent "$path: a file the subagent drivers load changed" ;;
+    tests/e2e/fixtures/mcp-* | tests/e2e/render-lab/tape.ts)
       require_mcp "$path: a file the MCP drivers load changed" ;;
   esac
 done <<<"$changed_files"
@@ -162,11 +193,13 @@ report() {
 report libfx "$libfx" ${libfx_reasons[@]+"${libfx_reasons[@]}"}
 report MCP "$mcp" ${mcp_reasons[@]+"${mcp_reasons[@]}"}
 report "transcript window" "$transcript_window" ${transcript_window_reasons[@]+"${transcript_window_reasons[@]}"}
+report "subagent and session-write" "$subagent" ${subagent_reasons[@]+"${subagent_reasons[@]}"}
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   {
     printf 'libfx=%s\n' "$libfx"
     printf 'mcp=%s\n' "$mcp"
     printf 'transcript_window=%s\n' "$transcript_window"
+    printf 'subagent=%s\n' "$subagent"
   } >>"$GITHUB_OUTPUT"
 fi
