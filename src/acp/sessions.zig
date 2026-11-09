@@ -1006,7 +1006,14 @@ fn appendProfileMcpConfigsIfRequested(
     };
     const config_path = try builtin_mcp.configPathFromHome(alloc, home);
     defer alloc.free(config_path);
-    var profile = builtin_mcp.loadConfigFromPath(alloc, config_path) catch |err| {
+    // An entry fx can't read is left out and the rest load, as in the CLI
+    // and TUI (`tests/tla/mcp_config/ProfileLoad.tla` OneBadEntrySkipsOnlyItself).
+    var skipped: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty;
+    defer {
+        for (skipped.items) |*diagnostic| diagnostic.deinit(alloc);
+        skipped.deinit(alloc);
+    }
+    var profile = builtin_mcp.loadConfigFromPath(alloc, config_path, &skipped) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("mcp", "ACP profile MCP servers unavailable err={s}", .{@errorName(err)});
         return;
@@ -1014,6 +1021,21 @@ fn appendProfileMcpConfigsIfRequested(
     defer {
         for (profile.items) |*config| config.deinit(alloc);
         profile.deinit(alloc);
+    }
+    for (skipped.items) |diagnostic| {
+        var name_buf: [256]u8 = undefined;
+        debug_trace.logf(
+            "mcp",
+            "ACP profile MCP config skipped cause={s} server={s} problem={s}",
+            .{
+                @tagName(diagnostic.cause),
+                if (diagnostic.server_name) |name|
+                    debug_trace.terminalPreview(name_buf[0..], name)
+                else
+                    "none",
+                if (diagnostic.problem) |problem| @tagName(problem) else "none",
+            },
+        );
     }
     debug_trace.logf("mcp", "ACP profile MCP servers requested count={d}", .{profile.items.len});
     try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &profile);

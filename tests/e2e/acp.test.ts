@@ -3905,6 +3905,76 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP skips one bad profile MCP entry and keeps the others",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-profile-mcp-skip-");
+      const goodPid = join(root.root, "good.pid");
+      const tracePath = join(root.root, "trace.log");
+      // Plain http to a host that isn't loopback is refused, so `bad` can't
+      // be read; `good` is a stdio server that can.
+      writeFileSync(
+        join(root.home, ".fx", "mcp.json"),
+        JSON.stringify({
+          mcp: {
+            bad: { type: "http", url: "http://example.com/mcp" },
+            good: {
+              type: "local",
+              command: [process.execPath, MCP_STDIO_FIXTURE],
+              environment: {
+                FX_MCP_PID_PATH: goodPid,
+                FX_MCP_RESULT_TEXT: "GOOD_PROFILE_RESULT",
+              },
+            },
+          },
+        }),
+      );
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("good_call", "mcp_good_echo", { text: "from good" }),
+        finalText("good tool used"),
+      ]);
+      const promptOf = (index: number) => acpGatewayRequest(gateway.requests[index]!.body).prompt
+        .map((message) => acpContentText(message.content))
+        .join("\n");
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "mcp",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        client.setPermissionOption("allow_once");
+        const opted = await client.request("session/new", {
+          cwd: root.workspace,
+          mcpServers: [],
+          _meta: { fx: { profileMcpServers: true } },
+        }, 2) as any;
+        expect(opted.error).toBeUndefined();
+        await client.readLine();
+        const prompt = await runPrompt(client, "Use the good echo tool.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(2);
+        expect(promptOf(0)).toContain('<server name="good"');
+        expect(promptOf(0)).not.toContain('<server name="bad"');
+        expect(acpToolResultText(gateway.requests[1]!.body, "good_call")).toContain("GOOD_PROFILE_RESULT");
+        expect(existsSync(goodPid)).toBe(true);
+        // The skipped entry is logged by name, and the file as a whole isn't.
+        const trace = readFileSync(tracePath, "utf8");
+        expect(trace).toContain("ACP profile MCP config skipped cause=invalid_entry server=bad problem=url");
+        expect(trace).not.toContain("ACP profile MCP servers unavailable");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
+  test(
     "ACP runs approved project MCP servers in the session workspace",
     async () => {
       const root = createIsolatedRoot("fx-acp-session-cwd-mcp-");

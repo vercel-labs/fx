@@ -222,6 +222,36 @@ describe("fx mcp", () => {
     expect(empty.stdout).toBe("No MCP servers configured. Add one with: fx mcp add NAME URL\n");
   });
 
+  test("list keeps a plain http loopback server with no port, and still skips plain http to other hosts", async () => {
+    // The profile from issue #1218, plus two servers fx must still refuse.
+    const root = createRoot({
+      mcp: {
+        "remote-server": { type: "http", url: "https://mcp.example.invalid/mcp" },
+        "local-server": { type: "http", url: "http://localhost/mcp" },
+        far: { type: "http", url: "http://example.com/mcp" },
+        farport: { type: "http", url: "http://example.com:8080/mcp" },
+      },
+    });
+    const text = await mcp(root, "list");
+    expect(text.code).toBe(0);
+    expect(text.stdout).toBe(
+      [
+        "NAME           SOURCE          TRANSPORT  STATUS",
+        "remote-server  ~/.fx/mcp.json  http       not started",
+        "local-server   ~/.fx/mcp.json  http       not started",
+        "",
+      ].join("\n"),
+    );
+    expect(text.stderr).toBe(
+      "note: ~/.fx/mcp.json server 'far' was skipped: its \"url\" isn't valid.\n" +
+        "note: ~/.fx/mcp.json server 'farport' was skipped: its \"url\" isn't valid.\n",
+    );
+    const json = await mcp(root, "list", "--json");
+    expect(json.code).toBe(0);
+    const local = JSON.parse(json.stdout).servers.find((s: { name: string }) => s.name === "local-server");
+    expect(local).toMatchObject({ source: "profile", transport: "http", status: "not_started", error: null });
+  });
+
   test("show connects to a server and lists its tools; a broken one exits 1", async () => {
     const root = createRoot({ mcpServers: { fixture: fixtureServer(), broken: { command: "fx-mcp-verbs-missing-binary" } } });
     const text = await mcp(root, "show", "fixture");

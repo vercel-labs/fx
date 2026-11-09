@@ -167,7 +167,7 @@ pub fn parseErrorMessage(err: ParseError) []const u8 {
         error.MissingEnv => "Each stdio MCP server requires env",
         error.InvalidEnv => "MCP server env must be an array of name/value string entries",
         error.MissingUrl => "Each HTTP MCP server requires url",
-        error.InvalidUrl => "MCP server url must be a valid HTTPS or explicit loopback HTTP endpoint",
+        error.InvalidUrl => "MCP server url must be a valid HTTPS or loopback HTTP endpoint",
         error.MissingHeaders => "Each HTTP MCP server requires headers",
         error.InvalidHeaders => "MCP server headers must be valid unique name/value string entries",
         error.InvalidTransport => "Unsupported MCP server transport",
@@ -291,7 +291,7 @@ fn parseRemoteServerInto(
 ) ParseError!void {
     const url_value = object.get("url") orelse return error.MissingUrl;
     if (url_value != .string or url_value.string.len == 0) return error.InvalidUrl;
-    http_config.validateEndpoint(url_value.string) catch return error.InvalidUrl;
+    http_config.validateServerUrl(url_value.string) catch return error.InvalidUrl;
 
     const headers_value = object.get("headers") orelse return error.MissingHeaders;
     const headers = try parseHttpHeaders(alloc, headers_value);
@@ -524,6 +524,22 @@ test "ACP MCP servers with one name are named in the refusal" {
     const message = (try duplicateNameMessage(alloc, &repeated)).?;
     defer alloc.free(message);
     try std.testing.expectEqualStrings("MCP server names must be unique: two appears more than once", message);
+}
+
+test "ACP MCP parser takes a plain HTTP loopback server with no port" {
+    const alloc = std.testing.allocator;
+    var configs = try parse(
+        alloc,
+        "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"local\",\"url\":\"http://localhost/mcp\",\"headers\":[]}]}",
+    );
+    defer configs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), configs.items.items.len);
+    try std.testing.expectEqualStrings("http://localhost/mcp", try configs.items.items[0].remoteUrl());
+
+    try std.testing.expectError(
+        error.InvalidUrl,
+        parse(alloc, "{\"mcpServers\":[{\"type\":\"http\",\"name\":\"far\",\"url\":\"http://example.test/mcp\",\"headers\":[]}]}"),
+    );
 }
 
 test "ACP MCP parser rejects invalid remote transports" {

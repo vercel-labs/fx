@@ -1652,6 +1652,8 @@ test "utf8PrefixByBytes keeps complete codepoints" {
     try std.testing.expectEqualStrings("ab", utf8PrefixByBytes(text, 3));
     try std.testing.expectEqualStrings("ab\xc3\xa9", utf8PrefixByBytes(text, 4));
     try std.testing.expectEqualStrings(text, utf8PrefixByBytes(text, text.len));
+    // A limit inside the first character leaves nothing.
+    try std.testing.expectEqualStrings("", utf8PrefixByBytes("\xc3\xa9", 1));
 }
 
 test "normalizeLineEndingsInPlace compacts crlf and normalizes lone cr" {
