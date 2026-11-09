@@ -11,11 +11,14 @@
 //! Version: 17.0; SHA-256: 12cc8267dc33cbd11ed32bcf6fc5dc2ad9c7a77bae1bdfba2f41b1b9b3ead8dd
 //! https://www.unicode.org/Public/emoji/latest/emoji-zwj-sequences.txt
 //! Version: 17.0; SHA-256: 5b25441daed2322b068c5e70cda522946a4f0274df864445a1965a92e5fc5cad
+//! https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt
+//! SHA-256: d62e5bab70ca74f099343f71224fa051cb1fdd61a1ab45c0488c44cfc0b6102e
 //!
 //! Selected properties: East_Asian_Width W/F, Emoji_Presentation,
 //! Emoji_Modifier, text/emoji variation bases, Emoji_Keycap_Sequence,
 //! RGI_Emoji_Flag_Sequence, RGI_Emoji_Tag_Sequence,
-//! RGI_Emoji_Modifier_Sequence, and RGI_Emoji_ZWJ_Sequence.
+//! RGI_Emoji_Modifier_Sequence, RGI_Emoji_ZWJ_Sequence, and the Thai block's
+//! General_Category Mn (from DerivedGeneralCategory.txt alone).
 //!
 //! Unicode data is used under https://www.unicode.org/license.txt.
 //! This module contains immutable lookup data only; display policy lives

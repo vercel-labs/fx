@@ -5,15 +5,22 @@
 # src/ui/footer/input_presentation.zig, and src/core/terminal/engine.zig) with
 # TLC and require each config's expected verdict.
 #
-# display-width.cfg is the change and must pass. display-width-today.cfg is fx
-# before it, which measured every Thai nonspacing mark as one cell
-# (CursorAligned). display-width-today-margin.cfg is fx before it at the right
-# margin, whose composer rows dropped the zero-width units after a full row
-# (MarksShown). Each planted mutation must be caught by the rule it names:
+# display-width.cfg is the change and must pass, and so must the change in a
+# window with no content cells (display-width-no-cells.cfg, two columns or
+# narrower) and with one (display-width-one-cell.cfg, three columns).
+# display-width-today.cfg is fx before it, which measured every Thai
+# nonspacing mark as one cell (CursorAligned). display-width-today-margin.cfg
+# is fx before it at the right margin, whose composer rows dropped the
+# zero-width units after a full row (MarksShown).
+# Each planted mutation must be caught by the rule it names:
 #
 #   sara-am          U+0E33 SARA AM measured as a mark                 RowAligned
 #   split-cluster    nextCharacterEnd stops after one unit             StopsAtCells
 #   wide-only-guard  only two-cell characters get the margin guard     MarksShown
+#   no-cells-keeps   a row with no content cells puts the marks of     MarksShown
+#                    undrawn characters on the prefix cell
+#   bare-marks       a row with no content cells keeps its leading     MarksShown
+#                    marks
 #
 # display-width-witness.cfg must reach a base with two stacked marks, the
 # cursor after them, and more text to their right (NoStackedCluster), so the
@@ -35,10 +42,14 @@ cd "$(dirname "$0")"
 
 tlc_verdicts "$@" <<'VERDICTS'
 DisplayWidth display-width -
+DisplayWidth display-width-no-cells -
+DisplayWidth display-width-one-cell -
 DisplayWidth display-width-today CursorAligned
 DisplayWidth display-width-today-margin MarksShown
+DisplayWidth display-width-no-cells-keeps MarksShown
 DisplayWidth display-width-mutation-sara-am RowAligned
 DisplayWidth display-width-mutation-split-cluster StopsAtCells
 DisplayWidth display-width-mutation-wide-only-guard MarksShown
+DisplayWidth display-width-mutation-bare-marks MarksShown
 DisplayWidth display-width-witness NoStackedCluster
 VERDICTS

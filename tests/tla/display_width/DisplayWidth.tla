@@ -27,20 +27,36 @@
 (*                    that ran U+0E31-U+0E3A would                         *)
 (*   "split-cluster"  planted bug: nextCharacterEnd stops after one unit   *)
 (*                                                                         *)
-(* The composer wraps its text into rows of Cols cells. Two steps decide   *)
+(* The composer wraps its text into rows of Cols cells, the cells after    *)
+(* its two-cell prefix: Cols is 0 in a window two columns wide or          *)
+(* narrower, where a row has no content cells. A unit is drawn only when   *)
+(* a row has the cells for it, and a mark only with its base, so a row     *)
+(* with no content cells draws nothing, no mark included. Two steps decide *)
 (* whether the marks on a character whose cell ends at the right margin    *)
 (* reach the screen: the row builder must keep them on the full row        *)
 (* (src/ui/footer/input_presentation.zig appendLayoutUnit), and, because   *)
 (* fx paints with autowrap off, the painter must turn autowrap on while it *)
 (* writes them, or the terminal puts them on another cell                  *)
-(* (src/core/terminal/engine.zig diffBand). Margin picks the behavior:     *)
+(* (src/core/terminal/engine.zig diffBand). The row builder also tracks    *)
+(* whether the last unit with cells went undrawn                           *)
+(* (omitted_positive_unit), and drops the marks after it. Margin picks the *)
+(* behavior:                                                               *)
 (*   "fixed"            the change: both steps, for one-cell and two-cell *)
-(*                      characters                                         *)
+(*                      characters, and a row with no content cells starts *)
+(*                      with the flag set                                  *)
 (*   "row-drops"        fx before it: the row builder dropped every        *)
 (*                      zero-width unit after a full row, so the marks on  *)
-(*                      any character in the last column vanished          *)
+(*                      any character in the last column vanished; a row   *)
+(*                      with no content cells drew nothing                 *)
 (*   "wide-only-guard"  planted bug: the row keeps the marks but only      *)
 (*                      two-cell characters get the painter's guard        *)
+(*   "cell-less-keeps"  planted bug: the row builder returns before it     *)
+(*                      sets the flag for a unit it cannot draw, so on a   *)
+(*                      row with no content cells the marks of every       *)
+(*                      undrawn character land on the prefix cell          *)
+(*   "bare-marks"       planted bug: only the early return sets the flag,  *)
+(*                      so a row with no content cells still draws the     *)
+(*                      marks that come before its first unit              *)
 (***************************************************************************)
 EXTENDS Integers, Sequences
 
@@ -95,24 +111,55 @@ Stops(t) == StopsFrom(t, 0)
 
 \* What the terminal shows of t on the cells fx meant. fx lays the units out
 \* in rows of Cols cells: a unit that does not fit starts the next row, and a
-\* zero-width unit stays on its base's row. A zero-width unit is lost from
-\* its base when that base ends at the right margin and one of the two steps
-\* above fails for it. `used` counts the cells of the current row, and `base`
-\* is the width of the last unit with cells on it (0 before any).
+\* zero-width unit stays on its base's row. A unit with cells is drawn only
+\* when it fits a row, which no unit does when Cols is 0. A zero-width unit
+\* is lost from its base when that base ends at the right margin and one of
+\* the two steps above fails for it, or when the last unit with cells went
+\* undrawn: `undrawn` is the row builder's omitted_positive_unit. `used`
+\* counts the cells of the current row, and `base` is the width of the last
+\* unit with cells on it (0 before any).
 LostAtMargin(w) ==
     \/ Margin = "row-drops"
     \/ Margin = "wide-only-guard" /\ w # 2
 
-RECURSIVE ShownFrom(_, _, _, _)
-ShownFrom(t, i, used, base) ==
+\* A unit of width w is drawn when a row has the cells for it.
+Drawn(w) == w <= Cols
+
+\* The flag when a row starts. A row with no content cells starts with it
+\* set, so the marks of the units it cannot draw are dropped.
+RowStartUndrawn == Cols = 0 /\ Margin \notin {"cell-less-keeps", "bare-marks"}
+
+\* The flag after a unit with cells. In the "cell-less-keeps" bug the row
+\* builder returns before it sets the flag on a row with no content cells.
+AfterCells(undrawn, w) ==
+    IF Cols = 0 /\ Margin = "cell-less-keeps" THEN undrawn ELSE ~Drawn(w)
+
+RECURSIVE ShownFrom(_, _, _, _, _)
+ShownFrom(t, i, used, base, undrawn) ==
     IF i > Len(t) THEN <<>>
     ELSE IF FxWidth(t[i]) = 0
-    THEN (IF base > 0 /\ used = Cols /\ LostAtMargin(base) THEN <<>> ELSE <<t[i]>>)
-         \o ShownFrom(t, i + 1, used, base)
-    ELSE LET start == IF used + FxWidth(t[i]) > Cols THEN 0 ELSE used
-         IN <<t[i]>> \o ShownFrom(t, i + 1, start + FxWidth(t[i]), FxWidth(t[i]))
+    THEN (IF undrawn \/ (base > 0 /\ used = Cols /\ LostAtMargin(base)) THEN <<>> ELSE <<t[i]>>)
+         \o ShownFrom(t, i + 1, used, base, undrawn)
+    ELSE LET w == FxWidth(t[i])
+             start == IF used + w > Cols THEN 0 ELSE used
+         IN (IF Drawn(w) THEN <<t[i]>> ELSE <<>>)
+            \o ShownFrom(t, i + 1, start + w, w, AfterCells(undrawn, w))
 
-Shown(t) == ShownFrom(t, 1, 0, 0)
+Shown(t) == ShownFrom(t, 1, 0, 0, RowStartUndrawn)
+
+\* What the terminal must show of t: a unit with cells when a row has the
+\* cells for it, a mark when its base is drawn, and a mark with no base only
+\* on a row that has content cells. `ok` is whether the last unit with cells
+\* is drawn.
+RECURSIVE WantedFrom(_, _, _)
+WantedFrom(t, i, ok) ==
+    IF i > Len(t) THEN <<>>
+    ELSE IF FxWidth(t[i]) = 0
+    THEN (IF ok THEN <<t[i]>> ELSE <<>>) \o WantedFrom(t, i + 1, ok)
+    ELSE (IF Drawn(FxWidth(t[i])) THEN <<t[i]>> ELSE <<>>)
+         \o WantedFrom(t, i + 1, Drawn(FxWidth(t[i])))
+
+Wanted(t) == WantedFrom(t, 1, Cols > 0)
 
 Insert(t, i, c) == SubSeq(t, 1, i) \o <<c>> \o SubSeq(t, i + 1, Len(t))
 Remove(t, a, b) == SubSeq(t, 1, a) \o SubSeq(t, b + 1, Len(t))
@@ -160,8 +207,9 @@ RowAligned == FxCol(text, Len(text)) = TermCol(text, Len(text))
 \* terminal drew on it.
 StopsAtCells == \A s \in Stops(text) : s = 0 \/ s = Len(text) \/ TermWidth(text[s + 1]) > 0
 
-\* The terminal shows every mark the text holds, the last column included.
-MarksShown == Shown(text) = text
+\* The terminal shows what it should: every mark whose base is drawn, the last
+\* column included, and none on a row that has no content cells.
+MarksShown == Shown(text) = Wanted(text)
 
 \* Witness: a base with two stacked marks, the cursor right after them, and
 \* more text to their right. The passing config reaches this state.

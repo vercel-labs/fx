@@ -1284,6 +1284,70 @@ fn expectFrameCellForeground(frame: *const footer_viewport.ComposedFooterFrame, 
     return error.TestUnexpectedResult;
 }
 
+/// The footer frame for `draft` typed into the composer of a window `cols`
+/// wide, and the screen row of the composer's first row.
+const DraftFrame = struct {
+    frame: footer_viewport.ComposedFooterFrame,
+    input_row: u16,
+
+    fn deinit(self: *DraftFrame, alloc: Allocator) void {
+        self.frame.deinit(alloc);
+    }
+};
+
+fn composeDraftFrame(alloc: Allocator, draft: []const u8, cols: u16) !DraftFrame {
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    try input.textReplacementState().replace(alloc, draft);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 18,
+            .cols = cols,
+            .content_bottom = 12,
+            .divider_top_row = 13,
+            .input_row = 14,
+            .divider_bottom_row = 15,
+            .hint_row = 16,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 8,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    const ctx = testContext(&input);
+    const geometry = input_presentation.measureRawInputGeometry(
+        ctx,
+        shell.layout.cols,
+        shell.layout.content_bottom,
+        true,
+        false,
+        false,
+        false,
+    );
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = geometry.input_extra,
+        .input_visible = true,
+        .composer_top_chrome_rows = composerTopChromeRows(),
+        .picker_rows = 0,
+        .banner_active = false,
+        .input_summary = geometry.summary,
+        .input_window = geometry.window,
+        .total_lines = geometry.total_lines,
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    return .{
+        .frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint),
+        .input_row = frame_plan.paint.footer.input_base,
+    };
+}
+
 test "transcript viewer footer is its keys alone on one row" {
     const alloc = std.testing.allocator;
     var input = InputRuntime{};
@@ -1500,63 +1564,16 @@ test "composer cursor follows Thai clusters on the VT grid" {
     };
 
     for (cases) |case| {
-        var input = InputRuntime{};
-        defer input.deinit(alloc);
-        try input.textReplacementState().replace(alloc, case.text);
+        var draft = try composeDraftFrame(alloc, case.text, 40);
+        defer draft.deinit(alloc);
 
-        var shell = TranscriptRuntime{
-            .layout = .{
-                .rows = 18,
-                .cols = 40,
-                .content_bottom = 12,
-                .divider_top_row = 13,
-                .input_row = 14,
-                .divider_bottom_row = 15,
-                .hint_row = 16,
-            },
-            .owned_top_row = 1,
-            .viewport_top_row = 1,
-            .cursor_row = 8,
-            .cursor_col = 1,
-        };
-        defer shell.deinit(alloc);
+        try std.testing.expectEqual(draft.input_row, draft.frame.cursor.row);
+        try std.testing.expectEqual(case.cursor_col, draft.frame.cursor.col);
 
-        const ctx = testContext(&input);
-        const geometry = input_presentation.measureRawInputGeometry(
-            ctx,
-            shell.layout.cols,
-            shell.layout.content_bottom,
-            true,
-            false,
-            false,
-            false,
-        );
-        const planner_input: FooterPlannerInput = .{
-            .active_label = null,
-            .ctx = ctx,
-            .place_mid_line_active = false,
-            .input_extra = geometry.input_extra,
-            .input_visible = true,
-            .composer_top_chrome_rows = composerTopChromeRows(),
-            .picker_rows = 0,
-            .banner_active = false,
-            .input_summary = geometry.summary,
-            .input_window = geometry.window,
-            .total_lines = geometry.total_lines,
-        };
-
-        const frame_plan = planFooterPaint(&shell, planner_input);
-        var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
-        defer frame.deinit(alloc);
-
-        const input_row = frame_plan.paint.footer.input_base;
-        try std.testing.expectEqual(input_row, frame.cursor.row);
-        try std.testing.expectEqual(case.cursor_col, frame.cursor.col);
-
-        var grid = try vt_emulator.Grid.init(alloc, shell.layout.cols, 1);
+        var grid = try vt_emulator.Grid.init(alloc, 40, 1);
         defer grid.deinit();
-        for (frame.rows.items) |row| {
-            if (row.row == input_row) try grid.feed(row.text.items);
+        for (draft.frame.rows.items) |row| {
+            if (row.row == draft.input_row) try grid.feed(row.text.items);
         }
         for (case.cells, 0..) |codepoint, index| {
             const cell = grid.cellAt(1, @intCast(3 + index)) orelse return error.TestUnexpectedResult;
@@ -1576,74 +1593,120 @@ test "composer keeps the marks of a Thai cluster in the last column" {
     // on the next row.
     const fill: [37]u8 = @splat('a');
     const text = fill ++ "\u{0E01}\u{0E31}\u{0E49}\u{0E07}".*;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.textReplacementState().replace(alloc, &text);
-
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 18,
-            .cols = 40,
-            .content_bottom = 12,
-            .divider_top_row = 13,
-            .input_row = 14,
-            .divider_bottom_row = 15,
-            .hint_row = 16,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 8,
-        .cursor_col = 1,
-    };
-    defer shell.deinit(alloc);
-
-    const ctx = testContext(&input);
-    const geometry = input_presentation.measureRawInputGeometry(
-        ctx,
-        shell.layout.cols,
-        shell.layout.content_bottom,
-        true,
-        false,
-        false,
-        false,
-    );
-    const planner_input: FooterPlannerInput = .{
-        .active_label = null,
-        .ctx = ctx,
-        .place_mid_line_active = false,
-        .input_extra = geometry.input_extra,
-        .input_visible = true,
-        .composer_top_chrome_rows = composerTopChromeRows(),
-        .picker_rows = 0,
-        .banner_active = false,
-        .input_summary = geometry.summary,
-        .input_window = geometry.window,
-        .total_lines = geometry.total_lines,
-    };
-
-    const frame_plan = planFooterPaint(&shell, planner_input);
-    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
-    defer frame.deinit(alloc);
+    var draft = try composeDraftFrame(alloc, &text, 40);
+    defer draft.deinit(alloc);
 
     // The cursor sits after ง on the second row; the full row is above it.
-    try std.testing.expectEqual(frame_plan.paint.footer.input_base, frame.cursor.row);
-    try std.testing.expectEqual(@as(u16, 4), frame.cursor.col);
-    const full_row = frame.cursor.row - 1;
-    var grid = try vt_emulator.Grid.init(alloc, shell.layout.cols, 1);
+    try std.testing.expectEqual(draft.input_row, draft.frame.cursor.row);
+    try std.testing.expectEqual(@as(u16, 4), draft.frame.cursor.col);
+    const full_row = draft.frame.cursor.row - 1;
+    var grid = try vt_emulator.Grid.init(alloc, 40, 1);
     defer grid.deinit();
     var fed = false;
-    for (frame.rows.items) |row| {
+    for (draft.frame.rows.items) |row| {
         if (row.row != full_row) continue;
         try grid.feed(row.text.items);
         fed = true;
     }
     try std.testing.expect(fed);
-    const before = grid.cellAt(1, shell.layout.cols - 1) orelse return error.TestUnexpectedResult;
+    const before = grid.cellAt(1, 39) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u21, 'a'), before.codepoint);
     try std.testing.expectEqual(@as(u32, 0), before.combining_suffix_id);
-    const last = grid.cellAt(1, shell.layout.cols) orelse return error.TestUnexpectedResult;
+    const last = grid.cellAt(1, 40) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u21, 0x0E01), last.codepoint);
     try std.testing.expectEqualStrings("\u{0E31}\u{0E49}", grid.combiningSuffix(last.combining_suffix_id) orelse "");
+}
+
+/// The VT grid that screen row `screen_row` of `drawn` paints, `cols` cells
+/// wide. The frame's `input_row` is the composer's last row, the cursor's.
+fn paintedRowGrid(alloc: Allocator, drawn: *const DraftFrame, screen_row: u16, cols: u16) !vt_emulator.Grid {
+    var grid = try vt_emulator.Grid.init(alloc, cols, 1);
+    errdefer grid.deinit();
+    var fed = false;
+    for (drawn.frame.rows.items) |row| {
+        if (row.row != screen_row) continue;
+        try grid.feed(row.text.items);
+        fed = true;
+    }
+    if (!fed) return error.TestUnexpectedResult;
+    return grid;
+}
+
+/// Paints `draft` in a window `cols` wide and requires the composer's first
+/// row to hold the bar and nothing else: no character and no combining mark.
+fn expectBarAlone(alloc: Allocator, draft: []const u8, cols: u16) !void {
+    var drawn = try composeDraftFrame(alloc, draft, cols);
+    defer drawn.deinit(alloc);
+    var grid = try paintedRowGrid(alloc, &drawn, drawn.input_row, cols);
+    defer grid.deinit();
+
+    try std.testing.expectEqual(@as(u21, 0x2503), (grid.cellAt(1, 1) orelse return error.TestUnexpectedResult).codepoint);
+    var col: u16 = 1;
+    while (col <= cols) : (col += 1) {
+        const cell = grid.cellAt(1, col) orelse return error.TestUnexpectedResult;
+        if (col > 1) try std.testing.expectEqual(@as(u21, ' '), cell.codepoint);
+        try std.testing.expectEqual(@as(u32, 0), cell.combining_suffix_id);
+    }
+}
+
+test "composer in a window with no content cells draws the bar alone" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    // "┃ " takes two cells, so in a window two columns wide or narrower a row
+    // has no cell for a character, and the marks of the characters it cannot
+    // draw must not pile up on the prefix.
+    var twelve: std.ArrayList(u8) = .empty;
+    defer twelve.deinit(alloc);
+    for (0..12) |_| try twelve.appendSlice(alloc, "\u{0E01}\u{0E31}\u{0E49}");
+    const drafts = [_][]const u8{
+        "\u{0E01}\u{0E31}\u{0E49}\u{0E07}\u{0E19}\u{0E49}\u{0E33}",
+        // Marks with no base come before the first character.
+        "\u{0E31}\u{0E49}\u{0E01}\u{0E31}",
+        "e\u{0301}a\u{0300}",
+        "\u{754C}\u{0301}",
+        // A space hangs past the margin and has no cell either.
+        "a \u{0301}b",
+        twelve.items,
+    };
+    for ([_]u16{ 1, 2 }) |cols| {
+        for (drafts) |draft| try expectBarAlone(alloc, draft, cols);
+    }
+}
+
+test "composer with one content cell keeps the marks of the character it draws" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    // Three columns leave one cell after "┃ ": กั้ takes it and ง wraps to the
+    // next row; 界 needs two cells, is not drawn, and takes its accent with it.
+    const Cell = struct { codepoint: u21, marks: []const u8 };
+    const Case = struct { text: []const u8, rows: []const Cell };
+    const cases = [_]Case{
+        .{
+            .text = "\u{0E01}\u{0E31}\u{0E49}\u{0E07}",
+            .rows = &.{ .{ .codepoint = 0x0E01, .marks = "\u{0E31}\u{0E49}" }, .{ .codepoint = 0x0E07, .marks = "" } },
+        },
+        .{
+            .text = "\u{754C}\u{0301}\u{0E01}",
+            .rows = &.{ .{ .codepoint = ' ', .marks = "" }, .{ .codepoint = 0x0E01, .marks = "" } },
+        },
+    };
+    for (cases) |case| {
+        var drawn = try composeDraftFrame(alloc, case.text, 3);
+        defer drawn.deinit(alloc);
+        const first_row = drawn.input_row - @as(u16, @intCast(case.rows.len - 1));
+        for (case.rows, 0..) |expected, index| {
+            var grid = try paintedRowGrid(alloc, &drawn, first_row + @as(u16, @intCast(index)), 3);
+            defer grid.deinit();
+            const cell = grid.cellAt(1, 3) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(expected.codepoint, cell.codepoint);
+            const marks = if (cell.combining_suffix_id == 0) "" else grid.combiningSuffix(cell.combining_suffix_id) orelse "";
+            try std.testing.expectEqualStrings(expected.marks, marks);
+        }
+    }
 }
 
 test "steering banner keeps two clean lines and a composer gap in both delivery modes" {

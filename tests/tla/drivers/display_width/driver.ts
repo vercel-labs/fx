@@ -15,9 +15,20 @@
 // a wide character, and marks on a Thai, Latin, and wide character in the
 // last column of a row. Seeded random walks follow.
 //
+// A second session is two columns wide, where the composer row has no content
+// cells (Cols 0 in the model). Its walks type the same kinds of text, among
+// them 12 Thai clusters, 72 bytes of text and 24 marks, which is past the 64
+// bytes a terminal cell holds. The row must stay the bar alone and fx must
+// stay alive, and TLC checks that against the model with Cols 0. fx clamps the
+// cursor to the window's last column there, so no cursor column is compared.
+// --narrow N sets the number of seeded random walks in that session, and
+// --only W runs just the pane W columns wide (60 or 2).
+//
 // TLC replays the walks through the model's own actions under Rule "fixed".
-// --self-check also replays them under Rule "today", fx before the change,
-// which must reject them.
+// --self-check also replays them under Rule "today", fx before the Thai
+// change, which must reject the 60-column walks, and the 2-column walks under
+// Margin "cell-less-keeps", a row builder that puts the marks of undrawn
+// characters on the prefix cell, which must reject them too.
 //
 // fx runs with FX_SOUND=0, FX_DISABLE_KEYCHAIN=1, a temporary HOME and
 // FX_HOME, a fake key, and a local fake gateway. The driver fails if fx sends
@@ -26,10 +37,12 @@
 // Usage (from the repository root, after zig build):
 //   bun tests/tla/drivers/display_width/driver.ts
 //   bun tests/tla/drivers/display_width/driver.ts --self-check --random 30 --seed 7
+//   bun tests/tla/drivers/display_width/driver.ts --self-check --only 2 --narrow 30 --seed 7
 //
 // Exit codes: 0 every walk accepted (and the self-check rejected), 1 a walk
-// the model rejects, 2 a toolchain or harness failure.
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+// the model rejects or fx exiting during a walk, 2 a toolchain or harness
+// failure.
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { binary, hashFile, targetHelpers } from "../lib/context";
@@ -51,6 +64,10 @@ type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 
 const PROMPT = "┃ ";
 const PANE_WIDTH = 60;
+// Two columns leave no content cells after the prompt.
+const NARROW_WIDTH = 2;
+// The cursor column of a step when the pane has no column to compare.
+const NO_COLUMN = -1;
 // A column no cursor can have: the cursor left the composer's first row.
 const OFF_ROW = 999;
 const tlaDir = join(TLA_ROOT, "display_width");
@@ -145,6 +162,27 @@ function edgeWalks(): Array<{ id: string; sends: Send[] }> {
   return walks;
 }
 
+/// Walks for the 2-column pane, where the composer row has no content cells
+/// and draws nothing. Each walk types text the row cannot draw: Thai clusters,
+/// marks with no base, a Latin accent, a wide character, and 12 clusters, 24
+/// marks and 72 bytes, past the 64 bytes of combining text a cell holds.
+function narrowWalks(): Array<{ id: string; sends: Send[] }> {
+  return [
+    {
+      id: "narrow-thai",
+      sends: [...typed("\u0E01\u0E31\u0E49\u0E07\u0E19\u0E49\u0E33"), ...keys("left", "right", "backspace", "home", "end")],
+    },
+    // Marks with no base come before the first character on the row.
+    { id: "narrow-bare-marks", sends: [...typed("\u0E31\u0E49\u0E01\u0E31"), ...keys("home", "backspace", "end")] },
+    { id: "narrow-latin", sends: [...typed("e\u0301\u0300a"), ...keys("left", "backspace")] },
+    { id: "narrow-wide", sends: [...typed("\u754C\u0301"), ...keys("left")] },
+    {
+      id: "narrow-many-clusters",
+      sends: [...typed("\u0E01\u0E31\u0E49".repeat(12)), ...keys("left", "left", "end", "backspace")],
+    },
+  ];
+}
+
 function seededRandom(seed: number): () => number {
   let state = seed >>> 0;
   return () => {
@@ -158,7 +196,7 @@ function seededRandom(seed: number): () => number {
 
 /// Seeded random walks of 12 keys. A walk types at most 14 code points, so
 /// it stays on the composer's first row.
-function randomWalks(seed: number, count: number): Array<{ id: string; sends: Send[] }> {
+function randomWalks(seed: number, count: number, prefix = "random"): Array<{ id: string; sends: Send[] }> {
   const random = seededRandom(seed);
   const pick = <T>(items: T[]): T => items[Math.floor(random() * items.length)]!;
   const classes = Object.keys(MEMBERS) as Class[];
@@ -176,7 +214,7 @@ function randomWalks(seed: number, count: number): Array<{ id: string; sends: Se
         sends.push({ key: pick<Key>(["left", "right", "backspace", "home", "end"]) });
       }
     }
-    walks.push({ id: `random-${seed}-${index}`, sends });
+    walks.push({ id: `${prefix}-${seed}-${index}`, sends });
   }
   return walks;
 }
@@ -252,40 +290,59 @@ function composerRows(grid: string[]): number[] {
   return grid.flatMap((line, index) => (line.startsWith(PROMPT.trimEnd()) ? [index] : []));
 }
 
-async function runWalks(session: Session, walks: Array<{ id: string; sends: Send[] }>): Promise<Walk[]> {
+type Observation = { walks: Walk[]; died: { walk: string; stderr: string } | null };
+
+/// Sends each walk's keys and records what the pane shows after every key.
+/// `observeCursor` is false for a pane with no content cells, where the
+/// cursor column is not compared. When fx exits, the walks recorded so far
+/// come back with the walk it died in and what it wrote to stderr.
+async function runWalks(
+  session: Session,
+  walks: Array<{ id: string; sends: Send[] }>,
+  observeCursor: boolean,
+  stderrPath: string,
+): Promise<Observation> {
   const observed: Walk[] = [];
+  const died = (walk: string) => ({ walk, stderr: readFileSync(stderrPath, "utf8").trim() });
   for (const walk of walks) {
     const steps: Step[] = [];
-    for (const send of [{ key: "clear" as const }, ...walk.sends]) {
-      if (send.key === "clear") {
-        await session.sendKeys("End");
-        await session.sendKeys("C-u");
-      } else if (send.key === "type") {
-        await session.sendLiteralText(send.text!);
-      } else {
-        await session.sendKeys(TMUX_KEY[send.key]);
+    try {
+      for (const send of [{ key: "clear" as const }, ...walk.sends]) {
+        if (send.key === "clear") {
+          await session.sendKeys("End");
+          await session.sendKeys("C-u");
+        } else if (send.key === "type") {
+          await session.sendLiteralText(send.text!);
+        } else {
+          await session.sendKeys(TMUX_KEY[send.key]);
+        }
+        const { grid, cursor } = await settled(session);
+        const rows = composerRows(grid).map((index) => ({ index, text: grid[index]!.trimEnd() }));
+        // The cursor's column counted across rows: the cells of the rows above
+        // it, then its place in its own row.
+        const at = rows.findIndex((row) => row.index === cursor.row);
+        const col = !observeCursor
+          ? NO_COLUMN
+          : at < 0
+            ? OFF_ROW
+            : rows.slice(0, at).reduce((sum, row) => sum + rowCells(row.text), 0) + cursor.col - PROMPT.length;
+        steps.push({
+          key: send.key,
+          cls: send.cls ?? "none",
+          col,
+          row: rows.flatMap((row) => rowClasses(row.text)),
+          ...(send.text ? { codepoint: `U+${send.text.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}` } : {}),
+          row_text: rows.map((row) => row.text).join("\n"),
+        });
       }
-      const { grid, cursor } = await settled(session);
-      const rows = composerRows(grid).map((index) => ({ index, text: grid[index]!.trimEnd() }));
-      // The cursor's column counted across rows: the cells of the rows above
-      // it, then its place in its own row.
-      const at = rows.findIndex((row) => row.index === cursor.row);
-      const col = at < 0
-        ? OFF_ROW
-        : rows.slice(0, at).reduce((sum, row) => sum + rowCells(row.text), 0) + cursor.col - PROMPT.length;
-      steps.push({
-        key: send.key,
-        cls: send.cls ?? "none",
-        col,
-        row: rows.flatMap((row) => rowClasses(row.text)),
-        ...(send.text ? { codepoint: `U+${send.text.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}` } : {}),
-        row_text: rows.map((row) => row.text).join("\n"),
-      });
+    } catch (error) {
+      if (session.isAlive()) throw error;
+      return { walks: observed, died: died(walk.id) };
     }
     observed.push({ id: walk.id, steps });
-    if (!session.isAlive()) throw new Error(`fx exited during walk ${walk.id}`);
+    if (!session.isAlive()) return { walks: observed, died: died(walk.id) };
   }
-  return observed;
+  return { walks: observed, died: null };
 }
 
 function observedModule(walks: Walk[]): string {
@@ -294,6 +351,7 @@ function observedModule(walks: Walk[]): string {
   const walk = (w: Walk) => `<< ${w.steps.map(step).join(", ")} >>`;
   return [
     "------------------------ MODULE DisplayWidthObserved ------------------------",
+    "EXTENDS Integers",
     `\\* Generated by tests/tla/drivers/display_width/driver.ts from ${walks.length} walks.`,
     `Observed == << ${walks.map(walk).join(",\n  ")} >>`,
     "=============================================================================",
@@ -301,7 +359,10 @@ function observedModule(walks: Walk[]): string {
   ].join("\n");
 }
 
-async function judge(dir: string, walks: Walk[], rule: "fixed" | "today") {
+type Margin = "fixed" | "row-drops" | "cell-less-keeps";
+
+/// `cols` is the model's Cols: the cells a composer row has after its prefix.
+async function judge(dir: string, walks: Walk[], rule: "fixed" | "today", margin: Margin, cols: number) {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "DisplayWidthObserved.tla"), observedModule(walks));
   writeFileSync(join(dir, "trace.cfg"), [
@@ -309,8 +370,8 @@ async function judge(dir: string, walks: Walk[], rule: "fixed" | "today") {
     "CONSTANTS",
     `    Rule = "${rule}"`,
     "    MaxLen = 0",
-    `    Cols = ${PANE_WIDTH - PROMPT.length}`,
-    `    Margin = "${rule === "fixed" ? "fixed" : "row-drops"}"`,
+    `    Cols = ${cols}`,
+    `    Margin = "${margin}"`,
     "INVARIANT NotAllMatched",
     "",
   ].join("\n"));
@@ -327,19 +388,33 @@ async function judge(dir: string, walks: Walk[], rule: "fixed" | "today") {
 
 /// When TLC rejects the run, it judges each walk alone, so the report names
 /// the walks the model cannot produce.
-async function rejectedWalks(dir: string, walks: Walk[]): Promise<string[]> {
+async function rejectedWalks(dir: string, walks: Walk[], cols: number): Promise<string[]> {
   const rejected: string[] = [];
   for (const [index, walk] of walks.entries()) {
-    const alone = await judge(join(dir, `walk-${index + 1}`), [walk], "fixed");
+    const alone = await judge(join(dir, `walk-${index + 1}`), [walk], "fixed", "fixed", cols);
     if (alone.verdict !== "ACCEPTED") rejected.push(walk.id);
   }
   return rejected;
 }
 
+/// One pane width and the walks run in it. The model's Cols is the cells
+/// after the prompt, and the self-check names the model of the fx that must
+/// reject the walks: fx before the Thai change at 60 columns, and a row
+/// builder that puts the marks of undrawn characters on the prefix cell at 2.
+type Batch = {
+  name: string;
+  width: number;
+  walks: Array<{ id: string; sends: Send[] }>;
+  observeCursor: boolean;
+  selfCheck: { rule: "fixed" | "today"; margin: Margin };
+};
+
 async function main(): Promise<number> {
   const selfCheck = process.argv.includes("--self-check");
   const seed = option("--seed", 1);
   const randomCount = option("--random", 20);
+  const narrowCount = option("--narrow", 6);
+  const only = option("--only", 0);
   const out = outDir("display-width");
   const helpers = await targetHelpers();
   const gateway = helpers.startFakeGateway([]);
@@ -347,84 +422,122 @@ async function main(): Promise<number> {
   const fxHome = join(home, "fx");
   mkdirSync(fxHome, { recursive: true });
   writeFileSync(join(fxHome, "settings.json"), JSON.stringify({ sandbox: "none" }));
-  const stderrPath = join(out, "fx-stderr.log");
-  writeFileSync(stderrPath, "");
-  let session: Session | null = null;
-  try {
-    session = await helpers.TmuxSession.create({
-      cmd: binary,
-      env: {
-        HOME: home,
-        FX_HOME: fxHome,
-        FX_SOUND: "0",
-        FX_DISABLE_KEYCHAIN: "1",
-        FX_AUTO_UPGRADE: "0",
-        AI_GATEWAY_API_KEY: "fake-display-width-key",
-        VERCEL_OIDC_TOKEN: undefined,
-        FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_MODEL: helpers.FAKE_GATEWAY_MODEL,
-      },
+  const batches: Batch[] = [
+    {
+      name: `${PANE_WIDTH}-column`,
       width: PANE_WIDTH,
-      height: 24,
-      stderrPath,
-      isolated: true,
-    });
-    await session.waitForComposer(15_000);
-    const walks = [...edgeWalks(), ...randomWalks(seed, randomCount)];
-    const observed = await runWalks(session, walks);
-    const steps = observed.reduce((sum, walk) => sum + walk.steps.length, 0);
-    const fixed = await judge(join(out, "tlc-fixed"), observed, "fixed");
-    const today = selfCheck ? await judge(join(out, "tlc-today"), observed, "today") : null;
-    const requests = {
-      chat: gateway.requests.length,
-      title: gateway.titleRequests.length,
-      classifier: gateway.classifierRequests.length,
-      models: gateway.modelRequests.length,
-    };
-    const rejected = fixed.verdict === "REJECTED" ? await rejectedWalks(join(out, "tlc-walks"), observed) : [];
-    const report = {
-      binary,
-      binary_sha256: hashFile(binary),
-      seed,
-      walks: observed.length,
-      steps,
-      gateway_requests: requests,
-      verdict: fixed.verdict,
-      tlc_distinct_states: fixed.distinctStates,
-      tlc_ms: fixed.durationMs,
-      self_check: today ? { rule: "today", verdict: today.verdict, distinct_states: today.distinctStates } : null,
-      rejected_walks: rejected,
-      observed,
-    };
-    writeJson(join(out, "report.json"), report);
-    console.log(`binary ${binary} sha256 ${report.binary_sha256}`);
-    console.log(`walks ${observed.length}, steps ${steps}, seed ${seed}`);
-    console.log(`fake gateway requests: chat ${requests.chat}, title ${requests.title}, classifier ${requests.classifier}, models ${requests.models}`);
-    console.log(`TLC (Rule "fixed"): ${fixed.verdict}, ${fixed.distinctStates} distinct states, ${fixed.durationMs} ms`);
-    if (today) console.log(`TLC self-check (Rule "today"): ${today.verdict}, ${today.distinctStates} distinct states`);
-    if (rejected.length > 0) {
-      console.log(`walks TLC rejects alone (${rejected.length} of ${observed.length}): ${rejected.join(", ")}`);
-      const first = observed.find((walk) => walk.id === rejected[0])!;
-      for (const step of first.steps) {
-        console.log(`  ${first.id} ${step.key}${step.codepoint ? ` ${step.codepoint}` : ""}: col ${step.col}, row ${JSON.stringify(step.row_text)}`);
+      walks: [...edgeWalks(), ...randomWalks(seed, randomCount)],
+      observeCursor: true,
+      selfCheck: { rule: "today", margin: "row-drops" },
+    },
+    {
+      name: `${NARROW_WIDTH}-column`,
+      width: NARROW_WIDTH,
+      walks: [...narrowWalks(), ...randomWalks(seed, narrowCount, "narrow-random")],
+      observeCursor: false,
+      selfCheck: { rule: "fixed", margin: "cell-less-keeps" },
+    },
+  ];
+  const selected = only === 0 ? batches : batches.filter((batch) => batch.width === only);
+  if (selected.length === 0) throw new Error(`--only ${only} names no pane: use ${PANE_WIDTH} or ${NARROW_WIDTH}`);
+  let failed = false;
+  let toolError = false;
+  const requests = { chat: 0, title: 0, classifier: 0, models: 0 };
+  const reports: unknown[] = [];
+  console.log(`binary ${binary} sha256 ${hashFile(binary)}`);
+  for (const batch of selected) {
+    const stderrPath = join(out, `fx-stderr-${batch.width}.log`);
+    writeFileSync(stderrPath, "");
+    let session: Session | null = null;
+    try {
+      session = await helpers.TmuxSession.create({
+        cmd: binary,
+        env: {
+          HOME: home,
+          FX_HOME: fxHome,
+          FX_SOUND: "0",
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          AI_GATEWAY_API_KEY: "fake-display-width-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: helpers.FAKE_GATEWAY_MODEL,
+        },
+        width: batch.width,
+        height: 24,
+        stderrPath,
+        isolated: true,
+      });
+      await session.waitForComposer(15_000);
+      const { walks: observed, died } = await runWalks(session, batch.walks, batch.observeCursor, stderrPath);
+      const steps = observed.reduce((sum, walk) => sum + walk.steps.length, 0);
+      const cols = Math.max(0, batch.width - PROMPT.length);
+      const fixed = observed.length > 0 ? await judge(join(out, `tlc-fixed-${batch.width}`), observed, "fixed", "fixed", cols) : null;
+      const check = selfCheck && observed.length > 0 && !died
+        ? await judge(join(out, `tlc-self-check-${batch.width}`), observed, batch.selfCheck.rule, batch.selfCheck.margin, cols)
+        : null;
+      const rejected = fixed?.verdict === "REJECTED"
+        ? await rejectedWalks(join(out, `tlc-walks-${batch.width}`), observed, cols)
+        : [];
+      console.log(`-- ${batch.name} pane (Cols ${cols}): walks ${observed.length} of ${batch.walks.length}, steps ${steps}, seed ${seed}`);
+      if (fixed) {
+        console.log(`TLC (Rule "fixed"): ${fixed.verdict}, ${fixed.distinctStates} distinct states, ${fixed.durationMs} ms`);
       }
+      if (check) {
+        console.log(`TLC self-check (Rule "${batch.selfCheck.rule}", Margin "${batch.selfCheck.margin}"): ${check.verdict}, ${check.distinctStates} distinct states`);
+      }
+      if (rejected.length > 0) {
+        console.log(`walks TLC rejects alone (${rejected.length} of ${observed.length}): ${rejected.join(", ")}`);
+        const first = observed.find((walk) => walk.id === rejected[0])!;
+        for (const step of first.steps) {
+          console.log(`  ${first.id} ${step.key}${step.codepoint ? ` ${step.codepoint}` : ""}: col ${step.col}, row ${JSON.stringify(step.row_text)}`);
+        }
+      }
+      if (died) {
+        console.log(`FAIL: fx exited during walk ${died.walk} in the ${batch.name} pane, stderr [${died.stderr}]`);
+        failed = true;
+      }
+      if (fixed?.verdict === "TOOL_ERROR" || check?.verdict === "TOOL_ERROR") toolError = true;
+      if (fixed && fixed.verdict !== "ACCEPTED") failed = true;
+      if (check && check.verdict !== "REJECTED") {
+        console.log(`FAIL: the model of fx with the bug accepted the ${batch.name} walks, so they do not test it`);
+        failed = true;
+      }
+      reports.push({
+        pane: batch.name,
+        cols,
+        walks: observed.length,
+        steps,
+        verdict: fixed?.verdict ?? "NO_WALKS",
+        tlc_distinct_states: fixed?.distinctStates,
+        tlc_ms: fixed?.durationMs,
+        self_check: check
+          ? { ...batch.selfCheck, verdict: check.verdict, distinct_states: check.distinctStates }
+          : null,
+        died,
+        rejected_walks: rejected,
+        observed,
+      });
+    } finally {
+      await session?.kill();
     }
+  }
+  requests.chat = gateway.requests.length;
+  requests.title = gateway.titleRequests.length;
+  requests.classifier = gateway.classifierRequests.length;
+  requests.models = gateway.modelRequests.length;
+  try {
+    writeJson(join(out, "report.json"), { binary, binary_sha256: hashFile(binary), seed, gateway_requests: requests, panes: reports });
+    console.log(`fake gateway requests: chat ${requests.chat}, title ${requests.title}, classifier ${requests.classifier}, models ${requests.models}`);
     console.log(`report ${join(out, "report.json")}`);
-
-    if (fixed.verdict === "TOOL_ERROR" || today?.verdict === "TOOL_ERROR") return 2;
+    if (toolError) return 2;
     if (requests.chat !== 0) {
       console.log(`FAIL: fx sent ${requests.chat} model requests to the fake gateway; none were expected`);
       return 1;
     }
-    if (fixed.verdict !== "ACCEPTED") return 1;
-    if (today && today.verdict !== "REJECTED") {
-      console.log("FAIL: the model of fx before the change accepted the walks, so they do not test the marks");
-      return 1;
-    }
-    return 0;
+    return failed ? 1 : 0;
   } finally {
-    await session?.kill();
     gateway.stop();
     rmSync(home, { recursive: true, force: true });
   }

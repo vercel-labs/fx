@@ -689,6 +689,35 @@ tmuxTest(
 );
 
 tmuxTest(
+  "Thai marks in a window two columns wide leave the composer row as the bar alone",
+  async () => {
+    // "┃ " takes two cells, so the composer has no cell for a character and
+    // none for a mark. Twelve clusters carry 24 marks, 72 bytes, which is past
+    // the 64 bytes of combining text one terminal cell holds.
+    const active = await startFx(2, 24);
+    await typeLiteral(active, THAI_KAN.repeat(12));
+
+    const { grid } = await waitForSettledPane(active).catch((error: unknown) => {
+      if (active.isAlive()) throw error;
+      throw new Error(
+        `fx exited while the Thai marks were typed; stderr: ${readFileSync(stderrPath!, "utf8").trim()}`,
+      );
+    });
+    const rows = grid.map((line) => line.trimEnd()).filter((line) => line.startsWith("┃"));
+    expect(rows).toEqual(["┃"]);
+    expect(active.isAlive()).toBe(true);
+
+    // The draft is intact: a wider window draws all twelve clusters.
+    await active.resizeWindow(60, 24, 300);
+    await waitForExactComposerRow(active, `┃ ${THAI_KAN.repeat(12)}`);
+
+    expectCleanStderr();
+    expect(active.isAlive()).toBe(true);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
   "tab edge wrapping handles final cells, wide runes, and following units",
   async () => {
     const active = await startFx(10, 24);

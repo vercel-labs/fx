@@ -12,12 +12,15 @@
 (* from the first cell after the composer's prefix across its rows, and    *)
 (* the classes of the code points tmux shows on the composer's rows after  *)
 (* the prefix, in order, with "gap" for a blank cell. Every walk starts    *)
-(* with clear, which is End then Ctrl+U.                                   *)
+(* with clear, which is End then Ctrl+U. In a window with no content cells *)
+(* fx clamps the cursor to the window's last column, so there is no        *)
+(* column to compare and the record holds col -1.                          *)
 (*                                                                         *)
 (* A step matches only when the model's action puts the cursor at the      *)
-(* observed column and the rows show exactly what the model says the       *)
-(* terminal shows (Shown): no gap, nothing left over from an earlier       *)
-(* repaint, and no mark lost at the right margin. The run is ACCEPTED when *)
+(* observed column (at any column when none is observed) and the rows show *)
+(* exactly what the model says the terminal shows (Shown): no gap, nothing *)
+(* left over from an earlier repaint, no mark lost at the right margin,    *)
+(* and no mark on a row with no content cells. The run is ACCEPTED when    *)
 (* TLC violates NotAllMatched, which is reachable only after every step of *)
 (* every walk matched. A completed search means REJECTED.                  *)
 (***************************************************************************)
@@ -41,7 +44,7 @@ Step ==
     /\ w <= Len(Observed)
     /\ k < Len(Observed[w])
     /\ Act(Observed[w][k + 1])
-    /\ col' = Observed[w][k + 1].col
+    /\ (Observed[w][k + 1].col < 0 \/ col' = Observed[w][k + 1].col)
     /\ Shown(text') = Observed[w][k + 1].row
     /\ k' = k + 1
     /\ UNCHANGED w
