@@ -26,12 +26,18 @@
 # tests/tla/drivers/transcript_window/, or the driver code they share:
 # tests/tla/drivers/lib/ and tests/tla/drivers/graph.mjs.
 #
-# All three run when the change touches build.zig, build.zig.zon,
+# acp: the TLA+ ACP models and drivers job model-checks tests/tla/acp/ and
+# drives the built fx acp along those models. A pull request runs it only when
+# it touches src/acp/, those models, their drivers in tests/tla/drivers/acp/,
+# the code they share: tests/tla/drivers/lib/ and tests/tla/lib/, or the fake
+# Gateway the drivers load from tests/e2e/tmux-helpers.ts.
+#
+# All four run when the change touches build.zig, build.zig.zon,
 # .github/workflows/ci.yml, or this script. A change to shared code the checks
 # also run, such as the agent loop, is checked by the run on main. Set
 # CI_NEED_REQUESTED to a reason to force every check.
 #
-# Writes libfx, mcp, and transcript_window, each true or false, to
+# Writes libfx, mcp, transcript_window, and acp, each true or false, to
 # $GITHUB_OUTPUT and the reasons to $GITHUB_STEP_SUMMARY when those files are
 # set. Exits non-zero when either revision cannot be read, so the checks fail
 # instead of passing without having looked at the change.
@@ -48,9 +54,11 @@ head="$2"
 libfx=false
 mcp=false
 transcript_window=false
+acp=false
 libfx_reasons=()
 mcp_reasons=()
 transcript_window_reasons=()
+acp_reasons=()
 
 require_libfx() {
   libfx=true
@@ -67,10 +75,16 @@ require_transcript_window() {
   transcript_window_reasons+=("$1")
 }
 
+require_acp() {
+  acp=true
+  acp_reasons+=("$1")
+}
+
 require_all() {
   require_libfx "$1"
   require_mcp "$1"
   require_transcript_window "$1"
+  require_acp "$1"
 }
 
 for revision in "$base" "$head"; do
@@ -104,9 +118,14 @@ while IFS= read -r path; do
     # *.mjs pattern below would take these folders' .mjs files too.
     tests/tla/drivers/mcp/* | tests/tla/drivers/mcp_host/*)
       require_mcp "$path: MCP driver changed" ;;
+    tests/tla/drivers/acp/*)
+      require_acp "$path: ACP driver changed" ;;
     tests/tla/drivers/lib/*)
       require_mcp "$path: shared driver code changed"
-      require_transcript_window "$path: shared driver code changed" ;;
+      require_transcript_window "$path: shared driver code changed"
+      require_acp "$path: shared driver code changed" ;;
+    tests/tla/lib/*)
+      require_acp "$path: shared TLC script changed" ;;
     tests/tla/drivers/transcript_window/*)
       require_transcript_window "$path: transcript window driver changed" ;;
     tests/tla/drivers/graph.mjs)
@@ -119,7 +138,10 @@ while IFS= read -r path; do
       fi ;;
     src/napi_*.zig | src/wasm_core_main.zig)
       require_libfx "$path: libfx entry point changed" ;;
-    src/acp/* | src/core/hosts/* | src/core/session_manager/*)
+    src/acp/*)
+      require_libfx "$path: code libfx owns changed"
+      require_acp "$path: ACP code changed" ;;
+    src/core/hosts/* | src/core/session_manager/*)
       require_libfx "$path: code libfx owns changed" ;;
     src/mcp/* | src/core/mcp_host/* | src/core/mcp/*)
       require_mcp "$path: MCP code changed" ;;
@@ -129,7 +151,12 @@ while IFS= read -r path; do
       require_transcript_window "$path: transcript window code changed" ;;
     tests/tla/transcript_window/*)
       require_transcript_window "$path: transcript window model changed" ;;
-    tests/e2e/fixtures/mcp-* | tests/e2e/tmux-helpers.ts | tests/evals/eval-helpers.ts | tests/e2e/render-lab/tape.ts)
+    tests/tla/acp/*)
+      require_acp "$path: ACP model changed" ;;
+    tests/e2e/tmux-helpers.ts)
+      require_mcp "$path: a file the MCP drivers load changed"
+      require_acp "$path: a file the ACP drivers load changed" ;;
+    tests/e2e/fixtures/mcp-* | tests/evals/eval-helpers.ts | tests/e2e/render-lab/tape.ts)
       require_mcp "$path: a file the MCP drivers load changed" ;;
   esac
 done <<<"$changed_files"
@@ -162,11 +189,13 @@ report() {
 report libfx "$libfx" ${libfx_reasons[@]+"${libfx_reasons[@]}"}
 report MCP "$mcp" ${mcp_reasons[@]+"${mcp_reasons[@]}"}
 report "transcript window" "$transcript_window" ${transcript_window_reasons[@]+"${transcript_window_reasons[@]}"}
+report ACP "$acp" ${acp_reasons[@]+"${acp_reasons[@]}"}
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   {
     printf 'libfx=%s\n' "$libfx"
     printf 'mcp=%s\n' "$mcp"
     printf 'transcript_window=%s\n' "$transcript_window"
+    printf 'acp=%s\n' "$acp"
   } >>"$GITHUB_OUTPUT"
 fi

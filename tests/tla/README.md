@@ -1,10 +1,10 @@
 # TLA+ models
 
-TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK, MCP, and transcript window models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides; the `fx mcp call` model on `main` and on pull requests labeled `ci:tla-mcp-call`; and the recovery, gateway_open, and agent_runtime models, each with its driver, on every pull request. Run the others when you change the behavior they describe.
+TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK, MCP, transcript window, and ACP models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides; the `fx mcp call` model on `main` and on pull requests labeled `ci:tla-mcp-call`; and the recovery, gateway_open, and agent_runtime models, each with its driver, on every pull request. Run the others when you change the behavior they describe.
 
 | Folder | What it models | Checker |
 |---|---|---|
-| `acp/` | The ACP permission modes, which match the CLI's `/permissions`, and the per-session Standard, Fast, and Ultrafast speed (`src/acp/`). | `acp/check.sh`, then the drivers in `drivers/acp/` |
+| `acp/` | The ACP permission modes, which match the CLI's `/permissions`, and the per-session Standard, Fast, and Ultrafast speed (`src/acp/`). | `acp/check.sh`, then the drivers in `drivers/acp/`; `acp/check.sh --ci` runs both |
 | `agent_runtime/` | The empty-reply nudge in the agent step loop (`src/core/agent/runtime/orchestrator.zig`): a reply that stops for `other` with no text and no tool call, as Gemini's `UNEXPECTED_TOOL_CALL` does through the AI SDK, is asked once to continue, a second empty reply in a row or one with no step left ends the turn as failed instead of with "Done.", separate stalls in one long turn each get their own nudge, and the step limit holds. `empty-reply-today.cfg` shows fx before it, and six planted mutations must each be caught by their named rule. | `agent_runtime/check.sh`, then `bun tests/tla/drivers/agent_runtime/driver.ts --self-check`, which runs `fx ask` turns of the built `zig-out/bin/fx` against a local gateway for every reply script up to three replies under step limits 0 to 3, plus seeded longer ones, and has TLC check every turn (`EmptyReplyTrace.tla`); `--stress N` adds one turn with N separate stalls |
 | `cache_warming/` | Claude cache warming (`src/core/agent/runtime/cache_warming.zig` and `cache_warmer.zig`): pings that resend the last request with a one-token reply before Anthropic's prompt cache entry expires, on a discrete clock with the provider's entry, early evictions, and sleeps that make the timer late. Every ping reads a live entry, the entry stays alive while armed, pings stop at the cap, a real request, a session change, or shutdown, and a stale ping's answer never stops a newer arm. Seven planted mutations must each be caught by their named rule. | `cache_warming/check.sh`, then `bun tests/tla/drivers/cache_warming/driver.ts --self-check`, which walks the real planner along every edge of the model's graph the planner can tell apart through a small Zig lab, `drivers/cache_warming/lab.zig`, and rejects four planted bugs in the planner |
 | `cli/` | How `fx` and `fx ask` handle `--model`, `--fast`, `--ultrafast`, and `--effort` at launch, for the current design and a proposed one that validates them. | `cli/check.sh`, `bun test drivers/cli/` |
@@ -68,6 +68,10 @@ CI's `TLA+ MCP models and drivers` job runs each engine model's smoke config (`m
 ## Transcript window in CI
 
 CI's `TLA+ transcript window model` job runs `transcript_window/check.sh --ci` on `main` and on pull requests that change the window's code, its model, its drivers, or the driver code they share. `--ci` leaves out the planted bugs and the run of a built fx along the model, which run only by hand with `transcript_window/check.sh`.
+
+## ACP in CI
+
+CI's `TLA+ ACP models and drivers` job runs `acp/check.sh --ci` on `main` and on pull requests that change `src/acp/`, the ACP models, their drivers, or the code the drivers share. `--ci` runs every config, then every `drivers/acp/*/driver.ts` against the built `fx acp`, so a new driver runs in CI without a workflow change. The planted bugs (`drivers/acp/*/check-spec.ts`) run only by hand: they measure the checks, not the code.
 
 ## MCP models without a driver here
 

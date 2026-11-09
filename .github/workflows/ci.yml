@@ -133,7 +133,7 @@ jobs:
   zig:
     name: Build & Test
     if: ${{ always() }}
-    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-package-guards, sdk-browser-wasm, tla-mcp, tla-transcript-window]
+    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-package-guards, sdk-browser-wasm, tla-mcp, tla-transcript-window, tla-acp]
     runs-on: ubuntu-latest
     steps:
       - name: Require unit tests and every SDK job
@@ -141,7 +141,7 @@ jobs:
           RESULTS: ${{ toJSON(needs.*.result) }}
         run: |
           printf '%s\n' "$RESULTS"
-          jq -e 'length == 8 and all(.[]; . == "success")' <<<"$RESULTS"
+          jq -e 'length == 9 and all(.[]; . == "success")' <<<"$RESULTS"
 
   build:
     name: Build fx (ReleaseSafe)
@@ -185,10 +185,10 @@ jobs:
 
   # The durable-session model check in SDK (Bun + N-API/WASM) takes about 40
   # minutes, the TLA+ MCP models and drivers about 20, and the TLA+ transcript
-  # window model a few. A pull request runs each only when it changes the code
-  # that check covers; see scripts/detect-ci-need.sh. Pushes to main and manual
-  # dispatches always run all three, so the main run that Publish libfx waits
-  # for includes them.
+  # window model and the TLA+ ACP models and drivers a few each. A pull request
+  # runs each only when it changes the code that check covers; see
+  # scripts/detect-ci-need.sh. Pushes to main and manual dispatches always run
+  # all four, so the main run that Publish libfx waits for includes them.
   ci-need:
     name: Detect CI need
     runs-on: ubuntu-24.04
@@ -197,6 +197,7 @@ jobs:
       libfx: ${{ steps.detect.outputs.libfx }}
       mcp: ${{ steps.detect.outputs.mcp }}
       transcript_window: ${{ steps.detect.outputs.transcript_window }}
+      acp: ${{ steps.detect.outputs.acp }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -752,6 +753,43 @@ jobs:
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
           TLA2TOOLS_JAR="$jar" tests/tla/transcript_window/check.sh --ci
 
+  # The ACP models, and the drivers that run the built fx acp along them. Their
+  # planted bugs stay local (tests/tla/acp/check.sh without --ci): they
+  # measure the checks, not the code.
+  tla-acp:
+    name: TLA+ ACP models and drivers
+    needs: [build, ci-need]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+        if: needs.ci-need.outputs.acp == 'true'
+      - name: Download fx
+        if: needs.ci-need.outputs.acp == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: fx-linux-x86_64
+          path: zig-out/bin
+      - name: Restore executable mode
+        if: needs.ci-need.outputs.acp == 'true'
+        run: chmod +x zig-out/bin/fx
+      - name: Setup Bun
+        if: needs.ci-need.outputs.acp == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Model-check ACP and drive fx acp along the models
+        if: needs.ci-need.outputs.acp == 'true'
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
+          TLA2TOOLS_JAR="$jar" tests/tla/acp/check.sh --ci
+
   e2e_mode:
     name: E2E (deterministic, shard ${{ matrix.shard.label }})
     needs: build
@@ -956,12 +994,14 @@ jobs:
             scripts/detect-macos-need.sh
             scripts/smoke-binary.sh
             tests/e2e/ci-run-files.sh
+            tests/tla/acp/check.sh
           )
           # bash -n parses only its first argument, so check each script.
           for script in "${scripts[@]}"; do
             bash -n "$script"
           done
-          shellcheck "${scripts[@]}"
+          # -x follows the files a script sources.
+          shellcheck -x "${scripts[@]}"
 
   e2e_acp_live:
     name: E2E ACP (live models)
