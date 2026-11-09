@@ -14,6 +14,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
@@ -3392,6 +3393,21 @@ async function enterSwitchCredential(pickerSession: TmuxSession): Promise<void> 
     (pane) => pane.includes("Credential source") && pane.includes("Automatic"),
     TIMEOUT,
   );
+}
+
+/** A loopback URL whose port refuses connections: a server takes a free port
+ * and closes it again. */
+async function refusedLoopbackUrl(path: string): Promise<string> {
+  const server = createServer();
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  return `http://127.0.0.1:${port}${path}`;
+}
+
+/** Screen text with wrapping and indentation collapsed to single spaces. */
+function collapsedText(text: string): string {
+  return text.replace(/\s+/g, " ");
 }
 
 async function openProviderPicker(pickerSession: TmuxSession): Promise<void> {
@@ -8510,6 +8526,46 @@ for (const outcome of ["cancel", "failure"] as const) {
   }, TIMEOUT);
 }
 
+tmuxTest("a Vercel team choice names an AI Gateway catalog fx could not connect to", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-team-catalog-refused-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+    teams: [{ id: "team_next", slug: "next-team", name: "Next Team" }],
+  });
+  chatgptOauth = startFakeChatGptOAuth();
+  writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_previous");
+  writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+  const settingsPath = join(home, ".fx", "settings.json");
+  const authPath = join(home, ".fx", "auth.json");
+  writeFileSync(settingsPath, JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
+  const beforeAuth = readFileSync(authPath, "utf8");
+  session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+    ...chatgptOauth.env,
+    FX_TEST_GATEWAY_MODELS_URL: await refusedLoopbackUrl("/coding-agent/v1/models"),
+    FX_MODEL: undefined,
+    FX_SOUND: "0",
+  });
+  await session.waitForComposer(TIMEOUT);
+  await openProviderPicker(session);
+  await session.sendLiteral("vercel");
+  await session.sendKeys("Enter");
+  await session.waitForText("oauth", TIMEOUT);
+  await session.sendKeys("Enter");
+  await session.waitForText("next-team", TIMEOUT);
+  await session.sendKeys("Enter");
+  await session.waitForText("couldn't connect to AI Gateway to validate", TIMEOUT);
+  const transcript = collapsedText(await session.captureFullScrollback());
+  expect(transcript).toContain(
+    "fx couldn't connect to AI Gateway to validate the selected Vercel team. Check your network connection or firewall. The current team is unchanged.",
+  );
+  expect(transcript).not.toContain("could not be validated for AI Gateway");
+  expect(readFileSync(authPath, "utf8")).toBe(beforeAuth);
+  expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("codex");
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, TIMEOUT);
+
 tmuxTest("provider preparation cancellation stops logout fallback", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-logout-preparation-cancel-"));
   stderrPath = join(home, "stderr.log");
@@ -8619,6 +8675,34 @@ tmuxTest("provider preparation resumes a held prompt after explicit provider ret
     expect(gateway.requests).toHaveLength(0);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   } finally { release(); }
+}, TIMEOUT);
+
+tmuxTest("a provider switch names a target catalog fx could not connect to", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-provider-switch-refused-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth();
+  writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+  const settingsPath = join(home, ".fx", "settings.json");
+  session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+    ...chatgptOauth.env,
+    FX_TEST_OPENAI_CODEX_MODELS_URL: await refusedLoopbackUrl("/chatgpt/models"),
+    FX_MODEL: undefined,
+    FX_SOUND: "0",
+  });
+  await session.waitForComposer(TIMEOUT);
+  await openProviderPicker(session);
+  await session.sendLiteral("codex");
+  await session.sendKeys("Enter");
+  await session.waitForText("couldn't connect to the model provider", TIMEOUT);
+  const transcript = collapsedText(await session.captureFullScrollback());
+  expect(transcript).toContain(
+    "fx couldn't connect to the model provider to load the target provider catalog. Check your network connection or firewall. The current provider is unchanged.",
+  );
+  expect(transcript).not.toContain("could not be validated");
+  if (existsSync(settingsPath)) expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).not.toBe("codex");
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
 }, TIMEOUT);
 
 tmuxTest("provider preparation completes existing-key recovery for a held prompt", async () => {

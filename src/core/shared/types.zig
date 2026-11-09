@@ -428,12 +428,15 @@ pub fn plainErrorText(raw: []const u8, buf: []u8) []const u8 {
         .{ "NetworkInterrupted", "network interrupted" },
         .{ "StreamInterrupted", "stream interrupted" },
         .{ "InvalidGatewaySseEvent", "unreadable reply" },
+        .{ "InvalidOpenAICodexSseEvent", "unreadable reply" },
+        .{ "InvalidXaiGrokSseEvent", "unreadable reply" },
         .{ "MalformedGatewaySseEvent", "unreadable reply" },
         .{ "MalformedOpenAICodexSseEvent", "unreadable reply" },
         .{ "MalformedXaiGrokSseEvent", "unreadable reply" },
         .{ "MalformedChatCompletionsChunk", "unreadable reply" },
         .{ "InvalidProviderFinishReason", "unreadable reply" },
         .{ "GatewaySseEventTooLarge", "reply too large to read" },
+        .{ "OpenAICodexSseEventTooLarge", "reply too large to read" },
         .{ "XaiGrokSseEventTooLarge", "reply too large to read" },
         // Storage faults read as fx says them on startup and in ACP.
         .{ "AccessDenied", "permission denied" },
@@ -441,6 +444,9 @@ pub fn plainErrorText(raw: []const u8, buf: []u8) []const u8 {
         .{ "NoSpaceLeft", "the disk is full" },
         .{ "FileTooBig", "a file-size limit was reached" },
         .{ "InputOutput", "a disk read or write failed" },
+        // A write to fx's own stdout or stderr, which a command reports in
+        // place of `WriteFailed` (`cli_surface.runIfRequested`).
+        .{ "OutputWriteFailed", "couldn't write the output" },
     };
     inline for (pairs) |pair| {
         if (std.mem.eql(u8, raw, pair[0])) return pair[1];
@@ -806,6 +812,15 @@ test "model failure diagnostics read as plain words" {
         .{ .raw = "ReadFailed", .plain = "connection dropped" },
         .{ .raw = "TlsInitializationFailed", .plain = "couldn't make a secure connection" },
         .{ .raw = "NoSpaceLeft", .plain = "the disk is full" },
+        // A failed write reads as a dropped connection unless fx knows the
+        // write was to its own output.
+        .{ .raw = "WriteFailed", .plain = "connection dropped" },
+        .{ .raw = "OutputWriteFailed", .plain = "couldn't write the output" },
+        // Every provider's unreadable stream event reads the same way.
+        .{ .raw = "InvalidGatewaySseEvent", .plain = "unreadable reply" },
+        .{ .raw = "InvalidOpenAICodexSseEvent", .plain = "unreadable reply" },
+        .{ .raw = "InvalidXaiGrokSseEvent", .plain = "unreadable reply" },
+        .{ .raw = "OpenAICodexSseEventTooLarge", .plain = "reply too large to read" },
         // Any other error name is split into words.
         .{ .raw = "InvalidProviderCompletion", .plain = "invalid provider completion" },
         .{ .raw = "HTTPRequestFailed", .plain = "http request failed" },
@@ -1352,6 +1367,107 @@ pub const PersistedContextNote = struct {
     sources: []ContextNoteSource = &.{},
 };
 
+/// What a model call was for: the turn's own request, or a compaction the
+/// turn ran. A record with a purpose this fx doesn't know is left out when
+/// read, as one written by a newer fx can be.
+pub const ModelCallPurpose = enum { turn, compaction };
+
+/// How a model call ended.
+pub const ModelCallOutcome = enum { completed, failed, cancelled };
+
+/// One settled model call, shown in Ctrl+O where it happened and never sent
+/// to the model. A turn's records sit at a tool step boundary, as context
+/// notes do: the calls made for step `after_tool_step_count`, which a
+/// replay places with that step: failed attempts before its text, the call
+/// that wrote it after (`tests/tla/full_detail/FullDetailOrder.tla`
+/// ReplayMatchesSaved). Strings come from the provider and are checked
+/// before they are saved or shown (`validModelCallText`).
+pub const ModelCallRecord = struct {
+    /// When the call settled, in Unix milliseconds.
+    at_ms: i64,
+    elapsed_ms: u64 = 0,
+    purpose: ModelCallPurpose = .turn,
+    outcome: ModelCallOutcome = .completed,
+    provider: []const u8,
+    model: []const u8,
+    served_by: ?[]const u8 = null,
+    /// The gateway's generation id, or the provider's response id.
+    generation_id: ?[]const u8 = null,
+    /// The finish reason's name for a completed call.
+    finish: ?[]const u8 = null,
+    /// The failure kind's name for a failed call.
+    failure: ?[]const u8 = null,
+    retry_after_s: ?u32 = null,
+    input_tokens: ?u64 = null,
+    output_tokens: ?u64 = null,
+    after_tool_step_count: usize = 0,
+    /// How many of the turn's steering messages came before the call at
+    /// its boundary, so a message delivered after it, at the same boundary,
+    /// is saved after it.
+    after_steering_count: usize = 0,
+};
+
+pub const model_call_text_max_bytes = 256;
+
+/// Whether `text` may be saved and shown in a call record: short, valid
+/// UTF-8, and free of control characters, so provider text cannot move the
+/// cursor or forge a line.
+pub fn validModelCallText(text: []const u8) bool {
+    if (text.len == 0 or text.len > model_call_text_max_bytes) return false;
+    if (!std.unicode.utf8ValidateSlice(text)) return false;
+    for (text) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    return true;
+}
+
+/// Caller owns the copy; free it with `freeModelCallRecords`.
+pub fn dupeModelCallRecords(alloc: std.mem.Allocator, records: []const ModelCallRecord) ![]ModelCallRecord {
+    const copies = try alloc.alloc(ModelCallRecord, records.len);
+    var done: usize = 0;
+    errdefer {
+        for (copies[0..done]) |copy| freeModelCallRecordStrings(alloc, copy);
+        alloc.free(copies);
+    }
+    for (records, copies) |record, *copy| {
+        copy.* = try dupeModelCallRecord(alloc, record);
+        done += 1;
+    }
+    return copies;
+}
+
+/// Caller owns the copy's strings; free them with `freeModelCallRecordStrings`.
+pub fn dupeModelCallRecord(alloc: std.mem.Allocator, record: ModelCallRecord) !ModelCallRecord {
+    var copy = record;
+    copy.provider = try alloc.dupe(u8, record.provider);
+    errdefer alloc.free(copy.provider);
+    copy.model = try alloc.dupe(u8, record.model);
+    errdefer alloc.free(copy.model);
+    copy.served_by = try dupeOptionalText(alloc, record.served_by);
+    errdefer if (copy.served_by) |text| alloc.free(text);
+    copy.generation_id = try dupeOptionalText(alloc, record.generation_id);
+    errdefer if (copy.generation_id) |text| alloc.free(text);
+    copy.finish = try dupeOptionalText(alloc, record.finish);
+    errdefer if (copy.finish) |text| alloc.free(text);
+    copy.failure = try dupeOptionalText(alloc, record.failure);
+    return copy;
+}
+
+fn dupeOptionalText(alloc: std.mem.Allocator, text: ?[]const u8) !?[]const u8 {
+    return if (text) |value| try alloc.dupe(u8, value) else null;
+}
+
+pub fn freeModelCallRecordStrings(alloc: std.mem.Allocator, record: ModelCallRecord) void {
+    alloc.free(record.provider);
+    alloc.free(record.model);
+    inline for (.{ record.served_by, record.generation_id, record.finish, record.failure }) |text| {
+        if (text) |value| alloc.free(value);
+    }
+}
+
+pub fn freeModelCallRecords(alloc: std.mem.Allocator, records: []const ModelCallRecord) void {
+    for (records) |record| freeModelCallRecordStrings(alloc, record);
+    alloc.free(records);
+}
+
 pub const SteeringDelivery = enum(u8) { queued, applied, not_applied };
 
 pub const FileEvidence = struct {
@@ -1379,6 +1495,9 @@ pub const ExecutionMemory = struct {
     /// unchanged (D94).
     runtime_context: ?[][]u8 = null,
     turn_summary: ?TurnSummary = null,
+    /// The turn's settled model calls, in order, for Ctrl+O. Display data:
+    /// never part of what the model is sent.
+    model_calls: []ModelCallRecord = &.{},
 
     pub fn isEmpty(self: ExecutionMemory) bool {
         return self.tool_steps.len == 0 and self.files.len == 0 and self.steering.len == 0 and self.context_notes.len == 0;
@@ -1625,6 +1744,10 @@ pub const UserTurn = struct {
     /// Who wrote the message that opened the turn. Only the user's counts as
     /// a request of the user's, for the reviewer and every later turn.
     author: MessageAuthor = .user,
+    /// When the message was sent, in Unix milliseconds, as a saved session's
+    /// line holding it says; 0 when unknown. For display only: nothing saves
+    /// it, and the model never sees it.
+    sent_at_ms: i64 = 0,
 };
 
 /// Borrows both strings; use dupeProviderReplay/freeProviderReplay for ownership.
@@ -2912,6 +3035,8 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     const context_notes = try dupePersistedContextNotes(alloc, memory.context_notes);
     errdefer freePersistedContextNotes(alloc, context_notes);
     const runtime_context = if (memory.runtime_context) |texts| try dupeRuntimeContext(alloc, texts) else null;
+    errdefer if (runtime_context) |texts| freeRuntimeContext(alloc, texts);
+    const model_calls = try dupeModelCallRecords(alloc, memory.model_calls);
     return .{
         .tool_steps = tool_steps,
         .files = files,
@@ -2919,10 +3044,12 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
         .context_notes = context_notes,
         .runtime_context = runtime_context,
         .turn_summary = memory.turn_summary,
+        .model_calls = model_calls,
     };
 }
 
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
+    freeModelCallRecords(alloc, memory.model_calls);
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
     freePersistedSteering(alloc, memory.steering);
@@ -3624,6 +3751,7 @@ pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
         .images = images,
         .work_id = work_id,
         .author = user.author,
+        .sent_at_ms = user.sent_at_ms,
     };
 }
 

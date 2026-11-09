@@ -21,6 +21,9 @@ pub const FetchInput = struct {
     endpoint: []const u8,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     view: View = .full,
+    /// A provider with `reports_connection` sets this once its request has a
+    /// connection: the DNS lookup, connect, and any TLS handshake are done.
+    connected: ?*std.atomic.Value(bool) = null,
 };
 
 pub const FailureCategory = enum {
@@ -68,6 +71,12 @@ pub const Failure = struct {
         return status == .unauthorized or status == .forbidden;
     }
 };
+
+/// Who serves `provider`'s model catalog, as a message about a connection fx
+/// could not make names it.
+pub fn serviceName(provider: model_provider.ProviderId) []const u8 {
+    return if (provider == .gateway) "AI Gateway" else "the model provider";
+}
 
 /// Milliseconds on the clock that times catalog refreshes. Natively it keeps
 /// counting while the machine sleeps, so a catalog goes stale overnight, and
@@ -150,6 +159,8 @@ pub const Provider = struct {
     lookup_capabilities_fn: ?*const fn (?*anyopaque, []const u8) model_capabilities.Capabilities = null,
     provider_id: model_provider.ProviderId = .gateway,
     refresh_interval_ms: ?i64 = null,
+    /// The fetch sets `FetchInput.connected` once its request has a connection.
+    reports_connection: bool = false,
 
     /// Returns owned catalog entries; the caller frees them with `freeModelCatalog`.
     pub fn fetch(self: Provider, alloc: Allocator, input: FetchInput) Allocator.Error!ProviderResult {

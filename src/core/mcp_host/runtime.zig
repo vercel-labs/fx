@@ -34,9 +34,10 @@ const login_timeout_ms: i64 = 5 * 60 * 1000;
 const idle_wait_ms: u32 = 1000;
 /// How long a logout waits for its revocation, as the engine's `close` does.
 const revoke_wait_ms: i64 = 2000;
-/// How long a refresh waits for another fx refreshing the same login; then
-/// it refreshes anyway.
-const refresh_lock_wait_ms: i64 = 10_000;
+/// How long a sent refresh waits for its answer, the engine's own timeout,
+/// which `config.zig` keeps for every server: the longest step a refresh
+/// lock's holder takes between its stamps (`credentials.Store.refreshHolderStopped`).
+const refresh_answer_ms: i64 = (@FieldType(mcp.engine.Options, "timeouts"){}).refresh_ms;
 /// How often a refresh waiting for that lock tries it again.
 const refresh_retry_ms: u32 = 20;
 
@@ -221,6 +222,8 @@ const Request = struct {
     note: ?mcp_contract.Progress = null,
     /// Guarded by `Runtime.mutex`: a question waiting for the caller to ask.
     question: ?Pending = null,
+    /// Set by the owner before a logout ends: why the saved login stayed.
+    logout_kept: ?anyerror = null,
     /// Owner thread only: fx declined the server's question, so the call's
     /// cancellation is fx's answer, not the user's.
     declined: bool = false,
@@ -442,7 +445,8 @@ pub const Runtime = struct {
         server: usize,
         lock: ?credentials.Store.Locked = null,
         sent: bool = false,
-        deadline_ms: i64,
+        /// When it began waiting for the refresh lock, on the awake clock.
+        started_ms: i64,
     };
 
     /// Starts the engine with `configs` (from `loadNativeConfigs`) and its
@@ -682,9 +686,12 @@ pub const Runtime = struct {
     }
 
     /// Signs out: the token is revoked where the server can, and forgotten.
-    pub fn logout(r: *Runtime, server: []const u8) Error!void {
+    /// Returns why the saved login couldn't be removed, if it couldn't: this
+    /// fx is signed out, but every other fx, and the next one, still has it.
+    pub fn logout(r: *Runtime, server: []const u8) Error!?anyerror {
         var req: Request = .{ .kind = .{ .logout = server }, .alloc = r.gpa };
         try r.submitOk(&req);
+        return req.logout_kept;
     }
 
     /// Every server that needs a login takes one saved since by another fx,
@@ -1034,10 +1041,13 @@ pub const Runtime = struct {
                 defer if (saved) |c| secret.zeroAndFree(r.gpa, c);
                 // The saved login goes first: a store that can't be read leaves
                 // the session signed in rather than half signed out.
-                _ = r.options.credentials.store.remove(r.gpa, s.credentialKey()) catch |err| switch (err) {
+                if (r.options.credentials.store.remove(r.gpa, s.credentialKey())) |_| {} else |err| switch (err) {
                     error.CredentialStoreUnreadable => return r.finish(req, .{ .failed = error.CredentialStoreUnreadable }),
-                    else => debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) }),
-                };
+                    else => {
+                        debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) });
+                        req.logout_kept = err;
+                    },
+                }
                 try r.engine.signOut(s.name);
                 if (saved) |c| if (!r.holds(i, c) and try r.engine.adoptCredential(s.name, c)) {
                     debug_trace.logf("mcp", "MCP logout also revokes server={s} reason=another fx saved a newer login", .{s.name});
@@ -1589,6 +1599,8 @@ pub const Runtime = struct {
             out.deinit();
         }
         if (try r.engine.saveCredential(s.name, &out.writer)) {
+            // A refresh's save is its last step under the refresh lock.
+            for (r.refreshes.items) |*f| if (f.server == i) if (f.lock) |*l| l.restamp();
             if (r.options.credentials.store.put(r.gpa, s.credentialKey(), out.written())) {
                 // Only a saved login is this process's own; one that wasn't
                 // leaves the store's as it was, for a refusal to remove.
@@ -1599,7 +1611,7 @@ pub const Runtime = struct {
                 if (r.flags[i].not_saved) return;
                 r.flags[i].not_saved = true;
                 var buf: [320]u8 = undefined;
-                r.notify(.{ .not_saved = .{ .server = s.name, .reason = notSavedReason(&buf, r.options.credentials.store, err) } });
+                r.notify(.{ .not_saved = .{ .server = s.name, .reason = r.options.credentials.store.writeFailure(&buf, err) } });
             }
         } else {
             // The tokens are gone, so this process is signed out whatever
@@ -2081,21 +2093,23 @@ pub const Runtime = struct {
     /// dropped, goes first: a server refreshes once at a time.
     fn refreshDue(r: *Runtime, i: usize) !void {
         r.endRefresh(i);
-        try r.refreshes.append(r.gpa, .{ .server = i, .deadline_ms = r.nowMs() + refresh_lock_wait_ms });
+        try r.refreshes.append(r.gpa, .{ .server = i, .started_ms = r.nowMs() });
         try r.tryRefresh(&r.refreshes.items[r.refreshes.items.len - 1]);
     }
 
     /// Under the login's refresh lock, one fx refreshes it at a time: this one
-    /// takes the login another fx saved meanwhile, or refreshes its own.
-    /// Waiting too long, or without the lock at all, it refreshes anyway.
+    /// takes the login another fx saved meanwhile, or refreshes its own. It
+    /// waits for as long as the fx holding the lock is still refreshing;
+    /// behind one that stopped (ctrl+z), or without the lock at all, it
+    /// refreshes anyway.
     fn tryRefresh(r: *Runtime, f: *Refresh) !void {
         const s = r.resolved.servers[f.server];
         if (r.options.credentials.store.tryRefreshLock(s.credentialKey())) |maybe| {
             if (maybe) |lock| {
                 f.lock = lock;
-            } else if (r.nowMs() < f.deadline_ms) {
+            } else if (!r.options.credentials.store.refreshHolderStopped(s.credentialKey(), f.started_ms, refresh_answer_ms)) {
                 return;
-            } else debug_trace.logf("mcp", "MCP refresh went ahead server={s} reason=another fx held its refresh lock too long", .{s.name});
+            } else debug_trace.logf("mcp", "MCP refresh went ahead server={s} reason=another fx stopped refreshing started={d} at={d}", .{ s.name, f.started_ms, r.nowMs() });
         } else |err| debug_trace.logf("mcp", "MCP refresh went ahead server={s} reason=no refresh lock err={s}", .{ s.name, @errorName(err) });
         f.sent = true;
         const saved = r.options.credentials.store.lookup(r.gpa, s.credentialKey()) catch |err| switch (err) {
@@ -2103,7 +2117,7 @@ pub const Runtime = struct {
             // Whether it's still saved can't be told, so it's refreshed as before.
             else => {
                 debug_trace.logf("mcp", "MCP saved login not read server={s} err={s}", .{ s.name, @errorName(err) });
-                return r.engine.refresh(s.name);
+                return r.sendRefresh(f);
             },
         };
         if (saved) |c| {
@@ -2122,7 +2136,14 @@ pub const Runtime = struct {
             return;
         }
         // Nothing goes out once a saved login replaced the refresh.
-        try r.engine.refresh(s.name);
+        try r.sendRefresh(f);
+    }
+
+    /// Sends `f`'s refresh, stamping its refresh lock first: the answer comes
+    /// within `refresh_answer_ms` of the stamp.
+    fn sendRefresh(r: *Runtime, f: *Refresh) !void {
+        if (f.lock) |*l| l.restamp();
+        try r.engine.refresh(r.resolved.servers[f.server].name);
     }
 
     /// Whether `saved` is the login server `i` last saved or took.
@@ -2224,16 +2245,6 @@ fn declaredCapabilities(questions: elicitation.Capabilities) []const u8 {
     if (questions.form) return "{\"elicitation\":{\"form\":{}}}";
     if (questions.url) return "{\"elicitation\":{\"url\":{}}}";
     return "{}";
-}
-
-/// Why a new login wasn't saved, in words.
-fn notSavedReason(buffer: []u8, store: credentials.Store, err: anyerror) []const u8 {
-    const why: []const u8 = switch (err) {
-        error.CredentialStoreUnreadable => "a newer fx saved it, or it's damaged",
-        error.LockBusy => "another fx kept it busy",
-        else => @errorName(err),
-    };
-    return std.mem.print(buffer, "{s} couldn't be written: {s}", .{ store.place(), why }) catch "the saved MCP sign-ins couldn't be written";
 }
 
 /// Why a sign-in failed, in words, with the authorization server's own when

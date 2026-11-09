@@ -663,8 +663,10 @@ function assertCommandOutputScrollback(
   let previousRow = -1;
   for (let index = 1; index <= 32; index++) {
     const marker = `ACTIVE_TOOL_LINE_${String(index).padStart(2, "0")}`;
+    // Ctrl+O shows a command's output under it at the detail indent, with
+    // no rail; the main screen's railed rows never count.
     const rows = lines.flatMap((line, row) =>
-      line.trimStart().startsWith(`│ ${marker}`) ? [row] : []
+      line.trimStart().startsWith(marker) ? [row] : []
     );
     if (rows.length !== 1) {
       push(
@@ -1086,17 +1088,13 @@ function isFooterHintRow(line: string): boolean {
   return text.length > 0 && !isDividerRow(line) && !isInputRow(text);
 }
 
+// Ctrl+O's footer is its keys alone, on the bottom row, under one blank row.
 function hasTranscriptViewerFooter(grid: string[]): boolean {
-  for (let row = 0; row + 2 < grid.length; row += 1) {
-    const navigation = semanticText(grid[row] ?? "").trim();
-    if (navigation !== "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close") {
-      continue;
-    }
-    if (isSemanticBlank(grid[row + 1] ?? "") && isFooterHintRow(grid[row + 2] ?? "")) {
-      return true;
-    }
-  }
-  return false;
+  let row = grid.length - 1;
+  while (row > 0 && isSemanticBlank(grid[row] ?? "")) row -= 1;
+  return row > 0 &&
+    semanticText(grid[row] ?? "").trim() === "esc close · pgup/pgdn scroll" &&
+    isSemanticBlank(grid[row - 1] ?? "");
 }
 
 function isDividerRow(line: string): boolean {

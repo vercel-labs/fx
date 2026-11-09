@@ -178,6 +178,9 @@ pub fn Runtime(comptime App: type) type {
             provider_strict: ?bool = null,
             /// `--permission-mode` for this launch; the saved mode is untouched.
             permission_mode: ?types.PermissionMode = null,
+            /// This launch replaces an older build after an update
+            /// (`--upgrade-relaunch`), so it takes over that build's screen.
+            upgrade_relaunch: bool = false,
         };
 
         pub fn bootstrap(
@@ -270,7 +273,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn beginFreshPersistedSessionDefault(app: *App) !void {
-            try app_session_runtime.Runtime(App).beginFreshPersistedSession(app, &app.main_agent);
+            try app_session_runtime.Runtime(App).beginInstanceSession(app, &app.main_agent);
         }
 
         fn enableSessionStoresDefault(app: *App) void {
@@ -397,12 +400,12 @@ pub fn Runtime(comptime App: type) type {
                 .skill_count = if (app.skills.refreshActive()) null else app.skills.items.len,
                 .mcp_servers = mcp_servers.items,
             });
-            try app.shell.appendFullDetailRecord(app.alloc, .{
+            try app.writeDomainNotice(.{
                 .topic = "session",
                 .tone = .neutral,
                 .body = body.written(),
                 .visibility = .full_only,
-            });
+            }, true);
         }
 
         fn bootstrapWithDeps(
@@ -425,6 +428,7 @@ pub fn Runtime(comptime App: type) type {
                 .terminal_title = deps.terminal_title,
                 .footer_rows = footer_rows,
                 .startup_min_body_rows = ui_render.welcome_message_reserved_rows,
+                .takes_over_screen = launch_overrides.upgrade_relaunch,
                 .default_model = default_model,
                 .default_agent_step_limit = default_agent_step_limit,
                 .secret_store = if (comptime @hasDecl(App, "secretStore"))
@@ -1292,12 +1296,14 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqual(@as(usize, 1), capture.load_skills_workspace_root_count);
     try std.testing.expectEqual(@as(usize, 1), capture.load_skills_global_root_count);
     const events = capture.eventSlice();
-    try std.testing.expectEqual(@as(usize, 5), events.len);
+    try std.testing.expectEqual(@as(usize, 6), events.len);
     try std.testing.expectEqualStrings("load_skills", events[0]);
     try std.testing.expectEqualStrings("welcome", events[1]);
-    try std.testing.expectEqualStrings("begin_fresh", events[2]);
-    try std.testing.expectEqualStrings("enable_stores", events[3]);
-    try std.testing.expectEqualStrings("title", events[4]);
+    // The session's full-only assembly notice, right after the welcome.
+    try std.testing.expectEqualStrings("welcome", events[2]);
+    try std.testing.expectEqualStrings("begin_fresh", events[3]);
+    try std.testing.expectEqualStrings("enable_stores", events[4]);
+    try std.testing.expectEqualStrings("title", events[5]);
     try std.testing.expectEqual(@as(usize, 1), capture.begin_calls);
     try std.testing.expectEqual(@as(usize, 1), capture.enable_calls);
     try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", capture.titleText());
@@ -1323,7 +1329,8 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.agent().effort);
     try std.testing.expect(app.workspace_identity.enabled);
     try std.testing.expectEqualStrings("/skills", app.skills.dir);
-    try std.testing.expectEqualStrings("welcome\n", app.transcript.items);
+    try std.testing.expect(std.mem.startsWith(u8, app.transcript.items, "welcome\n"));
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "session: provider:") != null);
     try std.testing.expect(app.transcript_recorded);
     try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
     try std.testing.expect(app.begin_fresh_called);
@@ -1508,15 +1515,13 @@ test "app_bootstrap_runtime records a full-only session assembly record" {
 
     try runBootstrapForTest(&app, &capture);
 
-    // The record lives in the full-detail side list, not the transcript.
-    try std.testing.expectEqualStrings("welcome\n", app.transcript.items);
-    try std.testing.expectEqual(@as(usize, 1), app.shell.notebook.full_detail_records.items.len);
-    const record = app.shell.notebook.full_detail_records.items[0].notice;
-    try std.testing.expectEqualStrings("session", record.topic);
-    try std.testing.expectEqual(types.NoticeTone.neutral, record.tone);
-    try std.testing.expectEqual(types.NoticeVisibility.full_only, record.visibility);
-    try std.testing.expect(std.mem.find(u8, record.body, "provider:") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "model: model-x") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "skills: 0 in catalog") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "mcp: none") != null);
+    // A full-only notice after the welcome, where the session started.
+    const written = app.transcript.items;
+    try std.testing.expect(std.mem.startsWith(u8, written, "welcome\n"));
+    const record = written["welcome\n".len..];
+    try std.testing.expect(std.mem.find(u8, record, "session: provider:") != null);
+    try std.testing.expect(std.mem.endsWith(u8, record, " [full-only]\n"));
+    try std.testing.expect(std.mem.find(u8, record, "model: model-x") != null);
+    try std.testing.expect(std.mem.find(u8, record, "skills: 0 in catalog") != null);
+    try std.testing.expect(std.mem.find(u8, record, "mcp: none") != null);
 }

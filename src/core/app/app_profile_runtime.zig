@@ -47,8 +47,8 @@ pub fn failureReason(alloc: std.mem.Allocator, name: []const u8) !?[]u8 {
 
 /// The model the first instance starts with: `--model`, else the launch
 /// profile's, unless `--provider` or `FX_MODEL` chose the process's model, as
-/// `applyProfileModel` decides for `/launch <profile>`. Null leaves the choice
-/// to startup.
+/// `applyProcessModelOverride` decides for `/launch <profile>`. Null leaves the
+/// choice to startup.
 pub fn launchModel(model_flag: ?[]const u8, provider_flag: bool, env_model: ?[]const u8, profile_model: ?[]const u8) ?[]const u8 {
     if (model_flag) |model| return model;
     if (provider_flag or env_model != null) return null;

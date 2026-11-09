@@ -43,7 +43,7 @@ pub const ConversationProgress = struct {
             const standalone = switch (event) {
                 .assistant, .context_checkpoint, .interrupted => true,
                 // A note counts no step, as steering does (D93, D94).
-                .steering, .context_note, .runtime_context => assistant.has_replay,
+                .steering, .context_note, .runtime_context, .model_call => assistant.has_replay,
                 else => false,
             };
             if (standalone) {
@@ -162,7 +162,7 @@ const ReplayState = struct {
             .interrupted => self.clearPendingToolCalls(),
             .user, .assistant, .steering, .turn_completed => {},
             // Only a v2 session saves a context note or runtime context (D93, D94).
-            .context_note, .runtime_context => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
         }
         self.last_seq = seq;
         self.turn_open = turn_open;
@@ -177,7 +177,7 @@ fn nextConversationTurnOpen(open: bool, event: session_event.ConversationEvent) 
         .context_checkpoint => open,
         // v1 logs never hold a context note or runtime context; only a v2
         // session saves them (D93, D94). Every v1 reader below refuses both.
-        .context_note, .runtime_context => error.InvalidConversationFrame,
+        .context_note, .runtime_context, .model_call => error.InvalidConversationFrame,
     };
 }
 
@@ -887,7 +887,7 @@ fn replayConversationHistory(
             .tool_call => |value| try turn.appendToolCall(value),
             .tool_result => |value| try turn.appendToolResult(value),
             .steering => |value| try turn.appendSteering(value.text),
-            .context_note, .runtime_context => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
             .turn_completed => |value| {
                 const completed = try turn.finishAssistant(value);
                 checkpoint_turn_open = false;
@@ -979,7 +979,7 @@ const ConversationHistoryReader = struct {
                     try self.builder.appendSteering(value.text);
                     break :blk null;
                 },
-                .context_note, .runtime_context => return error.InvalidConversationFrame,
+                .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
                 .turn_completed => |value| try self.builder.finishAssistant(value),
                 .interrupted => |value| try self.builder.finishInterrupted(value),
                 .context_checkpoint => blk: {
@@ -1084,7 +1084,7 @@ fn load_conversation_archive_from_source(
                 try builder.appendSteering(value.text);
                 break :blk null;
             },
-            .context_note, .runtime_context => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
             .turn_completed => |value| try builder.finishAssistant(value),
             .interrupted => |value| try builder.finishInterrupted(value),
             .context_checkpoint => |value| blk: {
@@ -1159,7 +1159,7 @@ const ConversationReplayScan = struct {
                     .coverage = checkpoint.covers_through_seq,
                 };
             },
-            .context_note, .runtime_context => return error.InvalidConversationFrame,
+            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
             else => {},
         }
     }
@@ -1224,6 +1224,7 @@ pub const ConversationTurnBuilder = struct {
     steering: std.ArrayList(types.PersistedSteering) = .empty,
     context_notes: std.ArrayList(types.PersistedContextNote) = .empty,
     runtime_context: ?[][]u8 = null,
+    model_calls: std.ArrayList(types.ModelCallRecord) = .empty,
 
     pub fn init(alloc: Allocator) ConversationTurnBuilder {
         return .{ .alloc = alloc };
@@ -1252,7 +1253,18 @@ pub const ConversationTurnBuilder = struct {
         for (self.context_notes.items) |item| types.freePersistedContextNote(self.alloc, item);
         self.context_notes.deinit(self.alloc);
         if (self.runtime_context) |texts| types.freeRuntimeContext(self.alloc, texts);
+        for (self.model_calls.items) |record| types.freeModelCallRecordStrings(self.alloc, record);
+        self.model_calls.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    /// Keeps a settled call's record with the turn. A record before the
+    /// turn's user message has no turn to show with and is left out.
+    pub fn appendModelCall(self: *ConversationTurnBuilder, record: types.ModelCallRecord) !void {
+        if (self.user == null) return;
+        const owned = try types.dupeModelCallRecord(self.alloc, record);
+        errdefer types.freeModelCallRecordStrings(self.alloc, owned);
+        try self.model_calls.append(self.alloc, owned);
     }
 
     pub fn isIdle(self: *const ConversationTurnBuilder) bool {
@@ -1575,6 +1587,8 @@ pub const ConversationTurnBuilder = struct {
         const context_notes = try self.context_notes.toOwnedSlice(self.alloc);
         errdefer types.freePersistedContextNotes(self.alloc, context_notes);
         const files = try types.dupeFileEvidenceSlice(self.alloc, files_source);
+        errdefer types.freeFileEvidenceSlice(self.alloc, files);
+        const model_calls = try self.model_calls.toOwnedSlice(self.alloc);
         const runtime_context = self.runtime_context;
         self.runtime_context = null;
         return .{
@@ -1584,6 +1598,7 @@ pub const ConversationTurnBuilder = struct {
             .context_notes = context_notes,
             .runtime_context = runtime_context,
             .turn_summary = turn_summary,
+            .model_calls = model_calls,
         };
     }
 };

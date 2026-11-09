@@ -365,6 +365,17 @@ class LinuxPlatformTests(unittest.TestCase):
         benchmark = PipelinePaths.create(self.root / "bench", selector="ui_activity")
         self.assertEqual((), linux.candidate_object_flags(benchmark))
 
+    def test_only_x86_64_asks_for_the_cold_code_machine_outliner(self) -> None:
+        # AArch64 runs the machine outliner by default; x86_64 has to ask.
+        outliner = "-enable-machine-outliner=conservative-pgo"
+        benchmark = PipelinePaths.create(self.root / "bench", selector="ui_activity")
+        self.assertEqual(
+            (outliner, "-function-sections"), linux.X86_64.candidate_object_flags(self.paths)
+        )
+        self.assertEqual((outliner,), linux.X86_64.candidate_object_flags(benchmark))
+        self.assertEqual(("-function-sections",), linux.ARM64.candidate_object_flags(self.paths))
+        self.assertEqual((), linux.ARM64.candidate_object_flags(benchmark))
+
     def test_discover_tools_reads_lld_readelf_and_the_profile_runtime_from_one_root(self) -> None:
         root = self.root / "llvm" / "bin"
         root.mkdir(parents=True)

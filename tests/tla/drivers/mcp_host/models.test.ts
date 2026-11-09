@@ -2,6 +2,8 @@
 // planted bug, the stated properties the code breaks, repair witnesses), and
 // the trace bridge qualified both ways: a known-good trace per model is
 // ACCEPTED and a known-bad one REJECTED at the record that breaks it.
+// StoreLockBudget's and RefreshLease's traces are checked against rules, not
+// steps, so their known-bad traces VIOLATE the rule they break.
 import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { artifacts } from "../lib/context";
@@ -14,9 +16,10 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   save(join(artifacts, "gate-summary.json"), results.map(({ module, label, kind, verdict, expected, distinct, exit }) => ({ module, label, kind, verdict, expected, distinct, exit })));
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
-  // SharedLogins, SubagentAccess, UrlRetry and MixedBuilds joined the four.
-  expect(count("smoke", "PASS")).toBe(8);
-  expect(count("stress", "PASS")).toBe(8);
+  // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget and
+  // RefreshLease joined the four.
+  expect(count("smoke", "PASS")).toBe(10);
+  expect(count("stress", "PASS")).toBe(10);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
@@ -139,6 +142,50 @@ for (const c of controls) {
     expect(bad.firstBad?.index).toBe(c.badAt);
   }, 300_000);
 }
+
+test("bridge control (store lock budget): the known-good trace is ACCEPTED, and a waiter giving up on holders taking turns VIOLATES", async () => {
+  const constants = { ObsBudget: 10_000, ObsSlack: 2_000, ObsTolerance: 600 };
+  const dir = join(artifacts, "bridge", "StoreLockBudget");
+  const take = (p: string, at: number, started: number): TraceRecord => ({ event: "take", data: { p, at, started } });
+  const release = (p: string, at: number): TraceRecord => ({ event: "release", data: { p, at } });
+  // Three holders of 6 s in turn; the last waited 12 s, longer than its own 12 s would allow.
+  const good = [take("a", 0, 0), release("a", 6_000), take("b", 6_010, 0), release("b", 12_000), take("c", 12_010, 0), release("c", 18_000)];
+  // The capped wait the lease replaced: c gives up 12 s after its start while b holds the lock.
+  const bad = [take("a", 0, 0), release("a", 6_000), take("b", 6_010, 0), { event: "giveup", data: { p: "c", at: 12_000, started: 0 } }, release("b", 12_100)];
+  const g = await checkTrace({ module: "StoreLockBudget", records: good, constants, dir: join(dir, "good") });
+  const b = await checkTrace({ module: "StoreLockBudget", records: bad, constants, dir: join(dir, "bad") });
+  expect(g.verdict).toBe("ACCEPTED");
+  expect(b.verdict).toBe("VIOLATES");
+  expect(b.broken?.sort()).toEqual(["GiveUpOnTime", "NoGiveUpOnLiveHolder"]);
+}, 300_000);
+
+test("bridge control (store lock budget): a hold of two 6 s calls stamped before each is ACCEPTED, and one stamped only when taken VIOLATES", async () => {
+  const constants = { ObsBudget: 10_000, ObsSlack: 2_000, ObsTolerance: 600 };
+  const dir = join(artifacts, "bridge", "StoreLockBudget-calls");
+  const take = (p: string, at: number, started: number): TraceRecord => ({ event: "take", data: { p, at, started } });
+  const good = [take("a", 0, 0), { event: "stamp", data: { p: "a", at: 6_000 } }, { event: "release", data: { p: "a", at: 12_000 } }, take("b", 12_010, 1_000)];
+  const bad = [take("a", 0, 0), { event: "release", data: { p: "a", at: 12_000 } }];
+  const g = await checkTrace({ module: "StoreLockBudget", records: good, constants, dir: join(dir, "good") });
+  const b = await checkTrace({ module: "StoreLockBudget", records: bad, constants, dir: join(dir, "bad") });
+  expect(g.verdict).toBe("ACCEPTED");
+  expect(b.verdict).toBe("VIOLATES");
+  expect(b.broken).toEqual(["HoldWithinBudget"]);
+}, 300_000);
+
+test("bridge control (refresh lease): going ahead behind a frozen holder on time is ACCEPTED, and going ahead 10 s in behind a live one VIOLATES", async () => {
+  const constants = { ObsRefreshMax: 30_000, ObsBudget: 10_000, ObsSlack: 2_000, ObsTolerance: 600 };
+  const dir = join(artifacts, "bridge", "RefreshLease");
+  const ev = (event: string, p: string, at: number, started?: number): TraceRecord => ({ event, data: started === undefined ? { p, at } : { p, at, started } });
+  // a sends its refresh at 100 and freezes; b, waiting since 50, goes ahead 2 s after a's 30 s step.
+  const good = [ev("take", "a", 0), ev("stamp", "a", 100), ev("freeze", "a", 200), ev("goahead", "b", 32_100, 50)];
+  // The fixed wait the lease replaced: b goes ahead 10 s after it started while a is still refreshing.
+  const bad = [ev("take", "a", 0), ev("stamp", "a", 100), ev("goahead", "b", 10_050, 50)];
+  const g = await checkTrace({ module: "RefreshLease", records: good, constants, dir: join(dir, "good") });
+  const b = await checkTrace({ module: "RefreshLease", records: bad, constants, dir: join(dir, "bad") });
+  expect(g.verdict).toBe("ACCEPTED");
+  expect(b.verdict).toBe("VIOLATES");
+  expect(b.broken?.sort()).toEqual(["GoAheadOnTime", "NoGoAheadPastLiveRefresher"]);
+}, 300_000);
 
 test("bridge control: an empty trace is INCONCLUSIVE, never a pass", async () => {
   const v = await checkTrace({ module: "SignIn", records: [], constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false }, dir: join(artifacts, "bridge", "empty") });

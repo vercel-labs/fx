@@ -6,6 +6,8 @@ const host_contract = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const io_mod = @import("../shared/io.zig");
+const leased_lock = @import("../shared/leased_lock.zig");
+const oauth_transport = @import("oauth_transport.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const secret = @import("secret.zig");
@@ -22,7 +24,13 @@ const schema_version: i64 = 1;
 const max_auth_file_bytes: usize = 64 * 1024;
 const expiry_skew_ms: i64 = 60 * 1000;
 const mutation_lock_file_name = "auth.lock";
-const mutation_lock_deadline_ms: u64 = 2000;
+/// The lock is leased (`leased_lock`): its holder stamps it before each
+/// Keychain call and each request to the issuer, and each ends within
+/// `mutation_step_ms`, the longer of their timeouts. A waiting fx gives up
+/// `leased_lock.slack_ms` after that, so it waits for another refreshing the
+/// login however slowly, and one frozen holding the lock (ctrl+z) costs it 17 s.
+const mutation_step_ms: i64 = @max(native_keychain.keychain_call_ms, oauth_transport.default_request_timeout_ms);
+const mutation_lock_wait_ms: i64 = mutation_step_ms + leased_lock.slack_ms;
 const e2e_lock_contention_file_name = "auth-lock-contention";
 
 const StorageBackend = enum {
@@ -294,21 +302,14 @@ const KeychainObservation = union(enum) {
 };
 
 fn observeAuthFile(alloc: Allocator, fx_dir: *std.Io.Dir) !FileObservation {
-    // A path that isn't a regular file, such as a fifo, is unusable without
-    // waiting for a writer.
-    var file = io_mod.openExistingReadOnlyRegularFile(fx_dir.*, auth_file_name, .no_follow) catch |err| switch (err) {
-        error.FileNotFound => return .absent,
-        else => {
-            debug_trace.logf("auth", "session load failed source=file step=open err={s}", .{@errorName(err)});
-            return .unusable;
-        },
-    };
-    defer file.close(io_mod.getIo());
-
-    const stat = file.stat(io_mod.getIo()) catch |err| {
-        debug_trace.logf("auth", "session load failed source=file step=stat err={s}", .{@errorName(err)});
+    var current = (session_presence.openCurrent(fx_dir.*, auth_file_name) catch |err| {
+        debug_trace.logf("auth", "session load failed source=file step=open err={s}", .{@errorName(err)});
         return .unusable;
-    };
+    }) orelse return .absent;
+    defer current.file.close(io_mod.getIo());
+    var file = current.file;
+
+    const stat = current.stat;
     if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
         debug_trace.logf("auth", "session load failed source=file step=permissions err=InsecureAuthFile", .{});
         return .unusable;
@@ -373,6 +374,8 @@ pub const Mutation = if (host_target.is_wasm) HostMutation else NativeMutation;
 const NativeMutation = struct {
     fx_dir: io_mod.VerifiedDir,
     lock: io_mod.TimedAdvisoryLock,
+    /// The lease's last stamp, on the awake clock (`mutation_lock_wait_ms`).
+    stamp_ms: i64,
     backend: StorageBackend,
     keychain: KeychainBackend,
     authority: Authority = .unresolved,
@@ -383,7 +386,50 @@ const NativeMutation = struct {
         }
     }
 
+    /// Stamps the lease again, before a request to the issuer: the request
+    /// has its whole budget from a fresh stamp. Keychain calls stamp it
+    /// themselves (`stamped`).
+    pub fn restamp(self: *NativeMutation) void {
+        self.stamp_ms = leased_lock.restamp(self.lock.file, "auth", "fx login");
+    }
+
+    /// `keychain`, stamping the lease before each call.
+    fn stamped(self: *NativeMutation) KeychainBackend {
+        return .{
+            .context = self,
+            .load_fn = stampedLoad,
+            .store_fn = stampedStore,
+            .delete_fn = stampedDelete,
+            .presence_fn = stampedPresence,
+        };
+    }
+
+    fn stampedLoad(context: ?*anyopaque, alloc: Allocator) KeychainError!?[]u8 {
+        const self: *NativeMutation = @ptrCast(@alignCast(context.?));
+        self.restamp();
+        return self.keychain.load(alloc);
+    }
+
+    fn stampedStore(context: ?*anyopaque, value: []const u8) KeychainError!void {
+        const self: *NativeMutation = @ptrCast(@alignCast(context.?));
+        self.restamp();
+        return self.keychain.store(value);
+    }
+
+    fn stampedDelete(context: ?*anyopaque, alloc: Allocator) KeychainError!bool {
+        const self: *NativeMutation = @ptrCast(@alignCast(context.?));
+        self.restamp();
+        return self.keychain.delete(alloc);
+    }
+
+    fn stampedPresence(context: ?*anyopaque) native_keychain.Error!host_contract.SecretStorePresence {
+        const self: *NativeMutation = @ptrCast(@alignCast(context.?));
+        self.restamp();
+        return self.keychain.presence();
+    }
+
     pub fn deinit(self: *Mutation) void {
+        debug_trace.logf("auth", "fx login lock released stamp={d} at={d}", .{ self.stamp_ms, io_mod.awakeMilliTimestamp() });
         self.lock.release();
         self.fx_dir.close();
         self.* = undefined;
@@ -414,7 +460,7 @@ const NativeMutation = struct {
     pub fn delete(self: *Mutation, alloc: Allocator) !DeleteResult {
         var result: DeleteResult = .{};
         if (self.backend == .macos_keychain) {
-            const deleted = self.keychain.delete(alloc) catch blk: {
+            const deleted = self.stamped().delete(alloc) catch blk: {
                 result.local_cleanup_failed = true;
                 break :blk false;
             };
@@ -440,7 +486,7 @@ const NativeMutation = struct {
     fn loadKeychainResolved(self: *Mutation, alloc: Allocator) !?Session {
         var file = try observeAuthFile(alloc, &self.fx_dir.dir);
         defer file.deinit(alloc);
-        var keychain = try observeKeychain(alloc, self.keychain);
+        var keychain = try observeKeychain(alloc, self.stamped());
         defer keychain.deinit(alloc);
 
         switch (selectResolution(file.state(), keychain.state())) {
@@ -479,7 +525,7 @@ const NativeMutation = struct {
                 if (migrated) self.authority = .keychain;
             },
             .keychain, .missing => {
-                try publishAndVerifyKeychain(alloc, self.keychain, session);
+                try publishAndVerifyKeychain(alloc, self.stamped(), session);
                 self.authority = .keychain;
             },
             .unresolved => unreachable,
@@ -487,7 +533,7 @@ const NativeMutation = struct {
     }
 
     fn publishAndCleanup(self: *Mutation, alloc: Allocator, session: Session) !bool {
-        publishAndVerifyKeychain(alloc, self.keychain, session) catch |err| {
+        publishAndVerifyKeychain(alloc, self.stamped(), session) catch |err| {
             debug_trace.logf("auth", "session migration deferred step=publish err={s}", .{@errorName(err)});
             return false;
         };
@@ -520,6 +566,9 @@ const HostMutation = struct {
 
     // Host storage validates writes through its revisioned save callback.
     pub fn requireWritable(_: *HostMutation) error{CredentialStorageUnavailable}!void {}
+
+    /// The host serializes its own storage; there is no lock to stamp.
+    pub fn restamp(_: *HostMutation) void {}
 
     fn init(store: js_host_auth.SessionStore) HostMutation {
         return .{ .store = store };
@@ -664,24 +713,19 @@ fn loadFromHost(alloc: Allocator, store: js_host_auth.SessionStore) !?Session {
 }
 
 fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) !?Session {
-    // A path that isn't a regular file, such as a fifo, fails without
-    // waiting for a writer.
-    var file = io_mod.openExistingReadOnlyRegularFile(fx_dir.*, auth_file_name, .no_follow) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => {
-            debug_trace.logf("auth", "session load failed step=open_file err={s}", .{@errorName(err)});
-            return session_presence.storageError(auth_file_name, err);
-        },
-    };
-    defer file.close(io_mod.getIo());
+    var current = (session_presence.openCurrent(fx_dir.*, auth_file_name) catch |err| {
+        debug_trace.logf("auth", "session load failed step=open_file err={s}", .{@errorName(err)});
+        return session_presence.storageError(auth_file_name, err);
+    }) orelse return null;
+    defer current.file.close(io_mod.getIo());
 
-    const stat = file.stat(io_mod.getIo()) catch |err| return session_presence.storageError(auth_file_name, err);
+    const stat = current.stat;
     if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
         debug_trace.logf("auth", "session load failed step=permissions err=InsecureAuthFile", .{});
         return error.InsecureAuthFile;
     }
 
-    const bytes = io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes) catch |err| return session_presence.storageError(auth_file_name, err);
+    const bytes = io_mod.readFileToEnd(alloc, &current.file, max_auth_file_bytes) catch |err| return session_presence.storageError(auth_file_name, err);
     defer secret.zeroAndFree(alloc, bytes);
     return try parseStoredSession(alloc, bytes);
 }
@@ -763,7 +807,7 @@ fn beginMutation() !Mutation {
 
 fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
     var probe = MutationLockProbe{ .fx_dir = open_fx_dir.dir };
-    return lockMutationWithOps(open_fx_dir, mutation_lock_deadline_ms, .{
+    return lockMutationWithOps(open_fx_dir, mutation_lock_wait_ms, .{
         .ctx = &probe,
         .try_lock = MutationLockProbe.tryLock,
     });
@@ -771,12 +815,12 @@ fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
 
 fn lockMutationWithOps(
     open_fx_dir: io_mod.VerifiedDir,
-    deadline_ms: u64,
+    wait_ms: i64,
     ops: io_mod.LockOps,
 ) !Mutation {
     return lockMutationWithBackend(
         open_fx_dir,
-        deadline_ms,
+        wait_ms,
         ops,
         storageBackend(),
         native_keychain_backend,
@@ -785,7 +829,7 @@ fn lockMutationWithOps(
 
 fn lockMutationWithBackend(
     open_fx_dir: io_mod.VerifiedDir,
-    deadline_ms: u64,
+    wait_ms: i64,
     ops: io_mod.LockOps,
     backend: StorageBackend,
     keychain: KeychainBackend,
@@ -793,17 +837,22 @@ fn lockMutationWithBackend(
     var fx_dir = open_fx_dir;
     errdefer fx_dir.close();
 
-    var lock = io_mod.acquireTimedAdvisoryLockWithOps(
+    const taken = leased_lock.acquire(
         &fx_dir,
         mutation_lock_file_name,
-        deadline_ms,
+        io_mod.awakeMilliTimestamp(),
+        wait_ms,
         ops,
+        "auth",
+        "fx login",
     ) catch |err| return session_presence.storageError(auth_file_name, err);
+    var lock = taken.lock;
     errdefer lock.release();
 
     return .{
         .fx_dir = fx_dir,
         .lock = lock,
+        .stamp_ms = taken.stamp_ms,
         .backend = backend,
         .keychain = keychain,
     };
@@ -1142,6 +1191,69 @@ fn testKeychainMutation(dir: std.Io.Dir, keychain: KeychainBackend) !Mutation {
         .macos_keychain,
         keychain,
     );
+}
+
+test "the fx login lock is stamped before each Keychain call made under it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The Keychain, recording the lock's stamp as each call finds it. Each
+    // call takes 3 ms, so a stamp written before the next one shows.
+    const Probe = struct {
+        fake: FakeOAuthKeychain,
+        dir: std.Io.Dir,
+        stamps: std.ArrayList(i64) = .empty,
+
+        fn backend(self: *@This()) KeychainBackend {
+            return .{ .context = self, .load_fn = probeLoad, .store_fn = probeStore, .delete_fn = probeDelete, .presence_fn = probePresence };
+        }
+
+        fn record(self: *@This()) void {
+            var dir: io_mod.VerifiedDir = .{ .dir = self.dir };
+            const stamp = leased_lock.readStamp(&dir, mutation_lock_file_name) orelse return;
+            self.stamps.append(std.testing.allocator, stamp) catch return;
+            io_mod.sleep(3 * std.time.ns_per_ms);
+        }
+
+        fn probeLoad(raw: ?*anyopaque, a: Allocator) KeychainError!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.record();
+            return FakeOAuthKeychain.loadCallback(&self.fake, a);
+        }
+
+        fn probeStore(raw: ?*anyopaque, value: []const u8) KeychainError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.record();
+            return FakeOAuthKeychain.storeCallback(&self.fake, value);
+        }
+
+        fn probeDelete(raw: ?*anyopaque, a: Allocator) KeychainError!bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.record();
+            return FakeOAuthKeychain.deleteCallback(&self.fake, a);
+        }
+
+        fn probePresence(raw: ?*anyopaque) native_keychain.Error!host_contract.SecretStorePresence {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return FakeOAuthKeychain.presenceCallback(&self.fake);
+        }
+    };
+    var probe: Probe = .{ .fake = .{ .alloc = alloc }, .dir = tmp.dir };
+    defer probe.fake.deinit();
+    defer probe.stamps.deinit(alloc);
+
+    var mutation = try testKeychainMutation(tmp.dir, probe.backend());
+    defer mutation.deinit();
+    const taken = mutation.stamp_ms;
+    var session = try parse(alloc, test_session_json);
+    defer session.deinit(alloc);
+    // A save writes the login, then reads it back: two calls, two stamps.
+    try mutation.save(alloc, session);
+    try std.testing.expectEqual(@as(usize, 2), probe.stamps.items.len);
+    try std.testing.expect(probe.stamps.items[0] >= taken);
+    try std.testing.expect(probe.stamps.items[1] > probe.stamps.items[0]);
+    try std.testing.expectEqual(probe.stamps.items[1], mutation.stamp_ms);
 }
 
 test "OAuth migration keeps a valid file authoritative until verified cleanup" {

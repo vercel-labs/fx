@@ -63,5 +63,19 @@
     "stress": "MixedBuilds.stress.cfg",
     "findings": [],
     "repair": []
+  },
+  {
+    "module": "StoreLockBudget",
+    "smoke": "StoreLockBudget.cfg",
+    "stress": "StoreLockBudget.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "RefreshLease",
+    "smoke": "RefreshLease.cfg",
+    "stress": "RefreshLease.stress.cfg",
+    "findings": [],
+    "repair": []
   }
 ]

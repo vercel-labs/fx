@@ -597,6 +597,14 @@ pub noinline fn nanoTimestamp() i128 {
     return @intCast(ts.nanoseconds);
 }
 
+/// Milliseconds on the awake clock, which every process on the machine shares
+/// and which stops while the machine sleeps (mach uptime on macOS). For
+/// timeouts one process sets and another reads.
+pub fn awakeMilliTimestamp() i64 {
+    const ts = std.Io.Timestamp.now(getIo(), .awake);
+    return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
+}
+
 pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const u8) !void {
     e2eFailIfDurableMutationAttempted();
     const maybe_existing_permissions = existingFilePermissions(path);
@@ -1882,4 +1890,24 @@ test "timed advisory lock reports unsupported without unlocked fallback" {
         error.LockUnsupported,
         acquireTimedAdvisoryLockWithOps(&dir, "settings.lock", 25, ops),
     );
+}
+
+/// Holds each standard stream the parent left closed open on /dev/null,
+/// read-only, so no file fx opens later takes its number. A write meant for a
+/// closed stdout then fails, instead of landing in that file, such as the
+/// session store's lock, and a read of a closed stdin ends at once. Call it
+/// before fx opens anything.
+pub fn reserveClosedStandardStreams() void {
+    if (comptime !builtin.link_libc or builtin.target.os.tag == .windows) return;
+    for ([_]std.c.fd_t{ 0, 1, 2 }) |fd| {
+        if (std.c.fcntl(fd, std.c.F.GETFD) != -1) continue;
+        // `open` returns the lowest free number, which is `fd` once the
+        // closed streams below it are held.
+        const held = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY });
+        if (held < 0) return;
+        if (held != fd) {
+            _ = std.c.dup2(held, fd);
+            _ = std.c.close(held);
+        }
+    }
 }

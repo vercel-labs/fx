@@ -680,6 +680,17 @@ pub const Runtime = struct {
         return self.state == .failed;
     }
 
+    /// Why the catalog is down, or null while it loads, after it loaded, or
+    /// when a failed refresh kept the earlier catalog.
+    pub fn downFailure(self: *Self) ?model_catalog.FailureCategory {
+        self.finishThreadIfDone();
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.state != .failed) return null;
+        const failed = self.outcome.last_failure orelse return .runtime;
+        return failed.failure.category;
+    }
+
     pub fn snapshotCachedModelIds(self: *Self, alloc: Allocator) !?std.ArrayList([]u8) {
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());

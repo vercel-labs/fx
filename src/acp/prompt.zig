@@ -60,6 +60,7 @@ const subagent_domain = @import("../core/subagent/domain.zig");
 const subagent_execution = @import("../core/subagent/execution.zig");
 const subagent_model_contract = @import("../core/subagent/model_contract.zig");
 const gateway_model_catalog = @import("../core/gateway/model_catalog.zig");
+const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const skill_invocation = @import("../core/skills/skill_invocation.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
@@ -1256,14 +1257,16 @@ fn maybeStartAcpTitleTask(
     session.title_task = task;
 }
 
-/// Joins the bounded title task and installs the generated title unless the
-/// session already carries a user-set title. No-op without a pending task.
+/// Gives the title task a short grace after the turn, then installs the
+/// generated title unless the session already carries a user-set title. A
+/// title still pending after the grace is dropped, and the session keeps the
+/// title derived from its first prompt. No-op without a pending task.
 fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessionState) void {
     _ = state;
     const task = session.title_task orelse return;
     session.title_task = null;
     defer task.destroy();
-    task.join();
+    task.joinOrCancel(&session.cancel_flag, session_title_generation.after_turn_grace_ms);
     const title = task.takeTitle() orelse return;
     defer std.heap.c_allocator.free(title);
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -1983,7 +1986,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
-        .model_catalog_unavailable = modelCatalogUnavailable,
+        .model_catalog_failure = modelCatalogFailure,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
         .record_tool_call_failed = recordToolCallFailed,
@@ -2176,9 +2179,9 @@ fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
     active.context_used.store(std.math.cast(usize, used) orelse std.math.maxInt(usize), .release);
 }
 
-fn modelCatalogUnavailable(raw_ctx: *anyopaque) bool {
+fn modelCatalogFailure(raw_ctx: *anyopaque) ?gateway_model_catalog.FailureCategory {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    return ctx.state.capability_resolver.state == .failed;
+    return ctx.state.capability_resolver.downFailure();
 }
 
 fn resolveModelCapabilities(
@@ -2189,7 +2192,7 @@ fn resolveModelCapabilities(
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return .{};
     const bundle = ctx.state.cfg.provider_set.select(session.provider);
-    return ctx.state.capability_resolver.resolve(
+    return ctx.state.capability_resolver.resolveWithin(
         ctx.state.alloc,
         bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model),
         .{
@@ -2204,6 +2207,7 @@ fn resolveModelCapabilities(
         },
         model,
         bundle.fallbackModelCapabilities(model),
+        gateway_provider.catalog_connect_wait_ms,
     );
 }
 
@@ -2219,7 +2223,7 @@ fn resolveModelOverride(
     const session = if (ctx.state.active_session) |*active| active else return .no_catalog;
     const bundle = ctx.state.cfg.provider_set.select(session.provider);
     const catalog_provider = bundle.model_catalog orelse return .no_catalog;
-    _ = ctx.state.capability_resolver.resolve(
+    _ = ctx.state.capability_resolver.resolveWithin(
         ctx.state.alloc,
         catalog_provider,
         .{
@@ -2234,6 +2238,7 @@ fn resolveModelOverride(
         },
         raw_model,
         bundle.fallbackModelCapabilities(raw_model),
+        gateway_provider.catalog_connect_wait_ms,
     ) catch return .no_catalog;
     const entries = ctx.state.capability_resolver.catalogEntries() orelse return .no_catalog;
     var ids = try gateway_model_catalog.projectModelIds(alloc, entries);

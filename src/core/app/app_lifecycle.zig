@@ -89,7 +89,8 @@ fn tmuxAbnormalExitHandler(sig: std.posix.SIG) callconv(.c) void {
 /// resumes it without counting a crash (`RequestRecovery.closeActive`,
 /// `tests/tla/recovery/Resume.tla` NoFalseCrashQuestion). It then restores
 /// the terminal and re-raises as the handler did before. Without that
-/// thread, the handler restores and re-raises itself.
+/// thread, the handler restores and re-raises itself. A terminal that hangs
+/// up closes fx the same way (`closeOnHangup`).
 var close_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 var close_signal: std.atomic.Value(i32) = .init(0);
 var closer_tmux = false;
@@ -112,12 +113,33 @@ fn closerMain() void {
     }
     const sig: std.posix.SIG = @fromBackingInt(@intCast(close_signal.load(.seq_cst)));
     const saved = request_recovery.RequestRecovery.closeActive();
-    debug_trace.logf("app", "event=closing signal={d} record_saved={}", .{ close_signal.load(.seq_cst), saved });
+    debug_trace.logf("app", "event=closing signal={d} records_saved={d}", .{ close_signal.load(.seq_cst), saved });
     if (closer_tmux) {
         abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, sig);
     } else {
         abnormalExitHandlerWithRestore(abnormal_exit_restore, sig);
     }
+}
+
+/// A terminal that hangs up is a closed window too, and fx often sees the
+/// hang-up before SIGHUP. With a turn running, fx closes here as `closerMain`
+/// does: it saves the request in flight marked clean and ends by SIGHUP, so
+/// the turn stays open and the next launch resumes it
+/// (`tests/tla/recovery/Resume.tla` Close). A graceful shutdown would cancel
+/// the turn as Esc does, and nothing would send it again. Returns only when
+/// no turn is running.
+pub fn closeOnHangup(turn_running: bool) void {
+    if (!turn_running) return;
+    const saved = request_recovery.RequestRecovery.closeActive();
+    debug_trace.logf("app", "event=closing cause=hangup records_saved={d} turn=left_open", .{saved});
+    if (io_mod.getenv("TMUX") != null) {
+        abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, std.posix.SIG.HUP);
+    } else {
+        abnormalExitHandlerWithRestore(abnormal_exit_restore, std.posix.SIG.HUP);
+    }
+    // SIGHUP is blocked in this thread: end at once, with the status it
+    // gives, as a death by SIGHUP would.
+    std.c._exit(128 + @as(c_int, @intCast(@backingInt(std.posix.SIG.HUP))));
 }
 
 /// Starts the closer once per process. False when it cannot run.
@@ -439,6 +461,11 @@ pub const BootstrapConfig = struct {
     terminal_title: host.TerminalTitle,
     footer_rows: u16,
     startup_min_body_rows: u16 = 0,
+    /// The terminal still shows the screen of the fx build this launch
+    /// replaces after an update, and the first frame clears it and draws the
+    /// conversation from the top. Startup leaves that screen where it is
+    /// instead of scrolling it to keep rows free for the welcome.
+    takes_over_screen: bool = false,
     default_model: []const u8,
     default_agent_step_limit: usize,
     secret_store: host.SecretStore,
@@ -1050,7 +1077,12 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
         break :blk row;
     };
     var launch_start_row = start_row;
-    const effective_startup_min_body_rows = try prepareStartupViewport(
+    const effective_startup_min_body_rows = if (cfg.takes_over_screen) kept: {
+        // Scrolling here would move the old screen up until the first frame
+        // clears it.
+        debug_trace.logf("render", "launch_scrollback_push skipped start_row={d} reason=first_frame_clears_terminal", .{start_row});
+        break :kept cfg.startup_min_body_rows;
+    } else try prepareStartupViewport(
         cfg.shell,
         cfg.metrics,
         &launch_start_row,

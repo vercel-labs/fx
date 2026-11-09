@@ -58,6 +58,7 @@ const subagent_authority = @import("../subagent/authority.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const builtin_tools = @import("../../builtins/tools.zig");
 const types = @import("../shared/types.zig");
+const full_transcript_metadata = @import("../output/full_transcript_metadata.zig");
 const history_range = @import("../shared/history_range.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
@@ -538,22 +539,13 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Gives an instance launched in a profile the profile's model, unless
-        /// `--model`, `--provider`, or `FX_MODEL` chose one for the process,
-        /// which still wins, as it does over the first instance's profile.
-        pub fn applyProfileModel(app: *App, agent: *AppAgent, model: []const u8) !void {
-            if (agent.session_persistence.process_model_override != null) return;
-            const preferences = if (agent.session_persistence.session_preferences) |*value| value else return;
-            const owned = try app.alloc.dupe(u8, model);
-            app.alloc.free(preferences.model);
-            preferences.model = owned;
-        }
-
-        /// Gives an instance launched after the first the model the launch
-        /// chose with `--model`, `--provider`, or `FX_MODEL`, which the first
-        /// instance takes through the app's selection at startup. An instance's
+        /// Gives an instance launched after the first, at launch and after each
+        /// `/new`, the model the launch chose with `--model`, `--provider`, or
+        /// `FX_MODEL`, which the first instance takes through the app's
+        /// selection at startup. An instance's
         /// model is its own session preference, and its fresh session still
-        /// saves the configured one, as the first instance's does.
+        /// saves the one it started with, its profile's or the configured one,
+        /// as the first instance's does.
         pub fn applyProcessModelOverride(app: *App, agent: *AppAgent) !void {
             const model = agent.session_persistence.process_model_override orelse return;
             const preferences = if (agent.session_persistence.session_preferences) |*value| value else return;
@@ -624,18 +616,51 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn beginFreshPersistedSession(app: *App, agent: *AppAgent) !void {
+            return beginFresh(app, agent, .later, null);
+        }
+
+        /// Starts the session an instance opens with. In a profile, it starts
+        /// with and saves the profile's model and effort, so resuming it
+        /// brings them back; `--model`, `--effort`, and `FX_MODEL` shape only
+        /// the run that passed them. A session `/new` starts later begins
+        /// with what the one it replaces had saved (`installFreshLiveSession`).
+        pub fn beginInstanceSession(app: *App, agent: *AppAgent) !void {
+            return beginFresh(app, agent, .instance_start, null);
+        }
+
+        const FreshStart = enum { instance_start, later };
+
+        /// `carried`, when given, is what the new session starts with in
+        /// place of the workspace's preferences. The caller keeps it.
+        fn beginFresh(app: *App, agent: *AppAgent, start: FreshStart, carried: ?session_codec.DurableSessionPreferences) !void {
             closeWritableSession(app, agent);
             // A fresh session starts with no usage, whether or not it persists.
             agent.total_input_tokens = 0;
             agent.total_output_tokens = 0;
             agent.total_web_search_requests = 0;
             if (comptime runtime_profile.allows(App, .js_host_sessions)) {
-                try beginFreshJsHostSession(app, agent);
+                try beginFreshJsHostSession(app, agent, carried);
             }
             defer syncTranscriptWindowSaveMode(app, agent);
             defer syncTranscriptArchiveAvailable(app, agent);
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            if (agent.session_persistence.v2_store) |v2_store| try beginFreshV2Session(app, agent, v2_store);
+            if (agent.session_persistence.v2_store) |v2_store| try beginFreshV2Session(app, agent, v2_store, start, carried);
+        }
+
+        /// The preferences `agent`'s open session has saved, or null when it
+        /// has no session or they can't be read. Caller owns.
+        fn savedPreferences(app: *App, agent: *AppAgent) ?session_codec.DurableSessionPreferences {
+            if (comptime runtime_profile.allows(App, .js_host_sessions)) {
+                if (jsHostSavedPreferences(app, agent)) |preferences| return preferences;
+            }
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return null;
+            agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = agent.session_persistence.v2 orelse return null;
+            return v2.currentPreferences(app.alloc) catch |err| {
+                debug_trace.logf("session", "saved preferences unavailable session={s} err={s}; the new session starts from the workspace's", .{ v2.id(), @errorName(err) });
+                return null;
+            };
         }
 
         /// The transcript window drops entries only once the session log holds
@@ -663,9 +688,28 @@ pub fn Runtime(comptime App: type) type {
 
         /// A v2 session starts in memory; its folder appears with the first
         /// turn (D2), so a launch that never prompts leaves nothing behind.
-        fn beginFreshV2Session(app: *App, agent: *AppAgent, v2_store: *session_adapter.Store) !void {
-            const preferences = agent.session_persistence.workspace_preferences orelse
+        fn beginFreshV2Session(
+            app: *App,
+            agent: *AppAgent,
+            v2_store: *session_adapter.Store,
+            start: FreshStart,
+            carried: ?session_codec.DurableSessionPreferences,
+        ) !void {
+            const seed = carried orelse agent.session_persistence.workspace_preferences orelse
                 return error.SessionPreferencesUnavailable;
+            var preferences = try seed.dupe(app.alloc);
+            defer preferences.deinit(app.alloc);
+            if (comptime agents.hasAgentField(App, "profile")) {
+                if (start == .instance_start) {
+                    const profile = &agent.profile.profile;
+                    if (profile.model) |model| {
+                        const owned = try app.alloc.dupe(u8, model);
+                        app.alloc.free(preferences.model);
+                        preferences.model = owned;
+                    }
+                    if (profile.effort) |effort| preferences.effort = effort;
+                }
+            }
             try replacePreferences(
                 app.alloc,
                 &agent.session_persistence.session_preferences,
@@ -684,8 +728,20 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.degraded_warning_emitted = false;
         }
 
-        fn beginFreshJsHostSession(app: *App, agent: *AppAgent) !void {
-            const preferences = agent.session_persistence.workspace_preferences orelse
+        /// The preferences `agent`'s JS-host session has saved, or null when
+        /// it has none or they can't be copied. Caller owns.
+        fn jsHostSavedPreferences(app: *App, agent: *AppAgent) ?session_codec.DurableSessionPreferences {
+            const owner = if (agent.session_persistence.js_host_session) |*value| value else return null;
+            return owner.state.preferences.dupe(app.alloc) catch |err| {
+                debug_trace.logf("session", "saved preferences unavailable session={s} err={s}; the new session starts from the workspace's", .{ owner.state.id, @errorName(err) });
+                return null;
+            };
+        }
+
+        /// `carried`, when given, is what the new session starts with in
+        /// place of the workspace's preferences, as in `beginFresh`.
+        fn beginFreshJsHostSession(app: *App, agent: *AppAgent, carried: ?session_codec.DurableSessionPreferences) !void {
+            const preferences = carried orelse agent.session_persistence.workspace_preferences orelse
                 return error.SessionPreferencesUnavailable;
             try replacePreferences(
                 app.alloc,
@@ -902,9 +958,31 @@ pub fn Runtime(comptime App: type) type {
                 agent.session_persistence.pending_live_session_wait = null;
                 releaseLiveSessionTransitionHold(app, agent);
             }
-            try beginFreshPersistedSession(app, agent);
+            // The new session keeps what the one it replaces had saved: its
+            // profile's model and effort, or a /model or /effort choice, never
+            // a run flag.
+            var carried = agent.session_persistence.next_session_preferences;
+            agent.session_persistence.next_session_preferences = null;
+            defer if (carried) |*value| value.deinit(app.alloc);
+            const keeps_process_model = runsProcessModel(app, agent);
+            try beginFresh(app, agent, .later, carried);
             enableSessionStores(app, agent);
+            // An instance launched after the first runs its session's model,
+            // so the --model or FX_MODEL it ran is laid over it again; the
+            // first keeps the app's selection across sessions.
+            if (keeps_process_model) try applyProcessModelOverride(app, agent);
             try finishLiveSessionTransition(app);
+        }
+
+        /// Whether `agent`, an instance launched after the first, runs the
+        /// model `--model` or `FX_MODEL` chose, not one picked since with
+        /// `/model`.
+        fn runsProcessModel(app: *App, agent: *AppAgent) bool {
+            if (comptime !agents.hasAgentField(App, "role")) return false;
+            if (agent == &app.main_agent or agent.role != .instance) return false;
+            const model = agent.session_persistence.process_model_override orelse return false;
+            const preferences = agent.session_persistence.session_preferences orelse return false;
+            return std.mem.eql(u8, preferences.model, model);
         }
 
         fn releaseLiveSessionTransitionHold(app: *App, agent: *AppAgent) void {
@@ -1000,6 +1078,11 @@ pub fn Runtime(comptime App: type) type {
                 app.subagents.clearProjection(app.alloc);
             }
 
+            // What the session saved, read before it closes, for a fresh
+            // session `installFreshLiveSession` starts next; a resume leaves
+            // it to the next transition, which reads it again.
+            if (agent.session_persistence.next_session_preferences) |*previous| previous.deinit(app.alloc);
+            agent.session_persistence.next_session_preferences = savedPreferences(app, agent);
             closeWritableSession(app, agent);
             app.stopStream(agent);
             app.shell.clearTranscript(app.alloc);
@@ -1257,7 +1340,7 @@ pub fn Runtime(comptime App: type) type {
             agent.session.reset(app.alloc);
             app.shell.clearTranscript(app.alloc);
             clearCachedSessionTitle(app, agent);
-            try beginFreshJsHostSession(app, agent);
+            try beginFreshJsHostSession(app, agent, null);
             try finishLiveSessionTransition(app);
         }
 
@@ -1853,7 +1936,8 @@ pub fn Runtime(comptime App: type) type {
             cancelSessionPicker(app, agent);
             if (comptime !agents.hasAgentField(App, "session")) return;
             if (agent.session_persistence.v2 != null) return;
-            beginFreshPersistedSession(app, agent) catch |err| {
+            // With no session yet, this is the one the instance opens with.
+            beginInstanceSession(app, agent) catch |err| {
                 debug_trace.logf(
                     "session",
                     "fresh session after picker cancel unavailable err={s}",
@@ -3562,35 +3646,37 @@ pub fn Runtime(comptime App: type) type {
                 switch (turn) {
                     .compacted_summary => {},
                     .assistant => |entry| {
-                        if (entry.execution.turn_summary) |summary| {
-                            sink.setCreatedAtMs(summary.started_at_ms);
-                        }
+                        if (promptTime(entry.user, entry.execution.turn_summary)) |at| sink.setCreatedAtMs(at);
                         try appendHistoryUserTurn(sink, entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, agent, sink, entry.execution, labels);
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.completed_at_ms);
                         }
+                        const final_calls = full_transcript_metadata.stepModelCalls(entry.execution.model_calls, entry.execution.tool_steps.len);
+                        try writeModelCallNotices(sink, final_calls.before);
                         if (entry.assistant.len > 0) {
                             try writeAssistantHistoryMarkdownToSink(app, sink, entry.assistant);
                         }
+                        try writeModelCallNotices(sink, final_calls.after);
                         if (entry.execution.turn_summary) |summary| {
                             try sink.appendTurnSummary(summary);
                         }
                     },
                     .interrupted => |entry| {
-                        if (entry.execution.turn_summary) |summary| {
-                            sink.setCreatedAtMs(summary.started_at_ms);
-                        }
+                        if (promptTime(entry.user, entry.execution.turn_summary)) |at| sink.setCreatedAtMs(at);
                         try appendHistoryUserTurn(sink, entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, agent, sink, entry.execution, labels);
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.completed_at_ms);
                         }
+                        const final_calls = full_transcript_metadata.stepModelCalls(entry.execution.model_calls, entry.execution.tool_steps.len);
+                        try writeModelCallNotices(sink, final_calls.before);
                         if (entry.assistant) |assistant| {
                             if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                         }
+                        try writeModelCallNotices(sink, final_calls.after);
                         if (entry.cancelled_command) |presentation| {
                             try writeCancelledCommandPresentation(app, agent, sink, entry.tool_call.?, presentation, labels);
                         }
@@ -3694,9 +3780,12 @@ pub fn Runtime(comptime App: type) type {
                     &steering_index,
                     step_index,
                 );
+                const calls = full_transcript_metadata.stepModelCalls(execution.model_calls, step_index);
+                try writeModelCallNotices(sink, calls.before);
                 if (step.assistant) |assistant| {
                     if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                 }
+                try writeModelCallNotices(sink, calls.after);
 
                 for (step.tool_calls) |call| {
                     if (findPersistedToolResult(step.tool_results, call.id)) |result| {
@@ -3721,6 +3810,31 @@ pub fn Runtime(comptime App: type) type {
                 }
                 if (steering.text.len == 0) continue;
                 try sink.appendUserTurn(savedSteeringTurn(steering.text), true);
+            }
+        }
+
+        /// When a saved turn's message was sent: its own line's time, else its
+        /// summary's start. A turn with neither keeps the clock it finds.
+        fn promptTime(user: types.UserTurn, summary: ?types.TurnSummary) ?i64 {
+            if (user.sent_at_ms > 0) return user.sent_at_ms;
+            const value = summary orelse return null;
+            return value.started_at_ms;
+        }
+
+        /// Writes each call record as the full-only notice Ctrl+O shows, at
+        /// the time the call settled.
+        fn writeModelCallNotices(sink: anytype, records: []const types.ModelCallRecord) !void {
+            for (records) |record| {
+                var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+                defer body.deinit();
+                try full_transcript_metadata.writeModelCallText(&body.writer, record);
+                sink.setCreatedAtMs(record.at_ms);
+                try sink.appendNotice(.{
+                    .topic = full_transcript_metadata.model_call_topic,
+                    .tone = if (record.outcome == .failed) .@"error" else .neutral,
+                    .body = body.written(),
+                    .visibility = .full_only,
+                });
             }
         }
 
@@ -5965,7 +6079,7 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         null,
     );
     app.agent().session_persistence.js_host_store = fake.store();
-    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), null);
 
     const first_turn = try session_runtime.makeAssistantTurn(alloc, "first prompt", "first reply");
     defer session_runtime.freeHistoryTurn(alloc, first_turn);
@@ -5997,7 +6111,7 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
     const previous_id = try alloc.dupe(u8, app.agent().session_persistence.js_host_session.?.state.id);
     defer alloc.free(previous_id);
     app.agent().session.reset(alloc);
-    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), null);
     try std.testing.expect(!std.mem.eql(
         u8,
         previous_id,
@@ -6005,6 +6119,54 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
     ));
     try std.testing.expect(app.agent().session_persistence.js_host_session.?.revision == null);
     try std.testing.expectEqual(@as(usize, 0), app.agent().session_persistence.js_host_session.?.state.history.len);
+}
+
+test "js-host /new starts with what the closing session saved, not the workspace's preferences" {
+    const alloc = std.testing.allocator;
+    var fake = FakeJsHostSessionStore{};
+    defer fake.deinit(alloc);
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+    try Runtime(TestApp).configureStartupPreferences(
+        &app,
+        (&app).agent(),
+        .gateway,
+        "fresh/model",
+        .user_global,
+        "fresh/model",
+        .auto,
+        false,
+        true,
+        false,
+        null,
+        null,
+        null,
+        null,
+    );
+    app.agent().session_persistence.js_host_store = fake.store();
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), null);
+
+    // As a resumed session would, this one saved a model and effort of its own.
+    const owner = &app.agent().session_persistence.js_host_session.?;
+    alloc.free(owner.state.preferences.model);
+    owner.state.preferences.model = try alloc.dupe(u8, "resumed/model");
+    owner.state.preferences.effort = types.ReasoningEffort.literal("high");
+    const previous_id = try alloc.dupe(u8, owner.state.id);
+    defer alloc.free(previous_id);
+
+    // `beginFresh` takes these on a JS host; this native test app calls the
+    // JS-host steps directly, as the tests above do.
+    var carried = Runtime(TestApp).jsHostSavedPreferences(&app, (&app).agent());
+    defer if (carried) |*value| value.deinit(alloc);
+    try std.testing.expectEqualStrings("resumed/model", carried.?.model);
+    app.agent().session.reset(alloc);
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), carried);
+
+    const fresh = &app.agent().session_persistence.js_host_session.?.state;
+    try std.testing.expect(!std.mem.eql(u8, previous_id, fresh.id));
+    try std.testing.expectEqualStrings("resumed/model", fresh.preferences.model);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), fresh.preferences.effort);
+    try std.testing.expectEqualStrings("resumed/model", app.agent().session_persistence.session_preferences.?.model);
 }
 
 test "js-host preference changes snapshot the updated session preferences" {
@@ -6039,7 +6201,7 @@ test "js-host preference changes snapshot the updated session preferences" {
         null,
     );
     app.agent().session_persistence.js_host_store = fake.store();
-    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent());
+    try Runtime(TestApp).beginFreshJsHostSession(&app, (&app).agent(), null);
 
     var result = Runtime(TestApp).commitRuntimePreferences(&app, (&app).agent(), .{
         .model = "browser/model",

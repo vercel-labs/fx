@@ -801,8 +801,13 @@ fn expectStderr(p: *Process, line: []const u8) !void {
 
 test "messages arrive, and a stop that closes stdin ends the server" {
     const argv = shell("printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\\n'; exec cat >/dev/null");
+    // `cat` exits as soon as stdin closes, but a busy machine can take longer
+    // than test_config's grace to run it, and then the stop sends SIGTERM. A
+    // long grace keeps SIGTERM out; a passing run returns when `cat` exits.
+    var config = test_config;
+    config.grace_ms = 5_000;
     var p: Process = undefined;
-    initTest(&p, &argv);
+    p.init(testing.io, testing.allocator, .{ .argv = &argv, .config = config, .poll_ms = 5, .max_line = 64 });
     defer p.deinit();
     try p.start();
     try testing.expectEqual(core.State.running, p.conn.state);

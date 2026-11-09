@@ -19,11 +19,9 @@ import {
 const TIMEOUT = 90_000;
 const LIST_HINT = "enter switch";
 
-// Shows the next or previous agent in switch order, wrapping at the ends, as
-// one press of the old Alt+Right or Alt+Left did: Ctrl+X opens the agent list
-// on the agent on screen, the arrows move to its neighbor's row, and Enter
-// keeps it.
-async function switchAgent(session: TmuxSession, direction: "next" | "previous") {
+// Directions follow the current menu order; a number selects that stable fx
+// instance regardless of where working state or completed replies put its row.
+async function switchAgent(session: TmuxSession, target: "next" | "previous" | number) {
   await session.sendKeys("C-x");
   const pane = await session.waitForText(LIST_HINT, 10_000);
   const lines = pane.split("\n");
@@ -34,7 +32,10 @@ async function switchAgent(session: TmuxSession, direction: "next" | "previous")
   const rows = lines.slice(top, hint - 1);
   const from = rows.findIndex((row) => row.includes("(on screen)"));
   if (from < 0 || rows.length < 2) throw new Error(`no agent list in:\n${pane}`);
-  const to = direction === "next" ? (from + 1) % rows.length : (from + rows.length - 1) % rows.length;
+  const to = typeof target === "number"
+    ? rows.findIndex((row) => new RegExp(`\\bfx ${target}(?: \\(on screen\\))? ·`).test(row))
+    : target === "next" ? (from + 1) % rows.length : (from + rows.length - 1) % rows.length;
+  if (to < 0) throw new Error(`no fx ${target} row in:\n${pane}`);
   for (let step = 0; step < Math.abs(to - from); step += 1) await session.sendKeys(to > from ? "Down" : "Up");
   await session.sendKeys("Enter");
   await session.waitForPane((value) => !value.includes(LIST_HINT), 10_000);
@@ -243,7 +244,7 @@ async function saveGroup(home: string, workspace: string): Promise<string[]> {
   await withHost(answerByLetter, { instances: 3, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
     for (const [index, letter] of ["A", "B", "C"].entries()) {
       if (index > 0) {
-        await switchAgent(session, "next");
+        await switchAgent(session, index + 1);
         await session.waitForPane((pane) => pane.includes(`fx ${index + 1}/3`), 15_000);
         await session.waitForComposer(15_000);
       }
@@ -312,7 +313,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       const bodies = await withHost(answerByLetter, { instances: 3 }, async ({ session }) => {
         for (const [index, letter] of ["A", "B", "C"].entries()) {
           if (index > 0) {
-            await switchAgent(session, "next");
+            await switchAgent(session, index + 1);
             await session.waitForPane((pane) => pane.includes(`fx ${index + 1}/3`), 15_000);
           } else {
             await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
@@ -327,12 +328,12 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           expect(pane).toContain(`fx ${index + 1}/3 \u2193`);
           expect(shownAnswers(pane)).toEqual([`HOST_ANSWER_${letter}`]);
         }
-        // After the last instance comes the first again, still as it was.
-        await switchAgent(session, "next");
+        // The first instance is still as it was.
+        await switchAgent(session, 1);
         const first = await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
         expect(shownAnswers(first)).toEqual(["HOST_ANSWER_A"]);
-        // And before the first comes the last.
-        await switchAgent(session, "previous");
+        // The last instance still has its own conversation.
+        await switchAgent(session, 3);
         const last = await session.waitForPane((pane) => pane.includes("fx 3/3"), 15_000);
         expect(shownAnswers(last)).toEqual(["HOST_ANSWER_C"]);
       });
@@ -520,7 +521,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForText("HOST_ANSWER_B", 30_000);
 
         // Close the first: the second takes over as fx 1, as it was.
-        await switchAgent(session, "previous");
+        await switchAgent(session, 1);
         await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendText("/close");
@@ -634,7 +635,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await withHost(answerByLetter, { instances: 3, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
           for (const [index, letter] of ["A", "B", "C"].entries()) {
             if (index > 0) {
-              await switchAgent(session, "next");
+              await switchAgent(session, index + 1);
               await session.waitForPane((pane) => pane.includes(`fx ${index + 1}/3`), 15_000);
               await session.waitForComposer(15_000);
             }
@@ -651,14 +652,14 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         const bodies = await withHost(answerByLetter, { args: `--resume ${b}`, reuse: { home, workspace } }, async ({ session }) => {
           const first = await session.waitForPane((pane) => pane.includes("fx 1/3") && pane.includes("HOST_ANSWER_B"), 30_000);
           expect(shownAnswers(first)).toEqual(["HOST_ANSWER_B"]);
-          await switchAgent(session, "next");
+          await switchAgent(session, 2);
           const second = await session.waitForPane((pane) => pane.includes("fx 2/3") && pane.includes("HOST_ANSWER_A"), 15_000);
           expect(shownAnswers(second)).toEqual(["HOST_ANSWER_A"]);
-          await switchAgent(session, "next");
+          await switchAgent(session, 3);
           const third = await session.waitForPane((pane) => pane.includes("fx 3/3") && pane.includes("HOST_ANSWER_C"), 15_000);
           expect(shownAnswers(third)).toEqual(["HOST_ANSWER_C"]);
           // A restored instance carries on its own conversation.
-          await switchAgent(session, "previous");
+          await switchAgent(session, 2);
           await session.waitForPane((pane) => pane.includes("fx 2/3"), 15_000);
           await session.waitForComposer(15_000);
           await session.sendText("HOST_D carries on A");
@@ -732,7 +733,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           await session.sendKeys("Enter");
           const first = await session.waitForPane((pane) => pane.includes("fx 1/3") && pane.includes("HOST_ANSWER_B"), 30_000);
           expect(shownAnswers(first)).toEqual(["HOST_ANSWER_B"]);
-          await switchAgent(session, "next");
+          await switchAgent(session, 2);
           await session.waitForPane((pane) => pane.includes("fx 2/3") && pane.includes("HOST_ANSWER_A"), 15_000);
           await quitWith(session, "/exit").catch(() => "");
         });
@@ -776,7 +777,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       await withHost(answerByLetter, { instances: 3 }, async ({ home, session }) => {
         for (const [index, letter] of ["A", "B", "C"].entries()) {
           if (index > 0) {
-            await switchAgent(session, "next");
+            await switchAgent(session, index + 1);
             await session.waitForPane((pane) => pane.includes(`fx ${index + 1}/3`), 15_000);
             await session.waitForComposer(15_000);
           }
@@ -1038,13 +1039,13 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("TREE_LEND_USER") && pane.includes("Subagent writer needs permission"), 30_000);
 
         // The first instance shows only the note that it waits.
-        await switchAgent(session, "previous");
+        await switchAgent(session, 1);
         const first = await session.waitForPane((pane) => pane.includes("fx 1/2") && pane.includes("writer needs approval"), 15_000);
         expect(first).not.toContain("Subagent writer needs permission");
 
         // Back on fx 2, the answer there reaches the subagent.
         expect(first).not.toContain("TREE_LEND_USER");
-        await switchAgent(session, "next");
+        await switchAgent(session, 2);
         await session.waitForPane((pane) => pane.includes("TREE_LEND_USER") && pane.includes("Subagent writer needs permission"), 15_000);
         await session.sendKeys("1");
         await session.waitForText("TREE_LEND_MAIN_DONE", 30_000);
@@ -1219,6 +1220,161 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         expect(plain?.reasoning).toBeNull();
         // `/launch` alone starts another instance in the launch profile.
         expect(preferencesOf(requests, "SAME_LAUNCH")).toMatchObject({ model: "other/model", reasoning: "low" });
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a group started in profiles resumes in each profile's model and effort, not the run's --effort",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-resume-profiles-")));
+      try {
+        writeProfile(home, "first", { description: "The launch profile", model: "other/model", effort: "low" });
+        writeProfile(home, "chooser", { description: "Chooses a model", model: "profile/model", effort: "high" });
+        const before: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: "--profile first --effort medium", env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: before, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await promptMarker(session, "SAVED_FIRST");
+          await session.sendText("/launch chooser");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "SAVED_CHOOSER");
+          await quitWith(session, "/exit");
+        });
+        expect(preferencesOf(before, "SAVED_FIRST")).toMatchObject({ model: "other/model", reasoning: "medium" });
+        expect(preferencesOf(before, "SAVED_CHOOSER")).toMatchObject({ model: "profile/model", reasoning: "medium" });
+        const first = sessionHolding(home, "DONE_SAVED_FIRST")!;
+        const after: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: `--resume ${first}`, env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: after, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("DONE_SAVED_FIRST"), 30_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "RESUMED_FIRST");
+          await switchAgent(session, "next");
+          await session.waitForPane((pane) => pane.includes("DONE_SAVED_CHOOSER"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "RESUMED_CHOOSER");
+        });
+        // Each session saved its profile's model and effort when it started;
+        // `--effort` shaped only the run that passed it.
+        expect(preferencesOf(after, "RESUMED_FIRST")).toMatchObject({ model: "other/model", reasoning: "low" });
+        expect(preferencesOf(after, "RESUMED_CHOOSER")).toMatchObject({ model: "profile/model", reasoning: "high" });
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "/new under fx --profile keeps a /model choice, and its session resumes in it",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-new-in-profile-")));
+      try {
+        writeProfile(home, "first", { description: "The launch profile", model: "other/model", effort: "low" });
+        const before: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: "--profile first", env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: before, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await promptMarker(session, "PROFILE_TURN");
+          await session.sendText("/model profile/model medium normal");
+          await session.waitForText("Switched to profile/model", 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("/new");
+          await session.waitForPane((pane) => !pane.includes("DONE_PROFILE_TURN"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "NEW_TURN");
+          await quitWith(session, "/exit");
+        });
+        expect(preferencesOf(before, "PROFILE_TURN")).toMatchObject({ model: "other/model", reasoning: "low" });
+        expect(preferencesOf(before, "NEW_TURN")).toMatchObject({ model: "profile/model", reasoning: "medium" });
+        const id = sessionHolding(home, "DONE_NEW_TURN")!;
+        const after: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: `--resume ${id}`, env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: after, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("DONE_NEW_TURN"), 30_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "RESUMED_TURN");
+        });
+        // Only the session an instance opens with starts in its profile; this
+        // one ran in the model and effort chosen before it.
+        expect(preferencesOf(after, "RESUMED_TURN")).toMatchObject({ model: "profile/model", reasoning: "medium" });
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "/new in a launched profile instance keeps the profile's model and effort, and its session resumes in them",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-new-launched-")));
+      try {
+        writeProfile(home, "chooser", { description: "Chooses a model", model: "profile/model", effort: "high" });
+        const before: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: before, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await session.sendText("/launch chooser");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "LAUNCHED_TURN");
+          await session.sendText("/new");
+          await session.waitForPane((pane) => !pane.includes("DONE_LAUNCHED_TURN") && pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "NEW_TURN");
+          await quitWith(session, "/exit");
+        });
+        expect(preferencesOf(before, "LAUNCHED_TURN")).toMatchObject({ model: "profile/model", reasoning: "high" });
+        expect(preferencesOf(before, "NEW_TURN")).toMatchObject({ model: "profile/model", reasoning: "high" });
+        const id = sessionHolding(home, "DONE_NEW_TURN")!;
+        const after: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: `--resume ${id}`, env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: after, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("DONE_NEW_TURN"), 30_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "RESUMED_TURN");
+        });
+        expect(preferencesOf(after, "RESUMED_TURN")).toMatchObject({ model: "profile/model", reasoning: "high" });
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "/new in a launched instance keeps FX_MODEL for the run without saving it",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-new-env-model-")));
+      try {
+        const before: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { env: { FX_MODEL: "other/model" }, models: PREFERENCE_MODELS, requests: before, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await session.sendText("/launch");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "LAUNCHED_TURN");
+          await session.sendText("/new");
+          await session.waitForPane((pane) => !pane.includes("DONE_LAUNCHED_TURN") && pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "NEW_TURN");
+          await quitWith(session, "/exit");
+        });
+        expect(preferencesOf(before, "LAUNCHED_TURN")?.model).toBe("other/model");
+        expect(preferencesOf(before, "NEW_TURN")?.model).toBe("other/model");
+        const id = sessionHolding(home, "DONE_NEW_TURN")!;
+        const after: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: `--resume ${id}`, env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: after, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("DONE_NEW_TURN"), 30_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "RESUMED_TURN");
+        });
+        // FX_MODEL shaped only the run that set it.
+        expect(preferencesOf(after, "RESUMED_TURN")?.model).not.toBe("other/model");
       } finally {
         cleanupIsolatedTestHome(home);
         rmSync(workspace, { recursive: true, force: true });

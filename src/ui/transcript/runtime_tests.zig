@@ -2065,7 +2065,16 @@ test "one retained semantic notice reflows through compact and full projection w
             null,
         );
         defer alloc.free(full);
-        try std.testing.expect(std.mem.find(u8, full, expected) != null);
+        // Ctrl+O draws the notice as gray rows that lead with its time,
+        // wrapped to the width, with the same words.
+        const plain = try plainTextForTest(alloc, full);
+        defer alloc.free(plain);
+        var rows = std.mem.splitScalar(u8, plain, '\n');
+        while (rows.next()) |row| try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row) <= case.cols);
+        var words: std.ArrayList(u8) = .empty;
+        defer words.deinit(alloc);
+        for (plain) |byte| if (!std.ascii.isWhitespace(byte)) try words.append(alloc, byte);
+        try std.testing.expect(std.mem.find(u8, words.items, "paths:review/workspace/packages/terminal/rendering.zigbeforecontinuing") != null);
         try std.testing.expectEqual(entry_id, runtime.notebook.entries.items[0].id());
     }
 }
@@ -12333,7 +12342,7 @@ test "tool status raw entry updates after command output appends" {
         null,
     );
     defer alloc.free(full);
-    try std.testing.expect(std.mem.find(u8, full, "│ ok") != null);
+    try std.testing.expect(std.mem.find(u8, full, "    ok") != null);
     try std.testing.expect(std.mem.find(u8, full, "Running npm test") == null);
 }
 
@@ -15587,4 +15596,59 @@ test "retint rewrites custom theme colors on a variant flip" {
     try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;89mMuted row") != null);
     try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;90mKeyword row") != null);
     try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;201muser output") != null);
+}
+
+test "rewrite publication keeps the frozen prefix when a finished turn holds a hidden notice" {
+    const alloc = std.testing.allocator;
+    const source_preparation = @import("source_preparation.zig");
+    const frozen_prefix = @import("frozen_prefix.zig");
+    var runtime = TranscriptRuntime{
+        .layout = .{ .cols = 80, .rows = 24, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 },
+        .detached_commit_alloc = alloc,
+        .committed_frame_layout = .{ .terminal_cols = 80, .terminal_rows = 24 },
+    };
+    defer runtime.deinit(alloc);
+    // A finished turn whose model call left a full-detail line, which the
+    // inline transcript never draws.
+    for (0..8) |_| _ = try runtime.appendRawTranscriptEntryClassified(alloc, "historical row\n", .unknown_raw);
+    _ = try transcript_store.appendSemanticNoticeAtomic(&runtime, alloc, .{
+        .topic = "model call",
+        .tone = .neutral,
+        .body = "12:00:01 PM · model",
+        .visibility = .full_only,
+    });
+    _ = try runtime.appendTurnSummaryEntry(alloc, .{ .turn_duration_ms = 1200 });
+    const live_id = try runtime.appendRawTranscriptEntryClassified(alloc, "live row\n", .unknown_raw);
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "next live row\n", .unknown_raw);
+    var source = try source_preparation.prepareRetentionSource(&runtime, alloc);
+    defer source.deinit(alloc);
+    runtime.transcript_commit_state = .{ .stable = .{
+        .flow = try alloc.dupe(u8, source.bytes),
+        .retention_identity = try source_preparation.RetentionIdentity.capture(&runtime, alloc, &source),
+        .visual_offset = 0,
+        .history_visual_offset = 0,
+        .total_visual_rows = source.transcript_visual_row_offsets[source.transcript_visual_row_offsets.len - 1],
+        .selection = .{ .start_line = 0, .top_row = 1, .bottom_row = 20, .partial_skip_rows = 0, .line_count = 20 },
+        .cursor_row = 12,
+        .cursor_col = 1,
+        .occupied_last_row = 12,
+        .occupied_last_row_blank = false,
+        .layout_id = 0,
+    } };
+    var captured = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
+    captured.deinit(alloc);
+    const boundary = frozen_prefix.boundary(runtime.notebook.entries.items);
+    try std.testing.expect(boundary > 0);
+
+    // Dropping a live row changes the entries, so its commit rebases the
+    // committed flow over a copy of the transcript.
+    try std.testing.expect(try transcript_store.dropEntriesAtomic(&runtime, alloc, &.{live_id}));
+
+    // That copy left the live prefix in place: the next frame resumes after it.
+    const slot = runtime.frozen_prefix.slots[@backingInt(frozen_prefix.Mode.prepared)] orelse return error.NoPrefix;
+    try std.testing.expectEqual(boundary, slot.state.entry_count);
+    const misses = runtime.frozen_prefix.misses;
+    var resumed = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
+    resumed.deinit(alloc);
+    try std.testing.expectEqual(misses, runtime.frozen_prefix.misses);
 }

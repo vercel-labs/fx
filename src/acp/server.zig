@@ -3024,31 +3024,12 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     }
 
     if (!state.cfg.minimal_kernel) {
-        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
         const startup_catalog = catalogProviderFor(state, state.provider) orelse
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
                 .message = "Selected provider is unavailable in this host",
             });
-        _ = try state.capability_resolver.resolve(
-            state.alloc,
-            startup_catalog,
-            .{
-                .access = if (state.cfg.auth_mode == .host_managed)
-                    .host_managed
-                else
-                    credentials.catalogAccessForCredentialAndAccount(
-                        state.credential_source,
-                        state.api_key,
-                        state.gateway_team,
-                        state.account_id,
-                    ),
-                .endpoint = state.cfg.gateway_models_path,
-                .cancel_flag = &catalog_cancel_flag,
-            },
-            state.selected_model,
-            state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
-        );
+        _ = try resolveSelectedModelCapabilities(state, startup_catalog);
     }
 
     if (state.cfg.effort_override) |raw| {
@@ -3098,6 +3079,38 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
+/// The selected model's capabilities from `provider`'s catalog, loading it
+/// first if needed. A first load whose request cannot connect gives up after
+/// `gateway_provider.catalog_connect_wait_ms`, as `fx ask`'s does, so a
+/// dead network doesn't hold up the reply for the 20 to 30 seconds its DNS
+/// lookup or connect takes to fail (`CapabilityResolver.resolveWithin`).
+fn resolveSelectedModelCapabilities(
+    state: *ServerState,
+    provider: model_catalog.Provider,
+) model_capabilities.ResolveError!model_capabilities.Capabilities {
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    return state.capability_resolver.resolveWithin(
+        state.alloc,
+        provider,
+        .{
+            .access = if (state.cfg.auth_mode == .host_managed)
+                .host_managed
+            else
+                credentials.catalogAccessForCredentialAndAccount(
+                    state.credential_source,
+                    state.api_key,
+                    state.gateway_team,
+                    state.account_id,
+                ),
+            .endpoint = state.cfg.gateway_models_path,
+            .cancel_flag = &cancel_flag,
+        },
+        state.selected_model,
+        state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
+        gateway_provider.catalog_connect_wait_ms,
+    );
+}
+
 /// Applies a host-supplied reasoning effort override to sessions created after
 /// initialize. A non-default effort must be one of the selected model's
 /// advertised efforts whenever the catalog resolves; a catalog outage leaves
@@ -3114,20 +3127,7 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
         // libfx cores skip the startup catalog resolve; explicit effort and
         // fast overrides are the creation-time consumers that need it.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
-        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-        capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
-            .access = if (state.cfg.auth_mode == .host_managed)
-                .host_managed
-            else
-                credentials.catalogAccessForCredentialAndAccount(
-                    state.credential_source,
-                    state.api_key,
-                    state.gateway_team,
-                    state.account_id,
-                ),
-            .endpoint = state.cfg.gateway_models_path,
-            .cancel_flag = &catalog_cancel_flag,
-        }, state.selected_model, fallback);
+        capabilities = try resolveSelectedModelCapabilities(state, catalog_provider);
     } else {
         capabilities = state.capability_resolver.available(state.selected_model, fallback);
     }
@@ -3233,20 +3233,7 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
         // Shares the effort override's one-shot catalog resolve: creation is
         // the only point that can reject before any turn runs.
         const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
-        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-        capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
-            .access = if (state.cfg.auth_mode == .host_managed)
-                .host_managed
-            else
-                credentials.catalogAccessForCredentialAndAccount(
-                    state.credential_source,
-                    state.api_key,
-                    state.gateway_team,
-                    state.account_id,
-                ),
-            .endpoint = state.cfg.gateway_models_path,
-            .cancel_flag = &catalog_cancel_flag,
-        }, state.selected_model, fallback);
+        capabilities = try resolveSelectedModelCapabilities(state, catalog_provider);
     } else {
         capabilities = state.capability_resolver.available(state.selected_model, fallback);
     }
@@ -3316,21 +3303,7 @@ fn applyUltrafastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.M
     }
     const catalog_provider = catalogProviderFor(state, state.provider) orelse
         return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode is unavailable for the selected provider");
-    var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-    const bundle = state.cfg.provider_set.select(state.provider);
-    const capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
-        .access = if (state.cfg.auth_mode == .host_managed)
-            .host_managed
-        else
-            credentials.catalogAccessForCredentialAndAccount(
-                state.credential_source,
-                state.api_key,
-                state.gateway_team,
-                state.account_id,
-            ),
-        .endpoint = state.cfg.gateway_models_path,
-        .cancel_flag = &catalog_cancel_flag,
-    }, state.selected_model, bundle.fallbackModelCapabilities(state.selected_model));
+    const capabilities = try resolveSelectedModelCapabilities(state, catalog_provider);
     if (state.capability_resolver.state == .failed) {
         return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode requires a verified Gateway model catalog");
     }
@@ -3376,6 +3349,134 @@ test "ultrafastOverrideRejection accepts only Gateway models with the catalog ca
     try std.testing.expect(std.mem.find(u8, rejection, "openai/model") != null);
     const unavailable = (try ultrafastOverrideRejection(alloc, .gateway, .{}, "openai/model")).?;
     defer alloc.free(unavailable);
+}
+
+test "ACP answers an ultrafast override without waiting out a model catalog that cannot connect" {
+    // A Gateway catalog on a dead network: its request never connects, and
+    // it fails only when cancelled or once a stalled DNS lookup would give up.
+    const UnconnectableCatalog = struct {
+        give_up_ms: i64 = 6_000,
+
+        fn fetch(raw: ?*anyopaque, _: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const started_ms = model_catalog.clockMs();
+            while (model_catalog.clockMs() - started_ms < self.give_up_ms) {
+                if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) {
+                    return .{ .failure = .{ .category = .cancellation } };
+                };
+                io_mod.sleep(std.time.ns_per_ms);
+            }
+            return .{ .failure = .{ .category = .transport } };
+        }
+    };
+    const Capture = struct {
+        saw_catalog_failure: bool = false,
+
+        fn write(raw: ?*anyopaque, frame: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (std.mem.find(u8, frame, "requires a verified Gateway model catalog") != null) {
+                self.saw_catalog_failure = true;
+            }
+        }
+    };
+    var catalog = UnconnectableCatalog{};
+    var capture = Capture{};
+    var model = "openai/gpt-5.5".*;
+    var state = ServerState{
+        .alloc = std.testing.allocator,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.initCallback(&capture, Capture.write),
+        .selected_model = &model,
+    };
+    defer state.capability_resolver.deinit(state.alloc);
+    state.cfg.auth_mode = .host_managed;
+    state.cfg.gateway_models_path = "/v1/models";
+    state.cfg.provider_set = @import("../core/gateway/provider_set.zig").gateway_only(.{
+        .model_catalog = .{ .context = &catalog, .fetch_fn = UnconnectableCatalog.fetch, .reports_connection = true },
+    });
+    var msg = jsonrpc.Message{ .id = .{ .integer = 1 }, .method = "initialize" };
+
+    const started_ms = model_catalog.clockMs();
+    try std.testing.expect(!try applyUltrafastOverride(&state, std.testing.allocator, &msg, true));
+    const elapsed_ms = model_catalog.clockMs() - started_ms;
+
+    // The override fails as on any catalog outage, after the first load's wait
+    // rather than after the lookup gives up.
+    try std.testing.expect(elapsed_ms < 5_000);
+    try std.testing.expect(capture.saw_catalog_failure);
+    try std.testing.expect(!state.ultrafast_mode);
+}
+
+test "ACP keeps its model catalog when a due refresh cannot connect" {
+    // A Gateway catalog that answers, then goes behind a dead network: its
+    // request never connects, and it fails only when cancelled or once a
+    // stalled DNS lookup would give up.
+    const RefreshingCatalog = struct {
+        answers: std.atomic.Value(bool) = .init(true),
+        give_up_ms: i64 = 6_000,
+
+        fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.answers.load(.seq_cst)) {
+                if (input.connected) |connected| connected.store(true, .release);
+                var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+                errdefer model_catalog.freeModelCatalog(alloc, &entries);
+                const id = try alloc.dupe(u8, "openai/gpt-5.5");
+                errdefer alloc.free(id);
+                const model_type = try alloc.dupe(u8, "language");
+                errdefer alloc.free(model_type);
+                try entries.append(alloc, .{ .id = id, .model_type = model_type });
+                return .{ .catalog = entries };
+            }
+            const started_ms = model_catalog.clockMs();
+            while (model_catalog.clockMs() - started_ms < self.give_up_ms) {
+                if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) {
+                    return .{ .failure = .{ .category = .cancellation } };
+                };
+                io_mod.sleep(std.time.ns_per_ms);
+            }
+            return .{ .failure = .{ .category = .transport } };
+        }
+    };
+    var catalog = RefreshingCatalog{};
+    var model = "openai/gpt-5.5".*;
+    var state = ServerState{
+        .alloc = std.testing.allocator,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.init(),
+        .selected_model = &model,
+    };
+    defer state.capability_resolver.deinit(state.alloc);
+    state.cfg.minimal_kernel = false;
+    state.cfg.auth_mode = .host_managed;
+    state.cfg.gateway_models_path = "/v1/models";
+    state.cfg.provider_set = @import("../core/gateway/provider_set.zig").gateway_only(.{
+        .model_catalog = .{
+            .context = &catalog,
+            .fetch_fn = RefreshingCatalog.fetch,
+            .reports_connection = true,
+            .refresh_interval_ms = 60_000,
+        },
+    });
+    var active: ActiveSessionState = undefined;
+    active.provider = .gateway;
+    state.active_session = active;
+
+    try refreshModelCatalogForOptions(&state);
+    try std.testing.expectEqual(@as(usize, 1), state.capability_resolver.catalogEntries().?.len);
+
+    // The refresh interval passes while the network is down.
+    state.capability_resolver.last_attempt_ms -= 60_000;
+    catalog.answers.store(false, .seq_cst);
+    const started_ms = model_catalog.clockMs();
+    try refreshModelCatalogForOptions(&state);
+    const elapsed_ms = model_catalog.clockMs() - started_ms;
+
+    // The refresh fails as on any catalog outage, after the wait for its
+    // connection rather than after the lookup gives up, and the models the
+    // catalog already listed stay in use.
+    try std.testing.expect(elapsed_ms < 5_000);
+    try std.testing.expectEqualStrings("openai/gpt-5.5", state.capability_resolver.catalogEntries().?[0].id);
 }
 
 fn handleCancel(state: *ServerState, notify_client: bool) void {
@@ -3783,6 +3884,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
+/// Loads the catalog when it is due, before a reply that lists its models. A
+/// due load whose request cannot connect gives up after
+/// `gateway_provider.catalog_connect_wait_ms` and keeps the catalog fx
+/// already has (`CapabilityResolver.refreshWithin`), so a dead network does
+/// not hold up the reply, or the prompt sent after it, for the 20 to 30
+/// seconds its DNS lookup or connect takes to fail.
 pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
     if (comptime host_target.is_wasm) return;
     if (state.cfg.minimal_kernel) return;
@@ -3791,7 +3898,7 @@ pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
     std.debug.assert(state.active_prompt == null);
     // Restoring the same session can leave its previous cancellation flag set.
     var cancel_flag = std.atomic.Value(bool).init(false);
-    try state.capability_resolver.refreshIfDue(state.alloc, provider, .{
+    try state.capability_resolver.refreshWithin(state.alloc, provider, .{
         .access = if (state.cfg.auth_mode == .host_managed)
             .host_managed
         else
@@ -3803,7 +3910,7 @@ pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
             ),
         .endpoint = state.cfg.gateway_models_path,
         .cancel_flag = &cancel_flag,
-    });
+    }, gateway_provider.catalog_connect_wait_ms);
 }
 
 fn commitActiveSessionProvider(

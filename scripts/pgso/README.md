@@ -25,6 +25,8 @@ The Linux platforms, `aarch64-linux` and `x86_64-linux`, run on a Linux host of 
 
 Profile use compiles the functions it judges cold for size, which slows Linux's short commands such as `fx help`. So training keeps a profile for each of the startup scenarios `direct-help`, `direct-version`, `direct-status`, `direct-doctor`, and `direct-sessions`. Before profile use, a first pass applies the production profile to find the startup functions marked `minsize`, and their records are removed from the production profile. Startup functions that stay hot, those the build inlines away, and those any heavy benchmark runs keep their records: the benchmarks build from the production profile, so removing a record they rely on would slow them. Every startup function is also marked `nooutline`, so neither outliner moves its code into shared helpers far from the rest of the startup code. The candidate link places the startup functions first, in the order they first run. lld orders by symbol, and Zig emits every function private, which leaves it no symbol in the object, so before code generation `ir_size.py name-functions` gives the fx candidate's private functions internal linkage: the same code, plus a local symbol that the final link strips. The link fails if any fx function section still has no symbol. Distributed builds don't carry the startup profiles, so they reject Linux. `.github/workflows/pgso-linux-arm64.yml` runs `all` for `aarch64-linux` in one job on a GitHub-hosted arm64 runner and uploads the manifest, logs, measurements, and candidate. The stable release calls it and ships that candidate as the Linux arm64 binary once the binary's SHA-256 matches the qualified candidate in the manifest. `.github/workflows/pgso-linux-x86_64.yml` does the same for `x86_64-linux` on a GitHub-hosted x86_64 runner, and differs from the arm64 workflow only in those architecture values. The stable release ships its candidate as the Linux x86_64 binary the same way.
 
+Without another check, the behavior corpus is the only test of code after the IR passes and outliners, so a miscompile in code it doesn't reach goes unnoticed. On Linux, `python3 -m scripts.pgso unit-tests --llvm-bin <path> --output-dir <path> --target <target>` runs fx's Zig unit tests on code built through the candidate's transforms. It builds the unit test executable with `zig build install-test`, records that link, and emits the executable's bitcode with `outline-helpers` applied. It then marks every function `minsize` and runs the candidate's profile-use passes without a profile, so the size-only paths, the AArch64 homogeneous prologue and epilogue, and both outliners reach as much code as they can. It applies the candidate's outlining chain, including the outliner guards and retry rounds described below, then its cleanup and size passes, and compiles with the candidate's code generation flags. Finally it relinks the result with the recorded link and runs it from the repository root with an open stdin, as `zig build test` does. When a test fails or the run aborts, the step runs the executable once more, as CI retries a failed E2E file once, and passes only if that run passes. The logs directory keeps both runs' complete output in `unit-tests.json` and `unit-tests-retry.json`. A pass on the retry prints a warning and keeps the first run's failed tests in the step's summary, so a test that passes only on retry stays visible. A failed build or link is never retried. The step also fails when `zero-fill-globals` or `compact-error-names` skips the module, so neither pass drops out of the check unnoticed. A test there defines the wasm host's `extern "fx"` functions itself, and Zig rejects such an extern in a static executable that is not position independent. So the test executable is a static PIE and its object adds `-relocation-model=pic`. Both Linux PGSO workflows run this step after the driver tests and upload its `logs` as their own artifact, so the evidence artifact keeps `candidate/fx` and `manifest.json` at its root, where the release reads them.
+
 Training records execution counts and first-use function timestamps in the same
 continuous profiles. Counter supplements preserve the temporal traces. The
 main PGSO executable uses LLVM's temporal function order through the native
@@ -80,18 +82,27 @@ runs LLVM's IR outliner once over the whole optimized program. Generated IR
 helpers are kept in one dense linker cluster ordered by their hottest profiled
 caller so outlining does not scatter startup code across cold pages.
 
-Code generation for the fx candidate runs the AArch64 machine outliner a second
-time and enables LLVM's homogeneous prologue and epilogue. Each function that
-profile use compiled for size then saves and restores its callee-saved
-registers by calling one of a few dozen shared frame helpers instead of
-repeating those loads and stores inline. Functions compiled for speed keep
-inline prologues. fx builds without frame pointers or unwind tables, so the
-helpers change no stack walking. The measured heavy benchmark candidates use
-the same profile-use flags and code generation as the fx candidate, so the
-heavy gates measure the code fx ships. A benchmark trained on its own workload
-keeps the default code generation and a higher cold cutoff, because its
-profile-use IR only selects the functions to transfer into the production
-profile.
+Code generation for the fx candidate runs the machine outliner a second time,
+which can fold sequences the first round exposed. The second round runs
+wherever the outliner runs: on AArch64, and on Linux x86_64 for the cold code
+described below. On AArch64, code generation also enables LLVM's homogeneous
+prologue and epilogue. Each function that profile use compiled for size then
+saves and restores its callee-saved registers by calling one of a few dozen
+shared frame helpers instead of repeating those loads and stores inline.
+Functions compiled for speed keep inline prologues. fx builds without frame
+pointers or unwind tables, so the helpers change no stack walking. The measured
+heavy benchmark candidates use the same profile-use flags and code generation
+as the fx candidate, so the heavy gates measure the code fx ships. A benchmark
+trained on its own workload keeps the default code generation and a higher cold
+cutoff, because its profile-use IR only selects the functions to transfer into
+the production profile.
+
+LLVM runs the machine outliner by default only on AArch64, where it outlines
+the functions profile use compiled for size. Linux x86_64 asks for it with
+`-enable-machine-outliner=conservative-pgo` on every candidate object, fx and
+benchmark alike, so it outlines only code the profile marks cold. Code without
+profile data counts as hot, and the startup functions are `nooutline`, so
+neither moves into shared helpers.
 
 LLVM's IR outliner does not compare constants nested inside a constant
 expression. Two regions that differ only in an instruction's constant can share

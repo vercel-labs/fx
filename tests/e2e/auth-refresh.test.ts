@@ -14,7 +14,9 @@ import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
+  TITLE_GENERATION_MARKER,
   fakeGatewayFinalText,
+  fakeResponsesTitleDefault,
   startFakeGateway,
 } from "./tmux-helpers";
 import { savedSessionIds } from "./saved-sessions";
@@ -127,6 +129,199 @@ async function waitForFileText(path: string, text: string): Promise<void> {
   throw new Error(`Timed out waiting for ${text} in ${path}`);
 }
 
+// Two fx whose login expired together: the second waits while the first is
+// still refreshing it, however slowly, and uses the login it saved.
+test(
+  "a second fx waits for another's slow login refresh and uses its login",
+  async () => {
+    const home = mkdtempSync(join(tmpdir(), "fx-auth-refresh-slow-holder-e2e-"));
+    let markRefreshStarted = () => {};
+    const refreshStarted = new Promise<void>((resolve) => {
+      markRefreshStarted = resolve;
+    });
+    let tokenRequestCount = 0;
+    // Answered 5 s late: longer than fx used to wait for the lock.
+    const oauth = startFakeOAuth([ISSUER_A_ACCESS_TOKEN], "", async () => {
+      tokenRequestCount += 1;
+      markRefreshStarted();
+      await Bun.sleep(5_000);
+    });
+    writeFxLogin(home, oauth.issuerUrl);
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("FIRST_ASK_DONE"),
+      fakeGatewayFinalText("SECOND_ASK_DONE"),
+    ]);
+    const env = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: undefined,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_MODEL: FAKE_GATEWAY_MODEL,
+    };
+
+    try {
+      const first = runFx(["ask", "--json", "--no-save", "first"], { env, timeoutMs: TIMEOUT });
+      await refreshStarted;
+      const second = runFx(["ask", "--json", "--no-save", "second"], { env, timeoutMs: TIMEOUT });
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+      expect(firstResult.code, `stdout: ${firstResult.stdout}\nstderr: ${firstResult.stderr}`).toBe(0);
+      expect(secondResult.code, `stdout: ${secondResult.stdout}\nstderr: ${secondResult.stderr}`).toBe(0);
+      expect(tokenRequestCount).toBe(1);
+      expect(gateway.requests).toHaveLength(2);
+      for (const request of gateway.requests) {
+        expect(request.headers.get("authorization")).toBe(`Bearer ${ISSUER_A_ACCESS_TOKEN}`);
+      }
+    } finally {
+      gateway.stop();
+      oauth.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+type Subscription = "codex" | "grok";
+const SUBSCRIPTION_ACCOUNT = "acct_refresh_e2e";
+
+function subscriptionAccessToken(provider: Subscription, signature: string): string {
+  if (provider === "grok") return `grok-${signature}`;
+  const payload = Buffer.from(JSON.stringify({
+    "https://api.openai.com/auth": { chatgpt_account_id: SUBSCRIPTION_ACCOUNT },
+  })).toString("base64url");
+  return `header.${payload}.${signature}`;
+}
+
+function writeExpiredSubscriptionLogin(home: string, provider: Subscription, accessToken: string): void {
+  const fxDir = join(home, ".fx");
+  mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+  chmodSync(fxDir, 0o700);
+  const authPath = join(fxDir, provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json");
+  writeFileSync(authPath, JSON.stringify({
+    version: 1,
+    access_token: accessToken,
+    refresh_token: `${provider}-refresh`,
+    expires_at_ms: Date.now() - 60_000,
+    account_id: SUBSCRIPTION_ACCOUNT,
+  }) + "\n", { mode: 0o600 });
+  chmodSync(authPath, 0o600);
+}
+
+/** Codex's or Grok's sign-in and model endpoints, answering refreshes after `beforeTokenResponse`. */
+function startFakeSubscription(provider: Subscription, refreshedAccessToken: string, beforeTokenResponse: () => Promise<void>) {
+  const tokenRequests: string[] = [];
+  /** Each model request's headers. */
+  const modelRequests: string[] = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (path === "/models") {
+        return Response.json(provider === "codex"
+          ? { models: [{ slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 }] }
+          : { data: [{ id: "grok-4.20", model: "grok-4.20", api_backend: "responses", context_window: 1_000_000, supports_reasoning_effort: false, reasoning_efforts: [] }] });
+      }
+      if (path === "/modalities") {
+        return Response.json({ models: [{ id: "grok-4.20", input_modalities: ["text"], output_modalities: ["text"] }] });
+      }
+      if (path === "/token") {
+        tokenRequests.push(path);
+        await beforeTokenResponse();
+        return Response.json({ access_token: refreshedAccessToken, refresh_token: `${provider}-refresh-next`, expires_in: 3600 });
+      }
+      if (path === "/userinfo") return Response.json({ sub: SUBSCRIPTION_ACCOUNT });
+      const body = await request.text();
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeResponsesTitleDefault();
+      modelRequests.push(JSON.stringify([...request.headers.entries()]));
+      return new Response(
+        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "SUBSCRIPTION_ASK_DONE" })}\n\n` +
+          'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  const base = `http://127.0.0.1:${server.port}`;
+  const env: Record<string, string> = provider === "codex"
+    ? {
+      FX_PROVIDER: "codex",
+      FX_MODEL: "gpt-5.4-mini",
+      FX_TEST_OPENAI_CODEX_RESPONSES_URL: `${base}/responses`,
+      FX_TEST_OPENAI_CODEX_MODELS_URL: `${base}/models`,
+      FX_TEST_CHATGPT_TOKEN_URL: `${base}/token`,
+    }
+    : {
+      FX_PROVIDER: "grok",
+      FX_MODEL: "grok-4.20",
+      FX_TEST_XAI_GROK_RESPONSES_URL: `${base}/responses`,
+      FX_TEST_XAI_GROK_MODELS_URL: `${base}/models`,
+      FX_TEST_XAI_GROK_MODALITIES_URL: `${base}/modalities`,
+      FX_TEST_GROK_TOKEN_URL: `${base}/token`,
+      FX_TEST_GROK_USERINFO_URL: `${base}/userinfo`,
+    };
+  return { tokenRequests, modelRequests, env, stop() { server.stop(true); } };
+}
+
+// The Codex and Grok subscriptions refresh under a lock of their own, and a
+// second fx waits for it the same way.
+for (const provider of ["codex", "grok"] as const) {
+  test(
+    `a second fx waits for another's slow ${provider} login refresh and uses its login`,
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), `fx-auth-refresh-slow-${provider}-e2e-`));
+      let markRefreshStarted = () => {};
+      const refreshStarted = new Promise<void>((resolve) => {
+        markRefreshStarted = resolve;
+      });
+      const stale = subscriptionAccessToken(provider, "stale");
+      const fresh = subscriptionAccessToken(provider, "fresh");
+      // Answered 5 s late: longer than fx used to wait for the lock.
+      const fake = startFakeSubscription(provider, fresh, async () => {
+        markRefreshStarted();
+        await Bun.sleep(5_000);
+      });
+      writeExpiredSubscriptionLogin(home, provider, stale);
+      // Unused: keeps fx away from the real gateway.
+      const gateway = startFakeGateway([]);
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        ...fake.env,
+      };
+
+      try {
+        const first = runFx(["ask", "--json", "--no-save", "first"], { env, timeoutMs: TIMEOUT });
+        await refreshStarted;
+        const second = runFx(["ask", "--json", "--no-save", "second"], { env, timeoutMs: TIMEOUT });
+        const [firstResult, secondResult] = await Promise.all([first, second]);
+        expect(firstResult.code, `stdout: ${firstResult.stdout}\nstderr: ${firstResult.stderr}`).toBe(0);
+        expect(secondResult.code, `stdout: ${secondResult.stdout}\nstderr: ${secondResult.stderr}`).toBe(0);
+        expect(fake.tokenRequests).toHaveLength(1);
+        expect(fake.modelRequests).toHaveLength(2);
+        for (const headers of fake.modelRequests) {
+          expect(headers).toContain(fresh);
+          expect(headers).not.toContain(stale);
+        }
+      } finally {
+        gateway.stop();
+        fake.stop();
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+}
+
 test(
   "logout cannot be undone by an in-flight login refresh",
   async () => {
@@ -184,10 +379,15 @@ test(
       releaseRefresh();
 
       const [askResult, logoutResult] = await Promise.all([ask, logout]);
-      expect(
-        askResult.code,
-        `stdout: ${askResult.stdout}\nstderr: ${askResult.stderr}`,
-      ).toBe(0);
+      // The ask reads the login again for its turn. It either reads it before
+      // the logout deletes it, or after, and then it's signed out: never a
+      // store it can't read.
+      if (askResult.code !== 0) {
+        expect(
+          JSON.parse(askResult.stdout).error,
+          `stdout: ${askResult.stdout}\nstderr: ${askResult.stderr}`,
+        ).toBe("MissingCredentials");
+      }
       expect(
         logoutResult.code,
         `stdout: ${logoutResult.stdout}\nstderr: ${logoutResult.stderr}`,

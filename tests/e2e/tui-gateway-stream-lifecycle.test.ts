@@ -14,6 +14,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
@@ -52,6 +53,10 @@ import { expectPermissionModeContext } from "./permission-mode-context";
 import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
 
 const MODEL = "openai/gpt-5.5";
+/** What fx says when it cannot connect to the model catalog and drops fast
+ * mode (`catalogDownNotice` in `src/core/agent/runtime/orchestrator.zig`). */
+const CATALOG_CONNECT_FAST_NOTICE =
+  "fx couldn't connect to AI Gateway to load the model catalog, so fast mode is off until it loads. Check your network connection or firewall.";
 
 // A message to a working subagent joins its turn as its parent's words; one
 // to an idle subagent starts its next turn. Each work's end reports to the
@@ -1539,6 +1544,7 @@ async function launchRouteRecoveryTui(
     model?: string;
     models?: FakeGatewayOptions["models"];
     settings?: Record<string, unknown>;
+    cmd?: string;
   } = {},
 ) {
   root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
@@ -1557,6 +1563,7 @@ async function launchRouteRecoveryTui(
   gateway = queuedGateway;
 
   session = await TmuxSession.create({
+    cmd: options.cmd,
     cwd: workspace,
     width: 72,
     height: 24,
@@ -1892,6 +1899,58 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     } finally {
       for (const release of releaseHungCatalogs) release();
     }
+  }, TIMEOUT * 2);
+
+  test("the transcript names the connection failure once when the model catalog cannot connect", async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-catalog-refused-")));
+    const home = join(root, "home");
+    const workspacePath = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspacePath, { recursive: true });
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ fast_mode: true }));
+    const workspace = realpathSync(workspacePath);
+
+    // A free port, closed again, so every catalog request is refused.
+    const probe = createServer();
+    await new Promise<void>(resolve => probe.listen(0, "127.0.0.1", resolve));
+    const refusedPort = (probe.address() as AddressInfo).port;
+    await new Promise<void>(resolve => probe.close(() => resolve()));
+    gateway = startFakeGateway([fakeGatewayFinalText("REFUSED_CATALOG_PROMPT_OK")]);
+
+    session = await TmuxSession.create({
+      cwd: workspace,
+      stderrPath,
+      width: 160,
+      height: 40,
+      env: {
+        HOME: home,
+        TMPDIR: root,
+        AI_GATEWAY_API_KEY: "fake-catalog-refused-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `http://127.0.0.1:${refusedPort}/coding-agent/v1/models`,
+        FX_MODEL: MODEL,
+      },
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Run without the catalog.");
+    await session.waitForText("REFUSED_CATALOG_PROMPT_OK", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback.split(CATALOG_CONNECT_FAST_NOTICE)).toHaveLength(2);
+    expect(scrollback).not.toContain("Fast mode is unavailable");
+    expect(scrollback).not.toContain("aren't reaching the model right now");
+
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT * 2);
 
   test("file edits keep earlier instruction bytes stable", async () => {
@@ -3016,6 +3075,78 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       TIMEOUT * 2,
     );
   }
+
+  // fx often sees a closed window as its terminal hanging up before SIGHUP
+  // reaches it. This fx starts with SIGHUP blocked, so the hang-up is all it
+  // sees, and the window must still close as SIGHUP closes it.
+  test.skipIf(!Bun.which("python3"))(
+    "a window that hangs up before SIGHUP reaches fx resumes its request on reopen",
+    async () => {
+      const interrupted: HoldState = { started: false, cancelled: false };
+      const resumed: HoldState = { started: false, cancelled: false };
+      const prompt = "Read before.txt, then report the result.";
+      const finalText = "Hung-up window recovered once.";
+      const blockSighup =
+        `python3 -c 'import os, signal, sys; signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGHUP}); os.execvp(sys.argv[1], sys.argv[1:])'`;
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-recovery-hangup-",
+        [
+          fakeGatewayToolCall("read_before_hangup", "read_file", { path: "before.txt" }),
+          () => heldGatewayResponse(interrupted),
+          () => heldGatewayResponse(resumed, [], [
+            { type: "text-delta", id: "answer_1", delta: finalText },
+            { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+          ]),
+        ],
+        { cmd: `${blockSighup} ${FX_BIN}` },
+      );
+      writeFileSync(join(root!, "workspace", "before.txt"), "Completed read survives the hang-up.\n");
+      await session!.sendText(prompt);
+      await waitForCondition(() => interrupted.started, "checkpointed response");
+      const firstPid = session!.processPid();
+      await session!.kill();
+      session = null;
+      await waitForCondition(() => !isProcessAlive(firstPid), "fx to exit after its window closed");
+
+      const resumedStderr = join(root!, "resumed-stderr.log");
+      session = await TmuxSession.create({
+        cmd: `${FX_BIN} --resume last`,
+        cwd: join(root!, "workspace"),
+        width: 100,
+        height: 32,
+        stderrPath: resumedStderr,
+        env: {
+          HOME: join(root!, "home"),
+          AI_GATEWAY_API_KEY: "fake-route-recovery-key",
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "auto",
+          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+          FX_MODEL: MODEL,
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+      // The hang-up left the turn open, so reopening sends the request again
+      // on its own (`tests/tla/recovery/Resume.tla` Close and AutoResumes).
+      await waitForCondition(() => resumed.started, "resumed request after the hang-up");
+      await session.waitForText("Resuming the interrupted request", TIMEOUT);
+      resumed.release?.();
+      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForPane((pane) => hasEmptyComposer(pane), TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+
+      expect(scrollback).not.toContain("Cancelled");
+      expect(scrollback.split(`┃ ${prompt}`).length - 1).toBe(1);
+      expect(scrollback.split("└ Read before.txt").length - 1).toBe(1);
+      expect(scrollback.split(finalText).length - 1).toBe(1);
+      expect(queuedGateway.requests).toHaveLength(3);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(readFileSync(resumedStderr, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
 
   test(
     "recovering tool lifecycle admits resumed tools on the same turn",
@@ -5556,7 +5687,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(observed.stderr).toBe(
           stage === "baseline-silent"
             ? ""
-            : "fx: LifecycleReconciliationCollision\n",
+            : "fx: lifecycle reconciliation collision\n",
         );
         return;
       }
@@ -6436,12 +6567,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(resized).toContain(`Ran ${supportedCommand}`);
 
       await session.sendKeys("C-o");
+      // Ctrl+O gives each call its own line with its mark, without the tree marks.
       const full = await session.waitForText(
-        `├ Failed ${unsupportedToolName}`,
+        `● Failed ${unsupportedToolName}`,
         TIMEOUT,
       );
-      expect(full).toContain(`├ Failed ${unsupportedToolName}`);
-      expect(full).toContain(`└ Ran ${supportedCommand}`);
+      expect(full).toContain(`● Failed ${unsupportedToolName}`);
+      expect(full).toContain(`● Ran ${supportedCommand}`);
       expect(countOccurrences(full, `Failed ${unsupportedToolName}`)).toBe(1);
       expect(countOccurrences(full, `Ran ${supportedCommand}`)).toBe(1);
       await session.sendKeys("C-o");
@@ -6892,7 +7024,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(narrow).toContain("sent to checker · Check replay again");
         await session.resizeWindow(110, 35);
         await session.sendKeys("C-o");
-        await session.waitForText("full detail", TIMEOUT);
+        await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
         let details = await session.capturePane();
         for (let page = 0; page < 12 && !(details.includes("CHILD_ROW_REPLY_0") && details.includes("Check one-off cleanup")); page += 1) {
           await session.sendKeys("PPage");
@@ -7137,28 +7269,28 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const fullAtTail = await session.waitForText(finalText, TIMEOUT);
       let fullAtNested = fullAtTail;
       for (let page = 0; page < 10 && !fullAtNested.includes(
-        "├ Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
+        "● Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
       ); page += 1) {
         await session.sendKeys("PPage");
         fullAtNested = await session.capturePane();
       }
       expect(fullAtNested).toContain(
-        "├ Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
+        "● Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
       );
-      expect(fullAtTail).toContain(`└ Ran ${thirdCommand}`);
+      expect(fullAtTail).toContain(`● Ran ${thirdCommand}`);
       expect(withoutWorkspaceStatusline(fullAtTail)).not.toContain(workspace);
 
       let fullAtFirst = await session.capturePane();
       for (
         let page = 0;
-        page < 20 && !fullAtFirst.includes(`├ Ran ${firstDisplayCommand}`);
+        page < 20 && !fullAtFirst.includes(`● Ran ${firstDisplayCommand}`);
         page += 1
       ) {
         await session.sendKeys("PPage");
         await Bun.sleep(50);
         fullAtFirst = await session.capturePane();
       }
-      expect(fullAtFirst).toContain(`├ Ran ${firstDisplayCommand}`);
+      expect(fullAtFirst).toContain(`● Ran ${firstDisplayCommand}`);
       expect(fullAtFirst).not.toContain(`Ran ${firstCommand}`);
       expect(withoutWorkspaceStatusline(fullAtFirst)).not.toContain(workspace);
 

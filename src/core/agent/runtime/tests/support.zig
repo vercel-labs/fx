@@ -18,6 +18,7 @@ const command_replay_store = @import("../../../session/command_replay_store.zig"
 const session_child_store = @import("../../../session/session_child_store.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
+const model_catalog = @import("../../../gateway/model_catalog.zig");
 const provider_set = @import("../../../gateway/provider_set.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
 const file_mutation_contract = @import("../../../tooling/file_mutation_contract.zig");
@@ -519,7 +520,7 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_waiting: ?*std.atomic.Value(bool) = null,
     permission_release: ?*std.atomic.Value(bool) = null,
     tool_execution_override: ?ToolExecutionOverride = null,
-    catalog_unavailable: bool = false,
+    catalog_failure: ?model_catalog.FailureCategory = null,
     permission_failure_names: []const []const u8 = &.{},
     permission_index: usize = 0,
     exec_plans: []const FakeExecPlan = &.{},
@@ -545,7 +546,7 @@ pub const FakeAgentRuntimeDeps = struct {
     last_execute_grant_count: usize = 0,
     command_complete_count: usize = 0,
     route_recovery_clear_count: usize = 0,
-    full_detail_records: std.ArrayList(types.SemanticNotice) = .empty,
+    model_calls: std.ArrayList(types.ModelCallRecord) = .empty,
     finish_event_count: usize = 0,
     finish_event_attempt_count: usize = 0,
     finish_event_error: ?anyerror = null,
@@ -684,8 +685,8 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.restored_prompts);
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
-        for (self.full_detail_records.items) |notice| types.freeSemanticNotice(self.alloc, notice);
-        self.full_detail_records.deinit(self.alloc);
+        for (self.model_calls.items) |call| types.freeModelCallRecordStrings(self.alloc, call);
+        self.model_calls.deinit(self.alloc);
         freeStringList(self.alloc, &self.context_notices);
         self.route_recovery_statuses.deinit(self.alloc);
         freeStringList(self.alloc, &self.permission_names);
@@ -796,7 +797,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .save_recovery_record = if (self.enable_recovery_record) saveRecoveryRecord else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
-            .model_catalog_unavailable = catalogUnavailable,
+            .model_catalog_failure = catalogFailure,
             .take_steering_boundary = if (self.steering_worker != null)
                 takeWorkerSteeringBoundary
             else if (self.steering_messages.len > 0 or
@@ -862,9 +863,9 @@ pub const FakeAgentRuntimeDeps = struct {
         return self.root_permission_mode.?;
     }
 
-    fn catalogUnavailable(raw: *anyopaque) bool {
+    fn catalogFailure(raw: *anyopaque) ?model_catalog.FailureCategory {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        return self.catalog_unavailable;
+        return self.catalog_failure;
     }
 
     fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {
@@ -1656,11 +1657,11 @@ pub const FakeAgentRuntimeDeps = struct {
         defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
         if (self.steering_worker) |worker| try worker.pushEvent(self.alloc, event);
         switch (event) {
-            .full_detail_record => |notice| {
-                const owned = try types.dupeSemanticNotice(self.alloc, notice);
-                errdefer types.freeSemanticNotice(self.alloc, owned);
-                try self.full_detail_records.append(self.alloc, owned);
-                try self.record("full_detail_record:{s}:{s}", .{ notice.topic, notice.body });
+            .model_call => |call| {
+                const owned = try types.dupeModelCallRecord(self.alloc, call);
+                errdefer types.freeModelCallRecordStrings(self.alloc, owned);
+                try self.model_calls.append(self.alloc, owned);
+                try self.record("model_call:{s}:{s}", .{ @tagName(call.outcome), call.model });
             },
             .open_model_picker => try self.record("event:open_model_picker", .{}),
             .clear_route_recovery_status => {

@@ -6,8 +6,10 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const host_target = @import("../hosts/target.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
+const leased_lock = @import("../shared/leased_lock.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const types = @import("../shared/types.zig");
+const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const session_presence = @import("session_presence.zig");
 
@@ -15,7 +17,13 @@ const Allocator = std.mem.Allocator;
 const schema_version: i64 = 1;
 const max_auth_file_bytes: usize = 64 * 1024;
 const expiry_skew_ms: i64 = 60 * 1000;
-const mutation_lock_deadline_ms: u64 = 2000;
+/// The lock is leased (`leased_lock`): its holder stamps it before each
+/// request to the provider, and each ends within the transport's
+/// `default_request_timeout_ms`. A waiting fx gives up
+/// `leased_lock.slack_ms` after that, so it waits for another refreshing the
+/// session however slowly the provider answers, and one frozen holding the
+/// lock (ctrl+z) costs it 17 s.
+const mutation_lock_wait_ms: i64 = oauth_transport.default_request_timeout_ms + leased_lock.slack_ms;
 
 const Spec = struct {
     auth_file_name: []const u8,
@@ -60,12 +68,21 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
         pub const Mutation = struct {
             fx_dir: io_mod.VerifiedDir,
             lock: io_mod.TimedAdvisoryLock,
+            /// The lease's last stamp, on the awake clock (`mutation_lock_wait_ms`).
+            stamp_ms: i64,
 
             pub fn requireWritable(self: *Mutation) error{CredentialStorageUnavailable}!void {
                 _ = try session_presence.requireWritableInDir(self.fx_dir.dir, spec.auth_file_name);
             }
 
+            /// Stamps the lease again, before a request to the provider: the
+            /// request has its whole budget from a fresh stamp.
+            pub fn restamp(self: *Mutation) void {
+                self.stamp_ms = leased_lock.restamp(self.lock.file, "auth", spec.trace_label ++ " login");
+            }
+
             pub fn deinit(self: *Mutation) void {
+                debug_trace.logf("auth", spec.trace_label ++ " login lock released stamp={d} at={d}", .{ self.stamp_ms, io_mod.awakeMilliTimestamp() });
                 self.lock.release();
                 self.fx_dir.close();
                 self.* = undefined;
@@ -125,18 +142,14 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
         }
 
         fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) !?Session {
-            // A path that isn't a regular file, such as a fifo, fails without
-            // waiting for a writer.
-            var file = io_mod.openExistingReadOnlyRegularFile(fx_dir.*, spec.auth_file_name, .no_follow) catch |err| switch (err) {
-                error.FileNotFound => return null,
-                else => {
-                    debug_trace.logf("auth", spec.trace_label ++ " session load failed step=open_file err={s}", .{@errorName(err)});
-                    return session_presence.storageError(spec.auth_file_name, err);
-                },
-            };
-            defer file.close(io_mod.getIo());
+            var current = (session_presence.openCurrent(fx_dir.*, spec.auth_file_name) catch |err| {
+                debug_trace.logf("auth", spec.trace_label ++ " session load failed step=open_file err={s}", .{@errorName(err)});
+                return session_presence.storageError(spec.auth_file_name, err);
+            }) orelse return null;
+            defer current.file.close(io_mod.getIo());
+            var file = current.file;
 
-            const stat = file.stat(io_mod.getIo()) catch |err| return session_presence.storageError(spec.auth_file_name, err);
+            const stat = current.stat;
             if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
                 debug_trace.logf("auth", spec.trace_label ++ " session load failed step=permissions err=InsecureAuthFile", .{});
                 return error.InsecureAuthFile;
@@ -189,13 +202,16 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
         fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
             var fx_dir = open_fx_dir;
             errdefer fx_dir.close();
-            var lock = io_mod.acquireTimedAdvisoryLock(
+            const taken = leased_lock.acquire(
                 &fx_dir,
                 spec.mutation_lock_file_name,
-                mutation_lock_deadline_ms,
+                io_mod.awakeMilliTimestamp(),
+                mutation_lock_wait_ms,
+                .{},
+                "auth",
+                spec.trace_label ++ " login",
             ) catch |err| return session_presence.storageError(spec.auth_file_name, err);
-            errdefer lock.release();
-            return .{ .fx_dir = fx_dir, .lock = lock };
+            return .{ .fx_dir = fx_dir, .lock = taken.lock, .stamp_ms = taken.stamp_ms };
         }
 
         pub fn parse(alloc: Allocator, bytes: []const u8) !Session {

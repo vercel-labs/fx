@@ -546,13 +546,16 @@ pub const Runtime = struct {
                         switch (result) {
                             .receipt => |delivery| break :steer delivery,
                             .waiting => {},
-                            .unavailable, .cancelled, .conflict, .capacity => return self.encodeManaged(alloc, .{
+                            .capacity => {
+                                var buf: [sent_result_bytes]u8 = undefined;
+                                return self.encodeManaged(alloc, .{ .ok = false, .error_code = "feedback_capacity", .result = capacityResult(&buf, agent) });
+                            },
+                            .unavailable, .cancelled, .conflict => return self.encodeManaged(alloc, .{
                                 .ok = false,
                                 .error_code = switch (result) {
                                     .unavailable => "state_unavailable",
                                     .cancelled => "child_cancelled",
                                     .conflict => "operation_conflict",
-                                    .capacity => "feedback_capacity",
                                     else => unreachable,
                                 },
                             }),
@@ -1026,10 +1029,12 @@ pub const Runtime = struct {
     /// What a report says about the work: the child's reply, or how it
     /// ended, with any text it had written.
     fn reportOutput(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) ![]const u8 {
-        const text = if (end.reply) |reply|
-            (if (reply.len > 0) reply else null)
+        const saved = if (end.reply) |reply|
+            reply
         else
             self.managedResultText(a, end.child_id, end.work_id) catch null;
+        // An empty reply says nothing, so the report reads as if it had none.
+        const text = if (saved) |value| (if (value.len > 0) value else null) else null;
         return switch (end.outcome) {
             .completed => text orelse "The subagent ended its turn without a reply.",
             .failed => formatFailedResult(a, if (end.failure) |*failure| failure.view() else null, text),
@@ -1553,6 +1558,7 @@ pub const Runtime = struct {
         };
         if (failure) |err| return self.closeNotWritten(owned, err);
         debug_trace.eventf("mailbox", "closed", .{}, "child={s}", .{owned});
+        self.managed.forgetFeedback(owned);
         return true;
     }
 
@@ -2032,6 +2038,8 @@ const MailboxFixture = struct {
     steerable: bool = false,
     /// While set, the first run fails once released.
     fail_first: bool = false,
+    /// While set, each run saves an empty reply.
+    empty_reply: bool = false,
     release: std.Io.Event = .unset,
     runs: std.atomic.Value(usize) = .init(0),
     mutex: std.Io.Mutex = .init,
@@ -2063,7 +2071,10 @@ const MailboxFixture = struct {
         while (self.hold and !self.release.isSet() and !cancel.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
         if (cancel.load(.seq_cst)) return error.Cancelled;
         if (self.fail_first and run_number == 1) return error.ProviderFailed;
-        const reply = std.testing.allocator.print("DONE {s}", .{message.content}) catch return error.ProviderFailed;
+        const reply = if (self.empty_reply)
+            std.testing.allocator.dupe(u8, "") catch return error.ProviderFailed
+        else
+            std.testing.allocator.print("DONE {s}", .{message.content}) catch return error.ProviderFailed;
         defer std.testing.allocator.free(reply);
         turn.commit(turn.active_work_id.?, .{ .assistant = .{
             .user = .{ .text = message.content },
@@ -2163,6 +2174,25 @@ test "a message returns at once, and the subagent's report reaches its parent on
 
     const status = try callTool(runtime, arena, .{ .status = .{} }, "call-2", null);
     try std.testing.expect(std.mem.find(u8, status, "reviewer: idle, last work completed, reports final") != null);
+}
+
+test "a work that saves an empty reply reports that it ended without one" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .empty_reply = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "check" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], " completed The subagent ended its turn without a reply."));
 }
 
 test "a message to a busy subagent waits and runs as its next work, in order" {
@@ -3162,6 +3192,12 @@ const sent_result_bytes = 256 + domain.max_agent_name_bytes;
 /// `message`'s answer when the child takes it now.
 fn sentResult(buf: []u8, agent: []const u8) []const u8 {
     return std.mem.print(buf, "Sent to {s}, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.", .{agent}) catch "Sent.";
+}
+
+/// `message`'s refusal when the child's running turn already holds as many
+/// unread messages as it takes.
+fn capacityResult(buf: []u8, agent: []const u8) []const u8 {
+    return std.mem.print(buf, "{s} already has {d} unread messages from you. Its next step reads them; send this one again after that, or wait for its report.", .{ agent, managed_owner.max_unread_feedback }) catch "The subagent already has too many unread messages from you.";
 }
 
 /// `message`'s answer when the child is busy and the message waits.

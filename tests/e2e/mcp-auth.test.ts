@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -10,10 +10,13 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { startIdleDropProxy } from "./fixtures/idle-drop-proxy";
 import { startLegacyStreamableHttpFixture } from "./fixtures/mcp-legacy-remote";
@@ -155,6 +158,8 @@ function startAuthFixture(
      * `revokeOnReplay` the newest login of the chain stops working too.
      */
     singleUseRefresh?: { graceMs: number; revokeOnReplay?: boolean };
+    /** With `singleUseRefresh`, answer each refresh this late, after retiring the token it sent. */
+    refreshDelayMs?: number;
     /** The code exchange waits for this file, after writing the other. */
     codeBarrierStartedPath?: string;
     codeBarrierReleasePath?: string;
@@ -317,6 +322,7 @@ function startAuthFixture(
               };
               Object.assign(chain, { current: answer.refresh_token, retired: sent, retiredAt: Date.now(), retiredAnswer: answer });
               validTokens.add(answer.access_token);
+              if (options.refreshDelayMs) await Bun.sleep(options.refreshDelayMs);
               return Response.json(answer);
             }
             if (sent === chain.retired && Date.now() - chain.retiredAt <= rule.graceMs) return Response.json(chain.retiredAnswer);
@@ -592,6 +598,61 @@ function seedV2Credential(root: ReturnType<typeof createRoot>, activeAuth: AuthF
   return path;
 }
 
+/**
+ * The MCP credential store's Keychain item for a throwaway account, through
+ * the same Security calls fx's osascript helper makes, so no other program
+ * needs Keychain access to it. `op` is "load" (the item's text, "" when
+ * there is none) or "delete".
+ */
+const MCP_KEYCHAIN_SERVICE = "FX_MCP_OAUTH_CREDENTIALS_V3";
+const MCP_KEYCHAIN_ACCOUNT_PREFIX = "fx-e2e-mcp-lock-";
+const MCP_KEYCHAIN_SCRIPT = `
+ObjC.import("Security");
+ObjC.import("Foundation");
+const object = (value) => ObjC.castRefToObject(value);
+function run(argv) {
+  const query = $.NSMutableDictionary.alloc.init;
+  query.setObjectForKey(object($.kSecClassGenericPassword), object($.kSecClass));
+  query.setObjectForKey($(argv[1]), object($.kSecAttrAccount));
+  query.setObjectForKey($(argv[2]), object($.kSecAttrService));
+  if (argv[0] === "delete") {
+    const status = $.SecItemDelete(query);
+    if (status !== 0 && status !== -25300) throw new Error("keychain status=" + status);
+    return "";
+  }
+  query.setObjectForKey($.NSNumber.numberWithBool(true), object($.kSecReturnData));
+  query.setObjectForKey(object($.kSecMatchLimitOne), object($.kSecMatchLimit));
+  const result = Ref();
+  const status = $.SecItemCopyMatching(query, result);
+  if (status === -25300) return "";
+  if (status !== 0) throw new Error("keychain status=" + status);
+  return $.NSString.alloc.initWithDataEncoding(ObjC.castRefToObject(result[0]), $.NSUTF8StringEncoding).js;
+}`;
+
+function mcpKeychainItem(op: "load" | "delete", account: string, home: string): string {
+  if (!account.startsWith(MCP_KEYCHAIN_ACCOUNT_PREFIX)) throw new Error("refusing to touch a non-test MCP Keychain account");
+  const result = spawnSync("/usr/bin/osascript", ["-l", "JavaScript", "-e", MCP_KEYCHAIN_SCRIPT, op, account, MCP_KEYCHAIN_SERVICE], {
+    encoding: "utf8",
+    env: { ...process.env, HOME: home, USER: account },
+  });
+  if (result.status !== 0) throw new Error(`MCP Keychain ${op} failed: ${result.stderr.trim()}`);
+  return result.stdout.trim();
+}
+
+/**
+ * Pauses the first Keychain read fx makes for `account` from now on, as a
+ * slow Keychain does; resolves with its pid, or null if none starts in 15 s.
+ */
+function pauseNextKeychainRead(account: string): { pid: Promise<number | null>; stop: () => void } {
+  const watcher = Bun.spawn(["/bin/sh", "-c", `while :; do p=$(pgrep -f "load ${account} ${MCP_KEYCHAIN_SERVICE}" | head -1); if [ -n "$p" ]; then kill -STOP "$p"; echo "$p"; exit 0; fi; done`], { stdout: "pipe" });
+  const pid = Promise.race([new Response(watcher.stdout).text(), Bun.sleep(15_000).then(() => "")]).then((out) => Number(out.trim()) || null);
+  return { pid, stop: () => { try { watcher.kill(); } catch {} } };
+}
+
+function releaseProcess(pid: number | null) {
+  if (pid) try { process.kill(pid, "SIGCONT"); } catch {}
+}
+
 function startToolGateway() {
   return startFakeGateway([
     fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
@@ -602,11 +663,12 @@ function startToolGateway() {
   });
 }
 
-function startDelayedToolGateway(delayMs: number, finalText: string) {
+/// Holds the call to the protected tool until `callAt`, a wall-clock time in ms.
+function startDelayedToolGateway(callAt: number, finalText: string) {
   return startFakeGateway([
     fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
     async () => {
-      await Bun.sleep(delayMs);
+      await Bun.sleep(Math.max(0, callAt - Date.now()));
       return fakeGatewayToolCall("call_mcp", TOOL_NAME, {
         text: "authenticated",
       });
@@ -617,13 +679,15 @@ function startDelayedToolGateway(delayMs: number, finalText: string) {
   });
 }
 
-function startRefreshRecoveryGateway(delayMs: number) {
+/// Holds the first call to the protected tool until `callAt()`, a wall-clock
+/// time in ms.
+function startRefreshRecoveryGateway(callAt: () => number) {
   return startFakeGateway([
     fakeGatewayToolCall("select_cancel", "mcp_select_tool", {
       name: TOOL_NAME,
     }),
     async () => {
-      await Bun.sleep(delayMs);
+      await Bun.sleep(Math.max(0, callAt() - Date.now()));
       return fakeGatewayToolCall("call_cancel", TOOL_NAME, {
         text: "cancelled",
       });
@@ -2012,6 +2076,72 @@ describe("MCP login", () => {
     expect(auth.replays).toBe(0);
   }, 90_000);
 
+  // One fx refreshes a login at a time. Another that needs it meanwhile
+  // waits for as long as the refresh is still going, here a token endpoint
+  // that takes 15 s to answer, and then takes the login it saved: refreshing
+  // with the token the first already sent would be refused. Both are
+  // connected before the token runs out, as fx windows in use are.
+  test("an fx waits for another's refresh that takes 15 s, and takes the login it saved", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { singleUseRefresh: { graceMs: 0 }, refreshDelayMs: 15_000 });
+    const activeAuth = auth;
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    const until = async (what: string, done: () => boolean) => {
+      const deadline = Date.now() + 30_000;
+      while (!done()) {
+        if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+        await Bun.sleep(25);
+      }
+    };
+    const models = { models: [{ id: MODEL, type: "language" as const, tags: ["tool-use"] }] };
+    // The first fx calls once the second is connected, and finds the token
+    // withdrawn; the second calls once the first's refresh is out.
+    let second: ReturnType<typeof startFakeGateway> | null = null;
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select_first", "mcp_select_tool", { name: TOOL_NAME }),
+      async () => {
+        await until("the second fx to connect", () => (second?.requests.length ?? 0) >= 2);
+        activeAuth.validTokens.delete(ACCESS_INITIAL);
+        return fakeGatewayToolCall("first", TOOL_NAME, { text: "first" });
+      },
+      fakeGatewayFinalText("First call done."),
+    ], models);
+    const first = gateway;
+    second = startFakeGateway([
+      fakeGatewayToolCall("select_second", "mcp_select_tool", { name: TOOL_NAME }),
+      async () => {
+        await until("the first fx's refresh", () => activeAuth.refreshes >= 1);
+        return fakeGatewayToolCall("second", TOOL_NAME, { text: "second" });
+      },
+      fakeGatewayFinalText("Second call done."),
+    ], models);
+    const other = second;
+    try {
+      const ask = (g: ReturnType<typeof startFakeGateway>) => runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture."], {
+        cwd: root.workspace,
+        env: { ...env, FX_GATEWAY_BASE_URL: g.baseUrl, FX_GATEWAY_CHAT_URL: g.chatUrl },
+        timeoutMs: 60_000,
+      });
+      const [a, b] = await Promise.all([ask(first), ask(other)]);
+      // Refreshing with the token the first sent is refused, and both lose the login.
+      expect(auth.replays).toBe(0);
+      expect(auth.refreshes).toBe(1);
+      expectExit0(a);
+      expectExit0(b);
+      expect(toolResultText(first.requests.at(-1)?.body ?? "", "first")).toContain("first");
+      expect(toolResultText(other.requests.at(-1)?.body ?? "", "second")).toContain("second");
+      // Both called the tool with the one refreshed login.
+      const calls = auth.requests.filter((r) => r.body.includes("\"tools/call\"") && r.authorization === `Bearer ${ACCESS_REFRESHED}-1`);
+      expect(calls.length).toBe(2);
+      expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-1`);
+    } finally {
+      other.stop();
+    }
+  }, 90_000);
+
   // A load balancer resets the token endpoint's keep-alive connection once it
   // sits idle. fx keeps it for the next renewal, which must find it gone and
   // go out on a new connection instead of failing every renewal until fx
@@ -2075,6 +2205,71 @@ describe("MCP login", () => {
     expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials-v3.json"))).toBe(false);
   }, 60_000);
 
+  // A logout that can't remove the saved login says so: every other fx, and
+  // the next one, would still sign in with it.
+  test("a logout that can't remove the saved login says so, and fx mcp logout fails", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const storePath = seedV2Credential(root, auth);
+    // Readable, but fx won't replace a file it isn't allowed to write.
+    chmodSync(storePath, 0o400);
+    const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Signed out of fixture here, but couldn't remove its saved login: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. Sign out again once that's fixed.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  test("removing a server whose saved login can't be deleted says so, and fx mcp remove fails", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const storePath = seedV2Credential(root, auth);
+    chmodSync(storePath, 0o400);
+    const done = await runFx(["mcp", "remove", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Removed fixture from ~/.fx/mcp.json, but couldn't delete its saved login: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. Once that's fixed, add it back and run fx mcp logout fixture to delete it.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(join(root.home, ".fx", "mcp.json"), "utf8")).not.toContain("fixture");
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  // A server waiting for approval has no session, so a saved login that
+  // can't be removed means nothing changed.
+  test("a logout of a held server whose saved login can't be removed changes nothing and says so", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    moveAuthFixtureToWorkspace(root);
+    const storePath = seedV2Credential(root, auth);
+    const doc = JSON.parse(readFileSync(storePath, "utf8"));
+    doc.servers[0].workspace = root.workspace;
+    writeFileSync(storePath, JSON.stringify(doc));
+    chmodSync(storePath, 0o400);
+    const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Couldn't sign out of fixture: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. Try again once that's fixed.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  test("a logout while another fx keeps the saved logins busy changes nothing and says so", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const storePath = seedV2Credential(root, auth);
+    // Private, as fx makes it.
+    writeFileSync(join(root.home, ".fx", "mcp-credentials", "credentials-v3.lock"), "", { mode: 0o600 });
+    const holder = await holdStoreLock(root, 8);
+    const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    holder.kill();
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Couldn't sign out of fixture: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: another fx kept it busy. Try again once that's fixed.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("a refreshed login that can't be saved says so in the shell, and keeps working there", async () => {
     upstream = startModernMcpHttpFixture("json");
     const options: { rejectRefresh?: boolean } = {};
@@ -2127,6 +2322,93 @@ describe("MCP login", () => {
     await tui.waitForText("Third call done.", 20_000);
     expect(JSON.parse(readFileSync(storePath, "utf8")).servers).toEqual([]);
   }, 90_000);
+
+  // Two shells share one login on the Keychain. Shell A starts while B is
+  // idle, and A's Keychain read hangs past the 10 s it may hold the store's
+  // lock; meanwhile B's token is refused, so B refreshes and saves. The
+  // auth server's refresh tokens work once, as WorkOS's do.
+  // Before, B waited 2 s for the lock, dropped its new login with "another
+  // fx kept it busy", and A, taking the saved login, replayed a refresh
+  // token B had already used. Now A's hung read is cut at its budget, B
+  // waits for that and saves, and A takes B's login without refreshing.
+  test.skipIf(process.platform !== "darwin" || !tmuxAvailable())("a refreshed login is saved while another fx hangs in the Keychain", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { singleUseRefresh: { graceMs: 0 } });
+    const root = createRoot(auth);
+    mkdirSync(join(root.home, "Library"), { recursive: true });
+    symlinkSync(join(homedir(), "Library", "Keychains"), join(root.home, "Library", "Keychains"), "dir");
+    const account = `${MCP_KEYCHAIN_ACCOUNT_PREFIX}${process.pid}-${randomUUID()}`;
+    const env = {
+      ...baseEnv(root), USER: account, FX_DISABLE_KEYCHAIN: undefined, DISPLAY: ":0", SSH_CONNECTION: undefined,
+      FX_NO_OPEN_BROWSER: undefined, FX_TRACE_SCOPES: "mcp,keychain",
+    };
+    const call = (id: string, done: string) => [
+      fakeGatewayToolCall(`select_${id}`, "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall(`call_${id}`, TOOL_NAME, { text: id }),
+      fakeGatewayFinalText(done),
+    ];
+    const models = [{ id: MODEL, type: "language", tags: ["tool-use"] }];
+    const gatewayA = startFakeGateway(call("a", "A call done."), { models });
+    let shellA: TmuxSession | null = null;
+    let paused: number | null = null;
+    let watcher: { pid: Promise<number | null>; stop: () => void } | null = null;
+    try {
+      expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+      expect(mcpKeychainItem("load", account, root.home)).toContain(ACCESS_INITIAL);
+      gateway = startFakeGateway([...call("first", "First call done."), ...call("second", "Second call done.")], { models });
+      tui = await TmuxSession.create({
+        isolated: true, cwd: root.workspace, width: 220, height: 40,
+        env: { ...env, FX_TRACE_LOG: `${root.trace}.b`, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Call the fixture.");
+      await tui.waitForText("First call done.", 20_000);
+      await tui.waitForComposer(10_000);
+      auth.validTokens.delete(ACCESS_INITIAL);
+
+      watcher = pauseNextKeychainRead(account);
+      const starting = TmuxSession.create({
+        isolated: true, cwd: root.workspace, width: 220, height: 40, startupWaitMs: 0,
+        env: { ...env, FX_TRACE_LOG: `${root.trace}.a`, FX_GATEWAY_BASE_URL: gatewayA.baseUrl, FX_GATEWAY_CHAT_URL: gatewayA.chatUrl },
+      });
+      paused = await watcher.pid;
+      shellA = await starting;
+      expect(paused).not.toBeNull();
+      const pausedAt = Date.now();
+
+      await tui.sendText("Call it again.");
+      await Bun.sleep(Math.max(0, pausedAt + 14_000 - Date.now()));
+      releaseProcess(paused);
+      paused = null;
+      await tui.waitForText("Second call done.", 45_000);
+      await shellA.waitForComposer(15_000);
+      await shellA.sendText("Call the fixture.");
+      await shellA.waitForText("A call done.", 30_000);
+
+      const screen = (await tui.capturePaneGrid()).join("\n").replace(/\n\s+/g, " ");
+      const saved = mcpKeychainItem("load", account, root.home);
+      if (screen.includes("another fx kept it busy") || !saved.includes(`${ACCESS_REFRESHED}-1`)) {
+        const trace = (who: string) => existsSync(`${root.trace}.${who}`) ? readFileSync(`${root.trace}.${who}`, "utf8").split("\n").filter((l) => /\[(keychain|mcp)\].*(lock|credential|saved login|refresh|load|store)/.test(l)).map((l) => `${who} ${l}`) : [];
+        console.log(`---- shell B ----\n${screen}\n---- traces ----\n${[...trace("a"), ...trace("b")].join("\n")}`);
+      }
+      expect(screen).not.toContain("another fx kept it busy");
+      // B's refreshed login is the saved one, A took it instead of
+      // refreshing, and no retired refresh token was sent.
+      expect(saved).toContain(`${ACCESS_REFRESHED}-1`);
+      expect(auth.refreshes).toBe(1);
+      expect(auth.replays).toBe(0);
+      const aCall = auth.requests.filter((r) => r.body.includes("\"tools/call\"")).at(-1);
+      expect(aCall?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}-1`);
+    } finally {
+      releaseProcess(paused);
+      watcher?.stop();
+      await shellA?.kill();
+      gatewayA.stop();
+      try { mcpKeychainItem("delete", account, root.home); } catch (err) { console.log(String(err)); }
+      // Only the link goes, never the Keychains it points at.
+      unlinkSync(join(root.home, "Library", "Keychains"));
+    }
+  }, 150_000);
 
   test("a configured oauth.resource reaches the authorization server as written", async () => {
     upstream = startModernMcpHttpFixture("json");
@@ -2195,14 +2477,16 @@ describe("MCP login", () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
     const root = createRoot(auth);
-    // Renewed 6 s before it expires, 10 s from now: the first use is outside
-    // that window, and the call 6 s later inside it.
-    seedV2Credential(root, auth, { expires_at_ms: Date.now() + 10_000, skew_ms: 6_000 });
-    gateway = startDelayedToolGateway(6_000, "Renewed call complete.");
+    // Renewed 6 s before it expires, 21 s from now: the first use is well
+    // before that window, even when fx starts slowly on a busy machine, and
+    // the call, held until 16 s from now, inside it.
+    const savedAt = Date.now();
+    seedV2Credential(root, auth, { expires_at_ms: savedAt + 21_000, skew_ms: 6_000 });
+    gateway = startDelayedToolGateway(savedAt + 16_000, "Renewed call complete.");
     const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture."], {
       cwd: root.workspace,
       env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
-      timeoutMs: 30_000,
+      timeoutMs: 45_000,
     });
     expect(result.code).toBe(0);
     expect(auth.refreshes).toBe(1);
@@ -2213,7 +2497,7 @@ describe("MCP login", () => {
     const call = sent.find((request) => request.body.includes('"tools/call"'));
     expect(call?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
     expect(auth.protectedToolCalls).toBe(1);
-  }, 40_000);
+  }, 60_000);
 
   // Before, a shell that started before another terminal signed in logged out
   // without that login, which stayed valid at the server for every other fx.
@@ -2366,7 +2650,9 @@ describe("MCP login", () => {
     // The first renewal never answers.
     auth = startAuthFixture(upstream.url, { stallRefresh: true });
     const root = createRoot(auth);
-    gateway = startRefreshRecoveryGateway(6_000);
+    // Times from the moment the login is saved, below.
+    let savedAt = 0;
+    gateway = startRefreshRecoveryGateway(() => savedAt + 16_000);
     tui = await TmuxSession.create({
       isolated: true,
       cwd: root.workspace,
@@ -2375,11 +2661,13 @@ describe("MCP login", () => {
       env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
     });
     await tui.waitForComposer(15_000);
-    // Renewed 6 s before it expires, 12 s from now: the tool is found
-    // outside that window, and called 6 s later inside it.
-    const store = seedV2Credential(root, auth, { expires_at_ms: Date.now() + 12_000, skew_ms: 6_000 });
+    // Renewed 6 s before it expires, 21 s from now: the tool is found well
+    // before that window, even on a slow machine, and called inside it, 16 s
+    // from now.
+    savedAt = Date.now();
+    const store = seedV2Credential(root, auth, { expires_at_ms: savedAt + 21_000, skew_ms: 6_000 });
     await tui.sendText("Call the protected MCP fixture.");
-    const refreshDeadline = Date.now() + 20_000;
+    const refreshDeadline = Date.now() + 40_000;
     while (auth.refreshes === 0 && Date.now() < refreshDeadline) await Bun.sleep(25);
     expect(auth.refreshes).toBe(1);
 

@@ -1181,7 +1181,7 @@ describe("ultrafast fake Gateway", () => {
           expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
             .toMatchObject({ ultrafast_mode: true, models: { gateway: ULTRA_MODEL }, effort: "xhigh" });
           expect(gateway.requests).toEqual([]);
-          await session.sendText("Return the marker selection response.");
+          await session.sendText("Return the model picker marker.");
           await session.waitForText("marker selection response", TIMEOUT);
           expect(gateway.requests).toHaveLength(1);
           expectUltrafastRequest(gateway.requests[0]!.body);

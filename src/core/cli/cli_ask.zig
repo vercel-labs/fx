@@ -313,6 +313,10 @@ pub const PromptRunResult = struct {
     /// never includes display-only text.
     final_source: []u8 = &.{},
     interrupted: bool = false,
+    /// The answer could not be written to stdout, or its reader went away;
+    /// the turn was still saved.
+    output_write_failed: bool = false,
+    output_reader_gone: bool = false,
     model: []u8 = &.{},
     session_id: []u8 = &.{},
     tool_calls: []ToolCallRecord = &.{},
@@ -662,6 +666,11 @@ const AskContext = struct {
     mcp_host: ?*mcp_host.Host = null,
     mcp_elicitation_capabilities: @import("../mcp/elicitation.zig").Capabilities = .{},
     failed: bool = false,
+    /// Set when a write of the answer to stdout failed, or found its reader
+    /// gone, as `head` leaves it. The stream drops the write's error, so the
+    /// turn still finishes and is saved; the run then ends on it.
+    output_write_failed: bool = false,
+    output_reader_gone: bool = false,
     typed_error_code: ?[]const u8 = null,
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     output_mode: OutputMode = .raw,
@@ -1174,7 +1183,14 @@ const AskContext = struct {
     }
 
     fn writeStdout(self: *AskContext, text: []const u8) !void {
-        try self.deps.write_stdout(self.deps.stdout_ctx, text);
+        self.deps.write_stdout(self.deps.stdout_ctx, text) catch |err| {
+            if (err == error.OutputReaderGone or err == error.BrokenPipe) {
+                self.output_reader_gone = true;
+            } else {
+                self.output_write_failed = true;
+            }
+            return err;
+        };
     }
 
     fn writeStderr(self: *AskContext, text: []const u8) !void {
@@ -1406,6 +1422,9 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     if (result.interrupted or interrupt_scope.requested()) {
         return headless_interrupt.exitCode();
     }
+    // The answer is in the saved session, but the reader never got it.
+    if (result.output_reader_gone) return error.OutputReaderGone;
+    if (result.output_write_failed) return error.OutputWriteFailed;
 
     if (options.json_output) {
         const json = try renderFinalJsonResult(alloc, result);
@@ -1464,6 +1483,8 @@ fn preflightAskImages(
 pub fn runPrompt(alloc: Allocator, prompt: []const u8, agent: agent_run_flags.Overrides, cfg: Config, context_registry: context_contract.Registry, tool_set: tool_set_contract.ToolSet) !u8 {
     const result = try runPromptWithRunFlags(alloc, prompt, agent, cfg, context_registry, tool_set, .raw);
     defer result.deinit(alloc);
+    if (result.output_reader_gone) return error.OutputReaderGone;
+    if (result.output_write_failed) return error.OutputWriteFailed;
     return result.exit_code;
 }
 
@@ -2007,11 +2028,13 @@ fn maybeStartAskTitleTask(
     return task;
 }
 
-/// Joins the bounded title task and installs the generated title unless the
-/// session already carries a user-set title.
+/// Gives the title task a short grace after the turn, then installs the
+/// generated title unless the session already carries a user-set title. A
+/// title still pending after the grace is dropped, and the session keeps the
+/// title derived from its first prompt.
 fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) void {
     defer task.destroy();
-    task.join();
+    task.joinOrCancel(ctx.cancelFlag(), session_title_generation.after_turn_grace_ms);
     const title = task.takeTitle() orelse return;
     defer std.heap.c_allocator.free(title);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -2074,6 +2097,8 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .final_output = final_output,
         .final_source = final_source,
         .interrupted = ctx.processInterruptRequested(),
+        .output_write_failed = ctx.output_write_failed,
+        .output_reader_gone = ctx.output_reader_gone,
         .model = model,
         .resolved_provider = resolved_provider,
         .session_id = session_id,
@@ -2142,16 +2167,16 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
-        .model_catalog_unavailable = modelCatalogUnavailable,
+        .model_catalog_failure = modelCatalogFailure,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
         .record_tool_call_failed = recordToolCallFailed,
     };
 }
 
-fn modelCatalogUnavailable(raw_ctx: *anyopaque) bool {
+fn modelCatalogFailure(raw_ctx: *anyopaque) ?model_catalog.FailureCategory {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    return ctx.capability_resolver.state == .failed;
+    return ctx.capability_resolver.downFailure();
 }
 
 fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
@@ -2226,7 +2251,7 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
     const catalog = bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model);
-    return ctx.capability_resolver.resolve(
+    return ctx.capability_resolver.resolveWithin(
         ctx.alloc,
         catalog,
         .{
@@ -2236,6 +2261,7 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
         },
         model,
         bundle.fallbackModelCapabilities(model),
+        gateway_provider.catalog_connect_wait_ms,
     );
 }
 
@@ -2254,7 +2280,7 @@ fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []con
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx.?));
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
     const catalog_provider = bundle.model_catalog orelse return .no_catalog;
-    _ = ctx.capability_resolver.resolve(
+    _ = ctx.capability_resolver.resolveWithin(
         ctx.alloc,
         catalog_provider,
         .{
@@ -2264,6 +2290,7 @@ fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []con
         },
         raw_model,
         bundle.fallbackModelCapabilities(raw_model),
+        gateway_provider.catalog_connect_wait_ms,
     ) catch return .no_catalog;
     const entries = ctx.capability_resolver.catalogEntries() orelse return .no_catalog;
     var ids = try model_catalog.projectModelIds(alloc, entries);
@@ -4172,8 +4199,16 @@ fn realStdoutIsTty(_: ?*anyopaque) bool {
     return std.Io.File.stdout().isTty(io_mod.getIo()) catch false;
 }
 
+/// A failed write to stdout reads "couldn't write the output"
+/// (`error.OutputWriteFailed`), and its cause goes to the trace. A reader that
+/// went away, as `head` does, gives `error.OutputReaderGone`, which ends the
+/// run quietly.
 fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
-    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+    std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text) catch |err| {
+        debug_trace.logf("core", "ask output write failed err={s}", .{@errorName(err)});
+        if (err == error.BrokenPipe) return error.OutputReaderGone;
+        return error.OutputWriteFailed;
+    };
 }
 
 fn writeRealStderr(_: ?*anyopaque, text: []const u8) !void {

@@ -21,9 +21,11 @@
 //! write before that send (`sendRecord`), so a turn's first write carries it;
 //! a completed response clears it in the write that saves the response
 //! (`responseRecord`); any other save is written at once. A launch reads the
-//! newest one to resume the request (`tests/tla/recovery/Resume.tla`). One
-//! request at a time registers for `closeActive`, which SIGHUP and SIGTERM
-//! call from the closer thread.
+//! newest one to resume the request (`tests/tla/recovery/Resume.tla`). Every
+//! request that keeps a record registers for `closeActive`, which SIGHUP and
+//! SIGTERM call from the closer thread, and a terminal that hangs up calls
+//! from the main thread. One fx process runs main, its subagents and other
+//! instances, and each can have a request in flight.
 //!
 //! The module retries every transient failure for as long as it lasts, and fx
 //! adds no limit of its own: only Esc ends a request whose failures keep
@@ -87,6 +89,10 @@ pub const RequestRecovery = struct {
     /// Replies this request could not read. Touched only by the request's
     /// own thread.
     unreadable_replies: u8 = 0,
+    /// Links the request into `registry` while it is registered. Guarded by
+    /// `registry_mutex`, not `mutex`.
+    registry_node: std.DoublyLinkedList.Node = .{},
+    registered: bool = false,
 
     mutex: std.Io.Mutex = .init,
     // Everything below is guarded by `mutex`.
@@ -189,17 +195,38 @@ pub const RequestRecovery = struct {
         self.writeRecordLocked();
     }
 
-    /// SIGHUP or SIGTERM: delivers `closing` to the registered request and
-    /// writes the clean record it returns, so the next launch resumes the
-    /// request without counting a death (`tests/tla/recovery/Resume.tla`
-    /// NoFalseCrashQuestion). Waits at most `close_wait_ms` for each lock.
-    /// Returns whether a record was written.
-    pub fn closeActive() bool {
+    /// SIGHUP, SIGTERM, or a terminal that hangs up: delivers `closing` to
+    /// every registered request and writes the clean record each returns, so
+    /// the next launch resumes them without counting a death
+    /// (`tests/tla/recovery/Resume.tla` NoFalseCrashQuestion). Main, its
+    /// subagents and other instances can each have a request in flight.
+    /// Waits at most `close_wait_ms` for each lock. Returns how many records
+    /// were written.
+    pub fn closeActive() usize {
         const io = io_mod.getIo();
-        if (!lockWithin(&active_mutex, close_wait_ms)) return false;
-        defer active_mutex.unlock(io);
-        const self = active orelse return false;
-        if (!lockWithin(&self.mutex, close_wait_ms)) return false;
+        if (!lockWithin(&registry_mutex, close_wait_ms)) {
+            debug_trace.logf("recovery", "closing skipped every request reason=registry_busy", .{});
+            return 0;
+        }
+        defer registry_mutex.unlock(io);
+        var written: usize = 0;
+        var node = registry.first;
+        while (node) |current| : (node = current.next) {
+            const request: *RequestRecovery = @fieldParentPtr("registry_node", current);
+            if (request.close()) written += 1;
+        }
+        return written;
+    }
+
+    /// Closes this request for `closeActive`. Returns whether its clean
+    /// record was written.
+    fn close(self: *RequestRecovery) bool {
+        const io = io_mod.getIo();
+        if (!lockWithin(&self.mutex, close_wait_ms)) {
+            // Its record stays as it was, so the next launch counts a death.
+            debug_trace.eventf("recovery", "closing_skipped", self.trace_ctx, "reason=request_busy", .{});
+            return false;
+        }
         defer self.mutex.unlock(io);
         if (self.closed) return false;
         _ = self.stepLocked(.closing) catch |err| {
@@ -560,23 +587,31 @@ fn lockWithin(mutex: *std.Io.Mutex, ms: u64) bool {
     return true;
 }
 
-/// The request `closeActive` closes. One host process runs one request that
-/// keeps a record at a time.
-var active_mutex: std.Io.Mutex = .init;
-var active: ?*RequestRecovery = null;
+/// The requests `closeActive` closes: every running request that keeps a
+/// record, in every agent of the process. Each links itself through its own
+/// `registry_node`, so registering never allocates.
+var registry_mutex: std.Io.Mutex = .init;
+var registry: std.DoublyLinkedList = .{};
 
 fn register(request: *RequestRecovery) void {
     const io = io_mod.getIo();
-    active_mutex.lockUncancelable(io);
-    defer active_mutex.unlock(io);
-    active = request;
+    registry_mutex.lockUncancelable(io);
+    defer registry_mutex.unlock(io);
+    if (request.registered) return;
+    registry.append(&request.registry_node);
+    request.registered = true;
 }
 
+/// Removes only `request`, so a request that ends never takes another
+/// agent's out of `closeActive`'s reach.
 fn unregister(request: *RequestRecovery) void {
     const io = io_mod.getIo();
-    active_mutex.lockUncancelable(io);
-    defer active_mutex.unlock(io);
-    if (active == request) active = null;
+    registry_mutex.lockUncancelable(io);
+    defer registry_mutex.unlock(io);
+    if (!request.registered) return;
+    registry.remove(&request.registry_node);
+    request.registry_node = .{};
+    request.registered = false;
 }
 
 // Tests.
@@ -934,20 +969,59 @@ test "closing saves a clean record that resumes without a death, and nothing rep
         defer request.deinit();
         _ = (try request.start(false, null)).?;
         _ = request.sendRecord();
-        try std.testing.expect(RequestRecovery.closeActive());
+        try std.testing.expectEqual(@as(usize, 1), RequestRecovery.closeActive());
         const saved = fake.recovery_record.?;
         // The dying send's failure saves nothing over it.
         try std.testing.expectEqual(@as(?Send, null), try request.failed(.{ .kind = .dropped }));
         try std.testing.expectEqual(saved, fake.recovery_record.?);
-        try std.testing.expect(!RequestRecovery.closeActive());
+        try std.testing.expectEqual(@as(usize, 0), RequestRecovery.closeActive());
     }
     // Ended requests are not closed.
-    try std.testing.expect(!RequestRecovery.closeActive());
+    try std.testing.expectEqual(@as(usize, 0), RequestRecovery.closeActive());
 
     var probe: recovery.State = .{};
     const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
     try std.testing.expect(plan.send != null);
     try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
+}
+
+test "closing saves a clean record for every request in flight" {
+    var main_fake = recordingFake();
+    defer main_fake.deinit();
+    var subagent_fake = recordingFake();
+    defer subagent_fake.deinit();
+    var ended_fake = recordingFake();
+    defer ended_fake.deinit();
+    const main_deps = main_fake.deps();
+    const subagent_deps = subagent_fake.deps();
+    const ended_deps = ended_fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    var main_request = RequestRecovery.init(&main_deps, &cancel_flag, .{});
+    defer main_request.deinit();
+    _ = (try main_request.start(false, null)).?;
+    _ = main_request.sendRecord();
+    // A request that starts later and ends first leaves main's registered.
+    {
+        var ended = RequestRecovery.init(&ended_deps, &cancel_flag, .{});
+        defer ended.deinit();
+        _ = (try ended.start(false, null)).?;
+        _ = ended.sendRecord();
+    }
+    // Another agent's request starts after main's.
+    var subagent_request = RequestRecovery.init(&subagent_deps, &cancel_flag, .{});
+    defer subagent_request.deinit();
+    _ = (try subagent_request.start(false, null)).?;
+    _ = subagent_request.sendRecord();
+
+    try std.testing.expectEqual(@as(usize, 2), RequestRecovery.closeActive());
+    for ([_]*const support.FakeAgentRuntimeDeps{ &main_fake, &subagent_fake }) |fake| {
+        var probe: recovery.State = .{};
+        const plan = recovery.step(&probe, .{ .start = .{ .resume_from = fake.recovery_record.? } }, 0);
+        try std.testing.expect(plan.send != null);
+        try std.testing.expectEqual(@as(u8, 0), probe.abrupt_deaths);
+    }
+    try std.testing.expectEqual(@as(usize, 0), RequestRecovery.closeActive());
 }
 
 test "a resumed start that must ask first sends nothing" {

@@ -144,20 +144,16 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     defer alloc.free(url);
     const authorization = if (token) |value| try alloc.print("Bearer {s}", .{value}) else null;
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
-    var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
-    defer client.deinit();
     var uri = try std.Uri.parse(url);
     uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;
-    var operation = client_mod.PostOperation{
-        .client = &client,
+    try request.admission.admit();
+    var opened = try client_mod.openBoundedPost(request.cancel_flag, phase_deadline(30_000, request.deadline), .{
         .uri = uri,
         .authorization = authorization,
         .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
-    };
-    try request.admission.admit();
-    var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
-    defer opened.deinit(alloc);
-    const http = &opened.request.?;
+    });
+    defer opened.deinit();
+    const http = &opened.request;
     var watch: client_mod.ConnectionWatch = .init(.{
         .timeout_ms = 120_000,
         .stall_timeout_ms = client_mod.ConnectionWatch.bodyStallTimeoutMs(request.deadline),

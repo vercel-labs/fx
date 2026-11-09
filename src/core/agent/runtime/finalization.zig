@@ -47,6 +47,13 @@ pub const TurnFinalizationGuard = struct {
     captured_runtime_context: ?[][]u8 = null,
     lease_allocator: Allocator = std.heap.c_allocator,
     agent_terminal_leases: std.ArrayList([]u8) = .empty,
+    /// The turn's settled model calls, in the order they settled, for
+    /// Ctrl+O. The first `stamped_model_calls` know their step; a newer one
+    /// takes the step count the next save sees and keeps it, so every later
+    /// save writes it the same way (`persistedExecution`). Owned with
+    /// `lease_allocator`.
+    model_calls: std.ArrayList(types.ModelCallRecord) = .empty,
+    stamped_model_calls: usize = 0,
 
     pub fn init(
         deps: *const AgentRuntimeDeps,
@@ -62,12 +69,34 @@ pub const TurnFinalizationGuard = struct {
     }
 
     /// The execution memory a save of this turn records: the part after any
-    /// in-turn compaction cut, with the runtime context the turn captured.
-    /// Borrows `execution` and the captured texts.
-    pub fn persistedExecution(self: *const TurnFinalizationGuard, arena: Allocator, execution: types.ExecutionMemory) !types.ExecutionMemory {
-        var projected = try self.compacted_execution.project(arena, execution);
+    /// in-turn compaction cut, with the runtime context the turn captured
+    /// and the model calls it made. `execution` holds the whole turn; a call
+    /// settled since the last save is placed after the steps it holds.
+    /// Borrows `execution`, the captured texts and the call records.
+    pub fn persistedExecution(self: *TurnFinalizationGuard, arena: Allocator, execution: types.ExecutionMemory) !types.ExecutionMemory {
+        for (self.model_calls.items[self.stamped_model_calls..]) |*record| {
+            record.after_tool_step_count = execution.tool_steps.len;
+            record.after_steering_count = execution.steering.len;
+        }
+        self.stamped_model_calls = self.model_calls.items.len;
+        var with_calls = execution;
+        with_calls.model_calls = self.model_calls.items;
+        var projected = try self.compacted_execution.project(arena, with_calls);
         projected.runtime_context = self.captured_runtime_context;
         return projected;
+    }
+
+    /// Keeps a settled call's record for every later save of the turn. One
+    /// that can't be kept is traced and dropped: it only shows in Ctrl+O.
+    pub fn recordModelCall(self: *TurnFinalizationGuard, record: types.ModelCallRecord) void {
+        const owned = types.dupeModelCallRecord(self.lease_allocator, record) catch |err| {
+            debug_trace.logf("agent", "model call record dropped turn={d} err={s} dropped=saved_call_record", .{ self.turn_id, @errorName(err) });
+            return;
+        };
+        self.model_calls.append(self.lease_allocator, owned) catch |err| {
+            types.freeModelCallRecordStrings(self.lease_allocator, owned);
+            debug_trace.logf("agent", "model call record dropped turn={d} err={s} dropped=saved_call_record", .{ self.turn_id, @errorName(err) });
+        };
     }
 
     pub fn deinit(self: *TurnFinalizationGuard) void {
@@ -75,6 +104,8 @@ pub const TurnFinalizationGuard = struct {
             self.lease_allocator.free(session_id);
         }
         self.agent_terminal_leases.deinit(self.lease_allocator);
+        for (self.model_calls.items) |record| types.freeModelCallRecordStrings(self.lease_allocator, record);
+        self.model_calls.deinit(self.lease_allocator);
         self.* = undefined;
     }
 
@@ -294,4 +325,35 @@ pub fn finalizeRetainedCandidateFailure(
         null,
         assistant_text.presentation,
     );
+}
+
+test "a save that fails keeps the turn's call records, and the next save places them the same" {
+    const alloc = std.testing.allocator;
+    var guard: TurnFinalizationGuard = .{
+        .deps = undefined,
+        .turn_id = 1,
+        .lifecycle = undefined,
+        .lease_allocator = alloc,
+        // The turn compacted after its first step, so a save rebases its
+        // records into the arena.
+        .compacted_execution = .{ .tool_steps = 1 },
+    };
+    defer guard.deinit();
+    var steps: [3]types.ToolExecutionStep = undefined;
+    guard.recordModelCall(.{ .at_ms = 1_000, .provider = "gateway", .model = "m", .generation_id = "gen-1" });
+
+    // The save after the second step fails before anything reaches the log.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var failed_arena = std.heap.ArenaAllocator.init(failing.allocator());
+    defer failed_arena.deinit();
+    try std.testing.expectError(error.OutOfMemory, guard.persistedExecution(failed_arena.allocator(), .{ .tool_steps = steps[0..2] }));
+
+    // The next save, a step later, still writes the call after the second
+    // step: the first step after the cut.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const saved = try guard.persistedExecution(arena.allocator(), .{ .tool_steps = steps[0..3] });
+    try std.testing.expectEqual(@as(usize, 1), saved.model_calls.len);
+    try std.testing.expectEqualStrings("gen-1", saved.model_calls[0].generation_id.?);
+    try std.testing.expectEqual(@as(usize, 1), saved.model_calls[0].after_tool_step_count);
 }

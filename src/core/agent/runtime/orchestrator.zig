@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
+const model_catalog = @import("../../gateway/model_catalog.zig");
 const types = @import("../../shared/types.zig");
 const history_range = @import("../../shared/history_range.zig");
 const worker_runtime = @import("../worker_runtime.zig");
@@ -70,6 +71,7 @@ const runtime_interruption = @import("interruption.zig");
 const runtime_parallel_execution = @import("parallel_execution.zig");
 const runtime_tool_batch = @import("tool_batch.zig");
 const observation = @import("observation.zig");
+const model_call_record = @import("model_call_record.zig");
 const resend_strategy = @import("resend_strategy.zig");
 const runtime_request_recovery = @import("request_recovery.zig");
 const response_language = @import("response_language.zig");
@@ -3830,7 +3832,7 @@ fn checkpointToolState(
 /// the message that issued them, the newest one (D51).
 fn appendRunningToolCalls(
     deps: *const AgentRuntimeDeps,
-    finalization: *const TurnFinalizationGuard,
+    finalization: *TurnFinalizationGuard,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
     calls: []const types.ToolCall,
@@ -3935,7 +3937,7 @@ fn streamMainCompletion(
 
 fn persistRecoveryCheckpoint(
     deps: *const AgentRuntimeDeps,
-    finalization: *const TurnFinalizationGuard,
+    finalization: *TurnFinalizationGuard,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
     assistant_source: []const u8,
@@ -3975,7 +3977,7 @@ fn persistRecoveryCheckpoint(
 /// such as a finished final reply that recovery must deliver as saved.
 fn persistRecoveryCheckpointWithAction(
     deps: *const AgentRuntimeDeps,
-    finalization: *const TurnFinalizationGuard,
+    finalization: *TurnFinalizationGuard,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
     assistant_source: []const u8,
@@ -4055,7 +4057,7 @@ fn persistRecoveryCheckpointWithAction(
 /// passed, and no steer, subagent, or stop hook continues it.
 fn persistFinalReplyCheckpoint(
     deps: *const AgentRuntimeDeps,
-    finalization: *const TurnFinalizationGuard,
+    finalization: *TurnFinalizationGuard,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
     reply: []const u8,
@@ -4101,7 +4103,7 @@ fn deliversSavedResponse(checkpoint: session_codec.RecoveryCheckpoint) bool {
 /// so a crash during compaction can recover it.
 const CompactionSource = struct {
     deps: *const AgentRuntimeDeps,
-    finalization: *const TurnFinalizationGuard,
+    finalization: *TurnFinalizationGuard,
     arena: Allocator,
     job: QueuedPrompt,
     current_turn_messages: []const ChatMessage,
@@ -4272,95 +4274,82 @@ test "running tool calls reach append_turn_piece before they run" {
     try std.testing.expectEqual(@as(usize, 1), sink.appends);
 }
 
-/// Pure formatter for the full-only network record: provider, model, latency,
-/// and the settled outcome. Only enum labels and provider-assigned ids are
-/// rendered; provider-controlled detail text is deliberately excluded.
-fn writeNetworkRecordBody(
-    writer: *std.Io.Writer,
-    provider: []const u8,
-    model: []const u8,
-    elapsed_ms: u64,
-    result: *const runtime_gateway_step.StreamResult,
-) !void {
-    try writer.print("provider: {s} · model: {s} · {d}ms\n", .{ provider, model, elapsed_ms });
-    switch (result.*) {
-        .completed => |*completed| {
-            try writer.writeAll("finish: ");
-            if (completed.completion.finish_reason) |reason| {
-                try writer.writeAll(@tagName(reason));
-            } else {
-                try writer.writeAll("unknown");
-            }
-            if (completed.completion.generation_id) |generation_id| {
-                try writer.print(" · generation: {s}", .{generation_id});
-            }
-            if (completed.completion.resolved_provider) |resolved| {
-                try writer.print(" · served-by: {s}", .{resolved});
-            }
-            try writeUsageTokens(writer, completed.completion.usage);
-        },
-        .failed => |*failure| {
-            try writer.print("failed: {s}", .{@tagName(failure.kind)});
-            if (failure.retry_after_seconds) |seconds| {
-                try writer.print(" · retry after: {d}s", .{seconds});
-            }
-        },
-    }
-}
-
-/// Appends the token-usage line when the completion reports any token counts.
-/// Reported values render exactly, including zero; absent fields are omitted.
-fn writeUsageTokens(writer: *std.Io.Writer, usage: types.Usage) !void {
-    const fields = .{
-        .{ "in", usage.input_tokens },
-        .{ "out", usage.output_tokens },
-        .{ "cache-read", usage.cache_read_tokens },
-        .{ "cache-write", usage.cache_write_tokens },
-        .{ "reasoning", usage.reasoning_tokens },
-    };
-    var wrote_any = false;
-    inline for (fields) |field| {
-        if (field[1]) |count| {
-            try writer.writeAll(if (wrote_any) " · " else "\ntokens: ");
-            wrote_any = true;
-            try writer.print("{d} {s}", .{ count, field[0] });
-        }
-    }
-}
-
-/// Publishes one full-detail record per settled provider request so the
-/// ctrl+o full transcript carries network call outcomes that the footer only
-/// shows transiently. Publication failure never fails the turn.
-fn pushNetworkRecord(
+/// Shows a settled call in Ctrl+O as it happens and keeps it with the turn,
+/// so every later save of the turn carries it. Neither may fail the turn: a
+/// record that can't be shown or kept is traced and dropped.
+fn noteModelCall(
     deps: *const AgentRuntimeDeps,
-    provider: model_provider.ProviderId,
+    finalization: *TurnFinalizationGuard,
+    record: types.ModelCallRecord,
+) void {
+    finalization.recordModelCall(record);
+    publishModelCall(deps, record);
+}
+
+/// `noteModelCall` for a turn request that settled. One whose attempt showed
+/// text waits in `held` until the step accepts the attempt or retries it: a
+/// retry gives that text back only while the attempt added nothing after it
+/// (`discardAssistantAttempt`), so the line shows once that is done.
+fn noteSettledCall(
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    held: *?types.ModelCallRecord,
+    attempt_showed_text: bool,
+    record: types.ModelCallRecord,
+) void {
+    finalization.recordModelCall(record);
+    if (!attempt_showed_text) return publishModelCall(deps, record);
+    if (held.*) |earlier| publishHeldModelCall(deps, earlier);
+    held.* = types.dupeModelCallRecord(std.heap.c_allocator, record) catch |err| {
+        debug_trace.logf("agent", "model call record dropped err={s} dropped=live_call_record", .{@errorName(err)});
+        held.* = null;
+        return;
+    };
+}
+
+fn publishModelCall(deps: *const AgentRuntimeDeps, record: types.ModelCallRecord) void {
+    const owned = types.dupeModelCallRecord(std.heap.c_allocator, record) catch |err| {
+        debug_trace.logf("agent", "model call record dropped err={s} dropped=live_call_record", .{@errorName(err)});
+        return;
+    };
+    publishHeldModelCall(deps, owned);
+}
+
+/// Shows an owned call record in Ctrl+O, giving it to the event queue.
+fn publishHeldModelCall(deps: *const AgentRuntimeDeps, owned: types.ModelCallRecord) void {
+    deps.push_event(deps.ctx, .{ .model_call = owned }) catch |err| {
+        types.freeModelCallRecordStrings(std.heap.c_allocator, owned);
+        debug_trace.logf("agent", "model call record publication failed err={s} dropped=live_call_record", .{@errorName(err)});
+    };
+}
+
+/// The record of a turn request that returned a result, cancelled when a
+/// stop was asked for while it streamed.
+fn settledCallRecord(
+    provider: []const u8,
     model: []const u8,
     started_ms: i64,
     result: *const runtime_gateway_step.StreamResult,
-) void {
-    const elapsed_ms: u64 = @intCast(@max(io_mod.milliTimestamp() - started_ms, 0));
-    var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
-    defer body.deinit();
-    writeNetworkRecordBody(&body.writer, provider.label(), model, elapsed_ms, result) catch |err| {
-        debug_trace.logf("agent", "network record format failed err={s}", .{@errorName(err)});
-        return;
-    };
-    // The event channel owns its payload: dupe before transfer, free on
-    // publication failure.
-    const owned = types.dupeSemanticNotice(std.heap.c_allocator, .{
-        .topic = "network",
-        .tone = if (streamSucceeded(result.*)) .neutral else .warning,
-        .body = body.written(),
-        .visibility = .full_only,
-    }) catch |err| {
-        debug_trace.logf("agent", "network record allocation failed err={s}", .{@errorName(err)});
-        return;
-    };
-    deps.push_event(deps.ctx, .{ .full_detail_record = owned }) catch |err| {
-        types.freeSemanticNotice(std.heap.c_allocator, owned);
-        debug_trace.logf("agent", "network record publication failed err={s}", .{@errorName(err)});
-    };
+    cancel_flag: *const std.atomic.Value(bool),
+) types.ModelCallRecord {
+    return model_call_record.ofResult(provider, model, .turn, started_ms, io_mod.milliTimestamp(), result, cancel_flag.load(.seq_cst));
 }
+
+/// The turn's model call sink for requests made outside the step loop, such
+/// as compaction (`model_call_record.Sink`).
+const TurnModelCalls = struct {
+    deps: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+
+    fn sink(self: *TurnModelCalls, provider: []const u8) model_call_record.Sink {
+        return .{ .context = self, .record_fn = record, .provider = provider };
+    }
+
+    fn record(context: *anyopaque, value: types.ModelCallRecord) void {
+        const self: *TurnModelCalls = @ptrCast(@alignCast(context));
+        noteModelCall(self.deps, self.finalization, value);
+    }
+};
 
 fn streamFailure(result: runtime_gateway_step.StreamResult) ?agent_stream_provider.Failure {
     return switch (result) {
@@ -6271,13 +6260,175 @@ test "requestUserImages splits kept images at the turn's own message" {
     try std.testing.expectEqual(RequestUserImages{ .this_turn = true, .earlier = false }, requestUserImages(&now, 2));
 }
 
-/// What the user hears, once per turn, when a down catalog withholds images.
-fn catalogDownNotice(chosen: image_route.Decision) []const u8 {
+/// What a down model catalog held back from one request, for the notice that
+/// tells the user once per turn.
+const CatalogDownNotice = struct {
+    /// Why the catalog is down.
+    failure: model_catalog.FailureCategory,
+    /// Who serves the catalog, as the notice names it.
+    service: []const u8,
+    /// The request's image decision, when the image route asked to tell the
+    /// user about images it withheld.
+    images: ?image_route.Decision = null,
+    /// Fast mode dropped for the first time this turn.
+    fast_off: bool = false,
+};
+
+/// At most one line for images and one for fast mode.
+const CatalogDownLines = struct {
+    buffer: [2][]const u8 = .{ "", "" },
+    len: usize = 0,
+
+    fn append(self: *CatalogDownLines, line: []const u8) void {
+        self.buffer[self.len] = line;
+        self.len += 1;
+    }
+
+    fn slice(self: *const CatalogDownLines) []const []const u8 {
+        return self.buffer[0..self.len];
+    }
+};
+
+/// The lines that tell the user what a down model catalog held back. When fx
+/// could not connect to the catalog at all, one line names the connection
+/// first, since the same fault usually blocks the model request too. Any other
+/// failure keeps one line for each thing held back. Lines are static or live
+/// in `arena`.
+fn catalogDownNotice(arena: Allocator, notice: CatalogDownNotice) Allocator.Error!CatalogDownLines {
+    var lines: CatalogDownLines = .{};
+    const images = if (notice.images) |chosen| withheldImageSubject(chosen) else null;
+    if (notice.failure == .transport) {
+        const held_back = if (images) |subject|
+            if (notice.fast_off)
+                try arena.print("{s} aren't reaching the model and fast mode is off", .{subject})
+            else
+                try arena.print("{s} aren't reaching the model", .{subject})
+        else if (notice.fast_off)
+            "fast mode is off"
+        else
+            return lines;
+        lines.append(try arena.print(
+            "fx couldn't connect to {s} to load the model catalog, so {s} until it loads. Check your network connection or firewall.",
+            .{ notice.service, held_back },
+        ));
+        return lines;
+    }
+    if (notice.images) |chosen| if (images != null) lines.append(catalogDownImageText(chosen));
+    if (notice.fast_off) lines.append("Fast mode is unavailable for this model right now; continuing at standard speed.");
+    return lines;
+}
+
+/// The images a down catalog withheld from a request, as the notice names
+/// them, or null when it withheld none.
+fn withheldImageSubject(chosen: image_route.Decision) ?[]const u8 {
+    const tools = chosen.tool_images == .withheld_unknown;
+    const earlier = chosen.earlier_images == .withheld_unknown;
+    if (earlier and tools) return "earlier images and images from tools";
+    if (earlier) return "earlier images";
+    if (tools) return "images from tools";
+    return null;
+}
+
+/// What the user hears when a catalog that answered with a failure withholds
+/// images. `tests/tla/drivers/image_route/binary-to-spec.ts` detects this
+/// line and the connection line by "aren't reaching the model".
+fn catalogDownImageText(chosen: image_route.Decision) []const u8 {
     const tools = chosen.tool_images == .withheld_unknown;
     const earlier = chosen.earlier_images == .withheld_unknown;
     if (earlier and tools) return "Earlier images and images from tools aren't reaching the model right now because image support couldn't be confirmed (model catalog unavailable). fx will retry automatically as the catalog recovers.";
     if (earlier) return "Earlier images aren't reaching the model right now because image support couldn't be confirmed (model catalog unavailable). fx will retry automatically as the catalog recovers.";
     return "Images from tools aren't reaching the model right now because image support couldn't be confirmed (model catalog unavailable). fx will retry automatically as the catalog recovers.";
+}
+
+/// The line that names a failed catalog connection before a turn fails
+/// because it could not confirm image input for an attached image, or null
+/// when the catalog failed some other way. Lives in `arena`.
+fn catalogUnreachableImageLine(arena: Allocator, failure: ?model_catalog.FailureCategory, service: []const u8) Allocator.Error!?[]const u8 {
+    if (failure != .transport) return null;
+    return try arena.print(
+        "fx couldn't connect to {s} to load the model catalog, so it couldn't confirm that this model accepts images. Check your network connection or firewall.",
+        .{service},
+    );
+}
+
+test "catalogDownNotice names a failed connection in one line and keeps the other failures' lines" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fast_line = "Fast mode is unavailable for this model right now; continuing at standard speed.";
+    const withheld = [_]struct { tools: image_route.ToolImages, earlier: image_route.ToolImages }{
+        .{ .tools = .none, .earlier = .none },
+        .{ .tools = .none, .earlier = .withheld_unknown },
+        .{ .tools = .withheld_unknown, .earlier = .none },
+        .{ .tools = .withheld_unknown, .earlier = .withheld_unknown },
+    };
+    // Every input: each failure, no image decision or each withheld mix, and
+    // fast mode dropped or not.
+    for (std.enums.values(model_catalog.FailureCategory)) |failure| {
+        for ([_]?usize{ null, 0, 1, 2, 3 }) |mix| {
+            for ([_]bool{ false, true }) |fast_off| {
+                const images: ?image_route.Decision = if (mix) |index| .{
+                    .route = .unavailable,
+                    .mode = .unavailable,
+                    .tool_images = withheld[index].tools,
+                    .earlier_images = withheld[index].earlier,
+                } else null;
+                const subject = if (images) |chosen| withheldImageSubject(chosen) else null;
+                const lines = try catalogDownNotice(arena, .{ .failure = failure, .service = "AI Gateway", .images = images, .fast_off = fast_off });
+                if (failure == .transport) {
+                    if (subject == null and !fast_off) {
+                        try std.testing.expectEqual(@as(usize, 0), lines.len);
+                        continue;
+                    }
+                    try std.testing.expectEqual(@as(usize, 1), lines.len);
+                    const line = lines.slice()[0];
+                    try std.testing.expect(std.mem.startsWith(u8, line, "fx couldn't connect to AI Gateway to load the model catalog, so "));
+                    try std.testing.expect(std.mem.endsWith(u8, line, " until it loads. Check your network connection or firewall."));
+                    try std.testing.expect(std.mem.findScalar(u8, line, '\n') == null);
+                    try std.testing.expectEqual(fast_off, std.mem.find(u8, line, "fast mode is off") != null);
+                    try std.testing.expectEqual(subject != null, std.mem.find(u8, line, "aren't reaching the model") != null);
+                    if (subject) |words| try std.testing.expect(std.mem.find(u8, line, words) != null);
+                    continue;
+                }
+                var expected: CatalogDownLines = .{};
+                if (subject != null) expected.append(catalogDownImageText(images.?));
+                if (fast_off) expected.append(fast_line);
+                try std.testing.expectEqual(expected.len, lines.len);
+                for (expected.slice(), lines.slice()) |want, got| {
+                    try std.testing.expectEqualStrings(want, got);
+                    try std.testing.expect(std.mem.find(u8, got, "couldn't connect") == null);
+                }
+            }
+        }
+    }
+
+    const both = try catalogDownNotice(arena, .{
+        .failure = .transport,
+        .service = model_catalog.serviceName(.gateway),
+        .images = .{ .route = .unavailable, .mode = .unavailable, .tool_images = .none, .earlier_images = .withheld_unknown },
+        .fast_off = true,
+    });
+    try std.testing.expectEqualStrings(
+        "fx couldn't connect to AI Gateway to load the model catalog, so earlier images aren't reaching the model and fast mode is off until it loads. Check your network connection or firewall.",
+        both.slice()[0],
+    );
+    const codex = try catalogDownNotice(arena, .{ .failure = .transport, .service = model_catalog.serviceName(.codex), .fast_off = true });
+    try std.testing.expectEqualStrings(
+        "fx couldn't connect to the model provider to load the model catalog, so fast mode is off until it loads. Check your network connection or firewall.",
+        codex.slice()[0],
+    );
+
+    // An attached image the turn cannot send gets a cause line only for a
+    // failed connection; the host's own error follows it.
+    for (std.enums.values(model_catalog.FailureCategory)) |failure| {
+        const line = try catalogUnreachableImageLine(arena, failure, "AI Gateway");
+        try std.testing.expectEqual(failure == .transport, line != null);
+    }
+    try std.testing.expect(try catalogUnreachableImageLine(arena, null, "AI Gateway") == null);
+    try std.testing.expectEqualStrings(
+        "fx couldn't connect to AI Gateway to load the model catalog, so it couldn't confirm that this model accepts images. Check your network connection or firewall.",
+        (try catalogUnreachableImageLine(arena, .transport, "AI Gateway")).?,
+    );
 }
 
 /// Whether a tool image in `messages` still reaches the request: one the
@@ -7295,6 +7446,10 @@ fn processQueuedPromptLoop(
         var successful_vision_route: runtime_vision_contracts.VisionRoute = .native_images;
         var successful_vision_mode: runtime_gateway_step.VisionToolMode = .unavailable;
         var reset_stream_for_next_attempt = false;
+        // A call whose attempt showed text, shown once the step accepts the
+        // attempt or a retry has given that text back (`noteSettledCall`).
+        var held_live_call: ?types.ModelCallRecord = null;
+        defer if (held_live_call) |held| publishHeldModelCall(deps, held);
         // The current failure's HTTP error notice is already on screen.
         var http_failure_notice_shown = false;
         // The next send reads the stored credential again, after a sign-in.
@@ -7360,6 +7515,8 @@ fn processQueuedPromptLoop(
             if (reset_stream_for_next_attempt) {
                 try stream_ctx.beginRecoveryAttempt();
                 reset_stream_for_next_attempt = false;
+                if (held_live_call) |held| publishHeldModelCall(deps, held);
+                held_live_call = null;
             }
 
             gateway_model = job.model;
@@ -7411,13 +7568,14 @@ fn processQueuedPromptLoop(
             // decision it returns (`tests/tla/image_route/spec/ImageRoute.tla`
             // OneSnapshot).
             const user_images = requestUserImages(recovery_source_messages, current_user_message_index);
+            const request_catalog_failure = if (deps.model_catalog_failure) |failure| failure(deps.ctx) else null;
             var image_event: image_route.Event = .{ .request_ready = .{
                 .user_images = job.images.len > 0 or user_images.this_turn,
                 .earlier_images = user_images.earlier,
                 .pending_images = pending_image_ids.len > 0,
                 .tool_images = requestHasToolImages(recovery_source_messages),
                 .fallback = config.provider_capabilities.vision_fallback and deps.tool_registry.lookup("vision") != null,
-                .catalog_down = if (deps.model_catalog_unavailable) |unavailable| unavailable(deps.ctx) else false,
+                .catalog_down = request_catalog_failure != null,
             } };
             var image_decision: ?image_route.Decision = null;
             var image_failure: ?image_route.FailReason = null;
@@ -7442,6 +7600,15 @@ fn processQueuedPromptLoop(
             if (image_failure) |reason| switch (reason) {
                 .capability_unknown => {
                     diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{gateway_model});
+                    // The host's error says the image was not sent. A fresh
+                    // reading, since resolving capabilities may have made the
+                    // first catalog request, says first when the cause is a
+                    // connection fx could not make.
+                    const failure = if (deps.model_catalog_failure) |catalog_failure| catalog_failure(deps.ctx) else null;
+                    if (try catalogUnreachableImageLine(overlay_arena, failure, model_catalog.serviceName(job.provider))) |line| {
+                        try deps.push_text(deps.ctx, .{ .operational = line });
+                        try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                    }
                     return error.ModelImageCapabilityUnavailable;
                 },
                 .no_native_image => {
@@ -7569,15 +7736,6 @@ fn processQueuedPromptLoop(
             if (request_messages.ptr != noted_messages.ptr) {
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{noted_messages.len});
             }
-            // Images withheld because the catalog could not confirm image
-            // input are invisible in the transcript otherwise. The core asks
-            // to tell the user once per turn, and only when the catalog itself
-            // is known to be down; a confirmed model without image input
-            // relies on the model-facing notice instead.
-            if (notify_catalog_down) {
-                try deps.push_text(deps.ctx, .{ .operational = catalogDownNotice(image_choice) });
-                try deps.push_text(deps.ctx, .{ .operational = "\n" });
-            }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
             var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, step_effort, attempt_fast_mode, config.ultrafast_mode);
             provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
@@ -7588,12 +7746,30 @@ fn processQueuedPromptLoop(
             // Tell the user once per turn, but only when the catalog itself is
             // known to be down; a reachable catalog that simply lacks fast
             // metadata for the model stays quiet.
-            if (attempt_fast_mode and !provider_opts.fast and !fast_unavailable_notified and
-                deps.model_catalog_unavailable != null and deps.model_catalog_unavailable.?(deps.ctx))
-            {
-                fast_unavailable_notified = true;
-                try deps.push_text(deps.ctx, .{ .operational = "Fast mode is unavailable for this model right now; continuing at standard speed." });
-                try deps.push_text(deps.ctx, .{ .operational = "\n" });
+            const fast_catalog_failure = if (attempt_fast_mode and !provider_opts.fast and !fast_unavailable_notified)
+                if (deps.model_catalog_failure) |failure| failure(deps.ctx) else null
+            else
+                null;
+            if (fast_catalog_failure != null) fast_unavailable_notified = true;
+            // Images withheld because the catalog could not confirm image
+            // input are invisible in the transcript otherwise. The core asks
+            // to tell the user once per turn, and only when the catalog itself
+            // is known to be down; a confirmed model without image input
+            // relies on the model-facing notice instead.
+            if (notify_catalog_down or fast_catalog_failure != null) {
+                const lines = try catalogDownNotice(overlay_arena, .{
+                    // The later reading is fresher. The image route asks to
+                    // notify only when the earlier one saw the catalog down
+                    // (`tests/tla/image_route/spec/ImageRoute.tla` NotifyOnlyWhenDown).
+                    .failure = fast_catalog_failure orelse request_catalog_failure orelse .runtime,
+                    .service = model_catalog.serviceName(job.provider),
+                    .images = if (notify_catalog_down) image_choice else null,
+                    .fast_off = fast_catalog_failure != null,
+                });
+                for (lines.slice()) |line| {
+                    try deps.push_text(deps.ctx, .{ .operational = line });
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                }
             }
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
                 .none
@@ -7745,8 +7921,10 @@ fn processQueuedPromptLoop(
                         .tool_evidence = preserved_tool_evidence,
                         .trace_ctx = step_ctx,
                     };
+                    var turn_model_calls: TurnModelCalls = .{ .deps = deps, .finalization = finalization };
                     var summary_model: runtime_text_completion.CompactorCaller = .{
                         .observer = deps.observer,
+                        .model_calls = turn_model_calls.sink(job.provider.label()),
                         .stream_provider = deps.agent_stream_provider,
                         .cooperative_transport_pulse = deps.cooperative_transport_pulse,
                         .provider = job.provider,
@@ -7951,6 +8129,9 @@ fn processQueuedPromptLoop(
                     debug_trace.logf("agent", "token progress publication failed source=gateway_error err={s}", .{@errorName(progress_err)});
                 };
                 const cancel_requested = config.cancel_flag.load(.seq_cst);
+                // A stopped call is noted once its text is out (below).
+                const thrown_at_ms = io_mod.milliTimestamp();
+                if (!cancel_requested) noteSettledCall(deps, finalization, &held_live_call, stream_ctx.raw_text.items.len > 0, model_call_record.ofError(job.provider.label(), gateway_model, .turn, gateway_wait_started_ms, thrown_at_ms, false, err));
                 const consumed_attempts = (request_recovery.attempt() - 1) +
                     @as(usize, @intFromBool(gateway_attempt_evidence.provider_admitted));
                 const network_failure = if (gateway_attempt_evidence.network_failure) |evidence| blk: {
@@ -8057,6 +8238,8 @@ fn processQueuedPromptLoop(
                     );
                     const interruption_source = stream_ctx.interruption_source_or("");
                     try runtime_assistant_stream.flushAssistantStream(&stream_ctx);
+                    // The stopped call's line goes after what text it wrote.
+                    if (cancel_requested) noteModelCall(deps, finalization, model_call_record.ofError(job.provider.label(), gateway_model, .turn, gateway_wait_started_ms, thrown_at_ms, true, err));
                     if (try append_immediate_steering_after_cancel(
                         deps,
                         arena,
@@ -8148,7 +8331,7 @@ fn processQueuedPromptLoop(
                 return err;
             };
             stream_result_set = true;
-            pushNetworkRecord(deps, job.provider, gateway_model, gateway_wait_started_ms, &stream_result);
+            noteSettledCall(deps, finalization, &held_live_call, stream_ctx.raw_text.items.len > 0, settledCallRecord(job.provider.label(), gateway_model, gateway_wait_started_ms, &stream_result, config.cancel_flag));
             const first_failure = streamFailure(stream_result);
             const auth_replay = auth_transition.decideAuthReplay(.{
                 .authentication_rejected = first_failure != null and first_failure.?.kind == .unauthorized,
@@ -8177,7 +8360,7 @@ fn processQueuedPromptLoop(
                     const replay_wait_started_ms = io_mod.milliTimestamp();
                     request_started_ms = replay_wait_started_ms;
                     stream_result = try streamMainCompletion(deps, arena, model_request);
-                    pushNetworkRecord(deps, job.provider, gateway_model, replay_wait_started_ms, &stream_result);
+                    noteSettledCall(deps, finalization, &held_live_call, stream_ctx.raw_text.items.len > 0, settledCallRecord(job.provider.label(), gateway_model, replay_wait_started_ms, &stream_result, config.cancel_flag));
                     debug_trace.eventf(
                         "auth",
                         "authenticated_request_replayed",
@@ -8809,6 +8992,9 @@ fn processQueuedPromptLoop(
             break;
         }
         defer if (stream_result_set) stream_result.deinit(arena);
+        // The accepted call's line, after its text and before its tools.
+        if (held_live_call) |held| publishHeldModelCall(deps, held);
+        held_live_call = null;
 
         var completion = streamCompletion(stream_result);
         const provider_replay: ?types.ProviderReplay = if (completion.provider_state_json) |parts| replay: {
@@ -12039,32 +12225,19 @@ fn processQueuedPromptLoop(
                     .continued => continue :agent_steps_loop,
                 }
             }
-            try deps.push_system_notice(
-                deps.ctx,
-                repeated_terminal_validation_notice,
-            );
-            const assistant_text: runtime_finalization.TerminalText = .{ .history = "", .presentation = if (stop_state.retained_candidate != null)
-                try hooks.prompt.joinVisibleSegments(
-                    arena,
-                    stop_state.retained_candidate,
-                    stop_state.latest_partial,
-                )
-            else
-                null };
-            stop_state.terminal_materializing = true;
-            try finishCommonAssistantTerminal(
+            // The turn fails with the notice as its text, as the other
+            // loop stops do, so a parent agent's report says why it ended.
+            try finishFailedTurnWithNotice(
                 deps,
                 finalization,
                 arena,
                 job,
                 within_turn_suffix.items,
                 &summary_accumulator,
-                assistant_text,
-                .completed,
-                null,
+                stop_state,
                 &finish_trace,
+                repeated_terminal_validation_notice,
                 "terminal_validation_retry",
-                null,
             );
             return;
         }
@@ -12471,49 +12644,4 @@ test "malformed duplicate unauthorized and path Vision calls settle no image ids
         &catalog,
     ));
     try std.testing.expectEqual(@as(usize, 0), settled_ids.items.len);
-}
-
-test "writeNetworkRecordBody renders completed and failed outcomes" {
-    const alloc = std.testing.allocator;
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-
-    var completed: runtime_gateway_step.StreamResult = .{ .completed = .{ .completion = .{
-        .finish_reason = .stop,
-        .generation_id = "gen_test_123",
-        .usage = .{
-            .input_tokens = 1240,
-            .output_tokens = 56,
-            .cache_read_tokens = 900,
-        },
-    } } };
-    try writeNetworkRecordBody(&body.writer, "gateway", "kimi-k3", 812, &completed);
-    try std.testing.expectEqualStrings(
-        "provider: gateway · model: kimi-k3 · 812ms\nfinish: stop · generation: gen_test_123\ntokens: 1240 in · 56 out · 900 cache-read",
-        body.written(),
-    );
-
-    body.clearRetainingCapacity();
-    var failed: runtime_gateway_step.StreamResult = .{ .failed = .{
-        .kind = .rate_limited,
-        .retry_after_seconds = 4,
-    } };
-    try writeNetworkRecordBody(&body.writer, "codex", "gpt-5.2", 1503, &failed);
-    try std.testing.expectEqualStrings(
-        "provider: codex · model: gpt-5.2 · 1503ms\nfailed: rate_limited · retry after: 4s",
-        body.written(),
-    );
-}
-
-test "writeNetworkRecordBody omits absent finish reason and generation" {
-    const alloc = std.testing.allocator;
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-
-    var completed: runtime_gateway_step.StreamResult = .{ .completed = .{} };
-    try writeNetworkRecordBody(&body.writer, "gateway", "m", 0, &completed);
-    try std.testing.expectEqualStrings(
-        "provider: gateway · model: m · 0ms\nfinish: unknown",
-        body.written(),
-    );
 }

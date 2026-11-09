@@ -111,7 +111,7 @@ async function waitFor(check: () => boolean, what: string) {
 
 async function walkCtrlO(session: TmuxSession): Promise<string[]> {
   await session.sendHexBytes(["0f"]);
-  await session.waitForText("full detail · ctrl+o close", TIMEOUT);
+  await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
   for (let i = 0; i < 40; i += 1) {
     await session.sendKeys("PageUp");
     await Bun.sleep(120);
