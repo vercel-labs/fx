@@ -411,8 +411,9 @@ pub const Runtime = struct {
     /// published that, so `statuses` never reports a premature signed_in.
     credentials_restored: std.Io.Event = .unset,
     /// Owner thread only: why the store of saved logins couldn't be read,
-    /// from the first read until one works. Its HTTP servers start without
-    /// a login, and one asked for a login reads the store again first.
+    /// from a read that gave servers no login (at the start, or for one a
+    /// reload added) until one works. Those servers start without a login,
+    /// and one asked for a login reads the store again first.
     store_unread: ?anyerror = null,
 
     /// Owner thread only.
@@ -1824,13 +1825,17 @@ pub const Runtime = struct {
     }
 
     /// A server a reload added signs in with the login saved for it, as
-    /// `restoreCredentials` does at the start.
+    /// `restoreCredentials` does at the start, and a store that can't be
+    /// read is noted in `store_unread` the same way.
     fn adoptSaved(r: *Runtime, i: usize) void {
         const s = r.resolved.servers[i];
         if (s.url == null) return;
-        const saved = r.options.credentials.store.get(r.gpa, s.credentialKey()) catch |err| {
+        const found = r.options.credentials.store.lookup(r.gpa, s.credentialKey()) catch |err| {
+            if (err != error.OutOfMemory) r.store_unread = err;
             return debug_trace.logf("mcp", "MCP saved login not read server={s} err={s}", .{ s.name, @errorName(err) });
-        } orelse return;
+        };
+        r.store_unread = null;
+        const saved = found orelse return;
         defer secret.zeroAndFree(r.gpa, saved);
         r.engine.restoreCredential(s.name, saved) catch |err| {
             return debug_trace.logf("mcp", "MCP credential not loaded server={s} err={s}", .{ s.name, @errorName(err) });

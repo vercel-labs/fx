@@ -1816,6 +1816,29 @@ describe("MCP login", () => {
     expect(json.code).toBe(1);
   }, 60_000);
 
+  // Before, a server a reload added read its login from a store fx could no
+  // longer read, found none, and asked for a sign-in that couldn't be saved.
+  test.skipIf(!tmuxAvailable())("a server a reload adds while fx can't read its saved logins is down for that reason, not asked to sign in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // The host read the store when it started; a newer fx saves it now.
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
+    await tui.sendText(`/mcp add --no-login web ${auth.url}`);
+    await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+    await tui.waitForText("web failed · /mcp", 15_000);
+    expect(await tui.capturePane()).not.toContain("web needs login");
+    expect(auth.authorizationRequests).toBe(0);
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("a login made by another fx process reaches a running shell", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
