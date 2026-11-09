@@ -107,6 +107,17 @@ pub const Status = struct {
 
 pub const Tool = struct { name: []const u8, raw: []const u8 };
 
+/// How a logout ended.
+pub const Logout = struct {
+    /// Why the saved login couldn't be removed, if it couldn't: this fx is
+    /// signed out, but every other fx, and the next one, still has it.
+    kept: ?anyerror = null,
+    /// A revocation went to the server. Without one, as when its
+    /// authorization server takes none, the tokens stay valid until they
+    /// expire.
+    revoked: bool = false,
+};
+
 pub const ToolsResult = union(enum) {
     tools: []Tool,
     needs_login,
@@ -224,6 +235,8 @@ const Request = struct {
     question: ?Pending = null,
     /// Set by the owner before a logout ends: why the saved login stayed.
     logout_kept: ?anyerror = null,
+    /// Set by the owner before a logout ends: a revocation went to the server.
+    logout_revoked: bool = false,
     /// Owner thread only: fx declined the server's question, so the call's
     /// cancellation is fx's answer, not the user's.
     declined: bool = false,
@@ -686,12 +699,10 @@ pub const Runtime = struct {
     }
 
     /// Signs out: the token is revoked where the server can, and forgotten.
-    /// Returns why the saved login couldn't be removed, if it couldn't: this
-    /// fx is signed out, but every other fx, and the next one, still has it.
-    pub fn logout(r: *Runtime, server: []const u8) Error!?anyerror {
+    pub fn logout(r: *Runtime, server: []const u8) Error!Logout {
         var req: Request = .{ .kind = .{ .logout = server }, .alloc = r.gpa };
         try r.submitOk(&req);
-        return req.logout_kept;
+        return .{ .kept = req.logout_kept, .revoked = req.logout_revoked };
     }
 
     /// Every server that needs a login takes one saved since by another fx,
@@ -1054,9 +1065,10 @@ pub const Runtime = struct {
                     try r.engine.signOut(s.name);
                 };
                 r.flags[i] = .{};
+                req.logout_revoked = r.engine.revoking(s.name);
                 // A program that exits next would lose a revocation still on
                 // its way, so the logout ends when it's answered.
-                if (!r.engine.revoking(s.name)) return r.finish(req, .ok);
+                if (!req.logout_revoked) return r.finish(req, .ok);
                 try r.logouts.append(r.gpa, .{ .server = i, .request = req, .deadline_ms = r.nowMs() + revoke_wait_ms });
             },
         }
