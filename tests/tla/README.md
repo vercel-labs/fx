@@ -102,6 +102,8 @@ bun tests/tla/drivers/drive.mjs send --walks 40         # one durable-session gr
 bun tests/tla/drivers/drive-agents.mjs --walks 60       # agent routing
 bun tests/tla/drivers/drive-tenants.mjs --walks 60      # tenants in one process
 bun tests/tla/drivers/drive-steer.mjs ideal --walks 20  # steering
+tests/tla/sdk/check-resumed-steer.sh                    # what a reader sees of the steers a resumed turn places (ResumedSteer.tla)
+bun tests/tla/drivers/drive-resumed-steer.mjs --walks 20  # that model along the real code, with SIGKILL and deadline hand-offs
 bun test ./tests/tla/drivers/shell_command/             # a driver written as bun tests; see each check.sh for its own
 tests/tla/session/check.sh                              # the shell's session, /status and the exit line, and a turn's stream
 tests/tla/subagent/check.sh                             # main's messages into its subagents' turns, and planted bugs
