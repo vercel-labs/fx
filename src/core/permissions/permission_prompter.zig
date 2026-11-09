@@ -40,7 +40,7 @@ pub const Prompter = struct {
             review,
             grant_offer,
         ) catch |err| {
-            if (wait) |value| value.end(if (err == error.Cancelled) .cancelled else .failed, &.{}, @errorName(err));
+            if (wait) |value| value.end(if (endsCancelled(err)) .cancelled else .failed, &.{}, @errorName(err));
             return err;
         };
         if (wait) |value| value.end(if (self.cancel_flag != null and self.cancel_flag.?.load(.seq_cst)) .cancelled else if (response.decision.isDenied()) .denied else .accepted, if (response.feedback) |feedback| &.{feedback} else &.{}, null);
@@ -53,6 +53,14 @@ pub const Prompter = struct {
         return true;
     }
 };
+
+/// Whether a failed request ended because it was cancelled, which a wait
+/// reports as cancelled and not failed: the prompter was cancelled, or the
+/// prompt it belongs to closed or the subagent that asked was stopped, as a
+/// cancel does to a parent's own request.
+fn endsCancelled(err: anyerror) bool {
+    return err == error.Cancelled or err == error.PermissionPromptClosed or err == error.PermissionPromptStopped;
+}
 
 /// The cause a prompter's failure carries, or null for one that names none. A
 /// prompter that cannot ask fails with `error.PermissionPromptUnavailable`, or
@@ -99,5 +107,30 @@ test "approval observer pairs actual prompt attempts without changing their deci
     try std.testing.expectError(error.Cancelled, prompter.request(std.testing.allocator, .{ .label = "Allow?" }, call, null, null));
     try std.testing.expectEqual(@as(usize, 3), capture.count(.wait_start));
     try std.testing.expectEqual(capture.count(.wait_start), capture.count(.wait_end));
+    try std.testing.expect(!capture.invalid);
+}
+
+test "a wait the prompt's close or a stop ended is cancelled, and any other failure is failed" {
+    const Fixture = struct {
+        err: anyerror = error.Cancelled,
+        fn request(raw: *anyopaque, _: Allocator, _: permission_request.PermissionRequest, _: types.ToolCall, _: ?*const diff_mod.FileReview, _: ?[]const types.PermissionGrant) !permission_request.OwnedPermissionResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.err;
+        }
+    };
+    var capture: @import("../agent/runtime/observation_testing.zig").Capture = .{ .expected_call = "approval-call" };
+    var observer = capture.observer();
+    var fixture: Fixture = .{};
+    const prompter = Prompter{ .context = &fixture, .request_fn = Fixture.request, .observer = &observer };
+    const call = types.ToolCall{ .id = "approval-call", .name = "shell", .arguments_json = "{}" };
+    const cancelled = [_]anyerror{ error.Cancelled, error.PermissionPromptClosed, error.PermissionPromptStopped };
+    const failed = [_]anyerror{ error.PermissionPromptFull, error.PermissionPromptClientUnavailable, error.PermissionPromptUnavailable, error.OutOfMemory };
+    for (cancelled ++ failed) |err| {
+        fixture.err = err;
+        try std.testing.expectError(err, prompter.request(std.testing.allocator, .{ .id = 42, .label = "Allow?" }, call, null, null));
+    }
+    try std.testing.expectEqual(cancelled.len + failed.len, capture.count(.wait_end));
+    try std.testing.expectEqual(cancelled.len, capture.outcomes[@backingInt(observation.WaitOutcome.cancelled)]);
+    try std.testing.expectEqual(failed.len, capture.outcomes[@backingInt(observation.WaitOutcome.failed)]);
     try std.testing.expect(!capture.invalid);
 }
