@@ -545,6 +545,40 @@ pub fn Runtime(comptime App: type) type {
             try body(context, app, agent);
         }
 
+        /// Runs `body` with `agent` in context and where its draft lives:
+        /// null for the composer while `agent` is on screen, or its stashed
+        /// draft while it is hidden, with its transcript on the screen as
+        /// `visitScreen` puts it. Returns false, running nothing, when no
+        /// open agent is at `agent`, which is compared by address only.
+        pub fn withAgentDraft(
+            app: *App,
+            agent: *const anyopaque,
+            context: anytype,
+            comptime body: fn (@TypeOf(context), *App, ?*composer_stash.State) anyerror!void,
+        ) !bool {
+            if (agent == @as(*const anyopaque, agents.screenAgentOf(app))) {
+                try body(context, app, null);
+                return true;
+            }
+            if (comptime !@hasField(App, "screen_owner")) return false;
+            const Target = struct { agent: *agents.Agent, screen: *ScreenSlot };
+            const target: Target = if (agent == @as(*const anyopaque, &app.main_agent))
+                .{ .agent = &app.main_agent, .screen = &app.main_screen }
+            else for (app.child_agents.items) |child| {
+                if (agent == @as(*const anyopaque, &child.agent)) break .{ .agent = &child.agent, .screen = &child.screen };
+            } else return false;
+            const Visit = struct {
+                context: @TypeOf(context),
+                draft: *composer_stash.State,
+
+                fn run(self: @This(), visited: *App, _: *agents.Agent) anyerror!void {
+                    try body(self.context, visited, self.draft);
+                }
+            };
+            try visitScreen(app, target.agent, target.screen, Visit{ .context = context, .draft = &target.screen.draft }, Visit.run);
+            return true;
+        }
+
         /// True when `child` has events for the loop to handle or assistant
         /// text left to pace out.
         pub fn hasPendingWork(child: *ChildAgent) bool {
@@ -2210,6 +2244,9 @@ pub fn Runtime(comptime App: type) type {
                     break;
                 };
             }
+            // A clipboard read it started finishes without it, before a new
+            // agent can take its address.
+            if (comptime @hasField(App, "clipboard_read")) app.clipboard_read.forget(&child.agent);
             if (!released) return;
             child.screen.deinit(app.alloc);
             if (child.name.len > 0) app.alloc.free(child.name);

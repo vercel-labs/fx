@@ -14,6 +14,7 @@ import {
   cleanupIsolatedTestHome,
   createIsolatedTestHome,
   HAS_API_KEY,
+  REPO_ROOT,
 } from "../evals/eval-helpers";
 import { readTrace } from "./tui-render-assertions";
 import {
@@ -273,6 +274,194 @@ describe.skipIf(!tmuxAvailable() || CLIPBOARD_PROGRAM === null)("tui: clipboard 
         await session.sendText("/copy");
         await session.waitForText("Failed to copy to clipboard.", 5_000);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        rmSync(workDir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
+const CLIPBOARD_PNG = join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png");
+
+/// Stands in for macOS osascript. Each run logs its pid, waits for a
+/// `release` file (at most 30 s), then writes the PNG the script names when
+/// `result` says `image`, or exits 1 as osascript does for an empty clipboard.
+function writeClipboardStub(binDir: string, stubDir: string): void {
+  const stub = join(binDir, "osascript");
+  writeFileSync(
+    stub,
+    [
+      "#!/bin/sh",
+      `dir='${stubDir}'`,
+      "echo \"start $$\" >> \"$dir/log\"",
+      "i=0",
+      "while [ ! -e \"$dir/release\" ]; do",
+      "  i=$((i + 1))",
+      "  if [ \"$i\" -gt 600 ]; then echo \"gave-up $$\" >> \"$dir/log\"; exit 1; fi",
+      "  sleep 0.05",
+      "done",
+      "out=$(printf '%s\\n' \"$2\" | sed -n 's/^set outFile to POSIX file \"\\(.*\\)\"$/\\1/p')",
+      "if [ \"$(cat \"$dir/result\" 2>/dev/null)\" = image ] && [ -n \"$out\" ]; then",
+      `  cp '${CLIPBOARD_PNG}' "$out"`,
+      "  echo \"exit 0 $$\" >> \"$dir/log\"",
+      "  exit 0",
+      "fi",
+      "echo \"exit 1 $$\" >> \"$dir/log\"",
+      "exit 1",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(stub, 0o755);
+}
+
+function clipboardStubLog(stubDir: string): string[] {
+  const path = join(stubDir, "log");
+  if (!existsSync(path)) return [];
+  return readFileSync(path, "utf8").split("\n").filter((line) => line.length > 0);
+}
+
+async function waitForStubLog(
+  stubDir: string,
+  done: (lines: string[]) => boolean,
+  timeoutMs: number,
+): Promise<string[]> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const lines = clipboardStubLog(stubDir);
+    if (done(lines)) return lines;
+    if (Date.now() > deadline) {
+      throw new Error(`stub osascript log never matched: ${JSON.stringify(lines)}`);
+    }
+    await Bun.sleep(25);
+  }
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function launchClipboardSession(workDir: string, gateway: ReturnType<typeof startDynamicFakeGateway>) {
+  const homeDir = join(workDir, "home");
+  const binDir = join(workDir, "bin");
+  const stubDir = join(workDir, "stub");
+  const stderrPath = join(workDir, "stderr.log");
+  mkdirSync(homeDir);
+  mkdirSync(binDir);
+  mkdirSync(stubDir);
+  writeClipboardStub(binDir, stubDir);
+  const tui = await TmuxSession.create({
+    cwd: workDir,
+    stderrPath,
+    env: {
+      HOME: homeDir,
+      AI_GATEWAY_API_KEY: "clipboard-image-fake-key",
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_MODEL: FAKE_GATEWAY_MODEL,
+      FX_AUTO_UPGRADE: "0",
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      TMPDIR: workDir,
+    },
+    width: 120,
+    height: 40,
+  });
+  return { tui, stubDir, stderrPath };
+}
+
+// macOS reads clipboard images through osascript; elsewhere /paste and
+// Ctrl+V stay silent, so these run only on macOS.
+describe.skipIf(!tmuxAvailable() || process.platform !== "darwin")("tui: clipboard image", () => {
+  test(
+    "Ctrl+V reads the clipboard image while typing stays live, refuses a second read, and attaches the image",
+    async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "fx-clipboard-image-"));
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("CLIPBOARD_IMAGE_ANSWER"), {
+        models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use", "vision"] }],
+      });
+      try {
+        const launched = await launchClipboardSession(workDir, gateway);
+        session = launched.tui;
+        writeFileSync(join(launched.stubDir, "result"), "image");
+        await session.waitForComposer(10_000);
+
+        await session.sendKeys("C-v");
+        await waitForStubLog(launched.stubDir, (lines) => lines.some((line) => line.startsWith("start ")), 5_000);
+        // The stub is still waiting: the composer and the notice must draw now.
+        await session.sendLiteral("typed while reading");
+        await session.waitForPane(
+          (pane) => pane.includes("typed while reading") && pane.includes("reading clipboard"),
+          3_000,
+        );
+
+        await session.sendKeys("C-v");
+        await session.waitForText("already reading clipboard", 3_000);
+        expect(clipboardStubLog(launched.stubDir).filter((line) => line.startsWith("start "))).toHaveLength(1);
+
+        writeFileSync(join(launched.stubDir, "release"), "");
+        await session.waitForPane((pane) => pane.includes("typed while reading[Image 1]"), 10_000);
+        await session.sendKeys("Enter");
+        await session.waitForText("CLIPBOARD_IMAGE_ANSWER", 10_000);
+
+        expect(gateway.requests).toHaveLength(1);
+        const body = gateway.requests[0]!.body;
+        expect(body).toContain("typed while reading[Image #1]");
+        expect(body).toContain("image/png");
+        expect(clipboardStubLog(launched.stubDir).filter((line) => line.startsWith("start "))).toHaveLength(1);
+        expect(readFileSync(launched.stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        rmSync(workDir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/quit during a clipboard read ends fx at once and stops osascript",
+    async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "fx-clipboard-quit-"));
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("unused"));
+      try {
+        const launched = await launchClipboardSession(workDir, gateway);
+        session = launched.tui;
+        await session.waitForComposer(10_000);
+
+        await session.sendKeys("C-v");
+        const started = await waitForStubLog(
+          launched.stubDir,
+          (lines) => lines.some((line) => line.startsWith("start ")),
+          5_000,
+        );
+        const pid = Number(started.find((line) => line.startsWith("start "))!.split(" ")[1]);
+        expect(processAlive(pid)).toBe(true);
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
+        session = null;
+        const deadline = Date.now() + 3_000;
+        while (processAlive(pid) && Date.now() < deadline) await Bun.sleep(25);
+        expect(processAlive(pid)).toBe(false);
+        // Killed, not finished: the stub never logged its exit.
+        expect(clipboardStubLog(launched.stubDir).some((line) => line.startsWith("exit "))).toBe(false);
+        expect(gateway.requests).toHaveLength(0);
+        expect(readFileSync(launched.stderrPath, "utf8")).toBe("");
       } finally {
         if (session) {
           await session.kill();

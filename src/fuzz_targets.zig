@@ -16,6 +16,7 @@ test {
     _ = @import("core/app/app_agents_runtime.zig");
     _ = @import("core/app/app_session_runtime.zig");
     _ = @import("core/app/host_record.zig");
+    _ = @import("core/images/clipboard_read.zig");
     _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_data.zig");
     _ = @import("core/images/image_route.zig");
