@@ -91,8 +91,19 @@ pub fn appendMessageLayoutRow(
     var safe = try text_utils.encodeTerminalSafe(alloc, normalized, std.math.maxInt(usize));
     defer safe.deinit(alloc);
     const ellipsis = layout.truncated and index + 1 == layout.row_count and layout.content_width > 0;
-    try row_text.appendClipped(alloc, row, safe.bytes, layout.content_width - @as(u16, @intFromBool(ellipsis)));
+    try appendRowClipped(alloc, row, safe.bytes, layout.content_width - @as(u16, @intFromBool(ellipsis)));
     if (ellipsis) try row.appendSlice(alloc, "…");
+}
+
+/// `row_text.appendClipped` for text that draws after a prefix cell, which is
+/// no base for a mark: a mark that starts the row is drawn on a circle that
+/// takes one of the `width` cells, as `steering_message_layout` counts it.
+fn appendRowClipped(alloc: Allocator, row: *std.ArrayList(u8), bytes: []const u8, width: u16) !void {
+    const bare = display_width.bareMarkInRow(bytes) orelse return row_text.appendClipped(alloc, row, bytes, width);
+    try row_text.appendClipped(alloc, row, bytes[0..bare.start], width);
+    if (width == 0) return;
+    try row.appendSlice(alloc, display_width.bare_mark_base);
+    try row_text.appendClipped(alloc, row, bytes[bare.start..], width - 1);
 }
 
 test "steering rows use the dotted rail without an escape hint" {
@@ -169,6 +180,42 @@ test "steering preview truncates after the second wide glyph" {
     try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
     try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "┋ 界") != null);
     try std.testing.expect(std.mem.find(u8, rows.rows.items[1].items, "┋ 海…") != null);
+}
+
+test "steering row draws a bare mark on a dotted circle in a cell of its own" {
+    const alloc = std.testing.allocator;
+    const rail = "┋ ";
+
+    // A mark that starts the message has no base: the rail's space is not
+    // one, so the mark is drawn on a circle that takes a cell of its own.
+    var bare = try composeSteeringMessageRows(alloc, "\u{0E49}abc", 20, 2, true);
+    defer bare.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), bare.rows.items.len);
+    const bare_row = bare.rows.items[0].items;
+    try std.testing.expectEqualStrings(
+        rail ++ "\u{25CC}\u{0E49}abc",
+        bare_row[ui_render.dim_style.len .. bare_row.len - ui_render.reset_style.len],
+    );
+
+    // A mark on a base gets no circle.
+    var on_base = try composeSteeringMessageRows(alloc, "a\u{0E49}bc", 20, 2, true);
+    defer on_base.deinit(alloc);
+    const base_row = on_base.rows.items[0].items;
+    try std.testing.expectEqualStrings(
+        rail ++ "a\u{0E49}bc",
+        base_row[ui_render.dim_style.len .. base_row.len - ui_render.reset_style.len],
+    );
+
+    // The message wraps after the circle: width 6 leaves four cells after the
+    // rail, and the second row starts with no mark, so it has no circle.
+    var wrapped = try composeSteeringMessageRows(alloc, "\u{0E49}abcdef", 6, 2, true);
+    defer wrapped.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), wrapped.rows.items.len);
+    const expected = [_][]const u8{ rail ++ "\u{25CC}\u{0E49}abc", rail ++ "def" };
+    for (wrapped.rows.items, expected) |row, text| {
+        try std.testing.expectEqualStrings(text, row.items[ui_render.dim_style.len .. row.items.len - ui_render.reset_style.len]);
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 6);
+    }
 }
 
 test "steering rows visibly escape terminal control bytes" {

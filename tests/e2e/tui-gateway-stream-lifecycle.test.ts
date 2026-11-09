@@ -4903,6 +4903,96 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "a queued message that starts with a bare mark is drawn on a dotted circle in a cell of its own",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-steering-bare-mark-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const releasePath = join(workspace, ".release-bare-mark-steering");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const command =
+        `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.05; done; ` +
+        "printf BARE_MARK_TOOL_DONE";
+      // The mark has no base: the rail's space is not one, so the mark is drawn
+      // on a circle that takes a cell of its own, and a long message wraps
+      // after the circle. 40 columns leave 38 cells after the rail.
+      const steering = "\u0E49abc";
+      const wrapped = `\u0E49${"d".repeat(60)}`;
+      const finalText = "BARE_MARK_STEERING_COMPLETE";
+      const steeringGateway = startFakeGateway([
+        fakeGatewayToolCall("bare_mark_steering_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            command,
+          },
+        }),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateway = steeringGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 40,
+        height: 30,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-bare-mark-steering-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_MODEL: MODEL,
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Run the bare mark steering fixture.");
+      await session.waitForText("Running while", TIMEOUT);
+      await session.sendText(steering);
+      await session.sendText(wrapped);
+      const expected = [
+        "┋ \u25CC\u0E49abc",
+        `┋ \u25CC\u0E49${"d".repeat(37)}`,
+        `┋ ${"d".repeat(23)}`,
+      ];
+      const started = Date.now();
+      let rails: string[] = [];
+      while (Date.now() - started < TIMEOUT) {
+        rails = (await session.capturePaneGrid())
+          .map((line) => line.trimEnd())
+          .filter((line) => line.startsWith("┋ "));
+        if (rails.length >= expected.length) break;
+        await Bun.sleep(50);
+      }
+      expect(rails).toEqual(expected);
+      expect(steeringGateway.requests).toHaveLength(1);
+
+      writeFileSync(releasePath, "release\n");
+      await session.waitForText(finalText, TIMEOUT);
+      await waitForCondition(
+        () => steeringGateway.requests.length === 2,
+        "bare mark steering request",
+      );
+      // The circle is only drawn: the model gets the bytes that were typed.
+      const continuedBody = steeringGateway.requests[1]!.body;
+      expect(continuedBody).toContain(steering);
+      expect(continuedBody).not.toContain("\u25CC");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "rich steering waits for the running tool and hands off without queue UI",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-rich-steering-tool-")));

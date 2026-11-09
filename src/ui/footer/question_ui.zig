@@ -130,7 +130,7 @@ fn writeQuestionPanelOptionLine(
             const label_line = if (!label_available or label.len == 0)
                 WrappedTextLine{ .content_end = label_start, .next_start = label_start }
             else
-                nextWrappedTextLine(label, label_start, if (row_index == 0) widths.first else widths.continuation);
+                nextWrappedRowLine(label, label_start, if (row_index == 0) widths.first else widths.continuation);
             const description_available = description_start < description.len;
             const description_line = if (description_available)
                 nextWrappedTextLine(description, description_start, description_width)
@@ -145,12 +145,15 @@ fn writeQuestionPanelOptionLine(
                 try writer.splatByteAll(' ', prefix_width);
                 try writer.writeAll(option_style);
             }
-            if (label_available) try writer.writeAll(label[label_start..label_line.content_end]);
+            // The label's row draws after the ordinal, which is no base for a
+            // mark, so a mark that starts it is drawn on a circle of its own.
+            var at_row_start = true;
+            if (label_available) try display_width.writeRowPart(writer, label[label_start..label_line.content_end], &at_row_start);
             try writer.writeAll(ui_render.reset_style);
 
             if (description_available) {
                 const visible = prefix_width + if (label_available)
-                    display_width.visibleWidth(label[label_start..label_line.content_end])
+                    display_width.rowWidth(label[label_start..label_line.content_end])
                 else
                     0;
                 if (visible < description_indent) {
@@ -176,7 +179,7 @@ fn writeQuestionPanelOptionLine(
         const line = if (label.len == 0)
             WrappedTextLine{ .content_end = 0, .next_start = 0 }
         else
-            nextWrappedTextLine(label, start, if (first) widths.first else widths.continuation);
+            nextWrappedRowLine(label, start, if (first) widths.first else widths.continuation);
 
         if (first) {
             try writer.writeAll(option_style);
@@ -186,7 +189,8 @@ fn writeQuestionPanelOptionLine(
             try writer.splatByteAll(' ', prefix_width);
             try writer.writeAll(option_style);
         }
-        try writer.writeAll(label[start..line.content_end]);
+        var at_row_start = true;
+        try display_width.writeRowPart(writer, label[start..line.content_end], &at_row_start);
         try writer.writeAll(ui_render.reset_style);
         try writer.writeByte('\n');
         if (label.len == 0) break;
@@ -226,7 +230,7 @@ fn questionOptionLineCount(
     const description = opt.description orelse "";
     const has_description = description.len > 0;
     const widths = questionOptionLabelWidths(index, row_budget, has_description);
-    const label_lines = wrappedTextLineCount(questionOptionLabel(entry, opt), widths.first, widths.continuation);
+    const label_lines = wrappedRowLineCount(questionOptionLabel(entry, opt), widths.first, widths.continuation);
     if (!has_description) return label_lines;
 
     const description_col = questionDescriptionColumn(row_budget);
@@ -281,24 +285,59 @@ const WrappedTextLine = struct {
 };
 
 fn wrappedTextLineCount(text: []const u8, first_width: usize, continuation_width: usize) usize {
+    return wrappedLineCount(text, first_width, continuation_width, false);
+}
+
+/// `wrappedTextLineCount` for rows that draw after a prefix cell, which is no
+/// base for a mark: see `nextWrappedRowLine`.
+fn wrappedRowLineCount(text: []const u8, first_width: usize, continuation_width: usize) usize {
+    return wrappedLineCount(text, first_width, continuation_width, true);
+}
+
+fn wrappedLineCount(
+    text: []const u8,
+    first_width: usize,
+    continuation_width: usize,
+    comptime bare_marks: bool,
+) usize {
     if (text.len == 0) return 1;
 
     var count: usize = 0;
     var start: usize = 0;
     while (start < text.len) : (count += 1) {
-        const line = nextWrappedTextLine(text, start, if (count == 0) first_width else continuation_width);
+        const line = nextWrappedLine(text, start, if (count == 0) first_width else continuation_width, bare_marks);
         start = line.next_start;
     }
     return @max(count, 1);
 }
 
 fn nextWrappedTextLine(text: []const u8, start: usize, content_width: usize) WrappedTextLine {
+    return nextWrappedLine(text, start, content_width, false);
+}
+
+/// `nextWrappedTextLine` for a row that draws after a prefix cell, such as an
+/// option's ordinal or an answer's indent. A mark that starts the row has no
+/// base, so it takes the cell of its circle, and the row wraps after it. The
+/// painter draws the circle with `display_width.writeRowPart`.
+fn nextWrappedRowLine(text: []const u8, start: usize, content_width: usize) WrappedTextLine {
+    return nextWrappedLine(text, start, content_width, true);
+}
+
+fn nextWrappedLine(
+    text: []const u8,
+    start: usize,
+    content_width: usize,
+    comptime bare_marks: bool,
+) WrappedTextLine {
     if (start >= text.len) return .{ .content_end = text.len, .next_start = text.len };
 
     const newline = std.mem.findScalar(u8, text[start..], '\n');
     const segment_end = if (newline) |relative| start + relative else text.len;
     const segment = text[start..segment_end];
-    const prefix = display_width.wrapCutIgnoringAnsi(segment, content_width);
+    const prefix = if (bare_marks)
+        display_width.rowWrapCutIgnoringAnsi(segment, content_width)
+    else
+        display_width.wrapCutIgnoringAnsi(segment, content_width);
     if (prefix.len < segment.len) {
         if (prefix.len > 0) {
             const content_end = start + prefix.len;
@@ -504,11 +543,14 @@ fn writeResolutionField(
     while (first or start < text.len) {
         const prefix = if (first) first_prefix else continuation_prefix;
         const budget = @as(usize, cols) -| display_width.visibleWidth(prefix);
-        const line = nextWrappedTextLine(text, start, budget);
+        const line = nextWrappedRowLine(text, start, budget);
 
         if (style) |row_style| try writer.writeAll(row_style);
         try writer.writeAll(prefix);
-        try writer.writeAll(text[start..line.content_end]);
+        // The row draws after a prefix or an indent, which is no base for a
+        // mark, so a mark that starts it is drawn on a circle of its own.
+        var at_row_start = true;
+        try display_width.writeRowPart(writer, text[start..line.content_end], &at_row_start);
         if (style != null) try writer.writeAll(ui_render.reset_style);
         try writer.writeByte('\n');
 
@@ -1143,4 +1185,125 @@ test "pasted freeform newlines render as measured continuation rows" {
     try std.testing.expect(std.mem.find(u8, text, "second line") != null);
     try std.testing.expectEqual(@as(u16, 7), try questionPanelRowsForLayout(std.testing.allocator, prompt.projection().?, width));
     try expectQuestionPanelRowsMatch(&prompt, width);
+}
+
+test "option label that starts with a bare mark is drawn on a dotted circle in a cell of its own" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    // A mark that starts a label has no base: the space after "1)" is not
+    // one, so the mark is drawn on a circle that takes a cell of its own. A
+    // mark on a base, and the marks of a Thai cluster, get no circle.
+    const options = [_]types.QuestionOption{
+        .{ .label = "\u{0E49}abc", .description = null },
+        .{ .label = "\u{0E49}\u{0E48}abc", .description = null },
+        .{ .label = "a\u{0E49}bc", .description = null },
+        .{ .label = "\u{0E01}\u{0E31}\u{0E49}\u{0E07}", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Pick one?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+
+    const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, 40);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "1) \u{25CC}\u{0E49}abc") != null);
+    try std.testing.expect(std.mem.find(u8, text, "2) \u{25CC}\u{0E49}\u{0E48}abc") != null);
+    try std.testing.expect(std.mem.find(u8, text, "3) a\u{0E49}bc") != null);
+    try std.testing.expect(std.mem.find(u8, text, "4) \u{0E01}\u{0E31}\u{0E49}\u{0E07}") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "\u{25CC}"));
+}
+
+test "option label counts a bare mark's circle in its rows at every width" {
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(std.testing.allocator);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "\u{0E49}abcdefghij klmnopqrst", .description = null },
+        .{ .label = "No", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Pick one?", .options = &options },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+
+    // The circle takes the first cell of the first row, so each row keeps
+    // inside the width, the circle is drawn once, and the measured rows match
+    // the composed ones.
+    var width: u16 = 12;
+    while (width <= 40) : (width += 1) {
+        const text = try composeQuestionPanelText(std.testing.allocator, prompt.projection().?, width);
+        defer std.testing.allocator.free(text);
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= width);
+        }
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\u{25CC}"));
+        try expectQuestionPanelRowsMatch(&prompt, width);
+    }
+
+    // The description column starts where it does for a label of the same
+    // cells: the circle's cell is counted in the label's width.
+    const described = [_]types.QuestionOption{
+        .{ .label = "\u{0E49}abc", .description = "described" },
+        .{ .label = "No", .description = null },
+    };
+    const described_entries = [_]types.QuestionBatchEntry{
+        .{ .question = "Pick one?", .options = &described },
+    };
+    var described_prompt = question_prompt.QuestionPrompt{};
+    defer described_prompt.deinit(std.testing.allocator);
+    try described_prompt.syncFrom(std.testing.allocator, &described_entries);
+    const text = try composeQuestionPanelText(std.testing.allocator, described_prompt.projection().?, 60);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "1) \u{25CC}\u{0E49}abc") != null);
+    try expectVisibleIndentBefore(text, "described", questionDescriptionColumn(60) - 1);
+    try expectQuestionPanelRowsMatch(&described_prompt, 60);
+}
+
+test "resolved answer that starts with a bare mark is drawn on a dotted circle in a cell of its own" {
+    // The question and the answer draw after a prefix and a five-cell indent,
+    // which are no base for a mark. A mark that starts a row after a newline
+    // or a soft break has none either; a mark on a base gets no circle.
+    const answers = [_]types.QuestionAnswer{
+        .{ .question = "\u{0E49}Which?", .answer = "\u{0E49}abc" },
+        .{ .question = "Plain?", .answer = "ab\n\u{0E49}cd\na\u{0E49}e" },
+        .{ .question = "Soft?", .answer = "aaaa \u{0E49}bbb" },
+    };
+    const text = try composeResolvedQuestionAnswers(std.testing.allocator, &answers, 40);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "  1) \u{25CC}\u{0E49}Which?\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "     \u{25CC}\u{0E49}abc") != null);
+    try std.testing.expect(std.mem.find(u8, text, "     \u{25CC}\u{0E49}cd") != null);
+    try std.testing.expect(std.mem.find(u8, text, "     a\u{0E49}e") != null);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, text, "\u{25CC}"));
+
+    // A soft break at the space starts the next row with the mark, which gets
+    // its circle there.
+    const soft = try composeResolvedQuestionAnswers(std.testing.allocator, answers[2..], 10);
+    defer std.testing.allocator.free(soft);
+    try std.testing.expect(std.mem.find(u8, soft, "     aaaa") != null);
+    try std.testing.expect(std.mem.find(u8, soft, "     \u{25CC}\u{0E49}bbb") != null);
+}
+
+test "resolved answer wraps after the circle of a bare mark" {
+    var answer: std.ArrayList(u8) = .empty;
+    defer answer.deinit(std.testing.allocator);
+    try answer.appendSlice(std.testing.allocator, "\u{0E49}");
+    try answer.appendNTimes(std.testing.allocator, 'a', 40);
+    const answers = [_]types.QuestionAnswer{.{ .question = "Q?", .answer = answer.items }};
+
+    // The circle takes one of the cells after the indent, so the first row
+    // holds fewer letters than the rows after it, and no row passes the width.
+    var cols: u16 = 7;
+    while (cols <= 30) : (cols += 1) {
+        const text = try composeResolvedQuestionAnswers(std.testing.allocator, &answers, cols);
+        defer std.testing.allocator.free(text);
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+        }
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\u{25CC}"));
+        try std.testing.expectEqual(@as(usize, 40), std.mem.count(u8, text, "a"));
+    }
 }

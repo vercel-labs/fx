@@ -532,7 +532,10 @@ pub fn steering_message_layout(
         var ellipsis_end = start;
         var last_space: ?usize = null;
         while (offset < message.len and message[offset] != '\n' and message[offset] != '\r') {
-            const unit = display_width.displayUnitAt(message, offset);
+            // `cells` is the content column: a mark that starts the row has no
+            // base (the rail or the indent before the row is not one), so it
+            // takes the cell of its circle. `appendMessageLayoutRow` draws it.
+            const unit = display_width.rowUnitAt(message, offset, cells);
             const raw = message[offset .. offset + unit.byte_len];
             const unit_width = if (message[offset] == '\t')
                 1
@@ -632,6 +635,38 @@ test "steering preview layout retains prefix slices at row boundaries" {
         try std.testing.expectEqualStrings(case.second, layout.rows[1]);
         try std.testing.expectEqual(case.truncated, layout.truncated);
     }
+}
+
+test "steering preview layout counts the cell of a bare mark's circle" {
+    // A mark that starts a row has no base, so it takes the cell of its
+    // circle: four cells hold the mark and three letters.
+    const bare = steering_message_layout("\u{0E49}abcdef", 4, false, 2);
+    try std.testing.expectEqual(@as(u16, 2), bare.row_count);
+    try std.testing.expectEqualStrings("\u{0E49}abc", bare.rows[0]);
+    try std.testing.expectEqualStrings("def", bare.rows[1]);
+    try std.testing.expect(!bare.truncated);
+
+    // A mark after a soft break starts its row, and one after a newline does.
+    const soft = steering_message_layout("ab \u{0E49}cd", 2, false, 3);
+    try std.testing.expectEqual(@as(u16, 3), soft.row_count);
+    try std.testing.expectEqualStrings("ab", soft.rows[0]);
+    try std.testing.expectEqualStrings("\u{0E49}c", soft.rows[1]);
+    try std.testing.expectEqualStrings("d", soft.rows[2]);
+    const hard = steering_message_layout("ab\n\u{0E49}cde", 3, false, 3);
+    try std.testing.expectEqualStrings("ab", hard.rows[0]);
+    try std.testing.expectEqualStrings("\u{0E49}cd", hard.rows[1]);
+    try std.testing.expectEqualStrings("e", hard.rows[2]);
+
+    // A mark on a base, and the marks of a Thai cluster, take no cell.
+    const on_base = steering_message_layout("a\u{0E49}bcd", 3, false, 2);
+    try std.testing.expectEqualStrings("a\u{0E49}bc", on_base.rows[0]);
+    try std.testing.expectEqualStrings("d", on_base.rows[1]);
+
+    // A row with one cell holds the circle and the marks stacked on it.
+    const narrow = steering_message_layout("\u{0E49}\u{0E48}ab", 1, false, 3);
+    try std.testing.expectEqualStrings("\u{0E49}\u{0E48}", narrow.rows[0]);
+    try std.testing.expectEqualStrings("a", narrow.rows[1]);
+    try std.testing.expectEqualStrings("b", narrow.rows[2]);
 }
 
 pub fn transientActivityGapRows(shell: *const TranscriptRuntime, tool_before_activity: bool) u16 {

@@ -50,7 +50,10 @@
 # the passing config is not vacuous.
 #
 # DisplayWidthTrace.tla checks walks of the built fx composer against the
-# model; tests/tla/drivers/display_width/driver.ts runs it.
+# model; tests/tla/drivers/display_width/driver.ts runs it. DisplayWidthRows.tla
+# checks the rows of the other surfaces that draw text after a prefix cell
+# (a question's option labels, its resolved answer, and the steering banner)
+# against the same model; tests/tla/drivers/display_width/prefixed.ts runs it.
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 #

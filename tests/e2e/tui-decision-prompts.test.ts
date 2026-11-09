@@ -3041,6 +3041,53 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "question option label and resolved answer draw a bare mark on a dotted circle in a cell of its own",
+    async () => {
+      const label = "\u0E49abc";
+      const ctx = await launchScenario([
+        outerToolCalls([
+          {
+            id: "question_bare_label_1",
+            name: "ask_user_question",
+            input: {
+              questions: [
+                {
+                  question: QUESTION_PROMPT,
+                  options: [{ label }, { label: "Run tests" }],
+                },
+              ],
+            },
+          },
+        ]),
+        outerText("question bare label handled"),
+      ]);
+
+      await ctx.session.sendText("Ask me which path to take.");
+      await ctx.session.waitForText(QUESTION_PROMPT, TIMEOUT);
+      // The mark has no base: the space after "1)" is not one, so the mark is
+      // drawn on a circle that takes a cell of its own.
+      await waitForGridState(ctx.session, "question bare label circle", (grid) =>
+        grid.some((line) => line.trimEnd() === "    1) \u25CC\u0E49abc"),
+      );
+
+      // The answer is the label. The row it leaves in the transcript has the
+      // same circle, after a five-cell indent.
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.waitForText("question bare label handled", TIMEOUT);
+      await waitForGridState(ctx.session, "resolved bare mark circle", (grid) =>
+        grid.some((line) => line.trimEnd() === "     \u25CC\u0E49abc"),
+      );
+
+      // The circle is only drawn: the model gets the bytes of the label.
+      const body = ctx.gateway.requests[1]?.body ?? "";
+      expect(requestContainsExactString(body, label)).toBe(true);
+      expect(body.includes("\u25CC")).toBe(false);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "long question content wraps onto aligned continuation rows",
     async () => {
       const finalMarker = "long question answer handled";

@@ -374,8 +374,17 @@ pub noinline fn wrapCutIgnoringAnsi(text: []const u8, max_width: usize) []const 
     const prefix = prefixByWidthIgnoringAnsi(text, max_width);
     if (prefix.len == text.len) return prefix;
 
+    if (lastBreakSpace(prefix, 0)) |space_index| {
+        if (space_index > 0) return text[0..space_index];
+    }
+    return prefix;
+}
+
+/// The last space or tab of `prefix` at or after `from`, outside an escape
+/// sequence.
+fn lastBreakSpace(prefix: []const u8, from: usize) ?usize {
     var last_space: ?usize = null;
-    var index: usize = 0;
+    var index = from;
     while (index < prefix.len) {
         // A space inside an escape, such as an OSC 8 URL, is not a break.
         if (prefix[index] == 0x1b) {
@@ -386,10 +395,7 @@ pub noinline fn wrapCutIgnoringAnsi(text: []const u8, max_width: usize) []const 
         if (prefix[index] == ' ' or prefix[index] == '\t') last_space = index;
         index += unit.byte_len;
     }
-    if (last_space) |space_index| {
-        if (space_index > 0) return text[0..space_index];
-    }
-    return prefix;
+    return last_space;
 }
 
 pub noinline fn trimBreakWhitespace(text: []const u8) []const u8 {
@@ -488,6 +494,18 @@ pub fn rowPrefixByWidth(row: []const u8, max_width: usize) []const u8 {
     const bare = bareMarkInRow(row) orelse return prefixByWidth(row, max_width);
     if (max_width == 0) return row[0..0];
     return row[0 .. bare.end + prefixByWidth(row[bare.end..], max_width - 1).len];
+}
+
+/// `wrapCutIgnoringAnsi` of `text`, which starts a row: a bare mark with the
+/// marks stacked on it takes one cell for its circle and stays whole on the
+/// row, however narrow the row is, and a space right after it is a break.
+pub fn rowWrapCutIgnoringAnsi(text: []const u8, max_width: usize) []const u8 {
+    const bare = bareMarkInRow(text) orelse return wrapCutIgnoringAnsi(text, max_width);
+    const tail = prefixByWidthIgnoringAnsi(text[bare.end..], max_width -| 1);
+    const prefix = text[0 .. bare.end + tail.len];
+    if (prefix.len == text.len) return prefix;
+    if (lastBreakSpace(prefix, bare.end)) |space_index| return text[0..space_index];
+    return prefix;
 }
 
 /// Writes `text`, which continues a row, with `bare_mark_base` before the bare
@@ -885,6 +903,33 @@ test "rowWidth and rowPrefixByWidth count the circle of a bare mark" {
     try std.testing.expectEqualStrings("a\u{0E49}b", rowPrefixByWidth("a\u{0E49}bc", 2));
 }
 
+test "rowWrapCutIgnoringAnsi spends a cell on the circle of a bare mark" {
+    // A row with no bare mark is cut as wrapCutIgnoringAnsi cuts it.
+    try std.testing.expectEqualStrings("ab", rowWrapCutIgnoringAnsi("ab cd", 4));
+    try std.testing.expectEqualStrings("a\u{0E49}bc", rowWrapCutIgnoringAnsi("a\u{0E49}bcde", 3));
+
+    // The circle takes one of the cells: the plain cut at 5 would keep five
+    // letters, and this one keeps four.
+    try std.testing.expectEqualStrings("\u{0E49}abcd", rowWrapCutIgnoringAnsi("\u{0E49}abcdefg", 5));
+    try std.testing.expectEqualStrings("\u{0E49}abcdefg", wrapCutIgnoringAnsi("\u{0E49}abcdefg", 7));
+    try std.testing.expectEqualStrings("\u{0E49}abcdefg", rowWrapCutIgnoringAnsi("\u{0E49}abcdefg", 8));
+    try std.testing.expectEqualStrings("\u{0E49}abcdef", rowWrapCutIgnoringAnsi("\u{0E49}abcdefg", 7));
+
+    // A text that fits with its circle is kept whole, and a break at a space
+    // is taken after the word that fits, or right after the circle.
+    try std.testing.expectEqualStrings("\u{0E49}abcd", rowWrapCutIgnoringAnsi("\u{0E49}abcd", 5));
+    try std.testing.expectEqualStrings("\u{0E49}ab", rowWrapCutIgnoringAnsi("\u{0E49}ab cde", 5));
+    try std.testing.expectEqualStrings("\u{0E49}", rowWrapCutIgnoringAnsi("\u{0E49} abc", 3));
+    try std.testing.expectEqualStrings("\u{200B}\u{0E49}ab", rowWrapCutIgnoringAnsi("\u{200B}\u{0E49}abcd", 3));
+
+    // However narrow the row is, the circle keeps the mark and the marks
+    // stacked on it, and an escape sequence is never cut.
+    try std.testing.expectEqualStrings("\u{0E49}\u{0E48}", rowWrapCutIgnoringAnsi("\u{0E49}\u{0E48}ab", 1));
+    try std.testing.expectEqualStrings("\u{0E49}\u{0E48}", rowWrapCutIgnoringAnsi("\u{0E49}\u{0E48}ab", 0));
+    try std.testing.expectEqualStrings("\u{0E49}\x1b[1ma", rowWrapCutIgnoringAnsi("\u{0E49}\x1b[1mabc", 2));
+    try std.testing.expectEqualStrings("\u{0E49}\x1b]8;;a b\x07a", rowWrapCutIgnoringAnsi("\u{0E49}\x1b]8;;a b\x07abc", 2));
+}
+
 test "writeRowPart draws the circle before the mark that starts the row only" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -1194,6 +1239,20 @@ fn fuzzDisplayUnitBoundaries(_: void, smith: *std.testing.Smith) !void {
         try std.testing.expect(isDisplayUnitBoundary(text, bare.start));
         try std.testing.expect(isDisplayUnitBoundary(text, bare.end));
         try std.testing.expectEqual(@as(usize, 0), visibleWidth(text[0..bare.end]));
+    }
+
+    // The cut of a row keeps the whole head of a bare mark and fits the rest
+    // in the cells left after its circle; a row with no bare mark is cut as
+    // the plain wrap cuts it.
+    for (budgets) |budget| {
+        const cut = rowWrapCutIgnoringAnsi(text, budget);
+        try std.testing.expect(isDisplayUnitBoundary(text, cut.len));
+        if (bareMarkInRow(text)) |bare| {
+            try std.testing.expect(cut.len >= bare.end);
+            try std.testing.expect(visibleWidthIgnoringAnsi(cut[bare.end..]) <= budget -| 1);
+        } else {
+            try std.testing.expectEqualStrings(wrapCutIgnoringAnsi(text, budget), cut);
+        }
     }
 }
 
