@@ -10,8 +10,14 @@ shorter lifetime:
   Successful or failed owned results are copied to the caller's allocator before
   that arena is destroyed. Deferred usage references and failure diagnostics
   are included in the copy. Stable borrowed provider results remain borrowed.
+* Each tool call runs on its own arena, freed when the call ends. The executor
+  copies the call's result to the turn's allocator, so what a tool reads or
+  builds on the way to its result is not kept. Shell and vision build their
+  result on the turn's allocator, because the turn adopts their completion and
+  its output capture. Sanitizing and truncating a result use scratch that is
+  freed before the result is copied.
 
-Both scopes release temporary storage on success, cancellation and error. The
+Each scope releases temporary storage on success, cancellation and error. The
 step limit, history contents, request semantics and retry policy are unchanged.
 The native prepared request body already uses the resetting overlay arena.
 

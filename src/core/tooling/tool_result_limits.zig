@@ -21,7 +21,9 @@ pub fn prepareSanitizedOutput(
     alloc: Allocator,
     raw: []const u8,
 ) error{OutOfMemory}![]u8 {
-    var scratch_impl = std.heap.ArenaAllocator.init(alloc);
+    // Not on `alloc`: fx passes the turn's arena, and a scratch arena on it
+    // would free nothing until the turn ends.
+    var scratch_impl = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer scratch_impl.deinit();
     const sanitized = try text_utils.sanitizeModelText(scratch_impl.allocator(), raw);
     return alloc.dupe(u8, sanitized);
@@ -47,7 +49,8 @@ pub fn prepareModelOutputWithTruncation(
     raw: []const u8,
     max_bytes: usize,
 ) error{OutOfMemory}!PreparedModelOutput {
-    var scratch_impl = std.heap.ArenaAllocator.init(alloc);
+    // Not on `alloc`, as in prepareSanitizedOutput.
+    var scratch_impl = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer scratch_impl.deinit();
     const scratch = scratch_impl.allocator();
 
