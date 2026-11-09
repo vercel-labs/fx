@@ -152,9 +152,12 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
     TIMEOUT,
   );
 
-  /// A 60x12 shell over `gateway`, recording to a tape, for the tests of the
-  /// `/status` panel in a terminal too short for all of it.
-  async function launchShortTerminal(name: string): Promise<{ stderrPath: string; tapePath: string }> {
+  /// A shell over `gateway`, recording to a tape. 60x12 by default, for the
+  /// tests of the `/status` panel in a terminal too short for all of it.
+  async function launchGatewayTerminal(
+    name: string,
+    size: { width: number; height: number } = { width: 60, height: 12 },
+  ): Promise<{ stderrPath: string; tapePath: string }> {
     const root = mkdtempSync(join(tmpdir(), `fx-status-${name}-`));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
@@ -167,8 +170,8 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       cwd: workspace,
       stderrPath,
       isolated: true,
-      width: 60,
-      height: 12,
+      width: size.width,
+      height: size.height,
       minimumHistoryLines: 2000,
       env: {
         HOME: home,
@@ -201,7 +204,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
     "compact status panel leaves native scrollback whole",
     async () => {
       gateway = startFakeGateway([]);
-      const { stderrPath, tapePath } = await launchShortTerminal("compact");
+      const { stderrPath, tapePath } = await launchGatewayTerminal("compact");
       expect((await session!.captureFullScrollback()).split("Run /help for commands")).toHaveLength(2);
 
       // Twelve rows leave the panel room for one line at a time. It scrolls
@@ -242,7 +245,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       const held = heldFakeGatewayFinalText();
       gateway = startDynamicFakeGateway((body) =>
         body.includes("slow question") ? held.response : fakeGatewayFinalText("unexpected request"));
-      const { stderrPath } = await launchShortTerminal("answer");
+      const { stderrPath } = await launchGatewayTerminal("answer");
 
       await session!.sendText("slow question");
       await session!.waitForText("Thinking", 10_000);
@@ -260,6 +263,45 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
         expect({ row, count: scrollback.split(row).length - 1 }).toEqual({ row, count: 1 });
       }
       expect(panelLinesIn(scrollback)).toEqual([]);
+      expect(session!.paneStatus()).toEqual({ dead: false, status: null });
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  /// The row the `/` menu in `pane` lists `command` on, or -1.
+  function slashMenuRow(pane: string, command: string): number {
+    return pane.split("\n").findIndex((row) => row.startsWith(`  ${command} `));
+  }
+
+  /// Types `/re` and returns the `/` menu's rows for `/resume` and `/reset`,
+  /// then clears the composer.
+  async function slashMenuRowsForRe(): Promise<{ resume: number; reset: number }> {
+    await session!.sendLiteral("/re");
+    const pane = await session!.waitForPane((shown) =>
+      slashMenuRow(shown, "/resume") >= 0 && slashMenuRow(shown, "/reset") >= 0, 5_000);
+    await session!.sendKeys("Escape");
+    await session!.sendKeys("C-u");
+    await session!.waitForPane((shown) => slashMenuRow(shown, "/reset") < 0, 5_000);
+    return { resume: slashMenuRow(pane, "/resume"), reset: slashMenuRow(pane, "/reset") };
+  }
+
+  test(
+    "/re offers /resume ahead of /reset until the session has a turn",
+    async () => {
+      gateway = startDynamicFakeGateway((body) =>
+        fakeGatewayFinalText(body.includes("first question") ? "FIRST_ANSWER" : "unexpected request"));
+      const { stderrPath } = await launchGatewayTerminal("resume-rank", { width: 100, height: 30 });
+
+      const fresh = await slashMenuRowsForRe();
+      expect(fresh.resume).toBeLessThan(fresh.reset);
+
+      await session!.sendText("first question");
+      await session!.waitForText("FIRST_ANSWER", 10_000);
+      await session!.waitForComposer(5_000);
+
+      const busy = await slashMenuRowsForRe();
+      expect(busy.reset).toBeLessThan(busy.resume);
       expect(session!.paneStatus()).toEqual({ dead: false, status: null });
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },

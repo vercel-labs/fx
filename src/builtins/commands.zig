@@ -732,6 +732,37 @@ pub const slash_specs = [_]SlashSpec{
 
 pub const slash_registry = SlashRegistry{ .commands = slash_specs[0..] };
 
+/// `slash_specs` with `/resume` ahead of `/reset`. A session with nothing in
+/// it has no context to reset, so `/re` offers a saved session first.
+const empty_session_slash_specs = specs: {
+    var specs = slash_specs;
+    var reset_index: ?usize = null;
+    var resume_index: ?usize = null;
+    for (specs, 0..) |spec, index| switch (spec.kind) {
+        .reset_session => reset_index = index,
+        .resume_session => resume_index = index,
+        else => {},
+    };
+    const reset = reset_index.?;
+    const resume_at = resume_index.?;
+    if (resume_at > reset) {
+        const resume_spec = specs[resume_at];
+        var index = resume_at;
+        while (index > reset) : (index -= 1) specs[index] = specs[index - 1];
+        specs[reset] = resume_spec;
+    }
+    break :specs specs;
+};
+
+/// The slash commands for a session with nothing in it yet: the same
+/// commands as `slash_registry`, with `/resume` ranked ahead of `/reset`.
+pub const empty_session_slash_registry = SlashRegistry{ .commands = empty_session_slash_specs[0..] };
+
+/// The slash commands to offer, by whether the session on screen is empty.
+pub fn slashRegistryFor(empty_session: bool) SlashRegistry {
+    return if (empty_session) empty_session_slash_registry else slash_registry;
+}
+
 pub fn matchesSlashExact(cmd: []const u8, kind: SlashKind) bool {
     return command_specs.matchesSlashExact(slash_registry, cmd, kind);
 }
@@ -798,6 +829,26 @@ test "fx config help names settings by their current keys" {
         }
     }
     try std.testing.expect(checked > 0);
+}
+
+test "an empty session ranks /resume ahead of /reset" {
+    const empty = slashRegistryFor(true);
+    const busy = slashRegistryFor(false);
+    for ([_][]const u8{ "/re", "/res" }) |prefix| {
+        try std.testing.expectEqualStrings("/resume", command_specs.nthSlashCompletion(empty, prefix, 0).?);
+        try std.testing.expectEqualStrings("/reset", command_specs.nthSlashCompletion(empty, prefix, 1).?);
+        try std.testing.expectEqualStrings("/reset", command_specs.nthSlashCompletion(busy, prefix, 0).?);
+        try std.testing.expectEqualStrings("/resume", command_specs.nthSlashCompletion(busy, prefix, 1).?);
+    }
+    try std.testing.expectEqualStrings("/resume", command_specs.firstSlashCompletion(empty, "/res").?);
+
+    // Only the two commands trade places.
+    try std.testing.expectEqual(slash_specs.len, empty.commands.len);
+    for (slash_specs, empty.commands) |spec, empty_spec| switch (spec.kind) {
+        .reset_session => try std.testing.expectEqual(SlashKind.resume_session, empty_spec.kind),
+        .resume_session => try std.testing.expectEqual(SlashKind.reset_session, empty_spec.kind),
+        else => try std.testing.expectEqual(spec.kind, empty_spec.kind),
+    };
 }
 
 test "built-in slash commands register exact active order" {
