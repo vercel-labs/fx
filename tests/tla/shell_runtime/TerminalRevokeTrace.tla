@@ -12,8 +12,10 @@
 (*            "RevokeStopped" (revoke(2) while fx is stopped or held in a  *)
 (*            request, so after a poll, never in one), "Hangup" (it        *)
 (*            closed the terminal's other side), "Suspend" (Ctrl+Z), "Bg"  *)
-(*            and "Fg" (the shell's job commands), or "Background" (reads  *)
-(*            start failing with EIO on a terminal that is still there)    *)
+(*            and "Fg" (the shell's job commands), "Background" (reads     *)
+(*            start failing with EIO on a terminal that is still there),   *)
+(*            or "Complete" (the sign-in of fx mcp login finished: the     *)
+(*            server redeemed the code and the login was saved)            *)
 (*   end      how fx ended up: "exited" (status 0), "failed" (status 1     *)
 (*            with an fx error on stderr), "crashed" (an abort),           *)
 (*            "spinning" (still running and burning CPU), "waiting" (still *)
@@ -33,12 +35,12 @@
 (*            "mcp_login" (the paste wait of fx mcp login --no-browser)    *)
 (*                                                                         *)
 (* fx's own steps (Poll, Drain, PromptReturns, PromptRead, SignInWait,     *)
-(* McpLoginWait, SignInEnds, Restore) run freely between the driver's      *)
-(* events; a read of typed input asks fx to quit exactly when the driver   *)
-(* typed /quit. The run index k advances only when the model has used all  *)
-(* of a run's events and ended in exactly the observed way. The trace is   *)
-(* ACCEPTED when TLC violates NotAllMatched, which is reachable only after *)
-(* every run matched. A completed search means REJECTED.                   *)
+(* McpLoginWait, McpLoginSees, SignInEnds, Restore) run freely between the *)
+(* driver's events; a read of typed input asks fx to quit exactly when the *)
+(* driver typed /quit. The run index k advances only when the model has    *)
+(* used all of a run's events and ended in exactly the observed way. The   *)
+(* trace is ACCEPTED when TLC violates NotAllMatched, which is reachable   *)
+(* only after every run matched. A completed search means REJECTED.        *)
 (***************************************************************************)
 EXTENDS TerminalRevoke, TerminalRevokeObserved
 
@@ -71,6 +73,7 @@ Reset(o) ==
     /\ stops' = o.stops
     /\ site' = o.site
     /\ eof' = FALSE
+    /\ signed' = FALSE
 
 \* The driver's next event.
 DriverStep ==
@@ -85,6 +88,7 @@ DriverStep ==
          [] Events[j] = "Bg" -> Bg /\ UNCHANGED typed
          [] Events[j] = "Fg" -> Fg /\ UNCHANGED typed
          [] Events[j] = "Background" -> Background /\ UNCHANGED typed
+         [] Events[j] = "Complete" -> McpSignInCompletes /\ UNCHANGED typed
     /\ j' = j + 1
     /\ UNCHANGED k
 
@@ -98,6 +102,7 @@ FxStep ==
        \/ PromptRead
        \/ SignInWait
        \/ McpLoginWait
+       \/ McpLoginSees
        \/ SignInEnds
        \/ Restore
     /\ UNCHANGED <<k, j, typed>>
@@ -113,7 +118,7 @@ RestoreSeen(r) ==
 Matches(o) ==
     /\ j > Len(o.events)
     /\ CASE o.end = "exited"   -> /\ phase = "exited"
-                                  /\ cause \in {"requested", "input_closed"}
+                                  /\ cause \in {"requested", "input_closed", "sign_in_ended"}
                                   /\ restore \in RestoreSeen(o.restore)
          [] o.end = "failed"   -> /\ phase = "exited"
                                   /\ cause \in {"write_failed", "read_failed", "prompt_failed", "login_stopped"}

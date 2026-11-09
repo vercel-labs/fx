@@ -69,6 +69,26 @@
 //                         between its polls (no spin)
 //   mcp-login-hangup      close the other side: POLLHUP and a read of 0, the
 //                         same wait
+//   mcp-login-complete-revoke-eio
+//                         the browser's callback finishes the sign-in, and the
+//                         driver revokes the terminal as soon as the login is
+//                         saved, so the revoke lands in the same 100 ms slice
+//                         as the sign-in, with the macOS 15 answer. The sign-in
+//                         finished, so fx must report it as done: status 0,
+//                         the server signed in after one token exchange. A
+//                         handler of the failed read that did not look again
+//                         said "the terminal is gone" with status 1
+//                         (FinishedSignInNeverFails). It runs three times, as
+//                         the revoke misses the slice when the login finishes
+//                         at its very end.
+//
+// --race N adds N more of that run, after the normal ones, with the callback
+// and the revoke at random offsets of 0 to 300 ms in either order. Each is
+// judged on its own, not replayed through TLC (the order of its events is not
+// known): fx ends with status 0, the server signed in after one token
+// exchange, and nothing on stderr; or with status 1, the terminal-gone line,
+// and nothing saved. Anything else is a wrong exit, the first being a server
+// that is signed in after fx said it was not.
 //
 // Two more runs start fx from an interactive bash in tmux and take it through
 // Ctrl+Z, bg, fg, and /quit: job-control with SIGTTIN and SIGTTOU at their
@@ -94,7 +114,11 @@
 // "sign_in_spins") and through the model of a fix that misses POLLNVAL alone
 // (Bug = "sign_in_nval"), and the fx mcp login run that ended through the
 // model of fx before the paste wait's fix (Bug = "mcp_login_spins") and
-// through the model of a fix that only sleeps (Bug = "mcp_login_sleeps").
+// through the model of a fix that only sleeps (Bug = "mcp_login_sleeps"). A
+// recorded outcome of fx before the sign-in re-check (the sign-in finished,
+// and fx reported it as failed) must be rejected by the design and accepted by
+// the model of that fx (Bug = "mcp_login_done_ignored"); the driver writes it
+// down by hand, because the fixed fx never produces it.
 //
 // revoke(2) exists only on macOS here, so the driver runs only there.
 //
@@ -103,6 +127,7 @@
 //   bun tests/tla/drivers/shell_runtime/driver.ts --self-check
 //   bun tests/tla/drivers/shell_runtime/driver.ts --random 20 --seed 7
 //   bun tests/tla/drivers/shell_runtime/driver.ts --scenario team-picker-revoke
+//   bun tests/tla/drivers/shell_runtime/driver.ts --scenario mcp-login-complete-revoke-eio --race 250
 //
 // Exit codes: 0 every run accepted (and the self-check rejected), 1 a run the
 // model cannot produce, 2 a toolchain, build, or harness failure.
@@ -111,9 +136,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { binary, targetHelpers, targetModule, worktree } from "../lib/context";
 import { TLA_ROOT, outDir, runTlc, writeJson } from "../lib/tlc";
-import { fixture, redemptions, startFake, writeProfile } from "../mcp_host/driver";
+import { fixture, redemptions, runFx, startFake, storePath, waitFor, writeProfile } from "../mcp_host/driver";
 
-type Event = "Type" | "Quit" | "Revoke" | "RevokeStopped" | "Hangup" | "Suspend" | "Bg" | "Fg" | "Background";
+type Event = "Type" | "Quit" | "Revoke" | "RevokeStopped" | "Hangup" | "Suspend" | "Bg" | "Fg" | "Background" | "Complete";
 type End = "exited" | "failed" | "crashed" | "spinning" | "waiting" | "other";
 type Restore = "restored" | "quiet" | "clean" | "error" | "lost" | "none";
 type Site = "shell" | "team_picker" | "sign_in" | "mcp_login";
@@ -136,6 +161,7 @@ type Scenario =
   | "mcp-login-revoke-eio"
   | "mcp-login-revoke"
   | "mcp-login-hangup"
+  | "mcp-login-complete-revoke-eio"
   | "job-control"
   | "job-control-signals-ignored";
 type Observation = {
@@ -161,6 +187,8 @@ type Observation = {
   };
 };
 type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
+// What TLC replays of a run.
+type Replayed = Pick<Observation, "events" | "end" | "restore" | "eio" | "stops" | "site">;
 
 const SCENARIOS: Scenario[] = [
   "quit",
@@ -181,6 +209,7 @@ const SCENARIOS: Scenario[] = [
   "mcp-login-revoke-eio",
   "mcp-login-revoke",
   "mcp-login-hangup",
+  ...Array<Scenario>(3).fill("mcp-login-complete-revoke-eio"),
   "job-control",
   "job-control-signals-ignored",
 ];
@@ -198,6 +227,7 @@ const EIO_MODE: Partial<Record<Scenario, "revoked" | "live">> = {
   "live-eio": "live",
   "team-picker-revoke-eio": "revoked",
   "mcp-login-revoke-eio": "revoked",
+  "mcp-login-complete-revoke-eio": "revoked",
 };
 // The team picker's run must end this fast, and not burn CPU while it waits.
 const PICKER_EXIT_WAIT_MS = 2_000;
@@ -209,6 +239,7 @@ const MCP_LOGIN_STOPPED = /^Couldn't sign in to web: the terminal is gone\.$/m;
 // How long fx has to exit after its terminal goes away, and how long a run that
 // is still going is watched for CPU use before it counts as spinning.
 const EXIT_WAIT_MS = 3_000;
+const RACE_EXIT_WAIT_MS = 6_000;
 const SPIN_WINDOW_MS = 1_000;
 const SPIN_CPU_SECONDS = 0.5;
 // A wait that sleeps its 100 ms slice polls ten times a second; one that spins
@@ -236,6 +267,7 @@ const options = {
   scenario: scenarioOption(),
   random: option("--random", 6),
   seed: option("--seed", 1),
+  race: option("--race", 0),
 };
 
 // mulberry32: a small seeded generator, so a failing random run replays.
@@ -774,6 +806,33 @@ async function runSignIn(
 // for a revoked terminal and for a hung-up one, and the wait goes on asleep
 // between its polls, waiting for the browser. A fake open first on PATH means
 // no browser starts.
+//
+// `mcp-login-complete-revoke-eio` also plays the browser: it approves at the
+// fake server and delivers the callback to fx's listener, so the sign-in
+// finishes. Without `race` the driver revokes the terminal as soon as the
+// login is saved. With it, the callback and the revoke follow each other at the
+// offsets `race` gives.
+type Race = { revokeFirst: boolean; offsetMs: number };
+
+// The address of the sign-in as the browser would take it: the fake server's
+// authorize endpoint answers with the redirect to fx's listener.
+async function callbackUrl(session: any): Promise<string> {
+  const address = (session.output().match(/https?:\/\/[^\s]*\/authorize\?[^\s]*/) ?? [])[0];
+  if (!address) throw new Error(`fx mcp login showed no authorize address: ${JSON.stringify(session.output().slice(0, 300))}`);
+  const approved = await fetch(address, { redirect: "manual" });
+  const back = approved.headers.get("location");
+  if (!back) throw new Error(`the fake server's authorize answered ${approved.status} with no redirect`);
+  return back;
+}
+
+// The browser arriving at fx's listener. A refused connection, because fx is
+// gone, is an answer too.
+async function deliver(url: string): Promise<void> {
+  try {
+    await (await fetch(url)).text();
+  } catch {}
+}
+
 async function runMcpLogin(
   helpers: any,
   pty: any,
@@ -782,8 +841,10 @@ async function runMcpLogin(
   scenario: Scenario,
   scratch: string,
   out: string,
+  race: Race | null = null,
 ): Promise<Observation> {
-  const emulateEio = scenario === "mcp-login-revoke-eio";
+  const emulateEio = scenario === "mcp-login-revoke-eio" || scenario === "mcp-login-complete-revoke-eio";
+  const completes = scenario === "mcp-login-complete-revoke-eio";
   const f = fixture(scratch, id);
   for (const dir of ["pty", "bin"]) mkdirSync(join(f.base, dir));
   writeFileSync(join(f.base, "bin", "open"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
@@ -792,15 +853,18 @@ async function runMcpLogin(
   const fake = await startFake(f);
   writeProfile(f, { web: { type: "http", url: fake.url } });
   const eioRecord = join(f.base, "stdin-eio.record");
+  const env = {
+    ...fxEnv(helpers, gateway, f.base),
+    FX_HOME: join(f.home, ".fx"),
+    PATH: `${join(f.base, "bin")}:/usr/bin:/bin`,
+  };
   const session = await pty.PtySession.launch({
     bin: binary,
     args: ["mcp", "login", "--no-browser", "web"],
     cwd: f.workspace,
     dir: join(f.base, "pty"),
     env: {
-      ...fxEnv(helpers, gateway, f.base),
-      FX_HOME: join(f.home, ".fx"),
-      PATH: `${join(f.base, "bin")}:/usr/bin:/bin`,
+      ...env,
       ...(emulateEio
         ? {
             DYLD_INSERT_LIBRARIES: stdinEioLibrary(out),
@@ -816,10 +880,42 @@ async function runMcpLogin(
     }
     // The wait is polling stdin for a pasted address.
     await session.waitForQuietOutput(300, 15_000);
-    if (scenario === "mcp-login-hangup") session.hangUp();
-    else session.revoke();
-    const started = performance.now();
-    const exit = await session.waitForExit(EXIT_WAIT_MS);
+    const events: Event[] = [];
+    let started: number;
+    if (!completes) {
+      events.push(scenario === "mcp-login-hangup" ? "Hangup" : "Revoke");
+      if (scenario === "mcp-login-hangup") session.hangUp();
+      else session.revoke();
+      started = performance.now();
+    } else if (race?.revokeFirst) {
+      const back = await callbackUrl(session);
+      session.revoke();
+      started = performance.now();
+      await Bun.sleep(race.offsetMs);
+      await deliver(back);
+    } else if (race) {
+      const back = await callbackUrl(session);
+      const delivered = deliver(back);
+      await Bun.sleep(race.offsetMs);
+      session.revoke();
+      started = performance.now();
+      await delivered;
+    } else {
+      // As soon as the login is saved the sign-in is finished, and the revoke
+      // lands in the slice that the callback fell into, unless fx has already
+      // ended it, which the model replays without the revoke.
+      const back = await callbackUrl(session);
+      const delivered = deliver(back);
+      await waitFor("the login to be saved", () => existsSync(storePath(f)), 15_000, 1);
+      events.push("Complete");
+      if (session.exited() === null) {
+        events.push("Revoke");
+        session.revoke();
+      }
+      started = performance.now();
+      await delivered;
+    }
+    const exit = await session.waitForExit(race ? RACE_EXIT_WAIT_MS : EXIT_WAIT_MS);
     const exitedAfter = exit ? Math.round(performance.now() - started) : null;
     const stderr = session.stderr();
     let end: End;
@@ -844,13 +940,23 @@ async function runMcpLogin(
     }
     const interposer = readLines(eioRecord);
     if (emulateEio && !interposer.some((line) => line.startsWith("read-eio"))) {
-      throw new Error(`${id}: stdin-eio.c never failed a read, so the run did not reach the EIO path`);
+      // A run that ended by the sign-in before the revoke reached fx never
+      // fails a read.
+      if (!(completes && end === "exited")) {
+        throw new Error(`${id}: stdin-eio.c never failed a read, so the run did not reach the EIO path`);
+      }
+    }
+    const issuer = [`token_exchanges=${redemptions(fake.entries()).length}`];
+    if (completes) {
+      // What the server says now, through the same fx and profile.
+      const listed = await runFx(binary, f, ["mcp", "list", "--json"], env);
+      issuer.push(`status=${(JSON.parse(listed.stdout).servers?.[0]?.status as string | undefined) ?? "unknown"}`);
     }
     return {
       id,
       scenario,
       delay_ms: 0,
-      events: [scenario === "mcp-login-hangup" ? "Hangup" : "Revoke"],
+      events,
       end,
       restore,
       eio: emulateEio,
@@ -865,7 +971,7 @@ async function runMcpLogin(
           models: gateway.modelRequests.length - modelsBefore,
           chat: gateway.requests.length - chatBefore,
         },
-        issuer: [`token_exchanges=${redemptions(fake.entries()).length}`],
+        issuer,
         interposer: [...new Set(interposer)],
         job_states: [],
         trace_errors: [],
@@ -993,11 +1099,31 @@ async function runJobControl(
   }
 }
 
+const MCP_LOGIN_GONE_LINE = "Couldn't sign in to web: the terminal is gone.\n";
+
+// What a run of mcp-login-complete-revoke-eio may end with: status 0 with the
+// server signed in after one token exchange and nothing on stderr, or status 1
+// with the terminal-gone line and nothing saved. A server that is signed in
+// after fx said it was not is the wrong exit that FinishedSignInNeverFails rules out.
+function wrongExit(o: Observation): string | null {
+  const [exchanges, state] = o.evidence.issuer;
+  const status = state?.replace(/^status=/, "");
+  const stderr = o.evidence.stderr;
+  const seen = `${exchanges} status=${status} stderr=${JSON.stringify(stderr)}`;
+  if (o.end === "exited") {
+    return exchanges === "token_exchanges=1" && status === "signed_in" && stderr === "" ? null : `exit 0 with ${seen}`;
+  }
+  if (o.end === "failed") {
+    return status !== "signed_in" && stderr === MCP_LOGIN_GONE_LINE ? null : `exit 1 with ${seen}`;
+  }
+  return `${o.end} with ${seen}`;
+}
+
 function tlaString(value: string): string {
   return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
 }
 
-function observedModule(observations: Observation[]): string {
+function observedModule(observations: Replayed[]): string {
   const records = observations.map((o) =>
     `    [events |-> <<${o.events.map(tlaString).join(", ")}>>, end |-> ${tlaString(o.end)}, ` +
       `restore |-> ${tlaString(o.restore)}, eio |-> ${o.eio ? "TRUE" : "FALSE"}, stops |-> ${o.stops ? "TRUE" : "FALSE"}, ` +
@@ -1014,7 +1140,7 @@ function observedModule(observations: Observation[]): string {
   ].join("\n");
 }
 
-async function check(dir: string, observations: Observation[], bug: string): Promise<{ verdict: Verdict; states: number | null }> {
+async function check(dir: string, observations: Replayed[], bug: string): Promise<{ verdict: Verdict; states: number | null }> {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "TerminalRevokeObserved.tla"), observedModule(observations));
   writeFileSync(
@@ -1062,6 +1188,7 @@ async function main(): Promise<number> {
     });
   }
   const observations: Observation[] = [];
+  const wrongExits: string[] = [];
   try {
     for (const [index, run] of runs.entries()) {
       const id = `run${index + 1}`;
@@ -1092,24 +1219,50 @@ async function main(): Promise<number> {
         console.error(`${observation.id}: expected the fake gateway to count ${expectedModels} models request and no chat request`);
         return 2;
       }
-      if (observation.site === "mcp_login" && issuer.join(",") !== "token_exchanges=0") {
-        console.error(`${observation.id}: expected the fake OAuth server to redeem no code, saw ${issuer.join(",") || "none"}`);
+      const completes = observation.scenario === "mcp-login-complete-revoke-eio";
+      if (observation.site === "mcp_login" && issuer[0] !== `token_exchanges=${completes ? 1 : 0}`) {
+        console.error(`${observation.id}: expected the fake OAuth server to redeem ${completes ? "one code" : "no code"}, saw ${issuer.join(",") || "none"}`);
         return 2;
       }
+      const wrong = completes ? wrongExit(observation) : null;
+      if (wrong) wrongExits.push(`${observation.id} ${wrong}`);
       if (observation.site === "team_picker" && issuer.join(",") !== "GET /v2/teams") {
         console.error(`${observation.id}: expected the fake issuer to count one teams request, saw ${issuer.join(",") || "none"}`);
         return 2;
       }
     }
+    // The race: the callback and the revoke at random offsets, in either order.
+    const tally: Record<string, number> = {};
+    for (let i = 0; i < options.race; i++) {
+      const revokeFirst = next() < 0.35;
+      const race: Race = { revokeFirst, offsetMs: Math.floor(next() * (revokeFirst ? 31 : 301)) };
+      const attempt = await runMcpLogin(helpers, pty, gateway, `race${i + 1}`, "mcp-login-complete-revoke-eio", scratch, out, race);
+      const [exchanges, state] = attempt.evidence.issuer;
+      const key = `${attempt.end} ${state} ${exchanges}`;
+      tally[key] = (tally[key] ?? 0) + 1;
+      const { models, chat } = attempt.evidence.gateway;
+      if (models !== 0 || chat !== 0) {
+        console.error(`${attempt.id}: expected the fake gateway to count no request, saw ${models} models and ${chat} chat`);
+        return 2;
+      }
+      const wrong = wrongExit(attempt);
+      if (wrong) {
+        wrongExits.push(`${attempt.id} (${revokeFirst ? "revoke first" : "callback first"}, offset ${race.offsetMs} ms) ${wrong}`);
+      }
+    }
+    if (options.race > 0) console.log(`race: ${options.race} attempts ${JSON.stringify(tally)}`);
   } finally {
     gateway.stop();
     rmSync(scratch, { recursive: true, force: true });
   }
   writeJson(join(out, "observations.json"), observations);
+  for (const wrong of wrongExits) console.error(`WRONG EXIT ${wrong}`);
+  if (options.race > 0) console.log(`race: ${wrongExits.length} wrong exits`);
 
   const design = await check(join(out, "design"), observations, "none");
   console.log(`TLC TerminalRevokeTrace Bug=none: ${design.verdict} (${design.states} distinct states)`);
   let status = design.verdict === "ACCEPTED" ? 0 : design.verdict === "REJECTED" ? 1 : 2;
+  if (wrongExits.length > 0 && status === 0) status = 1;
   if (options.selfCheck) {
     const today = await check(join(out, "today"), observations, "today");
     console.log(`TLC TerminalRevokeTrace Bug=today: ${today.verdict} (must be REJECTED)`);
@@ -1149,6 +1302,24 @@ async function main(): Promise<number> {
       console.log(`TLC TerminalRevokeTrace Bug=${bug} (fx mcp login run that ended only): ${replay.verdict} (must be REJECTED)`);
       if (replay.verdict === "TOOL_ERROR") status = 2;
       else if (replay.verdict !== "REJECTED" && status === 0) status = 1;
+    }
+    // The sign-in that finished while the terminal went. The fixed fx never
+    // reports it as failed, so the outcome of fx before the re-check is written
+    // down here: the design must reject it, and the model of that fx, where
+    // the handler of the failed read does not look again, must accept it.
+    const beforeRecheck: Replayed = {
+      events: ["Complete", "Revoke"],
+      end: "failed",
+      restore: "quiet",
+      eio: true,
+      stops: true,
+      site: "mcp_login",
+    };
+    for (const [name, bug, wanted] of [["recheck-design", "none", "REJECTED"], ["recheck-head", "mcp_login_done_ignored", "ACCEPTED"]] as const) {
+      const replay = await check(join(out, name), [beforeRecheck], bug);
+      console.log(`TLC TerminalRevokeTrace Bug=${bug} (a sign-in that finished, reported as failed): ${replay.verdict} (must be ${wanted})`);
+      if (replay.verdict === "TOOL_ERROR") status = 2;
+      else if (replay.verdict !== wanted && status === 0) status = 1;
     }
   }
   console.log(`output: ${out}`);

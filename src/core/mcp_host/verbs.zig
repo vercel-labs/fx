@@ -1105,7 +1105,21 @@ fn beginLogin(c: Context, arena: Allocator, host: *Host, server: @import("config
     return null;
 }
 
+/// How long one pass of the paste wait polls stdin, and how long a pass that
+/// found nothing to wait on sleeps instead. The slice bounds how often the
+/// wait looks at `Waiter.done` again.
+const paste_slice_ms: i32 = 100;
+const paste_slice_ns: u64 = @as(u64, paste_slice_ms) * std.time.ns_per_ms;
+
 fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open: bool) !u8 {
+    var stdin: PasteStdin = .{};
+    return waitForLoginFrom(c, arena, host, waiter, open, &stdin);
+}
+
+/// `waitForLogin` on any stdin source with the four methods of `PasteStdin`,
+/// so the tests script it. `host` is a `*Host`, or anything whose
+/// `runtime.finishLogin(name, address)` completes a login.
+fn waitForLoginFrom(c: Context, arena: Allocator, host: anytype, waiter: *Waiter, open: bool, source: anytype) !u8 {
     const io = io_mod.getIo();
     const name = waiter.name;
     var line: std.ArrayList(u8) = .empty;
@@ -1146,11 +1160,16 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
             return 1;
         }
         if (!open and waiter.shown) {
-            const pasted = readPasted(arena, &line) catch |err| switch (err) {
-                // Nothing more can be pasted. The login ends here and saves
+            const pasted = readPastedFrom(source, arena, &line) catch |err| switch (err) {
+                // Nothing more can be pasted. The login may have finished
+                // while the read ran: then it is done, and the top of the
+                // loop says how it ended
+                // (`tests/tla/shell_runtime/TerminalRevoke.tla`
+                // FinishedSignInNeverFails). Otherwise it ends here and saves
                 // nothing. stderr may be the terminal that went, so the
                 // message is best effort.
                 error.TerminalGone => {
+                    if (loginEnded(waiter)) continue;
                     c.err.print("Couldn't sign in to {s}: the terminal is gone.\n", .{try safe(arena, name)}) catch {};
                     return 1;
                 },
@@ -1163,12 +1182,20 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
                 };
                 continue;
             }
-        } else io_mod.sleep(100 * std.time.ns_per_ms);
+        } else source.sleep(paste_slice_ns);
     }
 }
 
-/// stdin as the paste wait uses it. The tests hand `readPastedFrom` another
-/// source with the same four methods.
+/// Whether the login thread has reported how the sign-in ended.
+fn loginEnded(waiter: *Waiter) bool {
+    const io = io_mod.getIo();
+    waiter.mutex.lockUncancelable(io);
+    defer waiter.mutex.unlock(io);
+    return waiter.done != null;
+}
+
+/// stdin as the paste wait uses it. The tests hand `waitForLoginFrom` and
+/// `readPastedFrom` another source with the same four methods.
 const PasteStdin = struct {
     fd: std.posix.fd_t = std.posix.STDIN_FILENO,
 
@@ -1190,15 +1217,10 @@ const PasteStdin = struct {
     }
 };
 
-/// A complete line from stdin, waiting at most 100 ms for one. Fails with
-/// `error.TerminalGone` when a read failed on a terminal that is gone.
-fn readPasted(arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
-    var stdin: PasteStdin = .{};
-    return readPastedFrom(&stdin, arena, line);
-}
-
-/// One pass of the paste wait: every pass ends the wait, takes input, or takes
-/// its 100 ms, so the loop never goes round again with no time passing
+/// One pass of the paste wait, waiting at most one slice for a complete line.
+/// Fails with `error.TerminalGone` when a read failed on a terminal that is
+/// gone. Every pass ends the wait, takes input, or takes its slice, so the
+/// loop never goes round again with no time passing
 /// (`tests/tla/shell_runtime/TerminalRevoke.tla` NoBusyLoop). A failed read is
 /// the end of input only on a terminal that is gone, which macOS 15 polls as
 /// readable for a revoked one and fails every read on with EIO
@@ -1206,19 +1228,19 @@ fn readPasted(arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
 /// read that SIGTTIN did not stop, or a read that would block, the wait sleeps
 /// its slice as it does for a read of 0.
 fn readPastedFrom(source: anytype, arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
-    if (try source.poll(100) == 0) return null;
+    if (try source.poll(paste_slice_ms) == 0) return null;
     var buffer: [1024]u8 = undefined;
     const n = source.read(&buffer) catch |err| {
         if (err != error.WouldBlock and source.gone()) {
             debug_trace.logf("mcp", "login paste wait: stdin is gone (read failed err={s}); ending the login", .{@errorName(err)});
             return error.TerminalGone;
         }
-        source.sleep(100 * std.time.ns_per_ms);
+        source.sleep(paste_slice_ns);
         return null;
     };
     if (n == 0) {
         // stdin closed: wait for the browser instead.
-        source.sleep(100 * std.time.ns_per_ms);
+        source.sleep(paste_slice_ns);
         return null;
     }
     try line.appendSlice(arena, buffer[0..n]);
@@ -1397,14 +1419,16 @@ test "status words follow commands.md, held states first" {
     try testing.expectEqualStrings("waiting for approval", try statusText(a, s));
 }
 
+/// Hosts for a verb that never reaches one.
+const NoHosts = struct {
+    fn get(_: *anyopaque, _: ?runtime_mod.Notify) anyerror!?*Host {
+        return null;
+    }
+    fn release(_: *anyopaque, _: *Host) void {}
+    fn changed(_: *anyopaque) void {}
+};
+
 test "every verb that uses ~/.fx needs an absolute home" {
-    const NoHosts = struct {
-        fn get(_: *anyopaque, _: ?runtime_mod.Notify) anyerror!?*Host {
-            return null;
-        }
-        fn release(_: *anyopaque, _: *Host) void {}
-        fn changed(_: *anyopaque) void {}
-    };
     var unused: u8 = 0;
     for ([_][]const u8{ "", "relative/home" }) |home| {
         var out: Writer.Allocating = .init(testing.allocator);
@@ -1485,8 +1509,6 @@ test "an MCP file fx can't read gets fx's words, and only mcp.json's own errors 
 // that neither takes its slice, nor takes input, nor ends the wait would send
 // the loop round again with no time passing: NoBusyLoop.
 
-const paste_slice_ns: u64 = 100 * std.time.ns_per_ms;
-
 /// stdin as a script for the paste wait: what poll says, what each read
 /// gives, and whether the terminal is gone. It records the time the wait
 /// spent asleep and how often the wait asked whether the terminal was gone,
@@ -1498,6 +1520,8 @@ const ScriptedStdin = struct {
     terminal_gone: bool = false,
     slept_ns: u64 = 0,
     gone_asked: usize = 0,
+    /// What the login thread reports to `waiter` while the first read runs.
+    during_read: struct { waiter: ?*Waiter = null, notices: []const runtime_mod.Notice = &.{} } = .{},
 
     const Read = union(enum) { bytes: []const u8, fail: anyerror };
 
@@ -1506,6 +1530,9 @@ const ScriptedStdin = struct {
     }
 
     fn read(self: *ScriptedStdin, buffer: []u8) !usize {
+        if (self.next == 0) if (self.during_read.waiter) |waiter| {
+            for (self.during_read.notices) |notice| Waiter.onNotice(waiter, notice);
+        };
         const answer = self.reads[self.next];
         self.next += 1;
         switch (answer) {
@@ -1642,6 +1669,162 @@ test "mcp login paste wait: a pasted address comes back whole or in pieces, and 
     try testing.expectEqualStrings("http://127.0.0.1:9/cb?code=1", pasted);
     try testing.expectEqualStrings("next", paste.line.items);
     try testing.expectEqual(@as(u64, 0), source.slept_ns);
+}
+
+/// What `waitForLoginFrom` asks of a host: nothing, because these tests paste
+/// no address.
+const PastedHost = struct {
+    runtime: Runtime = .{},
+
+    const Runtime = struct {
+        fn finishLogin(_: *Runtime, _: []const u8, _: []const u8) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+    };
+};
+
+const login_address = "https://example.test/authorize";
+
+/// A login whose address is on the screen and whose wait for a pasted address
+/// is about to start: the login thread has reported `authorize`.
+fn showingLogin(name: []const u8) Waiter {
+    var waiter: Waiter = .{ .gpa = testing.allocator, .name = name };
+    Waiter.onNotice(&waiter, .{ .authorize = .{ .server = name, .url = login_address } });
+    return waiter;
+}
+
+/// `waitForLoginFrom` on the CLI with a scripted stdin and its output kept.
+fn waitForLoginOn(waiter: *Waiter, source: anytype, out: *Writer.Allocating, err: *Writer.Allocating) !u8 {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var unused: u8 = 0;
+    const c: Context = .{
+        .gpa = testing.allocator,
+        .out = &out.writer,
+        .err = &err.writer,
+        .surface = .cli,
+        .home = "/Users/example",
+        .workspace_root = "/Users/example/project",
+        .hosts = .{ .context = &unused, .get = NoHosts.get, .release = NoHosts.release, .changed = NoHosts.changed },
+    };
+    var host: PastedHost = .{};
+    return waitForLoginFrom(c, arena_state.allocator(), &host, waiter, false, source);
+}
+
+const gone_line = "Couldn't sign in to fixture: the terminal is gone.\n";
+
+test "mcp login paste wait: a sign-in that finishes in the slice of the failed read is done, not gone" {
+    var waiter = showingLogin("fixture");
+    defer waiter.deinit();
+    var source: ScriptedStdin = .{
+        .reads = &.{.{ .fail = error.InputOutput }},
+        .terminal_gone = true,
+        .during_read = .{ .waiter = &waiter, .notices = &.{.{ .signed_in = "fixture" }} },
+    };
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var err: Writer.Allocating = .init(testing.allocator);
+    defer err.deinit();
+
+    try testing.expectEqual(@as(u8, 0), try waitForLoginOn(&waiter, &source, &out, &err));
+    try testing.expectEqualStrings("", err.written());
+    try testing.expect(std.mem.endsWith(u8, out.written(), "Signed in to fixture.\n"));
+    try testing.expectEqual(@as(usize, 1), source.next);
+}
+
+test "mcp login paste wait: a sign-in refused in the slice of the failed read says why, not that the terminal is gone" {
+    var waiter = showingLogin("fixture");
+    defer waiter.deinit();
+    var source: ScriptedStdin = .{
+        .reads = &.{.{ .fail = error.InputOutput }},
+        .terminal_gone = true,
+        .during_read = .{
+            .waiter = &waiter,
+            .notices = &.{.{ .sign_in_failed = .{ .server = "fixture", .reason = "the server refused" } }},
+        },
+    };
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var err: Writer.Allocating = .init(testing.allocator);
+    defer err.deinit();
+
+    try testing.expectEqual(@as(u8, 1), try waitForLoginOn(&waiter, &source, &out, &err));
+    try testing.expectEqualStrings("Couldn't sign in to fixture: the server refused.\n", err.written());
+}
+
+test "mcp login paste wait: a sign-in that finished but could not be saved says so, not that the terminal is gone" {
+    var waiter = showingLogin("fixture");
+    defer waiter.deinit();
+    var source: ScriptedStdin = .{
+        .reads = &.{.{ .fail = error.InputOutput }},
+        .terminal_gone = true,
+        .during_read = .{
+            .waiter = &waiter,
+            .notices = &.{
+                .{ .not_saved = .{ .server = "fixture", .reason = "the disk is full" } },
+                .{ .signed_in = "fixture" },
+            },
+        },
+    };
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var err: Writer.Allocating = .init(testing.allocator);
+    defer err.deinit();
+
+    try testing.expectEqual(@as(u8, 1), try waitForLoginOn(&waiter, &source, &out, &err));
+    try testing.expectEqualStrings(
+        "Signed in to fixture, but couldn't save the login: the disk is full. Sign in again once that's fixed.\n",
+        err.written(),
+    );
+}
+
+test "mcp login paste wait: a sign-in that has not finished when the terminal is gone ends the login" {
+    var waiter = showingLogin("fixture");
+    defer waiter.deinit();
+    var source: ScriptedStdin = .{ .reads = &.{.{ .fail = error.InputOutput }}, .terminal_gone = true };
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var err: Writer.Allocating = .init(testing.allocator);
+    defer err.deinit();
+
+    try testing.expectEqual(@as(u8, 1), try waitForLoginOn(&waiter, &source, &out, &err));
+    try testing.expectEqualStrings(gone_line, err.written());
+    try testing.expect(std.mem.indexOf(u8, out.written(), "Signed in") == null);
+    try testing.expectEqual(@as(?bool, null), waiter.done);
+    try testing.expectEqual(@as(u64, 0), source.slept_ns);
+}
+
+test "mcp login paste wait: a sign-in that finishes in the slice of any failed read or read of 0 is done" {
+    const answers = [_]ScriptedStdin.Read{
+        .{ .bytes = "" },
+        .{ .bytes = "partial address" },
+        .{ .fail = error.InputOutput },
+        .{ .fail = error.WouldBlock },
+        .{ .fail = error.Unexpected },
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .fail = error.SocketUnconnected },
+        .{ .fail = error.IsDir },
+        .{ .fail = error.SystemResources },
+    };
+    for ([_]bool{ false, true }) |terminal_gone| for (answers) |answer| {
+        var waiter = showingLogin("fixture");
+        defer waiter.deinit();
+        const script = [_]ScriptedStdin.Read{answer};
+        var source: ScriptedStdin = .{
+            .reads = &script,
+            .terminal_gone = terminal_gone,
+            .during_read = .{ .waiter = &waiter, .notices = &.{.{ .signed_in = "fixture" }} },
+        };
+        var out: Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var err: Writer.Allocating = .init(testing.allocator);
+        defer err.deinit();
+        errdefer std.debug.print("gone={} read={any}\n", .{ terminal_gone, answer });
+
+        try testing.expectEqual(@as(u8, 0), try waitForLoginOn(&waiter, &source, &out, &err));
+        try testing.expectEqualStrings("", err.written());
+        try testing.expect(std.mem.endsWith(u8, out.written(), "Signed in to fixture.\n"));
+    };
 }
 
 test "mcp login paste wait: every answer ends the wait, takes the slice, or takes input" {

@@ -77,6 +77,21 @@
 (* one and never ends the wait, which is no spin but breaks                *)
 (* GoneReadStopsLogin.                                                     *)
 (*                                                                         *)
+(* The sign-in itself finishes on the login thread: the browser's callback *)
+(* reaches fx's listener, the code is redeemed and saved, and              *)
+(* Waiter.onNotice sets done (McpSignInCompletes, the variable signed).    *)
+(* The top of waitForLogin's loop reads done once per pass and reports how *)
+(* the sign-in ended (McpLoginSees: status 0). A sign-in that finishes     *)
+(* while a pass waits is therefore seen only at the next top, and a failed *)
+(* read on a gone terminal can end that pass first. The handler of that    *)
+(* failed read now reads done again before it ends the login, in one step: *)
+(* when the sign-in finished it goes round the loop, and the top reports   *)
+(* it. Bug = "mcp_login_done_ignored" is the handler before that re-check: *)
+(* a sign-in that finished in the slice of the failed read was reported as *)
+(* failed with status 1 (FinishedSignInNeverFails). Bug =                  *)
+(* "mcp_login_reports_done" over-corrects and says the sign-in is done     *)
+(* whenever the terminal is gone (DoneOnlyWhenSignedIn).                   *)
+(*                                                                         *)
 (* Job control moves fx between the foreground ("fg"), stopped, and the    *)
 (* background ("bg"). Ctrl+Z (Suspend) stops fx. With SIGTTIN and SIGTTOU  *)
 (* at their default (stops), a background fx stops at its first terminal   *)
@@ -113,7 +128,8 @@ CONSTANTS MaxSpins, MaxIntr, Bug
 
 Bugs == {"none", "today", "prompts_strict", "picker_ignores_eof", "nval_ignored", "badf_unreachable",
          "enoent_unexpected", "no_eintr_retry", "eio_always_eof", "eio_poll_only",
-         "sign_in_spins", "sign_in_nval", "mcp_login_spins", "mcp_login_ends_always", "mcp_login_sleeps"}
+         "sign_in_spins", "sign_in_nval", "mcp_login_spins", "mcp_login_ends_always", "mcp_login_sleeps",
+         "mcp_login_done_ignored", "mcp_login_reports_done"}
 Prompts == {"team_picker", "masked_key"}
 Sites == {"shell", "sign_in", "mcp_login"} \cup Prompts
 ASSUME Bug \in Bugs
@@ -135,11 +151,13 @@ VARIABLES
     stops,    \* SIGTTIN and SIGTTOU keep their default action
     site,     \* "shell", "team_picker", "masked_key", "sign_in", or "mcp_login":
               \* who runs, and for the first three, restores the terminal
-    eof       \* stdin reached its end for the code that reads it: a prompt's or
+    eof,      \* stdin reached its end for the code that reads it: a prompt's or
               \* the paste wait's read returned 0, or the sign-in wait found stdin
               \* gone
+    signed    \* the login thread of fx mcp login has reported the sign-in done
+              \* (Waiter.done is set)
 
-vars == <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
+vars == <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof, signed>>
 
 Init ==
     /\ tty = "live"
@@ -156,6 +174,7 @@ Init ==
     /\ stops \in BOOLEAN
     /\ site \in Sites
     /\ eof = FALSE
+    /\ signed = FALSE
 
 Gone == tty # "live"
 Running == phase \in {"loop", "cleanup"}
@@ -219,7 +238,7 @@ Poll ==
        IF Readable(r)
        THEN IF ReadFails
             THEN /\ ReadFailed
-                 /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site, eof>>
+                 /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site, eof, signed>>
             ELSE IF queued
             \* The bytes are read and handled; one of them may ask fx to quit,
             \* which ends the loop before any frame is drawn.
@@ -229,20 +248,20 @@ Poll ==
                                      /\ UNCHANGED dirty
                                 ELSE /\ dirty' = TRUE
                                      /\ UNCHANGED <<phase, cause>>
-                 /\ UNCHANGED <<tty, spins, intr, restore, job, eio, stops, site, eof>>
+                 /\ UNCHANGED <<tty, spins, intr, restore, job, eio, stops, site, eof, signed>>
             \* read returned 0: the end of input.
             ELSE /\ EndLoop("input_closed")
-                 /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site, eof>>
+                 /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site, eof, signed>>
        ELSE IF Closed(r)
        THEN /\ EndLoop("input_closed")
-            /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site, eof>>
+            /\ UNCHANGED <<tty, queued, dirty, spins, intr, restore, job, eio, stops, site, eof, signed>>
        \* Nothing to do: settle, commit a frame, and poll again. On a live
        \* terminal that pass waited its timeout; on one that is gone it
        \* returned at once.
        ELSE /\ IF Gone THEN /\ spins < MaxSpins
                             /\ spins' = spins + 1
                        ELSE UNCHANGED spins
-            /\ UNCHANGED <<tty, queued, dirty, phase, cause, intr, restore, job, eio, stops, site, eof>>
+            /\ UNCHANGED <<tty, queued, dirty, phase, cause, intr, restore, job, eio, stops, site, eof, signed>>
 
 \* After a read: the loop's poll(0), then the frame for what it read. A poll
 \* that still reports input reads again, and a read that fails with EIO gets
@@ -260,7 +279,7 @@ Drain ==
        ELSE IF Closed(r) THEN EndLoop("input_closed")
        ELSE IF Gone THEN EndLoop("write_failed")
        ELSE UNCHANGED <<phase, cause>>
-    /\ UNCHANGED <<tty, waking, queued, spins, intr, restore, job, eio, stops, site, eof>>
+    /\ UNCHANGED <<tty, waking, queued, spins, intr, restore, job, eio, stops, site, eof, signed>>
 
 \* The person answers or cancels at a prompt: it returns to its caller, which
 \* restores the terminal on the way out (a defer).
@@ -269,7 +288,7 @@ PromptReturns ==
     /\ phase = "loop"
     /\ ~Gone
     /\ EndLoop("requested")
-    /\ UNCHANGED <<tty, waking, queued, dirty, spins, intr, restore, job, eio, stops, site, eof>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, spins, intr, restore, job, eio, stops, site, eof, signed>>
 
 \* A read on a terminal that reads 0 at the end of input: macOS answers that
 \* for a revoked terminal unless eio holds, and for one whose other side closed.
@@ -299,7 +318,7 @@ PromptRead ==
        ELSE /\ EndLoop("prompt_failed")
             /\ eof' = (eof \/ ReadsZero)
             /\ UNCHANGED spins
-    /\ UNCHANGED <<tty, waking, queued, dirty, intr, restore, job, eio, stops, site>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, intr, restore, job, eio, stops, site, signed>>
 
 \* A poll the sign-in wait takes as "stdin is gone": HUP, ERR, or NVAL
 \* without IN (classifyStdinPoll in login_flow.zig).
@@ -328,18 +347,19 @@ SignInWait ==
             /\ UNCHANGED eof
        ELSE /\ UNCHANGED spins
             /\ eof' = (eof \/ Gone)
-    /\ UNCHANGED <<tty, queued, dirty, phase, cause, intr, restore, job, eio, stops, site>>
+    /\ UNCHANGED <<tty, queued, dirty, phase, cause, intr, restore, job, eio, stops, site, signed>>
 
-\* The device code or the login is approved, refused, or expires, whatever the
-\* terminal is doing (the login's own deadline is five minutes). A login wait
-\* changed no terminal setting, so nothing is left to restore.
+\* The device code is approved, refused, or expires, whatever the terminal is
+\* doing (the login's own deadline is five minutes). A login wait changed no
+\* terminal setting, so nothing is left to restore. The login of fx mcp login
+\* ends in two steps, McpSignInCompletes and McpLoginSees.
 SignInEnds ==
-    /\ site \in {"sign_in", "mcp_login"}
+    /\ site = "sign_in"
     /\ phase = "loop"
     /\ phase' = "exited"
     /\ cause' = "sign_in_ended"
     /\ restore' = "gone"
-    /\ UNCHANGED <<tty, waking, queued, dirty, spins, intr, job, eio, stops, site, eof>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, spins, intr, job, eio, stops, site, eof, signed>>
 
 \* A read the paste wait makes that fails: EIO, from a revoked terminal where
 \* eio holds or a background read that SIGTTIN did not stop, or EBADF, from a
@@ -360,9 +380,40 @@ McpEndsOnFailedRead ==
 \* Before the fix a failed read returned at once: no end, no sleep.
 McpReturnsAtOnce == Bug \in {"today", "mcp_login_spins"}
 
+\* Whether the handler of a failed read on a terminal that is gone reads
+\* whether the sign-in finished (loginEnded) before it ends the login. The
+\* handler did not when it was written, so a sign-in that finished while the
+\* read ran was reported as failed (Bug = "mcp_login_done_ignored").
+McpChecksDone == Bug # "mcp_login_done_ignored"
+
+\* The browser's callback reaches fx's listener and the login thread finishes
+\* the sign-in: Waiter.onNotice sets done under the waiter's mutex, whatever
+\* the terminal is doing, at any moment while the login waits.
+McpSignInCompletes ==
+    /\ site = "mcp_login"
+    /\ phase = "loop"
+    /\ ~signed
+    /\ signed' = TRUE
+    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
+
+\* The top of waitForLogin's loop reads done and, when it is set, reports how
+\* the sign-in ended and returns: status 0 and "Signed in to NAME".
+McpLoginSees ==
+    /\ site = "mcp_login"
+    /\ phase = "loop"
+    /\ signed
+    /\ phase' = "exited"
+    /\ cause' = "sign_in_ended"
+    /\ restore' = "gone"
+    /\ UNCHANGED <<tty, waking, queued, dirty, spins, intr, job, eio, stops, site, eof, signed>>
+
 \* One pass of the paste wait (readPastedFrom): poll for up to 100 ms, then
 \* read once if the poll answered anything. A pass that returns at once with
-\* nothing done is a spin.
+\* nothing done is a spin. A failed read on a terminal that is gone reaches
+\* the handler in waitForLogin, which reads done and the failed read in one
+\* step: signed is as it was when the handler looked. The sign-in may finish
+\* before that step, while the poll waited or the read failed, or after it,
+\* when the login has already ended.
 McpLoginWait ==
     /\ site = "mcp_login"
     /\ phase = "loop"
@@ -373,12 +424,24 @@ McpLoginWait ==
        THEN UNCHANGED <<queued, phase, cause, spins, restore, eof>>
        ELSE IF McpReadFails
             THEN IF McpEndsOnFailedRead
-                 \* A failed read on a terminal that is gone: the wait ends
-                 \* with a short message and status 1, and saves nothing.
-                 THEN /\ phase' = "exited"
-                      /\ cause' = "login_stopped"
-                      /\ restore' = "gone"
-                      /\ UNCHANGED <<queued, spins, eof>>
+                 THEN IF Bug = "mcp_login_reports_done"
+                      \* A wrong fix: the handler says the sign-in is done
+                      \* whenever the terminal is gone, finished or not.
+                      THEN /\ phase' = "exited"
+                           /\ cause' = "sign_in_ended"
+                           /\ restore' = "gone"
+                           /\ UNCHANGED <<queued, spins, eof>>
+                      ELSE IF McpChecksDone /\ signed
+                           \* The sign-in finished: the handler goes round the
+                           \* loop, whose top reports it (McpLoginSees).
+                           THEN UNCHANGED <<queued, phase, cause, spins, restore, eof>>
+                           \* A failed read on a terminal that is gone, and no
+                           \* sign-in done: the wait ends with a short message
+                           \* and status 1, and saves nothing.
+                           ELSE /\ phase' = "exited"
+                                /\ cause' = "login_stopped"
+                                /\ restore' = "gone"
+                                /\ UNCHANGED <<queued, spins, eof>>
                  ELSE IF McpReturnsAtOnce
                       THEN /\ spins < MaxSpins
                            /\ spins' = spins + 1
@@ -393,7 +456,7 @@ McpLoginWait ==
                  \* goes on waiting for the browser.
                  ELSE /\ eof' = TRUE
                       /\ UNCHANGED <<queued, phase, cause, spins, restore>>
-    /\ UNCHANGED <<tty, dirty, intr, job, eio, stops, site>>
+    /\ UNCHANGED <<tty, dirty, intr, job, eio, stops, site, signed>>
 
 \* The pass that finds a read failing on a terminal that is gone.
 McpGoneReadFailure ==
@@ -443,7 +506,7 @@ Restore ==
                 ELSE /\ phase' = "exited"
                      /\ restore' = o
           /\ UNCHANGED intr
-    /\ UNCHANGED <<tty, waking, queued, dirty, cause, spins, job, eio, stops, site, eof>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, cause, spins, job, eio, stops, site, eof, signed>>
 
 -----------------------------------------------------------------------------
 (* The environment.                                                         *)
@@ -455,7 +518,7 @@ Type ==
     /\ tty = "live"
     /\ ~queued
     /\ queued' = TRUE
-    /\ UNCHANGED <<tty, waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
+    /\ UNCHANGED <<tty, waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof, signed>>
 
 \* The terminal goes away only while fx is in the foreground.
 
@@ -466,7 +529,7 @@ Revoke ==
     /\ tty = "live"
     /\ tty' = "revoked"
     /\ queued' = FALSE
-    /\ UNCHANGED <<waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
+    /\ UNCHANGED <<waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof, signed>>
 
 \* revoke(2) while fx waits in its poll, which wakes with POLLHUP, or with
 \* POLLIN where eio holds.
@@ -479,7 +542,7 @@ RevokeInPoll ==
     /\ ~dirty
     /\ tty' = "revoked"
     /\ waking' = TRUE
-    /\ UNCHANGED <<queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
+    /\ UNCHANGED <<queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof, signed>>
 
 \* The terminal's other side closes.
 Hangup ==
@@ -487,7 +550,7 @@ Hangup ==
     /\ job = "fg"
     /\ tty = "live"
     /\ tty' = "hungup"
-    /\ UNCHANGED <<waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
+    /\ UNCHANGED <<waking, queued, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof, signed>>
 
 \* The descriptor itself is closed under fx.
 CloseFd ==
@@ -496,7 +559,7 @@ CloseFd ==
     /\ tty = "live"
     /\ tty' = "closed"
     /\ queued' = FALSE
-    /\ UNCHANGED <<waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof>>
+    /\ UNCHANGED <<waking, dirty, phase, cause, spins, intr, restore, job, eio, stops, site, eof, signed>>
 
 \* Ctrl+Z: fx reads the key, restores the terminal, and stops itself with
 \* SIGTSTP (suspendToJobControl).
@@ -508,7 +571,7 @@ Suspend ==
     /\ ~queued
     /\ ~dirty
     /\ job' = "stopped"
-    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site, eof>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site, eof, signed>>
 
 \* The shell's bg: fx continues in the background. Its resume first sets
 \* raw mode again (resumeTerminalAfterJobControl), and SIGTTOU stops that
@@ -518,7 +581,7 @@ Bg ==
     /\ job = "stopped"
     /\ tty = "live"
     /\ job' = IF stops THEN "stopped" ELSE "bg"
-    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site, eof>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site, eof, signed>>
 
 \* The shell's fg: fx continues in the foreground.
 Fg ==
@@ -526,7 +589,7 @@ Fg ==
     /\ job \in {"stopped", "bg"}
     /\ tty = "live"
     /\ job' = "fg"
-    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site, eof>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site, eof, signed>>
 
 \* Another job takes the terminal while fx keeps running, which only a
 \* parent that ignores SIGTTIN and SIGTTOU allows.
@@ -537,7 +600,7 @@ Background ==
     /\ tty = "live"
     /\ ~stops
     /\ job' = "bg"
-    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site, eof>>
+    /\ UNCHANGED <<tty, waking, queued, dirty, phase, cause, spins, intr, restore, eio, stops, site, eof, signed>>
 
 Ended ==
     /\ phase \in {"exited", "crashed"}
@@ -546,11 +609,11 @@ Ended ==
 Environment ==
     Type \/ Revoke \/ RevokeInPoll \/ Hangup \/ CloseFd \/ Suspend \/ Bg \/ Fg \/ Background
 
-Next == Poll \/ Drain \/ PromptReturns \/ PromptRead \/ SignInWait \/ McpLoginWait \/ SignInEnds \/ Restore
-        \/ Environment \/ Ended
+Next == Poll \/ Drain \/ PromptReturns \/ PromptRead \/ SignInWait \/ McpLoginWait \/ McpSignInCompletes
+        \/ McpLoginSees \/ SignInEnds \/ Restore \/ Environment \/ Ended
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Poll) /\ WF_vars(Drain) /\ WF_vars(PromptRead) /\ WF_vars(SignInEnds)
-        /\ WF_vars(Restore)
+        /\ WF_vars(McpSignInCompletes) /\ WF_vars(McpLoginSees) /\ WF_vars(Restore)
 
 -----------------------------------------------------------------------------
 
@@ -569,6 +632,7 @@ TypeOK ==
     /\ stops \in BOOLEAN
     /\ site \in Sites
     /\ eof \in BOOLEAN
+    /\ signed \in BOOLEAN
 
 \* A pass of the loop never returns at once with nothing to do: once the
 \* terminal is gone, the next poll ends the loop, and the sign-in wait
@@ -608,8 +672,17 @@ GoneEndsLoop == Gone ~> (phase \in {"exited", "crashed"})
 NoReadAfterEof == [][~(PromptRead /\ eof)]_vars
 
 \* The end-of-input law of the paste wait: a pass that finds its read failing
-\* on a terminal that is gone ends the wait. It does not go round at once
-\* (NoBusyLoop), and it does not sleep and poll on until the login's own
-\* deadline.
-GoneReadStopsLogin == [][(McpLoginWait /\ McpGoneReadFailure) => phase' = "exited"]_vars
+\* on a terminal that is gone, with no sign-in done, ends the wait. It does not
+\* go round at once (NoBusyLoop), and it does not sleep and poll on until the
+\* login's own deadline.
+GoneReadStopsLogin == [][(McpLoginWait /\ McpGoneReadFailure /\ ~signed) => phase' = "exited"]_vars
+
+\* A sign-in that finished is never reported as failed: the wait does not end
+\* the login with "the terminal is gone" once the login thread has reported
+\* the sign-in done, however the callback and the loss of the terminal fall
+\* within one slice.
+FinishedSignInNeverFails == (site = "mcp_login" /\ cause = "login_stopped") => ~signed
+
+\* And the other way: the wait reports a sign-in as done only when it is.
+DoneOnlyWhenSignedIn == (site = "mcp_login" /\ cause = "sign_in_ended") => signed
 =============================================================================

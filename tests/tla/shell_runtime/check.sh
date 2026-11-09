@@ -37,9 +37,15 @@
 # deadline. The terminal-revoke-today-mcp-login config is fx with every other
 # fix and without that one (NoBusyLoop), and terminal-revoke-today-mcp-login-eof
 # holds the same fx to the end-of-input law (GoneReadStopsLogin): a failed read
-# on a terminal that is gone ends the wait with status 1. Each
-# terminal-revoke-mutation-*.cfg plants one defect, and the rule it names must
-# catch it:
+# on a terminal that is gone ends the wait with status 1. The same wait has a
+# sixth defect: the callback of the browser can finish the sign-in while a read
+# of stdin fails on a terminal that went in the same 100 ms slice, and the
+# handler of that failed read ended the login without reading whether the
+# sign-in had finished, so a signed-in server was reported as failed with
+# status 1 (terminal-revoke-today-mcp-login-done, FinishedSignInNeverFails).
+# The fixed handler reads it first and, when the sign-in finished, goes round
+# the loop, whose top reports the outcome. Each terminal-revoke-mutation-*.cfg
+# plants one defect, and the rule it names must catch it:
 #
 #   nval-ignored           POLLNVAL is not counted as closed input          NoBusyLoop
 #   badf-unreachable       EBADF from the restore aborts fx                 CleanupNeverCrashes
@@ -50,6 +56,7 @@
 #   sign-in-nval           the sign-in wait misses POLLNVAL alone           NoBusyLoop
 #   mcp-login-ends-always  every failed read ends the paste wait            InputClosedOnlyWhenGone
 #   mcp-login-sleeps       a failed read on a gone terminal only sleeps     GoneReadStopsLogin
+#   mcp-login-reports-done a gone terminal reports the sign-in as done      DoneOnlyWhenSignedIn
 #
 # TerminalRevokeTrace.tla checks runs of the built fx binary against the
 # model; tests/tla/drivers/shell_runtime/driver.ts runs it.
@@ -79,6 +86,7 @@ TerminalRevoke terminal-revoke-today-picker-liveness temporal
 TerminalRevoke terminal-revoke-today-sign-in NoBusyLoop
 TerminalRevoke terminal-revoke-today-mcp-login NoBusyLoop
 TerminalRevoke terminal-revoke-today-mcp-login-eof GoneReadStopsLogin
+TerminalRevoke terminal-revoke-today-mcp-login-done FinishedSignInNeverFails
 TerminalRevoke terminal-revoke-mutation-nval-ignored NoBusyLoop
 TerminalRevoke terminal-revoke-mutation-badf-unreachable CleanupNeverCrashes
 TerminalRevoke terminal-revoke-mutation-enoent-unexpected GoneQuietly
@@ -88,4 +96,5 @@ TerminalRevoke terminal-revoke-mutation-eio-poll-only ReadErrorOnlyWhenLive
 TerminalRevoke terminal-revoke-mutation-sign-in-nval NoBusyLoop
 TerminalRevoke terminal-revoke-mutation-mcp-login-ends-always InputClosedOnlyWhenGone
 TerminalRevoke terminal-revoke-mutation-mcp-login-sleeps GoneReadStopsLogin
+TerminalRevoke terminal-revoke-mutation-mcp-login-reports-done DoneOnlyWhenSignedIn
 VERDICTS
