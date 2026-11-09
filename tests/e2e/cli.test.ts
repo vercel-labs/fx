@@ -1523,9 +1523,11 @@ describe("cli: status", () => {
   test(
     "fx status --json returns valid status JSON",
     async () => {
+      // A fresh profile, so a developer's own settings can't leak in,
+      // including through FX_HOME.
       const home = createIsolatedTestHome();
       try {
-        const r = await runFx(["status", "--json"], { env: { HOME: home } });
+        const r = await runFx(["status", "--json"], { env: { HOME: home, FX_HOME: undefined } });
         expect(r.code).toBe(0);
         const json = JSON.parse(r.stdout.trim());
         expect(json.kind).toBe("status");
