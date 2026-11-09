@@ -266,10 +266,12 @@ pub const Owner = struct {
         // quit, the user's close, and any other cancel still refuse it.
         if (slot.stopped_by_parent or slot.stopped_by_user) return .stopping;
         if (slot.cancel.load(.seq_cst)) return .cancelled;
-        // The work's turn has not begun, so nothing can take the message
-        // yet; it belongs to this work, not the next one.
-        const worker = slot.worker orelse return .starting;
-        if (!std.mem.eql(u8, slot.work_id orelse return .starting, work_id)) return .waiting;
+        // The work's worker has not attached, or has not begun the turn, so
+        // nothing can take the message yet; it belongs to this work, not the
+        // next one. A turn that runs with no worker takes none, as before.
+        const attached = slot.work_id orelse return .starting;
+        if (!std.mem.eql(u8, attached, work_id)) return .waiting;
+        const worker = slot.worker orelse return .waiting;
         if (!worker.isProcessing()) return .starting;
         // The limit is this child's unread messages at one moment. A read
         // one stays only for a replay of its call, so it never counts.
@@ -777,16 +779,22 @@ test "a work whose turn has not begun answers starting until its worker processe
     }
     const fingerprint: [32]u8 = @splat(1);
 
-    // The slot has no worker yet, then one that has not begun the turn.
+    // The work has not attached its worker yet, then has one that has not
+    // begun the turn.
     try std.testing.expect((try owner.steer("child", "work", "before-attach", fingerprint, "text")) == .starting);
-    slot.worker = &worker;
     slot.work_id = "work";
+    slot.worker = &worker;
     try std.testing.expect((try owner.steer("child", "work", "before-begin", fingerprint, "text")) == .starting);
     try std.testing.expectEqual(@as(usize, 0), worker.queuedPromptCount());
 
     // Once the worker processes the turn, the message joins it.
     try std.testing.expect(worker.beginDirectProcessing(1));
     try std.testing.expectEqual(types.SteeringDelivery.queued, (try owner.steer("child", "work", "after-begin", fingerprint, "text")).receipt);
+
+    // A turn that runs with no worker leaves the message for the next turn.
+    slot.worker = null;
+    try std.testing.expect((try owner.steer("child", "work", "no-worker", fingerprint, "text")) == .waiting);
+    slot.worker = &worker;
 
     // A work that has ended still leaves a message for the next turn.
     slot.completion = .{ .published = .{ .phase = .finished, .outcome = .cancelled } };

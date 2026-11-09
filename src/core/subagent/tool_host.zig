@@ -2146,10 +2146,18 @@ const MailboxFixture = struct {
     fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, _: domain.AdmissionSnapshot, cancel: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         const worker = turn.workerRuntime();
-        // Counted once it can take steering, so a test that waits for the
-        // run can join it.
-        const steering = self.steerable and worker.beginDirectProcessing(self.runs.load(.seq_cst) + 1);
-        defer if (steering) worker.finishProcessing();
+        // Counted once its turn has begun, so a test that waits for the run
+        // can message it. A run that takes no steering is a turn past its
+        // last step, as a model turn's final answer is: it processes with
+        // steering closed, so a message waits for the next turn.
+        const turn_id = self.runs.load(.seq_cst) + 1;
+        const processing = worker.beginDirectProcessing(turn_id);
+        defer if (processing) worker.finishProcessing();
+        if (processing and !self.steerable) {
+            var boundary = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer boundary.deinit();
+            _ = worker.takeSteeringBoundaryInto(std.testing.allocator, boundary.allocator(), turn_id, .finalizing) catch return error.ProviderFailed;
+        }
         const run_number = self.runs.fetchAdd(1, .seq_cst) + 1;
         while (self.hold and !self.release.isSet() and !cancel.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
         if (cancel.load(.seq_cst)) return error.Cancelled;
