@@ -122,10 +122,10 @@ pub const ChildAgent = struct {
 };
 
 /// The agent list ↓, Ctrl+X, and `/agents` open. Its rows are every open
-/// agent in switch order, each instance followed by its own subagents, built
-/// each time it is drawn so each shows what it is doing now. The highlighted
-/// row's agent is the one on screen: moving through the list previews each
-/// agent, Enter keeps the one shown, and Esc or Ctrl+X go back to `origin`.
+/// agent in switch order, built each time it is drawn so each shows what it
+/// is doing now. The highlighted row's agent is the one on screen: moving
+/// through the list previews each agent, Enter keeps the one shown, and Esc
+/// or Ctrl+X go back to `origin`.
 pub const AgentsMenu = struct {
     open: bool = false,
     /// The selected agent's place in the switch list, from 0.
@@ -140,12 +140,18 @@ pub const AgentsMenu = struct {
     close_armed: ?*ChildAgent = null,
     /// Backs the rows the last projection showed. Owned.
     rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
+    /// Backs the instance names in `rows`, such as "fx 12". Owned.
+    names: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *AgentsMenu, alloc: Allocator) void {
         self.rows.deinit(alloc);
+        self.names.deinit(alloc);
         self.* = .{};
     }
 };
+
+/// Room for an instance's name in the agent list, such as "fx 12".
+const instance_name_bytes = 24;
 
 /// What an instance is doing, as the instance list shows it, most urgent
 /// first.
@@ -491,10 +497,8 @@ fn switchOrder(entries: []const OrderEntry, out: []usize) void {
     std.debug.assert(next == out.len);
 }
 
-/// Sorts each instance's subagents in `order`, a switch order over
-/// `entries`: the working ones first in the order they started, then the
-/// rest by newest reply, with equal timestamps keeping their start order.
-/// Every instance stays where it is, before its own subagents.
+/// Sorts each instance's subagents in switch order `order`: the working ones
+/// first in start order, then the rest by newest reply. Instances stay put.
 fn sortSubagentGroups(entries: []const OrderEntry, order: []usize) void {
     const Context = struct {
         entries: []const OrderEntry,
@@ -927,8 +931,8 @@ pub fn Runtime(comptime App: type) type {
             orderByListing(app.child_agents.items, order.items);
         }
 
-        /// The instances in launch order, each followed by its own subagents:
-        /// the working ones first, then the rest by their most recent reply.
+        /// The switch order, with each instance's subagents sorted
+        /// (`sortSubagentGroups`).
         pub fn switchList(app: *App, out: *std.ArrayList(?*ChildAgent)) !void {
             const hosted = app.child_agents.items;
             const entries = try app.alloc.alloc(OrderEntry, hosted.len);
@@ -1293,14 +1297,17 @@ pub fn Runtime(comptime App: type) type {
             switchList(app, &order) catch return .{};
             menu.rows.clearRetainingCapacity();
             menu.rows.ensureTotalCapacity(app.alloc, order.items.len) catch return .{};
+            menu.names.clearRetainingCapacity();
+            menu.names.ensureTotalCapacity(app.alloc, order.items.len * instance_name_bytes) catch return .{};
             for (order.items) |target| {
                 const agent = targetAgent(app, target);
                 const subagent: ?*ChildAgent = if (target) |child| (if (child.agent.role == .subagent) child else null) else null;
                 const model = provider_runtime.modelOf(app, agent);
                 const state = instanceState(agent, requestWaitsForUser(app, target));
+                const name = noteName(app, target, menu.names.addManyAsArrayAssumeCapacity(instance_name_bytes));
                 menu.rows.appendAssumeCapacity(.{
-                    .number = if (subagent == null) instanceNumber(app, target) orelse 0 else 0,
-                    .subagent_name = if (subagent) |child| child.displayName() else "",
+                    .name = name,
+                    .subagent = subagent != null,
                     .title = agent.session_title.items,
                     // A subagent's own agent never loads its profile; its
                     // host's list says which one it runs in.
@@ -2672,8 +2679,6 @@ test "an instance's working subagents come first in the order they started, and 
     // Start order: main, its first and last subagents, fx 2, its subagent.
     try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4, 2, 3 }, &order);
     sortSubagentGroups(&entries, &order);
-    // Main's working subagent moves above its idle one. A working fx 2 and
-    // its subagent stay below main's.
     try std.testing.expectEqualSlices(usize, &.{ 0, 4, 1, 2, 3 }, &order);
 }
 
@@ -2720,7 +2725,6 @@ test "sorting subagents keeps every instance in place and every subagent under i
                 group_start = index + 1;
                 continue;
             }
-            // The same subagents fill the group, whatever their order.
             try std.testing.expectEqual(entries[before - 1].root, entries[after - 1].root);
             try std.testing.expect(std.mem.findScalar(usize, sorted[group_start..len], before) != null);
             if (index == group_start) continue;

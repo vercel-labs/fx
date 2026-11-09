@@ -181,11 +181,11 @@ pub const AgentStateTone = enum {
 /// One row of the agent list: an open instance or one of its subagents, and
 /// how it is doing.
 pub const AgentsMenuRow = struct {
-    /// An instance's place among the open instances, from 1, as in "fx 3".
-    /// Unused for a subagent.
-    number: usize,
-    /// A subagent's name, such as "reviewer"; empty for an instance.
-    subagent_name: []const u8 = "",
+    /// How fx names it: "main", "fx 3" while several instances are open, or
+    /// a subagent's own name, such as "reviewer".
+    name: []const u8,
+    /// A subagent, drawn on its instance's branch.
+    subagent: bool = false,
     /// Its session's title, or empty before it has one.
     title: []const u8,
     /// The agent profile it runs in.
