@@ -98,14 +98,6 @@ pub fn parseInputRequired(
     return .{ .requests = requests, .request_state_json = request_state_json };
 }
 
-fn parseRequestJson(
-    alloc: Allocator,
-    input_requests_json: []const u8,
-    limits: Limits,
-) Error![]InputRequest {
-    return parseRequestJsonForWire(alloc, input_requests_json, .modern_mcp, limits);
-}
-
 pub fn parseRequestJsonForWire(
     alloc: Allocator,
     input_requests_json: []const u8,
@@ -233,74 +225,6 @@ fn renderRequestsFallible(
     return try out.toOwnedSlice();
 }
 
-pub fn validateResponses(
-    alloc: Allocator,
-    requests: []const InputRequest,
-    input_responses_json: []const u8,
-    limits: Limits,
-) Error!void {
-    if (input_responses_json.len > limits.max_json_bytes) {
-        return error.InvalidInputResponses;
-    }
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, input_responses_json, .{
-        .parse_numbers = false,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidInputResponses,
-    };
-    defer parsed.deinit();
-    try validateJsonBounds(parsed.value, limits, 0);
-    if (parsed.value != .object or parsed.value.object.count() != requests.len) {
-        return error.InvalidInputResponses;
-    }
-
-    for (requests) |request| {
-        const response = parsed.value.object.get(request.key) orelse
-            return error.InvalidInputResponses;
-        switch (request.payload) {
-            .unsupported => return error.UnsupportedInputRequest,
-            .elicitation_create => |elicitation_request| try validateElicitationResult(
-                alloc,
-                elicitation_request,
-                response,
-                limits,
-            ),
-        }
-    }
-}
-
-/// Validates the user response to a 2025-11 URL-required error. Acceptance is
-/// browser consent only; completion is decided separately from matching
-/// notifications or an explicit local manual retry.
-pub fn legacyUrlConsent(
-    alloc: Allocator,
-    requests: []const InputRequest,
-    input_responses_json: []const u8,
-    limits: Limits,
-) Error!elicitation.LegacyUrlConsent {
-    try validateResponses(alloc, requests, input_responses_json, limits);
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, input_responses_json, .{
-        .parse_numbers = false,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidInputResponses,
-    };
-    defer parsed.deinit();
-    var decision: elicitation.LegacyUrlConsent = .accepted;
-    for (requests) |request| {
-        if (request.payload != .elicitation_create or
-            request.payload.elicitation_create.mode != .url)
-        {
-            return error.InvalidInputResponses;
-        }
-        const response = parsed.value.object.get(request.key).?;
-        const action = elicitation.parseAction(response.object.get("action").?);
-        if (action == .cancel) return .cancelled;
-        if (action == .decline) decision = .declined;
-    }
-    return decision;
-}
-
 fn validateJsonBounds(value: std.json.Value, limits: Limits, depth: usize) Error!void {
     if (depth > limits.max_depth) return error.MetadataLimitExceeded;
     switch (value) {
@@ -321,36 +245,6 @@ fn validateJsonBounds(value: std.json.Value, limits: Limits, depth: usize) Error
         },
         else => {},
     }
-}
-
-fn validateElicitationResult(
-    alloc: Allocator,
-    request: ElicitationRequest,
-    value: std.json.Value,
-    limits: Limits,
-) Error!void {
-    const response_json = try stringifyBounded(alloc, value, limits.max_json_bytes);
-    defer alloc.free(response_json);
-    _ = elicitation.validateResponse(
-        alloc,
-        request,
-        response_json,
-        .{
-            .max_request_bytes = limits.max_json_bytes,
-            .max_response_bytes = limits.max_json_bytes,
-            .max_message_bytes = limits.max_string_bytes,
-            .max_schema_bytes = limits.max_json_bytes,
-            .max_fields = limits.max_collection_items,
-            .max_options = limits.max_collection_items,
-            .max_name_bytes = limits.max_name_bytes,
-            .max_label_bytes = limits.max_string_bytes,
-            .max_string_bytes = limits.max_string_bytes,
-        },
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.LimitExceeded => return error.MetadataLimitExceeded,
-        else => return error.InvalidInputResponses,
-    };
 }
 
 fn stringifyBounded(
@@ -395,45 +289,6 @@ test "MRTR parses the closed request union and rejects unknown methods" {
     );
 }
 
-test "MRTR validates only supported responses with exact keys" {
-    const alloc = std.testing.allocator;
-    const requests = try parseRequestJson(alloc,
-        \\{"form":{"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{"confirmed":{"type":"boolean"}},"required":["confirmed"]}}},"url":{"method":"elicitation/create","params":{"mode":"url","message":"Authenticate","url":"https://example.test/auth"}}}
-    , .{});
-    defer {
-        for (requests) |*request| request.deinit(alloc);
-        alloc.free(requests);
-    }
-    try validateResponses(alloc, requests,
-        \\{"form":{"action":"accept","content":{"confirmed":true}},"url":{"action":"accept"}}
-    , .{});
-    const invalid = [_][]const u8{
-        \\{"form":{"action":"accept","content":{"confirmed":true}}}
-        ,
-        \\{"form":{"action":"accept","content":{"confirmed":"yes"}},"url":{"action":"accept"}}
-        ,
-        \\{"other":{"action":"decline"},"url":{"action":"accept"}}
-        ,
-    };
-    for (invalid) |response| try std.testing.expectError(error.InvalidInputResponses, validateResponses(alloc, requests, response, .{}));
-}
-
-test "MRTR recognizes unsupported methods without implementing their semantics" {
-    const alloc = std.testing.allocator;
-    const requests = try parseRequestJson(alloc,
-        \\{"sample":{"method":"sampling/createMessage","params":{"unimplemented":true}}}
-    , .{});
-    defer {
-        for (requests) |*request| request.deinit(alloc);
-        alloc.free(requests);
-    }
-    try std.testing.expectEqualStrings("sampling/createMessage", requests[0].payload.method());
-    try std.testing.expect(requests[0].payload == .unsupported);
-    try std.testing.expectError(error.UnsupportedInputRequest, validateResponses(alloc, requests,
-        \\{"sample":{}}
-    , .{}));
-}
-
 test "MRTR parser and response validation release allocation failures" {
     try std.testing.checkAllAllocationFailures(
         testing_allocator.no_resize,
@@ -470,11 +325,4 @@ fn checkAllocationFailures(alloc: Allocator) !void {
     defer required.deinit(alloc);
     const rendered = try renderRequests(alloc, required.requests);
     defer alloc.free(rendered);
-    try validateResponses(
-        alloc,
-        required.requests,
-        \\{"form":{"action":"accept","content":{"confirmed":true}}}
-    ,
-        .{},
-    );
 }

@@ -250,7 +250,7 @@ pub const LoadMode = enum { stored, refresh_if_needed };
 
 const FxLoginRefreshMode = enum { if_needed, force };
 
-pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_interactive_credential_message = "fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login, open Connections, then choose Codex subscription.";
@@ -786,10 +786,14 @@ pub fn refreshFxSession(
 ) !void {
     try mutation.requireWritable();
     const issuer_url = session.issuer;
+    // Each request to the issuer has its whole budget from a fresh stamp, so
+    // another fx waits for this one however slowly the issuer answers.
+    mutation.restamp();
     var metadata = try oauth.discover(alloc, transport, issuer_url);
     defer metadata.deinit(alloc);
     try oauth_session.validateE2EEndpoint(issuer_url, metadata.token_endpoint);
 
+    mutation.restamp();
     var refreshed = oauth.refreshToken(
         alloc,
         transport,
@@ -815,7 +819,7 @@ pub fn refreshFxSession(
         try retire_fx_session(alloc, mutation);
         return error.NoRefreshToken;
     };
-    const expires_at_ms = oauth.expiry_timestamp_ms(
+    const expires_at_ms = oauth.expiryTimestampMs(
         io_mod.milliTimestamp(),
         refreshed.expires_in,
     ) catch |err| {
@@ -931,11 +935,12 @@ test "stored key label discloses the backend that answered" {
 
 test "missing credential messages use surface commands in preferred order" {
     const cli_login = std.mem.find(u8, missing_credential_message, "fx login").?;
-    const cli_setup = std.mem.find(u8, missing_credential_message, "fx setup").?;
+    const cli_api_key = std.mem.find(u8, missing_credential_message, "fx login vercel --api-key").?;
     const cli_env = std.mem.find(u8, missing_credential_message, "AI_GATEWAY_API_KEY").?;
 
-    try std.testing.expect(cli_login < cli_setup);
-    try std.testing.expect(cli_setup < cli_env);
+    try std.testing.expect(cli_login < cli_api_key);
+    try std.testing.expect(cli_api_key < cli_env);
+    try std.testing.expect(std.mem.find(u8, missing_credential_message, "fx setup") == null);
 
     const tui_login = std.mem.find(u8, missing_interactive_credential_message, "/login").?;
     const tui_setup = std.mem.find(u8, missing_interactive_credential_message, "/provider").?;

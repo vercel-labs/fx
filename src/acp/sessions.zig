@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const agent_frame = @import("../core/shared/agent_frame.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 const jsonrpc = @import("jsonrpc.zig");
@@ -11,8 +12,6 @@ const mcp_servers = @import("mcp_servers.zig");
 const client_instructions = @import("client_instructions.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
 const workspace_binding = @import("workspace_binding.zig");
-const mcp_carrier = @import("mcp_carrier.zig");
-const message_carrier = @import("../core/mcp/message_carrier.zig");
 const server = @import("server.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_display_metadata = @import("../core/session/session_display_metadata.zig");
@@ -26,7 +25,6 @@ const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const tool_call_presentation = @import("tool_call_presentation.zig");
 const runtime_tool_presentation = @import("../core/agent/runtime/tool_presentation.zig");
-const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mcp_host = @import("../core/mcp_host/host.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
 const project_config = @import("../core/mcp/project_config.zig");
@@ -417,6 +415,10 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         }),
     };
     defer mcp_configs.deinit(alloc);
+    if (try mcp_servers.duplicateNameMessage(alloc, &mcp_configs)) |message| {
+        defer alloc.free(message);
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = message });
+    }
     if (!state.cfg.allow_acp_mcp and mcp_configs.items.items.len > 0) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
@@ -427,30 +429,21 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
         try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
     }
-    retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
+        workspace_root,
         state.client_elicitation,
         server.legacyUrlCompletionSink(state),
-        hostChannel(state),
     );
     defer mcp_preparation.deinit(alloc);
     switch (mcp_preparation) {
-        .ready, .host => {},
+        .none, .host => {},
         .failed => |message| return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = message,
         }),
     }
-    const session_mcp = mcp_preparation.takeRuntime();
-    var session_mcp_owned = true;
-    defer if (session_mcp_owned) {
-        if (session_mcp) |runtime| {
-            runtime.deinit();
-            alloc.destroy(runtime);
-        }
-    };
     const session_host = mcp_preparation.takeHost();
     var session_host_owned = true;
     defer if (session_host_owned) if (session_host) |h| h.destroy();
@@ -458,11 +451,9 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         .code = ErrorCode.internal_error,
         .message = "Session store not available",
     });
-    session_mcp_owned = false;
     session_host_owned = false;
     return startV2Session(state, alloc, msg, v2_store, .{
         .observer_hooks = observer_hooks,
-        .mcp = session_mcp,
         .mcp_host = session_host,
         .workspace = if (workspace) |*binding| binding else null,
         .client_system_prompt = &client_system_prompt,
@@ -473,8 +464,6 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
 const V2Start = struct {
     observer_hooks: ?libfx_hooks.Config = null,
     /// Owned; the session takes it over.
-    mcp: ?*mcp_runtime.McpRuntime,
-    /// Owned like `mcp`.
     mcp_host: ?*mcp_host.Host = null,
     /// The request's `cwd`, borrowed as in v1.
     workspace: ?*workspace_binding.Binding,
@@ -493,14 +482,6 @@ fn startV2Session(
     v2_store: *session_adapter.Store,
     start: V2Start,
 ) !void {
-    const session_mcp = start.mcp;
-    var session_mcp_owned = true;
-    defer if (session_mcp_owned) {
-        if (session_mcp) |runtime| {
-            runtime.deinit();
-            alloc.destroy(runtime);
-        }
-    };
     const session_host = start.mcp_host;
     var session_host_owned = true;
     defer if (session_host_owned) if (session_host) |h| h.destroy();
@@ -548,7 +529,6 @@ fn startV2Session(
         .ultrafast_mode = state.ultrafast_mode,
         .effort = state.effort,
         .session_rt = session_rt,
-        .mcp = session_mcp,
         .mcp_host = session_host,
         .client_system_prompt = start.client_system_prompt.*,
         .workspace = start.workspace,
@@ -562,7 +542,6 @@ fn startV2Session(
     session_id_owned = false;
     model_owned = false;
     session_rt_owned = false;
-    session_mcp_owned = false;
     session_host_owned = false;
     try writeNewSessionResponse(state, alloc, msg, session_id, start.observer_hooks);
 }
@@ -822,6 +801,10 @@ fn handleRestoreSession(
         }),
     };
     defer mcp_configs.deinit(alloc);
+    if (try mcp_servers.duplicateNameMessage(alloc, &mcp_configs)) |message| {
+        defer alloc.free(message);
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = message });
+    }
     if (!state.cfg.allow_acp_mcp) {
         if (mcp_configs.items.items.len > 0) {
             return state.writer.writeError(alloc, msg.id, .{
@@ -833,30 +816,21 @@ fn handleRestoreSession(
         try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
         try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
     }
-    retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
+        workspace_root,
         state.client_elicitation,
         server.legacyUrlCompletionSink(state),
-        hostChannel(state),
     );
     defer mcp_preparation.deinit(alloc);
     switch (mcp_preparation) {
-        .ready, .host => {},
+        .none, .host => {},
         .failed => |message| return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = message,
         }),
     }
-    const session_mcp = mcp_preparation.takeRuntime();
-    var session_mcp_owned = true;
-    defer if (session_mcp_owned) {
-        if (session_mcp) |runtime| {
-            runtime.deinit();
-            alloc.destroy(runtime);
-        }
-    };
     const session_host = mcp_preparation.takeHost();
     var session_host_owned = true;
     defer if (session_host_owned) if (session_host) |h| h.destroy();
@@ -874,9 +848,6 @@ fn handleRestoreSession(
             server.cancelAndReapActivePrompt(state);
             server.disableSubagentHost(state);
             state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-            const previous_mcp = active.mcp;
-            active.mcp = session_mcp;
-            session_mcp_owned = false;
             const previous_host = active.mcp_host;
             active.mcp_host = session_host;
             session_host_owned = false;
@@ -884,12 +855,7 @@ fn handleRestoreSession(
             active.mode = start.id;
             active.permission_mode = start.permission_mode;
             state.subagent_authority_mutex.unlock(io_mod.getIo());
-            if (previous_mcp) |runtime| {
-                runtime.retireAndWait();
-                runtime.deinit();
-                alloc.destroy(runtime);
-            }
-            if (previous_host) |h| h.destroy();
+            if (previous_host) |h| h.stop();
             server.enableSubagentHost(state);
             // One map, so a recovered read can name a call from an earlier turn.
             var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
@@ -992,7 +958,6 @@ fn handleRestoreSession(
         .ultrafast_mode = restoredUltrafastMode(state, durable.preferences.ultrafast_mode),
         .effort = durable.preferences.effort,
         .session_rt = session_rt,
-        .mcp = session_mcp,
         .mcp_host = session_host,
         .client_system_prompt = client_system_prompt,
         .workspace = if (workspace) |*binding| binding else null,
@@ -1006,7 +971,6 @@ fn handleRestoreSession(
     sid_owned = false;
     model_owned = false;
     session_rt_owned = false;
-    session_mcp_owned = false;
     session_host_owned = false;
     // One map, so a recovered read can name a call from an earlier turn.
     var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
@@ -1023,37 +987,6 @@ fn handleRestoreSession(
         state.active_session.?.model,
         observer_hooks,
     );
-}
-
-fn detachActiveMcpForAuthorityReduction(
-    state: *server.ServerState,
-    active: *server.ActiveSessionState,
-) *mcp_runtime.McpRuntime {
-    server.cancelAndReapActivePrompt(state);
-    server.disableSubagentHost(state);
-    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-    const previous = active.mcp.?;
-    active.mcp = null;
-    state.subagent_authority_mutex.unlock(io_mod.getIo());
-    return previous;
-}
-
-fn retireReducedActiveMcp(
-    state: *server.ServerState,
-    alloc: Allocator,
-    next_configs: []const mcp_contract.McpServerConfig,
-) void {
-    const active = if (state.active_session) |*value| value else return;
-    const runtime = active.mcp orelse return;
-    if (!runtime.workspaceAuthorityReducedAgainstConfigs(
-        next_configs,
-        .acp_startup,
-    )) return;
-    const previous = detachActiveMcpForAuthorityReduction(state, active);
-    previous.retireAndWait();
-    previous.deinit();
-    alloc.destroy(previous);
-    server.enableSubagentHost(state);
 }
 
 /// Adds the user's profile MCP servers after the request's own servers when
@@ -1258,7 +1191,6 @@ const SessionActivation = struct {
     ultrafast_mode: bool,
     effort: types.ReasoningEffort,
     session_rt: session_runtime.SessionRuntime,
-    mcp: ?*mcp_runtime.McpRuntime,
     mcp_host: ?*mcp_host.Host = null,
     /// Owned client prompt. The session takes it over on success; the caller
     /// frees it when activation fails.
@@ -1345,7 +1277,6 @@ fn activateSession(state: *server.ServerState, activation: SessionActivation) !v
         .permission_mode = start.permission_mode,
         .permission_rules = state.permission_rules,
         .session_rt = activation.session_rt,
-        .mcp = activation.mcp,
         .mcp_host = activation.mcp_host,
         .cancel_flag = std.atomic.Value(bool).init(false),
         .pending_prompt_id = null,
@@ -1668,6 +1599,17 @@ fn sendUserHistoryTurn(
     session_id: []const u8,
     user: types.UserTurn,
 ) !void {
+    // A turn the terminal app sent to resume an interrupted request replays
+    // as the line it showed, not as fx's note to the model.
+    if (std.mem.eql(u8, user.text, session_runtime.resumed_request_prompt)) {
+        return sendAgentHistoryChunk(state, alloc, session_id, session_runtime.resumed_request_notice.body);
+    }
+    // A turn a subagent's report or message started is not the user's
+    // words, so it never replays as theirs; the agent's reply still does.
+    if (user.author != .user) {
+        debug_trace.logf("acp", "history replay skipped non-user prompt author={s} bytes={d}", .{ @tagName(user.author), user.text.len });
+        return;
+    }
     var message_id: acp_types.MessageIdBuffer = undefined;
     const stable_message_id = acp_types.generateMessageId(&message_id);
     if (user.text.len > 0) {
@@ -1741,7 +1683,7 @@ fn sendExecutionHistory(
     const frames = try planExecutionReplay(
         arena_state.allocator(),
         tool_call_presentation.activeToolRegistry(state),
-        activeSessionMcp(state),
+        activeSessionHost(state),
         if (state.active_session) |*active| &active.tool_identities else null,
         .{
             .alloc = alloc,
@@ -1753,7 +1695,15 @@ fn sendExecutionHistory(
     for (frames) |frame| {
         switch (frame) {
             .assistant_text => |text| try sendAgentHistoryChunk(state, alloc, session_id, text),
-            .steering_text => |text| try sendSteeringHistoryChunk(state, alloc, session_id, text),
+            .steering_text => |text| {
+                // A subagent's report a boundary took is not the user's
+                // message, so it isn't replayed as one.
+                if (agent_frame.isFrame(text)) {
+                    debug_trace.logf("acp", "event=history_steering_skipped reason=subagent_frame bytes={d}", .{text.len});
+                    continue;
+                }
+                try sendSteeringHistoryChunk(state, alloc, session_id, text);
+            },
             .tool_call => |call| try sendHistoryToolCall(state, alloc, session_id, call),
         }
     }
@@ -1803,7 +1753,7 @@ const ReplaySources = struct {
 fn planToolCallFrame(
     arena: Allocator,
     registry: tool_dispatch.Registry,
-    mcp: ?*mcp_runtime.McpRuntime,
+    session_host: ?*mcp_host.Host,
     identities: ?*tool_call_identities.Record,
     replay_sources: ReplaySources,
     replayed_call: types.ToolCall,
@@ -1826,9 +1776,9 @@ fn planToolCallFrame(
     const name = tool_call_presentation.acpToolName(call.name);
     // MCP identity comes from the live catalog, or from the identity recorded
     // when the session made the call; it is never guessed from the exposed
-    // name. Servers served over ACP connect only on the next turn.
+    // name.
     const mcp_identity = if (registry.lookup(call.name) == null)
-        (if (mcp) |runtime| runtime.toolIdentity(arena, call.name) catch null else null) orelse
+        (if (session_host) |h| h.catalog.toolIdentity(arena, call.name) catch null else null) orelse
             if (identities) |record| try record.lookup(arena, call.name) else null
     else
         null;
@@ -1864,15 +1814,10 @@ fn planToolCallFrame(
     };
 }
 
-fn hostChannel(state: *server.ServerState) ?message_carrier.Carrier {
-    if (comptime host_target.is_wasm) return null;
-    return mcp_carrier.carrier(state);
-}
-
-fn activeSessionMcp(state: *server.ServerState) ?*mcp_runtime.McpRuntime {
+fn activeSessionHost(state: *server.ServerState) ?*mcp_host.Host {
     if (comptime host_target.is_wasm) return null;
     const session = if (state.active_session) |*active| active else return null;
-    return session.mcp;
+    return session.mcp_host;
 }
 
 /// Maps a persisted execution memory onto the same session/update frame
@@ -1884,7 +1829,7 @@ fn activeSessionMcp(state: *server.ServerState) ?*mcp_runtime.McpRuntime {
 fn planExecutionReplay(
     arena: Allocator,
     registry: tool_dispatch.Registry,
-    mcp: ?*mcp_runtime.McpRuntime,
+    session_host: ?*mcp_host.Host,
     identities: ?*tool_call_identities.Record,
     replay_sources: ReplaySources,
     execution: types.ExecutionMemory,
@@ -1902,7 +1847,7 @@ fn planExecutionReplay(
                 matched[i] = true;
                 break :blk step.tool_results[i];
             } else null;
-            try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, mcp, identities, replay_sources, call, result) });
+            try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, session_host, identities, replay_sources, call, result) });
         }
         // Results without a surviving call record (e.g. trimmed history) still
         // replay as completed frames so the transcript stays faithful.
@@ -1913,12 +1858,15 @@ fn planExecutionReplay(
                 .name = result.tool_name,
                 .arguments_json = "{}",
             };
-            try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, mcp, identities, replay_sources, call, result) });
+            try frames.append(arena, .{ .tool_call = try planToolCallFrame(arena, registry, session_host, identities, replay_sources, call, result) });
         }
         steering_index = try appendSteeringReplay(arena, &frames, execution.steering, steering_index, step_index + 1);
     }
     // Entries past the last step still replay, in order, rather than vanish.
     _ = try appendSteeringReplay(arena, &frames, execution.steering, steering_index, null);
+    // `execution.context_notes` and `execution.runtime_context` never replay:
+    // they are fx's context for the model, not messages of the conversation
+    // (D93, D94).
     return frames.toOwnedSlice(arena);
 }
 
@@ -2155,7 +2103,9 @@ pub fn writeModeConfigOption(
         try writeJsonStr(mode.description, w);
         // ACP leaves extra value fields to `_meta`.
         try w.writeAll(",\"_meta\":{\"fx\":{\"permissionMode\":");
-        try writeJsonStr(permissions.permissionModeLabel(mode.permission_mode), w);
+        // ACP clients may read this field, so it keeps the original names,
+        // including `yolo` for full access, which settings no longer save.
+        try writeJsonStr(@tagName(mode.permission_mode), w);
         try w.writeAll("}}}");
     }
     try w.writeAll("]}");
@@ -2504,6 +2454,36 @@ test "ACP interrupted history replay hides model-only abort context" {
     try std.testing.expect(std.mem.find(u8, captured, "cancelled") != null);
     try std.testing.expect(std.mem.find(u8, captured, "Interrupted by user after completing") == null);
     try std.testing.expect(std.mem.find(u8, captured, "<turn_aborted>") == null);
+}
+
+test "ACP history replays a resumed request as its line, not fx's note" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-resumed-history.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+
+    {
+        var state = try initAcpSessionTestState(arena, workspace, capture);
+        defer state.deinit();
+        try sendTestHistoryTurn(&state, arena, "session-1", .{ .assistant = .{
+            .user = .{ .text = try arena.dupe(u8, session_runtime.resumed_request_prompt) },
+            .assistant = try arena.dupe(u8, "RESUMED_ANSWER"),
+        } });
+    }
+
+    const captured = try readCaptured(&capture, alloc);
+    defer alloc.free(captured);
+    try std.testing.expect(std.mem.find(u8, captured, "user_message_chunk") == null);
+    try std.testing.expect(std.mem.find(u8, captured, "session_resumed") == null);
+    const line = std.mem.find(u8, captured, session_runtime.resumed_request_notice.body).?;
+    try std.testing.expect(std.mem.find(u8, captured[line..], "RESUMED_ANSWER") != null);
 }
 
 fn readCaptured(capture_file: *std.Io.File, alloc: Allocator) ![]u8 {
@@ -3120,7 +3100,7 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
         .params_raw = "{\"mcpServers\":[]}",
     };
     try handleNewSession(&state, arena, &new_msg);
-    try std.testing.expect(state.active_session.?.mcp == null);
+    try std.testing.expect(state.active_session.?.mcp_host == null);
     const session_id = try alloc.dupe(u8, state.active_session.?.session_id);
     defer alloc.free(session_id);
 
@@ -3138,7 +3118,7 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
             .params_raw = params,
         };
         try restore.handler(&state, arena, &msg);
-        try std.testing.expect(state.active_session.?.mcp == null);
+        try std.testing.expect(state.active_session.?.mcp_host == null);
     }
 
     const local_request = try arena.print(
@@ -3168,7 +3148,7 @@ test "ACP host-disabled new load and resume skip project MCP effects" {
             .params_raw = params,
         };
         try request.handler(&state, arena, &msg);
-        try std.testing.expect(state.active_session.?.mcp == null);
+        try std.testing.expect(state.active_session.?.mcp_host == null);
         try std.testing.expectEqualStrings(
             session_id,
             state.active_session.?.session_id,
@@ -3296,102 +3276,6 @@ test "ACP new and loaded sessions provide a writable subagent host" {
     defer alloc.free(captured);
     try std.testing.expect(std.mem.find(u8, captured, "\"id\":1") != null);
     try std.testing.expect(std.mem.find(u8, captured, "\"id\":2") != null);
-}
-
-test "ACP same-session restore retires the replaced MCP runtime after active users drain" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-
-    const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home_path);
-    const workspace_path = try io_mod.dirRealpathAlloc(
-        alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer alloc.free(workspace_path);
-    const test_home = try AcpSessionTestHome.install(alloc, home_path);
-    defer test_home.deinit();
-
-    var capture = try tmp.dir.createFile(
-        io_mod.getIo(),
-        "acp-replace-output.jsonl",
-        .{ .read = true },
-    );
-    defer capture.close(io_mod.getIo());
-    var state = try initAcpSessionTestState(arena, workspace_path, capture);
-    defer state.deinit();
-    state.sessions_v2 = try session_adapter.Store.open(arena, home_path);
-
-    var new_msg = jsonrpc.Message{
-        .id = .{ .integer = 1 },
-        .method = "session/new",
-        .params_raw = "{\"mcpServers\":[]}",
-    };
-    try handleNewSession(&state, arena, &new_msg);
-
-    const runtime = try arena.create(mcp_runtime.McpRuntime);
-    runtime.* = mcp_runtime.McpRuntime.init(arena);
-    state.active_session.?.mcp = runtime;
-    try std.testing.expect(runtime.acquireUse());
-
-    var load_params: std.Io.Writer.Allocating = .init(arena);
-    defer load_params.deinit();
-    try load_params.writer.writeAll("{\"sessionId\":");
-    try writeJsonStr(state.active_session.?.session_id, &load_params.writer);
-    try load_params.writer.writeAll(",\"mcpServers\":[]}");
-    var load_msg = jsonrpc.Message{
-        .id = .{ .integer = 2 },
-        .method = "session/load",
-        .params_raw = load_params.writer.buffered(),
-    };
-
-    const Restore = struct {
-        state: *server.ServerState,
-        alloc: Allocator,
-        msg: *jsonrpc.Message,
-        done: std.atomic.Value(bool) = .init(false),
-        err: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            handleLoadSession(self.state, self.alloc, self.msg) catch |err| {
-                self.err = err;
-            };
-            self.done.store(true, .release);
-        }
-    };
-    var restore = Restore{
-        .state = &state,
-        .alloc = arena,
-        .msg = &load_msg,
-    };
-    const restore_thread = try std.Thread.spawn(.{}, Restore.run, .{&restore});
-    var joined = false;
-    defer if (!joined) restore_thread.join();
-
-    const observation_deadline = io_mod.milliTimestamp() + 5_000;
-    while (!restore.done.load(.acquire) and
-        !runtime.retiring.load(.acquire) and
-        io_mod.milliTimestamp() < observation_deadline)
-    {
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    const retired_before_destroy = runtime.retiring.load(.acquire);
-    const completed_while_leased = restore.done.load(.acquire);
-
-    runtime.releaseUse();
-    restore_thread.join();
-    joined = true;
-
-    if (restore.err) |err| return err;
-    try std.testing.expect(retired_before_destroy);
-    try std.testing.expect(!completed_while_leased);
 }
 
 test "libfx/new uses a valid host session id and generates one when none is named" {

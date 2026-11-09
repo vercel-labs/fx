@@ -16,6 +16,7 @@ Pick the lowest layer that proves the behavior, and extend the closest existing 
 | fx against the official MCP client conformance suite | `tests/e2e/conformance/`, an isolated npm project |
 | Evidence tooling for terminal rendering bugs | `tests/e2e/render-lab/` |
 | Task quality or tool choice with real models | `tests/evals/` |
+| Saved inputs for a fuzz test | `tests/fuzz/corpus/<target>/`, with the target listed in `tests/fuzz/targets.json` |
 | A protocol or crash-safety design, checked with TLC | A folder under `tests/tla/` named after the module it models |
 | libfx SDK behavior | `sdk/tests/`, which `sdk/AGENTS.md` owns |
 | Startup latency or memory | `benchmarks/` |
@@ -34,6 +35,9 @@ tests/
 ├── fixtures/
 │   └── v1-sessions/       sessions the v0.0.14 release saved, which the converter's tests copy;
 │                          generate.ts rebuilds them and manifest.json lists them
+├── fuzz/
+│   ├── targets.json       every fuzz test, for zig build fuzz and the nightly Fuzz workflow
+│   └── corpus/<target>/   saved inputs that zig build test replays; CONTRIBUTING.md explains them
 └── tla/                   TLA+ models, their checkers, and their Bun drivers
     ├── session_manager/   one folder per model area, named after the module it describes,
     ├── mcp/               each with a check.sh; tla/README.md lists them all
@@ -50,7 +54,7 @@ Only files that end in `.test.ts` at the root of `tests/e2e/` are E2E tests. CI 
 
 - Build first with `zig build`. Tests run `zig-out/bin/fx` through `FX_BIN` from `tests/evals/eval-helpers.ts`, never an installed `fx`.
 - Give every test its own profile with `createIsolatedTestHome()` and remove it with `cleanupIsolatedTestHome()`. A test must never read or write the developer's `~/.fx`.
-- Keep the network local. Point fx at a fake model server with `startFakeGateway()` or `startDynamicFakeGateway()` from `tmux-helpers.ts`, or the builders in `fixtures/chat-completions.ts`. `TmuxSession` clears credentials and the `FX_E2E_*` overrides from the inherited environment.
+- Keep the network local. Point fx at a fake model server with `startFakeGateway()` or `startDynamicFakeGateway()` from `tmux-helpers.ts`, or the builders in `fixtures/chat-completions.ts`. `TmuxSession` clears credentials and the `FX_TEST_*` overrides from the inherited environment.
 - Wait for state the user can see: `TmuxSession.waitForText()`, `waitForStableGrid()`, `waitForComposer()`, or `waitForSessionEnd()`. A fixed sleep can pace input, but it does not prove the state you assert next.
 - Skip, do not fail, a terminal test when tmux is missing: `test.skipIf(!tmuxAvailable())`.
 - A new test must not play sound. `TmuxSession` and the fixtures set `FX_SOUND=0`; set it yourself when you spawn fx another way. Sound playback is covered only by `notifications.test.ts` and the `/sound on` test in `tui-command-permissions.test.ts`, so keep sound coverage there. The repository `AGENTS.md` explains how to run them locally.
@@ -85,7 +89,7 @@ Every TLA+ spec, its TLC checker, the Bun drivers that walk code along a spec, a
 - Give each folder a `check.sh` that runs every config and exits non-zero when one misses its expected verdict. Configs that must fail, such as witnesses and planted mutations, are part of that contract, so encode their verdicts in `check.sh`. Source `../lib/tlc.sh` and list each config with its verdict for `tlc_verdicts`, rather than finding TLC yourself. A Python checker gets Java and the jar from `toolchain()` in `lib/tlc.py`.
 - Put Bun drivers in `tests/tla/drivers/<area>/`. They run the code under test, from `zig-out/bin/fx` or by relative import, and have TLC check each run. Use `drivers/lib/tlc.ts` to run TLC and `drivers/lib/context.ts` for the binary, the output folder, and the `tests/e2e/` helpers. Every fx process a driver starts sets `FX_SOUND=0`. Generated output, such as `tests/tla/sdk/graphs/`, goes to the temp folder or is ignored by git.
 - A model of code that has not landed says so at the top, and the drivers that need that code run only behind an explicit flag, such as `--next` or `FX_TLA_NEXT_MCP=1`. `tests/tla/README.md` lists them. Remove the flag in the change that lands the code.
-- When a change alters behavior that a spec models, update the spec in the same change and run its checker. CI runs only the `sdk/` model and its drivers; run the others yourself.
+- When a change alters behavior that a spec models, update the spec in the same change and run its checker. CI runs the `sdk/`, `mcp/`, and `mcp_host/` models and their drivers on `main` and on pull requests that change the code they cover (`scripts/detect-ci-need.sh`), the `mcp_call/` model on `main` and on pull requests labeled `ci:tla-mcp-call`, and the `recovery/` and `agent_runtime/` models and their drivers on every pull request; run the others yourself.
 - A new model, checker, or driver gets a row in `tests/tla/README.md`.
 
 ## Cite tests and specs from `src/`

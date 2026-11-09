@@ -6,7 +6,7 @@
 \*   - src/core/mcp_host/runtime.zig onServer `.elicit` (2025): callAsking
 \*     finds a call on the server that can ask and isn't holding a question
 \*     (req.question == null), and offers it Pending{reply = .elicit = slot};
-\*     with none, fx declines at once. `.elicit_withdrawn`: endUrl only.
+\*     with none, fx answers it cancel at once. `.elicit_withdrawn`: endUrl only.
 \*   - onEvent `.input` (2026): the call's input requests, offered as
 \*     Pending{reply = .input = {call handle, keys}}.
 \*   - askWaiting, on the caller's thread: takes the offered question
@@ -51,9 +51,9 @@ VARIABLES
     posted,     \* an answer posted to the owner: [q, key], q = 0 for none
     answeredBy, \* [Qs -> 0..MaxQ]: whose answer the server got for each question
     shown,      \* ghost: [Qs -> BOOLEAN] the user saw it
-    declined    \* ghost: [Qs -> BOOLEAN] fx declined it at once
+    dismissed    \* ghost: [Qs -> BOOLEAN] fx dismissed it at once
 
-vars == <<version, nextQ, holder, pending, calling, offered, offerKey, asking, askKey, posted, answeredBy, shown, declined>>
+vars == <<version, nextQ, holder, pending, calling, offered, offerKey, asking, askKey, posted, answeredBy, shown, dismissed>>
 
 Free == {s \in SlotIds : holder[s] = None}
 Lowest(S) == CHOOSE s \in S : \A t \in S : s <= t
@@ -69,7 +69,7 @@ TypeOK ==
     /\ posted \in [q : 0..MaxQ, key : 0..MaxQ]
     /\ answeredBy \in [Qs -> 0..MaxQ]
     /\ shown \in [Qs -> BOOLEAN]
-    /\ declined \in [Qs -> BOOLEAN]
+    /\ dismissed \in [Qs -> BOOLEAN]
 
 Init ==
     /\ version \in Versions
@@ -82,11 +82,11 @@ Init ==
     /\ posted = [q |-> None, key |-> 0]
     /\ answeredBy = [q \in Qs |-> None]
     /\ shown = [q \in Qs |-> FALSE]
-    /\ declined = [q \in Qs |-> FALSE]
+    /\ dismissed = [q \in Qs |-> FALSE]
 
 \* The server asks question q. 2025: the core takes the lowest free slot
 \* (none free: an error answers it, and it never reaches fx). 2026: a round.
-\* fx offers it to the call, or declines it at once when no call can take it.
+\* fx offers it to the call, or answers it cancel at once when no call can take it.
 Ask ==
     /\ nextQ <= MaxQ
     /\ version = "2025" => Free # {}
@@ -98,9 +98,9 @@ Ask ==
           /\ pending' = [pending EXCEPT ![q] = take]
           /\ offered' = IF take THEN q ELSE offered
           /\ offerKey' = IF take THEN (IF version = "2025" THEN s ELSE q) ELSE offerKey
-          \* fx's decline goes out at once, as this question's answer.
+          \* fx's cancel goes out at once, as this question's answer.
           /\ answeredBy' = IF take THEN answeredBy ELSE [answeredBy EXCEPT ![q] = q]
-          /\ declined' = [declined EXCEPT ![q] = ~take]
+          /\ dismissed' = [dismissed EXCEPT ![q] = ~take]
     /\ UNCHANGED <<version, calling, asking, askKey, posted, shown>>
 
 \* askWaiting: the caller's thread takes the offered question and shows it.
@@ -109,14 +109,14 @@ Take ==
     /\ asking' = offered /\ askKey' = offerKey
     /\ offered' = None /\ offerKey' = 0
     /\ shown' = [shown EXCEPT ![offered] = TRUE]
-    /\ UNCHANGED <<version, nextQ, holder, pending, calling, posted, answeredBy, declined>>
+    /\ UNCHANGED <<version, nextQ, holder, pending, calling, posted, answeredBy, dismissed>>
 
 \* The user answers what they see; the caller posts it to the owner.
 UserAnswers ==
     /\ asking # None /\ posted.q = None
     /\ posted' = [q |-> asking, key |-> askKey]
     /\ asking' = None /\ askKey' = 0
-    /\ UNCHANGED <<version, nextQ, holder, pending, calling, offered, offerKey, answeredBy, shown, declined>>
+    /\ UNCHANGED <<version, nextQ, holder, pending, calling, offered, offerKey, answeredBy, shown, dismissed>>
 
 \* `.answer` on the owner. 2025: answerElicitation(slot) answers whatever
 \* question holds the slot now; a free slot is UnknownElicitation (dropped).
@@ -131,7 +131,7 @@ Deliver ==
                   /\ holder' = IF version = "2025" THEN [holder EXCEPT ![posted.key] = None] ELSE holder
              ELSE UNCHANGED <<answeredBy, pending, holder>>
     /\ posted' = [q |-> None, key |-> 0]
-    /\ UNCHANGED <<version, nextQ, calling, offered, offerKey, asking, askKey, shown, declined>>
+    /\ UNCHANGED <<version, nextQ, calling, offered, offerKey, asking, askKey, shown, dismissed>>
 
 \* The server withdraws q: notifications/cancelled for its request (2025),
 \* which frees its slot. A shown question stays on screen. With the repair,
@@ -144,7 +144,7 @@ Withdraw(q) ==
     /\ IF Guard /\ offered = q
          THEN offered' = None /\ offerKey' = 0
          ELSE UNCHANGED <<offered, offerKey>>
-    /\ UNCHANGED <<version, nextQ, calling, asking, askKey, posted, answeredBy, shown, declined>>
+    /\ UNCHANGED <<version, nextQ, calling, asking, askKey, posted, answeredBy, shown, dismissed>>
 
 \* The call ends (answered, cancelled, timed out): finish drops a question
 \* it hadn't taken. A 2026 round ends with it. A question already shown
@@ -154,7 +154,7 @@ CallEnds ==
     /\ calling' = FALSE
     /\ offered' = None /\ offerKey' = 0
     /\ pending' = IF version = "2026" THEN [q \in Qs |-> FALSE] ELSE pending
-    /\ UNCHANGED <<version, nextQ, holder, asking, askKey, posted, answeredBy, shown, declined>>
+    /\ UNCHANGED <<version, nextQ, holder, asking, askKey, posted, answeredBy, shown, dismissed>>
 
 Next ==
     \/ Ask \/ Take \/ UserAnswers \/ Deliver \/ CallEnds
@@ -170,8 +170,8 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 \* Each question is answered at most once, by fx or by an answer the user gave.
 AnsweredOnce == \A q \in Qs : answeredBy[q] # None => ~pending[q]
 
-\* A question fx declined at once (no call could ask) is never shown.
-DeclinedNeverShown == \A q \in Qs : ~(shown[q] /\ declined[q])
+\* A question fx dismissed at once (no call could ask) is never shown.
+DismissedNeverShown == \A q \in Qs : ~(shown[q] /\ dismissed[q])
 
 \* One question at a time on screen, and the call holds at most one more.
 OneOnScreen == asking # offered \/ asking = None

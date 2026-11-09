@@ -1,7 +1,7 @@
 // fx as a harness of the durable core in durable.js: `createFxAgent` is that
 // core running fx engines. Everything the core needs to know about fx is
 // here; the core itself knows only the harness contract.
-import { checkPromptInput, coreAnswered, engineInternals, journalMarksWanted, normalizeInstructions, normalizeModelChoice, resumeOutputShown } from "./fx-sdk.js";
+import { checkPromptInput, coreAnswered, engineInternals, journalMarksWanted, normalizeInstructions, normalizeModelChoice, resumeOutputShown } from "./engine.js";
 import { createCredentialMemory, credentialMemory } from "./subscription.js";
 
 const encoder = new TextEncoder();

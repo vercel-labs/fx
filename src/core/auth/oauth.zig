@@ -130,7 +130,7 @@ pub const TokenTypeHint = enum {
     refresh_token,
 };
 
-pub fn expiry_timestamp_ms(now_ms: i64, expires_in_seconds: i64) OAuthError!i64 {
+pub fn expiryTimestampMs(now_ms: i64, expires_in_seconds: i64) OAuthError!i64 {
     if (expires_in_seconds <= 0) return OAuthError.InvalidOAuthResponse;
     const duration_ms = std.math.mul(i64, expires_in_seconds, std.time.ms_per_s) catch
         return OAuthError.InvalidOAuthResponse;
@@ -500,7 +500,7 @@ pub fn queryValueNonEmptyAlloc(
 }
 
 pub fn percentDecodeAlloc(alloc: Allocator, value: []const u8) QueryError![]u8 {
-    return percent_decode_alloc_detailed(alloc, value) catch |err| switch (err) {
+    return percentDecodeAllocDetailed(alloc, value) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidPercentEncoding,
     };
@@ -511,7 +511,7 @@ const PercentDecodeDetailedError = std.mem.Allocator.Error || error{
     InvalidPercentDigit,
 };
 
-fn percent_decode_alloc_detailed(alloc: Allocator, value: []const u8) PercentDecodeDetailedError![]u8 {
+fn percentDecodeAllocDetailed(alloc: Allocator, value: []const u8) PercentDecodeDetailedError![]u8 {
     var out = try alloc.alloc(u8, value.len);
     errdefer alloc.free(out);
     var read_index: usize = 0;
@@ -558,14 +558,14 @@ pub const FormCallbackContext = struct {
     consumed: bool = false,
 };
 
-pub fn parse_form_callback(
+pub fn parseFormCallback(
     raw: ?*anyopaque,
     alloc: Allocator,
     body: []const u8,
 ) browser_callback.ParseResult(FormCallback) {
     const context: *FormCallbackContext = @ptrCast(@alignCast(raw.?));
     if (context.consumed) return .unrelated;
-    const callback = parse_form_callback_body(alloc, body, context) catch |err| {
+    const callback = parseFormCallbackBody(alloc, body, context) catch |err| {
         if (err == error.OAuthFormStateMismatch) return .unrelated;
         return .{ .failed = err };
     };
@@ -573,12 +573,12 @@ pub fn parse_form_callback(
     return .{ .accepted = callback };
 }
 
-fn decode_form_callback_component(
+fn decodeFormCallbackComponent(
     alloc: Allocator,
     value: []const u8,
     context: *const FormCallbackContext,
 ) ![]u8 {
-    const decoded = percent_decode_alloc_detailed(alloc, value) catch |err| switch (err) {
+    const decoded = percentDecodeAllocDetailed(alloc, value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.TruncatedPercentEncoding => return if (context.require_visible_ascii)
             context.invalid_error
@@ -596,7 +596,7 @@ fn decode_form_callback_component(
     return decoded;
 }
 
-fn parse_form_callback_body(
+fn parseFormCallbackBody(
     alloc: Allocator,
     body: []const u8,
     context: *const FormCallbackContext,
@@ -606,7 +606,7 @@ fn parse_form_callback_body(
     var fields = std.mem.splitScalar(u8, body, '&');
     while (fields.next()) |field| {
         const equals = std.mem.findScalar(u8, field, '=') orelse return context.invalid_error;
-        const name = try decode_form_callback_component(alloc, field[0..equals], context);
+        const name = try decodeFormCallbackComponent(alloc, field[0..equals], context);
         defer alloc.free(name);
         const index: usize = if (std.mem.eql(u8, name, "state"))
             0
@@ -619,7 +619,7 @@ fn parse_form_callback_body(
         else
             return context.invalid_error;
         if (values[index] != null) return context.invalid_error;
-        const value = try decode_form_callback_component(alloc, field[equals + 1 ..], context);
+        const value = try decodeFormCallbackComponent(alloc, field[equals + 1 ..], context);
         values[index] = value;
         if (value.len == 0 or value.len > context.max_value_bytes) return context.invalid_error;
         if (index == 1 and value.len > context.code_max_bytes) return context.invalid_error;
@@ -744,7 +744,7 @@ test "browser token parsing and transfer clean up allocation failures" {
     );
 }
 
-fn check_metadata_allocation_failures(alloc: Allocator) !void {
+fn checkMetadataAllocationFailures(alloc: Allocator) !void {
     var metadata = try parseMetadata(
         alloc,
         "{\"issuer\":\"https://vercel.com\",\"device_authorization_endpoint\":\"https://vercel.com/device\",\"token_endpoint\":\"https://vercel.com/token\",\"revocation_endpoint\":\"https://vercel.com/revoke\"}",
@@ -752,7 +752,7 @@ fn check_metadata_allocation_failures(alloc: Allocator) !void {
     defer metadata.deinit(alloc);
 }
 
-fn check_device_authorization_allocation_failures(alloc: Allocator) !void {
+fn checkDeviceAuthorizationAllocationFailures(alloc: Allocator) !void {
     var device = try parseDeviceAuthorization(
         alloc,
         "{\"device_code\":\"device\",\"user_code\":\"user\",\"verification_uri\":\"https://vercel.com/verify\",\"verification_uri_complete\":\"https://vercel.com/verify?code=user\",\"expires_in\":600,\"interval\":5}",
@@ -760,7 +760,7 @@ fn check_device_authorization_allocation_failures(alloc: Allocator) !void {
     defer device.deinit(alloc);
 }
 
-fn check_token_set_allocation_failures(alloc: Allocator) !void {
+fn checkTokenSetAllocationFailures(alloc: Allocator) !void {
     var token = try parseTokenSet(
         alloc,
         "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}",
@@ -931,17 +931,17 @@ test "oauth parses token set" {
 }
 
 test "oauth parsers clean up allocation failures" {
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_metadata_allocation_failures, .{});
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_device_authorization_allocation_failures, .{});
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_token_set_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkMetadataAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkDeviceAuthorizationAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkTokenSetAllocationFailures, .{});
 }
 
 test "oauth expiry timestamps reject invalid durations" {
-    try std.testing.expectEqual(@as(i64, 11_000), try expiry_timestamp_ms(1_000, 10));
-    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiry_timestamp_ms(1_000, 0));
-    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiry_timestamp_ms(1_000, -1));
-    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiry_timestamp_ms(1_000, std.math.maxInt(i64)));
-    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiry_timestamp_ms(std.math.maxInt(i64), 1));
+    try std.testing.expectEqual(@as(i64, 11_000), try expiryTimestampMs(1_000, 10));
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiryTimestampMs(1_000, 0));
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiryTimestampMs(1_000, -1));
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiryTimestampMs(1_000, std.math.maxInt(i64)));
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiryTimestampMs(std.math.maxInt(i64), 1));
 }
 
 test "oauth parsers reject non-object JSON" {

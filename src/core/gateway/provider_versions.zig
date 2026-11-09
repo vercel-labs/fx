@@ -4,6 +4,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const host_target = @import("../hosts/target.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const cache_dir_name = "provider-versions";
@@ -89,12 +90,12 @@ fn cacheFile(provider: Provider) []const u8 {
 fn loadCache(_: ?*anyopaque, alloc: Allocator, provider: Provider) !?Cached {
     if (comptime host_target.is_wasm) return null;
     const home = io_mod.homeDir() orelse return null;
-    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{}) catch |err| {
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{}) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
     };
     defer home_dir.close(io_mod.getIo());
-    var profile_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{ .follow_symlinks = false }) catch |err| {
+    var profile_dir = home_dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{ .follow_symlinks = false }) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
     };
@@ -119,7 +120,7 @@ fn readCached(alloc: Allocator, dir: std.Io.Dir, provider: Provider) !?Cached {
     const bytes = try io_mod.readFileToEnd(alloc, &file, max_cache_bytes);
     defer alloc.free(bytes);
     const Record = struct { version: []const u8, checked_at_ms: i64 };
-    const parsed = try std.json.parseFromSlice(Record, alloc, bytes, .{});
+    const parsed = try json_decode.parseFromSlice(Record, alloc, bytes, .{});
     defer parsed.deinit();
     return .{
         .version = Version.parse(parsed.value.version) orelse return error.InvalidProviderVersionCache,
@@ -134,9 +135,9 @@ fn saveCache(_: ?*anyopaque, alloc: Allocator, provider: Provider, cached: Cache
 }
 
 fn saveCacheAtHome(alloc: Allocator, provider: Provider, cached: Cached, home: []const u8) !void {
-    var home_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true });
+    var home_dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true });
     defer home_dir.close(io_mod.getIo());
-    var profile_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(home_dir, profile_paths.root_dir_name);
+    var profile_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(home_dir, profile_paths.rootName());
     defer profile_dir.close();
     var cache_dir = try io_mod.openOrCreateVerifiedPrivateDir(&profile_dir, cache_dir_name);
     defer cache_dir.close();

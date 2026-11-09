@@ -15,12 +15,6 @@ pub const CallToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8,
 pub const SearchRequest = capability_retrieval.Request;
 pub const SearchToolsFn = *const fn (*anyopaque, Allocator, SearchRequest, types.PermissionRuleSet, context_limits.Values, Access, ?*std.atomic.Value(bool)) anyerror!SearchResult;
 pub const ToolSchemaFn = *const fn (*anyopaque, Allocator, []const u8, types.PermissionRuleSet, context_limits.Values, Access, ?*std.atomic.Value(bool)) anyerror!?ToolSchemaResult;
-pub const FeatureCallFn = *const fn (
-    *anyopaque,
-    Allocator,
-    FeatureRequest,
-    FeatureCallOptions,
-) anyerror!FeatureResult;
 
 pub const Progress = mcp_contract.Progress;
 pub const ProgressSink = mcp_contract.ProgressSink;
@@ -47,9 +41,22 @@ const LiveViewProvider = struct {
     }
 };
 
+/// The MCP servers an agent may use, by name: an instance's profile.
+pub const ServerFilter = struct {
+    context: *const anyopaque,
+    allows_fn: *const fn (*const anyopaque, []const u8) bool,
+
+    pub fn allows(self: ServerFilter, server: []const u8) bool {
+        return self.allows_fn(self.context, server);
+    }
+};
+
 pub const Access = union(enum) {
     unrestricted,
     disabled,
+    /// Every tool of a server the filter allows. The host, which knows each
+    /// tool's server, decides.
+    servers: ServerFilter,
     scoped: struct {
         captured: *const access_policy.View,
         admission_authority_generation: u64,
@@ -59,19 +66,10 @@ pub const Access = union(enum) {
 
     pub fn allowsTool(self: Access, runtime_generation: u64, name: []const u8) bool {
         return switch (self) {
-            .unrestricted => true,
+            .unrestricted, .servers => true,
             .disabled => false,
             .scoped => |scope| scope.captured.runtime_generation == runtime_generation and
                 scope.captured.tool(name) != null,
-        };
-    }
-
-    pub fn allowsFeatureServer(self: Access, runtime_generation: u64, name: []const u8) bool {
-        return switch (self) {
-            .unrestricted => true,
-            .disabled => false,
-            .scoped => |scope| scope.captured.runtime_generation == runtime_generation and
-                scope.captured.features_visible and scope.captured.server(name) != null,
         };
     }
 };
@@ -233,49 +231,6 @@ pub const ContinuationTerminal = enum {
 pub const Continuation = struct {
     input_responses_json: []const u8,
     request_state_json: ?[]const u8 = null,
-};
-
-pub const FeatureAction = enum {
-    resource_list,
-    resource_templates,
-    resource_read,
-    prompt_list,
-    prompt_get,
-    prompt_complete,
-    resource_complete,
-};
-
-pub const FeatureArgument = struct {
-    name: []const u8,
-    value: []const u8,
-};
-
-pub const FeatureRequest = struct {
-    action: FeatureAction,
-    server_name: []const u8,
-    identity: []const u8 = "",
-    argument_name: []const u8 = "",
-    value: []const u8 = "",
-    arguments_json: []const u8 = "{}",
-    context_arguments: []const FeatureArgument = &.{},
-};
-
-pub const FeatureCallOptions = struct {
-    cancel_flag: ?*std.atomic.Value(bool) = null,
-    input_responder: ?InputResponder = null,
-    output_limit_bytes: usize,
-    access: Access = .unrestricted,
-};
-
-pub const FeatureResult = struct {
-    model_output: []u8,
-    images: []types.ToolImage = &.{},
-
-    pub fn deinit(self: *FeatureResult, alloc: Allocator) void {
-        alloc.free(self.model_output);
-        types.freeToolImages(alloc, self.images);
-        self.* = undefined;
-    }
 };
 
 pub const CallStatus = enum {

@@ -3,14 +3,12 @@ const question_prompt = @import("../../core/agent/question_prompt.zig");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
 const credentials = @import("../../core/auth/credentials.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
-const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const types = @import("../../core/shared/types.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
-const paste_blocks = @import("../../core/input/pasted_blocks.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const visual_layout = @import("../input/visual_layout.zig");
 const ui_render = @import("../render.zig");
@@ -29,7 +27,7 @@ pub const composeDividerRow = row_text.composeDividerRow;
 pub const appendClipped = row_text.appendClipped;
 pub const appendAbsoluteColumn = row_text.appendAbsoluteColumn;
 
-pub const PickerKind = enum { model_stage, provider_stage, models, file, slash, skills, help, settings, sessions, fork, mcp, auth };
+pub const PickerKind = enum { model_stage, provider_stage, models, effort, file, slash, skills, help, settings, sessions, fork, agents, mcp, auth };
 pub const CappedInputRows = struct {
     row_limit: usize,
     total_lines: u16,
@@ -228,14 +226,24 @@ fn questionInteractionHint(
     }
 
     // Batch progress rides the hint row, right-aligned like the rest of the
-    // footer chrome; a lone question needs no counter.
-    if (projection.entry_count > 1) {
-        var counter_buf: [32]u8 = undefined;
-        const counter = std.mem.print(
-            &counter_buf,
-            "Question {d} of {d}",
-            .{ projection.current_index + 1, projection.entry_count },
-        ) catch "";
+    // footer chrome; a lone question needs no counter. A subagent's question
+    // on main's screen names the subagent there.
+    if (projection.entry_count > 1 or projection.asker.len > 0) {
+        var counter_buf: [96]u8 = undefined;
+        const counter = if (projection.asker.len > 0 and projection.entry_count > 1)
+            std.mem.print(&counter_buf, "{s} asks · Question {d} of {d}", .{
+                projection.asker,
+                projection.current_index + 1,
+                projection.entry_count,
+            }) catch ""
+        else if (projection.asker.len > 0)
+            std.mem.print(&counter_buf, "{s} asks", .{projection.asker}) catch ""
+        else
+            std.mem.print(
+                &counter_buf,
+                "Question {d} of {d}",
+                .{ projection.current_index + 1, projection.entry_count },
+            ) catch "";
         const base_width = display_width.visibleWidth(base);
         const counter_width = display_width.visibleWidth(counter);
         if (counter.len > 0 and base_width + counter_width + 2 <= width) {
@@ -534,6 +542,23 @@ pub fn composeHintRow(
         }
         if (esc_interrupt_hint.len == 0) hint_line = "esc esc to interrupt";
     }
+    // The agent indicator, such as "fx 2/3 ↓", follows whatever status
+    // shows on the right, as in "fx 3 finished · fx 1/3 ↓".
+    const status_text = if (ctx.waiting_note.len > 0)
+        ctx.waiting_note
+    else if (ctx.upgrade_status.len > 0)
+        ctx.upgrade_status
+    else if (ctx.mcp_status.len > 0)
+        ctx.mcp_status
+    else
+        ctx.working_note;
+    var indicated_buf: [max_status_line_len + 192]u8 = undefined;
+    const indicated_text = if (ctx.agent_label.len == 0)
+        status_text
+    else if (status_text.len == 0)
+        ctx.agent_label
+    else
+        std.mem.print(&indicated_buf, "{s} · {s}", .{ status_text, ctx.agent_label }) catch ctx.agent_label;
     // The armed clear indicator outranks the question suppression: a
     // freeform draft mid-question uses the same double-Esc contract as the
     // composer and needs the same cue. The armed interrupt indicator outranks
@@ -546,10 +571,8 @@ pub fn composeHintRow(
         ""
     else if (danger_text.len > 0)
         danger_text
-    else if (ctx.upgrade_status.len > 0)
-        ctx.upgrade_status
     else
-        ctx.mcp_status;
+        indicated_text;
     const right_width = display_width.visibleWidth(right_text);
     const danger_visible = danger_text.len > 0 and right_text.ptr == danger_text.ptr;
     const left_width: u16 = if (!danger_visible and right_width > 0 and width_usize > right_width)
@@ -637,75 +660,6 @@ pub fn composeVariantHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool,
     return row;
 }
 
-pub fn composeMcpMenuHintRow(
-    alloc: Allocator,
-    width: u16,
-    ctrl_c_pending: bool,
-    projection: render_input.McpMenuProjection,
-) !std.ArrayList(u8) {
-    const state = projection.state;
-
-    const root_variants = [_][]const u8{
-        "↑↓ move  tab section  enter inspect  s add Slack  a add  r reload  c help  esc close",
-        "↑↓ move  tab section  enter  s Slack  a add  r reload  c help  esc",
-        "tab enter s a r c esc",
-    };
-    const catalog_variants = [_][]const u8{
-        "↑↓ navigate     tab section     enter open     / filter     esc back",
-        "↑↓ move  tab section  enter  / filter  esc",
-        "tab enter / esc",
-    };
-    const preview_variants = [_][]const u8{
-        "↑↓ scroll     i insert     esc back",
-        "↑↓ scroll  i insert  esc",
-        "↑↓ i esc",
-    };
-    const add_variants = [_][]const u8{
-        "type field     enter next/save     tab transport     esc cancel",
-        "type  enter next/save  tab transport  esc",
-        "enter tab esc",
-    };
-    const argument_variants = [_][]const u8{
-        "type value  enter next/preview  tab complete  esc cancel",
-        "type  enter next  tab complete  esc",
-        "enter tab esc",
-    };
-    var details: std.ArrayList(u8) = .empty;
-    defer details.deinit(alloc);
-    if (projection.selectedServer()) |server| {
-        const labels = [_]struct { action: mcp_menu_state.Action, label: []const u8 }{
-            .{ .action = .authenticate, .label = "enter sign in  " },
-            .{ .action = .trust_approve, .label = "a approve  " },
-            .{ .action = .trust_reject, .label = "x reject  " },
-            .{ .action = .remove, .label = "d remove  " },
-            .{ .action = .logout, .label = "l logout  " },
-        };
-        for (labels) |item| if (mcp_menu_state.serverActionAvailable(item.action, server)) try details.appendSlice(alloc, item.label);
-    }
-    try details.appendSlice(alloc, "c help  esc back");
-    const details_variants = [_][]const u8{ details.items, "c help  esc back", "c esc" };
-    const confirm_variants = [_][]const u8{
-        "enter confirm     esc cancel",
-        "enter confirm  esc",
-        "enter esc",
-    };
-    const info_variants = [_][]const u8{
-        "esc back",
-        "esc",
-        "esc",
-    };
-    const variants = switch (state.screen) {
-        .browse => if (state.section == .servers) root_variants else catalog_variants,
-        .preview => preview_variants,
-        .add => add_variants,
-        .arguments => argument_variants,
-        .info => info_variants,
-        .details => details_variants,
-        .confirm => confirm_variants,
-    };
-    return composeVariantHintRow(alloc, width, ctrl_c_pending, &variants);
-}
-
 pub fn composeHelpMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
     if (ctrl_c_pending) {
         var warning: std.ArrayList(u8) = .empty;
@@ -722,6 +676,39 @@ pub fn composeHelpMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool
         "↑↓ move  tab category  enter  esc",
         "tab category  enter open  esc",
         "tab enter esc",
+    };
+    var hint = variants[variants.len - 1];
+    for (variants) |candidate| {
+        if (display_width.visibleWidth(candidate) <= width) {
+            hint = candidate;
+            break;
+        }
+    }
+
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row_text.appendClipped(alloc, &row, hint, width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
+pub fn composeEffortMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
+    if (ctrl_c_pending) {
+        var warning: std.ArrayList(u8) = .empty;
+        errdefer warning.deinit(alloc);
+        try warning.appendSlice(alloc, ui_render.statusline_style);
+        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
+        try warning.appendSlice(alloc, ui_render.reset_style);
+        return warning;
+    }
+
+    const variants = [_][]const u8{
+        "↑↓ navigate     enter use     esc close",
+        "↑↓ navigate  enter use  esc close",
+        "↑↓ move  enter  esc",
+        "enter use  esc close",
+        "enter esc",
     };
     var hint = variants[variants.len - 1];
     for (variants) |candidate| {
@@ -819,6 +806,15 @@ pub fn composeCompactCommandMenuHintRow(
             "↑↓ navigate     ←→ change     esc close",
             "↑↓ move  ←→ change  esc",
             "←→ esc",
+        },
+        .info_panel => |panel| if (panel.overflows) [_][]const u8{
+            "↑↓ scroll     esc close",
+            "↑↓ scroll  esc",
+            "↑↓ esc",
+        } else [_][]const u8{
+            "esc close",
+            "esc close",
+            "esc",
         },
         .usage => |usage_menu| if (!render_input.usageShowsTables(usage_menu)) [_][]const u8{
             "esc close",

@@ -29,6 +29,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const session_event = @import("session_event.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -137,7 +138,11 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
         .@"struct" => |info| {
             var value: T = undefined;
             inline for (info.field_names, info.field_types) |field_name, field_type| {
-                @field(value, field_name) = try decodeAny(field_type, alloc, cur);
+                if (comptime absentFromCaches(T, field_name)) {
+                    @field(value, field_name) = null;
+                } else {
+                    @field(value, field_name) = try decodeAny(field_type, alloc, cur);
+                }
             }
             return value;
         },
@@ -164,6 +169,14 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
         .void => return {},
         else => @compileError("snapshot codec: unsupported type: " ++ @typeName(T)),
     }
+}
+
+/// Fields added to the encoded types after the last release that wrote
+/// caches. No cache holds their bytes, so they decode as null and consume
+/// nothing; each must be optional. Reading released caches depends on this
+/// list staying exact.
+fn absentFromCaches(comptime T: type, comptime field_name: []const u8) bool {
+    return T == types.CommittedFilePresentation and std.mem.eql(u8, field_name, "review_lines");
 }
 
 /// Frees a decoded value tree. Only needed when decoding without an arena.

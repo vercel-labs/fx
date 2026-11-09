@@ -28,8 +28,10 @@ pub const Event = union(enum) {
     /// The host needs the tool list.
     need,
     /// A complete page arrived and its tools were added to the store.
-    /// `more`: it has a cursor. `ttl_ms`: from `tools.parsePage`.
-    page_received: struct { more: bool, ttl_ms: u32 },
+    /// `more`: it has a cursor. `ttl_ms`: from `tools.parsePage`. `now_ms`:
+    /// when it arrived, on a clock that never goes back; each page is fresh
+    /// for its own TTL from then.
+    page_received: struct { more: bool, ttl_ms: u32, now_ms: i64 },
     /// -32602 for a continuation page.
     invalid_cursor,
     /// Any other end of the page request (an error, `input_required`, a
@@ -50,9 +52,12 @@ pub const Effect = union(enum) {
     /// The listing ended: the gathered list becomes current (`Store.publish`)
     /// and goes to everyone waiting. `fresh`: it may be served from the cache.
     publish: bool,
-    /// The listing failed: everyone waiting gets the failure. The current
-    /// list stays as it was, and isn't served.
+    /// The listing failed and no list was ever listed: everyone waiting
+    /// gets the failure.
     fail,
+    /// The listing failed: everyone waiting gets the current list, the last
+    /// one listed. It stays stale, so the next need lists again.
+    serve_last,
     /// Serve the current list from the cache to this need.
     serve,
     /// Expire the current list after this long.
@@ -61,6 +66,9 @@ pub const Effect = union(enum) {
 
 pub const max_effects = 2;
 
+/// What the last listing to end gave its waiters.
+pub const Answer = enum { none, list, last_good, failure };
+
 pub const Projection = struct {
     era: ?Era,
     process: u32,
@@ -68,19 +76,23 @@ pub const Projection = struct {
     cache: Cache,
     cache_generation: Generation,
     cached_zero: bool,
+    cached_lapsed: bool,
     listing: bool,
     start_generation: Generation,
     page: u32,
     restarts: u1,
     zero_ttl: bool,
+    lapsed: bool,
     pending: Pending,
     waiting: bool,
+    answer: Answer,
 };
 
 pub const Transition = struct {
     event: []const u8,
     more: ?bool = null,
     ttl_zero: ?bool = null,
+    lapse: ?bool = null,
     era: ?Era = null,
     state: Projection,
 };
@@ -117,14 +129,20 @@ pub const Catalog = struct {
     cache: Cache = .none,
     cache_generation: Generation = 0,
     cached_zero: bool = false,
+    cached_lapsed: bool = false,
     listing: bool = false,
     start_generation: Generation = 0,
     page: u32 = 0,
     restarts: u1 = 0,
     /// The shortest TTL of the running listing's pages so far.
     ttl_min: u32 = std.math.maxInt(u32),
+    /// When the first of the running listing's pages with a TTL expires.
+    due_ms: ?i64 = null,
+    /// A page of the running listing expired before the listing ended.
+    lapsed: bool = false,
     pending: Pending = .none,
     waiting: bool = false,
+    answer: Answer = .none,
 
     pub fn init(config: Config) Catalog {
         std.debug.assert(config.max_pages > 0);
@@ -134,6 +152,7 @@ pub const Catalog = struct {
     /// Applies one event. Resets `out` first. Errors leave the catalog unchanged.
     pub fn step(c: *Catalog, event: Event, out: *Output) StepError!void {
         out.* = .{};
+        var lapse = false;
         switch (event) {
             .process_started => |era| {
                 if (c.listing) return error.Listing;
@@ -155,12 +174,18 @@ pub const Catalog = struct {
             },
             .page_received => |page| {
                 if (c.pending == .none) return error.NotReady;
+                if (c.due_ms) |due| lapse = c.era == .modern and due <= page.now_ms;
+                c.lapsed = c.lapsed or lapse;
                 c.page += 1;
                 c.ttl_min = @min(c.ttl_min, page.ttl_ms);
+                if (page.ttl_ms > 0) {
+                    const due = page.now_ms +| page.ttl_ms;
+                    c.due_ms = if (c.due_ms) |earlier| @min(earlier, due) else due;
+                }
                 if (page.more and c.page < c.config.max_pages) {
                     c.pending = .next;
                     out.push(.{ .send_page = .next });
-                } else c.finish(out);
+                } else c.finish(out, page.now_ms);
             },
             .invalid_cursor => {
                 if (c.pending != .next) return error.NotReady;
@@ -185,6 +210,7 @@ pub const Catalog = struct {
             .event = @tagName(event),
             .more = if (event == .page_received) event.page_received.more else null,
             .ttl_zero = if (event == .page_received) event.page_received.ttl_ms == 0 else null,
+            .lapse = if (event == .page_received) lapse else null,
             .era = if (event == .process_started) event.process_started else null,
             .state = c.projection(),
         };
@@ -198,13 +224,16 @@ pub const Catalog = struct {
             .cache = c.cache,
             .cache_generation = c.cache_generation,
             .cached_zero = c.cached_zero,
+            .cached_lapsed = c.cached_lapsed,
             .listing = c.listing,
             .start_generation = c.start_generation,
             .page = c.page,
             .restarts = c.restarts,
             .zero_ttl = c.ttl_min == 0,
+            .lapsed = c.lapsed,
             .pending = c.pending,
             .waiting = c.waiting,
+            .answer = c.answer,
         };
     }
 
@@ -218,24 +247,34 @@ pub const Catalog = struct {
         c.start_generation = c.generation;
         c.page = 0;
         c.ttl_min = std.math.maxInt(u32);
+        c.due_ms = null;
+        c.lapsed = false;
         c.pending = .first;
         out.push(.{ .send_page = .first });
     }
 
-    fn finish(c: *Catalog, out: *Output) void {
+    fn finish(c: *Catalog, out: *Output, now_ms: i64) void {
         const zero = c.ttl_min == 0;
-        const fresh = c.start_generation == c.generation and (c.era == .legacy or !zero);
+        const fresh = c.start_generation == c.generation and (c.era == .legacy or (!zero and !c.lapsed));
         c.cache = if (fresh) .fresh else .stale;
         c.cache_generation = c.start_generation;
         c.cached_zero = zero;
+        c.cached_lapsed = c.lapsed;
+        c.answer = .list;
         c.endListing();
         out.push(.{ .publish = fresh });
-        if (fresh and c.era == .modern) out.push(.{ .arm_expiry = .{ .generation = c.generation, .after_ms = c.ttl_min } });
+        // Fresh and modern: every page has a TTL and none has expired, so
+        // the first to expire is still ahead, within the last page's TTL.
+        if (fresh and c.era == .modern) out.push(.{ .arm_expiry = .{
+            .generation = c.generation,
+            .after_ms = @intCast(c.due_ms.? - now_ms),
+        } });
     }
 
     fn failListing(c: *Catalog, out: *Output) void {
+        c.answer = if (c.cache == .none) .failure else .last_good;
         c.endListing();
-        out.push(.fail);
+        out.push(if (c.answer == .failure) .fail else .serve_last);
     }
 
     fn endListing(c: *Catalog) void {
@@ -250,12 +289,13 @@ pub const Catalog = struct {
 pub fn writeTrace(writer: *trace.Writer, instance: []const u8, out: *const Output) std.Io.Writer.Error!void {
     const t = out.transition orelse return;
     const s = t.state;
-    var fields: [16]trace.Field = undefined;
+    var fields: [20]trace.Field = undefined;
     var count: usize = 0;
     if (t.more) |more| {
         fields[0] = .{ .name = "more", .value = .{ .boolean = more } };
         fields[1] = .{ .name = "ttl_zero", .value = .{ .boolean = t.ttl_zero.? } };
-        count = 2;
+        fields[2] = .{ .name = "lapse", .value = .{ .boolean = t.lapse.? } };
+        count = 3;
     }
     if (t.era) |era| {
         fields[count] = .{ .name = "arg_era", .value = .{ .string = @tagName(era) } };
@@ -268,13 +308,19 @@ pub fn writeTrace(writer: *trace.Writer, instance: []const u8, out: *const Outpu
         .{ .name = "cache", .value = .{ .string = @tagName(s.cache) } },
         .{ .name = "cache_gen", .value = .{ .int = @intCast(s.cache_generation) } },
         .{ .name = "cached_zero", .value = .{ .boolean = s.cached_zero } },
+        .{ .name = "cached_lapsed", .value = .{ .boolean = s.cached_lapsed } },
         .{ .name = "listing", .value = .{ .boolean = s.listing } },
         .{ .name = "start_gen", .value = .{ .int = @intCast(s.start_generation) } },
         .{ .name = "page", .value = .{ .int = s.page } },
         .{ .name = "restarts", .value = .{ .int = s.restarts } },
         .{ .name = "zero_ttl", .value = .{ .boolean = s.zero_ttl } },
+        .{ .name = "lapsed", .value = .{ .boolean = s.lapsed } },
         .{ .name = "pending", .value = .{ .string = @tagName(s.pending) } },
         .{ .name = "waiting", .value = .{ .boolean = s.waiting } },
+        .{ .name = "answer", .value = .{ .string = switch (s.answer) {
+            .last_good => "lastGood",
+            else => |a| @tagName(a),
+        } } },
     };
     @memcpy(fields[count..][0..projected.len], &projected);
     count += projected.len;
@@ -306,6 +352,13 @@ const World = struct {
     restarts: u32 = 0,
     zero_seen: bool = false,
     min_ttl: u32 = std.math.maxInt(u32),
+    /// The time of the last page, and when the first page of the running
+    /// listing with a TTL expires.
+    clock: i64 = 0,
+    due: ?i64 = null,
+    lapsed: bool = false,
+    /// A list was ever published, so a failed listing hands it over.
+    listed: bool = false,
     waiters: u32 = 0,
     /// The current list may be served: published fresh, with no invalidation
     /// or expiry since.
@@ -314,10 +367,13 @@ const World = struct {
     timers: [4]?Generation = @splat(null),
 };
 
+/// A page move's `now_ms` is how long after the last page it arrives.
 const Move = Event;
-const ttls = [_]u32{ 0, 50, 7 };
+const pages = [_]struct { u32, i64 }{ .{ 0, 0 }, .{ 7, 0 }, .{ 50, 0 }, .{ 50, 30 } };
 
-fn apply(c: *Catalog, w: *World, event: Event) !bool {
+fn apply(c: *Catalog, w: *World, move: Move) !bool {
+    var event = move;
+    if (event == .page_received) event.page_received.now_ms += w.clock;
     switch (event) {
         .process_started => if (w.processes >= 2 or w.listing) return false,
         .page_received, .page_failed => if (!w.listing) return false,
@@ -346,6 +402,13 @@ fn apply(c: *Catalog, w: *World, event: Event) !bool {
         },
         .need => w.waiters += 1,
         .page_received => |page| {
+            // A page expires its own TTL after it arrived; one that expired
+            // before this one arrived makes the listing stale.
+            const lapse = w.era == .modern and w.due != null and w.due.? <= page.now_ms;
+            try testing.expectEqual(lapse, out.transition.?.lapse.?);
+            w.lapsed = w.lapsed or lapse;
+            w.clock = page.now_ms;
+            if (page.ttl_ms > 0) w.due = @min(w.due orelse page.now_ms + page.ttl_ms, page.now_ms + page.ttl_ms);
             w.pages += 1;
             w.min_ttl = @min(w.min_ttl, page.ttl_ms);
             if (page.ttl_ms == 0) w.zero_seen = true;
@@ -380,6 +443,8 @@ fn apply(c: *Catalog, w: *World, event: Event) !bool {
                 w.pages = 0;
                 w.zero_seen = false;
                 w.min_ttl = std.math.maxInt(u32);
+                w.due = null;
+                w.lapsed = false;
                 w.start_invalidations = w.invalidations;
             }
             // PagesBounded.
@@ -388,17 +453,25 @@ fn apply(c: *Catalog, w: *World, event: Event) !bool {
         .discard_pages => try testing.expect(event == .invalid_cursor),
         .publish => |fresh| {
             try testing.expect(w.listing);
-            // CacheCurrent and ZeroTtlNotCached.
+            // CacheCurrent, ZeroTtlNotCached, and LapsedNotCached.
             if (fresh) {
                 try testing.expectEqual(w.start_invalidations, w.invalidations);
-                if (w.era == .modern) try testing.expect(!w.zero_seen);
+                if (w.era == .modern) try testing.expect(!w.zero_seen and !w.lapsed);
             }
             w.listing = false;
             w.waiters = 0;
             w.fresh = fresh;
+            w.listed = true;
         },
         .fail => {
-            try testing.expect(w.listing);
+            // LastGoodOnFailure.
+            try testing.expect(w.listing and !w.listed);
+            w.listing = false;
+            w.waiters = 0;
+        },
+        .serve_last => {
+            // LastGoodOnFailure and FallbackRetries: the last list, still stale.
+            try testing.expect(w.listing and w.listed and !w.fresh and c.cache == .stale);
             w.listing = false;
             w.waiters = 0;
         },
@@ -408,7 +481,8 @@ fn apply(c: *Catalog, w: *World, event: Event) !bool {
             w.waiters -= 1;
         },
         .arm_expiry => |a| {
-            try testing.expect(w.era == .modern and w.fresh and a.after_ms == w.min_ttl and a.after_ms > 0);
+            // The list expires with its first page to expire.
+            try testing.expect(w.era == .modern and w.fresh and a.after_ms > 0 and a.after_ms == w.due.? - w.clock);
             for (&w.timers) |*t| if (t.* == null) {
                 t.* = a.generation;
                 break;
@@ -433,8 +507,8 @@ fn candidateMoves(buffer: []Event) []Event {
         buffer[n] = m;
         n += 1;
     }
-    for ([_]bool{ false, true }) |more| for (ttls) |ttl| {
-        buffer[n] = .{ .page_received = .{ .more = more, .ttl_ms = ttl } };
+    for ([_]bool{ false, true }) |more| for (pages) |page| {
+        buffer[n] = .{ .page_received = .{ .more = more, .ttl_ms = page[0], .now_ms = page[1] } };
         n += 1;
     };
     return buffer[0..n];
@@ -471,7 +545,7 @@ test "random long runs keep the invariants, and every need is answered (EveryNee
         // The server answers every page, here with "more" each time.
         for (0..12) |_| {
             if (!c.waiting) break;
-            _ = try apply(&c, &w, .{ .page_received = .{ .more = true, .ttl_ms = 50 } });
+            _ = try apply(&c, &w, .{ .page_received = .{ .more = true, .ttl_ms = 50, .now_ms = 0 } });
         }
         try testing.expect(!c.waiting);
     }
@@ -483,9 +557,9 @@ test "a fresh modern list is served from the cache until its TTL runs out" {
     try c.step(.{ .process_started = .modern }, &out);
     try c.step(.need, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .send_page = .first }}, out.effects());
-    try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 900 } }, &out);
+    try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 900, .now_ms = 0 } }, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .send_page = .next }}, out.effects());
-    try c.step(.{ .page_received = .{ .more = false, .ttl_ms = 300 } }, &out);
+    try c.step(.{ .page_received = .{ .more = false, .ttl_ms = 300, .now_ms = 0 } }, &out);
     try testing.expectEqualSlices(Effect, &.{ .{ .publish = true }, .{ .arm_expiry = .{ .generation = 1, .after_ms = 300 } } }, out.effects());
     try c.step(.need, &out);
     try testing.expectEqualSlices(Effect, &.{.serve}, out.effects());
@@ -500,11 +574,11 @@ test "an invalidation during a listing keeps its answer out of the cache" {
     try c.step(.{ .process_started = .legacy }, &out);
     try c.step(.need, &out);
     try c.step(.invalidated, &out);
-    try c.step(.{ .page_received = .{ .more = false, .ttl_ms = 0 } }, &out);
+    try c.step(.{ .page_received = .{ .more = false, .ttl_ms = 0, .now_ms = 0 } }, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .publish = false }}, out.effects());
     try c.step(.need, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .send_page = .first }}, out.effects());
-    try c.step(.{ .page_received = .{ .more = false, .ttl_ms = 0 } }, &out);
+    try c.step(.{ .page_received = .{ .more = false, .ttl_ms = 0, .now_ms = 0 } }, &out);
     // A legacy list stays fresh until an invalidation.
     try testing.expectEqualSlices(Effect, &.{.{ .publish = true }}, out.effects());
     try c.step(.{ .expired = 2 }, &out);
@@ -517,12 +591,12 @@ test "a zero TTL on a modern server, or a new process, means listing again" {
     var out: Output = .{};
     try c.step(.{ .process_started = .modern }, &out);
     try c.step(.need, &out);
-    try c.step(.{ .page_received = .{ .more = false, .ttl_ms = 0 } }, &out);
+    try c.step(.{ .page_received = .{ .more = false, .ttl_ms = 0, .now_ms = 0 } }, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .publish = false }}, out.effects());
     var legacy: Catalog = .init(.{});
     try legacy.step(.{ .process_started = .legacy }, &out);
     try legacy.step(.need, &out);
-    try legacy.step(.{ .page_received = .{ .more = false, .ttl_ms = 0 } }, &out);
+    try legacy.step(.{ .page_received = .{ .more = false, .ttl_ms = 0, .now_ms = 0 } }, &out);
     try legacy.step(.{ .process_started = .legacy }, &out);
     try legacy.step(.need, &out);
     try testing.expectEqualSlices(Effect, &.{.{ .send_page = .first }}, out.effects());
@@ -533,15 +607,15 @@ test "pages stop at the limit; an invalid cursor restarts once" {
     var out: Output = .{};
     try c.step(.{ .process_started = .modern }, &out);
     try c.step(.need, &out);
-    try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 9 } }, &out);
+    try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 9, .now_ms = 0 } }, &out);
     try c.step(.invalid_cursor, &out);
     try testing.expectEqualSlices(Effect, &.{ .discard_pages, .{ .send_page = .first } }, out.effects());
-    try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 9 } }, &out);
+    try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 9, .now_ms = 0 } }, &out);
     try c.step(.invalid_cursor, &out);
     try testing.expectEqualSlices(Effect, &.{.fail}, out.effects());
     try c.step(.need, &out);
-    try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 9 } }, &out);
-    try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 9 } }, &out);
+    try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 9, .now_ms = 0 } }, &out);
+    try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 9, .now_ms = 0 } }, &out);
     try testing.expectEqual(Effect{ .publish = true }, out.effects()[0]);
     try testing.expectError(error.NotReady, c.step(.invalid_cursor, &out));
 }
@@ -557,4 +631,40 @@ test "later needs join a running listing; nothing lists before a server is ready
     try testing.expectError(error.Listing, c.step(.{ .process_started = .modern }, &out));
     try c.step(.page_failed, &out);
     try testing.expectEqualSlices(Effect, &.{.fail}, out.effects());
+}
+
+test "each page is fresh for its own TTL from its own arrival" {
+    var c: Catalog = .init(.{});
+    var out: Output = .{};
+    try c.step(.{ .process_started = .modern }, &out);
+    try c.step(.need, &out);
+    try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 100, .now_ms = 1_000 } }, &out);
+    try c.step(.{ .page_received = .{ .more = false, .ttl_ms = 5_000, .now_ms = 1_250 } }, &out);
+    // The first page expired at 1,100, before the listing ended.
+    try testing.expect(out.transition.?.lapse.?);
+    try testing.expectEqualSlices(Effect, &.{.{ .publish = false }}, out.effects());
+    try c.step(.need, &out);
+    try c.step(.{ .page_received = .{ .more = true, .ttl_ms = 100, .now_ms = 2_000 } }, &out);
+    try c.step(.{ .page_received = .{ .more = false, .ttl_ms = 5_000, .now_ms = 2_060 } }, &out);
+    // Fresh until the first page expires, 40 ms after the listing ended.
+    try testing.expectEqualSlices(Effect, &.{ .{ .publish = true }, .{ .arm_expiry = .{ .generation = 1, .after_ms = 40 } } }, out.effects());
+}
+
+test "a failed listing hands over the last list, still stale, and the next need lists again" {
+    var c: Catalog = .init(.{});
+    var out: Output = .{};
+    try c.step(.{ .process_started = .modern }, &out);
+    try c.step(.need, &out);
+    try c.step(.page_failed, &out);
+    // No list yet, so the failure goes to the waiters.
+    try testing.expectEqualSlices(Effect, &.{.fail}, out.effects());
+    try c.step(.need, &out);
+    try c.step(.{ .page_received = .{ .more = false, .ttl_ms = 500, .now_ms = 0 } }, &out);
+    try c.step(.invalidated, &out);
+    try c.step(.need, &out);
+    try c.step(.page_failed, &out);
+    try testing.expectEqualSlices(Effect, &.{.serve_last}, out.effects());
+    try testing.expectEqual(Cache.stale, c.cache);
+    try c.step(.need, &out);
+    try testing.expectEqualSlices(Effect, &.{.{ .send_page = .first }}, out.effects());
 }

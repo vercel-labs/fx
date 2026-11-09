@@ -253,6 +253,41 @@ describe("poisoned repository", () => {
   );
 
   test(
+    "a repository config that includes itself cannot stall the file listing",
+    async () => {
+      const fixture = poisonedRepository();
+      // Each include of the config reads it again with its includes, so four
+      // of them ask for about 4^10 reads before the include depth stops one
+      // chain. git refuses the file; fx must answer from it quickly.
+      const config = join(fixture.workspace, ".git", "config");
+      writeFileSync(config, readFileSync(config, "utf8") + "[include]\n\tpath = config\n".repeat(4));
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("glob", "glob_files", { pattern: "**/alpha-*.txt" }),
+        fakeGatewayFinalText("inspection complete"),
+      ], { classifierResponses: [] });
+      gateways.push(gateway);
+
+      const started = Date.now();
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Inspect the repository."],
+        { cwd: fixture.workspace, env: fxEnv(fixture, gateway), timeoutMs: 15_000 },
+      );
+      expect(result.code, result.stderr).toBe(0);
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(result.stderr).not.toMatch(/panic/i);
+      expect(sentinelRuns(fixture)).toEqual([]);
+
+      const bodies = gateway.requests.map((request: { body: string }) => request.body);
+      const glob = toolResult(bodies[1]!, "glob");
+      expect(glob).toContain("alpha-tracked.txt");
+      expect(glob).toContain("notes/alpha-untracked.txt");
+      // The config files past the limit are left unread, which the listing says.
+      expect(glob).toContain("candidate list may be incomplete");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx pr snapshots the repository without running its programs",
     async () => {
       const fixture = poisonedRepository();

@@ -32,7 +32,9 @@ export interface Rule {
   times?: number;
   /** Lines to write before the reply, for example notifications. */
   before?: unknown[];
-  /** Reply: a result, an error, a raw line (for malformed output), or nothing. */
+  /** Wait this long between `before` lines, in milliseconds. */
+  beforeEveryMs?: number;
+  /** Reply: a result, an error, a raw line (for malformed output; `{id}` becomes the request's id), or nothing. */
   result?: unknown;
   error?: { code: number; message: string; data?: unknown };
   raw?: string;
@@ -130,8 +132,11 @@ function main(): void {
       for (const line of rule.stderr ?? []) writeSync(2, line + "\n");
     }
     if (rule.rawBytes) send("x".repeat(rule.rawBytes));
-    for (const extra of rule.before ?? []) send(JSON.stringify(withId(extra, message.id)));
-    if (rule.raw !== undefined) send(rule.raw);
+    for (const [n, extra] of (rule.before ?? []).entries()) {
+      if (n > 0 && rule.beforeEveryMs) await Bun.sleep(rule.beforeEveryMs);
+      send(JSON.stringify(withId(extra, message.id)));
+    }
+    if (rule.raw !== undefined) send(rule.raw.replaceAll("{id}", JSON.stringify(message.id ?? null)));
     else if (rule.error) send(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, error: rule.error }));
     else if (!rule.noReply && (isRequest || rule.result !== undefined)) {
       send(JSON.stringify({ jsonrpc: "2.0", id: message.id ?? null, result: withId(rule.result ?? {}, message.id) }));

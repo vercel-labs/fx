@@ -3,6 +3,7 @@ const versions = @import("../core/gateway/provider_versions.zig");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_client = @import("client.zig");
+const json_decode = @import("../core/shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const lookup_timeout_ms = 3000;
@@ -16,8 +17,8 @@ pub fn resolve(
 ) versions.Error!versions.Version {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const override_name = switch (provider) {
-        .codex => "FX_E2E_CODEX_CLIENT_VERSION",
-        .grok => "FX_E2E_GROK_CLIENT_VERSION",
+        .codex => "FX_TEST_CODEX_CLIENT_VERSION",
+        .grok => "FX_TEST_GROK_CLIENT_VERSION",
     };
     if (io_mod.getenv(override_name)) |value| {
         return versions.Version.parse(value) orelse error.ProviderVersionUnavailable;
@@ -99,8 +100,8 @@ const LookupOperation = struct {
 /// environment. Borrowed; static or environment-owned.
 pub fn versionUrl(provider: versions.Provider) error{ProviderVersionUnavailable}![]const u8 {
     const override_name = switch (provider) {
-        .codex => "FX_E2E_CODEX_VERSION_URL",
-        .grok => "FX_E2E_GROK_VERSION_URL",
+        .codex => "FX_TEST_CODEX_VERSION_URL",
+        .grok => "FX_TEST_GROK_VERSION_URL",
     };
     if (io_mod.getenv(override_name)) |value| {
         if (!gateway_client.isLoopbackHttpUrl(value)) return error.ProviderVersionUnavailable;
@@ -116,7 +117,7 @@ pub fn parseResponse(alloc: Allocator, provider: versions.Provider, body: []cons
     if (body.len > max_response_bytes) return error.ProviderVersionResponseTooLarge;
     if (provider == .grok) return versions.Version.parse(body) orelse error.InvalidProviderVersion;
     const Release = struct { version: []const u8 };
-    const parsed = try std.json.parseFromSlice(Release, alloc, body, .{ .ignore_unknown_fields = true });
+    const parsed = try json_decode.parseFromSlice(Release, alloc, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     return versions.Version.parse(parsed.value.version) orelse error.InvalidProviderVersion;
 }

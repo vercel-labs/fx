@@ -31,6 +31,9 @@ const types = @import("../shared/types.zig");
 const diff_mod = @import("../output/diff.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
+const profiles = @import("../profiles/profiles.zig");
+const authority_mod = @import("authority.zig");
+const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_host = @import("tool_host.zig");
 const child_state = @import("child_state.zig");
 
@@ -106,6 +109,9 @@ const Context = struct {
         result.interactive = false;
         result.output_chunk_ctx = self;
         result.on_output_chunk = pushLiveOutputChunk;
+        // A child's tool calls are no rows of the parent's, so neither are
+        // the calls its commands make.
+        result.nested_tool_lifecycle = null;
         result.web_search_progress_ctx = null;
         result.on_web_search_progress = null;
         result.web_fetch_progress_ctx = null;
@@ -129,14 +135,7 @@ const Context = struct {
     ) !tool_mcp_runtime.ResolvedLiveView {
         const self: *Context = @ptrCast(@alignCast(raw));
         var authority = try self.turn.resolveLiveAuthority(alloc);
-        defer authority.deinit(alloc);
-        const view = authority.mcp_view orelse return error.McpRuntimeUnavailable;
-        authority.mcp_view = null;
-        return .{
-            .authority_generation = mcp_access.authorityGeneration(view),
-            .action_authority_generation = authority.generation,
-            .view = view,
-        };
+        return execution.liveMcpViewFrom(alloc, &authority);
     }
 };
 
@@ -257,21 +256,31 @@ pub fn run(
             .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
         },
     };
-    const child_tool_names = try withoutSubagentNames(
+    // The profile the child started in, cached when its admission resolved.
+    // The child is shown only the built-in tools it allows, the ones its live
+    // authority lets it call.
+    const profile = childProfile(turn.live_authority, turn.child_id);
+    const child_tool_names = try childToolNames(
         arena,
         config.advertised_tool_names,
+        config.tool_context.tool_registry,
+        .{ .profile = profile },
     );
-    const child_functions = try withoutSubagentFunctions(
+    const child_functions = try childFunctions(
         arena,
         config.advertised_functions,
+        config.tool_context.tool_registry,
+        .{ .profile = profile },
     );
-    const child_system_prompt = if (message.system_prompt_overlay.len == 0)
-        config.system_prompt
-    else
-        arena.print(
-            "{s}\n\n<subagent_instructions>\n{s}\n</subagent_instructions>",
-            .{ config.system_prompt, message.system_prompt_overlay },
-        ) catch return error.OutOfMemory;
+    // This engine never gives a child subagents of its own, so main
+    // started every child it runs.
+    const child_system_prompt = childSystemPrompt(
+        arena,
+        profile,
+        config.system_prompt,
+        .{ .name = turn.child_name orelse turn.child_id orelse "subagent", .parent = profiles.main_name },
+        message.system_prompt_overlay,
+    ) catch return error.OutOfMemory;
     debug_trace.eventf(
         "subagent",
         "trace_identity",
@@ -366,40 +375,93 @@ test "subagent finalization preserves every outcome and fails closed on absence"
     }
 }
 
-fn withoutSubagentNames(
-    alloc: Allocator,
-    names: []const []const u8,
-) ![]const []const u8 {
-    var count: usize = 0;
-    for (names) |name| {
-        if (!std.mem.eql(u8, name, "subagent")) count += 1;
-    }
-    const filtered = try alloc.alloc([]const u8, count);
-    var index: usize = 0;
-    for (names) |name| {
-        if (std.mem.eql(u8, name, "subagent")) continue;
-        filtered[index] = name;
-        index += 1;
-    }
-    return filtered;
+/// The profile child `child_id` started in, cached when its admission resolved.
+pub fn childProfile(resolver: ?*authority_mod.Resolver, child_id: ?[]const u8) ?*const profiles.Profile {
+    const value = resolver orelse return null;
+    const cache = value.profiles orelse return null;
+    return cache.find(child_id orelse return null);
 }
 
-fn withoutSubagentFunctions(
+/// Who a subagent is, for its system prompt: its own name, and the name of
+/// the agent that started it, `main` unless that is another subagent.
+pub const Role = struct { name: []const u8, parent: []const u8 };
+
+/// A child's system prompt: `base`, or its profile's prompt in its place or
+/// added to it, then what it is and who started it, whatever its profile,
+/// then the run's `<subagent_instructions>` overlay.
+pub fn childSystemPrompt(
+    alloc: Allocator,
+    profile: ?*const profiles.Profile,
+    base: []const u8,
+    role: Role,
+    overlay: []const u8,
+) Allocator.Error![]const u8 {
+    const base_prompt = if (profile) |value| try profiles.systemPrompt(alloc, value, base) else base;
+    const with_role = try alloc.print(
+        "{s}\n\n<subagent_role>\nYou are the subagent \"{s}\", started by \"{s}\". When work it gives you " ++
+            "ends, your output reaches it on its own as your report. To message it sooner, for example when the " ++
+            "user asks you to tell {s} something, call the subagent tool with action \"message\" and agent " ++
+            "\"parent\", if you have that tool.\n</subagent_role>",
+        .{ base_prompt, role.name, role.parent, role.parent },
+    );
+    if (overlay.len == 0) return with_role;
+    return alloc.print(
+        "{s}\n\n<subagent_instructions>\n{s}\n</subagent_instructions>",
+        .{ with_role, overlay },
+    );
+}
+
+/// Which built-in tools a child is shown. MCP and dynamic tools follow its
+/// integrations instead.
+pub const Shown = union(enum) {
+    /// The old engine's: the ones its profile allows, never `subagent`,
+    /// because it has no host for a child's own subagents.
+    profile: ?*const profiles.Profile,
+    /// The interactive app's: the ones its run was admitted with, its
+    /// parent's narrowed by its profile, so it is never shown a tool its
+    /// parent lacks. `subagent` is among them
+    /// only once it has its own host to start subagents on.
+    admitted: struct { tools: []const []const u8, starts_subagents: bool },
+};
+
+fn childSees(registry: tool_dispatch.Registry, shown: Shown, name: []const u8) bool {
+    const subagent = std.mem.eql(u8, name, "subagent");
+    switch (shown) {
+        .profile => |profile| {
+            if (subagent) return false;
+            const value = profile orelse return true;
+            if (registry.lookup(name) == null) return true;
+            return profiles.allowsTool(value, name);
+        },
+        .admitted => |admitted| {
+            if (subagent and !admitted.starts_subagents) return false;
+            if (registry.lookup(name) == null) return true;
+            for (admitted.tools) |tool| if (std.mem.eql(u8, tool, name)) return true;
+            return false;
+        },
+    }
+}
+
+pub fn childToolNames(
+    alloc: Allocator,
+    names: []const []const u8,
+    registry: tool_dispatch.Registry,
+    shown: Shown,
+) ![]const []const u8 {
+    var kept: std.ArrayList([]const u8) = .empty;
+    for (names) |name| if (childSees(registry, shown, name)) try kept.append(alloc, name);
+    return kept.items;
+}
+
+pub fn childFunctions(
     alloc: Allocator,
     functions: []const model_tool_schema.FunctionSchema,
+    registry: tool_dispatch.Registry,
+    shown: Shown,
 ) ![]const model_tool_schema.FunctionSchema {
-    var count: usize = 0;
-    for (functions) |function| {
-        if (!std.mem.eql(u8, function.name, "subagent")) count += 1;
-    }
-    const filtered = try alloc.alloc(model_tool_schema.FunctionSchema, count);
-    var index: usize = 0;
-    for (functions) |function| {
-        if (std.mem.eql(u8, function.name, "subagent")) continue;
-        filtered[index] = function;
-        index += 1;
-    }
-    return filtered;
+    var kept: std.ArrayList(model_tool_schema.FunctionSchema) = .empty;
+    for (functions) |function| if (childSees(registry, shown, function.name)) try kept.append(alloc, function);
+    return kept.items;
 }
 
 fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
@@ -446,6 +508,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
+        .record_usage = recordUsage,
     };
 }
 
@@ -556,14 +619,14 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
     };
     const deps = runtimeDeps(&context);
     const fallback = model_capabilities.capabilitiesForModel("legacy-fast");
-    try std.testing.expectEqualDeep(fallback, deps.available_model_capabilities(deps.ctx, "legacy-fast"));
-    try std.testing.expectEqualDeep(fallback, try deps.resolve_model_capabilities(deps.ctx, alloc, "legacy-fast"));
+    try model_capabilities.expectCapabilitiesEqualForTest(fallback, deps.available_model_capabilities(deps.ctx, "legacy-fast"));
+    try model_capabilities.expectCapabilitiesEqualForTest(fallback, try deps.resolve_model_capabilities(deps.ctx, alloc, "legacy-fast"));
     context.config.provider_set.gateway.model_catalog.?.lookup_capabilities_fn = Fixture.lookup;
     const available = deps.available_model_capabilities(deps.ctx, "child-model");
     try std.testing.expectEqual(@as(?u32, 512), available.max_output_tokens);
     try std.testing.expectEqual(@as(?u32, 32768), available.context_window);
-    try std.testing.expectEqualDeep(available, try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
-    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, deps.available_model_capabilities(deps.ctx, "unknown-fast"));
+    try model_capabilities.expectCapabilitiesEqualForTest(available, try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
+    try model_capabilities.expectCapabilitiesEqualForTest(.{}, deps.available_model_capabilities(deps.ctx, "unknown-fast"));
     context.config.tool_context.model_capability_resolver = .{ .ctx = &fixture, .resolve_fn = Fixture.resolveCapabilities };
     const resolved = try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model");
     try std.testing.expectEqual(model_capabilities.ImageInputSupport.native, resolved.image_input_support);
@@ -668,10 +731,10 @@ fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayL
     }, arena, messages);
 }
 
-fn appendStaticContext(raw: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(types.ChatMessage)) !void {
+fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     try context.config.context_registry.appendDefaultStatic(.{
-        .project_context = project_context orelse context.config.project_context,
+        .project_context = context.config.project_context,
     }, arena, messages);
     var snapshot = try snapshotModelCatalogForView(
         arena,
@@ -701,26 +764,36 @@ fn snapshotModelCatalogForView(
         for (view.tools) |tool| {
             if (std.mem.eql(u8, tool.server_name, server.name)) tool_count += 1;
         }
+        // Generation 0: the server's list hadn't loaded when the view was
+        // taken, so it starts when the subagent first needs it.
+        const on_demand = tool_count == 0 and server.catalog_generation == 0;
         servers[index] = .{
             .name = try alloc.dupe(u8, server.name),
-            .availability = .ready,
-            .tool_count = tool_count,
+            .availability = if (on_demand) .available_on_demand else .ready,
+            .tool_count = if (on_demand) null else tool_count,
         };
         initialized += 1;
     }
     return .{ .servers = servers };
 }
 
-test "subagent model catalog counts only tools in the captured MCP view" {
+test "subagent model catalog counts the captured view's tools and offers servers not yet listed" {
     const alloc = std.testing.allocator;
-    var servers = [_]mcp_access.ServerIdentity{.{
+    var servers = [_]mcp_access.ServerIdentity{ .{
         .name = @constCast("chrome-devtools"),
         .source = .profile,
         .scope = .profile,
         .connection_generation = 1,
         .catalog_generation = 2,
         .auth_generation = 3,
-    }};
+    }, .{
+        .name = @constCast("later"),
+        .source = .profile,
+        .scope = .profile,
+        .connection_generation = 0,
+        .catalog_generation = 0,
+        .auth_generation = 0,
+    } };
     var tools = [_]mcp_access.ToolIdentity{
         .{ .name = @constCast("mcp_chrome_one"), .server_name = @constCast("chrome-devtools") },
         .{ .name = @constCast("mcp_chrome_two"), .server_name = @constCast("chrome-devtools") },
@@ -729,7 +802,6 @@ test "subagent model catalog counts only tools in the captured MCP view" {
         .runtime_generation = 1,
         .owner_id = @constCast("child"),
         .parent_id = @constCast("parent"),
-        .features_visible = false,
         .servers = &servers,
         .tools = &tools,
     };
@@ -737,10 +809,13 @@ test "subagent model catalog counts only tools in the captured MCP view" {
     var snapshot = try snapshotModelCatalogForView(alloc, &view);
     defer snapshot.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), snapshot.servers.len);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.servers.len);
     try std.testing.expectEqualStrings("chrome-devtools", snapshot.servers[0].name);
     try std.testing.expectEqual(model_catalog.Availability.ready, snapshot.servers[0].availability);
     try std.testing.expectEqual(@as(?usize, 2), snapshot.servers[0].tool_count);
+    // A server whose list hadn't loaded is offered, not shown as empty.
+    try std.testing.expectEqual(model_catalog.Availability.available_on_demand, snapshot.servers[1].availability);
+    try std.testing.expectEqual(@as(?usize, null), snapshot.servers[1].tool_count);
 }
 
 test "subagent inherits model capabilities" {
@@ -923,6 +998,15 @@ fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
     }
 }
 
+/// Saves each reply's usage in the child's own log, as the root saves its
+/// own (D92). The parent's total leaves the child's out.
+fn recordUsage(raw: *anyopaque, usage: types.Usage) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    // A hosted run has no session here; its own agent saves its usage.
+    const child = context.turn.child orelse return;
+    try child.recordUsage(usage);
+}
+
 fn publishCommittedFileHandoff(_: *anyopaque, _: file_mutation.CommittedFileHandoff) agent_runtime.SecondaryPublicationReport {
     return .{ .diff = .skipped, .tracker = .skipped };
 }
@@ -1018,4 +1102,32 @@ fn pushLiveOutputChunk(
         .stream = stream,
         .text = @constCast(text),
     } });
+}
+
+test "a child's system prompt names it and who started it, then wraps the run's overlay" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const role: Role = .{ .name = "reviewer", .parent = "main" };
+    const expected_role = "<subagent_role>\nYou are the subagent \"reviewer\", started by \"main\". When work it " ++
+        "gives you ends, your output reaches it on its own as your report. To message it sooner, for example when " ++
+        "the user asks you to tell main something, call the subagent tool with action \"message\" and agent " ++
+        "\"parent\", if you have that tool.\n</subagent_role>";
+    try std.testing.expectEqualStrings(
+        "base prompt\n\n" ++ expected_role,
+        try childSystemPrompt(arena.allocator(), null, "base prompt", role, ""),
+    );
+    try std.testing.expectEqualStrings(
+        "base prompt\n\n" ++ expected_role ++ "\n\n<subagent_instructions>\nbe brief\n</subagent_instructions>",
+        try childSystemPrompt(arena.allocator(), null, "base prompt", role, "be brief"),
+    );
+}
+
+test "a profile that replaces the system prompt still leaves a child its role" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const profile: profiles.Profile = .{ .name = "review", .description = "", .source = .home, .prompt = "Review only.", .prompt_mode = .replace };
+    const prompt = try childSystemPrompt(arena.allocator(), &profile, "base prompt", .{ .name = "helper", .parent = "lead" }, "");
+    try std.testing.expect(std.mem.startsWith(u8, prompt, "Review only.\n\n<subagent_role>\n"));
+    try std.testing.expect(std.mem.find(u8, prompt, "You are the subagent \"helper\", started by \"lead\".") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "base prompt") == null);
 }

@@ -6,6 +6,7 @@ const mem_utils = @import("../shared/mem_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -555,7 +556,7 @@ fn answerCompactField(
         .invalid => return error.InvalidAnswer,
         .answer => |answer| answer,
     };
-    const parsed = std.json.parseFromSlice(struct {
+    const parsed = json_decode.parseFromSlice(struct {
         option: usize,
     }, temp, answer, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidAnswer;
     const index = parsed.value.option;

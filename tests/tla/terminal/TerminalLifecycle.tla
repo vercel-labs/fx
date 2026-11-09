@@ -107,7 +107,7 @@ BeginExit(x) ==
     /\ run' = [run EXCEPT ![x] = "exiting"]
     /\ UNCHANGED <<inst, crashedInst, owner, alive, rec, shown, badInteract, wrongEnd>>
 
-\* Shutdown: hang up the PTY, wait briefly, kill the process group, record it.
+\* Shutdown: hang up the PTY, wait briefly, kill the process tree, record it.
 CloseOnExit(x, t) ==
     /\ run[x] = "exiting"
     /\ alive[t]

@@ -166,13 +166,6 @@ function countOccurrences(value: string, needle: string): number {
   }
 }
 
-function textHex(value: string): string[] {
-  return Array.from(
-    Buffer.from(value),
-    (byte) => byte.toString(16).padStart(2, "0"),
-  );
-}
-
 function gatedResizeResponse(
   first: string,
   second: string,
@@ -947,6 +940,17 @@ async function waitForResizeAndInputTapeFrames(
       frames.map((frame) => frame.kind).join(",")
     }`,
   );
+}
+
+function setPaneBackground(session: TmuxSession, colour: string): void {
+  execFileSync("tmux", [
+    "set-option",
+    "-p",
+    "-t",
+    session.name,
+    "window-style",
+    `bg=${colour}`,
+  ]);
 }
 
 function sendRawTmuxBytes(
@@ -1813,7 +1817,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -1859,7 +1863,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
   );
 
   test(
-    "assistant stream retention preserves visible rows at default cap",
+    "a long assistant stream keeps every row and the collapsed group in order",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-assistant-retention-")));
       if (!KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
@@ -1905,11 +1909,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
         })}\n\ndata: [DONE]\n\n`));
         streams[turn].close();
       };
-      // Bounded inert destinations consume the real cap without thousands of rows.
+      // Long inert link destinations make each row large without thousands of rows.
       const inertRow = (marker: string) => Array.from({ length: 14 }, (_, index) =>
         `[${index === 0 ? marker : "."}](https://example.invalid/${"x".repeat(1000)})`
       ).join("") + "\n\n";
-      // Removing the old response must leave the collapsed group through a retention frame.
       const old = (id: number) => id === 0
         ? inertRow("RETAIN_OLD_0000")
         : `RETAIN_OLD_${String(id).padStart(4, "0")} immutable sentinel\n\n`;
@@ -1921,9 +1924,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
           HOME: home, AI_GATEWAY_API_KEY: "synthetic-retention-key",
           VERCEL_OIDC_TOKEN: undefined, FX_DISABLE_KEYCHAIN: "1",
           FX_E2E_DISABLE_DOTENV: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
-          FX_SKIP_ONBOARDING: "1", FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TEST_SKIP_ONBOARDING: "1", FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_TRACE_SCOPES: "transcript_retention,scroll", FX_TRACE_LOG: tracePath,
           FX_RECORD: join(root, "terminal.fxtape"),
         },
@@ -1975,25 +1978,19 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForText("RETAIN_TAIL_0064", 15_000);
       await Bun.sleep(300);
       await assertRows(65);
-      expect(readFileSync(tracePath, "utf8")).not.toContain("pruned entry");
       let tailCount = 65;
-      let retained = false;
       for (let id = 65; id < 81; id++) {
         send(1, tail(id));
         await session.waitForText(`RETAIN_TAIL_${String(id).padStart(4, "0")}`, 10_000);
         await Bun.sleep(150);
         tailCount = id + 1;
         await assertRows(tailCount);
-        if (readFileSync(tracePath, "utf8").includes("trimmed protected entry")) {
-          retained = true;
-          break;
-        }
       }
-      expect(retained).toBe(true);
       finish(1);
       await session.waitForStableComposer(15_000);
       await assertRows(tailCount);
-      await session.sendText("/status");
+      await session.sendText("/allowlist");
+      await session.waitForText("* allowlist: effective", 10_000);
       await session.waitForStableComposer(10_000);
       await assertRows(tailCount);
       await session.sendText("/quit");
@@ -2004,14 +2001,14 @@ describe.skipIf(SKIP)("tui: resize", () => {
     120_000,
   );
 
-  for (const { label, pressure, viewerCols } of [
-    { label: "no-prune control", pressure: false, viewerCols: 0 },
-    { label: "pressure", pressure: true, viewerCols: 0 },
-    { label: "pressure with Ctrl+O", pressure: true, viewerCols: 80 },
-    { label: "pressure with Ctrl+O resize 80 to 100", pressure: true, viewerCols: 100 },
+  for (const { label, large, viewerCols } of [
+    { label: "small output", large: false, viewerCols: 0 },
+    { label: "large output", large: true, viewerCols: 0 },
+    { label: "large output with Ctrl+O", large: true, viewerCols: 80 },
+    { label: "large output with Ctrl+O resize 80 to 100", large: true, viewerCols: 100 },
   ]) {
     test(
-      `command retention preserves native paragraphs at default cap (${label})`,
+      `command output keeps native paragraphs in history (${label})`,
       async () => {
         const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-command-retention-")));
         const home = join(root, "home");
@@ -2025,7 +2022,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         writeFileSync(join(home, ".fx", "settings.json"), "{}");
         writeFileSync(stderrPath, "");
         // Keep geometry and logical rows identical; only the old retained payload differs.
-        writeFileSync(join(workspace, "old.txt"), "S".repeat(pressure ? 1_040_000 : 8_000) + "\n");
+        writeFileSync(join(workspace, "old.txt"), "S".repeat(large ? 1_040_000 : 8_000) + "\n");
         writeFileSync(join(workspace, "new.txt"), "N".repeat(80_000) + "\n");
         writeFileSync(join(workspace, "probe.sh"), [
           "printf started > started",
@@ -2083,11 +2080,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
           AI_GATEWAY_API_KEY: "synthetic-command-retention", VERCEL_OIDC_TOKEN: undefined,
           FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
           FX_MODEL: FAKE_GATEWAY_MODEL, FX_MAX_AGENT_STEPS: "4",
-          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_SKIP_ONBOARDING: "1",
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TEST_SKIP_ONBOARDING: "1",
           FX_PERMISSION_MODE: "full-access",
           FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_TRACE_SCOPES: "transcript_retention,command_output,scroll,frame_plan,frame_commit,tool,ui_activity" +
             (viewerCols ? ",full_transcript,full_transcript_cache,resize" : ""),
           FX_TRACE_LOG: tracePath, FX_RECORD: tapePath, FX_RECORD_INPUT: "1",
@@ -2142,9 +2139,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
           await session.waitForStableComposer(15_000);
           const seeded = await capture("seeded");
           check("seeded history", () => expectHistory(seeded, false));
-          check("seed stays below default cap", () => {
-            expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
-          });
 
           await session.sendText("Run the new prepared output, then the later response.");
           const deadline = Date.now() + 15_000;
@@ -2154,16 +2148,15 @@ describe.skipIf(SKIP)("tui: resize", () => {
             await Bun.sleep(25);
           }
           await capture("before-output");
-          const fullFooter = "full detail · ctrl+o close";
+          const fullFooter = "esc close · pgup/pgdn scroll";
           if (viewerCols) {
             await session.sendHexBytes(["0f"]);
             await session.waitForText(fullFooter, TIMEOUT);
             await capture("viewer-open-before-output");
-            check("viewer admitted before first retirement", () => {
+            check("viewer opened before the output", () => {
               expect(existsSync(releasePath)).toBe(false);
               expect(existsSync(join(workspace, "finished"))).toBe(false);
               expect(requestCount).toBe(3);
-              expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
             });
           }
           const traceOffset = readFileSync(tracePath, "utf8").length;
@@ -2185,16 +2178,14 @@ describe.skipIf(SKIP)("tui: resize", () => {
                 .some(record => record.kind === "turn_committed");
               return completed && requestCount === 4 &&
                 existsSync(join(workspace, "finished")) &&
-                existsSync(join(workspace, "sibling-finished")) &&
-                /pruned (?:command output|entry)/.test(readFileSync(tracePath, "utf8").slice(traceOffset));
+                existsSync(join(workspace, "sibling-finished"));
             }, TIMEOUT);
-            checks["viewer turn completed and pruned before close"] = "PASS";
+            checks["viewer turn completed before close"] = "PASS";
             writeFileSync(join(root, "viewer-completed.events.jsonl"), readFileSync(eventsPath));
             const viewerTrace = readFileSync(tracePath, "utf8").slice(traceOffset);
             writeFileSync(join(root, "viewer-completed.trace.log"), viewerTrace);
             await capture("viewer-completed-before-close");
-            check("retirement completed while viewer owns screen", () => {
-              expect(viewerTrace).toMatch(/pruned (?:command output|entry)/);
+            check("turn completed while viewer owns screen", () => {
               expect(readFileSync(join(workspace, "finished"), "utf8")).toBe("finished");
               expect(readFileSync(join(workspace, "sibling-finished"), "utf8")).toBe("finished");
               expect(gateway.requests).toHaveLength(4);
@@ -2220,13 +2211,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
           const afterOutput = await capture("after-output");
           const boundary = readFileSync(tracePath, "utf8").slice(traceOffset);
           writeFileSync(join(root, "output-trace.log"), boundary);
-          // Scheduling can coalesce atomic append/status frames. Require actual pruning,
-          // not a particular frame reason; coordinator tests own those exact boundaries.
-          check("retention boundary", () => {
-            const prunes = boundary.match(/pruned (?:command output|entry)/g) ?? [];
-            if (pressure) expect(prunes.length).toBeGreaterThan(0);
-            else expect(prunes).toHaveLength(0);
-          });
           check("commands finished", () => {
             expect(readFileSync(join(workspace, "finished"), "utf8")).toBe("finished");
             expect(readFileSync(join(workspace, "sibling-finished"), "utf8")).toBe("finished");
@@ -2234,14 +2218,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
             expect(gateway.requests).toHaveLength(4);
           });
           check("native history after output", () => expectHistory(afterOutput, true));
-          await session.sendText("/status");
-          await session.waitForText("agent_step_limit=", 10_000);
+          await session.sendText("/allowlist");
+          await session.waitForText("* allowlist: effective", 10_000);
           await session.waitForStableComposer(10_000);
-          const afterStatus = await capture("after-status");
-          check("native history after status", () => expectHistory(afterStatus, true));
-          if (!pressure) check("control never prunes", () => {
-            expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
-          });
+          const afterNotice = await capture("after-notice");
+          check("native history after a local notice", () => expectHistory(afterNotice, true));
           await session.sendText("/quit");
           await session.waitForPane(() => session!.paneStatus().dead, 10_000);
           check("clean exit", () => {
@@ -2272,7 +2253,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         } finally {
           writeFileSync(releasePath, "cleanup");
           if (session) await capture("last");
-          writeFileSync(join(root, "checks.json"), JSON.stringify({ pressure, viewerCols, requestCount, checks }, null, 2));
+          writeFileSync(join(root, "checks.json"), JSON.stringify({ large, viewerCols, requestCount, checks }, null, 2));
           if (passed && !KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
           else console.error(`command retention evidence retained: ${root}`);
         }
@@ -2368,7 +2349,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_MAX_AGENT_STEPS: "4",
           FX_AUTO_UPGRADE: "0",
@@ -2525,7 +2506,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       const beforeCancelLine = readTraceLines(tracePath).length - 1;
       await active.sendKeys("Escape");
-      await active.waitForText("■ Cancelled", remainingTimeout());
+      await active.waitForText("▪ Cancelled", remainingTimeout());
       const cancellationAttempt = await waitForCommittedTraceAttempt(
         tracePath,
         beforeCancelLine,
@@ -2551,7 +2532,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       );
       await active.waitForPane((pane) => {
         const lastLine = pane.trimEnd().split("\n").at(-1)?.trim() ?? "";
-        return pane.includes("■ Cancelled") && lastLine.startsWith("ask ·");
+        return pane.includes("▪ Cancelled") && lastLine.startsWith("ask ·");
       }, remainingTimeout());
       const afterCancelScrollback = await captureScrollback("after-cancel");
 
@@ -2575,7 +2556,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       );
 
       expect(existsSync(markerPath)).toBe(false);
-      expect(afterCancelScrollback).toContain("■ Cancelled");
+      expect(afterCancelScrollback).toContain("▪ Cancelled");
       expect(afterCancelScrollback).not.toContain(approvalQuestion);
       expect(gateway.requests).toHaveLength(2);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2703,10 +2684,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const source = [
         "Recommended fix",
         "",
-        "1. Continue polling while ready.",
+        "9. Continue polling while ready.",
         `   ${paragraph}`,
         "",
-        `2. ${paragraph}`,
+        `10. ${paragraph}`,
         "",
         "- Bullet heading.",
         `  ${paragraph}`,
@@ -2718,10 +2699,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
       ].join("\n");
       // Split both paragraph prefixes across deltas, including a spaces-only delta.
       const chunks = [
-        "Recommended fix\n\n1. Continue polling while ready.\n ",
+        "Recommended fix\n\n9. Continue polling while ready.\n ",
         "  ",
         paragraph.slice(0, 83),
-        `${paragraph.slice(83)}\n\n2. ${paragraph}\n\n- Bullet heading.\n `,
+        `${paragraph.slice(83)}\n\n10. ${paragraph}\n\n- Bullet heading.\n `,
         ` ${paragraph.slice(0, 83)}`,
         `${paragraph.slice(83)}\n\n- ${paragraph}\n\nWRAP_REPRO_END\n`,
       ];
@@ -2748,7 +2729,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_AUTO_UPGRADE: "0",
           FX_SOUND: "0",
@@ -2776,8 +2757,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
         const lines = scrollback.split("\n");
         const markers = [
           "Recommended fix",
-          "1. Continue polling while ready.",
-          "2. I recommend checking",
+          "9. Continue polling while ready.",
+          "10. I recommend checking",
           "• Bullet heading.",
           "• I recommend checking",
           "WRAP_REPRO_END",
@@ -2791,16 +2772,20 @@ describe.skipIf(SKIP)("tui: resize", () => {
           .toBe(normalize(source.replace(/^- /gm, "• ")));
         expect(countOccurrences(scrollback, "I recommend checking")).toBe(4);
 
-        for (const [start, end, indent, marker] of [
-          [rows[1]! + 1, rows[2]!, 5, ""],
-          [rows[2]!, rows[3]!, 5, "2. "],
-          [rows[3]! + 1, rows[4]!, 4, ""],
-          [rows[4]!, rows[5]!, 4, "• "],
+        // Ordered numbers are right-aligned, so the markers of items 9 and
+        // 10 end in the same column and their text starts two columns later.
+        expect(lines[rows[1]!]!.indexOf("9. Continue")).toBe(4);
+        expect(lines[rows[2]!]!.indexOf("10. I recommend")).toBe(3);
+        for (const [start, end, firstIndent, indent, marker] of [
+          [rows[1]! + 1, rows[2]!, 7, 7, ""],
+          [rows[2]!, rows[3]!, 3, 7, "10. "],
+          [rows[3]! + 1, rows[4]!, 4, 4, ""],
+          [rows[4]!, rows[5]!, 2, 4, "• "],
         ] as const) {
           const paragraphRows = lines.slice(start, end).filter((line) => line.trim() !== "");
           expect(paragraphRows.length).toBeGreaterThan(1);
           for (const [index, line] of paragraphRows.entries()) {
-            const expectedIndent = index === 0 && marker ? 2 : indent;
+            const expectedIndent = index === 0 ? firstIndent : indent;
             expect(line.length - line.trimStart().length).toBe(expectedIndent);
             expect(line.length).toBeLessThanOrEqual(cols);
           }
@@ -3022,7 +3007,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -3155,7 +3140,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES:
             "frame_schedule,frame_diff,frame_commit,scroll,resize,input",
-          NO_COLOR: "1",
+          // The selected slash row is found by its color, so this session keeps it.
+          NO_COLOR: undefined,
         },
         width: 120,
         height: 34,
@@ -3184,7 +3170,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForText("/help", 10_000);
       await waitForSelectedSlashLabel(session, "/help");
       const shrinkStage = await session.captureFullScrollback();
-      expect(shrinkStage).toContain("Commands 37 · type to filter");
+      expect(shrinkStage).toContain("Commands 40 · type to filter");
       expect(shrinkStage).toContain("1–4");
       writeFileSync(join(root, "scrollback-after-shrink.txt"), shrinkStage);
 
@@ -3437,7 +3423,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           surfaceCase.height,
           gateway
             ? {
-                FX_E2E_GATEWAY_MODELS_URL:
+                FX_TEST_GATEWAY_MODELS_URL:
                   `${gateway.baseUrl}/coding-agent/v1/models`,
               }
             : {},
@@ -4065,9 +4051,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
           AI_GATEWAY_API_KEY: "fake-resize-activity-key",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-          FX_E2E_GATEWAY_CREDITS_URL: undefined,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CREDITS_URL: undefined,
           FX_MODEL: FAKE_GATEWAY_MODEL,
         },
       );
@@ -4161,11 +4147,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 37", 5_000);
+      await session.waitForText("Commands 40", 5_000);
       await session.resizeWindow(76, 24, 400);
 
       const grid = await session.capturePaneGrid();
-      expect(grid.join("\n")).toContain("Commands 37");
+      expect(grid.join("\n")).toContain("Commands 40");
       expect(findInlineHelpPicker(grid)).not.toBeNull();
 
       await session.sendKeys("Escape");
@@ -4183,7 +4169,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 37", 5_000);
+      await session.waitForText("Commands 40", 5_000);
 
       const captureScrollback = () =>
         execSync(`tmux capture-pane -t ${session!.name} -p -S -`, {
@@ -4191,7 +4177,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           stdio: "pipe",
         });
       const expectHelpCatalog = (grid: string[]) => {
-        expect(grid.join("\n")).toContain("Commands 37");
+        expect(grid.join("\n")).toContain("Commands 40");
         expect(findInlineHelpPicker(grid)).not.toBeNull();
       };
 
@@ -4209,7 +4195,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const restored = captureScrollback();
       expect(restored.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
       expect(restored.match(/Run \/help for commands/g)).toHaveLength(1);
-      expect(restored).not.toContain("Commands 37");
+      expect(restored).not.toContain("Commands 40");
       expect(findFooter(await session.capturePaneGrid())).not.toBeNull();
     },
     TIMEOUT,
@@ -4741,7 +4727,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(await session.captureFullScrollback()).toContain(marker);
 
         await session.sendText("/help");
-        await session.waitForText("Commands 37", 5_000);
+        await session.waitForText("Commands 40", 5_000);
         await session.resizeWindow(84, 28, 500);
 
         const catalog = await session.capturePaneGrid();
@@ -4755,7 +4741,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         );
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).not.toContain(marker);
-        expect(scrollback).not.toContain("Commands 37");
+        expect(scrollback).not.toContain("Commands 40");
         const finalGrid = await session.capturePaneGrid();
         expect(findFooter(finalGrid), finalGrid.join("\n")).not.toBeNull();
 
@@ -4783,9 +4769,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       const inlineMarker = "THEME_RESET_INLINE_CODE";
       const inlineTailMarker = "THEME_RESET_INLINE_TAIL";
-      const responseFence = textHex("\x1b[?1;2c");
-      const darkBackground = textHex("\x1b]11;rgb:0000/0000/0000\x1b\\");
-      const lightBackground = textHex("\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
       const gateway = startFakeGateway([
         fakeGatewayFinalText(
           `THEME_RESET_FIRST_RESPONSE \`${inlineMarker} ${"x".repeat(10_000)}\` ${inlineTailMarker}\n`,
@@ -4851,6 +4834,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
         rawBackgroundRequests,
       );
 
+      // tmux answers fx's background query from the pane's style, as a real
+      // terminal reports its own colors.
+      setPaneBackground(session, "#ffffff");
       sendRawTmuxBytes(
         session,
         "initial-theme-notification",
@@ -4866,13 +4852,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
         "theme_query_requested kind=background",
         backgroundRequests + 1,
       );
-      await session.sendHexBytes([
-        ...responseFence,
-        ...darkBackground,
-        ...lightBackground,
-        ...responseFence,
-      ]);
       await waitForTraceText(tracePath, "theme_update_settled light=true rgb=terminal");
+      // The redraw in the new theme clears the screen, and the trace says so.
+      await waitForTraceText(tracePath, "event=theme_change_redraw dropped=terminal_screen_and_scrollback");
       await waitForTapeOutputCount(tapePath, "\x1b[3J", resetCountBefore + 1);
 
       const replayed = await session.waitForText(inlineTailMarker, TIMEOUT);
@@ -4902,6 +4884,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       trace = readFileSync(tracePath, "utf8");
       fenceRequests = countOccurrences(trace, "theme_query_requested kind=response_fence");
       backgroundRequests = countOccurrences(trace, "theme_query_requested kind=background");
+      // The notification says light, but the terminal's dark background wins.
+      setPaneBackground(session, "#000000");
       sendRawTmuxBytes(
         session,
         "theme-notification",
@@ -4915,12 +4899,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(
         countOccurrences(queryTrace, "theme_query_requested kind=response_fence"),
       ).toBeGreaterThanOrEqual(fenceRequests + 1);
-      await session.sendHexBytes([
-        ...responseFence,
-        ...lightBackground,
-        ...darkBackground,
-        ...responseFence,
-      ]);
       await waitForTraceText(tracePath, "theme_update_settled light=false rgb=terminal");
       expect(
         await waitForTapeOutputCount(tapePath, "\x1b[3J", resetCountBefore + 2),

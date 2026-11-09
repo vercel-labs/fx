@@ -15,8 +15,9 @@
 \*     iss before anything else, and an error in a response that fails the
 \*     checks is never shown (AUTH-14, AUTH-15). Each verifier is redeemed once.
 \*   - A sign-in asks for the scopes the token held was asked with plus those of
-\*     the latest challenge (AUTH-23). At most MaxAuthorizations authorization
-\*     requests go out since the server last accepted a request.
+\*     the latest challenge (AUTH-23), also when both come from a login an
+\*     earlier run saved. At most MaxAuthorizations authorization requests go
+\*     out since the server last accepted a request.
 \*
 \* Issuers, scopes, and flows are small sets; their strings are data.
 EXTENDS Naturals
@@ -64,8 +65,12 @@ Init ==
     /\ flowScopes = {}
     /\ regs = {}
     /\ tokenIssuer = None
-    /\ granted = {}
-    /\ challenge = {}
+    \* A run starts with no login, or from one an earlier run saved: the
+    \* scopes its token was asked with and a step-up it still owes, so the
+    \* next sign-in asks for both. The core records no issuer for a saved
+    \* token, so tokenIssuer stays None.
+    /\ granted \in SUBSET Scopes
+    /\ challenge \in SUBSET Scopes
     /\ auths = 0
     /\ asIssuer \in Issuers
     /\ migrated = FALSE

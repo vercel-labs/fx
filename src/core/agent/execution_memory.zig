@@ -186,6 +186,10 @@ fn dupeCommittedFilePresentation(
     else
         null;
     errdefer if (content_handle) |handle| alloc.free(handle);
+    const review_lines = if (presentation.review_lines) |rows|
+        try types.dupeCommittedFilePresentationLines(alloc, rows)
+    else
+        null;
     return .{
         .path = path,
         .kind = presentation.kind,
@@ -197,6 +201,7 @@ fn dupeCommittedFilePresentation(
         .after_content = after_content,
         .lifecycle_id = lifecycle_id,
         .content_handle = content_handle,
+        .review_lines = review_lines,
     };
 }
 
@@ -283,6 +288,10 @@ const ChatMessageAdapter = struct {
         return value.role == .user and value.permission_feedback;
     }
 
+    fn isContextNote(value: Message) bool {
+        return value.role == .system and value.context_note;
+    }
+
     fn toolCalls(value: Message) []const ToolCall {
         return value.tool_calls;
     }
@@ -301,6 +310,10 @@ const ChatMessageAdapter = struct {
 
     fn toolResultMemory(value: Message) ?types.ToolResultMemory {
         return value.tool_result_memory;
+    }
+
+    fn toolResultCreatedAtMs(value: Message) ?i64 {
+        return value.tool_result_created_at_ms;
     }
 
     fn content(value: Message) ?[]const u8 {
@@ -334,6 +347,11 @@ const MessageAdapter = struct {
         return value.role == .user and value.permission_feedback;
     }
 
+    /// This message type carries no context notes.
+    fn isContextNote(_: Message) bool {
+        return false;
+    }
+
     fn toolCalls(value: Message) []const ToolCall {
         return value.tool_calls;
     }
@@ -352,6 +370,10 @@ const MessageAdapter = struct {
 
     fn toolResultMemory(value: Message) ?types.ToolResultMemory {
         return value.tool_result_memory;
+    }
+
+    fn toolResultCreatedAtMs(_: Message) ?i64 {
+        return null;
     }
 
     fn content(value: Message) ?[]const u8 {
@@ -411,15 +433,18 @@ fn buildNormalExecutionMemory(
 
         var j = i + 1;
         var last_result_index: ?usize = null;
-        while (j < messages.len and Adapter.isTool(messages[j])) : (j += 1) {
+        // A context note sits between steps; it never ends a step's results
+        // or feedback, and `buildExecutionMemory` records it (D93).
+        while (j < messages.len and (Adapter.isTool(messages[j]) or Adapter.isContextNote(messages[j]))) : (j += 1) {
             const result_msg = messages[j];
+            if (Adapter.isContextNote(result_msg)) continue;
             const tool_call_id = Adapter.toolCallId(result_msg) orelse continue;
             const call = findToolCallById(tool_calls, tool_call_id) orelse continue;
             const output = Adapter.content(result_msg) orelse "";
             const status = Adapter.toolResultStatus(result_msg) orelse
                 return error.MissingToolResultStatus;
             const result_memory = Adapter.toolResultMemory(result_msg);
-            const record = try makePersistedToolResult(
+            var record = try makePersistedToolResult(
                 alloc,
                 tool_call_id,
                 Adapter.toolName(result_msg) orelse call.name,
@@ -427,6 +452,11 @@ fn buildNormalExecutionMemory(
                 output,
                 result_memory,
             );
+            // The result keeps the time it was made, so every rebuild of the
+            // turn records it alike.
+            if (Adapter.toolResultCreatedAtMs(result_msg)) |stamp| {
+                if (stamp > 0) record.created_at_ms = stamp;
+            }
             var owns_record = true;
             errdefer if (owns_record) {
                 freeTransientPersistedToolResult(alloc, record);
@@ -444,7 +474,7 @@ fn buildNormalExecutionMemory(
             );
         }
 
-        while (j < messages.len and Adapter.isUser(messages[j])) : (j += 1) {
+        while (j < messages.len and (Adapter.isUser(messages[j]) or Adapter.isContextNote(messages[j]))) : (j += 1) {
             const feedback_msg = messages[j];
             if (!Adapter.isPermissionFeedback(feedback_msg)) continue;
             const text = Adapter.content(feedback_msg) orelse
@@ -1101,6 +1131,63 @@ test "durable execution memory preserves committed file presentation verbatim an
     try std.testing.expectEqualStrings("notes.txt", memory.files[0].path);
     try std.testing.expectEqual(types.FileEvidenceAction.write, memory.files[0].action);
     try std.testing.expectEqualStrings(result.tool_call_id, memory.files[0].tool_call_id);
+}
+
+test "durable execution memory keeps a committed edit's captured review rows" {
+    const alloc = std.testing.allocator;
+    const call_id = "call_edit_rows";
+    const preview_lines = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .deletion, .old_line = 9, .text = "old" },
+        .{ .kind = .addition, .new_line = 9, .text = "new" },
+    };
+    const review_rows = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .elision, .text = "8 unchanged lines ⋯" },
+        .{ .kind = .deletion, .old_line = 9, .text = "old" },
+        .{ .kind = .addition, .new_line = 9, .text = "new" },
+    };
+    const calls = [_]ToolCall{.{
+        .id = call_id,
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\"lock.yaml\",\"old_string\":\"old\",\"new_string\":\"new\"}",
+    }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = calls[0..] },
+        .{
+            .role = .tool,
+            .content = "edited lock.yaml",
+            .tool_call_id = call_id,
+            .tool_name = "edit_file",
+            .tool_result_status = .success,
+            .tool_result_memory = .{
+                .committed_file_presentation = .{
+                    .path = "lock.yaml",
+                    .kind = .edited,
+                    .lines = &preview_lines,
+                    .additions = 1,
+                    .deletions = 1,
+                    .truncated = false,
+                    .lifecycle_id = .{ .turn_id = 2, .call_id = call_id },
+                    .review_lines = &review_rows,
+                },
+            },
+        },
+    };
+
+    const memory = try buildNormalChatExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, memory);
+    const presentation = memory.tool_steps[0].tool_results[0].committed_file_presentation orelse
+        return error.TestExpectedPresentation;
+
+    const rows = presentation.review_lines orelse return error.TestExpectedReviewRows;
+    try std.testing.expectEqual(review_rows.len, rows.len);
+    for (review_rows, rows) |expected, actual| {
+        try std.testing.expectEqual(expected.kind, actual.kind);
+        try std.testing.expectEqual(expected.old_line, actual.old_line);
+        try std.testing.expectEqual(expected.new_line, actual.new_line);
+        try std.testing.expectEqualStrings(expected.text, actual.text);
+    }
+    try std.testing.expect(presentation.after_content == null);
+    try std.testing.expectEqualStrings(call_id, presentation.lifecycle_id.?.call_id);
 }
 
 test "file evidence does not parse unknown tool arguments" {

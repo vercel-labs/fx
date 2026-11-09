@@ -5,7 +5,9 @@ const build_options = @import("build_options");
 const secret = @import("../core/auth/secret.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const local_address = @import("../core/shared/local_address.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
+const input_loop_guard = @import("../core/shared/input_loop_guard.zig");
 const io_mod = @import("../core/shared/io.zig");
 const select_watch = @import("../core/shared/select_watch.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
@@ -13,24 +15,28 @@ const types = @import("../core/shared/types.zig");
 const atomic_value = @import("../core/mcp/atomic_value.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
+const json_depth = @import("json_depth.zig");
+const host_stream_provider = @import("host_stream_provider.zig");
+const open_job = @import("open_job.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
         err == error.ConnectionResetByPeer or
-        err == error.ConnectionTimedOut;
+        err == error.ConnectionTimedOut or
+        err == error.LocalAddressGone;
 }
 
 pub fn networkFailureEvidence(
     err: anyerror,
     delivery: DeliveryCertainty.State,
 ) ?agent_stream_provider.NetworkFailureEvidence {
-    const cause: agent_stream_provider.NetworkFailureCause = if (err == error.SystemResumed)
-        .system_resumed
-    else if (err == error.StreamStalled)
+    const cause: agent_stream_provider.NetworkFailureCause = if (err == error.StreamStalled)
         .stream_stalled
     else if (isConnectivityFailure(err))
         .connectivity_lost
+    else if (isUnreadableReply(err))
+        .unreadable_reply
     else if (isRetryableAgentNetworkError(err))
         .transport_interrupted
     else
@@ -39,7 +45,8 @@ pub fn networkFailureEvidence(
 }
 
 /// Errors that prove the network path itself is down: nothing reached a
-/// server, so no request was sent and no generation exists. Distinct from
+/// server, or no connection opened within the setup budget, so no request
+/// was sent and no generation exists. Distinct from
 /// connected-but-failed errors (reset mid-stream, closed connection), which
 /// carry delivery ambiguity and belong to the retry class.
 pub fn isConnectivityFailure(err: anyerror) bool {
@@ -50,6 +57,7 @@ pub fn isConnectivityFailure(err: anyerror) bool {
         err == error.AddressUnavailable or
         err == error.ConnectionRefused or
         err == error.ConnectionTimedOut or
+        err == error.ConnectionSetupTimedOut or
         err == error.HostUnreachable or
         err == error.NetworkUnreachable or
         err == error.NetworkDown;
@@ -75,38 +83,40 @@ fn isRetryableAgentNetworkError(err: anyerror) bool {
         isRetryableGatewayError(err);
 }
 
+/// A stream event that was not JSON at all: the server answered, so this is
+/// not a lost connection, but the reply was damaged on the way.
+fn isUnreadableReply(err: anyerror) bool {
+    return err == error.MalformedGatewaySseEvent or
+        err == error.MalformedOpenAICodexSseEvent or
+        err == error.MalformedXaiGrokSseEvent or
+        err == error.MalformedChatCompletionsChunk;
+}
+
 fn connectedIoFailure(
     cancelled: bool,
-    system_resumed: bool,
     transport_error: anyerror,
 ) anyerror {
     if (cancelled) return error.Cancelled;
-    if (system_resumed) return error.SystemResumed;
     return transport_error;
 }
 
 fn connectedIoFailureWithWatch(
     watch: ?*ConnectedRequestWatch,
     cancelled: bool,
-    system_resumed: bool,
     transport_error: anyerror,
 ) anyerror {
-    const mapped = connectedIoFailure(cancelled, system_resumed, transport_error);
+    const mapped = connectedIoFailure(cancelled, transport_error);
     return if (watch) |state| state.finish_error(mapped) else mapped;
 }
 
-test "connected request failures prefer cancellation then wake evidence" {
+test "connected request failures prefer cancellation" {
     try std.testing.expectEqual(
         error.Cancelled,
-        connectedIoFailure(true, true, error.WriteFailed),
-    );
-    try std.testing.expectEqual(
-        error.SystemResumed,
-        connectedIoFailure(false, true, error.WriteFailed),
+        connectedIoFailure(true, error.WriteFailed),
     );
     try std.testing.expectEqual(
         error.WriteFailed,
-        connectedIoFailure(false, false, error.WriteFailed),
+        connectedIoFailure(false, error.WriteFailed),
     );
 }
 
@@ -114,6 +124,7 @@ test "isRetryableGatewayError matches active retryable transport errors" {
     try std.testing.expect(isRetryableGatewayError(error.HttpConnectionClosing));
     try std.testing.expect(isRetryableGatewayError(error.ConnectionResetByPeer));
     try std.testing.expect(isRetryableGatewayError(error.ConnectionTimedOut));
+    try std.testing.expect(isRetryableGatewayError(error.LocalAddressGone));
     try std.testing.expect(!isRetryableGatewayError(error.AccessDenied));
 }
 
@@ -124,7 +135,7 @@ test "native network failure evidence covers setup send read and resume failures
     };
     const cases = [_]Cases{
         .{ .err = error.TlsInitializationFailed },
-        .{ .err = error.ConnectionSetupTimedOut },
+        .{ .err = error.ConnectionSetupTimedOut, .cause = .connectivity_lost },
         .{ .err = error.UnknownHostName, .cause = .connectivity_lost },
         .{ .err = error.NameServerFailure, .cause = .connectivity_lost },
         .{ .err = error.NoAddressReturned, .cause = .connectivity_lost },
@@ -143,7 +154,7 @@ test "native network failure evidence covers setup send read and resume failures
         .{ .err = error.WriteFailed },
         .{ .err = error.ReadFailed },
         .{ .err = error.StreamStalled, .cause = .stream_stalled },
-        .{ .err = error.SystemResumed, .cause = .system_resumed },
+        .{ .err = error.LocalAddressGone },
     };
 
     for (cases) |case| {
@@ -228,9 +239,9 @@ const gateway_transfer_buffer_bytes: usize = 256 * 1024;
 const provider_failure_detail_max_bytes: usize = 600;
 // Covers a 4 MiB string at worst-case JSON escaping plus SSE framing.
 const max_sse_event_line_bytes: usize = 32 * 1024 * 1024;
-const e2e_gateway_chat_url_env = "FX_E2E_GATEWAY_CHAT_URL";
-const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
-const e2e_gateway_credits_url_env = "FX_E2E_GATEWAY_CREDITS_URL";
+const e2e_gateway_chat_url_env = "FX_TEST_GATEWAY_CHAT_URL";
+const e2e_gateway_models_url_env = "FX_TEST_GATEWAY_MODELS_URL";
+const e2e_gateway_credits_url_env = "FX_TEST_GATEWAY_CREDITS_URL";
 const default_gateway_base_url = "https://ai-gateway.vercel.sh";
 pub const vercel_ai_gateway_team_header = "x-vercel-ai-gateway-team";
 pub const vercel_gateway_extended_time_header = "x-vercel-gateway-extended-time";
@@ -307,6 +318,89 @@ pub fn fetchUsageGet(
     );
 }
 
+/// The same GET as `fetchUsageGet`, through a host transport instead of
+/// fx's own HTTP client: the JS host in WebAssembly, which cannot open
+/// sockets. Pulses `cooperative_pulse` while the host has nothing ready.
+/// Redirects are the host's: `fetch` follows them and drops `authorization`
+/// when one leaves the origin.
+pub fn fetchUsageGetThroughHost(
+    alloc: std.mem.Allocator,
+    transport: host_stream_provider.Transport,
+    bearer: []const u8,
+    gateway_team: ?[]const u8,
+    account: UsageAccount,
+    url: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+    cooperative_pulse: ?agent_stream_provider.CooperativePulse,
+) !GetResult {
+    const authorization = try alloc.print("Bearer {s}", .{bearer});
+    defer secret.zeroAndFree(alloc, authorization);
+    var headers_buf: [5]std.http.Header = undefined;
+    headers_buf[0] = .{ .name = "authorization", .value = authorization };
+    const extra = usageExtraHeaders(headers_buf[1..5], gateway_team, account);
+    const response = try host_stream_provider.get(
+        alloc,
+        transport,
+        url,
+        headers_buf[0 .. 1 + extra.len],
+        usage_response_max_bytes,
+        cancel_flag,
+        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(usage_request_timeout_ms),
+        }),
+        cooperative_pulse,
+    );
+    return .{ .status = response.status, .body = response.body };
+}
+
+/// The headers a usage GET sends besides `authorization`: the AI Gateway
+/// team, or the provider account. Borrows from the arguments.
+fn usageExtraHeaders(buf: *[4]std.http.Header, gateway_team: ?[]const u8, account: UsageAccount) []const std.http.Header {
+    var count = gatewayModelCatalogExtraHeaders(buf, gateway_team).len;
+    switch (account) {
+        .none => {},
+        .chatgpt => |id| {
+            buf[count] = .{ .name = "chatgpt-account-id", .value = id };
+            buf[count + 1] = .{ .name = "originator", .value = "fx" };
+            count += 2;
+        },
+        // The proxy reads a subscription token only with the Grok CLI's
+        // token-auth marker, the same one fx's Grok requests send.
+        .grok => |id| {
+            buf[count] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
+            buf[count + 1] = .{ .name = "x-userid", .value = id };
+            buf[count + 2] = .{ .name = "x-grok-client-identifier", .value = "fx" };
+            count += 3;
+        },
+    }
+    return buf[0..count];
+}
+
+test "usage GETs send the team or provider account headers, whichever transport carries them" {
+    var buf: [4]std.http.Header = undefined;
+    try std.testing.expectEqual(@as(usize, 0), usageExtraHeaders(&buf, null, .none).len);
+    try std.testing.expectEqual(@as(usize, 0), usageExtraHeaders(&buf, "", .none).len);
+
+    const team = usageExtraHeaders(&buf, "team_example", .none);
+    try std.testing.expectEqual(@as(usize, 1), team.len);
+    try std.testing.expectEqualStrings(vercel_ai_gateway_team_header, team[0].name);
+    try std.testing.expectEqualStrings("team_example", team[0].value);
+
+    const chatgpt = usageExtraHeaders(&buf, null, .{ .chatgpt = "account-example" });
+    try std.testing.expectEqual(@as(usize, 2), chatgpt.len);
+    try std.testing.expectEqualStrings("chatgpt-account-id", chatgpt[0].name);
+    try std.testing.expectEqualStrings("account-example", chatgpt[0].value);
+    try std.testing.expectEqualStrings("originator", chatgpt[1].name);
+
+    const grok = usageExtraHeaders(&buf, null, .{ .grok = "user-example" });
+    try std.testing.expectEqual(@as(usize, 3), grok.len);
+    try std.testing.expectEqualStrings("X-XAI-Token-Auth", grok[0].name);
+    try std.testing.expectEqualStrings("x-userid", grok[1].name);
+    try std.testing.expectEqualStrings("user-example", grok[1].value);
+    try std.testing.expectEqualStrings("x-grok-client-identifier", grok[2].name);
+}
+
 const UsageGetOperation = struct {
     alloc: std.mem.Allocator,
     bearer: []const u8,
@@ -323,36 +417,14 @@ const UsageGetOperation = struct {
         defer client.deinit();
         const auth_header = try self.alloc.print("Bearer {s}", .{self.bearer});
         defer secret.zeroAndFree(self.alloc, auth_header);
-        var team_header_buf: [1]std.http.Header = undefined;
         var extra_headers_buf: [4]std.http.Header = undefined;
-        var extra_count: usize = 0;
-        for (gatewayModelCatalogExtraHeaders(&team_header_buf, self.gateway_team)) |header| {
-            extra_headers_buf[extra_count] = header;
-            extra_count += 1;
-        }
-        switch (self.account) {
-            .none => {},
-            .chatgpt => |id| {
-                extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = id };
-                extra_headers_buf[extra_count + 1] = .{ .name = "originator", .value = "fx" };
-                extra_count += 2;
-            },
-            // The proxy reads a subscription token only with the Grok CLI's
-            // token-auth marker, the same one fx's Grok requests send.
-            .grok => |id| {
-                extra_headers_buf[extra_count] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
-                extra_headers_buf[extra_count + 1] = .{ .name = "x-userid", .value = id };
-                extra_headers_buf[extra_count + 2] = .{ .name = "x-grok-client-identifier", .value = "fx" };
-                extra_count += 3;
-            },
-        }
         var req = try client.request(.GET, uri, .{
             .headers = .{
                 .accept_encoding = .omit,
                 .user_agent = .{ .override = user_agent },
                 .authorization = .{ .override = auth_header },
             },
-            .extra_headers = extra_headers_buf[0..extra_count],
+            .extra_headers = usageExtraHeaders(&extra_headers_buf, self.gateway_team, self.account),
             .redirect_behavior = .unhandled,
         });
         defer req.deinit();
@@ -408,17 +480,47 @@ pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, pat
     };
 }
 
+/// `fetchGatewayGetResult` with bounds: it fails with `error.Cancelled` once
+/// `cancel_flag` is set and with `error.Timeout` after
+/// `gateway_json_fetch_timeout_ms`, so a stalled endpoint cannot hold the caller.
+pub fn fetchGatewayGetResultCancellable(
+    alloc: std.mem.Allocator,
+    api_key: ?[]const u8,
+    path: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+) !GetResult {
+    var operation = GatewayGetOperation{ .alloc = alloc, .api_key = api_key, .path = path };
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(gateway_json_fetch_timeout_ms),
+    });
+    return runBoundedHttpOperation(GetResult, alloc, cancel_flag, deadline, &operation);
+}
+
+const GatewayGetOperation = struct {
+    alloc: std.mem.Allocator,
+    api_key: ?[]const u8,
+    path: []const u8,
+
+    fn run(self: *@This()) !GetResult {
+        return fetchGatewayGetResult(self.alloc, self.api_key, self.path);
+    }
+};
+
+/// Sets `connected`, when given, once the request has a connection: the DNS
+/// lookup, connect, and any TLS handshake are done.
 pub fn fetchGatewayJsonCancellable(
     alloc: std.mem.Allocator,
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    connected: ?*std.atomic.Value(bool),
 ) !GatewayJsonResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     const request_url = try resolveE2eGatewayUrl(e2e_gateway_models_url_env, url);
-    return fetchGatewayJsonAtUrlCancellable(alloc, api_key, gateway_team, request_url, cancel_flag, gateway_json_fetch_timeout_ms);
+    return fetchGatewayJsonAtUrlCancellable(alloc, api_key, gateway_team, request_url, cancel_flag, gateway_json_fetch_timeout_ms, connected);
 }
 
 /// A stalled catalog request fails with `error.Timeout` after this long, so a
@@ -432,6 +534,7 @@ fn fetchGatewayJsonAtUrlCancellable(
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
     timeout_ms: i64,
+    connected: ?*std.atomic.Value(bool),
 ) !GatewayJsonResult {
     var operation = GatewayJsonFetchOperation{
         .alloc = alloc,
@@ -439,6 +542,7 @@ fn fetchGatewayJsonAtUrlCancellable(
         .gateway_team = gateway_team,
         .url = url,
         .cancel_flag = cancel_flag,
+        .connected = connected,
     };
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
@@ -453,6 +557,7 @@ const GatewayJsonFetchOperation = struct {
     gateway_team: ?[]const u8,
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    connected: ?*std.atomic.Value(bool),
 
     fn run(self: *@This()) !GatewayJsonResult {
         return fetchGatewayJsonAtUrlCore(
@@ -461,6 +566,7 @@ const GatewayJsonFetchOperation = struct {
             self.gateway_team,
             self.url,
             self.cancel_flag,
+            self.connected,
         );
     }
 };
@@ -471,6 +577,7 @@ fn fetchGatewayJsonAtUrlCore(
     gateway_team: ?[]const u8,
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    connected: ?*std.atomic.Value(bool),
 ) !GatewayJsonResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
@@ -501,11 +608,13 @@ fn fetchGatewayJsonAtUrlCore(
         return err;
     };
     defer req.deinit();
+    // `client.request` returns once the connection is open, TLS included.
+    if (connected) |flag| flag.store(true, .release);
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     var cancel_watch_done = std.atomic.Value(bool).init(false);
     const cancel_watcher = if (req.connection) |conn|
-        try spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, null, null, null, conn.stream_writer.stream)
+        try spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, null, null, conn.stream_writer.stream)
     else
         null;
     defer {
@@ -731,6 +840,137 @@ fn markPooledConnectionClosing(req: *std.http.Client.Request, request: StreamReq
     if (req.connection) |conn| conn.closing = true;
 }
 
+/// Writes the request head and body and flushes them to the connection.
+fn sendGatewayRequestBody(req: *std.http.Client.Request, payload: []const u8, send_buf: []u8) std.Io.Writer.Error!void {
+    var body_writer = try req.sendBodyUnflushed(send_buf);
+    try body_writer.writer.writeAll(payload);
+    try body_writer.end();
+    try req.connection.?.flush();
+}
+
+/// Closes the origin's other idle connections, which the server may have
+/// closed the same way, so the next attempt dials a fresh one.
+fn prepareFreshConnectionRetry(
+    request: StreamRequest,
+    request_url: []const u8,
+    trace_ctx: debug_trace.TraceContext,
+    attempt: usize,
+    evidence: StaleConnectionEvidence,
+) void {
+    const closed = if (request.shared_pool) |pool| pool.closeIdleConnections(request_url) else 0;
+    traceReusedConnectionFailure("stale_connection_retry", trace_ctx, attempt, evidence, closed);
+}
+
+/// Records what a failure on a reused connection looked like, whether it was
+/// resent or reported, so a "Network interrupted" report can be explained
+/// from the trace.
+fn traceReusedConnectionFailure(
+    event: []const u8,
+    trace_ctx: debug_trace.TraceContext,
+    attempt: usize,
+    evidence: StaleConnectionEvidence,
+    idle_closed: usize,
+) void {
+    const socket_err = if (evidence.socket_error) |cause| @errorName(cause) else "none";
+    switch (evidence.stage) {
+        .send => debug_trace.eventf("gateway", event, trace_ctx, "attempt={d} stage=send err={s} socket_err={s} idle_closed={d}", .{
+            attempt + 1,
+            @errorName(evidence.transport_error),
+            socket_err,
+            idle_closed,
+        }),
+        .head => debug_trace.eventf("gateway", event, trace_ctx, "attempt={d} stage=head err={s} socket_err={s} received_bytes={d} elapsed_ms={d} idle_closed={d}", .{
+            attempt + 1,
+            @errorName(evidence.transport_error),
+            socket_err,
+            evidence.received_bytes,
+            evidence.elapsed_ms,
+            idle_closed,
+        }),
+    }
+}
+
+const StaleConnectionStage = enum { send, head };
+
+/// A connection the server closed while idle fails within one round trip of
+/// the write. A head failure later than this may follow a request the server
+/// read, so it is reported instead of resent.
+const stale_connection_head_window_ms: i64 = 5_000;
+
+/// What one failed request on a pooled connection looked like.
+const StaleConnectionEvidence = struct {
+    stage: StaleConnectionStage,
+    reused: bool,
+    /// The error the request failed with.
+    transport_error: anyerror,
+    /// The same failure after cancellation, wake, and watchdog evidence.
+    reported_error: anyerror,
+    /// The error the socket stored. std reports every socket error as
+    /// `ReadFailed` or `WriteFailed`, including a cancelled read or write.
+    socket_error: ?anyerror = null,
+    /// Response bytes already received, decoded or still undecrypted.
+    received_bytes: usize = 0,
+    /// Time from the end of the send to the head failure, including sleep.
+    elapsed_ms: i64 = 0,
+};
+
+/// A pooled connection that the server closed while it sat idle fails as
+/// soon as fx writes the request or reads the response head, before any
+/// response byte arrives, and the socket says the peer closed it. Servers
+/// close idle connections without reading what arrives next, so the request
+/// goes out once more on a fresh connection and the failure is never
+/// reported. Everything else is reported as before: a fresh connection, a
+/// cancelled read or write such as a request deadline, any other socket or
+/// TLS error, any received response byte, a head failure outside the window,
+/// and failures that cancellation, a wake from sleep, or a watchdog overrode.
+fn isStaleConnectionFailure(evidence: StaleConnectionEvidence) bool {
+    if (!evidence.reused or evidence.reported_error != evidence.transport_error) return false;
+    const peer_closed = if (evidence.socket_error) |cause| isPeerClosedError(cause) else false;
+    return switch (evidence.stage) {
+        .send => peer_closed,
+        .head => evidence.received_bytes == 0 and
+            evidence.elapsed_ms <= stale_connection_head_window_ms and
+            ((evidence.transport_error == error.ReadFailed and peer_closed) or
+                (evidence.transport_error == error.HttpConnectionClosing and evidence.socket_error == null)),
+    };
+}
+
+fn isPeerClosedError(err: anyerror) bool {
+    return err == error.ConnectionResetByPeer or err == error.SocketUnconnected;
+}
+
+test "only a reused connection the peer closed before the first response byte is stale" {
+    const stale = [_]StaleConnectionEvidence{
+        .{ .stage = .send, .reused = true, .transport_error = error.WriteFailed, .reported_error = error.WriteFailed, .socket_error = error.ConnectionResetByPeer },
+        .{ .stage = .send, .reused = true, .transport_error = error.WriteFailed, .reported_error = error.WriteFailed, .socket_error = error.SocketUnconnected },
+        .{ .stage = .head, .reused = true, .transport_error = error.HttpConnectionClosing, .reported_error = error.HttpConnectionClosing },
+        .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed, .socket_error = error.ConnectionResetByPeer, .elapsed_ms = 4_999 },
+    };
+    for (stale) |evidence| try std.testing.expect(isStaleConnectionFailure(evidence));
+
+    const reported = [_]StaleConnectionEvidence{
+        // A fresh connection failing is a real network problem.
+        .{ .stage = .send, .reused = false, .transport_error = error.WriteFailed, .reported_error = error.WriteFailed, .socket_error = error.ConnectionResetByPeer },
+        .{ .stage = .head, .reused = false, .transport_error = error.HttpConnectionClosing, .reported_error = error.HttpConnectionClosing },
+        // A request deadline cancels the socket read or write in place.
+        .{ .stage = .send, .reused = true, .transport_error = error.WriteFailed, .reported_error = error.WriteFailed, .socket_error = error.Canceled },
+        .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed, .socket_error = error.Canceled },
+        // Other socket errors, and TLS errors that leave no socket error.
+        .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed, .socket_error = error.NetworkDown },
+        .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed },
+        .{ .stage = .send, .reused = true, .transport_error = error.WriteFailed, .reported_error = error.WriteFailed },
+        // Cancellation evidence outranks the socket error.
+        .{ .stage = .send, .reused = true, .transport_error = error.WriteFailed, .reported_error = error.Cancelled, .socket_error = error.ConnectionResetByPeer },
+        // Once the server has started answering, resending could run the request twice.
+        .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed, .socket_error = error.ConnectionResetByPeer, .received_bytes = 17 },
+        .{ .stage = .head, .reused = true, .transport_error = error.HttpRequestTruncated, .reported_error = error.HttpRequestTruncated },
+        .{ .stage = .head, .reused = true, .transport_error = error.HttpHeadersInvalid, .reported_error = error.HttpHeadersInvalid },
+        // A head that dies long after the send may follow a request the server read.
+        .{ .stage = .head, .reused = true, .transport_error = error.HttpConnectionClosing, .reported_error = error.HttpConnectionClosing, .elapsed_ms = 5_001 },
+    };
+    for (reported) |evidence| try std.testing.expect(!isStaleConnectionFailure(evidence));
+}
+
 const ConnectionSetupTiming = struct {
     timeout_ms: i64 = gateway_connection_setup_timeout_ms,
 };
@@ -740,7 +980,7 @@ const ResponseHeadTiming = struct {
     /// Patient head-wait (agent streaming path): a long-thinking model and a
     /// hung gateway are byte-identical on the wire, and the gateway sends no
     /// heartbeat. Never abort a sent request on head silence alone; only a dead
-    /// socket, cancellation, or a system resume ends the wait.
+    /// socket, which the dead-peer probes find, or cancellation ends the wait.
     patient: bool = false,
     /// Mid-stream stall watchdog: once the head has arrived, a stream that
     /// produces no bytes for this long is treated as dead (positive evidence,
@@ -800,8 +1040,9 @@ const ConnectedRequestWatch = struct {
         completed,
         timed_out,
         cancelled,
-        system_resumed,
         stalled,
+        /// The connection's local address left the machine.
+        address_gone,
     };
 
     phase: std.atomic.Value(Phase) = .init(.sending),
@@ -934,7 +1175,7 @@ const ConnectedRequestWatch = struct {
     ) bool {
         if (self.timing.patient) {
             // Patient head-wait never aborts. The wait ends only with data,
-            // a dead socket, cancel, or system resume.
+            // a dead socket, or cancel.
             if (self.phase.load(.seq_cst) != .awaiting_head) return false;
             if (std.Io.Clock.Timestamp.compare(now, .lt, self.response_head_deadline)) return false;
             return false;
@@ -950,7 +1191,7 @@ const ConnectedRequestWatch = struct {
     fn is_active(phase: Phase) bool {
         return switch (phase) {
             .sending, .awaiting_head, .streaming => true,
-            .completed, .timed_out, .cancelled, .system_resumed, .stalled => false,
+            .completed, .timed_out, .cancelled, .stalled, .address_gone => false,
         };
     }
 
@@ -958,8 +1199,8 @@ const ConnectedRequestWatch = struct {
         return switch (phase) {
             .timed_out => error.Timeout,
             .cancelled => error.Cancelled,
-            .system_resumed => error.SystemResumed,
             .stalled => error.StreamStalled,
+            .address_gone => error.LocalAddressGone,
             .sending, .awaiting_head, .streaming, .completed => null,
         };
     }
@@ -972,6 +1213,8 @@ const RequestOpenOperation = struct {
     uri: std.Uri,
     options: std.http.Client.RequestOptions,
     request_open_override: ?RequestOpenOverride,
+    /// Set by `run` when the request reuses an idle pooled connection.
+    reused: bool = false,
 
     fn run(self: *@This()) anyerror!std.http.Client.Request {
         if (self.request_open_override) |request_open| {
@@ -983,20 +1226,317 @@ const RequestOpenOperation = struct {
                 self.options,
             );
         }
-        if (self.pool) |pool| return pool.openRequest(.POST, self.uri, self.options);
+        if (self.pool) |pool| {
+            const opened = try pool.openRequest(.POST, self.uri, self.options);
+            self.reused = opened.reused;
+            return opened.request;
+        }
         return self.client.request(.POST, self.uri, self.options);
     }
 };
 
+/// A request's connection open, on a thread of its own so the request can
+/// walk away from a DNS lookup or connect that hangs (`open_job.zig`).
+///
+/// A pooled open runs on the pool's client, which the pool keeps until its
+/// jobs are gone (`HttpPool.deinit`). Any other open runs on a client the job
+/// makes for it, because the caller's own client and allocator end with its
+/// attempt, which can come while the job still waits for a lookup. Whichever
+/// side owns the result frees that client: the request once it is done with
+/// the connection, or the job when the request walked away.
+///
+/// The job owns a copy of the URI, which `client.request` reads while it
+/// connects. Headers are only stored in the request, so the job opens
+/// without them and the request puts its own back when it takes the result.
+const OpenJob = struct {
+    gpa: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    /// The pool whose client the open runs on, or null for the job's own
+    /// client, which is `operation.client`.
+    pool: ?*http_pool.HttpPool,
+    operation: RequestOpenOperation,
+    handoff: open_job.Handoff = .{},
+    result: anyerror!std.http.Client.Request = error.ConnectionSetupTimedOut,
+
+    fn start(
+        pool: ?*http_pool.HttpPool,
+        uri: std.Uri,
+        options: std.http.Client.RequestOptions,
+        request_open_override: ?RequestOpenOverride,
+    ) !*OpenJob {
+        const gpa = if (pool) |shared| shared.client.allocator else own_client_gpa;
+        const job = try gpa.create(OpenJob);
+        job.* = .{ .gpa = gpa, .arena = .init(gpa), .pool = pool, .operation = undefined };
+        errdefer job.destroy();
+        const client = if (pool) |shared| &shared.client else try createOwnClient();
+        errdefer if (pool == null) destroyOwnClient(client);
+        var job_options = options;
+        job_options.headers = .{};
+        job_options.extra_headers = &.{};
+        job_options.privileged_headers = &.{};
+        job.operation = .{
+            .client = client,
+            .pool = pool,
+            .uri = try dupeUri(job.arena.allocator(), uri),
+            .options = job_options,
+            .request_open_override = request_open_override,
+        };
+        beginOpenJob(pool);
+        errdefer endOpenJob(pool);
+        // A detached thread, not an Io task: std.Io cannot cancel a lookup
+        // stuck in getaddrinfo, so the job has to be able to outlive the
+        // request that started it. It is not unowned: a counter tracks it
+        // from here to its last touch in `run`, the pool's or
+        // `own_client_open_jobs`, and `HttpPool.deinit` waits for the pool's
+        // before freeing the client.
+        const thread = try std.Thread.spawn(.{}, run, .{job});
+        thread.detach();
+        return job;
+    }
+
+    fn run(self: *OpenJob) void {
+        const pool = self.pool;
+        self.result = self.openUnlessAbandoned();
+        switch (self.handoff.publish()) {
+            // The request may free the job from here on.
+            .hand_over => {},
+            .close_late => {
+                if (self.result) |request| {
+                    // Nothing was sent on it, so std returns it to the pool
+                    // it came from; an own client closes it below.
+                    var late = request;
+                    late.deinit();
+                    debug_trace.logf("gateway", "open_job late connection {s}", .{if (pool == null) "closed" else "released"});
+                } else |err| {
+                    debug_trace.logf("gateway", "open_job late open failed err={s}", .{@errorName(err)});
+                }
+                if (pool == null) destroyOwnClient(self.operation.client);
+                self.destroy();
+            },
+        }
+        endOpenJob(pool);
+    }
+
+    /// Runs the open as an Io task, so the job can cancel it once the
+    /// request walked away. That ends a connect or TLS setup at once, which
+    /// closes the half-open connection; a lookup cannot be cancelled and
+    /// runs to its end first. With no Io task to spare, the job opens on its
+    /// own thread, where only std ends a stalled connect.
+    fn openUnlessAbandoned(self: *OpenJob) anyerror!std.http.Client.Request {
+        const Event = union(enum) {
+            request: anyerror!std.http.Client.Request,
+            watch: std.Io.Cancelable!select_watch.Outcome,
+        };
+        const Cancel = struct {
+            /// Cancels the open and returns what it ended with: a request
+            /// that finished first, or its error.
+            fn open(select: *std.Io.Select(Event), watch: *RequestGoneWatch) anyerror!std.http.Client.Request {
+                watch.stop(select.io);
+                var result: anyerror!std.http.Client.Request = error.Canceled;
+                while (select.cancel()) |item| switch (item) {
+                    .request => |late| result = late,
+                    .watch => {},
+                };
+                return result;
+            }
+        };
+        var watch: RequestGoneWatch = .{};
+        var buffer: [2]Event = undefined;
+        var select: std.Io.Select(Event) = .init(io_mod.getIo(), &buffer);
+        select.concurrent(.watch, RequestGoneWatch.run, .{ &watch, select.io, RequestGone{ .handoff = &self.handoff } }) catch
+            return self.operation.run();
+        select.concurrent(.request, RequestOpenOperation.run, .{&self.operation}) catch {
+            watch.finish(&select);
+            return self.operation.run();
+        };
+        const event = select.await() catch return Cancel.open(&select, &watch);
+        switch (event) {
+            .request => |result| {
+                watch.finish(&select);
+                return result;
+            },
+            .watch => {
+                debug_trace.logf("gateway", "open_job stopping its open after the request walked away", .{});
+                return Cancel.open(&select, &watch);
+            },
+        }
+    }
+
+    /// Waits for the open, or walks away from it on Esc, at `deadline`, or
+    /// when the task the request runs in is cancelled. Returns the request
+    /// with the caller's URI and headers.
+    fn waitForOpen(
+        self: *OpenJob,
+        uri: std.Uri,
+        options: std.http.Client.RequestOptions,
+        deadline: std.Io.Clock.Timestamp,
+        cancel_flag: *std.atomic.Value(bool),
+        reused: *bool,
+    ) anyerror!OpenedRequest {
+        const zio = io_mod.getIo();
+        var task_cancelled = false;
+        while (true) {
+            const now = std.Io.Clock.Timestamp.now(zio, .awake);
+            const stop_reason: ?anyerror = if (task_cancelled)
+                error.Canceled
+            else if (cancel_flag.load(.seq_cst))
+                error.Cancelled
+            else if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline))
+                error.ConnectionSetupTimedOut
+            else
+                null;
+            const stopped = stop_reason orelse switch (self.handoff.poll()) {
+                .wait => {
+                    zio.sleep(.fromMilliseconds(open_poll_ms), .awake) catch |err| switch (err) {
+                        error.Canceled => task_cancelled = true,
+                    };
+                    continue;
+                },
+                .take => return self.take(uri, options, reused),
+            };
+            switch (self.handoff.stop()) {
+                .walk_away => debug_trace.logf("gateway", "open_job walked away err={s}", .{@errorName(stopped)}),
+                .close_handed => {
+                    // The open finished as the request stopped, so it closes
+                    // the connection itself.
+                    if (self.take(uri, options, reused)) |handed| {
+                        var closing = handed;
+                        closing.deinit();
+                        debug_trace.logf("gateway", "open_job closed a handed connection err={s}", .{@errorName(stopped)});
+                    } else |err| {
+                        debug_trace.logf("gateway", "open_job handed open failed err={s} stopped={s}", .{ @errorName(err), @errorName(stopped) });
+                    }
+                },
+            }
+            return stopped;
+        }
+    }
+
+    /// Takes the handed-over result and frees the job. An own client goes
+    /// with the request, or is freed with a failed open.
+    fn take(
+        self: *OpenJob,
+        uri: std.Uri,
+        options: std.http.Client.RequestOptions,
+        reused: *bool,
+    ) anyerror!OpenedRequest {
+        const own_client: ?*std.http.Client = if (self.pool == null) self.operation.client else null;
+        defer self.destroy();
+        var request = self.result catch |err| {
+            if (own_client) |client| destroyOwnClient(client);
+            return err;
+        };
+        request.uri = uri;
+        request.headers = options.headers;
+        request.extra_headers = options.extra_headers;
+        request.privileged_headers = options.privileged_headers;
+        reused.* = self.operation.reused;
+        return .{ .request = request, .own_client = own_client };
+    }
+
+    fn destroy(self: *OpenJob) void {
+        const gpa = self.gpa;
+        self.arena.deinit();
+        gpa.destroy(self);
+    }
+
+    fn beginOpenJob(pool: ?*http_pool.HttpPool) void {
+        if (pool) |shared| return shared.beginOpenJob();
+        _ = own_client_open_jobs.fetchAdd(1, .acq_rel);
+    }
+
+    /// A job's last touch of anything it shares.
+    fn endOpenJob(pool: ?*http_pool.HttpPool) void {
+        if (pool) |shared| return shared.endOpenJob();
+        _ = own_client_open_jobs.fetchSub(1, .acq_rel);
+    }
+};
+
+/// How often a request checks on its open job.
+const open_poll_ms = 2;
+
+/// Fires once the request walked away from its open job.
+const RequestGone = struct {
+    handoff: *const open_job.Handoff,
+
+    pub fn cancelled(condition: RequestGone) bool {
+        return condition.handoff.abandoned();
+    }
+
+    pub fn expired(_: RequestGone, _: std.Io) bool {
+        return false;
+    }
+};
+
+const RequestGoneWatch = select_watch.Watch(RequestGone);
+
+/// Where an open job on a client of its own allocates the job and that
+/// client. Not the caller's allocator: that is the attempt's arena
+/// (`gateway_step.zig`), freed when the attempt returns, which can come
+/// while the job still waits for a lookup. Tests use the testing allocator,
+/// so its leak check covers every job.
+const own_client_gpa = if (builtin.is_test) std.testing.allocator else std.heap.c_allocator;
+
+/// Open jobs on clients of their own that are still running. A request may
+/// have walked away from one that waits for a lookup.
+var own_client_open_jobs: std.atomic.Value(u32) = .init(0);
+
+fn createOwnClient() !*std.http.Client {
+    const client = try own_client_gpa.create(std.http.Client);
+    client.* = .{ .allocator = own_client_gpa, .io = io_mod.getIo() };
+    return client;
+}
+
+fn destroyOwnClient(client: *std.http.Client) void {
+    client.deinit();
+    own_client_gpa.destroy(client);
+}
+
+/// A request an open job handed over, with the client it runs on when that
+/// client is the job's own. `deinit` ends the request, then frees the client.
+pub const OpenedRequest = struct {
+    request: std.http.Client.Request,
+    own_client: ?*std.http.Client = null,
+
+    pub fn deinit(self: *OpenedRequest) void {
+        self.request.deinit();
+        if (self.own_client) |client| destroyOwnClient(client);
+        self.* = undefined;
+    }
+};
+
+fn dupeUri(arena: std.mem.Allocator, uri: std.Uri) !std.Uri {
+    const Dupe = struct {
+        fn component(alloc: std.mem.Allocator, value: std.Uri.Component) !std.Uri.Component {
+            return switch (value) {
+                .raw => |text| .{ .raw = try alloc.dupe(u8, text) },
+                .percent_encoded => |text| .{ .percent_encoded = try alloc.dupe(u8, text) },
+            };
+        }
+    };
+    var copy = uri;
+    copy.scheme = try arena.dupe(u8, uri.scheme);
+    copy.path = try Dupe.component(arena, uri.path);
+    inline for (.{ "user", "password", "host", "query", "fragment" }) |field| {
+        if (@field(uri, field)) |value| @field(copy, field) = try Dupe.component(arena, value);
+    }
+    return copy;
+}
+
+/// Opens a request's connection on a job (`OpenJob`): on the pool's client
+/// when `pool` is set, and otherwise on a client of the job's own. Esc and
+/// the setup deadline return at once, however long the lookup takes.
 fn openGatewayRequestBounded(
-    client: *std.http.Client,
     pool: ?*http_pool.HttpPool,
     uri: std.Uri,
     options: std.http.Client.RequestOptions,
     request_open_override: ?RequestOpenOverride,
     epoch: *ConnectionSetupEpoch,
     cancel_flag: *std.atomic.Value(bool),
-) anyerror!std.http.Client.Request {
+    /// Set when the returned request reuses an idle pooled connection.
+    reused: *bool,
+) anyerror!OpenedRequest {
+    reused.* = false;
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
@@ -1004,67 +1544,23 @@ fn openGatewayRequestBounded(
         return error.ConnectionSetupTimedOut;
     }
 
-    const Event = union(enum) {
-        request: anyerror!std.http.Client.Request,
-        watch: anyerror!select_watch.Outcome,
-    };
-    const Cleanup = struct {
-        fn drain(select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
-            watch.stop(select.io);
-            while (select.cancel()) |item| switch (item) {
-                .request => |request_result| {
-                    var late_request = request_result catch continue;
-                    late_request.deinit();
-                },
-                .watch => {},
-            };
+    if (comptime !builtin.single_threaded) {
+        const job = try OpenJob.start(pool, uri, options, request_open_override);
+        var opened = try job.waitForOpen(uri, options, epoch.deadline, cancel_flag, reused);
+        if (cancel_flag.load(.seq_cst)) {
+            opened.deinit();
+            return error.Cancelled;
         }
-    };
-
-    var operation = RequestOpenOperation{
-        .client = client,
-        .pool = pool,
-        .uri = uri,
-        .options = options,
-        .request_open_override = request_open_override,
-    };
-    var watch: BoundedRequestWatch = .{};
-    var select_buffer: [2]Event = undefined;
-    var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, select.io, RequestCondition{ .cancel_flag = cancel_flag, .deadline = epoch.deadline } }) catch |err| return err;
-    select.concurrent(.request, RequestOpenOperation.run, .{&operation}) catch |err| {
-        watch.finish(&select);
-        return err;
-    };
-
-    const event = select.await() catch |err| {
-        Cleanup.drain(&select, &watch);
-        return err;
-    };
-    switch (event) {
-        .request => |request_result| {
-            watch.finish(&select);
-            if (cancel_flag.load(.seq_cst)) {
-                var cancelled_request = request_result catch return error.Cancelled;
-                cancelled_request.deinit();
-                return error.Cancelled;
-            }
-
-            var owned_request = request_result catch |request_err| return request_err;
-            const result_now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-            if (!std.Io.Clock.Timestamp.compare(result_now, .lt, epoch.deadline)) {
-                owned_request.deinit();
-                return error.ConnectionSetupTimedOut;
-            }
-            return owned_request;
-        },
-        .watch => |watch_result| {
-            Cleanup.drain(&select, &watch);
-            const outcome = try watch_result;
-            if (outcome == .cancelled or cancel_flag.load(.seq_cst)) return error.Cancelled;
+        const result_now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+        if (!std.Io.Clock.Timestamp.compare(result_now, .lt, epoch.deadline)) {
+            opened.deinit();
             return error.ConnectionSetupTimedOut;
-        },
+        }
+        return opened;
     }
+    // std.Io.Threaded runs no task without threads, so these builds never
+    // had a native open.
+    return error.ConcurrencyUnavailable;
 }
 
 fn sleepGatewaySetupRetry(
@@ -1207,6 +1703,7 @@ pub fn streamGatewayCompletion(
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
 ) !StreamResult {
+    input_loop_guard.noteNetworkRequest("gateway_stream");
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const expected_provider_tool_name = try expectedProviderToolName(alloc, request.payload);
     return streamGatewayCompletionCore(
@@ -1230,6 +1727,7 @@ pub fn streamGatewayCompletionBounded(
     deadline: std.Io.Clock.Timestamp,
     cancel_flag: *std.atomic.Value(bool),
 ) !StreamResult {
+    input_loop_guard.noteNetworkRequest("gateway_stream");
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const expected_provider_tool_name = try expectedProviderToolName(alloc, request.payload);
     var operation = BoundedStreamingGatewayOperation{
@@ -1477,20 +1975,17 @@ fn streamGatewayCompletionCoreWithOptions(
 
     if (request.admission) |admission| try admission.admit();
     var attempt: usize = 0;
+    // A pooled connection the server closed while idle earns one extra attempt.
+    var attempt_limit = retry_count;
+    var stale_retry_used = false;
     var delivery_ambiguous = false;
     var request_body_possibly_sent = false;
     var setup_epoch: ?ConnectionSetupEpoch = null;
-    while (attempt < retry_count) : (attempt += 1) {
+    while (attempt < attempt_limit) : (attempt += 1) {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        var local_client: std.http.Client = undefined;
-        const client: *std.http.Client = if (request.shared_pool) |pool|
-            pool.clientFor(request_url)
-        else blk: {
-            local_client = .{ .allocator = alloc, .io = io_mod.getIo() };
-            break :blk &local_client;
-        };
-        defer if (request.shared_pool == null) local_client.deinit();
         if (request.shared_pool) |pool| {
+            // Applies the pool's idle-staleness policy before the open.
+            _ = pool.clientFor(request_url);
             debug_trace.eventf("gateway", "pool_borrow", trace_ctx, "attempt={d} free_connections={d}", .{ attempt + 1, pool.freeConnectionCount() });
         }
 
@@ -1505,18 +2000,19 @@ fn streamGatewayCompletionCoreWithOptions(
         else
             .definitely_unsent;
 
-        debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d}", .{ attempt + 1, retry_count, attempt });
-        debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d} payload_bytes={d}", .{ attempt + 1, retry_count, attempt, payload.len });
-        var req = openGatewayRequestBounded(client, request.shared_pool, uri, .{
+        debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d}", .{ attempt + 1, attempt_limit, attempt });
+        debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d} payload_bytes={d}", .{ attempt + 1, attempt_limit, attempt, payload.len });
+        var reused_connection = false;
+        var opened = openGatewayRequestBounded(request.shared_pool, uri, .{
             .headers = request_headers,
             .extra_headers = extra_headers,
             .keep_alive = request.shared_pool != null,
             .redirect_behavior = .unhandled,
-        }, core_options.request_open_override, epoch, cancel_flag) catch |err| {
+        }, core_options.request_open_override, epoch, cancel_flag, &reused_connection) catch |err| {
             debug_trace.eventf("gateway", "http_open_connect_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             const decision = decideConnectionSetup(.{
                 .attempt = attempt + 1,
-                .attempt_limit = retry_count,
+                .attempt_limit = attempt_limit,
                 .now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
                 .deadline = epoch.deadline,
                 .cancelled = cancel_flag.load(.seq_cst),
@@ -1539,7 +2035,7 @@ fn streamGatewayCompletionCoreWithOptions(
         };
         const setup_success = decideConnectionSetup(.{
             .attempt = attempt + 1,
-            .attempt_limit = retry_count,
+            .attempt_limit = attempt_limit,
             .now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
             .deadline = epoch.deadline,
             .cancelled = cancel_flag.load(.seq_cst),
@@ -1549,26 +2045,26 @@ fn streamGatewayCompletionCoreWithOptions(
         switch (setup_success.action) {
             .succeed => {},
             .fail => |terminal_err| {
-                req.deinit();
+                opened.deinit();
                 return @as(anyerror!StreamResult, terminal_err);
             },
             .cancelled => {
-                req.deinit();
+                opened.deinit();
                 return error.Cancelled;
             },
             .retry => unreachable,
         }
         setup_epoch = null;
-        defer req.deinit();
+        defer opened.deinit();
+        const req = &opened.request;
         debug_trace.eventf("gateway", "after_http_open_connect", trace_ctx, "attempt={d}", .{attempt + 1});
         debug_trace.eventf("gateway", "after_request_open", trace_ctx, "attempt={d}", .{attempt + 1});
 
         var cancel_watch_done = std.atomic.Value(bool).init(false);
-        var system_resumed = std.atomic.Value(bool).init(false);
         var connected_watch = ConnectedRequestWatch.init(core_options.response_head_timing);
         const cancel_watcher = if (watch_connected_socket)
             if (req.connection) |conn|
-                spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, &system_resumed, null, &connected_watch, conn.stream_writer.stream) catch |err| {
+                spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, null, &connected_watch, conn.stream_writer.stream) catch |err| {
                     debug_trace.eventf("gateway", "cancel_watcher_spawn_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
                     return @as(anyerror!StreamResult, err);
                 }
@@ -1591,52 +2087,40 @@ fn streamGatewayCompletionCoreWithOptions(
         debug_trace.eventf("gateway", "before_request_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
         request_body_possibly_sent = true;
         if (request.delivery) |delivery| delivery.markPossiblySent();
-        var body_writer = req.sendBodyUnflushed(&send_buf) catch |err| {
+        sendGatewayRequestBody(req, payload, &send_buf) catch |err| {
             debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
-            markPooledConnectionClosing(&req, request);
-            return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
+            markPooledConnectionClosing(req, request);
+            const reported = connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
-                system_resumed.load(.seq_cst),
                 err,
-            ));
-        };
-        body_writer.writer.writeAll(payload) catch |err| {
-            debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
-            markPooledConnectionClosing(&req, request);
-            return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
-                active_connected_watch,
-                cancel_flag.load(.seq_cst),
-                system_resumed.load(.seq_cst),
-                err,
-            ));
-        };
-        body_writer.end() catch |err| {
-            debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
-            markPooledConnectionClosing(&req, request);
-            return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
-                active_connected_watch,
-                cancel_flag.load(.seq_cst),
-                system_resumed.load(.seq_cst),
-                err,
-            ));
-        };
-        req.connection.?.flush() catch |err| {
-            debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
-            markPooledConnectionClosing(&req, request);
-            return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
-                active_connected_watch,
-                cancel_flag.load(.seq_cst),
-                system_resumed.load(.seq_cst),
-                err,
-            ));
+            );
+            const evidence: StaleConnectionEvidence = .{
+                .stage = .send,
+                .reused = reused_connection,
+                .transport_error = err,
+                .reported_error = reported,
+                .socket_error = req.connection.?.stream_writer.err,
+            };
+            if (!stale_retry_used and isStaleConnectionFailure(evidence)) {
+                stale_retry_used = true;
+                attempt_limit += 1;
+                delivery_ambiguous = true;
+                prepareFreshConnectionRetry(request, request_url, trace_ctx, attempt, evidence);
+                continue;
+            }
+            if (reused_connection) traceReusedConnectionFailure("reused_connection_failure", trace_ctx, attempt, evidence, 0);
+            return @as(anyerror!StreamResult, reported);
         };
         debug_trace.eventf("gateway", "after_request_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
         debug_trace.eventf("gateway", "after_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
+        // The boot clock keeps counting through sleep, so a laptop that slept
+        // after the send cannot make a late failure look like a quick one.
+        const sent_at = std.Io.Clock.Timestamp.now(io_mod.getIo(), .boot);
 
         if (active_connected_watch) |watch| {
             if (watch.arm_response_head()) |err| {
-                markPooledConnectionClosing(&req, request);
+                markPooledConnectionClosing(req, request);
                 return @as(anyerror!StreamResult, err);
             }
         }
@@ -1646,14 +2130,34 @@ fn streamGatewayCompletionCoreWithOptions(
             const mapped = connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
-                system_resumed.load(.seq_cst),
                 err,
             );
-            if (mapped == error.Cancelled or mapped == error.SystemResumed) {
+            if (mapped == error.Cancelled) {
                 return @as(anyerror!StreamResult, mapped);
             }
+            const conn = req.connection.?;
+            const evidence: StaleConnectionEvidence = .{
+                .stage = .head,
+                .reused = reused_connection,
+                .transport_error = err,
+                .reported_error = mapped,
+                .socket_error = conn.stream_reader.err,
+                // TLS keeps an incomplete record undecrypted in the socket
+                // buffer. Plain HTTP reads the socket buffer directly.
+                .received_bytes = req.reader.in.buffered().len +
+                    if (conn.protocol == .tls) conn.stream_reader.interface.buffered().len else 0,
+                .elapsed_ms = sent_at.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .boot)).raw.toMilliseconds(),
+            };
+            if (!stale_retry_used and isStaleConnectionFailure(evidence)) {
+                stale_retry_used = true;
+                attempt_limit += 1;
+                delivery_ambiguous = true;
+                prepareFreshConnectionRetry(request, request_url, trace_ctx, attempt, evidence);
+                continue;
+            }
+            if (reused_connection) traceReusedConnectionFailure("reused_connection_failure", trace_ctx, attempt, evidence, 0);
             if (request.provider_attempt_owner == .transport and
-                isRetryableGatewayError(mapped) and attempt + 1 < retry_count)
+                isRetryableGatewayError(mapped) and attempt + 1 < attempt_limit)
             {
                 delivery_ambiguous = true;
                 try sleepGatewayRetry((attempt + 1) * 150 * std.time.ns_per_ms, cancel_flag);
@@ -1672,7 +2176,7 @@ fn streamGatewayCompletionCoreWithOptions(
             if (@backingInt(status) >= 500) delivery_ambiguous = true;
             const retry_after_seconds = retryAfterSeconds(response.head);
             const retry_delay_ns = if (request.provider_attempt_owner == .transport and
-                isRetryableGatewayStatus(status) and attempt + 1 < retry_count)
+                isRetryableGatewayStatus(status) and attempt + 1 < attempt_limit)
                 retryDelayNsForResponse(response.head, attempt)
             else
                 null;
@@ -1723,7 +2227,6 @@ fn streamGatewayCompletionCoreWithOptions(
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
-                system_resumed.load(.seq_cst),
                 err,
             ));
         };
@@ -1743,7 +2246,7 @@ fn streamGatewayCompletionCoreWithOptions(
                 .raw = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake).raw.addDuration(.fromMilliseconds(pool_drain_budget_ms)),
             };
             const drain_thread = if (req.connection) |conn|
-                spawn_gateway_cancel_watcher(&drain_watch_done, cancel_flag, null, drain_deadline, null, conn.stream_writer.stream) catch null
+                spawn_gateway_cancel_watcher(&drain_watch_done, cancel_flag, drain_deadline, null, conn.stream_writer.stream) catch null
             else
                 null;
             const drain_ok = if (body_reader.discardRemaining()) |drained_bytes| blk: {
@@ -1769,10 +2272,6 @@ fn streamGatewayCompletionCoreWithOptions(
         if (cancel_flag.load(.seq_cst)) {
             deinitGatewayCompletion(alloc, &completion);
             return error.Cancelled;
-        }
-        if (system_resumed.load(.seq_cst)) {
-            deinitGatewayCompletion(alloc, &completion);
-            return error.SystemResumed;
         }
         completion.delivery_ambiguous = delivery_ambiguous;
         if (!resolved_model_seen_in_head) traceResolvedModelMissingOnce(model, trace_ctx);
@@ -1957,6 +2456,7 @@ pub fn runBoundedHttpOperation(
     deadline: std.Io.Clock.Timestamp,
     operation: anytype,
 ) !Result {
+    input_loop_guard.noteNetworkRequest("bounded_http");
     if (cancel_flag.load(.seq_cst)) {
         debug_trace.logf("stream", "bounded termination cause=cancellation phase=admission", .{});
         return error.Cancelled;
@@ -2055,16 +2555,46 @@ const RequestCondition = struct {
 
 const BoundedRequestWatch = select_watch.Watch(RequestCondition);
 
+/// Finds a connection whose local address has left the machine. When the
+/// network changes under a request, the old connection can never answer
+/// again, yet its dead-peer probes go nowhere and take their full 45 seconds
+/// to fail it. The watch checks the address once a second instead
+/// (`local_address.missing`). Owned by the watcher thread.
+const LocalAddressWatch = struct {
+    /// Null for a socket without an IP address, one `getsockname` refused,
+    /// or a target without the check; such a connection is never reported
+    /// gone.
+    address: ?local_address.Address,
+    next_check: std.Io.Clock.Timestamp,
+
+    const interval_ms = 1_000;
+
+    fn init(handle: anytype, now: std.Io.Clock.Timestamp) LocalAddressWatch {
+        return .{ .address = local_address.of(handle), .next_check = later(now) };
+    }
+
+    /// Whether the address is gone, checked at most once per interval.
+    fn gone(self: *LocalAddressWatch, now: std.Io.Clock.Timestamp) bool {
+        const address = self.address orelse return false;
+        if (std.Io.Clock.Timestamp.compare(now, .lt, self.next_check)) return false;
+        self.next_check = later(now);
+        return local_address.missing(address);
+    }
+
+    fn later(now: std.Io.Clock.Timestamp) std.Io.Clock.Timestamp {
+        return .{ .clock = now.clock, .raw = now.raw.addDuration(.fromMilliseconds(interval_ms)) };
+    }
+};
+
 const GatewayCancelWatcher = struct {
     fn run(
         done: *std.atomic.Value(bool),
         cancel_flag: *std.atomic.Value(bool),
-        system_resumed: ?*std.atomic.Value(bool),
         deadline: ?std.Io.Clock.Timestamp,
         connected_watch: ?*ConnectedRequestWatch,
         stream: std.Io.net.Stream,
     ) void {
-        var previous = SuspendClockSample.now();
+        var address_watch = LocalAddressWatch.init(stream.socket.handle, std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake));
         while (!done.load(.seq_cst)) {
             if (cancel_flag.load(.seq_cst)) {
                 if (connected_watch == null or connected_watch.?.win(.cancelled)) {
@@ -2072,16 +2602,9 @@ const GatewayCancelWatcher = struct {
                 }
                 return;
             }
-            const current = SuspendClockSample.now();
-            if (system_resumed != null and suspendGapDetected(previous, current)) {
-                if (cancel_flag.load(.seq_cst)) {
-                    if (connected_watch == null or connected_watch.?.win(.cancelled)) {
-                        stream.shutdown(io_mod.getIo(), .both) catch {};
-                    }
-                    return;
-                }
-                if (connected_watch == null or connected_watch.?.win(.system_resumed)) {
-                    system_resumed.?.store(true, .seq_cst);
+            if (address_watch.gone(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake))) {
+                if (connected_watch == null or connected_watch.?.win(.address_gone)) {
+                    debug_trace.logf("gateway", "event=local_address_gone dropped=connection reason=the network changed under it", .{});
                     stream.shutdown(io_mod.getIo(), .both) catch {};
                 }
                 return;
@@ -2105,80 +2628,67 @@ const GatewayCancelWatcher = struct {
                 }
                 if (watch.phase.load(.seq_cst) == .completed) return;
             }
-            previous = current;
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
     }
 };
 
-const suspend_gap_tolerance_ns: i128 = 100 * std.time.ns_per_ms;
-
-const SuspendClockSample = struct {
-    awake_ns: i128,
-    boot_ns: i128,
-
-    fn now() SuspendClockSample {
-        const io = io_mod.getIo();
-        return .{
-            .awake_ns = @intCast(std.Io.Clock.Timestamp.now(io, .awake).raw.toNanoseconds()),
-            .boot_ns = @intCast(std.Io.Clock.Timestamp.now(io, .boot).raw.toNanoseconds()),
-        };
-    }
-};
-
-fn suspendGapDetected(previous: SuspendClockSample, current: SuspendClockSample) bool {
-    const awake_elapsed = current.awake_ns - previous.awake_ns;
-    const boot_elapsed = current.boot_ns - previous.boot_ns;
-    if (awake_elapsed < 0 or boot_elapsed < 0) return false;
-    return boot_elapsed - awake_elapsed > suspend_gap_tolerance_ns;
-}
-
-/// One shared concrete opener result so every backend reuses the same
-/// bounded-operation instantiation instead of specializing per file.
-pub const OpenedPost = struct {
-    request: ?std.http.Client.Request,
-
-    pub fn deinit(self: *OpenedPost, _: std.mem.Allocator) void {
-        if (self.request) |*request| request.deinit();
-        self.request = null;
-    }
-
-    pub fn take(self: *OpenedPost) std.http.Client.Request {
-        const request = self.request.?;
-        self.request = null;
-        return request;
-    }
-};
-
-pub const PostOperation = struct {
-    client: *std.http.Client,
+/// A POST that `openBoundedPost` opens. Borrowed until its request ends.
+pub const PostTarget = struct {
     uri: std.Uri,
     authorization: ?[]const u8,
     extra_headers: []const std.http.Header = &.{},
-
-    pub fn run(self: *PostOperation) !OpenedPost {
-        var headers: std.http.Client.Request.Headers = .{
-            .content_type = .{ .override = "application/json" },
-            .accept_encoding = .omit,
-            .user_agent = .{ .override = user_agent },
-        };
-        if (self.authorization) |value| headers.authorization = .{ .override = value };
-        return .{ .request = try self.client.request(.POST, self.uri, .{
-            .headers = headers,
-            .extra_headers = self.extra_headers,
-            .keep_alive = false,
-            .redirect_behavior = .unhandled,
-        }) };
-    }
 };
 
+/// Opens a POST on a client of its own, on an open job (`OpenJob`), so Esc
+/// and `deadline` return at once even while its lookup hangs. Fails with
+/// `error.Cancelled` once `cancel_flag` is set and with `error.Timeout` at
+/// `deadline`. The caller owns the result and frees it with `deinit`.
 pub fn openBoundedPost(
-    alloc: std.mem.Allocator,
     cancel_flag: *std.atomic.Value(bool),
     deadline: std.Io.Clock.Timestamp,
-    operation: *PostOperation,
-) !OpenedPost {
-    return runBoundedHttpOperation(OpenedPost, alloc, cancel_flag, deadline, operation);
+    target: PostTarget,
+) !OpenedRequest {
+    return openBoundedPostWith(cancel_flag, deadline, target, null);
+}
+
+fn openBoundedPostWith(
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: std.Io.Clock.Timestamp,
+    target: PostTarget,
+    request_open_override: ?RequestOpenOverride,
+) !OpenedRequest {
+    input_loop_guard.noteNetworkRequest("bounded_http");
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    std.debug.assert(deadline.clock == .awake);
+    const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline)) return error.Timeout;
+
+    var headers: std.http.Client.Request.Headers = .{
+        .content_type = .{ .override = "application/json" },
+        .accept_encoding = .omit,
+        .user_agent = .{ .override = user_agent },
+    };
+    if (target.authorization) |value| headers.authorization = .{ .override = value };
+    const options: std.http.Client.RequestOptions = .{
+        .headers = headers,
+        .extra_headers = target.extra_headers,
+        .keep_alive = false,
+        .redirect_behavior = .unhandled,
+    };
+    if (comptime builtin.single_threaded) return error.ConcurrencyUnavailable;
+    const job = try OpenJob.start(null, target.uri, options, request_open_override);
+    var reused = false;
+    var opened = job.waitForOpen(target.uri, options, deadline, cancel_flag, &reused) catch |err| return switch (err) {
+        // The bound error callers of a bounded operation already handle.
+        error.ConnectionSetupTimedOut => error.Timeout,
+        else => err,
+    };
+    if (cancel_flag.load(.seq_cst)) {
+        opened.deinit();
+        return error.Cancelled;
+    }
+    return opened;
 }
 
 /// Watches one provider request on its connection with the lifecycle the
@@ -2209,7 +2719,7 @@ pub const ConnectionWatch = struct {
 
     pub fn start(self: *ConnectionWatch, cancel: *std.atomic.Value(bool), deadline: ?std.Io.Clock.Timestamp, connection: std.Io.net.Stream) !void {
         self.done.store(false, .seq_cst);
-        self.thread = try spawn_gateway_cancel_watcher(&self.done, cancel, null, deadline, &self.state, connection);
+        self.thread = try spawn_gateway_cancel_watcher(&self.done, cancel, deadline, &self.state, connection);
     }
 
     /// Starts the response-head wait. An error names the cause that already
@@ -2378,10 +2888,168 @@ test "cancelling a request wins over its body stall window" {
     try std.testing.expect(body.elapsed_ms < 2_000);
 }
 
+test "the local address watch keeps a live connection's own address" {
+    if (comptime !local_address.supported) return error.SkipZigTest;
+    var server: SilentBodyServer = .{ .server = undefined, .events = 0, .gap_ms = 0, .close = false };
+    try server.start();
+    defer server.stop();
+    const zio = io_mod.getIo();
+    const address = std.Io.net.IpAddress{ .ip4 = .loopback(server.server.socket.address.getPort()) };
+    var stream = try address.connect(zio, .{ .mode = .stream });
+    defer stream.close(zio);
+
+    const now = std.Io.Clock.Timestamp.now(zio, .awake);
+    var watch = LocalAddressWatch.init(stream.socket.handle, now);
+    try std.testing.expect(watch.address != null);
+    // The first check waits out the interval.
+    try std.testing.expect(!watch.gone(now));
+    try std.testing.expect(!watch.gone(LocalAddressWatch.later(now)));
+}
+
+test "a request whose local address leaves the machine fails at once as a lost connection" {
+    if (comptime !local_address.supported) return error.SkipZigTest;
+    local_address.test_missing = true;
+    defer local_address.test_missing = false;
+    var server: SilentBodyServer = .{ .server = undefined, .events = 0, .gap_ms = 0, .close = false };
+    try server.start();
+    defer server.stop();
+    const zio = io_mod.getIo();
+    const address = std.Io.net.IpAddress{ .ip4 = .loopback(server.server.socket.address.getPort()) };
+    var stream = try address.connect(zio, .{ .mode = .stream });
+    defer stream.close(zio);
+
+    // A model that thinks sends no headers, so the request waits on its head
+    // with nothing to time it out.
+    var cancel = std.atomic.Value(bool).init(false);
+    var watch: ConnectionWatch = .init(.{ .patient = true, .stall_timeout_ms = ConnectionWatch.bodyStallTimeoutMs(null) });
+    defer watch.stop();
+    try watch.start(&cancel, null, stream);
+    if (watch.armHead()) |err| return err;
+    // If the watch ever misses the address, Esc ends the read instead of
+    // hanging the test.
+    const canceller = try std.Thread.spawn(.{}, cancelAfterMs, .{ &cancel, 4_000 });
+    defer canceller.join();
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    var socket_buffer: [64]u8 = undefined;
+    var socket_reader = stream.reader(zio, &socket_buffer);
+    const err = if (socket_reader.interface.takeByte()) |_| error.TestUnexpectedByte else |read_err| watch.failure(read_err);
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+
+    try std.testing.expectEqual(error.LocalAddressGone, err);
+    try std.testing.expect(elapsed_ms < 3_000);
+    const evidence = networkFailureEvidence(err, .possibly_sent) orelse return error.TestExpectedNetworkFailureEvidence;
+    try std.testing.expectEqual(agent_stream_provider.NetworkFailureCause.transport_interrupted, evidence.cause);
+}
+
+/// TCP keepalive for every watched connection. The gateway sends nothing while
+/// a model thinks, so silence alone cannot tell a thinking model from a
+/// connection whose server end is gone, and the stall window waits ten
+/// minutes. A live peer's kernel answers keepalive probes, so they leave a
+/// thinking model alone and turn a dead connection into a failed read: a reset
+/// at the first probe after the network returns, or `ConnectionTimedOut` once
+/// every probe goes unanswered. Both are retried like any dropped stream.
+const dead_peer_probe = struct {
+    /// Silence before the first probe.
+    const idle_s: c_int = 15;
+    /// Time between probes, and the longest a reset waits after the network
+    /// returns.
+    const interval_s: c_int = 5;
+    /// Unanswered probes before the read fails: 15 s + 6 x 5 s = 45 s.
+    const count: c_int = 6;
+};
+
+const SocketOption = struct { level: i32, name: u32, value: c_int };
+
+/// The socket options that turn on dead-peer probes for the target OS. Other
+/// targets get none and keep only the stall window.
+const dead_peer_probe_options: []const SocketOption = switch (builtin.target.os.tag) {
+    .macos => &.{
+        .{ .level = std.posix.SOL.SOCKET, .name = std.posix.SO.KEEPALIVE, .value = 1 },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPALIVE, .value = dead_peer_probe.idle_s },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPINTVL, .value = dead_peer_probe.interval_s },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPCNT, .value = dead_peer_probe.count },
+    },
+    .linux => &.{
+        .{ .level = std.posix.SOL.SOCKET, .name = std.posix.SO.KEEPALIVE, .value = 1 },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPIDLE, .value = dead_peer_probe.idle_s },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPINTVL, .value = dead_peer_probe.interval_s },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPCNT, .value = dead_peer_probe.count },
+    },
+    else => &.{},
+};
+
+const DeadPeerProbeRefusal = struct { name: u32, errno: std.posix.E };
+
+/// Applies `dead_peer_probe_options` to a socket. Returns the first option the
+/// kernel refused, or null; after a refusal the connection keeps only the
+/// stall window, as before. Calls the system directly because
+/// `std.posix.setsockopt` treats `EINVAL` as unreachable, and macOS returns
+/// `EINVAL` for a socket whose peer already reset it.
+fn enableDeadPeerProbes(handle: std.posix.socket_t) ?DeadPeerProbeRefusal {
+    inline for (dead_peer_probe_options) |option| {
+        const value: c_int = option.value;
+        const bytes = std.mem.asBytes(&value);
+        while (true) switch (std.posix.errno(std.posix.system.setsockopt(
+            handle,
+            option.level,
+            option.name,
+            bytes.ptr,
+            @intCast(bytes.len),
+        ))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => |errno| return .{ .name = option.name, .errno = errno },
+        };
+    }
+    return null;
+}
+
+test "dead-peer probes report a dead connection long before the stall window" {
+    const bound_ms = (dead_peer_probe.idle_s + dead_peer_probe.interval_s * dead_peer_probe.count) * std.time.ms_per_s;
+    try std.testing.expect(bound_ms < agent_stream_stall_timeout_ms);
+}
+
+test "a watched model connection probes for a dead peer" {
+    if (dead_peer_probe_options.len == 0) return error.SkipZigTest;
+    var server: SilentBodyServer = .{ .server = undefined, .events = 0, .gap_ms = 0, .close = false };
+    try server.start();
+    defer server.stop();
+    const zio = io_mod.getIo();
+    const address = std.Io.net.IpAddress{ .ip4 = .loopback(server.server.socket.address.getPort()) };
+    var stream = try address.connect(zio, .{ .mode = .stream });
+    defer stream.close(zio);
+    var cancel = std.atomic.Value(bool).init(false);
+    var watch: ConnectionWatch = .init(.{ .patient = true, .stall_timeout_ms = ConnectionWatch.bodyStallTimeoutMs(null) });
+    defer watch.stop();
+    try watch.start(&cancel, null, stream);
+    inline for (dead_peer_probe_options) |option| {
+        var value: c_int = 0;
+        var len: std.posix.socklen_t = @sizeOf(c_int);
+        try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.posix.system.getsockopt(
+            stream.socket.handle,
+            option.level,
+            option.name,
+            std.mem.asBytes(&value).ptr,
+            &len,
+        )));
+        // BSD reports a set flag as its bit, not as 1.
+        if (option.value == 1) try std.testing.expect(value != 0) else try std.testing.expectEqual(option.value, value);
+    }
+}
+
+test "a refused probe option is reported instead of failing the request" {
+    if (dead_peer_probe_options.len == 0) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "not-a-socket", .{});
+    defer file.close(std.testing.io);
+    const refusal = enableDeadPeerProbes(file.handle) orelse return error.TestExpectedRefusal;
+    try std.testing.expectEqual(std.posix.E.NOTSOCK, refusal.errno);
+}
+
 fn spawn_gateway_cancel_watcher(
     done: *std.atomic.Value(bool),
     cancel_flag: *std.atomic.Value(bool),
-    system_resumed: ?*std.atomic.Value(bool),
     deadline: ?std.Io.Clock.Timestamp,
     connected_watch: ?*ConnectedRequestWatch,
     stream: std.Io.net.Stream,
@@ -2389,30 +3057,16 @@ fn spawn_gateway_cancel_watcher(
     if (builtin.is_test) {
         if (test_cancel_watcher_spawn_error) |err| return err;
     }
+    if (enableDeadPeerProbes(stream.socket.handle)) |refusal| {
+        debug_trace.logf("gateway", "event=dead_peer_probe_unavailable option={d} errno={d}", .{ refusal.name, @backingInt(refusal.errno) });
+    }
     return std.Thread.spawn(.{}, GatewayCancelWatcher.run, .{
         done,
         cancel_flag,
-        system_resumed,
         deadline,
         connected_watch,
         stream,
     });
-}
-
-test "suspend gap classification compares boot and awake clocks" {
-    const before = SuspendClockSample{ .awake_ns = 1_000, .boot_ns = 10_000 };
-    try std.testing.expect(!suspendGapDetected(before, .{
-        .awake_ns = before.awake_ns + 10 * std.time.ns_per_ms,
-        .boot_ns = before.boot_ns + 10 * std.time.ns_per_ms,
-    }));
-    try std.testing.expect(!suspendGapDetected(before, .{
-        .awake_ns = before.awake_ns + 10 * std.time.ns_per_ms,
-        .boot_ns = before.boot_ns + 10 * std.time.ns_per_ms + suspend_gap_tolerance_ns,
-    }));
-    try std.testing.expect(suspendGapDetected(before, .{
-        .awake_ns = before.awake_ns + 10 * std.time.ns_per_ms,
-        .boot_ns = before.boot_ns + 10 * std.time.ns_per_ms + suspend_gap_tolerance_ns + 1,
-    }));
 }
 
 test "connected request watch keeps the first terminal winner" {
@@ -2420,11 +3074,6 @@ test "connected request watch keeps the first terminal winner" {
     try std.testing.expect(cancelled.win(.cancelled));
     try std.testing.expect(!cancelled.win_response_head_timeout());
     try std.testing.expectEqual(error.Cancelled, cancelled.finish().?);
-
-    var resumed = ConnectedRequestWatch.init(.{});
-    try std.testing.expect(resumed.win(.system_resumed));
-    try std.testing.expect(!resumed.win(.cancelled));
-    try std.testing.expectEqual(error.SystemResumed, resumed.finish().?);
 
     var ordinary = ConnectedRequestWatch.init(.{});
     try std.testing.expect(ordinary.finish() == null);
@@ -2515,16 +3164,9 @@ const HeaderMatch = struct {
     value: []const u8,
 };
 
+/// 429 and the 5xx statuses `types.isRetryableServerStatus` names.
 fn isRetryableGatewayStatus(status: std.http.Status) bool {
-    return switch (status) {
-        .too_many_requests,
-        .internal_server_error,
-        .bad_gateway,
-        .service_unavailable,
-        .gateway_timeout,
-        => true,
-        else => false,
-    };
+    return status == .too_many_requests or types.isRetryableServerStatus(@backingInt(status));
 }
 
 fn retryDelayNsForResponse(head: std.http.Client.Response.Head, attempt: usize) u64 {
@@ -2543,14 +3185,28 @@ fn retryAfterDelayNs(head: std.http.Client.Response.Head) ?u64 {
     return @min(delay, gateway_retry_after_max_ns);
 }
 
-fn retryAfterSeconds(head: std.http.Client.Response.Head) ?u64 {
+/// A response's Retry-After in whole seconds. Only digits count, as RFC 9110
+/// delay-seconds are written; a sign, a fraction, or the HTTP-date form
+/// reads as none.
+pub fn retryAfterSeconds(head: std.http.Client.Response.Head) ?u64 {
     const raw = findHeaderValue(head, "retry-after") orelse return null;
+    return parseRetryAfterSeconds(raw);
+}
+
+fn parseRetryAfterSeconds(raw: []const u8) ?u64 {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return null;
-    return std.fmt.parseInt(u64, trimmed, 10) catch |err| switch (err) {
-        error.Overflow => std.math.maxInt(u64),
-        error.InvalidCharacter => null,
-    };
+    for (trimmed) |byte| if (!std.ascii.isDigit(byte)) return null;
+    return std.fmt.parseInt(u64, trimmed, 10) catch std.math.maxInt(u64);
+}
+
+test "Retry-After counts only digits" {
+    try std.testing.expectEqual(@as(?u64, 5), parseRetryAfterSeconds(" 5 "));
+    try std.testing.expectEqual(@as(?u64, 0), parseRetryAfterSeconds("0"));
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), parseRetryAfterSeconds("99999999999999999999999"));
+    for ([_][]const u8{ "", "-5", "+5", "5.0", "5s", "Wed, 21 Oct 2026 07:28:00 GMT" }) |raw| {
+        try std.testing.expectEqual(@as(?u64, null), parseRetryAfterSeconds(raw));
+    }
 }
 
 fn findHeaderValue(head: std.http.Client.Response.Head, name: []const u8) ?[]const u8 {
@@ -3252,18 +3908,314 @@ fn providerFailureCause(root: std.json.Value) ?types.ProviderFailureCause {
     return null;
 }
 
+/// Error codes a resend can outlive: server errors, overload, and upstream
+/// timeouts. The gateway fixtures pair `provider_error` and
+/// `no_available_providers` with HTTP 503, and Anthropic documents
+/// `timeout_error` as a 504.
+const transient_provider_error_codes = [_][]const u8{
+    "server_error",
+    "internal_server_error",
+    "api_error",
+    "provider_error",
+    "provider_down",
+    "provider_unavailable",
+    "no_available_providers",
+    "service_unavailable",
+    "bad_gateway",
+    "overloaded",
+    "overloaded_error",
+    "timeout_error",
+    "gateway_timeout",
+    // The gateway's upstream stream ended before its last chunk: a resend
+    // gets a new upstream stream.
+    "gateway_stream_terminated",
+};
+
+const rate_limit_error_codes = [_][]const u8{
+    "rate_limit_exceeded",
+    "rate_limit_error",
+    "rate_limited",
+    "too_many_requests",
+};
+
+/// Error codes a resend cannot fix, because the request, its credentials, or
+/// the account is the problem: the codes this repository's gateway and
+/// provider fixtures carry, and the providers' standard authentication,
+/// permission, and not-found codes.
+const non_retryable_error_codes = [_][]const u8{
+    "invalid_request_error",
+    "invalid_prompt",
+    "context_length_exceeded",
+    "authentication_error",
+    "permission_error",
+    "model_not_found",
+    "api_key_required",
+    "credit_card_required",
+    "RestrictedProvidersError",
+    "no_providers_available",
+};
+
+/// Error codes for a used-up quota or spend cap. Providers send them with
+/// HTTP 429, but waiting does not restore the quota, so they end the turn like
+/// any other code a resend cannot fix.
+const quota_error_codes = [_][]const u8{
+    "insufficient_quota",
+};
+
+/// `type` values that name a kind of error rather than the error: the generic
+/// wrapper a provider body nests its real error under, and the AI SDK's error
+/// class names. They count as no code.
+const error_type_names = [_][]const u8{
+    "error",
+    "AI_APICallError",
+};
+
+/// What an SSE `error` event says about the request: fx classifies what has a
+/// code and resends what is unclear. This differs from the Responses protocol
+/// (`responses_protocol.zig` `accept_failure`), which ends the turn for
+/// `provider_error` and for a missing code. The AI Gateway names a provider
+/// route failure `provider_error` and pairs it with HTTP 503, and an event
+/// with neither a code nor a usable HTTP status is the same route failure
+/// that `captureProviderFailureDetail` labels `provider_error`, so here both
+/// are resent until Esc: a coded one as a server error, an uncoded one the
+/// same way.
+const ErrorEventClass = enum {
+    /// Neither a code nor a usable HTTP status, so fx cannot tell whether a
+    /// resend can succeed.
+    uncoded,
+    /// A server error or overload, which a resend can outlive.
+    transient,
+    /// The gateway ended a stream that ran too long.
+    stream_timeout,
+    rate_limited,
+    /// A code a resend cannot fix, or a code fx does not recognize and no
+    /// status to say more: a resend repeats the same request.
+    non_retryable,
+
+    /// Whether `next` replaces `current` as the stream's class: only when it
+    /// says more. A code or a usable HTTP status beats an event with neither,
+    /// a stream timeout beats a transient class, and a classified one beats
+    /// both. Between two classified events the first wins.
+    fn decides(current: ?ErrorEventClass, next: ErrorEventClass) bool {
+        const held = current orelse return true;
+        return next.rank() > held.rank();
+    }
+
+    fn rank(self: ErrorEventClass) u2 {
+        return switch (self) {
+            .uncoded => 0,
+            .transient => 1,
+            .stream_timeout => 2,
+            .rate_limited, .non_retryable => 3,
+        };
+    }
+};
+
+fn errorEventClass(root: std.json.Value) ErrorEventClass {
+    const status_class = if (providerErrorEventStatus(root)) |status| httpStatusClass(status) else null;
+    const code = providerErrorEventCode(root) orelse return status_class orelse .uncoded;
+    // A code fx recognizes decides. One it does not, such as an upstream
+    // provider's own `upstream_error`, says less than the status that came
+    // with it.
+    return recognizedCodeClass(code) orelse status_class orelse .non_retryable;
+}
+
+fn recognizedCodeClass(code: []const u8) ?ErrorEventClass {
+    if (std.mem.eql(u8, code, "gateway_stream_timeout")) return .stream_timeout;
+    for (transient_provider_error_codes) |transient| {
+        if (std.mem.eql(u8, code, transient)) return .transient;
+    }
+    for (rate_limit_error_codes) |rate_limit| {
+        if (std.mem.eql(u8, code, rate_limit)) return .rate_limited;
+    }
+    for (non_retryable_error_codes ++ quota_error_codes) |non_retryable| {
+        if (std.mem.eql(u8, code, non_retryable)) return .non_retryable;
+    }
+    return null;
+}
+
+/// The failure kind of an HTTP error response: `kind`, the provider's reading
+/// of its status, except that a 429 whose body names a used-up quota or spend
+/// cap is `quota_exhausted`, so the turn ends instead of waiting for a quota
+/// that does not come back. Every provider's HTTP failure path calls this.
+pub fn httpFailureKind(
+    alloc: std.mem.Allocator,
+    kind: agent_stream_provider.FailureKind,
+    body: ?[]const u8,
+) agent_stream_provider.FailureKind {
+    if (kind != .rate_limited) return kind;
+    const text = body orelse return kind;
+    return if (errorBodyNamesQuota(alloc, text)) .quota_exhausted else kind;
+}
+
+/// Whether an HTTP error body names a used-up quota or spend cap, read as
+/// `providerErrorEventCode` reads an error event.
+fn errorBodyNamesQuota(alloc: std.mem.Allocator, body: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return false;
+    defer parsed.deinit();
+    const code = providerErrorEventCode(parsed.value) orelse return false;
+    for (quota_error_codes) |quota| {
+        if (std.mem.eql(u8, code, quota)) return true;
+    }
+    return false;
+}
+
+/// An HTTP status an event carries in place of a code: a 5xx
+/// `types.isRetryableServerStatus` names is transient, 429 a rate limit, and
+/// any other 4xx or 5xx non-retryable.
+fn httpStatusClass(status: u16) ?ErrorEventClass {
+    if (status == 429) return .rate_limited;
+    if (types.isRetryableServerStatus(status)) return .transient;
+    if (status >= 400 and status <= 599) return .non_retryable;
+    return null;
+}
+
+/// The stream's failure cause from the class its error events decided, its
+/// finish, and whether the finish named a gateway stream timeout. Null is a
+/// transient provider error or no failure.
+///
+/// A content filter finish decides on its own, even when the stream names a
+/// gateway stream timeout. Otherwise a timeout named by the finish or by an
+/// error event makes the stream one, as it always did, unless the finish is
+/// an error or missing and an error event carried a classified code, which
+/// beats it. Error events decide an error finish or a missing one; any other
+/// normal finish decides on its own. A provider error with nothing to
+/// classify it is unclear, and fx resends it.
+fn streamFailureCause(
+    class: ?ErrorEventClass,
+    finish: ?types.ProviderFinishReason,
+    finish_timeout: bool,
+) ?types.ProviderFailureCause {
+    if (finish == .content_filter) return null;
+    const error_or_missing = finish == null or finish == .provider_error;
+    if (!error_or_missing) {
+        return if (finish_timeout or class == .stream_timeout) .gateway_stream_timeout else null;
+    }
+    const error_finish = finish != null;
+    const event = class orelse {
+        if (finish_timeout) return .gateway_stream_timeout;
+        return if (error_finish) .unexplained_error_finish else null;
+    };
+    return switch (event) {
+        // A classified code beats a timeout the finish names.
+        .non_retryable => .non_retryable,
+        .rate_limited => .rate_limited,
+        .stream_timeout => .gateway_stream_timeout,
+        .transient => if (finish_timeout) .gateway_stream_timeout else null,
+        .uncoded => if (finish_timeout)
+            .gateway_stream_timeout
+        else if (error_finish)
+            .uncoded_error
+        else
+            null,
+    };
+}
+
+/// The HTTP status an event carries, as `statusCode` on the event, on its
+/// `error` object, or on `error.param`, where the Gateway reports the
+/// upstream status of an `AI_APICallError` (`vercel_failure_diagnostics.zig`).
+fn providerErrorEventStatus(root: std.json.Value) ?u16 {
+    if (root != .object) return null;
+    if (statusCodeField(root.object)) |status| return status;
+    const err = root.object.get("error") orelse return null;
+    if (err != .object) return null;
+    if (statusCodeField(err.object)) |status| return status;
+    const param = err.object.get("param") orelse return null;
+    if (param != .object) return null;
+    return statusCodeField(param.object);
+}
+
+fn statusCodeField(object: std.json.ObjectMap) ?u16 {
+    const value = object.get("statusCode") orelse return null;
+    if (value != .integer or value.integer < 100 or value.integer > 599) return null;
+    return @intCast(value.integer);
+}
+
+/// The event's top-level `code`, or the `code`, then the `type`, of its
+/// `error` or `providerError` object, as `gateway_error_format` reads an
+/// error body. The event's own `type` is always "error".
+fn providerErrorEventCode(root: std.json.Value) ?[]const u8 {
+    if (root != .object) return null;
+    if (root.object.get("code")) |value| {
+        if (jsonValueString(value)) |code| return code;
+    }
+    inline for (.{ "error", "providerError" }) |key| {
+        if (root.object.get(key)) |value| {
+            if (value == .object) {
+                if (errorObjectCode(value.object)) |code| return code;
+            }
+        }
+    }
+    return null;
+}
+
+/// An error object's `code`, else its `type` when that is a code. A
+/// provider's own error body nests the real error one level down, as
+/// `{"type":"error","error":{"type":"overloaded_error"}}`, so an object with
+/// neither reads its nested `error` the same way.
+fn errorObjectCode(object: std.json.ObjectMap) ?[]const u8 {
+    if (object.get("code")) |value| {
+        if (jsonValueString(value)) |code| return code;
+    }
+    if (errorObjectType(object)) |code| return code;
+    const nested = nestedErrorObject(object) orelse return null;
+    if (nested.get("code")) |value| {
+        if (jsonValueString(value)) |code| return code;
+    }
+    return errorObjectType(nested);
+}
+
+/// The object's `type`, unless it is one of `error_type_names`.
+fn errorObjectType(object: std.json.ObjectMap) ?[]const u8 {
+    const value = object.get("type") orelse return null;
+    const kind = jsonValueString(value) orelse return null;
+    for (error_type_names) |name| {
+        if (std.mem.eql(u8, kind, name)) return null;
+    }
+    return kind;
+}
+
+/// The error object nested under a provider's wrapper, `{"type":"error",
+/// "error":{...}}`: only when the wrapper has no `code` and no `type` of its
+/// own that is a code.
+fn nestedErrorObject(object: std.json.ObjectMap) ?std.json.ObjectMap {
+    if (object.get("code")) |value| {
+        if (jsonValueString(value) != null) return null;
+    }
+    if (errorObjectType(object) != null) return null;
+    const nested = object.get("error") orelse return null;
+    return if (nested == .object) nested.object else null;
+}
+
 fn captureProviderFailureObject(
     alloc: std.mem.Allocator,
     current: *?[]u8,
     object: std.json.ObjectMap,
     include_type: bool,
 ) !bool {
-    const code = if (object.get("code")) |value|
-        jsonValueString(value)
-    else if (include_type)
-        if (object.get("type")) |value| jsonValueString(value) else null
-    else
-        null;
+    if (include_type) {
+        // A provider's wrapper, `{"type":"error","error":{...}}`, names
+        // nothing itself: its nested error does. Read exactly one level down,
+        // as `errorObjectCode` does, so the detail and the class come from the
+        // same object. When neither level names anything, the caller renders
+        // the value instead, and `replaceProviderFailureRendered` bounds how
+        // deep a value it renders.
+        if (nestedErrorObject(object)) |nested| {
+            if (try captureErrorObjectFields(alloc, current, nested, true)) return true;
+        }
+    }
+    return captureErrorObjectFields(alloc, current, object, include_type);
+}
+
+/// Captures the detail one error object names: its code and message, or
+/// whichever it has.
+fn captureErrorObjectFields(
+    alloc: std.mem.Allocator,
+    current: *?[]u8,
+    object: std.json.ObjectMap,
+    include_type: bool,
+) !bool {
+    const code = detailCode(object, include_type);
     const message = if (object.get("message")) |value| jsonValueString(value) else null;
     if (code) |code_text| {
         if (message) |message_text| {
@@ -3290,6 +4242,19 @@ fn captureProviderFailureObject(
     return false;
 }
 
+/// The code a detail names: the object's `code`, else, when `include_type`
+/// is set, its `type`. The notice detail keeps an SDK error name such as
+/// `AI_APICallError`, which it has always shown and which tells the reader
+/// where the error came from, though it is no code to classify by; it drops
+/// a wrapper's generic "error", which says nothing.
+fn detailCode(object: std.json.ObjectMap, include_type: bool) ?[]const u8 {
+    if (object.get("code")) |value| return jsonValueString(value);
+    if (!include_type) return null;
+    const value = object.get("type") orelse return null;
+    const kind = jsonValueString(value) orelse return null;
+    return if (std.mem.eql(u8, kind, "error")) null else kind;
+}
+
 fn captureProviderFailureDetail(alloc: std.mem.Allocator, current: *?[]u8, root: std.json.Value) !void {
     if (root != .object or current.* != null) return;
     if (try captureProviderFailureObject(alloc, current, root.object, false)) return;
@@ -3300,9 +4265,7 @@ fn captureProviderFailureDetail(alloc: std.mem.Allocator, current: *?[]u8, root:
         }
         if (value == .object) {
             if (try captureProviderFailureObject(alloc, current, value.object, true)) return;
-            const rendered = try stringifyJsonValueOwned(alloc, value);
-            defer alloc.free(rendered);
-            try replaceProviderFailureDetail(alloc, current, rendered);
+            try replaceProviderFailureRendered(alloc, current, value);
             return;
         }
     }
@@ -3314,10 +4277,62 @@ fn captureProviderFailureDetail(alloc: std.mem.Allocator, current: *?[]u8, root:
         if (value == .object) {
             if (try captureProviderFailureObject(alloc, current, value.object, true)) return;
         }
-        const rendered = try stringifyJsonValueOwned(alloc, value);
-        defer alloc.free(rendered);
-        try replaceProviderFailureDetail(alloc, current, rendered);
+        try replaceProviderFailureRendered(alloc, current, value);
     }
+}
+
+/// The deepest provider value a notice detail renders as JSON. No real error
+/// body nests anywhere near this, and `std.json.Stringify` aborts past 256
+/// levels in safe builds, so a provider's value can never take fx down.
+const max_rendered_detail_depth = 32;
+
+/// Renders a provider error value in which nothing named the failure, or the
+/// fixed `provider_error` label when it nests past `max_rendered_detail_depth`.
+fn replaceProviderFailureRendered(alloc: std.mem.Allocator, current: *?[]u8, value: std.json.Value) !void {
+    if (jsonNestsDeeperThan(value, max_rendered_detail_depth)) {
+        debug_trace.logf("stream", "provider failure detail nests past {d} levels; using the provider_error label", .{max_rendered_detail_depth});
+        try replaceProviderFailureDetail(alloc, current, "provider_error");
+        return;
+    }
+    const rendered = try stringifyJsonValueOwned(alloc, value);
+    defer alloc.free(rendered);
+    try replaceProviderFailureDetail(alloc, current, rendered);
+}
+
+/// Whether `value` nests objects and arrays more than `limit` levels deep,
+/// counting `value` itself. The walk keeps one frame per open level in a
+/// fixed `limit`-frame stack and stops at the first level past it, so it
+/// never recurses or allocates however deep or wide the value is.
+fn jsonNestsDeeperThan(value: std.json.Value, comptime limit: usize) bool {
+    const Frame = struct { items: []const std.json.Value, next: usize = 0 };
+    var stack: [limit]Frame = undefined;
+    const root_items = jsonContainerItems(value) orelse return false;
+    if (limit == 0) return true;
+    stack[0] = .{ .items = root_items };
+    var depth: usize = 1;
+    while (depth > 0) {
+        const top = &stack[depth - 1];
+        if (top.next == top.items.len) {
+            depth -= 1;
+            continue;
+        }
+        const child = top.items[top.next];
+        top.next += 1;
+        const items = jsonContainerItems(child) orelse continue;
+        if (depth == limit) return true;
+        stack[depth] = .{ .items = items };
+        depth += 1;
+    }
+    return false;
+}
+
+/// An object's values or an array's items; null for any other value.
+fn jsonContainerItems(value: std.json.Value) ?[]const std.json.Value {
+    return switch (value) {
+        .object => |object| object.values(),
+        .array => |array| array.items,
+        else => null,
+    };
 }
 
 fn materializeToolCalls(
@@ -3410,6 +4425,7 @@ fn traceSseTermination(trace: ?ResolvedModelTrace, cause: []const u8, finish_rea
 
 const SseFinishEvent = struct {
     finish_reason: types.ProviderFinishReason,
+    raw: types.ProviderFinishRaw = .{},
     usage: types.Usage = .{},
 };
 
@@ -3429,8 +4445,21 @@ fn parseSseFinishEvent(
     }
     return .{
         .finish_reason = finish_reason,
+        .raw = parseSseFinishRaw(root),
         .usage = parseSseUsage(root),
     };
+}
+
+/// The provider's own reason beside the unified one: the AI SDK folds Gemini
+/// stops it does not list, such as `UNEXPECTED_TOOL_CALL`, into `other`.
+/// Empty when the event has none or it is not a string.
+fn parseSseFinishRaw(root: std.json.Value) types.ProviderFinishRaw {
+    if (root != .object) return .{};
+    const finish_reason = root.object.get("finishReason") orelse return .{};
+    if (finish_reason != .object) return .{};
+    const raw = finish_reason.object.get("raw") orelse return .{};
+    if (raw != .string) return .{};
+    return .init(raw.string);
 }
 
 fn parseSseFinishReason(root: std.json.Value) SseFinishParseError!types.ProviderFinishReason {
@@ -3452,6 +4481,8 @@ fn parseSseUsage(root: std.json.Value) types.Usage {
     return .{
         .input_tokens = parseSseTokenTotal(usage_value, "inputTokens"),
         .output_tokens = parseSseTokenTotal(usage_value, "outputTokens"),
+        .cache_read_tokens = parseSseTokenDetail(usage_value, "inputTokens", "cacheRead"),
+        .cache_write_tokens = parseSseTokenDetail(usage_value, "inputTokens", "cacheWrite"),
         .reasoning_tokens = parseSseTokenDetail(usage_value, "outputTokens", "reasoning"),
     };
 }
@@ -3615,6 +4646,7 @@ fn consumeSseStreamTraced(
     }
 
     var finish_reason_holder: ?types.ProviderFinishReason = null;
+    var finish_raw: types.ProviderFinishRaw = .{};
     var finish_usage: types.Usage = .{};
     var finish_resolved_provider: ?[]const u8 = null;
     defer if (finish_resolved_provider) |provider| alloc.free(@constCast(provider));
@@ -3625,7 +4657,9 @@ fn consumeSseStreamTraced(
     defer if (resolved_model) |model| alloc.free(model);
     var generation_metadata_invalid = false;
     var provider_result_identity_failure: ?types.ProviderResultIdentityFailure = null;
-    var provider_failure_cause: ?types.ProviderFailureCause = null;
+    // The finish named a gateway stream timeout.
+    var finish_timeout = false;
+    var error_event_class: ?ErrorEventClass = null;
     var provider_failure_detail: ?[]u8 = null;
     defer if (provider_failure_detail) |detail| alloc.free(detail);
     var data_event_count: usize = 0;
@@ -3667,10 +4701,22 @@ fn consumeSseStreamTraced(
         data_event_count += 1;
 
         defer _ = event_arena.reset(.retain_capacity);
+        // fx serializes parts of an event, such as a tool input or provider
+        // metadata, and std.json.Stringify aborts past 256 levels.
+        if (json_depth.exceeds(json_text)) {
+            debug_trace.logf("sse", "event type=too_deep bytes={d} max_depth={d}", .{ json_text.len, json_depth.max_depth });
+            return error.InvalidGatewaySseEvent;
+        }
         const root = std.json.parseFromSliceLeaky(std.json.Value, event_arena.allocator(), json_text, .{}) catch |err| {
             if (err == error.OutOfMemory) return err;
+            // A duplicate key is valid JSON that fx refuses, so resending
+            // would get the same event back.
+            if (err == error.DuplicateField) {
+                debug_trace.logf("sse", "event type=duplicate_key bytes={d}", .{json_text.len});
+                return error.InvalidGatewaySseEvent;
+            }
             traceMalformedSseEvent(json_text.len);
-            return error.InvalidGatewaySseEvent;
+            return error.MalformedGatewaySseEvent;
         };
         traceParsedSseEvent(alloc, root, json_text.len);
         if (root != .object) continue;
@@ -3715,7 +4761,13 @@ fn consumeSseStreamTraced(
                 }
             }
         } else if (std.mem.eql(u8, event_type, "error")) {
-            provider_failure_cause = provider_failure_cause orelse providerFailureCause(root);
+            const event_class = errorEventClass(root);
+            if (ErrorEventClass.decides(error_event_class, event_class)) {
+                error_event_class = event_class;
+                // The notice names the event that decided the class.
+                if (provider_failure_detail) |earlier| alloc.free(earlier);
+                provider_failure_detail = null;
+            }
             try captureProviderFailureDetail(alloc, &provider_failure_detail, root);
         } else if (std.mem.eql(u8, event_type, "text-delta")) {
             if (root.object.get("delta")) |delta_val| {
@@ -4022,17 +5074,19 @@ fn consumeSseStreamTraced(
             acc.provider_result = owned_result;
             acc.provider_result_state = if (preliminary) .preliminary else .final;
         } else if (std.mem.eql(u8, event_type, "finish")) {
-            provider_failure_cause = provider_failure_cause orelse providerFailureCause(root);
-            const finish_event = parseSseFinishEvent(alloc, root, &provider_failure_detail) catch |err| {
-                switch (err) {
-                    error.UnknownProviderFinishReason => {
-                        traceSseTermination(resolved_model_trace, "invalid_finish", null);
-                        return error.InvalidProviderFinishReason;
-                    },
-                    else => return err,
-                }
+            finish_timeout = providerFailureCause(root) == .gateway_stream_timeout;
+            const finish_event = parseSseFinishEvent(alloc, root, &provider_failure_detail) catch |err| switch (err) {
+                // A finish fx cannot read ends the stream as one without a
+                // finish, so the turn resends it like any stream that ended
+                // early.
+                error.InvalidProviderFinishReason, error.UnknownProviderFinishReason => {
+                    traceSseTermination(resolved_model_trace, "invalid_finish", null);
+                    break;
+                },
+                else => return err,
             };
             finish_reason_holder = finish_event.finish_reason;
+            finish_raw = finish_event.raw;
             finish_usage = finish_event.usage;
             finish_resolved_provider = parseSseResolvedProvider(alloc, root);
             finish_service_tier = parseSseServiceTier(root);
@@ -4053,8 +5107,24 @@ fn consumeSseStreamTraced(
         completion.provider_state_json = try replay.finish(completion.content orelse "", completion.tool_calls);
     }
 
+    // The code wins: an error event whose code, or HTTP status in place of
+    // one, classifies the failure makes the stream a provider error even when
+    // no finish followed it. A stream timeout keeps its own path, and an
+    // event with neither a code nor a usable status says nothing, so the
+    // stream stays one that ended early.
+    if (finish_reason_holder == null) {
+        if (error_event_class) |class| {
+            switch (class) {
+                .transient, .rate_limited, .non_retryable => {
+                    finish_reason_holder = .provider_error;
+                    debug_trace.logf("stream", "sse error event without finish class={s}", .{@tagName(class)});
+                },
+                .uncoded, .stream_timeout => {},
+            }
+        }
+    }
     completion.provider_result_identity_failure = provider_result_identity_failure;
-    completion.provider_failure_cause = provider_failure_cause;
+    completion.provider_failure_cause = streamFailureCause(error_event_class, finish_reason_holder, finish_timeout);
     completion.provider_failure_detail = provider_failure_detail;
     provider_failure_detail = null;
     completion.generation_id = generation_id;
@@ -4064,14 +5134,16 @@ fn consumeSseStreamTraced(
     completion.service_tier = finish_service_tier;
     completion.generation_metadata_invalid = generation_metadata_invalid;
     completion.finish_reason = finish_reason_holder;
+    completion.finish_reason_raw = finish_raw;
     completion.usage = finish_usage;
 
     debug_trace.logf(
         "stream",
-        "sse summary events={d} finish_reason={s}",
+        "sse summary events={d} finish_reason={s} provider_finish_reason={s}",
         .{
             data_event_count,
             finish_reason_label(completion.finish_reason),
+            completion.finish_reason_raw.slice(),
         },
     );
 
@@ -4137,6 +5209,32 @@ test "provider framing assembles Gateway data fields" {
     }
 }
 
+test "provider framing rejects a Gateway event nested past the depth limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "deep-sse.log" });
+    defer alloc.free(path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, path, "sse");
+    // A tool input 300 levels deep aborted fx when it was serialized.
+    const deep_input = text_utils.repeat("{\"a\":", 300) ++ "0" ++ text_utils.repeat("}", 300);
+    var reader = std.Io.Reader.fixed("data: {\"type\":\"tool-call\",\"toolCallId\":\"deep\",\"toolName\":\"read_file\",\"input\":" ++ deep_input ++ "}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\"}}\n\n");
+    var cancelled = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    try std.testing.expectError(error.InvalidGatewaySseEvent, consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancelled));
+    debug_trace.shutdown();
+    const trace = try readTraceFileForTest(alloc, path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event type=too_deep") != null);
+}
+
 test "provider framing rejects malformed Gateway JSON" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4153,7 +5251,8 @@ test "provider framing rejects malformed Gateway JSON" {
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
-    try std.testing.expectError(error.InvalidGatewaySseEvent, consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancelled));
+    // Malformed, not too deep: the caller resends it like a dropped stream.
+    try std.testing.expectError(error.MalformedGatewaySseEvent, consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancelled));
     debug_trace.shutdown();
     const trace = try readTraceFileForTest(alloc, path);
     defer alloc.free(trace);
@@ -4234,6 +5333,143 @@ test "consumeSseStream captures the resolved routing provider" {
     try std.testing.expect(second_completion.resolved_provider == null);
 }
 
+const stream_fuzz = @import("stream_fuzz_testing.zig");
+
+fn fuzzGatewayChunkedStream(_: void, smith: *std.testing.Smith) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var reasoning: stream_fuzz.Text = .{};
+    try reasoning.generate(arena, smith, "", "", false);
+    var content: stream_fuzz.Text = .{};
+    try content.generate(arena, smith, "", "", false);
+    const with_tool = smith.boolWeighted(1, 1);
+    var arguments: stream_fuzz.Text = .{};
+    try arguments.generate(arena, smith, "{\"path\":\"", "\"}", true);
+
+    var wire_buffer: std.Io.Writer.Allocating = .init(arena);
+    const wire = &wire_buffer.writer;
+    if (reasoning.text.items.len > 0) {
+        for (try reasoning.pieces(arena)) |piece| {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"type\":\"reasoning-delta\",\"id\":\"r1\",\"delta\":{f}}}", piece);
+        }
+    }
+    if (content.text.items.len > 0) {
+        for (try content.pieces(arena)) |piece| {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":{f}}}", piece);
+        }
+    }
+    if (with_tool) {
+        try wire.writeAll("data: {\"type\":\"tool-input-start\",\"id\":\"c1\",\"toolName\":\"read_file\"}\n\n");
+        for (try arguments.pieces(arena)) |piece| {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"type\":\"tool-input-delta\",\"id\":\"c1\",\"delta\":{f}}}", piece);
+        }
+        try wire.print("data: {{\"type\":\"tool-call\",\"toolCallId\":\"c1\",\"toolName\":\"read_file\",\"input\":{s}}}\n\n", .{arguments.text.items});
+    }
+    try wire.print("data: {{\"type\":\"finish\",\"finishReason\":{{\"unified\":\"{s}\"}}}}\n\ndata: [DONE]\n\n", .{if (with_tool) "tool-calls" else "stop"});
+
+    const read_buffer = try stream_fuzz.readBuffer(arena, smith);
+    var fixed = std.Io.Reader.fixed(wire_buffer.written());
+    var source = fixed.limited(.unlimited, read_buffer);
+    var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
+    var cancelled = std.atomic.Value(bool).init(false);
+    var completion = try consumeSseStreamTraced(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, &cancelled, null, null, null, null);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
+    try deltas.expectEqual(content.text.items, reasoning.text.items);
+    try stream_fuzz.expectToolCall(completion.tool_calls, with_tool, "c1", arguments.text.items);
+}
+
+/// One Gateway event's data from fuzzed bytes: raw bytes, a valid event cut
+/// short at a fuzzed point, or brackets nested to a fuzzed depth, so each
+/// way an event can end a stream comes up often.
+fn fuzzedGatewayEventData(arena: std.mem.Allocator, smith: *std.testing.Smith) ![]u8 {
+    var data: std.ArrayList(u8) = .empty;
+    switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => {
+            var raw: [96]u8 = undefined;
+            try data.appendSlice(arena, raw[0..smith.slice(&raw)]);
+        },
+        1 => {
+            const event = "{\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"part\"}";
+            try data.appendSlice(arena, event[0..smith.valueRangeAtMost(u8, 0, event.len)]);
+        },
+        else => {
+            const depth = smith.valueRangeAtMost(u8, 0, json_depth.max_depth + 8);
+            const closers = smith.valueRangeAtMost(u8, 0, depth);
+            try data.appendNTimes(arena, '[', depth);
+            try data.appendNTimes(arena, ']', closers);
+        },
+    }
+    // One data line, so one event.
+    for (data.items) |*byte| if (byte.* == '\n' or byte.* == '\r') {
+        byte.* = ' ';
+    };
+    return data.items;
+}
+
+fn gatewayEventOutcome(wire: []const u8, read_buffer: []u8) anyerror!void {
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var fixed = std.Io.Reader.fixed(wire);
+    var source = fixed.limited(.unlimited, read_buffer);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var completion = try consumeSseStream(std.testing.allocator, &source.interface, undefined, Noop.chunk, null, &cancelled);
+    deinitGatewayCompletion(std.testing.allocator, &completion);
+}
+
+fn fuzzGatewayEventClass(_: void, smith: *std.testing.Smith) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const data = try fuzzedGatewayEventData(arena, smith);
+    const json_text = std.mem.trim(u8, data, " \t");
+    // An empty data line is skipped and `[DONE]` ends the stream.
+    if (json_text.len == 0 or std.mem.eql(u8, json_text, "[DONE]")) return;
+    const wire = try std.fmt.allocPrint(arena, "data: {s}\n\ndata: {{\"type\":\"finish\",\"finishReason\":{{\"unified\":\"stop\"}}}}\n\n", .{data});
+
+    var whole: [4096]u8 = undefined;
+    const outcome = gatewayEventOutcome(wire, &whole);
+    // The class of an event never depends on how its bytes arrive.
+    const cut = gatewayEventOutcome(wire, try stream_fuzz.readBuffer(arena, smith));
+    const name = struct {
+        fn of(result: anyerror!void) []const u8 {
+            return if (result) "ok" else |err| @errorName(err);
+        }
+    }.of;
+    try std.testing.expectEqualStrings(name(outcome), name(cut));
+
+    if (json_depth.exceeds(json_text)) {
+        // Too deep to parse safely: no resend can fix it.
+        try std.testing.expectError(error.InvalidGatewaySseEvent, outcome);
+    } else if (std.json.parseFromSliceLeaky(std.json.Value, arena, json_text, .{})) |_| {
+        // Readable JSON is never taken for a damaged event.
+        if (outcome) |_| {} else |err| try std.testing.expect(err != error.MalformedGatewaySseEvent);
+    } else |err| if (err == error.DuplicateField) {
+        // Valid JSON fx refuses: resending would get the same event back.
+        try std.testing.expectError(error.InvalidGatewaySseEvent, outcome);
+    } else {
+        // Damaged on the wire: resent as an unreadable reply.
+        try std.testing.expectError(error.MalformedGatewaySseEvent, outcome);
+        try std.testing.expect(networkFailureEvidence(error.MalformedGatewaySseEvent, .possibly_sent) != null);
+    }
+}
+
+test "a Gateway event that is not JSON is resent, a too-deep or duplicate-key one ends the turn, however its bytes arrive" {
+    try std.testing.fuzz({}, fuzzGatewayEventClass, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").gateway_event_class.*),
+    });
+}
+
+test "Gateway streams give the same result however they are cut into events and reads" {
+    try std.testing.fuzz({}, fuzzGatewayChunkedStream, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").vercel_stream.*),
+    });
+}
+
 test "consumeSseStream captures Gateway-applied service tiers" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
@@ -4282,12 +5518,12 @@ test "consumeSseStream leaves missing and unknown service tiers unconfirmed" {
     }
 }
 
-test "consumeSseStream surfaces finish reasoning tokens in turn usage" {
+test "consumeSseStream surfaces finish cache and reasoning tokens in turn usage" {
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
     const payload =
-        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":10},\"outputTokens\":{\"total\":25,\"reasoning\":5}}}\n\n";
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":10,\"noCache\":3,\"cacheRead\":6,\"cacheWrite\":1},\"outputTokens\":{\"total\":25,\"reasoning\":5}}}\n\n";
     var reader = std.Io.Reader.fixed(payload);
     var cancel_flag = std.atomic.Value(bool).init(false);
     var completion = try consumeSseStream(
@@ -4302,6 +5538,8 @@ test "consumeSseStream surfaces finish reasoning tokens in turn usage" {
 
     try std.testing.expectEqual(@as(?u64, 10), completion.usage.input_tokens);
     try std.testing.expectEqual(@as(?u64, 25), completion.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 6), completion.usage.cache_read_tokens);
+    try std.testing.expectEqual(@as(?u64, 1), completion.usage.cache_write_tokens);
     try std.testing.expectEqual(@as(?u64, 5), completion.usage.reasoning_tokens);
 
     const malformed =
@@ -4416,6 +5654,489 @@ test "providerFailureCause ignores matching prose without the structured code" {
     try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), providerFailureCause(parsed.value));
 }
 
+test "errorBodyNamesQuota reads a quota code from an HTTP error body" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(errorBodyNamesQuota(alloc, "{\"error\":{\"message\":\"You exceeded your current quota\",\"type\":\"insufficient_quota\",\"code\":\"insufficient_quota\"}}"));
+    try std.testing.expect(errorBodyNamesQuota(alloc, "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"insufficient_quota\",\"message\":\"quota used up\"}}}"));
+    try std.testing.expect(!errorBodyNamesQuota(alloc, "{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}"));
+    try std.testing.expect(!errorBodyNamesQuota(alloc, "{\"error\":{\"message\":\"insufficient_quota\"}}"));
+    try std.testing.expect(!errorBodyNamesQuota(alloc, "insufficient_quota"));
+    try std.testing.expect(!errorBodyNamesQuota(alloc, ""));
+}
+
+test "httpFailureKind ends the turn only for a 429 that names a used-up quota" {
+    const alloc = std.testing.allocator;
+    const Kind = agent_stream_provider.FailureKind;
+    const quota_body = "{\"error\":{\"message\":\"You exceeded your current quota\",\"type\":\"insufficient_quota\",\"code\":\"insufficient_quota\"}}";
+    const cases = [_]struct { kind: Kind, body: ?[]const u8, expected: Kind }{
+        .{ .kind = .rate_limited, .body = quota_body, .expected = .quota_exhausted },
+        .{ .kind = .rate_limited, .body = "{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}", .expected = .rate_limited },
+        .{ .kind = .rate_limited, .body = "Too Many Requests", .expected = .rate_limited },
+        .{ .kind = .rate_limited, .body = null, .expected = .rate_limited },
+        // Only a 429 changes kind.
+        .{ .kind = .forbidden, .body = quota_body, .expected = .forbidden },
+        .{ .kind = .server_error, .body = quota_body, .expected = .server_error },
+        .{ .kind = .invalid_request, .body = quota_body, .expected = .invalid_request },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, httpFailureKind(alloc, case.kind, case.body));
+    }
+}
+
+test "errorEventClass retries only server errors, overload, and upstream timeouts" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { event: []const u8, class: ErrorEventClass }{
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"retry\"}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"provider_error\",\"message\":\"route failed\"}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"no_available_providers\",\"message\":\"none\"}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"code\":\"server_error\",\"message\":\"retry\"}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_terminated\",\"message\":\"Upstream stream ended before terminal chunk\"}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"message\":\"wafer route unavailable\"}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":\"route unavailable\"}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"route unavailable\"}}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}", .class = .rate_limited },
+        .{ .event = "{\"type\":\"error\",\"providerError\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}", .class = .rate_limited },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad input\"}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"authentication_error\",\"message\":\"bad key\"}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"permission_error\",\"message\":\"denied\"}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"insufficient_quota\",\"message\":\"no credits\"}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"model_not_found\",\"message\":\"no model\"}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"RestrictedProvidersError\",\"message\":\"restricted\"}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"something_new\",\"message\":\"unknown\"}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_timeout\",\"message\":\"too long\"}}", .class = .stream_timeout },
+        // No code: `statusCode` on the event, its error, or `error.param`
+        // classifies the event.
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"upstream down\",\"statusCode\":503}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"statusCode\":502,\"message\":\"bad gateway\"}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"overloaded\",\"statusCode\":529}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"slow down\",\"statusCode\":429}}", .class = .rate_limited },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"bad input\",\"statusCode\":400}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"forbidden\",\"param\":{\"statusCode\":403}}}", .class = .non_retryable },
+        // An unrecognized code falls back to its status; a recognized one
+        // decides on its own.
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"upstream_error\",\"message\":\"bad gateway\",\"statusCode\":502}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"Service Unavailable\",\"type\":\"AI_APICallError\",\"param\":{\"statusCode\":503}}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"provider_error\",\"message\":\"route failed\",\"statusCode\":400}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\",\"statusCode\":503}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"something_new\",\"message\":\"rejected\",\"statusCode\":400}}", .class = .non_retryable },
+        // A quota code ends the turn even as a 429: waiting does not restore
+        // the quota.
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"insufficient_quota\",\"message\":\"quota used up\",\"statusCode\":429}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"insufficient_quota\",\"message\":\"quota used up\",\"param\":{\"statusCode\":429}}}", .class = .non_retryable },
+        // Upstream timeouts are transient, including Anthropic's
+        // `timeout_error` nested under a provider's wrapper.
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"timeout_error\",\"message\":\"Request timed out\"}}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"gateway_timeout\",\"message\":\"upstream timed out\"}}", .class = .transient },
+        // A type that names a kind of error, an SDK error name or the
+        // wrapper's "error", is no code: its status decides, and with none
+        // the event is unclear.
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"Bad Request\",\"type\":\"AI_APICallError\"}}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"Bad Request\",\"type\":\"AI_APICallError\",\"param\":{\"statusCode\":400}}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"message\":\"route unavailable\"}}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"error\",\"message\":\"route unavailable\"}}}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"message\":\"route unavailable\",\"statusCode\":503}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"AI_APICallError\",\"message\":\"Bad Request\"}}}", .class = .uncoded },
+        // A status that is not an error, is not a number, or sits in a field
+        // nothing in this repository uses says nothing.
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"odd\",\"statusCode\":200}}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"odd\",\"statusCode\":\"503\"}}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"odd\",\"status\":503}}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"something_new\",\"message\":\"odd\",\"status\":503}}", .class = .non_retryable },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.event, .{});
+        defer parsed.deinit();
+        std.testing.expectEqual(case.class, errorEventClass(parsed.value)) catch |err| {
+            std.debug.print("event: {s}\n", .{case.event});
+            return err;
+        };
+    }
+    // A code or a usable status beats neither, a stream timeout beats a
+    // transient class, a classified one beats both, and the first classified
+    // one wins.
+    try std.testing.expect(ErrorEventClass.decides(null, .uncoded));
+    try std.testing.expect(ErrorEventClass.decides(.uncoded, .transient));
+    try std.testing.expect(ErrorEventClass.decides(.transient, .stream_timeout));
+    try std.testing.expect(ErrorEventClass.decides(.stream_timeout, .non_retryable));
+    try std.testing.expect(!ErrorEventClass.decides(.rate_limited, .non_retryable));
+    try std.testing.expect(!ErrorEventClass.decides(.non_retryable, .stream_timeout));
+    try std.testing.expect(!ErrorEventClass.decides(.transient, .uncoded));
+}
+
+test "consumeSseStream reads a gateway stream timeout named by the finish or an error event" {
+    const timeout_event = "data: {\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_timeout\",\"message\":\"stream ran too long\"}}\n\n";
+    const Case = struct { payload: []const u8, cause: ?types.ProviderFailureCause };
+    const cases = [_]Case{
+        // A normal finish that names the timeout is one, as it always was.
+        .{ .payload = "data: {\"type\":\"text-delta\",\"id\":\"t\",\"delta\":\"answer\"}\n\n" ++
+            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"code\":\"gateway_stream_timeout\"}\n\n", .cause = .gateway_stream_timeout },
+        .{ .payload = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\",\"raw\":\"gateway_stream_timeout\"}}\n\n", .cause = .gateway_stream_timeout },
+        // So is a normal finish after an error event that names it.
+        .{ .payload = "data: {\"type\":\"text-delta\",\"id\":\"t\",\"delta\":\"answer\"}\n\n" ++ timeout_event ++
+            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n", .cause = .gateway_stream_timeout },
+        .{ .payload = timeout_event ++ "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n", .cause = .gateway_stream_timeout },
+        .{ .payload = timeout_event, .cause = .gateway_stream_timeout },
+        // An error finish that names the timeout outranks a transient code and
+        // an event that named nothing.
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"retry\"}}\n\n" ++
+            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\",\"raw\":\"gateway_stream_timeout\"}}\n\n", .cause = .gateway_stream_timeout },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"message\":\"cut off\"}}\n\n" ++
+            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\",\"raw\":\"gateway_stream_timeout\"}}\n\n", .cause = .gateway_stream_timeout },
+    };
+    for (cases) |case| {
+        var completion = try testStreamOutcome(case.payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{case.payload});
+        try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
+    }
+}
+
+test "consumeSseStream lets a content filter or a classified code outrank a named gateway stream timeout" {
+    const Case = struct { payload: []const u8, cause: ?types.ProviderFailureCause };
+    const cases = [_]Case{
+        // A content filter finish decides on its own.
+        .{ .payload = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"content-filter\"},\"code\":\"gateway_stream_timeout\"}\n\n", .cause = null },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_timeout\",\"message\":\"stream ran too long\"}}\n\n" ++
+            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"content-filter\"}}\n\n", .cause = null },
+        // A classified code on an error finish beats the timeout.
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}\n\n" ++
+            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\",\"raw\":\"gateway_stream_timeout\"}}\n\n", .cause = .non_retryable },
+    };
+    for (cases) |case| {
+        var completion = try testStreamOutcome(case.payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{case.payload});
+        try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
+    }
+}
+
+test "consumeSseStream lets a content filter finish decide on its own" {
+    const content_filter = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"content-filter\",\"raw\":\"content_filter\"}}\n\n";
+    for ([_][]const u8{
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}\n\n" ++ content_filter,
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}\n\n" ++ content_filter,
+        "data: {\"type\":\"error\",\"error\":{\"message\":\"no code\"}}\n\n" ++ content_filter,
+    }) |payload| {
+        var completion = try testStreamOutcome(payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{payload});
+        try std.testing.expectEqual(types.ProviderFinishReason.content_filter, completion.finish_reason.?);
+        try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), completion.provider_failure_cause);
+    }
+}
+
+test "consumeSseStream takes the cause and detail from the event that decided" {
+    const error_finish = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n";
+    const Case = struct {
+        payload: []const u8,
+        finish: ?types.ProviderFinishReason,
+        cause: ?types.ProviderFailureCause,
+        detail: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"first\"}}\n\n" ++
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"second\"}}\n\n" ++ error_finish,
+            .finish = .provider_error,
+            .cause = .non_retryable,
+            .detail = "invalid_request_error: second",
+        },
+        .{
+            .payload = "data: {\"type\":\"error\",\"error\":{\"message\":\"first\"}}\n\n" ++
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"second\"}}\n\n" ++ error_finish,
+            .finish = .provider_error,
+            .cause = .rate_limited,
+            .detail = "rate_limit_exceeded: second",
+        },
+        // A non-retryable code wins over a gateway stream timeout, in either
+        // order, and the stream becomes a provider error.
+        .{
+            .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_timeout\",\"message\":\"too long\"}}\n\n" ++
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}\n\n",
+            .finish = .provider_error,
+            .cause = .non_retryable,
+            .detail = "invalid_request_error: bad input",
+        },
+        .{
+            .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}\n\n" ++
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_timeout\",\"message\":\"too long\"}}\n\n",
+            .finish = .provider_error,
+            .cause = .non_retryable,
+            .detail = "invalid_request_error: bad input",
+        },
+        // The first of two classified codes keeps its detail.
+        .{
+            .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"first\"}}\n\n" ++
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"second\"}}\n\n" ++ error_finish,
+            .finish = .provider_error,
+            .cause = .non_retryable,
+            .detail = "invalid_request_error: first",
+        },
+    };
+    for (cases) |case| {
+        var completion = try testStreamOutcome(case.payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{case.payload});
+        try std.testing.expectEqual(case.finish, completion.finish_reason);
+        try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
+        try std.testing.expectEqualStrings(case.detail, completion.provider_failure_detail.?);
+    }
+}
+
+fn testStreamOutcome(payload: []const u8) !types.ModelCompletion {
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    return consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+}
+
+test "consumeSseStream names the error a provider's wrapper nests in the notice detail" {
+    const error_finish = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n";
+    const Case = struct {
+        payload: []const u8,
+        detail: []const u8,
+        cause: ?types.ProviderFailureCause,
+    };
+    const cases = [_]Case{
+        // Anthropic's documented 504 body, as the Gateway passes it through.
+        .{
+            .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"timeout_error\",\"message\":\"Request timed out\"}}}\n\n" ++ error_finish,
+            .detail = "timeout_error: Request timed out",
+            .cause = null,
+        },
+        // The wrapper's generic "error" is no code.
+        .{
+            .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"message\":\"route unavailable\"}}\n\n" ++ error_finish,
+            .detail = "provider_error: route unavailable",
+            .cause = .uncoded_error,
+        },
+        // An SDK error name stays in the notice detail, as it always has,
+        // but is no code to classify by.
+        .{
+            .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"AI_APICallError\",\"message\":\"input is too long\"}}\n\n" ++ error_finish,
+            .detail = "AI_APICallError: input is too long",
+            .cause = .uncoded_error,
+        },
+    };
+    for (cases) |case| {
+        var completion = try testStreamOutcome(case.payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{case.payload});
+        try std.testing.expectEqualStrings(case.detail, completion.provider_failure_detail.?);
+        try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
+    }
+}
+
+test "consumeSseStream reads a deep chain of provider wrappers only one level down" {
+    const alloc = std.testing.allocator;
+    // Past the levels a detail renders, and under the levels an event may
+    // nest before it is refused (`json_depth.max_depth`).
+    const depth = 50;
+    var payload: std.Io.Writer.Allocating = .init(alloc);
+    defer payload.deinit();
+    const writer = &payload.writer;
+    // The event, the wrapper, and its first nested error, which carries the
+    // message. Below it the wrappers go on, ending in a code that neither the
+    // detail nor the class may reach.
+    try writer.writeAll("data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"error\",\"message\":\"first nested\",\"error\":");
+    for (0..depth) |_| try writer.writeAll("{\"type\":\"error\",\"error\":");
+    try writer.writeAll("{\"type\":\"invalid_request_error\",\"message\":\"deep\"}");
+    for (0..depth + 3) |_| try writer.writeByte('}');
+    try writer.writeAll("\n\ndata: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n");
+
+    var completion = try testStreamOutcome(payload.written());
+    defer deinitGatewayCompletion(alloc, &completion);
+    try std.testing.expectEqualStrings("provider_error: first nested", completion.provider_failure_detail.?);
+    // The first nested error names no code, so the class is unclear too.
+    try std.testing.expectEqual(@as(?types.ProviderFailureCause, .uncoded_error), completion.provider_failure_cause);
+}
+
+/// `head`, then `open` `depth` times, then `leaf`, then one `}` for each
+/// `open`, then `tail`: a provider value nested `depth` levels below `head`.
+fn testDeepPayload(
+    alloc: std.mem.Allocator,
+    head: []const u8,
+    open: []const u8,
+    leaf: []const u8,
+    depth: usize,
+    tail: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll(head);
+    for (0..depth) |_| try out.writer.writeAll(open);
+    try out.writer.writeAll(leaf);
+    for (0..depth) |_| try out.writer.writeByte('}');
+    try out.writer.writeAll(tail);
+    return out.toOwnedSlice();
+}
+
+test "jsonNestsDeeperThan measures nesting up to its limit" {
+    const alloc = std.testing.allocator;
+    const Case = struct { json: []const u8, limit_2: bool, limit_3: bool };
+    const cases = [_]Case{
+        .{ .json = "5", .limit_2 = false, .limit_3 = false },
+        .{ .json = "{}", .limit_2 = false, .limit_3 = false },
+        .{ .json = "[[]]", .limit_2 = false, .limit_3 = false },
+        .{ .json = "[[[]]]", .limit_2 = true, .limit_3 = false },
+        .{ .json = "{\"a\":1,\"b\":[{}],\"c\":\"x\"}", .limit_2 = true, .limit_3 = false },
+        // Width does not add depth, and a deep branch after a shallow one counts.
+        .{ .json = "[1,2,3,[4,5],{\"a\":[6]}]", .limit_2 = true, .limit_3 = false },
+        .{ .json = "[[],[[[]]]]", .limit_2 = true, .limit_3 = true },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
+        defer parsed.deinit();
+        errdefer std.debug.print("json: {s}\n", .{case.json});
+        try std.testing.expectEqual(case.limit_2, jsonNestsDeeperThan(parsed.value, 2));
+        try std.testing.expectEqual(case.limit_3, jsonNestsDeeperThan(parsed.value, 3));
+    }
+    // Exactly `max_rendered_detail_depth` levels still renders; one more does not.
+    for ([_]struct { depth: usize, deeper: bool }{
+        .{ .depth = max_rendered_detail_depth, .deeper = false },
+        .{ .depth = max_rendered_detail_depth + 1, .deeper = true },
+        .{ .depth = 20_000, .deeper = true },
+    }) |case| {
+        const json = try testDeepPayload(alloc, "", "[", "[]", case.depth - 1, "");
+        defer alloc.free(json);
+        // `testDeepPayload` closes with `}`; rewrite the closers for arrays.
+        for (json) |*byte| {
+            if (byte.* == '}') byte.* = ']';
+        }
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.deeper, jsonNestsDeeperThan(parsed.value, max_rendered_detail_depth));
+    }
+}
+
+test "consumeSseStream labels a provider error value too deep to render" {
+    const alloc = std.testing.allocator;
+    const error_finish = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n";
+    const event_head = "data: {\"type\":\"error\",\"error\":";
+    const event_tail = "}\n\n" ++ error_finish;
+    const Case = struct {
+        name: []const u8,
+        head: []const u8,
+        open: []const u8,
+        leaf: []const u8,
+        depth: usize,
+        tail: []const u8,
+        cause: types.ProviderFailureCause,
+    };
+    const cases = [_]Case{
+        // Wrappers whose `type` is the generic "error", with no code or message.
+        .{ .name = "d3", .head = event_head, .open = "{\"type\":\"error\",\"error\":", .leaf = "{\"type\":\"error\"}", .depth = 50, .tail = event_tail, .cause = .uncoded_error },
+        // A chain of `error` objects with no type at all.
+        .{ .name = "d4", .head = event_head, .open = "{\"error\":", .leaf = "{}", .depth = 50, .tail = event_tail, .cause = .uncoded_error },
+        // Any other nesting under `error`.
+        .{ .name = "d5", .head = event_head, .open = "{\"a\":", .leaf = "{}", .depth = 50, .tail = event_tail, .cause = .uncoded_error },
+        // An error finish that carries d4's value, with no error event.
+        .{ .name = "f1", .head = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"},\"error\":", .open = "{\"error\":", .leaf = "{}", .depth = 50, .tail = "}\n\n", .cause = .unexplained_error_finish },
+    };
+    for (cases) |case| {
+        const payload = try testDeepPayload(alloc, case.head, case.open, case.leaf, case.depth, case.tail);
+        defer alloc.free(payload);
+        var completion = try testStreamOutcome(payload);
+        defer deinitGatewayCompletion(alloc, &completion);
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        try std.testing.expectEqual(@as(?types.ProviderFinishReason, .provider_error), completion.finish_reason);
+        try std.testing.expectEqualStrings("provider_error", completion.provider_failure_detail.?);
+        try std.testing.expectEqual(@as(?types.ProviderFailureCause, case.cause), completion.provider_failure_cause);
+    }
+    // An event nested past `json_depth.max_depth` is refused before it is read.
+    const too_deep = try testDeepPayload(alloc, event_head, "{\"type\":\"error\",\"error\":", "{\"type\":\"error\"}", 20_000, event_tail);
+    defer alloc.free(too_deep);
+    try std.testing.expectError(error.InvalidGatewaySseEvent, testStreamOutcome(too_deep));
+}
+
+test "consumeSseStream still renders a shallow provider error value that names nothing" {
+    const payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"error\"}}}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n";
+    var completion = try testStreamOutcome(payload);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    try std.testing.expectEqualStrings("{\"type\":\"error\",\"error\":{\"type\":\"error\"}}", completion.provider_failure_detail.?);
+    try std.testing.expectEqual(@as(?types.ProviderFailureCause, .uncoded_error), completion.provider_failure_cause);
+}
+
+test "consumeSseStream marks a provider error with neither a code nor a status unclear" {
+    const error_finish = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n";
+    const Case = struct {
+        payload: []const u8,
+        finish: ?types.ProviderFinishReason,
+        cause: ?types.ProviderFailureCause,
+    };
+    const cases = [_]Case{
+        // An error event with neither a code nor a status, then the error
+        // finish.
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"message\":\"wafer route unavailable\"}}\n\n" ++ error_finish, .finish = .provider_error, .cause = .uncoded_error },
+        // An error finish that no error event explained.
+        .{ .payload = error_finish, .finish = .provider_error, .cause = .unexplained_error_finish },
+        // A later coded event replaces the uncoded one.
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"message\":\"first\"}}\n\n" ++
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"second\"}}\n\n" ++ error_finish, .finish = .provider_error, .cause = null },
+        // With neither, and no finish, the stream simply ended early.
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"message\":\"cut off\"}}\n\n", .finish = null, .cause = null },
+    };
+    for (cases) |case| {
+        var completion = try testStreamOutcome(case.payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{case.payload});
+        try std.testing.expectEqual(case.finish, completion.finish_reason);
+        try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
+    }
+}
+
+test "consumeSseStream lets a classified code decide a stream without a finish" {
+    const Case = struct {
+        payload: []const u8,
+        finish: ?types.ProviderFinishReason,
+        cause: ?types.ProviderFailureCause,
+    };
+    const cases = [_]Case{
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}\n\n", .finish = .provider_error, .cause = .non_retryable },
+        .{ .payload = "data: {\"type\":\"text-delta\",\"id\":\"a\",\"delta\":\"partial\"}\n\n" ++
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}\n\n", .finish = .provider_error, .cause = .non_retryable },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}\n\n", .finish = .provider_error, .cause = .rate_limited },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"insufficient_quota\",\"message\":\"quota used up\",\"statusCode\":429}}\n\n", .finish = .provider_error, .cause = .non_retryable },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"retry\"}}\n\n", .finish = .provider_error, .cause = null },
+        // A gateway stream timeout keeps its own path.
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_timeout\",\"message\":\"too long\"}}\n\n", .finish = null, .cause = .gateway_stream_timeout },
+    };
+    for (cases) |case| {
+        var completion = try testStreamOutcome(case.payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{case.payload});
+        try std.testing.expectEqual(case.finish, completion.finish_reason);
+        try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
+    }
+}
+
+test "consumeSseStream marks an invalid request error event non-retryable" {
+    const payload =
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}\n" ++
+        "\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n" ++
+        "\n";
+
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+
+    var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+    try std.testing.expectEqual(types.ProviderFailureCause.non_retryable, completion.provider_failure_cause.?);
+    try std.testing.expectEqualStrings("invalid_request_error: bad input", completion.provider_failure_detail.?);
+}
+
 test "consumeSseStream assigns a fallback identity to message-only provider errors" {
     const payload =
         "data: {\"type\":\"error\",\"message\":\"wafer route unavailable\"}\n" ++
@@ -4501,23 +6222,31 @@ test "consumeSseStream returns immediately after valid finish without waiting fo
     try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
 }
 
-test "consumeSseStream rejects malformed provider finish reasons" {
-    const cases = [_][]const u8{
+test "consumeSseStream ends at an unreadable finish as a stream without a finish" {
+    const delta = "data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"partial\"}\n\n";
+    const finishes = [_][]const u8{
         "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"\"}}\n\n",
         "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"future-reason\"}}\n\n",
+        "data: {\"type\":\"finish\"}\n\n",
+        "data: {\"type\":\"finish\",\"finishReason\":\"stop\"}\n\n",
     };
 
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
 
-    for (cases) |payload| {
+    for (finishes) |finish| {
+        const payload = try std.mem.concat(std.testing.allocator, u8, &.{ delta, finish });
+        defer std.testing.allocator.free(payload);
         var reader = std.Io.Reader.fixed(payload);
         var cancel_flag = std.atomic.Value(bool).init(false);
-        try std.testing.expectError(
-            error.InvalidProviderFinishReason,
-            consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag),
-        );
+        var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+        // The turn sees what any stream that ended early leaves: the text so
+        // far and no finish, which it resends.
+        try std.testing.expectEqualStrings("partial", completion.content.?);
+        try std.testing.expect(completion.finish_reason == null);
     }
 }
 
@@ -5206,6 +6935,11 @@ test "gateway retry policy covers rate limits and transient server errors" {
     try std.testing.expect(isRetryableGatewayStatus(.bad_gateway));
     try std.testing.expect(isRetryableGatewayStatus(.service_unavailable));
     try std.testing.expect(isRetryableGatewayStatus(.gateway_timeout));
+    var code: u16 = 100;
+    while (code <= 999) : (code += 1) {
+        const status: std.http.Status = @fromBackingInt(@intCast(code));
+        try std.testing.expectEqual(code == 429 or (code >= 500 and code <= 599 and code != 501 and code != 505), isRetryableGatewayStatus(status));
+    }
     try std.testing.expect(!isRetryableGatewayStatus(.bad_request));
     try std.testing.expect(!isRetryableGatewayStatus(.unauthorized));
     try std.testing.expect(!isRetryableGatewayStatus(.forbidden));
@@ -6822,6 +8556,9 @@ const LoopbackGatewayMode = enum {
     private_model_catalog_success,
     keep_alive_reuse,
     keep_alive_close_after_response,
+    keep_alive_truncated_head_on_reuse,
+    keep_alive_head_stall_on_reuse,
+    keep_alive_partial_head_reset_on_reuse,
     reset_mid_request,
     reset_after_head_read,
     slow_terminal_chunk,
@@ -7148,6 +8885,62 @@ const LoopbackGatewayFixture = struct {
                 _ = self.accepted_count.fetchAdd(1, .seq_cst);
                 self.serveKeepAliveOnce(zio, recovered);
             },
+            .keep_alive_truncated_head_on_reuse => {
+                self.markStage();
+                var socket_buffer: [4096]u8 = undefined;
+                var reader = stream.reader(zio, &socket_buffer);
+                try readKeepAliveRequest(&reader.interface);
+                _ = self.requests_served.fetchAdd(1, .seq_cst);
+                try writeKeepAliveResponse(zio, stream);
+                // Start answering the next request on the pooled connection,
+                // then go away. The server read that request, so resending it
+                // could run it twice, and the client must report the failure.
+                try readKeepAliveRequest(&reader.interface);
+                _ = self.requests_served.fetchAdd(1, .seq_cst);
+                try writeLoopbackGatewayBytes(zio, stream, "HTTP/1.1 200 OK\r\n");
+                stream.shutdown(zio, .both) catch {};
+                // A wrongful resend would connect here and succeed.
+                var resent = (try self.acceptUnexpected(zio)) orelse return;
+                defer resent.close(zio);
+                self.serveKeepAliveOnce(zio, resent);
+            },
+            .keep_alive_head_stall_on_reuse => {
+                self.markStage();
+                var socket_buffer: [4096]u8 = undefined;
+                var reader = stream.reader(zio, &socket_buffer);
+                try readKeepAliveRequest(&reader.interface);
+                _ = self.requests_served.fetchAdd(1, .seq_cst);
+                try writeKeepAliveResponse(zio, stream);
+                // Read the next request on the pooled connection and never
+                // answer it. A resend after the caller's deadline would
+                // connect here.
+                try readKeepAliveRequest(&reader.interface);
+                _ = self.requests_served.fetchAdd(1, .seq_cst);
+                var resent = (try self.acceptUnexpected(zio)) orelse return;
+                resent.close(zio);
+            },
+            .keep_alive_partial_head_reset_on_reuse => {
+                self.markStage();
+                var socket_buffer: [4096]u8 = undefined;
+                var reader = stream.reader(zio, &socket_buffer);
+                try readKeepAliveRequest(&reader.interface);
+                _ = self.requests_served.fetchAdd(1, .seq_cst);
+                try writeKeepAliveResponse(zio, stream);
+                // Start answering the next request on the pooled connection,
+                // give the client time to read those bytes, then reset it.
+                try readKeepAliveRequest(&reader.interface);
+                _ = self.requests_served.fetchAdd(1, .seq_cst);
+                try writeLoopbackGatewayBytes(zio, stream, "HTTP/1.1 200 OK\r\n");
+                sleepBlocking(300);
+                const rst: std.posix.linger = .{ .onoff = 1, .linger = 0 };
+                try std.posix.setsockopt(
+                    stream.socket.handle,
+                    std.posix.SOL.SOCKET,
+                    std.posix.SO.LINGER,
+                    std.mem.asBytes(&rst),
+                );
+                // Returning closes the connection, which now sends a reset.
+            },
             .reset_mid_request => {
                 // Read one byte, then RST: the client fails mid-send or at
                 // head read; either way the connection must not be pooled.
@@ -7228,6 +9021,21 @@ const LoopbackGatewayFixture = struct {
             _ = self.requests_served.fetchAdd(1, .seq_cst);
             writeKeepAliveResponse(zio, stream) catch return;
         }
+    }
+
+    /// Accepts and counts a connection the client should never open. Returns
+    /// null when teardown wakes or fails the accept instead.
+    fn acceptUnexpected(self: *@This(), zio: std.Io) !?std.Io.net.Stream {
+        var extra = self.server.accept(zio) catch |err| {
+            if (self.stopping.load(.seq_cst)) return null;
+            return err;
+        };
+        if (self.stopping.load(.seq_cst)) {
+            extra.close(zio);
+            return null;
+        }
+        _ = self.accepted_count.fetchAdd(1, .seq_cst);
+        return extra;
     }
 
     fn serveKeepAliveOnce(self: *@This(), zio: std.Io, stream: std.Io.net.Stream) void {
@@ -7395,6 +9203,9 @@ test "direct gateway request-open cancellation interrupts real TLS setup" {
 
     try std.testing.expectError(error.Cancelled, result);
     try std.testing.expect(elapsed_ms < 500);
+    // The request walked away, and its job stops the TLS setup the server
+    // still stalls, so none is left holding the connection.
+    try waitForOwnClientOpenJobs();
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }
@@ -7433,6 +9244,7 @@ test "direct gateway request-open deadline interrupts real TLS setup" {
     try std.testing.expectError(error.ConnectionSetupTimedOut, result);
     try std.testing.expect(elapsed_ms < 400);
     try std.testing.expectEqual(DeliveryCertainty.State.definitely_unsent, delivery.load());
+    try waitForOwnClientOpenJobs();
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }
@@ -7648,7 +9460,7 @@ test "shared pool requests open with a current certificate clock" {
     if (harness.fixture.failure) |err| return err;
 }
 
-test "stale pooled connection fails once, never re-pools, and the next request redials" {
+test "a pooled connection the server closed while idle is resent once on a fresh connection" {
     var harness = try ConnectionSetupHarness.init(.keep_alive_close_after_response, false);
     defer harness.deinit();
     try harness.start();
@@ -7659,23 +9471,142 @@ test "stale pooled connection fails once, never re-pools, and the next request r
     var first = try pooledLoopbackCall(&pool, harness.url);
     defer first.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("ok", first.completion.content.?);
+    try std.testing.expect(!first.completion.delivery_ambiguous);
     try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
 
-    // The server silently dropped the pooled connection after responding
-    // (idle-close). The next borrow writes into the dead socket and fails.
-    const stale = pooledLoopbackCall(&pool, harness.url);
-    if (stale) |ok_result| {
+    // The server dropped the pooled connection after responding (idle-close).
+    // The next request fails on it before any response byte, goes out again on
+    // a fresh connection, and the caller sees only the answer.
+    var second = try pooledLoopbackCall(&pool, harness.url);
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", second.completion.content.?);
+    try std.testing.expect(second.completion.delivery_ambiguous);
+    // Only the fresh connection is pooled; the dead one was destroyed.
+    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
+    try std.testing.expectEqual(@as(usize, 2), harness.fixture.accepted_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), harness.fixture.requests_served.load(.seq_cst));
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "a deadline on a reused connection ends the request without a resend" {
+    var harness = try ConnectionSetupHarness.init(.keep_alive_head_stall_on_reuse, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    var first = try pooledLoopbackCall(&pool, harness.url);
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", first.completion.content.?);
+
+    // The server reads the next request on the pooled connection and never
+    // answers. The deadline cancels the head read, which std reports as a
+    // read failure on a reused connection with no response bytes. That is
+    // not a closed connection, so the request must end without a resend.
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const second = streamGatewayCompletionBounded(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = harness.url,
+            .payload = "{}",
+            .shared_pool = &pool,
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        testAwakeDeadlineAfter(300),
+        &cancel_flag,
+    );
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
+    if (second) |ok_result| {
         var r = ok_result;
         r.deinit(std.testing.allocator);
-        return error.TestExpectedStaleFailure;
-    } else |_| {}
-    // The dead connection was destroyed, not returned to the free list.
-    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+        return error.TestExpectedDeadline;
+    } else |err| try std.testing.expectEqual(error.Timeout, err);
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), harness.fixture.accepted_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), harness.fixture.requests_served.load(.seq_cst));
+    try std.testing.expect(elapsed_ms < 1_000);
+}
 
-    var third = try pooledLoopbackCall(&pool, harness.url);
-    defer third.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("ok", third.completion.content.?);
-    try std.testing.expectEqual(@as(usize, 2), harness.fixture.accepted_count.load(.seq_cst));
+test "a pooled connection reset after the response starts is reported, not resent" {
+    var harness = try ConnectionSetupHarness.init(.keep_alive_partial_head_reset_on_reuse, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    var first = try pooledLoopbackCall(&pool, harness.url);
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", first.completion.content.?);
+
+    // The socket reports a reset, as for a connection closed while idle, but
+    // the client had already read the start of the head. Only the received
+    // bytes tell the two apart. A resend would land on a connection nothing
+    // answers and run into the deadline instead of failing at once.
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const second = streamGatewayCompletionBounded(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = harness.url,
+            .payload = "{}",
+            .shared_pool = &pool,
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        testAwakeDeadlineAfter(3_000),
+        &cancel_flag,
+    );
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
+    if (second) |ok_result| {
+        var r = ok_result;
+        r.deinit(std.testing.allocator);
+        return error.TestExpectedResetFailure;
+    } else |err| try std.testing.expectEqual(error.ReadFailed, err);
+    try std.testing.expect(elapsed_ms < 2_500);
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 2), harness.fixture.requests_served.load(.seq_cst));
+}
+
+test "a pooled connection that dies after the response starts is reported, not resent" {
+    var harness = try ConnectionSetupHarness.init(.keep_alive_truncated_head_on_reuse, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    var first = try pooledLoopbackCall(&pool, harness.url);
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", first.completion.content.?);
+
+    const second = pooledLoopbackCall(&pool, harness.url);
+    if (second) |ok_result| {
+        var r = ok_result;
+        r.deinit(std.testing.allocator);
+        return error.TestExpectedTruncatedHeadFailure;
+    } else |err| try std.testing.expectEqual(error.HttpRequestTruncated, err);
+    try std.testing.expectEqual(@as(usize, 1), harness.fixture.accepted_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), harness.fixture.requests_served.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
 }
 
 test "mid-request reset never returns the connection to the pool" {
@@ -8303,9 +10234,9 @@ fn expectCancellableGatewayJsonCancellation(
 
     const started = std.Io.Clock.Timestamp.now(zio, .awake);
     const result = if (use_tls)
-        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, api_key, null, models_url, &cancel_flag, gateway_json_fetch_timeout_ms)
+        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, api_key, null, models_url, &cancel_flag, gateway_json_fetch_timeout_ms, null)
     else
-        fetchGatewayJsonCancellable(std.testing.allocator, api_key, null, "https://ai-gateway.vercel.sh/v1/models", &cancel_flag);
+        fetchGatewayJsonCancellable(std.testing.allocator, api_key, null, "https://ai-gateway.vercel.sh/v1/models", &cancel_flag, null);
     const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
 
     try std.testing.expectError(error.Cancelled, result);
@@ -8331,10 +10262,63 @@ test "cancellable gateway JSON request times out a held response head" {
     const started = std.Io.Clock.Timestamp.now(zio, .awake);
     try std.testing.expectError(
         error.Timeout,
-        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, "test-key", null, models_url, &cancel_flag, 100),
+        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, "test-key", null, models_url, &cancel_flag, 100, null),
     );
     const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
     try std.testing.expect(elapsed_ms < 1500);
+    if (fixture.failure) |err| return err;
+}
+
+test "a gateway JSON request reports no connection while its TLS handshake stalls" {
+    var fixture = try LoopbackGatewayFixture.init(.tls_handshake_stall, 5000);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+    const models_url = try std.testing.allocator.print("https://127.0.0.1:{d}/v1/models", .{fixture.port()});
+    defer std.testing.allocator.free(models_url);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var connected = std.atomic.Value(bool).init(false);
+    var request_done = std.atomic.Value(bool).init(false);
+    // The server has taken the TCP connection and never answers the TLS
+    // handshake; the request is cancelled while it waits.
+    const Cancel = struct {
+        fn run(server: *LoopbackGatewayFixture, flag: *std.atomic.Value(bool), done: *std.atomic.Value(bool)) void {
+            if (!server.waitForStageOrDone(done)) return;
+            LoopbackGatewayFixture.sleepBlocking(100);
+            flag.store(true, .seq_cst);
+        }
+    };
+    const cancel_thread = try std.Thread.spawn(.{}, Cancel.run, .{ &fixture, &cancel_flag, &request_done });
+    defer {
+        request_done.store(true, .seq_cst);
+        cancel_thread.join();
+    }
+
+    try std.testing.expectError(
+        error.Cancelled,
+        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, "test-key", null, models_url, &cancel_flag, gateway_json_fetch_timeout_ms, &connected),
+    );
+    try std.testing.expect(fixture.reached_stage.load(.seq_cst));
+    try std.testing.expect(!connected.load(.acquire));
+    if (fixture.failure) |err| return err;
+}
+
+test "a gateway JSON request reports its connection before any response arrives" {
+    var fixture = try LoopbackGatewayFixture.init(.response_head_stall, 5000);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+    const models_url = try std.testing.allocator.print("http://127.0.0.1:{d}/v1/models", .{fixture.port()});
+    defer std.testing.allocator.free(models_url);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var connected = std.atomic.Value(bool).init(false);
+    try std.testing.expectError(
+        error.Timeout,
+        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, "test-key", null, models_url, &cancel_flag, 1000, &connected),
+    );
+    try std.testing.expect(connected.load(.acquire));
     if (fixture.failure) |err| return err;
 }
 
@@ -8556,6 +10540,9 @@ fn expectBoundedLoopbackCancellation(
 
     request_done.store(true, .seq_cst);
     cancel_thread.join();
+    // An open the request walked away from stops while the server still
+    // stalls it.
+    try waitForOwnClientOpenJobs();
     fixture.deinit();
 
     try std.testing.expectError(error.Cancelled, request_result);
@@ -9319,4 +11306,749 @@ test "host-managed Gateway chat omits authentication-owned headers" {
     try std.testing.expect(fixture.capturedHeaderValue("authorization") == null);
     try std.testing.expect(fixture.capturedHeaderValue(vercel_ai_gateway_team_header) == null);
     try std.testing.expectEqualStrings(user_agent, fixture.capturedHeaderValue("user-agent").?);
+}
+
+test "a stream event that is not JSON is an unreadable reply, and a too-deep or duplicate-key one still ends" {
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var reader = std.Io.Reader.fixed("data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"partial\"}\n\ndata: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"\x01garb\n\n");
+    const garbled = if (consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag)) |completion| blk: {
+        var owned = completion;
+        deinitGatewayCompletion(std.testing.allocator, &owned);
+        break :blk error.TestExpectedStreamError;
+    } else |err| err;
+    const evidence = networkFailureEvidence(garbled, .possibly_sent) orelse return error.TestExpectedNetworkFailureEvidence;
+    try std.testing.expectEqual(agent_stream_provider.NetworkFailureCause.unreadable_reply, evidence.cause);
+
+    const deep = "data: " ++ text_utils.repeat("[", 300) ++ text_utils.repeat("]", 300) ++ "\n\n";
+    var deep_reader = std.Io.Reader.fixed(deep);
+    const too_deep = if (consumeSseStream(std.testing.allocator, &deep_reader, undefined, Noop.chunk, null, &cancel_flag)) |completion| blk: {
+        var owned = completion;
+        deinitGatewayCompletion(std.testing.allocator, &owned);
+        break :blk error.TestExpectedStreamError;
+    } else |err| err;
+    try std.testing.expectEqual(error.InvalidGatewaySseEvent, too_deep);
+    try std.testing.expect(networkFailureEvidence(too_deep, .possibly_sent) == null);
+
+    var duplicate_reader = std.Io.Reader.fixed("data: {\"type\":\"text-delta\",\"type\":\"finish\"}\n\n");
+    const duplicate = if (consumeSseStream(std.testing.allocator, &duplicate_reader, undefined, Noop.chunk, null, &cancel_flag)) |completion| blk: {
+        var owned = completion;
+        deinitGatewayCompletion(std.testing.allocator, &owned);
+        break :blk error.TestExpectedStreamError;
+    } else |err| err;
+    try std.testing.expectEqual(error.InvalidGatewaySseEvent, duplicate);
+    try std.testing.expect(networkFailureEvidence(duplicate, .possibly_sent) == null);
+}
+
+test "an unreadable stream event from any provider is an unreadable reply" {
+    for ([_]anyerror{
+        error.MalformedGatewaySseEvent,
+        error.MalformedOpenAICodexSseEvent,
+        error.MalformedXaiGrokSseEvent,
+        error.MalformedChatCompletionsChunk,
+    }) |err| {
+        const evidence = networkFailureEvidence(err, .possibly_sent) orelse return error.TestExpectedNetworkFailureEvidence;
+        try std.testing.expectEqual(agent_stream_provider.NetworkFailureCause.unreadable_reply, evidence.cause);
+    }
+}
+
+test "a connection that timed out before opening is offline" {
+    const evidence = networkFailureEvidence(error.ConnectionSetupTimedOut, .definitely_unsent) orelse return error.TestExpectedNetworkFailureEvidence;
+    try std.testing.expectEqual(agent_stream_provider.NetworkFailureCause.connectivity_lost, evidence.cause);
+}
+
+/// A connection open whose DNS lookup ignores cancellation, as getaddrinfo
+/// does, until the test releases it; it then connects for real. A cancel
+/// the lookup sat out ends the open at its next step, as it does once
+/// getaddrinfo returns, unless `connect_after_cancel` is set.
+const StuckLookupOpen = struct {
+    entered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    /// Set once the open was cancelled during the lookup.
+    cancelled: std.atomic.Value(bool) = .init(false),
+    connect_after_cancel: bool = false,
+
+    fn override(self: *StuckLookupOpen) RequestOpenOverride {
+        return .{ .ctx = self, .run = run };
+    }
+
+    fn run(
+        raw: *anyopaque,
+        client: *std.http.Client,
+        method: std.http.Method,
+        uri: std.Uri,
+        options: std.http.Client.RequestOptions,
+    ) anyerror!std.http.Client.Request {
+        const self: *StuckLookupOpen = @ptrCast(@alignCast(raw));
+        const zio = io_mod.getIo();
+        self.entered.store(true, .seq_cst);
+        var cancel_pending = false;
+        while (!self.release.load(.seq_cst)) {
+            zio.sleep(.fromMilliseconds(1), .awake) catch |err| switch (err) {
+                error.Canceled => {
+                    cancel_pending = true;
+                    self.cancelled.store(true, .seq_cst);
+                },
+            };
+        }
+        if (cancel_pending and !self.connect_after_cancel) zio.recancel();
+        return client.request(method, uri, options);
+    }
+
+    fn waitEntered(self: *StuckLookupOpen) void {
+        while (!self.entered.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+    }
+
+    /// Waits until the job that runs the open cancelled it.
+    fn waitCancelled(self: *StuckLookupOpen) !void {
+        var waited_ms: usize = 0;
+        while (!self.cancelled.load(.seq_cst)) : (waited_ms += 1) {
+            if (waited_ms > 5_000) return error.TestOpenNeverCancelled;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+    }
+};
+
+/// A loopback listener and the pool a pooled-open test opens through. Set up
+/// in place, since the pool's client must not move.
+const PooledOpenFixture = struct {
+    server: std.Io.net.Server,
+    url: []u8,
+    pool: http_pool.HttpPool,
+
+    fn init(self: *PooledOpenFixture) !void {
+        const zio = io_mod.getIo();
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.server = try address.listen(zio, .{ .reuse_address = true });
+        errdefer self.server.deinit(zio);
+        self.url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{self.server.socket.address.getPort()});
+        self.pool = http_pool.HttpPool.init(std.testing.allocator);
+    }
+
+    fn deinit(self: *PooledOpenFixture) void {
+        _ = self.pool.deinit();
+        std.testing.allocator.free(self.url);
+        self.server.deinit(io_mod.getIo());
+    }
+};
+
+fn waitForOpenJobs(pool: *http_pool.HttpPool) !void {
+    var waited_ms: usize = 0;
+    while (pool.open_jobs.load(.acquire) != 0) : (waited_ms += 1) {
+        if (waited_ms > 5_000) return error.TestOpenJobStillRunning;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
+/// Walks away from a pooled open stuck in its lookup with Esc, and leaves
+/// the lookup stuck with its job still running.
+fn escFromStuckPooledOpen(pool: *http_pool.HttpPool, url: []const u8, stuck: *StuckLookupOpen) !void {
+    const zio = io_mod.getIo();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const Esc = struct {
+        fn run(lookup: *StuckLookupOpen, flag: *std.atomic.Value(bool)) void {
+            lookup.waitEntered();
+            flag.store(true, .seq_cst);
+        }
+    };
+    const esc = try std.Thread.spawn(.{}, Esc.run, .{ stuck, &cancel_flag });
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+    var reused = false;
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    const result = openGatewayRequestBounded(pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+    esc.join();
+
+    try std.testing.expectError(error.Cancelled, result);
+    try std.testing.expect(elapsed_ms < 500);
+    // The lookup is still stuck, and its job still owns the open.
+    try std.testing.expectEqual(@as(u32, 1), pool.open_jobs.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+}
+
+test "Esc walks away from a pooled open stuck in its lookup, and its job stops the open" {
+    var fixture: PooledOpenFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const pool = &fixture.pool;
+
+    var stuck: StuckLookupOpen = .{};
+    try escFromStuckPooledOpen(pool, fixture.url, &stuck);
+    // The job cancels the open; the lookup sits that out, and the open ends
+    // once it returns instead of connecting.
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOpenJobs(pool);
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+}
+
+test "a pooled open that connects after the request walked away goes back to the pool" {
+    var fixture: PooledOpenFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const pool = &fixture.pool;
+
+    var stuck: StuckLookupOpen = .{ .connect_after_cancel = true };
+    try escFromStuckPooledOpen(pool, fixture.url, &stuck);
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOpenJobs(pool);
+    // Nothing was sent on the late connection, so the job released it to the
+    // pool instead of leaking it; the testing allocator checks the job freed
+    // itself.
+    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
+}
+
+test "the setup deadline walks away from a pooled open stuck in its lookup" {
+    const zio = io_mod.getIo();
+    var fixture: PooledOpenFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const url = fixture.url;
+    const pool = &fixture.pool;
+
+    var stuck: StuckLookupOpen = .{};
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 80 });
+    var reused = false;
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    const result = openGatewayRequestBounded(pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+
+    try std.testing.expectError(error.ConnectionSetupTimedOut, result);
+    try std.testing.expect(elapsed_ms < 400);
+    stuck.release.store(true, .seq_cst);
+    try waitForOpenJobs(pool);
+}
+
+/// Starts a pooled open stuck in its lookup and walks away from it at the
+/// setup deadline, so the pool has a running job and nothing else.
+fn leaveStuckOpenJob(pool: *http_pool.HttpPool, url: []const u8, stuck: *StuckLookupOpen) !void {
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 50 });
+    var reused = false;
+    const result = openGatewayRequestBounded(pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    try std.testing.expectError(error.ConnectionSetupTimedOut, result);
+    try std.testing.expectEqual(@as(u32, 1), pool.open_jobs.load(.acquire));
+}
+
+test "shutting the pool down waits for a connect job that finishes in time" {
+    const zio = io_mod.getIo();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(url);
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    var stuck: StuckLookupOpen = .{};
+    try leaveStuckOpenJob(&pool, url, &stuck);
+
+    const Release = struct {
+        fn run(lookup: *StuckLookupOpen) void {
+            io_mod.sleep(100 * std.time.ns_per_ms);
+            lookup.release.store(true, .seq_cst);
+        }
+    };
+    const release = try std.Thread.spawn(.{}, Release.run, .{&stuck});
+    defer release.join();
+    // The job returns its late connection to the pool and leaves before the
+    // wait runs out, so the pool frees everything; the testing allocator
+    // checks that nothing leaked.
+    try std.testing.expectEqual(http_pool.HttpPool.DestroyDisposition.destroyed, pool.deinit());
+}
+
+test "shutting the pool down leaves a connect job that is still stuck rather than freeing it" {
+    const zio = io_mod.getIo();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(url);
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    var stuck: StuckLookupOpen = .{};
+    try leaveStuckOpenJob(&pool, url, &stuck);
+
+    // The job still uses the client, so the pool gives up on it instead of
+    // freeing memory under it.
+    try std.testing.expectEqual(http_pool.HttpPool.DestroyDisposition.abandoned_open_job, pool.deinit());
+    stuck.release.store(true, .seq_cst);
+    try waitForOpenJobs(&pool);
+    // Once the job is gone the test frees what the pool left behind.
+    pool.client.deinit();
+}
+
+test "a pooled open hands over a request that carries the caller's URI and headers" {
+    var fixture: PooledOpenFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const url = fixture.url;
+    const pool = &fixture.pool;
+
+    const uri = try std.Uri.parse(url);
+    const extra = [_]std.http.Header{.{ .name = "x-fx-test", .value = "kept" }};
+    const options: std.http.Client.RequestOptions = .{
+        .headers = .{ .authorization = .{ .override = "Bearer test" } },
+        .extra_headers = &extra,
+    };
+    var stuck: StuckLookupOpen = .{};
+    stuck.release.store(true, .seq_cst);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+    var reused = true;
+    var opened = try openGatewayRequestBounded(pool, uri, options, stuck.override(), &epoch, &cancel_flag, &reused);
+    defer opened.deinit();
+    const request = &opened.request;
+    try std.testing.expect(opened.own_client == null);
+
+    try std.testing.expect(!reused);
+    // The job's own copies are freed with it; the request points at the
+    // caller's again.
+    const text = struct {
+        fn of(component: std.Uri.Component) []const u8 {
+            return switch (component) {
+                .raw, .percent_encoded => |value| value,
+            };
+        }
+    }.of;
+    try std.testing.expectEqual(text(uri.host.?).ptr, text(request.uri.host.?).ptr);
+    try std.testing.expectEqual(@as([*]const std.http.Header, &extra), request.extra_headers.ptr);
+    try std.testing.expectEqualStrings("Bearer test", request.headers.authorization.override);
+    try waitForOpenJobs(pool);
+}
+
+test "two hundred Esc presses during stuck lookups leave no job or connection behind" {
+    const zio = io_mod.getIo();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(url);
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    const Esc = struct {
+        fn run(lookup: *StuckLookupOpen, flag: *std.atomic.Value(bool)) void {
+            lookup.waitEntered();
+            flag.store(true, .seq_cst);
+            lookup.release.store(true, .seq_cst);
+        }
+    };
+    for (0..200) |_| {
+        var stuck: StuckLookupOpen = .{};
+        var cancel_flag = std.atomic.Value(bool).init(false);
+        const esc = try std.Thread.spawn(.{}, Esc.run, .{ &stuck, &cancel_flag });
+        var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+        var reused = false;
+        const result = openGatewayRequestBounded(&pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+        esc.join();
+        // Esc and the late open race: the request either walked away or
+        // closed what it was handed. Either way it ends cancelled.
+        try std.testing.expectError(error.Cancelled, result);
+        try waitForOpenJobs(&pool);
+    }
+    // Every late connection went back to the pool, which keeps a bounded
+    // number; the testing allocator checks no job leaked.
+    try std.testing.expect(pool.freeConnectionCount() <= pool.client.connection_pool.free_size);
+}
+
+/// Waits until no open job on a client of its own is left, so the testing
+/// allocator's leak check sees what each job freed.
+fn waitForOwnClientOpenJobs() !void {
+    var waited_ms: usize = 0;
+    while (own_client_open_jobs.load(.acquire) != 0) : (waited_ms += 1) {
+        if (waited_ms > 5_000) return error.TestOpenJobStillRunning;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
+/// Lets a stuck lookup return and waits for its job, so a failed test
+/// leaves no job reading its stack.
+fn releaseOwnClientJob(stuck: *StuckLookupOpen) void {
+    stuck.release.store(true, .seq_cst);
+    waitForOwnClientOpenJobs() catch {};
+}
+
+/// A loopback listener that an unpooled open connects to.
+const UnpooledOpenFixture = struct {
+    server: std.Io.net.Server,
+    url: []u8,
+
+    const Late = enum { none, closed };
+
+    fn init() !UnpooledOpenFixture {
+        const zio = io_mod.getIo();
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        var server = try address.listen(zio, .{ .reuse_address = true });
+        errdefer server.deinit(zio);
+        const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+        return .{ .server = server, .url = url };
+    }
+
+    fn deinit(self: *UnpooledOpenFixture) void {
+        std.testing.allocator.free(self.url);
+        self.server.deinit(io_mod.getIo());
+    }
+
+    /// What became of the connection a finished open may have made: none,
+    /// or one fx already closed. Fails when fx left one open. Waits up to
+    /// `appear_ms` for a connection to arrive.
+    fn lateConnection(self: *UnpooledOpenFixture, appear_ms: i32) !Late {
+        const zio = io_mod.getIo();
+        var listener = [_]std.posix.pollfd{.{ .fd = self.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&listener, appear_ms) == 0) return .none;
+        var stream = try self.server.accept(zio);
+        defer stream.close(zio);
+        // The close fx already made can reach this end a moment after the
+        // accept; a connection fx left open never reads end of stream.
+        var peer = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&peer, 2_000) == 0) return error.TestConnectionLeftOpen;
+        var buffer: [64]u8 = undefined;
+        var reader = stream.reader(zio, &buffer);
+        var byte: [1]u8 = undefined;
+        const read = reader.interface.readSliceShort(&byte) catch |err| switch (err) {
+            // A reset closes it too.
+            error.ReadFailed => return .closed,
+        };
+        return if (read == 0) .closed else error.TestConnectionLeftOpen;
+    }
+};
+
+/// Sets the cancel flag once the stuck lookup has started.
+const EscDuringLookup = struct {
+    fn run(lookup: *StuckLookupOpen, flag: *std.atomic.Value(bool)) void {
+        lookup.waitEntered();
+        flag.store(true, .seq_cst);
+    }
+};
+
+fn elapsedMsSince(started: std.Io.Clock.Timestamp) i64 {
+    return started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
+}
+
+/// Walks away from an unpooled open stuck in its lookup with Esc, and leaves
+/// the lookup stuck with its job still running.
+fn escFromStuckUnpooledOpen(fixture: *UnpooledOpenFixture, stuck: *StuckLookupOpen) !void {
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const esc = try std.Thread.spawn(.{}, EscDuringLookup.run, .{ stuck, &cancel_flag });
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+    var reused = false;
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = openGatewayRequestBounded(null, try std.Uri.parse(fixture.url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    const elapsed_ms = elapsedMsSince(started);
+    esc.join();
+
+    try std.testing.expectError(error.Cancelled, result);
+    try std.testing.expect(elapsed_ms < 500);
+    // The lookup is still stuck, and its job still owns the open and the
+    // client it opens on.
+    try std.testing.expectEqual(@as(u32, 1), own_client_open_jobs.load(.acquire));
+}
+
+test "Esc walks away from an unpooled open stuck in its lookup, and its job stops the open" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+
+    try escFromStuckUnpooledOpen(&fixture, &stuck);
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOwnClientOpenJobs();
+    // The open ended once its lookup returned, without connecting; the
+    // testing allocator checks the job freed its client and itself.
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+}
+
+test "an unpooled open that connects after the request walked away is closed with its client" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+    var stuck: StuckLookupOpen = .{ .connect_after_cancel = true };
+    defer releaseOwnClientJob(&stuck);
+
+    try escFromStuckUnpooledOpen(&fixture, &stuck);
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOwnClientOpenJobs();
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.closed, try fixture.lateConnection(2_000));
+}
+
+test "the setup deadline walks away from an unpooled open stuck in its lookup" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 80 });
+    var reused = false;
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = openGatewayRequestBounded(null, try std.Uri.parse(fixture.url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    const elapsed_ms = elapsedMsSince(started);
+
+    try std.testing.expectError(error.ConnectionSetupTimedOut, result);
+    try std.testing.expect(elapsed_ms < 400);
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOwnClientOpenJobs();
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+}
+
+test "an unpooled open hands over a request on its job's own client with the caller's URI and headers" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+
+    const uri = try std.Uri.parse(fixture.url);
+    const extra = [_]std.http.Header{.{ .name = "x-fx-test", .value = "kept" }};
+    const options: std.http.Client.RequestOptions = .{
+        .headers = .{ .authorization = .{ .override = "Bearer test" } },
+        .extra_headers = &extra,
+        .keep_alive = false,
+    };
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+    stuck.release.store(true, .seq_cst);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+    var reused = true;
+    var opened = try openGatewayRequestBounded(null, uri, options, stuck.override(), &epoch, &cancel_flag, &reused);
+
+    try std.testing.expect(!reused);
+    // The request runs on the client its job made, which now goes with it.
+    const own_client = opened.own_client orelse return error.TestExpectedOwnClient;
+    try std.testing.expectEqual(own_client, opened.request.client);
+    const text = struct {
+        fn of(component: std.Uri.Component) []const u8 {
+            return switch (component) {
+                .raw, .percent_encoded => |value| value,
+            };
+        }
+    }.of;
+    try std.testing.expectEqual(text(uri.host.?).ptr, text(opened.request.uri.host.?).ptr);
+    try std.testing.expectEqual(@as([*]const std.http.Header, &extra), opened.request.extra_headers.ptr);
+    try std.testing.expectEqualStrings("Bearer test", opened.request.headers.authorization.override);
+    opened.deinit();
+    try waitForOwnClientOpenJobs();
+    // Ending the request closed its connection along with the client.
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.closed, try fixture.lateConnection(2_000));
+}
+
+test "Esc during a stuck lookup ends an unpooled gateway request at once" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const esc = try std.Thread.spawn(.{}, EscDuringLookup.run, .{ &stuck, &cancel_flag });
+    var callback_ctx: u8 = 0;
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{ .api_key = "test-key", .model = "test/model", .retry_count = 3, .chat_url = fixture.url, .payload = "{}" },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{ .setup_timing = .{ .timeout_ms = 30_000 }, .request_open_override = stuck.override() },
+    );
+    const elapsed_ms = elapsedMsSince(started);
+    esc.join();
+
+    try std.testing.expectError(error.Cancelled, result);
+    try std.testing.expect(elapsed_ms < 500);
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOwnClientOpenJobs();
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+}
+
+test "a bounded request's deadline walks away from an unpooled open stuck in its lookup" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    // The request's own setup deadline is far off; the bounded operation
+    // around it cancels its task, which must end the wait as well.
+    const Operation = struct {
+        url: []const u8,
+        stuck: *StuckLookupOpen,
+        cancel_flag: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) !StreamResult {
+            var callback_ctx: u8 = 0;
+            return streamGatewayCompletionCoreWithOptions(
+                std.testing.allocator,
+                .{ .api_key = "test-key", .model = "test/model", .retry_count = 1, .chat_url = self.url, .payload = "{}" },
+                @ptrCast(&callback_ctx),
+                discardConnectionSetupTestChunk,
+                null,
+                self.cancel_flag,
+                null,
+                false,
+                .{ .setup_timing = .{ .timeout_ms = 30_000 }, .request_open_override = self.stuck.override() },
+            );
+        }
+    };
+    var operation: Operation = .{ .url = fixture.url, .stuck = &stuck, .cancel_flag = &cancel_flag };
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = runBoundedStreamOperation(std.testing.allocator, &cancel_flag, testAwakeDeadlineAfter(100), &operation);
+    const elapsed_ms = elapsedMsSince(started);
+
+    try std.testing.expectError(error.Timeout, result);
+    try std.testing.expect(elapsed_ms < 600);
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOwnClientOpenJobs();
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+}
+
+test "Esc walks away from a provider POST stuck in its lookup" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const esc = try std.Thread.spawn(.{}, EscDuringLookup.run, .{ &stuck, &cancel_flag });
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = openBoundedPostWith(&cancel_flag, testAwakeDeadlineAfter(30_000), .{
+        .uri = try std.Uri.parse(fixture.url),
+        .authorization = "Bearer test",
+    }, stuck.override());
+    const elapsed_ms = elapsedMsSince(started);
+    esc.join();
+
+    try std.testing.expectError(error.Cancelled, result);
+    try std.testing.expect(elapsed_ms < 500);
+    try std.testing.expectEqual(@as(u32, 1), own_client_open_jobs.load(.acquire));
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOwnClientOpenJobs();
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+}
+
+test "the connect deadline walks away from a provider POST stuck in its lookup as a timeout" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = openBoundedPostWith(&cancel_flag, testAwakeDeadlineAfter(80), .{
+        .uri = try std.Uri.parse(fixture.url),
+        .authorization = null,
+    }, stuck.override());
+    const elapsed_ms = elapsedMsSince(started);
+
+    try std.testing.expectError(error.Timeout, result);
+    try std.testing.expect(elapsed_ms < 400);
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOwnClientOpenJobs();
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+}
+
+test "a provider POST hands over its request with the provider's headers on its own client" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+
+    const extra = [_]std.http.Header{.{ .name = "accept", .value = "text/event-stream" }};
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+    stuck.release.store(true, .seq_cst);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var opened = try openBoundedPostWith(&cancel_flag, testAwakeDeadlineAfter(30_000), .{
+        .uri = try std.Uri.parse(fixture.url),
+        .authorization = "Bearer provider",
+        .extra_headers = &extra,
+    }, stuck.override());
+
+    const own_client = opened.own_client orelse return error.TestExpectedOwnClient;
+    try std.testing.expectEqual(own_client, opened.request.client);
+    try std.testing.expect(!opened.request.keep_alive);
+    try std.testing.expectEqualStrings("Bearer provider", opened.request.headers.authorization.override);
+    try std.testing.expectEqualStrings("application/json", opened.request.headers.content_type.override);
+    try std.testing.expectEqual(@as([*]const std.http.Header, &extra), opened.request.extra_headers.ptr);
+    opened.deinit();
+    try waitForOwnClientOpenJobs();
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.closed, try fixture.lateConnection(2_000));
+}
+
+/// Opens through `pool`, or on a job's own client when it is null, against a
+/// server that accepts and never answers the TLS handshake, walks away with
+/// Esc, and requires the job to end while the server still stalls.
+fn expectWalkAwayStopsStalledTlsSetup(pool: ?*http_pool.HttpPool) !void {
+    var fixture = try LoopbackGatewayFixture.init(.tls_handshake_stall, 10_000);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+    const url = try std.testing.allocator.print("https://127.0.0.1:{d}/chat", .{fixture.port()});
+    defer std.testing.allocator.free(url);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request_done = std.atomic.Value(bool).init(false);
+    const Esc = struct {
+        fn run(server: *LoopbackGatewayFixture, flag: *std.atomic.Value(bool), done: *std.atomic.Value(bool)) void {
+            if (server.waitForStageOrDone(done)) flag.store(true, .seq_cst);
+        }
+    };
+    const esc = try std.Thread.spawn(.{}, Esc.run, .{ &fixture, &cancel_flag, &request_done });
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+    var reused = false;
+    const result = openGatewayRequestBounded(pool, try std.Uri.parse(url), .{}, null, &epoch, &cancel_flag, &reused);
+    request_done.store(true, .seq_cst);
+    esc.join();
+    try std.testing.expectError(error.Cancelled, result);
+
+    const walked_away = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    if (pool) |shared| try waitForOpenJobs(shared) else try waitForOwnClientOpenJobs();
+    // The server holds the handshake for ten seconds; the job stopped it.
+    try std.testing.expect(elapsedMsSince(walked_away) < 3_000);
+    try std.testing.expect(fixture.reached_stage.load(.seq_cst));
+}
+
+test "a job the request walked away from stops a stalled TLS setup on its own client" {
+    try expectWalkAwayStopsStalledTlsSetup(null);
+}
+
+test "a job the request walked away from stops a stalled TLS setup on the pool's client" {
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+    try expectWalkAwayStopsStalledTlsSetup(&pool);
+}
+
+test "two hundred Esc presses during stuck unpooled lookups leave no job, client, or connection behind" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+
+    const Esc = struct {
+        fn run(lookup: *StuckLookupOpen, flag: *std.atomic.Value(bool)) void {
+            lookup.waitEntered();
+            flag.store(true, .seq_cst);
+            lookup.release.store(true, .seq_cst);
+        }
+    };
+    for (0..200) |_| {
+        var stuck: StuckLookupOpen = .{};
+        defer releaseOwnClientJob(&stuck);
+        var cancel_flag = std.atomic.Value(bool).init(false);
+        const esc = try std.Thread.spawn(.{}, Esc.run, .{ &stuck, &cancel_flag });
+        var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+        var reused = false;
+        const result = openGatewayRequestBounded(null, try std.Uri.parse(fixture.url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+        esc.join();
+        // Esc and the late open race: the request walked away, or closed what
+        // it was handed. Either way it ends cancelled, and whatever the open
+        // made is closed.
+        try std.testing.expectError(error.Cancelled, result);
+        try waitForOwnClientOpenJobs();
+        _ = try fixture.lateConnection(0);
+    }
 }

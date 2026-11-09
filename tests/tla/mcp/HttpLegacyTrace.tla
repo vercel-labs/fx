@@ -37,6 +37,7 @@ Step(r, id) ==
       [] r.event = "event" -> Event(id)
       [] r.event = "answer" -> Answer(id)
       [] r.event = "break" -> Break(id)
+      [] r.event = "too_large" -> TooLarge(id)
       [] r.event = "refused" -> Refused(id)
       [] r.event = "expired" -> Expired(id)
       [] r.event = "resume_due" -> ResumeDue(id)

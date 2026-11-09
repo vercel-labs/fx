@@ -108,11 +108,15 @@ try {
 
   const defaultMissing = await getBackendInfo({ backend: "native" });
   assert.equal(defaultMissing.backend, "unavailable");
+  // The source checkout has no platform package installed.
+  const nativePackage = { "darwin-arm64": "@libfx/libfx-darwin-arm64", "darwin-x64": "@libfx/libfx-darwin-x64",
+    "linux-arm64": "@libfx/libfx-linux-arm64-gnu", "linux-x64": "@libfx/libfx-linux-x64-gnu" }[`${process.platform}-${process.arch}`];
   assert.equal(defaultMissing.attempts[0].reason.code, "LIBFX_NATIVE_ARTIFACT_MISSING");
-  assert.equal(defaultMissing.attempts[0].reason.causeCode, "ENOENT");
+  assert.equal(defaultMissing.attempts[0].reason.causeCode, "ERR_MODULE_NOT_FOUND");
+  assert.equal(defaultMissing.attempts[0].reason.message, `the native addon package ${nativePackage} for ${process.platform}-${process.arch} is not installed`);
   await assert.rejects(
     createFxEngine({ backend: "native", apiKey: "missing-default-key" }),
-    (error) => error?.code === "LIBFX_NATIVE_UNAVAILABLE",
+    (error) => error?.code === "LIBFX_NATIVE_UNAVAILABLE" && error.message.includes(`Install ${nativePackage}`),
   );
   await assert.rejects(
     createFxTerminal({ backend: "native" }),
@@ -148,7 +152,7 @@ try {
         available: false,
         reason: {
           code: "LIBFX_JSPI_UNAVAILABLE",
-          message: "WebAssembly backend requires JavaScript Promise Integration (JSPI)",
+          message: "WebAssembly backend requires JavaScript Promise Integration (JSPI); run Node with --experimental-wasm-jspi",
         },
       }],
     });

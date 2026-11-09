@@ -142,7 +142,7 @@ fn persistInterruptedTurnWithPresentation(
     defer types.freeExecutionMemory(std.heap.c_allocator, full_execution);
     var projection_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer projection_arena.deinit();
-    const execution = try finalization.compacted_execution.project(projection_arena.allocator(), full_execution);
+    const execution = try finalization.persistedExecution(projection_arena.allocator(), full_execution);
     terminal_materializing.* = true;
 
     if (retained_candidate) |candidate| {
@@ -153,7 +153,7 @@ fn persistInterruptedTurnWithPresentation(
         );
         defer if (assistant.presentation) |text| std.heap.c_allocator.free(text);
         const turn: HistoryTurn = .{ .interrupted = .{
-            .user = .{ .text = job.prompt, .images = job.images },
+            .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
             .assistant = @constCast(assistant.history),
             .tool_call = durable_active_tool_call,
             .completed_tool_names = completed_tool_names,
@@ -196,7 +196,7 @@ fn persistInterruptedTurnWithPresentation(
 
     persisted.* = true;
     const turn: HistoryTurn = .{ .interrupted = .{
-        .user = .{ .text = job.prompt, .images = job.images },
+        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
         .assistant = if (partial_assistant) |text| if (text.len > 0) @constCast(text) else null else null,
         .tool_call = durable_active_tool_call,
         .completed_tool_names = completed_tool_names,
@@ -242,14 +242,37 @@ pub fn persistFailedPartialTurnOnce(
         null,
     );
     defer types.freeExecutionMemory(std.heap.c_allocator, full_execution);
+    try persistFailedTurn(
+        hooks,
+        finalization,
+        job,
+        partial_assistant,
+        persisted,
+        trace_ctx,
+        full_execution,
+        terminal_materializing,
+    );
+}
+
+/// Borrows `full_execution`; the caller keeps ownership.
+fn persistFailedTurn(
+    hooks: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    partial_assistant: []const u8,
+    persisted: *bool,
+    trace_ctx: TraceContext,
+    full_execution: types.ExecutionMemory,
+    terminal_materializing: *bool,
+) !void {
     var projection_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer projection_arena.deinit();
-    const execution = try finalization.compacted_execution.project(projection_arena.allocator(), full_execution);
+    const execution = try finalization.persistedExecution(projection_arena.allocator(), full_execution);
     terminal_materializing.* = true;
 
     const turn: HistoryTurn = .{ .interrupted = .{
-        .user = .{ .text = job.prompt, .images = job.images },
-        .assistant = @constCast(partial_assistant),
+        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
+        .assistant = if (std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0) @constCast(partial_assistant) else null,
         .execution = execution,
         .terminal_reason = .failed,
     } };

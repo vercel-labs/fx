@@ -38,7 +38,7 @@ pub fn knownReversibleAutoCommand(
     var index: usize = 0;
     while (index <= argv.tokens.len) : (index += 1) {
         const at_end = index == argv.tokens.len;
-        if (!at_end and !std.mem.eql(u8, argv.tokens[index].value, "&&")) {
+        if (!at_end and !isStageSeparator(argv.tokens[index])) {
             if (isUnsupportedAutoControlOperator(argv.tokens[index])) return false;
             continue;
         }
@@ -46,6 +46,13 @@ pub fn knownReversibleAutoCommand(
         stage_start = index + 1;
     }
     return true;
+}
+
+/// The `&&` between two stages. Only a bare `&&` separates commands: the
+/// shell passes a quoted or escaped one, such as `'&&'` or `\&\&`, to the
+/// command as an argument, so it is one here too.
+fn isStageSeparator(token: command_lex.ArgvToken) bool {
+    return std.mem.eql(u8, token.raw, "&&");
 }
 
 fn isUnsupportedAutoOperator(token: command_lex.ArgvToken) bool {
@@ -66,21 +73,34 @@ fn isUnsupportedAutoControlOperator(token: command_lex.ArgvToken) bool {
         std.mem.eql(u8, token.value, "}");
 }
 
-fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
-    var tokens = raw_tokens;
-    if (tokens.len >= 3 and
-        !tokens[tokens.len - 3].quoted and
-        !tokens[tokens.len - 2].quoted and
-        !tokens[tokens.len - 1].quoted and
-        std.mem.eql(u8, tokens[tokens.len - 3].value, "2") and
-        std.mem.eql(u8, tokens[tokens.len - 2].value, ">&") and
-        std.mem.eql(u8, tokens[tokens.len - 1].value, "1"))
+/// `tokens` without a trailing unquoted `2>&1`, the one redirection a
+/// review-free stage may end with. The shell reads `2` as a file descriptor
+/// only when it is written bare and touches `>&`: `\2>&1` and `2 >&1` pass
+/// `2` to the command and redirect standard output instead.
+fn withoutStderrToStdout(tokens: []const command_lex.ArgvToken) []const command_lex.ArgvToken {
+    if (tokens.len < 3) return tokens;
+    const descriptor = tokens[tokens.len - 3];
+    const operator = tokens[tokens.len - 2];
+    const target = tokens[tokens.len - 1];
+    if (std.mem.eql(u8, descriptor.raw, "2") and
+        descriptor.end == operator.start and
+        !operator.quoted and
+        !target.quoted and
+        std.mem.eql(u8, operator.value, ">&") and
+        std.mem.eql(u8, target.value, "1"))
     {
-        tokens = tokens[0 .. tokens.len - 3];
+        return tokens[0 .. tokens.len - 3];
     }
+    return tokens;
+}
+
+fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
+    const tokens = withoutStderrToStdout(raw_tokens);
     if (tokens.len == 0) return false;
     for (tokens) |token| {
-        if (isUnsupportedAutoOperator(token) or tokenHasDynamicShellSyntax(token.raw)) {
+        if (isUnsupportedAutoOperator(token) or
+            tokenHasDynamicShellSyntax(token.raw))
+        {
             return false;
         }
     }
@@ -104,9 +124,13 @@ fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
     return false;
 }
 
+// `^` and `#` are globs in zsh with `extendedglob`, which fx replays from the
+// user's startup files: `^x` matches every file not named `x`, and `x#`
+// matches any run of `x`, so a workspace file could supply the word. A word
+// that starts with an unquoted `#` also starts a comment in every shell.
 fn tokenHasDynamicShellSyntax(raw: []const u8) bool {
     for (raw) |byte| switch (byte) {
-        '$', '`', '*', '?', '[', '~', '\n', '\r', ';', '(', ')', '{', '}' => return true,
+        '$', '`', '*', '?', '[', '~', '^', '#', '\n', '\r', ';', '(', ')', '{', '}' => return true,
         else => {},
     };
     return false;
@@ -134,13 +158,84 @@ fn reversibleGit(words: []const command_lex.ArgvToken) bool {
     if (std.mem.eql(u8, subcommand, "worktree")) {
         return words.len >= 2 and std.mem.eql(u8, words[1].value, "list");
     }
-    if (std.mem.eql(u8, subcommand, "fetch")) {
-        for (words[1..]) |word| {
-            if (std.mem.eql(u8, word.value, "--prune") or
-                std.mem.eql(u8, word.value, "-p") or
-                std.mem.eql(u8, word.value, "--prune-tags")) return false;
+    if (std.mem.eql(u8, subcommand, "fetch")) return reversibleGitFetch(words[1..]);
+    return false;
+}
+
+/// Options `git fetch` may use without review. git accepts any unambiguous
+/// prefix of a long option, so an option spelled any other way goes to
+/// review. That keeps out `--upload-pack`, which names a command for git to
+/// run, and the prune options, which delete remote-tracking branches.
+const reversible_git_fetch_flags = [_][]const u8{
+    "--all",                    "--tags",               "-t",
+    "--no-tags",                "-n",                   "--quiet",
+    "-q",                       "--verbose",            "-v",
+    "--dry-run",                "--force",              "-f",
+    "--unshallow",              "--update-shallow",     "--progress",
+    "--multiple",               "--atomic",             "--append",
+    "-a",                       "--porcelain",          "--show-forced-updates",
+    "--no-show-forced-updates", "--write-fetch-head",   "--no-write-fetch-head",
+    "--set-upstream",           "--refetch",            "--prefetch",
+    "--ipv4",                   "-4",                   "--ipv6",
+    "-6",                       "--recurse-submodules", "--no-recurse-submodules",
+};
+
+/// Options that take a value, accepted only as `--name=value`. `--filter`
+/// is left out: it turns a full clone into a partial clone for good.
+const reversible_git_fetch_value_options = [_][]const u8{
+    "--depth=", "--deepen=",             "--shallow-since=", "--shallow-exclude=",
+    "--jobs=",  "--recurse-submodules=",
+};
+
+fn reversibleGitFetch(words: []const command_lex.ArgvToken) bool {
+    var options_ended = false;
+    for (words) |word| {
+        const value = word.value;
+        if (!options_ended and std.mem.eql(u8, value, "--")) {
+            // Everything after `--` names a repository or a refspec.
+            options_ended = true;
+            continue;
         }
-        return true;
+        if (!options_ended and value.len > 0 and value[0] == '-') {
+            if (!isReversibleGitFetchOption(value)) return false;
+            continue;
+        }
+        if (namesGitRemoteHelper(value)) return false;
+    }
+    return true;
+}
+
+/// Transports git runs itself, case-insensitively. git sends any other
+/// `<scheme>://` URL to a `git-remote-<scheme>` program, and `http` and
+/// `https` to the ones in its own exec path, which it searches before `PATH`.
+const builtin_git_url_schemes = [_][]const u8{ "file", "git", "ssh", "git+ssh", "ssh+git", "http", "https" };
+
+/// Whether git hands this repository to a remote helper it may find on
+/// `PATH`: `<helper>::<address>`, or a URL whose scheme is not a built-in
+/// transport. git reads the helper's name the way `transport_get` does.
+fn namesGitRemoteHelper(value: []const u8) bool {
+    var end: usize = 0;
+    while (end < value.len) : (end += 1) {
+        const byte = value[end];
+        const special = byte == '+' or byte == '-' or byte == '.';
+        if (!std.ascii.isAlphanumeric(byte) and (end == 0 or !special)) break;
+    }
+    if (end == 0) return false;
+    const rest = value[end..];
+    if (std.mem.startsWith(u8, rest, "::")) return true;
+    if (!std.mem.startsWith(u8, rest, "://")) return false;
+    for (builtin_git_url_schemes) |scheme| {
+        if (std.ascii.eqlIgnoreCase(value[0..end], scheme)) return false;
+    }
+    return true;
+}
+
+fn isReversibleGitFetchOption(value: []const u8) bool {
+    for (reversible_git_fetch_flags) |flag| {
+        if (std.mem.eql(u8, value, flag)) return true;
+    }
+    for (reversible_git_fetch_value_options) |prefix| {
+        if (std.mem.startsWith(u8, value, prefix)) return true;
     }
     return false;
 }
@@ -201,6 +296,16 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "git remote -v",
         "git worktree list --porcelain",
         "git fetch origin main",
+        "git fetch --all --tags",
+        "git fetch --depth=1 origin main",
+        "git fetch --no-tags origin +main:main",
+        "git fetch origin -- --not-an-option",
+        "git fetch https://github.com/vercel-labs/fx main",
+        "git fetch HTTPS://github.com/vercel-labs/fx",
+        "git fetch ssh://git@github.com/vercel-labs/fx.git",
+        "git fetch git@github.com:vercel-labs/fx.git",
+        "git fetch file:///tmp/repository",
+        "git fetch ../other main",
         "npm install 2>&1",
         "npm run dev",
         "zig build test",
@@ -222,6 +327,47 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "npm install --prefix=/tmp/global",
         "npm install --location global",
         "git fetch --prune origin",
+        // A quoted or escaped `&&` is an argument, so `--prune` here reaches
+        // `git fetch`.
+        "git fetch '&&' git status --prune",
+        "git fetch \\&\\& git status --prune",
+        // Every shell drops `#note` as a comment.
+        "git status #note",
+        "git fetch -p",
+        // `--upload-pack` names a command for git to run, and git accepts
+        // any unambiguous prefix of it.
+        "git fetch --upload-pack=x .",
+        "git fetch --upload-pack x origin",
+        "git fetch --upl=x .",
+        "git fetch origin --upload-pack=x",
+        "git fetch '--upload-pack=x' .",
+        // A filter turns a full clone into a partial clone.
+        "git fetch --filter=blob:none origin",
+        // git runs a `git-remote-<helper>` program, which it may find on
+        // `PATH`, for these repositories, also after `--`.
+        "git fetch probe::x",
+        "git fetch ext::sh",
+        "git fetch 'probe.v2+x::y' main",
+        "git fetch -- probe::x",
+        "git fetch origin -- probe::x",
+        "git fetch --multiple origin probe::x",
+        "git fetch probe://host/repository",
+        "git fetch PROBE://host/repository",
+        "git fetch ftp://host/repository",
+        // zsh's `extendedglob` expands these to workspace file names.
+        "git fetch ^nomatch .",
+        "git fetch --prun#e",
+        "npm install react@^18",
+        // Quoting does not help: the check reads the word as written.
+        "npm install 'react@^18'",
+        "npm test x##",
+        // The shell reads `2` as a file descriptor only when it is bare and
+        // touches `>&`. Each of these passes `2` to git as an argument and
+        // redirects standard output.
+        "git status \\2>&1",
+        "git status\t\\2>&1",
+        "git status 2 >&1",
+        "git status '2'>&1",
     }) |command| {
         try std.testing.expect(!try knownReversibleAutoCommand(
             std.testing.allocator,
@@ -1832,4 +1978,553 @@ test "planner bounds ls operands at sixty four" {
 
     try accepted.appendSlice(std.testing.allocator, " overflow");
     try expectApproval(accepted.items, false, .linux, .unsupported_argument);
+}
+
+const parity_programs = [_][]const u8{
+    "printf", "pwd",  "ls",    "wc",  "cat", "head", "tail", "grep",
+    "git",    "node", "which", "npm", "bun", "pnpm", "yarn", "zig",
+};
+
+/// Builtins that a function can replace in every shell here, including bash
+/// in POSIX mode, which is `/bin/sh` on macOS.
+const parity_guarded_builtins = [_][]const u8{
+    "kill",    "ulimit", "umask", "cd", "command", "builtin", "hash", "alias",
+    "unalias", "wait",   "fg",    "bg", "jobs",    "fc",      "read",
+};
+
+/// Special builtins that bash and zsh, outside POSIX mode, also let a
+/// function replace.
+const parity_guarded_special_builtins = [_][]const u8{
+    "enable", "disable", "disown", "suspend", "history", "logout",
+    "pushd",  "popd",    "source", "exec",    "eval",    "trap",
+};
+
+const ParityShell = struct {
+    name: []const u8,
+    paths: []const []const u8,
+    flags: []const []const u8,
+    guards_special_builtins: bool,
+    /// Runs before anything else in the script. fx turns off zsh's `equals`
+    /// option before every command (`zsh_command_prelude` in
+    /// `src/core/terminal/shell_resolver.zig`), so zsh here does too.
+    prelude: []const u8 = "",
+    /// Whether this shell stands in for options a user's startup files can
+    /// turn on. fx runs direct read-only commands without a shell, so only
+    /// the commands it hands to a shell are compared with this one.
+    user_options: bool = false,
+};
+
+/// `/bin/sh` is dash on Debian and Ubuntu and bash in POSIX mode on macOS,
+/// so dash is listed on its own as well. fx replays a user's zsh glob
+/// options, and `extendedglob` makes `^` and `#` glob operators, so zsh also
+/// runs with it on.
+const parity_shells = [_]ParityShell{
+    .{ .name = "sh", .paths = &.{"/bin/sh"}, .flags = &.{"-c"}, .guards_special_builtins = false },
+    .{ .name = "dash", .paths = &.{ "/bin/dash", "/usr/bin/dash" }, .flags = &.{"-c"}, .guards_special_builtins = false },
+    .{
+        .name = "bash",
+        .paths = &.{ "/bin/bash", "/usr/bin/bash" },
+        .flags = &.{ "--norc", "--noprofile", "-c" },
+        .guards_special_builtins = true,
+    },
+    .{
+        .name = "zsh",
+        .paths = &.{ "/bin/zsh", "/usr/bin/zsh" },
+        .flags = &.{ "-f", "-c" },
+        .guards_special_builtins = true,
+        .prelude = "\\builtin unsetopt equals\n",
+    },
+    .{
+        .name = "zsh with extendedglob",
+        .paths = &.{ "/bin/zsh", "/usr/bin/zsh" },
+        .flags = &.{ "-f", "-c" },
+        .guards_special_builtins = true,
+        .prelude = "\\builtin unsetopt equals\n\\builtin setopt extendedglob\n",
+        .user_options = true,
+    },
+};
+
+const parity_recorder = "#!/bin/sh\nprintf '%s\\0' \"$#\" \"$@\" >> \"$FX_PARITY_LOG\"\n";
+
+const ParityOrder = enum {
+    /// `&&` stages run one after another.
+    sequence,
+    /// Pipeline stages run at the same time, so their records can interleave.
+    any_order,
+};
+
+const ParityExpectation = struct {
+    /// Each stage's words, program first.
+    stages: []const []const []const u8,
+    order: ParityOrder,
+    /// Whether fx hands the command to a shell, rather than running it
+    /// itself.
+    runs_in_shell: bool,
+};
+
+const ParityRun = struct {
+    term: std.process.Child.Term,
+    /// One record per program call: its name, then its arguments.
+    records: []const []const []const u8,
+    stderr: []const u8,
+    /// Files the command left in its empty working directory.
+    created: []const []const u8,
+};
+
+const ParityMode = enum { must_run_without_review, if_run_without_review };
+
+/// What fx parsed for each review-free path that accepts `command`. Empty
+/// when both send it to review. Allocates from `arena`.
+fn parityExpectations(arena: std.mem.Allocator, command: []const u8) ![]const ParityExpectation {
+    var expectations: std.ArrayList(ParityExpectation) = .empty;
+    if (try knownReversibleAutoCommand(arena, command, false)) {
+        // Splits the way `knownReversibleAutoCommand` does.
+        const argv = try command_lex.tokenize_argv(arena, std.mem.trim(u8, command, " \t"));
+        var stages: std.ArrayList([]const []const u8) = .empty;
+        var start: usize = 0;
+        for (0..argv.tokens.len + 1) |index| {
+            if (index < argv.tokens.len and !isStageSeparator(argv.tokens[index])) continue;
+            try stages.append(arena, try parityWords(arena, withoutStderrToStdout(argv.tokens[start..index])));
+            start = index + 1;
+        }
+        try expectations.append(arena, .{ .stages = stages.items, .order = .sequence, .runs_in_shell = true });
+    }
+    const admission = try planWithGit(arena, command, "/workspace", false, @import("builtin").target.os.tag, test_git);
+    if (admission == .direct_read_only) {
+        // Splits the way `planWithGit` does: one stage per pipeline segment.
+        const segments = try command_lex.pipe_segments(arena, std.mem.trim(u8, command, " \t\n"));
+        var stages: std.ArrayList([]const []const u8) = .empty;
+        for (segments) |segment| {
+            const argv = try command_lex.tokenize_argv(arena, segment.text);
+            try stages.append(arena, try parityWords(arena, argv.tokens));
+        }
+        try expectations.append(arena, .{ .stages = stages.items, .order = .any_order, .runs_in_shell = false });
+    }
+    return expectations.items;
+}
+
+fn parityWords(arena: std.mem.Allocator, tokens: []const command_lex.ArgvToken) ![]const []const u8 {
+    const words = try arena.alloc([]const u8, tokens.len);
+    for (tokens, words) |token, *word| word.* = token.value;
+    return words;
+}
+
+fn checkShellParity(command: []const u8, mode: ParityMode) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const expectations = try parityExpectations(arena, command);
+    if (expectations.len == 0) {
+        if (mode == .if_run_without_review) return;
+        // The failure output names the command fx reviews.
+        std.testing.expectEqualStrings(
+            try arena.print("fx runs without review: {s}", .{command}),
+            try arena.print("fx reviews: {s}", .{command}),
+        ) catch {};
+        return error.TestExpectedReviewFreeCommand;
+    }
+    for (parity_shells) |shell| {
+        const path = try parityShellPath(shell) orelse continue;
+        const run = try runParityShell(arena, path, shell, command);
+        for (expectations) |expectation| {
+            if (shell.user_options and !expectation.runs_in_shell) continue;
+            try expectParity(arena, expectation, run, shell.name, command);
+        }
+    }
+}
+
+/// Finds the shell, or returns null to skip it. The Linux unit test job and
+/// the nightly Fuzz workflow install every shell and set
+/// `FX_TEST_SHELL_PARITY_ALL_SHELLS`, so a missing shell there fails instead of
+/// quietly narrowing the check. Tests read the process environment from
+/// `std.testing.environ`, since fx's own environment is never set up in them.
+fn parityShellPath(shell: ParityShell) !?[]const u8 {
+    for (shell.paths) |path| {
+        std.Io.Dir.accessAbsolute(std.testing.io, path, .{}) catch continue;
+        return path;
+    }
+    if (try std.testing.environ.contains(std.testing.allocator, "FX_TEST_SHELL_PARITY_ALL_SHELLS")) {
+        // The failure output names the path where the shell was expected.
+        std.testing.expectEqualStrings(shell.paths[0], "") catch {};
+        return error.TestShellParityShellMissing;
+    }
+    return null;
+}
+
+fn runParityShell(
+    arena: std.mem.Allocator,
+    shell_path: []const u8,
+    shell: ParityShell,
+    command: []const u8,
+) !ParityRun {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "cwd", "empty", "home" }) |name| try tmp.dir.createDirPath(io, name);
+    const root = try @import("../shared/io.zig").dirRealpathAlloc(arena, tmp.dir, ".");
+    const recorder = try std.Io.Dir.path.join(arena, &.{ root, "record" });
+    {
+        var file = try tmp.dir.createFile(io, "record", .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, parity_recorder);
+        try file.setPermissions(io, std.Io.File.Permissions.fromMode(0o700));
+    }
+
+    var script: std.ArrayList(u8) = .empty;
+    // Before the functions, since one of them replaces `builtin`.
+    try script.appendSlice(arena, shell.prelude);
+    try appendParityFunctions(&script, arena, recorder, &parity_programs);
+    try appendParityFunctions(&script, arena, recorder, &parity_guarded_builtins);
+    if (shell.guards_special_builtins) {
+        try appendParityFunctions(&script, arena, recorder, &parity_guarded_special_builtins);
+    }
+    try script.appendSlice(arena, command);
+    try script.append(arena, '\n');
+
+    var environ: std.process.Environ.Map = .init(arena);
+    try environ.put("PATH", try std.Io.Dir.path.join(arena, &.{ root, "empty" }));
+    try environ.put("HOME", try std.Io.Dir.path.join(arena, &.{ root, "home" }));
+    try environ.put("FX_PARITY_LOG", try std.Io.Dir.path.join(arena, &.{ root, "log" }));
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(arena, shell_path);
+    try argv.appendSlice(arena, shell.flags);
+    try argv.append(arena, script.items);
+    const result = try std.process.run(arena, io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = try std.Io.Dir.path.join(arena, &.{ root, "cwd" }) },
+        .environ_map = &environ,
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
+    });
+
+    const log = tmp.dir.readFileAlloc(io, "log", arena, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => "",
+        else => return err,
+    };
+    var created: std.ArrayList([]const u8) = .empty;
+    var cwd = try tmp.dir.openDir(io, "cwd", .{ .iterate = true });
+    defer cwd.close(io);
+    var entries = cwd.iterate();
+    while (try entries.next(io)) |entry| try created.append(arena, try arena.dupe(u8, entry.name));
+
+    return .{
+        .term = result.term,
+        .records = try parseParityLog(arena, log),
+        .stderr = result.stderr,
+        .created = created.items,
+    };
+}
+
+fn appendParityFunctions(
+    script: *std.ArrayList(u8),
+    arena: std.mem.Allocator,
+    recorder: []const u8,
+    names: []const []const u8,
+) !void {
+    for (names) |name| {
+        try script.appendSlice(arena, name);
+        try script.appendSlice(arena, "() { ");
+        try appendShellSingleQuoted(script, arena, recorder);
+        try script.append(arena, ' ');
+        try script.appendSlice(arena, name);
+        try script.appendSlice(arena, " \"$@\"; }\n");
+    }
+}
+
+/// Each record is a count, then that many fields: the program's name and
+/// its arguments. Every field ends with a NUL.
+fn parseParityLog(arena: std.mem.Allocator, log: []const u8) ![]const []const []const u8 {
+    var records: std.ArrayList([]const []const u8) = .empty;
+    if (log.len == 0) return records.items;
+    if (log[log.len - 1] != 0) return error.TestTruncatedParityLog;
+    var fields = std.mem.splitScalar(u8, log[0 .. log.len - 1], 0);
+    while (fields.next()) |count_text| {
+        const record = try arena.alloc([]const u8, try std.fmt.parseInt(usize, count_text, 10));
+        for (record) |*field| field.* = fields.next() orelse return error.TestTruncatedParityLog;
+        try records.append(arena, record);
+    }
+    return records.items;
+}
+
+fn expectParity(
+    arena: std.mem.Allocator,
+    expectation: ParityExpectation,
+    run: ParityRun,
+    shell_name: []const u8,
+    command: []const u8,
+) !void {
+    var expected = expectation.stages;
+    var actual = run.records;
+    if (expectation.order == .any_order) {
+        expected = try sortedParityRecords(arena, expected);
+        actual = try sortedParityRecords(arena, actual);
+    }
+    const exited_cleanly = switch (run.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (exited_cleanly and run.created.len == 0 and sameParityRecords(expected, actual)) return;
+
+    // The failure output shows what fx parsed against what the shell ran.
+    const term = switch (run.term) {
+        .exited => |code| try arena.print("exited {d}", .{code}),
+        else => try arena.print("{any}", .{run.term}),
+    };
+    std.testing.expectEqualStrings(
+        try parityReport(arena, shell_name, command, expected, "exited 0", "", &.{}),
+        try parityReport(arena, shell_name, command, actual, term, run.stderr, run.created),
+    ) catch {};
+    return error.TestShellParityMismatch;
+}
+
+/// One parity run as text: each record on its own line, then how the shell
+/// ended and anything it created.
+fn parityReport(
+    arena: std.mem.Allocator,
+    shell_name: []const u8,
+    command: []const u8,
+    records: []const []const []const u8,
+    term: []const u8,
+    stderr: []const u8,
+    created: []const []const u8,
+) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const writer = &out.writer;
+    try writer.print("{s} for: {s}\n", .{ shell_name, command });
+    for (records) |record| {
+        try writer.writeByte('[');
+        for (record, 0..) |field, index| {
+            try writer.print("{s}\"{f}\"", .{ if (index == 0) "" else " ", std.zig.fmtString(field) });
+        }
+        try writer.writeAll("]\n");
+    }
+    try writer.print("term: {s}\nstderr: {s}\n", .{ term, stderr });
+    for (created) |name| try writer.print("created: {s}\n", .{name});
+    return out.written();
+}
+
+fn sortedParityRecords(
+    arena: std.mem.Allocator,
+    records: []const []const []const u8,
+) ![]const []const []const u8 {
+    const sorted = try arena.dupe([]const []const u8, records);
+    std.mem.sort([]const []const u8, sorted, {}, parityRecordLessThan);
+    return sorted;
+}
+
+fn parityRecordLessThan(_: void, lhs: []const []const u8, rhs: []const []const u8) bool {
+    for (lhs[0..@min(lhs.len, rhs.len)], rhs[0..@min(lhs.len, rhs.len)]) |left, right| {
+        switch (std.mem.order(u8, left, right)) {
+            .lt => return true,
+            .gt => return false,
+            .eq => {},
+        }
+    }
+    return lhs.len < rhs.len;
+}
+
+fn sameParityRecords(expected: []const []const []const u8, actual: []const []const []const u8) bool {
+    if (expected.len != actual.len) return false;
+    for (expected, actual) |expected_record, actual_record| {
+        if (expected_record.len != actual_record.len) return false;
+        for (expected_record, actual_record) |expected_field, actual_field| {
+            if (!std.mem.eql(u8, expected_field, actual_field)) return false;
+        }
+    }
+    return true;
+}
+
+/// Every form of command that fx runs without review. Each must still be
+/// review-free and must run in every shell exactly as fx parsed it.
+const parity_review_free_commands = [_][]const u8{
+    "node -v",
+    "node --version",
+    "npm -v",
+    "which node",
+    "which node npm bun",
+    "git status",
+    "git status --short --branch",
+    "git remote -v",
+    "git worktree list",
+    "git worktree list --porcelain",
+    "git fetch",
+    "git fetch origin main",
+    "git fetch --all --tags",
+    "git fetch --depth=1 origin main",
+    "git fetch -q origin -- main",
+    "git fetch https://example.com/repository main",
+    "npm install",
+    "npm i",
+    "npm ci",
+    "npm test",
+    "npm install --save-dev typescript",
+    "npm run build",
+    "npm run lint -- --fix",
+    "bun -v",
+    "bun install",
+    "bun test",
+    "bun run dev",
+    "pnpm install",
+    "pnpm test",
+    "pnpm run build",
+    "yarn install",
+    "yarn test",
+    "yarn run lint",
+    "zig build",
+    "zig build test",
+    "zig build -Doptimize=ReleaseSafe",
+    "node -v && npm -v",
+    "git status && npm test",
+    "npm test 2>&1",
+    "git fetch 2>&1 && git status",
+    "npm run 'build:prod'",
+    "npm run \"build:prod\"",
+    "npm run 'with space'",
+    "git   status",
+    "npm\ttest",
+    "pwd",
+    "pwd -P",
+    "ls",
+    "ls -la",
+    "ls -1 src",
+    "ls -- -dashed",
+    "ls 'with space'",
+    "wc -l",
+    "cat",
+    "head",
+    "head -n 5",
+    "tail -n 20",
+    "git diff",
+    "git log -n 5",
+    "printf 'hello\\n'",
+    "ls | wc -l",
+    "printf x | cat",
+    "git log -n 5 | head -n 3",
+};
+
+/// Near misses that fx may or may not run without review. When it does,
+/// they must still run as fx parsed them.
+const parity_probe_commands = [_][]const u8{
+    "git fetch '&&' git status",
+    "git fetch \\&\\& git status --prune",
+    "npm test \\&\\& npm run build",
+    "npm test &\\&",
+    "npm test \\&&",
+    "npm run =ls",
+    "which =node",
+    "git status #note",
+    "npm run a#b",
+    "git fetch ^x .",
+    "git fetch --prun#e",
+    "npm install react@^18",
+    "npm test x##",
+    "ls ^x",
+    "git status&&npm test",
+    "npm run build 2> &1",
+    "npm run x\\ y",
+    "npm run \"a\\\"b\"",
+    "zig build -Dname=value",
+    "npm run !x",
+    "git fetch origin +main:main",
+    "npm run x,y",
+    "npm run %x",
+    "npm run ^x",
+    "ls =x",
+    "ls '#x'",
+    "printf '%s' '&&'",
+    "npm run 'a''b'",
+    "npm run \"\"",
+    "npm run ''",
+    "git status ''",
+    "npm run é",
+    "grep -n needle file.txt",
+    "grep 'two words' file.txt",
+    "git diff --stat",
+    "printf '%s\\n' a b",
+};
+
+test "shell parity: fx runs every review-free command form as sh, dash, bash, and zsh parse it" {
+    const os = @import("builtin").target.os.tag;
+    if (os != .macos and os != .linux) return error.SkipZigTest;
+    var failures: usize = 0;
+    for (parity_review_free_commands) |command| {
+        checkShellParity(command, .must_run_without_review) catch |err| switch (err) {
+            error.TestExpectedReviewFreeCommand, error.TestShellParityMismatch => failures += 1,
+            else => return err,
+        };
+    }
+    for (parity_probe_commands) |command| {
+        checkShellParity(command, .if_run_without_review) catch |err| switch (err) {
+            error.TestShellParityMismatch => failures += 1,
+            else => return err,
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 0), failures);
+}
+
+/// Program words that start a generated stage, weighted toward commands fx
+/// runs without review.
+const parity_stage_starts = [_][]const u8{
+    "node -v",  "which",   "git status",   "git remote -v", "git worktree list", "git fetch",
+    "git diff", "git log", "npm install",  "npm test",      "npm run",           "npm ci",
+    "bun test", "bun run", "pnpm install", "pnpm run",      "yarn run",          "zig build",
+    "pwd",      "ls",      "wc -l",        "cat",           "head -n 3",         "tail",
+    "grep",     "printf",
+};
+
+/// Pieces of generated words. None contains `/` or a builtin's name, so a
+/// stage the shell reads differently cannot reach a real program.
+const parity_fragments = [_][]const u8{
+    "a",       "build", "src",    "x.txt", "-n",    "-l",   "--",   "--flag",
+    "--o=v",   "-Dx=1", "=x",     "x=",    "#",     "#x",   "a#b",  "'q s'",
+    "\"d q\"", "''",    "\"\"",   "'",     "\"",    "\\",   "\\ ",  "\\#",
+    "&&",      "'&&'",  "\"&&\"", "&",     "|",     "||",   "2>&1", ">",
+    "<",       ">>",    "2>",     ";",     "$x",    "${x}", "`x`",  "$(x)",
+    "*",       "?",     "[a]",    "~",     "{a,b}", "(x)",  "!",    "!x",
+    "%",       "^",     ",",      ":",     "@",     "+",    "\t",   "\u{e9}",
+    "\u{a0}",  "\x1b",  "\\&\\&", "\\&",   "^x",    "x#",   "x##",
+};
+
+fn writeParityCommand(smith: *std.testing.Smith, out: *std.Io.Writer) std.Io.Writer.Error!void {
+    const joiner: []const u8 = if (smith.boolWeighted(1, 1)) " && " else " | ";
+    const stage_count = smith.valueRangeAtMost(u8, 1, 4);
+    for (0..stage_count) |stage| {
+        if (stage > 0) try out.writeAll(joiner);
+        try out.writeAll(parity_stage_starts[smith.index(parity_stage_starts.len)]);
+        for (0..smith.valueRangeAtMost(u8, 0, 4)) |_| {
+            try out.writeByte(if (smith.boolWeighted(7, 1)) ' ' else '\t');
+            for (0..smith.valueRangeAtMost(u8, 1, 3)) |_| {
+                if (smith.boolWeighted(1, 7)) {
+                    try out.writeAll(parity_fragments[smith.index(parity_fragments.len)]);
+                    continue;
+                }
+                var raw: [8]u8 = undefined;
+                for (raw[0..smith.slice(&raw)]) |byte| {
+                    // No letters, so raw bytes cannot spell a program or
+                    // builtin; no `/`, so they cannot name a path to one.
+                    const safe = !std.ascii.isAlphabetic(byte) and byte != '/' and byte != 0;
+                    try out.writeByte(if (safe) byte else '_');
+                }
+            }
+        }
+    }
+}
+
+fn fuzzShellParity(_: void, smith: *std.testing.Smith) !void {
+    const os = @import("builtin").target.os.tag;
+    if (os != .macos and os != .linux) return error.SkipZigTest;
+    var buffer: [512]u8 = undefined;
+    var command: std.Io.Writer = .fixed(&buffer);
+    writeParityCommand(smith, &command) catch |err| switch (err) {
+        // A full buffer ends the command early, which is still a command.
+        error.WriteFailed => {},
+    };
+    try checkShellParity(command.buffered(), .if_run_without_review);
+}
+
+test "shell parity holds for generated commands" {
+    try std.testing.fuzz({}, fuzzShellParity, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").shell_parity.*),
+    });
 }

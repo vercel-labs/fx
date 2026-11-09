@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
+const profile_paths = @import("profile_paths.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
 
@@ -27,8 +28,15 @@ fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
     return if (os_tag == .macos) darwin_process_spawn.wrap(zio) else zio;
 }
 
-pub fn getIo() std.Io {
+// Thousands of call sites reach `getIo`, so it stays out of line: an inlined
+// copy at each one costs more code than the call. The fallback is reached only
+// before main installs the process Io and in tests.
+pub noinline fn getIo() std.Io {
     if (real_io) |zio| return zio;
+    return fallbackIo();
+}
+
+noinline fn fallbackIo() std.Io {
     if (comptime builtin.is_test) return process_io_for(builtin.target.os.tag, std.testing.io);
     return process_io_for(builtin.target.os.tag, fallback_threaded.io());
 }
@@ -465,18 +473,24 @@ fn liveLibcEnviron() ?RawEnviron {
     return @ptrCast(std.c.environ);
 }
 
+/// What fx tells the user when `homeDir` returns null, after a prefix such as
+/// `fx mcp: `.
+pub const no_home_dir_reason = "HOME is not set to an absolute path";
+
 /// The home directory fx keeps its own files under: `HOME` when it is an
-/// absolute path, otherwise null. An empty or relative `HOME` counts as
-/// unset, so fx never builds profile paths relative to the current folder.
-/// Child processes still inherit `HOME` unchanged.
+/// absolute path, otherwise `FX_HOME`'s parent, or null when `FX_HOME` is
+/// unset too. An empty or relative `HOME` counts as unset, so fx never builds
+/// profile paths relative to the current folder. Child processes still
+/// inherit `HOME` unchanged.
 pub fn homeDir() ?[]const u8 {
-    const home = getenv("HOME") orelse return null;
-    if (!std.Io.Dir.path.isAbsolute(home)) return null;
+    // With HOME unset, FX_HOME alone names fx's files, so its parent serves.
+    const home = getenv("HOME") orelse return profile_paths.fxHomeParent();
+    if (!std.Io.Dir.path.isAbsolute(home)) return profile_paths.fxHomeParent();
     return home;
 }
 
 pub fn e2eFailIfDurableMutationAttempted() void {
-    const enabled = getenv("FX_E2E_FAIL_ON_DURABLE_MUTATION") orelse return;
+    const enabled = getenv("FX_TEST_FAIL_ON_DURABLE_MUTATION") orelse return;
     if (!std.mem.eql(u8, enabled, "1")) return;
     std.process.exit(86);
 }
@@ -572,14 +586,23 @@ pub fn readFileToEndZ(alloc: std.mem.Allocator, file: *std.Io.File, max_bytes: u
     return result[0..data.len :0];
 }
 
-pub fn milliTimestamp() i64 {
+// Called from hundreds of sites; one out-of-line copy keeps each call small.
+pub noinline fn milliTimestamp() i64 {
     const ts = std.Io.Timestamp.now(getIo(), .real);
     return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
 }
 
-pub fn nanoTimestamp() i128 {
+pub noinline fn nanoTimestamp() i128 {
     const ts = std.Io.Timestamp.now(getIo(), .real);
     return @intCast(ts.nanoseconds);
+}
+
+/// Milliseconds on the awake clock, which every process on the machine shares
+/// and which stops while the machine sleeps (mach uptime on macOS). For
+/// timeouts one process sets and another reads.
+pub fn awakeMilliTimestamp() i64 {
+    const ts = std.Io.Timestamp.now(getIo(), .awake);
+    return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
 }
 
 pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const u8) !void {
@@ -1867,4 +1890,24 @@ test "timed advisory lock reports unsupported without unlocked fallback" {
         error.LockUnsupported,
         acquireTimedAdvisoryLockWithOps(&dir, "settings.lock", 25, ops),
     );
+}
+
+/// Holds each standard stream the parent left closed open on /dev/null,
+/// read-only, so no file fx opens later takes its number. A write meant for a
+/// closed stdout then fails, instead of landing in that file, such as the
+/// session store's lock, and a read of a closed stdin ends at once. Call it
+/// before fx opens anything.
+pub fn reserveClosedStandardStreams() void {
+    if (comptime !builtin.link_libc or builtin.target.os.tag == .windows) return;
+    for ([_]std.c.fd_t{ 0, 1, 2 }) |fd| {
+        if (std.c.fcntl(fd, std.c.F.GETFD) != -1) continue;
+        // `open` returns the lowest free number, which is `fd` once the
+        // closed streams below it are held.
+        const held = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY });
+        if (held < 0) return;
+        if (held != fd) {
+            _ = std.c.dup2(held, fd);
+            _ = std.c.close(held);
+        }
+    }
 }

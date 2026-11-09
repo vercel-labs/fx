@@ -42,6 +42,8 @@ interface Line {
   final?: { ok: boolean; logged: { name: string; lines: number }[] };
 }
 type Log = { dir: string; line: string }[];
+/** One line of the trace every machine writes. */
+type Step = { machine: string; inst: string; event: string; from: string; to: string; data?: { id?: number; progress?: number; outcome?: string } };
 type Machine = "engine" | "stdio" | "request" | "era" | "catalog" | "subscription" | "elicitation" | { mrtr: string };
 
 interface EngineCase {
@@ -61,16 +63,19 @@ interface EngineCase {
   machines: { [name: string]: Machine[] };
   /** A planted control: the attempts the engine trace's model is given, and the verdict expected. */
   control?: { server: string; maxAttempts: number };
-  check?: (lines: Line[], logs: { [name: string]: Log }) => string | null;
+  check?: (lines: Line[], logs: { [name: string]: Log }, trace: Step[]) => string | null;
   timeoutMs?: number;
 }
 
 const BASE: Machine[] = ["engine", "stdio", "request", "era"];
+/** One 64 KiB notification line, for `yes` to repeat (u12-flood). */
+const FLOOD_LINE = JSON.stringify({ jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "x".repeat(65536) } });
 /** server/discover's answer for a stdio server written in shell. */
 const STUCK_DISCOVER = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } });
 
 function engineScenario(c: EngineCase): Scenario {
   let caseDir = "";
+  let tracePath = "";
   const attempts = c.maxAttempts ?? 8;
   const traces: TraceExpectation[] = [];
   for (const [server, machines] of Object.entries(c.machines)) {
@@ -95,6 +100,7 @@ function engineScenario(c: EngineCase): Scenario {
     needs: ["engine_lab"],
     setup: (ctx: ScenarioContext) => {
       caseDir = ctx.caseDir;
+      tracePath = ctx.tracePath;
       const declared = Object.entries(c.servers).map(([name, s]) => {
         const rules = join(ctx.caseDir, `${name}.rules.json`);
         writeFileSync(rules, JSON.stringify(s.rules));
@@ -130,7 +136,9 @@ function engineScenario(c: EngineCase): Scenario {
           const path = join(caseDir, `${name}.jsonl`);
           logs[name] = existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
         }
-        return c.check ? c.check(lines, logs) : null;
+        if (!c.check) return null;
+        const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Step) : [];
+        return c.check(lines, logs, trace);
       },
     },
     timeoutMs: c.timeoutMs ?? 60_000,
@@ -173,6 +181,29 @@ export const scenarios: Scenario[] = [
     },
   }),
   engineScenario({
+    name: "u12-tools-stale",
+    description: "The host hears when a server's tools may have changed, so it can list them again before its next call: once for a 2025 list_changed, once when a fresh list's TTL runs out, again after a failed re-list hands over the last list, never for a list that was never fresh, and never before the first list (CAT-05)",
+    servers: {
+      b: { rules: [initialize, list25("add"), { ...ok25("fine"), before: [{ jsonrpc: "2.0", method: "notifications/tools/list_changed" }] }] },
+      t: { rules: [discover, listen, { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")], ttlMs: 300 } }, ok("fine")] },
+      z: { rules: modern() },
+      f: { rules: [initialize, { ...list25("add"), times: 1 }, { ...ok25("fine"), before: [{ jsonrpc: "2.0", method: "notifications/tools/list_changed" }] }, { method: "tools/list", error: { code: -32603, message: "Internal error" } }] },
+    },
+    script: ["tools b", "tools t", "tools z", "tools f", "expect b.tools.ok", "expect t.tools.ok", "expect z.tools.ok", "expect f.tools.ok", "call b add", "expect b.called.1.result", "expect b.tools_stale", "call f add", "expect f.called.2.result", "expect f.tools_stale", "tools f", "expect f.tools.ok", "expect f.tools_stale", "expect t.tools_stale 3000", "drain 500"],
+    machines: { b: [...BASE, "catalog"], t: [...BASE, "catalog", "subscription"], z: [...BASE, "catalog", "subscription"], f: [...BASE, "catalog"] },
+    check(lines) {
+      const all = tags(lines);
+      const stale = (s: string) => all.filter((t) => t === `${s}.tools_stale`).length;
+      const before = (s: string) => all.indexOf(`${s}.tools_stale`) >= 0 && all.indexOf(`${s}.tools_stale`) < all.indexOf(`${s}.tools.ok`);
+      return first(
+        // f: its list_changed, then the failed re-list that hands over the
+        // last list, still stale.
+        same([stale("b"), stale("t"), stale("z"), stale("f")], [1, 1, 0, 2], "tools_stale events for b, t, z, f"),
+        expectThat(!before("b") && !before("t"), "a tools_stale came before the first list"),
+      );
+    },
+  }),
+  engineScenario({
     name: "u12-lazy",
     description: "A server nothing needs never starts: listing one server's tools leaves the other idle, with no process (LazyConnect)",
     servers: { a: { rules: modern() }, b: { rules: modern() } },
@@ -182,7 +213,7 @@ export const scenarios: Scenario[] = [
   }),
   engineScenario({
     name: "u12-denied",
-    description: "A call the host refuses ends denied at once, and its server never starts for it (SEC-01)",
+    description: "A call the host refuses ends denied at once, and its server never starts for it",
     servers: { a: { rules: modern() } },
     labFlags: ["--deny", "rm"],
     script: ['call a rm {"path":"/"}', "expect a.called.1.denied 2000", "drain 300"],
@@ -196,10 +227,10 @@ export const scenarios: Scenario[] = [
   }),
   engineScenario({
     name: "u12-one-failing",
-    description: "A server whose process dies at every start gives up after its tries in a row and ends what waits transport_failed, and a later call at once; another server is untouched",
+    description: "A server whose process dies at every start: the waiting call fails transport_failed with the first failed start, the server tries again by itself and gives up after its tries in a row, and a later call fails too; another server is untouched",
     servers: { a: { rules: modern(), flags: ["--exit-at-start", "1"] }, b: { rules: modern() } },
     maxAttempts: 2,
-    script: ["call a echo", "call b echo", "expect b.called.2.result", "expect a.called.1.transport_failed 15000", "call a echo", "expect a.called.3.transport_failed 2000"],
+    script: ["call a echo", "call b echo", "expect b.called.2.result", "expect a.called.1.transport_failed 15000", "expect a.phase.failed 5000", "call a echo", "expect a.called.3.transport_failed 2000"],
     machines: { a: ["engine", "stdio"], b: [...BASE, "subscription"] },
     check: (lines) =>
       first(
@@ -239,12 +270,64 @@ export const scenarios: Scenario[] = [
   }),
   engineScenario({
     name: "u12-spawn-fails",
-    description: "A command that can't be started fails within its tries instead of looking busy: each failed spawn is a down (found by mcpv2 list --connect), the waiting call ends transport_failed, and the status names the spawn error",
+    description: "A command that can't be started fails within its tries instead of looking busy: each failed spawn is a down (found by mcpv2 list --connect), the waiting call ends transport_failed with the first, the server gives up after its tries, and the status names the spawn error",
     servers: { a: { rules: [], argv: ["/nonexistent/mcp-server"] } },
     maxAttempts: 2,
-    script: ["call a echo", "expect a.called.1.transport_failed 10000", "expect a.phase.failed 1000", "status"],
+    script: ["call a echo", "expect a.called.1.transport_failed 10000", "expect a.phase.failed 5000", "status"],
     machines: { a: ["engine", "stdio"] },
     check: (lines) => same(lines.filter((l) => l.status).at(-1)?.status?.[0]?.last_error, "FileNotFound", "last errors"),
+  }),
+  engineScenario({
+    name: "u12-progress-note",
+    description: "A call's accepted progress reaches the host with its message, terminal-safe: a value that doesn't grow and another token's note never do",
+    servers: {
+      a: {
+        rules: modern({
+          method: "tools/call",
+          before: [
+            { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "$id", progress: 1, total: 4, message: "halfway\u0007 there" } },
+            { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "$id", progress: 1, message: "again" } },
+            { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "$id", progress: 2 } },
+            { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: 999, progress: 3, message: "not ours" } },
+          ],
+          result: { resultType: "complete", content: [{ type: "text", text: "done" }] },
+        }),
+      },
+    },
+    script: ["call a echo", "expect a.called.1.result 10000"],
+    machines: { a: [...BASE, "subscription"] },
+    check: (lines) => {
+      const notes = lines.filter((l) => l.event?.tag === "a.progress.1").map((l) => [l.event.progress, l.event.total, l.event.message]);
+      return same(notes, [[1, 4, "halfway? there"], [2, null, null]], "progress events");
+    },
+  }),
+  engineScenario({
+    name: "u12-start-failure-detail",
+    description: "A server that prints a banner instead of answering and exits: the status keeps its exit code and the banner, terminal-safe, until it starts again",
+    servers: { a: { rules: [{ method: "*", noReply: true }], flags: ["--banner", "Server started on stdio\u001b[31m", "--exit-after", "300"] } },
+    maxAttempts: 1,
+    script: ["call a echo", "expect a.called.1.transport_failed 10000", "expect a.phase.failed 5000", "status"],
+    machines: { a: ["engine", "stdio"] },
+    check: (lines) => {
+      const s = lines.filter((l) => l.status).at(-1)?.status?.[0];
+      return first(
+        same(s?.exit, { code: 1 }, "exit"),
+        same(s?.stray_line, "Server started on stdio?[31m", "stray line"),
+      );
+    },
+  }),
+  engineScenario({
+    name: "u12-start-failure-stderr",
+    description: "A server that writes errors to stderr and exits while starting: its last 3 stderr lines, terminal-safe and joined, are kept with its exit code, until it starts again",
+    servers: { a: { rules: [{ method: "*", noReply: true, stderr: ["first", "npm error code E401", "npm error Incorrect\u0007 or missing password.", "last  "] }], flags: ["--exit-after", "300"] } },
+    maxAttempts: 1,
+    script: ["call a echo", "expect a.called.1.transport_failed 10000", "expect a.phase.failed 5000", "status"],
+    machines: { a: ["engine", "stdio"] },
+    check: (lines) =>
+      first(
+        same(lines.filter((l) => l.status).at(-1)?.status?.[0]?.exit, { code: 1 }, "exit"),
+        same(lines.filter((l) => l.stderr_tails).at(-1)?.stderr_tails, ["npm error code E401 / npm error Incorrect? or missing password. / last"], "stderr tail"),
+      ),
   }),
   engineScenario({
     name: "u12-stderr-flood",
@@ -253,6 +336,16 @@ export const scenarios: Scenario[] = [
     script: ["call a echo", "expect a.called.1.result 20000", "drain 500"],
     machines: { a: [...BASE, "subscription"] },
     check: (lines) => same(lines.at(-1)!.final!.logged, [{ name: "a", lines: 5000 }], "stderr lines logged"),
+  }),
+  engineScenario({
+    name: "u12-flood",
+    description: "A server that floods 64 KiB notifications faster than they are read, and never answers, can't hold the engine: another server's call answers meanwhile, and the flooding server's probe and initialize still time out, so it fails. Its stdio trace, a step per line, is left unchecked",
+    servers: { a: { rules: [], argv: ["/usr/bin/yes", FLOOD_LINE] }, b: { rules: modern() } },
+    maxAttempts: 1,
+    labFlags: ["--timeout-ms", "1000"],
+    // Before the fix the engine read a's flood without end, so even drain hung.
+    script: ["call b echo", "expect b.called.1.result 10000", "tools a", "drain 500", "call b echo", "expect b.called.2.result 700", "expect a.phase.failed 15000"],
+    machines: { a: ["engine", "era"], b: [...BASE, "subscription"] },
   }),
   engineScenario({
     name: "u12-cancel-waiting",
@@ -285,7 +378,7 @@ export const scenarios: Scenario[] = [
   }),
   engineScenario({
     name: "u12-ping-during-initialize",
-    description: "A 2025 stdio server that pings before it answers initialize gets its pong: the connection takes a response before detection ends (STDIO-09, CORE-11)",
+    description: "A 2025 stdio server that pings before it answers initialize gets its pong: the connection takes a response before detection ends (STDIO-09)",
     servers: { b: { rules: [{ ...initialize, before: [{ jsonrpc: "2.0", id: "p1", method: "ping" }] }, list25("add"), ok25("fine")] } },
     script: ["tools b", "expect b.tools.ok", "drain 300"],
     machines: { b: BASE },
@@ -301,7 +394,7 @@ export const scenarios: Scenario[] = [
   }),
   engineScenario({
     name: "u12-elicit-withdrawn",
-    description: "A 2025 server withdraws its elicitation and asks another, which takes the same slot: the host's answer to the first is refused and reaches no one, and its answer to the second reaches the second",
+    description: "A 2025 server withdraws its elicitation and asks another, which takes the same slot: the host's answer to the first is refused and reaches no one, and its answer to the second reaches the second (fx P0 bug 8)",
     servers: {
       b: {
         rules: legacy({
@@ -358,7 +451,7 @@ export const scenarios: Scenario[] = [
   }),
   engineScenario({
     name: "u12-http-initialized-timeout",
-    description: "A 2025 HTTP server answers initialize but never answers notifications/initialized: after the request timeout the session fails with initialized_timed_out, and the server goes down instead of looking ready with no tools (CORE-6b)",
+    description: "A 2025 HTTP server answers initialize but never answers notifications/initialized: after the request timeout the session fails with initialized_timed_out, and the server goes down instead of looking ready with no tools",
     http: {
       name: "h",
       flags: ["--session", "--initialized-delay", "30000"],
@@ -413,6 +506,72 @@ export const scenarios: Scenario[] = [
     },
   }),
   engineScenario({
+    name: "u12-invalid-reply",
+    description: "A stdio reply with the call's id but no jsonrpc fails that call at once as -32600, not at its timeout; the server keeps running and answers the next call; a refused line naming no request stays ignored",
+    servers: {
+      b: {
+        rules: modern(
+          { method: "tools/call", raw: '{"id":{id},"result":{"content":[]}}', before: [{ jsonrpc: "1.0", id: 999, result: {} }], times: 1 },
+        ),
+      },
+    },
+    labFlags: ["--timeout-ms", "20000"],
+    script: ["call b echo", "expect b.called.1.failure 3000", "call b echo", "expect b.called.2.result 3000"],
+    machines: { b: [...BASE, "subscription"] },
+    check: (lines, logs) =>
+      first(
+        same(event(lines, "b.called.1")?.answer, 'error -32600 "invalid reply (its jsonrpc isn\'t \\"2.0\\"): {\\"id\\":3,\\"result\\":{\\"content\\":[]}}"', "the first call's answer"),
+        same(event(lines, "b.called.1")?.timed_out, false, "timed out"),
+        same(received(logs.b, "server/discover").length, 1, "processes"),
+      ),
+  }),
+  engineScenario({
+    name: "u12-start-deadline-legacy",
+    description: "A 2025 stdio server that never answers initialize fails its start when the start's time runs out, long before the request timeout, and goes down to retry",
+    servers: { b: { rules: [{ ...initialize, noReply: true }] } },
+    labFlags: ["--start-ms", "800"],
+    script: ["tools b", "expect b.phase.backoff 5000", "status"],
+    machines: { b: BASE },
+    check: (lines, logs) =>
+      first(
+        same(received(logs.b, "server/discover").length, 1, "discover requests"),
+        same(received(logs.b, "initialize").length, 1, "initialize requests"),
+        status(lines, "b")?.last_error ? null : "b has no last error",
+      ),
+  }),
+  engineScenario({
+    name: "u12-start-deadline-total",
+    description: "A stdio server that answers neither discover nor initialize: the probe falls back after its 1.5 s, and initialize gets only what is left of the 2 s start, so the start fails by 3 s instead of 3.5 s",
+    servers: { b: { rules: [{ method: "server/discover", noReply: true }, { ...initialize, noReply: true }] } },
+    labFlags: ["--probe-ms", "1500", "--start-ms", "2000"],
+    script: ["tools b", "expect b.phase.backoff 3000", "status"],
+    machines: { b: BASE },
+    check: (_lines, logs) => same(received(logs.b, "initialize").length, 1, "initialize requests"),
+  }),
+  engineScenario({
+    name: "u12-http-reinit-after-start",
+    description: "A 2025 HTTP session ends after a call, well after the start's time ran out: the initialize that renews it isn't a start, so it gets the request timeout and the next call answers",
+    http: {
+      name: "h",
+      flags: ["--session"],
+      rules: [
+        { method: "initialize", result: initialize.result },
+        { method: "tools/list", result: { tools: [tool("echo")] } },
+        { method: "tools/call", result: { content: [{ type: "text", text: "first" }] }, endSession: true, times: 1 },
+        { method: "tools/call", result: { content: [{ type: "text", text: "again" }] } },
+      ],
+    },
+    servers: {},
+    labFlags: ["--no-listen", "--start-ms", "300"],
+    script: ["call h echo", "expect h.called.1.result 5000", "drain 600", "call h echo", "expect h.called.2.result 5000", "status"],
+    machines: { h: ["engine", "request", "era", "catalog"] },
+    check: (lines, logs) => {
+      const raw = logs.h as unknown as { dir: string; body?: string }[];
+      const inits = raw.filter((l) => l.dir === "in" && l.body && JSON.parse(l.body).method === "initialize");
+      return first(same(inits.length, 2, "initialize posts"), same(event(lines, "h.called.2")?.answer, '[{"type":"text","text":"again"}]', "the second call's answer"));
+    },
+  }),
+  engineScenario({
     name: "u12-stopped-reading",
     description: "A stdio server stops reading stdin and gets a call bigger than a pipe holds: only that server's stdin writer waits, so another server's call still answers and the stuck call times out",
     servers: {
@@ -429,6 +588,40 @@ export const scenarios: Scenario[] = [
         same(event(lines, "b.called.2")?.answer, '[{"type":"text","text":"fine"}]', "b's answer"),
         same(event(lines, "a.called.1")?.timed_out, true, "the stuck call timed out"),
       ),
+  }),
+  engineScenario({
+    name: "u12-progress-one-idle-timer",
+    description: "Progress re-arms a call's idle timer in place: no stale timer is left to fire, another call's idle timer is its own, and the hard limit still ends the call",
+    servers: {
+      a: {
+        rules: modern(
+          { method: "tools/call", tool: "hang", noReply: true },
+          {
+            method: "tools/call",
+            tool: "slow",
+            before: Array.from({ length: 30 }, (_, n) => ({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "$id", progress: n + 1 } })),
+            beforeEveryMs: 100,
+            result: { resultType: "complete", content: [{ type: "text", text: "late" }] },
+          },
+        ),
+      },
+    },
+    labFlags: ["--no-listen", "--timeout-ms", "300", "--hard-ms", "1500"],
+    script: ["call a hang", "call a slow", "expect a.called.1.cancelled 1000", "expect a.called.2.cancelled 4000"],
+    machines: { a: BASE },
+    check: (lines, _logs, trace) => {
+      const calls = trace.filter((t) => t.machine === "request" && t.inst === "a.remote");
+      const slow = calls.find((t) => t.event === "send" && t.to === "inflight" && calls.some((u) => u.event === "progress_received" && u.data?.id === t.data?.id))?.data?.id;
+      const ended = calls.find((t) => t.data?.id === slow && t.to === "done");
+      return first(
+        same(event(lines, "a.called.1")?.timed_out, true, "the silent call timed out"),
+        same(event(lines, "a.called.2")?.timed_out, true, "the call with progress timed out"),
+        expectThat(slow !== undefined, "no call got progress"),
+        same(ended?.event, "timer_fired", "what ended the call with progress"),
+        expectThat((ended?.data?.progress ?? 0) >= 10, `the call with progress ended after ${ended?.data?.progress} progress, before the hard limit`),
+        same(calls.filter((t) => t.data?.id === slow && t.event === "timer_fired" && t.to === "inflight").length, 0, "stale idle timers that fired"),
+      );
+    },
   }),
   engineScenario({
     name: "u12-retry-recovers",
@@ -500,7 +693,8 @@ export const scenarios: Scenario[] = [
     description: "Planted control: the engine trace of a server that gives up after 2 tries, checked against a model told 3, is rejected",
     servers: { a: { rules: modern(), flags: ["--exit-at-start", "1"] } },
     maxAttempts: 2,
-    script: ["call a echo", "expect a.called.1.transport_failed 15000"],
+    // The call fails with the first start; the give-up comes later.
+    script: ["call a echo", "expect a.called.1.transport_failed 15000", "expect a.phase.failed 5000"],
     machines: { a: ["engine"] },
     control: { server: "a", maxAttempts: 3 },
   }),

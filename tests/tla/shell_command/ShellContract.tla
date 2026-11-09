@@ -8,7 +8,7 @@
 (*     -> permission admission reads the arguments                         *)
 (*     -> shell decode accepts or rejects                                  *)
 (*     -> execute in a shell -> record the result                          *)
-(*     -> history projection for the next model request                    *)
+(*     -> history replay for the next model request                        *)
 (*     -> loop guard ends the turn on a repeated invalid call.             *)
 (*                                                                         *)
 (* Design = "current" models the shell tool as fx implements it;          *)
@@ -44,8 +44,8 @@ Intents == {"run", "run_eq", "run_bash", "run_bash_tty", "type", "observe", "sto
 
 (* How the arguments arrived (all seen in real sessions or the evals).       *)
 (*   flat_new        proposed flat form: command | session_id (+ input, stop)*)
-(*   flat_action     flat with an action field and today's names (accepted)  *)
-(*   wrapped         {"request": {...}}, today's advertised form             *)
+(*   flat_action     flat with an action field, today's advertised form      *)
+(*   wrapped         {"request": {...}}, the earlier advertised form         *)
 (*   wrapped_string  {"request": "<valid JSON>"}  (Qwen, Nemotron)           *)
 (*   wrapped_broken  {"request": "<invalid JSON>"} (GLM escaping)            *)
 (*   invalid_json    the whole argument text is not JSON (long heredocs)     *)
@@ -70,13 +70,26 @@ Ambiguous  == {"both_bare"}
 (* The intent can be read from the bytes exactly, without guessing.         *)
 ExactlyReadable(e) == e.shape \notin (Unreadable \cup Ambiguous)
 
+(* current: a call without action whose fields fit exactly one action gets *)
+(*   that action before it is stored or admitted                             *)
+(*   (normalize_terminal_request_tool_calls with shell's inferAction). Every *)
+(*   legacy_names call fits one; the proposed flat form fits one only for a  *)
+(*   plain command, whose field names are today's.                           *)
+Inferred(e) ==
+  /\ Design = "current"
+  /\ \/ e.shape = "legacy_names"
+     \/ e.shape = "flat_new" /\ e.intent \in {"run", "run_eq", "run_bash"}
+
+CurrentReadable(e) == e.shape \in {"flat_action", "wrapped"} \/ Inferred(e)
+
 (* Shell decode.                                                             *)
-(* current: fx accepts the exact wrapper and flat-with-action (checked       *)
-(*   against the fresh build), and rejects an explicit shell without tty.    *)
+(* current: fx accepts the exact wrapper, flat-with-action, and an inferred *)
+(*   call, and rejects an explicit shell without tty. Checked against the    *)
+(*   fresh build.                                                            *)
 (* proposed: forgiving decoder.                                             *)
 Accepted(e) ==
   IF Design = "current"
-  THEN e.shape \in {"flat_action", "wrapped"} /\ e.intent # "run_bash"
+  THEN CurrentReadable(e) /\ e.intent # "run_bash"
   ELSE \/ ExactlyReadable(e)
        \/ (GuessAmbiguous /\ e.shape \in Ambiguous)
 
@@ -84,23 +97,24 @@ Accepted(e) ==
 Decoded(e) == IF e.shape \in Ambiguous THEN "run" ELSE e.intent
 
 (* What permission admission sees. Today the orchestrator unwraps the exact  *)
-(* wrapper before admission, so admission and decode agree. The redesign    *)
-(* needs                                                                     *)
-(* one normalization step feeding both; AdmissionReads = "raw" models the     *)
-(* bug where admission parses the original bytes instead.                    *)
+(* wrapper and adds an inferred action before admission, so admission and   *)
+(* decode agree. The redesign needs one normalization step feeding both;    *)
+(* AdmissionReads = "raw" models the bug where admission parses the         *)
+(* original bytes instead.                                                   *)
 RawReadable(e) == e.shape \in {"flat_action", "flat_new", "with_irrelevant"}
 NormalizedView(e) ==
   IF Design = "current"
-  THEN IF e.shape \in {"flat_action", "wrapped"} THEN e.intent ELSE "unreadable"
+  THEN IF CurrentReadable(e) THEN e.intent ELSE "unreadable"
   ELSE IF Accepted(e) THEN Decoded(e) ELSE "unreadable"
 AdmissionView(e) ==
   IF AdmissionReads = "normalized" THEN NormalizedView(e)
   ELSE IF RawReadable(e) THEN e.intent ELSE "unreadable"
 
 (* How the call appears in the next request's history.                       *)
-(* current: accepted calls are stored flat and re-wrapped exactly; a          *)
-(*   rejected call is stored raw and wrapped again unless it was already the  *)
-(*   exact wrapper (orchestrator project_terminal_request_messages).          *)
+(* current: accepted calls are stored and replayed flat with their action; a  *)
+(*   rejected call is replayed as stored, which is as sent except that the    *)
+(*   orchestrator unwrapped an exact wrapper or added an inferred action      *)
+(*   before the call was stored (normalize_terminal_request_tool_calls).      *)
 (* proposed: accepted calls appear in canonical form; rejected calls appear   *)
 (*   exactly as sent.                                                         *)
 (* Argument text that is not JSON cannot be replayed: providers require JSON  *)
@@ -108,7 +122,8 @@ AdmissionView(e) ==
 HistoryEntry(e, acc) ==
   IF acc THEN "canonical"
   ELSE IF e.shape = "invalid_json" THEN "placeholder"
-  ELSE IF Design = "current" /\ e.shape # "wrapped" THEN "rewrapped:" \o e.shape
+  ELSE IF Design = "current" /\ e.shape = "wrapped" THEN "unwrapped:wrapped"
+  ELSE IF Inferred(e) THEN "inferred:" \o e.shape
   ELSE "as_sent:" \o e.shape
 
 (* Result of bash-style text in the default shell (zsh). The redesign sets  *)

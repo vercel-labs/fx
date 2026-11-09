@@ -58,5 +58,11 @@
     "old": "    /\\ closed' = TRUE    \\* nothing more comes for the answered attempt\n",
     "new": "    /\\ UNCHANGED closed\n",
     "invariant": "AnsweredStreamClosed"
+  },
+  {
+    "description": "A listing whose answer was over the message limit is re-issued like a broken stream",
+    "old": "    /\\ phase' = \"lost\"\n    /\\ maybeRan' = (kind = \"call\")\n    /\\ Deliver(\"lost\")\n    /\\ UNCHANGED <<kind, attempts, headerRetries, currentId, nextId, closed, usedIds, reused, cancelNote>>",
+    "new": "    /\\ IF kind = \"idempotent\" /\\ attempts < MaxAttempts\n          THEN /\\ attempts' = attempts + 1\n               /\\ Post\n               /\\ UNCHANGED <<outcome, maybeRan, delivered>>\n          ELSE /\\ phase' = \"lost\"\n               /\\ maybeRan' = (kind = \"call\")\n               /\\ Deliver(\"lost\")\n               /\\ UNCHANGED <<attempts, currentId, nextId, closed, usedIds, reused>>\n    /\\ UNCHANGED <<kind, headerRetries, cancelNote>>",
+    "property": "TooLargeEnds"
   }
 ]

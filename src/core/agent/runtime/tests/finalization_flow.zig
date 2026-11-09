@@ -6,6 +6,7 @@ const io_mod = @import("../../../shared/io.zig");
 const tool_result_errors = @import("../../../tooling/tool_result_errors.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const session_runtime = @import("../../../session/session.zig");
+const worker_runtime = @import("../../worker_runtime.zig");
 
 const test_support = @import("support.zig");
 const runtime_finalization = @import("../finalization.zig");
@@ -120,7 +121,7 @@ test "processQueuedPrompt propagates completed summary with durable history" {
     );
 }
 
-test "processQueuedPrompt pauses missing finish without synthesizing output" {
+test "processQueuedPrompt Esc after a missing finish ends the turn without synthesizing output" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .omit_finish = true }};
     var gateway = FakeGateway.init(alloc, &completions);
@@ -129,24 +130,21 @@ test "processQueuedPrompt pauses missing finish without synthesizing output" {
     defer hooks.deinit();
     var fixture = PromptFixture{};
 
-    var config = fixture.config();
-    config.max_provider_attempts = 1;
-    // Missing finish retries autonomously now; park the turn with a lifecycle
-    // pause (the user's try-later) raised when the retry is scheduled.
-    var pause_flag = std.atomic.Value(bool).init(false);
-    hooks.pause_on_auto_retry_status = true;
-    hooks.recovery_pause_flag = &pause_flag;
-    config.recovery_pause_flag = &pause_flag;
+    const config = fixture.config();
+    // Esc while the request waits to retry ends the turn.
+    hooks.cancel_on_auto_retry_status = config.cancel_flag;
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 0), hooks.finish_event_count);
-    try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
+    // Esc keeps the existing cancel branch: the turn is saved as interrupted.
+    try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
     try std.testing.expect(!textContains(&hooks, "Done."));
-    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
 
-test "processQueuedPrompt pauses partial text without finish proof" {
+test "processQueuedPrompt Esc after partial text without finish proof keeps it interrupted" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{"Partial answer"};
     const completions = [_]FakeCompletion{.{
@@ -159,25 +157,21 @@ test "processQueuedPrompt pauses partial text without finish proof" {
     defer hooks.deinit();
     var fixture = PromptFixture{};
 
-    var config = fixture.config();
-    config.max_provider_attempts = 1;
-    // Missing finish retries autonomously now; park the turn with a lifecycle
-    // pause (the user's try-later) raised when the retry is scheduled.
-    var pause_flag = std.atomic.Value(bool).init(false);
-    hooks.pause_on_auto_retry_status = true;
-    hooks.recovery_pause_flag = &pause_flag;
-    config.recovery_pause_flag = &pause_flag;
+    const config = fixture.config();
+    // Esc while the request waits to retry ends the turn.
+    hooks.cancel_on_auto_retry_status = config.cancel_flag;
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expect(textContains(&hooks, "Partial answer"));
     try std.testing.expect(!textContains(&hooks, "Done."));
-    try std.testing.expectEqual(@as(usize, 0), hooks.finish_event_count);
-    try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
     try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
 
-test "processQueuedPrompt pauses tool calls without finish proof" {
+test "processQueuedPrompt Esc after tool calls without finish proof runs none of them" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_write", "write_file", "{\"path\":\"a.txt\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{.{
@@ -191,21 +185,17 @@ test "processQueuedPrompt pauses tool calls without finish proof" {
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.agent_step_limit = 1;
-    config.max_provider_attempts = 1;
-    // Missing finish retries autonomously now; park the turn with a lifecycle
-    // pause (the user's try-later) raised when the retry is scheduled.
-    var pause_flag = std.atomic.Value(bool).init(false);
-    hooks.pause_on_auto_retry_status = true;
-    hooks.recovery_pause_flag = &pause_flag;
-    config.recovery_pause_flag = &pause_flag;
+    // Esc while the request waits to retry ends the turn.
+    hooks.cancel_on_auto_retry_status = config.cancel_flag;
 
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.finish_event_count);
-    try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
+    try std.testing.expectEqual(@as(usize, 1), hooks.finish_event_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items[0].interrupted.execution.tool_steps.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
 
 test "processQueuedPrompt preserves finish precedence over malformed argument recovery" {
@@ -217,7 +207,7 @@ test "processQueuedPrompt preserves finish precedence over malformed argument re
         .argument_integrity = .malformed_json,
     }};
     const Expected = enum {
-        paused,
+        interrupted,
         model_error,
         length_limited,
     };
@@ -226,36 +216,35 @@ test "processQueuedPrompt preserves finish precedence over malformed argument re
         omit_finish: bool = false,
         expected: Expected,
     };
+    // The retryable cases wait to resend; Esc during the wait ends the turn.
     const cases = [_]Case{
-        .{ .omit_finish = true, .expected = .paused },
-        .{ .finish_reason = .provider_error, .expected = .paused },
+        .{ .omit_finish = true, .expected = .interrupted },
+        .{ .finish_reason = .provider_error, .expected = .interrupted },
         .{ .finish_reason = .stop, .expected = .model_error },
         .{ .finish_reason = .length, .expected = .length_limited },
     };
 
     for (cases) |case| {
-        const completions = [_]FakeCompletion{.{
+        const reply: FakeCompletion = .{
             .tool_calls = &calls,
             .finish_reason = case.finish_reason,
             .omit_finish = case.omit_finish,
-        }};
-        var gateway = FakeGateway.init(alloc, &completions);
+        };
+        // A cut-off reply with nothing usable is resent once with fx's limit;
+        // the resend's own cut-off reply ends the turn.
+        const completions = [_]FakeCompletion{ reply, reply };
+        const requests: usize = if (case.expected == .length_limited) 2 else 1;
+        var gateway = FakeGateway.init(alloc, completions[0..requests]);
         defer gateway.deinit();
         var hooks = FakeAgentRuntimeDeps.init(alloc);
-        if (case.finish_reason == .provider_error) hooks.enable_route_recovery = false;
         defer hooks.deinit();
         var fixture = PromptFixture{};
 
-        var config = fixture.config();
-        config.max_provider_attempts = 1;
-        // Recoverable cases retry autonomously now; park the turn with a
-        // lifecycle pause (the user's try-later) when the retry is scheduled.
-        var pause_flag = std.atomic.Value(bool).init(false);
-        hooks.pause_on_auto_retry_status = true;
-        hooks.recovery_pause_flag = &pause_flag;
-        config.recovery_pause_flag = &pause_flag;
+        const config = fixture.config();
+        // Esc while the request waits to retry ends the turn.
+        hooks.cancel_on_auto_retry_status = config.cancel_flag;
         switch (case.expected) {
-            .paused => try runFakePrompt(&gateway, &hooks, config, fixture.job()),
+            .interrupted => try runFakePrompt(&gateway, &hooks, config, fixture.job()),
             .model_error => try std.testing.expectError(
                 error.ModelError,
                 runFakePrompt(&gateway, &hooks, config, fixture.job()),
@@ -268,7 +257,7 @@ test "processQueuedPrompt preserves finish precedence over malformed argument re
             ),
         }
 
-        try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+        try std.testing.expectEqual(requests, gateway.request_bodies.items.len);
         try std.testing.expectEqual(@as(usize, 0), hooks.validated_names.items.len);
         try std.testing.expectEqual(@as(usize, 0), hooks.availability_checked_names.items.len);
         try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
@@ -285,11 +274,12 @@ test "processQueuedPrompt preserves finish precedence over malformed argument re
                 hooks.history_turns.items[0],
             ) orelse return error.TestExpectedTurnSummary;
             try std.testing.expectEqual(hooks.finish_summary.?, propagated_summary);
+        } else if (case.expected == .interrupted) {
+            try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+            try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items[0].interrupted.execution.tool_steps.len);
+            try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
         } else {
             try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
-        }
-        if (case.expected == .paused) {
-            try std.testing.expectEqual(types.TurnPresentationOutcome.paused, hooks.finalized_outcome.?);
         }
     }
 }
@@ -627,7 +617,6 @@ test "partial stream failure persists failed terminal reason" {
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.gateway_retry_count = 0;
-    config.max_provider_attempts = 1;
 
     try std.testing.expectError(
         error.TestProviderFailure,
@@ -755,7 +744,6 @@ test "common Stop natural completion allows and preserves disposition" {
     });
     defer gateway.deinit();
     var deps = FakeAgentRuntimeDeps.init(alloc);
-    deps.enable_route_recovery = false;
     defer deps.deinit();
     var fixture = PromptFixture{};
     var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
@@ -806,7 +794,6 @@ test "common Stop cancellation and failure preserve original replay" {
         });
         defer gateway.deinit();
         var deps = FakeAgentRuntimeDeps.init(alloc);
-        deps.enable_route_recovery = false;
         defer deps.deinit();
         var fixture = PromptFixture{};
         var runtime = lifecycle_hooks.Runtime.init(alloc);
@@ -814,8 +801,7 @@ test "common Stop cancellation and failure preserve original replay" {
         var handler = StopTestHandler{ .alloc = alloc, .action = .{ .continue_once = "verify" } };
         defer handler.deinit();
         const view = try registerStopTestHandler(&runtime, &handler);
-        var config = fixture.config();
-        config.max_provider_attempts = 1;
+        const config = fixture.config();
         runFakePromptWithLifecycle(&gateway, &deps, config, fixture.job(), testLifecycleContext(view, alloc, fixture.workspace_root)) catch |err| {
             if (err != error.TestProviderFailure) return err;
         };
@@ -863,7 +849,6 @@ test "common Stop preserves both original replies with optional replay" {
         });
         defer gateway.deinit();
         var deps = FakeAgentRuntimeDeps.init(alloc);
-        deps.enable_route_recovery = false;
         defer deps.deinit();
         var fixture = PromptFixture{};
         var hooks_runtime = lifecycle_hooks.Runtime.init(alloc);
@@ -897,7 +882,6 @@ test "common Stop continues once with original history and joined presentation" 
     });
     defer gateway.deinit();
     var deps = FakeAgentRuntimeDeps.init(alloc);
-    deps.enable_route_recovery = false;
     defer deps.deinit();
     var fixture = PromptFixture{};
     var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
@@ -1087,7 +1071,7 @@ test "common Stop pre-dispatch cancellation retains candidate without calling ha
     );
 }
 
-test "common Stop later provider failure pauses with candidate still visible" {
+test "common Stop later provider failure ends on Esc with candidate still visible" {
     const alloc = std.testing.allocator;
     var gateway = FakeGateway.init(alloc, &.{
         .{ .chunks = &.{"candidate"}, .content = "candidate" },
@@ -1095,7 +1079,6 @@ test "common Stop later provider failure pauses with candidate still visible" {
     });
     defer gateway.deinit();
     var deps = FakeAgentRuntimeDeps.init(alloc);
-    deps.enable_route_recovery = false;
     deps.enable_recovery_checkpoint = true;
     defer deps.deinit();
     var fixture = PromptFixture{};
@@ -1108,14 +1091,9 @@ test "common Stop later provider failure pauses with candidate still visible" {
     defer handler.deinit();
     const view = try registerStopTestHandler(&lifecycle_runtime, &handler);
 
-    var config = fixture.config();
-    config.max_provider_attempts = 1;
-    // The provider failure retries autonomously now; park the turn with a
-    // lifecycle pause (the user's try-later) when the retry is scheduled.
-    var pause_flag = std.atomic.Value(bool).init(false);
-    deps.pause_on_auto_retry_status = true;
-    deps.recovery_pause_flag = &pause_flag;
-    config.recovery_pause_flag = &pause_flag;
+    const config = fixture.config();
+    // Esc while the request waits to retry ends the turn.
+    deps.cancel_on_auto_retry_status = config.cancel_flag;
     try runFakePromptWithLifecycle(
         &gateway,
         &deps,
@@ -1126,12 +1104,14 @@ test "common Stop later provider failure pauses with candidate still visible" {
 
     try std.testing.expectEqual(@as(usize, 1), handler.calls);
     try std.testing.expect(textContains(&deps, "candidate"));
-    try std.testing.expectEqual(@as(usize, 0), deps.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);
+    try std.testing.expect(deps.history_turns.items[0] == .interrupted);
     try std.testing.expectEqual(
-        types.TurnPresentationOutcome.paused,
+        types.TurnPresentationOutcome.interrupted,
         deps.finalized_outcome.?,
     );
-    try std.testing.expectEqual(@as(usize, 0), deps.finish_event_count);
+    try std.testing.expectEqual(@as(usize, 1), deps.finish_event_count);
+    // The last checkpoint written before Esc still carries the candidate.
     const checkpoint = deps.recovery_checkpoints.items[deps.recovery_checkpoints.items.len - 1];
     try std.testing.expectEqualStrings("", checkpoint.assistant_source);
     try std.testing.expectEqual(@as(usize, 1), checkpoint.execution.tool_steps.len);
@@ -1282,7 +1262,7 @@ test "common Stop length-limited tool failure retains candidate" {
 
     const assistant = deps.finish_presentation_text.?;
     try std.testing.expect(std.mem.startsWith(u8, assistant, "candidate\npartial"));
-    try std.testing.expect(std.mem.find(u8, assistant, "did not execute") != null);
+    try std.testing.expect(std.mem.find(u8, assistant, "did not run them") != null);
     try std.testing.expect(std.mem.startsWith(u8, deps.history_turns.items[0].assistant.assistant, "partial\n"));
     try std.testing.expectEqualStrings("candidate", deps.history_turns.items[0].assistant.execution.tool_steps[0].assistant.?);
     try std.testing.expectEqual(
@@ -1335,6 +1315,115 @@ test "common Stop handler errors fail open" {
     }
 }
 
+/// A prompt the worker owns, allocated the way its queue frees it.
+fn ownedWorkerPrompt(alloc: std.mem.Allocator, text: []const u8) !worker_runtime.QueuedPrompt {
+    return .{
+        .prompt = try alloc.dupe(u8, text),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "provider/model"),
+        .api_key = try alloc.dupe(u8, "key"),
+        .permission_mode = .auto,
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    };
+}
+
+/// A Stop hook during whose first run the user submits a steer, admitted the
+/// way the terminal admits a prompt typed while a turn runs.
+const SteerDuringStop = struct {
+    alloc: std.mem.Allocator,
+    worker: *worker_runtime.WorkerRuntime,
+    calls: usize = 0,
+
+    fn run(
+        raw: *anyopaque,
+        _: lifecycle_hooks.StopInput,
+    ) lifecycle_hooks.HandlerError!lifecycle_hooks.StopAction {
+        const self: *SteerDuringStop = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        if (self.calls == 1) {
+            const steer = ownedWorkerPrompt(self.alloc, "also check the docs") catch return error.Failed;
+            self.worker.admitInteractivePrompt(self.alloc, steer) catch {
+                worker_runtime.freeQueuedPrompt(self.alloc, steer);
+                return error.Failed;
+            };
+        }
+        return .allow;
+    }
+};
+
+test "common Stop steer submitted during the hook joins the turn for every final reply" {
+    const alloc = std.testing.allocator;
+    const provider_calls = [_]ToolCall{.{
+        .id = "call_search",
+        .name = "perplexity_search",
+        .arguments_json = "{}",
+        .provider_result = "search result",
+        .provenance = .provider_executed,
+    }};
+    const Case = struct { name: []const u8, first: FakeCompletion };
+    const cases = [_]Case{
+        .{ .name = "plain reply", .first = .{ .content = "First answer" } },
+        .{ .name = "provider tool reply", .first = .{
+            .content = "First answer",
+            .tool_calls = &provider_calls,
+            .finish_reason = .stop,
+        } },
+        .{ .name = "provider tool reply with a streamed start", .first = .{
+            .content = "First answer",
+            .tool_calls = &provider_calls,
+            .streamed_tool_starts = &provider_calls,
+            .finish_reason = .stop,
+        } },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        // The turn starts the way the worker loop starts one, and the agent
+        // takes its steering, cancel flag, and events from that worker.
+        var worker = worker_runtime.WorkerRuntime{};
+        defer worker.deinit(alloc);
+        try worker.admitInteractivePrompt(alloc, try ownedWorkerPrompt(alloc, "user prompt"));
+        const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedQueuedWork;
+        defer worker_runtime.freeWorkItem(alloc, work);
+
+        var gateway = FakeGateway.init(alloc, &.{ case.first, .{ .content = "Updated answer" } });
+        defer gateway.deinit();
+        var deps = FakeAgentRuntimeDeps.init(alloc);
+        defer deps.deinit();
+        deps.steering_worker = &worker;
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.cancel_flag = &worker.worker_cancel_requested;
+        var job = fixture.job();
+        job.turn_id = work.prompt.turn_id;
+        var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
+        defer lifecycle_runtime.deinit();
+        var handler = SteerDuringStop{ .alloc = alloc, .worker = &worker };
+        try lifecycle_runtime.registerStop(.{ .name = "steer-during-stop", .ctx = &handler, .run = SteerDuringStop.run });
+
+        try runFakePromptWithLifecycle(
+            &gateway,
+            &deps,
+            config,
+            job,
+            testLifecycleContext(lifecycle_runtime.freeze(), alloc, fixture.workspace_root),
+        );
+        worker.finishProcessing();
+
+        // The steer reaches the turn's next request, and the turn ends once,
+        // with the updated reply.
+        try std.testing.expectEqual(@as(usize, 2), handler.calls);
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+        try expectBodyContainsInOrder(&gateway, 1, &.{ "First answer", "user_steering", "also check the docs" });
+        try std.testing.expectEqual(@as(usize, 0), deps.interrupted_history_count);
+        try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);
+        try std.testing.expect(deps.history_turns.items[0] == .assistant);
+        try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items[0].assistant.execution.steering.len);
+        // Nothing is left over to run as a later turn.
+        try std.testing.expectEqual(@as(usize, 0), worker.queuedPromptCount());
+    }
+}
+
 test "common Stop does not run for silent-tool auto-continuation" {
     const alloc = std.testing.allocator;
     const first_calls = [_]ToolCall{
@@ -1376,7 +1465,7 @@ test "common Stop does not run for silent-tool auto-continuation" {
     try expectBodyContains(&gateway, 3, "Summarize what you just did.");
 }
 
-test "common Stop HTTP failure pauses with candidate and partial still visible" {
+test "common Stop HTTP failure ends on Esc with candidate still visible" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{"later partial"};
     var gateway = FakeGateway.init(alloc, &.{
@@ -1404,14 +1493,9 @@ test "common Stop HTTP failure pauses with candidate and partial still visible" 
     defer handler.deinit();
     const view = try registerStopTestHandler(&lifecycle_runtime, &handler);
 
-    var config = fixture.config();
-    config.max_provider_attempts = 2;
-    // HTTP status failures retry patiently forever now; park the turn with a
-    // lifecycle pause (the user's try-later) when the retry is scheduled.
-    var pause_flag = std.atomic.Value(bool).init(false);
-    deps.pause_on_auto_retry_status = true;
-    deps.recovery_pause_flag = &pause_flag;
-    config.recovery_pause_flag = &pause_flag;
+    const config = fixture.config();
+    // Esc while the request waits to retry ends the turn.
+    deps.cancel_on_auto_retry_status = config.cancel_flag;
     try runFakePromptWithLifecycle(
         &gateway,
         &deps,
@@ -1420,13 +1504,15 @@ test "common Stop HTTP failure pauses with candidate and partial still visible" 
         testLifecycleContext(view, alloc, fixture.workspace_root),
     );
 
+    // Esc during the HTTP wait takes the existing cancel branch, which saves
+    // the turn as interrupted without flushing the failed attempt's text.
     try std.testing.expectEqual(@as(usize, 1), handler.calls);
     try std.testing.expect(textContains(&deps, "candidate"));
-    try std.testing.expect(textContains(&deps, "later partial"));
-    try std.testing.expectEqual(@as(usize, 0), deps.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);
+    try std.testing.expect(deps.history_turns.items[0] == .interrupted);
     try std.testing.expectEqual(@as(?std.http.Status, null), deps.http_status);
     try std.testing.expectEqual(
-        types.TurnPresentationOutcome.paused,
+        types.TurnPresentationOutcome.interrupted,
         deps.finalized_outcome.?,
     );
 }

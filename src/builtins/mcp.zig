@@ -1,550 +1,31 @@
 const std = @import("std");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 
-const builtin_tools = @import("tools.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
-const command_provider_contract = @import("../core/mcp/command_provider.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
 const mcp_health = @import("../core/mcp/health.zig");
 const project_config = @import("../core/mcp/project_config.zig");
 const workspace_config = @import("../core/mcp/workspace_config.zig");
-const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mcp_host = @import("../core/mcp_host/host.zig");
 const config_file = @import("../core/mcp_host/config_file.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const build_options = @import("build_options");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
-const streamable_http = @import("../core/mcp/streamable_http.zig");
-const slack_preset = @import("../core/mcp/slack_preset.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
-const CommandRequest = command_provider_contract.Request;
-const CommandResult = command_provider_contract.Result;
 const McpServerConfig = mcp_contract.McpServerConfig;
 const McpTransport = mcp_contract.McpTransport;
-
-const add_usage = "usage: /" ++ @import("../core/slash_commands/command_specs.zig").mcp_add_usage;
-
-pub const command_provider = command_provider_contract.Provider{ .handle_fn = handleCommand };
-
-fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandRequest) !CommandResult {
-    const trimmed = std.mem.trim(u8, rest, " \t");
-    if (trimmed.len == 0) {
-        const summarize = command_request.summarize_servers orelse
-            command_request.list_servers_and_tools;
-        const summary = try summarize(command_request.list_ctx, alloc);
-        errdefer alloc.free(summary);
-        return .{
-            .display = .{
-                .block = try appendProfileWarning(
-                    alloc,
-                    command_request.home,
-                    summary,
-                ),
-            },
-        };
-    }
-    if (std.mem.eql(u8, trimmed, "list")) {
-        const listing = try command_request.list_servers_and_tools(
-            command_request.list_ctx,
-            alloc,
-        );
-        errdefer alloc.free(listing);
-        return .{
-            .display = .{
-                .block = try appendProfileWarning(
-                    alloc,
-                    command_request.home,
-                    listing,
-                ),
-            },
-        };
-    }
-
-    if (std.mem.startsWith(u8, trimmed, "resource ")) {
-        return handleResourceCommand(alloc, std.mem.trimStart(u8, trimmed[9..], " \t"), command_request);
-    }
-    if (std.mem.startsWith(u8, trimmed, "prompt ")) {
-        return handlePromptCommand(alloc, std.mem.trimStart(u8, trimmed[7..], " \t"), command_request);
-    }
-
-    const home = command_request.home orelse return lineLiteral(alloc, "HOME is not available.", false);
-    const config_path = try configPathFromHome(alloc, home);
-    defer alloc.free(config_path);
-
-    if (std.mem.eql(u8, trimmed, "path")) {
-        return lineParts(alloc, &.{config_path}, false);
-    }
-
-    if (std.mem.eql(u8, trimmed, "reload")) {
-        var maybe_document: ?project_config.ProfileParseResult =
-            loadProfileDocumentFromPath(alloc, config_path) catch null;
-        defer if (maybe_document) |*document| document.deinit(alloc);
-        if (maybe_document) |document| if (document.diagnostic) |warning| {
-            const warning_text = try renderProfileWarning(alloc, warning);
-            defer alloc.free(warning_text);
-            return .{
-                .display = .{ .line = try alloc.print(
-                    "{s}\nEvaluating trusted profile MCP configuration.",
-                    .{warning_text},
-                ) },
-                .reload = true,
-                .report_reload = true,
-            };
-        };
-        return .{
-            .display = .{
-                .line = try alloc.dupe(u8, "Evaluating trusted profile MCP configuration."),
-            },
-            .reload = true,
-            .report_reload = true,
-        };
-    }
-
-    if (std.mem.startsWith(u8, trimmed, "trust ")) {
-        var tokens = std.mem.tokenizeAny(u8, trimmed[6..], " \t");
-        const operation = tokens.next() orelse
-            return lineLiteral(alloc, "usage: /mcp trust approve|reject <server> | approve-all | reset", false);
-        if (std.mem.eql(u8, operation, "approve-all")) {
-            if (tokens.next() != null) return lineLiteral(alloc, "usage: /mcp trust approve-all", false);
-            return .{
-                .display = .{ .line = try alloc.dupe(u8, "Approving all project MCP servers for this workspace.") },
-                .project_action = .approve_all,
-            };
-        }
-        if (std.mem.eql(u8, operation, "reset")) {
-            if (tokens.next() != null) return lineLiteral(alloc, "usage: /mcp trust reset", false);
-            return .{
-                .display = .{ .line = try alloc.dupe(u8, "Resetting project MCP choices for this workspace.") },
-                .project_action = .reset,
-            };
-        }
-        const name = tokens.next() orelse
-            return lineLiteral(alloc, "usage: /mcp trust approve|reject <server>", false);
-        if (tokens.next() != null) return lineLiteral(alloc, "usage: /mcp trust approve|reject <server>", false);
-        if (std.mem.eql(u8, operation, "approve")) {
-            return .{
-                .display = .{ .line = try alloc.print("Approving project MCP server '{s}'.", .{name}) },
-                .project_action = .{ .approve = name },
-            };
-        }
-        if (std.mem.eql(u8, operation, "reject")) {
-            return .{
-                .display = .{ .line = try alloc.print("Rejecting project MCP server '{s}'.", .{name}) },
-                .project_action = .{ .reject = name },
-            };
-        }
-        return lineLiteral(alloc, "usage: /mcp trust approve|reject <server> | approve-all | reset", false);
-    }
-
-    if (std.mem.eql(u8, trimmed, "auth") or std.mem.startsWith(u8, trimmed, "auth ")) {
-        var tokens = std.mem.tokenizeAny(u8, trimmed[4..], " \t");
-        const name = tokens.next() orelse
-            return lineLiteral(alloc, "usage: /mcp auth <name> [--open]", false);
-        const confirmation = tokens.next();
-        if (tokens.next() != null or
-            (confirmation != null and !std.mem.eql(u8, confirmation.?, "--open")))
-        {
-            return lineLiteral(alloc, "usage: /mcp auth <name> [--open]", false);
-        }
-        const validate = command_request.validate_authentication_server orelse
-            return lineLiteral(
-                alloc,
-                "Interactive MCP authentication is unavailable here.",
-                false,
-            );
-        validate(command_request.auth_ctx orelse command_request.list_ctx, name) catch |err| {
-            return lineParts(
-                alloc,
-                &.{ "MCP authentication for '", name, "' failed: ", @errorName(err), "." },
-                false,
-            );
-        };
-        if (confirmation == null) {
-            return lineParts(
-                alloc,
-                &.{ "Run /mcp auth ", name, " --open to confirm opening your browser." },
-                false,
-            );
-        }
-        const authenticate = command_request.authenticate_server orelse
-            return lineLiteral(
-                alloc,
-                "Interactive MCP authentication is unavailable here.",
-                false,
-            );
-        const authentication = authenticate(
-            command_request.auth_ctx orelse command_request.list_ctx,
-            name,
-        ) catch |err| {
-            return lineParts(
-                alloc,
-                &.{ "MCP authentication for '", name, "' failed: ", @errorName(err), "." },
-                false,
-            );
-        };
-        return switch (authentication) {
-            .started => lineParts(
-                alloc,
-                &.{ "Waiting for MCP authentication for '", name, "'. You can continue using fx while the browser flow completes." },
-                false,
-            ),
-            .busy => lineParts(
-                alloc,
-                &.{ "MCP authentication for '", name, "' is already in progress or MCP configuration is reloading." },
-                false,
-            ),
-        };
-    }
-
-    if (std.mem.startsWith(u8, trimmed, "logout ")) {
-        const name = std.mem.trim(u8, trimmed[7..], " \t");
-        if (name.len == 0 or std.mem.findAny(u8, name, " \t") != null) {
-            return lineLiteral(alloc, "usage: /mcp logout <name>", false);
-        }
-        const logout = command_request.logout_server orelse
-            return lineLiteral(alloc, "MCP logout is unavailable here.", false);
-        const result = logout(
-            command_request.auth_ctx orelse command_request.list_ctx,
-            name,
-        ) catch |err| {
-            return lineParts(
-                alloc,
-                &.{ "MCP logout for '", name, "' failed: ", @errorName(err), "." },
-                false,
-            );
-        };
-        if (result.busy) {
-            return lineParts(
-                alloc,
-                &.{ "MCP authentication for '", name, "' is still in progress. Wait for it to finish before logging out." },
-                false,
-            );
-        }
-        if (!result.removed) {
-            return lineParts(
-                alloc,
-                &.{ "No stored MCP credentials found for '", name, "'." },
-                false,
-            );
-        }
-        if (result.repaired_entries > 0) {
-            const text = if (result.revocation_failed)
-                try alloc.print(
-                    "Logged out of MCP server '{s}' locally; remote revocation failed. Removed {d} unreadable MCP credential {s}.",
-                    .{
-                        name,
-                        result.repaired_entries,
-                        if (result.repaired_entries == 1) "entry" else "entries",
-                    },
-                )
-            else
-                try alloc.print(
-                    "Logged out of MCP server '{s}'. Removed {d} unreadable MCP credential {s}.",
-                    .{
-                        name,
-                        result.repaired_entries,
-                        if (result.repaired_entries == 1) "entry" else "entries",
-                    },
-                );
-            return .{
-                .display = .{ .line = text },
-                .reload = false,
-            };
-        }
-        if (result.revocation_failed) {
-            return lineParts(
-                alloc,
-                &.{ "Logged out of MCP server '", name, "' locally; remote revocation failed." },
-                false,
-            );
-        }
-        return lineParts(
-            alloc,
-            &.{ "Logged out of MCP server '", name, "'." },
-            false,
-        );
-    }
-
-    if (std.mem.startsWith(u8, trimmed, "remove ")) {
-        const name = std.mem.trim(u8, trimmed[7..], " \t");
-        if (name.len == 0) {
-            return lineLiteral(alloc, "usage: /mcp remove <name>", false);
-        }
-
-        const removed = removeServerFromPath(alloc, config_path, name) catch |err| {
-            return lineParts(
-                alloc,
-                &.{ "Failed to remove MCP server '", name, "': ", @errorName(err), "." },
-                false,
-            );
-        };
-        if (!removed) {
-            return lineParts(alloc, &.{ "MCP server '", name, "' not found." }, false);
-        }
-        return lineParts(alloc, &.{ "Removed MCP server '", name, "'." }, true);
-    }
-
-    if (std.mem.startsWith(u8, trimmed, "add ")) {
-        var tokens: std.ArrayList([]const u8) = .empty;
-        defer tokens.deinit(alloc);
-
-        var it = std.mem.tokenizeAny(u8, trimmed[4..], " \t");
-        while (it.next()) |token| try tokens.append(alloc, token);
-
-        const intent = command_provider_contract.parseAddIntent(tokens.items) catch |err| switch (err) {
-            error.McpAddUsage => return lineLiteral(alloc, add_usage, false),
-            else => return lineParts(
-                alloc,
-                &.{ "Failed to save MCP server config: ", @errorName(err), "." },
-                false,
-            ),
-        };
-        const warning = addProfileServerToPath(alloc, config_path, intent) catch |err| {
-            if (err == error.SlackConfigurationConflict) return lineLiteral(alloc, slack_preset.configuration_conflict, false);
-            return lineParts(
-                alloc,
-                &.{ "Failed to save MCP server config: ", @errorName(err), "." },
-                false,
-            );
-        };
-        const name = switch (intent) {
-            .slack => "slack",
-            .local => |local| local.name,
-            .http => |http| http.name,
-        };
-        if (intent == .slack) {
-            const message = "Connecting Slack. Keep fx running while you authorize in your browser.";
-            var result = if (warning) |value| result: {
-                const warning_text = try renderProfileWarning(alloc, value);
-                defer alloc.free(warning_text);
-                break :result try lineParts(alloc, &.{ warning_text, "\n", message }, true);
-            } else try lineLiteral(alloc, message, true);
-            result.connect_slack = true;
-            return result;
-        }
-        if (warning) |value| {
-            const warning_text = try renderProfileWarning(alloc, value);
-            defer alloc.free(warning_text);
-            return lineParts(
-                alloc,
-                &.{ warning_text, "\nSaved MCP server '", name, "'." },
-                true,
-            );
-        }
-        return lineParts(alloc, &.{ "Saved MCP server '", name, "'." }, true);
-    }
-
-    return lineLiteral(
-        alloc,
-        "usage: /mcp [list|resource|prompt|add|remove|path|reload|auth|logout|trust]",
-        false,
-    );
-}
-
-fn appendProfileWarning(
-    alloc: Allocator,
-    home: ?[]const u8,
-    owned_body: []u8,
-) ![]u8 {
-    const home_path = home orelse return owned_body;
-    const path = try configPathFromHome(alloc, home_path);
-    defer alloc.free(path);
-    var document = loadProfileDocumentFromPath(alloc, path) catch return owned_body;
-    defer document.deinit(alloc);
-    const warning = document.diagnostic orelse return owned_body;
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll(owned_body);
-    if (out.written().len > 0 and out.written()[out.written().len - 1] != '\n') {
-        try out.writer.writeByte('\n');
-    }
-    const warning_text = try renderProfileWarning(alloc, warning);
-    defer alloc.free(warning_text);
-    try out.writer.writeAll(warning_text);
-    try out.writer.writeByte('\n');
-    const rendered = try out.toOwnedSlice();
-    alloc.free(owned_body);
-    return rendered;
-}
-
-fn renderProfileWarning(
-    alloc: Allocator,
-    warning: project_config.ProfileDiagnostic,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.print("MCP config warning: {s}", .{@tagName(warning.cause)});
-    if (warning.key()) |key| {
-        const encoded = try text_utils.encodeTerminalSafe(alloc, key, 128);
-        defer alloc.free(encoded.bytes);
-        try out.writer.print(" key={s}", .{encoded.bytes});
-    }
-    try out.writer.print(
-        " additional_matches={d}",
-        .{warning.additional_matches},
-    );
-    return out.toOwnedSlice();
-}
-
-fn handleResourceCommand(alloc: Allocator, rest: []const u8, command_request: CommandRequest) !CommandResult {
-    var input = rest;
-    const action = takeToken(&input) orelse return lineLiteral(
-        alloc,
-        "usage: /mcp resource [list|templates|read|complete] ...",
-        false,
-    );
-    const context = command_request.feature_ctx orelse command_request.list_ctx;
-    if (std.mem.eql(u8, action, "list") or std.mem.eql(u8, action, "templates")) {
-        const server = takeToken(&input) orelse return lineLiteral(
-            alloc,
-            "usage: /mcp resource list <server> or /mcp resource templates <server>",
-            false,
-        );
-        if (takeToken(&input) != null) return lineLiteral(
-            alloc,
-            "usage: /mcp resource list <server> or /mcp resource templates <server>",
-            false,
-        );
-        const callback = command_request.list_resources orelse return lineLiteral(alloc, "MCP resources are unavailable here.", false);
-        const text = callback(context, alloc, server, std.mem.eql(u8, action, "templates")) catch |err| {
-            return lineParts(alloc, &.{ "MCP resource listing failed: ", @errorName(err), "." }, false);
-        };
-        return .{ .display = .{ .block = text } };
-    }
-    if (std.mem.eql(u8, action, "read")) {
-        const server = takeToken(&input) orelse return lineLiteral(alloc, "usage: /mcp resource read <server> <uri>", false);
-        const uri = std.mem.trim(u8, input, " \t");
-        if (uri.len == 0) return lineLiteral(alloc, "usage: /mcp resource read <server> <uri>", false);
-        const callback = command_request.read_resource orelse return lineLiteral(alloc, "MCP resource reads are unavailable here.", false);
-        const text = callback(context, alloc, server, uri) catch |err| {
-            return lineParts(alloc, &.{ "MCP resource read failed: ", @errorName(err), "." }, false);
-        };
-        return .{ .display = .{ .block = text } };
-    }
-    if (std.mem.eql(u8, action, "complete")) {
-        const server = takeToken(&input) orelse return resourceCompletionUsage(alloc);
-        const uri_template = takeToken(&input) orelse return resourceCompletionUsage(alloc);
-        const variable_name = takeToken(&input) orelse return resourceCompletionUsage(alloc);
-        const value = std.mem.trim(u8, input, " \t");
-        const callback = command_request.complete_resource orelse return lineLiteral(alloc, "MCP resource completion is unavailable here.", false);
-        const text = callback(context, alloc, server, uri_template, variable_name, value) catch |err| {
-            return lineParts(alloc, &.{ "MCP resource completion failed: ", @errorName(err), "." }, false);
-        };
-        return .{ .display = .{ .block = text } };
-    }
-    return lineLiteral(alloc, "usage: /mcp resource [list|templates|read|complete] ...", false);
-}
-
-fn handlePromptCommand(alloc: Allocator, rest: []const u8, command_request: CommandRequest) !CommandResult {
-    var input = rest;
-    const action = takeToken(&input) orelse return lineLiteral(
-        alloc,
-        "usage: /mcp prompt [list|get|complete] ...",
-        false,
-    );
-    const context = command_request.feature_ctx orelse command_request.list_ctx;
-    if (std.mem.eql(u8, action, "list")) {
-        const server = takeToken(&input) orelse return lineLiteral(alloc, "usage: /mcp prompt list <server>", false);
-        if (takeToken(&input) != null) return lineLiteral(alloc, "usage: /mcp prompt list <server>", false);
-        const callback = command_request.list_prompts orelse return lineLiteral(alloc, "MCP prompts are unavailable here.", false);
-        const text = callback(context, alloc, server) catch |err| {
-            return lineParts(alloc, &.{ "MCP prompt listing failed: ", @errorName(err), "." }, false);
-        };
-        return .{ .display = .{ .block = text } };
-    }
-    if (std.mem.eql(u8, action, "get")) {
-        const server = takeToken(&input) orelse return promptGetUsage(alloc);
-        const prompt_name = takeToken(&input) orelse return promptGetUsage(alloc);
-        const arguments_json = if (std.mem.trim(u8, input, " \t").len > 0)
-            std.mem.trim(u8, input, " \t")
-        else
-            "{}";
-        const callback = command_request.get_prompt orelse return lineLiteral(alloc, "MCP prompt invocation is unavailable here.", false);
-        const text = callback(context, alloc, server, prompt_name, arguments_json) catch |err| {
-            return lineParts(alloc, &.{ "MCP prompt invocation failed: ", @errorName(err), "." }, false);
-        };
-        return .{ .display = .{ .block = text } };
-    }
-    if (std.mem.eql(u8, action, "complete")) {
-        const server = takeToken(&input) orelse return promptCompletionUsage(alloc);
-        const prompt_name = takeToken(&input) orelse return promptCompletionUsage(alloc);
-        const argument_name = takeToken(&input) orelse return promptCompletionUsage(alloc);
-        const value = std.mem.trim(u8, input, " \t");
-        const callback = command_request.complete_prompt orelse return lineLiteral(alloc, "MCP prompt completion is unavailable here.", false);
-        const text = callback(context, alloc, server, prompt_name, argument_name, value) catch |err| {
-            return lineParts(alloc, &.{ "MCP prompt completion failed: ", @errorName(err), "." }, false);
-        };
-        return .{ .display = .{ .block = text } };
-    }
-    return lineLiteral(alloc, "usage: /mcp prompt [list|get|complete] ...", false);
-}
-
-fn takeToken(input: *[]const u8) ?[]const u8 {
-    input.* = std.mem.trimStart(u8, input.*, " \t");
-    if (input.*.len == 0) return null;
-    const end = std.mem.findAny(u8, input.*, " \t") orelse input.*.len;
-    const token = input.*[0..end];
-    input.* = input.*[end..];
-    return token;
-}
-
-fn resourceCompletionUsage(alloc: Allocator) !CommandResult {
-    return lineLiteral(alloc, "usage: /mcp resource complete <server> <uri-template> <variable> [value]", false);
-}
-
-fn promptGetUsage(alloc: Allocator) !CommandResult {
-    return lineLiteral(alloc, "usage: /mcp prompt get <server> <name> [arguments-json]", false);
-}
-
-fn promptCompletionUsage(alloc: Allocator) !CommandResult {
-    return lineLiteral(alloc, "usage: /mcp prompt complete <server> <name> <argument> [value]", false);
-}
-
-fn lineLiteral(alloc: Allocator, text: []const u8, reload: bool) !CommandResult {
-    return .{ .display = .{ .line = try alloc.dupe(u8, text) }, .reload = reload };
-}
 
 // Non-generic on purpose: a comptime-format sibling stamps out one
 // formatter instantiation per call shape; every message here is a plain
 // string splice.
-fn lineParts(alloc: Allocator, parts: []const []const u8, reload: bool) !CommandResult {
-    return .{ .display = .{ .line = try std.mem.concat(alloc, u8, parts) }, .reload = reload };
-}
 
 pub fn configPathFromHome(alloc: Allocator, home: []const u8) ![]u8 {
     return profile_paths.mcpConfigPath(alloc, home);
-}
-
-pub fn addProfileServer(
-    alloc: Allocator,
-    intent: command_provider_contract.AddIntent,
-) !command_provider_contract.ProfileAddResult {
-    const home = io_mod.homeDir() orelse return error.HomeNotSet;
-    const config_path = try configPathFromHome(alloc, home);
-    errdefer alloc.free(config_path);
-    const warning = try addProfileServerToPath(alloc, config_path, intent);
-    return .{ .profile_path = config_path, .warning = warning };
-}
-
-pub fn removeProfileServer(
-    alloc: Allocator,
-    name: []const u8,
-) !command_provider_contract.ProfileRemoveResult {
-    const home = io_mod.homeDir() orelse return error.HomeNotSet;
-    const config_path = try configPathFromHome(alloc, home);
-    errdefer alloc.free(config_path);
-    const result = try removeProfileServerFromPath(alloc, config_path, name);
-    return .{
-        .profile_path = config_path,
-        .removed = result.removed,
-        .warning = result.warning,
-    };
 }
 
 /// The servers fx runs in `workspace_root`: the profile's, then the project's
@@ -564,16 +45,22 @@ pub const NativeConfigs = struct {
 pub fn loadNativeConfigs(alloc: Allocator, workspace_root: []const u8) !NativeConfigs {
     var profile: std.ArrayList(McpServerConfig) = .empty;
     errdefer freeConfigs(alloc, &profile);
+    // A profile entry fx can't read is skipped with a note, ahead of the
+    // project's notes.
+    var loaded: NativeConfigs = .{};
+    errdefer loaded.deinit(alloc);
     if (io_mod.homeDir()) |home| {
         const config_path = try configPathFromHome(alloc, home);
         defer alloc.free(config_path);
-        profile = try loadConfigFromPath(alloc, config_path);
+        profile = try readProfile(alloc, config_path, &loaded.diagnostics);
     }
 
     var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("mcp", "workspace MCP choices unavailable err={s}", .{@errorName(err)});
-        return .{ .configs = profile };
+        loaded.configs = profile;
+        try project_config.noteIgnoredKeys(alloc, &loaded.diagnostics, loaded.configs.items);
+        return loaded;
     };
     defer choice_load.deinit(alloc);
     for (choice_load.diagnostics.items) |diagnostic| {
@@ -599,52 +86,44 @@ pub fn loadNativeConfigs(alloc: Allocator, workspace_root: []const u8) !NativeCo
     );
     defer workspace.deinit(alloc);
     traceWorkspaceDiagnostics(workspace.diagnostics.items);
+    // The workspace's notes move over, so `workspace.deinit` frees only its list.
+    try loaded.diagnostics.appendSlice(alloc, workspace.diagnostics.items);
+    workspace.diagnostics.clearRetainingCapacity();
 
-    var loaded: NativeConfigs = .{
-        .configs = try project_config.mergeNative(alloc, &profile, &workspace.configs),
-    };
+    loaded.configs = try project_config.mergeNative(alloc, &profile, &workspace.configs);
     profile.deinit(alloc);
-    loaded.diagnostics = workspace.diagnostics;
-    workspace.diagnostics = .empty;
+    try project_config.noteIgnoredKeys(alloc, &loaded.diagnostics, loaded.configs.items);
     return loaded;
 }
 
-pub fn loadRuntime(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    elicitation_capabilities: elicitation.Capabilities,
-) !?*mcp_runtime.McpRuntime {
-    // MCP-v2 runs the servers instead (`loadHost`).
-    if (mcp_host.selected()) return null;
-    var loaded = try loadNativeConfigs(alloc, workspace_root);
-    defer loaded.deinit(alloc);
-    var runtime = try runtimeFromConfigs(alloc, &loaded.configs, elicitation_capabilities);
-    if (runtime == null and loaded.diagnostics.items.len > 0) {
-        runtime = try alloc.create(mcp_runtime.McpRuntime);
-        runtime.?.* = mcp_runtime.McpRuntime.initWithElicitation(
-            alloc,
-            elicitation_capabilities,
-        );
+/// A server name a terminal can't show as is, such as one with an escape
+/// sequence in a repository's `.mcp.json`, never reaches a terminal or the
+/// model: the server is skipped with a note, which escapes the name.
+fn skipUnprintableNames(alloc: Allocator, loaded: *NativeConfigs) Allocator.Error!void {
+    var i: usize = 0;
+    while (i < loaded.configs.items.len) {
+        const c = &loaded.configs.items[i];
+        if (text_utils.isTerminalSafe(c.name)) {
+            i += 1;
+            continue;
+        }
+        try loaded.diagnostics.ensureUnusedCapacity(alloc, 1);
+        const name = try alloc.dupe(u8, c.name);
+        loaded.diagnostics.appendAssumeCapacity(.{ .profile = c.source != .workspace, .server_name = name, .cause = .invalid_entry, .problem = .name });
+        var removed = loaded.configs.orderedRemove(i);
+        removed.deinit(alloc);
     }
-    if (runtime) |value| {
-        value.takeWorkspaceDiagnostics(&loaded.diagnostics) catch |err| {
-            value.deinit();
-            alloc.destroy(value);
-            return err;
-        };
-    }
-    return runtime;
 }
 
-/// MCP-v2's host for the workspace when FX_MCP_ENGINE=v2 selects it,
-/// or null. Its servers start when the model first needs them.
+/// The MCP host for the workspace, or null when no server is configured and
+/// there is nothing to report. Its servers start when the model first needs
+/// them.
 pub fn loadHost(
     alloc: Allocator,
     workspace_root: []const u8,
     builtins: tool_dispatch.Registry,
     extras: mcp_host.Extras,
 ) !?*mcp_host.Host {
-    if (!mcp_host.selected()) return null;
     var loaded = try loadNativeConfigs(alloc, workspace_root);
     defer loaded.deinit(alloc);
     const home = io_mod.homeDir() orelse return null;
@@ -652,46 +131,46 @@ pub fn loadHost(
     var inherited = try io_mod.cloneEnvironMap(alloc);
     defer inherited.deinit();
     try project_config.expandProfileConfigs(alloc, &loaded.configs, &loaded.diagnostics, &inherited);
+    try skipUnprintableNames(alloc, &loaded);
     // A host with no servers still carries the notes saying why.
     if (loaded.configs.items.len == 0 and loaded.diagnostics.items.len == 0) return null;
-    const notes = try alloc.alloc([]const u8, loaded.diagnostics.items.len);
-    var rendered: usize = 0;
-    errdefer {
-        for (notes[0..rendered]) |note| alloc.free(note);
-        alloc.free(notes);
+    if (extras.reuse) |h| {
+        // Only the servers whose config changed restart. The host owns the
+        // notes either way.
+        if (h.reload(loaded.configs.items, &inherited, try renderNotes(alloc, loaded.diagnostics.items))) |_| return h else |err| {
+            debug_trace.logf("mcp", "MCP host not reloaded in place, starting a new one err={s}", .{@errorName(err)});
+        }
     }
-    for (loaded.diagnostics.items, notes) |diagnostic, *note| {
-        note.* = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic);
-        rendered += 1;
+    const notes = try renderNotes(alloc, loaded.diagnostics.items);
+    errdefer {
+        for (notes) |note| alloc.free(note);
+        alloc.free(notes);
     }
     const h = try mcp_host.Host.create(alloc, io_mod.getIo(), loaded.configs.items, &inherited, .{
         .client_version = build_options.app_version,
         .credentials = .{ .detect = home },
+        .workspace_root = workspace_root,
         .questions = extras.questions,
         .notify = extras.notify,
+        .slash_commands = extras.slash_commands,
     }, builtins);
     h.notes = notes;
     return h;
 }
 
-pub fn previewNativeWorkspaceAuthority(
-    alloc: Allocator,
-    workspace_root: []const u8,
-) ![][]u8 {
-    var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        debug_trace.logf("mcp", "workspace MCP authority unavailable err={s}", .{@errorName(err)});
-        return alloc.alloc([]u8, 0);
-    };
-    defer choice_load.deinit(alloc);
-    var workspace = try workspace_config.load(
-        alloc,
-        workspace_root,
-        .workspace,
-        choice_load.choices,
-    );
-    defer workspace.deinit(alloc);
-    return project_config.authorityNames(alloc, workspace.configs.items, .all);
+/// Each diagnostic in a sentence, owned by `alloc`.
+fn renderNotes(alloc: Allocator, diagnostics: []const project_config.WorkspaceDiagnostic) ![]const []const u8 {
+    const notes = try alloc.alloc([]const u8, diagnostics.len);
+    var rendered: usize = 0;
+    errdefer {
+        for (notes[0..rendered]) |note| alloc.free(note);
+        alloc.free(notes);
+    }
+    for (diagnostics, notes) |diagnostic, *note| {
+        note.* = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic);
+        rendered += 1;
+    }
+    return notes;
 }
 
 fn traceWorkspaceDiagnostics(diagnostics: []const project_config.WorkspaceDiagnostic) void {
@@ -861,178 +340,29 @@ fn localInspectionFromConfigs(
     };
 }
 
-fn runtimeFromConfigs(
-    alloc: Allocator,
-    configs: *std.ArrayList(McpServerConfig),
-    elicitation_capabilities: elicitation.Capabilities,
-) !?*mcp_runtime.McpRuntime {
-    if (configs.items.len == 0) return null;
-
-    const runtime = try alloc.create(mcp_runtime.McpRuntime);
-    errdefer alloc.destroy(runtime);
-    runtime.* = mcp_runtime.McpRuntime.initWithElicitation(alloc, elicitation_capabilities);
-    errdefer runtime.deinit();
-    while (configs.items.len > 0) {
-        var config = configs.orderedRemove(0);
-        runtime.addServer(config) catch |err| {
-            config.deinit(alloc);
-            return err;
-        };
-    }
-
-    return runtime;
+pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(McpServerConfig) {
+    return readProfile(alloc, path, null);
 }
 
-pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(McpServerConfig) {
-    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
-        if (err == error.FileNotFound) return .empty;
-        logConfigFailure("open", path, err);
-        return err;
-    };
-    defer file.close(io_mod.getIo());
-
-    const json_text = io_mod.readFileToEnd(alloc, &file, 1024 * 1024) catch |err| {
+/// With `skipped`, see `project_config.parseProfileServers`.
+fn readProfile(alloc: Allocator, path: []const u8, skipped: ?*std.ArrayList(project_config.WorkspaceDiagnostic)) !std.ArrayList(McpServerConfig) {
+    const json_text = (config_file.read(alloc, path) catch |err| {
         logConfigFailure("read", path, err);
-        return err;
-    };
+        // Named for this file, so a caller that has only the error, such as
+        // `fx ask` at startup, can say what's wrong with ~/.fx/mcp.json.
+        return switch (err) {
+            error.SymLinkLoop => error.McpConfigLinkLoop,
+            error.StreamTooLong => error.McpConfigTooLarge,
+            error.DurablePathUnsafe => error.McpConfigNotPlainFile,
+            else => err,
+        };
+    }) orelse return .empty;
     defer alloc.free(json_text);
 
-    return loadConfigFromJson(alloc, json_text) catch |err| {
+    return project_config.parseProfileServers(alloc, json_text, skipped) catch |err| {
         logConfigFailure("load", path, err);
         return err;
     };
-}
-
-fn addProfileServerToPath(
-    alloc: Allocator,
-    path: []const u8,
-    intent: command_provider_contract.AddIntent,
-) !?project_config.ProfileDiagnostic {
-    if (intent == .slack) return addSlackToPath(alloc, path);
-    const next = switch (intent) {
-        .slack => unreachable,
-        .local => |local| try configFromCommandParts(alloc, local.name, local.command, local.args),
-        .http => |http| blk: {
-            const owned_name = try alloc.dupe(u8, http.name);
-            errdefer alloc.free(owned_name);
-            const owned_url = try alloc.dupe(u8, http.url);
-            break :blk McpServerConfig{
-                .name = owned_name,
-                .transport = .http,
-                .url = owned_url,
-                .allow_stored_credentials = true,
-            };
-        },
-    };
-    return addOrReplaceServer(alloc, path, next);
-}
-
-fn addSlackToPath(alloc: Allocator, path: []const u8) !?project_config.ProfileDiagnostic {
-    var lock = try config_file.lockProfile(path);
-    defer lock.release();
-    var document = try loadProfileDocumentFromPath(alloc, path);
-    defer document.deinit(alloc);
-    if (!document.mutation_allowed) return error.McpConfigAmbiguousServerKey;
-    const endpoint = try slack_preset.endpoint_alloc(alloc);
-    defer alloc.free(endpoint);
-    for (document.configs.items) |*existing| {
-        if (!std.mem.eql(u8, existing.name, "slack")) continue;
-        if (existing.transport != .http or existing.url == null or
-            !std.mem.eql(u8, existing.url.?, endpoint) or
-            existing.headers.len > 0 or existing.header_env.len > 0 or existing.bearer_token_env != null)
-            return error.SlackConfigurationConflict;
-        if (existing.auth) |auth| {
-            if (auth.client_id) |id| {
-                if (!std.mem.eql(u8, id, slack_preset.client_id)) return error.SlackConfigurationConflict;
-            }
-            if (auth.resource != null or auth.issuer != null or auth.client_secret_env != null or auth.client_metadata_url != null)
-                return error.SlackConfigurationConflict;
-        }
-        if (existing.auth == null) existing.auth = .{};
-        if (existing.auth.?.client_id == null) existing.auth.?.client_id = try alloc.dupe(u8, slack_preset.client_id);
-        existing.enabled = true;
-        existing.allow_stored_credentials = true;
-        try saveConfigsToPath(alloc, path, document.configs.items);
-        return document.diagnostic;
-    }
-    var next = McpServerConfig{
-        .name = try alloc.dupe(u8, "slack"),
-        .transport = .http,
-        .allow_stored_credentials = true,
-    };
-    var owned = true;
-    errdefer if (owned) next.deinit(alloc);
-    next.url = try alloc.dupe(u8, endpoint);
-    next.auth = .{ .client_id = try alloc.dupe(u8, slack_preset.client_id) };
-    try document.configs.append(alloc, next);
-    owned = false;
-    try saveConfigsToPath(alloc, path, document.configs.items);
-    return document.diagnostic;
-}
-
-fn addOrReplaceServer(
-    alloc: Allocator,
-    path: []const u8,
-    next_value: McpServerConfig,
-) !?project_config.ProfileDiagnostic {
-    var next = next_value;
-    var moved = false;
-    errdefer if (!moved) next.deinit(alloc);
-
-    var lock = try config_file.lockProfile(path);
-    defer lock.release();
-    var document = try loadProfileDocumentFromPath(alloc, path);
-    defer document.deinit(alloc);
-    if (!document.mutation_allowed) return error.McpConfigAmbiguousServerKey;
-    const configs = &document.configs;
-    const warning = document.diagnostic;
-
-    for (configs.items) |*existing| {
-        if (!std.mem.eql(u8, existing.name, next.name)) continue;
-        existing.deinit(alloc);
-        existing.* = next;
-        moved = true;
-        try saveConfigsToPath(alloc, path, configs.items);
-        return warning;
-    }
-
-    try configs.append(alloc, next);
-    moved = true;
-    try saveConfigsToPath(alloc, path, configs.items);
-    return warning;
-}
-
-const ProfileRemoveFromPathResult = struct {
-    removed: bool,
-    warning: ?project_config.ProfileDiagnostic = null,
-};
-
-fn removeProfileServerFromPath(
-    alloc: Allocator,
-    path: []const u8,
-    name: []const u8,
-) !ProfileRemoveFromPathResult {
-    var lock = try config_file.lockProfile(path);
-    defer lock.release();
-    var document = try loadProfileDocumentFromPath(alloc, path);
-    defer document.deinit(alloc);
-    if (!document.mutation_allowed) return error.McpConfigAmbiguousServerKey;
-    const configs = &document.configs;
-    const warning = document.diagnostic;
-
-    for (configs.items, 0..) |config, i| {
-        if (!std.mem.eql(u8, config.name, name)) continue;
-        var removed = configs.orderedRemove(i);
-        removed.deinit(alloc);
-        try saveConfigsToPath(alloc, path, configs.items);
-        return .{ .removed = true, .warning = warning };
-    }
-
-    return .{ .removed = false, .warning = warning };
-}
-
-fn removeServerFromPath(alloc: Allocator, path: []const u8, name: []const u8) !bool {
-    return (try removeProfileServerFromPath(alloc, path, name)).removed;
 }
 
 fn loadConfigFromJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(McpServerConfig) {
@@ -1043,12 +373,7 @@ fn loadProfileDocumentFromPath(
     alloc: Allocator,
     path: []const u8,
 ) !project_config.ProfileParseResult {
-    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
-        if (err == error.FileNotFound) return .{};
-        return err;
-    };
-    defer file.close(io_mod.getIo());
-    const json_text = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    const json_text = (try config_file.read(alloc, path)) orelse return .{};
     defer alloc.free(json_text);
     return project_config.parseProfileDocument(alloc, json_text);
 }
@@ -1080,39 +405,6 @@ noinline fn logConfigFailure(action: []const u8, path: []const u8, err: anyerror
         "failed to {s} config {s}: {s}",
         .{ action, path, @errorName(err) },
     );
-}
-
-fn configFromCommandParts(
-    alloc: Allocator,
-    name: []const u8,
-    command: []const u8,
-    command_args: []const []const u8,
-) !McpServerConfig {
-    const args: [][]u8 = if (command_args.len > 0) try alloc.alloc([]u8, command_args.len) else &.{};
-    errdefer if (args.len > 0) alloc.free(args);
-
-    var parsed: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < parsed) : (i += 1) alloc.free(args[i]);
-    }
-
-    for (command_args, 0..) |arg, i| {
-        args[i] = try alloc.dupe(u8, arg);
-        parsed += 1;
-    }
-
-    const owned_command = try alloc.dupe(u8, command);
-    errdefer alloc.free(owned_command);
-
-    return .{
-        .name = try alloc.dupe(u8, name),
-        .source = .profile,
-        .scope = .profile,
-        .command = owned_command,
-        .args = args,
-        .enabled = true,
-    };
 }
 
 fn renderConfigJson(alloc: Allocator, configs: []const McpServerConfig) ![]u8 {
@@ -1285,36 +577,42 @@ const ListFixture = struct {
     }
 };
 
-fn request(home: ?[]const u8, fixture: *ListFixture) CommandRequest {
-    return .{
-        .home = home,
-        .list_ctx = @ptrCast(fixture),
-        .summarize_servers = ListFixture.summary,
-        .list_servers_and_tools = ListFixture.list,
-    };
-}
-
-fn expectBlock(result: CommandResult, expected: []const u8) !void {
-    switch (result.display) {
-        .block => |text| try std.testing.expectEqualStrings(expected, text),
-        .line => return error.TestExpectedEqual,
-    }
-}
-
-fn expectLine(result: CommandResult, expected: []const u8, reload: bool) !void {
-    switch (result.display) {
-        .line => |text| try std.testing.expectEqualStrings(expected, text),
-        .block => return error.TestExpectedEqual,
-    }
-    try std.testing.expectEqual(reload, result.reload);
-}
-
 fn tmpRoot(alloc: Allocator, tmp: std.testing.TmpDir) ![]u8 {
     return io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
 }
 
 fn tmpPath(alloc: Allocator, root: []const u8, name: []const u8) ![]u8 {
     return std.Io.Dir.path.join(alloc, &.{ root, name });
+}
+
+test "a server whose name a terminal can't show is skipped with a note that escapes it" {
+    const alloc = std.testing.allocator;
+    // An escape sequence, a right-to-left override, and a lone byte that
+    // isn't UTF-8; "caf\u00e9" and a space are printable and stay.
+    const json =
+        \\{"mcpServers":{"ok":{"command":"true"},"evil\u001b]0;x\u0007":{"command":"true"},"rtl\u202etxt":{"command":"true"},"caf\u00e9 two":{"command":"true"}}}
+    ;
+    var loaded: NativeConfigs = .{};
+    defer loaded.deinit(alloc);
+    loaded.configs = try project_config.parseProfileServers(alloc, json, &loaded.diagnostics);
+    try std.testing.expectEqual(@as(usize, 4), loaded.configs.items.len);
+    alloc.free(loaded.configs.items[0].name);
+    loaded.configs.items[0].name = try alloc.dupe(u8, "bad\xff");
+
+    try skipUnprintableNames(alloc, &loaded);
+    try std.testing.expectEqual(@as(usize, 1), loaded.configs.items.len);
+    try std.testing.expectEqualStrings("caf\u{e9} two", loaded.configs.items[0].name);
+    try std.testing.expectEqual(@as(usize, 3), loaded.diagnostics.items.len);
+    const expected = [_][]const u8{
+        "~/.fx/mcp.json server 'bad\\xff' was skipped: its name has a character fx won't print.",
+        "~/.fx/mcp.json server 'evil\\x1b]0;x\\x07' was skipped: its name has a character fx won't print.",
+        "~/.fx/mcp.json server 'rtl\\u{202e}txt' was skipped: its name has a character fx won't print.",
+    };
+    for (loaded.diagnostics.items, expected) |diagnostic, want| {
+        const note = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic);
+        defer alloc.free(note);
+        try std.testing.expectEqualStrings(want, note);
+    }
 }
 
 test "saving MCP config replaces the file durably" {
@@ -1388,14 +686,6 @@ fn readFileForTest(alloc: Allocator, path: []const u8) ![]u8 {
     return io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
 }
 
-test "built-in MCP runtime returns null when HOME is missing" {
-    const alloc = std.testing.allocator;
-    const home = try TestHome.install(alloc, null);
-    defer home.deinit();
-
-    try std.testing.expect(try loadRuntime(alloc, "/", .{}) == null);
-}
-
 test "MCP config diagnostic treats nonblocking profile states as clear" {
     const alloc = std.testing.allocator;
 
@@ -1435,24 +725,6 @@ test "MCP config diagnostic treats nonblocking profile states as clear" {
             .failed => return error.TestUnexpectedResult,
         }
     }
-}
-
-test "MCP config diagnostic preserves the startup parser error" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeTempFile(&tmp, "home/.fx/mcp.json", "{invalid json");
-    const home_path = try tmpDirPath(alloc, tmp.dir, "home");
-    defer alloc.free(home_path);
-
-    const test_home = try TestHome.install(alloc, home_path);
-    defer test_home.deinit();
-
-    switch (try inspectProfileConfig(alloc)) {
-        .clear, .warning => return error.TestUnexpectedResult,
-        .failed => |err| try std.testing.expectEqual(error.McpConfigInvalidJson, err),
-    }
-    try std.testing.expectError(error.McpConfigInvalidJson, loadRuntime(alloc, "/", .{}));
 }
 
 test "MCP config diagnostic propagates allocation failure" {
@@ -1516,384 +788,63 @@ test "workspace MCP loading expands command args environment and HTTP headers" {
     try std.testing.expectEqualStrings("Bearer secret-value", remote.headers[0].value);
 }
 
-test "workspace MCP missing environment variable is actionable and secret free" {
+test "fx mcp approve saves the approval of a project server" {
     const alloc = std.testing.allocator;
+    const mcp_verbs = @import("../core/mcp_host/verbs.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try writeTempFile(&tmp, "workspace/.mcp.json",
-        \\{"mcpServers":{"secure":{"type":"http","url":"https://example.test/mcp","headers":{"X-MCP-Token":"secret-prefix-${MCP_REQUIRED_TOKEN}"}}}}
+        \\{"mcpServers":{"fixture":{"command":"fixture-server"}}}
     );
+    const home = try tmpDirPath(alloc, tmp.dir, "home");
+    defer alloc.free(home);
     const workspace_root = try tmpDirPath(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace_root);
-    const settings = try alloc.print(
-        "{{\"workspaces\":{{\"{s}\":{{\"enableAllProjectMcpServers\":true}}}}}}",
-        .{workspace_root},
-    );
-    defer alloc.free(settings);
-    try writeTempFile(&tmp, "home/.fx/settings.json", settings);
-    const home_path = try tmpDirPath(alloc, tmp.dir, "home");
-    defer alloc.free(home_path);
-    const environment = try TestHome.install(alloc, home_path);
-    defer environment.deinit();
+    const test_home = try TestHome.install(alloc, home);
+    defer test_home.deinit();
+    // Sign-ins go to a file under the test home, never the user's Keychain.
+    try test_home.map.put("FX_DISABLE_KEYCHAIN", "1");
 
-    const runtime = try loadRuntime(alloc, workspace_root, .{}) orelse
-        return error.TestUnexpectedResult;
-    defer {
-        runtime.deinit();
-        alloc.destroy(runtime);
-    }
-    const listing = try runtime.listServersAndTools(alloc);
-    defer alloc.free(listing);
+    // `fx mcp` signals servers for exit when it is done, which would stop
+    // every later test from starting one; this host is destroyed instead.
+    const Hosts = struct {
+        workspace_root: []const u8,
 
-    try std.testing.expect(std.mem.find(u8, listing, ".mcp.json") != null);
-    try std.testing.expect(std.mem.find(u8, listing, "secure") != null);
-    try std.testing.expect(std.mem.find(u8, listing, "MCP_REQUIRED_TOKEN") != null);
-    try std.testing.expect(std.mem.find(u8, listing, "http_header") != null);
-    try std.testing.expect(std.mem.find(u8, listing, "secret-prefix") == null);
-}
-
-test "built-in MCP runtime loads disabled configured servers without spawning" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try writeTempFile(&tmp, "home/.fx/mcp.json",
-        \\{"mcp":{"noop":{"type":"local","command":["node","server.js"],"enabled":false}}}
-    );
-    const home_path = try tmpDirPath(alloc, tmp.dir, "home");
-    defer alloc.free(home_path);
-
-    const home = try TestHome.install(alloc, home_path);
-    defer home.deinit();
-
-    const runtime = try loadRuntime(alloc, "/", .{}) orelse return error.TestUnexpectedResult;
-    defer {
-        runtime.deinit();
-        alloc.destroy(runtime);
-    }
-    runtime.connectAll(builtin_tools.registry);
-
-    try std.testing.expectEqual(@as(usize, 1), runtime.servers.items.len);
-    try std.testing.expectEqual(mcp_runtime.ServerState.disabled, runtime.servers.items[0].state.load(.acquire));
-    try std.testing.expectEqualStrings("noop", runtime.servers.items[0].config.name);
-}
-
-test "built-in MCP runtime loading leaves enabled servers disconnected" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try writeTempFile(&tmp, "home/.fx/mcp.json",
-        \\{"mcp":{"pending":{"type":"local","command":["false"],"enabled":true}}}
-    );
-    const home_path = try tmpDirPath(alloc, tmp.dir, "home");
-    defer alloc.free(home_path);
-
-    const home = try TestHome.install(alloc, home_path);
-    defer home.deinit();
-
-    const runtime = try loadRuntime(alloc, "/", .{}) orelse return error.TestUnexpectedResult;
-    defer {
-        runtime.deinit();
-        alloc.destroy(runtime);
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), runtime.servers.items.len);
-    try std.testing.expectEqual(mcp_runtime.ServerState.disconnected, runtime.servers.items[0].state.load(.acquire));
-}
-
-test "built-in MCP runtime config transfer cleans its unvisited suffix on append failure" {
-    const alloc = testing_allocator.no_resize;
-    var configs = try loadConfigFromJson(alloc,
-        \\{"mcp":{"first":{"type":"local","command":["node"],"enabled":false},"second":{"type":"local","command":["node"],"environment":{"TOKEN":"value"},"enabled":false}}}
-    );
-    defer freeConfigs(alloc, &configs);
-
-    var failing = std.testing.FailingAllocator.init(
-        alloc,
-        .{ .fail_index = 1 },
-    );
-    try std.testing.expectError(
-        error.OutOfMemory,
-        runtimeFromConfigs(failing.allocator(), &configs, .{}),
-    );
-    try std.testing.expectEqual(@as(usize, 1), configs.items.len);
-    try std.testing.expectEqualStrings("second", configs.items[0].name);
-}
-
-test "built-in MCP runtime reserves active registry names" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const shell_server =
-        \\while IFS= read -r line; do
-        \\  case "$line" in
-        \\    *'"method":"server/discover"'*)
-        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"Method not found"}}'
-        \\      ;;
-        \\    *'"method":"initialize"'*)
-        \\      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"shell","version":"0"}}}'
-        \\      ;;
-        \\    *'"method":"notifications/initialized"'*)
-        \\      ;;
-        \\    *'"method":"tools/list"'*)
-        \\      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"tool","description":"Collision fixture","inputSchema":{"type":"object","properties":{}}}]}}'
-        \\      ;;
-        \\    *)
-        \\      exit 3
-        \\      ;;
-        \\  esac
-        \\done
-    ;
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    const home_path = try tmpDirPath(alloc, tmp.dir, "home");
-    defer alloc.free(home_path);
-    const config_path = try configPathFromHome(alloc, home_path);
-    defer alloc.free(config_path);
-
-    const args = [_][]const u8{ "-c", shell_server };
-    const configs = [_]McpServerConfig{.{
-        .name = "select",
-        .command = "sh",
-        .args = args[0..],
-    }};
-    try saveConfigsToPath(alloc, config_path, configs[0..]);
-
-    const home = try TestHome.install(alloc, home_path);
-    defer home.deinit();
-
-    const runtime = try loadRuntime(alloc, "/", .{}) orelse return error.TestUnexpectedResult;
-    defer {
-        runtime.deinit();
-        alloc.destroy(runtime);
-    }
-    runtime.connectAll(builtin_tools.registry);
-
-    try std.testing.expectEqual(@as(usize, 1), runtime.servers.items.len);
-    try std.testing.expectEqual(mcp_runtime.ServerState.ready, runtime.servers.items[0].state.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), runtime.servers.items[0].tool_catalog.tools.items.len);
-    try std.testing.expectEqualStrings("mcp_select_tool_2", runtime.servers.items[0].tool_catalog.tools.items[0].prefixed_name);
-}
-
-test "built-in MCP command handles list path and reload requests" {
-    const alloc = std.testing.allocator;
-    var fixture = ListFixture{ .text = "No MCP servers configured.\n" };
-
-    var list_result = try handleCommand(alloc, "", request(null, &fixture));
-    defer list_result.deinit(alloc);
-    try expectBlock(
-        list_result,
-        "MCP: no servers configured. Use /mcp add <name> <command> [args...].",
-    );
-    try std.testing.expectEqual(@as(usize, 1), fixture.summary_calls);
-    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    try std.testing.expect(!list_result.reload);
-
-    var details = try handleCommand(alloc, "list", request(null, &fixture));
-    defer details.deinit(alloc);
-    try expectBlock(details, "No MCP servers configured.\n");
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const expected_path = try configPathFromHome(alloc, home);
-    defer alloc.free(expected_path);
-
-    var path_result = try handleCommand(alloc, "path", request(home, &fixture));
-    defer path_result.deinit(alloc);
-    try expectLine(path_result, expected_path, false);
-
-    var reload_result = try handleCommand(alloc, "reload", request(home, &fixture));
-    defer reload_result.deinit(alloc);
-    try expectLine(reload_result, "Evaluating trusted profile MCP configuration.", true);
-}
-
-test "built-in MCP feature commands require exact servers and preserve typed values" {
-    const alloc = std.testing.allocator;
-    const Fixture = struct {
-        calls: usize = 0,
-
-        fn list(_: *anyopaque, allocator: Allocator) ![]u8 {
-            return allocator.dupe(u8, "servers\n");
+        fn get(context: *anyopaque, notify: ?mcp_verbs.Notify) anyerror!?*mcp_host.Host {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return loadHost(std.testing.allocator, self.workspace_root, @import("tools.zig").registry, .{ .notify = notify });
         }
 
-        fn read(raw: *anyopaque, allocator: Allocator, server: []const u8, uri: []const u8) ![]u8 {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-            try std.testing.expectEqualStrings("server-a", server);
-            try std.testing.expectEqualStrings("git+ssh://host/repo?ref=main#README", uri);
-            return allocator.dupe(u8, "resource\n");
+        fn release(_: *anyopaque, h: *mcp_host.Host) void {
+            h.destroy();
         }
 
-        fn get(raw: *anyopaque, allocator: Allocator, server: []const u8, name: []const u8, arguments: []const u8) ![]u8 {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-            try std.testing.expectEqualStrings("server-b", server);
-            try std.testing.expectEqualStrings("shared", name);
-            try std.testing.expectEqualStrings("{\"tone\":\"very brief\"}", arguments);
-            return allocator.dupe(u8, "prompt\n");
-        }
-
-        fn complete(raw: *anyopaque, allocator: Allocator, server: []const u8, name: []const u8, argument: []const u8, value: []const u8) ![]u8 {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-            try std.testing.expectEqualStrings("server-b", server);
-            try std.testing.expectEqualStrings("shared", name);
-            try std.testing.expectEqualStrings("tone", argument);
-            try std.testing.expectEqualStrings("very brief", value);
-            return allocator.dupe(u8, "completion\n");
-        }
+        fn changed(_: *anyopaque) void {}
     };
-    var fixture = Fixture{};
-    const feature_request = CommandRequest{
-        .home = null,
-        .list_ctx = @ptrCast(&fixture),
-        .list_servers_and_tools = Fixture.list,
-        .feature_ctx = @ptrCast(&fixture),
-        .read_resource = Fixture.read,
-        .get_prompt = Fixture.get,
-        .complete_prompt = Fixture.complete,
-    };
+    var hosts: Hosts = .{ .workspace_root = workspace_root };
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(alloc);
+    defer err.deinit();
 
-    var resource = try handleCommand(
-        alloc,
-        "resource read server-a git+ssh://host/repo?ref=main#README",
-        feature_request,
-    );
-    defer resource.deinit(alloc);
-    try expectBlock(resource, "resource\n");
+    const code = mcp_verbs.run(.{
+        .gpa = alloc,
+        .out = &out.writer,
+        .err = &err.writer,
+        .surface = .cli,
+        .home = home,
+        .workspace_root = workspace_root,
+        .hosts = .{ .context = &hosts, .get = Hosts.get, .release = Hosts.release, .changed = Hosts.changed },
+    }, &.{ "approve", "fixture" });
+    try std.testing.expectEqualStrings("", err.written());
+    try std.testing.expectEqualStrings("Approved fixture, which runs: fixture-server\n", out.written());
+    try std.testing.expectEqual(@as(u8, 0), code);
 
-    var prompt = try handleCommand(
-        alloc,
-        "prompt get server-b shared {\"tone\":\"very brief\"}",
-        feature_request,
-    );
-    defer prompt.deinit(alloc);
-    try expectBlock(prompt, "prompt\n");
-
-    var completion = try handleCommand(
-        alloc,
-        "prompt complete server-b shared tone very brief",
-        feature_request,
-    );
-    defer completion.deinit(alloc);
-    try expectBlock(completion, "completion\n");
-
-    var ambiguous = try handleCommand(alloc, "prompt get shared", feature_request);
-    defer ambiguous.deinit(alloc);
-    try expectLine(
-        ambiguous,
-        "usage: /mcp prompt get <server> <name> [arguments-json]",
-        false,
-    );
-    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
-}
-
-test "built-in MCP command mutates profile config and requests reload after save and remove" {
-    const alloc = std.testing.allocator;
-    var fixture = ListFixture{ .text = "" };
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const config_path = try configPathFromHome(alloc, home);
-    defer alloc.free(config_path);
-
-    var add_result = try handleCommand(alloc, "add fs node server.js", request(home, &fixture));
-    defer add_result.deinit(alloc);
-    try expectLine(add_result, "Saved MCP server 'fs'.", true);
-
-    var configs = try loadConfigFromPath(alloc, config_path);
-    defer freeConfigs(alloc, &configs);
-    try std.testing.expectEqual(@as(usize, 1), configs.items.len);
-    try std.testing.expectEqualStrings("fs", configs.items[0].name);
-    try std.testing.expectEqualStrings("node", try configs.items[0].stdioCommand());
-    try std.testing.expectEqualStrings("server.js", configs.items[0].args[0]);
-
-    var remove_result = try handleCommand(alloc, "remove fs", request(home, &fixture));
-    defer remove_result.deinit(alloc);
-    try expectLine(remove_result, "Removed MCP server 'fs'.", true);
-
-    var missing_result = try handleCommand(alloc, "remove fs", request(home, &fixture));
-    defer missing_result.deinit(alloc);
-    try expectLine(missing_result, "MCP server 'fs' not found.", false);
-}
-
-test "built-in MCP command adds a remote HTTP server and preserves local add" {
-    const alloc = std.testing.allocator;
-    var fixture = ListFixture{ .text = "" };
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const config_path = try configPathFromHome(alloc, home);
-    defer alloc.free(config_path);
-
-    var remote = try handleCommand(
-        alloc,
-        "add --transport http prisma https://mcp.prisma.io/mcp",
-        request(home, &fixture),
-    );
-    defer remote.deinit(alloc);
-    try expectLine(remote, "Saved MCP server 'prisma'.", true);
-
-    var local = try handleCommand(
-        alloc,
-        "add files node server.js",
-        request(home, &fixture),
-    );
-    defer local.deinit(alloc);
-    try expectLine(local, "Saved MCP server 'files'.", true);
-
-    var configs = try loadConfigFromPath(alloc, config_path);
-    defer freeConfigs(alloc, &configs);
-    try std.testing.expectEqual(@as(usize, 2), configs.items.len);
-    try std.testing.expectEqualStrings("prisma", configs.items[0].name);
-    try std.testing.expectEqual(McpTransport.http, configs.items[0].transport);
-    try std.testing.expectEqualStrings(
-        "https://mcp.prisma.io/mcp",
-        try configs.items[0].remoteUrl(),
-    );
-    try std.testing.expectEqualStrings("files", configs.items[1].name);
-    try std.testing.expectEqual(McpTransport.stdio, configs.items[1].transport);
-    try std.testing.expectEqualStrings("node", try configs.items[1].stdioCommand());
-    try std.testing.expectEqualStrings("server.js", configs.items[1].args[0]);
-}
-
-test "built-in MCP command rejects invalid remote add forms without mutation" {
-    const alloc = std.testing.allocator;
-    var fixture = ListFixture{ .text = "" };
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const config_path = try configPathFromHome(alloc, home);
-    defer alloc.free(config_path);
-
-    for ([_][]const u8{
-        "add --transport http prisma",
-        "add --transport sse prisma https://mcp.prisma.io/mcp",
-        "add --transport http prisma https://mcp.prisma.io/mcp extra",
-    }) |command| {
-        var result = try handleCommand(alloc, command, request(home, &fixture));
-        defer result.deinit(alloc);
-        try expectLine(
-            result,
-            add_usage,
-            false,
-        );
-    }
-
-    var configs = try loadConfigFromPath(alloc, config_path);
-    defer freeConfigs(alloc, &configs);
-    try std.testing.expectEqual(@as(usize, 0), configs.items.len);
+    var choices = try config_runtime.loadProjectMcpChoices(alloc, workspace_root);
+    defer choices.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), choices.choices.approved.len);
+    try std.testing.expectEqualStrings("fixture", choices.choices.approved[0]);
 }
 
 test "saving MCP config refuses a symlinked target" {
@@ -1921,207 +872,25 @@ test "saving MCP config refuses a symlinked target" {
     try std.testing.expectEqualStrings(external, untouched);
 }
 
-test "built-in MCP command reports a failed save instead of a missing server" {
-    if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+test "a profile config fx can't read fails with an error named for the file" {
     const alloc = std.testing.allocator;
-    var fixture = ListFixture{ .text = "" };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const root = try tmpDirPath(alloc, tmp.dir, ".");
+    defer alloc.free(root);
 
-    try writeTempFile(&tmp, "home/external.json", "{\"mcp\":{\"fs\":{\"command\":\"node\"}}}");
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    const external_path = try tmpDirPath(alloc, tmp.dir, "home/external.json");
-    defer alloc.free(external_path);
-    try tmp.dir.symLink(io_mod.getIo(), external_path, "home/.fx/mcp.json", .{ .is_directory = false });
+    try tmp.dir.symLink(io_mod.getIo(), "loop.json", "loop.json", .{ .is_directory = false });
+    const loop = try std.Io.Dir.path.join(alloc, &.{ root, "loop.json" });
+    defer alloc.free(loop);
+    try std.testing.expectError(error.McpConfigLinkLoop, loadConfigFromPath(alloc, loop));
 
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-
-    // The server loads through the symlink, so this is a real entry whose
-    // removal cannot be persisted. It must not be reported as missing.
-    var result = try handleCommand(alloc, "remove fs", request(home, &fixture));
-    defer result.deinit(alloc);
-    try expectLine(result, "Failed to remove MCP server 'fs': DurablePathUnsafe.", false);
-}
-
-test "adding an MCP server creates the profile directory privately" {
-    if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-    var fixture = ListFixture{ .text = "" };
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-
-    var result = try handleCommand(alloc, "add fs node server.js", request(home, &fixture));
-    defer result.deinit(alloc);
-    try expectLine(result, "Saved MCP server 'fs'.", true);
-
-    const dir_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o700), dir_stat.permissions.toMode() & 0o777);
-    const file_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx/mcp.json", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o600), file_stat.permissions.toMode() & 0o777);
-}
-
-test "built-in MCP command preserves usage and missing-home notices" {
-    const alloc = std.testing.allocator;
-    var fixture = ListFixture{ .text = "" };
-
-    var no_home = try handleCommand(alloc, "path", request(null, &fixture));
-    defer no_home.deinit(alloc);
-    try expectLine(no_home, "HOME is not available.", false);
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-
-    var add_usage_result = try handleCommand(alloc, "add server", request(home, &fixture));
-    defer add_usage_result.deinit(alloc);
-    try expectLine(add_usage_result, add_usage, false);
-
-    var generic_usage = try handleCommand(alloc, "wat", request(home, &fixture));
-    defer generic_usage.deinit(alloc);
-    try expectLine(
-        generic_usage,
-        "usage: /mcp [list|resource|prompt|add|remove|path|reload|auth|logout|trust]",
-        false,
-    );
-}
-
-test "MCP auth requires explicit browser confirmation and logout stays non-secret" {
-    const Fixture = struct {
-        validation_calls: usize = 0,
-        auth_calls: usize = 0,
-        logout_calls: usize = 0,
-        logout_busy: bool = false,
-        logout_repaired_entries: usize = 0,
-
-        fn list(_: *anyopaque, alloc: Allocator) ![]u8 {
-            return alloc.dupe(u8, "");
-        }
-
-        fn authenticate(
-            raw: *anyopaque,
-            name: []const u8,
-        ) !command_provider_contract.AuthenticationStart {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.auth_calls += 1;
-            if (std.mem.eql(u8, name, "busy")) return .busy;
-            try std.testing.expectEqualStrings("remote", name);
-            return .started;
-        }
-
-        fn validate(raw: *anyopaque, name: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.validation_calls += 1;
-            if (std.mem.eql(u8, name, "local")) {
-                return error.McpAuthenticationNotRemote;
-            }
-            if (!std.mem.eql(u8, name, "busy")) {
-                try std.testing.expectEqualStrings("remote", name);
-            }
-        }
-
-        fn logout(
-            raw: *anyopaque,
-            name: []const u8,
-        ) !command_provider_contract.LogoutResult {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            try std.testing.expectEqualStrings("remote", name);
-            self.logout_calls += 1;
-            if (self.logout_busy) return .{ .busy = true };
-            return .{
-                .removed = true,
-                .repaired_entries = self.logout_repaired_entries,
-            };
-        }
-    };
-    const alloc = std.testing.allocator;
-    var fixture = Fixture{};
-    const command_request = CommandRequest{
-        .home = "/tmp",
-        .list_ctx = @ptrCast(&fixture),
-        .list_servers_and_tools = Fixture.list,
-        .auth_ctx = @ptrCast(&fixture),
-        .validate_authentication_server = Fixture.validate,
-        .authenticate_server = Fixture.authenticate,
-        .logout_server = Fixture.logout,
-    };
-
-    var prompt = try handleCommand(alloc, "auth remote", command_request);
-    defer prompt.deinit(alloc);
-    try expectLine(
-        prompt,
-        "Run /mcp auth remote --open to confirm opening your browser.",
-        false,
-    );
-    try std.testing.expectEqual(@as(usize, 1), fixture.validation_calls);
-    try std.testing.expectEqual(@as(usize, 0), fixture.auth_calls);
-
-    var started = try handleCommand(
-        alloc,
-        "auth remote --open",
-        command_request,
-    );
-    defer started.deinit(alloc);
-    try expectLine(
-        started,
-        "Waiting for MCP authentication for 'remote'. You can continue using fx while the browser flow completes.",
-        false,
-    );
-    try std.testing.expectEqual(@as(usize, 2), fixture.validation_calls);
-    try std.testing.expectEqual(@as(usize, 1), fixture.auth_calls);
-
-    var busy = try handleCommand(
-        alloc,
-        "auth busy --open",
-        command_request,
-    );
-    defer busy.deinit(alloc);
-    try expectLine(
-        busy,
-        "MCP authentication for 'busy' is already in progress or MCP configuration is reloading.",
-        false,
-    );
-    try std.testing.expectEqual(@as(usize, 3), fixture.validation_calls);
-    try std.testing.expectEqual(@as(usize, 2), fixture.auth_calls);
-
-    var local = try handleCommand(alloc, "auth local", command_request);
-    defer local.deinit(alloc);
-    try expectLine(
-        local,
-        "MCP authentication for 'local' failed: McpAuthenticationNotRemote.",
-        false,
-    );
-    try std.testing.expectEqual(@as(usize, 4), fixture.validation_calls);
-    try std.testing.expectEqual(@as(usize, 2), fixture.auth_calls);
-
-    fixture.logout_busy = true;
-    var logout_busy = try handleCommand(alloc, "logout remote", command_request);
-    defer logout_busy.deinit(alloc);
-    try expectLine(
-        logout_busy,
-        "MCP authentication for 'remote' is still in progress. Wait for it to finish before logging out.",
-        false,
-    );
-    fixture.logout_busy = false;
-
-    var logged_out = try handleCommand(alloc, "logout remote", command_request);
-    defer logged_out.deinit(alloc);
-    try expectLine(logged_out, "Logged out of MCP server 'remote'.", false);
-    try std.testing.expectEqual(@as(usize, 2), fixture.logout_calls);
-
-    fixture.logout_repaired_entries = 2;
-    var repaired = try handleCommand(alloc, "logout remote", command_request);
-    defer repaired.deinit(alloc);
-    try expectLine(
-        repaired,
-        "Logged out of MCP server 'remote'. Removed 2 unreadable MCP credential entries.",
-        false,
-    );
+    const big = try alloc.alloc(u8, 1024 * 1024 + 1);
+    defer alloc.free(big);
+    @memset(big, ' ');
+    try writeTempFile(&tmp, "big.json", big);
+    const big_path = try std.Io.Dir.path.join(alloc, &.{ root, "big.json" });
+    defer alloc.free(big_path);
+    try std.testing.expectError(error.McpConfigTooLarge, loadConfigFromPath(alloc, big_path));
 }
 
 test "loadConfigFromJson parses canonical local config with command array" {
@@ -2349,7 +1118,7 @@ test "profile config rejects a mixed set containing invalid client metadata URLs
 
 test "profile config reports literal authorization secrets" {
     try std.testing.expectError(
-        error.McpConfigInvalidHeaders,
+        error.McpConfigAuthorizationHeader,
         loadConfigFromJson(std.testing.allocator,
             \\{"mcp":{"unsafe":{"type":"http","url":"https://api.example.com/mcp","headers":{"Authorization":"Bearer secret-value"}}}}
         ),
@@ -2535,112 +1304,6 @@ test "invalid stdio lifecycle policy reports its field" {
             loadConfigFromJson(std.testing.allocator, case.json),
         );
     }
-}
-
-test "addProfileServerToPath roundtrips local replacement and remove" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const path = try configPathFromHome(alloc, home);
-    defer alloc.free(path);
-
-    _ = try addProfileServerToPath(
-        alloc,
-        path,
-        try command_provider_contract.parseAddIntent(&.{ "everything", "npx", "-y", "@modelcontextprotocol/server-everything" }),
-    );
-
-    var configs = try loadConfigFromPath(alloc, path);
-    defer freeConfigs(alloc, &configs);
-    try std.testing.expectEqual(@as(usize, 1), configs.items.len);
-    try std.testing.expectEqualStrings("everything", configs.items[0].name);
-    try std.testing.expectEqualStrings("npx", try configs.items[0].stdioCommand());
-
-    _ = try addProfileServerToPath(
-        alloc,
-        path,
-        try command_provider_contract.parseAddIntent(&.{ "everything", "node", "server.js" }),
-    );
-
-    var replaced = try loadConfigFromPath(alloc, path);
-    defer freeConfigs(alloc, &replaced);
-    try std.testing.expectEqual(@as(usize, 1), replaced.items.len);
-    try std.testing.expectEqualStrings("node", try replaced.items[0].stdioCommand());
-    try std.testing.expectEqualStrings("server.js", replaced.items[0].args[0]);
-
-    try std.testing.expect(try removeServerFromPath(alloc, path, "everything"));
-
-    var after = try loadConfigFromPath(alloc, path);
-    defer freeConfigs(alloc, &after);
-    try std.testing.expectEqual(@as(usize, 0), after.items.len);
-}
-
-test "profile mutation preserves canonical files with suspicious sibling maps" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const path = try configPathFromHome(alloc, home);
-    defer alloc.free(path);
-    const original =
-        "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"MCP-Servers\":{\"shadow\":{\"command\":\"two\"}},\"metadata\":{\"owner\":\"team\"}}";
-    try tmp.dir.writeFile(io_mod.getIo(), .{
-        .sub_path = "home/.fx/mcp.json",
-        .data = original,
-    });
-
-    try std.testing.expectError(
-        error.McpConfigAmbiguousServerKey,
-        addProfileServerToPath(
-            alloc,
-            path,
-            try command_provider_contract.parseAddIntent(&.{ "new", "node" }),
-        ),
-    );
-
-    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
-    defer file.close(io_mod.getIo());
-    const after = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
-    defer alloc.free(after);
-    try std.testing.expectEqualStrings(original, after);
-}
-
-test "MCP add intent rejects invalid server names" {
-    for ([_][]const u8{ "", "bad/name", "bad name", "bad.name" }) |name| {
-        try std.testing.expectError(
-            error.McpInvalidServerName,
-            command_provider_contract.parseAddIntent(&.{ name, "node" }),
-        );
-    }
-}
-
-test "removeServerFromPath remains permissive for odd legacy names" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const root = try tmpRoot(alloc, tmp);
-    defer alloc.free(root);
-    const path = try tmpPath(alloc, root, "mcp.json");
-    defer alloc.free(path);
-
-    var configs = try loadConfigFromJson(alloc,
-        \\{"mcp":{"legacy/name":{"type":"local","command":["node"]}}}
-    );
-    defer freeConfigs(alloc, &configs);
-    try saveConfigsToPath(alloc, path, configs.items);
-
-    try std.testing.expect(try removeServerFromPath(alloc, path, "legacy/name"));
-
-    var after = try loadConfigFromPath(alloc, path);
-    defer freeConfigs(alloc, &after);
-    try std.testing.expectEqual(@as(usize, 0), after.items.len);
 }
 
 test "freeConfigs accepts an empty ArrayList" {

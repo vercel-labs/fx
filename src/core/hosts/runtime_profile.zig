@@ -56,7 +56,8 @@ pub const native = Profile{
 pub const wasm = Profile{
     .cooperative_agent = true,
     .durable_sessions = false,
-    .profile_usage = false,
+    // `/usage` reads through the JS host's fetch.
+    .profile_usage = true,
     .native_auth = false,
     .file_index = false,
     .mcp = false,

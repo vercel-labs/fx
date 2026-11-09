@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const report = @import("report.zig");
+const sort_utils = @import("../core/shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -217,7 +218,7 @@ fn finish(shares: []Share) []Share {
         shares[n] = .{ .name = s.name, .speed = s.speed, .percent = s.percent / total * 100 };
         n += 1;
     }
-    std.mem.sort(Share, shares[0..n], {}, struct {
+    sort_utils.sort(Share, shares[0..n], {}, struct {
         fn lessThan(_: void, a: Share, b: Share) bool {
             if (a.percent != b.percent) return a.percent > b.percent;
             const by_name = std.mem.order(u8, a.name, b.name);
@@ -481,7 +482,7 @@ pub fn parseProfile(gpa: Allocator, body: []const u8) ParseError!ProfileOwned {
                 const tokens = try count(item.object.get("tokens")) orelse 0;
                 try days.append(alloc, .{ .day = day, .tokens = tokens });
             }
-            std.mem.sort(Day, days.items, {}, struct {
+            sort_utils.sort(Day, days.items, {}, struct {
                 fn lessThan(_: void, a: Day, b: Day) bool {
                     return a.day < b.day;
                 }
@@ -561,7 +562,7 @@ pub fn parseBreakdown(gpa: Allocator, body: []const u8) ParseError!BreakdownOwne
         };
         try days.append(alloc, day);
     }
-    std.mem.sort(BreakdownDay, days.items, {}, struct {
+    sort_utils.sort(BreakdownDay, days.items, {}, struct {
         fn lessThan(_: void, a: BreakdownDay, b: BreakdownDay) bool {
             return a.day < b.day;
         }

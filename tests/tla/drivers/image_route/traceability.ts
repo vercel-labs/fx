@@ -10,7 +10,7 @@
 //   mutation:ID     a planted bug in mutations.json
 //   zig:path#name   a `test "name"` block in that Zig file
 //   e2e:path#name, sdk:path#name   a test whose source contains that name
-//   driver:name     a driver stage: spec-to-code or code-to-spec
+//   driver:name     a driver stage: spec-to-code, code-to-spec, or binary-to-spec
 //   review:text     how a check that cannot be automated is enforced instead
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -83,7 +83,7 @@ export function checkTraceability(designPath = join(MODEL_DIR, "design", "DESIGN
         fileTest();
         break;
       case "driver":
-        if (!["spec-to-code", "code-to-spec"].includes(value)) problems.push(`${owner}: ${token} is not a driver stage`);
+        if (!["spec-to-code", "code-to-spec", "binary-to-spec"].includes(value)) problems.push(`${owner}: ${token} is not a driver stage`);
         break;
       case "review":
         if (value.length < 20) problems.push(`${owner}: ${token} must say how it is enforced`);

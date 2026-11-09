@@ -1,0 +1,28 @@
+[
+  {
+    "description": "This build keeps its logins in credentials-v2.json, which an older build reads as empty and writes over",
+    "old": "Loc == \"v3\"",
+    "new": "Loc == \"v2\"",
+    "config": "MixedBuilds.erasure.cfg",
+    "invariant": "NoLoginErasedByOlder"
+  },
+  {
+    "description": "This build copies the v2 login over, so an older build's refresh retires the copy it holds",
+    "old": "Copy == FALSE",
+    "new": "Copy == TRUE",
+    "config": "MixedBuilds.shared.cfg",
+    "invariant": "NoLoginEndedByOlder"
+  },
+  {
+    "description": "This build copies the v2 login over",
+    "old": "Copy == FALSE",
+    "new": "Copy == TRUE",
+    "invariant": "OlderLoginNotTaken"
+  },
+  {
+    "description": "With no login of its own, this build reads the older store's",
+    "old": "Doc == IF Loc = \"v3\" THEN v3 ELSE v2",
+    "new": "Doc == IF Loc = \"v3\" /\\ v3 # None THEN v3 ELSE v2",
+    "invariant": "OlderLoginNotTaken"
+  }
+]

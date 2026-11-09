@@ -13,7 +13,10 @@
 \*   redeem {login}            the fake's token endpoint got that login's code
 \*   signed_in {login}         "Signed in to NAME."
 \*   failed {login}            "Couldn't sign in to NAME: ..."
-\*   reload {}, lease {}, release {}
+\*   reload {server}           a /mcp change reloaded in place: "kept" left
+\*                             the server as it was, "dropped" removed or
+\*                             changed it
+\*   replace {}, lease {}, release {}  a reload that replaced the host
 \*   status {signing}          the shell's status line says "Signing in to NAME"
 EXTENDS SignIn, TraceObs, Sequences
 
@@ -25,14 +28,15 @@ Viol ==
     (IF NoListenerWithoutHost THEN {} ELSE {"NoListenerWithoutHost"}) \cup
     (IF OneSignInPerHost THEN {} ELSE {"OneSignInPerHost"}) \cup
     (IF IndicatorImpliesListener THEN {} ELSE {"IndicatorImpliesListener"}) \cup
-    (IF OneSignInPerServer THEN {} ELSE {"OneSignInPerServer"})
+    (IF OneSignInPerServer THEN {} ELSE {"OneSignInPerServer"}) \cup
+    (IF FlowHasListener THEN {} ELSE {"FlowHasListener"})
 
 Probed(k, result) ==
     /\ IF result = "open" THEN phase[k] = "open" /\ alive[hostOf[k]] ELSE ~Open(k)
     /\ UNCHANGED vars
 
 Step(rec) ==
-    CASE rec.event = "login" -> StartLogin
+    CASE rec.event = "login" -> StartLogin \/ AgainLogin
       [] rec.event = "authorize" -> Authorize(rec.data.login)
       [] rec.event = "probe" -> Probed(rec.data.login, rec.data.result)
       [] rec.event = "callback" -> Arrive(rec.data.login, rec.data.state, rec.data.kind)
@@ -41,7 +45,8 @@ Step(rec) ==
       [] rec.event = "failed" -> \/ Handle(rec.data.login) /\ phase'[rec.data.login] = "closed"
                                  \/ Redeemed(rec.data.login, FALSE)
                                  \/ Expire(rec.data.login)
-      [] rec.event = "reload" -> Reload
+      [] rec.event = "reload" -> IF rec.data.server = "kept" THEN ReloadKeeps ELSE ReloadDrops
+      [] rec.event = "replace" -> Replace
       [] rec.event = "lease" -> Lease
       [] rec.event = "release" -> \E h \in Hosts : Release(h)
       [] rec.event = "status" -> indicator = rec.data.signing /\ UNCHANGED vars

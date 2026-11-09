@@ -1,23 +1,33 @@
 ---- MODULE SignIn ----
-\* fx's MCP-v2 sign-in for one HTTP server (vercel-labs/fx at 53a561bea).
+\* fx's MCP sign-in for one HTTP server (vercel-labs/fx at 53a561bea).
 \*
 \* Code:
-\*   - src/core/mcp_host/runtime.zig: startLogin (endLogin of this server's
-\*     earlier login, then a new Login: a loopback listener and the
-\*     awaitBrowser task, then engine.signIn), awaitBrowser (the first
+\*   - src/core/mcp_host/runtime.zig: startLogin (a login already under way
+\*     for the server is the one asked for: its address is shown again;
+\*     else a new Login: a loopback listener and the awaitBrowser task, then
+\*     engine.signIn, which starts a flow only when none is running,
+\*     client.zig Auth.signIn), awaitBrowser (the first
 \*     `GET /callback`, or for a bridged server the first form posted from
-\*     the bridge's origin, is posted as finish_login; the task then ends),
-\*     `.finish_login` (engine.finishSignIn: MCP-v2's flow checks the state),
+\*     the bridge's origin, carrying the state `.authorize` gave the
+\*     listener, is posted as finish_login; the task then ends),
+\*     finishLogin (`fx mcp login NAME --no-browser`: a pasted address,
+\*     past the listener), `.finish_login` (engine.finishSignIn: the engine's
+\*     flow checks the state),
 \*     onServer `.authorize` / `.signed_in` / `.sign_in_failed`, expireLogins
 \*     (5 minutes), shutdown (endLogin for every login, each with a
 \*     `.sign_in_failed`: the MCP config changed). While another
 \*     host is retired but alive, a login waits.
-\*   - src/core/mcp_host/login.zig: Listener.accept, answer, answerForm.
+\*   - src/core/mcp_host/login.zig: Listener.accept, takeReturn, takeForm
+\*     (any other return gets a 404 and the wait goes on).
 \*   - src/core/app/app_mcp_runtime.zig HostSink: `.authorize` sets the
 \*     shell's "Signing in to NAME" (sign_in), `.signed_in` and
 \*     `.sign_in_failed` clear it; it lives in the shell's State, not in the
-\*     host, so it outlives a host a reload replaces. reloadHost replaces the
-\*     host; the old one goes with its last lease.
+\*     host, so it outlives a host a reload replaces. reloadHost reloads the
+\*     host in place (Runtime.reload): a change that leaves the server alone
+\*     leaves its login, and one that removes or changes it ends the login
+\*     (dropServer: endLogin with a `.sign_in_failed`). It replaces the host
+\*     only when the loader can't reload in place (the config went empty or
+\*     came back, or the reload failed); the old one goes with its last lease.
 \*   - src/mcp/auth/client.zig finishSignIn + core/auth.zig: a response whose
 \*     state isn't the live flow's fails the sign-in; the code is redeemed
 \*     only when it matches.
@@ -89,19 +99,33 @@ Init ==
 \* endLogin(k): cancel its task, close its listener, forget it. No notice.
 Ended(k) == [phase EXCEPT ![k] = "closed"]
 
-\* `/mcp login NAME` or `fx mcp login NAME` on the current host. It waits
-\* while any other host is alive.
+\* The host's login, while it's under way.
+SigningIn(h) == live[h] # 0 /\ Open(live[h])
+
+\* `/mcp login NAME` or `fx mcp login NAME` on the current host, or the same
+\* login `add` starts for a new server that asks for one (verbs.zig
+\* signInAfterAdd, app_mcp_runtime.zig signInAfterAdd). It waits while any
+\* other host is alive. The engine starts a flow only when none is running.
 StartLogin ==
     /\ alive[cur] /\ next <= MaxLogins
     /\ \A h \in Hosts : alive[h] => h = cur
+    /\ ~SigningIn(cur)
     /\ LET k == next
-           old == live[cur]
-       IN /\ phase' = [(IF old # 0 THEN Ended(old) ELSE phase) EXCEPT ![k] = "open"]
+       IN /\ phase' = [phase EXCEPT ![k] = "open"]
           /\ hostOf' = [hostOf EXCEPT ![k] = cur]
           /\ live' = [live EXCEPT ![cur] = k]
-          /\ flow' = [flow EXCEPT ![cur] = k]
+          /\ flow' = IF flow[cur] = 0 THEN [flow EXCEPT ![cur] = k] ELSE flow
           /\ next' = next + 1
     /\ UNCHANGED <<cur, alive, retired, leases, got, shownUrl, indicator, saved, badRedeem, foreignTaken>>
+
+\* The same, asked for while the host's login is under way: that login is
+\* the one asked for, and its listener and flow stay. Its address, if it
+\* came, is shown again.
+AgainLogin ==
+    /\ alive[cur]
+    /\ \A h \in Hosts : alive[h] => h = cur
+    /\ SigningIn(cur)
+    /\ UNCHANGED vars
 
 \* The engine's `.authorize` event for login k: the notice sets the shell's
 \* "Signing in" and carries the URL (with the state and redirect port).
@@ -111,21 +135,30 @@ Authorize(k) ==
     /\ indicator' = TRUE
     /\ UNCHANGED <<cur, alive, retired, leases, phase, hostOf, got, live, flow, saved, next, badRedeem, foreignTaken>>
 
-\* login.zig answer/answerForm: what the listener takes. A non-bridged
+\* login.zig takeReturn/takeForm: what the listener takes. A non-bridged
 \* listener takes GET /callback; a bridged one takes a form only from the
-\* bridge's origin. Anything else gets a 404 and the wait goes on.
+\* bridge's origin. Either carries the login's own state. Anything else gets
+\* a 404 and the wait goes on, so a stray return never ends a sign-in.
 Takes(kind) == IF Bridge THEN kind = "form_ours" ELSE kind = "get"
 
 Arrive(k, s, kind) ==
     /\ phase[k] = "open"
-    /\ IF Takes(kind)
+    /\ IF Takes(kind) /\ s = k
        THEN /\ phase' = [phase EXCEPT ![k] = "consumed"]
             /\ got' = [got EXCEPT ![k] = s]
-            /\ foreignTaken' = (foreignTaken \/ kind \in {"form_foreign", "other"})
+            /\ foreignTaken' = (foreignTaken \/ kind \in {"form_foreign", "other"} \/ s # k)
        ELSE UNCHANGED <<phase, got, foreignTaken>>
     /\ UNCHANGED <<cur, alive, retired, leases, hostOf, live, flow, shownUrl, indicator, saved, next, badRedeem>>
 
-\* `.finish_login`: MCP-v2 checks the state against the live flow.
+\* finishLogin: the address the browser ended on, pasted. It goes to the engine
+\* as it is, past the listener, so a wrong one fails the sign-in there.
+Paste(k, s) ==
+    /\ phase[k] = "open"
+    /\ phase' = [phase EXCEPT ![k] = "consumed"]
+    /\ got' = [got EXCEPT ![k] = s]
+    /\ UNCHANGED <<cur, alive, retired, leases, hostOf, live, flow, shownUrl, indicator, saved, next, badRedeem, foreignTaken>>
+
+\* `.finish_login`: the engine checks the state against the live flow.
 Handle(k) ==
     /\ phase[k] = "consumed" /\ alive[hostOf[k]] /\ live[hostOf[k]] = k
     /\ LET h == hostOf[k]
@@ -187,8 +220,25 @@ Release(h) ==
        ELSE UNCHANGED <<alive, phase, live, flow, indicator>>
     /\ UNCHANGED <<cur, retired, hostOf, got, shownUrl, saved, next, badRedeem, foreignTaken>>
 
-\* `/mcp add`, `remove`, `approve`, `reject` in the shell: reloadHost.
-Reload ==
+\* `/mcp add`, `remove`, `approve`, `reject` in the shell, applied in place,
+\* that remove or change this server: dropServer ends its login with a
+\* `.sign_in_failed` that clears the shell's "Signing in", and the engine's
+\* flow goes with the server's old slot.
+ReloadDrops ==
+    /\ alive[cur]
+    /\ IF SigningIn(cur)
+       THEN /\ phase' = Ended(live[cur])
+            /\ live' = [live EXCEPT ![cur] = 0]
+            /\ indicator' = FALSE
+       ELSE UNCHANGED <<phase, live, indicator>>
+    /\ flow' = [flow EXCEPT ![cur] = 0]
+    /\ UNCHANGED <<cur, alive, retired, leases, hostOf, got, shownUrl, saved, next, badRedeem, foreignTaken>>
+
+\* The same, leaving this server as it was.
+ReloadKeeps == alive[cur] /\ UNCHANGED vars
+
+\* A reload the loader can't apply in place: reloadHost replaces the host.
+Replace ==
     /\ cur < MaxHosts
     /\ LET n == cur + 1
            free == leases[cur] = 0
@@ -203,11 +253,15 @@ Reload ==
 
 Next ==
     \/ StartLogin
+    \/ AgainLogin
     \/ \E k \in Logins : Authorize(k) \/ Handle(k) \/ Expire(k) \/ Redeemed(k, TRUE) \/ Redeemed(k, FALSE)
     \/ \E k \in Logins, s \in States, kind \in Kinds : Arrive(k, s, kind)
+    \/ \E k \in Logins, s \in States : Paste(k, s)
     \/ Lease
     \/ \E h \in Hosts : Release(h)
-    \/ Reload
+    \/ ReloadKeeps
+    \/ ReloadDrops
+    \/ Replace
     \* Nothing more to do is not a deadlock: Next allows stuttering.
     \/ UNCHANGED vars
 
@@ -223,8 +277,9 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 \* A token is redeemed only for a callback whose state matches the live sign-in.
 RedeemOnlyLiveState == ~badRedeem
 
-\* A listener takes only the browser's return of its own kind of sign-in: a
-\* bridged one only a form from the bridge's origin.
+\* A listener takes only the browser's return of its own sign-in: of its
+\* kind (a bridged one only a form from the bridge's origin), and carrying
+\* its state.
 ListenerTakesOnlyItsOwn == ~foreignTaken
 
 \* A login's listener never outlives its host.
@@ -238,6 +293,13 @@ IndicatorImpliesListener == indicator => \E k \in Logins : Open(k) /\ alive[host
 
 \* One sign-in per server, whatever hosts are alive.
 OneSignInPerServer == Cardinality({k \in Logins : Open(k)}) <= 1
+
+\* The engine's live flow is the host's login, with its listener open: the
+\* browser can come back to the sign-in the engine waits on.
+FlowHasListener == \A h \in Hosts : flow[h] # 0 => live[h] = flow[h] /\ Open(flow[h])
+
+\* A reload that leaves the server as it was leaves its sign-in going.
+KeptSignInGoesOn == [][ReloadKeeps => \A k \in Logins : Open(k) => Open(k)']_vars
 
 \* ---- Liveness ----
 

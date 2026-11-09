@@ -4,6 +4,7 @@ const token_estimate = @import("../../shared/token_estimate.zig");
 const types = @import("../../shared/types.zig");
 const stream_provider = @import("../stream_provider.zig");
 const text_utils = @import("../../shared/text_utils.zig");
+const json_decode = @import("../../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -41,10 +42,10 @@ const ImageUrl = struct {
 
     pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !ImageUrl {
         if (try source.peekNextTokenType() == .string) {
-            return .{ .url = try std.json.innerParse([]const u8, alloc, source, options) };
+            return .{ .url = try json_decode.innerParse([]const u8, alloc, source, options) };
         }
         const Wrapped = struct { url: []const u8 };
-        const wrapped = try std.json.innerParse(Wrapped, alloc, source, options);
+        const wrapped = try json_decode.innerParse(Wrapped, alloc, source, options);
         return .{ .url = wrapped.url };
     }
 };
@@ -62,7 +63,7 @@ const MessageContent = struct {
 
     pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !MessageContent {
         if (try source.peekNextTokenType() == .array_begin) {
-            return .{ .parts = try std.json.innerParse([]const ImagePart, alloc, source, options) };
+            return .{ .parts = try json_decode.innerParse([]const ImagePart, alloc, source, options) };
         }
         try source.skipValue();
         return .{};
@@ -104,7 +105,7 @@ pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: strea
     }
 
     // Typed parsing borrows unescaped payload strings. Value parsing copies them.
-    const parsed = std.json.parseFromSlice(CostRequest, alloc, body, .{
+    const parsed = json_decode.parseFromSlice(CostRequest, alloc, body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_if_needed,
     }) catch |err| return switch (err) {

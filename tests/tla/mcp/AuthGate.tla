@@ -13,8 +13,11 @@
 \*   - One refresh at a time. A request that would go out during a
 \*     refresh, or with a token close to expiry, waits for it.
 \*   - The refresh token may rotate, and the client always presents the latest
-\*     (AUTH-25). A refusal drops both tokens; a transport failure keeps them
-\*     and fails the requests waiting.
+\*     (AUTH-25). A refusal, any answer naming an error at 200 or a 4xx other
+\*     than 429, drops both tokens: the authorization server won't take that
+\*     refresh token again (AUTH-27). A 429, a 5xx or no answer within
+\*     30 s keeps them and fails the requests waiting. A request the host
+\*     cancels leaves the refresh running for the next one.
 \*   - Signing in brings a new token; signing out cancels the refresh in flight.
 EXTENDS Naturals
 
@@ -36,12 +39,13 @@ VARIABLES
     \* Server.
     valid,        \* generations the server accepts; 0 when it needs no token
     serverRt,     \* the refresh token the authorization server accepts
+    deadRt,       \* refresh tokens it refused for good
     \* Ghosts.
     usedRt,       \* the refresh token the refresh in flight presented
     sends,        \* [Keys -> times sent]
     rejectedG     \* [Keys -> the token its rejected send carried]
 
-vars == <<gen, held, refreshable, rt, inflight, req, valid, serverRt, usedRt, sends, rejectedG>>
+vars == <<gen, held, refreshable, rt, inflight, req, valid, serverRt, deadRt, usedRt, sends, rejectedG>>
 
 Init ==
     /\ gen = 0
@@ -52,6 +56,7 @@ Init ==
     /\ req = [k \in Keys |-> [phase |-> "idle", g |-> 0, again |-> FALSE]]
     /\ valid \in {{}, {0}}
     /\ serverRt = 0
+    /\ deadRt = {}
     /\ usedRt = 0
     /\ sends = [k \in Keys |-> 0]
     /\ rejectedG = [k \in Keys |-> 0]
@@ -73,14 +78,14 @@ Send(k, expiring) ==
        ELSE /\ req' = [req EXCEPT ![k].phase = "sent", ![k].g = Token]
             /\ sends' = [sends EXCEPT ![k] = @ + 1]
             /\ UNCHANGED <<inflight, usedRt>>
-    /\ UNCHANGED <<gen, held, refreshable, rt, valid, serverRt, rejectedG>>
+    /\ UNCHANGED <<gen, held, refreshable, rt, valid, serverRt, deadRt, rejectedG>>
 
 \* The server accepts the request.
 Accept(k) ==
     /\ req[k].phase = "sent"
     /\ req[k].g \in valid
     /\ req' = [req EXCEPT ![k].phase = "done"]
-    /\ UNCHANGED <<gen, held, refreshable, rt, inflight, valid, serverRt, usedRt, sends, rejectedG>>
+    /\ UNCHANGED <<gen, held, refreshable, rt, inflight, valid, serverRt, deadRt, usedRt, sends, rejectedG>>
 
 \* The server rejects it with 401.
 Reject(k) ==
@@ -105,7 +110,7 @@ Reject(k) ==
             /\ UNCHANGED sends
        ELSE /\ req' = [req EXCEPT ![k].phase = "needs_sign_in"]
             /\ UNCHANGED <<inflight, usedRt, sends>>
-    /\ UNCHANGED <<gen, held, refreshable, rt, valid, serverRt>>
+    /\ UNCHANGED <<gen, held, refreshable, rt, valid, serverRt, deadRt>>
 
 \* Waiting requests go out once the refresh ends with a token, or end.
 Release(next) ==
@@ -118,7 +123,7 @@ Released(next) ==
 Forget(k) ==
     /\ req[k].phase \in {"sent", "waiting"}
     /\ req' = [req EXCEPT ![k].phase = "cancelled"]
-    /\ UNCHANGED <<gen, held, refreshable, rt, inflight, valid, serverRt, usedRt, sends, rejectedG>>
+    /\ UNCHANGED <<gen, held, refreshable, rt, inflight, valid, serverRt, deadRt, usedRt, sends, rejectedG>>
 
 \* ---- Authorization server ----
 
@@ -134,23 +139,27 @@ RefreshOk(rotate) ==
     /\ inflight' = 0
     /\ req' = Release("sent")
     /\ sends' = Released("sent")
-    /\ UNCHANGED <<refreshable, usedRt, rejectedG>>
+    /\ UNCHANGED <<refreshable, deadRt, usedRt, rejectedG>>
 
-\* invalid_grant: both tokens are dropped.
+\* The answer names an error, at 200 or a 4xx other than 429 (RFC 6749 §5.2, or
+\* Slack's ok:false): the refresh token is dead for good, and both tokens are
+\* dropped (AUTH-27).
 RefreshRefused ==
     /\ inflight > 0
+    /\ deadRt' = deadRt \cup {usedRt}
     /\ held' = FALSE
     /\ refreshable' = FALSE
     /\ inflight' = 0
     /\ req' = [k \in Keys |-> IF req[k].phase = "waiting" THEN [req[k] EXCEPT !.phase = "needs_sign_in"] ELSE req[k]]
     /\ UNCHANGED <<gen, rt, valid, serverRt, usedRt, sends, rejectedG>>
 
-\* The refresh never got an answer: the tokens are kept.
+\* A 429, a 5xx, or no answer: the refresh token may work later, so the
+\* tokens are kept.
 RefreshFailed ==
     /\ inflight > 0
     /\ inflight' = 0
     /\ req' = [k \in Keys |-> IF req[k].phase = "waiting" THEN [req[k] EXCEPT !.phase = "failed"] ELSE req[k]]
-    /\ UNCHANGED <<gen, held, refreshable, rt, valid, serverRt, usedRt, sends, rejectedG>>
+    /\ UNCHANGED <<gen, held, refreshable, rt, valid, serverRt, deadRt, usedRt, sends, rejectedG>>
 
 \* ---- Environment ----
 
@@ -158,7 +167,7 @@ RefreshFailed ==
 Expire(g) ==
     /\ g \in valid
     /\ valid' = valid \ {g}
-    /\ UNCHANGED <<gen, held, refreshable, rt, inflight, req, serverRt, usedRt, sends, rejectedG>>
+    /\ UNCHANGED <<gen, held, refreshable, rt, inflight, req, serverRt, deadRt, usedRt, sends, rejectedG>>
 
 \* A sign-in (AuthFlow.tla) brings a token, with or without a refresh token.
 \* It replaces the refresh in flight, whose answer is ignored, and the requests
@@ -174,7 +183,7 @@ SignedIn(withRefresh) ==
     /\ inflight' = 0
     /\ req' = Release("sent")
     /\ sends' = Released("sent")
-    /\ UNCHANGED <<usedRt, rejectedG>>
+    /\ UNCHANGED <<deadRt, usedRt, rejectedG>>
 
 \* Signing out drops the tokens and cancels the refresh in flight.
 SignOut ==
@@ -182,7 +191,7 @@ SignOut ==
     /\ refreshable' = FALSE
     /\ inflight' = 0
     /\ req' = [k \in Keys |-> IF req[k].phase = "waiting" THEN [req[k] EXCEPT !.phase = "needs_sign_in"] ELSE req[k]]
-    /\ UNCHANGED <<gen, rt, valid, serverRt, usedRt, sends, rejectedG>>
+    /\ UNCHANGED <<gen, rt, valid, serverRt, deadRt, usedRt, sends, rejectedG>>
 
 Answer(k) == Accept(k) \/ Reject(k)
 Refreshed == (\E r \in BOOLEAN : RefreshOk(r)) \/ RefreshRefused \/ RefreshFailed
@@ -195,8 +204,8 @@ Next ==
     \/ \E r \in BOOLEAN : SignedIn(r)
     \/ SignOut
 
-\* The server answers every request, and the authorization server every
-\* refresh.
+\* The server answers every request, and every refresh ends: the client gives
+\* one with no answer 30 s, then ends it as RefreshFailed.
 Fairness ==
     /\ \A k \in Keys : WF_vars(Answer(k))
     /\ WF_vars(Refreshed)
@@ -211,6 +220,7 @@ TypeOK ==
     /\ inflight \in Nat
     /\ \A k \in Keys : req[k].phase \in Phases /\ req[k].g \in 0..MaxGen /\ req[k].again \in BOOLEAN
     /\ valid \subseteq 0..MaxGen
+    /\ deadRt \subseteq 0..MaxGen
 
 \* One refresh at a time.
 SingleFlightRefresh == inflight <= 1
@@ -218,6 +228,10 @@ SingleFlightRefresh == inflight <= 1
 \* AUTH-25: a refresh presents the refresh token the server accepts, the latest
 \* one it issued.
 RefreshUsesLatest == inflight > 0 => usedRt = serverRt
+
+\* AUTH-27, A refresh never presents a refresh token the authorization
+\* server refused for good, so a refusal can't repeat with every request.
+NoDeadRefresh == inflight > 0 => usedRt \notin deadRt
 
 \* A request goes out at most twice, and its second send carries a newer
 \* token than the one rejected.

@@ -1,5 +1,5 @@
 // The trace bridge: turns what a scenario saw of real fx into TraceObs.tla
-// and checks it against a model's trace wrapper, MCP-v2's way (sentinel
+// and checks it against a model's trace wrapper, as drivers/mcp/bridge.ts does (sentinel
 // invariant: violated exactly when a complete match exists).
 //
 // Verdicts:
@@ -47,10 +47,14 @@ export function traceObs(records: TraceRecord[], constants: Record<string, Value
 }
 
 const substitutions: Record<string, string[]> = {
-  HostLifecycle: ["Servers", "Project", "Reachable", "NeedsAuth", "MaxHosts", "MaxLeases"],
-  Credentials: ["Names", "Faults", "InitKinds", "InitEntries", "InitImported", "InitMarked", "InitV1"],
+  HostLifecycle: ["Servers", "Project", "Reachable", "NeedsAuth", "MaxReloads", "MaxLeases"],
+  Credentials: ["Names", "Faults", "InitKinds", "InitEntries", "InitV1"],
   SignIn: ["MaxLogins", "MaxHosts", "MaxLeases", "Bridge"],
   ElicitationRouting: ["Versions", "MaxQ", "Slots", "Guard"],
+  UrlRetry: ["Urls", "Slots", "MaxCalls", "Guard"],
+  MixedBuilds: ["RevokeOnReplay"],
+  StoreLockBudget: ["Budget", "Slack", "Tolerance"],
+  RefreshLease: ["RefreshMax", "Budget", "Slack", "Tolerance"],
 };
 
 function wrapperCfg(module: string, invariant: string): string {

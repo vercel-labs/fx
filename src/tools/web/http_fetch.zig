@@ -3898,3 +3898,136 @@ test "web_fetch closed peer write returns a cause without terminating process" {
     };
     return error.TestExpectedError;
 }
+
+test "web_fetch response parser reads a response the same however it is split" {
+    try std.testing.fuzz({}, fuzzResponseParser, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").http_response.*),
+    });
+}
+
+const fuzz_response_pieces = [_][]const u8{
+    "HTTP/1.1 ",        "HTTP/1.0 ",                  "200",          "301",           "100", " OK", "\r\n", "\r\n\r\n",
+    "Content-Length:",  "Transfer-Encoding: chunked", "Location: /a", "Content-Type:", " ",   "0",   "5",    "a",
+    "ffffffffffffffff", ";x=1",                       ";q=\"v\"",     "hello",         "\n",  ":",   "gzip", ",",
+};
+
+const fuzz_statuses = [_]struct { code: u16, text: []const u8 }{
+    .{ .code = 200, .text = "OK" },    .{ .code = 201, .text = "Created" },   .{ .code = 301, .text = "Moved Permanently" },
+    .{ .code = 302, .text = "Found" }, .{ .code = 404, .text = "Not Found" }, .{ .code = 500, .text = "" },
+};
+
+/// Appends a well-formed response and returns its body.
+fn appendFuzzResponse(alloc: Allocator, smith: *std.testing.Smith, wire: *std.ArrayList(u8), body: *std.ArrayList(u8)) !u16 {
+    for (0..smith.valueRangeAtMost(u8, 0, 2)) |_| try wire.appendSlice(alloc, "HTTP/1.1 100 Continue\r\n\r\n");
+    const status = fuzz_statuses[smith.index(fuzz_statuses.len)];
+    try wire.print(alloc, "HTTP/1.1 {d} {s}\r\n", .{ status.code, status.text });
+    if (smith.value(bool)) try wire.appendSlice(alloc, "Content-Type: text/plain; charset=utf-8\r\n");
+    if (status.code == 301 or status.code == 302) try wire.appendSlice(alloc, "Location: /next?q=1\r\n");
+    if (smith.value(bool)) try wire.appendSlice(alloc, "X-Extra:  value with spaces \r\n");
+
+    for (0..smith.valueRangeAtMost(u16, 0, 320)) |_| try body.append(alloc, smith.value(u8));
+    switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => {
+            const name = if (smith.value(bool)) "Content-Length" else "content-length";
+            try wire.print(alloc, "{s}: {d}\r\n\r\n", .{ name, body.items.len });
+            try wire.appendSlice(alloc, body.items);
+        },
+        1 => {
+            try wire.appendSlice(alloc, "Transfer-Encoding: chunked\r\n\r\n");
+            var sent: usize = 0;
+            while (sent < body.items.len) {
+                const size = @min(body.items.len - sent, @as(usize, smith.valueRangeAtMost(u16, 1, 80)));
+                if (smith.value(bool)) try wire.print(alloc, "{X}", .{size}) else try wire.print(alloc, "{x}", .{size});
+                if (smith.valueRangeAtMost(u8, 0, 3) == 0) try wire.appendSlice(alloc, ";ext=\"a b\"");
+                try wire.appendSlice(alloc, "\r\n");
+                try wire.appendSlice(alloc, body.items[sent .. sent + size]);
+                try wire.appendSlice(alloc, "\r\n");
+                sent += size;
+            }
+            try wire.appendSlice(alloc, "0\r\n");
+            if (smith.value(bool)) try wire.appendSlice(alloc, "X-Trailer: ignored\r\n");
+            try wire.appendSlice(alloc, "\r\n");
+        },
+        else => {
+            // Without a length the body runs to the end of the connection.
+            try wire.appendSlice(alloc, "Connection: close\r\n\r\n");
+            try wire.appendSlice(alloc, body.items);
+        },
+    }
+    return status.code;
+}
+
+fn fuzzResponseParser(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(alloc);
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(alloc);
+    const well_formed = smith.valueRangeAtMost(u8, 0, 3) != 0;
+    var status: u16 = 0;
+    if (well_formed) {
+        status = try appendFuzzResponse(alloc, smith, &wire, &body);
+    } else {
+        for (0..smith.valueRangeAtMost(u8, 0, 24)) |_| {
+            if (smith.valueRangeAtMost(u8, 0, 5) == 0) {
+                try wire.append(alloc, smith.value(u8));
+            } else {
+                try wire.appendSlice(alloc, fuzz_response_pieces[smith.index(fuzz_response_pieces.len)]);
+            }
+        }
+    }
+    const cap = @as(usize, smith.valueRangeAtMost(u16, 0, 400));
+
+    var splits: std.ArrayList(usize) = .empty;
+    defer splits.deinit(alloc);
+    var at: usize = 0;
+    while (at < wire.items.len) {
+        at = @min(wire.items.len, at + @as(usize, smith.valueRangeAtMost(u16, 1, 64)));
+        try splits.append(alloc, at);
+    }
+
+    const whole_splits = [_]usize{wire.items.len};
+    var whole = readFuzzResponse(alloc, wire.items, &whole_splits, cap);
+    defer if (whole) |*response| response.deinit(alloc) else |_| {};
+    var pieces = readFuzzResponse(alloc, wire.items, splits.items, cap);
+    defer if (pieces) |*response| response.deinit(alloc) else |_| {};
+
+    if (whole) |response| {
+        const other = try pieces;
+        try std.testing.expectEqual(response.status, other.status);
+        try std.testing.expectEqualStrings(response.body, other.body);
+        try expectEqualOptionalStrings(response.location, other.location);
+        try expectEqualOptionalStrings(response.content_type, other.content_type);
+        try expectEqualOptionalStrings(response.content_encoding, other.content_encoding);
+        try std.testing.expect(response.body.len <= cap);
+        if (well_formed) {
+            try std.testing.expectEqual(status, @backingInt(response.status));
+            try std.testing.expectEqualStrings(body.items, response.body);
+        }
+    } else |err| {
+        try std.testing.expectError(err, pieces);
+        if (well_formed) {
+            try std.testing.expect(body.items.len > cap);
+            try std.testing.expectEqual(error.BodyTooLarge, err);
+        }
+    }
+}
+
+fn readFuzzResponse(alloc: Allocator, wire: []const u8, splits: []const usize, cap: usize) anyerror!ConnectorResponse {
+    const calls = try alloc.alloc(std.testing.Reader.Call, splits.len);
+    defer alloc.free(calls);
+    var start: usize = 0;
+    for (splits, calls) |end, *call| {
+        call.* = .{ .buffer = wire[start..end] };
+        start = end;
+    }
+    var buffer: [64]u8 = undefined;
+    var reader: std.testing.Reader = .init(&buffer, calls);
+    var failure_stage: FailureStage = .response_head;
+    return readResponse(alloc, &reader.interface, cap, .{}, &failure_stage);
+}
+
+fn expectEqualOptionalStrings(expected: ?[]const u8, actual: ?[]const u8) !void {
+    if (expected) |value| return std.testing.expectEqualStrings(value, actual orelse return error.TestExpectedEqual);
+    try std.testing.expect(actual == null);
+}

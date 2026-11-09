@@ -16,15 +16,9 @@ import { artifacts, binary, shellQuote, targetHelpers } from "../lib/context";
 import { fixture, fxEnv, save, serverEvents, stdioServer, waitFor, writeProfile } from "./driver";
 import { checkTrace, type TraceRecord } from "./trace";
 
-// Tests marked NEXT_MCP check the MCP host fixes from the next MCP-v2
-// version, which src/core/mcp_host/ does not have yet. They run only with
-// FX_TLA_NEXT_MCP=1.
-const NEXT_MCP = process.env.FX_TLA_NEXT_MCP === "1";
-
-
 const TOOL = "mcp_fixture_elicit";
 
-test.skipIf(!NEXT_MCP)("an answer to a withdrawn 2025 question reaches no one, and question 2 gets its own (trace ACCEPTED with the guard)", async () => {
+test("An answer to a withdrawn 2025 question reaches no one, and question 2 gets its own (trace ACCEPTED with the guard)", async () => {
   const f = fixture(artifacts, "elicit-slot-reuse");
   writeProfile(f, { fixture: stdioServer(f, "fixture") });
   const { TmuxSession, startFakeGateway, fakeGatewayToolCall, fakeGatewayFinalText } = await targetHelpers();

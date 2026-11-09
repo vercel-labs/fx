@@ -1,18 +1,10 @@
 const std = @import("std");
 const debug_trace = @import("debug_trace.zig");
 const display_width = @import("display_width.zig");
+const ascii_case = @import("ascii_case.zig");
 
-pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-
-    const last_start = haystack.len - needle.len;
-    var i: usize = 0;
-    while (i <= last_start) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
+pub const containsIgnoreCase = ascii_case.containsIgnoreCase;
+pub const hasMajorVersionAtLeast = ascii_case.hasMajorVersionAtLeast;
 
 /// Returns `text` repeated `count` times as a comptime string literal.
 pub inline fn repeat(comptime text: []const u8, comptime count: usize) *const [text.len * count:0]u8 {
@@ -416,6 +408,97 @@ pub fn encodeTerminalSafeInline(
     return encodeTerminalSafe(alloc, flattened.items, max_encoded_bytes);
 }
 
+/// `raw` as a `{f}` format argument, written with the visible escapes
+/// `encodeTerminalSafe` uses, without allocating or shortening it. Messages
+/// use it to quote a word from the command line, the environment, or a file,
+/// so the terminal shows the word instead of acting on its escape sequences.
+pub fn terminalSafe(raw: []const u8) TerminalSafe {
+    return .{ .raw = raw };
+}
+
+const TerminalSafe = struct {
+    raw: []const u8,
+
+    pub fn format(self: TerminalSafe, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        var index: usize = 0;
+        while (index < self.raw.len) {
+            var token_buf: [12]u8 = undefined;
+            const token = terminalSafeToken(self.raw, index, &token_buf);
+            try writer.writeAll(token.bytes);
+            index += token.source_len;
+        }
+    }
+};
+
+test "terminalSafe writes what encodeTerminalSafe returns" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "plain --model", "dark\x1b]0;owned\x07\x1b[2J", "tab\there\r\n", "caf\xc3\xa9 \xff\xfe", "\x7f\xc2\x9b" }) |raw| {
+        var encoded = try encodeTerminalSafe(alloc, raw, std.math.maxInt(usize));
+        defer encoded.deinit(alloc);
+        const formatted = try alloc.print("{f}", .{terminalSafe(raw)});
+        defer alloc.free(formatted);
+        try std.testing.expectEqualStrings(encoded.bytes, formatted);
+        try std.testing.expect(isTerminalSafe(formatted));
+    }
+}
+
+/// Appends one line of file text ready to draw. Tabs stay, since they only
+/// move along the row, and a trailing carriage return from a CRLF line ending
+/// is dropped. Every other control byte, C1 control, and invalid UTF-8 byte
+/// becomes the visible escape `encodeTerminalSafe` writes, so the terminal
+/// never acts on the file's own sequences.
+pub fn appendTerminalSafeLine(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    raw: []const u8,
+) error{OutOfMemory}!void {
+    const line = if (raw.len > 0 and raw[raw.len - 1] == '\r') raw[0 .. raw.len - 1] else raw;
+    var index: usize = 0;
+    while (index < line.len) {
+        if (line[index] == '\t') {
+            try out.append(alloc, '\t');
+            index += 1;
+            continue;
+        }
+        var token_buf: [12]u8 = undefined;
+        const token = terminalSafeToken(line, index, &token_buf);
+        try out.appendSlice(alloc, token.bytes);
+        index += token.source_len;
+    }
+}
+
+/// A copy of `raw` that is valid UTF-8. Each byte outside a valid sequence
+/// becomes the `\xNN` escape `encodeTerminalSafe` writes for it; everything
+/// else, control bytes included, is kept for the renderer to handle. Caller
+/// owns the result.
+pub fn dupeValidUtf8(alloc: std.mem.Allocator, raw: []const u8) error{OutOfMemory}![]u8 {
+    if (std.unicode.utf8ValidateSlice(raw)) return alloc.dupe(u8, raw);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var index: usize = 0;
+    while (index < raw.len) {
+        const sequence_len = validUtf8SequenceLength(raw, index) orelse {
+            var buf: [12]u8 = undefined;
+            try out.appendSlice(alloc, writeByteEscape(&buf, raw[index]));
+            index += 1;
+            continue;
+        };
+        try out.appendSlice(alloc, raw[index .. index + sequence_len]);
+        index += sequence_len;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// The length of the valid UTF-8 sequence at `index`, or null when the byte
+/// there does not start one, by the same rule `terminalSafeToken` applies.
+fn validUtf8SequenceLength(raw: []const u8, index: usize) ?usize {
+    if (raw[index] < 0x80) return 1;
+    const sequence_len = std.unicode.utf8ByteSequenceLength(raw[index]) catch return null;
+    if (index + sequence_len > raw.len) return null;
+    _ = display_width.decodeUtf8Sequence(raw[index .. index + sequence_len]) catch return null;
+    return sequence_len;
+}
+
 /// Returns true when `raw` is valid printable terminal text and
 /// `encodeTerminalSafe` would preserve it byte-for-byte.
 pub fn isTerminalSafe(raw: []const u8) bool {
@@ -428,6 +511,93 @@ pub fn isTerminalSafe(raw: []const u8) bool {
         index += token.source_len;
     }
     return true;
+}
+
+/// Returns true when `raw` draws as it is under `appendTerminalSafeText`:
+/// line breaks and tabs are its only control bytes, and the rest is valid
+/// UTF-8 with no C1 control.
+pub fn isTerminalSafeText(raw: []const u8) bool {
+    var index: usize = 0;
+    while (index < raw.len) {
+        if (raw[index] == '\n' or raw[index] == '\t') {
+            index += 1;
+            continue;
+        }
+        var token_buf: [12]u8 = undefined;
+        const token = escapedToken(raw, index, &token_buf, .controls);
+        if (token.source_len != token.bytes.len) return false;
+        if (!std.mem.eql(u8, raw[index .. index + token.source_len], token.bytes)) return false;
+        index += token.source_len;
+    }
+    return true;
+}
+
+/// Appends prose of any number of lines, such as a prompt or a model's reply,
+/// ready to draw: line breaks and tabs stay, a carriage return before a line
+/// break is dropped, and every other control byte, C1 control, and invalid
+/// UTF-8 byte becomes the visible escape `encodeTerminalSafe` writes. Unlike
+/// `appendTerminalSafeLine`, it keeps zero-width joiners, direction marks,
+/// and other invisible format characters, which emoji sequences and some
+/// scripts need.
+pub fn appendTerminalSafeText(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    raw: []const u8,
+) error{OutOfMemory}!void {
+    var index: usize = 0;
+    while (index < raw.len) {
+        const byte = raw[index];
+        if (byte == '\n' or byte == '\t') {
+            try out.append(alloc, byte);
+            index += 1;
+            continue;
+        }
+        if (byte == '\r' and index + 1 < raw.len and raw[index + 1] == '\n') {
+            index += 1;
+            continue;
+        }
+        var token_buf: [12]u8 = undefined;
+        const token = escapedToken(raw, index, &token_buf, .controls);
+        try out.appendSlice(alloc, token.bytes);
+        index += token.source_len;
+    }
+}
+
+test "terminal-safe text keeps its lines and tabs and shows every other control as an escape" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try appendTerminalSafeText(alloc, &out, "one\ttab\r\ntwo \x1b]2;pwned\x07 \xc2\x9b2J caf\xc3\xa9 \xff");
+    try std.testing.expectEqualStrings("one\ttab\ntwo \\x1b]2;pwned\\x07 \\u{009b}2J caf\xc3\xa9 \\xff", out.items);
+    try std.testing.expect(isTerminalSafeText(out.items));
+
+    try std.testing.expect(isTerminalSafeText("one\ttwo\nthree caf\xc3\xa9"));
+
+    // A joined emoji, a zero-width non-joiner, and a right-to-left mark stay.
+    const joined = "team \u{1f469}\u{200d}\u{1f4bb} \u{200c}\u{200f}";
+    try std.testing.expect(isTerminalSafeText(joined));
+    out.clearRetainingCapacity();
+    try appendTerminalSafeText(alloc, &out, joined);
+    try std.testing.expectEqualStrings(joined, out.items);
+    for ([_][]const u8{ "a\x1bb", "a\xc2\x9bb", "a\r\nb", "a\x7fb", "a\xffb" }) |raw| {
+        try std.testing.expect(!isTerminalSafeText(raw));
+    }
+}
+
+/// Returns true when `url` can be an OSC 8 link target as it is: printable
+/// ASCII with no space, so nothing in it can end the sequence. Show any other
+/// address as text instead.
+pub fn isLinkTarget(url: []const u8) bool {
+    if (url.len == 0) return false;
+    for (url) |c| if (c <= ' ' or c >= 0x7f) return false;
+    return true;
+}
+
+test "a link target is printable ASCII with no space" {
+    try std.testing.expect(isLinkTarget("https://mcp.example.com/authorize?state=a%20b&x=1#y"));
+    for ([_][]const u8{ "", "https://h/a b", "https://h/a\x1b\\\x1b]8;;evil", "https://h/a\x07", "https://h/\xc3\xa9", "https://h/\x7f" }) |odd| {
+        try std.testing.expect(!isLinkTarget(odd));
+    }
 }
 
 pub fn terminalSafeVisibleWidth(raw: []const u8) usize {
@@ -567,7 +737,20 @@ const TerminalSafeToken = struct {
     bytes: []const u8,
 };
 
+/// The code points a token writes as an escape: every non-printing one, or
+/// only the C1 controls a terminal acts on.
+const EscapedCodepoints = enum { non_printing, controls };
+
 fn terminalSafeToken(raw: []const u8, index: usize, buf: *[12]u8) TerminalSafeToken {
+    return escapedToken(raw, index, buf, .non_printing);
+}
+
+fn escapedToken(
+    raw: []const u8,
+    index: usize,
+    buf: *[12]u8,
+    comptime codepoints: EscapedCodepoints,
+) TerminalSafeToken {
     const byte = raw[index];
     if (byte < 0x20 or byte == 0x7f) {
         return .{ .source_len = 1, .bytes = writeByteEscape(buf, byte) };
@@ -587,7 +770,11 @@ fn terminalSafeToken(raw: []const u8, index: usize, buf: *[12]u8) TerminalSafeTo
     const codepoint = display_width.decodeUtf8Sequence(sequence) catch {
         return .{ .source_len = 1, .bytes = writeByteEscape(buf, byte) };
     };
-    if (isNonPrintingCodepoint(codepoint)) {
+    const escape = switch (codepoints) {
+        .non_printing => isNonPrintingCodepoint(codepoint),
+        .controls => codepoint >= 0x80 and codepoint <= 0x9f,
+    };
+    if (escape) {
         return .{ .source_len = sequence_len, .bytes = writeCodepointEscape(buf, codepoint) };
     }
     return .{ .source_len = sequence_len, .bytes = sequence };
@@ -1505,4 +1692,33 @@ test "utf8ForwardBoundary snaps past the codepoint tail" {
     try std.testing.expectEqual(@as(usize, 4), utf8ForwardBoundary(text, 3));
     try std.testing.expectEqual(@as(usize, 4), utf8ForwardBoundary(text, 4));
     try std.testing.expectEqual(@as(usize, text.len), utf8ForwardBoundary(text, text.len + 3));
+}
+
+test "appendTerminalSafeLine keeps tabs and shows a file's control sequences as text" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try appendTerminalSafeLine(alloc, &out, "a\tb\x1b[2J\x1b[Hc\u{9b}31md\xffe\r");
+    try std.testing.expectEqualStrings("a\tb\\x1b[2J\\x1b[Hc\\u{009b}31md\\xffe", out.items);
+
+    // Only a trailing carriage return ends a line; one inside it would return
+    // to the start of the row and draw over its gutter.
+    out.clearRetainingCapacity();
+    try appendTerminalSafeLine(alloc, &out, "good\rbad\r");
+    try std.testing.expectEqualStrings("good\\x0dbad", out.items);
+}
+
+test "dupeValidUtf8 escapes only bytes outside valid sequences" {
+    const alloc = std.testing.allocator;
+    const kept = try dupeValidUtf8(alloc, "tab\tesc\x1b ok ⋯");
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("tab\tesc\x1b ok ⋯", kept);
+
+    // A truncated sequence and an encoded surrogate are invalid byte by byte,
+    // as `encodeTerminalSafe` sees them.
+    const fixed = try dupeValidUtf8(alloc, "a\xff\xfe\x00\xc3(b\xed\xa0\x80");
+    defer alloc.free(fixed);
+    try std.testing.expectEqualStrings("a\\xff\\xfe\x00\\xc3(b\\xed\\xa0\\x80", fixed);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(fixed));
 }

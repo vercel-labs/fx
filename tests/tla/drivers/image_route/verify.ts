@@ -7,15 +7,23 @@
 //   3. the harness, built from the real src/core/images/image_route.zig;
 //   4. spec to code: every graph edge replayed against the real core;
 //   5. code to spec: scripted and random traces with faults, checked by TLC;
-//   6. every planted bug in the spec caught by its property;
-//   7. every planted bug in the code caught in both directions;
-//   8. traceability: DESIGN.md accounts for every question, rule, and law.
+//   6. binary to spec: `fx ask` turns of the built binary, a matrix and
+//      random sessions, each checked by TLC against the model, and doctored
+//      observations the check must reject;
+//   7. every planted bug in the spec caught by its property;
+//   8. every planted bug in the code caught in both directions;
+//   9. traceability: DESIGN.md accounts for every question, rule, and law.
 //
 // Settings: FX_IMAGE_ROUTE_SEED (default 20261019), FX_IMAGE_ROUTE_TRACES
-// (random traces, default 300), FX_TLA_OUT (where the report goes).
+// (random traces, default 300), FX_IMAGE_ROUTE_BINARY_SESSIONS (random
+// binary sessions, default 8), FX_BIN (the binary, default zig-out/bin/fx,
+// which `zig build` must have built from this checkout), FX_TLA_OUT (where
+// the report goes).
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { binary } from "../lib/context.ts";
 import { outDir, writeJson } from "../lib/tlc.ts";
+import { binaryToSpec, checkObservations, doctoredObservations } from "./binary-to-spec.ts";
 import { codeToSpec } from "./code-to-spec.ts";
 import { MODEL_DIR, PINNED_TLC_VERSION, buildHarness, checkTlc, pinnedToolchain, specFiles } from "./lib.ts";
 import { codeMutations, specMutations } from "./mutations.ts";
@@ -24,8 +32,9 @@ import { checkTraceability } from "./traceability.ts";
 
 const seed = Number(process.env.FX_IMAGE_ROUTE_SEED ?? "20261019");
 const randomTraces = Number(process.env.FX_IMAGE_ROUTE_TRACES ?? "300");
+const binarySessions = Number(process.env.FX_IMAGE_ROUTE_BINARY_SESSIONS ?? "8");
 const out = outDir("image-route");
-const report: Record<string, unknown> = { started: new Date().toISOString(), seed, randomTraces, out };
+const report: Record<string, unknown> = { started: new Date().toISOString(), seed, randomTraces, binarySessions, binary, out };
 const failures: string[] = [];
 const started = performance.now();
 const elapsed = (from: number) => `${((performance.now() - from) / 1000).toFixed(1)} s`;
@@ -65,6 +74,23 @@ try {
   report.codeToSpec = { traces: traces.traces, steps: traces.steps, tracesPath: traces.tracesPath, verdict: traces.tlc.verdict, property: traces.tlc.property, distinctStates: traces.tlc.distinctStates, durationMs: traces.tlc.durationMs };
   stage("code to spec", traces.tlc.verdict === "pass",
     `${traces.traces} traces, ${traces.steps} steps, TLC ${traces.tlc.verdict}${traces.tlc.property ? ` (${traces.tlc.property})` : ""}, ${traces.tlc.distinctStates} distinct states, ${elapsed(at)}`);
+
+  at = performance.now();
+  const turns = await binaryToSpec({ bin: binary, dir: join(out, "binary-to-spec"), seed, randomSessions: binarySessions, maxTurns: 5 });
+  const doctored = doctoredObservations(JSON.parse(readFileSync(turns.observationsPath, "utf8")));
+  const doctoredRejected: string[] = [];
+  for (const [index, entry] of doctored.entries()) {
+    if (!(await checkObservations(join(out, "binary-to-spec", `doctored-${index + 1}`), entry.observations, false)).ok) doctoredRejected.push(entry.name);
+  }
+  report.binaryToSpec = { ok: turns.ok, sessions: turns.sessions, turns: turns.turns, observationsPath: turns.observationsPath, mismatches: turns.mismatches, doctored: doctored.map((entry) => entry.name), rejected: doctoredRejected };
+  const first = turns.mismatches[0];
+  // Each doctored copy needs a turn of its kind, so all four must exist.
+  stage("binary to spec", turns.ok && doctored.length === 4 && doctoredRejected.length === doctored.length,
+    turns.ok
+      ? `${turns.turns} turns over ${turns.sessions} sessions of ${binary} as the model decides; rejects ${doctoredRejected.length} of ${doctored.length} doctored observations; ${elapsed(at)}`
+      : first
+        ? `${first.observation.session}, turn ${first.observation.turn}: the model expects ${first.expected}, the binary showed ${JSON.stringify(first.observation.seen)}`
+        : `TLC ${turns.tlc.verdict}${turns.tlc.property ? ` (${turns.tlc.property})` : ""}`);
 
   at = performance.now();
   const specBugs = await specMutations(join(out, "spec-mutations"));

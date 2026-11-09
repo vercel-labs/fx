@@ -46,7 +46,7 @@ export interface FxModelOptions {
   effort?: FxEffort;
   /** Enables the fast lane for models that advertise one. */
   fast?: boolean;
-  /** Requests Ultra mode, the higher-cost service tier, for models whose metadata advertises it. Disables Fast. */
+  /** Requests Ultrafast mode, the higher-cost service tier, for models whose metadata advertises it. Disables Fast. */
   ultrafast?: boolean;
 }
 
@@ -224,7 +224,7 @@ export type FxKeyedTool =
   | (Omit<FxHostTool, "name"> & { name?: string })
   | (Omit<FxProviderTool, "name"> & { name?: "web_search" });
 
-/** At most 64 tools: an array of descriptors, or an object keyed by tool name. */
+/** Tools: an array of descriptors, or an object keyed by tool name. */
 export type FxTools = readonly FxTool[] | { readonly [name: string]: FxKeyedTool };
 
 /** A tool descriptor for `createFxAgent()`. */
@@ -235,7 +235,7 @@ export type FxAgentKeyedTool =
   | (Omit<FxAgentHostTool, "name"> & { name?: string })
   | (Omit<FxProviderTool, "name"> & { name?: "web_search" });
 
-/** At most 64 `createFxAgent()` tools: an array of descriptors, or an object keyed by tool name. */
+/** `createFxAgent()` tools: an array of descriptors, or an object keyed by tool name. */
 export type FxAgentTools = readonly FxAgentTool[] | { readonly [name: string]: FxAgentKeyedTool };
 
 // ---------------------------------------------------------------------------
@@ -261,8 +261,8 @@ export interface FxUsage {
   reasoningTokens?: number;
 }
 
-/** Why an engine turn ended. */
-export type FxStopReason = "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled";
+/** Why an engine turn ended. `yielded`: it stopped at its `yieldAt` and stays open for `resume()`. */
+export type FxStopReason = "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled" | "yielded";
 
 // ---------------------------------------------------------------------------
 // Diagnostics
@@ -304,7 +304,8 @@ export type FxEngineEvent = FxEventBase & (
   | { type: "permission.request"; request: unknown }
   | { type: "permission.resolve"; optionId: unknown }
   | { type: "journal.open"; events: number; checkpoint: boolean; turns: unknown; resumable: boolean }
-  | { type: "journal.append"; events: number }
+  /** `barrier`: the record's `barrier`, as `Persistence.append` receives it. */
+  | { type: "journal.append"; events: number; barrier: boolean }
   | { type: "journal.error"; error: string }
   | { type: "checkpoint.save"; through: string; bytes: number }
   | { type: "checkpoint.error"; error: string; message: string }
@@ -423,7 +424,7 @@ export type FxHookEvent = FxHookEnvelope & (
   | { type: "mcp.start"; data: { operationId: number | string; callId: string | null; server: string | null; tool: string; transport: string | null } }
   | { type: "mcp.request"; data: { operationId: number | string; requestId: number | string; requestIdKind: "jsonrpc" | "engine" | "correlation" } }
   | { type: "mcp.end"; data: { operationId: number | string; status: "success" | "failure" | "cancelled" | "input_required" | "unavailable" | "unknown"; error: string | null } }
-  | { type: "delegation"; data: { callId: string; childSessionId: string; workId: string; operationId: string | null; phase: "dispatched" | "completed" | "yielded" | "replayed" | "failed" | "cancelled" | "feedback_queued" | "feedback_applied" | "feedback_not_applied" } }
+  | { type: "delegation"; data: { callId: string; childSessionId: string; workId: string; operationId: string | null; phase: "dispatched" | "completed" | "replayed" | "failed" | "cancelled" | "feedback_queued" | "feedback_applied" | "feedback_not_applied" } }
   /** Emitted only after append resolves and its cursor validates. */
   | { type: "journal.commit"; data: { cursor: string; firstSeq: number | null; lastSeq: number | null; eventCount: number } }
   | { type: "journal.restore"; data: { cursor: string | null; lastSeq: number; resumable: boolean; openTurnId: string | null; lastTurnId: string | null } }
@@ -796,8 +797,8 @@ export interface FxAccepted {
 /** How a durable turn ended. */
 export interface FxTurnResult {
   messageId: string;
-  /** `error` when the turn failed, with the reason in `error`; `unknown` when the process that ran it stopped before writing how it ended. */
-  stopReason: FxStopReason | "error" | "unknown";
+  /** `error` when the turn failed, with the reason in `error`; `unknown` when the process that ran it stopped before writing how it ended. A yielded turn continues, so it never ends `yielded`. */
+  stopReason: Exclude<FxStopReason, "yielded"> | "error" | "unknown";
   /** Absent when the result is a failure read from the session's log rather than from the turn's end. */
   usage?: FxUsage;
   error?: FxErrorSummary;
@@ -848,7 +849,7 @@ export type FxStreamLine = (
   | {
     type: "turn_end";
     messageId: string;
-    stopReason: FxStopReason | "error" | "unknown";
+    stopReason: Exclude<FxStopReason, "yielded"> | "error" | "unknown";
     usage?: FxUsage;
     error?: FxErrorSummary;
     repeated?: true;

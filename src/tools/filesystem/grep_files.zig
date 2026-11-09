@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const glob_pattern = @import("../../core/workspace/glob_pattern.zig");
 const grep_search = @import("../../core/workspace/grep_search.zig");
 const tool_files = @import("../../core/workspace/tool_files.zig");
@@ -7,6 +8,7 @@ const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 
 const Allocator = std.mem.Allocator;
@@ -51,47 +53,40 @@ pub const Input = struct {
 
 /// Decodes grep_files JSON into an owned Input released by ToolInput.deinit.
 pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files arguments must be valid JSON") };
-    };
+    var args: tool_args.ArgsDecoder = .{ .alloc = ctx.allocator, .tool = "grep_files" };
+    var parsed = args.parse(args_json) catch |err| return .{ .failure = try args.takeFailure(err) };
     defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files arguments must be an object") };
-    }
-
-    const pattern_value = parsed.value.object.get("pattern") orelse {
-        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files requires string field \"pattern\"") };
-    };
-    if (pattern_value != .string) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files field \"pattern\" must be a string") };
-    }
-
-    const path_string = optionalStringField(parsed.value.object, "path");
-    const include_string = optionalStringField(parsed.value.object, "include");
-    const case_insensitive = if (parsed.value.object.get("case_insensitive")) |value| switch (value) {
+    const object = parsed.value.object;
+    const pattern = args.requiredString(object, "pattern") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const path_string = args.optionalString(object, "path") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const include_string = args.optionalString(object, "include") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const case_insensitive = if (object.get("case_insensitive")) |value| switch (value) {
+        .null => false,
         .bool => |enabled| enabled,
-        else => false,
+        else => return .{ .failure = try ctx.allocator.dupe(u8, "grep_files field \"case_insensitive\" must be a boolean") },
     } else false;
-    const mode = parseOutputMode(parsed.value.object);
+    const raw_mode = args.optionalString(object, "mode") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const mode: OutputMode = if (raw_mode) |raw| std.meta.stringToEnum(OutputMode, raw) orelse {
+        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files field \"mode\" must be one of matches, files_with_matches, count") };
+    } else .matches;
 
-    const head_limit = switch (try parseOptionalInteger(ctx.allocator, parsed.value.object, "head_limit", 1, "positive")) {
+    const head_limit = switch (try parseOptionalInteger(ctx.allocator, object, "head_limit", 1, "positive")) {
         .missing => output_cap,
         .value => |value| @min(value, output_cap),
         .failure => |body| return .{ .failure = body },
     };
-    const offset = switch (try parseOptionalInteger(ctx.allocator, parsed.value.object, "offset", 0, "non-negative")) {
+    const offset = switch (try parseOptionalInteger(ctx.allocator, object, "offset", 0, "non-negative")) {
         .missing => 0,
         .value => |value| value,
         .failure => |body| return .{ .failure = body },
     };
-    const context_lines = switch (try parseOptionalInteger(ctx.allocator, parsed.value.object, "context_lines", 0, "non-negative")) {
+    const context_lines = switch (try parseOptionalInteger(ctx.allocator, object, "context_lines", 0, "non-negative")) {
         .missing => 0,
         .value => |value| @min(value, context_lines_cap),
         .failure => |body| return .{ .failure = body },
     };
 
-    const owned_pattern = try ctx.allocator.dupe(u8, pattern_value.string);
+    const owned_pattern = try ctx.allocator.dupe(u8, pattern);
     errdefer ctx.allocator.free(owned_pattern);
     const effective_path = if (path_string) |path|
         if (path.len == 0) "." else path
@@ -124,21 +119,6 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
     alloc.destroy(input);
 }
 
-fn optionalStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = object.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
-fn parseOutputMode(object: std.json.ObjectMap) OutputMode {
-    const raw = optionalStringField(object, "mode") orelse return .matches;
-    if (std.mem.eql(u8, raw, "count")) return .count;
-    if (std.mem.eql(u8, raw, "files_with_matches")) return .files_with_matches;
-    return .matches;
-}
-
 const OptionalIntegerParse = union(enum) {
     missing,
     value: usize,
@@ -165,7 +145,22 @@ pub fn validate(_: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) to
 
 /// Searches the resolved root and returns an owned tool result body.
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    return callWithOps(ctx, erased, .{});
+    const result = try callWithOps(ctx, erased, .{});
+    holdForTest();
+    return result;
+}
+
+// Only `tests/e2e/tui-interrupt-recovery.test.ts` sets
+// `FX_TEST_GREP_RELEASE`: a finished search then waits until the file it
+// names exists, so the test can cancel the turn while the tool is still
+// running. The libfx artifacts leave it out.
+fn holdForTest() void {
+    if (comptime build_options.libfx) return;
+    const release_path = io_mod.getenv("FX_TEST_GREP_RELEASE") orelse return;
+    while (true) : (io_mod.sleep(std.time.ns_per_ms)) {
+        std.Io.Dir.accessAbsolute(io_mod.getIo(), release_path, .{}) catch continue;
+        return;
+    }
 }
 
 const StatRootFn = *const fn ([]const u8) anyerror!std.Io.File.Stat;
@@ -841,6 +836,11 @@ test "grep_files decodes invalid argument shapes as failures" {
     try expectDecodeFailure("[]", "grep_files arguments must be an object");
     try expectDecodeFailure("{\"path\":\".\"}", "grep_files requires string field \"pattern\"");
     try expectDecodeFailure("{\"pattern\":1}", "grep_files field \"pattern\" must be a string");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"path\":1}", "grep_files field \"path\" must be a string");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"include\":[\"*.zig\"]}", "grep_files field \"include\" must be a string");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"case_insensitive\":\"true\"}", "grep_files field \"case_insensitive\" must be a boolean");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"mode\":\"files\"}", "grep_files field \"mode\" must be one of matches, files_with_matches, count");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"mode\":2}", "grep_files field \"mode\" must be a string");
 }
 
 test "grep_files validate preserves active raw pattern and path values" {
@@ -871,7 +871,7 @@ test "grep_files decodes defaults and all fields" {
         5,
         2,
     );
-    try expectDecodeInput("{\"pattern\":\"needle\",\"path\":1,\"include\":1,\"case_insensitive\":\"yes\"}", "needle", ".", null, false, output_cap, 0);
+    try expectDecodeInput("{\"pattern\":\"needle\",\"path\":null,\"include\":null,\"case_insensitive\":null,\"mode\":null}", "needle", ".", null, false, output_cap, 0);
 }
 
 test "grep_files decodes context_lines above cap as bounded" {

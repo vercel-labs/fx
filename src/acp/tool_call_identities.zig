@@ -7,12 +7,12 @@
 
 const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
-const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const catalog_state = @import("../core/mcp/catalog_state.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
 
 const Allocator = std.mem.Allocator;
-const Identity = mcp_runtime.McpRuntime.ToolIdentity;
+const Identity = catalog_state.ToolIdentity;
 
 /// The side file a v1 session keeps its record in.
 pub const file_name = "mcp-tool-identities.json";
@@ -155,7 +155,7 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Record {
         const tool = stringField(object, "tool") orelse return error.InvalidToolIdentityRecord;
         const title: ?[]u8 = switch (object.get("title") orelse .null) {
             .null => null,
-            .string => |text| if (mcp_runtime.usableDisplayTitle(text)) |usable| @constCast(usable) else null,
+            .string => |text| if (catalog_state.usableDisplayTitle(text)) |usable| @constCast(usable) else null,
             else => return error.InvalidToolIdentityRecord,
         };
         try record.put(alloc, field.key_ptr.*, .{ .server = server, .tool = tool, .title = title });

@@ -1946,13 +1946,39 @@ fn permissionOutcomeForDecision(
 }
 
 /// Reports whether a shell call asks to reload the user's startup files.
+/// Admission sees the top-level arguments the orchestrator stores, and also
+/// reads an exact `request` wrapper so the check never depends on intake.
 fn shellCallRequestsReload(arena: Allocator, call: ToolCall) bool {
     const value = std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments_json, .{}) catch return false;
     if (value != .object) return false;
-    const request = value.object.get("request") orelse return false;
-    if (request != .object) return false;
-    const reload = request.object.get("reload") orelse return false;
+    const args = if (value.object.get("request")) |request| switch (request) {
+        .object => |object| object,
+        else => return false,
+    } else value.object;
+    const reload = args.get("reload") orelse return false;
     return reload == .bool and reload.bool;
+}
+
+test "shell reload detection reads top-level and wrapped arguments" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { arguments_json: []const u8, reload: bool }{
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"git status\",\"reload\":true}", .reload = true },
+        .{ .arguments_json = "{\"request\":{\"action\":\"run\",\"command\":\"git status\",\"reload\":true}}", .reload = true },
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"git status\",\"reload\":false}", .reload = false },
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"git status\"}", .reload = false },
+        .{ .arguments_json = "{\"action\":\"run\",\"command\":\"git status\",\"reload\":\"true\"}", .reload = false },
+        .{ .arguments_json = "{\"request\":\"{\\\"reload\\\":true}\"}", .reload = false },
+        .{ .arguments_json = "not json", .reload = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.reload, shellCallRequestsReload(arena, .{
+            .id = "reload",
+            .name = "shell",
+            .arguments_json = case.arguments_json,
+        }));
+    }
 }
 
 /// Binds the remembered grant's shell snapshot epoch to a shell admission.

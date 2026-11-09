@@ -208,12 +208,14 @@ fn selectRecentContext(
         };
         var base = textTokens(user) +| textTokens(reply) +| replay_tokens(replay, provider) +| 8;
         var steering_index = execution.steering.len;
+        var note_index = execution.context_notes.len;
         var step_index = execution.tool_steps.len;
         if (step_index == 0) {
             for (execution.steering) |entry| {
                 base +|= textTokens(entry.text);
                 if (entry.assistant_prefix) |prefix| base +|= textTokens(prefix);
             }
+            for (execution.context_notes) |note| base +|= textTokens(note.text);
             if (input_capacity) |capacity| {
                 if (!selected_any and base >= capacity) break :history_scan;
             }
@@ -233,6 +235,11 @@ fn selectRecentContext(
                 next_steering -= 1;
                 cost +|= textTokens(execution.steering[next_steering].text);
                 if (execution.steering[next_steering].assistant_prefix) |prefix| cost +|= textTokens(prefix);
+            }
+            // A cut here keeps the notes at and after this boundary (D93).
+            while (note_index > 0 and execution.context_notes[note_index - 1].after_tool_step_count >= step_index) {
+                note_index -= 1;
+                cost +|= textTokens(execution.context_notes[note_index].text);
             }
             if (!selected_any and cost > target) break :history_scan;
             if (input_capacity) |capacity| {

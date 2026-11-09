@@ -203,6 +203,11 @@ jobs:
           zig build -Dwasm-surface=core -Doptimize=ReleaseSmall -Dupdate-channel=${{ needs.metadata.outputs.channel }}
           zig build -Dwasm-surface=term -Doptimize=ReleaseSmall -Dupdate-channel=${{ needs.metadata.outputs.channel }}
 
+      - name: Shrink WebAssembly surfaces with wasm-opt
+        run: |
+          npm ci --prefix sdk/tools
+          node sdk/scripts/optimize-wasm.mjs zig-out/bin/fx-core.wasm zig-out/bin/fx-term.wasm
+
       - name: Install terminal test dependencies
         run: npm ci --prefix sdk/node
 
@@ -269,13 +274,17 @@ jobs:
             (.bin == null)
           ' sdk/package.json >/dev/null
 
-          node sdk/scripts/package-libfx.mjs sdk/dist/libfx native-addons/*.node
-          jq --arg version "$LIBFX_VERSION" '.version = $version' \
-            sdk/dist/libfx/package.json > sdk/dist/libfx/package.json.tmp
-          mv sdk/dist/libfx/package.json.tmp sdk/dist/libfx/package.json
+          # LIBFX_VERSION sets the version of libfx, of each platform's
+          # package, and of the optional dependencies that pin them.
+          node sdk/scripts/package-libfx.mjs sdk/dist native-addons/*.node
+          cp sdk/dist/libfx/package.json /tmp/libfx-manifest.json
           npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
           mv "$(jq -r '.[0].filename' /tmp/libfx-pack.json)" libfx-package.tgz
-          sha256sum libfx-package.tgz > libfx-package.tgz.sha256
+          mkdir libfx-native
+          for package in sdk/dist/libfx-*/; do
+            npm pack "./$package" --ignore-scripts --pack-destination libfx-native --json
+          done | jq -s add > /tmp/libfx-native-pack.json
+          sha256sum libfx-package.tgz libfx-native/*.tgz > libfx-packages.sha256
 
       - name: Validate package archive
         run: |
@@ -283,13 +292,11 @@ jobs:
             const report = require("/tmp/libfx-pack.json")[0];
             const names = new Set(report.files.map(({ path }) => path));
             const required = [
-              "package.json", "README.md", "LICENSE", "browser.js", "node.js", "node.cjs", "fx-sdk.js", "wasm-module.js",
+              "package.json", "README.md", "LICENSE", "browser.js", "browser-agent.js", "browser-terminal.js", "node.js", "node.cjs", "node-wasm.js", "bundled-asset.js", "fx-sdk.js", "engine.js", "xterm.js", "wasm-runtime.js", "wasm-terminal.js", "wasm-module.js",
               "core-output.js", "tool-observation.js", "fetch-cleanup.js", "mcp.js", "skills.js", "skills-node.js", "subscription.js", "oauth.js", "chatgpt.js", "chatgpt-sign-in.js", "grok.js", "grok-sign-in.js", "custom-provider.js",
-              "durable.js", "fx-harness.js", "durable/local.mjs", "durable/vercel.mjs", "durable/world.mjs",
+              "durable.js", "fx-harness.js", "durable/local.mjs", "durable/vercel.mjs", "durable/world.mjs", "durable/local.mjs.map", "durable/vercel.mjs.map", "durable/world.mjs.map",
               "types/browser.d.ts", "types/chatgpt.d.ts", "types/durable-local.d.ts", "types/durable-vercel.d.ts", "types/durable-world.d.ts", "types/grok.d.ts", "types/libfx.d.cts", "types/mcp.d.ts", "types/node.d.cts", "types/node.d.ts", "types/skills-node.d.ts", "types/skills.d.ts", "types/wasm.d.ts",
               "fx-core.wasm", "fx-term.wasm",
-              "libfx.linux-x64.node", "libfx.linux-arm64.node",
-              "libfx.darwin-x64.node", "libfx.darwin-arm64.node",
             ];
             if (names.size !== required.length) throw new Error(`unexpected package file count: ${names.size}`);
             for (const name of required) {
@@ -298,12 +305,30 @@ jobs:
             console.log(`validated ${report.name}@${report.version}: ${report.files.length} files, ${report.size} bytes packed`);
           '
 
+      # libfx pins one package per platform. Each must be packed at the pinned
+      # version and carry exactly its addon and its loader.
+      - name: Validate platform package archives
+        run: |
+          node -e '
+            const manifest = require("/tmp/libfx-manifest.json");
+            const reports = require("/tmp/libfx-native-pack.json");
+            const pinned = manifest.optionalDependencies;
+            const names = reports.map(({ name }) => name).sort();
+            if (names.join() !== Object.keys(pinned).sort().join()) throw new Error(`packed platform packages ${names.join(", ")} do not match the pinned ${Object.keys(pinned).join(", ")}`);
+            for (const report of reports) {
+              if (report.version !== manifest.version || pinned[report.name] !== manifest.version) throw new Error(`${report.name}@${report.version} does not match libfx@${manifest.version}`);
+              const files = report.files.map(({ path }) => path).sort();
+              if (files.join() !== "LICENSE,README.md,index.js,libfx.node,package.json") throw new Error(`${report.name} has unexpected files: ${files.join(", ")}`);
+              console.log(`validated ${report.name}@${report.version}: ${report.size} bytes packed`);
+            }
+          '
+
       # Pull request CI runs the full package qualification (Next, resilience,
       # every module format). Publishing only proves this exact archive installs
       # and runs on each backend.
       - name: Smoke test the installed package
         run: |
-          node sdk/tests/test-packed-example.mjs libfx-package.tgz native esm
+          node sdk/tests/test-packed-example.mjs libfx-package.tgz native esm --native-dir libfx-native
           node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs libfx-package.tgz wasm esm
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -311,7 +336,8 @@ jobs:
           name: libfx-package
           path: |
             libfx-package.tgz
-            libfx-package.tgz.sha256
+            libfx-native/*.tgz
+            libfx-packages.sha256
           if-no-files-found: error
 
   publish:
@@ -335,7 +361,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: libfx-package
-      - run: sha256sum --check libfx-package.tgz.sha256
+      - run: sha256sum --check libfx-packages.sha256
 
       - name: Confirm dev publish still targets main
         if: needs.metadata.outputs.channel == 'dev'
@@ -358,6 +384,28 @@ jobs:
             echo "libfx@${LIBFX_VERSION} is already published; leaving ${NPM_TAG} unchanged"
             exit 0
           fi
+          declare -A archives
+          for archive in libfx-native/*.tgz; do
+            archives[$(tar -xzOf "$archive" package/package.json | jq -r .name)]=$archive
+          done
+          # libfx carries no native addon of its own, so every platform package
+          # it pins goes first. Without them, installs fall back to WebAssembly.
+          # A rerun after a partial publish skips the packages already there.
+          for package in $(tar -xzOf libfx-package.tgz package/package.json | jq -r '.optionalDependencies | keys[]'); do
+            archive=${archives[$package]:-}
+            if [ -z "$archive" ]; then
+              echo "::error::no archive for ${package}; refusing to publish libfx without it"
+              exit 1
+            fi
+            if npm view "${package}@${LIBFX_VERSION}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
+              echo "${package}@${LIBFX_VERSION} is already published"
+              continue
+            fi
+            if ! npm publish "./$archive" --ignore-scripts --access public --tag "$NPM_TAG" --provenance; then
+              echo "::error::publishing ${package} failed. A new package needs its first version published by hand and a trusted publisher for this workflow; see sdk/NAPI.md"
+              exit 1
+            fi
+          done
           npm publish ./libfx-package.tgz --ignore-scripts --access public --tag "$NPM_TAG" --provenance
 
   verify-published:
@@ -370,14 +418,18 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: libfx-package
-      # A byte-identical registry archive is the package that already passed
+      # Byte-identical registry archives are the packages that already passed
       # the smoke test above, so comparing bytes is the whole verification.
-      - name: Download and compare the immutable registry version
+      - name: Download and compare the immutable registry versions
         env:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           set -euo pipefail
-          sha256sum --check libfx-package.tgz.sha256
-          npm pack "libfx@${LIBFX_VERSION}" --ignore-scripts --registry=https://registry.npmjs.org/ --json > /tmp/libfx-registry-pack.json
-          mv "$(jq -r '.[0].filename' /tmp/libfx-registry-pack.json)" libfx-registry.tgz
-          cmp libfx-package.tgz libfx-registry.tgz
+          sha256sum --check libfx-packages.sha256
+          mkdir registry
+          for archive in libfx-package.tgz libfx-native/*.tgz; do
+            name=$(tar -xzOf "$archive" package/package.json | jq -r .name)
+            npm pack "${name}@${LIBFX_VERSION}" --ignore-scripts --registry=https://registry.npmjs.org/ --pack-destination registry --json > /tmp/libfx-registry-pack.json
+            cmp "$archive" "registry/$(jq -r '.[0].filename' /tmp/libfx-registry-pack.json)"
+            echo "verified ${name}@${LIBFX_VERSION}"
+          done

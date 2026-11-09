@@ -55,7 +55,6 @@ pub const View = struct {
     runtime_generation: u64,
     owner_id: []u8,
     parent_id: []u8,
-    features_visible: bool,
     servers: []ServerIdentity,
     tools: []ToolIdentity,
 
@@ -98,7 +97,6 @@ pub const View = struct {
             .runtime_generation = self.runtime_generation,
             .owner_id = owner_id,
             .parent_id = parent_id,
-            .features_visible = self.features_visible,
             .servers = servers,
             .tools = tools,
         };
@@ -119,22 +117,6 @@ pub const View = struct {
     }
 };
 
-pub const Target = union(enum) {
-    tool: []const u8,
-    tool_server: []const u8,
-    feature_server: []const u8,
-};
-
-pub const Decision = enum {
-    allow,
-    reject_owner,
-    reject_runtime_generation,
-    reject_server,
-    reject_server_generation,
-    reject_tool,
-    reject_features,
-};
-
 /// Stable witness for only the authority that can affect MCP access. Child
 /// lifecycle revisions are deliberately excluded; ownership, permission-
 /// filtered visibility, and every runtime/catalog/auth identity are included.
@@ -144,7 +126,6 @@ pub fn authorityGeneration(view: View) u64 {
     hashU64(&hash, view.runtime_generation);
     hashString(&hash, view.owner_id);
     hashString(&hash, view.parent_id);
-    hashU64(&hash, @intFromBool(view.features_visible));
     for (view.servers) |server_identity| {
         hashString(&hash, server_identity.name);
         hashU64(&hash, @backingInt(server_identity.source));
@@ -174,65 +155,12 @@ fn hashU64(hash: *std.crypto.hash.sha2.Sha256, value: u64) void {
     hash.update(&bytes);
 }
 
-pub fn authorize(captured: View, live: View, target: Target) Decision {
-    if (!std.mem.eql(u8, captured.owner_id, live.owner_id) or
-        !std.mem.eql(u8, captured.parent_id, live.parent_id))
-    {
-        return .reject_owner;
-    }
-    if (captured.runtime_generation == 0 or
-        captured.runtime_generation != live.runtime_generation)
-    {
-        return .reject_runtime_generation;
-    }
-    const server_name = switch (target) {
-        .tool => |name| (captured.tool(name) orelse return .reject_tool).server_name,
-        .tool_server => |name| name,
-        .feature_server => |name| blk: {
-            if (!captured.features_visible or !live.features_visible) {
-                return .reject_features;
-            }
-            break :blk name;
-        },
-    };
-    const captured_server = captured.server(server_name) orelse return .reject_server;
-    const live_server = live.server(server_name) orelse return .reject_server;
-    if (captured_server.source != live_server.source or
-        captured_server.scope != live_server.scope)
-    {
-        return .reject_server;
-    }
-    if (captured_server.connection_generation != live_server.connection_generation or
-        captured_server.catalog_generation != live_server.catalog_generation or
-        captured_server.auth_generation != live_server.auth_generation)
-    {
-        return .reject_server_generation;
-    }
-    switch (target) {
-        .tool => |name| {
-            const live_tool = live.tool(name) orelse return .reject_tool;
-            if (!std.mem.eql(u8, live_tool.server_name, server_name)) return .reject_tool;
-        },
-        .tool_server => {
-            for (captured.tools) |tool_identity| {
-                if (!std.mem.eql(u8, tool_identity.server_name, server_name)) continue;
-                const live_tool = live.tool(tool_identity.name) orelse continue;
-                if (std.mem.eql(u8, live_tool.server_name, server_name)) return .allow;
-            }
-            return .reject_tool;
-        },
-        .feature_server => {},
-    }
-    return .allow;
-}
-
-test "MCP view authorization intersects immutable and live authority" {
+test "MCP authority generation changes with every captured identity" {
     const alloc = std.testing.allocator;
     var captured = View{
         .runtime_generation = 7,
         .owner_id = try alloc.dupe(u8, "session"),
         .parent_id = try alloc.dupe(u8, "parent"),
-        .features_visible = true,
         .servers = try alloc.alloc(ServerIdentity, 1),
         .tools = try alloc.alloc(ToolIdentity, 1),
     };
@@ -251,42 +179,37 @@ test "MCP view authorization intersects immutable and live authority" {
     defer captured.deinit(alloc);
     var live = try captured.clone(alloc);
     defer live.deinit(alloc);
-
-    try std.testing.expectEqual(authorityGeneration(captured), authorityGeneration(live));
-    try std.testing.expectEqual(Decision.allow, authorize(captured, live, .{ .tool = "docs_search" }));
-    try std.testing.expectEqual(Decision.allow, authorize(captured, live, .{ .tool_server = "docs" }));
-    try std.testing.expectEqual(Decision.reject_tool, authorize(captured, live, .{ .tool = "other" }));
+    const base = authorityGeneration(captured);
+    try std.testing.expectEqual(base, authorityGeneration(live));
 
     live.owner_id[0] = 'x';
-    try std.testing.expectEqual(Decision.reject_owner, authorize(captured, live, .{ .tool = "docs_search" }));
+    try std.testing.expect(authorityGeneration(live) != base);
     live.owner_id[0] = 's';
     live.parent_id[0] = 'x';
-    try std.testing.expectEqual(Decision.reject_owner, authorize(captured, live, .{ .tool = "docs_search" }));
+    try std.testing.expect(authorityGeneration(live) != base);
     live.parent_id[0] = 'p';
     live.runtime_generation += 1;
-    try std.testing.expectEqual(Decision.reject_runtime_generation, authorize(captured, live, .{ .tool = "docs_search" }));
+    try std.testing.expect(authorityGeneration(live) != base);
     live.runtime_generation -= 1;
-    live.features_visible = false;
-    try std.testing.expectEqual(Decision.reject_features, authorize(captured, live, .{ .feature_server = "docs" }));
-    live.features_visible = true;
     live.servers[0].source = .acp;
-    try std.testing.expectEqual(Decision.reject_server, authorize(captured, live, .{ .feature_server = "docs" }));
+    try std.testing.expect(authorityGeneration(live) != base);
     live.servers[0].source = .profile;
     live.servers[0].scope = .acp_session;
-    try std.testing.expectEqual(Decision.reject_server, authorize(captured, live, .{ .feature_server = "docs" }));
+    try std.testing.expect(authorityGeneration(live) != base);
     live.servers[0].scope = .profile;
     live.servers[0].connection_generation += 1;
-    try std.testing.expectEqual(Decision.reject_server_generation, authorize(captured, live, .{ .tool = "docs_search" }));
+    try std.testing.expect(authorityGeneration(live) != base);
     live.servers[0].connection_generation -= 1;
     live.servers[0].catalog_generation += 1;
-    try std.testing.expectEqual(Decision.reject_server_generation, authorize(captured, live, .{ .tool = "docs_search" }));
+    try std.testing.expect(authorityGeneration(live) != base);
     live.servers[0].catalog_generation -= 1;
     live.servers[0].auth_generation += 1;
-    try std.testing.expect(authorityGeneration(captured) != authorityGeneration(live));
-    try std.testing.expectEqual(Decision.reject_server_generation, authorize(captured, live, .{ .feature_server = "docs" }));
+    try std.testing.expect(authorityGeneration(live) != base);
     live.servers[0].auth_generation -= 1;
     live.tools[0].name[0] = 'x';
-    try std.testing.expectEqual(Decision.reject_tool, authorize(captured, live, .{ .tool = "docs_search" }));
+    try std.testing.expect(authorityGeneration(live) != base);
+    live.tools[0].name[0] = 'd';
+    try std.testing.expectEqual(base, authorityGeneration(live));
 }
 
 test "MCP view clone cleans up every partial allocation" {
@@ -302,7 +225,6 @@ fn checkViewCloneAllocationFailures(alloc: Allocator) !void {
         .runtime_generation = 7,
         .owner_id = try std.testing.allocator.dupe(u8, "child"),
         .parent_id = try std.testing.allocator.dupe(u8, "parent"),
-        .features_visible = true,
         .servers = try std.testing.allocator.alloc(ServerIdentity, 1),
         .tools = try std.testing.allocator.alloc(ToolIdentity, 1),
     };

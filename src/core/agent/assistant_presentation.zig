@@ -3,6 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const Allocator = std.mem.Allocator;
 
 const display_width = @import("../shared/display_width.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const ansi = @import("presentation/ansi.zig");
 const tu = @import("presentation/text_util.zig");
 const bp = @import("presentation/block_parse.zig");
@@ -32,6 +33,13 @@ pub const Event = union(enum) {
     table: TablePayload,
     code_block: CodeBlockPayload,
     thematic_rule,
+    /// An answer attempt starts. It waits for earlier text to show, so the
+    /// host knows where the attempt's output begins.
+    attempt_start,
+    /// The attempt broke off and the answer starts over. The host replaces
+    /// what it showed of the attempt when it still can, and otherwise shows
+    /// this line after it.
+    attempt_restart: []u8,
 
     pub fn clone(self: Event, alloc: Allocator) Allocator.Error!Event {
         return switch (self) {
@@ -39,13 +47,15 @@ pub const Event = union(enum) {
             .table => |table| .{ .table = try table.clone(alloc) },
             .code_block => |block| .{ .code_block = try block.clone(alloc) },
             .thematic_rule => .thematic_rule,
+            .attempt_start => .attempt_start,
+            .attempt_restart => |text| .{ .attempt_restart = try alloc.dupe(u8, text) },
         };
     }
 
     pub fn requiresTextDrain(self: Event) bool {
         return switch (self) {
-            .text => false,
-            .table, .code_block, .thematic_rule => true,
+            .text, .attempt_restart => false,
+            .table, .code_block, .thematic_rule, .attempt_start => true,
         };
     }
 
@@ -61,7 +71,8 @@ pub const Event = union(enum) {
                 break :blk total;
             },
             .code_block => |block| block.language.len +| block.code.len,
-            .thematic_rule => 1,
+            .thematic_rule, .attempt_start => 1,
+            .attempt_restart => |text| text.len,
         };
     }
 
@@ -70,7 +81,8 @@ pub const Event = union(enum) {
             .text => |text| alloc.free(text),
             .table => |*table| table.deinit(alloc),
             .code_block => |*block| block.deinit(alloc),
-            .thematic_rule => {},
+            .thematic_rule, .attempt_start => {},
+            .attempt_restart => |text| alloc.free(text),
         }
         self.* = undefined;
     }
@@ -140,8 +152,18 @@ const ActiveFootnote = struct {
     append_body: bool,
 };
 
+/// An ordered list item whose number was padded to right-align its marker.
+/// Source lines indented to `content_column` belong to the item and move
+/// right by `shift`, the padding of this item and the items it is nested in.
+const OpenOrderedItem = struct {
+    content_column: usize,
+    shift: usize,
+};
+
 pub const MarkdownProcessor = struct {
     line_buf: std.ArrayList(u8) = .empty,
+    /// The current line with its control sequences written as visible text.
+    safe_line: std.ArrayList(u8) = .empty,
     pending_top_level_line: std.ArrayList(u8) = .empty,
     pipe_buf: std.ArrayList(u8) = .empty,
     code_buf: std.ArrayList(u8) = .empty,
@@ -157,23 +179,29 @@ pub const MarkdownProcessor = struct {
     active_footnote: ?ActiveFootnote = null,
     next_footnote_number: usize = 0,
     previous_line_was_blank: bool = true,
+    /// Innermost last; each entry's shift already includes its parents'.
+    open_ordered_items: std.ArrayList(OpenOrderedItem) = .empty,
 
     pub fn deinit(self: *MarkdownProcessor, alloc: Allocator) void {
         self.line_buf.deinit(alloc);
+        self.safe_line.deinit(alloc);
         self.pending_top_level_line.deinit(alloc);
         self.pipe_buf.deinit(alloc);
         self.code_buf.deinit(alloc);
         self.code_language.deinit(alloc);
         self.deinitFootnotes(alloc);
+        self.open_ordered_items.deinit(alloc);
     }
 
     pub fn reset(self: *MarkdownProcessor, alloc: Allocator) void {
         self.line_buf.clearAndFree(alloc);
+        self.safe_line.clearAndFree(alloc);
         self.pending_top_level_line.clearAndFree(alloc);
         self.pipe_buf.clearAndFree(alloc);
         self.code_buf.clearAndFree(alloc);
         self.code_language.clearAndFree(alloc);
         self.deinitFootnotes(alloc);
+        self.open_ordered_items.clearAndFree(alloc);
         self.in_code_block = false;
         self.code_fence = null;
         self.in_pipe_block = false;
@@ -211,7 +239,7 @@ pub const MarkdownProcessor = struct {
                 const line_end = self.line_buf.items.len - @intFromBool(
                     self.line_buf.items.len > 0 and self.line_buf.items[self.line_buf.items.len - 1] == '\r',
                 );
-                try self.handleLine(alloc, self.line_buf.items[0..line_end], true, out, completions);
+                try self.handleModelLine(alloc, self.line_buf.items[0..line_end], true, out, completions);
                 self.line_buf.clearRetainingCapacity();
             } else {
                 try self.line_buf.append(alloc, byte);
@@ -241,10 +269,11 @@ pub const MarkdownProcessor = struct {
         defer self.active_blockquote = null;
         defer self.active_definition = false;
         defer self.active_footnote = null;
+        defer self.open_ordered_items.clearRetainingCapacity();
         const had_partial_line = self.line_buf.items.len > 0;
         const len_before = out.items.len;
         if (self.line_buf.items.len > 0) {
-            try self.handleLine(alloc, self.line_buf.items, false, out, completions);
+            try self.handleModelLine(alloc, self.line_buf.items, false, out, completions);
             self.line_buf.clearRetainingCapacity();
         }
         try self.flushPendingTopLevelLine(alloc, out);
@@ -258,6 +287,24 @@ pub const MarkdownProcessor = struct {
             self.code_fence = null;
         }
         try self.flushFootnotes(alloc, out);
+    }
+
+    /// Renders one line of model text. Control bytes, C1 controls, and invalid
+    /// UTF-8 become visible text such as `\x1b[2J` first, so a reply can never
+    /// clear the screen, erase scrollback, or switch the terminal's screen.
+    /// Joiners and other invisible format characters stay, since emoji
+    /// sequences and some scripts need them.
+    fn handleModelLine(
+        self: *MarkdownProcessor,
+        alloc: Allocator,
+        line: []const u8,
+        line_has_lf: bool,
+        out: *std.ArrayList(u8),
+        completions: payload.MarkdownCompletions,
+    ) !void {
+        self.safe_line.clearRetainingCapacity();
+        try text_utils.appendTerminalSafeText(alloc, &self.safe_line, line);
+        try self.handleLine(alloc, self.safe_line.items, line_has_lf, out, completions);
     }
 
     fn handleLine(
@@ -455,6 +502,8 @@ pub const MarkdownProcessor = struct {
             return;
         }
 
+        const shift = self.orderedItemShift(line);
+
         if (bp.isHorizontalRule(line)) {
             try ansi.writeHorizontalRule(alloc, out);
             return;
@@ -467,7 +516,7 @@ pub const MarkdownProcessor = struct {
 
         if (bp.parseBlockquote(line)) |parsed| {
             const blockquote = bp.BlockquotePrefix{
-                .indent = parsed.indent.len,
+                .indent = shift + parsed.indent.len,
                 .depth = parsed.depth,
             };
             self.active_blockquote = if (bp.isBlockquoteParagraph(parsed.content)) blockquote else null;
@@ -475,9 +524,30 @@ pub const MarkdownProcessor = struct {
             return;
         }
 
-        if (try block_render.writeListLine(alloc, line, line_has_lf, out, &fs, &link_id_counter)) return;
+        try out.appendNTimes(alloc, ' ', shift);
+        if (try block_render.writeListLine(alloc, line, line_has_lf, .right_aligned, out, &fs, &link_id_counter)) {
+            if (bp.parseOrderedList(line)) |item| {
+                try self.open_ordered_items.append(alloc, .{
+                    .content_column = item.indent.len + item.marker.len + 1,
+                    .shift = shift + block_render.orderedMarkerPad(item.marker),
+                });
+            }
+            return;
+        }
 
         try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(line, line_has_lf), out, false, &fs, &link_id_counter);
+    }
+
+    /// Returns how far padded ordered markers move `line`, first closing the
+    /// open items it is not indented into. Blank lines keep items open.
+    fn orderedItemShift(self: *MarkdownProcessor, line: []const u8) usize {
+        if (tu.isBlankMarkdownLine(line)) return 0;
+        const indent = line.len - tu.leftTrim(line).len;
+        while (self.open_ordered_items.last()) |item| {
+            if (indent >= item.content_column) return item.shift;
+            _ = self.open_ordered_items.pop();
+        }
+        return 0;
     }
 
     fn finalizePipeBlock(
@@ -774,11 +844,6 @@ test "escaped and malformed markdown images remain literal without OSC 8" {
     try std.testing.expectEqualStrings("![alt](https://example.com/diagram.png\n", out.items);
     try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
 
-    out.clearRetainingCapacity();
-    try processor.push(alloc, "![alt](https://example.com/\x1bdiagram.png)\n", &out);
-    try std.testing.expectEqualStrings("![alt](https://example.com/\x1bdiagram.png)\n", out.items);
-    try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
-
     var oversized_url: [max_link_url_bytes + 1]u8 = undefined;
     @memset(&oversized_url, 'a');
     var input_buf: [max_link_url_bytes + 16]u8 = undefined;
@@ -787,6 +852,46 @@ test "escaped and malformed markdown images remain literal without OSC 8" {
     try processor.push(alloc, oversized, &out);
     try std.testing.expectEqualStrings(oversized, out.items);
     try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
+}
+
+test "model control sequences render as visible text while markdown keeps its own styling" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // A stream can split an escape sequence and a UTF-8 C1 control across chunks.
+    try processor.push(alloc, "**bold** \x1b[2J \x1b[?10", &out);
+    try processor.push(alloc, "49h \xc2", &out);
+    try processor.push(alloc, "\x9b31m \x1b[3J end\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[1mbold\x1b[22m \\x1b[2J \\x1b[?1049h \\u{009b}31m \\x1b[3J end\n",
+        out.items,
+    );
+
+    // A control byte inside a link target becomes text before the link is
+    // parsed, so the OSC 8 hyperlink fx writes carries no raw control byte.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "![alt](https://example.com/\x1bdiagram.png)\n", &out);
+    try std.testing.expect(std.mem.find(u8, out.items, "https://example.com/\\x1bdiagram.png") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "example.com/\x1b") == null);
+
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "`https://example.com\x07`\n", &out);
+    try std.testing.expect(std.mem.find(u8, out.items, "https://example.com\\x07") != null);
+    try std.testing.expect(std.mem.findScalar(u8, out.items, 0x07) == null);
+
+    // Joined emoji keep their zero-width joiner.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "team \u{1f469}\u{200d}\u{1f4bb}\n", &out);
+    try std.testing.expectEqualStrings("team \u{1f469}\u{200d}\u{1f4bb}\n", out.items);
+
+    // The last line has no newline and reaches the output through flush.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "last \x1b]0;title\x07 line", &out);
+    try processor.flush(alloc, &out);
+    try std.testing.expectEqualStrings("last \\x1b]0;title\\x07 line", out.items);
 }
 
 test "markdown images preserve code isolation, chunk buffering, and heading underline" {
@@ -1062,7 +1167,6 @@ test "non-URL and unsafe inline code stays literal" {
         "`curl https://example.com`\n",
         "`https://example.com more`\n",
         "`http://`\n",
-        "`https://example.com\x07`\n",
         "`<https://example.com>`\n",
     };
     for (cases) |input| {
@@ -2473,8 +2577,8 @@ test "ordered list accepts paren markers and rejects long numbers" {
 
     try processor.push(alloc, "1) first\n12) twelfth\n1234567890. too long\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[2m1)\x1b[22m first\n" ++
-            "\x1b[2m12)\x1b[22m twelfth\n" ++
+        "  \x1b[2m1)\x1b[22m first\n" ++
+            " \x1b[2m12)\x1b[22m twelfth\n" ++
             "1234567890. too long\n",
         out.items,
     );
@@ -2540,7 +2644,7 @@ test "fenced code inside a list item drops the item indentation" {
 
     try processor.push(alloc, "1. step\n   ```sh\n   ls -la\n     nested\n   ```\n- next\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[2m1.\x1b[22m step\n" ++
+        "  \x1b[2m1.\x1b[22m step\n" ++
             "\x1b[2m\xe2\x94\x82 \x1b[22mls -la\n" ++
             "\x1b[2m\xe2\x94\x82 \x1b[22m  nested\n" ++
             "\x1b[2m\xe2\x80\xa2 \x1b[22mnext\n",
@@ -2557,7 +2661,7 @@ test "tab indented fence inside a list item closes on a tab indented fence" {
 
     try processor.push(alloc, "1. item\n\t```\n\tcode\n\t```\n\tprose after\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[2m1.\x1b[22m item\n" ++
+        "  \x1b[2m1.\x1b[22m item\n" ++
             "\x1b[2m\xe2\x94\x82 \x1b[22mcode\n" ++
             "\tprose after\n",
         out.items,
@@ -2621,6 +2725,22 @@ test "blockquote renders headings and list items inside the quote" {
     );
 }
 
+test "ordered lists inside a quote keep their markers as written" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "> 9. nine\n>    - child\n> 10. ten\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m9.\x1b[22m nine\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m   \x1b[2m\xe2\x80\xa2 \x1b[22mchild\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m10.\x1b[22m ten\n",
+        out.items,
+    );
+}
+
 test "literal bullet without trailing space stays prose" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
@@ -2640,7 +2760,132 @@ test "ordered list keeps number marker" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "1. step one\n", &out);
-    try std.testing.expectEqualStrings("\x1b[2m1.\x1b[22m step one\n", out.items);
+    try std.testing.expectEqualStrings("  \x1b[2m1.\x1b[22m step one\n", out.items);
+}
+
+test "ordered list markers end in one column through 999" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "9. nine\n10. ten\n100. hundred\n1000. thousand\n", &out);
+    try std.testing.expectEqualStrings(
+        "  \x1b[2m9.\x1b[22m nine\n" ++
+            " \x1b[2m10.\x1b[22m ten\n" ++
+            "\x1b[2m100.\x1b[22m hundred\n" ++
+            "\x1b[2m1000.\x1b[22m thousand\n",
+        out.items,
+    );
+}
+
+test "content nested in an ordered item moves with its padded marker" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(
+        alloc,
+        "1. Parent\n" ++
+            "   - child\n" ++
+            "   continuation\n" ++
+            "   > quoted\n" ++
+            "   lazy\n" ++
+            "\n" ++
+            "   after blank\n" ++
+            "   1. nested\n" ++
+            "      - grandchild\n" ++
+            "after list\n" ++
+            "   indented prose\n",
+        &out,
+    );
+    try std.testing.expectEqualStrings(
+        "  \x1b[2m1.\x1b[22m Parent\n" ++
+            "     \x1b[2m\xe2\x80\xa2 \x1b[22mchild\n" ++
+            "     continuation\n" ++
+            "     \x1b[2m\xe2\x94\x82 \x1b[22mquoted\n" ++
+            "     \x1b[2m\xe2\x94\x82 \x1b[22m   lazy\n" ++
+            "\n" ++
+            "     after blank\n" ++
+            "       \x1b[2m1.\x1b[22m nested\n" ++
+            "          \x1b[2m\xe2\x80\xa2 \x1b[22mgrandchild\n" ++
+            "after list\n" ++
+            "   indented prose\n",
+        out.items,
+    );
+}
+
+test "flushing assistant text closes open ordered items" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "1. item\n", &out);
+    try processor.flush(alloc, &out);
+    try processor.push(alloc, "   prose\n", &out);
+    try std.testing.expectEqualStrings("  \x1b[2m1.\x1b[22m item\n   prose\n", out.items);
+}
+
+const fuzz_markdown_list_pieces = [_][]const u8{
+    "1. ",   "9. ",      "10. ",  "100) ", "1000. ", "123456789. ", "1234567890. ", "1.",
+    "- ",    "* ",       "+ ",    "[x] ",  "[ ] ",   " ",           "   ",          "    ",
+    "\t",    "\n",       "\n\n",  "\r\n",  "> ",     ">> ",         "```",          "~~~",
+    "|a|\n", "---\n",    "===\n", "# ",    "[^1]: ", ": ",          "word",         "**b**",
+    "`c`",   "\u{754c}",
+};
+
+/// Open items nest strictly inward, and each level pads by at most two.
+fn expectOpenOrderedItemsNested(processor: *const MarkdownProcessor) !void {
+    const items = processor.open_ordered_items.items;
+    for (items, 0..) |item, i| {
+        try std.testing.expect(item.shift <= 2 * (i + 1));
+        if (i == 0) continue;
+        try std.testing.expect(items[i - 1].content_column < item.content_column);
+        try std.testing.expect(items[i - 1].shift <= item.shift);
+    }
+}
+
+fn fuzzMarkdownLists(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(alloc);
+    for (0..smith.valueRangeAtMost(u8, 0, 64)) |_| {
+        try source.appendSlice(alloc, fuzz_markdown_list_pieces[smith.index(fuzz_markdown_list_pieces.len)]);
+    }
+
+    var whole = MarkdownProcessor{};
+    defer whole.deinit(alloc);
+    var whole_out: std.ArrayList(u8) = .empty;
+    defer whole_out.deinit(alloc);
+    try whole.push(alloc, source.items, &whole_out);
+    try expectOpenOrderedItemsNested(&whole);
+    try whole.flush(alloc, &whole_out);
+    try std.testing.expectEqual(@as(usize, 0), whole.open_ordered_items.items.len);
+
+    var split = MarkdownProcessor{};
+    defer split.deinit(alloc);
+    var split_out: std.ArrayList(u8) = .empty;
+    defer split_out.deinit(alloc);
+    var start: usize = 0;
+    while (start < source.items.len) {
+        const len: usize = smith.valueRangeAtMost(u16, 1, @intCast(source.items.len - start));
+        try split.push(alloc, source.items[start..][0..len], &split_out);
+        try expectOpenOrderedItemsNested(&split);
+        start += len;
+    }
+    try split.flush(alloc, &split_out);
+    try std.testing.expectEqualStrings(whole_out.items, split_out.items);
+}
+
+test "Markdown lists render the same however assistant text is split" {
+    try std.testing.fuzz({}, fuzzMarkdownLists, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").markdown_lists.*),
+    });
 }
 
 test "task list items render static pending and completed markers" {
@@ -2676,8 +2921,8 @@ test "ordered task list items retain their number markers" {
 
     try processor.push(alloc, "1. [ ] first\n2. [X] done\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[2m1.\x1b[22m \x1b[2m\xe2\x98\x90 \x1b[22mfirst\n" ++
-            "\x1b[2m2.\x1b[22m \x1b[38;5;252m\xe2\x9c\x93\x1b[39m done\n",
+        "  \x1b[2m1.\x1b[22m \x1b[2m\xe2\x98\x90 \x1b[22mfirst\n" ++
+            "  \x1b[2m2.\x1b[22m \x1b[38;5;252m\xe2\x9c\x93\x1b[39m done\n",
         out.items,
     );
 }
@@ -3267,7 +3512,7 @@ test "markdown completion flushes an unterminated code fence" {
     try std.testing.expectEqualStrings("last line\n", block.code);
 }
 
-test "line intake buffers partial lines and preserves standalone carriage returns" {
+test "line intake buffers partial lines and shows standalone carriage returns as text" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
@@ -3293,8 +3538,10 @@ test "line intake buffers partial lines and preserves standalone carriage return
     try std.testing.expectEqualStrings("run \x1b[38;5;255mzig build\x1b[39m now\n", out.items);
 
     out.clearRetainingCapacity();
+    // Only a line feed ends a line. A carriage return inside one would move the
+    // cursor back over the line's gutter, so it shows as text.
     try processor.push(alloc, "left\rright\n", &out);
-    try std.testing.expectEqualStrings("left\rright\n", out.items);
+    try std.testing.expectEqualStrings("left\\x0dright\n", out.items);
 }
 
 test "flush emits pending line without newline" {
@@ -3859,7 +4106,7 @@ test "nested ordered list preserves indent" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "    1. sub-step\n", &out);
-    try std.testing.expectEqualStrings("    \x1b[2m1.\x1b[22m sub-step\n", out.items);
+    try std.testing.expectEqualStrings("      \x1b[2m1.\x1b[22m sub-step\n", out.items);
 }
 
 test "right-aligned GFM column pads cell on the left" {

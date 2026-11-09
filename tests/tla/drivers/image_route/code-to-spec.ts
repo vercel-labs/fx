@@ -20,17 +20,18 @@ const visionOnly = listed(true, false);
 const views: View[] = [listed(true, true), visionOnly, listed(false, true), listed(false, false), missing, down];
 
 function req(flags: Partial<Request>): Request {
-  return { user_images: false, pending_images: false, tool_images: false, fallback: false, catalog_down: false, ...flags };
+  return { user_images: false, earlier_images: false, pending_images: false, tool_images: false, fallback: false, catalog_down: false, ...flags };
 }
 
 const requests: Request[] = [];
-for (let bits = 0; bits < 32; bits += 1) {
+for (let bits = 0; bits < 64; bits += 1) {
   const r = req({
     user_images: (bits & 1) !== 0,
     pending_images: (bits & 2) !== 0,
     tool_images: (bits & 4) !== 0,
     fallback: (bits & 8) !== 0,
     catalog_down: (bits & 16) !== 0,
+    earlier_images: (bits & 32) !== 0,
   });
   if (r.pending_images && !r.user_images) continue;
   requests.push(r);
@@ -65,6 +66,20 @@ export const scripted: Record<string, Event[]> = {
   "user images with no route": [turn(listed(false, true)), ready({ user_images: true, pending_images: true }), ready({ user_images: true, fallback: true, pending_images: true })],
   // The catalog recovers within the turn: the one resolve picks it up.
   "catalog recovers within the turn": [turn(down), ready({ tool_images: true, user_images: true, fallback: true }), reply(listed(true, false)), ready({ tool_images: true })],
+  // The reported session: an earlier screenshot, then text-only turns after
+  // a restart with the catalog unreachable. Each is sent, the image
+  // withheld with a note, and the user hears once per turn.
+  "earlier image while the catalog is down": [
+    turn(down), ready({ earlier_images: true, fallback: true, catalog_down: true }), reply(down),
+    ready({ earlier_images: true, fallback: true, catalog_down: true }),
+    turn(down), ready({ earlier_images: true, fallback: true, catalog_down: true }), reply(down),
+  ],
+  // An image attached now still fails while support is unknown.
+  "image attached now while the catalog is down": [turn(down), ready({ user_images: true, pending_images: true, earlier_images: true, catalog_down: true }), reply(down)],
+  // A model without vision and no vision tool: the earlier image is a dead end, not a failure.
+  "earlier image with no route": [turn(listed(false, false)), ready({ earlier_images: true })],
+  // Earlier images go inline again once the catalog lists vision.
+  "earlier image after the catalog recovers": [turn(missing), ready({ earlier_images: true }), reply(missing), turn(visionOnly), ready({ earlier_images: true })],
 };
 
 function randomEvents(random: () => number, length: number): Event[] {

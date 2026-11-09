@@ -19,8 +19,8 @@
   },
   {
     "description": "Waiting calls stay behind when their server is ready",
-    "old": "    /\\ call' = [c \\in Calls |-> IF c \\in Waiting(s) THEN \"sent\" ELSE call[c]]\n    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped>>",
-    "new": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, call, ended, allowed, cause, host, stayed, dropped>>",
+    "old": "    /\\ call' = [c \\in Calls |-> IF c \\in Waiting(s) THEN \"sent\" ELSE call[c]]\n    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped>>",
+    "new": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, call, ended, allowed, cause, host, stayed, dropped>>",
     "invariant": "StatusConsistent"
   },
   {
@@ -48,10 +48,10 @@
     "invariant": "StatusConsistent"
   },
   {
-    "description": "A server that gave up keeps the calls waiting on it",
-    "old": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ (gaveUp /\\ c \\in Waiting(s)) THEN \"done\" ELSE call[c]]",
+    "description": "A failed start keeps the calls waiting on it, even when the server gives up",
+    "old": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ c \\in Waiting(s) THEN \"done\" ELSE call[c]]",
     "new": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"done\" ELSE call[c]]",
-    "invariant": "StatusConsistent"
+    "property": "WaitsForOneStart"
   },
   {
     "description": "A call to a failed server waits instead of ending",
@@ -73,8 +73,8 @@
   },
   {
     "description": "One server's failure loses another server's calls",
-    "old": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ (gaveUp /\\ c \\in Waiting(s)) THEN \"done\" ELSE call[c]]",
-    "new": "       /\\ call' = [c \\in Calls |-> IF call[c] = \"sent\" \\/ (gaveUp /\\ c \\in Waiting(s)) THEN \"done\" ELSE call[c]]",
+    "old": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ c \\in Waiting(s) THEN \"done\" ELSE call[c]]",
+    "new": "       /\\ call' = [c \\in Calls |-> IF call[c] = \"sent\" \\/ c \\in Waiting(s) THEN \"done\" ELSE call[c]]",
     "property": "Isolation"
   },
   {
@@ -84,21 +84,33 @@
     "invariant": "StatusConsistent"
   },
   {
-    "description": "a server down by a failure never starts again by itself",
+    "description": "A server down by a failure never starts again by itself",
     "old": "    /\\ Demand(s) \\/ retry[s]\n    /\\ attempts[s] < MaxAttempts",
     "new": "    /\\ Demand(s)\n    /\\ attempts[s] < MaxAttempts",
     "property": "RetriesEnd"
   },
   {
-    "description": "a server's tries start over the moment it is up, so one that dies after every start loops",
-    "old": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped>>",
-    "new": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ attempts' = [attempts EXCEPT ![s] = 0]\n    /\\ UNCHANGED <<ended, allowed, cause, host, stayed, dropped>>",
+    "description": "A server's tries start over the moment it is up, so one that dies after every start loops",
+    "old": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped>>",
+    "new": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ attempts' = [attempts EXCEPT ![s] = 0]\n    /\\ UNCHANGED <<ended, allowed, cause, host, stayed, dropped>>",
     "invariant": "StayedBeforeFreshTries"
   },
   {
-    "description": "a host disconnect leaves a server starting again by itself",
-    "old": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ dropped' = [dropped EXCEPT ![s] = TRUE]\n    /\\ UNCHANGED <<allowed, cause, stayed>>",
-    "new": "    /\\ dropped' = [dropped EXCEPT ![s] = TRUE]\n    /\\ UNCHANGED <<allowed, cause, stayed, retry>>",
+    "description": "A host disconnect leaves a server starting again by itself",
+    "old": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ dropped' = [dropped EXCEPT ![s] = TRUE]\n",
+    "new": "    /\\ dropped' = [dropped EXCEPT ![s] = TRUE]\n    /\\ UNCHANGED retry\n",
     "invariant": "RetryOnlyAfterFailure"
+  },
+  {
+    "description": "A disconnect clears the tool list need without answering it, so a host waiting for it waits for ever",
+    "old": "    /\\ asked' = [asked EXCEPT ![s] = asked[s] /\\ keep]",
+    "new": "    /\\ asked' = asked",
+    "invariant": "AskedHasNeed"
+  },
+  {
+    "description": "A call waits through every try, not just one start",
+    "old": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ c \\in Waiting(s) THEN \"done\" ELSE call[c]]\n       /\\ ended' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"lost\"\n                                    ELSE IF c \\in Waiting(s) THEN \"failed\" ELSE ended[c]]",
+    "new": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ (gaveUp /\\ c \\in Waiting(s)) THEN \"done\" ELSE call[c]]\n       /\\ ended' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"lost\"\n                                    ELSE IF gaveUp /\\ c \\in Waiting(s) THEN \"failed\" ELSE ended[c]]",
+    "property": "WaitsForOneStart"
   }
 ]

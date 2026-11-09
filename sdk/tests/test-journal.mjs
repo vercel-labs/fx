@@ -150,7 +150,7 @@ function framesFor(prompt) {
       { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
     ];
   }
-  if (text === "use the tool" && toolResults(prompt).length === 0) {
+  if ((text === "use the tool" || text === "use the tool, then hold") && toolResults(prompt).length === 0) {
     return [
       { type: "tool-call", toolCallId: "call-1", toolName: "lookup", input: { key: "alpha" } },
       { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage },
@@ -165,6 +165,9 @@ function framesFor(prompt) {
 
 const requests = [];
 const sessionHeaders = [];
+// While armed, the model request that follows the tool step of "use the
+// tool, then hold" stays open with no response, so a test can cancel it.
+const hold = { armed: false, responses: [] };
 const server = createServer((request, response) => {
   let body = "";
   request.setEncoding("utf8");
@@ -188,6 +191,11 @@ const server = createServer((request, response) => {
       return;
     }
     response.writeHead(200, { "content-type": "text/event-stream" });
+    if (hold.armed && scriptText(prompt) === "use the tool, then hold" && toolResults(prompt).length > 0) {
+      hold.armed = false;
+      hold.responses.push(response);
+      return;
+    }
     response.end(framesFor(prompt).map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join("") + "data: [DONE]\n\n");
   });
 });
@@ -633,7 +641,7 @@ test("a resume that restarts a reply the last process had started sends that sta
   // The new engine's host saw none of the turn: it gets what the last
   // process had sent of the reply, then the restart.
   assert.ok(text.startsWith("answer to remember plums"), JSON.stringify(text));
-  assert.ok(text.includes("[Response interrupted. Restarting.]"), JSON.stringify(text));
+  assert.ok(text.includes("↻ Restarted the answer"), JSON.stringify(text));
 });
 
 test("a turn's result waits until its end is stored", async () => {
@@ -871,7 +879,7 @@ test("a journal that does not fold is refused", async () => {
   const invalid = (pattern) => (error) => pattern.test(error.message) && error.code === "FX_JOURNAL_INVALID";
   const duplicated = eventJournal([...journal.events, journal.events.at(-1)]);
   await assert.rejects(createFxEngine(options(targetBackend, duplicated)), invalid(/libfx journal events are out of order/));
-  const newer = eventJournal([{ ...journal.events[0], v: 4 }]);
+  const newer = eventJournal([{ ...journal.events[0], v: 5 }]);
   await assert.rejects(createFxEngine(options(targetBackend, newer)), /libfx journal was written by a newer fx/);
   const garbled = eventJournal([{ v: 1, seq: 1, turn: 1, type: "turn_committed", data: { kind: "nope" } }]);
   await assert.rejects(createFxEngine(options(targetBackend, garbled)), invalid(/Invalid libfx journal/));
@@ -1247,7 +1255,7 @@ test("a turn left open resumes under the tools the new agent has", async () => {
 });
 
 test("a journal from a newer libfx is refused", async () => {
-  const future = eventJournal([{ v: 4, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
+  const future = eventJournal([{ v: 5, seq: 1, turn: 1, type: "turn_progress", data: {} }]);
   const newer = (error) => error instanceof FxJournalVersionError && error.code === "FX_JOURNAL_VERSION";
   await assert.rejects(createFxEngine(options(sourceBackend, future)), newer);
   const record = (format) => ({
@@ -1498,6 +1506,37 @@ test("a resumed turn cancelled during a slow journal's barrier is committed once
     const commits = stored.events.filter((event) => event.type === "turn_committed" && event.data.user?.text === "use the tool");
     assert.equal(commits.length, 1, `${backend}: ${stored.events.map((event) => event.type).join(",")}`);
     assert.equal(userTexts(requests.at(-1)).filter((text) => text === "use the tool").length, 1);
+  }
+});
+
+test("a turn cancelled after a tool step keeps its id, so retrying its prompt does not run it again", async () => {
+  for (const backend of [sourceBackend, targetBackend]) {
+    const journal = eventJournal();
+    const agent = await createFxEngine(options(backend, journal));
+    hold.armed = true;
+    const turn = agent.prompt("use the tool, then hold", { turnId: "turn-cancelled-after-tool" });
+    const drained = (async () => { for await (const _ of turn) {} })();
+    // The tool step is done and the next model request is open.
+    for (let waited = 0; hold.responses.length === 0 && waited < 5_000; waited += 10) await sleepMs(10);
+    assert.equal(hold.responses.length, 1, `${backend}: the request after the tool step never arrived`);
+    turn.cancel();
+    await drained;
+    assert.equal((await turn.result).stopReason, "cancelled");
+    for (const response of hold.responses.splice(0)) response.destroy();
+    await agent.close();
+    const types = `${backend}: ${journal.events.map((event) => event.type).join(",")}`;
+    assert.equal(journal.events.filter((event) => event.type === "turn_committed").length, 1, types);
+
+    // A host retrying the cancelled prompt with its id gets the ended turn
+    // back, and the model is not asked again.
+    const reopened = await createFxEngine(options(backend, eventJournal(journal.events)));
+    assert.equal(reopened.resume(), null, `a cancelled turn is not resumed; ${types}`);
+    requests.length = 0;
+    const retried = reopened.prompt("use the tool, then hold", { turnId: "turn-cancelled-after-tool" });
+    for await (const _ of retried) {}
+    await retried.result;
+    await reopened.close();
+    assert.equal(requests.length, 0, `the retried prompt ran again; ${types}`);
   }
 });
 

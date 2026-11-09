@@ -15,8 +15,7 @@ export function parseStatus(pane: string): Line | null {
   if ((m = /(\S+) is waiting for approval · \/mcp/.exec(tail))) return { k: "attn", who: m[1]!, why: "waiting", r: 0, e: 0 };
   if ((m = /(\S+) needs login · \/mcp/.exec(tail))) return { k: "attn", who: m[1]!, why: "login", r: 0, e: 0 };
   if ((m = /(\S+) failed · \/mcp/.exec(tail))) return { k: "attn", who: m[1]!, why: "failed", r: 0, e: 0 };
-  if ((m = /(\d+) MCP servers need you · \/mcp/.exec(tail))) return { k: "many", who: "", why: "", r: Number(m[1]), e: 0 };
-  if ((m = /\bmcp (\d+)\/(\d+)\b/.exec(tail))) return { k: "count", who: "", why: "", r: Number(m[1]), e: Number(m[2]) };
+  if ((m = /(\d+) MCP need attention · \/mcp/.exec(tail))) return { k: "many", who: "", why: "", r: Number(m[1]), e: 0 };
   return null;
 }
 
@@ -27,11 +26,12 @@ export class Shell {
   tui: any = null;
   constructor(readonly f: Fixture) {}
 
-  async start(extra: Record<string, string> = {}) {
+  /** `width` wide enough keeps a printed sign-in address on one line. */
+  async start(extra: Record<string, string> = {}, width = 160) {
     const { TmuxSession, startFakeGateway } = await targetHelpers();
     this.gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
     this.tui = await TmuxSession.create({
-      cmd: shellQuote(binary), cwd: this.f.workspace, isolated: true, width: 160, height: 40, remainOnExit: true,
+      cmd: shellQuote(binary), cwd: this.f.workspace, isolated: true, width, height: 40, remainOnExit: true,
       stderrPath: join(this.f.base, "stderr.txt"),
       env: fxEnv(this.f, { FX_GATEWAY_BASE_URL: this.gateway!.baseUrl, FX_GATEWAY_CHAT_URL: this.gateway!.chatUrl, FX_MODEL: "openai/gpt-5", ...extra }),
     });
@@ -49,7 +49,8 @@ export class Shell {
     const deadline = Date.now() + timeoutMs;
     let last: string | null = null, since = Date.now(), line: Line | null = null;
     while (Date.now() < deadline) {
-      line = parseStatus(await this.tui.capturePane());
+      // With nothing that needs attention the line says nothing about MCP.
+      line = parseStatus(await this.tui.capturePane()) ?? (want?.k === "none" ? { k: "none", who: "", why: "", r: 0, e: 0 } : null);
       const key = JSON.stringify(line);
       if (key !== last) { last = key; since = Date.now(); }
       const fits = want === null || (line !== null && Object.entries(want).every(([k, v]) => (line as never)[k] === v));

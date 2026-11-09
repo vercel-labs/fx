@@ -172,7 +172,7 @@ fn warning_at_command_position(command: []const u8) ?DestructiveEffect {
     var cursor = command_classification.skip_whitespace(command, 0);
     while (command_classification.next_token(command, cursor)) |token| {
         if (!command_classification.is_env_assignment(token.text)) break;
-        cursor = token.end;
+        cursor = command_classification.word_end(command, token.start) orelse return null;
     }
     const first = command_classification.next_token(command, cursor) orelse return null;
 
@@ -204,7 +204,7 @@ fn sudo_like_command_tail(command: []const u8, start: usize) ?[]const u8 {
             return command[next.start..];
         }
         if (command_classification.is_env_assignment(token.text)) {
-            cursor = token.end;
+            cursor = command_classification.word_end(command, token.start) orelse return null;
             continue;
         }
         if (std.mem.startsWith(u8, token.text, "-")) {
@@ -725,6 +725,42 @@ test "command risk note detects privilege-wrapped git reset" {
     try std.testing.expectEqualStrings("note: command may discard version-control state", command_risk_note_for("sudo git reset --hard").?);
 }
 
+test "command risk note sees past quoted and escaped assignment values" {
+    // Each value hides a space from a split on whitespace, so `ls` looked
+    // like the command and the removal like its arguments.
+    for ([_][]const u8{
+        "CI='x ls' rm -rf /tmp/x",
+        "CI=\"x ls\" rm -rf /tmp/x",
+        "CI=x\\ ls rm -rf /tmp/x",
+        "env CI=x\\ ls rm -rf /tmp/x",
+        "sudo CI='x ls' rm -rf /tmp/x",
+    }) |command| {
+        try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for(command).?);
+        try std.testing.expectEqualStrings("safer: inspect targets first", command_safer_alternative_for(command).?);
+    }
+    try std.testing.expectEqualStrings("note: command may discard version-control state", command_risk_note_for("CI='x ls' git reset --hard").?);
+    // An assignment whose quote never closes names no command.
+    try std.testing.expect(command_risk_note_for("CI='x ls rm -rf /tmp/x") == null);
+}
+
+test "command risk note sees past substitutions in safe assignment values" {
+    // Each value holds a space, so a split on whitespace ended the
+    // assignment inside the substitution and found no command after it.
+    for ([_][]const u8{
+        "CI=$(echo a b) rm -rf /tmp/x",
+        "CI=\"$(echo a b)\" rm -rf /tmp/x",
+        "CI=${X:-a b} rm -rf /tmp/x",
+        "CI=`echo a b` rm -rf /tmp/x",
+        "env CI=$(echo a b) rm -rf /tmp/x",
+    }) |command| {
+        try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for(command).?);
+        try std.testing.expectEqualStrings("safer: inspect targets first", command_safer_alternative_for(command).?);
+    }
+    // Other assignments stay in the analyzed command, and a substitution can
+    // expand to any command, so the note doesn't guess.
+    try std.testing.expect(command_risk_note_for("X=$(date +%s) rm -rf /tmp/x") == null);
+}
+
 test "command risk note detects quoted su command payload" {
     try std.testing.expectEqualStrings("note: command may remove files forcefully", command_risk_note_for("su -c 'rm -rf /tmp'").?);
     try std.testing.expectEqualStrings("note: command may discard version-control state", command_risk_note_for("su -c \"git reset --hard\"").?);
@@ -766,6 +802,22 @@ test "command risk note detects command after sequence boundary" {
 
 test "semantic annotation explains grep exit one" {
     try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation("grep foo bar", 1, "").?);
+}
+
+test "semantic annotation sees past substitutions in assignment values" {
+    // Each value holds a space, so a split on whitespace ended the word
+    // inside the substitution and found no command.
+    for ([_][]const u8{
+        "CI=$(echo a b) grep foo .",
+        "CI=\"$(echo a b)\" grep foo .",
+        "CI=${X:-a b} grep foo .",
+        "CI=`echo a b` grep foo .",
+        "env CI=$(echo a b) grep foo .",
+    }) |command| {
+        try std.testing.expectEqualStrings("note: no matches found", semantic_exit_annotation(command, 1, "").?);
+    }
+    // A substitution that never closes names no command.
+    try std.testing.expect(semantic_exit_annotation("CI=$(echo a b grep foo .", 1, "") == null);
 }
 
 test "semantic annotation leaves grep real errors alone" {

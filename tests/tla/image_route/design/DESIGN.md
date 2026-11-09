@@ -22,8 +22,8 @@ How fx decides, for each model request, where images go: inline, through the vis
 - Q14: The catalog fetch keeps the transport's deadline. A timeout leaves the resolver failed and support unknown, so the request goes out without images and with the "could not confirm" notice. The caller assumes nothing about vision.
 - Q15: A slow, down, rate-limited, or malformed catalog leaves the resolver failed (`gateway.zig:2713-2715` rejects malformed JSON), which the core sees as unknown support. The request still goes out, without images.
 - Q16: The core's state lives in memory and dies with the process. Tool images stay in the session store, and the next process decides again from its first turn.
-- Q18: Unknown support with a down catalog: one notice per turn in the transcript (`orchestrator.zig:7493-7496`, this change), and a model-facing note that it may recover. No vision: the model is told to call the vision tool, or to ask for a vision model. User images with no route: `ModelImageCapabilityUnavailable` or `SubscriptionNativeImageUnavailable`, as before. Each recovers on a later turn once the catalog answers.
-- Q19: Nothing. A withheld image stays in the store with a notice (`NoSilentWithhold`), session-dropped images become notes (`image_attachments.zig:883-887`), and the `vision_policy` trace line now records the tool image decision (`orchestrator.zig:7375-7388`, this change).
+- Q18: Unknown support with a down catalog: one notice per turn in the transcript (`orchestrator.zig:7493-7496`, this change), and a model-facing note that it may recover. No vision: the model is told to call the vision tool, or to ask for a vision model. Images attached this turn with no route: `ModelImageCapabilityUnavailable` or `SubscriptionNativeImageUnavailable`, and the failed turn is not saved, so its image never enters the history. Images from earlier turns never fail a turn: on a route that cannot carry them they leave the request as one note each (`image_attachments.withholdEarlierImages`), as tool images do, and a down catalog tells the user once per turn. Counting them as attached now once left a session that attached a screenshot, restarted, and could not reach the catalog unable to send even plain text. Each recovers on a later turn once the catalog answers.
+- Q19: Nothing. A withheld image stays in the store with a notice (`NoSilentWithhold`), session-dropped images become notes (`image_attachments.zig:883-887`), withheld earlier images become one note each (`image_attachments.withholdEarlierImages`), and the `vision_policy` trace line records the tool image and earlier image decisions.
 - Q21: None in the core. The resolver's refresh interval uses `io_mod.milliTimestamp` (`gateway_provider.zig:173`), unchanged.
 - Q22: The core has one waiting request and at most two effects per step (`Bounded`). Images in history are bounded by the existing caps in Q2.
 - Q24: One `step` call and one scan of the request's messages per model request (`requestHasToolImages`, `orchestrator.zig:6199-6208`, this change). Nothing runs at startup, per keystroke, or per token.
@@ -34,12 +34,12 @@ How fx decides, for each model request, where images go: inline, through the vis
 - Q30: The gateway controls the tags over TLS. A repository cannot set capabilities, because project `.fx.json` accepts no profile-owned keys (`config_runtime.zig` `parseProjectSafeFields`). Tool output reaches the core only as a flag that images exist.
 - Q31: Nowhere. Core events and the trace line hold only model ids and tag names.
 - Q32: No. Images from permission-denied results still never leave the process (`vercel_protocol.zig:691-704`).
-- Q33: Dropping `file_input` from one condition (`model_capabilities.zig:100` on `b0a90fd3a`) fixes the reported bug.
+- Q33: Dropping `file_input` from one condition (`model_capabilities.zig:100` on `b0a90fd3a`) fixes the first reported bug. The second, an earlier image blocking every turn, needs the shell to split a request's user images at the turn's own message (`orchestrator.zig` `requestUserImages`) and the core to treat earlier ones as it treats tool images.
 - Q34: The core extraction. Without it the reported bug is still fixed, but Q9's ordering fix has no function to check against a model. The design keeps it for that reason and for G6; see R10.
-- Q35: It reuses the resolver, `projectToolImageMessages`, and the wire encoder. It replaces `visionPolicy` and the inline re-resolve, so no parallel path remains, and it drops both inherited flaws: the `file-input` rule and the late re-resolve.
+- Q35: It reuses the resolver, `projectToolImageMessages`, and the wire encoder. It replaces `visionPolicy` and the inline re-resolve, so no parallel path remains, and it drops both inherited flaws: the `file-input` rule and the late re-resolve. Earlier images reuse the tool image rule (`held`) and the dropped-image note pattern rather than a rule of their own.
 - Q36: Nothing. No setting, override, or provider table.
-- Q37: `tests/e2e/file-tool-paths.test.ts` through the built binary, `sdk/tests/test-agent-images.mjs` through libfx on both backends, the drivers on the real core, and a live run of the built binary against the gateway (`GOAL.md`, item 6).
-- Q38: The `vision_policy` trace line logs `image_support`, `route`, `mode`, `pending_images`, and `tool_images` for every request, and `image_gate` diagnostics record each failure (`orchestrator.zig:7357-7366`, this change).
+- Q37: `tests/e2e/file-tool-paths.test.ts` through the built binary, `sdk/tests/test-agent-images.mjs` through libfx on both backends, the drivers on the real core, the binary stage on `fx ask` turns of the built binary (`binary-to-spec.ts`), `tests/e2e/vision-route-fake-gateway.test.ts` for a resumed turn while the catalog is down, and a live run of the built binary against the gateway (`GOAL.md`, item 6).
+- Q38: The `vision_policy` trace line logs `image_support`, `route`, `mode`, `pending_images`, `tool_images`, and `earlier_images` for every request, and `image_gate` diagnostics record each failure (`orchestrator.zig:7357-7366`, this change).
 - Q39: Revert the change. No data needs migrating. Reverting `supportFromCatalog` alone (`image_route.zig:47-52`, this change) restores the old rule.
 
 Not applicable: Q17, Q20, Q23, Q28 (the core writes nothing that can be partial, holds no process, file, lock, or connection, consumes one synchronous event at a time, and changes no saved format, so nothing needs migrating).
@@ -53,15 +53,16 @@ The laws `step` obeys. Each one is a named invariant or property in `spec/ImageR
 - **L3 NativeExcludesFallback**: native delivery and the vision tool never meet in one request.
 - **L4 OneSnapshot**: a request's route, vision tool mode, and tool image handling all follow the one support value the state holds after the step (ordering).
 - **L5 UnknownNeverInline**: no image goes to a model the catalog has not confirmed (ownership: the catalog decides).
-- **L6 NoSilentWithhold**: tool images are attached, or withheld with a notice the model can act on, never neither. The vision tool is required exactly while user images wait for it (`RequiredWhenPending`).
-- **L7 FailExactlyWhenUnroutable**: a request with user images and no route fails, with the reason that matches support. Nothing else fails.
+- **L6 NoSilentWithhold**: tool images and images from earlier turns are attached, or withheld with a notice the model can act on, never neither. The vision tool is required exactly while images attached this turn wait for it (`RequiredWhenPending`).
+- **L7 FailExactlyWhenUnroutable**: a request whose images were attached this turn and have no route fails, with the reason that matches support. Nothing else fails, so an image from an earlier turn never blocks a turn.
 - **L8 ResolveOncePerTurn**: the core asks for capabilities only when images wait on unknown support (`ResolveOnlyWhenNeeded`), and at most once per turn (idempotence). This also makes the shell's effect loop end.
-- **L9 NotifyOncePerTurn**: the user hears about a down catalog only for tool images it withholds (`NotifyOnlyWhenDown`), and at most once per turn (idempotence).
+- **L9 NotifyOncePerTurn**: the user hears about a down catalog only for images it withholds (`NotifyOnlyWhenDown`), and at most once per turn (idempotence).
 - **L10 DuplicateRequestIsQuiet**: a request delivered while a reply is owed runs nothing, and a reply nothing waits for changes nothing (`StaleReplyIsQuiet`) (idempotence and ordering).
 - **L11 Bounded**: at most one waiting request, and at most two effects per step, a notice and then one answer (bounds).
 - **L12 Answered**: every request that waits for a reply is answered, unless its turn ends first (liveness).
 - **L13 DecideOnlyWhenReady**: a decision comes only once no reply is owed. While one is owed, the turn has asked once and decided nothing (`PendingWaitsForReply`) (ordering).
 - **L14 TurnResets**: a new turn, and a new process after a crash, start with no request waiting and no capability request or notice spent.
+- **L15 AskedBeforeUnknown**: a turn judges support unknown, by withholding images as unconfirmed or by failing for it, only after it asked the catalog in that turn (ordering).
 
 ## Enforcement
 
@@ -75,7 +76,7 @@ The laws `step` obeys. Each one is a named invariant or property in `spec/ImageR
 | R4 | pass | The gateway catalog is the source, the resolver caches it, and the core keeps one snapshot per turn that only a reply to its own request replaces. | `inv:VisionImpliesNative`, `inv:OneSnapshot`, `prop:StaleReplyIsQuiet` |
 | R5 | pass | One event per request, at most one capability request per turn, at most two effects per step. Image bytes per request are capped as in Q2. | `inv:Bounded`, `prop:ResolveOncePerTurn`, `inv:ResolveOnlyWhenNeeded` |
 | R6 | pass | Only the capability request repeats safely, and the core still sends it once per turn. Sends, failures, and notices are never re-emitted. | `prop:DuplicateRequestIsQuiet`, `prop:NotifyOncePerTurn`, `prop:ResolveOncePerTurn` |
-| R7 | pass | Crashes, a down or missing catalog, and lost, stale, and duplicated replies are actions in the model, and the code is checked on traces that inject them. | `inv:UnknownNeverInline`, `inv:TurnResets`, `prop:Answered`, `inv:FailExactlyWhenUnroutable`, `driver:code-to-spec` |
+| R7 | pass | Crashes, a down or missing catalog, and lost, stale, and duplicated replies are actions in the model, and the code is checked on traces that inject them. | `inv:UnknownNeverInline`, `inv:TurnResets`, `prop:Answered`, `inv:FailExactlyWhenUnroutable`, `driver:code-to-spec`, `driver:binary-to-spec` |
 | R8 | n/a | No saved format or protocol changes (Q27). The routing decision is never saved. | |
 | R9 | pass | It drops two inherited flaws: the `file-input` rule and the re-resolve after the route is chosen. | `mutation:S1`, `mutation:C1`, `mutation:S2`, `mutation:C7`, `inv:OneSnapshot` |
 | R10 | fail | Accepted. The reported bug needs one line. The pure core, its harness, and the drivers exist so the ordering fix (Q9) is checkable against a model, as G6 requires. | `review:the core adds no setting, cache, or provider table; Q34 and Final design name what could be removed`, `driver:spec-to-code` |
@@ -89,16 +90,17 @@ The laws `step` obeys. Each one is a named invariant or property in `spec/ImageR
 | L2 | Vision tool only on the fallback route | `inv:RouteModeCoherent`, `trace:RouteModeCoherent`, `mutation:S18`, `mutation:C17`, `zig:src/core/images/image_route.zig#every decision reads one support value` |
 | L3 | Native excludes the vision tool | `inv:NativeExcludesFallback`, `trace:NativeExcludesFallback`, `mutation:S19`, `mutation:C18`, `sdk:sdk/tests/test-agent-images.mjs#a native image model is not offered the vision tool` |
 | L4 | One snapshot per request | `inv:OneSnapshot`, `trace:OneSnapshot`, `mutation:S2`, `mutation:C7` |
-| L5 | Unknown never inline | `inv:UnknownNeverInline`, `trace:UnknownNeverInline`, `mutation:S5`, `mutation:C4`, `zig:src/core/agent/runtime/gateway_step.zig#projectToolImageMessages tells the truth when the catalog is unavailable` |
-| L6 | No silent withhold | `inv:NoSilentWithhold`, `inv:RequiredWhenPending`, `trace:NoSilentWithhold`, `trace:RequiredWhenPending`, `mutation:S17`, `mutation:C16`, `mutation:S10`, `mutation:C10`, `zig:src/core/agent/runtime/orchestrator.zig#requestHasToolImages ignores images the session dropped`, `e2e:tests/e2e/file-tool-paths.test.ts#read_file image is withheld with guidance for a text-only model` |
-| L7 | Fail exactly when unroutable | `inv:FailExactlyWhenUnroutable`, `trace:FailExactlyWhenUnroutable`, `mutation:S8`, `mutation:C9`, `zig:src/core/images/image_route.zig#user images without a route fail the request and never send` |
+| L5 | Unknown never inline | `inv:UnknownNeverInline`, `trace:UnknownNeverInline`, `mutation:S5`, `mutation:C4`, `zig:src/core/agent/runtime/gateway_step.zig#projectToolImageMessages tells the truth when the catalog is unavailable`, `mutation:S21`, `mutation:C20`, `driver:binary-to-spec` |
+| L6 | No silent withhold | `inv:NoSilentWithhold`, `inv:RequiredWhenPending`, `trace:NoSilentWithhold`, `trace:RequiredWhenPending`, `mutation:S17`, `mutation:C16`, `mutation:S10`, `mutation:C10`, `zig:src/core/agent/runtime/orchestrator.zig#requestHasToolImages ignores images the session dropped`, `e2e:tests/e2e/file-tool-paths.test.ts#read_file image is withheld with guidance for a text-only model`, `mutation:S22`, `mutation:C21`, `zig:src/core/images/image_attachments.zig#requests leave out earlier images the route cannot carry, each with a note`, `zig:src/core/images/image_attachments.zig#earlier images withheld from seeded random histories always leave a note` |
+| L7 | Fail exactly when unroutable | `inv:FailExactlyWhenUnroutable`, `trace:FailExactlyWhenUnroutable`, `mutation:S8`, `mutation:C9`, `zig:src/core/images/image_route.zig#user images without a route fail the request and never send`, `mutation:S20`, `mutation:C19`, `zig:src/core/images/image_route.zig#an earlier image never blocks a turn`, `zig:src/core/agent/runtime/orchestrator.zig#requestUserImages splits kept images at the turn's own message`, `zig:src/core/agent/runtime/tests/gateway_flow.zig#processQueuedPrompt sends a text-only turn while a down catalog withholds an earlier image`, `e2e:tests/e2e/vision-route-fake-gateway.test.ts#a resumed text-only turn is sent while the catalog is down, with the earlier image withheld`, `driver:binary-to-spec` |
 | L8 | One capability request per turn, only for images | `inv:ResolveOnlyWhenNeeded`, `prop:ResolveOncePerTurn`, `trace:ResolveOnlyWhenNeeded`, `trace:ResolveOncePerTurn`, `mutation:S3`, `mutation:C2`, `mutation:S15`, `mutation:C14`, `zig:src/core/images/image_route.zig#a turn asks for capabilities at most once and answers the request it held` |
-| L9 | One catalog-down notice per turn, only when down | `inv:NotifyOnlyWhenDown`, `prop:NotifyOncePerTurn`, `trace:NotifyOnlyWhenDown`, `trace:NotifyOncePerTurn`, `mutation:S4`, `mutation:C3`, `mutation:S16`, `mutation:C15`, `zig:src/core/images/image_route.zig#the catalog-down notice reaches the user once per turn` |
+| L9 | One catalog-down notice per turn, only when down | `inv:NotifyOnlyWhenDown`, `prop:NotifyOncePerTurn`, `trace:NotifyOnlyWhenDown`, `trace:NotifyOncePerTurn`, `mutation:S4`, `mutation:C3`, `mutation:S16`, `mutation:C15`, `zig:src/core/images/image_route.zig#the catalog-down notice reaches the user once per turn`, `driver:binary-to-spec` |
 | L10 | Duplicates and stale replies are quiet | `prop:DuplicateRequestIsQuiet`, `prop:StaleReplyIsQuiet`, `trace:DuplicateRequestIsQuiet`, `trace:StaleReplyIsQuiet`, `mutation:S6`, `mutation:C5`, `mutation:S7`, `mutation:C6` |
 | L11 | Bounded | `inv:Bounded`, `trace:Bounded`, `mutation:S12`, `mutation:C11`, `zig:src/core/images/image_route.zig#abstract maps the pending request onto a sequence of at most one` |
 | L12 | Every waiting request is answered | `prop:Answered`, `mutation:S11`, `review:a finite trace cannot show liveness; TLC proves Answered over the whole model under fairness of replies, and ConformsToSpec makes each recorded reply clear its request` |
 | L13 | Decide only when no reply is owed | `inv:DecideOnlyWhenReady`, `inv:PendingWaitsForReply`, `trace:DecideOnlyWhenReady`, `trace:PendingWaitsForReply`, `mutation:S13`, `mutation:C12`, `mutation:S14`, `mutation:C13` |
 | L14 | Turns and processes start clean | `inv:TurnResets`, `trace:TurnResets`, `mutation:S9`, `mutation:C8` |
+| L15 | Unknown only after asking | `inv:AskedBeforeUnknown`, `trace:AskedBeforeUnknown`, `mutation:S23`, `mutation:C22`, `zig:src/core/images/image_route.zig#the core keeps the model's laws on arbitrary event sequences`, `zig:src/core/images/image_route.zig#the core keeps the model's laws on seeded random event sequences` |
 
 ## Final design
 
@@ -108,7 +110,7 @@ The laws `step` obeys. Each one is a named invariant or property in `spec/ImageR
 
 ### The core
 
-`src/core/images/image_route.zig` (this change) imports only `std`.
+`src/core/images/image_route.zig` (this change) imports only `std` outside its tests.
 
 - **State** (`:107-116`): `support`, the turn's one capability snapshot; `resolved` and `notified`, the turn's spent capability request and notice; `pending`, the request waiting for a reply, if any.
 - **Events** (`:118-127`): `turn_started(Support)`, `request_ready(Request)`, and `capabilities_resolved(Support)`. Time does not enter. I/O results arrive as `capabilities_resolved`, and failures arrive as the support value they produce.
@@ -128,6 +130,12 @@ The turn loop in `processQueuedPromptLoop` is the only code that runs effects.
 
 `visionPolicy`, `ImageRoute`, `VisionPolicy`, and the per-turn flags `tool_image_capabilities_resolved` and `tool_image_strip_notified` are gone, along with their tests. The core's tests and the model cover the same laws.
 
+### Earlier images
+
+A request's user images are split at the turn's own user message (`orchestrator.zig` `requestUserImages`): `user_images` are the ones attached this turn and `earlier_images` the ones earlier turns left in the history, counting only images the session still holds. Only `user_images` can fail a request (L7). `decision` gives earlier images the tool image rule (`held` in `image_route.zig`), so they go inline to a model listed with vision, through the vision tool's image references on the fallback route, and otherwise leave the request as one note each (`image_attachments.withholdEarlierImages`). A down catalog that withholds them tells the user once per turn (`catalogDownNotice`), and the turn asks the catalog before judging support unknown (L15).
+
+`binary-to-spec.ts` checks this through the built binary: each `fx ask` turn is recorded with the catalog view it saw, the flags the spec says the shell computes from the turn, and what its first request carried, and `BinaryImageRoute.tla` holds every turn to `DecideOut`. On the binary before this change it fails on exactly the text-only turns after an earlier image while the catalog is missing or down.
+
 ### Mechanisms added, and the answers that required them
 
 | Mechanism | Required by |
@@ -135,6 +143,8 @@ The turn loop in `processQueuedPromptLoop` is the only code that runs effects.
 | Support from `vision` alone | Q1 and R9: the inherited rule reads a document tag as an image tag |
 | Asking before deciding, with the request held in `pending` | Q9: deciding first splits one request across two snapshots |
 | `pending` replaced by a newer request, and stale replies ignored | Q8 and Q11 |
+| `earlier_images`, split from `user_images` | Q18: an earlier image failed every later turn while support was unknown |
+| The binary stage and `BinaryImageRoute.tla` | Q37: the shell's flags, which caused the second bug, are outside what the core harness can see |
 | A pure core with `abstract` and a harness | Q37 and G6: the orchestrator cannot be checked against a model, and a pure step can |
 
 ### Rules this design breaks

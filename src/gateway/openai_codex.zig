@@ -13,7 +13,7 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
 const endpoint = "https://chatgpt.com/backend-api/codex/responses";
-const e2e_endpoint_env = "FX_E2E_OPENAI_CODEX_RESPONSES_URL";
+const e2e_endpoint_env = "FX_TEST_OPENAI_CODEX_RESPONSES_URL";
 const max_error_body_bytes: usize = 1024 * 1024;
 const max_sse_line_bytes: usize = 32 * 1024 * 1024;
 const max_sse_aggregate_bytes: usize = 64 * 1024 * 1024;
@@ -282,27 +282,18 @@ pub fn streamPrepared(
     var extra_headers_buf: [max_extra_headers]std.http.Header = undefined;
     const extra_headers = extraHeaders(&extra_headers_buf, auth_headers.account_id, request.session_id);
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
-    var open_operation = gateway_client.PostOperation{
-        .client = &client,
-        .uri = uri,
-        .authorization = auth_headers.authorization,
-        .extra_headers = extra_headers,
-    };
     const connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(connect_timeout_ms),
     });
     try request.admission.admit();
-    var opened = try gateway_client.openBoundedPost(
-        alloc,
-        request.cancel_flag,
-        connect_deadline,
-        &open_operation,
-    );
-    var http_request = opened.take();
-    defer http_request.deinit();
+    var opened = try gateway_client.openBoundedPost(request.cancel_flag, connect_deadline, .{
+        .uri = uri,
+        .authorization = auth_headers.authorization,
+        .extra_headers = extra_headers,
+    });
+    defer opened.deinit();
+    const http_request = &opened.request;
     var watch: gateway_client.ConnectionWatch = .init(.{
         .patient = true,
         .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
@@ -325,6 +316,9 @@ pub fn streamPrepared(
     var response = http_request.receiveHead(&.{}) catch |err| return watch.failure(err);
     if (watch.commitHead()) |err| return err;
     if (response.head.status != .ok) {
+        // Read before the body, whose reads reuse the buffer the head's
+        // header bytes live in.
+        const retry_after = gateway_client.retryAfterSeconds(response.head);
         var transfer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer);
         const body = reader.allocRemaining(alloc, .limited(max_error_body_bytes)) catch |err| switch (err) {
@@ -332,8 +326,10 @@ pub fn streamPrepared(
             else => return err,
         };
         return .{ .failed = .{
-            .kind = failureKind(response.head.status),
+            .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body),
+            .http_status = response.head.status,
             .detail = body,
+            .retry_after_seconds = retry_after,
             .ownership = .owned,
         } };
     }
@@ -360,10 +356,10 @@ pub fn completeFromStream(
         alloc,
         reader,
         &events,
-        EventBridge.content,
-        EventBridge.toolStart,
-        EventBridge.reasoning,
-        EventBridge.toolInput,
+        stream_provider.EventSink.onContentChunk,
+        stream_provider.EventSink.onToolStart,
+        stream_provider.EventSink.onReasoningChunk,
+        stream_provider.EventSink.onToolInputChunk,
         request.cancel_flag,
         request.content_capture_limit,
         .{},
@@ -380,43 +376,6 @@ pub fn completeFromStream(
         .completion = completion,
         .ownership = .owned,
     } };
-}
-
-const EventBridge = struct {
-    fn sink(raw: *anyopaque) *stream_provider.EventSink {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn content(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .content_delta = chunk });
-    }
-
-    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .reasoning_delta = chunk });
-    }
-
-    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .tool_input_delta = chunk });
-    }
-
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
-    }
-};
-
-pub fn failureKind(status: std.http.Status) stream_provider.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
 }
 
 fn consumeSse(
@@ -470,6 +429,7 @@ fn mapReducerError(err: anyerror) anyerror {
     return switch (err) {
         error.EventTooLarge => error.OpenAICodexSseEventTooLarge,
         error.InvalidEvent => error.InvalidOpenAICodexSseEvent,
+        error.MalformedEvent => error.MalformedOpenAICodexSseEvent,
         error.StreamIncomplete => error.OpenAICodexStreamIncomplete,
         error.ToolCallLimitExceeded => error.OpenAICodexToolCallLimitExceeded,
         error.ToolArgumentsTooLarge => error.OpenAICodexToolArgumentsTooLarge,
@@ -909,4 +869,87 @@ test "OpenAI Codex rejects a 129th streamed tool call" {
     } else |err| {
         try std.testing.expectEqual(error.OpenAICodexToolCallLimitExceeded, err);
     }
+}
+
+const stream_fuzz = @import("stream_fuzz_testing.zig");
+
+fn fuzzResponsesChunkedStream(_: void, smith: *std.testing.Smith) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var reasoning: stream_fuzz.Text = .{};
+    try reasoning.generate(arena, smith, "", "", false);
+    var content: stream_fuzz.Text = .{};
+    try content.generate(arena, smith, "", "", false);
+    const with_tool = smith.boolWeighted(1, 1);
+    var arguments: stream_fuzz.Text = .{};
+    try arguments.generate(arena, smith, "{\"path\":\"", "\"}", true);
+
+    // Each output item has its own index. Its closing `output_item.done`
+    // event is optional, and when sent it repeats the complete text.
+    var wire_buffer: std.Io.Writer.Allocating = .init(arena);
+    const wire = &wire_buffer.writer;
+    var index: usize = 0;
+    if (reasoning.text.items.len > 0) {
+        try wire.print("data: {{\"type\":\"response.output_item.added\",\"output_index\":{d},\"item\":{{\"type\":\"reasoning\"}}}}\n\n", .{index});
+        for (try reasoning.pieces(arena)) |piece| {
+            try wire.print("data: {{\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":{d},\"delta\":{f}}}\n\n", .{ index, std.json.fmt(piece, .{}) });
+        }
+        if (smith.boolWeighted(1, 1)) {
+            try wire.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}}}}\n\n", .{index});
+        }
+        index += 1;
+    }
+    if (content.text.items.len > 0) {
+        try wire.print("data: {{\"type\":\"response.output_item.added\",\"output_index\":{d},\"item\":{{\"type\":\"message\"}}}}\n\n", .{index});
+        for (try content.pieces(arena)) |piece| {
+            if (smith.boolWeighted(1, 7)) try wire.writeAll(": ping\n\n");
+            try wire.print("data: {{\"type\":\"response.output_text.delta\",\"output_index\":{d},\"delta\":{f}}}\n\n", .{ index, std.json.fmt(piece, .{}) });
+        }
+        if (smith.boolWeighted(1, 1)) {
+            try wire.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":{f}}}]}}}}\n\n", .{ index, std.json.fmt(content.text.items, .{}) });
+        }
+        index += 1;
+    }
+    if (with_tool) {
+        try wire.print("data: {{\"type\":\"response.output_item.added\",\"output_index\":{d},\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}}}\n\n", .{index});
+        for (try arguments.pieces(arena)) |piece| {
+            try wire.print("data: {{\"type\":\"response.function_call_arguments.delta\",\"output_index\":{d},\"delta\":{f}}}\n\n", .{ index, std.json.fmt(piece, .{}) });
+        }
+        if (smith.boolWeighted(1, 1)) {
+            try wire.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":{f}}}}}\n\n", .{ index, std.json.fmt(arguments.text.items, .{}) });
+        }
+    }
+    try wire.writeAll("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}\n\n");
+
+    const read_buffer = try stream_fuzz.readBuffer(arena, smith);
+    var fixed = std.Io.Reader.fixed(wire_buffer.written());
+    var source = fixed.limited(.unlimited, read_buffer);
+    var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
+    var cancelled = std.atomic.Value(bool).init(false);
+    const completion = try consumeSse(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, &cancelled, null, .{}, null);
+    defer {
+        if (completion.content) |value| std.testing.allocator.free(@constCast(value));
+        types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
+        if (completion.provider_state_json) |value| std.testing.allocator.free(@constCast(value));
+    }
+
+    try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
+    try deltas.expectEqual(content.text.items, reasoning.text.items);
+    try stream_fuzz.expectToolCall(completion.tool_calls, with_tool, "call_1", arguments.text.items);
+}
+
+test "Responses streams give the same result however they are cut into events and reads" {
+    try std.testing.fuzz({}, fuzzResponsesChunkedStream, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").responses_stream.*),
+    });
+}
+
+test "a Codex event that is not JSON resends, and a duplicate key still ends the turn" {
+    const partial = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\n";
+    try expectOpenAICodexSseError(error.MalformedOpenAICodexSseEvent, partial ++ "data: {not-json}\n\n", .{});
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.MalformedOpenAICodexSseEvent, .possibly_sent) != null);
+    try expectOpenAICodexSseError(error.InvalidOpenAICodexSseEvent, partial ++ "data: {\"type\":\"a\",\"type\":\"b\"}\n\n", .{});
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.InvalidOpenAICodexSseEvent, .possibly_sent) == null);
 }

@@ -11,6 +11,7 @@
 //! provider switching, OAuth, API key entry, and team selection.
 
 const std = @import("std");
+const agents = @import("../agents/agents.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
@@ -20,6 +21,7 @@ const picker_state = @import("../input/picker_state.zig");
 const list_window = @import("../shared/list_window.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const provider_runtime = @import("provider_runtime.zig");
 
 const ProviderPickerStage = picker_state.ProviderPickerStage;
@@ -51,6 +53,7 @@ pub fn supported(comptime App: type) bool {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         /// Fills one column with its options and their `current` annotations,
         /// then narrows both to what the typed query matches.
         pub fn columnOptions(
@@ -67,6 +70,14 @@ pub fn Runtime(comptime App: type) type {
                 column.annotations[0] = "";
                 column.count = 1;
                 return column.count;
+            }
+            if (comptime @hasDecl(@TypeOf(app.auth), "teamListLoading")) {
+                if (app.auth.teamListLoading()) {
+                    column.labels[0] = auth_runtime.team_list_loading_label;
+                    column.annotations[0] = "";
+                    column.count = 1;
+                    return column.count;
+                }
             }
             const active_provider = provider_runtime.provider(app);
             var count: usize = 0;
@@ -249,6 +260,12 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !supported(App)) return false;
             if (!hasQuery(app)) return false;
             if (app.auth.sourceInventoryRefreshActive()) return true;
+            if (comptime @hasDecl(@TypeOf(app.auth), "teamListLoading")) {
+                if (app.auth.teamListLoading()) {
+                    debug_trace.logf("provider", "provider picker ignored enter reason=team_list_loading", .{});
+                    return true;
+                }
+            }
             const query = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) orelse return false;
             var column: ColumnBuffer = .{};
             _ = columnOptions(app, query, &column);
@@ -296,43 +313,13 @@ pub fn Runtime(comptime App: type) type {
                     }
                     // A first sign-in picks the team as part of the OAuth flow,
                     // so the team column only earns a place once a session
-                    // exists to list teams for.
-                    const prefix = try app.alloc.dupe(u8, query.prefix);
-                    defer app.alloc.free(prefix);
-                    const provider_slug = try app.alloc.dupe(u8, app.input_runtime.picker.provider_picker_pending_provider.items);
-                    defer app.alloc.free(provider_slug);
-
-                    const teams = try app_auth_runtime.Runtime(App).loadTeamsForProviderPicker(app);
-                    switch (teams) {
-                        .ready => {},
-                        .needs_sign_in, .blocked => {
-                            // An ambient OIDC token satisfies oauth without a
-                            // browser round trip; switch to it instead of
-                            // forcing a sign-in it does not need.
-                            if (ambientOauthSource(app)) |source| {
-                                try commitSource(app, source, provider);
-                                return true;
-                            }
-                            if (teams == .blocked) return true;
-                            app.input_runtime.picker.clearProviderPickerFlow();
-                            app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                            try app_auth_runtime.Runtime(App).beginSignInForProviderPicker(app);
-                            app.shell.render_requests.request(.footer);
-                            return true;
-                        },
-                        // Teams refine the account rather than gate it, so this
-                        // is the last column the choice has: the login is still
-                        // the credential the user asked for, teams or not.
-                        .unavailable => {
-                            try commitSource(app, .fx_login, provider);
-                            return true;
-                        },
-                    }
-                    const method_slug = provider_picker_catalog.methodSlug(method);
-                    try setComposerText(app, "{s}{s} {s} ", .{ prefix, provider_slug, method_slug });
-                    try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, provider_slug, method_slug, .team);
-                    selectCurrentTeam(app);
-                    app.shell.render_requests.request(.footer);
+                    // exists to list teams for. Listing talks to the network,
+                    // so it may finish in `collectProviderPickerTeams`.
+                    const teams = (try app_auth_runtime.Runtime(App).beginTeamsForProviderPicker(app)) orelse {
+                        app.shell.render_requests.request(.footer);
+                        return true;
+                    };
+                    try continueOauthChoice(app, query.prefix, provider, teams);
                     return true;
                 },
                 .key_source => {
@@ -341,7 +328,7 @@ pub fn Runtime(comptime App: type) type {
                         app.input_runtime.picker.provider_picker_pending_provider.items,
                     ) orelse .gateway;
                     if (provider_picker_catalog.keySourceCredential(key_source)) |credential| {
-                        try commitSource(app, credential, pending_provider);
+                        try commitSource(app, agents.screenAgentOf(app), credential, pending_provider);
                     } else {
                         try openKeyStage(app, query.prefix, .api_key);
                     }
@@ -355,7 +342,7 @@ pub fn Runtime(comptime App: type) type {
                     const provider = provider_catalog.parse(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
                     ) orelse .gateway;
-                    try commitTeam(app, index, provider);
+                    try commitTeam(app, agents.screenAgentOf(app), index, provider);
                     return true;
                 },
             }
@@ -444,7 +431,7 @@ pub fn Runtime(comptime App: type) type {
             // picker were still waiting for input.
             app.input_runtime.picker.clearProviderPickerFlow();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
-            try app_auth_runtime.Runtime(App).applyPickerChoice(app, choice);
+            try app_auth_runtime.Runtime(App).applyPickerChoice(app, agents.screenAgentOf(app), choice);
             app.shell.render_requests.request(.footer);
         }
 
@@ -452,6 +439,72 @@ pub fn Runtime(comptime App: type) type {
         /// round trip. It is the only source worth switching to here: a stored
         /// fx login session that reached this point was already judged dead by
         /// the team load, so offering it back would switch to a corpse.
+        /// Resumes the Vercel account choice once its team list loads, if the
+        /// picker still shows that provider's methods.
+        pub fn collectProviderPickerTeams(app: *App) !void {
+            if (comptime !supported(App)) return;
+            if (comptime !@hasDecl(@TypeOf(app.auth), "takeTeamList")) return;
+            const loaded = app.auth.takeTeamList(.provider_picker) orelse return;
+            const active = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state);
+            const query = if (active) |value| if (value.stage == .method) value else null else null;
+            if (query == null) {
+                debug_trace.logf("provider", "team list dropped reason=picker_moved", .{});
+                var dropped = loaded;
+                if (dropped) |*selection| selection.deinit(app.alloc) else |_| {}
+                return;
+            }
+            const provider = provider_catalog.parse(
+                app.input_runtime.picker.provider_picker_pending_provider.items,
+            ) orelse .gateway;
+            const teams = try app_auth_runtime.Runtime(App).finishTeamsForProviderPicker(app, loaded);
+            try continueOauthChoice(app, query.?.prefix, provider, teams);
+        }
+
+        /// Finishes choosing a Vercel account once the team column is known.
+        fn continueOauthChoice(
+            app: *App,
+            query_prefix: []const u8,
+            provider: model_provider.ProviderId,
+            teams: app_auth_runtime.Runtime(App).TeamColumn,
+        ) !void {
+            // Rewriting the composer replaces the text these borrow.
+            const prefix = try app.alloc.dupe(u8, query_prefix);
+            defer app.alloc.free(prefix);
+            const provider_slug = try app.alloc.dupe(u8, app.input_runtime.picker.provider_picker_pending_provider.items);
+            defer app.alloc.free(provider_slug);
+
+            switch (teams) {
+                .ready => {},
+                .needs_sign_in, .blocked => {
+                    // An ambient OIDC token satisfies oauth without a browser
+                    // round trip; switch to it instead of forcing a sign-in it
+                    // does not need.
+                    if (ambientOauthSource(app)) |source| {
+                        try commitSource(app, agents.screenAgentOf(app), source, provider);
+                        return;
+                    }
+                    if (teams == .blocked) return;
+                    app.input_runtime.picker.clearProviderPickerFlow();
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    try app_auth_runtime.Runtime(App).beginSignInForProviderPicker(app, agents.screenAgentOf(app));
+                    app.shell.render_requests.request(.footer);
+                    return;
+                },
+                // Teams refine the account rather than gate it, so this is the
+                // last column the choice has: the login is still the
+                // credential the user asked for, teams or not.
+                .unavailable => {
+                    try commitSource(app, agents.screenAgentOf(app), .fx_login, provider);
+                    return;
+                },
+            }
+            const method_slug = provider_picker_catalog.methodSlug(.oauth);
+            try setComposerText(app, "{s}{s} {s} ", .{ prefix, provider_slug, method_slug });
+            try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, provider_slug, method_slug, .team);
+            selectCurrentTeam(app);
+            app.shell.render_requests.request(.footer);
+        }
+
         fn ambientOauthSource(app: *App) ?credentials.Source {
             const view = app.auth.pickerView();
             if (!view.available_sources.contains(.vercel_oidc_token)) return null;
@@ -461,16 +514,16 @@ pub fn Runtime(comptime App: type) type {
 
         /// Switching to a detected credential is a complete leaf: apply the
         /// source, then the provider it authenticates.
-        fn commitSource(app: *App, source: credentials.Source, provider: model_provider.ProviderId) !void {
+        fn commitSource(app: *App, agent: *AppAgent, source: credentials.Source, provider: model_provider.ProviderId) !void {
             app.input_runtime.picker.clearProviderPickerFlow();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             const auth_rt = app_auth_runtime.Runtime(App);
             // The provider only follows a credential that actually applied;
             // switching after a failed selection would strand the provider
             // without the credential the user just asked it to use.
-            if (try auth_rt.applySourceChoice(app, source)) {
-                if (!provider_runtime.provider(app).eql(provider)) {
-                    try auth_rt.applyPickerChoice(app, .{ .provider = provider });
+            if (try auth_rt.applySourceChoice(app, agent, source)) {
+                if (!provider_runtime.providerOf(app, agent).eql(provider)) {
+                    try auth_rt.applyPickerChoice(app, agent, .{ .provider = provider });
                 }
             }
             app.shell.render_requests.request(.footer);
@@ -478,13 +531,13 @@ pub fn Runtime(comptime App: type) type {
 
         /// The team is the last column, so this is where the whole path
         /// (provider, method, team) finally takes effect.
-        fn commitTeam(app: *App, index: usize, provider: model_provider.ProviderId) !void {
+        fn commitTeam(app: *App, agent: *AppAgent, index: usize, provider: model_provider.ProviderId) !void {
             app.input_runtime.picker.clearProviderPickerFlow();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             const auth_rt = app_auth_runtime.Runtime(App);
-            if (try auth_rt.applyTeamChoice(app, index)) {
-                if (!provider_runtime.provider(app).eql(provider)) {
-                    try auth_rt.applyPickerChoice(app, .{ .provider = provider });
+            if (try auth_rt.applyTeamChoice(app, agent, index)) {
+                if (!provider_runtime.providerOf(app, agent).eql(provider)) {
+                    try auth_rt.applyPickerChoice(app, agent, .{ .provider = provider });
                 }
             }
             app.shell.render_requests.request(.footer);
@@ -666,14 +719,24 @@ const ColumnTestApp = struct {
     }
 };
 
-fn columnFor(app: *ColumnTestApp, stage: ProviderPickerStage, query: []const u8) ColumnBuffer {
-    var column: ColumnBuffer = .{};
+fn fillColumn(app: *ColumnTestApp, stage: ProviderPickerStage, query: []const u8, column: *ColumnBuffer) void {
+    column.* = .{};
     _ = Runtime(ColumnTestApp).columnOptions(app, .{
         .stage = stage,
         .prefix = "/provider ",
         .query = query,
         .token_start = 0,
-    }, &column);
+    }, column);
+}
+
+/// Returns a copy of the column, so it serves only stages whose labels do not
+/// point into the buffer's own `field`. The key stage writes its row there, and
+/// a copy's label would still point at this function's dead stack frame; use
+/// `fillColumn` with a caller-owned buffer for it.
+fn columnFor(app: *ColumnTestApp, stage: ProviderPickerStage, query: []const u8) ColumnBuffer {
+    std.debug.assert(stage != .api_key);
+    var column: ColumnBuffer = .{};
+    fillColumn(app, stage, query, &column);
     return column;
 }
 
@@ -770,19 +833,22 @@ test "key column is a masked field, not a list of options" {
     defer app.deinit();
     try app.input_runtime.picker.beginProviderPickerFlow(alloc, "vercel", "api-key", .api_key);
 
-    const empty = columnFor(&app, .api_key, "");
+    var empty: ColumnBuffer = undefined;
+    fillColumn(&app, .api_key, "", &empty);
     try std.testing.expectEqual(@as(usize, 1), empty.count);
     try std.testing.expect(std.mem.endsWith(u8, empty.labels[0], provider_picker_catalog.key_field_placeholder));
 
     app.auth.mask_count = 4;
-    const typed = columnFor(&app, .api_key, "");
+    var typed: ColumnBuffer = undefined;
+    fillColumn(&app, .api_key, "", &typed);
     try std.testing.expectEqual(@as(usize, 1), typed.count);
     try std.testing.expect(std.mem.find(u8, typed.labels[0], provider_picker_catalog.key_field_placeholder) == null);
 
     // While the save thread works the row says so instead of rendering an
     // empty ready-looking field.
     app.auth.save_in_flight = true;
-    const saving = columnFor(&app, .api_key, "");
+    var saving: ColumnBuffer = undefined;
+    fillColumn(&app, .api_key, "", &saving);
     try std.testing.expectEqual(@as(usize, 1), saving.count);
     try std.testing.expectEqualStrings("saving the key...", saving.labels[0]);
 }

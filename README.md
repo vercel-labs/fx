@@ -46,10 +46,10 @@ fx runs on macOS and Linux, on x86_64 and arm64. The installer puts it in `~/.lo
 Sign in with one of these:
 
 ```bash
-fx login          # Vercel AI Gateway
-fx login codex    # ChatGPT subscription
-fx login grok     # Grok subscription
-fx setup          # AI Gateway API key
+fx login                    # Vercel AI Gateway
+fx login codex              # ChatGPT subscription
+fx login grok               # Grok subscription
+fx login vercel --api-key   # AI Gateway API key
 ```
 
 Then open a project and start fx:
@@ -139,7 +139,7 @@ fx/
 │   ├── tools/       built-in tools: files, shell, web, skills, subagents
 │   ├── ui/          terminal rendering and input
 │   ├── gateway/     model provider transport
-│   ├── mcp/         MCP v2 engine, behind FX_MCP_ENGINE=v2
+│   ├── mcp/         MCP engine
 │   └── acp/         Agent Client Protocol server
 ├── sdk/             libfx, the JavaScript library
 ├── tests/           end-to-end tests and model evals

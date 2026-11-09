@@ -828,14 +828,14 @@ test "display unit clipping preserves sequence boundaries" {
 
 test "fuzz display unit boundaries" {
     try std.testing.fuzz({}, fuzzDisplayUnitBoundaries, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             "",
             "plain text",
             "\xff\xf0\x28\x8c\x28",
             "\u{2600}\u{FE0E}\u{2600}\u{FE0F}",
             "\u{1F44D}\u{1F3FD}\u{1F1FA}\u{1F1F8}",
             "#\u{FE0F}\u{20E3}\u{1F469}\u{200D}\u{1F4BB}",
-        },
+        }) ++ @import("fuzz_corpus").display_width.*),
     });
 }
 

@@ -1,11 +1,13 @@
 //! The engine's core for one server: its phase and tries in a row, the host's tool list need, and the
 //! tool calls the host made to it. A call goes nowhere without the host's
 //! permission. A call to a ready server goes out at once; one to any
-//! other server waits, goes out the moment the server is ready, and ends when
-//! it gives up. A server starts only when the host needs its tool list or a
-//! call waits for it (LazyConnect), at most `max_attempts` times in a row,
-//! and after a failure only once its backoff is over. A step that
-//! also starts the server is traced as a second record. Pure.
+//! other server waits, goes out the moment the server is ready, and fails
+//! with the first start that fails while it waits. A server first
+//! starts only when the host needs its tool list
+//! or a call waits for it (LazyConnect). After a failure it starts again by
+//! itself once its backoff is over, at most `max_attempts` times in a
+//! row; the tries start over once it has stayed up for `stable_ms`. A step
+//! that also starts the server is traced as a second record. Pure.
 //!
 //! TLA+ model: `tests/tla/mcp/Engine.tla`.
 
@@ -22,6 +24,8 @@ pub const max_calls = 24;
 pub const Config = struct {
     /// Tries in a row before the server gives up.
     max_attempts: u8 = 8,
+    /// How long a server stays up before its tries start over.
+    stable_ms: u32 = 60_000,
 };
 
 pub const Event = union(enum) {
@@ -38,6 +42,8 @@ pub const Event = union(enum) {
     /// The start or the link failed.
     down,
     backoff_over,
+    /// The server has been ready for `stable_ms`.
+    stable,
     /// The server ended a call in flight, however it ended.
     answered: Handle,
 };
@@ -58,6 +64,8 @@ pub const Effect = union(enum) {
     refuse_need,
     /// The server may start again after this long.
     arm_backoff: u32,
+    /// Its tries start over if it is still ready after this long.
+    arm_stable: u32,
     /// Stop the server's link. What was in flight on it ended with `end`.
     teardown,
 };
@@ -71,6 +79,7 @@ pub const Projection = struct {
     sent: u32,
     /// The state of the step's call: 0 none, 1 waiting, 2 sent, 3 done.
     state: u8,
+    retry: bool,
 };
 
 pub const Output = struct {
@@ -106,6 +115,8 @@ pub const Gate = struct {
     phase: Phase = .idle,
     attempts: u8 = 0,
     need: bool = false,
+    /// Down by a failure: it starts again by itself once its backoff is over.
+    retry: bool = false,
     calls: [max_calls]Call = @splat(.{}),
     /// The number of the last call asked.
     last: u32 = 0,
@@ -158,26 +169,35 @@ pub const Gate = struct {
                 };
                 s.phase = .idle;
                 s.attempts = 0;
+                // A disconnect refuses a waiting tool list need, so the host
+                // hears; a reconnect keeps it.
+                if (s.need and !d.keep) out.emit(.refuse_need);
                 s.need = s.need and d.keep;
+                s.retry = false;
                 s.connect(out);
             },
             .up => {
                 out.action = "up";
                 if (s.phase != .connecting) return ignore(out);
                 s.phase = .ready;
-                s.attempts = 0;
+                s.retry = false;
                 if (s.need) out.emit(.list);
                 s.need = false;
                 for (&s.calls) |*c| if (c.used and !c.sent) {
                     c.sent = true;
                     out.emit(.{ .send = c.handle });
                 };
+                // Its tries start over only once it stays up.
+                out.emit(.{ .arm_stable = s.config.stable_ms });
             },
             .down => {
                 out.action = "down";
                 if (s.phase != .connecting and s.phase != .ready) return ignore(out);
                 const gave_up = s.attempts >= s.config.max_attempts;
-                for (&s.calls) |*c| if (c.used and (c.sent or gave_up)) {
+                s.retry = !gave_up;
+                // A call waits for one start: it fails with this one, and
+                // later tries are for later calls.
+                for (&s.calls) |*c| if (c.used) {
                     out.emit(.{ .end = .{ .call = c.handle, .end = if (c.sent) .lost else .failed } });
                     c.* = .{};
                 };
@@ -196,6 +216,11 @@ pub const Gate = struct {
                 s.phase = .idle;
                 s.connect(out);
             },
+            .stable => {
+                out.action = "stable";
+                if (s.phase != .ready or s.attempts == 0) return ignore(out);
+                s.attempts = 0;
+            },
             .answered => |handle| {
                 out.action = "answer";
                 const c = s.find(handle) orelse return ignore(out);
@@ -207,9 +232,9 @@ pub const Gate = struct {
     }
 
     /// The model's Connect, when it is enabled: an idle server that something
-    /// needs, with tries left.
+    /// needs or that went down by a failure, with tries left.
     fn connect(s: *Gate, out: *Output) void {
-        if (s.phase != .idle or !s.demand() or s.attempts >= s.config.max_attempts) return;
+        if (s.phase != .idle or !(s.demand() or s.retry) or s.attempts >= s.config.max_attempts) return;
         out.mid = s.project(out.n);
         s.phase = .connecting;
         s.attempts += 1;
@@ -228,7 +253,7 @@ pub const Gate = struct {
     }
 
     pub fn project(s: *const Gate, n: u32) Projection {
-        var p: Projection = .{ .phase = s.phase, .attempts = s.attempts, .need = s.need, .waiting = 0, .sent = 0, .state = if (n == 0) 0 else 3 };
+        var p: Projection = .{ .phase = s.phase, .attempts = s.attempts, .need = s.need, .waiting = 0, .sent = 0, .state = if (n == 0) 0 else 3, .retry = s.retry };
         for (s.calls) |c| if (c.used) {
             if (c.sent) p.sent += 1 else p.waiting += 1;
             if (c.n == n) p.state = if (c.sent) 2 else 1;
@@ -276,6 +301,7 @@ fn record(writer: *trace.Writer, instance: []const u8, s: *const Gate, event: Ev
             .{ .name = "waiting", .value = .{ .int = p.waiting } },
             .{ .name = "sent", .value = .{ .int = p.sent } },
             .{ .name = "state", .value = .{ .int = p.state } },
+            .{ .name = "retry", .value = .{ .boolean = p.retry } },
             .{ .name = "max", .value = .{ .int = s.config.max_attempts } },
         },
     });
@@ -286,11 +312,13 @@ fn record(writer: *trace.Writer, instance: []const u8, s: *const Gate, event: Ev
 const testing = std.testing;
 
 /// The model's ghosts for one walk, by call number: whether the host allowed
-/// the call, and whether it ever went out.
+/// the call, and whether it ever went out; and downs since the server last
+/// stayed up or the host dropped it.
 const World = struct {
     const max_n = 512;
     allowed: [max_n]bool = @splat(false),
     went_out: [max_n]bool = @splat(false),
+    downs: u32 = 0,
 
     fn check(w: *World, s: *const Gate, before: *const Gate, event: Event, out: *const Output) !void {
         if (event == .asked and out.n > 0 and out.n < max_n) w.allowed[out.n] = event.asked.allowed;
@@ -303,26 +331,36 @@ const World = struct {
                 try testing.expectEqual(Phase.ready, s.phase);
                 w.went_out[n] = true;
             },
-            // LazyConnect: something needed it when it started.
+            // LazyConnect: something needed it, or it failed, when it started.
             .connect => {
                 const mid = out.mid.?;
-                try testing.expect(mid.phase == .idle and (mid.need or mid.waiting > 0));
+                try testing.expect(mid.phase == .idle and (mid.need or mid.waiting > 0 or mid.retry));
                 try testing.expect(mid.attempts < s.config.max_attempts);
             },
             .end => |e| if (e.end == .denied) try testing.expect(event == .asked and !event.asked.allowed),
             .list => try testing.expect(s.phase == .ready),
-            .refuse_need => try testing.expect(s.phase == .failed),
+            .refuse_need => try testing.expect(s.phase == .failed or (event == .drop and !event.drop.keep)),
             else => {},
         };
         try testing.expect(s.attempts <= s.config.max_attempts);
+        if (!out.ignored) switch (event) {
+            .down => w.downs += 1,
+            .stable, .drop => w.downs = 0,
+            else => {},
+        };
+        // It starts again only after a failure, at most `max_attempts` times in a row.
+        try testing.expect(w.downs <= @as(u32, s.config.max_attempts) + 1);
+        if (s.retry) try testing.expect(w.downs > 0 and (s.phase == .backoff or s.phase == .idle or s.phase == .connecting));
         // BoundedReconnect
         if (s.phase == .failed) try testing.expectEqual(s.config.max_attempts, s.attempts);
         // StatusConsistent
         const p = s.project(0);
         if (p.sent > 0) try testing.expectEqual(Phase.ready, s.phase);
         if (s.phase == .failed or s.phase == .ready) try testing.expect(!s.need and p.waiting == 0);
+        // WaitsForOneStart: a failed start leaves no call waiting.
+        if ((before.phase == .connecting or before.phase == .ready) and (s.phase == .backoff or s.phase == .failed)) try testing.expectEqual(@as(u32, 0), p.waiting);
         // Where the model has no choice, the core must act: Connect is enabled.
-        try testing.expect(!(s.phase == .idle and s.demand() and s.attempts < s.config.max_attempts));
+        try testing.expect(!(s.phase == .idle and (s.demand() or s.retry) and s.attempts < s.config.max_attempts));
         // Ignored steps change nothing.
         if (out.ignored and out.mid == null) try testing.expectEqualDeep(before.project(0), s.project(0));
         switch (event) {
@@ -336,8 +374,16 @@ const World = struct {
             .answered, .cancel => |h| for (before.calls) |c| if (c.used and c.handle == h and c.sent == (event == .cancel)) {
                 try testing.expect(out.ignored);
             },
-            // A host drop starts the tries over.
-            .drop => try testing.expect(s.attempts <= 1),
+            // A host drop starts the tries over, and a disconnect answers a
+            // waiting need.
+            .drop => |d| {
+                try testing.expect(s.attempts <= 1);
+                if (before.need and !d.keep) {
+                    var refused = false;
+                    for (out.effects()) |effect| refused = refused or effect == .refuse_need;
+                    try testing.expect(refused);
+                }
+            },
             else => {},
         }
     }
@@ -354,6 +400,7 @@ const alphabet = [_]Event{
     .up,
     .down,
     .backoff_over,
+    .stable,
     .{ .answered = 1 },
     .{ .answered = 2 },
 };
@@ -389,7 +436,7 @@ test "random long sequences keep the model's invariants, past max_calls" {
         var w: World = .{};
         var handle: Handle = 1;
         for (0..300) |_| {
-            const event: Event = switch (random.uintLessThan(u8, 9)) {
+            const event: Event = switch (random.uintLessThan(u8, 10)) {
                 0 => blk: {
                     handle += 1;
                     break :blk .{ .asked = .{ .call = handle, .allowed = random.boolean() } };
@@ -400,6 +447,7 @@ test "random long sequences keep the model's invariants, past max_calls" {
                 4 => .up,
                 5 => .down,
                 6 => .backoff_over,
+                7 => .stable,
                 else => .{ .answered = random.uintAtMost(Handle, handle) },
             };
             const before = s;
@@ -435,7 +483,7 @@ test "a call waits for its server, which starts for it, and goes out when it is 
     out = try run(&s, .need);
     try testing.expectEqual(@as(usize, 0), out.effect_count);
     out = try run(&s, .up);
-    try testing.expectEqualSlices(Effect, &.{ .list, .{ .send = 1 } }, out.effects());
+    try testing.expectEqualSlices(Effect, &.{ .list, .{ .send = 1 }, .{ .arm_stable = 60_000 } }, out.effects());
     out = try run(&s, .{ .asked = .{ .call = 2, .allowed = true } });
     try testing.expectEqualSlices(Effect, &.{.{ .send = 2 }}, out.effects());
     out = try run(&s, .need);
@@ -443,16 +491,19 @@ test "a call waits for its server, which starts for it, and goes out when it is 
     try testing.expectEqualSlices(Effect, &.{.list}, out.effects());
 }
 
-test "failures back off, then the server gives up and ends what waits" {
+test "a call fails with the start it waited for; the server backs off, then gives up" {
     var s: Gate = .init(.{ .max_attempts = 2 });
     _ = try run(&s, .{ .asked = .{ .call = 1, .allowed = true } });
     var out = try run(&s, .down);
-    try testing.expectEqualSlices(Effect, &.{.{ .arm_backoff = 1000 }}, out.effects());
+    // The call waited for that start, not for every try.
+    try testing.expectEqualSlices(Effect, &.{ .{ .end = .{ .call = 1, .end = .failed } }, .{ .arm_backoff = 1000 } }, out.effects());
     out = try run(&s, .backoff_over);
     try testing.expectEqualSlices(Effect, &.{.connect}, out.effects());
+    // A call made during that try waits for it, and fails with it.
+    _ = try run(&s, .{ .asked = .{ .call = 4, .allowed = true } });
     _ = try run(&s, .need);
     out = try run(&s, .down);
-    try testing.expectEqualSlices(Effect, &.{ .{ .end = .{ .call = 1, .end = .failed } }, .refuse_need }, out.effects());
+    try testing.expectEqualSlices(Effect, &.{ .{ .end = .{ .call = 4, .end = .failed } }, .refuse_need }, out.effects());
     try testing.expectEqual(Phase.failed, s.phase);
     out = try run(&s, .{ .asked = .{ .call = 2, .allowed = true } });
     try testing.expectEqualSlices(Effect, &.{.{ .end = .{ .call = 2, .end = .failed } }}, out.effects());
@@ -463,28 +514,62 @@ test "failures back off, then the server gives up and ends what waits" {
     try testing.expectEqual(Phase.idle, s.phase);
 }
 
-test "each time a server is ready its tries start over, so links that keep dying never give up" {
+test "a server that dies soon after each start starts again by itself, then gives up" {
     var s: Gate = .init(.{ .max_attempts = 2 });
     _ = try run(&s, .need);
-    for (0..5) |_| {
-        _ = try run(&s, .up);
-        _ = try run(&s, .down);
-        try testing.expectEqual(Phase.backoff, s.phase);
-        _ = try run(&s, .backoff_over);
-        _ = try run(&s, .need);
-        try testing.expectEqual(Phase.connecting, s.phase);
-    }
+    _ = try run(&s, .up);
+    _ = try run(&s, .down);
+    try testing.expectEqual(Phase.backoff, s.phase);
+    // Nothing needs it, and it starts again by itself.
+    var out = try run(&s, .backoff_over);
+    try testing.expectEqualSlices(Effect, &.{.connect}, out.effects());
+    _ = try run(&s, .up);
+    out = try run(&s, .down);
+    try testing.expectEqual(Phase.failed, s.phase);
+    try testing.expect(!s.retry);
 }
 
-test "a ready server's link dies: calls in flight are lost, and it starts again on demand" {
+test "a server that stayed up starts its tries over" {
+    var s: Gate = .init(.{ .max_attempts = 2 });
+    _ = try run(&s, .need);
+    _ = try run(&s, .up);
+    try testing.expectEqual(@as(u8, 1), s.attempts);
+    var out = try run(&s, .stable);
+    try testing.expect(!out.ignored);
+    try testing.expectEqual(@as(u8, 0), s.attempts);
+    out = try run(&s, .stable);
+    try testing.expect(out.ignored);
+    for (0..2) |_| {
+        _ = try run(&s, .down);
+        _ = try run(&s, .backoff_over);
+        try testing.expectEqual(Phase.connecting, s.phase);
+    }
+    _ = try run(&s, .down);
+    try testing.expectEqual(Phase.failed, s.phase);
+}
+
+test "a disconnected server never starts again by itself" {
+    var s: Gate = .init(.{});
+    _ = try run(&s, .need);
+    _ = try run(&s, .up);
+    _ = try run(&s, .down);
+    try testing.expect(s.retry);
+    const out = try run(&s, .{ .drop = .{ .keep = false } });
+    try testing.expectEqualSlices(Effect, &.{.teardown}, out.effects());
+    try testing.expect(!s.retry);
+    try testing.expect((try run(&s, .backoff_over)).ignored);
+    try testing.expectEqual(Phase.idle, s.phase);
+}
+
+test "a ready server's link dies: calls in flight are lost, and it starts again by itself" {
     var s: Gate = .init(.{});
     _ = try run(&s, .{ .asked = .{ .call = 1, .allowed = true } });
     _ = try run(&s, .up);
     var out = try run(&s, .down);
     try testing.expectEqualSlices(Effect, &.{ .{ .end = .{ .call = 1, .end = .lost } }, .{ .arm_backoff = 1000 } }, out.effects());
     out = try run(&s, .backoff_over);
-    try testing.expectEqual(@as(usize, 0), out.effect_count);
-    try testing.expectEqual(Phase.idle, s.phase);
+    try testing.expectEqualSlices(Effect, &.{.connect}, out.effects());
+    try testing.expectEqual(Phase.connecting, s.phase);
 }
 
 test "disconnect ends everything; reconnect keeps what waits and starts again" {

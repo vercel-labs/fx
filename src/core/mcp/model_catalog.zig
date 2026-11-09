@@ -1,16 +1,21 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
-const health = @import("health.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const mcp_call_capability = @import("../tooling/mcp_call_capability.zig");
 
 const Allocator = std.mem.Allocator;
 
 const max_prompt_bytes: usize = 4 * 1024;
-const header =
+const guidance =
     "Configured MCP servers visible to this model turn are listed below.\n" ++
-    "A listed server is not a reason to use MCP. Use capability_search only when the task clearly needs a capability not already available locally. Pass the task and an optional exact server name. Call tools advertised after search directly. Use mcp_select_tool when a relevant result is not yet callable. Use returned identities and refine the query when needed.\n" ++
-    "<mcp_servers>\n";
+    "A listed server is not a reason to use MCP. Use capability_search only when the task clearly needs a capability not already available locally. Pass the task and an optional exact server name. Call tools advertised after search directly. Use mcp_select_tool when a relevant result is not yet callable. Use returned identities and refine the query when needed.\n";
+/// `fx mcp call` (`src/core/mcp_host/mcp_call_client.zig`), where it works.
+const file_guidance = if (mcp_call_capability.supported)
+    "When a tool's result would be large or needs filtering, run it from a shell command instead: fx mcp call TOOL_NAME '<JSON arguments>' > FILE. Only what the command prints returns to you.\n"
+else
+    "";
+const header = guidance ++ file_guidance ++ "<mcp_servers>\n";
 const footer = "</mcp_servers>\n";
 const empty_entry = "  <none />\n";
 
@@ -184,22 +189,6 @@ fn findCurrentEntry(current: []const ServerSummary, name: []const u8) ?ServerSum
     return null;
 }
 
-pub fn classifyAvailability(
-    connection: health.ConnectionState,
-    authentication: health.AuthenticationState,
-    deferred_for_ask: bool,
-) Availability {
-    return switch (health.classify(connection, authentication, deferred_for_ask)) {
-        .disabled => .disabled,
-        .connecting => .discovering,
-        .ready => .ready,
-        .needs_auth => .authentication_required,
-        .failed => .failed,
-        .unavailable => .unavailable,
-        .on_demand => .available_on_demand,
-    };
-}
-
 /// Returns an owned prompt section. The caller releases it with `deinit` unless
 /// both values are intentionally retained by the supplied request arena.
 pub fn render(alloc: Allocator, snapshot: Snapshot) Allocator.Error!PromptSection {
@@ -348,32 +337,6 @@ fn ownedSnapshot(
     return .{ .servers = servers };
 }
 
-test "availability follows canonical connection authentication and deferred state" {
-    const Case = struct {
-        connection: health.ConnectionState,
-        authentication: health.AuthenticationState = .none,
-        deferred_for_ask: bool = false,
-        expected: Availability,
-    };
-    const cases = [_]Case{
-        .{ .connection = .ready, .expected = .ready },
-        .{ .connection = .connecting, .expected = .discovering },
-        .{ .connection = .disconnected, .deferred_for_ask = true, .expected = .available_on_demand },
-        .{ .connection = .failed, .authentication = .required, .expected = .authentication_required },
-        .{ .connection = .disconnected, .authentication = .required, .expected = .authentication_required },
-        .{ .connection = .disabled, .expected = .disabled },
-        .{ .connection = .disabled, .authentication = .required, .expected = .disabled },
-        .{ .connection = .failed, .expected = .failed },
-        .{ .connection = .disconnected, .expected = .unavailable },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(
-            case.expected,
-            classifyAvailability(case.connection, case.authentication, case.deferred_for_ask),
-        );
-    }
-}
-
 test "render exposes sorted server summaries without tool metadata" {
     const alloc = std.testing.allocator;
     var snapshot = try ownedSnapshot(alloc, &.{
@@ -388,6 +351,7 @@ test "render exposes sorted server summaries without tool metadata" {
     try std.testing.expectEqualStrings(
         "Configured MCP servers visible to this model turn are listed below.\n" ++
             "A listed server is not a reason to use MCP. Use capability_search only when the task clearly needs a capability not already available locally. Pass the task and an optional exact server name. Call tools advertised after search directly. Use mcp_select_tool when a relevant result is not yet callable. Use returned identities and refine the query when needed.\n" ++
+            file_guidance ++
             "<mcp_servers>\n" ++
             "  <server name=\"alpha\" state=\"ready\" tools=\"2\" />\n" ++
             "  <server name=\"zeta\" state=\"authentication_required\" />\n" ++

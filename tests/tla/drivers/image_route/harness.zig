@@ -5,7 +5,7 @@
 //! it reads one event per line and prints one line per event:
 //!
 //!   in:  {"event":"turn_started","view":{"kind":"listed","vision":true,"file_input":false}}
-//!        {"event":"request_ready","req":{"user_images":false,...}}
+//!        {"event":"request_ready","req":{"user_images":false,"earlier_images":true,...}}
 //!        {"event":"capabilities_resolved","view":{"kind":"down","vision":false,"file_input":false}}
 //!   out: {"state":{"support":"unknown","resolved":false,"notified":false,"pending":[]},"out":[...]}
 //!
@@ -35,6 +35,7 @@ const EffectJson = struct {
     route: ?image_route.Route = null,
     mode: ?image_route.VisionMode = null,
     tool_images: ?image_route.ToolImages = null,
+    earlier_images: ?image_route.ToolImages = null,
     reason: ?image_route.FailReason = null,
 };
 
@@ -67,7 +68,7 @@ fn effectJson(effect: image_route.Effect) EffectJson {
     return switch (effect) {
         .resolve_capabilities => .{ .kind = "resolve" },
         .notify_catalog_down => .{ .kind = "notify" },
-        .send => |chosen| .{ .kind = "send", .route = chosen.route, .mode = chosen.mode, .tool_images = chosen.tool_images },
+        .send => |chosen| .{ .kind = "send", .route = chosen.route, .mode = chosen.mode, .tool_images = chosen.tool_images, .earlier_images = chosen.earlier_images },
         .fail => |reason| .{ .kind = "fail", .reason = reason },
     };
 }

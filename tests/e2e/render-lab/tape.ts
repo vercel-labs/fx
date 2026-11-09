@@ -8,7 +8,10 @@ export type TapeFrame = {
   payload: Buffer;
 };
 
-export function readTapeFrames(path: string): TapeFrame[] {
+/// Every frame of the tape at `path`. A final frame cut short, as a killed
+/// process can leave it, throws unless `ignoreTruncatedTail` is set; then it
+/// is left out, as `fx replay` leaves it out.
+export function readTapeFrames(path: string, options: { ignoreTruncatedTail?: boolean } = {}): TapeFrame[] {
   const bytes = readFileSync(path);
   const magic = Buffer.from("FXTP\x01", "binary");
   if (!bytes.subarray(0, magic.length).equals(magic)) {
@@ -24,13 +27,19 @@ export function readTapeFrames(path: string): TapeFrame[] {
   const frames: TapeFrame[] = [];
   let index = 0;
   while (offset < bytes.length) {
-    if (offset + 9 > bytes.length) throw new Error(`truncated tape frame header at ${offset}`);
+    if (offset + 9 > bytes.length) {
+      if (options.ignoreTruncatedTail) break;
+      throw new Error(`truncated tape frame header at ${offset}`);
+    }
     const deltaMs = bytes.readInt32LE(offset);
     const kind = bytes.readUInt8(offset + 4);
     const len = bytes.readUInt32LE(offset + 5);
     const start = offset + 9;
     const end = start + len;
-    if (end > bytes.length) throw new Error(`truncated tape frame payload at ${offset}`);
+    if (end > bytes.length) {
+      if (options.ignoreTruncatedTail) break;
+      throw new Error(`truncated tape frame payload at ${offset}`);
+    }
     frames.push({ index: ++index, deltaMs, kind, payload: bytes.subarray(start, end) });
     offset = end;
   }

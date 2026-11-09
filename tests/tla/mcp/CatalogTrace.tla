@@ -7,6 +7,8 @@
 \*     and every step matches the whole projection instead.
 \*   - `expired` is Expired; a timer that no longer applies is no step, and
 \*     the core writes no record for it.
+\*   - `page_received` carries `lapse`, which the core works out from the
+\*     pages' arrival times; the model takes it as given.
 \*   - MaxPages comes from the scenario (ObsMaxPages). MaxGen and
 \*     MaxProcesses are the highest values in the trace.
 EXTENDS Catalog, TraceObs, Integers, Sequences
@@ -21,7 +23,7 @@ ObsMaxProcesses == Highest({r.data.process : r \in Recs} \cup {1})
 Step(r) ==
     CASE r.event = "process_started" -> ProcessStarted(r.data.arg_era)
       [] r.event = "need" -> Need
-      [] r.event = "page_received" -> PageReceived(r.data.more, r.data.ttl_zero)
+      [] r.event = "page_received" -> PageReceived(r.data.more, r.data.ttl_zero, r.data.lapse)
       [] r.event = "invalid_cursor" -> InvalidCursor
       [] r.event = "page_failed" -> PageFailed
       [] r.event = "invalidated" -> Invalidate
@@ -35,13 +37,16 @@ Matches(r) ==
     /\ cache' = r.data.cache
     /\ cacheGen' = r.data.cache_gen
     /\ cachedZero' = r.data.cached_zero
+    /\ cachedLapsed' = r.data.cached_lapsed
     /\ listing' = IF r.data.listing THEN "fetching" ELSE "idle"
     /\ startGen' = r.data.start_gen
     /\ page' = r.data.page
     /\ restarts' = r.data.restarts
     /\ zeroTtl' = r.data.zero_ttl
+    /\ lapsed' = r.data.lapsed
     /\ pending' = r.data.pending
     /\ waiting' = r.data.waiting
+    /\ answer' = r.data.answer
 
 TraceInit ==
     /\ Init

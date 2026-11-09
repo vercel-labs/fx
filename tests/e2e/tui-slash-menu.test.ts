@@ -181,13 +181,13 @@ async function waitForStatuslineValue(
   let latest: unknown;
   while (Date.now() < deadline) {
     if (existsSync(settingsPath)) {
-      latest = JSON.parse(readFileSync(settingsPath, "utf8")).statusLine?.[key];
+      latest = JSON.parse(readFileSync(settingsPath, "utf8")).status_line?.[key];
       if (latest === expected) return;
     }
     await Bun.sleep(100);
   }
   throw new Error(
-    `Timed out waiting for statusLine.${key}=${expected}; last=${JSON.stringify(latest)}`,
+    `Timed out waiting for status_line.${key}=${expected}; last=${JSON.stringify(latest)}`,
   );
 }
 
@@ -605,7 +605,246 @@ function longAssistantResponse(): string {
   }).join("\n");
 }
 
+const RENAME_MENU_SKILLS: Record<string, string> = {
+  deploy: "ship the app to production",
+  fix: "fix the failing test",
+  review: "review a pull request",
+  "rename-files": "rename files in bulk",
+};
+
+/// Starts fx in a workspace whose skills share names with likely session
+/// titles, with a trace log, so /rename can be driven from the slash menu.
+async function startRenameMenuSession(): Promise<{ tracePath: string; stderrPath: string }> {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-rename-menu-")));
+  workDirs.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  for (const [name, description] of Object.entries(RENAME_MENU_SKILLS)) {
+    const dir = join(workspace, ".agents", "skills", name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "SKILL.md"),
+      `---\nname: ${name}\ndescription: ${description}\n---\n\nRENAME_MENU_SKILL_BODY\n`,
+    );
+  }
+  writeFileSync(
+    join(home, ".fx", "settings.json"),
+    JSON.stringify({ sandbox: "none", permission: {} }),
+  );
+  const stderrPath = join(root, "stderr.log");
+  const tracePath = join(root, "trace.log");
+  gateway = startFakeGateway([]);
+  session = await TmuxSession.create({
+    cwd: workspace,
+    env: {
+      HOME: home,
+      AI_GATEWAY_API_KEY: "fake-rename-menu-key",
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_MODEL: FAKE_GATEWAY_MODEL,
+      FX_AUTO_UPGRADE: "0",
+      FX_TRACE: "1",
+      FX_TRACE_LOG: tracePath,
+    },
+    width: 110,
+    height: 30,
+    stderrPath,
+  });
+  await session.waitForComposer(10_000);
+  return { tracePath, stderrPath };
+}
+
+/// Waits until `ready` holds and the screen stops changing, so a menu that
+/// is about to appear has had its chance to.
+async function waitForSettledPane(
+  current: TmuxSession,
+  ready: (pane: string) => boolean,
+  timeoutMs = 5_000,
+): Promise<string> {
+  await current.waitForPane(ready, timeoutMs);
+  let previous = "";
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pane = await current.capturePane();
+    if (pane === previous && ready(pane)) return pane;
+    previous = pane;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  throw new Error(`pane did not settle:\n${previous}`);
+}
+
+async function clearRenameComposer(current: TmuxSession): Promise<void> {
+  await current.sendKeys("C-u");
+  await current.waitForPane((pane) => hasEmptyComposer(pane), 5_000);
+}
+
 describe.skipIf(SKIP)("tui: slash menu", () => {
+  test(
+    "a command that needs an argument waits for it when chosen from the slash menu",
+    async () => {
+      const { stderrPath } = await startRenameMenuSession();
+      const s = session!;
+
+      // A prefix, then the menu's own "enter use".
+      await s.sendLiteralText("/ren");
+      await s.waitForText("rename the current session", 5_000);
+      await s.sendKeys("Enter");
+      await s.sendLiteralText("picked from menu");
+      let pane = await s.waitForPane((current) => composerContains(current, "picked from menu"), 5_000);
+      expect(pane).not.toContain("usage: /rename <title>");
+      expect(composerContains(pane, "/rename picked from menu")).toBe(true);
+      await s.sendKeys("Enter");
+      await s.waitForText('renamed to "picked from menu"', 5_000);
+
+      // The whole command name, then Enter.
+      await s.sendLiteralText("/rename");
+      await s.waitForText("rename the current session", 5_000);
+      await s.sendKeys("Enter");
+      await s.sendLiteralText("typed in full");
+      pane = await s.waitForPane((current) => composerContains(current, "typed in full"), 5_000);
+      expect(pane).not.toContain("usage: /rename <title>");
+      expect(composerContains(pane, "/rename typed in full")).toBe(true);
+      await s.sendKeys("Enter");
+      await s.waitForText('renamed to "typed in full"', 5_000);
+
+      // Other commands whose argument is required.
+      for (const [typed, command, description, usage] of [
+        ["/ima", "/image", "attach an image by path", "usage: /image <path>"],
+        ["/she", "/shell", "reload shell startup files", "usage: /shell reload"],
+      ] as const) {
+        await s.sendLiteralText(typed);
+        await s.waitForText(description, 5_000);
+        await s.sendKeys("Enter");
+        await s.sendLiteralText("arg");
+        pane = await s.waitForPane((current) => composerContains(current, "arg"), 5_000);
+        expect(pane).not.toContain(usage);
+        expect(composerContains(pane, `${command} arg`)).toBe(true);
+        await clearRenameComposer(s);
+      }
+
+      // A command whose argument is optional still runs on Enter.
+      await s.sendLiteralText("/permis");
+      await s.waitForText("choose what fx is allowed to do", 5_000);
+      await s.sendKeys("Enter");
+      await s.waitForText("Configured rules", 5_000);
+      await s.sendKeys("Escape");
+      await s.waitForPane((current) => hasEmptyComposer(current) && !current.includes("Configured rules"), 5_000);
+
+      // An empty title sent on purpose still says how to use the command.
+      await s.sendLiteralText("/rename ");
+      await s.waitForText("rename the current session", 5_000);
+      await s.sendKeys("Enter");
+      await s.waitForText("usage: /rename <title>", 5_000);
+
+      expect(gateway!.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a /rename title that matches a skill stays a title",
+    async () => {
+      const { tracePath, stderrPath } = await startRenameMenuSession();
+      const s = session!;
+
+      await s.sendLiteralText("/rename deploy");
+      let pane = await waitForSettledPane(s, (current) => composerContains(current, "/rename deploy"));
+      expect(pane).not.toContain("ship the app to production");
+      await s.sendKeys("Tab");
+      pane = await waitForSettledPane(s, () => true);
+      expect(composerContains(pane, "/rename deploy")).toBe(true);
+      await s.sendKeys("Enter");
+      await s.waitForText('renamed to "deploy"', 5_000);
+
+      for (const title of ["dep", "rename-files"]) {
+        await s.sendLiteralText(`/rename ${title}`);
+        await waitForSettledPane(s, (current) => composerContains(current, `/rename ${title}`));
+        await s.sendKeys("Enter");
+        await s.waitForText(`renamed to "${title}"`, 5_000);
+      }
+
+      // A $ mention picked inside a title never turns the rename into the skill.
+      await s.sendLiteralText("/rename ship $dep");
+      await s.waitForText("Agents · Workspace", 5_000);
+      for (let press = 0; press < 4; press += 1) {
+        await s.sendKeys("Enter");
+        pane = await waitForSettledPane(s, () => true);
+        if (hasEmptyComposer(pane)) break;
+      }
+      pane = await s.captureFullScrollback();
+      expect(pane).toContain('renamed to "ship');
+      expect(pane).not.toContain("requested skill loaded");
+      expect(gateway!.requests).toHaveLength(0);
+
+      // The same rule on another command that takes free text.
+      await clearRenameComposer(s);
+      await s.sendLiteralText("/launch review");
+      pane = await waitForSettledPane(s, (current) => composerContains(current, "/launch review"));
+      expect(pane).not.toContain("review a pull request");
+      await clearRenameComposer(s);
+
+      // Picking a skill from the slash menu still works, and the trace says
+      // what it replaced.
+      await s.sendLiteralText("/dep");
+      await s.waitForText("ship the app to production", 5_000);
+      await s.sendKeys("Tab");
+      await s.waitForPane(
+        (current) => composerContains(current, "deploy") && !composerContains(current, "/dep"),
+        5_000,
+      );
+      const deadline = Date.now() + 5_000;
+      let trace = "";
+      while (Date.now() < deadline) {
+        trace = readFileSync(tracePath, "utf8");
+        if (trace.includes("slash menu replaced composer text with skill=deploy")) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(trace).toContain("slash menu replaced composer text with skill=deploy dropped_bytes=4");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "rename titles lose wrapping quotes and rename errors name the problem",
+    async () => {
+      const { stderrPath } = await startRenameMenuSession();
+      const s = session!;
+
+      await s.sendText('/rename "quoted title"');
+      await s.waitForText('renamed to "quoted title"', 5_000);
+      expect(await s.captureFullScrollback()).not.toContain('""quoted');
+      expect(await s.paneTitle()).toBe("quoted title");
+
+      // Quotes with nothing inside are an empty title, not text to replace.
+      await s.sendText('/rename ""');
+      await s.waitForText("usage: /rename <title>", 5_000);
+      expect(await s.paneTitle()).toBe("quoted title");
+
+      await s.sendText(`/rename ${"x".repeat(241)}`);
+      await s.waitForText("title is too long (at most 240 bytes)", 5_000);
+      // The notice wraps after "renamed to", so wait for the quoted title.
+      await s.sendText(`/rename ${"y".repeat(240)}`);
+      await s.waitForText(`"${"y".repeat(100)}`, 5_000);
+
+      await s.sendLiteralText("/rename line one");
+      await s.pasteText("\nline two");
+      await s.sendKeys("Enter");
+      await s.waitForText("title must be one line", 5_000);
+
+      await s.sendText("/rename same");
+      await s.waitForText('renamed to "same"', 5_000);
+      await s.sendText("/rename same");
+      await s.waitForText('already named "same"', 5_000);
+
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TEST_TIMEOUT,
+  );
+
   test(
     "linked workspace skill is visible and usable from the skills menu",
     async () => {
@@ -724,10 +963,6 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         stderrPath: fixture.stderrPath,
       });
 
-      await session.waitForText(
-        "skills: 1 discovery issue; some skills may be missing (ctrl+o to view)",
-        10_000,
-      );
       await session.waitForComposer(10_000);
       await session.sendKeys("C-o");
       await session.waitForPane(
@@ -743,6 +978,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-o");
       await session.waitForComposer(5_000);
+      // The warning exists (Ctrl+O showed it) but never reaches the inline transcript.
+      const inline = await session.captureFullScrollback();
+      expect(inline).not.toContain("skills:");
+      expect(inline).not.toContain("skill discovery warning:");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
@@ -780,6 +1019,75 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (pane) => composerContains(pane, "zig-best-practices"),
         5_000,
       );
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "fuzzy queries find commands, skills, and MCP servers",
+    async () => {
+      const fixture = createSkillRankingFixture();
+      writeFileSync(
+        join(fixture.home, ".fx", "mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            context7: { type: "http", url: "http://127.0.0.1:9/mcp" },
+            linear: { type: "http", url: "http://127.0.0.1:9/linear" },
+          },
+        }),
+      );
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+        stderrPath: fixture.stderrPath,
+      });
+      await session.waitForComposer(10_000);
+
+      // Each query holds its item's letters in order from the start of a
+      // word, and no item holds it as typed.
+      await session.sendLiteralText("/mdl");
+      await session.waitForPane(
+        (pane) => /Commands 1\b/.test(pane) && /^\s*\/model\s{2,}/m.test(pane),
+        5_000,
+      );
+      await session.sendKeys("C-u");
+
+      await session.sendLiteralText("$zbp");
+      const skills = await waitForSkillsMenu(session, 1);
+      expect(skills.some((line) => line.includes("zig-best-practices"))).toBe(true);
+      expect(skills.some((line) => line.includes("workflow-helper"))).toBe(false);
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (pane) => composerContains(pane, "zig-best-practices"),
+        5_000,
+      );
+      await session.sendKeys("C-u");
+
+      const serverRow = (name: string) => new RegExp(`^\\s*(?:›\\s*)?${name}\\s{2,}.*profile\\s*$`, "m");
+      await session.sendText("/mcp");
+      await session.waitForPane(
+        (pane) => serverRow("context7").test(pane) && serverRow("linear").test(pane),
+        10_000,
+      );
+      await session.sendLiteralText("ctx7");
+      const filtered = await session.waitForText(/MCP servers\s+1 of 2/, 5_000);
+      expect(filtered).toMatch(serverRow("context7"));
+      expect(filtered).not.toMatch(serverRow("linear"));
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("MCP servers"), 5_000);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
       await session.sendKeys("C-u");
@@ -865,7 +1173,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       gateway.stop();
       gateway = startFakeGateway([]);
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} resume ${sessionIds[0]}`,
+        cmd: `${FX_BIN} --resume ${sessionIds[0]}`,
         cwd: resumedWorkspace,
         env: {
           ...env,
@@ -954,7 +1262,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       gateway.stop();
       gateway = startFakeGateway([]);
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} resume ${sessionIds[0]}`,
+        cmd: `${FX_BIN} --resume ${sessionIds[0]}`,
         cwd: workspace,
         env: {
           HOME: home,
@@ -1012,7 +1320,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       ).toBe(69);
       expect(closedComposerRow).toBe(73);
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 37", 5_000);
+      await session.waitForText("Commands 40", 5_000);
       const afterSlash = await capture("after-slash");
       expect(visibleTranscriptTailRow(afterSlash)).toBe(60);
       expect(composerRow(afterSlash)).toBe(64);
@@ -1201,13 +1509,13 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("Down");
       await session.waitForText(
-        "manage local and remote MCP servers, resources, prompts, and project trust",
+        "manage MCP servers and their logins",
         5_000,
       );
       const scrolledGrid = await session.capturePaneGrid();
       const mcpRow = scrolledGrid.find((line) =>
         line.includes("/mcp") &&
-        line.includes("manage local and remote MCP servers, resources, prompts, and project trust")
+        line.includes("manage MCP servers and their logins")
       );
       expect(mcpRow).toBeDefined();
       expect(mcpRow!.indexOf("Extensions")).toBe(metadataColumn);
@@ -1273,7 +1581,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(modelRow).toContain("choose what model and reasoning effort to use");
       expect(modelRow).not.toContain("Model");
       expect(mcpRow).toContain(
-        "manage local and remote MCP servers, resources, prompts, and project trust",
+        "manage MCP servers and their logins",
       );
       expect(mcpRow).not.toContain("Extensions");
 
@@ -1537,7 +1845,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let grid = await waitForHelpMenu(session, 37);
+      let grid = await waitForHelpMenu(session, 40);
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
       expect(pane).toContain("Run /help for commands");
@@ -1553,7 +1861,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       grid = await waitForHelpMenu(session, 5);
       expect(grid.join("\n")).toContain("[General]");
       await session.sendKeys("BTab");
-      grid = await waitForHelpMenu(session, 37);
+      grid = await waitForHelpMenu(session, 40);
       expect(grid.join("\n")).toContain("[All]");
 
       await session.sendLiteralText("clipboard");
@@ -1564,11 +1872,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("/clear");
 
       await session.sendKeys("C-u");
-      await waitForHelpMenu(session, 37);
+      await waitForHelpMenu(session, 40);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 37"),
+        (current) => hasEmptyComposer(current) && !current.includes("Commands 40"),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
@@ -1577,7 +1885,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 37);
+      await waitForHelpMenu(session, 40);
       await session.sendLiteralText("additional directories");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
@@ -1594,7 +1902,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 37);
+      await waitForHelpMenu(session, 40);
       await session.sendLiteralText("no command can match this query");
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
@@ -1788,7 +2096,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "Context");
       pane = grid.join("\n");
-      expect(pane).not.toContain("saved to user settings");
+      expect(pane).not.toContain("saved to global settings");
       expect(pane).not.toMatch(/[*✓!✗⊘i] statusline:/);
       await waitForStatuslineValue(settingsPath, "session", true);
 
@@ -1796,7 +2104,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "Workspace");
       pane = grid.join("\n");
-      expect(pane).not.toContain("saved to user settings");
+      expect(pane).not.toContain("saved to global settings");
       await waitForStatuslineValue(settingsPath, "workspace", true);
 
       await session.sendKeys("Escape");
@@ -2172,7 +2480,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
 
       await session.sendText("/help");
-      grid = await waitForHelpMenu(session, 37);
+      grid = await waitForHelpMenu(session, 40);
       expect(grid.join("\n")).toContain("Run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
@@ -2335,7 +2643,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: currentModel,
           FX_AUTO_UPGRADE: "0",
           FX_RECORD: fixture.tapePath,
@@ -2392,7 +2700,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("xAI");
       expect(pane).not.toContain("Z.AI");
       expect(pane).toContain(currentModel);
-      expect(pane).toContain("1M context · 32K output · Fast");
+      expect(pane).toContain("1M context · 32K output · Fast mode");
       expect(pane).toContain("Note: Gateway catalog is authenticated with an API key");
       const headerRow = grid.findIndex((line) => line.includes("Models 4"));
       const firstModelRow = grid.findIndex((line) => line.includes("openai/gpt-5.4"));
@@ -2511,7 +2819,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: currentModel,
           FX_AUTO_UPGRADE: "0",
         },
@@ -2637,7 +2945,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: currentModel,
           FX_AUTO_UPGRADE: "0",
         },
@@ -2708,7 +3016,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: modelIds[0],
           FX_AUTO_UPGRADE: "0",
         },
@@ -2759,7 +3067,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: "openai/gpt-4o",
           FX_AUTO_UPGRADE: "0",
         },
@@ -2781,6 +3089,82 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane.split("\n").find((line) => line.startsWith("auto · "))).toBe("auto · deepseek-v4-pro-0813");
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models.gateway).toBe(selectedModel);
       expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model completion lists newer model versions first",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      // The Gateway lists models oldest first. The newest models fill the
+      // picker's highlight slots, so the sol models keep the catalog's order.
+      const catalog: Array<[string, number]> = [
+        ["openai/gpt-5.6-sol", 100],
+        ["openai/gpt-5.6-sol-fast", 100],
+        ["openai/gpt-6-sol", 200],
+        ["openai/gpt-6-sol-fast", 200],
+        ["openai/gpt-6.1-sol", 300],
+        ["openai/gpt-6.1-sol-fast", 300],
+        ["openai/gpt-6.1-terra", 400],
+        ["openai/gpt-6.1-terra-fast", 400],
+      ];
+      gateway = startFakeGateway([], {
+        models: catalog.map(([id, released]) => ({
+          id,
+          type: "language",
+          released,
+          tags: ["tool-use"],
+          context_window: 400_000,
+        })),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-model-order-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_MODEL: "openai/gpt-6.1-terra",
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      const solRows = (pane: string) =>
+        pane
+          .split("\n")
+          .filter((line) => !isComposerLine(line))
+          .map((line) => line.trim().split(/\s+/)[0] ?? "")
+          .filter((id) => /^openai\/gpt-[\d.]+-sol/.test(id));
+
+      await session.sendLiteralText("/model sol");
+      const pane = await session.waitForPane((current) => solRows(current).length === 6, 10_000);
+      expect(solRows(pane)).toEqual([
+        "openai/gpt-6.1-sol",
+        "openai/gpt-6.1-sol-fast",
+        "openai/gpt-6-sol",
+        "openai/gpt-6-sol-fast",
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-sol-fast",
+      ]);
+
+      await session.sendKeys("C-u");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && solRows(current).length === 0,
+        5_000,
+      );
       expect(session.isAlive()).toBe(true);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
@@ -2831,7 +3215,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
             VERCEL_OIDC_TOKEN: undefined,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
             FX_MODEL: currentModel,
             FX_AUTO_UPGRADE: "0",
           },
@@ -3271,13 +3655,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         height: 36,
       });
 
-      const diagnosticSummary =
-        "skills: 1 discovery issue; some skills may be missing (ctrl+o to view)";
-      await session.waitForText(diagnosticSummary, 10_000);
       await session.waitForComposer(10_000);
-      expect(await session.captureFullScrollback()).not.toContain(
-        "skill discovery warning:",
-      );
       await session.sendKeys("C-o");
       await session.waitForText("skill discovery warning:", 5_000);
       const tracePathPattern = tracePath
@@ -3289,6 +3667,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       await session.sendKeys("C-o");
       await session.waitForComposer(5_000);
+      const inline = await session.captureFullScrollback();
+      expect(inline).not.toContain("skills:");
+      expect(inline).not.toContain("skill discovery warning:");
       const startupDiagnosticCount = fileMarkerCount(
         tracePath,
         fixture.malformedMarker,
@@ -3339,12 +3720,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       expect(loadScrollback).not.toContain("1 tool call");
 
-      expect(
-        countOccurrences(
-          await session.captureFullScrollback(),
-          diagnosticSummary,
-        ),
-      ).toBe(1);
+      const finalScrollback = await session.captureFullScrollback();
+      expect(finalScrollback).not.toContain("discovery issue");
+      expect(finalScrollback).not.toContain("skill discovery warning:");
       expect(session.isAlive()).toBe(true);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -3377,7 +3755,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 37", 5_000);
+      await session.waitForText("Commands 40", 5_000);
 
       for (let i = 0; i < 5; i += 1) {
         await session.sendKeys("Down");

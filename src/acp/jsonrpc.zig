@@ -737,3 +737,180 @@ test "Writer keeps each frame on one line when caller JSON has line breaks" {
         try std.testing.expectEqualStrings(expected_json, actual_json);
     }
 }
+
+test "ACP frames stay one parseable line and read the same however they are split" {
+    try std.testing.fuzz({}, fuzzAcpFrames, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").acp_jsonrpc.*),
+    });
+}
+
+const fuzz_text_pieces = [_][]const u8{
+    "a",      "Z",        " ",         "\"",       "\\", "\n", "\r", "\t", "\x00", "\x08", "\x1f", "\x7f", "/", "{", "]",
+    "\u{e9}", "\u{754c}", "\u{1f600}", "\u{2028}",
+};
+
+const FuzzFrameSink = struct {
+    alloc: Allocator,
+    out: std.ArrayList(u8) = .empty,
+
+    fn write(raw: ?*anyopaque, bytes: []const u8) anyerror!void {
+        const self: *FuzzFrameSink = @ptrCast(@alignCast(raw.?));
+        try self.out.appendSlice(self.alloc, bytes);
+    }
+};
+
+fn appendFuzzText(smith: *std.testing.Smith, w: *std.Io.Writer) !void {
+    for (0..smith.valueRangeAtMost(u8, 0, 12)) |_| try w.writeAll(fuzz_text_pieces[smith.index(fuzz_text_pieces.len)]);
+}
+
+/// Writes a JSON value, sometimes pretty-printed across lines as a model's
+/// tool input can be.
+fn appendFuzzJson(alloc: Allocator, smith: *std.testing.Smith, w: *std.Io.Writer, depth: u8) !void {
+    const spaces = [_][]const u8{ "", " ", "\n", "\r\n", "\t" };
+    try w.writeAll(spaces[smith.index(spaces.len)]);
+    switch (smith.valueRangeAtMost(u8, 0, if (depth >= 3) 4 else 6)) {
+        0 => try w.writeAll("null"),
+        1 => try w.writeAll(if (smith.value(bool)) "true" else "false"),
+        2 => try w.print("{d}", .{smith.value(i32)}),
+        3, 4 => {
+            var text: std.Io.Writer.Allocating = .init(alloc);
+            defer text.deinit();
+            try appendFuzzText(smith, &text.writer);
+            try writeJsonStr(text.written(), w);
+        },
+        5 => {
+            try w.writeByte('[');
+            for (0..smith.valueRangeAtMost(u8, 0, 3)) |index| {
+                if (index > 0) try w.writeByte(',');
+                try appendFuzzJson(alloc, smith, w, depth + 1);
+            }
+            try w.writeByte(']');
+        },
+        else => {
+            try w.writeByte('{');
+            for (0..smith.valueRangeAtMost(u8, 0, 3)) |index| {
+                if (index > 0) try w.writeByte(',');
+                try w.print("\"k{d}\":", .{index});
+                try appendFuzzJson(alloc, smith, w, depth + 1);
+            }
+            try w.writeByte('}');
+        },
+    }
+    try w.writeAll(spaces[smith.index(spaces.len)]);
+}
+
+fn fuzzAcpFrames(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    try expectFuzzFrame(alloc, smith);
+    try expectFuzzLines(alloc, smith);
+}
+
+fn expectFuzzFrame(alloc: Allocator, smith: *std.testing.Smith) !void {
+    var text: std.Io.Writer.Allocating = .init(alloc);
+    defer text.deinit();
+    try appendFuzzText(smith, &text.writer);
+    var json: std.Io.Writer.Allocating = .init(alloc);
+    defer json.deinit();
+    try appendFuzzJson(alloc, smith, &json.writer, 0);
+    var id_text: std.Io.Writer.Allocating = .init(alloc);
+    defer id_text.deinit();
+    try appendFuzzText(smith, &id_text.writer);
+    const id: RequestId = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => .{ .integer = smith.value(i64) },
+        1 => .{ .string = id_text.written() },
+        else => .null,
+    };
+
+    var sink: FuzzFrameSink = .{ .alloc = alloc };
+    defer sink.out.deinit(alloc);
+    var writer = Writer.initCallback(&sink, FuzzFrameSink.write);
+    const kind = smith.valueRangeAtMost(u8, 0, 3);
+    switch (kind) {
+        0 => try writer.writeRequest(alloc, id, text.written(), json.written()),
+        1 => try writer.writeNotification(alloc, text.written(), json.written()),
+        2 => try writer.writeResponse(alloc, id, json.written()),
+        else => try writer.writeError(alloc, id, .{ .code = ErrorCode.invalid_params, .message = text.written() }),
+    }
+
+    // One frame is one line of JSON.
+    const frame = sink.out.items;
+    try std.testing.expect(frame.len > 0 and frame[frame.len - 1] == '\n');
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, frame, "\n"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, frame[0 .. frame.len - 1], .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("2.0", object.get("jsonrpc").?.string);
+
+    // It carries what the caller wrote.
+    if (kind != 1) try expectFuzzId(id, object.get("id").?);
+    if (kind <= 1) try std.testing.expectEqualStrings(text.written(), object.get("method").?.string);
+    if (kind == 3) try std.testing.expectEqualStrings(text.written(), object.get("error").?.object.get("message").?.string);
+    if (kind <= 2) {
+        const field = if (kind == 2) "result" else "params";
+        const expected = try std.json.parseFromSlice(std.json.Value, alloc, json.written(), .{});
+        defer expected.deinit();
+        const expected_text = try stringifyValueAlloc(alloc, expected.value);
+        defer alloc.free(expected_text);
+        const actual_text = try stringifyValueAlloc(alloc, object.get(field).?);
+        defer alloc.free(actual_text);
+        try std.testing.expectEqualStrings(expected_text, actual_text);
+    }
+
+    // The server's own parser reads it back.
+    if (kind >= 2 or text.written().len > 0) {
+        var message = try parseMessage(alloc, frame[0 .. frame.len - 1]);
+        defer freeMessage(alloc, &message);
+        if (kind <= 1) try std.testing.expectEqualStrings(text.written(), message.method);
+        if (kind >= 2) try std.testing.expect(message.isResponse());
+    }
+}
+
+fn expectFuzzId(expected: RequestId, actual: std.json.Value) !void {
+    switch (expected) {
+        .integer => |n| try std.testing.expectEqual(n, actual.integer),
+        .string => |s| try std.testing.expectEqualStrings(s, actual.string),
+        .null => try std.testing.expect(actual == .null),
+    }
+}
+
+fn expectFuzzLines(alloc: Allocator, smith: *std.testing.Smith) !void {
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(alloc);
+    for (0..smith.valueRangeAtMost(u8, 0, 16)) |_| {
+        if (smith.valueRangeAtMost(u8, 0, 3) == 0) {
+            try stream.append(alloc, '\n');
+        } else {
+            for (0..smith.valueRangeAtMost(u8, 0, 40)) |_| try stream.append(alloc, 'a' + smith.valueRangeAtMost(u8, 0, 25));
+        }
+    }
+    const limit: usize = smith.valueRangeAtMost(u16, 1, 48);
+
+    // A line ends at a newline. An empty line is skipped, a line over the
+    // limit is reported once as an overflow, and a final line without a
+    // newline is dropped unless it is over the limit.
+    var expected: std.ArrayList(?[]const u8) = .empty;
+    defer expected.deinit(alloc);
+    var rest: []const u8 = stream.items;
+    while (std.mem.findScalar(u8, rest, '\n')) |end| {
+        const line = rest[0..end];
+        if (line.len > limit) try expected.append(alloc, null) else if (line.len > 0) try expected.append(alloc, line);
+        rest = rest[end + 1 ..];
+    }
+    if (rest.len > limit) try expected.append(alloc, null);
+
+    for ([_]usize{ stream.items.len + 1, smith.valueRangeAtMost(u16, 1, 64) }) |max_chunk| {
+        var source = ChunkedTestSource{ .bytes = stream.items, .max_chunk = max_chunk };
+        var reader = Reader.initForTesting(&source, ChunkedTestSource.read);
+        for (expected.items) |want| {
+            const got = (try reader.readLineWithLimit(alloc, limit)) orelse return error.TestExpectedLine;
+            switch (got) {
+                .line => |line| {
+                    defer alloc.free(line);
+                    try std.testing.expectEqualStrings(want orelse return error.TestExpectedOverflow, line);
+                },
+                .overflow => try std.testing.expect(want == null),
+            }
+        }
+        try std.testing.expect((try reader.readLineWithLimit(alloc, limit)) == null);
+    }
+}

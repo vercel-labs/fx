@@ -249,6 +249,22 @@ pub const Session = struct {
         return session.identity.id;
     }
 
+    /// Whether this open session's log is on disk, so a resume finds it:
+    /// from the publish of its first turn (D2), or from its open when it
+    /// was resumed or forked (D58). A failed session keeps the log it had.
+    /// One whose first publish failed counts as not on disk, though the
+    /// publish may have landed before the failure (D90).
+    pub fn onDisk(session: *Session) bool {
+        const io = session.env.s.io;
+        session.mutex.lockUncancelable(io);
+        defer session.mutex.unlock(io);
+        return switch (session.phase) {
+            .held, .closed => false,
+            .live => true,
+            .failed => |live| live != null,
+        };
+    }
+
     /// Whether appending `events` leaves this session held in memory, so it
     /// needs no disk, not even the root folder (D2). A publishing thread
     /// always opens the root first, so a stale answer is harmless.

@@ -306,9 +306,10 @@ manager:
 - **Item types and data:** each completed piece is one `item`, and its
   `data` comes from v1's piece codec (`encodeConversationFrame`,
   `src/core/session/session_event.zig` lines 439 to 482). The types are
-  `user`, `assistant`, `tool_call`, `tool_result`, `steering`, `turn_end`
-  (files and turn summary), `interruption` (reason detail, partial text,
-  command refs, origin), `recovery` and `continues`.
+  `user`, `assistant`, `tool_call`, `tool_result`, `steering`,
+  `context_note` (D93), `runtime_context` (D94), `model_call` (D96), `turn_end` (files and
+  turn summary), `interruption` (reason detail, partial text, command
+  refs, origin), `recovery` and `continues`.
 - **Recovery:** the agent loop's checkpoint becomes a small `recovery` item
   (cause, action, tool state, attempts, route, partial text). The pieces it
   used to copy are already in the log (D10).
@@ -356,7 +357,8 @@ manager:
 
   fx has since dropped its local usage ledger and these markers with it,
   so this item describes the design before that change, and `Wiring.tla`
-  no longer models it (D85).
+  no longer models it (D85). `set usage` now holds the session's token
+  totals, written after each reply (D92).
 - **Checks the adapter keeps:** tool call and result pairing, and v1's
   per-piece size rules, before anything reaches `append`.
 
@@ -797,7 +799,7 @@ Settled in the 2026-09-27 pre-wiring API check:
   work item, and `State.children` lists every child with its newest work,
   outcome, data and seq. **Why:** fx needs the whole list, not only running
   work, to continue a named child, detect replaced work and report status
-  (`src/core/subagent/child_state.zig` lines 42 to 57), and this removes
+  (`src/core/subagent/child_state.zig` `Kind`, `Phase`, and `Outcome`), and this removes
   `children.json` without a second owner. **Alternative:** keep
   `children.json` next to v2 for now, which gives the same state two owners.
 - **D23 Decision:** "continue" after an interrupted turn starts a new turn
@@ -1069,6 +1071,9 @@ Settled after main's new compactor landed (2026-10-01):
   a side folder kept only for records, which D48 rules out. `Fork.tla`
   `SetBlob` now lists a blob inside a turn as well as outside it, since
   compaction runs mid-turn; such a setting is checked as an item is.
+  Writes of one session run one at a time, so a subagent's finish line
+  written during main's compaction never lists the same records again
+  (`tests/tla/session/SessionWrite.tla`).
 
 Settled after the first dogfood finding (2026-10-01):
 - **D51 Decision:** the message that issues running calls keeps its text
@@ -1170,8 +1175,10 @@ Settled for `/fork` (2026-10-02):
   to the end of the previous turn under a new id and hard-links the
   blobs (D5), so the source is never written. The app switches to the
   fork as a resume does, opening it before it closes the source (D41),
-  writes `original session fx --resume` and the source's id in the
-  transcript, and puts the prompt back in the input box. The fork's title
+  writes `Resume the original session with:` and, on the line below,
+  `fx --resume` and the source's id after the replayed turns, so they stay
+  in view however long the session is, and puts the prompt back in the
+  input box. The fork's title
   is the source's with ` (fork)` once. `/fork` waits for a running turn
   to end. (Until D53 removed the switch, the line named `--sessions-v2`
   and `/fork` refused without it.)
@@ -1528,6 +1535,249 @@ for an image pasted into its prompt):
   **Alternative:** save at capture, when no session is on disk (D44);
   keep D79's two copies; load every blob when the session opens; or name
   the temporary snapshot, which is gone when its process exits.
+
+Settled for `/status` (2026-10-23, after a user could find a session's id
+only by quitting):
+- **D90 Decision (amends D2's exit line and D58):** `/status` in the
+  interactive app opens a panel in the footer, and writes nothing to the
+  transcript. Its first line names the open session as `<id> · saved`
+  exactly when its log is on disk, so `fx --resume <id>` opens it, and as
+  `<id> · not saved yet` before then. A shell with no session, because none
+  could be created, shows `none · this shell can't save sessions`. While
+  the panel is open, it follows a turn that saves the session or ends. The
+  manager answers whether the log is on disk
+  (`Session.onDisk`): from the publish of the first turn, or from the open
+  of a resumed or forked session. A failed session keeps the log it had.
+  One whose first publish failed counts as not on disk, though the publish
+  may have landed before the failure, so `/status` errs toward unsaved.
+  - The adapter's `saved` asks the manager instead of counting turns. A
+    fork before the first prompt holds no turn, but its log is on disk
+    from the fork, and resume opens it. Counting turns hid it: the exit
+    line left it out, while `/status` would have to show it as unsaved.
+    Now the exit line and `/status` give the same answer for every
+    session.
+  - `fx status` runs outside any session and shows none.
+  - `tests/tla/session/ShellSession.tla` models the open session across
+    launches, prompts, `/new`, `/clear`, `/resume`, `/fork`, quitting and
+    crashes, with what `/status` and the exit line say. Its planted bugs
+    include counting turns. `tests/tla/drivers/session/` runs the real
+    binary along it and has TLC check every run.
+
+  **Why:** a user who wants to come back to a session needs its id while
+  it is open, and an id is useful only when fx says truthfully whether it
+  can be resumed yet. **Alternative:** show the id only once saved; print
+  the full `fx --resume` command; or keep counting turns and show a fork
+  before its first prompt as unsaved, though resume opens it.
+- **D91 Decision (amends D44):** a command's output handle is
+  `fx-command-replay-`, a random 12-hex id for the run, `-`, the body's
+  full hash and `.bin`. Readers take the hash after the handle's last `-`,
+  as they do for every v2 handle, so no name index exists, a handle from
+  before this decision still resolves, and two runs with the same output
+  keep sharing one blob. **Why:** a handle that was only the output's hash
+  gave two commands with identical output the same handle, so the model
+  read a later result as a replay of an earlier one. **Alternative:** hash
+  the command into the body, which changes the replay format and still
+  repeats a handle when the same command prints the same output twice.
+- **D92 Decision (amends D25):** after each main-model reply, fx adds the
+  reply's provider token counts to the session's totals and writes them as
+  `set usage`: `input_tokens`, `output_tokens`, `cache_read_tokens`,
+  `cache_write_tokens` and `reasoning_tokens`, each null until a provider
+  reports it. The first reply a process records reads the totals from the
+  newest `set usage`, so a resumed or forked session keeps counting; a value
+  in any other shape counts from zero. Each session's totals cover its own
+  replies: a subagent child writes its totals in its own log, and its
+  parent's leave them out, as `fx ask --json` does. **Why:** a run that is
+  killed or times out never
+  reaches the end of its turn, and its log is the only record a benchmark
+  harness can read afterwards. **Alternative:** put each reply's counts on
+  its `assistant` item, which a reply with no text and no provider replay
+  does not write.
+
+Settled for context notes (2026-10-22, to add context mid-session without
+rewriting a cached prompt prefix):
+- **D93 Decision:** a context note is text fx adds to a turn after its
+  latest message, such as the scoped rules a tool call reaches, a changed
+  git branch, or a skill's note. Each note is its own
+  `context_note` item, whose `data` is the note's text, like `steering`,
+  and the instruction files it delivered, each with a stamp of the file's
+  size, modification time and inode.
+  - **Position:** a note sits at a step boundary, right after the user's
+    message or after the last result of a step, never inside a step's
+    results. At one boundary the turn's notes come before its steering, so
+    fx adds a note there only before it places that boundary's steering.
+    The item is written at that boundary, and a resume rebuilds the note
+    there as a flagged system message, so a resumed turn sends the messages
+    the live turn sent.
+  - **Carrier:** no provider gets a note as a message of its own. Each
+    request appends a note to the end of the last tool result of its step,
+    past that step's permission feedback, the same way for a live and a
+    resumed turn (`src/core/agent/stream_provider.zig` carryContextNotes);
+    the saved order does not change. The session-start instructions always
+    say what such a block is and that the user's instructions come first
+    (`src/builtins/context.zig` project_instruction_guidance), so they do
+    not change when rules arrive. The same request escapes every
+    `<scoped-rules` and `</scoped-rules` in tool output, in any case, to
+    `&lt;`, so a tool's own output cannot open the block; the user's text
+    and the note are left as they are. A note with no tool result before it
+    joins the user message right before it, such as the turn's own message
+    for a note at its start; after any other message, which only a
+    compaction that keeps a note but not its step leaves, it is sent as a
+    user message of its own. With a system message instead,
+    providers each broke the cache differently: Claude when a user message
+    followed the note, Kimi when the note was last, and Qwen rejected it
+    (`tests/tla/prompt_context/PromptCache.tla` Carrier, p6-note-claude.cfg
+    and p6-note-openai.cfg).
+  - **Delivered rules:** a turn counts each file a saved note delivered as
+    delivered while its stamp still matches, so a tool call that reaches it
+    again does not deliver it again. The next delivery of a changed file
+    says it replaces the earlier copy. A deleted file's rules stay in the
+    conversation until compaction. fx no longer rebuilds rules from earlier
+    tool calls into the instructions.
+  - **Older fx:** an fx from before D93 does not know the type and leaves
+    the item out (D17), so it reads the turn without the note.
+  - **libfx and ACP saved state:** the execution JSON in
+    `session_codec.zig` names notes only in schema version 11, written only
+    for a turn that has notes; a turn without them keeps version 10 and its
+    bytes. An older fx rejects version 11, as it rejects every newer
+    version. A libfx journal event, kernel checkpoint, or snapshot that
+    holds such a turn is written as version 4, so an older libfx reports a
+    newer journal format, `FxJournalVersionError`, instead of an invalid
+    journal; one without notes keeps its earlier version.
+  - **Compaction:** notes in turns a summary covers go with them. In the
+    first kept turn, the notes before the cut's step boundary go, and so do
+    the notes at that boundary when the cut also covers steering there,
+    which follows them; the rest count from the cut, as steering does
+    (D87). The `compacted` line keeps only `keep_tool_steps` and
+    `keep_steering`: the notes the cut covers follow from those. The
+    summarizer reads no notes.
+  - **Who gets them:** every model and provider, libfx hosts included,
+    since a tool result is part of every provider's conversation. ACP
+    clients never see them replayed.
+
+  **Why:** text that changes during a session, added to the instructions,
+  rewrites the cached prefix of every request after it. A note on the
+  newest tool result leaves that prefix as it was, and saving it where it
+  was sent keeps the next request, and a resumed one, the same as the last.
+  Live replays of ten model families followed the rules as well as with
+  the rules in the instructions, and read the whole conversation from the
+  cache.
+  **Alternative:** a system message after the latest message, which needs
+  a list of the models it works for; a user message of its own, which the
+  model reads as the user's words; or keep notes only in memory, so a
+  resume sends a different request and loses the cache.
+
+Settled for the runtime context (2026-10-24, so a changed branch, date or
+permission mode does not rewrite a cached prompt prefix):
+- **D94 Decision:** a session sends one runtime context ahead of the
+  history on every request: the system messages a host adds after the
+  stable instructions, such as the `<fx-turn-context>` block with its date
+  and git branch, the permission mode and the other runtime notes. The
+  turn that captures it saves it with that turn, and later turns, resumed
+  ones included, send that saved copy unchanged.
+  - **Capture:** the first step of a turn captures the host's runtime
+    context when no retained turn saved one, which is the session's first
+    turn and the first turn after a compaction summary. The turn's
+    `runtime_context` item comes right after its user message, and every
+    save of the turn carries it, so a streamed turn keeps the same prefix.
+    In the execution JSON it needs schema version 12, written only for that
+    turn, and libfx versions the journal, checkpoint, and snapshot that hold
+    it as D93 does.
+  - **Changes:** before each request fx compares the host's current runtime
+    context with what the model last saw: the newest update note in the
+    retained turns, or else the saved copy. When they differ, an update
+    note with the whole current runtime context, opened by
+    `<fx-context-update>`, becomes a context note (D93) at that step
+    boundary, before its steering. It rides on the turn's user message when
+    the change happened between turns, and on the tool result of the step
+    that made it otherwise. Tool output escapes the tag the way it escapes
+    `<scoped-rules` (`src/core/agent/stream_provider.zig` carryContextNotes).
+    The system prompt says what the block is and that its values replace
+    the runtime context from then on (`src/builtins/system_prompt.md`);
+    without that line, GPT-6.1 kept the instructions' permission mode.
+  - **Compaction:** a compaction summary ends the search, so the next turn
+    captures the current runtime context. An update kept after the summary
+    still counts as what the model last saw, so a turn whose new copy
+    differs from it adds one more update.
+  - **Older fx:** an fx from before D94 leaves the item out (D17) and
+    rebuilds the runtime context for every request, as it did.
+
+  **Why:** the runtime context sits ahead of the history, so any change to
+  it, a date rollover, a branch switch or a new permission mode, made the
+  next request read the whole conversation uncached. A saved copy keeps
+  those bytes the same for the session and its resumes, and the update
+  costs only its own tokens (`tests/tla/prompt_context/PromptCache.tla`
+  "outside", p6-mutant-overlay-rebuilt.cfg and
+  p6-mutant-overlay-not-saved.cfg).
+  **Alternative:** keep the runtime context only in memory, which a resume
+  or `fx ask --resume` rebuilds with new values; list only the changed
+  fields, which needs a parser for each runtime note; or move the runtime
+  context onto the first user message, which changes every session's
+  prompt for every model.
+
+Settled for named skills (2026-10-24, so naming a skill does not rewrite a
+cached prompt prefix):
+- **D95 Decision:** the text of a skill the user names with `$name` rides
+  on that turn's user message, and the turn saves a short note in its
+  place.
+  - **The turn:** fx loads the full text as before and adds it as a
+    context note (D93) at the turn's first step boundary, after any note
+    already there, so it joins the user's message. Every request of the
+    turn sends it there, and the instructions stay as they were.
+  - **Saved:** the turn saves only the short note, opened by
+    `<fx-skill-used>`. It names the skills, says fx sent their full text
+    with that message, and says to load them again with the skill tool if
+    they still apply. Later turns and resumes send that note. A recovered
+    turn sends the full text again in the note's place.
+  - **Compaction:** when an in-turn compaction cuts the note, fx adds it
+    again where the kept messages start, so the text still rides on the
+    turn's message and the turn still saves the short note.
+
+  **Why:** the text sat in the instructions for one turn, so it rewrote the
+  cached prefix twice: when it appeared and when it went. On the message,
+  the skill turn reads the whole conversation from the cache, and the next
+  turn pays again only from that message. In live runs of eleven model
+  families, every skill turn followed the skill, against ten of eleven with
+  the text in the instructions, and new tokens at those two requests fell
+  by about half. With the text gone and no note, one model took back its
+  earlier reply on the next turn, saying it had never loaded the skill.
+  **Alternative:** keep the full text in the conversation, which every
+  later request pays for, or keep it in the instructions.
+- **D96 Decision:** every model call a turn's agent loop makes, its
+  retries, replays after a refreshed login, failed attempts and compactions
+  included, is saved with the turn as a `model_call`
+  item: when it settled, how long it took, what it was for, how it ended,
+  the provider, model and serving provider, the gateway's generation id or
+  the provider's response id, the finish or failure kind, a retry wait, and
+  the tokens. Ctrl+O shows each where it happened, live and after a resume.
+  The model never sees one.
+  - **Place:** a record keeps the tool step boundary of the call
+    (`after_tool_step_count`) and how many of the turn's steering messages
+    came before it (`after_steering_count`), both taken from the first save
+    after the call settles and kept from then on. A write puts a boundary's
+    records after its notes, before each steering message they don't
+    count, and before the step's pieces, so every write of a turn only adds
+    to the end and a streamed turn keeps its prefix, also when a message
+    such as a subagent's report arrives after a saved call
+    (`tests/tla/full_detail/FullDetailLog.tla` AppendOnly). A replay shows
+    a step's failed attempts before its text and the call that wrote it
+    after (`FullDetailOrder.tla` ReplayMatchesSaved).
+  - **Compaction:** an in-turn cut, and a resume's view after one, leaves
+    out the records of the steps it covers and counts the rest from the
+    cut, as it does steering (`history_range.rebasedModelCalls`).
+  - **Reading:** a record is read with its unknown fields ignored, and one
+    whose strings aren't short, valid UTF-8 without control characters, or
+    whose numbers are out of range, is left out with a trace line, so a
+    record never fails a session. A v1 log never holds one.
+  - **Older fx:** an fx from before D96 leaves the item out (D17).
+  - **Not yet:** calls made inside tools, such as web search and image
+    descriptions, and the permission reviewer's calls have no record.
+
+  **Why:** the generation id is what support and billing ask for, and a call
+  record kept only in memory was gone after a restart, so Ctrl+O showed
+  ids only for the session's newest live calls, all at the top of its first
+  page. Saving them with the turn costs one short line per call.
+  **Alternative:** keep records in memory only, or in a separate file,
+  which a resume and a fork would have to join back to their turns.
 
 ## Design Risks And Failure Behavior
 

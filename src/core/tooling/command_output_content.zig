@@ -707,11 +707,11 @@ fn fuzzCommandOutputContent(_: void, smith: *std.testing.Smith) anyerror!void {
 
 test "fuzz command output content" {
     try std.testing.fuzz({}, fuzzCommandOutputContent, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             "progress\roverwrite\n",
             "\x1b[31mred\x1b[0m\n",
             "exit_code=0\n<stdout>\none\n</stdout>\n",
             "\xff\x00\xe2\x82",
-        },
+        }) ++ @import("fuzz_corpus").command_output_content.*),
     });
 }

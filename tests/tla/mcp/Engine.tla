@@ -1,6 +1,4 @@
 ---- MODULE Engine ----
-\* Updated for the next MCP-v2 version: it can describe behavior that src/mcp/
-\* does not have yet, so its traces from the current src/mcp/ may not match.
 \* U12 engine: several servers, each connected only when something needs it,
 \* the host's permission before every tool call, and calls that wait for
 \* their server. Rules: SEC-01, STDIO-08.
@@ -18,13 +16,16 @@
 \* server Owner(c). The host's permission comes first: a call it refuses
 \* never reaches a server (PermissionBeforeCall). A call to a ready server
 \* goes out at once; one to any other server waits, goes out the moment its
-\* server is ready, and ends when the server gives up. A call in flight ends
+\* server is ready, and fails with the first start that fails while it waits
+\* (WaitsForOneStart). A call in flight ends
 \* with its server's answer, or as lost when its process dies. The host may
 \* reconnect or disconnect a server at most MaxHost times in all. The ghosts
 \* record what the invariants need: whether the host allowed a call, whether
 \* something needed the server (or its own failure) when it started, whether
-\* it stayed up since it last started, and whether the host dropped it since
-\* it last went down.
+\* it stayed up since it last started, whether the host dropped it since it
+\* last went down, and whether the host waits for an answer to its tool list
+\* need. Whatever clears a need answers it: a listing, a refusal once the
+\* server gave up, or a disconnect, which refuses it too.
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Servers, Calls, Owner(_), MaxAttempts, MaxHost
@@ -40,9 +41,10 @@ Ends == {"none", "denied", "failed", "cancelled", "answered", "lost"}
 VARIABLES phase, attempts, need, call, ended, allowed, cause, host,
     retry,   \* [Servers -> BOOLEAN]: down by a failure, it starts again by itself
     stayed,  \* ghost: [Servers -> BOOLEAN], it stayed up since it last started
-    dropped  \* ghost: [Servers -> BOOLEAN], the host dropped it since it last went down
+    dropped, \* ghost: [Servers -> BOOLEAN], the host dropped it since it last went down
+    asked    \* ghost: [Servers -> BOOLEAN], the host waits for an answer to its tool list need
 
-vars == <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped>>
+vars == <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked>>
 
 Waiting(s) == {c \in Calls: Owner(c) = s /\ call[c] = "waiting"}
 Sent(s) == {c \in Calls: Owner(c) = s /\ call[c] = "sent"}
@@ -60,6 +62,7 @@ TypeOK ==
     /\ retry \in [Servers -> BOOLEAN]
     /\ stayed \in [Servers -> BOOLEAN]
     /\ dropped \in [Servers -> BOOLEAN]
+    /\ asked \in [Servers -> BOOLEAN]
 
 Init ==
     /\ phase = [s \in Servers |-> "idle"]
@@ -73,6 +76,7 @@ Init ==
     /\ retry = [s \in Servers |-> FALSE]
     /\ stayed = [s \in Servers |-> FALSE]
     /\ dropped = [s \in Servers |-> FALSE]
+    /\ asked = [s \in Servers |-> FALSE]
 
 \* ---- The host ----
 
@@ -88,7 +92,7 @@ Ask(c, ok) ==
               ELSE IF phase[s] = "ready" THEN "sent" ELSE "waiting"]
        /\ ended' = [ended EXCEPT ![c] =
               IF ~ok THEN "denied" ELSE IF phase[s] = "failed" THEN "failed" ELSE "none"]
-    /\ UNCHANGED <<phase, attempts, need, cause, host, retry, stayed, dropped>>
+    /\ UNCHANGED <<phase, attempts, need, cause, host, retry, stayed, dropped, asked>>
 
 \* The host needs the tool list. A ready server lists at once (the catalog
 \* answers every need, U05); a failed one says so at once.
@@ -96,6 +100,7 @@ Need(s) ==
     /\ ~need[s]
     /\ phase[s] \notin {"ready", "failed"}
     /\ need' = [need EXCEPT ![s] = TRUE]
+    /\ asked' = [asked EXCEPT ![s] = TRUE]
     /\ UNCHANGED <<phase, attempts, call, ended, allowed, cause, host, retry, stayed, dropped>>
 
 \* A waiting call is cancelled before it went out. One in flight is the
@@ -104,7 +109,7 @@ Cancel(c) ==
     /\ call[c] = "waiting"
     /\ call' = [call EXCEPT ![c] = "done"]
     /\ ended' = [ended EXCEPT ![c] = "cancelled"]
-    /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped>>
+    /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped, asked>>
 
 \* The host drops a server's link and its tries in a row. Reconnect keeps what
 \* waits for it, which starts it again; disconnect ends that too. Either way
@@ -120,6 +125,8 @@ Drop(s, keep) ==
     /\ ended' = [c \in Calls |-> IF c \in Sent(s) \/ (~keep /\ c \in Waiting(s)) THEN "cancelled" ELSE ended[c]]
     /\ retry' = [retry EXCEPT ![s] = FALSE]
     /\ dropped' = [dropped EXCEPT ![s] = TRUE]
+    \* Disconnect refuses a waiting tool list need.
+    /\ asked' = [asked EXCEPT ![s] = asked[s] /\ keep]
     /\ UNCHANGED <<allowed, cause, stayed>>
 
 \* ---- The link ----
@@ -134,7 +141,7 @@ Connect(s) ==
     /\ attempts' = [attempts EXCEPT ![s] = @ + 1]
     /\ cause' = [cause EXCEPT ![s] = Demand(s) \/ retry[s]]
     /\ stayed' = [stayed EXCEPT ![s] = FALSE]
-    /\ UNCHANGED <<need, call, ended, allowed, host, retry, dropped>>
+    /\ UNCHANGED <<need, call, ended, allowed, host, retry, dropped, asked>>
 
 \* Ready: the tool list need goes to the server, and every waiting call goes
 \* out. Its tries in a row start over only once it stays up (Stable).
@@ -144,6 +151,7 @@ Up(s) ==
     /\ need' = [need EXCEPT ![s] = FALSE]
     /\ call' = [c \in Calls |-> IF c \in Waiting(s) THEN "sent" ELSE call[c]]
     /\ retry' = [retry EXCEPT ![s] = FALSE]
+    /\ asked' = [asked EXCEPT ![s] = FALSE]
     /\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped>>
 
 \* It stayed up: its tries in a row start over.
@@ -151,33 +159,36 @@ Stable(s) ==
     /\ phase[s] = "ready" /\ attempts[s] > 0
     /\ attempts' = [attempts EXCEPT ![s] = 0]
     /\ stayed' = [stayed EXCEPT ![s] = TRUE]
-    /\ UNCHANGED <<phase, need, call, ended, allowed, cause, host, retry, dropped>>
+    /\ UNCHANGED <<phase, need, call, ended, allowed, cause, host, retry, dropped, asked>>
 
-\* The start or the link failed. The calls in flight are lost. After
-\* MaxAttempts tries in a row the server gives up, and what waits for it ends.
+\* The start or the link failed. The calls in flight are lost, and the calls
+\* waiting for that start fail with it: a call waits for one start, and later
+\* tries are for later calls. After MaxAttempts tries in a row the server
+\* gives up.
 Down(s) ==
     /\ phase[s] \in {"connecting", "ready"}
     /\ LET gaveUp == attempts[s] >= MaxAttempts IN
        /\ phase' = [phase EXCEPT ![s] = IF gaveUp THEN "failed" ELSE "backoff"]
        /\ need' = [need EXCEPT ![s] = need[s] /\ ~gaveUp]
-       /\ call' = [c \in Calls |-> IF c \in Sent(s) \/ (gaveUp /\ c \in Waiting(s)) THEN "done" ELSE call[c]]
+       /\ call' = [c \in Calls |-> IF c \in Sent(s) \/ c \in Waiting(s) THEN "done" ELSE call[c]]
        /\ ended' = [c \in Calls |-> IF c \in Sent(s) THEN "lost"
-                                    ELSE IF gaveUp /\ c \in Waiting(s) THEN "failed" ELSE ended[c]]
+                                    ELSE IF c \in Waiting(s) THEN "failed" ELSE ended[c]]
        /\ retry' = [retry EXCEPT ![s] = ~gaveUp]
+       /\ asked' = [asked EXCEPT ![s] = asked[s] /\ ~gaveUp]
     /\ dropped' = [dropped EXCEPT ![s] = FALSE]
     /\ UNCHANGED <<attempts, allowed, cause, host, stayed>>
 
 BackoffOver(s) ==
     /\ phase[s] = "backoff"
     /\ phase' = [phase EXCEPT ![s] = "idle"]
-    /\ UNCHANGED <<attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped>>
+    /\ UNCHANGED <<attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked>>
 
 \* The server answers a call in flight.
 Answer(c) ==
     /\ call[c] = "sent"
     /\ call' = [call EXCEPT ![c] = "done"]
     /\ ended' = [ended EXCEPT ![c] = "answered"]
-    /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped>>
+    /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped, asked>>
 
 Next ==
     \/ \E c \in Calls, ok \in BOOLEAN: Ask(c, ok)
@@ -226,6 +237,10 @@ StatusConsistent ==
     /\ \A s \in Servers: phase[s] = "failed" => ~need[s] /\ Waiting(s) = {}
     /\ \A s \in Servers: phase[s] = "ready" => ~need[s] /\ Waiting(s) = {}
 
+\* The host waits for a tool list only while the engine holds its need,
+\* so clearing a need always answers it.
+AskedHasNeed == \A s \in Servers: asked[s] => need[s]
+
 \* ---- Properties ----
 
 \* One server's step changes no other server and no other server's calls.
@@ -234,6 +249,13 @@ Isolation ==
         (phase'[s] # phase[s]) =>
             /\ \A t \in Servers \ {s}: phase'[t] = phase[t]
             /\ \A c \in Calls: Owner(c) # s => call'[c] = call[c]]_vars
+
+\* A start that fails leaves no call to its server waiting; a call waits
+\* for one start, never through every try.
+WaitsForOneStart ==
+    [][\A s \in Servers:
+        (phase[s] \in {"connecting", "ready"} /\ phase'[s] \in {"backoff", "failed"}) =>
+            \A c \in Calls: Owner(c) = s => call'[c] # "waiting"]_vars
 
 \* Every allowed call ends, and every need is served or refused.
 EveryCallEnds == \A c \in Calls: call[c] \in {"waiting", "sent"} ~> call[c] = "done"

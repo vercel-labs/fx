@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const wire = @import("../protocol/wire.zig");
+const http_headers = @import("../protocol/http_headers.zig");
 const discovery = @import("discovery.zig");
 const core = @import("../core/auth.zig");
 
@@ -283,14 +284,21 @@ fn unsendable(kind: []const u8) bool {
     return false;
 }
 
+/// Whether `access` is an access token as RFC 6749 appendix A.12 spells one,
+/// 1*VSCHAR (0x20..0x7E). It goes in the `Authorization` header, where any
+/// other byte could break the request.
+pub fn validToken(access: []const u8) bool {
+    return access.len != 0 and http_headers.printable(access);
+}
+
 /// Reads a token response. Every token is sent as Bearer; a type that
-/// can't be is refused.
+/// can't be is refused, and so is an access token that isn't valid.
 pub fn parseToken(a: Allocator, raw: []const u8) error{ OutOfMemory, Malformed }!Token {
     var f: [5]?[]const u8 = undefined;
     wire.objectFields(raw, &.{ "access_token", "token_type", "refresh_token", "expires_in", "scope" }, &f) catch return error.Malformed;
     const access = (try wire.decodeString(a, f[0] orelse return error.Malformed)) orelse return error.Malformed;
     const kind = wire.plainString(f[1] orelse return error.Malformed) orelse return error.Malformed;
-    if (access.len == 0 or unsendable(kind)) return error.Malformed;
+    if (!validToken(access) or unsendable(kind)) return error.Malformed;
     var t: Token = .{ .access = access };
     if (f[2]) |v| t.refresh = try wire.decodeString(a, v);
     if (f[3]) |v| t.expires_in = std.fmt.parseInt(u64, v, 10) catch null;
@@ -303,9 +311,9 @@ pub fn parseToken(a: Allocator, raw: []const u8) error{ OutOfMemory, Malformed }
 /// status since some answer 200 with one (Slack's `ok:false`), or what a
 /// 200 answer lacked. Owned by `a`; never any part of a token.
 pub fn tokenFailure(a: Allocator, status: u16, raw: []const u8) Allocator.Error![]const u8 {
-    var f: [3]?[]const u8 = .{ null, null, null };
-    const json = if (wire.objectFields(raw, &.{ "error", "error_description", "token_type" }, &f)) true else |_| false;
-    if (!json) f = .{ null, null, null };
+    var f: [4]?[]const u8 = .{ null, null, null, null };
+    const json = if (wire.objectFields(raw, &.{ "error", "error_description", "token_type", "access_token" }, &f)) true else |_| false;
+    if (!json) f = .{ null, null, null, null };
     if (f[0]) |raw_code| if (wire.plainString(raw_code)) |code| {
         const text = if (f[1]) |v| try wire.decodeString(a, v) else null;
         return if (text) |t| a.print("{s}: {s}", .{ code, t }) else a.dupe(u8, code);
@@ -315,15 +323,33 @@ pub fn tokenFailure(a: Allocator, status: u16, raw: []const u8) Allocator.Error!
     const kind = wire.plainString(f[2] orelse return a.dupe(u8, "its token response has no token_type")) orelse
         return a.dupe(u8, "its token response has no token_type");
     if (unsendable(kind)) return a.print("its token is of type {s}, which can't be sent as a Bearer token", .{kind});
+    if (f[3]) |v| if (try wire.decodeString(a, v)) |access| if (access.len != 0 and !validToken(access))
+        return a.dupe(u8, "its token has characters OAuth doesn't allow");
     return a.dupe(u8, "its token response has no access_token");
 }
 
-/// Whether a token endpoint's error refuses the grant for good: then the
-/// refresh token is dropped (`invalid_grant`, RFC 6749 §5.2).
-pub fn refusesGrant(raw: []const u8) bool {
+/// The errors that refuse a refresh for good: RFC 6749 §5.2's for a grant or
+/// client the server no longer accepts, and Slack's for a dead refresh token.
+const refresh_refusals = [_][]const u8{ "invalid_grant", "invalid_client", "unauthorized_client", "invalid_refresh_token" };
+
+/// A refresh the token endpoint refused for good: its HTTP status and the
+/// error it named. `code` is one of `refresh_refusals`, never the server's
+/// own bytes, so it can be logged anywhere.
+pub const Refusal = struct { status: u16, code: []const u8 };
+
+/// Whether a token endpoint's answer to a refresh refuses it for good, so
+/// the refresh token is dropped: an answer at 200 or a 4xx other than 429
+/// that names one of `refresh_refusals`. RFC 6749 sends its errors with 400
+/// or 401, and Slack sends its own with 200 and `ok:false`. Any other error,
+/// such as Slack's `internal_error`, a 429, a 5xx, or an answer naming no
+/// error may pass on a retry, so the tokens stay: null.
+pub fn refreshRefusal(status: u16, raw: []const u8) ?Refusal {
+    if (status != 200 and (status < 400 or status >= 500 or status == 429)) return null;
     var f: [1]?[]const u8 = undefined;
-    wire.objectFields(raw, &.{"error"}, &f) catch return false;
-    return std.mem.eql(u8, wire.plainString(f[0] orelse return false) orelse return false, "invalid_grant");
+    wire.objectFields(raw, &.{"error"}, &f) catch return null;
+    const code = wire.plainString(f[0] orelse return null) orelse return null;
+    for (refresh_refusals) |refusal| if (std.mem.eql(u8, code, refusal)) return .{ .status = status, .code = refusal };
+    return null;
 }
 
 // ---- Scopes ----
@@ -363,6 +389,16 @@ pub const ScopeSet = struct {
             if (try wire.decodeString(a, e)) |name| mask |= try s.bit(a, name);
         }
         return mask;
+    }
+
+    /// The names in `mask`, kept in `buf`.
+    pub fn namesOf(s: *const ScopeSet, mask: u32, buf: *[max_scopes][]const u8) []const []const u8 {
+        var n: usize = 0;
+        for (s.names[0..s.count], 0..) |name, i| if (mask & (@as(u32, 1) << @intCast(i)) != 0) {
+            buf[n] = name;
+            n += 1;
+        };
+        return buf[0..n];
     }
 
     /// The names in `mask`, space-separated, with `offline_access` added when
@@ -498,8 +534,45 @@ test "token responses: Bearer only, refresh and expiry optional" {
     const slack = try parseToken(a, "{\"ok\":true,\"access_token\":\"xoxp-1\",\"token_type\":\"user\",\"scope\":\"search:read\"}");
     try testing.expectEqualStrings("xoxp-1", slack.access);
     try testing.expectError(error.Malformed, parseToken(a, "{\"token_type\":\"Bearer\"}"));
-    try testing.expect(refusesGrant("{\"error\":\"invalid_grant\"}"));
-    try testing.expect(!refusesGrant("{\"error\":\"temporarily_unavailable\"}"));
+    // Only VSCHAR: a CR, LF, NUL, DEL or non-ASCII byte would break the header.
+    for ([_][]const u8{ "at\\r\\n1", "at\\n1", "at\\u00001", "at\\u007f", "\\u00e9t", "" }) |bad| {
+        const raw = try a.print("{{\"access_token\":\"{s}\",\"token_type\":\"Bearer\"}}", .{bad});
+        try testing.expectError(error.Malformed, parseToken(a, raw));
+    }
+    try testing.expectEqualStrings("a b~", (try parseToken(a, "{\"access_token\":\"a b~\",\"token_type\":\"Bearer\"}")).access);
+}
+
+test "a refresh answer refuses it only for a grant, client or token the server won't take, at 200 or a 4xx other than 429" {
+    try testing.expect(refreshRefusal(400, "{\"error\":\"invalid_grant\"}") != null);
+    try testing.expect(refreshRefusal(401, "{\"error\":\"invalid_client\"}") != null);
+    try testing.expect(refreshRefusal(400, "{\"error\":\"unauthorized_client\"}") != null);
+    // Slack's refusal: HTTP 200 with ok:false.
+    try testing.expect(refreshRefusal(200, "{\"ok\":false,\"error\":\"invalid_refresh_token\"}") != null);
+    // Slack's errors that pass on a retry keep the tokens.
+    for ([_][]const u8{ "internal_error", "service_unavailable", "request_timeout", "fatal_error", "bad_client_secret" }) |code| {
+        var buf: [96]u8 = undefined;
+        const body = try std.mem.print(&buf, "{{\"ok\":false,\"error\":\"{s}\"}}", .{code});
+        try testing.expect(refreshRefusal(200, body) == null);
+    }
+    try testing.expect(refreshRefusal(400, "{\"error\":\"invalid_request\"}") == null);
+    try testing.expect(refreshRefusal(400, "{\"error\":\"temporarily_unavailable\"}") == null);
+    // Passing: rate limited, unavailable, or nothing named.
+    try testing.expect(refreshRefusal(429, "{\"error\":\"slow_down\"}") == null);
+    // A 429 may pass later, whatever it names.
+    try testing.expect(refreshRefusal(429, "{\"error\":\"invalid_grant\"}") == null);
+    try testing.expect(refreshRefusal(503, "{\"error\":\"temporarily_unavailable\"}") == null);
+    try testing.expect(refreshRefusal(302, "{\"error\":\"invalid_grant\"}") == null);
+    try testing.expect(refreshRefusal(400, "not json") == null);
+    try testing.expect(refreshRefusal(200, "{\"ok\":false}") == null);
+    try testing.expect(refreshRefusal(400, "{\"error\":\"\"}") == null);
+    try testing.expect(refreshRefusal(400, "{\"error\":7}") == null);
+    // What it names is fx's own copy of the code, with the status: the
+    // server's bytes never travel further.
+    const body = "{\"error\":\"invalid_grant\",\"error_description\":\"Bearer at-secret\"}";
+    const refusal = refreshRefusal(400, body).?;
+    try testing.expectEqual(@as(u16, 400), refusal.status);
+    try testing.expectEqualStrings("invalid_grant", refusal.code);
+    try testing.expect(@intFromPtr(refusal.code.ptr) < @intFromPtr(body.ptr) or @intFromPtr(refusal.code.ptr) >= @intFromPtr(body.ptr) + body.len);
 }
 
 test "scope sets as bits, with offline_access added once" {
@@ -533,4 +606,6 @@ test "a token endpoint's refusal is said in its own words, and a token never" {
     try std.testing.expectEqualStrings("invalid_code", try tokenFailure(a, 200, "{\"ok\":false,\"error\":\"invalid_code\"}"));
     try std.testing.expectEqualStrings("its token response has no token_type", try tokenFailure(a, 200, "{\"access_token\":\"secret\"}"));
     try std.testing.expectEqualStrings("its token response has no access_token", try tokenFailure(a, 200, "{\"token_type\":\"bearer\"}"));
+    try std.testing.expectEqualStrings("its token response has no access_token", try tokenFailure(a, 200, "{\"access_token\":\"\",\"token_type\":\"bearer\"}"));
+    try std.testing.expectEqualStrings("its token has characters OAuth doesn't allow", try tokenFailure(a, 200, "{\"access_token\":\"secret\\r\\nX: 1\",\"token_type\":\"bearer\"}"));
 }

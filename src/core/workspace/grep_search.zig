@@ -305,8 +305,6 @@ const FileOutcome = struct {
 /// once finished batches hold the cap, no batch that has not started can
 /// reach the merged result.
 const ParallelScan = struct {
-    /// Thread-safe and temporary: candidate resolution and per-file matches.
-    work: Allocator,
     workspace_root: []const u8,
     provider_root: []const u8,
     files: []const []const u8,
@@ -314,6 +312,11 @@ const ParallelScan = struct {
     case_insensitive: bool,
     mode: ScanMode,
     outcomes: []FileOutcome,
+    /// Candidate resolution and per-file matches, one arena per worker over
+    /// the thread-safe scratch allocator. Threads never share an arena: a
+    /// shared `std.heap.ArenaAllocator` can hand one thread bytes that another
+    /// thread's in-place resize read, with nothing ordering the two.
+    worker_arenas: [max_scan_workers]std.heap.ArenaAllocator,
     next_batch: std.atomic.Value(usize) = .init(0),
     stop: std.atomic.Value(bool) = .init(false),
     mutex: std.Io.Mutex = .init,
@@ -322,14 +325,20 @@ const ParallelScan = struct {
     done_matches: usize = 0,
     out_of_memory_from: ?usize = null,
 
-    fn run(self: *ParallelScan) void {
+    /// Frees every worker's matches. Call after the merge.
+    fn deinit(self: *ParallelScan) void {
+        for (&self.worker_arenas) |*worker_arena| worker_arena.deinit();
+    }
+
+    fn run(self: *ParallelScan, worker: usize) void {
+        const work = self.worker_arenas[worker].allocator();
         while (!self.stop.load(.acquire)) {
             const batch = self.next_batch.fetchAdd(1, .monotonic);
             const first = batch * batch_files;
             if (first >= self.files.len) return;
             const last = @min(first + batch_files, self.files.len);
             for (first..last) |index| {
-                _ = self.scanOne(index) catch {
+                _ = self.scanOne(work, index) catch {
                     self.mutex.lockUncancelable(io_mod.getIo());
                     self.out_of_memory_from = @min(self.out_of_memory_from orelse first, first);
                     self.mutex.unlock(io_mod.getIo());
@@ -341,13 +350,13 @@ const ParallelScan = struct {
         }
     }
 
-    fn scanOne(self: *ParallelScan, index: usize) Allocator.Error!void {
+    fn scanOne(self: *ParallelScan, work: Allocator, index: usize) Allocator.Error!void {
         var absolute_match_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const candidate_file = try resolveCandidateFile(self.work, self.workspace_root, self.provider_root, self.files[index], absolute_match_buf[0..]) orelse return;
+        const candidate_file = try resolveCandidateFile(work, self.workspace_root, self.provider_root, self.files[index], absolute_match_buf[0..]) orelse return;
         switch (self.mode) {
             .matches => {
                 var local: std.ArrayList(Match) = .empty;
-                _ = scanFileAt(self.work, candidate_file.display_path, candidate_file.read_path, self.pattern, self.case_insensitive, &local) catch |err| {
+                _ = scanFileAt(work, candidate_file.display_path, candidate_file.read_path, self.pattern, self.case_insensitive, &local) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
                     debug_trace.logf("core", "grep_files scan skipped path={s} err={s}", .{ candidate_file.display_path, @errorName(err) });
                     return;
@@ -355,7 +364,7 @@ const ParallelScan = struct {
                 self.outcomes[index] = .{ .matches = local.items };
             },
             .count => {
-                const file_count = countFileAt(self.work, candidate_file.display_path, candidate_file.read_path, self.pattern, self.case_insensitive) catch |err| {
+                const file_count = countFileAt(work, candidate_file.display_path, candidate_file.read_path, self.pattern, self.case_insensitive) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
                     debug_trace.logf("core", "grep_files scan skipped path={s} err={s}", .{ candidate_file.display_path, @errorName(err) });
                     return;
@@ -393,10 +402,10 @@ fn runParallelScan(scan: *ParallelScan) void {
     var started: usize = 0;
     if (!builtin.single_threaded) {
         while (started < helpers) : (started += 1) {
-            threads[started] = std.Thread.spawn(.{}, ParallelScan.run, .{scan}) catch break;
+            threads[started] = std.Thread.spawn(.{}, ParallelScan.run, .{ scan, started + 1 }) catch break;
         }
     }
-    scan.run();
+    scan.run(0);
     for (threads[0..started]) |thread| thread.join();
 }
 
@@ -409,8 +418,12 @@ fn selectCandidates(work: Allocator, candidates: []const []const u8, include: ?g
     return selected.toOwnedSlice(work);
 }
 
+/// `work` holds the outcomes and is used only by the calling thread. `scratch`
+/// must be thread-safe; it backs each worker's arena. The caller calls `deinit`
+/// once it has merged the outcomes.
 fn initParallelScan(
     work: Allocator,
+    scratch: Allocator,
     workspace_root: []const u8,
     provider_root: []const u8,
     files: []const []const u8,
@@ -421,7 +434,7 @@ fn initParallelScan(
     const outcomes = try work.alloc(FileOutcome, files.len);
     @memset(outcomes, .{});
     return .{
-        .work = work,
+        .worker_arenas = @splat(std.heap.ArenaAllocator.init(scratch)),
         .workspace_root = workspace_root,
         .provider_root = provider_root,
         .files = files,
@@ -447,7 +460,8 @@ fn scanCandidateList(
     defer work_state.deinit();
     const work = work_state.allocator();
     const files = try selectCandidates(work, candidates, include);
-    var scan = try initParallelScan(work, workspace_root, provider_root, files, pattern, case_insensitive, .matches);
+    var scan = try initParallelScan(work, scratch, workspace_root, provider_root, files, pattern, case_insensitive, .matches);
+    defer scan.deinit();
     runParallelScan(&scan);
     return mergeMatches(arena, &scan, matches);
 }
@@ -482,7 +496,8 @@ fn countCandidateList(
     defer work_state.deinit();
     const work = work_state.allocator();
     const files = try selectCandidates(work, candidates, include);
-    var scan = try initParallelScan(work, workspace_root, provider_root, files, pattern, case_insensitive, .count);
+    var scan = try initParallelScan(work, scratch, workspace_root, provider_root, files, pattern, case_insensitive, .count);
+    defer scan.deinit();
     runParallelScan(&scan);
     // A count needs every file.
     if (scan.out_of_memory_from != null) return error.OutOfMemory;
@@ -1427,7 +1442,8 @@ test "parallel grep stops once finished batches hold the cap, even with an earli
     const work = work_state.allocator();
     const files = try work.alloc([]const u8, batch_files * 4);
     for (files) |*file| file.* = "f";
-    var scan = try initParallelScan(work, "/w", "/w", files, "x", false, .matches);
+    var scan = try initParallelScan(work, std.testing.allocator, "/w", "/w", files, "x", false, .matches);
+    defer scan.deinit();
     const many = try work.alloc(Match, collection_cap);
     for (many) |*match| match.* = .{ .absolute_path = "/w/f", .line_number = 1, .line = "x" };
 
@@ -1437,7 +1453,8 @@ test "parallel grep stops once finished batches hold the cap, even with an earli
     try std.testing.expect(scan.stop.load(.acquire));
 
     // Below the cap the scan keeps going.
-    var short = try initParallelScan(work, "/w", "/w", files, "x", false, .matches);
+    var short = try initParallelScan(work, std.testing.allocator, "/w", "/w", files, "x", false, .matches);
+    defer short.deinit();
     short.outcomes[batch_files] = .{ .matches = many[0 .. collection_cap - 1] };
     short.finishBatch(batch_files, batch_files * 2);
     try std.testing.expect(!short.stop.load(.acquire));
@@ -1454,7 +1471,8 @@ test "grep fails for running out of memory only before the cut" {
 
     // The cut lands in the first file, so a later batch running out of
     // memory changes nothing.
-    var past = try initParallelScan(work, "/w", "/w", files, "x", false, .matches);
+    var past = try initParallelScan(work, std.testing.allocator, "/w", "/w", files, "x", false, .matches);
+    defer past.deinit();
     past.outcomes[0] = .{ .matches = many };
     past.out_of_memory_from = batch_files * 2;
     var kept: std.ArrayList(Match) = .empty;
@@ -1462,7 +1480,8 @@ test "grep fails for running out of memory only before the cut" {
     try std.testing.expectEqual(collection_cap, kept.items.len);
 
     // Before the cut, the missing matches would change the result.
-    var before = try initParallelScan(work, "/w", "/w", files, "x", false, .matches);
+    var before = try initParallelScan(work, std.testing.allocator, "/w", "/w", files, "x", false, .matches);
+    defer before.deinit();
     before.outcomes[0] = .{ .matches = many[0..10] };
     before.out_of_memory_from = batch_files;
     var partial: std.ArrayList(Match) = .empty;

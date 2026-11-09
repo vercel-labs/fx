@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { TraceRecord } from "./trace";
 
 export const FIXTURE = join(import.meta.dirname, "fixtures", "stdio-server.ts");
-/** MCP-v2's fake Streamable HTTP server with fake OAuth, used read-only. */
+/** The engine models' fake Streamable HTTP server with fake OAuth, used read-only. */
 export const HTTP_FAKE = join(import.meta.dirname, "../mcp/fakes/http.ts");
 export const BUN = process.execPath;
 
@@ -22,18 +22,17 @@ export function fixture(root: string, name: string): Fixture {
   return { base, home, workspace, control, serverLog: join(base, "servers.jsonl"), traceLog: join(base, "fx-trace.log") };
 }
 
-/** fx's environment: scratch HOME, MCP-v2, no Keychain, no browser, no sound, a fake gateway key. */
+/** fx's environment: scratch HOME, no Keychain, no browser, no sound, a fake gateway key. */
 export function fxEnv(f: Fixture, extra: Record<string, string> = {}): Record<string, string> {
   return {
     PATH: process.env.PATH ?? "/usr/bin:/bin",
     HOME: f.home,
     TMPDIR: process.env.TMPDIR ?? "/tmp",
-    FX_MCP_ENGINE: "v2",
     FX_DISABLE_KEYCHAIN: "1",
     FX_NO_OPEN_BROWSER: "1",
     FX_AUTO_UPGRADE: "0",
     FX_SOUND: "0",
-    FX_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_ONBOARDING: "1",
     FX_E2E_DISABLE_DOTENV: "1",
     FX_TRACE_LOG: f.traceLog,
     AI_GATEWAY_API_KEY: "fake-mcp-v2-model-key",
@@ -51,6 +50,50 @@ export function writeProfile(f: Fixture, servers: Record<string, unknown>) {
 }
 export function writeProject(f: Fixture, servers: Record<string, unknown>) {
   writeFileSync(join(f.workspace, ".mcp.json"), JSON.stringify({ mcpServers: servers }, null, 2));
+}
+
+// ---- sign-in against the fake HTTP server ----
+
+export const MODERN = "2026-07-28";
+const SIGN_IN_RULES = [
+  { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
+  { method: "tools/list", result: { resultType: "complete", tools: [{ name: "echo", inputSchema: { type: "object" } }] } },
+];
+
+/** The fake Streamable HTTP server with fake OAuth (`HTTP_FAKE`), serving one echo tool. */
+export async function startFake(f: Fixture, server: Record<string, unknown> = {}) {
+  if (!existsSync(HTTP_FAKE)) throw new Error(`harness: the fake HTTP server is missing at ${HTTP_FAKE}`);
+  const rules = join(f.base, "rules.json"), auth = join(f.base, "auth.json"), log = join(f.base, "http-fake.jsonl");
+  writeFileSync(rules, JSON.stringify(SIGN_IN_RULES));
+  writeFileSync(auth, JSON.stringify({ servers: [server], challengeScope: "mcp:read" }));
+  const child = Bun.spawn([BUN, HTTP_FAKE, "--script", rules, "--log", log, "--auth", auth], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const reader = child.stdout.getReader();
+  let text = "";
+  const deadline = Date.now() + 10_000;
+  while (!text.includes("\n") && Date.now() < deadline) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    text += new TextDecoder().decode(value);
+  }
+  const port = JSON.parse(text.split("\n")[0]!).listening as number;
+  const entries = () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []) as { t: number; dir?: string; path?: string; form?: Record<string, string>; json?: { redirect_uris?: string[] } }[];
+  return { url: `http://127.0.0.1:${port}/mcp`, entries, stop: () => child.kill() };
+}
+
+export const redemptions = (entries: ReturnType<Awaited<ReturnType<typeof startFake>>["entries"]>) =>
+  entries.filter((e) => e.dir === "auth" && e.path?.endsWith("/token") && e.form?.grant_type === "authorization_code");
+
+/** `fx mcp login --no-browser web` with stdin left open, its output read as it comes. */
+export async function cliLogin(binary: string, f: Fixture) {
+  const child = Bun.spawn([binary, "mcp", "login", "--no-browser", "web"], { cwd: f.workspace, env: fxEnv(f), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  let out = "", err = "";
+  void (async () => { for await (const c of child.stdout) out += new TextDecoder().decode(c); })();
+  void (async () => { for await (const c of child.stderr) err += new TextDecoder().decode(c); })();
+  const killer = setTimeout(() => child.kill("SIGKILL"), 60_000);
+  return {
+    child, out: () => out, err: () => err,
+    async done() { const code = await child.exited; clearTimeout(killer); await Bun.sleep(50); return code; },
+  };
 }
 
 export interface Ran { args: string[]; code: number; stdout: string; stderr: string; ms: number }
@@ -84,8 +127,10 @@ export async function waitFor<T>(what: string, probe: () => T | undefined | null
   }
 }
 
-/** A GET to a loopback port: "open" when something answered, "closed" when the connection was refused. */
-export async function probe(port: number, path = "/favicon.ico"): Promise<{ result: "open" | "closed" | "hang"; status?: number }> {
+/** A GET to a loopback port: "open" when something answered, "closed" when
+ * the connection was refused, and "reset" when a listener that was closing
+ * dropped it while it waited to be accepted, so a caller probes again. */
+export async function probe(port: number, path = "/favicon.ico"): Promise<{ result: "open" | "closed" | "hang" | "reset"; status?: number }> {
   try {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, { signal: AbortSignal.timeout(2000) });
     await response.text();
@@ -94,6 +139,7 @@ export async function probe(port: number, path = "/favicon.ico"): Promise<{ resu
     const text = String((error as { code?: string }).code ?? error);
     if (/ECONNREFUSED|ConnectionRefused|Unable to connect/i.test(text)) return { result: "closed" };
     if (/Timeout|abort/i.test(text)) return { result: "hang" };
+    if (/ECONNRESET/i.test(text)) return { result: "reset" };
     throw error;
   }
 }
@@ -101,10 +147,10 @@ export async function probe(port: number, path = "/favicon.ico"): Promise<{ resu
 // ---- credentials ----
 
 export const credDir = (f: Fixture) => join(f.home, ".fx", "mcp-credentials");
-export const v2Path = (f: Fixture) => join(credDir(f), "credentials-v2.json");
+export const storePath = (f: Fixture) => join(credDir(f), "credentials-v3.json");
+/** The store older builds keep, which this one never opens (MixedBuilds.tla). */
+export const olderStorePath = (f: Fixture) => join(credDir(f), "credentials-v2.json");
 export const v1Path = (f: Fixture) => join(credDir(f), "credentials.json");
-/** The note that v1's logins were taken over. */
-export const notePath = (f: Fixture) => join(credDir(f), "v1-imported");
 
 /** A v1 login as v1's store keeps it (mcp_auth_store.zig, its own test's shape). */
 export function v1Entry(name: string, url: string) {
@@ -121,20 +167,19 @@ export function writeV1(f: Fixture, entries: object[]) {
   writeFileSync(v1Path(f), JSON.stringify({ version: 1, credentials: entries }), { mode: 0o600 });
 }
 
-/** The documents as the model sees them: the v2 one's kind, entries, and flag; v1's logins. */
+/** The documents as the model sees them: the store's kind and entries; v1's logins. */
 export function observeStores(f: Fixture) {
-  let kind = "absent", entries: string[] = [], imported = false;
-  if (existsSync(v2Path(f))) {
-    const text = readFileSync(v2Path(f), "utf8");
+  let kind = "absent", entries: string[] = [];
+  if (existsSync(storePath(f))) {
+    const text = readFileSync(storePath(f), "utf8");
     try {
       const doc = JSON.parse(text);
       entries = (doc.servers ?? []).map((s: { name: string }) => s.name).sort();
-      imported = doc.imported_v1 === true;
-      kind = doc.version === 1 && Array.isArray(doc.servers) ? "ok" : "unreadable";
+      kind = (doc.version === 1 || doc.version === 2) && Array.isArray(doc.servers) ? "ok" : "unreadable";
     } catch { kind = "unreadable"; }
   }
   const v1 = existsSync(v1Path(f)) ? (JSON.parse(readFileSync(v1Path(f), "utf8")).credentials ?? []).map((c: { server_identity: string }) => c.server_identity).sort() : [];
-  return { kind, entries, imported, marked: existsSync(notePath(f)), v1 };
+  return { kind, entries, v1 };
 }
 
 export function save(path: string, value: unknown) {

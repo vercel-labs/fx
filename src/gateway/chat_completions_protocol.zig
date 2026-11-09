@@ -7,6 +7,7 @@ const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
 const sse = @import("sse.zig");
+const json_depth = @import("json_depth.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -43,13 +44,13 @@ pub const Error = error{
     RequiredToolMissing,
     UnexpectedToolCall,
     InvalidChunk,
+    MalformedChatCompletionsChunk,
     ConflictingIdentity,
     InvalidFinishReason,
     InconsistentFinishReason,
     IncompleteStream,
     StreamClosed,
     ProviderError,
-    OutputTruncated,
     ContentFiltered,
     Refused,
     EventTooLarge,
@@ -67,7 +68,7 @@ pub const Error = error{
 const max_selected_tools = 256;
 const max_name_bytes = 128;
 const max_history_arguments_bytes = 1024 * 1024;
-const max_json_depth = 64;
+const max_json_depth = json_depth.max_depth;
 
 const Function = struct {
     name: []const u8,
@@ -188,28 +189,7 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
 }
 
 fn check_json_depth(text: []const u8) Error!void {
-    var depth: usize = 0;
-    var quoted = false;
-    var escaped = false;
-    for (text) |byte| {
-        if (quoted) {
-            if (escaped) {
-                escaped = false;
-            } else if (byte == '\\') {
-                escaped = true;
-            } else if (byte == '"') quoted = false;
-        } else switch (byte) {
-            '"' => quoted = true,
-            '{', '[' => {
-                if (depth == max_json_depth) return error.JsonTooDeep;
-                depth += 1;
-            },
-            '}', ']' => if (depth > 0) {
-                depth -= 1;
-            },
-            else => {},
-        }
-    }
+    if (json_depth.exceeds(text)) return error.JsonTooDeep;
 }
 
 /// Caller owns the bounded diagnostic. Normalize JSON before masking so later
@@ -703,7 +683,10 @@ pub const Reducer = struct {
         try check_json_depth(data);
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, data, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidChunk,
+            // Valid JSON that fx refuses ends the turn. Text that is not JSON
+            // at all was damaged on the way, so the request is resent.
+            error.DuplicateField => return error.InvalidChunk,
+            else => return error.MalformedChatCompletionsChunk,
         };
         defer parsed.deinit();
         const root = try object(parsed.value);
@@ -915,8 +898,10 @@ pub const Reducer = struct {
         self.usage_final_fields = final_fields;
     }
 
-    /// Requires finish_reason followed by [DONE]. Length/filter/refusal are
-    /// explicit errors, never executable partial calls or successful tool turns.
+    /// Requires finish_reason followed by [DONE]. Filter and refusal are
+    /// explicit errors. A reply the output limit cut off returns with the
+    /// `length` reason, as the Gateway and Responses providers return it, so
+    /// the agent loop can resend it; it never runs that reply's partial calls.
     /// Results use stream_provider.Result.deinit with this reducer's allocator.
     pub fn finish(self: *Reducer, cancelled: bool) Error!stream_provider.Result {
         errdefer self.phase = .closed;
@@ -925,14 +910,17 @@ pub const Reducer = struct {
         if (self.phase != .done) return error.IncompleteStream;
         const reason = self.finish_reason.?;
         switch (reason) {
-            .length => return error.OutputTruncated,
             .content_filter => return error.ContentFiltered,
-            .stop, .tool_calls => {},
+            .stop, .tool_calls, .length => {},
             else => return error.InvalidFinishReason,
         }
         if (self.refusal_seen) return error.Refused;
-        if ((reason == .tool_calls) != (self.tools.items.len != 0)) return error.InconsistentFinishReason;
-        if (self.choice == .required and self.tools.items.len == 0) return error.RequiredToolMissing;
+        // A cut-off reply may stop anywhere, so only a finished one has to
+        // agree with its tool calls.
+        if (reason != .length) {
+            if ((reason == .tool_calls) != (self.tools.items.len != 0)) return error.InconsistentFinishReason;
+            if (self.choice == .required and self.tools.items.len == 0) return error.RequiredToolMissing;
+        }
         // Unadvertised names and invalid arguments are returned as sent. The tool
         // loop decides whether such a call runs and answers the rest, and the
         // permission reviewer retries a malformed decision.
@@ -2215,8 +2203,19 @@ test "chat completions terminal evidence and finish reasons are strict" {
         try test_accept(&reducer, test_stop);
         try std.testing.expectError(error.IncompleteStream, reducer.finish(false));
     }
+    // A cut-off reply returns as such, with or without the call it cut off,
+    // for the agent loop to resend; the loop never runs its calls.
+    const test_length = "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}";
+    for ([_]?[]const u8{ test_call, null }) |call| {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        if (call) |chunk| try test_accept(&reducer, chunk);
+        var result = try test_finish(&reducer, test_length);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(types.ProviderFinishReason.length, result.completed.completion.finish_reason.?);
+        try std.testing.expectEqual(@as(usize, if (call != null) 1 else 0), result.completed.completion.tool_calls.len);
+    }
     for ([_]struct { reason: []const u8, failure: Error }{
-        .{ .reason = "length", .failure = error.OutputTruncated },
         .{ .reason = "content_filter", .failure = error.ContentFiltered },
         .{ .reason = "stop", .failure = error.InconsistentFinishReason },
     }) |case| {
@@ -2244,7 +2243,7 @@ test "chat completions terminal evidence and finish reasons are strict" {
 test "chat completions rejects malformed chunks contradictory identities and extra choices" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { first: ?[]const u8 = null, chunk: []const u8, failure: Error }{
-        .{ .chunk = "not JSON", .failure = error.InvalidChunk },
+        .{ .chunk = "not JSON", .failure = error.MalformedChatCompletionsChunk },
         .{ .chunk = "{\"choices\":[],\"choices\":[]}", .failure = error.InvalidChunk },
         .{ .chunk = "{\"error\":{\"message\":\"bad request\"}}", .failure = error.ProviderError },
         .{ .chunk = "{\"choices\":[{\"index\":1,\"delta\":{}}]}", .failure = error.InvalidChunk },
@@ -2335,6 +2334,67 @@ test "chat completions stream framing handles chunks trailers truncation and wir
     source.end = wire.len;
     var result = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null);
     defer result.deinit(alloc);
+}
+
+const stream_fuzz = @import("stream_fuzz_testing.zig");
+
+fn fuzzChunkedStream(_: void, smith: *std.testing.Smith) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var reasoning: stream_fuzz.Text = .{};
+    try reasoning.generate(arena, smith, "", "", false);
+    var content: stream_fuzz.Text = .{};
+    try content.generate(arena, smith, "", "", false);
+    const with_tool = smith.boolWeighted(1, 1);
+    var arguments: stream_fuzz.Text = .{};
+    try arguments.generate(arena, smith, "{\"path\":\"", "\"}", true);
+
+    var wire_buffer: std.Io.Writer.Allocating = .init(arena);
+    const wire = &wire_buffer.writer;
+    if (reasoning.text.items.len > 0) {
+        for (try reasoning.pieces(arena)) |piece| {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning\":{f}}}}}]}}", piece);
+        }
+    }
+    for (try content.pieces(arena), 0..) |piece, index| {
+        if (index == 0) {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"id\":\"chat-1\",\"model\":\"resolved-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":{f}}},\"finish_reason\":null}}]}}", piece);
+        } else {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{f}}}}}]}}", piece);
+        }
+    }
+    if (with_tool) {
+        for (try arguments.pieces(arena), 0..) |piece, index| {
+            if (index == 0) {
+                try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{{\"name\":\"read_file\",\"arguments\":{f}}}}}]}}}}]}}", piece);
+            } else {
+                try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":{f}}}}}]}}}}]}}", piece);
+            }
+        }
+    }
+    try wire.print("data: {s}\n\ndata: [DONE]\n\n", .{if (with_tool) test_tools_finish else test_stop});
+
+    const read_buffer = try stream_fuzz.readBuffer(arena, smith);
+    var fixed = std.Io.Reader.fixed(wire_buffer.written());
+    var source = fixed.limited(.unlimited, read_buffer);
+    var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
+    const cancelled = std.atomic.Value(bool).init(false);
+    var result = try consume_stream(std.testing.allocator, &source.interface, test_tool_request(), .{}, deltas.sink(), &cancelled, null);
+    defer result.deinit(std.testing.allocator);
+
+    if (result != .completed) return error.TestStreamFailed;
+    const completion = result.completed.completion;
+    try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
+    try deltas.expectEqual(content.text.items, reasoning.text.items);
+    try stream_fuzz.expectToolCall(completion.tool_calls, with_tool, "call-1", arguments.text.items);
+}
+
+test "chat completions streams give the same result however they are cut into events and reads" {
+    try std.testing.fuzz({}, fuzzChunkedStream, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").chat_completions_stream.*),
+    });
 }
 
 test "chat completions reducer caps events content identities arguments tools and nesting" {

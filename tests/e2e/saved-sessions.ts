@@ -112,10 +112,18 @@ export function compactionRecordPath(home: string, id: string, name: string): st
 }
 
 /// The command replays session `id` kept: each is one of its blobs, named in
-/// the session by its handle, `fx-command-replay-<hash>.bin` (D44).
+/// the session by its handle, `fx-command-replay-<run>-<hash>.bin` (D44, D91).
+/// A handle from before D91 has no run id.
 export function commandReplays(home: string, id: string): { name: string; path: string }[] {
-  const names = [...new Set(savedText(home, id).match(/fx-command-replay-[0-9a-f]{64}\.bin/g) ?? [])];
-  return names.map((name) => ({ name, path: join(sessionDir(home, id), "blobs", name.slice("fx-command-replay-".length, -".bin".length)) }));
+  const names = [...new Set(savedText(home, id).match(commandReplayHandles) ?? [])];
+  return names.map((name) => ({ name, path: join(sessionDir(home, id), "blobs", commandReplayHash(name)) }));
+}
+
+const commandReplayHandles = /fx-command-replay-(?:[0-9a-f]{12}-)?[0-9a-f]{64}\.bin/g;
+
+/// The hash of the blob a command replay handle names, which comes last.
+export function commandReplayHash(handle: string): string {
+  return /([0-9a-f]{64})\.bin$/.exec(handle)![1]!;
 }
 
 /// Every tool call a saved history holds, finished or left open by an
@@ -167,4 +175,16 @@ export function copyV1Fixture(home: string, kind: string, count = 1, workspace?:
     if (typeof saved === "number" && existsSync(log)) utimesSync(log, saved / 1000, saved / 1000);
   }
   return ids;
+}
+
+/// What `fx ask` writes first when converting a session an older fx saved
+/// takes over 150 ms (`slow_conversion_text` in
+/// `src/core/session/session_adapter.zig`). A busy runner can make any
+/// conversion that slow.
+const SLOW_CONVERSION_NOTICE = "fx ask: Converting this session from the previous session format…\n";
+
+/// `stderr` from an `fx ask` that opened a copied v1 session, without the one
+/// slow-conversion notice it may start with.
+export function withoutConversionNotice(stderr: string): string {
+  return stderr.startsWith(SLOW_CONVERSION_NOTICE) ? stderr.slice(SLOW_CONVERSION_NOTICE.length) : stderr;
 }

@@ -313,9 +313,9 @@ function fakeGatewayEnv(
     VERCEL_OIDC_TOKEN: undefined,
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-    FX_E2E_GATEWAY_CREDITS_URL: undefined,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CREDITS_URL: undefined,
     FX_MODEL: OUTER_MODEL,
     ...extra,
   };
@@ -604,7 +604,7 @@ describe("web_search Gateway fixture", () => {
         for (const request of [initial, continuing]) {
           expect(findUnavailableCapabilityReferences(request)).toEqual([]);
           expect(customProviderGuidanceState(request)).toEqual({
-            providerToolIndices: [13],
+            providerToolIndices: [12],
             guidanceMessageIndices: [1],
           });
           expect(
@@ -614,7 +614,7 @@ describe("web_search Gateway fixture", () => {
           ).toHaveLength(1);
         }
         expect(toolByName(initial, "web_fetch")?.description).toContain(
-          "broad or current web research",
+          "public http(s) URL",
         );
         expect(toolByName(initial, "web_fetch")?.description).not.toContain(
           "web_search",
@@ -666,7 +666,7 @@ describe("web_search Gateway fixture", () => {
         expect(gateway.requests).toHaveLength(1);
 
         const resumed = await runFx(
-          ["ask", "--auto", "--json", "--resume-id", saved.session_id, "Summarize the saved search."],
+          ["ask", "--auto", "--json", "--resume", saved.session_id, "Summarize the saved search."],
           { cwd: root.workspace, env, timeoutMs: TIMEOUT },
         );
         expect(resumed.code).toBe(0);
@@ -846,7 +846,7 @@ describe("web_search Gateway fixture", () => {
         );
         expect(findUnavailableCapabilityReferences(request)).toEqual([]);
         expect(customProviderGuidanceState(request)).toEqual({
-          providerToolIndices: [13],
+          providerToolIndices: [12],
           guidanceMessageIndices: [1],
         });
       } finally {

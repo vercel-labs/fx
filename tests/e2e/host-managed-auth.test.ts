@@ -21,6 +21,9 @@ describe("host-managed authentication", () => {
   let server: ReturnType<typeof Bun.serve>;
   let baseUrl = "";
   let codexUnauthorizedResponses = 0;
+  // Replies the Codex and Grok fakes cut short before any text.
+  let emptyLengthReplies = 0;
+  const responseBodies: Array<{ path: string; body: string }> = [];
 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "fx-host-managed-auth-"));
@@ -66,6 +69,16 @@ describe("host-managed authentication", () => {
             input_modalities: ["text"],
             context_window: 272000,
           }] });
+        }
+        if (path === "/codex/responses" || path === "/grok/responses") {
+          responseBodies.push({ path, body: await request.text() });
+          if (emptyLengthReplies > 0) {
+            emptyLengthReplies -= 1;
+            return new Response(
+              'data: {"type":"response.incomplete","response":{"id":"resp_empty_length","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":4,"output_tokens":4096}}}\n\n',
+              { headers: { "content-type": "text/event-stream" } },
+            );
+          }
         }
         if (path === "/codex/responses") {
           if (codexUnauthorizedResponses > 0) {
@@ -128,15 +141,15 @@ describe("host-managed authentication", () => {
       FX_AUTH_MODE: "host-managed",
       FX_AUTO_UPGRADE: "0",
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_SOUND: "0",
-      FX_E2E_GATEWAY_MODELS_URL: `${baseUrl}/gateway/models`,
-      FX_E2E_GATEWAY_CHAT_URL: `${baseUrl}/gateway/responses`,
-      FX_E2E_OPENAI_CODEX_MODELS_URL: `${baseUrl}/codex/models`,
-      FX_E2E_OPENAI_CODEX_RESPONSES_URL: `${baseUrl}/codex/responses`,
-      FX_E2E_XAI_GROK_MODELS_URL: `${baseUrl}/grok/models`,
-      FX_E2E_XAI_GROK_MODALITIES_URL: `${baseUrl}/grok/modalities`,
-      FX_E2E_XAI_GROK_RESPONSES_URL: `${baseUrl}/grok/responses`,
+      FX_TEST_GATEWAY_MODELS_URL: `${baseUrl}/gateway/models`,
+      FX_TEST_GATEWAY_CHAT_URL: `${baseUrl}/gateway/responses`,
+      FX_TEST_OPENAI_CODEX_MODELS_URL: `${baseUrl}/codex/models`,
+      FX_TEST_OPENAI_CODEX_RESPONSES_URL: `${baseUrl}/codex/responses`,
+      FX_TEST_XAI_GROK_MODELS_URL: `${baseUrl}/grok/models`,
+      FX_TEST_XAI_GROK_MODALITIES_URL: `${baseUrl}/grok/modalities`,
+      FX_TEST_XAI_GROK_RESPONSES_URL: `${baseUrl}/grok/responses`,
     };
   }
 
@@ -147,10 +160,11 @@ describe("host-managed authentication", () => {
     expect(status.stderr).toBe("");
     expect(JSON.parse(status.stdout).auth).toBe("host managed");
 
-    for (const command of [["login"], ["logout"], ["setup"], ["teams"]]) {
+    for (const command of [["login"], ["login", "--api-key"], ["logout"], ["setup"], ["teams"]]) {
       const result = await runFx(command, { cwd: workspace, env: childEnv });
       expect(result.code).toBe(0);
-      expect(result.stderr).toBe("");
+      // `fx setup` is deprecated and says so even when the host manages authentication.
+      expect(result.stderr).toBe(command[0] === "setup" ? "fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n" : "");
       expect(result.stdout).toBe("Authentication is managed by the host.\n");
     }
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
@@ -238,6 +252,49 @@ describe("host-managed authentication", () => {
     expect(after - before).toBe(1);
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
   }, TIMEOUT);
+
+  test("an empty reply cut short is asked again with fx's limit through Grok and at low effort through Codex", async () => {
+    const childEnv = env();
+    const turnBodies = (path: string) => responseBodies
+      .filter((entry) => entry.path === path && !entry.body.includes("Generate a short title"))
+      .map((entry) => JSON.parse(entry.body) as { max_output_tokens?: number; reasoning?: { effort?: string } });
+    for (const provider of ["codex", "grok"] as const) {
+      const selected = await runFx(["provider", provider], {
+        cwd: workspace,
+        env: childEnv,
+        timeoutMs: TIMEOUT,
+      });
+      expect(selected.code).toBe(0);
+      const path = `/${provider}/responses`;
+      const before = turnBodies(path).length;
+      emptyLengthReplies = 1;
+      const asked = await runFx(["ask", "--json", "--no-save", "Reply once."], {
+        cwd: workspace,
+        env: childEnv,
+        timeoutMs: TIMEOUT,
+      });
+      emptyLengthReplies = 0;
+      const sent = turnBodies(path).slice(before);
+      expect(asked.code).toBe(0);
+      expect(sent[0]!.max_output_tokens).toBeUndefined();
+      if (provider === "codex") {
+        // The Codex endpoint ignores fx's limit, so the resend asks for less
+        // reasoning instead, which the selected model offers.
+        expect(sent).toHaveLength(2);
+        expect(sent[1]!.max_output_tokens).toBeUndefined();
+        expect(sent[0]!.reasoning?.effort).toBeUndefined();
+        expect(sent[1]!.reasoning?.effort).toBe("low");
+        expect(asked.stderr).toContain("Retrying with low effort.");
+        expect(asked.stderr).not.toContain("Retrying with a higher limit");
+        expect(asked.stdout).toContain("CODEX_HOST_MANAGED_OK");
+      } else {
+        expect(sent).toHaveLength(2);
+        expect(sent[1]!.max_output_tokens).toBe(32_768);
+        expect(asked.stderr).toContain("Retrying with a higher limit.");
+        expect(asked.stdout).toContain("GROK_HOST_MANAGED_OK");
+      }
+    }
+  }, TIMEOUT * 2);
 
   test("interactive host-managed session streams through the same authority", async () => {
     const childEnv = env();

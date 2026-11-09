@@ -15,7 +15,7 @@ const Allocator = std.mem.Allocator;
 const endpoint = "https://cli-chat-proxy.grok.com/v1/responses";
 // The proxy gates this as Grok wire compatibility; fx identifies itself separately below.
 const version_lookup = @import("provider_versions.zig");
-const e2e_endpoint_env = "FX_E2E_XAI_GROK_RESPONSES_URL";
+const e2e_endpoint_env = "FX_TEST_XAI_GROK_RESPONSES_URL";
 const max_error_body_bytes: usize = 256 * 1024;
 const max_sse_line_bytes: usize = 1024 * 1024;
 const max_sse_aggregate_bytes: usize = 64 * 1024 * 1024;
@@ -282,14 +282,6 @@ pub fn streamPrepared(
         .session_id = request.session_id,
     });
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
-    var open_operation = gateway_client.PostOperation{
-        .client = &client,
-        .uri = uri,
-        .authorization = auth_headers.authorization,
-        .extra_headers = extra_headers,
-    };
     var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(connect_timeout_ms),
@@ -300,14 +292,13 @@ pub fn streamPrepared(
         }
     }
     try request.admission.admit();
-    var opened = try gateway_client.openBoundedPost(
-        alloc,
-        request.cancel_flag,
-        connect_deadline,
-        &open_operation,
-    );
-    var http_request = opened.take();
-    defer http_request.deinit();
+    var opened = try gateway_client.openBoundedPost(request.cancel_flag, connect_deadline, .{
+        .uri = uri,
+        .authorization = auth_headers.authorization,
+        .extra_headers = extra_headers,
+    });
+    defer opened.deinit();
+    const http_request = &opened.request;
     var watch: gateway_client.ConnectionWatch = .init(.{
         .patient = true,
         .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
@@ -330,6 +321,9 @@ pub fn streamPrepared(
     var response = http_request.receiveHead(&.{}) catch |err| return watch.failure(err);
     if (watch.commitHead()) |err| return err;
     if (response.head.status != .ok) {
+        // Read before the body, whose reads reuse the buffer the head's
+        // header bytes live in.
+        const retry_after = gateway_client.retryAfterSeconds(response.head);
         var transfer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer);
         const bounded_body = reader.allocRemaining(alloc, .limited(max_error_body_bytes + 1)) catch |err| switch (err) {
@@ -341,8 +335,10 @@ pub fn streamPrepared(
             break :body try alloc.dupe(u8, "xAI Grok error response exceeded the local limit");
         } else bounded_body;
         return .{ .failed = .{
-            .kind = failureKind(response.head.status),
+            .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body),
+            .http_status = response.head.status,
             .detail = body,
+            .retry_after_seconds = retry_after,
             .ownership = .owned,
         } };
     }
@@ -369,10 +365,10 @@ pub fn completeFromStream(
         alloc,
         reader,
         &events,
-        EventBridge.content,
-        EventBridge.toolStart,
-        EventBridge.reasoning,
-        EventBridge.toolInput,
+        stream_provider.EventSink.onContentChunk,
+        stream_provider.EventSink.onToolStart,
+        stream_provider.EventSink.onReasoningChunk,
+        stream_provider.EventSink.onToolInputChunk,
         request.cancel_flag,
         request.content_capture_limit,
         progress,
@@ -388,43 +384,6 @@ pub fn completeFromStream(
         .completion = completion,
         .ownership = .owned,
     } };
-}
-
-const EventBridge = struct {
-    fn sink(raw: *anyopaque) *stream_provider.EventSink {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn content(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .content_delta = chunk });
-    }
-
-    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .reasoning_delta = chunk });
-    }
-
-    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .tool_input_delta = chunk });
-    }
-
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
-    }
-};
-
-pub fn failureKind(status: std.http.Status) stream_provider.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
 }
 
 fn consumeSse(
@@ -479,6 +438,7 @@ fn mapReducerError(err: anyerror) anyerror {
         error.EventTooLarge => error.XaiGrokSseEventTooLarge,
         error.StreamTooLarge => error.XaiGrokResourceLimitExceeded,
         error.InvalidEvent => error.InvalidXaiGrokSseEvent,
+        error.MalformedEvent => error.MalformedXaiGrokSseEvent,
         error.StreamIncomplete => error.XaiGrokStreamIncomplete,
         error.ToolCallLimitExceeded => error.XaiGrokToolCallLimitExceeded,
         error.ToolArgumentsTooLarge => error.XaiGrokToolArgumentsTooLarge,
@@ -869,7 +829,7 @@ const XaiTestEnvironment = struct {
         };
         errdefer self.map.deinit();
         try self.map.put(e2e_endpoint_env, responses_url);
-        try self.map.put("FX_E2E_GROK_CLIENT_VERSION", "1.0.6");
+        try self.map.put("FX_TEST_GROK_CLIENT_VERSION", "1.0.6");
         io_mod.setEnvironMap(&self.map);
         return self;
     }
@@ -1188,4 +1148,12 @@ test "xAI Grok SSE reducer cleans up bounded tool arguments and provider state" 
     const excess_state = try buildProviderStateSse(std.testing.allocator, max_provider_state_bytes + 1);
     defer std.testing.allocator.free(excess_state);
     try expectTestSseError(error.XaiGrokResourceLimitExceeded, excess_state);
+}
+
+test "an xAI event that is not JSON resends, and a duplicate key still ends the turn" {
+    const partial = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\n";
+    try expectTestSseError(error.MalformedXaiGrokSseEvent, partial ++ "data: {not-json}\n\n");
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.MalformedXaiGrokSseEvent, .possibly_sent) != null);
+    try expectTestSseError(error.InvalidXaiGrokSseEvent, partial ++ "data: {\"type\":\"a\",\"type\":\"b\"}\n\n");
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.InvalidXaiGrokSseEvent, .possibly_sent) == null);
 }

@@ -5,6 +5,15 @@ pub const max_source_entries: usize = 256;
 pub const Anchor = union(enum) {
     tail,
     entry_index: usize,
+    /// A page of an older compaction cycle the transcript reads from the
+    /// session log: `back` cycles before the held entries (1 is the newest),
+    /// around one of that cycle's entries. `maxInt` is its last entry.
+    archive: Archive,
+};
+
+pub const Archive = struct {
+    back: u32,
+    entry_index: usize,
 };
 
 pub const Request = struct {
@@ -28,13 +37,13 @@ pub fn sourceRange(request: Request, total_entries: usize) SourceRange {
     }
 
     const latest_start = total_entries - max_source_entries;
-    const start = switch (request.anchor) {
-        .tail => latest_start,
-        .entry_index => |requested_index| blk: {
-            const anchor_index = @min(requested_index, total_entries - 1);
-            break :blk @min(anchor_index -| max_source_entries / 2, latest_start);
-        },
+    const requested_index = switch (request.anchor) {
+        .tail => return .{ .start = latest_start, .end = total_entries },
+        .entry_index => |index| index,
+        .archive => |archive| archive.entry_index,
     };
+    const anchor_index = @min(requested_index, total_entries - 1);
+    const start = @min(anchor_index -| max_source_entries / 2, latest_start);
     return .{ .start = start, .end = start + max_source_entries };
 }
 
@@ -149,4 +158,20 @@ test "full transcript page navigation stops at document boundaries" {
         next.?,
     );
     try std.testing.expect(nextAnchor(.{ .start = 744, .end = 1_000 }, 1_000) == null);
+}
+
+test "an archive page ranges over its own cycle's entries" {
+    const request = Request{
+        .content_revision = 1,
+        .cols = 80,
+        .anchor = .{ .archive = .{ .back = 2, .entry_index = std.math.maxInt(usize) } },
+    };
+    const tail = sourceRange(request, 1000);
+    try std.testing.expectEqual(@as(usize, 1000), tail.end);
+    try std.testing.expectEqual(max_source_entries, tail.len());
+    var middle = request;
+    middle.anchor.archive.entry_index = 500;
+    const range = sourceRange(middle, 1000);
+    try std.testing.expect(range.start <= 500 and 500 < range.end);
+    try std.testing.expect(!sameRequest(request, middle));
 }

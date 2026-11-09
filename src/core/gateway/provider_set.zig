@@ -20,6 +20,9 @@ pub const Bundle = struct {
         gateway_prompt_caching: bool = false,
         fx_search: bool = false,
         vision_fallback: bool = false,
+        /// Whether a request carries fx's output limit. ChatGPT's Codex
+        /// endpoint chooses its own and rejects the parameter.
+        sends_output_limit: bool = true,
     };
 
     capabilities: Capabilities = .{},

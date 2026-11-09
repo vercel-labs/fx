@@ -1,8 +1,8 @@
 [
   {
     "description": "A listing that started before an invalidation is cached as fresh",
-    "old": "    /\\ cache' = IF startGen = gen /\\ (era = \"legacy\" \\/ ~z) THEN \"fresh\" ELSE \"stale\"",
-    "new": "    /\\ cache' = IF era = \"legacy\" \\/ ~z THEN \"fresh\" ELSE \"stale\"",
+    "old": "    /\\ cache' = IF startGen = gen /\\ (era = \"legacy\" \\/ (~z /\\ ~l)) THEN \"fresh\" ELSE \"stale\"",
+    "new": "    /\\ cache' = IF era = \"legacy\" \\/ (~z /\\ ~l) THEN \"fresh\" ELSE \"stale\"",
     "invariant": "CacheCurrent"
   },
   {
@@ -19,8 +19,8 @@
   },
   {
     "description": "A modern list with a zero-TTL page is cached",
-    "old": "    /\\ cache' = IF startGen = gen /\\ (era = \"legacy\" \\/ ~z) THEN \"fresh\" ELSE \"stale\"",
-    "new": "    /\\ cache' = IF startGen = gen THEN \"fresh\" ELSE \"stale\"",
+    "old": "    /\\ cache' = IF startGen = gen /\\ (era = \"legacy\" \\/ (~z /\\ ~l)) THEN \"fresh\" ELSE \"stale\"",
+    "new": "    /\\ cache' = IF startGen = gen /\\ (era = \"legacy\" \\/ ~l) THEN \"fresh\" ELSE \"stale\"",
     "invariant": "ZeroTtlNotCached"
   },
   {
@@ -43,14 +43,14 @@
   },
   {
     "description": "A legacy list is cached even after an invalidation during its listing",
-    "old": "    /\\ cache' = IF startGen = gen /\\ (era = \"legacy\" \\/ ~z) THEN \"fresh\" ELSE \"stale\"",
-    "new": "    /\\ cache' = IF era = \"legacy\" \\/ (startGen = gen /\\ ~z) THEN \"fresh\" ELSE \"stale\"",
+    "old": "    /\\ cache' = IF startGen = gen /\\ (era = \"legacy\" \\/ (~z /\\ ~l)) THEN \"fresh\" ELSE \"stale\"",
+    "new": "    /\\ cache' = IF era = \"legacy\" \\/ (startGen = gen /\\ ~z /\\ ~l) THEN \"fresh\" ELSE \"stale\"",
     "invariant": "CacheCurrent"
   },
   {
     "description": "A failed listing leaves its waiters waiting",
-    "old": "PageFailed ==\n    /\\ pending # \"none\"\n    /\\ listing' = \"idle\"\n    /\\ pending' = \"none\"\n    /\\ waiting' = FALSE",
-    "new": "PageFailed ==\n    /\\ pending # \"none\"\n    /\\ listing' = \"idle\"\n    /\\ pending' = \"none\"\n    /\\ waiting' = waiting",
+    "old": "Failed ==\n    /\\ listing' = \"idle\"\n    /\\ pending' = \"none\"\n    /\\ waiting' = FALSE",
+    "new": "Failed ==\n    /\\ listing' = \"idle\"\n    /\\ pending' = \"none\"\n    /\\ waiting' = waiting",
     "invariant": "WaitingMeansListing"
   },
   {
@@ -61,8 +61,26 @@
   },
   {
     "description": "The last page asks for another page instead of finishing",
-    "old": "          ELSE /\\ page' = p /\\ zeroTtl' = z\n               /\\ Finish(z)",
-    "new": "          ELSE /\\ page' = 0 /\\ zeroTtl' = z /\\ pending' = \"first\"\n               /\\ UNCHANGED <<listing, startGen, restarts, waiting, cache, cacheGen, cachedZero>>",
+    "old": "          ELSE /\\ page' = p /\\ zeroTtl' = z /\\ lapsed' = l\n               /\\ Finish(z, l)",
+    "new": "          ELSE /\\ page' = 0 /\\ zeroTtl' = z /\\ lapsed' = l /\\ pending' = \"first\"\n               /\\ UNCHANGED <<listing, startGen, restarts, waiting, answer, cache, cacheGen,\n                              cachedZero, cachedLapsed>>",
     "property": "EveryNeedAnswered"
+  },
+  {
+    "description": "A modern list with a page that expired before the listing ended is cached",
+    "old": "    /\\ cache' = IF startGen = gen /\\ (era = \"legacy\" \\/ (~z /\\ ~l)) THEN \"fresh\" ELSE \"stale\"",
+    "new": "    /\\ cache' = IF startGen = gen /\\ (era = \"legacy\" \\/ ~z) THEN \"fresh\" ELSE \"stale\"",
+    "invariant": "LapsedNotCached"
+  },
+  {
+    "description": "A failed listing hands its waiters the failure even when a list was listed before",
+    "old": "    /\\ answer' = IF cache = \"none\" THEN \"failure\" ELSE \"lastGood\"",
+    "new": "    /\\ answer' = \"failure\"",
+    "invariant": "LastGoodOnFailure"
+  },
+  {
+    "description": "A failed listing makes the last list fresh, so it is served from the cache instead of listed again",
+    "old": "    /\\ Failed\n    /\\ UNCHANGED <<era, process, gen, cache, cacheGen, cachedZero, cachedLapsed, startGen,\n                   page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>",
+    "new": "    /\\ Failed\n    /\\ cache' = IF cache = \"none\" THEN cache ELSE \"fresh\"\n    /\\ cacheGen' = gen\n    /\\ cachedZero' = FALSE\n    /\\ cachedLapsed' = FALSE\n    /\\ UNCHANGED <<era, process, gen, startGen,\n                   page, restarts, zeroTtl, lapsed, servedStale, extraFetch>>",
+    "invariant": "FallbackRetries"
   }
 ]

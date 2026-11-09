@@ -47,17 +47,23 @@ pub const Tool = struct {
 pub const List = struct {
     bytes: std.ArrayList(u8) = .empty,
     spans: std.ArrayList(Span) = .empty,
+    /// Finds a tool by name in constant time, so gathering a large list stays
+    /// linear: open addressing over `spans`, each slot a tool's index
+    /// + 1 (0 is empty), a power of two at least twice the tools.
+    slots: std.ArrayList(u32) = .empty,
 
     const Span = struct { raw_start: u32, raw_len: u32, name_start: u32, name_len: u32 };
 
     pub fn deinit(list: *List, gpa: std.mem.Allocator) void {
         list.bytes.deinit(gpa);
         list.spans.deinit(gpa);
+        list.slots.deinit(gpa);
     }
 
     pub fn clear(list: *List) void {
         list.bytes.clearRetainingCapacity();
         list.spans.clearRetainingCapacity();
+        list.slots.clearRetainingCapacity();
     }
 
     pub fn len(list: *const List) usize {
@@ -73,11 +79,37 @@ pub const List = struct {
     }
 
     pub fn find(list: *const List, name: []const u8) ?Tool {
-        for (0..list.len()) |i| {
-            const tool = list.get(i);
+        const slots = list.slots.items;
+        if (slots.len == 0) return null;
+        var at = slotFor(name, slots.len);
+        while (slots[at] != 0) : (at = (at + 1) & (slots.len - 1)) {
+            const tool = list.get(slots[at] - 1);
             if (std.mem.eql(u8, tool.name, name)) return tool;
         }
         return null;
+    }
+
+    /// Makes room in `slots` for one more tool, before it is appended, so
+    /// running out of memory never leaves a tool unindexed.
+    fn reserve(list: *List, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
+        const n = list.len() + 1;
+        if (n * 2 <= list.slots.items.len) return;
+        const size = std.math.ceilPowerOfTwo(usize, @max(16, n * 2)) catch return error.OutOfMemory;
+        try list.slots.resize(gpa, size);
+        @memset(list.slots.items, 0);
+        for (0..list.len()) |i| list.place(i);
+    }
+
+    /// Indexes tool `index`, which `reserve` made room for.
+    fn place(list: *List, index: usize) void {
+        const slots = list.slots.items;
+        var at = slotFor(list.get(index).name, slots.len);
+        while (slots[at] != 0) at = (at + 1) & (slots.len - 1);
+        slots[at] = @intCast(index + 1);
+    }
+
+    fn slotFor(name: []const u8, slots: usize) usize {
+        return @as(usize, @truncate(std.hash.Wyhash.hash(0, name))) & (slots - 1);
     }
 };
 
@@ -148,6 +180,7 @@ pub const Store = struct {
             const list = &store.gathering;
             const start = list.bytes.items.len;
             if (start + raw.len > std.math.maxInt(u32)) return error.OutOfMemory;
+            try list.reserve(gpa);
             try list.spans.ensureUnusedCapacity(gpa, 1);
             try list.bytes.appendSlice(gpa, raw);
             const name_offset = @intFromPtr(name.ptr) - @intFromPtr(raw.ptr);
@@ -157,6 +190,7 @@ pub const Store = struct {
                 .name_start = @intCast(start + name_offset),
                 .name_len = @intCast(name.len),
             });
+            list.place(list.len() - 1);
             added.added += 1;
         }
         store.cursor.clearRetainingCapacity();
@@ -288,6 +322,45 @@ test "gathers valid tools, skipping malformed ones and later duplicates" {
     try testing.expectEqual(@as(?[]const u8, null), store.nextCursor());
     try testing.expectEqual(@as(usize, 2), store.current.len());
     try testing.expectError(error.NotAnArray, store.addPage(testing.allocator, .{ .tools = "{}", .next_cursor = null, .ttl_ms = 0 }));
+}
+
+test "a large list over pages: each tool is found as first listed, and a later one of the same name is skipped" {
+    const gpa = testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(gpa);
+    var page: std.Io.Writer.Allocating = .init(gpa);
+    defer page.deinit();
+    // Three pages of 3,000; the second repeats every even name of the first,
+    // and the index grows and is rebuilt several times.
+    for (0..2) |round| {
+        for (0..3) |p| {
+            page.clearRetainingCapacity();
+            try page.writer.writeAll("{\"tools\":[");
+            for (0..3000) |i| {
+                const n = if (p == 1 and i % 2 == 0) i else p * 3000 + i;
+                if (i > 0) try page.writer.writeByte(',');
+                try page.writer.print("{{\"name\":\"t{d}\",\"inputSchema\":{{}},\"page\":{d}}}", .{ n, p });
+            }
+            try page.writer.writeAll("]}");
+            const added = try store.addPage(gpa, try parsePage(page.written()));
+            try testing.expectEqual(Added{ .added = if (p == 1) 1500 else 3000, .duplicate = if (p == 1) 1500 else 0 }, added);
+        }
+        // The second round gathers again into the memory the first left.
+        if (round == 0) store.discard() else store.publish();
+    }
+    try testing.expectEqual(@as(usize, 7500), store.current.len());
+    var name: [16]u8 = undefined;
+    for (0..9000) |n| {
+        const tool = store.current.find(try std.mem.print(&name, "t{d}", .{n}));
+        if (n >= 3000 and n < 6000 and n % 2 == 0) {
+            try testing.expectEqual(@as(?Tool, null), tool);
+            continue;
+        }
+        const first: u8 = if (n < 3000) '0' else if (n < 6000) '1' else '2';
+        try testing.expectEqualStrings(&.{ '"', 'p', 'a', 'g', 'e', '"', ':', first, '}' }, tool.?.raw[tool.?.raw.len - 9 ..]);
+    }
+    try testing.expectEqual(@as(?Tool, null), store.current.find("t9000"));
+    try testing.expectEqual(@as(?Tool, null), store.gathering.find("t0"));
 }
 
 test "over HTTP, tools with an invalid x-mcp-header are dropped; the others stay" {

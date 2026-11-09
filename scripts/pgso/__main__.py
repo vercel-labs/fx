@@ -19,9 +19,9 @@ from scripts.pgso.pipeline import (
     build_control,
     build_instrumented,
     emit_bitcode,
+    exempt_cold_startup_functions,
     link_candidate,
     merge_profile_batch,
-    read_macos_minos,
     verify_candidate,
 )
 from scripts.pgso.qualify import (
@@ -36,7 +36,8 @@ from scripts.pgso.qualify import (
     require_measurements_passed,
 )
 from scripts.pgso.runner import cancellation_guard, run_checked
-from scripts.pgso.toolchain import SUPPORTED_TARGET
+from scripts.pgso import platforms, unit_tests
+from scripts.pgso.toolchain import DEFAULT_TARGET
 from scripts.pgso.toolchain import Toolchain
 
 
@@ -84,7 +85,7 @@ def load_read_only_manifest(path: pathlib.Path) -> Mapping[str, object]:
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--llvm-bin", required=True)
     parser.add_argument("--output-dir", required=True, type=pathlib.Path)
-    parser.add_argument("--target", default=SUPPORTED_TARGET)
+    parser.add_argument("--target", default=DEFAULT_TARGET)
     parser.add_argument(
         "--update-channel",
         choices=("stable", "dev"),
@@ -101,7 +102,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python3 -m scripts.pgso",
-        description="Build and qualify macOS arm64 fx PGSO candidates",
+        description="Build and qualify fx PGSO candidates",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     descriptions = {
@@ -121,13 +122,22 @@ def _parser() -> argparse.ArgumentParser:
         help="Print an existing eligible manifest without modifying it",
     )
     report_parser.add_argument("--output-dir", required=True, type=pathlib.Path)
+    unit_tests_parser = subparsers.add_parser(
+        "unit-tests",
+        help="Run the Zig unit tests on code built through the candidate's transforms",
+    )
+    unit_tests_parser.add_argument("--llvm-bin", required=True)
+    unit_tests_parser.add_argument("--output-dir", required=True, type=pathlib.Path)
+    unit_tests_parser.add_argument("--target", required=True, choices=unit_tests.TARGETS)
+    unit_tests_parser.add_argument("--update-channel", choices=("stable", "dev"), default="stable")
+    unit_tests_parser.add_argument("--zig", default="zig")
     return parser
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = _parser()
     arguments = parser.parse_args(argv)
-    if arguments.command == "report":
+    if arguments.command in ("report", "unit-tests"):
         return arguments
     if arguments.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
@@ -245,14 +255,7 @@ def _runtime_versions(
         log_path=paths.logs / "tmux-version.json",
         require_empty_stderr=True,
     )
-    macos_result = run_checked(
-        ("sw_vers", "-productVersion"),
-        cwd=REPO_ROOT,
-        env=os.environ.copy(),
-        timeout_s=30,
-        log_path=paths.logs / "macos-version.json",
-        require_empty_stderr=True,
-    )
+    os_versions = platforms.for_target(arguments.target).os_versions(paths)
     return bun, hyperfine, {
         "bun_path": str(bun),
         "bun_version": bun_version,
@@ -260,7 +263,7 @@ def _runtime_versions(
         "hyperfine_version": hyperfine_version,
         "tmux_path": str(tmux),
         "tmux_version": tmux_result.stdout.strip(),
-        "macos_version": macos_result.stdout.strip(),
+        **os_versions,
     }
 
 
@@ -321,7 +324,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
         stage = "control"
         recorder.stage(stage, "running")
         control = build_control(toolchain, spec, paths)
-        control_minos = read_macos_minos(
+        control_identity = toolchain.platform.read_control_identity(
             toolchain,
             control,
             paths.logs / "control-load-commands.json",
@@ -335,7 +338,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
                     "path": str(control),
                     "sha256": control_sha256,
                     "size_bytes": control.stat().st_size,
-                    "minimum_macos": control_minos,
+                    **control_identity,
                 }
             },
         )
@@ -365,7 +368,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
         smoke_profiles = build_instrumented(
             toolchain,
             paths,
-            control_minos,
+            control_identity,
         )
         merged_raw_profiles = merge_profile_batch(
             toolchain,
@@ -394,6 +397,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
 
         stage = "corpus-training"
         recorder.stage(stage, "running")
+        startup_scenarios = toolchain.platform.STARTUP_SCENARIOS
         training_result = run_corpus(
             corpus,
             paths.instrumented_binary,
@@ -401,21 +405,29 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
             paths.merged_profile,
             toolchain=toolchain,
             bun=bun,
+            startup_scenarios=startup_scenarios,
+            startup_profile_dir=paths.startup_profiles,
         )
         merged_raw_profiles += training_result.merged_raw_profiles
         profile_summary = _profile_summary(toolchain, paths)
+        training_profile = {
+            "path": str(paths.merged_profile),
+            "sha256": sha256_file(paths.merged_profile),
+            "size_bytes": paths.merged_profile.stat().st_size,
+            "merged_raw_profiles": merged_raw_profiles,
+            "summary": profile_summary,
+        }
+        if startup_scenarios:
+            training_profile["startup_profiles"] = {
+                name: sha256_file(paths.startup_profiles / f"{name}.profdata")
+                for name in startup_scenarios
+            }
         recorder.stage(
             stage,
             "passed",
             {
                 "training_corpus": dataclasses.asdict(training_result),
-                "profile": {
-                    "path": str(paths.merged_profile),
-                    "sha256": sha256_file(paths.merged_profile),
-                    "size_bytes": paths.merged_profile.stat().st_size,
-                    "merged_raw_profiles": merged_raw_profiles,
-                    "summary": profile_summary,
-                },
+                "profile": training_profile,
             },
         )
 
@@ -432,7 +444,24 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
             paths,
             expected_sha256=bitcode_sha256,
         )
-        apply_profile(toolchain, paths, bitcode_sha256)
+        startup_exemption = None
+        if startup_scenarios:
+            benchmark_profiles = [linked.pair.merged_profile for linked in linked_benchmarks.values()]
+            if any(profile is None for profile in benchmark_profiles):
+                raise PgsoError("benchmark training profile is incomplete")
+            startup_exemption = exempt_cold_startup_functions(
+                toolchain,
+                paths,
+                bitcode_sha256,
+                startup_scenarios,
+                benchmark_profiles=benchmark_profiles,
+            )
+        apply_profile(
+            toolchain,
+            paths,
+            bitcode_sha256,
+            no_outline_functions=paths.startup_order if startup_scenarios else None,
+        )
         link_candidate(toolchain, paths)
         linked_benchmarks = relink_profile_linked_benchmarks(
             toolchain,
@@ -442,7 +471,7 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
         candidate = verify_candidate(
             toolchain,
             paths,
-            expected_minos=control_minos,
+            control_identity,
         )
         if not candidate.artifact.preferred_headroom_met:
             raise PgsoError(
@@ -454,15 +483,13 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
                 "path": str(control),
                 "sha256": control_sha256,
                 "size_bytes": control.stat().st_size,
-                "minimum_macos": control_minos,
+                **control_identity,
             },
             "candidate": {
                 "path": str(paths.candidate_binary),
                 "sha256": candidate.sha256,
                 "size": dataclasses.asdict(candidate.artifact),
-                "architecture": candidate.metadata.architecture,
-                "minimum_macos": candidate.metadata.min_macos,
-                "signature_valid": candidate.metadata.signature_valid,
+                **toolchain.platform.candidate_evidence(candidate.metadata),
                 "version": candidate.version_output,
             },
             "warnings": 0,
@@ -485,6 +512,8 @@ def run_command(arguments: argparse.Namespace) -> pathlib.Path:
             "summary": _profile_summary(toolchain, paths),
             "supplements": supplement_evidence,
         }
+        if startup_exemption is not None:
+            profile["startup_exemption"] = startup_exemption
         recorder.stage(
             stage,
             "passed",
@@ -568,6 +597,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             if arguments.command == "report":
                 payload = load_read_only_manifest(arguments.output_dir)
                 print(json.dumps(payload, indent=2, sort_keys=True))
+                return 0
+            if arguments.command == "unit-tests":
+                output_dir = ensure_fresh_output(arguments.output_dir)
+                toolchain = Toolchain.discover(arguments.zig, arguments.llvm_bin, arguments.target)
+                summary = unit_tests.transformed_unit_tests(
+                    toolchain,
+                    REPO_ROOT,
+                    output_dir,
+                    update_channel=arguments.update_channel,
+                )
+                print(json.dumps(summary, indent=2, sort_keys=True))
                 return 0
             manifest_path = run_command(arguments)
             print(manifest_path)

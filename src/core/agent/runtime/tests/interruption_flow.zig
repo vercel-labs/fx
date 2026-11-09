@@ -683,7 +683,8 @@ test "processQueuedPrompt retains cancelled command replay in interrupted histor
 
     try expectBodyContains(&follow_gateway, 0, "<turn_aborted>");
     try expectBodyContains(&follow_gateway, 0, session_runtime.aborted_tool_output);
-    try expectBodyContains(&follow_gateway, 0, "\"toolName\":\"terminal\"");
+    // History replays the legacy exec as the shell run it maps to.
+    try expectBodyContains(&follow_gateway, 0, "\"toolName\":\"shell\"");
     try expectBodyContains(&follow_gateway, 0, "\"toolCallId\":\"call_cancelled_command\"");
     try expectBodyNotContains(&follow_gateway, 0, "RESULT-ONLY-OUTPUT-SENTINEL");
     try expectBodyNotContains(&follow_gateway, 0, "RESULT-JSON-ONLY-SENTINEL");

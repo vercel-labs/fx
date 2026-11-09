@@ -65,6 +65,7 @@ NoSilentWithhold == IR!NoSilentWithhold
 RequiredWhenPending == IR!RequiredWhenPending
 FailExactlyWhenUnroutable == IR!FailExactlyWhenUnroutable
 ResolveOnlyWhenNeeded == IR!ResolveOnlyWhenNeeded
+AskedBeforeUnknown == IR!AskedBeforeUnknown
 NotifyOnlyWhenDown == IR!NotifyOnlyWhenDown
 DecideOnlyWhenReady == IR!DecideOnlyWhenReady
 TurnResets == IR!TurnResets

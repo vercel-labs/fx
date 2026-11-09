@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -11,29 +11,26 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
-import {
-  startLegacyHttpSseFixture,
-  startLegacyStreamableHttpFixture,
-} from "./fixtures/mcp-legacy-remote";
+import { startIdleDropProxy } from "./fixtures/idle-drop-proxy";
+import { startLegacyStreamableHttpFixture } from "./fixtures/mcp-legacy-remote";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
+import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
   fakeGatewayToolCall,
+  isComposerLine,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
-import {
-  buildMcpDispatcherDriver,
-  ZIG_BUILD_WARMUP_TIMEOUT_MS,
-  zigGlobalCacheDir,
-} from "./zig-build";
+import { zigGlobalCacheDir } from "./zig-build";
 
 const MODEL = "openai/gpt-5";
 const TOOL_NAME = "mcp_fixture_echo";
@@ -41,48 +38,8 @@ const ACCESS_INITIAL = "mcp-access-initial-secret";
 const ACCESS_REFRESHED = "mcp-access-refreshed-secret";
 const REFRESH_INITIAL = "mcp-refresh-initial-secret";
 const REFRESH_ROTATED = "mcp-refresh-rotated-secret";
-const REPO_ROOT = realpathSync(join(import.meta.dirname, "..", ".."));
-const MCP_KEYCHAIN_SERVICE = "FX_MCP_OAUTH_CREDENTIALS_V1";
 const FX_SLACK_CLIENT_ID = "12364000946.12017137861236";
-const FX_SLACK_SCOPES = [
-  "channels:history", "channels:read", "channels:write", "chat:write", "emoji:read",
-  "files:write", "search:read.public", "search:read.users", "users:read",
-];
 const inheritedKeychainDisable = process.env.FX_DISABLE_KEYCHAIN;
-const MCP_KEYCHAIN_PROBE_SCRIPT = `
-ObjC.import("Security");
-ObjC.import("Foundation");
-const object = (value) => ObjC.castRefToObject(value);
-function query(account, service) {
-  const value = $.NSMutableDictionary.alloc.init;
-  value.setObjectForKey(object($.kSecClassGenericPassword), object($.kSecClass));
-  value.setObjectForKey($(account), object($.kSecAttrAccount));
-  value.setObjectForKey($(service), object($.kSecAttrService));
-  return value;
-}
-function run(argv) {
-  const value = query(argv[1], argv[2]);
-  if (argv[0] === "load") {
-    value.setObjectForKey($.NSNumber.numberWithBool(true), object($.kSecReturnData));
-    value.setObjectForKey(object($.kSecMatchLimitOne), object($.kSecMatchLimit));
-    const result = Ref();
-    const status = $.SecItemCopyMatching(value, result);
-    if (status !== 0) throw new Error("keychain status=" + status);
-    $.NSFileHandle.fileHandleWithStandardOutput.writeData(
-      ObjC.castRefToObject(result[0]),
-    );
-    return;
-  }
-  if (argv[0] === "delete") {
-    const status = $.SecItemDelete(value);
-    if (status !== 0 && status !== -25300) {
-      throw new Error("keychain status=" + status);
-    }
-    return;
-  }
-  throw new Error("unsupported probe operation");
-}
-`;
 
 type AuthFixture = ReturnType<typeof startAuthFixture>;
 
@@ -91,43 +48,14 @@ let upstream: ReturnType<typeof startModernMcpHttpFixture> | null = null;
 let legacyStreamable:
   | ReturnType<typeof startLegacyStreamableHttpFixture>
   | null = null;
-let legacySse: ReturnType<typeof startLegacyHttpSseFixture> | null = null;
 let auth: AuthFixture | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
 let tui: TmuxSession | null = null;
-
-function runMcpKeychainProbe(
-  operation: "load" | "delete",
-  account: string,
-  service: string,
-  home: string,
-) {
-  return spawnSync(
-    "/usr/bin/osascript",
-    [
-      "-l",
-      "JavaScript",
-      "-e",
-      MCP_KEYCHAIN_PROBE_SCRIPT,
-      operation,
-      account,
-      service,
-    ],
-    {
-      encoding: "utf8",
-      env: { ...process.env, HOME: home, USER: account },
-      timeout: 10_000,
-    },
-  );
-}
+let tokenProxy: Awaited<ReturnType<typeof startIdleDropProxy>> | null = null;
 
 beforeAll(() => {
   process.env.FX_DISABLE_KEYCHAIN = "1";
 });
-
-beforeAll(() => {
-  buildMcpDispatcherDriver(REPO_ROOT);
-}, ZIG_BUILD_WARMUP_TIMEOUT_MS);
 
 afterAll(() => {
   if (inheritedKeychainDisable === undefined) {
@@ -178,22 +106,22 @@ afterEach(async () => {
   const activeAuth = auth;
   const activeUpstream = upstream;
   const activeLegacyStreamable = legacyStreamable;
-  const activeLegacySse = legacySse;
+  const activeTokenProxy = tokenProxy;
   const activeCleanupRoot = cleanupRoot;
   tui = null;
   gateway = null;
   auth = null;
   upstream = null;
   legacyStreamable = null;
-  legacySse = null;
+  tokenProxy = null;
   cleanupRoot = null;
 
   if (activeTui) await activeTui.kill();
   activeGateway?.stop();
+  activeTokenProxy?.stop();
   activeAuth?.stop();
   activeUpstream?.stop();
   activeLegacyStreamable?.stop();
-  activeLegacySse?.stop();
   if (activeCleanupRoot) {
     rmSync(activeCleanupRoot, { recursive: true, force: true });
   }
@@ -202,39 +130,44 @@ afterEach(async () => {
 function startAuthFixture(
   upstreamUrl: string,
   options: {
-    wrongState?: boolean;
     rejectRefresh?: boolean;
     authorizationMetadataContentType?: string;
-    transport?: "http" | "sse";
-    rejectToolAuth?: boolean;
-    challengeMarkerPath?: string;
-    refreshBarrierStartedPath?: string;
-    refreshBarrierReleasePath?: string;
     stallRefresh?: boolean;
-    subscriptionChallenge?: "unauthorized" | "scope";
-    rotateOnSecondToolsPage?: boolean;
     rotateAuthorizationToken?: boolean;
-    rotateOnResourceReadCall?: number;
-    failFeatureRefreshAfterRotation?: boolean;
-    rejectResourceTemplateAuth?: boolean;
-    authorizationServerTrailingSlash?: boolean;
-    authorizationResponseIssuer?: string;
-    authorizationResponseTrailingSlash?: boolean;
+    /** Appended to the access token a code is exchanged for, such as "\r\n". */
+    accessTokenSuffix?: string;
     omitScopes?: boolean;
-    rejectDiscoveryWithoutChallenge?: boolean;
-    rejectDiscoveryWithRestAuthorizationDocument?: boolean;
+    /** The metadata's token endpoint, in place of its own. */
+    tokenEndpoint?: string;
     slackBridgeClientId?: string;
-    slackBridgeStatus?: number;
-    slackBridgeScopes?: unknown;
+    /** fx's Slack app signs in with `http://localhost:<port>/callback`, as fx does now, not fx.sh's redirect. */
+    slackLocalhostRedirect?: boolean;
+    /** Answer every refresh with this status and body, such as Slack's HTTP-200 `ok:false`. */
+    refreshAnswer?: { status: number; body: unknown };
     challengeScope?: string;
     rejectCodeExchange?: boolean;
     resourceAtOrigin?: boolean;
     /** Answer revocations this late. */
     revokeDelayMs?: number;
+    /** Answer the authorization server's metadata this late, like a slow sign-in. */
+    discoveryDelayMs?: number;
+    /**
+     * Each refresh token works once, as WorkOS and RFC 9700 have it: a refresh
+     * returns a new one and retires the one sent. The one just retired still
+     * returns the same tokens for `graceMs`; after that it's refused, and with
+     * `revokeOnReplay` the newest login of the chain stops working too.
+     */
+    singleUseRefresh?: { graceMs: number; revokeOnReplay?: boolean };
+    /** With `singleUseRefresh`, answer each refresh this late, after retiring the token it sent. */
+    refreshDelayMs?: number;
+    /** The code exchange waits for this file, after writing the other. */
+    codeBarrierStartedPath?: string;
+    codeBarrierReleasePath?: string;
+    /** Lists a registration endpoint, so a server added without a client ID can sign in. */
+    registration?: boolean;
   } = {},
 ) {
-  const transport = options.transport ?? "http";
-  const resourcePath = transport === "sse" ? "/sse" : "/mcp";
+  const resourcePath = "/mcp";
   const metadataResourcePath = (options.resourceAtOrigin ?? Boolean(options.slackBridgeClientId)) ? "" : resourcePath;
   const requests: Array<{
     method: string;
@@ -248,15 +181,20 @@ function startAuthFixture(
   let authorizationRequests = 0;
   let tokenExchanges = 0;
   let refreshes = 0;
+  let replays = 0;
+  const chain = {
+    current: REFRESH_INITIAL,
+    issued: 0,
+    retired: "",
+    retiredAt: 0,
+    retiredAnswer: {} as Record<string, unknown>,
+  };
   let refreshCancellations = 0;
   let revocations = 0;
+  let registrations = 0;
   let protectedToolCalls = 0;
-  let proxyStreamCancellations = 0;
   let expectedChallenge = "";
   let expectedScope = "tools.read offline_access";
-  let subscriptionRejections = 0;
-  let paginationRejections = 0;
-  let resourceReadRequests = 0;
 
   const server = Bun.serve({
     port: 0,
@@ -274,16 +212,14 @@ function startAuthFixture(
       });
       const origin = `http://127.0.0.1:${server.port}`;
       const resource = `${origin}${metadataResourcePath}`;
-      const protectedRoute = url.pathname === resourcePath ||
-        (transport === "sse" && url.pathname === "/messages");
+      const protectedRoute = url.pathname === resourcePath;
 
       if (url.pathname === "/api/slack/install/config" && options.slackBridgeClientId) {
         expect(url.searchParams.get("flow")).toBe("auth");
-        if (options.slackBridgeStatus) return new Response("unavailable", { status: options.slackBridgeStatus });
         return Response.json({
           client_id: options.slackBridgeClientId,
           redirect_uri: "https://fx.sh/api/slack/oauth/callback",
-          user_scopes: "slackBridgeScopes" in options ? options.slackBridgeScopes : ["tools.read"],
+          user_scopes: ["tools.read"],
         });
       }
 
@@ -301,154 +237,14 @@ function startAuthFixture(
           });
         }
         const message = body === "" ? null : JSON.parse(body);
-        if (
-          message?.method === "server/discover" &&
-          options.rejectDiscoveryWithoutChallenge
-        ) {
-          return new Response("", { status: 403 });
-        }
-        if (
-          message?.method === "server/discover" &&
-          options.rejectDiscoveryWithRestAuthorizationDocument
-        ) {
-          return Response.json(
-            {
-              error: 401,
-              reason: "Unauthorized",
-              detail: "You are not authorized for this resource.",
-            },
-            { status: 400 },
-          );
-        }
-        if (message?.method === "resources/read") {
-          resourceReadRequests += 1;
-          if (
-            token === ACCESS_INITIAL &&
-            resourceReadRequests === options.rotateOnResourceReadCall
-          ) {
-            return new Response("", {
-              status: 401,
-              headers: {
-                "www-authenticate":
-                  `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}", scope="tools.read"`,
-              },
-            });
-          }
-        }
-        if (
-          token === ACCESS_REFRESHED &&
-          options.failFeatureRefreshAfterRotation &&
-          [
-            "resources/list",
-            "resources/templates/list",
-            "prompts/list",
-          ].includes(message?.method)
-        ) {
-          return Response.json(
-            { error: "feature refresh failed after rotation" },
-            { status: 503 },
-          );
-        }
-        if (
-          message?.method === "resources/templates/list" &&
-          options.rejectResourceTemplateAuth
-        ) {
-          return new Response("", {
-            status: 403,
-            headers: {
-              "www-authenticate":
-                `Bearer error="insufficient_scope", scope="resources.read", resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`,
-            },
-          });
-        }
-        if (
-          message?.method === "subscriptions/listen" &&
-          options.subscriptionChallenge &&
-          subscriptionRejections === 0
-        ) {
-          subscriptionRejections += 1;
-          const scopeChallenge = options.subscriptionChallenge === "scope";
-          return new Response("", {
-            status: scopeChallenge ? 403 : 401,
-            headers: {
-              "www-authenticate": scopeChallenge
-                ? `Bearer error="insufficient_scope", scope="tools.call", resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`
-                : `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}", scope="tools.read"`,
-            },
-          });
-        }
-        if (
-          message?.method === "tools/list" &&
-          message.params?.cursor === "p2" &&
-          token === ACCESS_INITIAL &&
-          options.rotateOnSecondToolsPage &&
-          paginationRejections === 0
-        ) {
-          paginationRejections += 1;
-          return new Response("", {
-            status: 401,
-            headers: {
-              "www-authenticate":
-                `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}", scope="tools.read"`,
-            },
-          });
-        }
-        if (message?.method === "tools/call") {
-          protectedToolCalls += 1;
-          if (options.rejectToolAuth) {
-            if (options.challengeMarkerPath) {
-              writeFileSync(
-                options.challengeMarkerPath,
-                `${message.id}\n`,
-              );
-            }
-            return new Response("", {
-              status: 403,
-              headers: {
-                "www-authenticate":
-                  `Bearer error="insufficient_scope", scope="tools.call", resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`,
-              },
-            });
-          }
-        }
-        const target = transport === "sse" && url.pathname === "/messages"
-          ? `${new URL(upstreamUrl).origin}/messages`
-          : upstreamUrl;
+        if (message?.method === "tools/call") protectedToolCalls += 1;
         const upstreamHeaders = new Headers(request.headers);
         upstreamHeaders.set("connection", "close");
-        const upstreamResponse = await fetch(target, {
+        return await fetch(upstreamUrl, {
           method: request.method,
           headers: upstreamHeaders,
           ...(body === "" ? {} : { body }),
         });
-        if (
-          transport === "sse" &&
-          request.method === "GET" &&
-          upstreamResponse.body
-        ) {
-          const reader = upstreamResponse.body.getReader();
-          return new Response(
-            new ReadableStream({
-              async pull(controller) {
-                const chunk = await reader.read();
-                if (chunk.done) {
-                  controller.close();
-                } else {
-                  controller.enqueue(chunk.value);
-                }
-              },
-              async cancel(reason) {
-                proxyStreamCancellations += 1;
-                await reader.cancel(reason);
-              },
-            }),
-            {
-              status: upstreamResponse.status,
-              headers: upstreamResponse.headers,
-            },
-          );
-        }
-        return upstreamResponse;
       }
       if (
         url.pathname ===
@@ -457,7 +253,7 @@ function startAuthFixture(
         return Response.json({
           resource,
           authorization_servers: [
-            options.authorizationServerTrailingSlash ? `${origin}/` : origin,
+            origin,
           ],
           ...(options.omitScopes
             ? {}
@@ -465,10 +261,11 @@ function startAuthFixture(
         });
       }
       if (url.pathname === "/.well-known/oauth-authorization-server") {
+        if (options.discoveryDelayMs) await Bun.sleep(options.discoveryDelayMs);
         const metadata = {
           issuer: origin,
           authorization_endpoint: `${origin}/authorize`,
-          token_endpoint: `${origin}/token`,
+          token_endpoint: options.tokenEndpoint ?? `${origin}/token`,
           revocation_endpoint: `${origin}/revoke`,
           ...(options.omitScopes
             ? {}
@@ -477,6 +274,7 @@ function startAuthFixture(
           token_endpoint_auth_methods_supported: ["none"],
           code_challenge_methods_supported: ["S256"],
           authorization_response_iss_parameter_supported: true,
+          ...(options.registration ? { registration_endpoint: `${origin}/register` } : {}),
         };
         if (options.authorizationMetadataContentType) {
           return new Response(JSON.stringify(metadata), {
@@ -497,12 +295,11 @@ function startAuthFixture(
         redirect.searchParams.set("code", "fixture-code");
         redirect.searchParams.set(
           "state",
-          options.wrongState ? "wrong-state" : url.searchParams.get("state")!,
+          url.searchParams.get("state")!,
         );
         redirect.searchParams.set(
           "iss",
-          options.authorizationResponseIssuer ??
-            (options.authorizationResponseTrailingSlash ? `${origin}/` : origin),
+          origin,
         );
         return Response.redirect(redirect, 302);
       }
@@ -511,20 +308,33 @@ function startAuthFixture(
         expect(form.get("resource")).toBe(new URL(resource).href);
         if (form.get("grant_type") === "refresh_token") {
           refreshes += 1;
-          expect(form.get("refresh_token")).toBe(REFRESH_INITIAL);
-          if (
-            refreshes === 1 &&
-            options.refreshBarrierStartedPath &&
-            options.refreshBarrierReleasePath
-          ) {
-            writeFileSync(options.refreshBarrierStartedPath, "refresh-started");
-            if (!await waitForFile(options.refreshBarrierReleasePath, 10_000)) {
-              return Response.json(
-                { error: "refresh barrier timed out" },
-                { status: 504 },
-              );
+          const rule = options.singleUseRefresh;
+          if (rule) {
+            const sent = form.get("refresh_token") ?? "";
+            if (sent !== "" && sent === chain.current) {
+              chain.issued += 1;
+              const answer = {
+                access_token: `${ACCESS_REFRESHED}-${chain.issued}`,
+                refresh_token: `${REFRESH_ROTATED}-${chain.issued}`,
+                token_type: "Bearer",
+                scope: "tools.read offline_access",
+                expires_in: 3600,
+              };
+              Object.assign(chain, { current: answer.refresh_token, retired: sent, retiredAt: Date.now(), retiredAnswer: answer });
+              validTokens.add(answer.access_token);
+              if (options.refreshDelayMs) await Bun.sleep(options.refreshDelayMs);
+              return Response.json(answer);
             }
+            if (sent === chain.retired && Date.now() - chain.retiredAt <= rule.graceMs) return Response.json(chain.retiredAnswer);
+            replays += 1;
+            if (rule.revokeOnReplay) {
+              chain.current = "";
+              validTokens.clear();
+            }
+            return Response.json({ error: "invalid_grant" }, { status: 400 });
           }
+          // A refused refresh is refused whichever token it presents.
+          if (!options.rejectRefresh) expect(form.get("refresh_token")).toBe(REFRESH_INITIAL);
           if (options.stallRefresh && refreshes === 1) {
             return new Response(
               new ReadableStream({
@@ -541,6 +351,7 @@ function startAuthFixture(
               { status: 400 },
             );
           }
+          if (options.refreshAnswer) return Response.json(options.refreshAnswer.body, { status: options.refreshAnswer.status });
           return Response.json({
             access_token: ACCESS_REFRESHED,
             refresh_token: REFRESH_ROTATED,
@@ -550,8 +361,18 @@ function startAuthFixture(
           });
         }
         tokenExchanges += 1;
-        if (form.get("client_id") === FX_SLACK_CLIENT_ID) {
-          expect(form.get("redirect_uri")).toBe("https://fx.sh/api/slack/oauth/callback");
+        if (options.codeBarrierStartedPath && options.codeBarrierReleasePath) {
+          writeFileSync(options.codeBarrierStartedPath, "code-started");
+          if (!await waitForFile(options.codeBarrierReleasePath, 10_000)) {
+            return Response.json({ error: "code barrier timed out" }, { status: 504 });
+          }
+        }
+        // Only a server playing Slack's bridge gets fx.sh's redirect; another
+        // server that names fx's Slack app signs in on its own.
+        if (options.slackBridgeClientId && form.get("client_id") === FX_SLACK_CLIENT_ID) {
+          if (options.slackLocalhostRedirect) expect(form.get("redirect_uri")).toMatch(/^http:\/\/localhost:\d+\/callback$/);
+          else expect(form.get("redirect_uri")).toBe("https://fx.sh/api/slack/oauth/callback");
+          expect(form.get("client_secret")).toBeNull();
         }
         if (options.rejectCodeExchange) return Response.json({ error: "invalid_grant" }, { status: 400 });
         expect(form.get("grant_type")).toBe("authorization_code");
@@ -562,9 +383,9 @@ function startAuthFixture(
           .digest("base64url");
         expect(actualChallenge).toBe(expectedChallenge);
         return Response.json({
-          access_token: options.rotateAuthorizationToken
+          access_token: (options.rotateAuthorizationToken
             ? ACCESS_REFRESHED
-            : ACCESS_INITIAL,
+            : ACCESS_INITIAL) + (options.accessTokenSuffix ?? ""),
           refresh_token: options.rotateAuthorizationToken
             ? REFRESH_ROTATED
             : REFRESH_INITIAL,
@@ -578,24 +399,36 @@ function startAuthFixture(
         if (options.revokeDelayMs) await Bun.sleep(options.revokeDelayMs);
         return new Response("", { status: 200 });
       }
+      if (url.pathname === "/register" && options.registration && request.method === "POST") {
+        registrations += 1;
+        const asked = JSON.parse(body) as { redirect_uris?: string[] };
+        return Response.json({ client_id: "fx-mcp-auth-test", token_endpoint_auth_method: "none", redirect_uris: asked.redirect_uris ?? [] }, { status: 201 });
+      }
       return new Response("not found", { status: 404 });
     },
   });
 
   return {
     resource: `http://127.0.0.1:${server.port}${metadataResourcePath}`,
-    url: `http://127.0.0.1:${server.port}${
-      transport === "sse" ? "/sse" : "/mcp"
-    }`,
+    url: `http://127.0.0.1:${server.port}/mcp`,
     requests,
+    /** The access tokens the server takes; a test may withdraw them. */
+    validTokens,
     get authorizationRequests() {
       return authorizationRequests;
     },
     get tokenExchanges() {
       return tokenExchanges;
     },
+    get registrations() {
+      return registrations;
+    },
     get refreshes() {
       return refreshes;
+    },
+    /** Refreshes with a retired refresh token, past its grace. */
+    get replays() {
+      return replays;
     },
     get refreshCancellations() {
       return refreshCancellations;
@@ -605,15 +438,6 @@ function startAuthFixture(
     },
     get protectedToolCalls() {
       return protectedToolCalls;
-    },
-    get proxyStreamCancellations() {
-      return proxyStreamCancellations;
-    },
-    get subscriptionRejections() {
-      return subscriptionRejections;
-    },
-    get paginationRejections() {
-      return paginationRejections;
     },
     stop() {
       server.stop(true);
@@ -652,7 +476,6 @@ function createRoot(
         fixture: {
           type: transport,
           url: serverUrl,
-          environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
           ...(configureOauth
             ? {
                 oauth: {
@@ -662,7 +485,6 @@ function createRoot(
               }
             : {}),
           startup_timeout_ms: 5_000,
-          operation_timeout_ms: 5_000,
         },
       },
     }),
@@ -698,12 +520,16 @@ function baseEnv(root: ReturnType<typeof createRoot>) {
     AI_GATEWAY_API_KEY: "fake-mcp-auth-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_AUTO_UPGRADE: "0",
-    FX_MCP_PROTOCOL_VERSION: "2026-07-28",
     FX_PERMISSION_MODE: "auto",
     FX_MODEL: MODEL,
     FX_TRACE_LOG: root.trace,
     FX_TRACE_SCOPES: "mcp,core",
   };
+}
+
+/** fx exited 0. When it didn't, the failure shows what it printed. */
+function expectExit0(result: { code: number; stdout: string; stderr: string }): void {
+  expect({ code: result.code, stdout: result.stdout, stderr: result.stderr }).toMatchObject({ code: 0 });
 }
 
 function seedExpiredCredentials(
@@ -744,6 +570,89 @@ function seedExpiredCredentials(
   return path;
 }
 
+/**
+ * Holds fx's MCP credential store lock from another process, as a busy fx would, for
+ * `seconds`; resolves once it is held.
+ */
+async function holdStoreLock(root: ReturnType<typeof createRoot>, seconds: number) {
+  const path = join(root.home, ".fx", "mcp-credentials", "credentials-v3.lock");
+  const holder = Bun.spawn(["perl", "-e", 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print "held\n"; sleep $ARGV[1];', path, String(seconds)], { stdout: "pipe" });
+  const reader = holder.stdout.getReader();
+  const { value } = await reader.read();
+  expect(new TextDecoder().decode(value)).toBe("held\n");
+  return holder;
+}
+
+/** A login in fx's MCP credential store (FX_DISABLE_KEYCHAIN), as fx saves it. */
+function seedV2Credential(root: ReturnType<typeof createRoot>, activeAuth: AuthFixture, fields: Record<string, unknown> = {}) {
+  const origin = new URL(activeAuth.url).origin;
+  const directory = join(root.home, ".fx", "mcp-credentials");
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const credential = JSON.stringify({
+    access: ACCESS_INITIAL, refresh: REFRESH_INITIAL, expires_at_ms: null, skew_ms: 30_000,
+    token_endpoint: `${origin}/token`, revocation_endpoint: `${origin}/revoke`,
+    resource: new URL(activeAuth.resource).href, client_id: "fx-mcp-auth-test", client_secret: null, method: "none", ...fields,
+  });
+  const path = join(directory, "credentials-v3.json");
+  writeFileSync(path, JSON.stringify({ version: 1, servers: [{ name: "fixture", url: activeAuth.url, credential }] }), { mode: 0o600 });
+  return path;
+}
+
+/**
+ * The MCP credential store's Keychain item for a throwaway account, through
+ * the same Security calls fx's osascript helper makes, so no other program
+ * needs Keychain access to it. `op` is "load" (the item's text, "" when
+ * there is none) or "delete".
+ */
+const MCP_KEYCHAIN_SERVICE = "FX_MCP_OAUTH_CREDENTIALS_V3";
+const MCP_KEYCHAIN_ACCOUNT_PREFIX = "fx-e2e-mcp-lock-";
+const MCP_KEYCHAIN_SCRIPT = `
+ObjC.import("Security");
+ObjC.import("Foundation");
+const object = (value) => ObjC.castRefToObject(value);
+function run(argv) {
+  const query = $.NSMutableDictionary.alloc.init;
+  query.setObjectForKey(object($.kSecClassGenericPassword), object($.kSecClass));
+  query.setObjectForKey($(argv[1]), object($.kSecAttrAccount));
+  query.setObjectForKey($(argv[2]), object($.kSecAttrService));
+  if (argv[0] === "delete") {
+    const status = $.SecItemDelete(query);
+    if (status !== 0 && status !== -25300) throw new Error("keychain status=" + status);
+    return "";
+  }
+  query.setObjectForKey($.NSNumber.numberWithBool(true), object($.kSecReturnData));
+  query.setObjectForKey(object($.kSecMatchLimitOne), object($.kSecMatchLimit));
+  const result = Ref();
+  const status = $.SecItemCopyMatching(query, result);
+  if (status === -25300) return "";
+  if (status !== 0) throw new Error("keychain status=" + status);
+  return $.NSString.alloc.initWithDataEncoding(ObjC.castRefToObject(result[0]), $.NSUTF8StringEncoding).js;
+}`;
+
+function mcpKeychainItem(op: "load" | "delete", account: string, home: string): string {
+  if (!account.startsWith(MCP_KEYCHAIN_ACCOUNT_PREFIX)) throw new Error("refusing to touch a non-test MCP Keychain account");
+  const result = spawnSync("/usr/bin/osascript", ["-l", "JavaScript", "-e", MCP_KEYCHAIN_SCRIPT, op, account, MCP_KEYCHAIN_SERVICE], {
+    encoding: "utf8",
+    env: { ...process.env, HOME: home, USER: account },
+  });
+  if (result.status !== 0) throw new Error(`MCP Keychain ${op} failed: ${result.stderr.trim()}`);
+  return result.stdout.trim();
+}
+
+/**
+ * Pauses the first Keychain read fx makes for `account` from now on, as a
+ * slow Keychain does; resolves with its pid, or null if none starts in 15 s.
+ */
+function pauseNextKeychainRead(account: string): { pid: Promise<number | null>; stop: () => void } {
+  const watcher = Bun.spawn(["/bin/sh", "-c", `while :; do p=$(pgrep -f "load ${account} ${MCP_KEYCHAIN_SERVICE}" | head -1); if [ -n "$p" ]; then kill -STOP "$p"; echo "$p"; exit 0; fi; done`], { stdout: "pipe" });
+  const pid = Promise.race([new Response(watcher.stdout).text(), Bun.sleep(15_000).then(() => "")]).then((out) => Number(out.trim()) || null);
+  return { pid, stop: () => { try { watcher.kill(); } catch {} } };
+}
+
+function releaseProcess(pid: number | null) {
+  if (pid) try { process.kill(pid, "SIGCONT"); } catch {}
+}
+
 function startToolGateway() {
   return startFakeGateway([
     fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
@@ -754,11 +663,12 @@ function startToolGateway() {
   });
 }
 
-function startDelayedToolGateway(delayMs: number, finalText: string) {
+/// Holds the call to the protected tool until `callAt`, a wall-clock time in ms.
+function startDelayedToolGateway(callAt: number, finalText: string) {
   return startFakeGateway([
     fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
     async () => {
-      await Bun.sleep(delayMs);
+      await Bun.sleep(Math.max(0, callAt - Date.now()));
       return fakeGatewayToolCall("call_mcp", TOOL_NAME, {
         text: "authenticated",
       });
@@ -769,17 +679,26 @@ function startDelayedToolGateway(delayMs: number, finalText: string) {
   });
 }
 
-function startRefreshRecoveryGateway(delayMs: number) {
+/// Holds the first call to the protected tool until `callAt()`, a wall-clock
+/// time in ms.
+function startRefreshRecoveryGateway(callAt: () => number) {
   return startFakeGateway([
     fakeGatewayToolCall("select_cancel", "mcp_select_tool", {
       name: TOOL_NAME,
     }),
     async () => {
-      await Bun.sleep(delayMs);
+      await Bun.sleep(Math.max(0, callAt() - Date.now()));
       return fakeGatewayToolCall("call_cancel", TOOL_NAME, {
         text: "cancelled",
       });
     },
+    fakeGatewayToolCall("select_retry", "mcp_select_tool", {
+      name: TOOL_NAME,
+    }),
+    fakeGatewayToolCall("call_retry", TOOL_NAME, {
+      text: "retried",
+    }),
+    fakeGatewayFinalText("Retry ended."),
     fakeGatewayToolCall("select_recovery", "mcp_select_tool", {
       name: TOOL_NAME,
     }),
@@ -827,1647 +746,7 @@ function toolResultText(
   return output.value;
 }
 
-function preserveAuthFailure(
-  label: string,
-  root: ReturnType<typeof createRoot>,
-  result: Awaited<ReturnType<typeof runFx>>,
-  activeAuth: AuthFixture,
-  activeUpstream: ReturnType<typeof startModernMcpHttpFixture>,
-  activeGateway: ReturnType<typeof startFakeGateway>,
-): void {
-  if (result.code === 0) return;
-  cleanupRoot = null;
-  writeFileSync(join(root.root, "fx-stdout.log"), result.stdout);
-  writeFileSync(join(root.root, "fx-stderr.log"), result.stderr);
-  writeFileSync(
-    join(root.root, "failure.json"),
-    JSON.stringify({
-      label,
-      result,
-      authRequests: activeAuth.requests.map((request) => ({
-        ...request,
-        authorization: request.authorization === `Bearer ${ACCESS_INITIAL}`
-          ? "initial"
-          : request.authorization === `Bearer ${ACCESS_REFRESHED}`
-          ? "refreshed"
-          : request.authorization === null
-          ? null
-          : "other",
-      })),
-      upstreamRequests: activeUpstream.requests.map((request) => ({
-        message: request.message,
-        receivedAtMs: request.receivedAtMs,
-      })),
-      gatewayRequests: activeGateway.requests.map((request) => request.body),
-    }, null, 2),
-  );
-  throw new Error(`fx ${label} failed; retained artifacts: ${root.root}`);
-}
-
-async function preserveAuthTuiFailure(
-  label: string,
-  root: ReturnType<typeof createRoot>,
-  error: unknown,
-): Promise<never> {
-  cleanupRoot = null;
-  const activeTui = tui;
-  writeFileSync(
-    join(root.root, "tui-failure.json"),
-    JSON.stringify({
-      label,
-      error: error instanceof Error ? error.stack ?? error.message : String(error),
-      paneStatus: activeTui?.paneStatus() ?? null,
-      pane: activeTui ? await activeTui.captureFullScrollback() : "",
-      authRequests: auth?.requests.map((request) => ({
-        method: request.method,
-        path: request.path,
-        body: request.body,
-      })) ?? [],
-      upstreamRequests: upstream?.requests.map((request) => request.message) ?? [],
-      gatewayRequests: gateway?.requests.map((request) => request.body) ?? [],
-    }, null, 2),
-  );
-  throw new Error(`fx ${label} failed; retained artifacts: ${root.root}`);
-}
-
-async function authorizePersonalFixture(activeAuth: AuthFixture, start: URL) {
-  const authorize = new URL("/authorize", activeAuth.url);
-  authorize.search = new URLSearchParams({
-    client_id: start.searchParams.get("client_id")!, resource: new URL(activeAuth.resource).href, response_type: "code",
-    redirect_uri: "https://fx.sh/api/slack/oauth/callback", scope: start.searchParams.get("scope")!,
-    state: start.searchParams.get("state")!, code_challenge: start.searchParams.get("challenge")!, code_challenge_method: "S256",
-  }).toString();
-  const issued = await fetch(authorize, { redirect: "manual" });
-  return new URL(issued.headers.get("location")!).searchParams;
-}
-
-describe("MCP remote authentication lifecycle", () => {
-  test("generic MCP auth missing a Client ID does not recommend Slack setup", async () => {
-    upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url);
-    const root = createRoot(auth, false);
-    const result = await runFx(["mcp", "auth", "fixture"], {
-      cwd: root.workspace,
-      env: { ...baseEnv(root), AI_GATEWAY_API_KEY: undefined },
-    });
-    expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain("ClientRegistrationUnavailable");
-    expect(result.stderr).not.toContain("/mcp add slack");
-    expect(existsSync(root.openLog)).toBe(false);
-    expect(auth.tokenExchanges).toBe(0);
-  });
-
-  for (const scenario of ["fresh", "missing-client", "denied"] as const) {
-    test(`Slack preset CLI connects from ${scenario} configuration`, async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID });
-      const root = createRoot(auth, false, "http", auth.url, false);
-      const profilePath = join(root.home, ".fx", "mcp.json");
-      const other = { type: "http", url: "https://example.test/mcp", enabled: false };
-      if (scenario === "fresh") rmSync(profilePath);
-      else writeFileSync(profilePath, JSON.stringify({ mcp: {
-        other, slack: { type: "http", url: auth.url, operation_timeout_ms: 1234 },
-      } }));
-      const origin = new URL(auth.url).origin;
-      const env = { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: origin, AI_GATEWAY_API_KEY: undefined };
-      const authentication = runFx(["mcp", "add", "slack"], { cwd: root.workspace, env, timeoutMs: 15_000 });
-      expect(await waitForFileText(root.openLog, "/api/slack/auth?", 5_000)).toBe(true);
-      const start = new URL(readFileSync(root.openLog, "utf8").trim());
-      expect(start.searchParams.get("client_id")).toBe(FX_SLACK_CLIENT_ID);
-      expect(start.searchParams.get("scope")).toBe("tools.read");
-      const body = await authorizePersonalFixture(auth, start);
-      if (scenario === "denied") { body.delete("code"); body.set("error", "access_denied"); }
-      const response = await fetch(`http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`, {
-        method: "POST", headers: { origin }, body, redirect: "manual",
-      });
-      expect(response.status).toBe(303);
-      const result = await authentication;
-      expect(result.stderr).not.toMatch(/panic|abort|segmentation/i);
-      expect(result.stdout + result.stderr).not.toContain(ACCESS_INITIAL);
-      expect(result.stdout + result.stderr).not.toContain(REFRESH_INITIAL);
-      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-      expect(profile.mcp.slack.oauth).toEqual({ client_id: FX_SLACK_CLIENT_ID });
-      if (scenario !== "fresh") {
-        expect(profile.mcp.other.url).toBe(other.url);
-        expect(profile.mcp.other.enabled).toBe(false);
-        expect(profile.mcp.slack.operation_timeout_ms).toBe(1234);
-      }
-      if (scenario === "denied") {
-        expect(result.code).not.toBe(0);
-        expect(result.stderr).toContain("Authorization was declined");
-        expect(result.stdout).not.toContain("Slack connected");
-      } else {
-        expect(result.stderr).toBe("");
-        expect(result.code).toBe(0);
-        expect(result.stdout).toContain("Slack connected. You can now use Slack.");
-        rmSync(root.openLog);
-        const repeated = await runFx(["mcp", "add", "slack"], { cwd: root.workspace, env, timeoutMs: 15_000 });
-        expect(repeated.code).toBe(0);
-        expect(repeated.stdout).toContain("Slack is already connected");
-        expect(existsSync(root.openLog)).toBe(false);
-        expect(auth.tokenExchanges).toBe(1);
-        const removed = await runFx(["mcp", "remove", "slack"], { cwd: root.workspace, env });
-        expect(removed.code).toBe(0);
-        const restored = await runFx(["mcp", "add", "slack"], { cwd: root.workspace, env, timeoutMs: 15_000 });
-        expect(restored.code).toBe(0);
-        expect(JSON.parse(readFileSync(profilePath, "utf8")).mcp.slack.oauth.client_id).toBe(FX_SLACK_CLIENT_ID);
-        expect(auth.tokenExchanges).toBe(1);
-      }
-    }, 45_000);
-  }
-
-  for (const custom of [
-    { type: "http", url: "https://custom.example/mcp" },
-    { type: "http", oauth: { client_id: "another-app" } },
-    { type: "http", headers: { "X-Custom": "custom" } },
-    { type: "local", command: ["custom-slack"] },
-  ]) {
-    test(`Slack preset preserves custom configuration: ${JSON.stringify(custom)}`, async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID });
-      const root = createRoot(auth, false, "http", auth.url, false);
-      const profilePath = join(root.home, ".fx", "mcp.json");
-      const original = JSON.stringify({ mcp: { slack: { url: auth.url, ...custom } } });
-      writeFileSync(profilePath, original);
-      const result = await runFx(["mcp", "add", "slack"], {
-        cwd: root.workspace, env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin },
-      });
-      expect(result.code).not.toBe(0);
-      expect(result.stderr).toContain("Slack has custom configuration");
-      expect(readFileSync(profilePath, "utf8")).toBe(original);
-      expect(existsSync(root.openLog)).toBe(false);
-      expect(auth.requests).toHaveLength(0);
-    });
-  }
-
-  for (const entry of ["command", "menu"] as const) {
-    test.skipIf(!tmuxAvailable())(`Slack preset ${entry} connects in the current session`, async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID });
-      const root = createRoot(auth, false, "http", auth.url, false);
-      rmSync(join(root.home, ".fx", "mcp.json"));
-      const origin = new URL(auth.url).origin;
-      gateway = startFakeGateway([
-        fakeGatewayToolCall("select_slack", "mcp_select_tool", { name: "mcp_slack_echo" }),
-        fakeGatewayToolCall("call_slack", "mcp_slack_echo", { text: "connected" }),
-        fakeGatewayFinalText("Slack tool call complete."),
-      ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
-      tui = await TmuxSession.create({
-        isolated: true, cwd: root.workspace, width: 120, height: 34,
-        env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: origin, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
-      });
-      await tui.waitForComposer(15_000);
-      if (entry === "menu") {
-        await tui.sendText("/mcp");
-        await tui.waitForText("[Servers]", 5_000);
-        await tui.sendKeys("s");
-      } else await tui.sendText("/mcp add slack");
-      expect(await waitForFileText(root.openLog, "/api/slack/auth?", 8_000)).toBe(true);
-      const start = new URL(readFileSync(root.openLog, "utf8").trim());
-      await tui.waitForComposer(5_000);
-      await tui.sendText("/mcp add slack");
-      await tui.waitForText("Slack authorization is already in progress.", 5_000);
-      const body = await authorizePersonalFixture(auth, start);
-      const response = await fetch(`http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`, {
-        method: "POST", headers: { origin }, body, redirect: "manual",
-      });
-      expect(response.status).toBe(303);
-      const pane = await tui.waitForText("Slack connected. You can now use Slack.", 15_000);
-      expect(pane).not.toContain(ACCESS_INITIAL);
-      expect(tui.paneStatus().dead).toBe(false);
-      await tui.waitForComposer(5_000);
-      await tui.sendText("/mcp list");
-      const menu = await tui.waitForText("[Servers]", 10_000);
-      expect(menu).toMatch(/slack[\s\S]{0,120}Ready/);
-      await tui.sendKeys("Escape");
-      await tui.waitForComposer(5_000);
-      await tui.sendText("Use the connected Slack tool.");
-      await tui.waitForText("Slack tool call complete.", 15_000);
-      expect(upstream.requests.filter((request) => request.message.method === "tools/call")).toHaveLength(1);
-      expect(auth.tokenExchanges).toBe(1);
-    }, 40_000);
-  }
-
-  for (const scenario of ["success", "reauth", "no-scopes", "extra-scopes", "denied", "issuer", "exchange", "save"] as const) {
-    test(`personal Slack HTTPS bridge completes after persistence: ${scenario}`, async () => {
-      const succeeds = ["success", "reauth", "no-scopes", "extra-scopes"].includes(scenario);
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, rejectCodeExchange: scenario === "exchange", rotateAuthorizationToken: scenario === "reauth" });
-      const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
-      if (scenario === "reauth") {
-        const path = seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
-        const saved = JSON.parse(readFileSync(path, "utf8"));
-        saved.credentials[0].client_id = FX_SLACK_CLIENT_ID;
-        saved.credentials[0].scope = "tools.read offline_access im:history search:read.private";
-        writeFileSync(path, JSON.stringify(saved), { mode: 0o600 });
-      }
-      const bridgeOrigin = new URL(auth.url).origin;
-      const profilePath = join(root.home, ".fx", "mcp.json");
-      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-      profile.mcp.fixture.oauth.callback_port = Number(new URL(auth.url).port);
-      if (scenario === "no-scopes") delete profile.mcp.fixture.oauth.scopes;
-      if (scenario === "extra-scopes") profile.mcp.fixture.oauth.scopes = ["tools.read", "im:history", "search:read.private"];
-      writeFileSync(profilePath, JSON.stringify(profile));
-      const env = { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: bridgeOrigin, AI_GATEWAY_API_KEY: undefined };
-      const authentication = runFx(["mcp", "auth", "fixture"], { cwd: root.workspace, env, timeoutMs: 15_000 });
-      expect(await waitForFileText(root.openLog, "/api/slack/auth?", 5_000)).toBe(true);
-      const start = new URL(readFileSync(root.openLog, "utf8").trim());
-      expect(start.origin).toBe(bridgeOrigin);
-      expect([...start.searchParams.keys()].sort()).toEqual(["challenge", "client_id", "port", "scope", "state"]);
-      expect(start.searchParams.get("scope")).toBe("tools.read");
-      const target = `http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`;
-      const body = await authorizePersonalFixture(auth, start);
-      const postCallback = (fields: URLSearchParams, origin = bridgeOrigin) => fetch(target, { method: "POST", headers: { origin }, body: fields, redirect: "manual" });
-      expect((await postCallback(body, "https://evil.example")).status).toBe(404);
-      const wrong = new URLSearchParams(body);
-      wrong.set("state", "wrong-state");
-      expect((await postCallback(wrong)).status).toBe(404);
-      expect(auth.tokenExchanges).toBe(0);
-      if (scenario === "denied") { body.delete("code"); body.set("error", "access_denied"); }
-      if (scenario === "issuer") body.set("iss", "https://wrong.example");
-      const credentialDir = join(root.home, ".fx", "mcp-credentials");
-      const credentialPath = join(credentialDir, "credentials.json");
-      if (scenario === "save") writeFileSync(credentialDir, "blocked persistence", { mode: 0o600 });
-      const response = await postCallback(body);
-      expect(response.status).toBe(303);
-      expect(response.headers.get("location")).toBe(`${bridgeOrigin}/api/slack/auth/complete?result=${succeeds ? "success" : "failed"}`);
-      expect(response.headers.get("cache-control")).toBe("no-store");
-      expect(response.headers.get("referrer-policy")).toBe("no-referrer");
-      expect(await response.text()).toBe("");
-      expect(existsSync(credentialPath)).toBe(succeeds);
-      const result = await authentication;
-      expect(result.stderr).not.toMatch(/panic|abort|segmentation/i);
-      expect(auth.tokenExchanges).toBe(["denied", "issuer"].includes(scenario) ? 0 : 1);
-      for (const secret of ["fixture-code", ACCESS_INITIAL, REFRESH_INITIAL, ACCESS_REFRESHED, REFRESH_ROTATED]) {
-        expect(result.stdout + result.stderr + JSON.stringify([...response.headers])).not.toContain(secret);
-      }
-      expect(JSON.stringify([...response.headers])).not.toContain(body.get("state")!);
-      expect(existsSync(join(root.home, ".fx", "slack", "installation.json"))).toBe(false);
-      if (succeeds) {
-        expect(result.code).toBe(0);
-        expect(result.stderr).toBe("");
-        expect(result.stdout).toContain("Authenticated MCP server 'fixture'");
-        const credentials = JSON.parse(readFileSync(credentialPath, "utf8")).credentials;
-        expect(credentials).toHaveLength(1);
-        expect(credentials[0].access_token).toBe(scenario === "reauth" ? ACCESS_REFRESHED : ACCESS_INITIAL);
-        expect(credentials[0].refresh_token).toBe(scenario === "reauth" ? REFRESH_ROTATED : REFRESH_INITIAL);
-        expect(credentials[0].scope).toBe("tools.read");
-        expect(credentials[0].resource).toBe(`${bridgeOrigin}/`);
-        expect(statSync(credentialPath).mode & 0o777).toBe(0o600);
-      } else {
-        expect(result.stdout).not.toContain("Authenticated MCP server");
-      }
-      expect(await postCallback(body).catch(() => null)).toBe(null);
-    }, 20_000);
-  }
-
-  test("personal Slack rejects an endpoint-scoped resource before opening a browser", async () => {
-    upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, resourceAtOrigin: false });
-    const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
-    const result = await runFx(["mcp", "auth", "fixture"], {
-      cwd: root.workspace, env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin }, timeoutMs: 15_000,
-    });
-    expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain("InvalidSlackAuthorizationResource");
-    expect(existsSync(root.openLog)).toBe(false);
-    expect(auth.authorizationRequests).toBe(0);
-    expect(auth.tokenExchanges).toBe(0);
-    expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json"))).toBe(false);
-  }, 20_000);
-
-  for (const scenario of ["read-only", "empty", "unrelated-extra", "reauth"] as const) {
-    test(`personal Slack rejects scope expansion without changing credentials: ${scenario}`, async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, slackBridgeScopes: FX_SLACK_SCOPES });
-      const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
-      const profilePath = join(root.home, ".fx", "mcp.json");
-      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-      profile.mcp.fixture.oauth.scopes = scenario === "empty" ? [] :
-        scenario === "unrelated-extra" ? ["channels:read", "im:history"] : ["channels:read"];
-      writeFileSync(profilePath, JSON.stringify(profile));
-      const env = { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin, AI_GATEWAY_API_KEY: undefined };
-      if (scenario === "empty") {
-        const added = await runFx(["mcp", "add", "auxiliary", "echo"], { cwd: root.workspace, env });
-        expect(added.code).toBe(0);
-        expect(JSON.parse(readFileSync(profilePath, "utf8")).mcp.fixture.oauth.scopes).toEqual([]);
-      }
-      const originalProfile = readFileSync(profilePath, "utf8");
-      const credentialPath = join(root.home, ".fx", "mcp-credentials", "credentials.json");
-      let originalCredentials: string | undefined;
-      if (scenario === "reauth") {
-        seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
-        const saved = JSON.parse(readFileSync(credentialPath, "utf8"));
-        saved.credentials[0].client_id = FX_SLACK_CLIENT_ID;
-        saved.credentials[0].scope = FX_SLACK_SCOPES.join(" ");
-        originalCredentials = JSON.stringify(saved);
-        writeFileSync(credentialPath, originalCredentials, { mode: 0o600 });
-      }
-      const result = await runFx(["mcp", "auth", "fixture"], { cwd: root.workspace, env, timeoutMs: 15_000 });
-      expect(result.code).not.toBe(0);
-      expect(result.stderr).toContain("Your configured Slack scopes request fewer permissions than fx requires");
-      expect(result.stderr).toContain("Authorization was not started");
-      expect(result.stderr).toContain("Remove the local scopes override only if you want to authorize the full shared scope set");
-      expect(result.stdout).not.toContain("/api/slack/auth?");
-      expect(existsSync(root.openLog)).toBe(false);
-      expect(auth.requests.map((request) => request.path)).toEqual(["/api/slack/install/config"]);
-      expect(auth.authorizationRequests).toBe(0);
-      expect(auth.tokenExchanges).toBe(0);
-      expect(readFileSync(profilePath, "utf8")).toBe(originalProfile);
-      if (originalCredentials !== undefined) expect(readFileSync(credentialPath, "utf8")).toBe(originalCredentials);
-      else expect(existsSync(credentialPath)).toBe(false);
-      expect(result.stderr).not.toMatch(/panic|abort|segmentation/i);
-      expect(result.stdout + result.stderr).not.toContain(ACCESS_INITIAL);
-      expect(result.stdout + result.stderr).not.toContain(REFRESH_INITIAL);
-    }, 20_000);
-  }
-
-  for (const scopes of [undefined, [], [""], ["tools.read im:history"], ["bad<scope"], ["x".repeat(257)]]) {
-    test(`personal Slack rejects invalid shared scopes: ${JSON.stringify(scopes)}`, async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, slackBridgeScopes: scopes });
-      const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
-      const result = await runFx(["mcp", "auth", "fixture"], {
-        cwd: root.workspace, env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin }, timeoutMs: 15_000,
-      });
-      expect(result.code).not.toBe(0);
-      expect(result.stderr).toContain("InvalidSlackBridgeConfiguration");
-      expect(existsSync(root.openLog)).toBe(false);
-      expect(auth.tokenExchanges).toBe(0);
-      expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json"))).toBe(false);
-    }, 20_000);
-  }
-
-  for (const status of [200, 503]) test(`another Slack client keeps its direct callback when fx.sh returns ${status}`, async () => {
-    upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, slackBridgeStatus: status === 503 ? status : undefined });
-    const root = createRoot(auth);
-    const result = await runFx(["mcp", "auth", "fixture"], {
-      cwd: root.workspace, env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin }, timeoutMs: 15_000,
-    });
-    expect(result.code).toBe(0);
-    expect(result.stderr).toBe("");
-    expect(auth.requests.some((request) => request.path === "/api/slack/install/config")).toBe(false);
-    const opened = new URL(readFileSync(root.openLog, "utf8").trim());
-    expect(opened.pathname).toBe("/authorize");
-    expect(new URL(opened.searchParams.get("redirect_uri")!).hostname).toBe("127.0.0.1");
-    expect(opened.searchParams.get("scope")).toBe("tools.read offline_access");
-    expect(auth.tokenExchanges).toBe(1);
-  }, 20_000);
-
-  for (const scenario of ["unavailable", "wrong-client"] as const) test(`personal Slack fails closed when fx.sh metadata is ${scenario}`, async () => {
-    upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url, {
-      slackBridgeClientId: scenario === "wrong-client" ? "other-slack-client" : FX_SLACK_CLIENT_ID,
-      slackBridgeStatus: scenario === "unavailable" ? 503 : undefined,
-    });
-    const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
-    const result = await runFx(["mcp", "auth", "fixture"], {
-      cwd: root.workspace, env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin }, timeoutMs: 15_000,
-    });
-    expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain(scenario === "unavailable" ? "SlackBridgeUnavailable" : "InvalidSlackBridgeConfiguration");
-    expect(auth.requests.map((request) => request.path)).toEqual(["/api/slack/install/config"]);
-    expect(existsSync(root.openLog)).toBe(false);
-    expect(auth.authorizationRequests).toBe(0);
-    expect(auth.tokenExchanges).toBe(0);
-    expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json"))).toBe(false);
-  }, 20_000);
-
-  test.skipIf(!tmuxAvailable())("in-session personal Slack HTTPS auth reconnects after saving", async () => {
-    upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, challengeScope: "im:history", slackBridgeScopes: ["tools.read", "tools.approved"] });
-    const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
-    const profilePath = join(root.home, ".fx", "mcp.json");
-    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-    delete profile.mcp.fixture.oauth.scopes;
-    writeFileSync(profilePath, JSON.stringify(profile));
-    const bridgeOrigin = new URL(auth.url).origin;
-    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
-    tui = await TmuxSession.create({
-      isolated: true, cwd: root.workspace, width: 120, height: 34,
-      env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: bridgeOrigin, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
-    });
-    await tui.waitForComposer(15_000);
-    await tui.sendText("/mcp auth fixture --open");
-    expect(await waitForFileText(root.openLog, "/api/slack/auth?", 5_000)).toBe(true);
-    const start = new URL(readFileSync(root.openLog, "utf8").trim());
-    expect(start.searchParams.get("scope")).toBe("tools.read tools.approved");
-    const body = await authorizePersonalFixture(auth, start);
-    const response = await fetch(`http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`, {
-      method: "POST", headers: { origin: bridgeOrigin }, body, redirect: "manual",
-    });
-    expect(response.status).toBe(303);
-    expect(response.headers.get("location")).toBe(`${bridgeOrigin}/api/slack/auth/complete?result=success`);
-    expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json"))).toBe(true);
-    const pane = await tui.waitForText("Authenticated MCP server 'fixture'.", 15_000);
-    expect(pane).not.toContain(ACCESS_INITIAL);
-    expect(tui.paneStatus().dead).toBe(false);
-    await tui.waitForComposer(5_000);
-    await tui.sendText("/mcp list");
-    const menu = await tui.waitForText("[Servers]", 10_000);
-    expect(menu).toMatch(/fixture[\s\S]{0,120}Ready/);
-    expect(menu).not.toContain(ACCESS_INITIAL);
-    await tui.sendKeys("Escape");
-    await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
-    expect(auth.tokenExchanges).toBe(1);
-  }, 40_000);
-
-  test.skipIf(!tmuxAvailable())("in-session personal Slack rejects narrower scopes before opening a browser", async () => {
-    upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, slackBridgeScopes: ["tools.read", "tools.write"] });
-    const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
-    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
-    tui = await TmuxSession.create({
-      isolated: true, cwd: root.workspace, width: 120, height: 34,
-      env: { ...baseEnv(root), FX_E2E_SLACK_ORIGIN: new URL(auth.url).origin, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
-    });
-    await tui.waitForComposer(15_000);
-    await tui.sendText("/mcp auth fixture --open");
-    const pane = await tui.waitForText("Authorization was not started", 15_000);
-    expect(pane).toContain("Your configured Slack scopes request fewer permissions");
-    expect(existsSync(root.openLog)).toBe(false);
-    expect(auth.authorizationRequests).toBe(0);
-    expect(auth.tokenExchanges).toBe(0);
-    expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json"))).toBe(false);
-    expect(tui.paneStatus().dead).toBe(false);
-    await tui.waitForComposer(5_000);
-  }, 40_000);
-
-  test("top-level MCP auth accepts a manual callback when browser launch fails", async () => {
-    upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url);
-    const root = createRoot(auth, true, "http", auth.url, false);
-    for (const name of ["open", "xdg-open"]) {
-      writeFileSync(join(root.bin, name),
-        `#!/bin/sh\nprintf '%s\\n' "$1" > '${root.openLog}'\nexit 1\n`);
-    }
-    const authentication = Bun.spawn([FX_BIN, "mcp", "auth", "fixture"], {
-      cwd: root.workspace,
-      env: { ...process.env, ...baseEnv(root), AI_GATEWAY_API_KEY: undefined, FX_NO_OPEN_BROWSER: undefined },
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    let stdout = "";
-    let authorizationUrl: string | undefined;
-    let callback: Promise<Response | null> | undefined;
-    const readStdout = (async () => {
-      const decoder = new TextDecoder();
-      for await (const chunk of authentication.stdout) {
-        stdout += decoder.decode(chunk, { stream: true });
-        const match = stdout.match(/^(https?:\/\/[^\r\n]+)\r?\n/m);
-        if (!authorizationUrl && match) {
-          authorizationUrl = match[1];
-          callback = fetch(authorizationUrl).catch(() => null);
-        }
-      }
-    })();
-    const timer = setTimeout(() => authentication.kill(), 10_000);
-    let code: number;
-    let stderr: string;
-    try {
-      [code, stderr] = await Promise.all([
-        authentication.exited,
-        new Response(authentication.stderr).text(),
-        readStdout,
-      ]);
-    } finally {
-      clearTimeout(timer);
-    }
-    expect(code).toBe(0);
-    expect(authorizationUrl).toBeDefined();
-    expect(stdout).toContain("Authenticated MCP server 'fixture'");
-    expect(stderr).toBe("");
-    const response = await callback;
-    expect(response?.status).toBe(200);
-    expect(auth.tokenExchanges).toBe(1);
-    expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json"))).toBe(true);
-  }, 15_000);
-
-  test("top-level MCP auth and logout complete without TUI or Gateway", async () => {
-    upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url);
-    const root = createRoot(auth);
-    const env = {
-      ...baseEnv(root),
-      AI_GATEWAY_API_KEY: undefined,
-    };
-
-    const authenticated = await runFx(["mcp", "auth", "fixture"], {
-      cwd: root.workspace,
-      env,
-      timeoutMs: 20_000,
-    });
-    if (authenticated.code !== 0) {
-      throw new Error(JSON.stringify({
-        authenticated,
-        authorizationRequests: auth.authorizationRequests,
-        tokenExchanges: auth.tokenExchanges,
-        authRequests: auth.requests,
-        trace: existsSync(root.trace) ? readFileSync(root.trace, "utf8") : "",
-      }, null, 2));
-    }
-    expect(authenticated.code).toBe(0);
-    expect(authenticated.stderr).toBe("");
-    expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
-    expect(auth.authorizationRequests).toBe(1);
-    expect(auth.tokenExchanges).toBe(1);
-    expect(existsSync(root.openLog)).toBe(true);
-    expect(
-      await waitForFileText(root.callbackLog, "Authorization complete", 5_000),
-    ).toBe(true);
-    const callbackPage = readFileSync(root.callbackLog, "utf8");
-    expect(callbackPage).toContain("<h1>Authorization complete</h1>");
-    expect(callbackPage).toContain("prefers-color-scheme:dark");
-    const credentialPath = join(
-      root.home,
-      ".fx",
-      "mcp-credentials",
-      "credentials.json",
-    );
-    expect(existsSync(credentialPath)).toBe(true);
-    const profilePath = join(root.home, ".fx", "mcp.json");
-    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-    delete profile.mcp.fixture.oauth;
-    writeFileSync(profilePath, JSON.stringify(profile));
-
-    const requestCountBeforeList = auth.requests.length;
-    const listed = await runFx(["mcp", "list"], {
-      cwd: root.workspace,
-      env,
-      timeoutMs: 20_000,
-    });
-    expect(listed.code).toBe(0);
-    expect(listed.stderr).toBe("");
-    expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}auth=authenticated/);
-    expect(auth.requests).toHaveLength(requestCountBeforeList);
-
-    const loggedOut = await runFx(["mcp", "logout", "fixture"], {
-      cwd: root.workspace,
-      env,
-      timeoutMs: 20_000,
-    });
-    expect(loggedOut.code).toBe(0);
-    expect(loggedOut.stderr).toBe("");
-    expect(loggedOut.stdout).toContain("Logged out of MCP server 'fixture'");
-    expect(existsSync(credentialPath)).toBe(false);
-    expect(auth.revocations).toBe(2);
-  }, 30_000);
-
-  test("pinned localhost callback reuses one port without aborting", async () => {
-    upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url);
-    const root = createRoot(auth, true, "http", auth.url, false);
-    const callbackPort = unusedCallbackPort();
-    const profilePath = join(root.home, ".fx", "mcp.json");
-    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-    profile.mcp.fixture.oauth.callback_port = callbackPort;
-    writeFileSync(profilePath, JSON.stringify(profile));
-    const env = {
-      ...baseEnv(root),
-      AI_GATEWAY_API_KEY: undefined,
-    };
-
-    const attempts = 12;
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      rmSync(root.openLog, { force: true });
-      const authentication = runFx(["mcp", "auth", "fixture"], {
-        cwd: root.workspace,
-        env,
-        timeoutMs: 20_000,
-      });
-      const opened = await waitForFileText(root.openLog, "http", 5_000);
-      let callbackStatus: number | null = null;
-      let callbackBody = "";
-      let callbackError: unknown = null;
-      if (opened) {
-        try {
-          const authorizationUrl = readFileSync(root.openLog, "utf8").trim();
-          const authorizationResponse = await fetch(authorizationUrl, {
-            redirect: "manual",
-          });
-          const callbackUrl = authorizationResponse.headers.get("location");
-          if (!callbackUrl) throw new Error("authorization redirect is missing");
-          const callbackResponse = await fetch(callbackUrl);
-          callbackStatus = callbackResponse.status;
-          callbackBody = await callbackResponse.text();
-        } catch (error) {
-          callbackError = error;
-        }
-      }
-      const authenticated = await authentication;
-      if (
-        !opened ||
-        callbackError !== null ||
-        callbackStatus !== 200 ||
-        authenticated.code !== 0 ||
-        authenticated.stderr !== ""
-      ) {
-        throw new Error(JSON.stringify({
-          attempt,
-          callbackPort,
-          opened,
-          callbackStatus,
-          callbackError: callbackError === null ? null : String(callbackError),
-          authenticated,
-        }, null, 2));
-      }
-      expect(callbackBody).toContain("Authorization complete");
-      expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
-
-      const loggedOut = await runFx(["mcp", "logout", "fixture"], {
-        cwd: root.workspace,
-        env,
-        timeoutMs: 20_000,
-      });
-      expect(loggedOut.code).toBe(0);
-      expect(loggedOut.stderr).toBe("");
-    }
-    expect(auth.authorizationRequests).toBe(attempts);
-    expect(auth.tokenExchanges).toBe(attempts);
-  }, 90_000);
-
-  test("rejected stored credentials report required auth without discovery fallback", async () => {
-    upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url, {
-      rejectDiscoveryWithoutChallenge: true,
-    });
-    const root = createRoot(auth);
-    const env = {
-      ...baseEnv(root),
-      AI_GATEWAY_API_KEY: undefined,
-    };
-
-    const authenticated = await runFx(["mcp", "auth", "fixture"], {
-      cwd: root.workspace,
-      env,
-      timeoutMs: 20_000,
-    });
-    expect(authenticated.code).toBe(0);
-    expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
-
-    const listed = await runFx(["mcp", "list", "--connect"], {
-      cwd: root.workspace,
-      env,
-      timeoutMs: 20_000,
-    });
-    expect(listed.code).toBe(0);
-    expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}auth=required/);
-    expect(listed.stdout).not.toContain("auth=authenticated");
-    expect(listed.stdout).toContain("Authentication is required");
-    expect(listed.stdout).not.toContain("InvalidJsonResponse");
-    for (const secret of [ACCESS_INITIAL, REFRESH_INITIAL]) {
-      expect(listed.stdout).not.toContain(secret);
-      expect(listed.stderr).not.toContain(secret);
-      if (existsSync(root.trace)) {
-        expect(readFileSync(root.trace, "utf8")).not.toContain(secret);
-      }
-    }
-    expect(auth.requests.some((request) =>
-      request.body.includes('"method":"server/discover"')
-    )).toBe(true);
-    expect(auth.requests.some((request) =>
-      request.body.includes('"method":"tools/list"')
-    )).toBe(false);
-    expect(upstream.requests).toHaveLength(0);
-  }, 30_000);
-
-  test("OAuth-authenticated MongoDB-like discovery reaches legacy tools", async () => {
-    upstream = startModernMcpHttpFixture("legacy_session_required");
-    auth = startAuthFixture(upstream.url);
-    const root = createRoot(auth);
-    const env = {
-      ...baseEnv(root),
-      AI_GATEWAY_API_KEY: undefined,
-    };
-
-    const authenticated = await runFx(["mcp", "auth", "fixture"], {
-      cwd: root.workspace,
-      env,
-      timeoutMs: 20_000,
-    });
-    expect(authenticated.code).toBe(0);
-    expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
-
-    const listed = await runFx(["mcp", "list", "--connect"], {
-      cwd: root.workspace,
-      env,
-      timeoutMs: 20_000,
-    });
-    expect(listed.code).toBe(0);
-    expect(listed.stderr).toBe("");
-    expect(listed.stdout).toMatch(
-      /fixture[\s\S]{0,240}state=ready auth=authenticated/,
-    );
-    expect(listed.stdout).toContain("protocol=2025-11-25");
-    expect(listed.stdout).toContain(
-      "negotiated_name=mongodb-managed-fixture negotiated_version=1.0.0",
-    );
-    expect(listed.stdout).toContain("tools=1");
-    for (const secret of [ACCESS_INITIAL, REFRESH_INITIAL]) {
-      expect(listed.stdout).not.toContain(secret);
-      expect(listed.stderr).not.toContain(secret);
-    }
-    expect(upstream.requests.map((entry) => entry.message.method)).toEqual([
-      "server/discover",
-      "initialize",
-      "notifications/initialized",
-      "tools/list",
-    ]);
-  }, 30_000);
-
-  test("OAuth-authenticated MongoDB deployed session error reaches legacy tools", async () => {
-    upstream = startModernMcpHttpFixture("legacy_mongodb_session_required");
-    auth = startAuthFixture(upstream.url);
-    const root = createRoot(auth);
-    const env = {
-      ...baseEnv(root),
-      AI_GATEWAY_API_KEY: undefined,
-    };
-
-    const authenticated = await runFx(["mcp", "auth", "fixture"], {
-      cwd: root.workspace,
-      env,
-      timeoutMs: 20_000,
-    });
-    expect(authenticated.code).toBe(0);
-    expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
-
-    const listed = await runFx(["mcp", "list", "--connect"], {
-      cwd: root.workspace,
-      env,
-      timeoutMs: 20_000,
-    });
-    expect(listed.code).toBe(0);
-    expect(listed.stderr).toBe("");
-    expect(listed.stdout).toMatch(
-      /fixture[\s\S]{0,240}state=ready auth=authenticated/,
-    );
-    expect(listed.stdout).toContain("protocol=2025-11-25");
-    expect(listed.stdout).toContain(
-      "negotiated_name=mongodb-managed-fixture negotiated_version=1.0.0",
-    );
-    expect(listed.stdout).toContain("tools=1");
-    expect(upstream.requests.map((entry) => entry.message.method)).toEqual([
-      "server/discover",
-      "initialize",
-      "notifications/initialized",
-      "tools/list",
-    ]);
-  }, 30_000);
-
-  test("MongoDB-like REST authorization document rejects stored credentials", async () => {
-    upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url, {
-      rejectDiscoveryWithRestAuthorizationDocument: true,
-    });
-    const root = createRoot(auth);
-    const env = {
-      ...baseEnv(root),
-      AI_GATEWAY_API_KEY: undefined,
-    };
-
-    const authenticated = await runFx(["mcp", "auth", "fixture"], {
-      cwd: root.workspace,
-      env,
-      timeoutMs: 20_000,
-    });
-    expect(authenticated.code).toBe(0);
-    expect(authenticated.stdout).toContain("Authenticated MCP server 'fixture'");
-
-    const listed = await runFx(["mcp", "list", "--connect"], {
-      cwd: root.workspace,
-      env,
-      timeoutMs: 20_000,
-    });
-    expect(listed.code).toBe(0);
-    expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}auth=required/);
-    expect(listed.stdout).not.toContain("auth=authenticated");
-    expect(listed.stdout).toContain("Authentication is required");
-    expect(listed.stdout).not.toContain("InvalidJsonResponse");
-    expect(upstream.requests).toHaveLength(0);
-    for (const secret of [ACCESS_INITIAL, REFRESH_INITIAL]) {
-      expect(listed.stdout).not.toContain(secret);
-      expect(listed.stderr).not.toContain(secret);
-      if (existsSync(root.trace)) {
-        expect(readFileSync(root.trace, "utf8")).not.toContain(secret);
-      }
-    }
-  }, 30_000);
-
-  test.skipIf(process.platform !== "darwin")(
-    "MCP auth falls back to the private profile store when HOME has no Keychain",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url);
-      const root = createRoot(auth);
-      const env = {
-        ...baseEnv(root),
-        AI_GATEWAY_API_KEY: undefined,
-        FX_DISABLE_KEYCHAIN: undefined,
-      };
-
-      const authenticated = await runFx(["mcp", "auth", "fixture"], {
-        cwd: root.workspace,
-        env,
-        timeoutMs: 20_000,
-      });
-      expect(authenticated.code).toBe(0);
-      expect(authenticated.stderr).toBe("");
-      expect(auth.authorizationRequests).toBe(1);
-      expect(auth.tokenExchanges).toBe(1);
-      const credentialPath = join(
-        root.home,
-        ".fx",
-        "mcp-credentials",
-        "credentials.json",
-      );
-      expect(existsSync(credentialPath)).toBe(true);
-      expect(statSync(credentialPath).mode & 0o777).toBe(0o600);
-
-      const loggedOut = await runFx(["mcp", "logout", "fixture"], {
-        cwd: root.workspace,
-        env,
-        timeoutMs: 20_000,
-      });
-      expect(loggedOut.code).toBe(0);
-      expect(loggedOut.stderr).toBe("");
-      expect(existsSync(credentialPath)).toBe(false);
-    },
-    30_000,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "no-scope OAuth credentials survive reload and preserve an unrelated server",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      const canary = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url, { omitScopes: true });
-      const root = createRoot(auth);
-      const profilePath = join(root.home, ".fx", "mcp.json");
-      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-      delete profile.mcp.fixture.oauth.scopes;
-      profile.mcp.canary = {
-        type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
-        url: canary.url,
-        startup_timeout_ms: 5_000,
-        operation_timeout_ms: 5_000,
-      };
-      writeFileSync(profilePath, JSON.stringify(profile));
-      const credentialDir = join(root.home, ".fx", "mcp-credentials");
-      mkdirSync(credentialDir, { recursive: true, mode: 0o700 });
-      const credentialPath = join(credentialDir, "credentials.json");
-      writeFileSync(
-        credentialPath,
-        JSON.stringify({ version: 1, credentials: [{}] }),
-        { mode: 0o600 },
-      );
-      chmodSync(credentialPath, 0o600);
-      gateway = startFakeGateway([], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-
-      try {
-        const env = {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        };
-        tui = await TmuxSession.create({
-          isolated: true,
-          cwd: root.workspace,
-          env,
-          width: 150,
-          height: 38,
-        });
-        await tui.waitForComposer(15_000);
-
-        await tui.sendText("/mcp auth fixture --open");
-        const authenticated = await tui.waitForText(
-          "Authenticated MCP server 'fixture'.",
-          15_000,
-        );
-        expect(authenticated).toContain(
-          "Removed 1 unreadable MCP credential entry.",
-        );
-        await tui.sendText("/mcp reload");
-        await tui.waitForText("MCP configuration reloaded", 15_000);
-        await tui.sendText("/mcp list");
-        let pane = await tui.waitForText("[Servers]", 10_000);
-        expect(pane).toMatch(/fixture[\s\S]{0,120}Ready/);
-        expect(pane).toMatch(/canary[\s\S]{0,120}Ready/);
-
-        const stored = JSON.parse(readFileSync(credentialPath, "utf8"));
-        expect(stored.credentials).toHaveLength(1);
-        expect(stored.credentials[0].scope).toBe("");
-
-        await tui.kill();
-        tui = null;
-        tui = await TmuxSession.create({
-          isolated: true,
-          cwd: root.workspace,
-          env,
-          width: 150,
-          height: 38,
-        });
-        await tui.waitForComposer(15_000);
-        await tui.sendText("/mcp list");
-        pane = await tui.waitForText("[Servers]", 10_000);
-        expect(pane).toMatch(/fixture[\s\S]{0,120}Ready/);
-        expect(pane).toMatch(/canary[\s\S]{0,120}Ready/);
-      } finally {
-        canary.stop();
-      }
-    },
-    45_000,
-  );
-
-  test("required resource template authentication failure propagates before read", async () => {
-    upstream = startModernMcpHttpFixture("features");
-    auth = startAuthFixture(upstream.url, {
-      rejectResourceTemplateAuth: true,
-    });
-    const root = createRoot(auth);
-    seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
-    gateway = startFakeGateway([
-      fakeGatewayToolCall("template_auth_read", "mcp_features", {
-        action: "resource_read",
-        server: "fixture",
-        uri: "custom://project/src/main.zig",
-      }),
-      fakeGatewayFinalText("Template authentication failure observed."),
-    ], {
-      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-    });
-
-    const result = await runFx(
-      ["ask", "--json", "--auto", "--no-save", "Read an authenticated resource template."],
-      {
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        timeoutMs: 25_000,
-      },
-    );
-
-    preserveAuthFailure(
-      "resource-template-auth-required",
-      root,
-      result,
-      auth,
-      upstream,
-      gateway,
-    );
-    expect(result.code).toBe(0);
-    const finalBody = gateway.requests.at(-1)!.body;
-    expect(toolResultText(finalBody, "template_auth_read", "error-text")).toContain(
-      "McpAuthenticationRequired",
-    );
-    expect(toolResultText(finalBody, "template_auth_read", "error-text")).not.toContain(
-      "McpResourceNotFound",
-    );
-    expect(auth.requests.filter((request) =>
-      request.body.includes('"resources/templates/list"')
-    )).toHaveLength(1);
-    expect(upstream.requests.filter((request) =>
-      request.message.method === "resources/templates/list"
-    )).toHaveLength(0);
-    expect(upstream.requests.filter((request) =>
-      request.message.method === "resources/read"
-    )).toHaveLength(0);
-  }, 35_000);
-
-  test("private feature catalogs rotate with authenticated identity without leaking credentials", async () => {
-    upstream = startModernMcpHttpFixture("features");
-    auth = startAuthFixture(upstream.url);
-    const root = createRoot(auth);
-    seedExpiredCredentials(root, auth, Date.now() + 65_000);
-    gateway = startFakeGateway([
-      fakeGatewayToolCall("auth_resource_list_one", "mcp_features", {
-        action: "resource_list",
-        server: "fixture",
-      }),
-      async () => {
-        await Bun.sleep(6_000);
-        return fakeGatewayToolCall("auth_resource_list_two", "mcp_features", {
-          action: "resource_list",
-          server: "fixture",
-        });
-      },
-      async () => {
-        await Bun.sleep(500);
-        return fakeGatewayToolCall("auth_resource_read", "mcp_features", {
-          action: "resource_read",
-          server: "fixture",
-          uri: "custom://alpha",
-        });
-      },
-      fakeGatewayToolCall("auth_prompt_list", "mcp_features", {
-        action: "prompt_list",
-        server: "fixture",
-      }),
-      fakeGatewayToolCall("auth_prompt_get", "mcp_features", {
-        action: "prompt_get",
-        server: "fixture",
-        prompt: "review",
-        arguments: { tone: "brief" },
-      }),
-      fakeGatewayToolCall("auth_prompt_complete", "mcp_features", {
-        action: "prompt_complete",
-        server: "fixture",
-        prompt: "review",
-        argument: "tone",
-        value: "b",
-      }),
-      fakeGatewayFinalText("Authenticated MCP features complete."),
-    ], {
-      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-    });
-
-    const result = await runFx(
-      ["ask", "--json", "--auto", "--no-save", "Use authenticated MCP features after rotation."],
-      {
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        timeoutMs: 25_000,
-      },
-    );
-
-    expect(result.code).toBe(0);
-    expect(auth.refreshes).toBe(1);
-    const resourcePages = auth.requests.filter((request) =>
-      request.body.includes('"resources/list"')
-    );
-    expect(resourcePages.map((request) => request.authorization)).toEqual([
-      `Bearer ${ACCESS_INITIAL}`,
-      `Bearer ${ACCESS_INITIAL}`,
-      `Bearer ${ACCESS_REFRESHED}`,
-      `Bearer ${ACCESS_REFRESHED}`,
-    ]);
-    const bodies = gateway.requests.map((request) => request.body).join("\n");
-    expect(bodies).toContain("HTTP_RESOURCE_TEXT");
-    expect(bodies).toContain("HTTP_PROMPT_TEXT");
-    for (const secret of [ACCESS_INITIAL, ACCESS_REFRESHED]) {
-      expect(result.stdout).not.toContain(secret);
-      expect(result.stderr).not.toContain(secret);
-      expect(readFileSync(root.trace, "utf8")).not.toContain(secret);
-      expect(bodies).not.toContain(secret);
-    }
-  }, 35_000);
-
-  test("private feature catalogs fail closed when refresh after auth rotation fails", async () => {
-    upstream = startModernMcpHttpFixture("features_stale_read");
-    auth = startAuthFixture(upstream.url, {
-      rotateAuthorizationToken: true,
-      rotateOnResourceReadCall: 2,
-      failFeatureRefreshAfterRotation: true,
-    });
-    const root = createRoot(auth);
-    seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
-    gateway = startFakeGateway([
-      fakeGatewayToolCall("private_resource_a", "mcp_features", {
-        action: "resource_list",
-        server: "fixture",
-      }),
-      fakeGatewayToolCall("private_templates_a", "mcp_features", {
-        action: "resource_templates",
-        server: "fixture",
-      }),
-      fakeGatewayToolCall("private_prompts_a", "mcp_features", {
-        action: "prompt_list",
-        server: "fixture",
-      }),
-      fakeGatewayToolCall("private_read_a", "mcp_features", {
-        action: "resource_read",
-        server: "fixture",
-        uri: "custom://alpha",
-      }),
-      fakeGatewayToolCall("private_rotate", "mcp_features", {
-        action: "resource_read",
-        server: "fixture",
-        uri: "custom://alpha",
-      }),
-      fakeGatewayToolCall("private_resource_b", "mcp_features", {
-        action: "resource_list",
-        server: "fixture",
-      }),
-      fakeGatewayToolCall("private_templates_b", "mcp_features", {
-        action: "resource_templates",
-        server: "fixture",
-      }),
-      fakeGatewayToolCall("private_prompts_b", "mcp_features", {
-        action: "prompt_list",
-        server: "fixture",
-      }),
-      fakeGatewayToolCall("private_read_b", "mcp_features", {
-        action: "resource_read",
-        server: "fixture",
-        uri: "custom://alpha",
-      }),
-      fakeGatewayFinalText("Private feature rotation failure observed."),
-    ], {
-      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-    });
-
-    const result = await runFx(
-      ["ask", "--json", "--auto", "--no-save", "Check private MCP features after failed rotation."],
-      {
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_MCP_AUTH_AUTOMATE: "1",
-        },
-        timeoutMs: 25_000,
-      },
-    );
-
-    preserveAuthFailure(
-      "private-feature-auth-rotation",
-      root,
-      result,
-      auth,
-      upstream,
-      gateway,
-    );
-    expect(result.code).toBe(0);
-    expect(auth.refreshes).toBe(0);
-    expect(auth.authorizationRequests).toBe(1);
-    expect(auth.tokenExchanges).toBe(1);
-    const finalBody = gateway.requests.at(-1)!.body;
-    expect(toolResultText(finalBody, "private_resource_a")).toContain(
-      "custom://alpha",
-    );
-    expect(toolResultText(finalBody, "private_templates_a")).toContain(
-      "custom://project/{path}",
-    );
-    expect(toolResultText(finalBody, "private_prompts_a")).toContain(
-      "review",
-    );
-    expect(toolResultText(finalBody, "private_read_a")).toContain(
-      "HTTP_RESOURCE_TEXT",
-    );
-    expect(toolResultText(finalBody, "private_rotate", "error-text")).toContain(
-      "tool_execution_failed",
-    );
-    for (const callId of [
-      "private_resource_b",
-      "private_templates_b",
-      "private_prompts_b",
-      "private_read_b",
-    ]) {
-      const output = toolResultText(finalBody, callId, "error-text");
-      expect(output).not.toContain("custom://alpha");
-      expect(output).not.toContain("custom://project/{path}");
-      expect(output).not.toContain("review");
-      expect(output).toContain("tool_execution_failed");
-    }
-    const featureRequests = auth.requests.filter((request) =>
-      request.body.includes('"resources/list"') ||
-      request.body.includes('"resources/templates/list"') ||
-      request.body.includes('"prompts/list"')
-    );
-    expect(featureRequests.filter((request) =>
-      request.authorization === `Bearer ${ACCESS_REFRESHED}`
-    ).length).toBeGreaterThanOrEqual(3);
-    expect(readFileSync(root.trace, "utf8")).toContain(
-      "preserved_snapshot=false",
-    );
-    expect(auth.requests.filter((request) =>
-      request.body.includes('"resources/read"')
-    )).toHaveLength(2);
-  }, 35_000);
-
-  test("public feature and resource-read caches survive an unrelated auth rotation", async () => {
-    upstream = startModernMcpHttpFixture("features_public");
-    auth = startAuthFixture(upstream.url, {
-      failFeatureRefreshAfterRotation: true,
-    });
-    const root = createRoot(auth);
-    seedExpiredCredentials(root, auth, Date.now() + 65_000);
-    gateway = startFakeGateway([
-      fakeGatewayToolCall("public_resource_a", "mcp_features", {
-        action: "resource_list",
-        server: "fixture",
-      }),
-      fakeGatewayToolCall("public_templates_a", "mcp_features", {
-        action: "resource_templates",
-        server: "fixture",
-      }),
-      fakeGatewayToolCall("public_prompts_a", "mcp_features", {
-        action: "prompt_list",
-        server: "fixture",
-      }),
-      fakeGatewayToolCall("public_read_a", "mcp_features", {
-        action: "resource_read",
-        server: "fixture",
-        uri: "custom://alpha",
-      }),
-      fakeGatewayToolCall("public_select", "mcp_select_tool", {
-        name: TOOL_NAME,
-      }),
-      async () => {
-        await Bun.sleep(6_000);
-        return fakeGatewayToolCall("public_rotate", TOOL_NAME, {
-          text: "rotate",
-        });
-      },
-      fakeGatewayToolCall("public_resource_b", "mcp_features", {
-        action: "resource_list",
-        server: "fixture",
-      }),
-      fakeGatewayToolCall("public_templates_b", "mcp_features", {
-        action: "resource_templates",
-        server: "fixture",
-      }),
-      fakeGatewayToolCall("public_prompts_b", "mcp_features", {
-        action: "prompt_list",
-        server: "fixture",
-      }),
-      fakeGatewayToolCall("public_read_b", "mcp_features", {
-        action: "resource_read",
-        server: "fixture",
-        uri: "custom://alpha",
-      }),
-      fakeGatewayFinalText("Public feature rotation control complete."),
-    ], {
-      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-    });
-
-    const result = await runFx(
-      ["ask", "--json", "--auto", "--no-save", "Reuse public MCP state after auth rotation."],
-      {
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        timeoutMs: 30_000,
-      },
-    );
-
-    expect(result.code).toBe(0);
-    expect(auth.refreshes).toBe(1);
-    const finalBody = gateway.requests.at(-1)!.body;
-    for (const callId of ["public_resource_a", "public_resource_b"]) {
-      expect(toolResultText(finalBody, callId)).toContain("custom://alpha");
-    }
-    for (const callId of ["public_templates_a", "public_templates_b"]) {
-      expect(toolResultText(finalBody, callId)).toContain(
-        "custom://project/{path}",
-      );
-    }
-    for (const callId of ["public_prompts_a", "public_prompts_b"]) {
-      expect(toolResultText(finalBody, callId)).toContain("review");
-    }
-    for (const callId of ["public_read_a", "public_read_b"]) {
-      expect(toolResultText(finalBody, callId)).toContain("HTTP_RESOURCE_TEXT");
-    }
-    const resourceListRequests = auth.requests.filter((request) =>
-      request.body.includes('"resources/list"')
-    );
-    const initialResourceLists = resourceListRequests.filter((request) =>
-      request.authorization === `Bearer ${ACCESS_INITIAL}`
-    );
-    const refreshedResourceLists = resourceListRequests.filter((request) =>
-      request.authorization === `Bearer ${ACCESS_REFRESHED}`
-    );
-    expect(initialResourceLists).toHaveLength(2);
-    // A later resource read may cross the failed-refresh backoff and retry once.
-    expect(refreshedResourceLists.length).toBeGreaterThanOrEqual(1);
-    expect(refreshedResourceLists.length).toBeLessThanOrEqual(2);
-    expect(new Set(resourceListRequests.map((request) =>
-      (JSON.parse(request.body) as { id: number | string }).id
-    )).size).toBe(resourceListRequests.length);
-    expect(auth.requests.filter((request) =>
-      request.body.includes('"resources/templates/list"')
-    )).toHaveLength(2);
-    expect(auth.requests.filter((request) =>
-      request.body.includes('"prompts/list"')
-    )).toHaveLength(2);
-    expect(auth.requests.filter((request) =>
-      request.body.includes('"resources/read"')
-    )).toHaveLength(1);
-    expect(auth.requests.filter((request) =>
-      request.authorization === `Bearer ${ACCESS_REFRESHED}` &&
-      (request.body.includes('"resources/list"') ||
-        request.body.includes('"resources/templates/list"') ||
-        request.body.includes('"prompts/list"'))
-    ).length).toBe(2 + refreshedResourceLists.length);
-  }, 40_000);
-
-  for (
-    const readCacheCase of [
-      { mode: "features_public", publicCache: true },
-      { mode: "features", publicCache: false },
-    ] as const
-  ) {
-    test(`${readCacheCase.mode} resource cache orders public lookup before credential refresh`, async () => {
-      upstream = startModernMcpHttpFixture(readCacheCase.mode);
-      auth = startAuthFixture(upstream.url, { rejectRefresh: true });
-      const root = createRoot(auth);
-      seedExpiredCredentials(root, auth, Date.now() + 65_000);
-      gateway = startFakeGateway([
-        fakeGatewayToolCall("ordered_read_a", "mcp_features", {
-          action: "resource_read",
-          server: "fixture",
-          uri: "custom://alpha",
-        }),
-        async () => {
-          await Bun.sleep(6_000);
-          return fakeGatewayToolCall("ordered_read_b", "mcp_features", {
-            action: "resource_read",
-            server: "fixture",
-            uri: "custom://alpha",
-          });
-        },
-        fakeGatewayFinalText("Resource cache ordering observed."),
-      ], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-
-      const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Read the same authenticated MCP resource twice."],
-        {
-          cwd: root.workspace,
-          env: {
-            ...baseEnv(root),
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          },
-          timeoutMs: 25_000,
-        },
-      );
-
-      expect(result.code).toBe(0);
-      const finalBody = gateway.requests.at(-1)!.body;
-      expect(toolResultText(finalBody, "ordered_read_a")).toContain(
-        "HTTP_RESOURCE_TEXT",
-      );
-      const second = toolResultText(
-        finalBody,
-        "ordered_read_b",
-        readCacheCase.publicCache ? "text" : "error-text",
-      );
-      if (readCacheCase.publicCache) {
-        expect(second).toContain("HTTP_RESOURCE_TEXT");
-        expect(auth.refreshes).toBeGreaterThanOrEqual(1);
-      } else {
-        expect(second).not.toContain("HTTP_RESOURCE_TEXT");
-        expect(second).toContain("McpRefreshRejected");
-        expect(auth.refreshes).toBe(1);
-      }
-      expect(auth.requests.filter((request) =>
-        request.body.includes('"resources/read"')
-      )).toHaveLength(1);
-    }, 35_000);
-  }
-
-  test("active subscription re-establishes with refreshed credentials", async () => {
-    upstream = startModernMcpHttpFixture("cache_auth_subscription");
-    auth = startAuthFixture(upstream.url);
-    const root = createRoot(auth);
-    seedExpiredCredentials(root, auth, Date.now() + 62_000);
-    gateway = startFakeGateway([
-        fakeGatewayToolCall("search_initial", "capability_search", {
-          query: "echo",
-        }),
-        async () => {
-          await Bun.sleep(3_000);
-          return fakeGatewayToolCall("search_refreshed", "capability_search", {
-            query: "echo",
-          });
-        },
-        async () => {
-          expect(auth!.refreshes).toBe(1);
-          upstream!.finishSubscription();
-          const listenerDeadline = Date.now() + 10_000;
-          while (
-            !readFileSync(root.trace, "utf8").includes(
-              "tool subscription closed connection_generation=",
-            ) && Date.now() < listenerDeadline
-          ) {
-            await Bun.sleep(25);
-          }
-          expect(readFileSync(root.trace, "utf8")).toContain(
-            "tool subscription closed connection_generation=",
-          );
-          return fakeGatewayToolCall(
-            "search_reconnected",
-            "capability_search",
-            { query: "echo" },
-          );
-        },
-        fakeGatewayFinalText("Refreshed subscription complete."),
-    ], {
-      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-    });
-    const result = await runFx(
-      ["ask", "--json", "--auto", "--no-save", "Refresh the active authenticated subscription."],
-      {
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        timeoutMs: 30_000,
-      },
-    );
-
-    expect(result.code).toBe(0);
-    expect(auth.refreshes).toBe(1);
-    const listens = auth.requests.filter((request) =>
-      request.body.includes('"subscriptions/listen"')
-    );
-    expect(listens).toHaveLength(2);
-    expect(listens[0]?.authorization).toBe(`Bearer ${ACCESS_INITIAL}`);
-    expect(listens[1]?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
-    for (const secret of [ACCESS_INITIAL, ACCESS_REFRESHED]) {
-      expect(result.stdout).not.toContain(secret);
-      expect(result.stderr).not.toContain(secret);
-      expect(readFileSync(root.trace, "utf8")).not.toContain(secret);
-    }
-  }, 35_000);
-
-  for (const challenge of ["unauthorized", "scope"] as const) {
-    test(`subscription recovers from a ${challenge} authentication challenge`, async () => {
-      upstream = startModernMcpHttpFixture("cache_invalidate_before_send");
-      auth = startAuthFixture(upstream.url, {
-        subscriptionChallenge: challenge,
-        rotateAuthorizationToken: true,
-      });
-      const root = createRoot(auth);
-      seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
-      gateway = startFakeGateway([
-        fakeGatewayToolCall("search_after_challenge", "capability_search", {
-          query: "echo",
-        }),
-        async () => {
-          const deadline = Date.now() + 10_000;
-          while (
-            auth!.requests.filter((request) =>
-              request.body.includes('"subscriptions/listen"')
-            ).length < 2 && Date.now() < deadline
-          ) {
-            await Bun.sleep(25);
-          }
-          return fakeGatewayFinalText("Subscription challenge recovered.");
-        },
-      ], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-
-      const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Recover the subscription."],
-        {
-          cwd: root.workspace,
-          env: {
-            ...baseEnv(root),
-            FX_E2E_MCP_AUTH_AUTOMATE: "1",
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          },
-          timeoutMs: 20_000,
-        },
-      );
-
-      expect(result.code).toBe(0);
-      expect(auth.subscriptionRejections).toBe(1);
-      expect(auth.authorizationRequests).toBe(1);
-      expect(auth.tokenExchanges).toBe(1);
-      const listens = auth.requests.filter((request) =>
-        request.body.includes('"subscriptions/listen"')
-      );
-      expect(listens).toHaveLength(2);
-      expect(listens[1]?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
-      for (const secret of [ACCESS_INITIAL, ACCESS_REFRESHED]) {
-        expect(result.stdout).not.toContain(secret);
-        expect(result.stderr).not.toContain(secret);
-        expect(readFileSync(root.trace, "utf8")).not.toContain(secret);
-      }
-    }, 30_000);
-  }
-
-  test("private pagination restarts from page one after auth rotation", async () => {
-    upstream = startModernMcpHttpFixture("cache_private_pagination_rotation");
-    auth = startAuthFixture(upstream.url, {
-      rotateOnSecondToolsPage: true,
-      rotateAuthorizationToken: true,
-    });
-    const root = createRoot(auth);
-    seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
-    gateway = startFakeGateway([
-      fakeGatewayToolCall("search_rotated_catalog", "capability_search", {
-        query: "fixture",
-      }),
-      fakeGatewayFinalText("Private pagination rotation complete."),
-    ], {
-      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-    });
-
-    const result = await runFx(
-      ["ask", "--json", "--auto", "--no-save", "Load the rotated private catalog."],
-      {
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_E2E_MCP_AUTH_AUTOMATE: "1",
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        timeoutMs: 20_000,
-      },
-    );
-
-    expect(result.code).toBe(0);
-    expect(auth.paginationRejections).toBe(1);
-    expect(auth.authorizationRequests).toBe(1);
-    expect(upstream.toolsListCalls).toBe(4);
-    const toolPages = auth.requests.filter((request) =>
-      request.body.includes('"tools/list"')
-    );
-    expect(toolPages.map((request) => request.authorization)).toEqual([
-      `Bearer ${ACCESS_INITIAL}`,
-      `Bearer ${ACCESS_INITIAL}`,
-      `Bearer ${ACCESS_REFRESHED}`,
-      `Bearer ${ACCESS_REFRESHED}`,
-      `Bearer ${ACCESS_REFRESHED}`,
-    ]);
-    expect(readFileSync(root.trace, "utf8")).toContain(
-      "restarting paginated tool fetch after auth identity change",
-    );
-    for (const secret of [ACCESS_INITIAL, ACCESS_REFRESHED]) {
-      expect(result.stdout).not.toContain(secret);
-      expect(result.stderr).not.toContain(secret);
-      expect(readFileSync(root.trace, "utf8")).not.toContain(secret);
-    }
-  }, 30_000);
-
-  for (
-    const cacheCase of [
-      { mode: "cache_private_identity", expectedLists: 2 },
-      { mode: "cache_public_identity", expectedLists: 1 },
-    ] as const
-  ) {
-    test(`${cacheCase.mode} partitions or reuses the Tools snapshot after token rotation`, async () => {
-      upstream = startModernMcpHttpFixture(cacheCase.mode);
-      auth = startAuthFixture(upstream.url);
-      const root = createRoot(auth);
-      seedExpiredCredentials(root, auth, Date.now() + 65_000);
-      gateway = startFakeGateway([
-        fakeGatewayToolCall("select_before_refresh", "mcp_select_tool", {
-          name: TOOL_NAME,
-        }),
-        async () => {
-          await Bun.sleep(6_000);
-          return fakeGatewayToolCall("call_after_skew", TOOL_NAME, {
-            text: "rotate",
-          });
-        },
-        fakeGatewayToolCall("search_after_rotation", "capability_search", {
-          query: "echo",
-        }),
-        fakeGatewayFinalText("Authentication cache partition observed."),
-      ], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-
-      const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Exercise the authenticated cache."],
-        {
-          cwd: root.workspace,
-          env: {
-            ...baseEnv(root),
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          },
-          timeoutMs: 20_000,
-        },
-      );
-
-      expect(result.code).toBe(0);
-      expect(auth.refreshes).toBe(1);
-      expect(upstream.toolsListCalls).toBe(cacheCase.expectedLists);
-      expect(result.stdout).not.toContain(ACCESS_INITIAL);
-      expect(result.stdout).not.toContain(ACCESS_REFRESHED);
-      expect(result.stderr).not.toContain(ACCESS_INITIAL);
-      expect(result.stderr).not.toContain(ACCESS_REFRESHED);
-      expect(readFileSync(root.trace, "utf8")).not.toContain(ACCESS_INITIAL);
-      expect(readFileSync(root.trace, "utf8")).not.toContain(ACCESS_REFRESHED);
-    }, 30_000);
-  }
-
+describe("MCP login", () => {
   test(
     "fx ask isolates failed-server authentication from healthy tool search",
     async () => {
@@ -2479,13 +758,13 @@ describe("MCP remote authentication lifecycle", () => {
         JSON.stringify({
           mcp: {
             linear: {
-              type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
+              type: "http",
               url: upstream.url,
               startup_timeout_ms: 5_000,
               operation_timeout_ms: 5_000,
             },
             slack: {
-              type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
+              type: "http",
               url: auth.url,
               oauth: {
                 client_id: "fx-mcp-auth-test",
@@ -2554,1611 +833,12 @@ describe("MCP remote authentication lifecycle", () => {
     30_000,
   );
 
-  for (const targeted of [false, true]) test(
-    `fx ask reports an actionable auth requirement for ${targeted ? "named" : "broad"} search without opening a browser`,
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url);
-      const root = createRoot(auth, false);
-      gateway = startFakeGateway([
-        fakeGatewayToolCall("search_auth", "capability_search", {
-          query: "fixture",
-          ...(targeted ? { server: "fixture" } : {}),
-        }),
-        fakeGatewayFinalText("MCP authentication is required."),
-      ], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-
-      const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Find the protected MCP tool."],
-        {
-          cwd: root.workspace,
-          env: {
-            ...baseEnv(root),
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          },
-          timeoutMs: 20_000,
-        },
-      );
-
-      expect(result.code).toBe(0);
-      expect(auth.authorizationRequests).toBe(0);
-      expect(
-        auth.requests.filter((request) => request.path === "/mcp"),
-      ).toHaveLength(1);
-      expect(gateway.requests[1]?.body).toContain("authentication_required");
-      expect(gateway.requests[1]?.body).toContain(
-        "Run /mcp auth fixture --open in an interactive fx session.",
-      );
-      expect(
-        existsSync(join(root.home, ".fx", "mcp-credentials")),
-      ).toBe(false);
-    },
-    30_000,
-  );
-
-  test.skipIf(process.platform !== "darwin" || !tmuxAvailable())(
-    "macOS migrates MCP credentials to Keychain and logout deletes them",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url);
-      const root = createRoot(auth);
-      const account = `fx-mcp-auth-${process.pid}-${Date.now()}`;
-      mkdirSync(join(root.home, "Library"), { recursive: true });
-      symlinkSync(
-        join(homedir(), "Library", "Keychains"),
-        join(root.home, "Library", "Keychains"),
-        "dir",
-      );
-      const credentialPath = seedExpiredCredentials(
-        root,
-        auth,
-        Date.now() + 3_600_000,
-      );
-      const legacyStore = readFileSync(credentialPath, "utf8");
-      const legacyDigest = createHash("sha256").update(legacyStore).digest("hex");
-      const keychainEnv = {
-        ...baseEnv(root),
-        USER: account,
-        FX_DISABLE_KEYCHAIN: undefined,
-      };
-
-      try {
-        gateway = startToolGateway();
-        const ask = await runFx(
-          ["ask", "--json", "--auto", "--no-save", "Call the authenticated MCP fixture."],
-          {
-            cwd: root.workspace,
-            env: {
-              ...keychainEnv,
-              FX_GATEWAY_BASE_URL: gateway.baseUrl,
-              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            },
-            timeoutMs: 20_000,
-          },
-        );
-        expect(ask.code).toBe(0);
-        expect(JSON.parse(ask.stdout).output).toContain(
-          "Authenticated MCP call complete.",
-        );
-        expect(existsSync(credentialPath)).toBe(false);
-
-        const stored = runMcpKeychainProbe(
-          "load",
-          account,
-          MCP_KEYCHAIN_SERVICE,
-          root.home,
-        );
-        expect(stored.status, stored.stderr).toBe(0);
-        const storedValue = stored.stdout.trimEnd();
-        expect(storedValue.length).toBe(legacyStore.length);
-        expect(
-          createHash("sha256").update(storedValue).digest("hex"),
-        ).toBe(legacyDigest);
-        const persisted = JSON.parse(storedValue);
-        expect(persisted.credentials[0].access_token).toBe(ACCESS_INITIAL);
-        expect(persisted.credentials[0].refresh_token).toBe(REFRESH_INITIAL);
-
-        const profilePath = join(root.home, ".fx", "mcp.json");
-        const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-        delete profile.mcp.fixture.oauth;
-        writeFileSync(profilePath, JSON.stringify(profile));
-        const requestCountBeforeList = auth.requests.length;
-        const listed = await runFx(["mcp", "list"], {
-          cwd: root.workspace,
-          env: keychainEnv,
-          timeoutMs: 20_000,
-        });
-        expect(listed.code).toBe(0);
-        expect(listed.stderr).toBe("");
-        expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}auth=authenticated/);
-        expect(auth.requests).toHaveLength(requestCountBeforeList);
-
-        gateway.stop();
-        gateway = startFakeGateway([
-          fakeGatewayFinalText("TUI idle."),
-        ], {
-          models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-        });
-        tui = await TmuxSession.create({
-          isolated: true,
-          cwd: root.workspace,
-          env: {
-            ...keychainEnv,
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          },
-          width: 110,
-          height: 34,
-        });
-        await tui.waitForComposer(15_000);
-        await tui.sendText("/mcp logout fixture");
-        await tui.waitForText("Logged out of MCP server 'fixture'.", 10_000);
-
-        const deleted = runMcpKeychainProbe(
-          "load",
-          account,
-          MCP_KEYCHAIN_SERVICE,
-          root.home,
-        );
-        expect(deleted.status).not.toBe(0);
-        expect(existsSync(credentialPath)).toBe(false);
-        expect(auth.revocations).toBe(2);
-        for (const value of [ACCESS_INITIAL, REFRESH_INITIAL]) {
-          expect(ask.stdout).not.toContain(value);
-          expect(ask.stderr).not.toContain(value);
-          expect(readFileSync(root.trace, "utf8")).not.toContain(value);
-        }
-      } finally {
-        runMcpKeychainProbe(
-          "delete",
-          account,
-          MCP_KEYCHAIN_SERVICE,
-          root.home,
-        );
-      }
-    },
-    45_000,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "pending browser authentication keeps input responsive and cancels on exit",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url);
-      const root = createRoot(auth, true, "http", auth.url, false);
-      gateway = startFakeGateway([], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        width: 110,
-        height: 34,
-        stderrPath: root.stderr,
-      });
-      await tui.waitForComposer(15_000);
-
-      await tui.sendText("/mcp auth fixture --open");
-      await tui.waitForText(
-        "Waiting for MCP authentication for 'fixture'.",
-        5_000,
-      );
-      expect(await waitForFile(root.openLog, 5_000)).toBe(true);
-      expect(auth.authorizationRequests).toBe(0);
-
-      await tui.sendText("/mcp logout fixture");
-      await tui.waitForText(
-        "MCP authentication for 'fixture' is still in progress. Wait for it to finish before logging out.",
-        5_000,
-      );
-      await tui.sendText("/mcp list");
-      const menu = await tui.waitForText("Needs authentication", 5_000);
-      expect(menu).toContain("fixture");
-      await tui.sendKeys("Escape");
-      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
-
-      await tui.sendText("/mcp reload");
-      await tui.waitForText("MCP reconnection started.", 5_000);
-      await tui.waitForText("MCP configuration reloaded", 10_000);
-      expect(readFileSync(root.trace, "utf8")).toContain(
-        "discarding pending authentication server=fixture reason=reload",
-      );
-
-      rmSync(root.openLog, { force: true });
-      await tui.sendText("/mcp auth fixture --open");
-      expect(await waitForFile(root.openLog, 5_000)).toBe(true);
-
-      await tui.sendKeys("C-c");
-      await tui.waitForText("press ctrl+c again to exit", 5_000);
-      await tui.sendKeys("C-c");
-      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
-
-      const trace = readFileSync(root.trace, "utf8");
-      expect(trace).toContain(
-        "discarding pending authentication server=fixture reason=shutdown",
-      );
-      for (const secretMarker of [
-        "redirect_uri=",
-        "code_verifier",
-        "access_token",
-        "refresh_token",
-      ]) {
-        expect(trace).not.toContain(secretMarker);
-      }
-      expect(
-        existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json")),
-      ).toBe(false);
-      expect(readFileSync(root.stderr, "utf8")).toBe("");
-    },
-    30_000,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "pending workspace authentication is blocked and logout deletes local credentials only",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url);
-      const root = createRoot(auth, true, "http", auth.url, false);
-      moveAuthFixtureToWorkspace(root);
-      const credentialPath = seedExpiredCredentials(
-        root,
-        auth,
-        Date.now() + 3_600_000,
-      );
-      gateway = startFakeGateway([], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        width: 120,
-        height: 34,
-        stderrPath: root.stderr,
-      });
-      await tui.waitForComposer(15_000);
-      await tui.waitForText(
-        "Project MCP server 'fixture' is defined in .mcp.json",
-        10_000,
-      );
-      await tui.sendKeys("Escape");
-      await tui.waitForText(
-        "Project MCP approval prompts dismissed for this process",
-        10_000,
-      );
-
-      await tui.sendText("/mcp auth fixture --open");
-      await tui.waitForText("McpWorkspaceApprovalRequired", 10_000);
-      expect(existsSync(root.openLog)).toBe(false);
-      expect(auth.authorizationRequests).toBe(0);
-      expect(existsSync(credentialPath)).toBe(true);
-      await Bun.sleep(250);
-      const requestsBeforeLogout = auth.requests.length;
-
-      await tui.sendText("/mcp logout fixture");
-      await tui.waitForText("Logged out of MCP server 'fixture'", 10_000);
-      await Bun.sleep(250);
-      expect(existsSync(credentialPath)).toBe(false);
-      expect(auth.revocations).toBe(0);
-      expect(auth.requests).toHaveLength(requestsBeforeLogout);
-    },
-    35_000,
-  );
-
-  test("top-level pending workspace auth is blocked and logout stays local", async () => {
-    upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url);
-    const root = createRoot(auth, true, "http", auth.url, false);
-    moveAuthFixtureToWorkspace(root);
-    const credentialPath = seedExpiredCredentials(
-      root,
-      auth,
-      Date.now() + 3_600_000,
-    );
-    const env = {
-      ...baseEnv(root),
-      AI_GATEWAY_API_KEY: undefined,
-    };
-
-    const authentication = await runFx(["mcp", "auth", "fixture"], {
-      cwd: root.workspace,
-      env,
-      timeoutMs: 20_000,
-    });
-    expect(authentication.code).not.toBe(0);
-    expect(authentication.stderr).toContain("McpWorkspaceApprovalRequired");
-    expect(existsSync(root.openLog)).toBe(false);
-    expect(auth.authorizationRequests).toBe(0);
-    expect(existsSync(credentialPath)).toBe(true);
-    const requestsBeforeLogout = auth.requests.length;
-
-    const logout = await runFx(["mcp", "logout", "fixture"], {
-      cwd: root.workspace,
-      env,
-      timeoutMs: 20_000,
-    });
-    expect(logout.code).toBe(0);
-    expect(logout.stdout).toContain("Logged out of MCP server 'fixture' locally");
-    expect(existsSync(credentialPath)).toBe(false);
-    expect(auth.revocations).toBe(0);
-    expect(auth.requests).toHaveLength(requestsBeforeLogout);
-  }, 30_000);
-
-  test.skipIf(!tmuxAvailable())(
-    "reauthentication replaces a modern HTTP connection with an active subscription",
-    async () => {
-      upstream = startModernMcpHttpFixture("features");
-      auth = startAuthFixture(upstream.url);
-      const root = createRoot(auth);
-      const initial = await runFx(["mcp", "auth", "fixture"], {
-        cwd: root.workspace,
-        env: baseEnv(root),
-        timeoutMs: 20_000,
-      });
-      expect(initial.code).toBe(0);
-      gateway = startToolGateway();
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-      });
-      await tui.waitForComposer(15_000);
-      await upstream.waitForSubscription();
-      const subscriptions = () => upstream!.requests.filter((entry) =>
-        entry.message.method === "subscriptions/listen"
-      ).length;
-      const before = subscriptions();
-      expect(before).toBeGreaterThan(0);
-      await tui.sendText("/mcp auth fixture --open");
-      await tui.waitForText("Authenticated MCP server 'fixture'.", 15_000);
-      const deadline = Date.now() + 8_000;
-      while (subscriptions() === before && Date.now() < deadline) await Bun.sleep(25);
-      expect(subscriptions()).toBe(before + 1);
-      await tui.sendText("Call the authenticated MCP echo tool.");
-      await tui.waitForText("Authenticated MCP call complete.", 15_000);
-      expect(upstream.requests.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
-    },
-    45_000,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "fresh TUI login persists, ask refreshes after restart, and logout revokes",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url);
-      const root = createRoot(auth);
-      const profilePath = join(root.home, ".fx", "mcp.json");
-      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-      profile.mcp.healthy = { type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" }, url: upstream.url, headers: { "x-test-healthy": "1" }, startup_timeout_ms: 5_000 };
-      writeFileSync(profilePath, JSON.stringify(profile));
-      gateway = startFakeGateway([
-        fakeGatewayFinalText("TUI idle."),
-      ], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      const tuiEnv = {
-        ...baseEnv(root),
-        FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-      };
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        env: tuiEnv,
-        width: 110,
-        height: 34,
-      });
-      await tui.waitForComposer(15_000);
-
-      const healthyDeadline = Date.now() + 10_000;
-      while (!upstream.requests.some((entry) => entry.headers["x-test-healthy"] === "1" && entry.message.method === "tools/list") && Date.now() < healthyDeadline) await Bun.sleep(25);
-      const healthyRequests = () => upstream!.requests.filter((entry) => entry.headers["x-test-healthy"] === "1").length;
-      const healthyBeforeAuth = healthyRequests();
-      expect(healthyBeforeAuth).toBeGreaterThan(0);
-      await tui.sendText("/mcp auth fixture");
-      await tui.waitForText(
-        "Run /mcp auth fixture --open to confirm opening your browser.",
-        5_000,
-      );
-      expect(auth.authorizationRequests).toBe(0);
-      await tui.waitForComposer(5_000);
-
-      const beforeMenu = await tui.captureFullScrollback();
-      await tui.sendText("/mcp");
-      const menu = await tui.waitForText("Needs authentication", 10_000);
-      expect(menu).toContain("fixture");
-      await tui.sendKeys("Enter");
-      await tui.waitForText("Profile · ~/.fx/mcp.json", 5_000);
-      await tui.sendKeys("Enter");
-      const authDeadline = Date.now() + 10_000;
-      while (auth.authorizationRequests === 0 && Date.now() < authDeadline) {
-        await Bun.sleep(25);
-      }
-      expect(auth.authorizationRequests).toBe(1);
-      const tokenDeadline = Date.now() + 10_000;
-      while (auth.tokenExchanges === 0 && Date.now() < tokenDeadline) {
-        await Bun.sleep(25);
-      }
-      expect(auth.tokenExchanges).toBe(1);
-      await tui.waitForText("Authenticated MCP server 'fixture'.", 15_000);
-      expect(healthyRequests()).toBe(healthyBeforeAuth);
-      expect(auth.authorizationRequests).toBe(1);
-      expect(auth.tokenExchanges).toBe(1);
-      const credentialPath = join(
-        root.home,
-        ".fx",
-        "mcp-credentials",
-        "credentials.json",
-      );
-      expect(existsSync(credentialPath)).toBe(true);
-      let stored = JSON.parse(readFileSync(credentialPath, "utf8"));
-      expect(stored.credentials[0].access_token).toBe(ACCESS_INITIAL);
-
-      await tui.sendKeys("Escape");
-      await tui.waitForText("enter inspect", 5_000);
-      await tui.sendKeys("Escape");
-      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
-      expect(await tui.captureFullScrollback()).toBe(beforeMenu);
-
-      await tui.kill();
-      tui = null;
-      gateway.stop();
-      gateway = startToolGateway();
-      stored.credentials[0].expires_at_ms = 0;
-      writeFileSync(credentialPath, JSON.stringify(stored), { mode: 0o600 });
-
-      const ask = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Call the authenticated MCP fixture."],
-        {
-          cwd: root.workspace,
-          env: {
-            ...baseEnv(root),
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          },
-          timeoutMs: 20_000,
-        },
-      );
-      expect(ask.code).toBe(0);
-      expect(JSON.parse(ask.stdout).output).toContain(
-        "Authenticated MCP call complete.",
-      );
-      expect(auth.refreshes).toBe(1);
-      const modernRequests = auth.requests.filter(
-        (request) => request.path === "/mcp",
-      );
-      expect(modernRequests.length).toBeGreaterThan(0);
-      for (const request of modernRequests) {
-        expect(request.method).toBe("POST");
-        expect(request.sessionId).toBeNull();
-        expect(request.lastEventId).toBeNull();
-      }
-      stored = JSON.parse(readFileSync(credentialPath, "utf8"));
-      expect(stored.credentials[0].access_token).toBe(ACCESS_REFRESHED);
-      expect(stored.credentials[0].refresh_token).toBe(REFRESH_ROTATED);
-
-      gateway.stop();
-      gateway = startFakeGateway([
-        fakeGatewayFinalText("TUI idle."),
-      ], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        width: 110,
-        height: 34,
-      });
-      await tui.waitForComposer(15_000);
-      await tui.sendText("/mcp");
-      const summary = await tui.waitForText("MCP 2", 5_000);
-      expect(summary).toContain("fixture");
-      expect(summary).toContain("Ready");
-      await tui.sendKeys("Escape");
-      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
-      const beforeListMenu = await tui.captureFullScrollback();
-      await tui.sendText("/mcp list");
-      const status = await tui.waitForText("[Servers]", 5_000);
-      expect(status).toContain("fixture");
-      expect(status).toContain("Ready");
-      expect(status).not.toContain(ACCESS_REFRESHED);
-      await tui.sendKeys("Enter");
-      await tui.waitForText("Profile · ~/.fx/mcp.json", 5_000);
-      await tui.sendKeys("L");
-      await tui.waitForText("Log out of this MCP server?", 5_000);
-      await tui.sendKeys("Enter");
-      await tui.waitForText("Logged out of MCP server 'fixture'.", 15_000);
-      expect(existsSync(credentialPath)).toBe(false);
-      expect(auth.revocations).toBe(2);
-      await tui.sendKeys("Escape");
-      await tui.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
-      expect(await tui.captureFullScrollback()).toBe(beforeListMenu);
-      await tui.kill();
-      tui = null;
-
-      const trace = readFileSync(root.trace, "utf8");
-      for (
-        const secret of [
-          ACCESS_INITIAL,
-          ACCESS_REFRESHED,
-          REFRESH_INITIAL,
-          REFRESH_ROTATED,
-        ]
-      ) {
-        expect(trace).not.toContain(secret);
-        expect(status).not.toContain(secret);
-        expect(ask.stdout).not.toContain(secret);
-        expect(ask.stderr).not.toContain(secret);
-        for (const path of collectRegularFiles(root.root)) {
-          expect(readFileSync(path).toString("utf8")).not.toContain(secret);
-        }
-      }
-    },
-    60_000,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "authorization metadata accepts a trailing-slash discrepancy",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url, {
-        authorizationServerTrailingSlash: true,
-      });
-      const root = createRoot(auth);
-      gateway = startFakeGateway([], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        width: 120,
-        height: 34,
-      });
-      await tui.waitForComposer(15_000);
-
-      await tui.sendText("/mcp auth fixture --open");
-      await tui.waitForText("Authenticated MCP server 'fixture'.", 15_000);
-      expect(auth.authorizationRequests).toBe(1);
-      expect(auth.tokenExchanges).toBe(1);
-      expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json")))
-        .toBe(true);
-    },
-    30_000,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "authorization response issuer mismatch names the response and preserves the trust boundary",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url, {
-        authorizationResponseTrailingSlash: true,
-      });
-      const returnedIssuer = `${new URL(auth.url).origin}/`;
-      const root = createRoot(auth);
-      gateway = startFakeGateway([], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        width: 140,
-        height: 36,
-      });
-      await tui.waitForComposer(15_000);
-
-      await tui.sendText("/mcp auth fixture --open");
-      const mismatch = await tui.waitForText("was rejected", 15_000);
-      const compactMismatch = mismatch.replace(/\s+/g, " ");
-      expect(compactMismatch).toContain("authorization response returned issuer");
-      expect(compactMismatch).toContain(returnedIssuer);
-      expect(compactMismatch).toContain("stopped before token exchange");
-      expect(compactMismatch).toContain("Contact the MCP server provider");
-      expect(compactMismatch).not.toContain('Add "oauth":{"issuer":');
-      expect(auth.authorizationRequests).toBe(1);
-      expect(auth.tokenExchanges).toBe(0);
-      expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json")))
-        .toBe(false);
-    },
-    30_000,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "state mismatch rejects the callback before token exchange or persistence",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url, { wrongState: true });
-      const root = createRoot(auth);
-      gateway = startFakeGateway([
-        fakeGatewayFinalText("TUI idle."),
-      ], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        width: 110,
-        height: 34,
-      });
-      await tui.waitForComposer(15_000);
-      await tui.sendText("/mcp auth fixture --open");
-      await tui.waitForText("OAuthStateMismatch", 15_000);
-      expect(auth.authorizationRequests).toBe(1);
-      expect(auth.tokenExchanges).toBe(0);
-      expect(
-        existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json")),
-      ).toBe(false);
-    },
-    30_000,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "non-JSON authorization metadata is rejected before browser authorization",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url, {
-        authorizationMetadataContentType: "text/plain",
-      });
-      const root = createRoot(auth);
-      gateway = startFakeGateway([
-        fakeGatewayFinalText("TUI idle."),
-      ], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        width: 110,
-        height: 34,
-      });
-      await tui.waitForComposer(15_000);
-      await tui.sendText("/mcp auth fixture --open");
-      await tui.waitForText("InvalidOAuthResponseContentType", 15_000);
-      expect(auth.authorizationRequests).toBe(0);
-      expect(auth.tokenExchanges).toBe(0);
-      expect(
-        existsSync(join(root.home, ".fx", "mcp-credentials", "credentials.json")),
-      ).toBe(false);
-    },
-    30_000,
-  );
-
-  test(
-    "scoped HTTP authentication effects fail closed across authority changes",
-    async () => {
-      for (const mode of ["expired", "challenge"] as const) {
-        upstream = startModernMcpHttpFixture("json");
-        const fixtureOptions: {
-          rejectToolAuth?: boolean;
-          challengeMarkerPath?: string;
-        } = mode === "challenge"
-          ? { rejectToolAuth: true, challengeMarkerPath: "" }
-          : {};
-        auth = startAuthFixture(upstream.url, fixtureOptions);
-        const root = createRoot(auth);
-        const markerPath = join(root.root, `${mode}-authority-revoked`);
-        fixtureOptions.challengeMarkerPath = markerPath;
-        const credentialPath = seedExpiredCredentials(
-          root,
-          auth,
-          Date.now() + 3_600_000,
-        );
-        const storedBefore = readFileSync(credentialPath, "utf8");
-
-        const proc = Bun.spawn(
-          [
-            "zig",
-            "build",
-            "run-mcp-stdio-dispatcher-e2e",
-            "--",
-            "runtime-scoped-http-auth",
-            auth.url,
-            markerPath,
-            mode,
-          ],
-          {
-            cwd: REPO_ROOT,
-            env: {
-              ...process.env,
-              ...baseEnv(root),
-              FX_E2E_MCP_AUTH_AUTOMATE: "1",
-            },
-            stdout: "pipe",
-            stderr: "pipe",
-          },
-        );
-        const [stdout, stderr, code] = await Promise.all([
-          new Response(proc.stdout).text(),
-          new Response(proc.stderr).text(),
-          proc.exited,
-        ]);
-        expect(code, stderr).toBe(0);
-        const result = JSON.parse(stdout.trim()) as {
-          mode: string;
-          error: string;
-          auth_generation: number;
-          challenge_present: boolean;
-          resolutions: number;
-        };
-        expect(result.mode).toBe(mode);
-        expect(result.error).toBe(
-          mode === "expired"
-            ? "McpAuthenticationRequired"
-            : "McpAuthorityChanged",
-        );
-        expect(result.auth_generation).toBe(0);
-        expect(result.challenge_present).toBe(false);
-        expect(result.resolutions).toBeGreaterThan(0);
-        expect(auth.refreshes).toBe(0);
-        expect(auth.authorizationRequests).toBe(0);
-        expect(auth.tokenExchanges).toBe(0);
-        expect(readFileSync(credentialPath, "utf8")).toBe(storedBefore);
-
-        if (mode === "expired") {
-          expect(auth.protectedToolCalls).toBe(0);
-          expect(existsSync(markerPath)).toBe(false);
-        } else {
-          expect(auth.protectedToolCalls).toBe(1);
-          expect(existsSync(markerPath)).toBe(true);
-          expect(
-            upstream.requests.filter((request) =>
-              request.message.method === "tools/call"
-            ),
-          ).toHaveLength(0);
-        }
-
-        const evidenceDir = process.env.FX_S11_EVIDENCE_DIR;
-        if (evidenceDir) {
-          mkdirSync(evidenceDir, { recursive: true });
-          writeFileSync(
-            join(evidenceDir, `http-auth-${mode}.json`),
-            JSON.stringify({
-              result,
-              refreshes: auth.refreshes,
-              authorizationRequests: auth.authorizationRequests,
-              tokenExchanges: auth.tokenExchanges,
-              protectedToolCalls: auth.protectedToolCalls,
-              upstreamToolCalls: upstream.requests.filter((request) =>
-                request.message.method === "tools/call"
-              ).length,
-              credentialStoreUnchanged:
-                readFileSync(credentialPath, "utf8") === storedBefore,
-            }, null, 2),
-          );
-        }
-
-        auth.stop();
-        auth = null;
-        upstream.stop();
-        upstream = null;
-        rmSync(root.root, { recursive: true, force: true });
-        cleanupRoot = null;
-      }
-    },
-    60_000,
-  );
-
-  test(
-    "scope escalation updates credentials without replaying a modern tool call",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url, { rejectToolAuth: true });
-      const root = createRoot(auth);
-      seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
-      gateway = startToolGateway();
-
-      const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Call the protected MCP fixture."],
-        {
-          cwd: root.workspace,
-          env: {
-            ...baseEnv(root),
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_E2E_MCP_AUTH_AUTOMATE: "1",
-          },
-          timeoutMs: 20_000,
-        },
-      );
-
-      expect(result.code).toBe(0);
-      expect(auth.protectedToolCalls).toBe(1);
-      expect(auth.authorizationRequests).toBe(1);
-      expect(auth.tokenExchanges).toBe(1);
-      expect(
-        upstream.requests.filter((request) =>
-          request.message.method === "tools/call"
-        ),
-      ).toHaveLength(0);
-      expect(gateway.requests[2]?.body).toContain("McpAuthenticationUpdated");
-    },
-    30_000,
-  );
-
-  test(
-    "legacy Streamable HTTP refreshes expired credentials before initialization",
-    async () => {
-      legacyStreamable = startLegacyStreamableHttpFixture("2025-11-25");
-      auth = startAuthFixture(legacyStreamable.url);
-      const root = createRoot(auth);
-      seedExpiredCredentials(root, auth);
-      gateway = startToolGateway();
-
-      const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Call the protected legacy fixture."],
-        {
-          cwd: root.workspace,
-          env: {
-            ...baseEnv(root),
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          },
-          timeoutMs: 20_000,
-        },
-      );
-
-      expect(result.code).toBe(0);
-      expect(auth.refreshes).toBe(1);
-      expect(legacyStreamable.initializeCalls).toBe(1);
-      expect(legacyStreamable.toolCallCalls).toBe(1);
-      for (
-        const request of auth.requests.filter((entry) => entry.path === "/mcp")
-      ) {
-        expect(request.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
-      }
-    },
-    30_000,
-  );
-
-  test(
-    "legacy HTTP+SSE refreshes expired credentials before endpoint discovery",
-    async () => {
-      legacySse = startLegacyHttpSseFixture();
-      auth = startAuthFixture(legacySse.url, { transport: "sse" });
-      const root = createRoot(auth, true, "sse");
-      seedExpiredCredentials(root, auth);
-      gateway = startToolGateway();
-
-      const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Call the protected SSE fixture."],
-        {
-          cwd: root.workspace,
-          env: {
-            ...baseEnv(root),
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          },
-          timeoutMs: 20_000,
-        },
-      );
-
-      expect(result.code).toBe(0);
-      expect(auth.refreshes).toBe(1);
-      expect(legacySse.discoveryGets).toBe(1);
-      expect(
-        legacySse.requests.filter((request) =>
-          request.message?.method === "tools/call"
-        ),
-      ).toHaveLength(1);
-      for (
-        const request of auth.requests.filter((entry) =>
-          entry.path === "/sse" || entry.path === "/messages"
-        )
-      ) {
-        expect(request.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
-      }
-    },
-    30_000,
-  );
-
-  test(
-    "legacy refresh network work releases auth and connection locks",
-    async () => {
-      legacyStreamable = startLegacyStreamableHttpFixture("2025-11-25");
-      const fixtureOptions: {
-        refreshBarrierStartedPath?: string;
-        refreshBarrierReleasePath?: string;
-      } = {};
-      auth = startAuthFixture(legacyStreamable.url, fixtureOptions);
-      const root = createRoot(auth);
-      const refreshStartedPath = join(root.root, "refresh-started");
-      const refreshReleasePath = join(root.root, "refresh-release");
-      fixtureOptions.refreshBarrierStartedPath = refreshStartedPath;
-      fixtureOptions.refreshBarrierReleasePath = refreshReleasePath;
-      seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
-
-      const proc = Bun.spawn(
-        [
-          "zig",
-          "build",
-          "run-mcp-stdio-dispatcher-e2e",
-          "--",
-          "runtime-legacy-refresh-locks",
-          auth.url,
-          refreshStartedPath,
-          refreshReleasePath,
-        ],
-        {
-          cwd: REPO_ROOT,
-          env: {
-            ...process.env,
-            ...baseEnv(root),
-          },
-          stdout: "pipe",
-          stderr: "pipe",
-        },
-      );
-      const [stdout, stderr, code] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-
-      expect(code, stderr).toBe(0);
-      const result = JSON.parse(stdout.trim()) as {
-        auth_lock_available: boolean;
-        connection_lock_available: boolean;
-        initial_auth_generation: number;
-        final_auth_generation: number;
-      };
-      expect(result.auth_lock_available).toBe(true);
-      expect(result.connection_lock_available).toBe(true);
-      expect(result.final_auth_generation).toBe(
-        result.initial_auth_generation + 1,
-      );
-      expect(existsSync(refreshStartedPath)).toBe(true);
-      expect(existsSync(refreshReleasePath)).toBe(true);
-      expect(auth.refreshes).toBe(1);
-      expect(legacyStreamable.initializeCalls).toBe(2);
-      expect(legacyStreamable.toolCallCalls).toBe(1);
-    },
-    30_000,
-  );
-
-  test(
-    "logout cannot persist an in-flight legacy credential refresh",
-    async () => {
-      legacyStreamable = startLegacyStreamableHttpFixture("2025-11-25");
-      const fixtureOptions: {
-        refreshBarrierStartedPath?: string;
-        refreshBarrierReleasePath?: string;
-      } = {};
-      auth = startAuthFixture(legacyStreamable.url, fixtureOptions);
-      const root = createRoot(auth);
-      const refreshStartedPath = join(root.root, "logout-refresh-started");
-      const refreshReleasePath = join(root.root, "logout-refresh-release");
-      fixtureOptions.refreshBarrierStartedPath = refreshStartedPath;
-      fixtureOptions.refreshBarrierReleasePath = refreshReleasePath;
-      seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
-      const credentialStorePath = join(
-        root.home,
-        ".fx",
-        "mcp-credentials",
-        "credentials.json",
-      );
-
-      const proc = Bun.spawn(
-        [
-          "zig",
-          "build",
-          "run-mcp-stdio-dispatcher-e2e",
-          "--",
-          "runtime-logout-refresh-race",
-          auth.url,
-          refreshStartedPath,
-          refreshReleasePath,
-          credentialStorePath,
-        ],
-        {
-          cwd: REPO_ROOT,
-          env: {
-            ...process.env,
-            ...baseEnv(root),
-          },
-          stdout: "pipe",
-          stderr: "pipe",
-        },
-      );
-      const [stdout, stderr, code] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-
-      expect(code, stderr).toBe(0);
-      expect(JSON.parse(stdout.trim())).toEqual({
-        logout_removed: true,
-        store_present_while_auth_locked: true,
-        credentials_reloaded_after_restart: false,
-      });
-      expect(existsSync(refreshStartedPath)).toBe(true);
-      expect(existsSync(refreshReleasePath)).toBe(true);
-      expect(auth.refreshes).toBe(1);
-    },
-    30_000,
-  );
-
-  test(
-    "interactive browser work releases MCP auth and catalog locks",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url);
-      const root = createRoot(auth);
-      const authStartedPath = join(root.root, "interactive-auth-started");
-      const authReleasePath = join(root.root, "interactive-auth-release");
-
-      const proc = Bun.spawn(
-        [
-          "zig",
-          "build",
-          "run-mcp-stdio-dispatcher-e2e",
-          "--",
-          "runtime-interactive-auth-locks",
-          auth.url,
-          authStartedPath,
-          authReleasePath,
-        ],
-        {
-          cwd: REPO_ROOT,
-          env: {
-            ...process.env,
-            ...baseEnv(root),
-          },
-          stdout: "pipe",
-          stderr: "pipe",
-        },
-      );
-      const [stdout, stderr, code] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-
-      expect(code, stderr).toBe(0);
-      expect(JSON.parse(stdout.trim())).toEqual({
-        auth_lock_available: true,
-        catalog_lock_available: true,
-        credentials_published: false,
-      });
-      expect(existsSync(authStartedPath)).toBe(true);
-      expect(existsSync(authReleasePath)).toBe(true);
-      expect(auth.authorizationRequests).toBe(0);
-      expect(auth.tokenExchanges).toBe(0);
-    },
-    30_000,
-  );
-
-  test(
-    "runtime retirement cancels an interactive authorization callback wait",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url);
-      const root = createRoot(auth);
-      const authStartedPath = join(root.root, "retiring-auth-started");
-
-      const proc = Bun.spawn(
-        [
-          "zig",
-          "build",
-          "run-mcp-stdio-dispatcher-e2e",
-          "--",
-          "runtime-interactive-auth-retirement",
-          auth.url,
-          authStartedPath,
-        ],
-        {
-          cwd: REPO_ROOT,
-          env: {
-            ...process.env,
-            ...baseEnv(root),
-          },
-          stdout: "pipe",
-          stderr: "pipe",
-        },
-      );
-      const [stdout, stderr, code] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-
-      expect(code, stderr).toBe(0);
-      const result = JSON.parse(stdout.trim()) as {
-        error: string;
-        elapsed_ms: number;
-        credentials_published: boolean;
-      };
-      expect(result.error).toBe("Cancelled");
-      expect(result.elapsed_ms).toBeLessThan(1_000);
-      expect(result.credentials_published).toBe(false);
-      expect(existsSync(authStartedPath)).toBe(true);
-      expect(auth.authorizationRequests).toBe(0);
-      expect(auth.tokenExchanges).toBe(0);
-    },
-    30_000,
-  );
-
-  for (
-    const version of [
-      "2025-11-25",
-      "2025-06-18",
-      "2025-03-26",
-    ] as const
-  ) {
-    test(
-      `legacy Streamable HTTP ${version} reconnects before a call when credentials enter refresh skew`,
-      async () => {
-        legacyStreamable = startLegacyStreamableHttpFixture(version);
-        auth = startAuthFixture(legacyStreamable.url);
-        const root = createRoot(auth);
-        seedExpiredCredentials(root, auth, Date.now() + 65_000);
-        gateway = startDelayedToolGateway(
-          6_000,
-          "Legacy HTTP refresh complete.",
-        );
-
-        const result = await runFx(
-          ["ask", "--json", "--auto", "--no-save", "Call the protected legacy fixture."],
-          {
-            cwd: root.workspace,
-            env: {
-              ...baseEnv(root),
-              FX_GATEWAY_BASE_URL: gateway.baseUrl,
-              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            },
-            timeoutMs: 25_000,
-          },
-        );
-
-        expect(result.code).toBe(0);
-        expect(auth.refreshes).toBe(1);
-        expect(legacyStreamable.initializeCalls).toBe(2);
-        expect(legacyStreamable.toolCallCalls).toBe(1);
-        const protectedRequests = auth.requests.filter((request) =>
-          request.path === "/mcp"
-        );
-        expect(protectedRequests.some((request) =>
-          request.authorization === `Bearer ${ACCESS_INITIAL}`
-        )).toBe(true);
-        expect(protectedRequests.at(-1)?.authorization).toBe(
-          `Bearer ${ACCESS_REFRESHED}`,
-        );
-      },
-      35_000,
-    );
-  }
-
-  test(
-    "legacy HTTP+SSE reconnects before a call when credentials enter refresh skew",
-    async () => {
-      legacySse = startLegacyHttpSseFixture();
-      auth = startAuthFixture(legacySse.url, { transport: "sse" });
-      const root = createRoot(auth, true, "sse");
-      seedExpiredCredentials(root, auth, Date.now() + 65_000);
-      gateway = startDelayedToolGateway(
-        8_000,
-        "Legacy SSE refresh complete.",
-      );
-
-      const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Call the protected SSE fixture."],
-        {
-          cwd: root.workspace,
-          env: {
-            ...baseEnv(root),
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          },
-          timeoutMs: 25_000,
-        },
-      );
-
-      expect(result.code).toBe(0);
-      expect(auth.refreshes).toBe(1);
-      expect(legacySse.discoveryGets).toBe(2);
-      expect(
-        legacySse.requests.filter((request) =>
-          request.message?.method === "tools/call"
-        ),
-      ).toHaveLength(1);
-      const protectedRequests = auth.requests.filter((request) =>
-        request.path === "/sse" || request.path === "/messages"
-      );
-      expect(protectedRequests.some((request) =>
-        request.authorization === `Bearer ${ACCESS_INITIAL}`
-      )).toBe(true);
-      expect(protectedRequests.at(-1)?.authorization).toBe(
-        `Bearer ${ACCESS_REFRESHED}`,
-      );
-    },
-    35_000,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "TUI cancellation interrupts an in-flight credential refresh before the MCP call",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url, { stallRefresh: true });
-      const root = createRoot(auth);
-      const credentialPath = seedExpiredCredentials(
-        root,
-        auth,
-        Date.now() + 65_000,
-      );
-      gateway = startRefreshRecoveryGateway(8_000);
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        width: 110,
-        height: 34,
-      });
-      await tui.waitForComposer(15_000);
-
-      await tui.sendText("Call the protected MCP fixture.");
-      const refreshDeadline = Date.now() + 15_000;
-      while (auth.refreshes === 0 && Date.now() < refreshDeadline) {
-        await Bun.sleep(25);
-      }
-      expect(auth.refreshes).toBe(1);
-
-      await tui.sendInterruptEscapePair(10_000);
-      await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
-      const cancelDeadline = Date.now() + 5_000;
-      while (
-        auth.refreshCancellations === 0 &&
-        Date.now() < cancelDeadline
-      ) {
-        await Bun.sleep(25);
-      }
-
-      expect(auth.refreshCancellations).toBe(1);
-      expect(auth.protectedToolCalls).toBe(0);
-      expect(upstream.requests).toHaveLength(2);
-      const stored = readFileSync(credentialPath, "utf8");
-      expect(stored).toContain(ACCESS_INITIAL);
-      expect(stored).not.toContain(ACCESS_REFRESHED);
-      await tui.waitForComposer(10_000);
-
-      await tui.sendText("Retry the protected MCP fixture.");
-      await tui.waitForText("Refresh recovery complete.", 15_000);
-      expect(auth.refreshes).toBe(2);
-      expect(auth.protectedToolCalls).toBe(1);
-      expect(readFileSync(credentialPath, "utf8")).toContain(ACCESS_REFRESHED);
-    },
-    45_000,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "legacy Streamable HTTP logout closes its session and permits sign-in from the inspector",
-    async () => {
-      legacyStreamable = startLegacyStreamableHttpFixture("2025-06-18");
-      auth = startAuthFixture(legacyStreamable.url);
-      const root = createRoot(auth);
-      const credentialPath = seedExpiredCredentials(
-        root,
-        auth,
-        Date.now() + 3_600_000,
-      );
-      gateway = startFakeGateway([
-        fakeGatewayFinalText("TUI idle."),
-      ], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        width: 110,
-        height: 34,
-      });
-      await tui.waitForComposer(15_000);
-
-      await tui.sendText("/mcp logout fixture");
-      await tui.waitForText("Logged out of MCP server 'fixture'.", 10_000);
-
-      expect(legacyStreamable.deleteCalls).toBe(1);
-      const deleteRequest = auth.requests.find((request) =>
-        request.method === "DELETE" && request.path === "/mcp"
-      );
-      expect(deleteRequest?.authorization).toBe(`Bearer ${ACCESS_INITIAL}`);
-      expect(existsSync(credentialPath)).toBe(false);
-      await tui.sendText("/mcp");
-      await tui.waitForPane((pane) => /fixture\s+Disconnected/.test(pane), 5_000);
-      expect(auth.authorizationRequests).toBe(0);
-      await tui.sendKeys("Enter");
-      await tui.waitForText("enter sign in", 5_000);
-      expect(await tui.capturePane()).toMatch(/State\s+Disconnected/);
-
-      await tui.sendKeys("Enter");
-      await tui.waitForPane((pane) => /State\s+Ready/.test(pane), 15_000);
-      expect(auth.authorizationRequests).toBe(1);
-      expect(auth.tokenExchanges).toBe(1);
-      expect(existsSync(credentialPath)).toBe(true);
-      expect(gateway.requests).toHaveLength(0);
-    },
-    30_000,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "logout without stored credentials preserves the live server",
-    async () => {
-      upstream = startModernMcpHttpFixture("cache_auth_subscription");
-      auth = startAuthFixture(upstream.url);
-      const root = createRoot(auth, false, "http", upstream.url);
-      gateway = startToolGateway();
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        width: 110,
-        height: 34,
-        stderrPath: join(root.root, "tui-stderr.log"),
-        remainOnExit: true,
-      });
-      try {
-        await tui.waitForComposer(15_000);
-        const listenerDeadline = Date.now() + 10_000;
-        while (
-          upstream.requests.filter((request) =>
-            request.message.method === "subscriptions/listen"
-          ).length < 1 && Date.now() < listenerDeadline
-        ) {
-          await Bun.sleep(25);
-        }
-        expect(
-          upstream.requests.filter((request) =>
-            request.message.method === "subscriptions/listen"
-          ),
-        ).toHaveLength(1);
-
-        await tui.sendText("/mcp logout fixture");
-        await tui.waitForText(
-          "No stored MCP credentials found for 'fixture'.",
-          10_000,
-        );
-        expect(upstream.cancelledCalls).toBe(0);
-        await tui.waitForComposer(10_000);
-        await tui.sendText("Call the still-connected MCP fixture.");
-        await tui.waitForText("Authenticated MCP call complete.", 15_000);
-        expect(tui.paneStatus()).toEqual({ dead: false, status: null });
-
-        expect(
-          upstream.requests.filter((request) =>
-            request.message.method === "tools/call"
-          ),
-        ).toHaveLength(1);
-        upstream.finishSubscription();
-      } catch (error) {
-        await preserveAuthTuiFailure("logout-without-store", root, error);
-      }
-    },
-    35_000,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "logout store failure preserves the live server",
-    async () => {
-      upstream = startModernMcpHttpFixture("cache_auth_subscription");
-      auth = startAuthFixture(upstream.url);
-      const root = createRoot(auth, false, "http", upstream.url);
-      gateway = startToolGateway();
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        width: 110,
-        height: 34,
-        stderrPath: join(root.root, "tui-stderr.log"),
-        remainOnExit: true,
-      });
-      try {
-        await tui.waitForComposer(15_000);
-        const listenerDeadline = Date.now() + 10_000;
-        while (
-          upstream.requests.filter((request) =>
-            request.message.method === "subscriptions/listen"
-          ).length < 1 && Date.now() < listenerDeadline
-        ) {
-          await Bun.sleep(25);
-        }
-        expect(
-          upstream.requests.filter((request) =>
-            request.message.method === "subscriptions/listen"
-          ),
-        ).toHaveLength(1);
-
-        const credentialDirectory = join(
-          root.home,
-          ".fx",
-          "mcp-credentials",
-        );
-        mkdirSync(credentialDirectory, { recursive: true, mode: 0o700 });
-        writeFileSync(
-          join(credentialDirectory, "credentials.json"),
-          "{",
-          { mode: 0o600 },
-        );
-        await tui.sendText("/mcp logout fixture");
-        await tui.waitForText("MCP logout for 'fixture' failed:", 10_000);
-        await tui.waitForComposer(10_000);
-        await tui.sendText("Call the still-connected MCP fixture.");
-        await tui.waitForText("Authenticated MCP call complete.", 15_000);
-        expect(tui.paneStatus()).toEqual({ dead: false, status: null });
-
-        expect(
-          upstream.requests.filter((request) =>
-            request.message.method === "tools/call"
-          ),
-        ).toHaveLength(1);
-        expect(upstream.cancelledCalls).toBe(0);
-        upstream.finishSubscription();
-      } catch (error) {
-        await preserveAuthTuiFailure("logout-store-failure", root, error);
-      }
-    },
-    35_000,
-  );
-
-  test.skipIf(!tmuxAvailable())(
-    "legacy HTTP+SSE logout joins its reader and deletes stored credentials",
-    async () => {
-      legacySse = startLegacyHttpSseFixture();
-      auth = startAuthFixture(legacySse.url, { transport: "sse" });
-      const root = createRoot(auth, true, "sse");
-      const credentialPath = seedExpiredCredentials(
-        root,
-        auth,
-        Date.now() + 3_600_000,
-      );
-      gateway = startFakeGateway([
-        fakeGatewayFinalText("TUI idle."),
-      ], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        env: {
-          ...baseEnv(root),
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        },
-        width: 110,
-        height: 34,
-      });
-      await tui.waitForComposer(15_000);
-
-      await tui.sendText("/mcp logout fixture");
-      await tui.waitForText("Logged out of MCP server 'fixture'.", 10_000);
-      const cancelDeadline = Date.now() + 5_000;
-      while (
-        auth.proxyStreamCancellations === 0 &&
-        Date.now() < cancelDeadline
-      ) {
-        await Bun.sleep(25);
-      }
-
-      expect(auth.proxyStreamCancellations).toBe(1);
-      expect(existsSync(credentialPath)).toBe(false);
-    },
-    30_000,
-  );
-
-  test(
-    "expired refresh rejection does not send or replay an MCP operation",
-    async () => {
-      upstream = startModernMcpHttpFixture("json");
-      auth = startAuthFixture(upstream.url, { rejectRefresh: true });
-      const root = createRoot(auth);
-      const credentialPath = seedExpiredCredentials(root, auth);
-      gateway = startFakeGateway([
-        fakeGatewayToolCall("inspect_refresh_rejection", "capability_search", {
-          query: "echo",
-        }),
-        fakeGatewayFinalText("Refresh failure handled."),
-      ], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-
-      const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Check the MCP fixture."],
-        {
-          cwd: root.workspace,
-          env: {
-            ...baseEnv(root),
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          },
-          timeoutMs: 20_000,
-        },
-      );
-      expect(result.code).toBe(0);
-      expect(auth.refreshes).toBe(1);
-      expect(upstream.requests).toHaveLength(0);
-      expect(readFileSync(credentialPath, "utf8")).toContain(REFRESH_INITIAL);
-      expect(result.stdout).not.toContain(REFRESH_INITIAL);
-      expect(result.stderr).not.toContain(REFRESH_INITIAL);
-      expect(readFileSync(root.trace, "utf8")).not.toContain(REFRESH_INITIAL);
-
-      const listed = await runFx(["mcp", "list", "--connect"], {
-        cwd: root.workspace,
-        env: { ...baseEnv(root) },
-        timeoutMs: 20_000,
-      });
-      expect(listed.code).toBe(0);
-      expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}auth=required/);
-      expect(listed.stdout).toMatch(/fixture[\s\S]{0,240}status=needs_auth/);
-    },
-    45_000,
-  );
-});
-
-describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
   // Without a display (Linux with no DISPLAY, an SSH session, or
   // FX_NO_OPEN_BROWSER) fx offers paste-back instead of opening a browser.
   // These tests drive the fake browser, so they declare one everywhere.
   const v2Env = (root: ReturnType<typeof createRoot>) => ({
     ...baseEnv(root),
-    FX_MCP_ENGINE: "v2",
     FX_DISABLE_KEYCHAIN: "1",
-    FX_MCP_PROTOCOL_VERSION: undefined,
     DISPLAY: ":0",
     SSH_CONNECTION: undefined,
     FX_NO_OPEN_BROWSER: undefined,
@@ -4168,6 +848,73 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     expect(list.code).toBe(0);
     return JSON.parse(list.stdout).servers[0].status;
   };
+  // What the model is told to ask for depends on where the user is.
+  const searchNeedingLogin = () => startFakeGateway([
+    fakeGatewayToolCall("search_auth", "capability_search", { query: "fixture", server: "fixture" }),
+    fakeGatewayFinalText("Sign in first."),
+  ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+
+  test("fx ask tells the model the user signs in with fx mcp login in a terminal", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    gateway = searchNeedingLogin();
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Find the protected MCP tool."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 20_000,
+    });
+    expect(result.code).toBe(0);
+    expect(gateway.requests[1]?.body).toContain("Run fx mcp login fixture in a terminal, then search again.");
+    expect(auth.authorizationRequests).toBe(0);
+  }, 30_000);
+
+  test("an open search that matches nothing names the servers it couldn't look in, and why", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const profile = join(root.home, ".fx", "mcp.json");
+    const config = JSON.parse(readFileSync(profile, "utf8"));
+    config.mcp.broken = { type: "local", command: ["false"], startup_timeout_ms: 5_000 };
+    writeFileSync(profile, JSON.stringify(config));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("search_open", "capability_search", { query: "weather forecast" }),
+      fakeGatewayFinalText("Nothing found."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "What's the weather?"], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    const told = toolResultText(gateway.requests[1]?.body ?? "", "search_open");
+    expect(told).toContain('"state":"no_match"');
+    expect(told).toContain('"mcp_unavailable":[');
+    expect(told).toContain("\"MCP server 'fixture' needs a login. Ask the user to run fx mcp login fixture in a terminal, then try again.\"");
+    expect(told).toContain("\"MCP server 'broken' is unavailable: ");
+    expect(auth.authorizationRequests).toBe(0);
+  }, 45_000);
+
+  test.skipIf(!tmuxAvailable())("the shell tells the model the user signs in with /mcp login", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    gateway = searchNeedingLogin();
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Find the protected MCP tool.");
+    await tui.waitForText("Sign in first.", 20_000);
+    const told = gateway.requests[1]?.body ?? "";
+    expect(told).toContain("Run /mcp login fixture, then search again.");
+    expect(told).not.toContain("fx mcp login fixture in a terminal");
+    expect(auth.authorizationRequests).toBe(0);
+  }, 45_000);
 
   test("fx mcp login signs in through the browser, and logout signs out", async () => {
     upstream = startModernMcpHttpFixture("json");
@@ -4178,7 +925,7 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
 
     const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
     expect(login.stderr).toBe("");
-    expect(login.code).toBe(0);
+    expectExit0(login);
     expect(login.stdout).toContain("Approve in your browser.");
     expect(login.stdout).toContain("Signed in to fixture.");
     const opened = new URL(readFileSync(root.openLog, "utf8").trim());
@@ -4190,7 +937,7 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
 
     const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
     expect(show.stderr).toBe("");
-    expect(show.code).toBe(0);
+    expectExit0(show);
     expect(show.stdout).toMatch(/status +ready/);
     expect(show.stdout).not.toContain(ACCESS_INITIAL);
 
@@ -4261,6 +1008,181 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     expect(auth.tokenExchanges).toBe(1);
   }, 40_000);
 
+  test("fx mcp login takes only its own return: a stray return and a silent connection don't end or hold up the sign-in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const child = Bun.spawn([FX_BIN, "mcp", "login", "--no-browser", "fixture"], {
+      cwd: root.workspace,
+      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let silent: Awaited<ReturnType<typeof Bun.connect>> | undefined;
+    try {
+      const reader = child.stdout.getReader();
+      let stdout = "";
+      const decoder = new TextDecoder();
+      const deadline = Date.now() + 15_000;
+      while (!/\/authorize\?[^\n]*\n/.test(stdout) && Date.now() < deadline) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        stdout += decoder.decode(value);
+      }
+      const address = stdout.split("\n").map((line) => line.trim()).find((line) => line.includes("/authorize?"));
+      expect(address).toBeDefined();
+      const port = Number(new URL(new URL(address!).searchParams.get("redirect_uri")!).port);
+      // A return with a state fx never made, from anything that can reach the
+      // port: a 404, and the sign-in goes on.
+      const stray = await fetch(`http://127.0.0.1:${port}/callback?code=stray&state=not-the-state-fx-made`, { signal: AbortSignal.timeout(5_000) });
+      expect(stray.status).toBe(404);
+      // A connection that sends nothing, as a browser's spare one does.
+      silent = await Bun.connect({ hostname: "127.0.0.1", port, socket: { data() {} } });
+      const approved = await fetch(address!, { redirect: "manual" });
+      const back = approved.headers.get("location")!;
+      const page = await fetch(back, { signal: AbortSignal.timeout(5_000) });
+      expect(page.status).toBe(200);
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        stdout += decoder.decode(value);
+      }
+      expect(await child.exited).toBe(0);
+      expect(await new Response(child.stderr).text()).toBe("");
+      expect(stdout).toContain("Signed in to fixture.");
+      // Only the sign-in's own code was redeemed.
+      expect(auth.tokenExchanges).toBe(1);
+    } finally {
+      silent?.end();
+      child.kill();
+    }
+  }, 40_000);
+
+  test("fx mcp login asks for the oauth.scopes in the config when the server names none", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { omitScopes: true });
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const profile = join(root.home, ".fx", "mcp.json");
+    const config = JSON.parse(readFileSync(profile, "utf8"));
+    config.mcp.fixture.oauth.scopes = ["custom.scope", "other.scope"];
+    writeFileSync(profile, JSON.stringify(config));
+    const child = Bun.spawn([FX_BIN, "mcp", "login", "--no-browser", "fixture"], {
+      cwd: root.workspace,
+      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const reader = child.stdout.getReader();
+      let stdout = "";
+      const decoder = new TextDecoder();
+      const deadline = Date.now() + 15_000;
+      // Wait for the whole line: a long address can arrive in pieces.
+      while (!/\/authorize\?[^\n]*\n/.test(stdout) && Date.now() < deadline) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        stdout += decoder.decode(value);
+      }
+      const address = stdout.split("\n").map((line) => line.trim()).find((line) => line.includes("/authorize?"));
+      expect(address).toBeDefined();
+      const scopes = (new URL(address!).searchParams.get("scope") ?? "").split(" ");
+      expect(scopes).toContain("custom.scope");
+      expect(scopes).toContain("other.scope");
+    } finally {
+      child.kill();
+      await child.exited;
+    }
+  }, 40_000);
+
+  // A listener on this machine that counts connections. 0.0.0.0 reaches it,
+  // as a sign-in server's metadata could point fx at it.
+  const internalListener = () => {
+    const seen = { connections: 0 };
+    const listener = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { open() { seen.connections++; }, data() {}, close() {} } });
+    return { seen, url: `https://0.0.0.0:${listener.port}/token`, stop: () => listener.stop(true) };
+  };
+
+  test("fx mcp login refuses a sign-in server whose token endpoint is an internal address, and contacts nothing there", async () => {
+    const internal = internalListener();
+    try {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { tokenEndpoint: internal.url });
+      const root = createRoot(auth);
+      const result = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+      // Refused before the browser: nothing at the address, and no sign-in page.
+      expect(internal.seen.connections).toBe(0);
+      expect(auth.authorizationRequests).toBe(0);
+      expect(existsSync(root.openLog)).toBe(false);
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain("Couldn't sign in to fixture: its sign-in server points at an internal address fx won't contact.");
+    } finally {
+      internal.stop();
+    }
+  }, 30_000);
+
+  test("an approved .mcp.json server doesn't use a login saved for another server with its name and URL", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    // A login for the profile's fixture, which then moves to the workspace.
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    const before = auth.requests.length;
+    moveAuthFixtureToWorkspace(root);
+    const approved = await runFx(["mcp", "approve", "fixture"], { cwd: root.workspace, env });
+    expect(approved.code).toBe(0);
+    const shown = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(shown.signal).toBeNull();
+    expect(JSON.parse(shown.stdout).status).toBe("needs_login");
+    expect(auth.requests.slice(before).some((r) => (r.authorization ?? "").includes(ACCESS_INITIAL))).toBe(false);
+  }, 30_000);
+
+  test("an approved .mcp.json server keeps its own login, in its own workspace only", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    moveAuthFixtureToWorkspace(root);
+    // A second workspace with the same .mcp.json.
+    const other = join(root.root, "other");
+    mkdirSync(other, { recursive: true });
+    writeFileSync(join(other, ".mcp.json"), readFileSync(join(root.workspace, ".mcp.json")));
+    const env = v2Env(root);
+    for (const cwd of [root.workspace, other]) {
+      expect((await runFx(["mcp", "approve", "fixture"], { cwd, env })).code).toBe(0);
+    }
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expectExit0(login);
+    expect(login.stdout).toContain("Signed in to fixture.");
+    const status = async (cwd: string) =>
+      JSON.parse((await runFx(["mcp", "show", "fixture", "--json"], { cwd, env, timeoutMs: 20_000 })).stdout).status;
+    expect(await status(root.workspace)).toBe("ready");
+    expect(await status(other)).toBe("needs_login");
+    expect(auth.tokenExchanges).toBe(1);
+    // Removing it from the workspace deletes that workspace's login.
+    const removed = await runFx(["mcp", "remove", "fixture", "--project"], { cwd: root.workspace, env });
+    expect(removed.code).toBe(0);
+    expect(removed.stdout).toContain("and deleted its login");
+  }, 60_000);
+
+  test("a saved sign-in whose token endpoint is an internal address is never refreshed there", async () => {
+    const internal = internalListener();
+    try {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url);
+      const root = createRoot(auth);
+      // Expired, so its next use refreshes it at the saved endpoint.
+      seedV2Credential(root, auth, { expires_at_ms: 0, token_endpoint: internal.url });
+      const shown = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+      expect(internal.seen.connections).toBe(0);
+      expect(shown.signal).toBeNull();
+      expect(JSON.parse(shown.stdout).status).toBe("needs_login");
+    } finally {
+      internal.stop();
+    }
+  }, 30_000);
+
   test("fx mcp login says why the sign-in page refused, in its words", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
@@ -4320,6 +1242,97 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     expect(pane).not.toContain(ACCESS_INITIAL);
   }, 60_000);
 
+  test("fx mcp add signs in to a new server that needs a login, --no-login skips it, and without a browser it names the command", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { registration: true });
+    const root = createRoot(auth);
+    writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify({ mcp: {} }));
+    const env = v2Env(root);
+
+    const added = await runFx(["mcp", "add", "web", auth.url], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(added.stderr).toBe("");
+    expectExit0(added);
+    expect(added.stdout).toStartWith("Added web to ~/.fx/mcp.json.\nweb needs a login.\nApprove in your browser.");
+    expect(added.stdout).toEndWith("Signed in to web.\n");
+    expect(added.stdout).not.toContain(ACCESS_INITIAL);
+    expect(new URL(readFileSync(root.openLog, "utf8").trim()).pathname).toBe("/authorize");
+    expect(auth.registrations).toBe(1);
+    expect(auth.tokenExchanges).toBe(1);
+
+    const skipped = await runFx(["mcp", "add", "--no-login", "quiet", auth.url], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expectExit0(skipped);
+    expect(skipped.stdout).toBe("Added quiet to ~/.fx/mcp.json.\n");
+    // Without a browser, taking the address pasted back is `fx mcp login`'s.
+    const headless = await runFx(["mcp", "add", "later", auth.url], { cwd: root.workspace, env: { ...env, FX_NO_OPEN_BROWSER: "1" }, timeoutMs: 30_000 });
+    expectExit0(headless);
+    expect(headless.stdout).toBe("Added later to ~/.fx/mcp.json.\nlater needs a login. Sign in with: fx mcp login later\n");
+    expect(auth.tokenExchanges).toBe(1);
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp add signs in to a new server that needs a login once the shell loads it, and --no-login leaves it on the status line", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { registration: true });
+    const root = createRoot(auth);
+    writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify({ mcp: {} }));
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText(`/mcp add web ${auth.url}`);
+    await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+    // The shell loads it, sees it needs a login, and signs in as a typed /mcp login would.
+    await tui.waitForText("Sign in to web in your browser.", 15_000);
+    await tui.waitForText("Signed in to web.", 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+    await tui.sendText(`/mcp add --no-login quiet ${auth.url}`);
+    await tui.waitForText("Added quiet to ~/.fx/mcp.json.", 10_000);
+    await tui.waitForText("quiet needs login · /mcp", 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp login NAME --no-browser links the address and prints the outcome in the transcript", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const tapePath = join(root.root, "no-browser.fxtape");
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), FX_RECORD: tapePath, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // The flag after the name, which the parser takes like the flag before it.
+    await tui.sendText("/mcp login fixture --no-browser");
+    // The transcript: everything above the composer, not the status line below it.
+    const transcript = async () => {
+      const lines = (await tui!.captureFullScrollback()).split("\n");
+      const composer = lines.findLastIndex(isComposerLine);
+      return composer < 0 ? lines : lines.slice(0, composer);
+    };
+    await tui.waitForText("Sign in to fixture in your browser.", 10_000);
+    // A few words stand for the address, which only their link carries.
+    const shown = (await transcript()).join("\n");
+    expect(shown).toContain("Didn't open? Open the sign-in page.");
+    expect(shown).not.toContain("/authorize?");
+    const written = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
+    const link = /\x1b\]8;id=fx-mcp-sign-in;([^\x1b]+)\x1b\\/.exec(written);
+    expect(link).not.toBeNull();
+    const address = link![1];
+    expect(new URL(address).searchParams.get("state")).toBeTruthy();
+    expect(existsSync(root.openLog)).toBe(false);
+    // The user approves in some other browser, which then loads fx's loopback address.
+    const approved = await fetch(address, { redirect: "manual" });
+    const back = approved.headers.get("location")!;
+    expect(new URL(back).hostname).toBe("127.0.0.1");
+    await fetch(back);
+    await tui.waitForText("Signed in to fixture.", 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+    // In the transcript, not only on the status line.
+    expect((await transcript()).join("\n")).toContain("Signed in to fixture.");
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("the /mcp menu's Log in signs in, and the server's tools follow", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
@@ -4358,11 +1371,10 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     await tui.waitForText("Its tools show here once you log in.", 15_000);
     await tui.waitForText("› Log in        /mcp login fixture", 5_000);
 
-    // /trace reports MCP-v2's servers, and the one that waits for a login.
+    // /trace reports the MCP servers, and the one that waits for a login.
     await tui.sendKeys("C-c");
     await tui.waitForPane((pane) => !pane.includes("MCP servers") && !pane.includes("esc back"), 5_000);
     const waiting = await captureTrace();
-    expect(waiting).toContain("mcp_engine: v2");
     expect(waiting).toContain("- mcp server needs login name=fixture");
     expect(waiting).toMatch(/- fixture state=\w+ transport=http tools=0 signed_in=false needs_login=true/);
     expect(waiting).not.toContain("mcp_servers: runtime not loaded");
@@ -4380,18 +1392,19 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     expect(auth.tokenExchanges).toBe(1);
     await tui.sendKeys("C-c");
     await tui.waitForPane((pane) => !pane.includes("esc back"), 5_000);
-    // The news waits on the status line for a few seconds, then the count returns.
+    // The news waits on the status line for a few seconds, then goes. It was
+    // never printed in the transcript, and with nothing wrong the status line
+    // says nothing about MCP.
     await tui.waitForText("Signed in to fixture.", 3_000);
-    await tui.waitForText("mcp 1/1", 10_000);
-    // Gone with the news: it was never printed in the transcript.
-    expect(await tui.capturePane()).not.toContain("Signed in to fixture.");
+    await tui.waitForPane((pane) => !pane.includes("Signed in to fixture."), 10_000);
+    expect(await tui.capturePane()).not.toMatch(/mcp \d+\/\d+/);
     const ready = await captureTrace();
     expect(ready).toMatch(/- fixture state=ready transport=http tools=\d+ signed_in=true needs_login=false\n(?! {4}error:)/);
     expect(ready).not.toContain("- mcp server needs login name=fixture");
     expect(await tui.captureFullScrollback()).not.toContain(ACCESS_INITIAL);
   }, 60_000);
 
-  test.skipIf(!tmuxAvailable())("while a sign-in waits, the server's screen says so and shows its whole address", async () => {
+  test.skipIf(!tmuxAvailable())("while a sign-in waits, the server's screen says so and links its address", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
     const root = createRoot(auth);
@@ -4405,61 +1418,1014 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     await tui.waitForText("MCP servers  1", 10_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("› Log in        /mcp login fixture", 15_000);
-    // No browser opens, so the sign-in waits, and the screen says what for.
+    // No browser opens, so the sign-in waits, and the screen says what for in
+    // one line, like the transcript: its label links the address.
     await tui.sendKeys("Enter");
-    await tui.waitForText("Waiting for the browser. Didn't open? Go to:", 10_000);
+    await tui.waitForText("Waiting for the browser. Didn't open? Open the sign-in page.", 10_000);
     const pane = await tui.capturePane();
-    expect(pane).toContain("/authorize?");
+    expect(pane).not.toContain("/authorize?");
     expect(pane).not.toContain("Its tools show here once you log in.");
     expect(auth.tokenExchanges).toBe(0);
   }, 60_000);
 
-  test("a v1 login carries over once: signed in without signing in again, and a sign-out sticks", async () => {
+  // Before, nothing changed on the screen until the address came, which a
+  // slow sign-in server makes seconds, and each Enter in the meantime closed
+  // the port the browser comes back to, so the sign-in could never finish.
+  // On the code before, this fails at "Signing in…".
+  test.skipIf(!tmuxAvailable())("Log in says \"Signing in…\" at once, more Enters keep that sign-in, and its address is one link that signs in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { discoveryDelayMs: 2_000 });
+    const root = createRoot(auth);
+    const tapePath = join(root.root, "sign-in.fxtape");
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 100, height: 40,
+      env: { ...v2Env(root), FX_NO_OPEN_BROWSER: "1", FX_RECORD: tapePath, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp");
+    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("› Log in        /mcp login fixture", 15_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Signing in…", 1_500);
+    expect(await tui.capturePane()).not.toContain("Waiting for the browser");
+    // Pressed again while the sign-in server is slow, then once its address shows.
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Waiting for the browser. Didn't open? Open the sign-in page.", 15_000);
+    await tui.sendKeys("Enter");
+    await Bun.sleep(500);
+
+    // The label is one link to the whole address, which the screen doesn't spell out.
+    expect(await tui.capturePane()).not.toContain("/authorize?");
+    const written = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
+    const link = /\x1b\]8;id=fx-mcp-sign-in;([^\x1b]+)\x1b\\Open the sign-in page/.exec(written);
+    expect(link).not.toBeNull();
+    const address = link![1];
+    expect(address).toContain("/authorize?");
+
+    // The browser's return reaches the sign-in those Enters kept.
+    const redirect = await fetch(address, { redirect: "manual" });
+    const back = await fetch(redirect.headers.get("location")!, { signal: AbortSignal.timeout(10_000) });
+    expect(back.status).toBe(200);
+    // Signed in, the screen offers Log out.
+    await tui.waitForText("Log out       /mcp logout fixture", 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+    expect(auth.requests.filter((r) => r.path === "/.well-known/oauth-authorization-server").length).toBe(1);
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("a config change during a sign-in keeps it going, unless it removes that server: then it ends and clears \"Signing in\"", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), FX_NO_OPEN_BROWSER: "1", FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // No browser opens, so the sign-in waits.
+    await tui.sendText("/mcp login fixture");
+    await tui.waitForText("Sign in to fixture in your browser.", 10_000);
+    await tui.waitForText("Signing in to fixture", 10_000);
+
+    // Another server's change leaves this sign-in waiting for its browser.
+    await tui.sendText("/mcp add web https://w.example/mcp");
+    await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+    await Bun.sleep(1_000);
+    expect(await tui.capturePane()).toContain("Signing in to fixture");
+    expect(await tui.captureFullScrollback()).not.toContain("Couldn't sign in to fixture");
+
+    // Removing the server it signs in to ends it.
+    await tui.sendText("/mcp remove fixture");
+    await tui.waitForText("Couldn't sign in to fixture: the MCP config changed before the browser came back.", 10_000);
+    // The status line catches up within its 250 ms refresh.
+    const clearBy = Date.now() + 2_000;
+    while ((await tui.capturePane()).includes("Signing in to fixture") && Date.now() < clearBy) await Bun.sleep(50);
+    expect(await tui.capturePane()).not.toContain("Signing in to fixture");
+    expect(auth.tokenExchanges).toBe(0);
+  }, 60_000);
+
+  // A v1 login taken over would be refreshed by an older fx and this one
+  // apart, neither seeing the other's saves, so a server that takes each
+  // refresh token once signs both out. fx signs in on its own instead.
+  test("a v1 login isn't carried over: the server needs its own login, and v1's store stays as it is", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
     const root = createRoot(auth);
     const v1Store = seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
+    const v1Before = readFileSync(v1Store, "utf8");
     const env = v2Env(root);
-    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
-    expect(show.stderr).toBe("");
-    expect(show.code).toBe(0);
-    expect(show.stdout).toMatch(/status +ready/);
-    expect(auth.tokenExchanges).toBe(0);
-    expect(existsSync(root.openLog)).toBe(false);
-    // Signed out here, it stays signed out, though v1's copy is still there.
-    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
-    expect(logout.code).toBe(0);
-    expect(await statusOf(root)).not.toBe("signed_in");
-    expect(existsSync(v1Store)).toBe(true);
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(JSON.parse(show.stdout).status).toBe("needs_login");
+    expect(auth.requests.some((r) => (r.authorization ?? "").includes(ACCESS_INITIAL))).toBe(false);
+    expect(auth.refreshes).toBe(0);
+    expect(readFileSync(v1Store, "utf8")).toBe(v1Before);
+    expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials-v3.json"))).toBe(false);
   }, 60_000);
 
-  test("Slack signs in through fx.sh: the bridge's form comes back from its origin only", async () => {
+  // Older builds keep their logins in credentials-v2.json. Those from before
+  // version 2 of it read a version-2 document as empty and write it back with
+  // only their own login, and every older fx still running refreshes the
+  // logins it holds apart from this one. So nothing there is carried over,
+  // the server signs in once, and an older fx's writes never reach it.
+  test("an older fx's credentials-v2.json is never read or written: the server signs in once, and that fx's rewrites never reach the login", async () => {
     upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID });
-    const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
-    const bridgeOrigin = new URL(auth.url).origin;
-    const env = { ...v2Env(root), FX_E2E_SLACK_ORIGIN: bridgeOrigin };
-    const login = runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
-    // The browser opens fx.sh's start, which goes on to Slack's page.
-    expect(await waitForFileText(root.openLog, "/api/slack/auth?", 10_000)).toBe(true);
-    const start = new URL(readFileSync(root.openLog, "utf8").trim());
-    expect(start.origin).toBe(bridgeOrigin);
-    expect([...start.searchParams.keys()].sort()).toEqual(["challenge", "client_id", "port", "scope", "state"]);
-    expect(start.searchParams.get("state")).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(start.searchParams.get("challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(start.searchParams.get("client_id")).toBe(FX_SLACK_CLIENT_ID);
-    expect(start.searchParams.get("scope")!.split(" ").sort()).toEqual([...FX_SLACK_SCOPES, "groups:history", "im:history", "mpim:history"].sort());
-    // fx.sh's page posts what Slack sent back; only its origin is taken.
-    const target = `http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`;
-    const body = await authorizePersonalFixture(auth, start);
-    const post = (fields: URLSearchParams, origin: string) => fetch(target, { method: "POST", headers: { origin }, body: fields, redirect: "manual" });
-    expect((await post(body, "https://evil.example")).status).toBe(404);
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const directory = join(root.home, ".fx", "mcp-credentials");
+    const older = join(directory, "credentials-v2.json");
+    const own = join(directory, "credentials-v3.json");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const olderCredential = JSON.stringify({
+      access: "older-fx-access", refresh: "older-fx-refresh", expires_at_ms: null, skew_ms: 30_000,
+      token_endpoint: `${new URL(auth.url).origin}/token`, revocation_endpoint: null,
+      resource: new URL(auth.resource).href, client_id: "older-fx", client_secret: null, method: "none",
+    });
+    let olderText = JSON.stringify({ version: 2, servers: [{ name: "fixture", url: auth.url, credential: olderCredential }] });
+    writeFileSync(older, olderText, { mode: 0o600 });
+
+    // The older login isn't taken: the server needs one of its own.
+    const before = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(JSON.parse(before.stdout).status).toBe("needs_login");
+    expect(auth.requests.some((r) => (r.authorization ?? "").includes("older-fx-access"))).toBe(false);
+    expect(auth.refreshes).toBe(0);
+    expect(readFileSync(older, "utf8")).toBe(olderText);
+    expect(existsSync(own)).toBe(false);
+
+    // One sign-in, saved in this fx's own store.
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    expect(readFileSync(older, "utf8")).toBe(olderText);
+    const signedIn = readFileSync(own, "utf8");
+    expect(JSON.parse(signedIn).servers.map((s: { name: string }) => s.name)).toEqual(["fixture"]);
+
+    // An older fx reads its version-2 store as empty and writes it back.
+    olderText = JSON.stringify({ version: 1, imported_v1: true, servers: [] });
+    writeFileSync(older, olderText, { mode: 0o600 });
+    const after = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(after.stderr).toBe("");
+    expect(JSON.parse(after.stdout).status).toBe("ready");
+    expect(readFileSync(own, "utf8")).toBe(signedIn);
+    expect(readFileSync(older, "utf8")).toBe(olderText);
+    expect(auth.tokenExchanges).toBe(1);
+  }, 60_000);
+
+  test("a refresh refused with HTTP 200 and ok:false, as Slack refuses, needs a new login at once and isn't tried again", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refreshAnswer: { status: 200, body: { ok: false, error: "invalid_refresh_token" } } });
+    const root = createRoot(auth);
+    seedV2Credential(root, auth, { expires_at_ms: 0 });
+    const env = v2Env(root);
+    const started = Date.now();
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(JSON.parse(show.stdout).status).toBe("needs_login");
+    expect(auth.refreshes).toBe(1);
+    // The dead refresh token is dropped, so the next run doesn't send it.
+    const again = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(JSON.parse(again.stdout).status).toBe("needs_login");
+    expect(auth.refreshes).toBe(1);
+  }, 60_000);
+
+  test("a refresh that fails for now (503) ends fx mcp show as retrying, keeps the login, and asks for no new one", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refreshAnswer: { status: 503, body: { error: "temporarily_unavailable" } } });
+    const root = createRoot(auth);
+    const store = seedV2Credential(root, auth, { expires_at_ms: 0 });
+    const env = v2Env(root);
+    const started = Date.now();
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(Date.now() - started).toBeLessThan(10_000);
+    // A sign-in server that didn't answer says nothing about the login.
+    const status = JSON.parse(show.stdout);
+    expect(status.status).toBe("retrying");
+    expect(status.error).toContain("couldn't be renewed");
+    expect(auth.refreshes).toBe(1);
+    expect(readFileSync(store, "utf8")).toContain(REFRESH_INITIAL);
+  }, 60_000);
+
+  test("a refresh Slack answers with a temporary error at HTTP 200 keeps the login, and fx mcp show says it's retrying", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refreshAnswer: { status: 200, body: { ok: false, error: "internal_error" } } });
+    const root = createRoot(auth);
+    const store = seedV2Credential(root, auth, { expires_at_ms: 0 });
+    const env = v2Env(root);
+    const started = Date.now();
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(Date.now() - started).toBeLessThan(10_000);
+    // Only a refusal ends the login; a temporary error leaves it for the next try.
+    const status = JSON.parse(show.stdout);
+    expect(status.status).toBe("retrying");
+    expect(status.error).toContain("couldn't be renewed");
+    expect(auth.refreshes).toBe(1);
+    expect(readFileSync(store, "utf8")).toContain(REFRESH_INITIAL);
+  }, 60_000);
+
+  // Slack refreshes a PKCE app's tokens without its secret only for a
+  // localhost redirect, so fx's Slack app signs in with one.
+  test("Slack signs in as fx's Slack app at Slack's own page, with a localhost redirect on its port and the app's scopes, and refreshes without a secret", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    // Slack's 401 names one of its own scopes; the login asks for it with
+    // the app's, so it adds nothing here.
+    auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, slackLocalhostRedirect: true, challengeScope: "chat:write" });
+    const root = createRoot(auth, true, "http", auth.url, true, FX_SLACK_CLIENT_ID);
+    // fx's Slack app with no scopes of the config's own, on a free port.
+    const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+    const port = probe.port;
+    probe.stop(true);
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.oauth = { client_id: FX_SLACK_CLIENT_ID, callback_port: port };
+    writeFileSync(profilePath, JSON.stringify(profile));
+    const standIn = new URL(auth.url).origin;
+    const env = { ...v2Env(root), FX_TEST_SLACK_ORIGIN: standIn };
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.stderr).toBe("");
+    expectExit0(login);
+    expect(login.stdout).toContain("Signed in to fixture.");
+    // The browser goes to Slack's own page; nothing asks fx.sh.
+    const opened = new URL(readFileSync(root.openLog, "utf8").trim());
+    expect(opened.origin).toBe(standIn);
+    expect(opened.pathname).toBe("/authorize");
+    expect(opened.searchParams.get("client_id")).toBe(FX_SLACK_CLIENT_ID);
+    expect(opened.searchParams.get("redirect_uri")).toBe(`http://localhost:${port}/callback`);
+    // fx adds offline_access when the authorization server lists it, as
+    // the stand-in does; Slack doesn't list it.
+    expect(opened.searchParams.get("scope")!.split(" ").filter((x) => x !== "offline_access").sort()).toEqual([
+      "channels:history", "channels:read", "channels:write", "chat:write", "emoji:read", "files:write",
+      "groups:history", "groups:read", "im:history", "im:read", "mpim:history", "mpim:read",
+      "search:read.im", "search:read.mpim", "search:read.private", "search:read.public", "search:read.users", "users:read",
+    ]);
+    expect(auth.requests.some((r) => r.path.startsWith("/api/slack/"))).toBe(false);
+    expect(auth.tokenExchanges).toBe(1);
+    // Its token runs out: the refresh goes without a secret, and the server is ready.
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    const store = JSON.parse(readFileSync(storePath, "utf8"));
+    const credential = JSON.parse(store.servers[0].credential);
+    expect(credential.client_secret).toBeNull();
+    store.servers[0].credential = JSON.stringify({ ...credential, expires_at_ms: 0 });
+    writeFileSync(storePath, JSON.stringify(store), { mode: 0o600 });
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.stderr).toBe("");
+    expect(JSON.parse(show.stdout).status).toBe("ready");
+    expect(auth.refreshes).toBe(1);
+    const refresh = auth.requests.find((r) => r.path === "/token" && new URLSearchParams(r.body).get("grant_type") === "refresh_token");
+    expect(new URLSearchParams(refresh!.body).get("client_secret")).toBeNull();
+  }, 60_000);
+
+  test("a sign-in whose fixed callback port is taken says so, and sends nothing", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const taken = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("taken") });
+    try {
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.fixture.oauth.callback_port = taken.port;
+      writeFileSync(profilePath, JSON.stringify(profile));
+      const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+      expect(login.code).toBe(1);
+      expect(login.stderr).toBe(`Couldn't sign in to fixture: port ${taken.port} is in use, maybe by another app signing in. Try again once it's free.\n`);
+      expect(existsSync(root.openLog)).toBe(false);
+      expect(auth.tokenExchanges).toBe(0);
+    } finally {
+      taken.stop(true);
+    }
+  }, 60_000);
+
+  test("a server that only names fx's Slack app signs in on its own, never as fx's Slack app", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    // A stand-in for Slack at another origin, which must never be asked.
+    const bridgeRequests: string[] = [];
+    const bridge = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request) {
+        bridgeRequests.push(new URL(request.url).pathname);
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      const root = createRoot(auth, true, "http", auth.url, true, FX_SLACK_CLIENT_ID);
+      const env = { ...v2Env(root), FX_TEST_SLACK_ORIGIN: `http://127.0.0.1:${bridge.port}` };
+      const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+      expect(bridgeRequests).toEqual([]);
+      // The browser goes to the server's own page, with fx's own loopback redirect.
+      const opened = new URL(readFileSync(root.openLog, "utf8").trim());
+      expect(opened.origin).toBe(new URL(auth.url).origin);
+      expect(opened.pathname).toBe("/authorize");
+      expect(opened.searchParams.get("redirect_uri")).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/callback$/);
+      // The code comes back to fx on 127.0.0.1 and is redeemed with that redirect.
+      const token = auth.requests.find(r => r.path === "/token");
+      expect(new URLSearchParams(token!.body).get("redirect_uri")).toBe(opened.searchParams.get("redirect_uri"));
+      expect(login.stderr).toBe("");
+      expectExit0(login);
+      expect(login.stdout).toContain("Signed in to fixture.");
+      expect(auth.tokenExchanges).toBe(1);
+    } finally {
+      bridge.stop(true);
+    }
+  }, 60_000);
+
+  test("a token with a CR LF in it fails the sign-in, is never saved, and never reaches a header", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { accessTokenSuffix: "\r\nX-Injected: 1" });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.signal).toBeNull();
+    expect(login.code).toBe(1);
+    expect(login.stderr).toBe("Couldn't sign in to fixture: it didn't accept the sign-in (its token has characters OAuth doesn't allow).\n");
+    expect(auth.tokenExchanges).toBe(1);
+    expect(await statusOf(root)).not.toBe("signed_in");
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(JSON.parse(show.stdout).status).toBe("needs_login");
+    expect(auth.requests.some(r => (r.authorization ?? "").includes(ACCESS_INITIAL))).toBe(false);
+  }, 60_000);
+
+  test("a saved login whose token has a CR LF doesn't crash fx; the server needs a login again", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    // The saved token gains a CR LF, as an older fx could have saved it.
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    const store = JSON.parse(readFileSync(storePath, "utf8"));
+    const saved = JSON.parse(store.servers[0].credential);
+    saved.access += "\r\nX-Injected: 1";
+    store.servers[0].credential = JSON.stringify(saved);
+    writeFileSync(storePath, JSON.stringify(store));
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(show.code).toBe(1);
+    expect(JSON.parse(show.stdout).status).toBe("needs_login");
+    expect(auth.requests.some(r => (r.authorization ?? "").includes("X-Injected"))).toBe(false);
+  }, 60_000);
+
+  test("a login store a newer fx saved is never written over, and login and logout say why they can't", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    // A newer fx saves the same store as version 2.
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
+    const before = readFileSync(storePath, "utf8");
+    const unreadable = "fx can't read the saved MCP sign-ins in ~/.fx/mcp-credentials/credentials-v3.json. A newer fx saved them, or they're damaged; fix or delete them, then try again.\n";
+
+    expect((await runFx(["mcp", "list", "--json"], { cwd: root.workspace, env })).code).toBe(0);
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(logout.stderr).toBe(`Can't sign out of fixture: ${unreadable}`);
+    expect(logout.code).toBe(1);
+    const login = await runFx(["mcp", "login", "--no-browser", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.stderr).toBe(`Can't sign in to fixture: ${unreadable}`);
+    expect(login.code).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toBe(before);
+    expect(auth.tokenExchanges).toBe(1);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a login made by another fx process reaches a running shell", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 40, env });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +needs login/, 15_000);
+    // Another fx with the same profile signs in.
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    expect(auth.tokenExchanges).toBe(1);
+    await tui.waitForComposer(5_000);
+    await tui.sendText("/mcp list");
+    await tui.waitForText(/fixture +~\/\.fx\/mcp\.json +http +(connecting|ready)/, 15_000);
+    await tui.sendText("/mcp show fixture");
+    const pane = await tui.waitForText(/status +ready/, 15_000);
+    // The shell took that login and never signed in itself.
+    expect(pane).toContain("Signed in to fixture.");
+    expect(auth.tokenExchanges).toBe(1);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a login another fx process saved that the server can't use isn't announced, and the server still needs one", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 40, env });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +needs login/, 15_000);
+    // Another fx saves a login whose token would break its header.
+    seedV2Credential(root, auth, { access: "at\r\n1" });
+    await tui.waitForComposer(5_000);
+    await tui.sendText("/mcp show fixture");
+    const pane = await tui.waitForText(/status +needs login[\s\S]*status +needs login/, 15_000);
+    expect(pane).not.toContain("Signed in to fixture.");
     expect(auth.tokenExchanges).toBe(0);
-    expect((await post(body, bridgeOrigin)).status).toBe(200);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a login another fx process made before the shell first used the server is used at once", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 40, env });
+    await tui.waitForComposer(15_000);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +ready/, 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a saved login the server no longer takes is tried once, not again and again", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rejectRefresh?: boolean } = {};
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    // The server stops taking that login, and its refresh.
+    auth.validTokens.clear();
+    options.rejectRefresh = true;
+    tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 40, env });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +needs login/, 15_000);
+    const settled = auth.requests.length;
+    await Bun.sleep(2_000);
+    expect(auth.requests.length - settled).toBeLessThan(3);
+    // Asked again, the shell doesn't take that login a second time.
+    const before = auth.requests.length;
+    await tui.waitForComposer(5_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +needs login[\s\S]*status +needs login/, 15_000);
+    expect(auth.requests.length).toBe(before);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("the model's call after a login made by another fx process works without a restart", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rejectRefresh?: boolean; rotateAuthorizationToken?: boolean } = {};
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select", "mcp_select_tool", { name: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "mcp_fixture_echo", { text: "first" }),
+      fakeGatewayFinalText("First call done."),
+      // A selected tool lasts for its turn, so each turn selects it again.
+      fakeGatewayToolCall("select2", "mcp_select_tool", { name: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "mcp_fixture_echo", { text: "second" }),
+      fakeGatewayFinalText("It needs a login."),
+      fakeGatewayToolCall("select3", "mcp_select_tool", { name: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("third", "mcp_fixture_echo", { text: "third" }),
+      fakeGatewayFinalText("Third call done."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 120, height: 40,
+      env: { ...env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: MODEL },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the fixture.");
+    await tui.waitForText("First call done.", 20_000);
+    // The server stops taking that login and its refresh, so the next call needs a login.
+    auth.validTokens.clear();
+    options.rejectRefresh = true;
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Call it again.");
+    await tui.waitForText("It needs a login.", 20_000);
+    // Another fx with the same profile signs in, and gets a new token.
+    options.rotateAuthorizationToken = true;
+    auth.validTokens.add(ACCESS_REFRESHED);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    // The model tries again, as the needs-login text tells it to.
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Try again.");
+    await tui.waitForText("Third call done.", 20_000);
+    const calls = auth.requests.filter((r) => r.body.includes("\"tools/call\""));
+    expect(calls.at(-1)?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
+    expect(calls.at(-1)?.body).toContain("third");
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("a login another fx process saved stays when the shell's own is refused, and the shell takes it", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rejectRefresh?: boolean; rotateAuthorizationToken?: boolean } = {};
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select", "mcp_select_tool", { name: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "mcp_fixture_echo", { text: "first" }),
+      fakeGatewayFinalText("First call done."),
+      fakeGatewayToolCall("select2", "mcp_select_tool", { name: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "mcp_fixture_echo", { text: "second" }),
+      fakeGatewayFinalText("Second call done."),
+      fakeGatewayToolCall("select3", "mcp_select_tool", { name: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("third", "mcp_fixture_echo", { text: "third" }),
+      fakeGatewayFinalText("Third call done."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 120, height: 40,
+      env: { ...env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: MODEL },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the fixture.");
+    await tui.waitForText("First call done.", 20_000);
+    // Another fx signs in again and saves a new token; the server then takes
+    // only that one, and refuses the shell's refresh.
+    options.rotateAuthorizationToken = true;
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    auth.validTokens.clear();
+    auth.validTokens.add(ACCESS_REFRESHED);
+    options.rejectRefresh = true;
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Call it again.");
+    await tui.waitForText("Second call done.", 20_000);
+    // The shell's own login was refused, and the other fx's stays saved.
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_REFRESHED);
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Try again.");
+    await tui.waitForText("Third call done.", 20_000);
+    const calls = auth.requests.filter((r) => r.body.includes("\"tools/call\""));
+    expect(calls.at(-1)?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("the shell's own refreshed login, when refused, is removed by that shell", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rejectRefresh?: boolean } = {};
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select", "mcp_select_tool", { name: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "mcp_fixture_echo", { text: "first" }),
+      fakeGatewayFinalText("First call done."),
+      fakeGatewayToolCall("select2", "mcp_select_tool", { name: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "mcp_fixture_echo", { text: "second" }),
+      fakeGatewayFinalText("Second call done."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 120, height: 40,
+      env: { ...env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: MODEL },
+    });
+    await tui.waitForComposer(15_000);
+    // The first token stops working, so the shell refreshes and saves the new one.
+    auth.validTokens.delete(ACCESS_INITIAL);
+    await tui.sendText("Call the fixture.");
+    await tui.waitForText("First call done.", 20_000);
+    expect(auth.refreshes).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_REFRESHED);
+    // Then that one stops too, and its refresh is refused.
+    auth.validTokens.clear();
+    options.rejectRefresh = true;
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Call it again.");
+    await tui.waitForText("Second call done.", 20_000);
+    expect(JSON.parse(readFileSync(storePath, "utf8")).servers).toEqual([]);
+    // The trace says why the login went, and holds no token.
+    const trace = readFileSync(root.trace, "utf8");
+    expect(trace).toContain("MCP login dropped server=fixture reason=refresh refused status=400 error=invalid_grant");
+    expect(trace).toContain("MCP login dropped server=fixture saved=removed");
+    for (const token of [ACCESS_INITIAL, ACCESS_REFRESHED, REFRESH_INITIAL, REFRESH_ROTATED]) expect(trace).not.toContain(token);
+    // Its screen says it needs a login, not that it's signed in, and offers
+    // no sign-out of a login that's gone.
+    await tui.waitForComposer(5_000);
+    await tui.sendText("/mcp");
+    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("› Log in        /mcp login fixture", 15_000);
+    const screen = await tui.capturePane();
+    expect(screen).toMatch(/ status +needs login/);
+    expect(screen).not.toContain("signed in");
+    expect(screen).not.toContain("Log out");
+  }, 90_000);
+
+  // Every fx holding a login refreshes it from memory. Where a refresh
+  // token works once, the shell must take the login another fx refreshed, not
+  // send the token that fx's refresh retired.
+  for (const [rule, singleUseRefresh] of [
+    ["a retired one is refused", { graceMs: 0 }],
+    ["sending a retired one cancels the newest too", { graceMs: 0, revokeOnReplay: true }],
+  ] as const) test.skipIf(!tmuxAvailable())(`a shell takes the login another fx refreshed when refresh tokens work once (${rule})`, async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { singleUseRefresh });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select", "mcp_select_tool", { name: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "mcp_fixture_echo", { text: "first" }),
+      fakeGatewayFinalText("First call done."),
+      fakeGatewayToolCall("select2", "mcp_select_tool", { name: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "mcp_fixture_echo", { text: "second" }),
+      fakeGatewayFinalText("Second call done."),
+      fakeGatewayToolCall("select3", "mcp_select_tool", { name: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("third", "mcp_fixture_echo", { text: "third" }),
+      fakeGatewayFinalText("Third call done."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 120, height: 40,
+      env: { ...env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: MODEL },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the fixture.");
+    await tui.waitForText("First call done.", 20_000);
+    // The access token runs out for every fx holding it, and another fx
+    // refreshes it first.
+    auth.validTokens.delete(ACCESS_INITIAL);
+    const other = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expectExit0(other);
+    expect(auth.refreshes).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-1`);
+    // Then the shell needs a token too.
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Call it again.");
+    await tui.waitForText("Second call done.", 20_000);
+    expect(auth.replays).toBe(0);
+    const calls = auth.requests.filter((r) => r.body.includes("\"tools/call\""));
+    expect(calls.at(-1)?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}-1`);
+    // The login still works, for the shell and for the next fx.
+    expect(auth.validTokens.has(`${ACCESS_REFRESHED}-1`)).toBe(true);
+    expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-1`);
+    // The shell refreshes on its own next and lets the lock go, so another fx
+    // refreshing after it doesn't wait for it.
+    auth.validTokens.delete(`${ACCESS_REFRESHED}-1`);
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Call a third time.");
+    await tui.waitForText("Third call done.", 20_000);
+    expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-2`);
+    auth.validTokens.delete(`${ACCESS_REFRESHED}-2`);
+    const startedAt = Date.now();
+    expectExit0(await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-3`);
+    expect(auth.replays).toBe(0);
+  }, 90_000);
+
+  // One fx refreshes a login at a time. Another that needs it meanwhile
+  // waits for as long as the refresh is still going, here a token endpoint
+  // that takes 15 s to answer, and then takes the login it saved: refreshing
+  // with the token the first already sent would be refused. Both are
+  // connected before the token runs out, as fx windows in use are.
+  test("an fx waits for another's refresh that takes 15 s, and takes the login it saved", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { singleUseRefresh: { graceMs: 0 }, refreshDelayMs: 15_000 });
+    const activeAuth = auth;
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    const until = async (what: string, done: () => boolean) => {
+      const deadline = Date.now() + 30_000;
+      while (!done()) {
+        if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+        await Bun.sleep(25);
+      }
+    };
+    const models = { models: [{ id: MODEL, type: "language" as const, tags: ["tool-use"] }] };
+    // The first fx calls once the second is connected, and finds the token
+    // withdrawn; the second calls once the first's refresh is out.
+    let second: ReturnType<typeof startFakeGateway> | null = null;
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select_first", "mcp_select_tool", { name: TOOL_NAME }),
+      async () => {
+        await until("the second fx to connect", () => (second?.requests.length ?? 0) >= 2);
+        activeAuth.validTokens.delete(ACCESS_INITIAL);
+        return fakeGatewayToolCall("first", TOOL_NAME, { text: "first" });
+      },
+      fakeGatewayFinalText("First call done."),
+    ], models);
+    const first = gateway;
+    second = startFakeGateway([
+      fakeGatewayToolCall("select_second", "mcp_select_tool", { name: TOOL_NAME }),
+      async () => {
+        await until("the first fx's refresh", () => activeAuth.refreshes >= 1);
+        return fakeGatewayToolCall("second", TOOL_NAME, { text: "second" });
+      },
+      fakeGatewayFinalText("Second call done."),
+    ], models);
+    const other = second;
+    try {
+      const ask = (g: ReturnType<typeof startFakeGateway>) => runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture."], {
+        cwd: root.workspace,
+        env: { ...env, FX_GATEWAY_BASE_URL: g.baseUrl, FX_GATEWAY_CHAT_URL: g.chatUrl },
+        timeoutMs: 60_000,
+      });
+      const [a, b] = await Promise.all([ask(first), ask(other)]);
+      // Refreshing with the token the first sent is refused, and both lose the login.
+      expect(auth.replays).toBe(0);
+      expect(auth.refreshes).toBe(1);
+      expectExit0(a);
+      expectExit0(b);
+      expect(toolResultText(first.requests.at(-1)?.body ?? "", "first")).toContain("first");
+      expect(toolResultText(other.requests.at(-1)?.body ?? "", "second")).toContain("second");
+      // Both called the tool with the one refreshed login.
+      const calls = auth.requests.filter((r) => r.body.includes("\"tools/call\"") && r.authorization === `Bearer ${ACCESS_REFRESHED}-1`);
+      expect(calls.length).toBe(2);
+      expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-1`);
+    } finally {
+      other.stop();
+    }
+  }, 90_000);
+
+  // A load balancer resets the token endpoint's keep-alive connection once it
+  // sits idle. fx keeps it for the next renewal, which must find it gone and
+  // go out on a new connection instead of failing every renewal until fx
+  // restarts.
+  test("a renewal after the token endpoint reset its idle connection still goes through", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { singleUseRefresh: { graceMs: 0 } });
+    tokenProxy = await startIdleDropProxy(auth.url, "reset");
+    const root = createRoot(auth);
+    seedV2Credential(root, auth, { token_endpoint: `${tokenProxy.origin}/token` });
+    const activeAuth = auth;
+    // Each call finds its access token withdrawn, so fx renews the login
+    // first. The second comes after the proxy reset the first one's
+    // connection.
+    const renewed = (withdrawn: string, id: string, waitMs: number) => async () => {
+      await Bun.sleep(waitMs);
+      activeAuth.validTokens.delete(withdrawn);
+      return fakeGatewayToolCall(id, TOOL_NAME, { text: id });
+    };
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+      renewed(ACCESS_INITIAL, "first", 0),
+      renewed(`${ACCESS_REFRESHED}-1`, "second", 600),
+      fakeGatewayFinalText("Renewed twice."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture twice."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 30_000,
+    });
+    expectExit0(result);
+    const last = gateway.requests.at(-1)?.body ?? "";
+    expect(toolResultText(last, "first")).toContain("first");
+    expect(toolResultText(last, "second")).toContain("second");
+    expect(auth.refreshes).toBe(2);
+    expect(auth.replays).toBe(0);
+    // Each renewal had its own connection: the reset one wasn't used again.
+    expect(tokenProxy.dropped).toBeGreaterThanOrEqual(1);
+    expect(tokenProxy.connections).toBe(2);
+  }, 40_000);
+
+  // A login that can't be saved works only where it was made, so fx says so.
+  test("a login that can't be saved says so, and fx mcp login fails", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const barrier = mkdtempSync(join(tmpdir(), "fx-mcp-code-barrier-"));
+    const started = join(barrier, "started");
+    const release = join(barrier, "release");
+    auth = startAuthFixture(upstream.url, { codeBarrierStartedPath: started, codeBarrierReleasePath: release });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const login = runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    // Once the browser came back, another fx keeps the saved logins busy.
+    expect(await waitForFile(started, 10_000)).toBe(true);
+    const holder = await holdStoreLock(root, 6);
+    writeFileSync(release, "go");
     const done = await login;
-    expect(done.stderr).toBe("");
-    expect(done.code).toBe(0);
-    expect(done.stdout).toContain("Signed in to fixture.");
+    holder.kill();
+    expect(done.stderr).toBe("Signed in to fixture, but couldn't save the login: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: another fx kept it busy. Sign in again once that's fixed.\n");
+    expect(done.code).toBe(1);
+    expect(auth.tokenExchanges).toBe(1);
+    expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials-v3.json"))).toBe(false);
+  }, 60_000);
+
+  // A logout that can't remove the saved login says so: every other fx, and
+  // the next one, would still sign in with it.
+  test("a logout that can't remove the saved login says so, and fx mcp logout fails", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const storePath = seedV2Credential(root, auth);
+    // Readable, but fx won't replace a file it isn't allowed to write.
+    chmodSync(storePath, 0o400);
+    const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Signed out of fixture here, but couldn't remove its saved login: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. Sign out again once that's fixed.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  test("removing a server whose saved login can't be deleted says so, and fx mcp remove fails", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const storePath = seedV2Credential(root, auth);
+    chmodSync(storePath, 0o400);
+    const done = await runFx(["mcp", "remove", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Removed fixture from ~/.fx/mcp.json, but couldn't delete its saved login: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. Once that's fixed, add it back and run fx mcp logout fixture to delete it.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(join(root.home, ".fx", "mcp.json"), "utf8")).not.toContain("fixture");
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  // A server waiting for approval has no session, so a saved login that
+  // can't be removed means nothing changed.
+  test("a logout of a held server whose saved login can't be removed changes nothing and says so", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    moveAuthFixtureToWorkspace(root);
+    const storePath = seedV2Credential(root, auth);
+    const doc = JSON.parse(readFileSync(storePath, "utf8"));
+    doc.servers[0].workspace = root.workspace;
+    writeFileSync(storePath, JSON.stringify(doc));
+    chmodSync(storePath, 0o400);
+    const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Couldn't sign out of fixture: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it. Try again once that's fixed.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  test("a logout while another fx keeps the saved logins busy changes nothing and says so", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const storePath = seedV2Credential(root, auth);
+    // Private, as fx makes it.
+    writeFileSync(join(root.home, ".fx", "mcp-credentials", "credentials-v3.lock"), "", { mode: 0o600 });
+    const holder = await holdStoreLock(root, 8);
+    const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    holder.kill();
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Couldn't sign out of fixture: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: another fx kept it busy. Try again once that's fixed.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a refreshed login that can't be saved says so in the shell, and keeps working there", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rejectRefresh?: boolean } = {};
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select", "mcp_select_tool", { name: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "mcp_fixture_echo", { text: "first" }),
+      fakeGatewayFinalText("First call done."),
+      fakeGatewayToolCall("select2", "mcp_select_tool", { name: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "mcp_fixture_echo", { text: "second" }),
+      fakeGatewayFinalText("Second call done."),
+      fakeGatewayToolCall("select3", "mcp_select_tool", { name: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("third", "mcp_fixture_echo", { text: "third" }),
+      fakeGatewayFinalText("Third call done."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 120, height: 40,
+      env: { ...env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: MODEL },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the fixture.");
+    await tui.waitForText("First call done.", 20_000);
+    auth.validTokens.delete(ACCESS_INITIAL);
+    // Another fx keeps the saved logins busy past both waits for them.
+    const holder = await holdStoreLock(root, 6);
+    try {
+      await tui.waitForComposer(5_000);
+      await tui.sendText("Call it again.");
+      await tui.waitForText("Couldn't save fixture's new login", 20_000);
+      await tui.waitForText("Second call done.", 20_000);
+    } finally {
+      holder.kill();
+    }
+    // The refresh worked here, and the store still has the login before it.
+    expect(auth.refreshes).toBe(1);
+    const calls = auth.requests.filter((r) => r.body.includes("\"tools/call\""));
+    expect(calls.at(-1)?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+    // Then the server takes neither the refreshed login nor its refresh. The
+    // shell, refused, removes the saved login it had, which its refresh
+    // replaced, so nothing takes that one later.
+    auth.validTokens.clear();
+    options.rejectRefresh = true;
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Call a third time.");
+    await tui.waitForText("Third call done.", 20_000);
+    expect(JSON.parse(readFileSync(storePath, "utf8")).servers).toEqual([]);
+  }, 90_000);
+
+  // Two shells share one login on the Keychain. Shell A starts while B is
+  // idle, and A's Keychain read hangs past the 10 s it may hold the store's
+  // lock; meanwhile B's token is refused, so B refreshes and saves. The
+  // auth server's refresh tokens work once, as WorkOS's do.
+  // Before, B waited 2 s for the lock, dropped its new login with "another
+  // fx kept it busy", and A, taking the saved login, replayed a refresh
+  // token B had already used. Now A's hung read is cut at its budget, B
+  // waits for that and saves, and A takes B's login without refreshing.
+  test.skipIf(process.platform !== "darwin" || !tmuxAvailable())("a refreshed login is saved while another fx hangs in the Keychain", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { singleUseRefresh: { graceMs: 0 } });
+    const root = createRoot(auth);
+    mkdirSync(join(root.home, "Library"), { recursive: true });
+    symlinkSync(join(homedir(), "Library", "Keychains"), join(root.home, "Library", "Keychains"), "dir");
+    const account = `${MCP_KEYCHAIN_ACCOUNT_PREFIX}${process.pid}-${randomUUID()}`;
+    const env = {
+      ...baseEnv(root), USER: account, FX_DISABLE_KEYCHAIN: undefined, DISPLAY: ":0", SSH_CONNECTION: undefined,
+      FX_NO_OPEN_BROWSER: undefined, FX_TRACE_SCOPES: "mcp,keychain",
+    };
+    const call = (id: string, done: string) => [
+      fakeGatewayToolCall(`select_${id}`, "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall(`call_${id}`, TOOL_NAME, { text: id }),
+      fakeGatewayFinalText(done),
+    ];
+    const models = [{ id: MODEL, type: "language", tags: ["tool-use"] }];
+    const gatewayA = startFakeGateway(call("a", "A call done."), { models });
+    let shellA: TmuxSession | null = null;
+    let paused: number | null = null;
+    let watcher: { pid: Promise<number | null>; stop: () => void } | null = null;
+    try {
+      expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+      expect(mcpKeychainItem("load", account, root.home)).toContain(ACCESS_INITIAL);
+      gateway = startFakeGateway([...call("first", "First call done."), ...call("second", "Second call done.")], { models });
+      tui = await TmuxSession.create({
+        isolated: true, cwd: root.workspace, width: 220, height: 40,
+        env: { ...env, FX_TRACE_LOG: `${root.trace}.b`, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Call the fixture.");
+      await tui.waitForText("First call done.", 20_000);
+      await tui.waitForComposer(10_000);
+      auth.validTokens.delete(ACCESS_INITIAL);
+
+      watcher = pauseNextKeychainRead(account);
+      const starting = TmuxSession.create({
+        isolated: true, cwd: root.workspace, width: 220, height: 40, startupWaitMs: 0,
+        env: { ...env, FX_TRACE_LOG: `${root.trace}.a`, FX_GATEWAY_BASE_URL: gatewayA.baseUrl, FX_GATEWAY_CHAT_URL: gatewayA.chatUrl },
+      });
+      paused = await watcher.pid;
+      shellA = await starting;
+      expect(paused).not.toBeNull();
+      const pausedAt = Date.now();
+
+      await tui.sendText("Call it again.");
+      await Bun.sleep(Math.max(0, pausedAt + 14_000 - Date.now()));
+      releaseProcess(paused);
+      paused = null;
+      await tui.waitForText("Second call done.", 45_000);
+      await shellA.waitForComposer(15_000);
+      await shellA.sendText("Call the fixture.");
+      await shellA.waitForText("A call done.", 30_000);
+
+      const screen = (await tui.capturePaneGrid()).join("\n").replace(/\n\s+/g, " ");
+      const saved = mcpKeychainItem("load", account, root.home);
+      if (screen.includes("another fx kept it busy") || !saved.includes(`${ACCESS_REFRESHED}-1`)) {
+        const trace = (who: string) => existsSync(`${root.trace}.${who}`) ? readFileSync(`${root.trace}.${who}`, "utf8").split("\n").filter((l) => /\[(keychain|mcp)\].*(lock|credential|saved login|refresh|load|store)/.test(l)).map((l) => `${who} ${l}`) : [];
+        console.log(`---- shell B ----\n${screen}\n---- traces ----\n${[...trace("a"), ...trace("b")].join("\n")}`);
+      }
+      expect(screen).not.toContain("another fx kept it busy");
+      // B's refreshed login is the saved one, A took it instead of
+      // refreshing, and no retired refresh token was sent.
+      expect(saved).toContain(`${ACCESS_REFRESHED}-1`);
+      expect(auth.refreshes).toBe(1);
+      expect(auth.replays).toBe(0);
+      const aCall = auth.requests.filter((r) => r.body.includes("\"tools/call\"")).at(-1);
+      expect(aCall?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}-1`);
+    } finally {
+      releaseProcess(paused);
+      watcher?.stop();
+      await shellA?.kill();
+      gatewayA.stop();
+      try { mcpKeychainItem("delete", account, root.home); } catch (err) { console.log(String(err)); }
+      // Only the link goes, never the Keychains it points at.
+      unlinkSync(join(root.home, "Library", "Keychains"));
+    }
+  }, 150_000);
+
+  test("a configured oauth.resource reaches the authorization server as written", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    // The fixture advertises its origin as the resource and checks it on
+    // /authorize and /token; fx's own address is .../mcp.
+    auth = startAuthFixture(upstream.url, { resourceAtOrigin: true });
+    const root = createRoot(auth);
+    const configPath = join(root.home, ".fx", "mcp.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    config.mcp.fixture.oauth.resource = `${new URL(auth.url).origin}/`;
+    writeFileSync(configPath, JSON.stringify(config));
+    // Freed memory reads as 0x55, so a resource fx failed to copy is garbled.
+    const env = { ...v2Env(root), MallocScribble: "1", MALLOC_PERTURB_: "85" };
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.signal).toBeNull();
+    expect(login.stderr).toBe("");
+    expectExit0(login);
     expect(auth.tokenExchanges).toBe(1);
     expect(await statusOf(root)).toBe("signed_in");
   }, 60_000);
@@ -4479,4 +2445,294 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     expect(existsSync(root.openLog)).toBe(false);
     expect(auth.authorizationRequests).toBe(0);
   }, 30_000);
+
+  // A saved login is renewed before it's sent once it's expired, or within
+  // its renewal window (skew_ms before it expires), whatever the server's era.
+  for (const era of ["2026-07-28", "2025-11-25"] as const) {
+    test(`an expired saved login is renewed before fx first talks to a ${era} server`, async () => {
+      const target = era === "2026-07-28"
+        ? (upstream = startModernMcpHttpFixture("json"))
+        : (legacyStreamable = startLegacyStreamableHttpFixture(era));
+      auth = startAuthFixture(target.url);
+      const root = createRoot(auth);
+      seedV2Credential(root, auth, { expires_at_ms: 0 });
+      gateway = startToolGateway();
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture."], {
+        cwd: root.workspace,
+        env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+        timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      expect(auth.refreshes).toBe(1);
+      // The expired token never reached the server.
+      const sent = auth.requests.filter((request) => request.path === "/mcp");
+      expect(sent.length).toBeGreaterThan(0);
+      for (const request of sent) expect(request.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
+      expect(auth.protectedToolCalls).toBe(1);
+      expect(toolResultText(gateway.requests[2]?.body ?? "", "call_mcp")).toContain("authenticated");
+    }, 30_000);
+  }
+
+  test("a login that comes within its renewal window while fx runs is renewed before the next call", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    // Renewed 6 s before it expires, 21 s from now: the first use is well
+    // before that window, even when fx starts slowly on a busy machine, and
+    // the call, held until 16 s from now, inside it.
+    const savedAt = Date.now();
+    seedV2Credential(root, auth, { expires_at_ms: savedAt + 21_000, skew_ms: 6_000 });
+    gateway = startDelayedToolGateway(savedAt + 16_000, "Renewed call complete.");
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 45_000,
+    });
+    expect(result.code).toBe(0);
+    expect(auth.refreshes).toBe(1);
+    const sent = auth.requests.filter((request) => request.path === "/mcp");
+    expect(sent[0]?.authorization).toBe(`Bearer ${ACCESS_INITIAL}`);
+    // The fixture takes both tokens, so the call carries the new one only
+    // because fx renewed it first.
+    const call = sent.find((request) => request.body.includes('"tools/call"'));
+    expect(call?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
+    expect(auth.protectedToolCalls).toBe(1);
+  }, 60_000);
+
+  // Before, a shell that started before another terminal signed in logged out
+  // without that login, which stayed valid at the server for every other fx.
+  test.skipIf(!tmuxAvailable())("a logout in a shell revokes the login another terminal saved after the shell started", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 110, height: 34,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // Another terminal signs in while the shell runs.
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 }));
+    expect(auth.revocations).toBe(0);
+    await tui.sendText("/mcp logout fixture");
+    await tui.waitForText("Signed out of fixture.", 15_000);
+    const revoked = auth.requests.filter((request) => request.path === "/revoke").map((request) => new URLSearchParams(request.body).get("token"));
+    expect(revoked).toEqual([REFRESH_INITIAL]);
+    expect(readFileSync(join(root.home, ".fx", "mcp-credentials", "credentials-v3.json"), "utf8")).not.toContain("\"name\":\"fixture\"");
+  }, 60_000);
+
+  // Before, a shell holding a login renewed it at its next use after another
+  // terminal logged out, and saved it again: at a server that doesn't end the
+  // login on revocation, as this fixture, the logout undid itself.
+  test.skipIf(!tmuxAvailable())("after another terminal logs out, a shell holding the login signs out at its next renewal instead of saving it back", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    // Due for renewal 10 s from now: the shell connects with it before, and
+    // calls a tool after.
+    const seeded = Date.now();
+    const store = seedV2Credential(root, auth, { expires_at_ms: seeded + 20_000, skew_ms: 10_000 });
+    gateway = startToolGateway();
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 110, height: 34,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    const connectedBy = Date.now() + 9_000;
+    while (!auth.requests.some((request) => request.path === "/mcp" && request.authorization === `Bearer ${ACCESS_INITIAL}`) && Date.now() < connectedBy) await Bun.sleep(50);
+    expect(auth.requests.some((request) => request.path === "/mcp" && request.authorization === `Bearer ${ACCESS_INITIAL}`)).toBe(true);
+    expect(auth.refreshes).toBe(0);
+
+    // Another terminal logs out.
+    expectExit0(await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 }));
+    expect(readFileSync(store, "utf8")).not.toContain("\"name\":\"fixture\"");
+
+    await Bun.sleep(Math.max(0, seeded + 10_500 - Date.now()));
+    await tui.sendText("Call the protected fixture.");
+    await tui.waitForText("Authenticated MCP call complete.", 20_000);
+    // The shell didn't renew the login, so nothing saved it again.
+    expect(auth.refreshes).toBe(0);
+    expect(auth.protectedToolCalls).toBe(0);
+    expect(readFileSync(store, "utf8")).not.toContain("\"name\":\"fixture\"");
+    expect(await statusOf(root)).not.toBe("signed_in");
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp logout with no saved login says so and leaves the running server alone", async () => {
+    upstream = startModernMcpHttpFixture("cache_auth_subscription");
+    auth = startAuthFixture(upstream.url);
+    // A server that needs no login, reached directly.
+    const root = createRoot(auth, false, "http", upstream.url);
+    const listens = () => upstream!.requests.filter((request) => request.message.method === "subscriptions/listen");
+    const calls = () => upstream!.requests.filter((request) => request.message.method === "tools/call");
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select_first", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("call_first", TOOL_NAME, { text: "first" }),
+      fakeGatewayFinalText("First call complete."),
+      fakeGatewayToolCall("select_second", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("call_second", TOOL_NAME, { text: "second" }),
+      fakeGatewayFinalText("Second call complete."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 110,
+      height: 34,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the MCP fixture.");
+    await tui.waitForText("First call complete.", 20_000);
+    const deadline = Date.now() + 10_000;
+    while (listens().length < 1 && Date.now() < deadline) await Bun.sleep(25);
+    expect(listens()).toHaveLength(1);
+
+    await tui.sendText("/mcp logout fixture");
+    await tui.waitForText("fixture wasn't signed in.", 10_000);
+    expect(upstream.cancelledListens).toBe(0);
+    await tui.waitForComposer(10_000);
+    await tui.sendText("Call it again.");
+    await tui.waitForText("Second call complete.", 20_000);
+    // The same connection served both calls.
+    expect(calls()).toHaveLength(2);
+    expect(listens()).toHaveLength(1);
+    expect(upstream.cancelledListens).toBe(0);
+    expect(tui.paneStatus()).toEqual({ dead: false, status: null });
+    upstream.finishSubscription();
+  }, 60_000);
+
+  // RFC 8414 section 3.2: the metadata is an application/json response.
+  test("fx mcp login refuses sign-in metadata that isn't JSON before opening the browser", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { authorizationMetadataContentType: "text/plain" });
+    const root = createRoot(auth);
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(login.code).not.toBe(0);
+    expect(`${login.stdout}${login.stderr}`).toContain("text/plain");
+    expect(existsSync(root.openLog)).toBe(false);
+    expect(auth.authorizationRequests).toBe(0);
+    expect(auth.tokenExchanges).toBe(0);
+    expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials-v3.json"))).toBe(false);
+  }, 30_000);
+
+  // MongoDB's deployed server answers server/discover with a session error
+  // where a 2025-11-25 server would answer with an unknown method.
+  for (const mode of ["legacy_session_required", "legacy_mongodb_session_required"] as const) {
+    test(`a signed-in server that refuses discovery as MongoDB's does (${mode}) falls back and lists its tools`, async () => {
+      upstream = startModernMcpHttpFixture(mode);
+      auth = startAuthFixture(upstream.url);
+      const root = createRoot(auth);
+      const env = v2Env(root);
+      const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+      expectExit0(login);
+      expect(login.stdout).toContain("Signed in to fixture.");
+      const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+      expectExit0(show);
+      expect(show.stderr).toBe("");
+      const status = JSON.parse(show.stdout);
+      expect(status.status).toBe("ready");
+      expect(status.version).toBe("2025-11-25");
+      expect(status.tools).toHaveLength(1);
+      for (const secret of [ACCESS_INITIAL, REFRESH_INITIAL]) {
+        expect(show.stdout).not.toContain(secret);
+        expect(show.stderr).not.toContain(secret);
+      }
+      const methods = upstream.requests.map((entry) => entry.message.method);
+      expect(methods.slice(0, 3)).toEqual(["server/discover", "initialize", "notifications/initialized"]);
+      expect(methods).toContain("tools/list");
+    }, 30_000);
+  }
+
+  // Esc stops only the call: the renewal runs on, so a server that swaps its
+  // refresh token on each renewal never sees an old one. A renewal gets 30 s;
+  // the call waiting when it runs out fails, and the next call renews afresh.
+  test.skipIf(!tmuxAvailable())("Esc while a login is being renewed cancels the call before it's sent, and a renewal that never answers ends after 30 s", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    // The first renewal never answers.
+    auth = startAuthFixture(upstream.url, { stallRefresh: true });
+    const root = createRoot(auth);
+    // Times from the moment the login is saved, below.
+    let savedAt = 0;
+    gateway = startRefreshRecoveryGateway(() => savedAt + 16_000);
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 110,
+      height: 34,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // Renewed 6 s before it expires, 21 s from now: the tool is found well
+    // before that window, even on a slow machine, and called inside it, 16 s
+    // from now.
+    savedAt = Date.now();
+    const store = seedV2Credential(root, auth, { expires_at_ms: savedAt + 21_000, skew_ms: 6_000 });
+    await tui.sendText("Call the protected MCP fixture.");
+    const refreshDeadline = Date.now() + 40_000;
+    while (auth.refreshes === 0 && Date.now() < refreshDeadline) await Bun.sleep(25);
+    expect(auth.refreshes).toBe(1);
+
+    const renewalStarted = Date.now();
+
+    await tui.sendInterruptEscapePair(10_000);
+    await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+    expect(auth.protectedToolCalls).toBe(0);
+    expect(upstream.requests.some((entry) => entry.message.method === "tools/call")).toBe(false);
+    expect(readFileSync(store, "utf8")).toContain(ACCESS_INITIAL);
+    expect(readFileSync(store, "utf8")).not.toContain(ACCESS_REFRESHED);
+    await tui.waitForComposer(10_000);
+    // The renewal is still open.
+    expect(auth.refreshCancellations).toBe(0);
+
+    // The retry waits for that renewal, which fx drops after its 30 s.
+    await tui.sendText("Retry the protected MCP fixture.");
+    await tui.waitForText("Retry ended.", 45_000);
+    const waited = Date.now() - renewalStarted;
+    expect(waited).toBeGreaterThan(28_000);
+    expect(waited).toBeLessThan(40_000);
+    expect(auth.refreshes).toBe(1);
+    expect(auth.refreshCancellations).toBe(1);
+    expect(auth.protectedToolCalls).toBe(0);
+    const retried = gateway.requests.find((r) => r.body.includes('"toolCallId":"call_retry"'))?.body ?? "{}";
+    expect(toolResultText(retried, "call_retry", "error-text")).toContain("couldn't be renewed because the sign-in server didn't answer");
+    expect(readFileSync(store, "utf8")).toContain(ACCESS_INITIAL);
+    await tui.waitForComposer(10_000);
+
+    // The login was kept, so the next call renews it afresh.
+    await tui.sendText("Call the protected MCP fixture again.");
+    await tui.waitForText("Refresh recovery complete.", 20_000);
+    expect(auth.refreshes).toBe(2);
+    expect(auth.protectedToolCalls).toBe(1);
+    expect(readFileSync(store, "utf8")).toContain(ACCESS_REFRESHED);
+  }, 120_000);
+
+  test("a pinned callback port is bound again for each of several sign-ins in a row", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    // This test plays the browser itself.
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const callbackPort = unusedCallbackPort();
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.oauth.callback_port = callbackPort;
+    writeFileSync(profilePath, JSON.stringify(profile));
+    const env = v2Env(root);
+    const attempts = 8;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      rmSync(root.openLog, { force: true });
+      const login = runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+      expect(await waitForFileText(root.openLog, "http", 10_000)).toBe(true);
+      const authorization = await fetch(readFileSync(root.openLog, "utf8").trim(), { redirect: "manual" });
+      const callback = authorization.headers.get("location");
+      expect(callback).not.toBeNull();
+      expect(new URL(callback!).port).toBe(String(callbackPort));
+      expect((await fetch(callback!)).status).toBe(200);
+      const done = await login;
+      expect({ attempt, code: done.code, stderr: done.stderr }).toEqual({ attempt, code: 0, stderr: "" });
+      expect(done.stdout).toContain("Signed in to fixture.");
+      const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+      expect({ attempt, code: logout.code, stderr: logout.stderr }).toEqual({ attempt, code: 0, stderr: "" });
+    }
+    expect(auth.authorizationRequests).toBe(attempts);
+    expect(auth.tokenExchanges).toBe(attempts);
+  }, 120_000);
 });

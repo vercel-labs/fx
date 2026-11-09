@@ -18,8 +18,8 @@
     {
       "id": "S3",
       "breaks": "A turn asks for capabilities again after it already asked.",
-      "find": "NeedsResolve(r) == support = \"unknown\" /\\ ~resolved /\\ (r.user_images \\/ r.tool_images)",
-      "replace": "NeedsResolve(r) == support = \"unknown\" /\\ (r.user_images \\/ r.tool_images)",
+      "find": "NeedsResolve(r) == support = \"unknown\" /\\ ~resolved /\\ HasImages(r)",
+      "replace": "NeedsResolve(r) == support = \"unknown\" /\\ HasImages(r)",
       "expect": "ResolveOncePerTurn"
     },
     {
@@ -102,7 +102,7 @@
     {
       "id": "S15",
       "breaks": "The core asks for capabilities for a request without images.",
-      "find": "NeedsResolve(r) == support = \"unknown\" /\\ ~resolved /\\ (r.user_images \\/ r.tool_images)",
+      "find": "NeedsResolve(r) == support = \"unknown\" /\\ ~resolved /\\ HasImages(r)",
       "replace": "NeedsResolve(r) == support = \"unknown\" /\\ ~resolved",
       "expect": "ResolveOnlyWhenNeeded"
     },
@@ -133,6 +133,34 @@
       "find": "LET route == CASE s = \"native\" -> \"native\"",
       "replace": "LET route == CASE s = \"native\" -> (IF r.fallback THEN \"fallback\" ELSE \"native\")",
       "expect": "NativeExcludesFallback"
+    },
+    {
+      "id": "S20",
+      "breaks": "An earlier image fails the request like one attached now: the reported bug.",
+      "find": "Unroutable(s, r) == r.user_images /\\ Decide(s, r).route = \"unavailable\"",
+      "replace": "Unroutable(s, r) == (r.user_images \\/ r.earlier_images) /\\ Decide(s, r).route = \"unavailable\"",
+      "expect": "FailExactlyWhenUnroutable"
+    },
+    {
+      "id": "S21",
+      "breaks": "Earlier images go inline whatever the support.",
+      "find": "earlier == IF ~r.earlier_images THEN \"none\" ELSE Held(s, route)",
+      "replace": "earlier == IF ~r.earlier_images THEN \"none\" ELSE \"attached\"",
+      "expect": "UnknownNeverInline"
+    },
+    {
+      "id": "S22",
+      "breaks": "Earlier images vanish from the request without a notice.",
+      "find": "earlier == IF ~r.earlier_images THEN \"none\" ELSE Held(s, route)",
+      "replace": "earlier == \"none\"",
+      "expect": "NoSilentWithhold"
+    },
+    {
+      "id": "S23",
+      "breaks": "Earlier images are withheld as unconfirmed without the turn asking the catalog.",
+      "find": "HasImages(r) == r.user_images \\/ r.earlier_images \\/ r.tool_images",
+      "replace": "HasImages(r) == r.user_images \\/ r.tool_images",
+      "expect": "AskedBeforeUnknown"
     }
   ],
   "code": [
@@ -146,15 +174,15 @@
     {
       "id": "C2",
       "breaks": "A turn asks for capabilities again after it already asked.",
-      "find": "if (state.support == .unknown and !state.resolved and (request.user_images or request.tool_images)) {",
-      "replace": "if (state.support == .unknown and (request.user_images or request.tool_images)) {",
+      "find": "if (state.support == .unknown and !state.resolved and hasImages(request)) {",
+      "replace": "if (state.support == .unknown and hasImages(request)) {",
       "expect": "ResolveOncePerTurn"
     },
     {
       "id": "C3",
       "breaks": "The catalog-down notice repeats within a turn.",
-      "find": "if (chosen.tool_images == .withheld_unknown and request.catalog_down and !state.notified) {",
-      "replace": "if (chosen.tool_images == .withheld_unknown and request.catalog_down) {",
+      "find": "if (withholdsUnknown(chosen) and request.catalog_down and !state.notified) {",
+      "replace": "if (withholdsUnknown(chosen) and request.catalog_down) {",
       "expect": "NotifyOncePerTurn"
     },
     {
@@ -230,15 +258,15 @@
     {
       "id": "C14",
       "breaks": "The core asks for capabilities for a request without images.",
-      "find": "if (state.support == .unknown and !state.resolved and (request.user_images or request.tool_images)) {",
+      "find": "if (state.support == .unknown and !state.resolved and hasImages(request)) {",
       "replace": "if (state.support == .unknown and !state.resolved) {",
       "expect": "ResolveOnlyWhenNeeded"
     },
     {
       "id": "C15",
       "breaks": "The catalog-down notice appears when the catalog is up.",
-      "find": "if (chosen.tool_images == .withheld_unknown and request.catalog_down and !state.notified) {",
-      "replace": "if (chosen.tool_images == .withheld_unknown and !state.notified) {",
+      "find": "if (withholdsUnknown(chosen) and request.catalog_down and !state.notified) {",
+      "replace": "if (withholdsUnknown(chosen) and !state.notified) {",
       "expect": "NotifyOnlyWhenDown"
     },
     {
@@ -261,6 +289,34 @@
       "find": ".native => .native,",
       "replace": ".native => if (request.fallback) .fallback else .native,",
       "expect": "NativeExcludesFallback"
+    },
+    {
+      "id": "C19",
+      "breaks": "An earlier image fails the request like one attached now: the reported bug.",
+      "find": "if (request.user_images and chosen.route == .unavailable) {",
+      "replace": "if ((request.user_images or request.earlier_images) and chosen.route == .unavailable) {",
+      "expect": "FailExactlyWhenUnroutable"
+    },
+    {
+      "id": "C20",
+      "breaks": "Earlier images go inline whatever the support.",
+      "find": ".earlier_images = held(request.earlier_images, support, route),",
+      "replace": ".earlier_images = if (request.earlier_images) .attached else .none,",
+      "expect": "UnknownNeverInline"
+    },
+    {
+      "id": "C21",
+      "breaks": "Earlier images vanish from the request without a notice.",
+      "find": ".earlier_images = held(request.earlier_images, support, route),",
+      "replace": ".earlier_images = .none,",
+      "expect": "NoSilentWithhold"
+    },
+    {
+      "id": "C22",
+      "breaks": "Earlier images are withheld as unconfirmed without the turn asking the catalog.",
+      "find": "return request.user_images or request.earlier_images or request.tool_images;",
+      "replace": "return request.user_images or request.tool_images;",
+      "expect": "AskedBeforeUnknown"
     }
   ]
 }

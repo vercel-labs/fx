@@ -32,6 +32,7 @@ const compacted_records = @import("records.zig");
 const trace = @import("trace.zig");
 const token_estimate = @import("../shared/token_estimate.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const sort_utils = @import("../shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -453,7 +454,7 @@ fn compactPart(alloc: Allocator, request: Request, users: []const []const u8, mo
         try turn_records.append(scratch, .{ .number = turn.number, .text = text, .first_tool = turn.first_tool, .last_tool = turn.last_tool });
     }
     // The turn in progress is turn zero, so it goes first.
-    std.mem.sort(lint.Record, turn_records.items, {}, byNumber);
+    sort_utils.sort(lint.Record, turn_records.items, {}, byNumber);
 
     var written: ledger.Written = .{};
     if (plan.needsModel()) notes: {

@@ -263,7 +263,7 @@ test "provider framing fuzzes chunk-invariant event data" {
             try std.testing.expectEqual(null, try reader.next(alloc, &source.interface, &cancelled));
         }
     };
-    try std.testing.fuzz({}, Probe.run, .{ .corpus = &.{ "", "one", "split every field" } });
+    try std.testing.fuzz({}, Probe.run, .{ .corpus = &(@import("fuzz_seed").slices(.{ "", "one", "split every field" }) ++ @import("fuzz_corpus").sse_framing.*) });
 }
 
 fn check_allocations(alloc: std.mem.Allocator) !void {

@@ -44,7 +44,7 @@ const LOCAL_MENU_ACTIONS = [
   { name: "settingsOpen", command: "/settings", marker: "Settings" },
   { name: "modelOpen", command: "/model", marker: "Models " },
   { name: "resumeOpen", command: "/resume", marker: "Sessions " },
-  { name: "mcpOpen", command: "/mcp", marker: "[Servers]" },
+  { name: "mcpOpen", command: "/mcp", marker: "MCP servers" },
   { name: "usageOpen", command: "/usage", marker: "usage: API key" },
   { name: "statuslineOpen", command: "/statusline", marker: "Status line" },
   { name: "workspaceOpen", command: "/workspace", marker: "enter use" },
@@ -497,7 +497,7 @@ test.skipIf(!tmuxAvailable())(
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_AUTO_UPGRADE: "0",
           FX_DISABLE_KEYCHAIN: "1",
-          FX_SKIP_ONBOARDING: "1",
+          FX_TEST_SKIP_ONBOARDING: "1",
           FX_SOUND: "0",
           NO_COLOR: "1",
         },
@@ -603,7 +603,7 @@ test.skipIf(!tmuxAvailable())(
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_AUTO_UPGRADE: "0",
           FX_DISABLE_KEYCHAIN: "1",
-          FX_SKIP_ONBOARDING: "1",
+          FX_TEST_SKIP_ONBOARDING: "1",
           FX_SOUND: "0",
           NO_COLOR: "1",
         },
@@ -723,7 +723,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
 
       // One correctness cycle also fences the inline prewarm before timing.
       session.sendKeysImmediate(["C-o"]);
-      await session.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       expect(await session.captureFullScrollback()).toContain("PERF_TRANSCRIPT_HEAD");
       session.sendKeysImmediate(["Escape"]);
       await session.waitForComposer(TIMEOUT);
@@ -741,15 +741,15 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         const open = await measureAction(
           fixture.tapePath,
           () => session!.sendKeysImmediate(["C-o"]),
-          () => session!.waitForText("full detail · ctrl+o close", TIMEOUT),
-          "full detail",
+          () => session!.waitForText("esc close · pgup/pgdn scroll", TIMEOUT),
+          "esc close · pgup/pgdn scroll",
         );
         const beforeScroll = await session.capturePane();
         const scroll = await measureAction(
           fixture.tapePath,
           () => session!.sendKeysImmediate(["Up"]),
           () => session!.waitForPane(
-            (pane) => pane !== beforeScroll && pane.includes("full detail"),
+            (pane) => pane !== beforeScroll && pane.includes("esc close · pgup/pgdn scroll"),
             TIMEOUT,
           ),
         );
@@ -762,14 +762,14 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       }
 
       session.sendKeysImmediate(["C-o"]);
-      await session.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       let beforePrime = await session.capturePane();
       // The first key moves one viewport into the three-viewport prepared
       // window. Each loop then moves to its edge before the measured key
       // crosses that edge and waits for the replacement window.
       session.sendKeysImmediate(["PageUp"]);
       await session.waitForPane(
-        (pane) => pane !== beforePrime && pane.includes("full detail"),
+        (pane) => pane !== beforePrime && pane.includes("esc close · pgup/pgdn scroll"),
         TIMEOUT,
       );
       await waitForTapeQuiescence(fixture.tapePath);
@@ -778,7 +778,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         beforePrime = await session.capturePane();
         session.sendKeysImmediate([key]);
         await session.waitForPane(
-          (pane) => pane !== beforePrime && pane.includes("full detail"),
+          (pane) => pane !== beforePrime && pane.includes("esc close · pgup/pgdn scroll"),
           TIMEOUT,
         );
         await waitForTapeQuiescence(fixture.tapePath);
@@ -787,7 +787,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           fixture.tapePath,
           () => session!.sendKeysImmediate([key]),
           () => session!.waitForPane(
-            (pane) => pane !== beforeMiss && pane.includes("full detail"),
+            (pane) => pane !== beforeMiss && pane.includes("esc close · pgup/pgdn scroll"),
             TIMEOUT,
           ),
         );
@@ -1095,7 +1095,7 @@ test.skipIf(!LIVE_ENABLED || !tmuxAvailable())(
       await session.waitForText("LIVE_PERFORMANCE_DONE", TIMEOUT);
 
       session.sendKeysImmediate(["C-o"]);
-      await session.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       session.sendKeysImmediate(["Up"]);
       await Bun.sleep(25);
       session.sendKeysImmediate(["Escape"]);

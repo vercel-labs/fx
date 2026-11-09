@@ -806,10 +806,7 @@ test "ids follow v1's alphabet and avoid the reserved names" {
 }
 
 test "header parsing never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzHeader, .{ .corpus = &.{
-        "{\"v\":1,\"seq\":1,\"ts\":0,\"kind\":\"item\"",
-        "{\"v\":99999999999,\"seq\":1",
-    } });
+    try testing.fuzz({}, fuzzHeader, .{ .corpus = &(.{""} ++ @import("build_options").fuzz_corpus_session_schema_header.*) });
 }
 
 fn fuzzHeader(_: void, smith: *testing.Smith) anyerror!void {

@@ -5,10 +5,12 @@
 import assert from "node:assert/strict";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { binary, shellQuote } from "../../lib/context";
+import { binary, shellQuote, targetModule } from "../../lib/context";
 import {
   Acp, fakeGatewayFinalText, fakeGatewaySse, fakeGatewayToolCall, plainReplies, shown, TmuxSession, waitUntil, type Fixture, type Via, v1Writer,
 } from "./driver";
+
+const { readPermissionsPanel } = await targetModule("info-panel.ts");
 
 export type Made = { id: string; read(home: string, v2: boolean): Promise<string | null> };
 
@@ -17,7 +19,7 @@ export type Made = { id: string; read(home: string, v2: boolean): Promise<string
 // fixture's full access runs every tool call unreviewed.
 async function continued(f: Fixture, id: string, home: string, v2: boolean, prompt: string) {
   const mark = f.gateway.requests.length;
-  const run = await f.fx(v2, ["ask", "--json", "--resume-id", id, prompt], home);
+  const run = await f.fx(v2, ["ask", "--json", v2 ? "--resume" : "--resume-id", id, prompt], home);
   return run.code === 0 ? f.gateway.requests.slice(mark).map((r: any) => r.body as string) : null;
 }
 
@@ -74,10 +76,19 @@ async function rules(f: Fixture): Promise<Made> {
   assert(readFileSync(join(f.v1Root, id, "permissions.json"), "utf8").includes("conv-allowed"), "the v1 app saved no permission rule");
   return {
     id, read: (home, v2) => inApp(f, home, v2, id, async app => {
+      // The older build lists the rules in the transcript; this one in the
+      // /permissions panel. Both read back as the older build listed them.
+      if (v2) {
+        const panel = await readPermissionsPanel(app, 15_000, (shown: any) => shown.fields["Saved rules"] !== undefined);
+        const count = panel.fields["Saved rules"];
+        if (count === "none") return "saved-session permission rules: none";
+        return [`saved-session permission rules (${count}):`, ...(panel.items["Saved rules"] ?? []).map((rule: string) => `  ${rule}`)].join("\n");
+      }
       await app.sendText("/permissions");
       await app.waitForText("saved-session permission rules", 15_000);
       const text = await app.captureFullScrollback();
-      return text.slice(text.lastIndexOf("saved-session permission rules")).split("\n\n")[0];
+      const [head, ...listed] = text.slice(text.lastIndexOf("saved-session permission rules")).split("\n\n")[0]!.split("\n");
+      return [head!.trimEnd(), ...listed.map((rule) => `  ${rule.trim()}`)].join("\n");
     }),
   };
 }

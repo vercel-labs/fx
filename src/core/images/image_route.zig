@@ -10,8 +10,8 @@
 //! below are the model's properties; `tests/tla/image_route/design/DESIGN.md`
 //! lists where each one is enforced.
 //!
-//! This file imports only `std`, so the JSON-lines harness in
-//! `tests/tla/drivers/image_route/` can build it on its own.
+//! Outside its tests, this file imports only `std`, so the JSON-lines
+//! harness in `tests/tla/drivers/image_route/` can build it on its own.
 const std = @import("std");
 
 /// Whether the selected model takes images inline.
@@ -68,7 +68,8 @@ pub const VisionMode = enum {
     required,
 };
 
-/// What happens to the tool images in the request's history.
+/// What happens to the images already in the request's history: tool
+/// images, and user images from earlier turns, which follow the same rule.
 pub const ToolImages = enum {
     /// The history has none.
     none,
@@ -83,18 +84,22 @@ pub const ToolImages = enum {
 };
 
 pub const FailReason = enum {
-    /// User images, and the catalog could not confirm image input.
+    /// Images attached this turn, and the catalog could not confirm image input.
     capability_unknown,
-    /// User images, a model without vision, and no vision tool.
+    /// Images attached this turn, a model without vision, and no vision tool.
     no_native_image,
 };
 
 /// What the shell knows about the request it is about to send. Only flags:
 /// image bytes never enter the core.
 pub const Request = struct {
-    /// The turn carries user images, attached now or authorized earlier.
+    /// The user attached images this turn. Only these can fail a request.
     user_images: bool,
-    /// Some of those images still wait for the model's first look.
+    /// The history holds user images from earlier turns that the session
+    /// still has. They are attached or withheld like tool images, so an old
+    /// image never blocks a new turn.
+    earlier_images: bool,
+    /// Some images attached this turn still wait for the model's first look.
     pending_images: bool,
     /// The request history holds tool images the session still has.
     tool_images: bool,
@@ -130,6 +135,7 @@ pub const Decision = struct {
     route: Route,
     mode: VisionMode,
     tool_images: ToolImages,
+    earlier_images: ToolImages,
 };
 
 pub const Effect = union(enum) {
@@ -171,7 +177,7 @@ fn onRequest(state: State, request: Request) Output {
         next.pending = request;
         return .{ .state = next };
     }
-    if (state.support == .unknown and !state.resolved and (request.user_images or request.tool_images)) {
+    if (state.support == .unknown and !state.resolved and hasImages(request)) {
         var next = state;
         next.resolved = true;
         next.pending = request;
@@ -195,12 +201,20 @@ fn decide(state: State, request: Request) Output {
         const reason: FailReason = if (state.support == .unknown) .capability_unknown else .no_native_image;
         return withEffects(state, &.{.{ .fail = reason }});
     }
-    if (chosen.tool_images == .withheld_unknown and request.catalog_down and !state.notified) {
+    if (withholdsUnknown(chosen) and request.catalog_down and !state.notified) {
         var next = state;
         next.notified = true;
         return withEffects(next, &.{ .notify_catalog_down, .{ .send = chosen } });
     }
     return withEffects(state, &.{.{ .send = chosen }});
+}
+
+fn hasImages(request: Request) bool {
+    return request.user_images or request.earlier_images or request.tool_images;
+}
+
+fn withholdsUnknown(chosen: Decision) bool {
+    return chosen.tool_images == .withheld_unknown or chosen.earlier_images == .withheld_unknown;
 }
 
 /// The image handling `support` implies for `request`.
@@ -216,12 +230,24 @@ pub fn decision(support: Support, request: Request) Decision {
         .required
     else
         .optional;
-    const tool_images: ToolImages = if (!request.tool_images) .none else switch (support) {
+    return .{
+        .route = route,
+        .mode = mode,
+        .tool_images = held(request.tool_images, support, route),
+        .earlier_images = held(request.earlier_images, support, route),
+    };
+}
+
+/// How images already in the history travel when `present`: inline only to
+/// a model the catalog lists with vision, and otherwise withheld with the
+/// reason the model needs to act on.
+fn held(present: bool, support: Support, route: Route) ToolImages {
+    if (!present) return .none;
+    return switch (support) {
         .native => .attached,
         .unknown => .withheld_unknown,
         .non_native => if (route == .fallback) .withheld_fallback else .withheld_dead_end,
     };
-    return .{ .route = route, .mode = mode, .tool_images = tool_images };
 }
 
 fn withEffects(state: State, list: []const Effect) Output {
@@ -251,13 +277,14 @@ pub fn abstract(state: *const State) Abstract {
 }
 
 fn eachRequest(comptime body: anytype) !void {
-    for (0..32) |bits| {
+    for (0..64) |bits| {
         const request: Request = .{
             .user_images = bits & 1 != 0,
             .pending_images = bits & 2 != 0,
             .tool_images = bits & 4 != 0,
             .fallback = bits & 8 != 0,
             .catalog_down = bits & 16 != 0,
+            .earlier_images = bits & 32 != 0,
         };
         if (request.pending_images and !request.user_images) continue;
         try body(request);
@@ -283,10 +310,13 @@ test "every decision reads one support value" {
                 try std.testing.expectEqual(chosen.route == .native, support == .native);
                 try std.testing.expectEqual(chosen.route == .fallback, chosen.mode != .unavailable);
                 try std.testing.expectEqual(chosen.tool_images == .none, !request.tool_images);
-                if (chosen.tool_images == .attached) try std.testing.expectEqual(Support.native, support);
-                if (chosen.tool_images == .withheld_unknown) try std.testing.expectEqual(Support.unknown, support);
-                if (chosen.tool_images == .withheld_fallback) try std.testing.expectEqual(Route.fallback, chosen.route);
-                if (chosen.tool_images == .withheld_dead_end) try std.testing.expect(support == .non_native and chosen.route == .unavailable);
+                try std.testing.expectEqual(chosen.earlier_images == .none, !request.earlier_images);
+                for ([_]ToolImages{ chosen.tool_images, chosen.earlier_images }) |images| {
+                    if (images == .attached) try std.testing.expectEqual(Support.native, support);
+                    if (images == .withheld_unknown) try std.testing.expectEqual(Support.unknown, support);
+                    if (images == .withheld_fallback) try std.testing.expectEqual(Route.fallback, chosen.route);
+                    if (images == .withheld_dead_end) try std.testing.expect(support == .non_native and chosen.route == .unavailable);
+                }
                 if (chosen.route == .fallback) try std.testing.expectEqual(request.pending_images, chosen.mode == .required);
             }
         }
@@ -298,7 +328,7 @@ test "a turn asks for capabilities at most once and answers the request it held"
         fn check(request: Request) !void {
             const started = step(.{}, .{ .turn_started = .unknown });
             const first = step(started.state, .{ .request_ready = request });
-            if (!request.user_images and !request.tool_images) {
+            if (!hasImages(request)) {
                 try std.testing.expectEqual(@as(usize, 1), first.len);
                 try std.testing.expect(first.effects()[0] == .send);
                 return;
@@ -323,7 +353,7 @@ test "a turn asks for capabilities at most once and answers the request it held"
 }
 
 test "the catalog-down notice reaches the user once per turn" {
-    const request: Request = .{ .user_images = false, .pending_images = false, .tool_images = true, .fallback = true, .catalog_down = true };
+    const request: Request = .{ .user_images = false, .earlier_images = false, .pending_images = false, .tool_images = true, .fallback = true, .catalog_down = true };
     var state = step(.{}, .{ .turn_started = .unknown }).state;
     var notices: usize = 0;
     for (0..3) |_| {
@@ -341,7 +371,7 @@ test "the catalog-down notice reaches the user once per turn" {
 
 test "user images without a route fail the request and never send" {
     for (all_support) |support| {
-        const request: Request = .{ .user_images = true, .pending_images = true, .tool_images = true, .fallback = false, .catalog_down = false };
+        const request: Request = .{ .user_images = true, .earlier_images = true, .pending_images = true, .tool_images = true, .fallback = false, .catalog_down = false };
         const out = step(.{ .support = support, .resolved = true }, .{ .request_ready = request });
         try std.testing.expectEqual(@as(usize, 1), out.len);
         switch (support) {
@@ -353,7 +383,7 @@ test "user images without a route fail the request and never send" {
 }
 
 test "abstract maps the pending request onto a sequence of at most one" {
-    const request: Request = .{ .user_images = true, .pending_images = false, .tool_images = false, .fallback = true, .catalog_down = false };
+    const request: Request = .{ .user_images = true, .earlier_images = false, .pending_images = false, .tool_images = false, .fallback = true, .catalog_down = false };
     const idle: State = .{};
     try std.testing.expectEqual(@as(usize, 0), abstract(&idle).pending.len);
     const waiting: State = .{ .resolved = true, .pending = request };
@@ -366,4 +396,215 @@ test "requests carry flags, not image bytes" {
     inline for (@typeInfo(Request).@"struct".field_types) |field_type| {
         try std.testing.expect(field_type == bool);
     }
+}
+
+test "an earlier image never blocks a turn" {
+    // The reported session: a screenshot from an earlier turn, then a
+    // text-only turn after a restart, while the catalog cannot be reached.
+    for (all_support) |support| {
+        for ([_]bool{ false, true }) |fallback| {
+            for ([_]bool{ false, true }) |catalog_down| {
+                const request: Request = .{ .user_images = false, .earlier_images = true, .pending_images = false, .tool_images = false, .fallback = fallback, .catalog_down = catalog_down };
+                const asked = step(step(.{}, .{ .turn_started = .unknown }).state, .{ .request_ready = request });
+                try std.testing.expectEqual(Effect.resolve_capabilities, asked.effects()[0]);
+                const out = step(asked.state, .{ .capabilities_resolved = support });
+                const answer = out.effects()[out.len - 1];
+                try std.testing.expect(answer == .send);
+                const expected: ToolImages = switch (support) {
+                    .native => .attached,
+                    .non_native => if (fallback) .withheld_fallback else .withheld_dead_end,
+                    .unknown => ToolImages.withheld_unknown,
+                };
+                try std.testing.expectEqual(expected, answer.send.earlier_images);
+                // The user hears once that the catalog is down.
+                try std.testing.expectEqual(support == .unknown and catalog_down, out.len == 2);
+            }
+        }
+    }
+}
+
+/// The request a step decided: the event's own request, or the one a reply
+/// answered.
+fn decidedRequest(before: State, event: Event) ?Request {
+    return switch (event) {
+        .turn_started => null,
+        .request_ready => |request| if (before.pending == null) request else null,
+        .capabilities_resolved => before.pending,
+    };
+}
+
+/// The laws of `tests/tla/image_route/spec/ImageRoute.tla` that one step
+/// shows, checked on what `step` returned for `event` from `before`. The
+/// fuzz target and the seeded test run every step through it, so
+/// `zig build test` holds the core to the model where TLC does not run.
+fn expectLaws(before: State, event: Event, out: Output) !void {
+    const after = out.state;
+    const effects = out.effects();
+    const decided = decidedRequest(before, event);
+    // Bounded: at most a notice, then one answer.
+    try std.testing.expect(effects.len <= max_effects);
+    if (effects.len == 2) try std.testing.expect(effects[0] == .notify_catalog_down and effects[1] == .send);
+    for (effects) |effect| switch (effect) {
+        // ResolveOnlyWhenNeeded, ResolveOncePerTurn, and PendingWaitsForReply.
+        .resolve_capabilities => {
+            try std.testing.expect(event == .request_ready and before.pending == null);
+            try std.testing.expect(before.support == .unknown and !before.resolved and hasImages(event.request_ready));
+            try std.testing.expect(after.resolved and after.pending != null);
+        },
+        // NotifyOnlyWhenDown and NotifyOncePerTurn.
+        .notify_catalog_down => {
+            const request = decided orelse return error.TestUnexpectedResult;
+            try std.testing.expect(effects.len == 2 and withholdsUnknown(effects[1].send));
+            try std.testing.expect(request.catalog_down and !before.notified and after.notified);
+        },
+        .send => |chosen| {
+            const request = decided orelse return error.TestUnexpectedResult;
+            // DecideOnlyWhenReady.
+            try std.testing.expect(after.pending == null);
+            // OneSnapshot and NativeExcludesFallback.
+            try std.testing.expectEqual(after.support == .native, chosen.route == .native);
+            const kinds = [_]struct { bool, ToolImages }{
+                .{ request.tool_images, chosen.tool_images },
+                .{ request.earlier_images, chosen.earlier_images },
+            };
+            for (kinds) |kind| {
+                const present, const images = kind;
+                // NoSilentWithhold: attached or withheld with a notice, never neither.
+                try std.testing.expectEqual(present, images != .none);
+                // UnknownNeverInline, OneSnapshot, and AskedBeforeUnknown.
+                switch (images) {
+                    .none => {},
+                    .attached => try std.testing.expectEqual(Support.native, after.support),
+                    .withheld_unknown => try std.testing.expect(after.support == .unknown and after.resolved),
+                    .withheld_fallback => try std.testing.expect(after.support == .non_native and chosen.route == .fallback),
+                    .withheld_dead_end => try std.testing.expect(after.support == .non_native and chosen.route == .unavailable),
+                }
+            }
+            // RouteModeCoherent and RequiredWhenPending.
+            try std.testing.expectEqual(chosen.route == .fallback, chosen.mode != .unavailable);
+            if (chosen.route == .fallback) try std.testing.expectEqual(request.pending_images, chosen.mode == .required);
+            // FailExactlyWhenUnroutable: images attached this turn always have a route.
+            if (request.user_images) try std.testing.expect(chosen.route != .unavailable);
+        },
+        .fail => |reason| {
+            const request = decided orelse return error.TestUnexpectedResult;
+            try std.testing.expect(after.pending == null);
+            // FailExactlyWhenUnroutable: only images attached this turn fail
+            // a request, so an earlier image never blocks one.
+            try std.testing.expect(request.user_images);
+            switch (reason) {
+                // AskedBeforeUnknown.
+                .capability_unknown => try std.testing.expect(after.support == .unknown and after.resolved),
+                .no_native_image => try std.testing.expect(after.support == .non_native and !request.fallback),
+            }
+        },
+    };
+    switch (event) {
+        // TurnResets.
+        .turn_started => try std.testing.expect(effects.len == 0 and !after.resolved and !after.notified and after.pending == null),
+        // DuplicateRequestIsQuiet, and every other request is asked about or answered.
+        .request_ready => try std.testing.expectEqual(before.pending != null, effects.len == 0),
+        // StaleReplyIsQuiet.
+        .capabilities_resolved => if (before.pending == null) {
+            try std.testing.expectEqual(@as(usize, 0), effects.len);
+            try std.testing.expectEqualDeep(before, after);
+        },
+    }
+}
+
+/// Draws for `driveCore` from a fuzzer. Each draw site passes its own hash,
+/// so the fuzzer tells the draws apart.
+const FuzzDraws = struct {
+    smith: *std.testing.Smith,
+
+    fn below(self: FuzzDraws, n: usize, site: u32) usize {
+        return self.smith.indexWithHash(n, site);
+    }
+
+    fn flag(self: FuzzDraws, site: u32) bool {
+        return self.smith.valueWithHash(bool, site);
+    }
+};
+
+/// Draws for `driveCore` from a seeded generator.
+const SeededDraws = struct {
+    random: std.Random,
+
+    fn below(self: SeededDraws, n: usize, _: u32) usize {
+        return self.random.uintLessThan(usize, n);
+    }
+
+    fn flag(self: SeededDraws, _: u32) bool {
+        return self.random.boolean();
+    }
+};
+
+/// Drives the core through up to 64 events that `draws` chooses, crashes
+/// included, and checks every step against the model's laws.
+fn driveCore(draws: anytype) !void {
+    var state: State = .{};
+    const steps = 1 + draws.below(64, 1);
+    for (0..steps) |_| {
+        const event: Event = switch (draws.below(4, 2)) {
+            0 => .{ .turn_started = all_support[draws.below(all_support.len, 3)] },
+            1 => ready: {
+                const user_images = draws.flag(4);
+                const earlier_images = draws.flag(5);
+                // Pending images are some of the images attached this turn.
+                const pending_images = user_images and draws.flag(6);
+                break :ready .{ .request_ready = .{
+                    .user_images = user_images,
+                    .earlier_images = earlier_images,
+                    .pending_images = pending_images,
+                    .tool_images = draws.flag(7),
+                    .fallback = draws.flag(8),
+                    .catalog_down = draws.flag(9),
+                } };
+            },
+            2 => .{ .capabilities_resolved = all_support[draws.below(all_support.len, 10)] },
+            else => {
+                // A crash: the next process starts from the core's zero state.
+                state = .{};
+                continue;
+            },
+        };
+        const out = step(state, event);
+        try expectLaws(state, event, out);
+        state = out.state;
+    }
+}
+
+fn fuzzCore(_: void, smith: *std.testing.Smith) !void {
+    try driveCore(FuzzDraws{ .smith = smith });
+}
+
+/// A fuzz corpus entry: the draws `driveCore` reads, one little-endian u64
+/// each, as the fuzzer's input format holds them.
+fn corpusOf(comptime values: []const u64) []const u8 {
+    comptime {
+        var bytes: [values.len * 8]u8 = undefined;
+        for (values, 0..) |value, index| std.mem.writeInt(u64, bytes[index * 8 ..][0..8], value, .little);
+        const final = bytes;
+        return &final;
+    }
+}
+
+test "the core keeps the model's laws on arbitrary event sequences" {
+    try std.testing.fuzz({}, fuzzCore, .{
+        .corpus = &(.{
+            // The reported session: a turn starts with support unknown, its
+            // request holds only an earlier image while the catalog is down, and
+            // the catalog check answers unknown.
+            comptime corpusOf(&.{ 2, 0, 0, 1, 0, 1, 0, 1, 1, 2, 0 }),
+            // An image attached now while the catalog is down still fails.
+            comptime corpusOf(&.{ 2, 0, 0, 1, 1, 1, 1, 0, 1, 1, 2, 0 }),
+        } ++ @import("fuzz_corpus").image_route.*),
+    });
+}
+
+test "the core keeps the model's laws on seeded random event sequences" {
+    // The fuzz target's driver with a seeded generator in place of a fuzzer,
+    // so every test run walks thousands of sequences, not only the corpus.
+    var prng: std.Random.DefaultPrng = .init(20261022);
+    for (0..4000) |_| try driveCore(SeededDraws{ .random = prng.random() });
 }

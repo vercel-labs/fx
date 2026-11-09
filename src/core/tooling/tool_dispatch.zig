@@ -27,6 +27,7 @@ const host = @import("../hosts/host.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 const tool_result_limits = @import("tool_result_limits.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
+const mcp_call_capability = @import("mcp_call_capability.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -312,12 +313,14 @@ pub const DispatchContext = struct {
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
-    mcp_call_feature: ?tool_mcp_runtime.FeatureCallFn = null,
     mcp_access: tool_mcp_runtime.Access = .unrestricted,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     mcp_call_options: tool_mcp_runtime.CallOptions = .{},
     mcp_call_status_sink: ?*?tool_mcp_runtime.CallStatus = null,
     mcp_execution_error_sink: ?*?anyerror = null,
+    /// Lent to `fx mcp call` while this tool call runs; see
+    /// `mcp_call_capability.zig`. Only the shell tool uses it.
+    mcp_call_capability: ?mcp_call_capability.Capability = null,
     mcp_permission_rules: core_types.PermissionRuleSet = .{},
     selected_dynamic_tool_ctx: ?*anyopaque = null,
     on_selected_dynamic_tool: ?SelectedDynamicToolSinkFn = null,
@@ -417,7 +420,6 @@ pub const ExecutorKind = enum {
     subagent,
     capability_search,
     mcp_select_tool,
-    mcp_features,
     ask_user_question,
     vision,
     host,
@@ -437,6 +439,9 @@ pub const RuntimeProviderKind = enum {
 };
 
 pub const CapturedCommandFn = *const fn (ToolInput) bool;
+/// Names the action a model call without one means, or null when it is not
+/// exactly one. See `Tool.infer_action_fn`.
+pub const InferActionFn = *const fn (std.json.ObjectMap) ?[]const u8;
 pub const ProcessLocalFn = *const fn (ToolInput) bool;
 
 pub const CallPresentation = struct {
@@ -492,6 +497,10 @@ pub const Tool = struct {
     captured_command_host: command_environment.Host = .native,
     captured_command_action: ?[]const u8 = null,
     captured_command_fn: ?CapturedCommandFn = null,
+    /// The orchestrator adds the inferred action to a model call that leaves
+    /// it out before the call is stored or admitted, so admission and decode
+    /// read the same arguments.
+    infer_action_fn: ?InferActionFn = null,
     process_local_fn: ?ProcessLocalFn = null,
     cancel_if_requested_after_call: bool = false,
     run_command_compatibility: ?RunCommandCompatibility = null,
@@ -563,7 +572,13 @@ pub fn dispatchRunCommandCompatibility(
 }
 
 pub fn toolActivityKind(registry: Registry, tool_name: []const u8) core_types.ToolActivityKind {
-    return if (registry.lookup(tool_name)) |tool| tool.activity_kind else .command;
+    return if (registry.lookup(tool_name)) |tool| tool.activity_kind else unregisteredActivityKind(tool_name);
+}
+
+/// A name the registry does not hold is an MCP server's tool when it has the
+/// `mcp_` prefix every MCP tool name gets, and is otherwise treated as a command.
+fn unregisteredActivityKind(tool_name: []const u8) core_types.ToolActivityKind {
+    return if (std.mem.startsWith(u8, tool_name, "mcp_")) .mcp else .command;
 }
 
 pub fn staticPresentation(tool: Tool) CallPresentation {
@@ -604,7 +619,7 @@ pub fn toolActivityKindForCall(
     call: core_types.ToolCall,
 ) core_types.ToolActivityKind {
     const presentation = toolCallPresentation(alloc, registry, call) orelse
-        return .command;
+        return unregisteredActivityKind(call.name);
     return presentation.activity_kind;
 }
 

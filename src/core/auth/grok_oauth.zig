@@ -22,10 +22,10 @@ const token_url = "https://auth.x.ai/oauth2/token";
 const issuer_url = "https://auth.x.ai";
 const userinfo_url = "https://auth.x.ai/oauth2/userinfo";
 const revoke_url = "https://auth.x.ai/oauth2/revoke";
-const e2e_token_url_env = "FX_E2E_GROK_TOKEN_URL";
-const e2e_issuer_url_env = "FX_E2E_GROK_ISSUER_URL";
-const e2e_userinfo_url_env = "FX_E2E_GROK_USERINFO_URL";
-const e2e_revoke_url_env = "FX_E2E_GROK_REVOKE_URL";
+const e2e_token_url_env = "FX_TEST_GROK_TOKEN_URL";
+const e2e_issuer_url_env = "FX_TEST_GROK_ISSUER_URL";
+const e2e_userinfo_url_env = "FX_TEST_GROK_USERINFO_URL";
+const e2e_revoke_url_env = "FX_TEST_GROK_REVOKE_URL";
 const browser_scope = "openid profile email offline_access grok-cli:access api:access";
 const browser_login_timeout_seconds: i64 = 5 * 60;
 
@@ -305,6 +305,7 @@ fn classifyBrowserCallback(
 fn completeSignIn(
     raw: ?*anyopaque,
     alloc: Allocator,
+    _: oauth_transport.Provider,
     _: []const u8,
     _: []const u8,
     token: *oauth.TokenSet,
@@ -432,12 +433,38 @@ pub const LogoutResult = struct {
 };
 
 pub fn logout(alloc: Allocator, transport: oauth_transport.Provider) !LogoutResult {
-    var mutation = (try grok_session.beginExistingMutation()) orelse return .{
+    const local = try logoutLocally(alloc);
+    defer if (local.refresh_token) |token| secret.zeroAndFree(alloc, token);
+    var result = local.result;
+    if (local.refresh_token) |token| {
+        revokeToken(alloc, transport, token) catch {
+            result.revocation_failed = true;
+        };
+    }
+    return result;
+}
+
+/// The outcome of deleting the saved Grok session, with its refresh token kept
+/// so it can still be revoked.
+pub const LocalLogout = struct {
+    result: LogoutResult,
+    /// Owned by the caller when set; release it with `secret.zeroAndFree`
+    /// using the allocator passed to `logoutLocally`.
+    refresh_token: ?[]u8 = null,
+};
+
+/// Deletes the saved Grok session without contacting xAI. Revoke the returned
+/// refresh token with `revokeToken`, then release it. The session is deleted
+/// first, so a failed deletion never leaves a revoked token on disk.
+pub fn logoutLocally(alloc: Allocator) !LocalLogout {
+    var mutation = (try grok_session.beginExistingMutation()) orelse return .{ .result = .{
         .deletion = .missing,
         .revocation_failed = false,
-    };
+    } };
     defer mutation.deinit();
     var revocation_failed = false;
+    var refresh_token: ?[]u8 = null;
+    errdefer if (refresh_token) |token| secret.zeroAndFree(alloc, token);
     const loaded_session = mutation.load(alloc) catch |err| blk: {
         debug_trace.logf("auth", "Grok logout could not load the saved credential err={s}", .{@errorName(err)});
         revocation_failed = true;
@@ -446,13 +473,14 @@ pub fn logout(alloc: Allocator, transport: oauth_transport.Provider) !LogoutResu
     if (loaded_session) |loaded| {
         var session = loaded;
         defer session.deinit(alloc);
-        revokeToken(alloc, transport, session.refresh_token) catch {
-            revocation_failed = true;
-        };
+        refresh_token = try alloc.dupe(u8, session.refresh_token);
     }
     return .{
-        .deletion = try mutation.delete(),
-        .revocation_failed = revocation_failed,
+        .result = .{
+            .deletion = try mutation.delete(),
+            .revocation_failed = revocation_failed,
+        },
+        .refresh_token = refresh_token,
     };
 }
 
@@ -509,29 +537,34 @@ fn refreshSession(
     try form.append(&body.writer, "grant_type", "refresh_token");
     try form.append(&body.writer, "client_id", client_id);
     try form.append(&body.writer, "refresh_token", session.refresh_token);
+    // Each request has its whole budget from a fresh stamp, so another fx
+    // waits for this one however slowly xAI answers.
+    mutation.restamp();
     var token = requestRefreshToken(alloc, transport, body.written()) catch |err| switch (err) {
         error.CredentialRefreshRejected,
         error.InvalidGrokOAuthResponse,
         => {
             debug_trace.logf("auth", "retiring terminal Grok session reason={s}", .{@errorName(err)});
-            try retire_refresh_session(mutation);
+            try retireRefreshSession(mutation);
             return error.CredentialRefreshRejected;
         },
         else => return err,
     };
     defer token.deinit(alloc);
 
-    var replacement = refresh_replacement(alloc, transport, &token, session.*) catch |err| {
+    // The replacement asks xAI for the account the new token belongs to.
+    mutation.restamp();
+    var replacement = refreshReplacement(alloc, transport, &token, session.*) catch |err| {
         if (err == error.OutOfMemory) return err;
         debug_trace.logf("auth", "retiring unusable Grok refresh reason={s}", .{@errorName(err)});
-        try retire_refresh_session(mutation);
+        try retireRefreshSession(mutation);
         if (err == error.GrokAccountChanged) return err;
         return error.CredentialRefreshRejected;
     };
     errdefer replacement.deinit(alloc);
     mutation.save(alloc, replacement) catch |err| {
         debug_trace.logf("auth", "retiring Grok session after refresh save failed err={s}", .{@errorName(err)});
-        retire_refresh_session(mutation) catch |cleanup_err| {
+        retireRefreshSession(mutation) catch |cleanup_err| {
             debug_trace.logf("auth", "Grok session retirement failed err={s}", .{@errorName(cleanup_err)});
         };
         return error.CredentialRefreshPersistenceUncertain;
@@ -544,7 +577,7 @@ fn refreshSession(
     replacement.account_id = &.{};
 }
 
-fn refresh_replacement(
+fn refreshReplacement(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     token: *RefreshTokenResponse,
@@ -576,7 +609,7 @@ fn refresh_replacement(
     return replacement;
 }
 
-fn retire_refresh_session(mutation: *grok_session.Mutation) !void {
+fn retireRefreshSession(mutation: *grok_session.Mutation) !void {
     const outcome = mutation.delete() catch return error.CredentialRefreshPersistenceUncertain;
     if (outcome == .deleted_not_durable) return error.CredentialRefreshPersistenceUncertain;
 }
@@ -726,7 +759,7 @@ fn fetchAccountId(
     return account_id;
 }
 
-fn revokeToken(
+pub fn revokeToken(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     token: []const u8,

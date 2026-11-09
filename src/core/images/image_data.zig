@@ -544,7 +544,7 @@ test "encoded image dimensions agree with raw headers at every truncation" {
 
 test "image dimension parsing stays bounded on arbitrary bytes" {
     try std.testing.fuzz({}, fuzzImageDimensions, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             &testPngHeader(3420, 2224),
             &testJpeg(2001, 1),
             &testGif(1, 1),
@@ -556,7 +556,7 @@ test "image dimension parsing stays bounded on arbitrary bytes" {
             "\x89PNG\r\n\x1a\n\x00\x00\x00\x00IHDR\xff\xff\xff\xff\xff\xff\xff\xff",
             // RIFF header naming WebP with no chunk.
             "RIFF\x00\x00\x00\x00WEBP",
-        },
+        }) ++ @import("fuzz_corpus").image_dimensions.*),
     });
 }
 

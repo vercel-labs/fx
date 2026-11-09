@@ -2,6 +2,7 @@ const std = @import("std");
 const observation = @import("observation.zig");
 const types = @import("../../shared/types.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const io_mod = @import("../../shared/io.zig");
 const diff = @import("../../output/diff.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -28,6 +29,9 @@ pub const StepBatchState = struct {
     step_error_count: usize = 0,
     step_total_count: usize = 0,
     step_had_writes: bool = false,
+    /// Whether a write or edit in this step changed a file. Unlike
+    /// `step_had_writes`, a write or edit that failed does not count.
+    step_changed_files: bool = false,
     pending_user_suffix: std.ArrayList(ChatMessage) = .empty,
     /// Turn-scoped identical-failure tracker owned by the orchestrator step
     /// loop. Null disables escalation (tests and non-turn callers).
@@ -97,6 +101,7 @@ pub fn appendToolResultContent(
         .tool_result_status = accounting.status orelse
             if (accounting.increment_error) .failure else .success,
         .tool_result_memory = memory,
+        .tool_result_created_at_ms = io_mod.milliTimestamp(),
     });
     if (accounting.record_completion) {
         try runtime_interruption.recordCompletedToolName(arena, completed_tool_names, tool_call.name);
@@ -382,6 +387,7 @@ pub fn processCommittedFileResult(
             model_output,
         ),
         .tool_result_memory = prepared_memory,
+        .tool_result_created_at_ms = io_mod.milliTimestamp(),
     });
     if (batch.observer) |observer| observer.emit(.{ .tool_result = .{
         .call = tool_call,
@@ -489,6 +495,7 @@ pub fn processCommittedFileResult(
     );
     batch.step_total_count += 1;
     batch.step_had_writes = true;
+    batch.step_changed_files = true;
     completed_tool_names.appendAssumeCapacity(committed_file_tool_name);
 }
 
@@ -504,6 +511,9 @@ pub fn appendOrdinaryExecutedResult(
     execution: ToolExecutionResult,
 ) !void {
     const activity = runtime_tool_presentation.activityKindForCall(arena, tool_registry, tool_call);
+    const is_write = activity == .write or activity == .edit;
+    const failed = execution.status == .failure or tool_result_errors.isToolOutputError(model_output);
+    if (is_write and !failed) batch.step_changed_files = true;
     try appendToolResultContent(
         arena,
         within_turn_suffix,
@@ -513,9 +523,9 @@ pub fn appendOrdinaryExecutedResult(
         model_output,
         memory,
         .{
-            .increment_error = execution.status == .failure or tool_result_errors.isToolOutputError(model_output),
+            .increment_error = failed,
             .record_completion = true,
-            .mark_write = activity == .write or activity == .edit,
+            .mark_write = is_write,
             .status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(
                 execution.status,
                 model_output,

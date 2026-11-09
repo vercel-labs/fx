@@ -79,7 +79,7 @@ export async function engine(): Promise<FxEngine> {
   for await (const _ of turn) {}
   const result = await turn.result;
   assertType<Equal<typeof result, FxEngineTurnResult>>();
-  assertType<Equal<typeof result.stopReason, "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled">>();
+  assertType<Equal<typeof result.stopReason, "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled" | "yielded">>();
 
   agent.prompt([
     { type: "text", text: "What does this screenshot show?" },
@@ -256,6 +256,7 @@ export async function events(): Promise<void> {
       if (event.type === "transport.retry") console.log(event.nextAttempt);
       if (event.type === "checkpoint.save") console.log(event.through, event.bytes);
       if (event.type === "journal.error") console.log(event.error);
+      if (event.type === "journal.append") assertType<Equal<typeof event.barrier, boolean>>();
       // @ts-expect-error session events come from createFxAgent(), not an engine
       if (event.type === "session.error") console.log(event);
     },

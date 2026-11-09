@@ -1,0 +1,20 @@
+[
+  {
+    "description": "a child may call only the tools listed when it was created",
+    "old": "    /\\ (t \\in v.tools \\/ t[1] \\in v.servers)",
+    "new": "    /\\ t \\in v.tools",
+    "invariant": "NotNarrower"
+  },
+  {
+    "description": "a child's view outlives a reload",
+    "old": "    /\\ v.run = run\n",
+    "new": "",
+    "invariant": "RunScoped"
+  },
+  {
+    "description": "a child may call a server's tool before its list loads",
+    "old": "    /\\ t[1] \\in loaded\n    /\\ (t",
+    "new": "    /\\ (t",
+    "invariant": "ChildWithinParent"
+  }
+]

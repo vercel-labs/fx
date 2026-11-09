@@ -21,6 +21,7 @@ Each criterion is a check that passes on this change and failed, or could fail, 
 | G5 | No extra catalog traffic: at most one capability request per turn from the image decision, and none for a request without images. | `ResolveOncePerTurn` and `ResolveOnlyWhenNeeded` |
 | G6 | The decision is one pure function, checked against its model in both directions. | `bun run verify` in `tests/tla/image_route` |
 | G7 | Nothing slows startup or adds network I/O on a path without images. | The `Startup Latency` CI job, and `ResolveOnlyWhenNeeded` |
+| G8 | An image from an earlier turn never fails a later turn: while support is unknown, the turn is sent with the image withheld and a note in its place, and only an image attached now can fail. | `FailExactlyWhenUnroutable` and planted bugs S20 and C19, the binary stage of `bun run verify`, and `tests/e2e/vision-route-fake-gateway.test.ts`, "a resumed text-only turn is sent while the catalog is down, with the earlier image withheld". Both fail on the binary before this change |
 
 ## Non-goals
 

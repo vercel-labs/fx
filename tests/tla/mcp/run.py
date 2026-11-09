@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run TLC checks for the MCP-v2 engine models in this folder.
+"""Run TLC checks for the MCP engine models in this folder.
 
 Modes:
   list      show the models in spec/catalog.json

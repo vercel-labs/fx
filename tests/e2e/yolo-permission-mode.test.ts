@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
+import { readStatusPanel } from "./info-panel";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -163,7 +164,7 @@ describe("yolo permission mode", () => {
       const configured = await runFx(["status", "--json"], { cwd: fixture.workspace, env });
       expect(configured.code).toBe(0);
       expect(configured.stderr).toBe("");
-      expect(JSON.parse(configured.stdout).permission_mode).toBe("yolo");
+      expect(JSON.parse(configured.stdout).permission_mode).toBe("full-access");
       const fake = startFakeGateway([fakeGatewayFinalText("ALIAS_WRITE_DONE")]);
       gateway = fake;
       const request = await runFx(["ask", "--no-save", "--json", "Reply once."], {
@@ -190,7 +191,7 @@ describe("yolo permission mode", () => {
         env: { ...env, FX_PERMISSION_MODE: mode },
       });
       expect(overridden.code).toBe(0);
-      expect(JSON.parse(overridden.stdout).permission_mode).toBe("yolo");
+      expect(JSON.parse(overridden.stdout).permission_mode).toBe("full-access");
       const text = await runFx(["permissions"], {
         cwd: fixture.workspace,
         env: { ...env, FX_PERMISSION_MODE: mode },
@@ -227,7 +228,7 @@ describe("yolo permission mode", () => {
 
       expect(result.code).toBe(0);
       const status = JSON.parse(result.stdout.trim());
-      expect(status).toMatchObject({ permission_mode: "yolo" });
+      expect(status).toMatchObject({ permission_mode: "full-access" });
       expect(status).not.toHaveProperty("sandbox");
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).sandbox).toBe(
         CONFIGURED_SANDBOX,
@@ -342,17 +343,16 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
 
       const stored = JSON.parse(readFileSync(fixture.settingsPath, "utf8"));
       expect(stored).toMatchObject({
-        permission_mode: "yolo",
+        permission_mode: "full-access",
         sandbox: CONFIGURED_SANDBOX,
         yolo_acknowledged: true,
       });
 
       await session.sendKeys("BTab");
       await session.waitForText("ask ·", TIMEOUT);
-      await session.sendText("/status");
-      const statusPane = await session.waitForText("agent_step_limit=", TIMEOUT);
-      expect(statusPane).toContain("permission_mode=ask");
-      expect(statusPane).not.toContain("sandbox=");
+      const panel = await readStatusPanel(session, TIMEOUT);
+      expect(panel.fields.Permissions).toBe("ask");
+      expect(panel.rows.join("\n").toLowerCase()).not.toContain("sandbox");
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).not.toContain("YOLO ·");
       expect(scrollback).not.toContain("YOLO enabled:");
@@ -360,7 +360,7 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
         await session.sendText(`/permissions ${mode}`);
         await session.waitForText("mode set to full access", TIMEOUT);
         await session.waitForText("full access ·", TIMEOUT);
-        expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).permission_mode).toBe("yolo");
+        expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).permission_mode).toBe("full-access");
         await session.sendKeys("BTab");
         await session.waitForText("ask ·", TIMEOUT);
       }

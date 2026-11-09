@@ -15,6 +15,7 @@ const session_layout = @import("session_layout.zig");
 const session_replay = @import("session_replay.zig");
 const result_store = @import("result_store.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const json_decode = @import("../shared/json_decode.zig");
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
 const Allocator = std.mem.Allocator;
@@ -41,7 +42,8 @@ pub const ConversationProgress = struct {
         if (self.pending_assistant) |assistant| {
             const standalone = switch (event) {
                 .assistant, .context_checkpoint, .interrupted => true,
-                .steering => assistant.has_replay,
+                // A note counts no step, as steering does (D93, D94).
+                .steering, .context_note, .runtime_context, .model_call => assistant.has_replay,
                 else => false,
             };
             if (standalone) {
@@ -159,6 +161,8 @@ const ReplayState = struct {
             },
             .interrupted => self.clearPendingToolCalls(),
             .user, .assistant, .steering, .turn_completed => {},
+            // Only a v2 session saves a context note or runtime context (D93, D94).
+            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
         }
         self.last_seq = seq;
         self.turn_open = turn_open;
@@ -171,6 +175,9 @@ fn nextConversationTurnOpen(open: bool, event: session_event.ConversationEvent) 
         .turn_completed, .interrupted => if (open) false else error.InvalidConversationFrame,
         .assistant, .tool_call, .tool_result, .steering => if (open) true else error.InvalidConversationFrame,
         .context_checkpoint => open,
+        // v1 logs never hold a context note or runtime context; only a v2
+        // session saves them (D93, D94). Every v1 reader below refuses both.
+        .context_note, .runtime_context, .model_call => error.InvalidConversationFrame,
     };
 }
 
@@ -208,7 +215,7 @@ pub fn loadConversationRecoveryCheckpoint(
         else => return err,
     };
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(struct {
+    var parsed = json_decode.parseFromSlice(struct {
         conversation_seq: u64,
         checkpoint: std.json.Value,
     }, alloc, bytes, .{
@@ -880,6 +887,7 @@ fn replayConversationHistory(
             .tool_call => |value| try turn.appendToolCall(value),
             .tool_result => |value| try turn.appendToolResult(value),
             .steering => |value| try turn.appendSteering(value.text),
+            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
             .turn_completed => |value| {
                 const completed = try turn.finishAssistant(value);
                 checkpoint_turn_open = false;
@@ -971,6 +979,7 @@ const ConversationHistoryReader = struct {
                     try self.builder.appendSteering(value.text);
                     break :blk null;
                 },
+                .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
                 .turn_completed => |value| try self.builder.finishAssistant(value),
                 .interrupted => |value| try self.builder.finishInterrupted(value),
                 .context_checkpoint => blk: {
@@ -1075,6 +1084,7 @@ fn load_conversation_archive_from_source(
                 try builder.appendSteering(value.text);
                 break :blk null;
             },
+            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
             .turn_completed => |value| try builder.finishAssistant(value),
             .interrupted => |value| try builder.finishInterrupted(value),
             .context_checkpoint => |value| blk: {
@@ -1149,6 +1159,7 @@ const ConversationReplayScan = struct {
                     .coverage = checkpoint.covers_through_seq,
                 };
             },
+            .context_note, .runtime_context, .model_call => return error.InvalidConversationFrame,
             else => {},
         }
     }
@@ -1211,6 +1222,9 @@ pub const ConversationTurnBuilder = struct {
     results: std.ArrayList(types.PersistedToolResult) = .empty,
     steps: std.ArrayList(types.ToolExecutionStep) = .empty,
     steering: std.ArrayList(types.PersistedSteering) = .empty,
+    context_notes: std.ArrayList(types.PersistedContextNote) = .empty,
+    runtime_context: ?[][]u8 = null,
+    model_calls: std.ArrayList(types.ModelCallRecord) = .empty,
 
     pub fn init(alloc: Allocator) ConversationTurnBuilder {
         return .{ .alloc = alloc };
@@ -1236,7 +1250,21 @@ pub const ConversationTurnBuilder = struct {
         }
         self.steps.deinit(self.alloc);
         self.steering.deinit(self.alloc);
+        for (self.context_notes.items) |item| types.freePersistedContextNote(self.alloc, item);
+        self.context_notes.deinit(self.alloc);
+        if (self.runtime_context) |texts| types.freeRuntimeContext(self.alloc, texts);
+        for (self.model_calls.items) |record| types.freeModelCallRecordStrings(self.alloc, record);
+        self.model_calls.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    /// Keeps a settled call's record with the turn. A record before the
+    /// turn's user message has no turn to show with and is left out.
+    pub fn appendModelCall(self: *ConversationTurnBuilder, record: types.ModelCallRecord) !void {
+        if (self.user == null) return;
+        const owned = try types.dupeModelCallRecord(self.alloc, record);
+        errdefer types.freeModelCallRecordStrings(self.alloc, owned);
+        try self.model_calls.append(self.alloc, owned);
     }
 
     pub fn isIdle(self: *const ConversationTurnBuilder) bool {
@@ -1245,7 +1273,9 @@ pub const ConversationTurnBuilder = struct {
             self.calls.items.len == 0 and
             self.results.items.len == 0 and
             self.steps.items.len == 0 and
-            self.steering.items.len == 0;
+            self.steering.items.len == 0 and
+            self.context_notes.items.len == 0 and
+            self.runtime_context == null;
     }
 
     pub fn begin(
@@ -1258,6 +1288,13 @@ pub const ConversationTurnBuilder = struct {
             .images = @constCast(value.images),
             .work_id = if (value.work_id) |work_id| @constCast(work_id) else null,
         });
+    }
+
+    /// Marks who wrote the message that opened the turn being built.
+    pub fn setUserAuthor(self: *ConversationTurnBuilder, author: types.MessageAuthor) !void {
+        if (self.user) |*user| {
+            user.author = author;
+        } else return error.InvalidConversationFrame;
     }
 
     pub fn appendAssistant(self: *ConversationTurnBuilder, value: session_event.ConversationAssistant) !void {
@@ -1327,6 +1364,45 @@ pub const ConversationTurnBuilder = struct {
         if (self.results.items.len == self.calls.items.len) try self.finishStep();
     }
 
+    /// Gives the result of `call_id`, already appended in this turn, the
+    /// full-diff rows its edit saved apart from it. Copies `rows`. Returns
+    /// false, keeping nothing, when no such result has a presentation
+    /// without a full-diff source of its own.
+    pub fn attachReviewLines(
+        self: *ConversationTurnBuilder,
+        call_id: []const u8,
+        lifecycle_id: types.ToolLifecycleId,
+        rows: []const types.CommittedFilePresentationLine,
+    ) !bool {
+        const result = self.findResult(call_id) orelse return false;
+        const presentation = if (result.committed_file_presentation) |*value| value else return false;
+        if (presentation.review_lines != null or presentation.lifecycle_id != null or
+            presentation.previous_content != null or presentation.after_content != null or
+            presentation.content_handle != null) return false;
+        const owned_rows = try types.dupeCommittedFilePresentationLines(self.alloc, rows);
+        errdefer types.freeCommittedFilePresentationLines(self.alloc, owned_rows);
+        const owned_call_id = try self.alloc.dupe(u8, lifecycle_id.call_id);
+        presentation.review_lines = owned_rows;
+        presentation.lifecycle_id = .{ .turn_id = lifecycle_id.turn_id, .call_id = owned_call_id };
+        return true;
+    }
+
+    /// The result of `call_id` in the open step or in a step this turn
+    /// already finished.
+    fn findResult(self: *ConversationTurnBuilder, call_id: []const u8) ?*types.PersistedToolResult {
+        for (self.results.items) |*result| {
+            if (std.mem.eql(u8, result.tool_call_id, call_id)) return result;
+        }
+        var index = self.steps.items.len;
+        while (index > 0) {
+            index -= 1;
+            for (self.steps.items[index].tool_results) |*result| {
+                if (std.mem.eql(u8, result.tool_call_id, call_id)) return result;
+            }
+        }
+        return null;
+    }
+
     pub fn finishStandalone(self: *ConversationTurnBuilder) !void {
         if (self.calls.items.len != 0 or self.results.items.len != 0) return error.InvalidConversationFrame;
         const text = self.pending_assistant orelse return;
@@ -1367,6 +1443,38 @@ pub const ConversationTurnBuilder = struct {
             .after_tool_step_count = self.steps.items.len,
         });
         self.pending_assistant = null;
+    }
+
+    /// The runtime context a turn captured comes right after its user message,
+    /// once (D94).
+    pub fn setRuntimeContext(self: *ConversationTurnBuilder, messages: []const []const u8) !void {
+        if (self.user == null or self.runtime_context != null or self.steps.items.len != 0 or
+            self.calls.items.len != 0 or self.results.items.len != 0 or self.pending_assistant != null or
+            self.pending_replay != null or self.steering.items.len != 0 or self.context_notes.items.len != 0)
+        {
+            return error.InvalidConversationFrame;
+        }
+        if (messages.len == 0) return error.InvalidConversationFrame;
+        self.runtime_context = try types.dupeRuntimeContext(self.alloc, messages);
+    }
+
+    /// A note sits at a step boundary: after the user's message or a step's
+    /// last result, and before any steering or assistant text there (D93).
+    pub fn appendContextNote(self: *ConversationTurnBuilder, text: []const u8, sources: []const types.ContextNoteSource) !void {
+        if (self.user == null or self.calls.items.len != 0 or self.results.items.len != 0) {
+            return error.InvalidConversationFrame;
+        }
+        if (self.pending_replay != null) try self.finishStep();
+        if (self.pending_assistant != null) return error.InvalidConversationFrame;
+        const owned = try self.alloc.dupe(u8, text);
+        errdefer mem_utils.free(self.alloc, owned);
+        const owned_sources = try types.dupeNoteSources(self.alloc, sources);
+        errdefer types.freeNoteSources(self.alloc, owned_sources);
+        try self.context_notes.append(self.alloc, .{
+            .text = owned,
+            .after_tool_step_count = self.steps.items.len,
+            .sources = owned_sources,
+        });
     }
 
     pub fn finishAssistant(
@@ -1476,12 +1584,21 @@ pub const ConversationTurnBuilder = struct {
         errdefer types.freeToolExecutionSteps(self.alloc, steps);
         const steering = try self.steering.toOwnedSlice(self.alloc);
         errdefer types.freePersistedSteering(self.alloc, steering);
+        const context_notes = try self.context_notes.toOwnedSlice(self.alloc);
+        errdefer types.freePersistedContextNotes(self.alloc, context_notes);
         const files = try types.dupeFileEvidenceSlice(self.alloc, files_source);
+        errdefer types.freeFileEvidenceSlice(self.alloc, files);
+        const model_calls = try self.model_calls.toOwnedSlice(self.alloc);
+        const runtime_context = self.runtime_context;
+        self.runtime_context = null;
         return .{
             .tool_steps = steps,
             .files = files,
             .steering = steering,
+            .context_notes = context_notes,
+            .runtime_context = runtime_context,
             .turn_summary = turn_summary,
+            .model_calls = model_calls,
         };
     }
 };
@@ -1499,6 +1616,53 @@ test "conversation replay keeps reasoning-only assistant units before the final 
     try std.testing.expectEqualStrings("answer", turn.assistant.assistant);
     try std.testing.expectEqual(@as(usize, 1), turn.assistant.execution.tool_steps.len);
     try std.testing.expectEqualStrings(replay.parts_json, turn.assistant.execution.tool_steps[0].provider_replay.?.parts_json);
+}
+
+test "review rows attach once, only to a turn's edit with no full-diff source" {
+    const alloc = std.testing.allocator;
+    var builder = ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    const preview = [_]types.CommittedFilePresentationLine{.{ .kind = .addition, .new_line = 1, .text = "new" }};
+    const rows = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .addition, .new_line = 1, .text = "new" },
+        .{ .kind = .context, .old_line = 1, .new_line = 2, .text = "tail" },
+    };
+    try builder.begin(.{ .text = "edit" });
+    try builder.appendToolCall(.{ .call_id = "edit-1", .tool_name = "edit_file", .arguments_json = "{}" });
+    try builder.appendToolCall(.{ .call_id = "write-1", .tool_name = "write_file", .arguments_json = "{}" });
+    try builder.appendToolResult(.{
+        .call_id = "edit-1",
+        .tool_name = "edit_file",
+        .status = .success,
+        .artifact_ref = "result.txt",
+        .stored_bytes = 0,
+        .completeness = .complete,
+        .committed_file_presentation = .{ .path = "a.txt", .kind = .edited, .lines = &preview, .additions = 1, .deletions = 0, .truncated = false },
+    });
+    // The second result finishes the step; attaching still finds both.
+    try builder.appendToolResult(.{
+        .call_id = "write-1",
+        .tool_name = "write_file",
+        .status = .success,
+        .artifact_ref = "result.txt",
+        .stored_bytes = 0,
+        .completeness = .complete,
+        .committed_file_presentation = .{ .path = "b.txt", .kind = .added, .lines = &preview, .additions = 1, .deletions = 0, .truncated = false, .previous_content = "", .after_content = "new\n" },
+    });
+    const edit_id: types.ToolLifecycleId = .{ .turn_id = 1, .call_id = "edit-1" };
+    try std.testing.expect(!try builder.attachReviewLines("missing", edit_id, &rows));
+    try std.testing.expect(!try builder.attachReviewLines("write-1", .{ .turn_id = 1, .call_id = "write-1" }, &rows));
+    try std.testing.expect(try builder.attachReviewLines("edit-1", edit_id, &rows));
+    try std.testing.expect(!try builder.attachReviewLines("edit-1", edit_id, &rows));
+    try builder.appendAssistant(.{ .text = "done" });
+    const turn = try builder.finishAssistant(.{});
+    defer types.freeHistoryTurn(alloc, turn);
+    const results = turn.assistant.execution.tool_steps[0].tool_results;
+    const edit = results[0].committed_file_presentation.?;
+    try std.testing.expectEqual(rows.len, edit.review_lines.?.len);
+    try std.testing.expectEqualStrings("tail", edit.review_lines.?[1].text);
+    try std.testing.expectEqualStrings("edit-1", edit.lifecycle_id.?.call_id);
+    try std.testing.expect(results[1].committed_file_presentation.?.review_lines == null);
 }
 
 test "reasoning-only checkpoint coverage and replay count the same completed unit" {
@@ -1841,29 +2005,29 @@ pub const Root = struct {
         mode: OpenMode,
     ) !Root {
         const zio = io_mod.getIo();
-        var home = std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }) catch |err| switch (err) {
+        var home = std.Io.Dir.openDirAbsolute(zio, profile_paths.rootParent(home_path), .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => blk: {
                 if (mode == .read_only) {
                     return .{
                         .sessions = null,
                         .display_root = try std.Io.Dir.path.join(
                             alloc,
-                            &.{ home_path, profile_paths.root_dir_name, profile_paths.sessions_dir_name },
+                            &.{ profile_paths.rootParent(home_path), profile_paths.rootName(), profile_paths.sessions_dir_name },
                         ),
                         .mode = mode,
                     };
                 }
-                std.Io.Dir.createDirAbsolute(zio, home_path, private_dir_permissions) catch |create_err| switch (create_err) {
+                std.Io.Dir.createDirAbsolute(zio, profile_paths.rootParent(home_path), private_dir_permissions) catch |create_err| switch (create_err) {
                     error.PathAlreadyExists => {},
                     else => return create_err,
                 };
-                break :blk try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true });
+                break :blk try std.Io.Dir.openDirAbsolute(zio, profile_paths.rootParent(home_path), .{ .iterate = true });
             },
             else => return err,
         };
         defer home.close(zio);
 
-        var durable_home = home.openDir(zio, profile_paths.root_dir_name, .{
+        var durable_home = home.openDir(zio, profile_paths.rootName(), .{
             .iterate = true,
             .follow_symlinks = false,
         }) catch |err| switch (err) {
@@ -1873,20 +2037,20 @@ pub const Root = struct {
                         .sessions = null,
                         .display_root = try std.Io.Dir.path.join(
                             alloc,
-                            &.{ home_path, profile_paths.root_dir_name, profile_paths.sessions_dir_name },
+                            &.{ profile_paths.rootParent(home_path), profile_paths.rootName(), profile_paths.sessions_dir_name },
                         ),
                         .mode = mode,
                     };
                 }
                 var verified_home = io_mod.VerifiedDir{
-                    .dir = try std.Io.Dir.openDirAbsolute(zio, home_path, .{
+                    .dir = try std.Io.Dir.openDirAbsolute(zio, profile_paths.rootParent(home_path), .{
                         .iterate = true,
                     }),
                 };
                 defer verified_home.close();
                 const created = try io_mod.openOrCreateVerifiedPrivateDir(
                     &verified_home,
-                    profile_paths.root_dir_name,
+                    profile_paths.rootName(),
                 );
                 break :blk created.dir;
             },
@@ -1910,7 +2074,7 @@ pub const Root = struct {
                         .sessions = null,
                         .display_root = try std.Io.Dir.path.join(
                             alloc,
-                            &.{ home_path, profile_paths.root_dir_name, profile_paths.sessions_dir_name },
+                            &.{ profile_paths.rootParent(home_path), profile_paths.rootName(), profile_paths.sessions_dir_name },
                         ),
                         .mode = mode,
                     };

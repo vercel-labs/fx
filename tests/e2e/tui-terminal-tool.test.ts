@@ -171,7 +171,7 @@ function askEnv(
     AI_GATEWAY_API_KEY: "fake-shell-tool-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_DISABLE_KEYCHAIN: "1",
-    FX_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_ONBOARDING: "1",
     FX_AUTO_UPGRADE: "0",
     FX_PERMISSION_MODE: "yolo",
     FX_MODEL: FAKE_GATEWAY_MODEL,
@@ -293,11 +293,10 @@ test.skipIf(!tmuxAvailable())(
     expect(sessionId.length).toBeGreaterThan(0);
     expect(gateway.requests).toHaveLength(3);
     const schema = schemaFromRequest(gateway.requests[0]!.body);
-    const request = (schema.properties as Record<string, any>).request;
-    const actions = request.oneOf.map(
-      (branch: any) => branch.properties.action.enum[0],
-    );
-    expect(actions).toEqual(["run", "run", "interact", "stop"]);
+    const properties = schema.properties as Record<string, any>;
+    expect(properties.request).toBeUndefined();
+    expect(schema.required).toEqual(["action"]);
+    expect(properties.action.enum).toEqual(["run", "interact", "stop"]);
     expect(gateway.requests[0]!.body).not.toContain('"name":"terminal"');
     const runResult = toolResultEnvelope(
       gateway.requests[1]!.body,
@@ -426,7 +425,7 @@ test.skipIf(!tmuxAvailable())(
       "shell_stubborn_stop",
     );
     expect(stopResult).toContain('\\"state\\":\\"stopped\\"');
-    expect(stopResult).toContain('\\"termination_indeterminate\\":false');
+    expect(stopResult).not.toContain("termination_indeterminate");
     expect(toolResultEnvelope(
       gateway.requests[3]!.body,
       "shell_after_stop",
@@ -761,17 +760,18 @@ test.skipIf(!tmuxAvailable())(
     expect(mainRows.join("\n")).not.toContain("FULL_LAUNCH_TAIL");
 
     // `interact` carries no command argument, so the Observed heading is the
-    // only place Ctrl-O can show the launch command. It must wrap under the
-    // tree rail instead of trailing. Heading continuations start "│ word";
-    // detail rows start "│  key: value".
+    // only place Ctrl-O can show the launch command. It must wrap instead of
+    // trailing. The heading opens with the tool's mark and ends at a blank
+    // row, an argument row ("    key: value") or the tool's time
+    // ("    12:00:00").
     const fullObservedHeading = (grid: string[]) => {
       const rows = grid.map((line) => line.trimEnd());
-      const start = rows.findIndex((line) => line.startsWith("├ Observed "));
+      const start = rows.findIndex((line) => line.startsWith("● Observed "));
       if (start < 0) return null;
-      const parts = [rows[start]!.slice("├ ".length)];
+      const parts = [rows[start]!.slice("● ".length).trim()];
       for (const line of rows.slice(start + 1)) {
-        if (!line.startsWith("│ ") || line.startsWith("│  ")) break;
-        parts.push(line.slice("│ ".length));
+        if (line.trim() === "" || /^ {4}[a-z_]+: /.test(line) || /^ {4}\d{2}:\d{2}:\d{2}\b/.test(line)) break;
+        parts.push(line.trim());
       }
       return parts.join(" ");
     };
@@ -786,21 +786,21 @@ test.skipIf(!tmuxAvailable())(
       return grid;
     };
     await session.sendKeys("C-o");
-    await session.waitForText("full detail · ctrl+o close", TIMEOUT);
+    await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
     let grid = await settledFullGrid();
-    expect(fullObservedHeading(grid)).toBe(expectedHeading);
+    expect(fullObservedHeading(grid), grid.join("\n")).toBe(expectedHeading);
     expect(grid.join("\n")).toContain("action: interact");
     expect(grid.join("\n")).not.toContain("…");
 
     await session.resizeWindow(60, 72);
     grid = await settledFullGrid();
-    expect(fullObservedHeading(grid)).toBe(expectedHeading);
+    expect(fullObservedHeading(grid), grid.join("\n")).toBe(expectedHeading);
     expect(grid.join("\n")).not.toContain("…");
 
     // Closing Ctrl-O returns to the trailing main view and leaks none of the
     // full-detail rows into scrollback.
     await session.sendKeys("C-o");
-    await session.waitForPane((pane) => !pane.includes("full detail · ctrl+o close"), TIMEOUT);
+    await session.waitForPane((pane) => !pane.includes("esc close · pgup/pgdn scroll"), TIMEOUT);
     const scrollback = await session.captureFullScrollback();
     expect(scrollback).toContain("├ Observed echo word0");
     expect(scrollback).not.toContain("FULL_LAUNCH_TAIL");
@@ -1055,7 +1055,7 @@ test.skipIf(!tmuxAvailable())(
     );
     expect(waitResult).toContain('\\"state\\":\\"completed\\"');
     expect(waitResult).toContain('\\"error\\":\\"TimeoutExpired\\"');
-    expect(waitResult).toContain('\\"termination_indeterminate\\":false');
+    expect(waitResult).not.toContain("termination_indeterminate");
     const record = terminalRecords(fixture.home).find((candidate) =>
       candidate.session_id === sessionId
     );
@@ -1065,6 +1065,34 @@ test.skipIf(!tmuxAvailable())(
   },
   TIMEOUT,
 );
+
+test("shell TTY timeout stops a nested interactive shell before its next command", async () => {
+  const fixture = createFixture("fx-shell-tty-timeout-tree-");
+  const pidFile = join(fixture.root, "nested-shell.pid");
+  const marker = join(fixture.root, "after-timeout");
+  const gateway = startFakeGateway([
+    // An interactive bash moves itself and its job out of the terminal's
+    // process group, so killing only that group leaves it to run `touch`.
+    ttyRun(
+      "shell_tty_tree_timeout_run",
+      `bash --norc --noprofile -i -c 'printf %s $$ > ${pidFile}; sleep 3; touch ${marker}'`,
+      { yield_time_ms: 30_000, timeout_ms: 1_000 },
+    ),
+    fakeGatewayFinalText("TREE_TIMEOUT_DONE"),
+  ]);
+  gateways.push(gateway);
+
+  const result = await runFx(["ask", "--json", "Run the nested shell."], {
+    cwd: fixture.workspace,
+    env: askEnv(fixture, gateway),
+    timeoutMs: TIMEOUT,
+  });
+  expect(result.code).toBe(0);
+  const runResult = toolResultEnvelope(gateway.requests[1]!.body, "shell_tty_tree_timeout_run");
+  expect(runResult).toContain('\\"error\\":\\"TimeoutExpired\\"');
+  await waitUntilGone([Number(readFileSync(pidFile, "utf8"))], 1_000);
+  expect(existsSync(marker)).toBe(false);
+}, TIMEOUT);
 
 test.skipIf(!tmuxAvailable())(
   "quit ends a managed TTY and resume reports it as ended",
@@ -1108,7 +1136,7 @@ test.skipIf(!tmuxAvailable())(
     const resumed = await launch(
       fixture,
       gateway,
-      `${FX_BIN} --resume-last`,
+      `${FX_BIN} --resume last`,
     );
     await resumed.sendText("Use the earlier managed TTY.");
     await resumed.waitForText("SHELL_TTY_RESUME_OK", TIMEOUT);

@@ -1,6 +1,4 @@
 ---- MODULE HttpLegacy ----
-\* Updated for the next MCP-v2 version: it can describe behavior that src/mcp/
-\* does not have yet, so its traces from the current src/mcp/ may not match.
 \* U07 Streamable HTTP with 2025 sessions, client side, one endpoint.
 \* Rules: LHTTP-01..LHTTP-08 (rules.md).
 \*
@@ -16,7 +14,9 @@
 \*     broke after an event id is resumed with GET and Last-Event-ID once its
 \*     retry wait is over, at most MaxResumes times, and only in the session it
 \*     started in. One without an event id is lost and never re-POSTed
-\*     (LHTTP-05). A disconnect is not a cancel; cancelling posts
+\*     (LHTTP-05). An answer over the message limit is lost at once and
+\*     never resumed: it would come the same again (LHTTP-11). A
+\*     disconnect is not a cancel; cancelling posts
 \*     notifications/cancelled (LHTTP-08). A request holds a stream only
 \*     while it waits on one: once it ends, answered too, the client closes
 \*     what the server left open (LHTTP-10).
@@ -232,6 +232,13 @@ Break(r) ==
                                  ELSE End(r, "lost")]
     /\ UNCHANGED <<session, nextEvent, listen, deleted, ghosts>>
 
+\* The answer is over the message limit, on a posted or resumed stream: lost
+\* at once, since resuming would only bring it again (LHTTP-11).
+TooLarge(r) ==
+    /\ req[r].st \in Open
+    /\ req' = [req EXCEPT ![r] = End(r, "lost")]
+    /\ UNCHANGED <<session, nextEvent, listen, deleted, ghosts>>
+
 \* A status without a JSON-RPC answer, other than a session 404: the POST
 \* failed; a resumed stream is lost (the request may have run).
 Refused(r) ==
@@ -280,7 +287,7 @@ Client ==
 
 Server ==
     \/ InitAnswered(TRUE) \/ InitAnswered(FALSE) \/ InitFailed \/ EndSession
-    \/ \E r \in Requests : Event(r) \/ Answer(r) \/ Break(r) \/ Refused(r) \/ Expired(r)
+    \/ \E r \in Requests : Event(r) \/ Answer(r) \/ Break(r) \/ TooLarge(r) \/ Refused(r) \/ Expired(r)
     \/ ListenRefused \/ ListenBroke \/ ListenExpired
 
 Next == Client \/ Server
@@ -292,7 +299,7 @@ Fairness ==
     /\ WF_vars(Start)
     /\ \A r \in Requests : WF_vars(Post(r)) /\ WF_vars(ResumeDue(r))
     /\ WF_vars(InitAnswered(TRUE) \/ InitAnswered(FALSE) \/ InitFailed)
-    /\ \A r \in Requests : WF_vars(Answer(r) \/ Break(r) \/ Refused(r) \/ Expired(r))
+    /\ \A r \in Requests : WF_vars(Answer(r) \/ Break(r) \/ TooLarge(r) \/ Refused(r) \/ Expired(r))
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 
@@ -324,6 +331,10 @@ NoReplayOfLostPost == \A r \in Requests :
 ResumeAfterEventId == \A r \in Requests :
     req[r].st \in {"broken", "resuming"} => req[r].ev /\ req[r].resumes <= MaxResumes
 ResumeSameSession == ~crossResume
+
+\* LHTTP-11: an answer over the message limit ends its request, lost; the
+\* stream is never resumed for it. An action property, so it adds no state.
+TooLargeEnds == [][\A r \in Requests : TooLarge(r) => req'[r].st = "done" /\ req'[r].outcome = "lost"]_vars
 
 \* LHTTP-03: nothing goes out after close, and the DELETE only names a live session.
 NothingAfterClose == ~sentClosed

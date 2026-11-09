@@ -144,20 +144,16 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     defer alloc.free(url);
     const authorization = if (token) |value| try alloc.print("Bearer {s}", .{value}) else null;
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
-    var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
-    defer client.deinit();
     var uri = try std.Uri.parse(url);
     uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;
-    var operation = client_mod.PostOperation{
-        .client = &client,
+    try request.admission.admit();
+    var opened = try client_mod.openBoundedPost(request.cancel_flag, phase_deadline(30_000, request.deadline), .{
         .uri = uri,
         .authorization = authorization,
         .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
-    };
-    try request.admission.admit();
-    var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
-    defer opened.deinit(alloc);
-    const http = &opened.request.?;
+    });
+    defer opened.deinit();
+    const http = &opened.request;
     var watch: client_mod.ConnectionWatch = .init(.{
         .timeout_ms = 120_000,
         .stall_timeout_ms = client_mod.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
@@ -202,7 +198,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
             detail = redacted;
         }
 
-        return .{ .failed = .{ .kind = failure_kind(response.head.status), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
+        return .{ .failed = .{ .kind = client_mod.httpFailureKind(alloc, .fromHttpStatus(response.head.status), detail), .http_status = response.head.status, .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
     var result = consume(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
     if (watch.finish()) |err| {
@@ -210,21 +206,6 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
         return err;
     }
     return result;
-}
-
-pub fn failure_kind(status: std.http.Status) streams.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
 }
 
 /// Parses a successful streamed reply from `reader`, telling `progress` about
@@ -283,7 +264,7 @@ test "configured capability lookup matches catalog projection and preserves unkn
     defer catalog.freeModelCatalog(alloc, &fetched.catalog);
     for (fetched.catalog.items) |entry| {
         const actual = provider.lookupCapabilities(entry.id).?;
-        try std.testing.expectEqualDeep(model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(entry)), actual);
+        try model_capabilities.expectCapabilitiesEqualForTest(model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(entry)), actual);
         const declared_vision = std.mem.eql(u8, entry.id, "small");
         try std.testing.expectEqual(declared_vision, actual.supports_vision);
         try std.testing.expectEqual(
@@ -295,7 +276,7 @@ test "configured capability lookup matches catalog projection and preserves unkn
     try std.testing.expectEqual(@as(?u32, 1024), provider.lookupCapabilities("large").?.max_output_tokens);
     try std.testing.expect(provider.lookupCapabilities("partial").?.context_window == null);
     try std.testing.expect(provider.lookupCapabilities("unknown").?.max_output_tokens == null);
-    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, provider.lookupCapabilities("missing-fast").?);
+    try model_capabilities.expectCapabilitiesEqualForTest(.{}, provider.lookupCapabilities("missing-fast").?);
 }
 
 fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider.CliModelCatalogInput) gateway_provider.CliModelCatalogResult {
@@ -360,7 +341,10 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
         else => return .permanent_failure,
     };
     errdefer result.deinit(alloc);
-    if (result == .failed) {
+    // A review the output limit cut off holds no decision, and the same
+    // review would be cut off again, so it stays unavailable.
+    const cut_off = result == .completed and result.completed.completion.finish_reason == .length;
+    if (result == .failed or cut_off) {
         result.deinit(alloc);
         return .permanent_failure;
     }

@@ -59,24 +59,6 @@ pub const FunctionSchema = struct {
     input_schema: ObjectSchema = .{},
 };
 
-pub fn isSingleRequiredObjectUnionField(
-    schema: ObjectSchema,
-    field_name: []const u8,
-) bool {
-    if (schema.properties.len != 1 or schema.required.len != 1 or
-        schema.additional_properties != false or
-        !std.mem.eql(u8, schema.properties[0].name, field_name) or
-        !std.mem.eql(u8, schema.required[0], field_name))
-    {
-        return false;
-    }
-    const shape = schema.properties[0].shape orelse return false;
-    return switch (shape.*) {
-        .object => |object| object.one_of.len > 0,
-        else => false,
-    };
-}
-
 test "static property representation stays within the measured size budget" {
     try std.testing.expect(@sizeOf(Property) <= 64);
 }
@@ -155,6 +137,17 @@ pub fn writeObjectSchema(
     writer: *std.Io.Writer,
     schema: ObjectSchema,
 ) anyerror!void {
+    return writeDescribedObjectSchema(alloc, writer, schema, "");
+}
+
+/// Writes `schema` with `description` as a member when it is not empty, so an
+/// object-valued property keeps the description it declares.
+fn writeDescribedObjectSchema(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    schema: ObjectSchema,
+    description: []const u8,
+) anyerror!void {
     if (schema.one_of.len > 0) {
         if (schema.properties.len > 0 or
             schema.required.len > 0 or
@@ -169,7 +162,9 @@ pub fn writeObjectSchema(
             if (index > 0) try writer.writeByte(',');
             try writeObjectSchema(alloc, writer, alternative);
         }
-        try writer.writeAll("]}");
+        try writer.writeByte(']');
+        try writeDescriptionMember(alloc, writer, description);
+        try writer.writeByte('}');
         return;
     }
 
@@ -195,7 +190,18 @@ pub fn writeObjectSchema(
         }
         try writer.writeByte(']');
     }
+    try writeDescriptionMember(alloc, writer, description);
     try writer.writeByte('}');
+}
+
+fn writeDescriptionMember(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    description: []const u8,
+) anyerror!void {
+    if (description.len == 0) return;
+    try writer.writeAll(",\"description\":");
+    try writeCappedDescriptionJsonString(alloc, writer, description);
 }
 
 fn writePropertySchema(
@@ -206,7 +212,7 @@ fn writePropertySchema(
     if (property.shape) |shape| {
         switch (shape.*) {
             .object => |object_schema| {
-                try writeObjectSchema(alloc, writer, object_schema.*);
+                try writeDescribedObjectSchema(alloc, writer, object_schema.*, property.description);
                 return;
             },
             else => {},
@@ -232,10 +238,7 @@ fn writePropertySchema(
     if (bounds.max_length != no_u32_bound) try writer.print(",\"maxLength\":{d}", .{bounds.max_length});
     if (bounds.minimum != no_u64_bound) try writer.print(",\"minimum\":{d}", .{bounds.minimum});
     if (bounds.maximum != no_u64_bound) try writer.print(",\"maximum\":{d}", .{bounds.maximum});
-    if (property.description.len > 0) {
-        try writer.writeAll(",\"description\":");
-        try writeCappedDescriptionJsonString(alloc, writer, property.description);
-    }
+    try writeDescriptionMember(alloc, writer, property.description);
     if (bounds.min_items != no_u32_bound) try writer.print(",\"minItems\":{d}", .{bounds.min_items});
     if (bounds.max_items != no_u32_bound) try writer.print(",\"maxItems\":{d}", .{bounds.max_items});
     if (property.shape) |shape| {
@@ -288,6 +291,33 @@ test "nested object schema serializes exact property bounds" {
     try std.testing.expect(std.mem.find(u8, json, "\"maxProperties\":1") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"create\":{\"type\":\"object\",\"properties\":{") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"additionalProperties\":false") != null);
+}
+
+test "object-valued properties keep their description" {
+    const alloc = std.testing.allocator;
+    const schema = FunctionSchema{
+        .name = "described",
+        .description = "described",
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "shell", .json_type = .object, .description = "Only with tty=true.", .shape = &.{ .object = &.{
+                    .properties = &.{.{ .name = "path", .json_type = .string }},
+                } } },
+                .{ .name = "request", .json_type = .object, .description = "Choose one request.", .shape = &.{ .object = &.{
+                    .one_of = &.{.{ .properties = &.{.{ .name = "handle", .json_type = .string }} }},
+                } } },
+            },
+        },
+    };
+
+    const json = try builtinFunctionSchemaJsonAlloc(alloc, schema);
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const properties = parsed.value.object.get("inputSchema").?.object.get("properties").?.object;
+    try std.testing.expectEqualStrings("Only with tty=true.", properties.get("shell").?.object.get("description").?.string);
+    try std.testing.expectEqualStrings("Choose one request.", properties.get("request").?.object.get("description").?.string);
+    try std.testing.expect(properties.get("request").?.object.get("oneOf") != null);
 }
 
 test "object alternatives serialize as exclusive object branches" {

@@ -45,11 +45,26 @@ const tools = @import("protocol/tools.zig");
 const trace = @import("io/trace.zig");
 const wire = @import("protocol/wire.zig");
 const auth_client = @import("auth/client.zig");
+const oauth = @import("auth/oauth.zig");
 const elicitation = @import("protocol/elicitation.zig");
 const elicit_core = @import("core/elicitation.zig");
 const auth_core = @import("core/auth.zig");
 const subscription = @import("core/subscription.zig");
 const subscriptions = @import("protocol/subscriptions.zig");
+
+/// Bytes of a line an excerpt keeps, before "...".
+const excerpt_max = 80;
+/// Bytes of a progress note the host is shown, before "...".
+const note_max = 160;
+
+/// The start of `line`, at most `max` bytes, terminal-safe, in `buf`: never
+/// a cut UTF-8 sequence, control bytes as '?', and "..." when cut.
+fn excerptOf(comptime max: usize, buf: *[max + 3]u8, line: []const u8) []const u8 {
+    const n = process.maskedPrefix(buf[0..max], line).len;
+    if (n == line.len) return buf[0..n];
+    @memcpy(buf[n..][0..3], "...");
+    return buf[0 .. n + 3];
+}
 
 pub const Link = union(enum) {
     http: http.Options,
@@ -84,12 +99,19 @@ pub const Failure = union(enum) {
     era: era.Failure,
     /// A 2025 session ended and a new one couldn't be started.
     session,
+    /// A 2025 server didn't answer the initialized notification within the
+    /// request timeout, so nothing else could be sent.
+    initialized_timed_out,
     /// Detection needs a sign-in first; `detect` again after it.
     needs_auth,
+    /// Detection needed a refresh, and the authorization server gave no
+    /// usable answer: a 429, a 5xx, or none. The login stays, and the
+    /// server starts again after its backoff.
+    auth_unavailable,
 };
 
 /// How a call ended: the exchange's outcomes, and a chain's.
-pub const CallOutcome = enum { result, failure, lost, http_failure, cancelled, rounds_exceeded, unsupported_input, malformed, needs_auth };
+pub const CallOutcome = enum { result, failure, lost, http_failure, cancelled, rounds_exceeded, unsupported_input, malformed, needs_auth, auth_unavailable };
 
 pub const Event = union(enum) {
     /// Detection finished; requests carry this version.
@@ -98,15 +120,26 @@ pub const Event = union(enum) {
     /// A listing ended (or a need was served from the cache). Read the list
     /// with `toolList`.
     tools: struct { ok: bool, fresh: bool, dropped: tools.Added = .{}, needs_auth: bool = false },
+    /// The tool list may have changed: `list_changed`, a call answer that
+    /// suggests so, a new process, or a fresh list's TTL ran out. A host
+    /// that keeps its own copy lists again before its next call (CAT-05).
+    tools_stale,
     /// A call ended. `answer` is set when the server answered, valid until the next `next`.
-    called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call },
+    /// `oversized` says a lost call's answer was over the message limit: a
+    /// stdio line over `max_line`, or an HTTP answer over `max_message`.
+    called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false },
+    /// A call's server reported progress that the request core accepted.
+    /// `message` is terminal-safe and cut to 160 bytes, valid until the
+    /// next `next`.
+    progress: struct { handle: Handle, progress: f64, total: ?f64, message: ?[]const u8 },
     /// A call needs the host's answers to its input requests: `respond` with
     /// one value per request, in order, or `cancel`. The requests stay
     /// valid until then.
     input: struct { handle: Handle, requests: []const mrtr.Request },
     /// Requests need a sign-in: after a 401 a refresh can't fix, or a
-    /// 403 asking for more scopes (`step_up`).
-    auth_required: struct { step_up: bool },
+    /// 403 asking for more scopes (`step_up`). `refused` is the refresh the
+    /// token endpoint refused, when that ended the login.
+    auth_required: struct { step_up: bool, refused: ?oauth.Refusal = null },
     /// The host opens this URL in a browser, and passes the URL it comes back
     /// to to `finishSignIn`.
     authorize: []const u8,
@@ -114,6 +147,11 @@ pub const Event = union(enum) {
     /// `message` is the authorization server's own, from a checked response
     /// or from its token endpoint.
     sign_in_failed: struct { why: auth_client.Failure, message: ?[]const u8 },
+    /// A refresh is due (`refresh_via_host`): answer with `refresh`, or with
+    /// `useCredential` and a newer credential another process saved.
+    refresh_due,
+    /// That refresh ended, or a sign-in or sign-out replaced it.
+    refresh_ended,
     /// The tool list subscription is acknowledged: the server will send these.
     listening: subscription.Filter,
     /// It ended for good.
@@ -122,8 +160,9 @@ pub const Event = union(enum) {
     /// `elicitation.parse` and answer with `answerElicitation`. `params` stays
     /// valid until the slot is used again. `required`: listed in a call's
     /// -32042 error, so nothing is sent back, accept is the user's consent to
-    /// open the URL, and the host calls again when it completes.
-    elicit: struct { slot: u8, params: []const u8, required: bool },
+    /// open the URL, and the host calls again when it completes. The answer
+    /// names `id`, so one to an elicitation that is gone is refused.
+    elicit: struct { id: elicit_core.Id, params: []const u8, required: bool },
     /// The host no longer holds `slot`: the server cancelled it, or the
     /// session ended.
     elicit_withdrawn: u8,
@@ -167,6 +206,8 @@ const Logical = struct {
     chain_instance: []const u8 = "",
     /// The gate gave up on it for want of a sign-in.
     needs_auth: bool = false,
+    /// The gate gave up on it: its login couldn't be renewed.
+    unrenewed: bool = false,
     /// A listen: its subscription and filter, its id once sent, and
     /// whether it listens again after an abrupt end.
     sub: u8 = 0,
@@ -186,7 +227,7 @@ const Kept = struct {
 };
 
 const Timer = struct {
-    kind: union(enum) { request: request.Timer, probe: u32, expiry: catalog.Generation, resume_stream: request.Id, listen, listen_wait, backoff: Handle, relisten: struct { sub: u8, generation: u32 } },
+    kind: union(enum) { request: request.Timer, probe: u32, expiry: catalog.Generation, resume_stream: request.Id, listen, listen_wait, backoff: Handle, relisten: struct { sub: u8, generation: u32 }, initialized: u64, refresh: u64 },
     due_ms: i64,
 };
 
@@ -214,13 +255,18 @@ pub const Server = struct {
     /// Stdio: the process the era was last detected for, and a start asked
     /// for while the last process was still stopping.
     era_generation: stdio_conn.Generation = 0,
+    /// When the current start's time runs out.
+    start_due_ms: i64 = 0,
+    /// The refresh whose deadline is armed.
+    refresh_timed: u64 = 0,
     catalog_generation: stdio_conn.Generation = 0,
     start_pending: bool = false,
     table: request.Table,
     table_slots: [64]request.Slot = undefined,
     detector: era.Detector,
     catalog: catalog.Catalog,
-    store: tools.Store = .{ .check_headers = true },
+    /// Its `check_headers` is set for each page from the session's era.
+    store: tools.Store = .{},
     logicals: [32]Logical = undefined,
     next_handle: Handle = 1,
     timers: std.ArrayList(Timer) = .empty,
@@ -229,6 +275,19 @@ pub const Server = struct {
     event_count: usize = 0,
     /// The answer an event points into, kept until the next `next`.
     held_answer: ?tools.Call = null,
+    /// Set while requests end lost because an answer was over the message
+    /// limit: a stdio process fx killed for an oversized line, or an HTTP
+    /// answer over `max_message`.
+    losing_oversized: bool = false,
+    /// The message of an invalid reply's answer, kept as long as the line it
+    /// came from: until the process is read again.
+    refused_reply: [512]u8 = undefined,
+    /// An excerpt of the last stdout line that answered nothing, since the
+    /// server was last ready: what a failed start wrote instead.
+    stray: [excerpt_max + 3]u8 = undefined,
+    stray_len: u8 = 0,
+    /// The message of the last progress event, until the next `next`.
+    note: [note_max + 3]u8 = undefined,
     /// What the last page added, for the warning about dropped tools.
     last_added: tools.Added = .{},
 
@@ -299,7 +358,7 @@ pub const Server = struct {
             .http => |h| {
                 try r.client.init(io, gpa, h);
                 r.auth = .init(io, gpa, &r.client, h.url, options.auth, trace.on(options.trace));
-                if (options.auth.saved) |saved| try r.auth.restore(saved);
+                if (options.auth.saved) |saved| _ = try r.auth.restore(saved);
             },
             .stdio => |o| {
                 var po = o;
@@ -361,6 +420,28 @@ pub const Server = struct {
         try r.started();
     }
 
+    /// How the server's last process ended, once it has.
+    pub fn exitStatus(r: *Server) ?process.Exit {
+        return if (r.stdio) r.proc.exitStatus() else null;
+    }
+
+    /// An excerpt of the last stdout line that answered nothing since the
+    /// server was last ready.
+    pub fn strayLine(r: *const Server) ?[]const u8 {
+        return if (r.stray_len == 0) null else r.stray[0..r.stray_len];
+    }
+
+    /// The server's last stderr lines, in `out`, while it runs over stdio.
+    pub fn stderrTail(r: *Server, out: *[process.tail_max]u8) ?[]const u8 {
+        if (!r.stdio) return null;
+        const tail = r.proc.stderrTail(out);
+        return if (tail.len == 0) null else tail;
+    }
+
+    fn keepStray(r: *Server, line: []const u8) void {
+        r.stray_len = @intCast(excerptOf(excerpt_max, &r.stray, line).len);
+    }
+
     /// Why the last start of the process failed, if it did. The engine shows
     /// it in the server's status.
     pub fn spawnError(r: *const Server) ?anyerror {
@@ -379,14 +460,16 @@ pub const Server = struct {
         for (&r.logicals) |*l| if (l.used) {
             if (l.id) |id| {
                 try r.stepRequest(.{ .transport_lost = id });
-                try r.closeKey(id);
+                try r.closeKey(id, .forgotten);
             }
             l.used = false;
         };
-        if (r.listen_key) |key| try r.closeKey(key);
+        if (r.listen_key) |key| try r.closeKey(key, .forgotten);
         r.listen_key = null;
         r.timers.clearRetainingCapacity();
         r.held_sends.clearRetainingCapacity();
+        // An initialized notification still unanswered: its POST goes too.
+        if (r.initialized_key) |key| try r.closeKey(key, .forgotten);
         r.initialized_key = null;
         r.listen_pending = false;
         r.legacy = null;
@@ -484,18 +567,19 @@ pub const Server = struct {
         try r.stepChain(l, .provided);
     }
 
-    /// Answers the 2025 elicitation in `slot`: accept with content for a
-    /// form, accept for a URL, decline, or cancel. Content that fails the
-    /// schema is refused, and the host still holds the elicitation.
-    pub fn answerElicitation(r: *Server, slot: u8, answer: elicitation.Answer) Error!void {
-        const s = r.elicit.held(slot) orelse return error.UnknownElicitation;
+    /// Answers the 2025 elicitation `id`: accept with content for a form,
+    /// accept for a URL, decline, or cancel. One that is gone is unknown, even
+    /// when its slot holds another. Content that fails the schema is refused,
+    /// and the host still holds the elicitation.
+    pub fn answerElicitation(r: *Server, id: elicit_core.Id, answer: elicitation.Answer) Error!void {
+        const s = r.elicit.find(id) orelse return error.UnknownElicitation;
         var form: elicitation.Form = .{};
-        _ = elicitation.parse(r.elicit_held[slot].params, &form) catch return error.InvalidAnswer; // read when asked
+        _ = elicitation.parse(r.elicit_held[id.slot].params, &form) catch return error.InvalidAnswer; // read when asked
         const valid = if (elicitation.check(s.mode, &form, answer)) true else |err| switch (err) {
             error.InvalidAnswer => return error.InvalidAnswer,
             error.InvalidContent => false,
         };
-        try r.stepElicit(.{ .answered = .{ .slot = slot, .action = answer.action, .valid = valid } }, .{ .content = answer.content });
+        try r.stepElicit(.{ .answered = .{ .id = id, .action = answer.action, .valid = valid } }, .{ .content = answer.content });
         if (!valid) return error.InvalidAnswer;
     }
 
@@ -520,6 +604,24 @@ pub const Server = struct {
     pub fn cancelSignIn(r: *Server) Error!void {
         if (r.stdio) return error.NotReady;
         try r.auth.cancelSignIn();
+        try r.runAuth(null);
+    }
+
+    /// Takes a credential `saveCredential` wrote, as a sign-in would: what
+    /// waits for one goes out with it (another host process signed in).
+    /// False when it can't be used, as `Auth.restore` says, and nothing
+    /// changes.
+    pub fn useCredential(r: *Server, saved: []const u8) Error!bool {
+        if (r.stdio) return error.NotReady;
+        if (!try r.auth.restore(saved)) return false;
+        try r.runAuth(null);
+        return true;
+    }
+
+    /// Sends the refresh `refresh_due` announced.
+    pub fn refresh(r: *Server) Error!void {
+        if (r.stdio) return error.NotReady;
+        try r.auth.refreshNow();
         try r.runAuth(null);
     }
 
@@ -583,10 +685,24 @@ pub const Server = struct {
 
     /// The next thing that happened, without waiting; null for nothing. The
     /// engine reads each server when its bell rings, or a timer is due.
+    /// Due timers come before what waits, and one call reads at most `burst`
+    /// messages, then rings the bell for the rest: a server that sends
+    /// faster than they are handled can't hold back its timers or the
+    /// other servers.
     pub fn poll(r: *Server) Error!?Event {
         r.held_answer = null;
+        var read: u32 = 0;
         while (true) {
             if (r.take()) |event| return event;
+            if (r.dueMs()) |due| if (due <= r.now()) {
+                try r.fireTimers();
+                continue;
+            };
+            if (read == burst) {
+                if (if (r.stdio) r.proc.options.bell else r.client.options.bell) |b| b.ring();
+                return null;
+            }
+            read += 1;
             if (r.stdio) {
                 if (try r.proc.poll()) |incoming| {
                     try r.onProcess(incoming);
@@ -596,11 +712,12 @@ pub const Server = struct {
                 try r.onHttp(incoming);
                 continue;
             }
-            const due = r.dueMs() orelse return null;
-            if (due > r.now()) return null;
-            try r.fireTimers();
+            return null;
         }
     }
+
+    /// What `poll` reads at most per call: a queue's worth.
+    const burst = 64;
 
     /// An event already queued, without reading anything. The engine
     /// takes what one read queued together, such as a process exit's lost
@@ -628,7 +745,7 @@ pub const Server = struct {
             .opened => |key| if (r.legacy != null and key == r.listen_key) try r.listenSettled(),
             .ended => |e| try r.onEnded(e.key, e.status, e.how, e.challenge),
             .fetched => |f| {
-                _ = try r.auth.fetched(f.key, f.status, f.body);
+                _ = try r.auth.fetched(f.key, f.status, f.media, f.challenge, f.body);
                 try r.runAuth(null);
             },
             .timeout => unreachable,
@@ -641,17 +758,43 @@ pub const Server = struct {
         switch (incoming) {
             // On stdio a response names its request only by its id.
             .message => |m| try r.onMessage(if (m.message == .response) m.message.response.id orelse 0 else 0, 200, m.message),
-            // With no sink for stderr, and a line that isn't MCP.
-            .stderr, .dropped => {},
-            .changed => |c| try r.onProcessChanged(c.state, c.lost),
+            // With no sink for stderr.
+            .stderr => {},
+            .dropped => |d| try r.onRefusedLine(d.err, d.line),
+            .changed => |c| try r.onProcessChanged(c.state, c.lost, c.oversized),
             .timeout => unreachable,
         }
     }
 
-    fn onProcessChanged(r: *Server, state: stdio_conn.State, lost: bool) Error!void {
+    /// A line `decode` refused that names a request in flight is that
+    /// request's answer, an invalid one: the request fails with what was
+    /// wrong and the start of the line. Any other is ignored.
+    fn onRefusedLine(r: *Server, err: wire.DecodeError, line: []const u8) Error!void {
+        // Empty for a process that has gone since.
+        if (line.len == 0) return;
+        const id = wire.responseId(line) orelse return r.keepStray(line);
+        if (r.logicalFor(id) == null) return r.keepStray(line);
+        const why = switch (err) {
+            error.NotJsonRpc2 => "its jsonrpc isn't \"2.0\"",
+            error.Ambiguous => "it has both a result and an error, or neither",
+            error.InvalidResult => "its result isn't an object",
+            error.InvalidErrorObject => "its error isn't an error object",
+            else => "it isn't valid JSON-RPC",
+        };
+        var buf: [excerpt_max + 3]u8 = undefined;
+        var text: [192]u8 = undefined;
+        const plain = std.mem.print(&text, "invalid reply ({s}): {s}", .{ why, excerptOf(excerpt_max, &buf, line) }) catch unreachable;
+        var w: std.Io.Writer = .fixed(&r.refused_reply);
+        std.json.Stringify.value(plain, .{}, &w) catch unreachable;
+        try r.onMessage(id, 200, .{ .response = .{ .id = id, .body = .{ .failure = .{ .code = wire.code.invalid_request, .message = w.buffered(), .data = null } } } });
+    }
+
+    fn onProcessChanged(r: *Server, state: stdio_conn.State, lost: bool, oversized: bool) Error!void {
         if (lost) {
             // What was in flight on the process is lost. The exit ends every
             // listen, and its elicitations are over.
+            r.losing_oversized = oversized;
+            defer r.losing_oversized = false;
             for (r.table_slots) |slot| if (slot.used) try r.stepRequest(.{ .transport_lost = slot.id });
             if (r.subs.up) try r.stepSubs(.transport_down);
             try r.endElicitations();
@@ -701,10 +844,16 @@ pub const Server = struct {
             },
             .list => try r.stepCatalog(try r.pageEvent(body)),
             .call => _ = try r.callAnswer(body),
-            // A result ends a listen gracefully, an error refuses it.
-            .listen => try r.stepSubs(.{ .final = .{ .id = id, .end = if (body == .result) .result else .refused } }),
+            .listen => try r.stepSubs(.{ .final = .{ .id = id, .end = listenEnd(body) } }),
         }
         try r.stepRequest(.{ .response_received = .{ .id = id, .response = if (body == .result) .result else .peer_error } });
+    }
+
+    /// A complete result ends a listen gracefully. An error refuses it, and so
+    /// does a result whose `resultType` is invalid or input_required, which a
+    /// listen never is (WIRE-07).
+    fn listenEnd(body: @FieldType(wire.Response, "body")) subscription.End {
+        return if (body == .result and body.result.kind == .complete) .result else .refused;
     }
 
     /// A stdio request ended in the request table: its logical request ends.
@@ -807,11 +956,18 @@ pub const Server = struct {
         var id: request.Id = 0;
         for (out.effects()) |effect| switch (effect) {
             .write_request => |w| id = w.id,
-            .arm_timer => |a| try r.timers.append(r.gpa, .{ .kind = .{ .request = a.timer }, .due_ms = r.now() + a.after_ms }),
+            .arm_timer => |a| try r.armRequestTimer(a.timer, if (kind == .initialize and a.timer.kind == .hard) r.startLeft(a.after_ms) else a.after_ms),
             else => {},
         };
         if (r.questionsHeld() > 0) try r.stepRequest(.{ .idle_paused = id });
         return id;
+    }
+
+    /// What is left of the start's time, at most `after_ms`. An initialize
+    /// that renews a ready 2025 session isn't a start.
+    fn startLeft(r: *const Server, after_ms: u32) u32 {
+        if (r.detector.ready()) return after_ms;
+        return @intCast(std.math.clamp(r.start_due_ms - r.now(), 0, after_ms));
     }
 
     /// 2025 questions the host holds and hasn't answered.
@@ -842,7 +998,11 @@ pub const Server = struct {
                 try r.stepCatalog(.invalidated);
                 try r.stepCatalog(.need);
             },
-            .close => if (l.id) |id| try r.closeKey(id),
+            // After an answer, or as the cancellation.
+            .close => if (l.id) |id| {
+                l.id = null;
+                try r.closeKey(id, if (l.exchange.phase == .cancelled) .forgotten else .answered);
+            },
             .deliver => |d| {
                 // A call's round ended: its chain decides what comes next.
                 if (l.what == .call) return r.roundEnded(l, d.outcome);
@@ -967,11 +1127,26 @@ pub const Server = struct {
                 // One without a subscriptionId still refreshes the list.
                 if (std.mem.eql(u8, n.method, "notifications/tools/list_changed")) return r.stepCatalog(.invalidated);
                 if (std.mem.eql(u8, n.method, "notifications/progress")) {
-                    var found: [2]?[]const u8 = undefined;
-                    wire.objectFields(n.params orelse "{}", &.{ "progressToken", "progress" }, &found) catch return;
+                    var found: [4]?[]const u8 = undefined;
+                    wire.objectFields(n.params orelse "{}", &.{ "progressToken", "progress", "total", "message" }, &found) catch return;
                     const token = wire.decimal(found[0] orelse return) orelse return;
                     const value = std.fmt.parseFloat(f64, found[1] orelse return) catch return;
-                    return r.stepRequest(.{ .progress_received = .{ .token = token, .value = value } });
+                    const before = r.table.progressCount(token);
+                    try r.stepRequest(.{ .progress_received = .{ .token = token, .value = value } });
+                    // Accepted progress on a call reaches the host.
+                    if (r.table.progressCount(token) == before) return;
+                    const l = r.logicalFor(token) orelse return;
+                    if (l.what != .call) return;
+                    var text: [1024]u8 = undefined;
+                    var fixed: std.heap.FixedBufferAllocator = .init(&text);
+                    const said = if (found[3]) |raw| wire.decodeString(fixed.allocator(), raw) catch null else null;
+                    r.emit(.{ .progress = .{
+                        .handle = l.handle,
+                        .progress = value,
+                        .total = if (found[2]) |t| std.fmt.parseFloat(f64, t) catch null else null,
+                        .message = if (said) |m| excerptOf(note_max, &r.note, m) else null,
+                    } });
+                    return;
                 }
             },
             // A 2026 server sends no requests; they are dropped. A 2025
@@ -1008,14 +1183,13 @@ pub const Server = struct {
                             .failure, .invalid => .failure,
                         };
                     },
-                    // A result ends it gracefully, an error refuses it.
                     .listen => blk: {
-                        try r.stepSubs(.{ .final = .{ .id = key, .end = if (resp.body == .result) .result else .refused } });
+                        try r.stepSubs(.{ .final = .{ .id = key, .end = listenEnd(resp.body) } });
                         break :blk if (resp.body == .result) .result else .failure;
                     },
                     .initialize => unreachable,
                 };
-                l.id = null;
+                // The answer's `close` lets go of the id and the stream.
                 try r.stepExchange(l, .{ .answer = answer });
             },
         }
@@ -1074,6 +1248,12 @@ pub const Server = struct {
             if (l.what == .discover) try r.stepEra(era.classifyDiscoverHttp(r.detector.config, status, null));
             return r.stepExchange(l, .http_failure);
         }
+        // Another attempt would bring the same answer again (HTTP-14).
+        if (how == .too_large) {
+            r.losing_oversized = true;
+            defer r.losing_oversized = false;
+            return r.stepExchange(l, .too_large);
+        }
         try r.stepExchange(l, .stream_broken);
     }
 
@@ -1083,9 +1263,12 @@ pub const Server = struct {
             .result => |res| {
                 if (res.kind != .complete) return .page_failed;
                 const page = tools.parsePage(res.raw) catch return .page_failed;
+                // `x-mcp-header` is a 2026 annotation: a 2025 server's tools
+                // keep theirs unchecked, as nothing projects them.
+                r.store.check_headers = !r.legacyEra();
                 const added = r.store.addPage(r.gpa, page) catch return .page_failed;
                 r.last_added = added;
-                return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms } };
+                return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms, .now_ms = r.now() } };
             },
         }
     }
@@ -1153,7 +1336,7 @@ pub const Server = struct {
                 r.emit(.{
                     .called = .{
                         .handle = l.handle,
-                        .outcome = if (l.needs_auth and o == .http_failure) .needs_auth else switch (o) {
+                        .outcome = if (l.needs_auth and o == .http_failure) .needs_auth else if (l.unrenewed and o == .http_failure) .auth_unavailable else switch (o) {
                             .none => .failure,
                             inline else => |tag| @field(CallOutcome, @tagName(tag)),
                         },
@@ -1161,6 +1344,7 @@ pub const Server = struct {
                         .maybe_ran = o == .lost,
                         .timed_out = l.timed_out,
                         .answer = if (o == .result or o == .failure) r.held_answer else null,
+                        .oversized = o == .lost and r.losing_oversized,
                     },
                 });
                 l.used = false;
@@ -1205,6 +1389,9 @@ pub const Server = struct {
                 try era.writeInitialized(&body.writer);
                 const key = r.auxKey();
                 r.initialized_key = key;
+                // Everything after it waits for its answer, so it gets the
+                // request timeout too.
+                try r.timers.append(r.gpa, .{ .kind = .{ .initialized = key }, .due_ms = r.now() + r.options.timeouts.idle_ms });
                 try r.sendLegacy(key, .post, body.written(), null);
             },
             .post => |id| {
@@ -1241,7 +1428,7 @@ pub const Server = struct {
                 try r.sendLegacy(key, .get, null, r.listen_last_event_id);
             },
             .close_listen => if (r.listen_key) |key| {
-                try r.closeKey(key);
+                try r.closeKey(key, .forgotten);
                 r.listen_key = null;
             },
             .arm_listen => |ms| try r.timers.append(r.gpa, .{ .kind = .listen, .due_ms = r.now() + ms }),
@@ -1252,12 +1439,12 @@ pub const Server = struct {
                 try r.sendLegacy(key, .delete, null, null);
             },
             .deliver => |d| {
-                if (d.outcome != .result) {
+                // Nothing reads its stream now, so one still open is closed,
+                // after an answer too. A disconnect cancels nothing in
+                // 2025; notifications/cancelled did.
+                if (d.outcome == .result) try r.closeKey(d.id, .answered) else {
                     try r.stepRequest(.{ .transport_lost = d.id });
-                    // Nothing reads its answer now, so a stream still open is
-                    // closed. A disconnect cancels nothing in 2025;
-                    // notifications/cancelled did.
-                    try r.closeKey(d.id);
+                    try r.closeKey(d.id, .forgotten);
                 }
                 try r.legacyDelivered(d.id, d.outcome);
             },
@@ -1412,9 +1599,34 @@ pub const Server = struct {
         // An answer would have freed it: initialize ended without one.
         l.used = false;
         try r.stepRequest(.{ .transport_lost = key });
+        try r.initializeFailed(l, .{ .initialize_error = false });
+    }
+
+    /// A 2025 initialize timed out. It can't be cancelled, so nothing else
+    /// ends it: its stream is closed, and the session fails as if the stream
+    /// had ended.
+    fn onInitializeTimedOut(r: *Server, l: *Logical, id: request.Id) Error!void {
+        l.used = false;
+        try r.closeKey(id, .forgotten);
+        try r.initializeFailed(l, .initialize_timed_out);
+    }
+
+    /// A 2025 initialized notification went unanswered for the request
+    /// timeout. Every later send waits for it, so the session can't go on:
+    /// it fails with the reason. Nothing reads its answer now, so its POST
+    /// is closed here; the teardown doesn't know of it.
+    fn onInitializedTimedOut(r: *Server) Error!void {
+        if (r.initialized_key) |key| try r.closeKey(key, .forgotten);
+        r.initialized_key = null;
+        r.emit(.{ .failed = .initialized_timed_out });
+    }
+
+    /// The session's initialize ended without an answer: a first one fails
+    /// detection with `event`, a later one fails the session.
+    fn initializeFailed(r: *Server, l: *const Logical, event: era.Event) Error!void {
         const first = r.detector.state == .initializing;
         try r.stepLegacy(.initialize_failed);
-        if (first) try r.stepEra(.{ .initialize_error = false }) else r.emit(.{ .failed = if (l.needs_auth) .needs_auth else .session });
+        if (first) try r.stepEra(event) else r.emit(.{ .failed = if (l.needs_auth) .needs_auth else .session });
     }
 
     fn onLegacyAnswer(r: *Server, l: *Logical, key: u64, status: u16, body: @FieldType(wire.Response, "body")) Error!void {
@@ -1439,7 +1651,7 @@ pub const Server = struct {
         const s = &r.legacy.?;
         const req = s.find(key) orelse return;
         if (req.state != .posted and req.state != .resuming) return;
-        try r.stepLegacy(if (status == 404)
+        const event: http_legacy.Event = if (status == 404)
             // `expired` takes a request without a session id for a refusal.
             .{ .expired = key }
         else if (status >= 300)
@@ -1448,8 +1660,13 @@ pub const Server = struct {
             // A stream that ended or broke before the answer, which the
             // server may have closed to be polled.
             .complete, .accepted, .broken => .{ .broke = key },
+            // Resuming would bring the same answer again (LHTTP-11).
+            .too_large => .{ .too_large = key },
             .http_failure, .rejected => .{ .refused = key },
-        });
+        };
+        r.losing_oversized = event == .too_large;
+        defer r.losing_oversized = false;
+        try r.stepLegacy(event);
     }
 
     /// Any refusal of the listening GET but a session 404 means the
@@ -1484,13 +1701,14 @@ pub const Server = struct {
                         else => .result,
                     } else .result,
                     .lost => .lost,
-                    .failed, .none => if (l.needs_auth) .needs_auth else .http_failure,
+                    .failed, .none => if (l.needs_auth) .needs_auth else if (l.unrenewed) .auth_unavailable else .http_failure,
                     .cancelled => .cancelled,
                 },
                 // Only a lost stream leaves the call maybe run.
                 .maybe_ran = outcome == .lost,
                 .timed_out = l.timed_out,
                 .answer = if (outcome == .result) r.held_answer else null,
+                .oversized = outcome == .lost and r.losing_oversized,
             },
         });
         if (l.what == .list and outcome != .result) {
@@ -1561,7 +1779,7 @@ pub const Server = struct {
                 h.* = .{ .params = params };
                 if (with.id) |id| h.id = try r.gpa.dupe(u8, id);
                 if (with.eid) |eid| h.eid = try r.gpa.dupe(u8, eid);
-                r.emit(.{ .elicit = .{ .slot = slot, .params = h.params, .required = event.asked.origin == .required } });
+                r.emit(.{ .elicit = .{ .id = .{ .slot = slot, .n = out.n }, .params = h.params, .required = event.asked.origin == .required } });
             },
             .reject => |why| {
                 var body: std.Io.Writer.Allocating = .init(r.gpa);
@@ -1598,14 +1816,20 @@ pub const Server = struct {
     /// for this request is posted at once, so a send that can't go out is the
     /// caller's to handle, as before.
     fn send(r: *Server, key: u64, method: http.Method, body: ?[]const u8, headers: []const std.http.Header) Error!void {
-        var arena: std.heap.ArenaAllocator = .init(r.gpa);
-        errdefer arena.deinit();
-        const a = arena.allocator();
-        const copies = try a.alloc(std.http.Header, headers.len + 1);
-        for (headers, copies[0..headers.len]) |h, *c| c.* = .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) };
-        try r.outbox.append(r.gpa, .{ .key = key, .method = method, .body = if (body) |b| try a.dupe(u8, b) else null, .headers = copies, .arena = arena });
-        try r.auth.beforeSend(key);
-        r.runAuth(key) catch |err| {
+        {
+            var arena: std.heap.ArenaAllocator = .init(r.gpa);
+            errdefer arena.deinit();
+            const a = arena.allocator();
+            const copies = try a.alloc(std.http.Header, headers.len + 1);
+            for (headers, copies[0..headers.len]) |h, *c| c.* = .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) };
+            try r.outbox.append(r.gpa, .{ .key = key, .method = method, .body = if (body) |b| try a.dupe(u8, b) else null, .headers = copies, .arena = arena });
+        }
+        // The outbox owns the copies now: `unkeep` frees them, once.
+        const sent: Error!void = blk: {
+            r.auth.beforeSend(key) catch |err| break :blk err;
+            break :blk r.runAuth(key);
+        };
+        sent catch |err| {
             // It never went out: the gate forgets it too.
             if (r.kept(key) != null) {
                 r.unkeep(key);
@@ -1628,12 +1852,14 @@ pub const Server = struct {
         };
     }
 
-    /// Closes request `key`'s stream; the gate forgets it.
-    fn closeKey(r: *Server, key: u64) Error!void {
+    /// Closes request `key`'s stream and tells the gate how it ended:
+    /// `.answered` once its answer is in, though the server may have left the
+    /// stream open, or `.forgotten` when it is dropped unanswered.
+    fn closeKey(r: *Server, key: u64, how: auth_client.Ending) Error!void {
         r.client.cancel(key);
         if (r.kept(key) == null) return;
         r.unkeep(key);
-        _ = try r.auth.ended(key, .forgotten);
+        _ = try r.auth.ended(key, how);
         try r.runAuth(null);
     }
 
@@ -1650,12 +1876,20 @@ pub const Server = struct {
                     else => return err,
                 },
                 .give_up => |g| try r.authGaveUp(g.key, g.why),
-                .needs_sign_in => |n| r.emit(.{ .auth_required = .{ .step_up = n.step_up } }),
+                .needs_sign_in => |n| r.emit(.{ .auth_required = .{ .step_up = n.step_up, .refused = n.refused } }),
                 .authorize => |url| r.emit(.{ .authorize = url }),
                 .signed_in => r.emit(.signed_in),
                 .sign_in_failed => |f| r.emit(.{ .sign_in_failed = .{ .why = f.why, .message = f.message } }),
                 .save => r.emit(.credential),
+                .refresh_due => r.emit(.refresh_due),
+                .refresh_ended => r.emit(.refresh_ended),
             }
+        }
+        // A refresh that went out gets `refresh_ms` to be answered.
+        const key = r.auth.refresh_key;
+        if (key != 0 and key != r.refresh_timed) {
+            r.refresh_timed = key;
+            try r.timers.append(r.gpa, .{ .kind = .{ .refresh = key }, .due_ms = r.now() + r.options.timeouts.refresh_ms });
         }
     }
 
@@ -1671,25 +1905,34 @@ pub const Server = struct {
         try r.client.send(key, k.method, k.body, k.headers[0..count]);
     }
 
-    /// The gate gave up on `key`. Before the era is known that stops detection;
-    /// otherwise the request ends as it would have: a 401 for want of a
-    /// sign-in, a broken stream when the refresh got no answer.
+    /// The gate gave up on `key`. Before the era is known that stops detection.
+    /// Otherwise a request ends as the server's 401: the server never read
+    /// it, whether it waited for a sign-in or for a renewal that got no usable
+    /// answer, so a call never counts as maybe run. A listen whose renewal
+    /// got no usable answer ends as a broken stream instead, so it listens
+    /// again after its backoff rather than stopping for good, as anything
+    /// else does, such as the listening GET.
     fn authGaveUp(r: *Server, key: u64, why: auth_core.GiveUp) Error!void {
         r.unkeep(key);
         if (key < aux_base) if (r.logicalFor(key)) |l| {
             l.needs_auth = why == .needs_sign_in;
-            if ((l.what == .discover or l.what == .initialize) and !r.detector.ready()) return r.abortDetection();
+            l.unrenewed = why == .failed;
+            if ((l.what == .discover or l.what == .initialize) and !r.detector.ready()) return r.abortDetection(why);
+            if (why == .failed and l.what == .listen) return r.onEndedDomain(key, 0, .broken);
+            return r.onEndedDomain(key, 401, .http_failure);
         };
         try r.onEndedDomain(key, if (why == .needs_sign_in) 401 else 0, if (why == .needs_sign_in) .http_failure else .broken);
     }
 
-    /// A rejection says nothing about the era. Detection stops, and the
-    /// host signs in and detects again, as a new run with its own traces.
-    fn abortDetection(r: *Server) Error!void {
+    /// A rejection says nothing about the era. Detection stops, as a new run
+    /// with its own traces: for a sign-in, the host signs in and detects
+    /// again; for a refresh that got no usable answer, the start failed and
+    /// the server starts again after its backoff, keeping its login.
+    fn abortDetection(r: *Server, why: auth_core.GiveUp) Error!void {
         for (&r.logicals) |*l| if (l.used and (l.what == .discover or l.what == .initialize)) {
             if (l.id) |id| {
                 try r.stepRequest(.{ .transport_lost = id });
-                try r.closeKey(id);
+                try r.closeKey(id, .forgotten);
             }
             l.used = false;
         };
@@ -1700,7 +1943,7 @@ pub const Server = struct {
         r.legacy = null;
         try r.endElicitations();
         r.newEraRun();
-        r.emit(.{ .failed = .needs_auth });
+        r.emit(.{ .failed = if (why == .needs_sign_in) .needs_auth else .auth_unavailable });
     }
 
     /// Detection starts over as a new run, with its own era and session
@@ -1712,6 +1955,21 @@ pub const Server = struct {
     }
 
     // ---- shared machines ----
+
+    /// Arms a request's timer. Accepted progress re-arms a request's idle timer
+    /// with a new generation, and the one it replaces could only fire to be
+    /// ignored, so it is replaced in place: one idle timer per request, however
+    /// much progress comes.
+    fn armRequestTimer(r: *Server, timer: request.Timer, after_ms: u32) Error!void {
+        const due_ms = r.now() + after_ms;
+        if (timer.kind == .idle) for (r.timers.items) |*t| {
+            if (t.kind == .request and t.kind.request.id == timer.id and t.kind.request.kind == .idle) {
+                t.* = .{ .kind = .{ .request = timer }, .due_ms = due_ms };
+                return;
+            }
+        };
+        try r.timers.append(r.gpa, .{ .kind = .{ .request = timer }, .due_ms = due_ms });
+    }
 
     fn stepRequest(r: *Server, event: request.Event) Error!void {
         var out: request.Output = .{};
@@ -1736,7 +1994,11 @@ pub const Server = struct {
                 r.proc.send(.notification, body.written()) catch {};
             } else try r.stepLegacy(.{ .cancel = id }),
             .deliver => |d| if (r.stdio) try r.stdioDelivered(d.id, d.outcome) else switch (d.outcome) {
-                .timed_out => if (r.legacy == null) if (r.logicalFor(d.id)) |l| try r.stepExchange(l, .cancel),
+                // 2026: closing the stream cancels it. 2025: a call or list's
+                // cancel goes through the session, but initialize has none.
+                .timed_out => if (r.logicalFor(d.id)) |l| {
+                    if (r.legacy == null) try r.stepExchange(l, .cancel) else if (l.what == .initialize) try r.onInitializeTimedOut(l, d.id);
+                },
                 // The server ended the listen; its stream closes.
                 .ended => if (r.logicalFor(d.id)) |l| {
                     try r.stepSubs(.{ .final = .{ .id = d.id, .end = .server_cancelled } });
@@ -1744,7 +2006,7 @@ pub const Server = struct {
                 },
                 else => {},
             },
-            .arm_timer => |a| try r.timers.append(r.gpa, .{ .kind = .{ .request = a.timer }, .due_ms = r.now() + a.after_ms }),
+            .arm_timer => |a| try r.armRequestTimer(a.timer, a.after_ms),
             .disarm_timers => |id| {
                 var i: usize = 0;
                 while (i < r.timers.items.len) {
@@ -1756,8 +2018,10 @@ pub const Server = struct {
     }
 
     fn stepEra(r: *Server, event: era.Event) Error!void {
+        const was = r.detector.state;
         var out: era.Output = .{};
         r.detector.step(event, &out) catch return;
+        if (was == .unknown and r.detector.state != .unknown) r.start_due_ms = r.now() + r.options.timeouts.start_ms;
         if (r.tracer()) |t| try era.writeTrace(t, r.era_instance, &out);
         for (out.effects()) |effect| switch (effect) {
             .send_discover => |i| {
@@ -1776,7 +2040,7 @@ pub const Server = struct {
                 try era.writeInitialized(&body.writer);
                 r.proc.send(.notification, body.written()) catch {};
             },
-            .arm_probe_timer => |a| try r.timers.append(r.gpa, .{ .kind = .{ .probe = a.probe }, .due_ms = r.now() + a.after_ms }),
+            .arm_probe_timer => |a| try r.timers.append(r.gpa, .{ .kind = .{ .probe = a.probe }, .due_ms = r.now() + r.startLeft(a.after_ms) }),
             .ready => |v| {
                 // The catalog starts over for each new process or detection
                 // run; a new 2025 session in a run does that too.
@@ -1784,6 +2048,7 @@ pub const Server = struct {
                 const first = r.catalog_generation != run;
                 r.catalog_generation = run;
                 if (r.stdio) r.proc.setEra(if (v == .legacy) .legacy else .modern) catch {};
+                r.stray_len = 0;
                 r.emit(.{ .ready = era.versionName(r.detector.config, v).? });
                 if (first) try r.stepCatalog(.{ .process_started = if (v == .legacy) .legacy else .modern });
                 // The listens a process exit ended go out again.
@@ -1801,8 +2066,14 @@ pub const Server = struct {
 
     fn stepCatalog(r: *Server, event: catalog.Event) Error!void {
         var out: catalog.Output = .{};
+        const generation = r.catalog.generation;
+        const was_fresh = r.catalog.cache == .fresh;
         r.catalog.step(event, &out) catch return;
         if (r.tracer()) |t| try catalog.writeTrace(t, "remote", &out);
+        // A host has nothing to drop before the first list, unless one is
+        // being listed: what that listing brings is already old.
+        const changed = r.catalog.generation != generation and (r.catalog.cache != .none or r.catalog.listing);
+        if (changed or (was_fresh and r.catalog.cache != .fresh)) r.emit(.tools_stale);
         for (out.effects()) |effect| switch (effect) {
             .send_page => {
                 const l = try r.newLogical(.list, .idempotent);
@@ -1819,6 +2090,17 @@ pub const Server = struct {
                 r.emit(.{ .tools = .{ .ok = false, .fresh = false, .needs_auth = r.page_needs_auth } });
                 r.page_needs_auth = false;
                 try r.relisted(false);
+            },
+            // The last list goes out unless the page needs a sign-in, which
+            // every call from that list would need too.
+            .serve_last => {
+                r.store.discard();
+                r.emit(.{ .tools = .{ .ok = !r.page_needs_auth, .fresh = false, .needs_auth = r.page_needs_auth } });
+                r.page_needs_auth = false;
+                try r.relisted(false);
+                // Still stale: a host that keeps its copy asks again next
+                // time.
+                r.emit(.tools_stale);
             },
             .serve => r.emit(.{ .tools = .{ .ok = true, .fresh = true } }),
             .arm_expiry => |a| try r.timers.append(r.gpa, .{ .kind = .{ .expiry = a.generation }, .due_ms = r.now() + a.after_ms }),
@@ -1883,6 +2165,14 @@ pub const Server = struct {
                 .listen_wait => try r.listenSettled(),
                 .backoff => |handle| if (r.logicalByHandle(handle)) |l| try r.stepChain(l, .backoff_elapsed),
                 .relisten => |x| try r.stepSubs(.{ .retry_due = .{ .sub = x.sub, .generation = x.generation } }),
+                .initialized => |key| if (r.initialized_key == key) try r.onInitializedTimedOut(),
+                // No answer in time is no answer: the refresh fails, the
+                // tokens stay, and what waits for it fails.
+                .refresh => |key| if (r.auth.refresh_key == key) {
+                    r.client.cancel(key);
+                    _ = try r.auth.fetched(key, 0, "", null, "");
+                    try r.runAuth(null);
+                },
             }
             i = 0;
         }
@@ -1893,4 +2183,25 @@ test {
     // Behavior is tested by the conformance suite and the Bun driver, which
     // run cli/conformance.zig on this; this makes sure everything compiles.
     std.testing.refAllDecls(Server);
+}
+
+test "a send that fails after the outbox took its copy frees the copy once" {
+    var r: Server = undefined;
+    // No request may start, so each waits for a slot and nothing reaches the network.
+    try r.init(std.testing.io, std.testing.allocator, .{
+        .link = .{ .http = .{ .url = "http://127.0.0.1:1/mcp", .max_in_flight = 0 } },
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    });
+    defer r.deinit();
+    const headers = [_]std.http.Header{.{ .name = "accept", .value = "application/json" }};
+    // Requests wait until every place is taken; the next fails once kept.
+    var key: u64 = 1;
+    const failed = while (key < 100) : (key += 1) {
+        r.send(key, .post, "{}", &headers) catch |err| break err;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(error.TooManyInFlight, failed);
+    try std.testing.expectEqual(@as(u64, 33), key);
+    // The one that failed keeps nothing; the others stay kept.
+    try std.testing.expect(r.kept(key) == null);
+    try std.testing.expect(r.kept(key - 1) != null);
 }

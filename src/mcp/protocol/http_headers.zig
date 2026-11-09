@@ -12,11 +12,30 @@ pub const Header = std.http.Header;
 pub const max_annotations = 32;
 pub const max_depth = 8;
 
+/// Whether every byte is printable ASCII, 0x20..0x7E, as a header value can
+/// hold it unchanged.
+pub fn printable(value: []const u8) bool {
+    for (value) |c| if (c < 0x20 or c > 0x7e) return false;
+    return true;
+}
+
+/// Whether every header can go out as it is: a name of token characters
+/// (RFC 9110 §5.6.2) and a value with no control character but tab (§5.5).
+/// A line break would split the header, and `std.http` asserts on CR LF.
+pub fn sendable(headers: []const Header) bool {
+    for (headers) |h| {
+        if (h.name.len == 0) return false;
+        for (h.name) |c| if (!std.ascii.isAlphanumeric(c) and std.mem.findScalar(u8, "!#$%&'*+-.^_`|~", c) == null) return false;
+        for (h.value) |c| if ((c < 0x20 and c != '\t') or c == 0x7f) return false;
+    }
+    return true;
+}
+
 /// Whether a header value must be sent base64-wrapped: any byte
 /// outside 0x20..0x7E, tab included, a leading or trailing space, or a
 /// value that already looks wrapped.
 pub fn needsEncoding(value: []const u8) bool {
-    for (value) |c| if (c < 0x20 or c > 0x7e) return true;
+    if (!printable(value)) return true;
     if (value.len > 0 and (value[0] == ' ' or value[value.len - 1] == ' ')) return true;
     return std.mem.startsWith(u8, value, "=?base64?") and std.mem.endsWith(u8, value, "?=");
 }
@@ -264,9 +283,7 @@ pub fn validSessionId(value: []const u8) bool {
 /// An event id the client can send back as `Last-Event-ID`: printable ASCII
 /// and at most 1 KiB. A stream with any other id isn't resumable.
 pub fn validEventId(value: []const u8) bool {
-    if (value.len == 0 or value.len > 1024) return false;
-    for (value) |c| if (c < 0x20 or c > 0x7e) return false;
-    return true;
+    return value.len != 0 and value.len <= 1024 and printable(value);
 }
 
 /// The headers every POST carries: `Accept`,
@@ -290,6 +307,16 @@ pub fn requestHeaders(
 }
 
 const testing = std.testing;
+
+test "a header goes out only if HTTP can carry it as it is" {
+    try testing.expect(sendable(&.{ .{ .name = "Authorization", .value = "Bearer abc" }, .{ .name = "X-Team", .value = "a b\tc \xc3\xa9" } }));
+    for ([_][]const u8{ "a\r\nb", "a\nInjected: yes", "a\rb", "a\x00b", "a\x7fb" }) |value| {
+        try testing.expect(!sendable(&.{.{ .name = "X-Team", .value = value }}));
+    }
+    for ([_][]const u8{ "", "X Team", "X:Team", "X\nTeam" }) |name| {
+        try testing.expect(!sendable(&.{.{ .name = name, .value = "v" }}));
+    }
+}
 
 test "2025 requests carry the session, the agreed version, and Last-Event-ID to resume" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);

@@ -1,4 +1,4 @@
-const maxTools = 64;
+const maxPages = 64;
 const maxInstructionsBytes = 64 * 1024;
 
 function contentText(content, mode = "tool") {
@@ -45,10 +45,10 @@ export async function createMcpAdapter(client, options = {}) {
   const cursors = new Set();
   let cursor;
   for (let page = 0; ; page += 1) {
-    if (page >= maxTools) throw new RangeError("MCP tool pagination exceeded its page limit");
+    if (page >= maxPages) throw new RangeError("MCP tool pagination exceeded its page limit");
     const listed = await client.listTools(cursor === undefined ? undefined : { cursor });
     const tools = Array.isArray(listed) ? listed : listed?.tools;
-    if (!Array.isArray(tools) || tools.length > maxTools - catalog.length) throw new TypeError("MCP listTools() returned an invalid tool catalog");
+    if (!Array.isArray(tools)) throw new TypeError("MCP listTools() returned an invalid tool catalog");
     catalog.push(...tools);
     cursor = Array.isArray(listed) ? undefined : listed.nextCursor;
     if (cursor === undefined || cursor === null) break;

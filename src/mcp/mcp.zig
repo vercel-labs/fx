@@ -84,6 +84,7 @@ test {
     _ = engine;
     _ = @import("io/lines.zig");
     _ = @import("io/bell.zig");
+    _ = @import("io/budget.zig");
     _ = core.request;
     _ = core.stdio_conn;
     _ = core.era;

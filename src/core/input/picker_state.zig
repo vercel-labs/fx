@@ -3,7 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("file_picker_path.zig");
 const file_completion_state = @import("file_completion_state.zig");
 const editor_state = @import("editor_state.zig");
-const text_utils = @import("../shared/text_utils.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -48,6 +48,9 @@ const InlinePickerSuppression = union(enum) {
 
 pub const model_picker_speed_options = [_][]const u8{ "normal", "fast", "ultrafast" };
 
+/// The composer text that opens the effort column for the current model.
+pub const effort_prefix = "/effort ";
+
 /// `/login` and `/setup` are aliases of `/provider`: all open the same
 /// columnar picker. Typed text keeps whichever spelling the user wrote;
 /// executing the bare command reseeds the composer with the canonical
@@ -57,10 +60,15 @@ pub const login_prefix = "/login ";
 const setup_prefix = "/setup ";
 pub const provider_picker_prefixes = [_][]const u8{ provider_prefix, login_prefix, setup_prefix };
 
+/// The command a model picker query belongs to. `/effort ` opens the effort
+/// column of `/model` on its own, for the current model.
+pub const ModelPickerCommand = enum { model, effort };
+
 pub const ModelPickerQuery = struct {
     stage: ModelPickerStage,
     query: []const u8,
     token_start: usize,
+    command: ModelPickerCommand = .model,
 };
 
 pub const ProviderPickerQuery = struct {
@@ -291,6 +299,12 @@ pub const State = struct {
         const items = editor.input.items;
         const trim_start = leadingWhitespaceLen(items);
         const trimmed = items[trim_start..];
+        if (trimmed.len >= effort_prefix.len and std.ascii.eqlIgnoreCase(trimmed[0..effort_prefix.len], effort_prefix)) return .{
+            .stage = .effort,
+            .command = .effort,
+            .query = trimmed[effort_prefix.len..],
+            .token_start = trim_start + effort_prefix.len,
+        };
         const prefix = "/model ";
         if (trimmed.len < prefix.len or !std.ascii.eqlIgnoreCase(trimmed[0..prefix.len], prefix)) return null;
 
@@ -431,6 +445,10 @@ pub const State = struct {
                 self.model_completion_index = 0;
                 self.model_completion_window_start = 0;
                 self.model_completion_anchor_current = false;
+                // The `/effort ` column reads the effort highlight with no
+                // `/model` flow open; `/model` sets it again on its effort stage.
+                self.model_picker_effort_index = 0;
+                self.model_picker_effort_window_start = 0;
             },
             .effort => {
                 self.model_picker_effort_index = 0;
@@ -519,12 +537,20 @@ pub fn isBareModelCommandAtCursor(editor: *const editor_state.State) bool {
     return std.ascii.eqlIgnoreCase(trimmed, "/model");
 }
 
+pub fn isBareEffortCommandAtCursor(editor: *const editor_state.State) bool {
+    if (editor.cursor != editor.input.items.len) return false;
+    const trimmed = std.mem.trimStart(u8, editor.input.items, " \t");
+    return std.ascii.eqlIgnoreCase(trimmed, effort_prefix[0 .. effort_prefix.len - 1]);
+}
+
+/// Copies the options `query` keeps into `out`, in order, as every fx menu
+/// filters (`fuzzy_match.Filter`).
 pub fn filterCompletionLabels(query: []const u8, options: []const []const u8, out: [][]const u8) usize {
-    const normalized_query = std.mem.trim(u8, query, " \t");
+    const kept: fuzzy_match.Filter(fuzzy_match.LabelMatches) = .init(.{ .labels = options, .query = query }, options.len);
     var count: usize = 0;
-    for (options) |option| {
+    for (options, 0..) |option, position| {
         if (count >= out.len) break;
-        if (normalized_query.len == 0 or text_utils.containsIgnoreCase(option, normalized_query)) {
+        if (kept.keeps(position)) {
             out[count] = option;
             count += 1;
         }
@@ -540,12 +566,12 @@ pub fn filterAnnotatedLabels(
     annotations: [][]const u8,
     count: usize,
 ) usize {
-    const normalized_query = std.mem.trim(u8, query, " \t");
-    if (normalized_query.len == 0) return count;
-
+    // `init` reads every label before any moves, and the loop only writes
+    // at or below the label it reads next.
+    const keep: fuzzy_match.Filter(fuzzy_match.LabelMatches) = .init(.{ .labels = labels[0..count], .query = query }, count);
     var kept: usize = 0;
     for (0..count) |i| {
-        if (!text_utils.containsIgnoreCase(labels[i], normalized_query)) continue;
+        if (!keep.keeps(i)) continue;
         labels[kept] = labels[i];
         annotations[kept] = annotations[i];
         kept += 1;

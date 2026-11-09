@@ -3,20 +3,17 @@
 //! stream's last event id; and `retry`, the reconnection time. Comments (lines
 //! starting with `:`) and `event` are ignored. 2026 streams can't be
 //! resumed, so only 2025 sessions use `id` and `retry`.
-//! Pure: the caller feeds lines without their line endings (`io/lines.zig`)
-//! and owns the buffer.
+//! Pure: the caller reads each line, without its ending, onto the end of the
+//! event's buffer (`io/lines.zig`), which it owns, so a large event is read
+//! into one buffer once.
 
 const std = @import("std");
 
-pub const Error = error{
-    OutOfMemory,
-    /// An event over the limit ends the stream.
-    EventTooLarge,
-};
+pub const Error = error{OutOfMemory};
 
-/// One dispatched event. Slices are valid until the next call.
+/// One dispatched event. `id` is valid until the next call.
 pub const Event = struct {
-    /// The joined `data` lines; null when the event had none.
+    /// The joined `data` lines, the event's buffer; null when it had none.
     data: ?[]const u8,
     /// The stream's last event id, when this event set it.
     id: ?[]const u8,
@@ -25,58 +22,54 @@ pub const Event = struct {
 };
 
 pub const Parser = struct {
-    data: std.ArrayList(u8) = .empty,
     last_id: std.ArrayList(u8) = .empty,
     has_data: bool = false,
     set_id: bool = false,
     retry_ms: ?u32 = null,
-    /// The last call returned an event, so its fields are cleared on the next.
-    returned: bool = false,
-    max_event: usize,
-
-    pub fn init(max_event: usize) Parser {
-        return .{ .max_event = max_event };
-    }
 
     pub fn deinit(p: *Parser, gpa: std.mem.Allocator) void {
-        p.data.deinit(gpa);
         p.last_id.deinit(gpa);
     }
 
-    /// Feeds one line. When the line ends an event that carried data, an id,
-    /// or a retry, returns it.
-    pub fn line(p: *Parser, gpa: std.mem.Allocator, text: []const u8) Error!?Event {
-        if (p.returned) {
-            p.data.clearRetainingCapacity();
-            p.has_data = false;
-            p.set_id = false;
-            p.retry_ms = null;
-            p.returned = false;
-        }
+    /// Takes the line at the end of `buf`, from `mark`. A data line's value
+    /// stays there, after a LF when data came before, so `buf` holds the
+    /// event's data and nothing else; any other line is read and cut off.
+    /// An empty line ends the event: when it carried data, an id, or a
+    /// retry, returns it, its data `buf`'s items, which the caller then takes
+    /// or clears.
+    pub fn line(p: *Parser, gpa: std.mem.Allocator, buf: *std.ArrayList(u8), mark: usize) Error!?Event {
+        const text = buf.items[mark..];
         if (text.len == 0) {
             if (!p.has_data and !p.set_id and p.retry_ms == null) return null;
-            p.returned = true;
-            return .{
-                .data = if (p.has_data) p.data.items else null,
+            const event: Event = .{
+                .data = if (p.has_data) buf.items else null,
                 .id = if (p.set_id) p.last_id.items else null,
                 .retry_ms = p.retry_ms,
             };
+            p.has_data = false;
+            p.set_id = false;
+            p.retry_ms = null;
+            return event;
         }
-        if (text[0] == ':') return null;
         const colon = std.mem.findScalar(u8, text, ':');
         const field = text[0 .. colon orelse text.len];
-        var value = if (colon) |c| text[c + 1 ..] else "";
-        if (value.len > 0 and value[0] == ' ') value = value[1..];
-        if (std.mem.eql(u8, field, "data")) {
-            const extra = value.len + @intFromBool(p.has_data);
-            if (p.data.items.len + extra > p.max_event) return error.EventTooLarge;
-            if (p.has_data) try p.data.append(gpa, '\n');
-            try p.data.appendSlice(gpa, value);
+        var start = if (colon) |c| c + 1 else text.len;
+        if (start < text.len and text[start] == ' ') start += 1;
+        if (text[0] != ':' and std.mem.eql(u8, field, "data")) {
+            const len = text.len - start;
+            const at = mark + @intFromBool(p.has_data);
+            if (p.has_data) buf.items[mark] = '\n';
+            @memmove(buf.items[at..][0..len], buf.items[mark + start ..][0..len]);
+            buf.shrinkRetainingCapacity(at + len);
             p.has_data = true;
-        } else if (std.mem.eql(u8, field, "id")) {
+            return null;
+        }
+        defer buf.shrinkRetainingCapacity(mark);
+        if (text[0] == ':') return null;
+        const value = text[start..];
+        if (std.mem.eql(u8, field, "id")) {
             // The SSE standard ignores an id containing NUL.
             if (std.mem.findScalar(u8, value, 0) != null) return null;
-            if (value.len > p.max_event) return error.EventTooLarge;
             p.last_id.clearRetainingCapacity();
             try p.last_id.appendSlice(gpa, value);
             p.set_id = true;
@@ -99,13 +92,24 @@ const testing = std.testing;
 
 const Seen = struct { data: ?[]const u8, id: ?[]const u8, retry_ms: ?u32 };
 
+/// Reads each line onto the buffer, as `io/lines.zig` does, and takes each
+/// event's data as the HTTP reader does.
 fn feed(p: *Parser, text: []const u8, out: *std.ArrayList(Seen)) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
     var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |l| if (try p.line(testing.allocator, l)) |e| try out.append(testing.allocator, .{
-        .data = if (e.data) |d| try testing.allocator.dupe(u8, d) else null,
-        .id = if (e.id) |i| try testing.allocator.dupe(u8, i) else null,
-        .retry_ms = e.retry_ms,
-    });
+    while (it.next()) |l| {
+        const mark = buf.items.len;
+        try buf.appendSlice(testing.allocator, l);
+        if (try p.line(testing.allocator, &buf, mark)) |e| {
+            try out.append(testing.allocator, .{
+                .data = if (e.data) |d| try testing.allocator.dupe(u8, d) else null,
+                .id = if (e.id) |i| try testing.allocator.dupe(u8, i) else null,
+                .retry_ms = e.retry_ms,
+            });
+            buf.clearRetainingCapacity();
+        }
+    }
 }
 
 fn freeAll(events: *std.ArrayList(Seen)) void {
@@ -117,7 +121,7 @@ fn freeAll(events: *std.ArrayList(Seen)) void {
 }
 
 test "joins data lines into events and ignores comments and the event field" {
-    var p: Parser = .init(1024);
+    var p: Parser = .{};
     defer p.deinit(testing.allocator);
     var events: std.ArrayList(Seen) = .empty;
     defer freeAll(&events);
@@ -130,7 +134,7 @@ test "joins data lines into events and ignores comments and the event field" {
 }
 
 test "reports ids and retry values, including a priming event" {
-    var p: Parser = .init(1024);
+    var p: Parser = .{};
     defer p.deinit(testing.allocator);
     var events: std.ArrayList(Seen) = .empty;
     defer freeAll(&events);
@@ -149,9 +153,19 @@ test "reports ids and retry values, including a priming event" {
     try testing.expectEqual(@as(?u32, std.math.maxInt(u32)), events.items[3].retry_ms);
 }
 
-test "an event over the limit is an error" {
-    var p: Parser = .init(8);
+test "the buffer keeps only the event's data: comments, ids, and retries are cut off" {
+    var p: Parser = .{};
     defer p.deinit(testing.allocator);
-    try testing.expectEqual(@as(?Event, null), try p.line(testing.allocator, "data: 1234"));
-    try testing.expectError(error.EventTooLarge, p.line(testing.allocator, "data: 5678"));
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    for ([_][]const u8{ "data: ab", ": a comment between data lines", "id: 7", "retry: 10", "data:c", "event: x" }) |l| {
+        const mark = buf.items.len;
+        try buf.appendSlice(testing.allocator, l);
+        try testing.expectEqual(@as(?Event, null), try p.line(testing.allocator, &buf, mark));
+    }
+    try testing.expectEqualStrings("ab\nc", buf.items);
+    const e = (try p.line(testing.allocator, &buf, buf.items.len)).?;
+    try testing.expectEqualStrings("ab\nc", e.data.?);
+    try testing.expectEqualStrings("7", e.id.?);
+    try testing.expectEqual(@as(?u32, 10), e.retry_ms);
 }

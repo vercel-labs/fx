@@ -586,7 +586,7 @@ async function setupScenario(
       ]);
       checkpoint = "cancelled";
       activityKind = "none";
-      contains = "■";
+      contains = "▪";
       trigger = async () => {
         gate.release();
         await session.waitForText("Apply this change?", TIMEOUT_MS);
@@ -594,7 +594,7 @@ async function setupScenario(
       };
       expected = (record) =>
         hasActivityKind(record, "none") &&
-        recordContains(record, "■") &&
+        recordContains(record, "▪") &&
         recordContains(record, "Cancelled");
       break;
     }

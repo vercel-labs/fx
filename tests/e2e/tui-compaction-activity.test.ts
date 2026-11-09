@@ -23,6 +23,12 @@ const FOLLOWUP = "FOLLOWUP_OK_732c";
 const REOPEN = "REOPEN_OK_492a";
 const ACTIVITY = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
 const COMPACTION_OUTPUT = /Compacting|compaction|Context compacted|No context to compact|Synthetic summary rejection|INTERNAL_HANDOFF_4e12/i;
+// Ctrl+O gives each compaction's model call its own line, as for every call;
+// nothing else there may speak of compaction.
+const COMPACTION_CALL_LINE = /^  (?:[A-Z][a-z]{2} \d{1,2} )?\d{2}:\d{2}:\d{2} · [^\n]* \(compaction\)$/gm;
+function withoutCompactionCallLines(full: string): string {
+  return full.replace(COMPACTION_CALL_LINE, "");
+}
 
 type Trigger = "manual" | "auto" | "overflow" | "ordinary";
 type Outcome = "success" | "cancel" | "empty" | "provider-error";
@@ -113,11 +119,11 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   const env = {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
     TERM: "xterm-256color", AI_GATEWAY_API_KEY: "synthetic-compaction-key",
-    FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_SKIP_ONBOARDING: "1",
+    FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1",
     FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
   };
   let sessionId = "";
   let eventsPath = "";
@@ -240,11 +246,11 @@ async function assertSilent(terminal: InstanceType<typeof TmuxSession>, root: st
   expect(inline.length).toBeGreaterThan(0);
   expect(inline).not.toMatch(COMPACTION_OUTPUT);
   await terminal.sendKeys("C-o");
-  await terminal.waitForText("full detail", 5000);
+  await terminal.waitForText("esc close · pgup/pgdn scroll", 5000);
   await terminal.sendKeys("End");
-  const full = await terminal.waitForPane((pane) => pane.includes("full detail"), 5000);
+  const full = await terminal.waitForPane((pane) => pane.includes("esc close · pgup/pgdn scroll"), 5000);
   writeFileSync(join(root, `${label}.full-transcript.txt`), full);
-  expect(full).not.toMatch(COMPACTION_OUTPUT);
+  expect(withoutCompactionCallLines(full)).not.toMatch(COMPACTION_OUTPUT);
   await terminal.sendKeys("C-o");
   await terminal.waitForComposer(5000);
 }
@@ -279,7 +285,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         expect(f.counts().ordinary).toBe(f.seedTurns + (trigger === "overflow" ? 1 : 0));
         if (trigger === "manual") {
           await terminal.sendKeys("C-o");
-          await terminal.waitForText("full detail", 5000);
+          await terminal.waitForText("esc close · pgup/pgdn scroll", 5000);
           expect(await terminal.capturePane()).not.toMatch(COMPACTION_OUTPUT);
           await terminal.sendKeys("C-o");
           await terminal.waitForText(ACTIVITY, 5000);
@@ -491,12 +497,12 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
 
         const reopened = await f.launch();
         await reopened.sendKeys("C-o");
-        await reopened.waitForText("full detail", 5000);
+        await reopened.waitForText("esc close · pgup/pgdn scroll", 5000);
         await reopened.sendKeys("End");
         const full = await reopened.waitForPane((pane) => pane.includes("Cancel this held response."), 5000);
         writeFileSync(join(f.root, "cancellation-reopened.txt"), full);
         expect(full.includes("Cancelled")).toBe(trigger === "ordinary");
-        expect(full).not.toMatch(COMPACTION_OUTPUT);
+        expect(withoutCompactionCallLines(full)).not.toMatch(COMPACTION_OUTPUT);
         await reopened.sendKeys("C-o");
         await reopened.waitForComposer(5000);
         expect(await reopened.captureFullScrollbackEscapes()).not.toMatch(COMPACTION_OUTPUT);
@@ -568,9 +574,9 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       const authMessage = "fx needs access to Vercel AI Gateway";
       async function authNotices(label: string) {
         await terminal.sendKeys("C-o");
-        await terminal.waitForText("full detail", 5000);
+        await terminal.waitForText("esc close · pgup/pgdn scroll", 5000);
         await terminal.sendKeys("End");
-        const pane = await terminal.waitForPane((text) => text.includes("full detail") && text.includes(authMessage), 5000);
+        const pane = await terminal.waitForPane((text) => text.includes("esc close · pgup/pgdn scroll") && text.includes(authMessage), 5000);
         writeFileSync(join(f.root, `${label}.txt`), pane);
         await terminal.sendKeys("C-o");
         await terminal.waitForComposer(5000);
@@ -649,11 +655,11 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     const env: Record<string, string> = {
       PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
       TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
-      FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
       FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_PERMISSION_MODE: "full-access",
       FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
-      FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     };
     const command = `/usr/bin/env -i ${Object.entries(env)
       .map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)}`;

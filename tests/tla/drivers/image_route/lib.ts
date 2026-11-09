@@ -18,12 +18,13 @@ export const PINNED_TLC_VERSION = "TLC2 Version 2.19 of 08 August 2024 (rev: 5a4
 export type View = { kind: "listed" | "missing" | "down"; vision: boolean; file_input: boolean };
 export type Request = {
   user_images: boolean;
+  earlier_images: boolean;
   pending_images: boolean;
   tool_images: boolean;
   fallback: boolean;
   catalog_down: boolean;
 };
-export type Effect = { kind: string; route?: string; mode?: string; tool_images?: string; reason?: string };
+export type Effect = { kind: string; route?: string; mode?: string; tool_images?: string; earlier_images?: string; reason?: string };
 export type CoreState = { support: string; resolved: boolean; notified: boolean; pending: Request[] };
 export type Shown = CoreState & { out: Effect[] };
 export type Act =

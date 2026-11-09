@@ -1,11 +1,9 @@
 const std = @import("std");
 const testing_allocator = @import("../../shared/testing_allocator.zig");
-const catalog_freshness = @import("../catalog_freshness.zig");
 const json_number = @import("../json_number.zig");
 const mcp_contract = @import("../mcp_contract.zig");
 const mrtr = @import("../mrtr.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
-const sort_utils = @import("../../shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -23,6 +21,9 @@ pub const Limits = struct {
     max_metadata_bytes: usize = 128 * 1024,
     max_content_items: usize = 256,
     max_content_field_bytes: usize = 1024 * 1024,
+    /// A text item, or a resource's text, may be as large as the whole
+    /// result: fx stores or cuts a big result itself.
+    max_content_text_bytes: usize = @import("../../images/image_data.zig").max_result_frame_bytes,
     max_image_bytes: usize = @import("../../images/image_data.zig").max_encoded_image_bytes,
     max_input_requests: usize = 32,
     max_request_state_bytes: usize = 64 * 1024,
@@ -52,8 +53,6 @@ pub const Error = error{
     MetadataLimitExceeded,
 } || mrtr.Error || Allocator.Error || std.Io.Writer.Error;
 
-pub const CacheScope = enum { private, public };
-
 pub const Tool = struct {
     name: []u8,
     title: ?[]u8 = null,
@@ -74,146 +73,6 @@ pub const Tool = struct {
         if (self.annotations_json) |value| alloc.free(value);
         if (self.metadata_json) |value| alloc.free(value);
         self.* = undefined;
-    }
-};
-
-pub const Page = struct {
-    tools: []Tool,
-    next_cursor: ?[]u8 = null,
-    ttl_ms: u64 = 0,
-    ttl_present: bool = false,
-    cache_scope: CacheScope = .private,
-
-    pub fn deinit(self: *Page, alloc: Allocator) void {
-        for (self.tools) |*tool| tool.deinit(alloc);
-        alloc.free(self.tools);
-        if (self.next_cursor) |cursor| alloc.free(cursor);
-        self.* = undefined;
-    }
-};
-
-pub const Catalog = struct {
-    tools: []Tool,
-    fetched_at_ms: u64,
-    expires_at_ms: u64,
-    cache_scope: CacheScope,
-
-    pub fn deinit(self: *Catalog, alloc: Allocator) void {
-        for (self.tools) |*tool| tool.deinit(alloc);
-        alloc.free(self.tools);
-        self.* = undefined;
-    }
-};
-
-pub const CatalogBuilder = struct {
-    tools: std.ArrayList(Tool) = .empty,
-    cursors: std.StringHashMap(void),
-    /// Borrows a key owned by cursors, independent of the parsed page lifetime.
-    next_cursor: ?[]const u8 = null,
-    protocol: Protocol,
-    pages: usize = 0,
-    first_received_at_ms: ?u64 = null,
-    expires_at_ms: ?u64 = null,
-    cache_scope: ?CacheScope = null,
-
-    pub fn init(alloc: Allocator, protocol: Protocol) CatalogBuilder {
-        return .{
-            .cursors = std.StringHashMap(void).init(alloc),
-            .protocol = protocol,
-        };
-    }
-
-    pub fn deinit(self: *CatalogBuilder, alloc: Allocator) void {
-        for (self.tools.items) |*tool| tool.deinit(alloc);
-        self.tools.deinit(alloc);
-        var iterator = self.cursors.keyIterator();
-        while (iterator.next()) |cursor| alloc.free(cursor.*);
-        self.cursors.deinit();
-        self.* = undefined;
-    }
-
-    /// Decodes one response and owns its continuation until the next page.
-    pub fn appendResponse(self: *CatalogBuilder, alloc: Allocator, response: []const u8, received_at_ms: u64, limits: Limits) Error!bool {
-        var page = try parseListPage(alloc, response, self.protocol, limits);
-        defer page.deinit(alloc);
-        try self.appendPage(alloc, &page, received_at_ms, limits);
-        return self.next_cursor == null;
-    }
-
-    /// Consumes the page's tools and cursor on successful append.
-    pub fn appendPage(
-        self: *CatalogBuilder,
-        alloc: Allocator,
-        page: *Page,
-        received_at_ms: u64,
-        limits: Limits,
-    ) Error!void {
-        self.pages = std.math.add(usize, self.pages, 1) catch
-            return error.PaginationLimitExceeded;
-        if (self.pages > limits.max_pages) return error.PaginationLimitExceeded;
-        const total = std.math.add(usize, self.tools.items.len, page.tools.len) catch
-            return error.ToolLimitExceeded;
-        if (total > limits.max_tools) return error.ToolLimitExceeded;
-
-        if (page.next_cursor) |cursor| {
-            if (self.cursors.contains(cursor)) return error.DuplicateCursor;
-        }
-        if (self.cache_scope) |scope| {
-            if (scope != page.cache_scope) return error.InconsistentCacheScope;
-        } else {
-            self.cache_scope = page.cache_scope;
-        }
-        if (self.first_received_at_ms == null) {
-            self.first_received_at_ms = received_at_ms;
-        }
-        const page_expiry_ms = catalog_freshness.pageExpiry(
-            switch (self.protocol) {
-                .legacy => .legacy,
-                .modern => .modern,
-            },
-            received_at_ms,
-            page.ttl_present,
-            page.ttl_ms,
-        );
-        self.expires_at_ms = catalog_freshness.earliestExpiry(
-            self.expires_at_ms,
-            page_expiry_ms,
-        );
-        for (page.tools, 0..) |tool, index| {
-            for (self.tools.items) |existing| {
-                if (std.mem.eql(u8, existing.name, tool.name)) return error.DuplicateTool;
-            }
-            for (page.tools[0..index]) |previous| {
-                if (std.mem.eql(u8, previous.name, tool.name)) return error.DuplicateTool;
-            }
-        }
-
-        try self.tools.ensureUnusedCapacity(alloc, page.tools.len);
-        for (page.tools) |*tool| {
-            self.tools.appendAssumeCapacity(tool.*);
-            tool.* = undefined;
-        }
-        alloc.free(page.tools);
-        page.tools = &.{};
-
-        if (page.next_cursor) |cursor| {
-            try self.cursors.put(cursor, {});
-            self.next_cursor = cursor;
-            page.next_cursor = null;
-        } else self.next_cursor = null;
-    }
-
-    /// Returns one complete owned catalog sorted by protocol name. Cache expiry
-    /// is the earliest absolute expiry across every validated page.
-    pub fn finish(self: *CatalogBuilder, alloc: Allocator) Error!Catalog {
-        if (self.pages == 0) return error.InvalidListResult;
-        sort_utils.sort(Tool, self.tools.items, {}, lessThanTool);
-        return .{
-            .tools = try self.tools.toOwnedSlice(alloc),
-            .fetched_at_ms = self.first_received_at_ms.?,
-            .expires_at_ms = self.expires_at_ms.?,
-            .cache_scope = self.cache_scope orelse .private,
-        };
     }
 };
 
@@ -256,69 +115,6 @@ pub const CallOutcome = union(enum) {
         self.* = undefined;
     }
 };
-
-pub fn parseListPage(
-    alloc: Allocator,
-    response: []const u8,
-    protocol: Protocol,
-    limits: Limits,
-) Error!Page {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, response, .{
-        .parse_numbers = false,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidEnvelope,
-    };
-    defer parsed.deinit();
-    mcp_contract.validateJsonRpcResponseEnvelope(parsed.value) catch
-        return error.InvalidEnvelope;
-    if (parsed.value.object.get("error") != null) return error.ProtocolFailure;
-    const result = parsed.value.object.get("result") orelse return error.InvalidListResult;
-    if (result != .object) return error.InvalidListResult;
-    try requireCompleteResult(result, protocol);
-    const tools_value = result.object.get("tools") orelse return error.InvalidListResult;
-    if (tools_value != .array or tools_value.array.items.len > limits.max_tools) {
-        return error.InvalidListResult;
-    }
-
-    const tools = try alloc.alloc(Tool, tools_value.array.items.len);
-    var parsed_count: usize = 0;
-    errdefer {
-        for (tools[0..parsed_count]) |*tool| tool.deinit(alloc);
-        alloc.free(tools);
-    }
-    for (tools_value.array.items, 0..) |value, index| {
-        tools[index] = try parseTool(alloc, value, limits);
-        parsed_count += 1;
-    }
-
-    var next_cursor: ?[]u8 = null;
-    errdefer if (next_cursor) |value| mem_utils.free(alloc, value);
-    if (result.object.get("nextCursor")) |cursor| {
-        if (cursor != .string or cursor.string.len > limits.max_cursor_bytes) {
-            return error.InvalidListResult;
-        }
-        next_cursor = try alloc.dupe(u8, cursor.string);
-    }
-    const ttl_value = result.object.get("ttlMs");
-    const ttl_ms = if (ttl_value) |value|
-        ttlMilliseconds(alloc, value) orelse return error.InvalidListResult
-    else
-        0;
-    const cache_scope: CacheScope = if (result.object.get("cacheScope")) |value| blk: {
-        if (value != .string) return error.InvalidListResult;
-        if (std.mem.eql(u8, value.string, "public")) break :blk .public;
-        if (std.mem.eql(u8, value.string, "private")) break :blk .private;
-        return error.InvalidListResult;
-    } else .private;
-    return .{
-        .tools = tools,
-        .next_cursor = next_cursor,
-        .ttl_ms = ttl_ms,
-        .ttl_present = ttl_value != null,
-        .cache_scope = cache_scope,
-    };
-}
 
 pub fn parseCallOutcome(
     alloc: Allocator,
@@ -418,33 +214,6 @@ fn prepareSchema(schema: std.json.Value, object_root: bool) Error!void {
     }
     var remaining: usize = 4096;
     try checkValueBounds(schema, 0, &remaining);
-}
-
-pub fn buildListRequest(
-    alloc: Allocator,
-    request_id: u64,
-    protocol: Protocol,
-    cursor: ?[]const u8,
-    write_modern_metadata: *const fn (*std.Io.Writer) anyerror!void,
-) ![]u8 {
-    var output: std.Io.Writer.Allocating = .init(alloc);
-    defer output.deinit();
-    try output.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-    try output.writer.print("{d}", .{request_id});
-    try output.writer.writeAll(",\"method\":\"tools/list\",\"params\":{");
-    var wrote_param = false;
-    if (protocol == .modern) {
-        try output.writer.writeAll("\"_meta\":");
-        try write_modern_metadata(&output.writer);
-        wrote_param = true;
-    }
-    if (cursor) |value| {
-        if (wrote_param) try output.writer.writeByte(',');
-        try output.writer.writeAll("\"cursor\":");
-        try std.json.Stringify.value(value, .{}, &output.writer);
-    }
-    try output.writer.writeAll("}}");
-    return try output.toOwnedSlice();
 }
 
 /// Parses one tool object from a `tools/list` result, with the same checks a
@@ -553,7 +322,7 @@ fn validateContentItem(alloc: Allocator, value: std.json.Value, limits: Limits) 
         _ = try boundedJsonLength(metadata, limits.max_metadata_bytes);
     }
     if (std.mem.eql(u8, type_value.string, "text")) {
-        _ = try requireBoundedString(value.object, "text", limits.max_content_field_bytes);
+        _ = try requireBoundedString(value.object, "text", limits.max_content_text_bytes);
         return;
     }
     if (std.mem.eql(u8, type_value.string, "image") or std.mem.eql(u8, type_value.string, "audio")) {
@@ -606,7 +375,7 @@ fn validateEmbeddedResource(alloc: Allocator, value: std.json.Value, limits: Lim
     const blob = value.object.get("blob");
     if ((text == null) == (blob == null)) return error.InvalidContent;
     if (text) |content| {
-        if (content != .string or content.string.len > limits.max_content_field_bytes) {
+        if (content != .string or content.string.len > limits.max_content_text_bytes) {
             return error.InvalidContent;
         }
     }
@@ -669,15 +438,6 @@ fn validateAnnotations(value: std.json.Value, limits: Limits) Error!void {
     _ = try boundedJsonLength(value, limits.max_metadata_bytes);
 }
 
-fn requireCompleteResult(result: std.json.Value, protocol: Protocol) Error!void {
-    _ = protocol;
-    if (result.object.get("resultType")) |value| {
-        if (value != .string or !std.mem.eql(u8, value.string, "complete")) {
-            return error.UnsupportedResultType;
-        }
-    }
-}
-
 fn requireBoundedString(object: std.json.ObjectMap, name: []const u8, max_bytes: usize) Error![]const u8 {
     const value = object.get(name) orelse return error.InvalidContent;
     if (value != .string or value.string.len > max_bytes) return error.InvalidContent;
@@ -724,16 +484,6 @@ fn nonNegativeU64(alloc: Allocator, value: std.json.Value) ?u64 {
     return std.math.cast(u64, result);
 }
 
-fn ttlMilliseconds(alloc: Allocator, value: std.json.Value) ?u64 {
-    const parsed = json_number.fromValue(alloc, value, .{}) catch return null;
-    if (parsed == null) return null;
-    var number = parsed.?;
-    defer number.deinit(alloc);
-    if (number.negative) return 0;
-    const result = number.toNonNegativeUsize() orelse return null;
-    return std.math.cast(u64, result);
-}
-
 fn jsonNumber(value: std.json.Value) ?f64 {
     return switch (value) {
         .integer => |number| @floatFromInt(number),
@@ -743,58 +493,24 @@ fn jsonNumber(value: std.json.Value) ?f64 {
     };
 }
 
-fn lessThanTool(_: void, left: Tool, right: Tool) bool {
-    return std.mem.order(u8, left.name, right.name) == .lt;
-}
-
-fn noopMetadata(_: *std.Io.Writer) anyerror!void {}
-
 fn checkToolParsingAllocationFailures(alloc: Allocator) !void {
-    var page = try parseListPage(
+    var tool = try parseToolJson(
         alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","title":"Echo","description":"Echo input","icons":[{"src":"data:image/png;base64,AA=="}],"annotations":{"readOnlyHint":true},"inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]},"outputSchema":{"type":"object"},"_meta":{"vendor":"test"}}]}}
+        \\{"name":"echo","title":"Echo","description":"Echo input","icons":[{"src":"data:image/png;base64,AA=="}],"annotations":{"readOnlyHint":true},"inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]},"outputSchema":{"type":"object"},"_meta":{"vendor":"test"}}
     ,
-        .modern,
         .{},
     );
-    defer page.deinit(alloc);
+    defer tool.deinit(alloc);
     var outcome = try parseCallOutcome(
         alloc,
         \\{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"image","data":"AA==","mimeType":"image/png"}],"structuredContent":{}}}
     ,
         .modern,
-        page.tools[0].output_schema_json,
+        tool.output_schema_json,
         64 * 1024,
         .{},
     );
     defer outcome.deinit(alloc);
-}
-
-fn fuzzListPageParser(_: void, smith: *std.testing.Smith) !void {
-    var input_buffer: [4096]u8 = undefined;
-    const input_len = std.math.cast(usize, smith.slice(&input_buffer)) orelse return;
-    if (parseListPage(
-        std.testing.allocator,
-        input_buffer[0..input_len],
-        .modern,
-        .{},
-    )) |page_value| {
-        var page = page_value;
-        page.deinit(std.testing.allocator);
-    } else |_| {}
-}
-
-test "tools list parser handles fuzzed cache and cursor input" {
-    try std.testing.fuzz({}, fuzzListPageParser, .{
-        .corpus = &.{
-            "",
-            "{}",
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":-1}}",
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"tools\":[],\"nextCursor\":\"\"}}",
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":\"bad\"}}",
-            "\xff\x00{}",
-        },
-    });
 }
 
 test "tool protocol parsing releases every allocation failure path" {
@@ -803,167 +519,6 @@ test "tool protocol parsing releases every allocation failure path" {
         checkToolParsingAllocationFailures,
         .{},
     );
-}
-
-test "tools list pages preserve complete metadata validate schemas and sort deterministically" {
-    const alloc = std.testing.allocator;
-    var first = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","nextCursor":"p2","ttlMs":10,"cacheScope":"private","tools":[{"name":"zeta","title":"Zeta","description":"z","icons":[{"src":"data:image/png;base64,AA==","mimeType":"image/png","sizes":["16x16"],"theme":"dark"}],"annotations":{"readOnlyHint":true},"inputSchema":{"type":"object"},"outputSchema":{"type":"array","items":{"type":"integer"}},"_meta":{"vendor":"x"}}]}}
-    ,
-        .modern,
-        .{},
-    );
-    defer first.deinit(alloc);
-    var second = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"alpha","inputSchema":{"type":"object","properties":{"n":{"type":"integer"}}}}]}}
-    ,
-        .modern,
-        .{},
-    );
-    defer second.deinit(alloc);
-    var builder = CatalogBuilder.init(alloc, .modern);
-    defer builder.deinit(alloc);
-    try builder.appendPage(alloc, &first, 1_000, .{});
-    try builder.appendPage(alloc, &second, 1_050, .{});
-    var catalog = try builder.finish(alloc);
-    defer catalog.deinit(alloc);
-    try std.testing.expectEqualStrings("alpha", catalog.tools[0].name);
-    try std.testing.expectEqualStrings("zeta", catalog.tools[1].name);
-    try std.testing.expectEqualStrings("Zeta", catalog.tools[1].title.?);
-    try std.testing.expect(catalog.tools[1].icons_json != null);
-    try std.testing.expect(catalog.tools[1].annotations_json != null);
-    try std.testing.expect(catalog.tools[1].output_schema_json != null);
-    try std.testing.expect(catalog.tools[1].metadata_json != null);
-    try std.testing.expectEqual(@as(u64, 1_000), catalog.fetched_at_ms);
-    try std.testing.expectEqual(@as(u64, 1_010), catalog.expires_at_ms);
-    try std.testing.expectEqual(CacheScope.private, catalog.cache_scope);
-}
-
-test "tools list retains schemas delegated to the MCP server" {
-    const alloc = std.testing.allocator;
-    var page = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"simple","inputSchema":{"type":"object"}},{"name":"provider_pattern","inputSchema":{"type":"object","properties":{"email":{"type":"string","pattern":"^(?!\\.)(?!.*\\.\\.)[A-Za-z0-9_+.-]+@[A-Za-z0-9.-]+$"}}}}]}}
-    ,
-        .modern,
-        .{},
-    );
-    defer page.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 2), page.tools.len);
-    try std.testing.expectEqualStrings("simple", page.tools[0].name);
-    try std.testing.expectEqualStrings("provider_pattern", page.tools[1].name);
-    try std.testing.expect(
-        std.mem.find(u8, page.tools[1].input_schema_json, "^(?!\\\\.)") != null,
-    );
-}
-
-test "tools list tolerates negative TTL and accepts an empty opaque cursor" {
-    const alloc = std.testing.allocator;
-    var page = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","nextCursor":"","ttlMs":-25,"cacheScope":"public","tools":[]}}
-    ,
-        .modern,
-        .{},
-    );
-    defer page.deinit(alloc);
-    try std.testing.expectEqualStrings("", page.next_cursor.?);
-    try std.testing.expect(page.ttl_present);
-    try std.testing.expectEqual(@as(u64, 0), page.ttl_ms);
-
-    var builder = CatalogBuilder.init(alloc, .modern);
-    defer builder.deinit(alloc);
-    try builder.appendPage(alloc, &page, 1_000, .{});
-    try std.testing.expectEqualStrings("", builder.next_cursor.?);
-    var catalog = try builder.finish(alloc);
-    defer catalog.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 1_000), catalog.expires_at_ms);
-}
-
-test "catalog response assembly retains its cursor after parsed page cleanup" {
-    const alloc = std.testing.allocator;
-    var builder = CatalogBuilder.init(alloc, .legacy);
-    defer builder.deinit(alloc);
-    try std.testing.expect(!try builder.appendResponse(alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"second","inputSchema":{"type":"object"}}],"nextCursor":"page two"}}
-    , 100, .{}));
-    try std.testing.expectEqualStrings("page two", builder.next_cursor.?);
-    try std.testing.expect(try builder.appendResponse(alloc,
-        \\{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"first","inputSchema":{"type":"object"}}]}}
-    , 110, .{}));
-    var catalog = try builder.finish(alloc);
-    defer catalog.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), catalog.tools.len);
-    try std.testing.expectEqualStrings("first", catalog.tools[0].name);
-    try std.testing.expectEqualStrings("second", catalog.tools[1].name);
-}
-
-test "tools catalog rejects cache scope changes across pages" {
-    const alloc = std.testing.allocator;
-    var first = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"ttlMs":100,"cacheScope":"private","tools":[]}}
-    ,
-        .modern,
-        .{},
-    );
-    defer first.deinit(alloc);
-    var second = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":2,"result":{"ttlMs":100,"cacheScope":"public","tools":[]}}
-    ,
-        .modern,
-        .{},
-    );
-    defer second.deinit(alloc);
-    var builder = CatalogBuilder.init(alloc, .modern);
-    defer builder.deinit(alloc);
-    try builder.appendPage(alloc, &first, 100, .{});
-    try std.testing.expectError(
-        error.InconsistentCacheScope,
-        builder.appendPage(alloc, &second, 101, .{}),
-    );
-}
-
-test "tools list rejects repeated cursors and duplicate tools while retaining schema references" {
-    const alloc = std.testing.allocator;
-    var page = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[],"nextCursor":"repeat"}}
-    ,
-        .legacy,
-        .{},
-    );
-    defer page.deinit(alloc);
-    var builder = CatalogBuilder.init(alloc, .legacy);
-    defer builder.deinit(alloc);
-    try builder.appendPage(alloc, &page, 100, .{});
-    var repeated = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":2,"result":{"tools":[],"nextCursor":"repeat"}}
-    ,
-        .legacy,
-        .{},
-    );
-    defer repeated.deinit(alloc);
-    try std.testing.expectError(error.DuplicateCursor, builder.appendPage(alloc, &repeated, 101, .{}));
-    var duplicates = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"same","inputSchema":{"type":"object"}},{"name":"same","inputSchema":{"type":"object"}}]}}
-    ,
-        .legacy,
-        .{},
-    );
-    defer duplicates.deinit(alloc);
-    try std.testing.expectError(error.DuplicateTool, builder.appendPage(alloc, &duplicates, 102, .{}));
-    var references = try parseListPage(alloc,
-        \\{"jsonrpc":"2.0","id":4,"result":{"tools":[{"name":"remote","inputSchema":{"type":"object","properties":{"x":{"$ref":"https://example.com/x"}}}}]}}
-    , .legacy, .{});
-    defer references.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, references.tools[0].input_schema_json, "https://example.com/x") != null);
 }
 
 test "MCP tool call results preserve content types errors and server output" {
@@ -1095,12 +650,27 @@ test "tool call outcomes distinguish protocol tool and MRTR results" {
     );
 }
 
-test "tools list request carries pagination cursor after modern metadata" {
+test "a text item may be as large as the whole result, and other fields keep their limit" {
     const alloc = std.testing.allocator;
-    const request = try buildListRequest(alloc, 7, .legacy, "next", noopMetadata);
-    defer alloc.free(request);
-    try std.testing.expectEqualStrings(
-        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\",\"params\":{\"cursor\":\"next\"}}",
-        request,
-    );
+    const limits: Limits = .{};
+    const big = try alloc.alloc(u8, 1536 * 1024);
+    defer alloc.free(big);
+    @memset(big, 'a');
+    const text = try alloc.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}}}", .{big});
+    defer alloc.free(text);
+    var outcome = try parseCallOutcome(alloc, text, .modern, null, limits.max_content_text_bytes, limits);
+    outcome.deinit(alloc);
+    const resource = try alloc.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"resource\",\"resource\":{{\"uri\":\"file:///big.txt\",\"text\":\"{s}\"}}}}]}}}}", .{big});
+    defer alloc.free(resource);
+    outcome = try parseCallOutcome(alloc, resource, .modern, null, limits.max_content_text_bytes, limits);
+    outcome.deinit(alloc);
+    const link = try alloc.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"resource_link\",\"uri\":\"{s}\",\"name\":\"n\"}}]}}}}", .{big});
+    defer alloc.free(link);
+    try std.testing.expectError(error.InvalidContent, parseCallOutcome(alloc, link, .modern, null, limits.max_content_text_bytes, limits));
+    const huge = try alloc.alloc(u8, limits.max_content_text_bytes + 1);
+    defer alloc.free(huge);
+    @memset(huge, 'a');
+    const over = try alloc.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}}}", .{huge});
+    defer alloc.free(over);
+    try std.testing.expectError(error.InvalidContent, parseCallOutcome(alloc, over, .modern, null, limits.max_content_text_bytes, limits));
 }

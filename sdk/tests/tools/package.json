@@ -1,0 +1,12 @@
+{
+  "name": "libfx-test-tools",
+  "private": true,
+  "description": "Bundlers and package checks the libfx package tests run",
+  "type": "module",
+  "devDependencies": {
+    "@arethetypeswrong/cli": "0.18.5",
+    "esbuild": "0.28.2",
+    "publint": "0.3.25",
+    "vite": "8.3.5"
+  }
+}

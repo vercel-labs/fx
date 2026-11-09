@@ -60,6 +60,8 @@ pub const Event = union(enum) {
     answered: Id,
     /// The stream broke before the answer.
     broke: Id,
+    /// The answer was over the message limit (LHTTP-11).
+    too_large: Id,
     /// A status without a JSON-RPC answer, other than a session 404.
     refused: Id,
     /// A 404 to a POST or resume that carried a session id.
@@ -237,6 +239,13 @@ pub const Session = struct {
                     out.push(.{ .arm_resume = .{ .id = id, .after_ms = r.retry_ms orelse s.config.default_retry_ms } });
                 } else s.end(r, .lost, out);
                 s.record("break", id, s.phase, out);
+            },
+            // Resuming would only bring the same answer: lost at once.
+            .too_large => |id| {
+                const r = s.find(id) orelse return error.UnknownRequest;
+                if (r.state != .posted and r.state != .resuming) return s.ignore("too_large", id, out);
+                s.end(r, .lost, out);
+                s.record("too_large", id, s.phase, out);
             },
             .refused => |id| {
                 const r = s.find(id) orelse return error.UnknownRequest;
@@ -526,6 +535,7 @@ fn candidates(s: *Session, w: *const World, ids: []const Id, buf: []Event) []Eve
                 if (w.events < 3) add(buf, &n, .{ .event_seen = .{ .id = id, .has_id = true, .retry_ms = 5 } });
                 add(buf, &n, .{ .answered = id });
                 add(buf, &n, .{ .broke = id });
+                add(buf, &n, .{ .too_large = id });
                 add(buf, &n, .{ .refused = id });
                 if (r.session != 0 and w.server_ended[r.session]) add(buf, &n, .{ .expired = id });
             },
@@ -625,6 +635,18 @@ test "a broken stream resumes after its event id and retry, and is lost without 
     try testing.expectEqualSlices(Effect, &.{.{ .get_resume = 1 }}, out.effects());
     // A `retry` without an id is no event id: the stream is lost, not re-POSTed.
     out = try steps(&s, &.{ .{ .event_seen = .{ .id = 2, .has_id = false, .retry_ms = 10 } }, .{ .broke = 2 } });
+    try testing.expectEqualSlices(Effect, &.{.{ .deliver = .{ .id = 2, .outcome = .lost } }}, out.effects());
+}
+
+test "an answer over the message limit is lost at once, even on a stream that could resume" {
+    var slots: [2]Request = undefined;
+    var s: Session = .init(&slots, .{ .listen = false });
+    _ = try steps(&s, &.{ .start, .{ .initialize_answered = .{ .session = true } }, .{ .send = 1 }, .{ .send = 2 } });
+    var out = try steps(&s, &.{ .{ .event_seen = .{ .id = 1, .has_id = true, .retry_ms = 500 } }, .{ .too_large = 1 } });
+    try testing.expectEqualSlices(Effect, &.{.{ .deliver = .{ .id = 1, .outcome = .lost } }}, out.effects());
+    // On a resumed stream too.
+    _ = try steps(&s, &.{ .{ .event_seen = .{ .id = 2, .has_id = true, .retry_ms = 5 } }, .{ .broke = 2 }, .{ .resume_due = 2 } });
+    out = try steps(&s, &.{.{ .too_large = 2 }});
     try testing.expectEqualSlices(Effect, &.{.{ .deliver = .{ .id = 2, .outcome = .lost } }}, out.effects());
 }
 

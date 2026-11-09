@@ -6,6 +6,7 @@
 //! TLA+ model: `tests/tla/mcp_host/HostLifecycle.tla`.
 
 const std = @import("std");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const runtime = @import("runtime.zig");
 
@@ -39,6 +40,12 @@ pub const Choice = enum {
             .remove, .approve, .reject => true,
             .login, .logout => false,
         };
+    }
+
+    /// Remove and Reject ask on the choice's own row, with yes and no. An
+    /// approval keeps its own screen: it shows everything it trusts.
+    pub fn asksOnRow(c: Choice) bool {
+        return c == .remove or c == .reject;
     }
 };
 
@@ -76,10 +83,16 @@ pub fn choices(row: Row, out: *[max_choices]Choice) []const Choice {
     return out[0..n];
 }
 
-/// Case-insensitive, like fx's other pickers; an empty filter keeps everything.
-pub fn matches(name: []const u8, filter: []const u8) bool {
-    return filter.len == 0 or std.ascii.findIgnoreCase(name, filter) != null;
-}
+/// Servers match by name, as fx's other menus match, and the list keeps its
+/// own order (`fuzzy_match.Filter`); an empty filter keeps everything.
+const ServerMatches = struct {
+    rows: []const Row,
+    filter: []const u8,
+
+    pub fn matchAt(self: ServerMatches, position: usize) ?fuzzy_match.Match {
+        return fuzzy_match.match(self.filter, &.{.{ .text = self.rows[position].status.name }});
+    }
+};
 
 /// What the menu knows of the open server's tools.
 pub const Tools = union(enum) {
@@ -92,10 +105,20 @@ pub const Tools = union(enum) {
 
 pub const Tool = struct { name: []const u8, description: []const u8 };
 
-/// A tool matches by its name or by what it says it does, so a terse name is
-/// still found.
-pub fn toolMatches(t: Tool, filter: []const u8) bool {
-    return matches(t.name, filter) or matches(t.description, filter);
+/// A tool matches by its name or by the words of what it says it does, so a
+/// terse name is still found.
+const ToolMatches = struct {
+    tools: []const Tool,
+    filter: []const u8,
+
+    pub fn matchAt(self: ToolMatches, position: usize) ?fuzzy_match.Match {
+        const t = self.tools[position];
+        return fuzzy_match.match(self.filter, &.{ .{ .text = t.name }, .{ .text = t.description, .kind = .text } });
+    }
+};
+
+fn toolFilter(tools: []const Tool, filter: []const u8) fuzzy_match.Filter(ToolMatches) {
+    return .init(.{ .tools = tools, .filter = filter }, tools.len);
 }
 
 /// How many tools `filter` keeps.
@@ -104,20 +127,12 @@ pub fn toolCount(tools: Tools, filter: []const u8) usize {
         .ready => |t| t,
         else => return 0,
     };
-    var n: usize = 0;
-    for (all) |t| n += @intFromBool(toolMatches(t, filter));
-    return n;
+    return toolFilter(all, filter).count();
 }
 
 /// The `n`th tool `filter` keeps.
 pub fn nthTool(tools: []const Tool, filter: []const u8, n: usize) ?Tool {
-    var seen: usize = 0;
-    for (tools) |t| {
-        if (!toolMatches(t, filter)) continue;
-        if (seen == n) return t;
-        seen += 1;
-    }
-    return null;
+    return tools[toolFilter(tools, filter).at(n) orelse return null];
 }
 
 /// A server's screen below its title: its facts and a blank, its choices,
@@ -147,10 +162,10 @@ pub const Layout = struct {
         return if (cursor < l.choices) l.lead + cursor else l.lead + l.choices + l.gap + l.waiting + (cursor - l.choices);
     }
 
-    /// Content lines shown; when everything doesn't fit, two rows go to the
-    /// counts of what's above and below.
+    /// Content lines shown; when everything doesn't fit, a row goes to the
+    /// count of what's below.
     pub fn shown(l: Layout) usize {
-        return if (l.lines() <= l.window) l.lines() else @max(l.window -| 2, 1);
+        return if (l.lines() <= l.window) l.lines() else @max(l.window -| 1, 1);
     }
 };
 
@@ -173,8 +188,9 @@ pub fn toolsFor(row: Row, tools: Tools) Tools {
 pub fn serverLayout(row: Row, tools: Tools, filter: []const u8, window: usize) Layout {
     var buf: [max_choices]Choice = undefined;
     return .{
-        // http or runs, file, and error when there is one; then a blank.
-        .lead = 2 + @as(usize, @intFromBool(showsError(row))) + 1,
+        // http or runs, file, status, protocol when known, and error when
+        // there is one; then a blank.
+        .lead = 3 + @as(usize, @intFromBool(row.status.version != null)) + @intFromBool(showsError(row)) + 1,
         .choices = choices(row, &buf).len,
         // A blank, then the heading or the reason there are no tools.
         .gap = 2,
@@ -195,6 +211,8 @@ pub const State = struct {
     cursor: usize = 0,
     top: usize = 0,
     confirm: ?Choice = null,
+    /// On a question asked on its row: "no" is chosen instead of "yes".
+    answer_no: bool = false,
     /// The list's filter, kept while a server's screen filters its tools.
     list_filter_len: usize = 0,
     list_filter_buf: [name_capacity]u8 = undefined,
@@ -230,7 +248,8 @@ pub const State = struct {
     }
 };
 
-pub const Key = enum { up, down, enter, escape };
+/// ← and → only choose between yes and no on a question asked on its row.
+pub const Key = enum { up, down, left, right, enter, escape };
 
 pub const Effect = union(enum) {
     none,
@@ -243,32 +262,52 @@ pub const Effect = union(enum) {
 };
 
 pub const View = struct {
-    /// The servers the list shows, after the filter.
+    /// The servers the list shows, after the filter: the ones that work,
+    /// then the ones that need attention, each by name.
     rows: []const Row,
+    /// Where the servers that need attention start in `rows`; null when the
+    /// list shows none.
+    attention_start: ?usize = null,
     /// The open server, found by name among all servers; null once it's gone.
     open: ?Row = null,
     layout: Layout = .{ .lead = 0, .choices = 0, .gap = 0, .tools = 0, .window = 1 },
 };
 
-/// The lines a server's screen has below its title: the inline panel's 12
-/// rows less the title. A shorter panel moves its own view to keep the
-/// selection.
-pub const server_window: usize = 11;
+/// The lines a server's screen has below its title: the inline panel's 13
+/// rows less the title. That fits `http`, `file`, `status`, a blank, two
+/// choices, a blank, and a waiting sign-in's heading with four rows of
+/// address. A shorter panel moves its own view to keep the selection.
+pub const server_window: usize = 12;
 
 /// What `s` shows of `rows` with `filter` typed, the list's rows going into
 /// `buf`. On a server's screen `filter` narrows its tools instead.
 pub fn viewOf(s: *const State, rows: []const Row, filter: []const u8, tools: Tools, buf: []Row) View {
     var n: usize = 0;
     var open_row: ?Row = null;
-    for (rows) |r| {
-        if (s.screen != .list and std.mem.eql(u8, r.status.name, s.selectedName())) open_row = r;
-        if (n == buf.len or !matches(r.status.name, filter)) continue;
-        buf[n] = r;
-        n += 1;
+    var attention_start: usize = 0;
+    const servers: fuzzy_match.Filter(ServerMatches) = .init(.{ .rows = rows, .filter = filter }, rows.len);
+    // The servers that work first, then the ones that need attention, each
+    // group by name.
+    for ([_]bool{ false, true }) |attention_pass| {
+        if (attention_pass) attention_start = n;
+        const group_start = n;
+        for (rows, 0..) |r, position| {
+            if (needsAttention(r.status) != attention_pass) continue;
+            if (s.screen != .list and std.mem.eql(u8, r.status.name, s.selectedName())) open_row = r;
+            if (n == buf.len or !servers.keeps(position)) continue;
+            buf[n] = r;
+            n += 1;
+        }
+        std.sort.insertion(Row, buf[group_start..n], {}, byName);
     }
-    var v: View = .{ .rows = buf[0..n], .open = open_row };
+    var v: View = .{ .rows = buf[0..n], .attention_start = if (attention_start < n) attention_start else null, .open = open_row };
     if (open_row) |r| v.layout = serverLayout(r, tools, filter, server_window);
     return v;
+}
+
+/// Alphabetical, ignoring case, like a directory listing.
+fn byName(_: void, a: Row, b: Row) bool {
+    return std.ascii.lessThanIgnoreCase(a.status.name, b.status.name);
 }
 
 /// A new tool filter on a server's screen selects the first tool it keeps,
@@ -310,6 +349,7 @@ pub fn press(s: *State, view: View, key: Key) Effect {
             switch (key) {
                 .up => s.select(view.rows[i -| 1].status.name),
                 .down => s.select(view.rows[@min(i + 1, view.rows.len - 1)].status.name),
+                .left, .right => {},
                 .enter => {
                     const name = view.rows[i].status.name;
                     s.select(name);
@@ -330,6 +370,7 @@ pub fn press(s: *State, view: View, key: Key) Effect {
                 .down => if (s.cursor + 1 < l.selectable()) {
                     s.cursor += 1;
                 },
+                .left, .right => {},
                 .enter => {
                     var buf: [max_choices]Choice = undefined;
                     const cs = choices(r, &buf);
@@ -338,6 +379,7 @@ pub fn press(s: *State, view: View, key: Key) Effect {
                     if (!c.asks()) return .{ .run = .{ .choice = c, .server = r.status.name } };
                     s.screen = .confirm;
                     s.confirm = c;
+                    s.answer_no = false;
                     return .none;
                 },
                 .escape => {
@@ -350,12 +392,23 @@ pub fn press(s: *State, view: View, key: Key) Effect {
             keepVisible(s, l);
             return .none;
         },
-        // Nothing moves while a confirmation is open.
+        // Only the answer moves while a confirmation is open: ← chooses yes
+        // and → no, and Enter on no is Esc.
         .confirm => {
             const r = view.open orelse return settle(s, view);
             const c = s.confirm.?;
             switch (key) {
-                .enter => {
+                .left => if (c.asksOnRow()) {
+                    s.answer_no = false;
+                },
+                .right => if (c.asksOnRow()) {
+                    s.answer_no = true;
+                },
+                .enter => if (c.asksOnRow() and s.answer_no) {
+                    s.screen = .server;
+                    s.confirm = null;
+                    s.answer_no = false;
+                } else {
                     // A removed server has no screen to come back to.
                     s.screen = if (c == .remove) .list else .server;
                     s.confirm = null;
@@ -368,6 +421,7 @@ pub fn press(s: *State, view: View, key: Key) Effect {
                 .escape => {
                     s.screen = .server;
                     s.confirm = null;
+                    s.answer_no = false;
                 },
                 .up, .down => {},
             }
@@ -391,9 +445,77 @@ fn keepVisible(s: *State, l: Layout) void {
 /// How long news of a sign-in stays on the status line.
 pub const news_ms: i64 = 5000;
 
+/// The link a waiting sign-in offers when the browser didn't open, in the
+/// transcript and on the server's screen alike.
+pub const sign_in_link_label = "Open the sign-in page";
+
+/// The longest the status line waits for servers to finish starting.
+pub const startup_quiet_ms: i64 = 10_000;
+
+/// Whether servers started `since_start_ms` ago are done starting: none is
+/// still idle, connecting, or retrying, or `startup_quiet_ms` passed. Until
+/// then the count of servers that need the user would climb while they
+/// report in, so the status line waits and shows the total once.
+pub fn startupSettled(statuses: []const runtime.Status, since_start_ms: i64) bool {
+    if (since_start_ms >= startup_quiet_ms) return true;
+    for (statuses) |s| switch (s.state) {
+        .idle, .connecting, .retrying => if (!needsAttention(s)) return false,
+        else => {},
+    };
+    return true;
+}
+
+/// The servers the user already saw needing attention, by name, so the
+/// status line can stop repeating them once they've sent a prompt.
+pub const Seen = struct {
+    pub const capacity = 128;
+    hashes: [capacity]u64 = undefined,
+    len: usize = 0,
+    /// More servers needed attention than fit; every one counts as seen.
+    overflowed: bool = false,
+
+    /// Remembers every server in `statuses` that needs attention now.
+    pub fn record(seen: *Seen, statuses: []const runtime.Status) void {
+        seen.* = .{};
+        for (statuses) |s| {
+            if (!needsAttention(s)) continue;
+            if (seen.len == capacity) {
+                seen.overflowed = true;
+                return;
+            }
+            seen.hashes[seen.len] = nameHash(s.name);
+            seen.len += 1;
+        }
+    }
+
+    pub fn contains(seen: *const Seen, name: []const u8) bool {
+        if (seen.overflowed) return true;
+        const h = nameHash(name);
+        for (seen.hashes[0..seen.len]) |x| if (x == h) return true;
+        return false;
+    }
+
+    fn nameHash(name: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, name);
+    }
+};
+
+/// The servers in `statuses` that need attention and aren't in `seen`,
+/// copied into `out`: what the status line still has to say.
+pub fn unseen(statuses: []const runtime.Status, seen: *const Seen, out: []runtime.Status) []runtime.Status {
+    var n: usize = 0;
+    for (statuses) |s| {
+        if (n == out.len) break;
+        if (!needsAttention(s) or seen.contains(s.name)) continue;
+        out[n] = s;
+        n += 1;
+    }
+    return out[0..n];
+}
+
 /// What the status line says about MCP, written into `buf`: fresh news,
 /// else the sign-in waiting for the browser, else what needs the user until
-/// it's handled, else how many servers are ready. Empty with no servers.
+/// it's handled. Empty when nothing does: `/mcp` lists every server.
 /// `notes` counts config problems, which `/mcp list` shows.
 pub fn statusLine(buf: []u8, statuses: []const runtime.Status, signing_in: ?[]const u8, news: ?[]const u8, notes: usize) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
@@ -409,13 +531,8 @@ pub fn statusLine(buf: []u8, statuses: []const runtime.Status, signing_in: ?[]co
     }
     var needs: usize = 0;
     var first: ?runtime.Status = null;
-    var ready: usize = 0;
-    var enabled: usize = 0;
     for (statuses) |s| {
-        if (s.state == .disabled or s.state == .rejected) continue;
-        enabled += 1;
-        if (s.state == .ready) ready += 1;
-        if (attention(s) == null) continue;
+        if (!needsAttention(s)) continue;
         if (needs == 0) first = s;
         needs += 1;
     }
@@ -423,13 +540,18 @@ pub fn statusLine(buf: []u8, statuses: []const runtime.Status, signing_in: ?[]co
         writeSafe(&w, first.?.name);
         w.print(" {s} · /mcp", .{attention(first.?).?}) catch {};
     } else if (needs > 1) {
-        w.print("{d} MCP servers need you · /mcp", .{needs}) catch {};
+        w.print("{d} MCP need attention · /mcp", .{needs}) catch {};
     } else if (notes > 0) {
         w.print("MCP config has {d} problem{s} · /mcp list", .{ notes, if (notes == 1) "" else "s" }) catch {};
-    } else if (enabled > 0) {
-        w.print("mcp {d}/{d}", .{ ready, enabled }) catch {};
     }
     return whole(w.buffered());
+}
+
+/// Whether a server waits on the user: the servers the status line counts,
+/// and the list's "Needs attention" group. A disabled or rejected server
+/// was the user's choice, so it doesn't.
+pub fn needsAttention(s: runtime.Status) bool {
+    return s.state != .disabled and s.state != .rejected and attention(s) != null;
 }
 
 /// What a server needs from the user, if anything.
@@ -439,6 +561,7 @@ fn attention(s: runtime.Status) ?[]const u8 {
         .waiting_for_approval => "is waiting for approval",
         .failed => "failed",
         .missing_env => "needs a variable",
+        .invalid_env => "can't use a variable",
         else => null,
     };
 }
@@ -466,7 +589,7 @@ fn whole(bytes: []const u8) []const u8 {
 
 const testing = std.testing;
 
-test "the status line puts news first, then what needs the user, then a count" {
+test "the status line puts news first, then what needs the user, and is quiet when nothing does" {
     var buf: [96]u8 = undefined;
     const plain: runtime.Status = .{ .name = "plain", .source = .profile, .transport = .http, .state = .idle, .needs_login = true };
     const ready: runtime.Status = .{ .name = "linear", .source = .profile, .transport = .http, .state = .ready };
@@ -475,11 +598,44 @@ test "the status line puts news first, then what needs the user, then a count" {
     try testing.expectEqualStrings("Signed in to plain", statusLine(&buf, &.{ plain, ready }, null, "Signed in to plain", 0));
     try testing.expectEqualStrings("Signing in to plain · /mcp", statusLine(&buf, &.{ plain, ready }, "plain", null, 0));
     try testing.expectEqualStrings("plain needs login · /mcp", statusLine(&buf, &.{ plain, ready, off }, null, null, 0));
-    try testing.expectEqualStrings("2 MCP servers need you · /mcp", statusLine(&buf, &.{ plain, proj, ready }, null, null, 3));
+    try testing.expectEqualStrings("2 MCP need attention · /mcp", statusLine(&buf, &.{ plain, proj, ready }, null, null, 3));
     try testing.expectEqualStrings("MCP config has 2 problems · /mcp list", statusLine(&buf, &.{ready}, null, null, 2));
-    // Disabled servers aren't counted.
-    try testing.expectEqualStrings("mcp 1/1", statusLine(&buf, &.{ ready, off }, null, null, 0));
+    // All is well, starting included: nothing to say.
+    const starting: runtime.Status = .{ .name = "web", .source = .profile, .transport = .http, .state = .connecting };
+    try testing.expectEqualStrings("", statusLine(&buf, &.{ ready, off, starting }, null, null, 0));
     try testing.expectEqualStrings("", statusLine(&buf, &.{}, null, null, 0));
+}
+
+test "the status line waits for servers to finish starting, at most startup_quiet_ms" {
+    const ready: runtime.Status = .{ .name = "a", .source = .profile, .transport = .http, .state = .ready };
+    const login: runtime.Status = .{ .name = "b", .source = .profile, .transport = .http, .state = .idle, .needs_login = true };
+    const connecting: runtime.Status = .{ .name = "c", .source = .profile, .transport = .http, .state = .connecting };
+    const not_started: runtime.Status = .{ .name = "d", .source = .profile, .transport = .stdio, .state = .idle };
+    // A server still starting holds the count back.
+    try testing.expect(!startupSettled(&.{ ready, login, connecting }, 100));
+    try testing.expect(!startupSettled(&.{ ready, not_started }, 100));
+    // Waiting on a login is an answer, not a server still starting.
+    try testing.expect(startupSettled(&.{ ready, login }, 100));
+    // A slow server doesn't hide the count for long.
+    try testing.expect(startupSettled(&.{connecting}, startup_quiet_ms));
+}
+
+test "after a prompt, the status line names only servers that newly need attention" {
+    const login: runtime.Status = .{ .name = "linear", .source = .profile, .transport = .http, .state = .idle, .needs_login = true };
+    const ready: runtime.Status = .{ .name = "notion", .source = .profile, .transport = .http, .state = .ready };
+    var seen: Seen = .{};
+    seen.record(&.{ login, ready });
+    var out: [4]runtime.Status = undefined;
+    // What the user already saw isn't repeated.
+    try testing.expectEqual(@as(usize, 0), unseen(&.{ login, ready }, &seen, &out).len);
+    // A server that newly needs attention is.
+    var broken = ready;
+    broken.state = .failed;
+    const fresh = unseen(&.{ login, broken }, &seen, &out);
+    try testing.expectEqual(@as(usize, 1), fresh.len);
+    try testing.expectEqualStrings("notion", fresh[0].name);
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings("notion failed · /mcp", statusLine(&buf, fresh, null, null, 0));
 }
 
 test "the status line keeps names inert and never ends inside a character" {
@@ -523,18 +679,60 @@ test "a server's choices start with its next step and end with Remove" {
     try testing.expect(!Choice.login.asks() and !Choice.logout.asks());
 }
 
-test "the filter is a case-insensitive part of the name" {
-    try testing.expect(matches("Linear", "lin"));
-    try testing.expect(matches("context7", ""));
-    try testing.expect(!matches("context7", "li"));
+test "the filter matches server names and tools as every menu does" {
+    const tools = [_]Tool{
+        .{ .name = "create_issue", .description = "Open a ticket" },
+        .{ .name = "close_issue", .description = "Close a ticket that is open" },
+    };
+    try testing.expectEqual(@as(usize, 1), toolCount(.{ .ready = &tools }, "createissue"));
+    try testing.expectEqual(@as(usize, 2), toolCount(.{ .ready = &tools }, "ticket open"));
+    try testing.expectEqual(@as(usize, 0), toolCount(.{ .ready = &tools }, "tkt"));
+    // `open a` is in the first description as typed, and in the second only
+    // word by word, so only the first is kept.
+    try testing.expectEqual(@as(usize, 1), toolCount(.{ .ready = &tools }, "open a"));
+    try testing.expectEqualStrings("create_issue", nthTool(&tools, "open a", 0).?.name);
+    try testing.expect(nthTool(&tools, "open a", 1) == null);
+
     const rows = [_]Row{ testRow("context7", .ready, .{}), testRow("linear", .ready, .{}) };
     var buf: [2]Row = undefined;
     var s: State = .{ .active = true };
     try testing.expectEqual(@as(usize, 1), viewOf(&s, &rows, "LIN", .loading, &buf).rows.len);
+    try testing.expectEqual(@as(usize, 2), viewOf(&s, &rows, "", .loading, &buf).rows.len);
+    // `li` is not in `context7`, only at the start of `linear`.
+    try testing.expectEqual(@as(usize, 1), viewOf(&s, &rows, "li", .loading, &buf).rows.len);
+    try testing.expectEqualStrings("linear", viewOf(&s, &rows, "li", .loading, &buf).rows[0].status.name);
+    try testing.expectEqualStrings("context7", viewOf(&s, &rows, "ctx7", .loading, &buf).rows[0].status.name);
     // The open server is found among all servers, whatever the filter.
     s.select("context7");
     s.screen = .server;
     try testing.expectEqualStrings("context7", viewOf(&s, &rows, "lin", .loading, &buf).open.?.status.name);
+}
+
+test "the list shows the servers that work first, then the ones that need attention, each by name" {
+    const rows = [_]Row{
+        testRow("linear", .failed, .{ .needs_login = true }),
+        testRow("context7", .ready, .{}),
+        testRow("proj", .waiting_for_approval, .{ .source = .workspace }),
+        testRow("old", .disabled, .{ .needs_login = true }),
+        testRow("docs", .idle, .{}),
+    };
+    var buf: [5]Row = undefined;
+    var s: State = .{};
+    open(&s);
+    const v = viewOf(&s, &rows, "", .loading, &buf);
+    var names: [5][]const u8 = undefined;
+    for (v.rows, 0..) |r, i| names[i] = r.status.name;
+    try testing.expectEqualSlices([]const u8, &.{ "context7", "docs", "old", "linear", "proj" }, names[0..v.rows.len]);
+    try testing.expectEqual(@as(?usize, 3), v.attention_start);
+    // Case doesn't change a server's place.
+    try testing.expect(byName({}, testRow("aws", .ready, .{}), testRow("GitLab", .ready, .{})));
+    try testing.expect(byName({}, testRow("GitLab", .ready, .{}), testRow("notion", .ready, .{})));
+    // ↓ follows the groups, from the last working server into the first that needs attention.
+    s.select("old");
+    _ = press(&s, v, .down);
+    try testing.expectEqualStrings("linear", s.selectedName());
+    // A filter that keeps no server needing attention has no such group.
+    try testing.expectEqual(@as(?usize, null), viewOf(&s, &rows, "doc", .loading, &buf).attention_start);
 }
 
 test "the list keeps its selection by name, and Enter opens the server" {
@@ -584,19 +782,48 @@ test "on a server, the next step is selected, and asking actions confirm first" 
     try testing.expectEqual(Effect.close, press(&s, view, .escape));
 }
 
+test "a question on its row chooses yes or no with left and right" {
+    const r = testRow("linear", .failed, .{ .needs_login = true });
+    var s: State = .{ .active = true, .screen = .server, .cursor = 1 };
+    const view: View = .{ .rows = &.{}, .open = r, .layout = serverLayout(r, .needs_login, "", 9) };
+    _ = press(&s, view, .enter);
+    try testing.expectEqual(Screen.confirm, s.screen);
+    try testing.expect(!s.answer_no);
+    // → chooses no, and Enter on no runs nothing and goes back.
+    _ = press(&s, view, .right);
+    try testing.expect(s.answer_no);
+    try testing.expectEqual(Effect.none, press(&s, view, .enter));
+    try testing.expectEqual(Screen.server, s.screen);
+    try testing.expect(!s.answer_no);
+    // Asked again, it starts on yes; ← keeps yes, and Enter removes.
+    _ = press(&s, view, .enter);
+    _ = press(&s, view, .right);
+    _ = press(&s, view, .left);
+    try testing.expectEqual(Choice.remove, press(&s, view, .enter).run.choice);
+
+    // An approval keeps its own screen, where ← and → choose nothing.
+    const proj = testRow("proj", .waiting_for_approval, .{ .source = .workspace });
+    var a: State = .{ .active = true, .screen = .confirm, .confirm = .approve };
+    const approval: View = .{ .rows = &.{}, .open = proj, .layout = serverLayout(proj, .needs_approval, "", 9) };
+    _ = press(&a, approval, .right);
+    try testing.expect(!a.answer_no);
+    try testing.expectEqual(Choice.approve, press(&a, approval, .enter).run.choice);
+}
+
 test "the selection moves on from the choices through the tools, and the screen scrolls" {
     var tools: [30]Tool = undefined;
     for (&tools) |*t| t.* = .{ .name = "t", .description = "" };
     const r = testRow("github", .ready, .{ .signed_in = true });
     const layout = serverLayout(r, .{ .ready = &tools }, "", 8);
-    try testing.expectEqual(@as(usize, 3), layout.lead);
+    // http, file, status, and a blank.
+    try testing.expectEqual(@as(usize, 4), layout.lead);
     try testing.expectEqual(@as(usize, 2), layout.choices);
-    try testing.expectEqual(@as(usize, 37), layout.lines());
+    try testing.expectEqual(@as(usize, 38), layout.lines());
     var s: State = .{ .active = true, .screen = .server };
     const view: View = .{ .rows = &.{}, .open = r, .layout = layout };
     for (0..10) |_| _ = press(&s, view, .down);
     try testing.expectEqual(@as(usize, 10), s.cursor);
-    // The selected tool is in view, between the counts above and below.
+    // The selected tool is in view, above the count of what's below.
     const at = layout.line(s.cursor);
     try testing.expect(at >= s.top and at < s.top + layout.shown());
     // Enter on a tool does nothing.

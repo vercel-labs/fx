@@ -1,5 +1,5 @@
 #!/bin/sh
-# Model-check the MCP-v2 engine models (src/mcp/) with TLC.
+# Model-check the MCP engine models (src/mcp/) with TLC.
 #
 # run.py reads catalog.json: each model's smoke config must pass, and each
 # planted bug in <Module>.mutants.json must be caught by its named property.

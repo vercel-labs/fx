@@ -1,4 +1,5 @@
 const std = @import("std");
+const agents = @import("../agents/agents.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const builtin = @import("builtin");
@@ -7,6 +8,7 @@ const display_width = @import("../shared/display_width.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const image_data = @import("image_data.zig");
+const image_route = @import("image_route.zig");
 const io_mod = @import("../shared/io.zig");
 const png_downscale = @import("png_downscale.zig");
 const types = @import("../shared/types.zig");
@@ -332,7 +334,7 @@ pub fn captureImageAttachmentForAdmission(
     app: *App,
     attachment: *types.ImageAttachment,
 ) !CaptureAdmissionResult {
-    App.captureImageAttachment(app, attachment) catch |err| {
+    App.captureImageAttachment(app, agents.screenAgentOf(app), attachment) catch |err| {
         const notice = captureRejectionNotice(err) orelse return err;
         if (comptime !@hasDecl(App, "writeDomainNotice")) return err;
         try app.writeDomainNotice(.{
@@ -907,6 +909,51 @@ pub fn withholdDroppedImages(arena: std.mem.Allocator, messages: []const types.C
         }
         projected[index].images = kept;
         projected[index].content = try std.mem.concat(arena, u8, &.{ notice.written(), projected[index].content orelse "" });
+    }
+    return result orelse messages;
+}
+
+/// Leaves the user images in `messages` out of a request when the image
+/// route core withholds earlier images (`held`), each with a note in its
+/// place that says why, so the model knows an image exists that it cannot
+/// see. The core fails a request whose images attached this turn have no
+/// route, so on that route every user image left is an earlier one. Images
+/// that go inline or through the vision tool are not withheld here, and
+/// images the session dropped stay for `withholdDroppedImages` to note.
+/// Returns `messages` itself when nothing is withheld, otherwise a copy
+/// allocated in `arena`. History is not modified.
+pub fn withholdEarlierImages(
+    arena: std.mem.Allocator,
+    messages: []const types.ChatMessage,
+    held: image_route.ToolImages,
+) ![]const types.ChatMessage {
+    const reason: []const u8 = switch (held) {
+        .none, .attached, .withheld_fallback => return messages,
+        .withheld_unknown => "fx could not confirm image input support for this model (the model is not listed in the model catalog, or the catalog is unavailable). It stays in this session and can be sent again once support is confirmed; until then, ask the user to describe it if you need it.",
+        .withheld_dead_end => "this model does not accept inline images and no vision fallback is available. Ask the user to describe it or switch to a vision-capable model if you need it.",
+    };
+    var result: ?[]types.ChatMessage = null;
+    for (messages, 0..) |message, index| {
+        var withheld: usize = 0;
+        for (message.images) |image| {
+            if (!image.droppedFromSession()) withheld += 1;
+        }
+        if (withheld == 0) continue;
+        const projected = result orelse try arena.dupe(types.ChatMessage, messages);
+        result = projected;
+        const dropped = try arena.alloc(types.ImageAttachment, message.images.len - withheld);
+        var notice: std.Io.Writer.Allocating = .init(arena);
+        var next: usize = 0;
+        for (message.images) |image| {
+            if (image.droppedFromSession()) {
+                dropped[next] = image;
+                next += 1;
+                continue;
+            }
+            notice.writer.print("[Image #{d} was not sent with this request: {s}]\n", .{ image.id, reason }) catch return error.OutOfMemory;
+        }
+        projected[index].images = dropped;
+        projected[index].content = try std.mem.concat(arena, u8, &.{ notice.written(), message.content orelse "" });
     }
     return result orelse messages;
 }
@@ -3233,6 +3280,152 @@ test "requests leave out images the session dropped, each with a note" {
     // A request without dropped images passes through untouched.
     const kept = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #2]", .images = images[1..] }};
     try std.testing.expect((try withholdDroppedImages(arena, &kept)).ptr == (&kept).ptr);
+}
+
+test "requests leave out earlier images the route cannot carry, each with a note" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const digest = text_utils.repeat("a", 64);
+    const images = [_]types.ImageAttachment{
+        .{ .id = 1, .path = @constCast("inline://image-1"), .media_type = @constCast("image/png"), .snapshot_sha256 = @constCast(digest), .inline_data = @constCast("png") },
+        .{ .id = 2, .path = @constCast("inline://image-2"), .media_type = @constCast("image/png"), .snapshot_sha256 = @constCast(digest) },
+    };
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "Look at [Image #1] [Image #2]", .images = &images },
+        .{ .role = .assistant, .content = "It shows a logo." },
+        .{ .role = .user, .content = "Testing" },
+    };
+    const unknown = try withholdEarlierImages(arena, &messages, .withheld_unknown);
+    // Image 1 leaves as a note; image 2, which the session dropped, stays for
+    // withholdDroppedImages.
+    try std.testing.expectEqual(@as(usize, 1), unknown[0].images.len);
+    try std.testing.expectEqual(@as(usize, 2), unknown[0].images[0].id);
+    try std.testing.expect(std.mem.startsWith(u8, unknown[0].content.?, "[Image #1 was not sent with this request: fx could not confirm image input support for this model"));
+    try std.testing.expect(std.mem.endsWith(u8, unknown[0].content.?, "]\nLook at [Image #1] [Image #2]"));
+    try std.testing.expect(unknown[2].content.?.ptr == messages[2].content.?.ptr);
+    try std.testing.expectEqual(@as(usize, 2), messages[0].images.len);
+
+    const dead_end = try withholdEarlierImages(arena, &messages, .withheld_dead_end);
+    try std.testing.expect(std.mem.find(u8, dead_end[0].content.?, "no vision fallback is available") != null);
+
+    for ([_]image_route.ToolImages{ .none, .attached, .withheld_fallback }) |held| {
+        try std.testing.expect((try withholdEarlierImages(arena, &messages, held)).ptr == (&messages).ptr);
+    }
+}
+
+/// Draws for `driveWithholdEarlierImages` from a fuzzer, with one hash per
+/// draw site so the fuzzer tells the draws apart.
+const EarlierImageFuzzDraws = struct {
+    smith: *std.testing.Smith,
+
+    fn below(self: EarlierImageFuzzDraws, n: usize, site: u32) usize {
+        return self.smith.indexWithHash(n, site);
+    }
+
+    fn flag(self: EarlierImageFuzzDraws, site: u32) bool {
+        return self.smith.valueWithHash(bool, site);
+    }
+};
+
+/// Draws for `driveWithholdEarlierImages` from a seeded generator.
+const EarlierImageSeededDraws = struct {
+    random: std.Random,
+
+    fn below(self: EarlierImageSeededDraws, n: usize, _: u32) usize {
+        return self.random.uintLessThan(usize, n);
+    }
+
+    fn flag(self: EarlierImageSeededDraws, _: u32) bool {
+        return self.random.boolean();
+    }
+};
+
+/// Builds a history that `draws` chooses, with images the session holds and
+/// images it dropped, projects it under one held-images value, and checks
+/// what every projection must keep.
+fn driveWithholdEarlierImages(draws: anytype) !void {
+    const max_messages = 6;
+    const max_images = 3;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const digest = text_utils.repeat("a", 64);
+    const roles = [_]types.ChatRole{ .user, .assistant, .tool };
+    var images: [max_messages][max_images]types.ImageAttachment = undefined;
+    var image_counts: [max_messages]usize = undefined;
+    var messages: [max_messages]types.ChatMessage = undefined;
+    const count = draws.below(max_messages + 1, 1);
+    for (messages[0..count], 0..) |*message, index| {
+        image_counts[index] = draws.below(max_images + 1, 2);
+        for (images[index][0..image_counts[index]]) |*image| {
+            image.* = .{
+                .id = 1 + draws.below(9, 3),
+                .path = @constCast("inline://image"),
+                .media_type = @constCast("image/png"),
+                .snapshot_sha256 = @constCast(digest),
+                // Without bytes and with a digest, the session dropped it.
+                .inline_data = if (draws.flag(4)) null else @constCast("png"),
+            };
+        }
+        message.* = .{
+            .role = roles[draws.below(roles.len, 5)],
+            .content = if (draws.flag(6)) null else "text",
+            .images = images[index][0..image_counts[index]],
+        };
+    }
+    const kinds = [_]image_route.ToolImages{ .none, .attached, .withheld_fallback, .withheld_dead_end, .withheld_unknown };
+    const held = kinds[draws.below(kinds.len, 7)];
+    const source = messages[0..count];
+    const projected = try withholdEarlierImages(arena, source, held);
+
+    try std.testing.expectEqual(count, projected.len);
+    const withholds = held == .withheld_unknown or held == .withheld_dead_end;
+    var withheld_any = false;
+    for (source, projected, 0..) |before, after, index| {
+        // History is not modified.
+        try std.testing.expectEqual(image_counts[index], before.images.len);
+        var held_here: usize = 0;
+        for (before.images) |image| {
+            if (!image.droppedFromSession()) held_here += 1;
+        }
+        if (!withholds or held_here == 0) {
+            try std.testing.expect(after.images.ptr == before.images.ptr and after.images.len == before.images.len);
+            try std.testing.expectEqual(before.content, after.content);
+            continue;
+        }
+        withheld_any = true;
+        // No image the session holds reaches the request; dropped ones stay.
+        try std.testing.expectEqual(before.images.len - held_here, after.images.len);
+        for (after.images) |image| try std.testing.expect(image.droppedFromSession());
+        // One note per withheld image, ahead of the unchanged text.
+        const content = after.content orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.endsWith(u8, content, before.content orelse ""));
+        try std.testing.expectEqual(held_here, std.mem.count(u8, content, " was not sent with this request: "));
+        for (before.images) |image| {
+            if (image.droppedFromSession()) continue;
+            var buffer: [64]u8 = undefined;
+            const note = try std.mem.print(&buffer, "[Image #{d} was not sent with this request: ", .{image.id});
+            try std.testing.expect(std.mem.find(u8, content, note) != null);
+        }
+    }
+    if (!withheld_any) try std.testing.expect(projected.ptr == source.ptr);
+}
+
+fn fuzzWithholdEarlierImages(_: void, smith: *std.testing.Smith) !void {
+    try driveWithholdEarlierImages(EarlierImageFuzzDraws{ .smith = smith });
+}
+
+test "earlier images withheld from a request always leave a note" {
+    try std.testing.fuzz({}, fuzzWithholdEarlierImages, .{
+        // Empty input draws the smallest values: a request with no messages.
+        .corpus = &(.{""} ++ @import("fuzz_corpus").earlier_image_notes.*),
+    });
+}
+
+test "earlier images withheld from seeded random histories always leave a note" {
+    var prng: std.Random.DefaultPrng = .init(20261022);
+    for (0..2000) |_| try driveWithholdEarlierImages(EarlierImageSeededDraws{ .random = prng.random() });
 }
 
 test "requests name the saved file of each attached image, never its source" {

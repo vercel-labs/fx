@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from scripts.pgso import macos
 from scripts.pgso.model import PgsoError
 from scripts.pgso.toolchain import IR_SIZE_SCRIPT, Toolchain
 
@@ -51,8 +52,6 @@ esac""")
             "llvm-profdata",
             "llvm-ar",
             "llvm-nm",
-            "llvm-link",
-            "llvm-split",
         ):
             self.write_llvm_tool(name)
         self.write_clang()
@@ -116,34 +115,27 @@ esac"""
         )
         self.assertEqual((self.llvm_bin / "llvm-ar").resolve(), toolchain.llvm_ar)
         self.assertEqual((self.llvm_bin / "llvm-nm").resolve(), toolchain.llvm_nm)
-        self.assertEqual(
-            (self.llvm_bin / "llvm-link").resolve(),
-            toolchain.llvm_link,
-        )
-        self.assertEqual(
-            (self.llvm_bin / "llvm-split").resolve(),
-            toolchain.llvm_split,
-        )
         self.assertEqual((self.llvm_bin / "clang").resolve(), toolchain.clang)
         self.assertEqual(self.libllvm.resolve(), toolchain.libllvm)
         self.assertEqual(IR_SIZE_SCRIPT, toolchain.ir_size)
         self.assertTrue(toolchain.ir_size.is_file())
-        self.assertEqual((self.system_bin / "strip").resolve(), toolchain.strip)
+        self.assertEqual((self.system_bin / "strip").resolve(), toolchain.tools.strip)
         self.assertEqual(
             (self.system_bin / "codesign").resolve(),
-            toolchain.codesign,
+            toolchain.tools.codesign,
         )
-        self.assertEqual((self.system_bin / "otool").resolve(), toolchain.otool)
-        self.assertEqual(self.sdk.resolve(), toolchain.sdk)
-        self.assertEqual("26.4", toolchain.sdk_version)
-        self.assertEqual((self.system_bin / "ld").resolve(), toolchain.apple_ld)
-        self.assertEqual("1167.5", toolchain.apple_ld_version)
-        self.assertEqual(self.zig_sdk.resolve(), toolchain.zig_darwin_sdk)
-        self.assertEqual("26.4", toolchain.zig_sdk_version)
+        self.assertEqual((self.system_bin / "otool").resolve(), toolchain.tools.otool)
+        self.assertEqual(self.sdk.resolve(), toolchain.tools.sdk)
+        self.assertEqual("26.4", toolchain.tools.sdk_version)
+        self.assertEqual((self.system_bin / "ld").resolve(), toolchain.tools.apple_ld)
+        self.assertEqual("1167.5", toolchain.tools.apple_ld_version)
+        self.assertEqual(self.zig_sdk.resolve(), toolchain.tools.zig_darwin_sdk)
+        self.assertEqual("26.4", toolchain.tools.zig_sdk_version)
         self.assertEqual(self.profile_runtime.resolve(), toolchain.profile_runtime)
         self.assertEqual("0.17.0", toolchain.zig_version)
         self.assertEqual("22.1.8", toolchain.llvm_version)
         self.assertEqual("aarch64-macos", toolchain.target)
+        self.assertIs(macos, toolchain.platform)
         self.assertEqual("arm64", toolchain.host_arch)
 
     def test_discover_requires_the_llvm_c_library_from_the_same_root(self) -> None:

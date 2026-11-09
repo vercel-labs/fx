@@ -44,7 +44,9 @@ jobs:
         run: zig fmt --check src/
 
       - name: Validate PGSO corpus classification
-        run: python3 -m scripts.pgso.corpus --manifest scripts/pgso/corpus.json --list
+        run: |
+          python3 -m scripts.pgso.corpus --manifest scripts/pgso/corpus.json --list
+          python3 -m unittest scripts.pgso.tests.test_corpus
 
       - name: Audit public surface
         run: ./scripts/check-public-surface.sh
@@ -55,19 +57,70 @@ jobs:
       - name: Check indexer boundary
         run: ./scripts/check-indexer-boundary.sh
 
+      - name: Check agents boundary
+        run: ./scripts/check-agents-boundary.sh
+
+      - name: Check recovery boundary
+        run: ./scripts/check-recovery-boundary.sh
+
+      - name: Model-check request recovery
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
+          TLA2TOOLS_JAR="$jar" tests/tla/recovery/check.sh
+
+      - name: Model-check the empty-reply nudge
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/agent_runtime/check.sh
+
+      - name: Model-check the connection open hand-off
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/gateway_open/check.sh
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Walk the recovery module along its model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/recovery/driver.ts --self-check
+
+      - name: Walk the connection open hand-off along its model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/gateway_open/driver.ts --self-check
+
+      - name: Check CLI shape
+        run: python3 -m scripts.check_cli_shape
+
       - name: Test CI and release scripts
-        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need -q
+        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape
 
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 
+      - name: Walk fx ask turns along the empty-reply model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/driver.ts --self-check
+
+      # The zsh user profile tests in src/core/execution/command_runner.zig
+      # skip without /bin/zsh. They start interactive zsh with no terminal,
+      # where Ubuntu's global zshrc runs compinit, and on this runner compinit
+      # aborts and writes an error to stderr, so the job turns it off. The
+      # shell parity tests in src/core/shell_command/command_effect.zig use
+      # zsh too.
+      - name: Install zsh
+        run: |
+          command -v zsh >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zsh; }
+          echo 'skip_global_compinit=1' | sudo tee -a /etc/zsh/zshenv >/dev/null
+
       - name: Test
         env:
           TEST_TIMEOUT_SECONDS: ${{ matrix.test_timeout_seconds }}
+          # Ubuntu has sh, dash, and bash, and the step above adds zsh, so the
+          # shell parity tests fail here if any of them is missing.
+          FX_TEST_SHELL_PARITY_ALL_SHELLS: "1"
         run: |
           started_at=$SECONDS
           trap 'printf "Unit tests elapsed: %ss\n" "$((SECONDS - started_at))"' EXIT
-          timeout "${TEST_TIMEOUT_SECONDS}s" zig build test -Doptimize=${{ matrix.optimize }}
+          timeout "${TEST_TIMEOUT_SECONDS}s" zig build test -Doptimize=${{ matrix.optimize }} --summary all
 
       - name: Save Zig cache
         uses: ./.github/actions/save-zig-cache
@@ -80,7 +133,7 @@ jobs:
   zig:
     name: Build & Test
     if: ${{ always() }}
-    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-browser-wasm]
+    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-package-guards, sdk-browser-wasm, tla-mcp, tla-transcript-window]
     runs-on: ubuntu-latest
     steps:
       - name: Require unit tests and every SDK job
@@ -88,7 +141,7 @@ jobs:
           RESULTS: ${{ toJSON(needs.*.result) }}
         run: |
           printf '%s\n' "$RESULTS"
-          jq -e 'length == 5 and all(.[]; . == "success")' <<<"$RESULTS"
+          jq -e 'length == 8 and all(.[]; . == "success")' <<<"$RESULTS"
 
   build:
     name: Build fx (ReleaseSafe)
@@ -130,6 +183,32 @@ jobs:
           cache-key: ${{ steps.zig.outputs.cache-key }}
           cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
+  # The durable-session model check in SDK (Bun + N-API/WASM) takes about 40
+  # minutes, the TLA+ MCP models and drivers about 20, and the TLA+ transcript
+  # window model a few. A pull request runs each only when it changes the code
+  # that check covers; see scripts/detect-ci-need.sh. Pushes to main and manual
+  # dispatches always run all three, so the main run that Publish libfx waits
+  # for includes them.
+  ci-need:
+    name: Detect CI need
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      libfx: ${{ steps.detect.outputs.libfx }}
+      mcp: ${{ steps.detect.outputs.mcp }}
+      transcript_window: ${{ steps.detect.outputs.transcript_window }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Decide which model checks this change needs
+        id: detect
+        env:
+          CI_NEED_REQUESTED: ${{ github.event_name == 'push' && 'push to main' || (github.event_name == 'workflow_dispatch' && 'manual dispatch' || '') }}
+        # A pull request's merge commit has the base branch as its first parent.
+        run: scripts/detect-ci-need.sh HEAD^1 HEAD
+
   sdk-wasm:
     name: SDK build (WASM)
     runs-on: ubuntu-latest
@@ -148,6 +227,17 @@ jobs:
         run: |
           zig build fx-core-wasm -Dwasm-surface=core -Doptimize=ReleaseSmall
           zig build fx-term-wasm -Dwasm-surface=term -Doptimize=ReleaseSmall
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      # The SDK jobs test the modules the package ships, after wasm-opt.
+      - name: Shrink WASM surfaces with wasm-opt
+        run: |
+          npm ci --prefix sdk/tools
+          node sdk/scripts/optimize-wasm.mjs zig-out/bin/fx-core.wasm zig-out/bin/fx-term.wasm
 
       - name: Share WASM surfaces with SDK jobs
         uses: actions/upload-artifact@v4
@@ -317,7 +407,7 @@ jobs:
 
   sdk-bun:
     name: SDK (Bun + N-API/WASM)
-    needs: [sdk-wasm, sdk-napi]
+    needs: [ci-need, sdk-wasm, sdk-napi]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -375,6 +465,7 @@ jobs:
           bun sdk/tests/test-durable-core.mjs local
 
       - name: Model-check durable sessions and drive the code along the model
+        if: needs.ci-need.outputs.libfx == 'true'
         run: |
           set -euo pipefail
           jar="$RUNNER_TEMP/tla2tools.jar"
@@ -446,18 +537,20 @@ jobs:
           node --experimental-wasm-jspi sdk/tests/test-node-bundled-assets.mjs
           node sdk/tests/test-node-package.mjs
           node sdk/tests/test-term-demo-package.mjs
-          node sdk/scripts/package-libfx.mjs sdk/dist/libfx native-addons/libfx.linux-x64.node native-addons/libfx.linux-arm64.node native-addons/libfx.darwin-x64.node native-addons/libfx.darwin-arm64.node
+          node sdk/scripts/package-libfx.mjs sdk/dist native-addons/libfx.linux-x64.node native-addons/libfx.linux-arm64.node native-addons/libfx.darwin-x64.node native-addons/libfx.darwin-arm64.node
           node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist/libfx
           npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
           mv "$(node -p 'require("/tmp/libfx-pack.json")[0].filename')" /tmp/libfx-package.tgz
-          node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native esm
-          node --no-experimental-require-module sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native cjs
+          mkdir -p /tmp/libfx-native
+          for package in sdk/dist/libfx-*/; do npm pack "./$package" --ignore-scripts --pack-destination /tmp/libfx-native; done
+          node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native esm --native-dir /tmp/libfx-native
+          node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native cjs --native-dir /tmp/libfx-native
           node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm esm
-          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm cjs
+          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm cjs
 
       - name: Test package recovery and lifecycle boundaries
         run: |
-          node sdk/tests/test-package-resilience.mjs --package /tmp/libfx-package.tgz \
+          node sdk/tests/test-package-resilience.mjs --package /tmp/libfx-package.tgz --native-dir /tmp/libfx-native \
             --cheap-cycles 100 --tool-workflows 20 --duration-ms 5000 --concurrency 4 \
             --json-out "${{ runner.temp }}/libfx-package-evidence/resilience.json"
 
@@ -468,9 +561,9 @@ jobs:
         env:
           LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-package-evidence
         run: |
-          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz
-          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --webpack
-          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --next15
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native --webpack
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native --next15
 
       - name: Retain package qualification evidence
         if: always()
@@ -484,6 +577,68 @@ jobs:
             ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/*.log
             ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/results.json
           if-no-files-found: ignore
+
+  sdk-package-guards:
+    name: SDK package guards
+    needs: [sdk-wasm, sdk-napi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Download WASM surfaces
+        uses: actions/download-artifact@v4
+        with:
+          name: sdk-wasm
+          path: zig-out/bin
+
+      - name: Download native addons
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sdk-napi-*
+          path: native-addons
+          merge-multiple: true
+
+      - name: Install the durable Worlds and the package test tools
+        run: |
+          npm ci --prefix sdk/durable
+          npm ci --prefix sdk/tests/tools
+
+      - name: Package libfx and its platform packages
+        run: |
+          node sdk/scripts/package-libfx.mjs sdk/dist native-addons/libfx.linux-x64.node native-addons/libfx.linux-arm64.node native-addons/libfx.darwin-x64.node native-addons/libfx.darwin-arm64.node
+          npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
+          mv "$(node -p 'require("/tmp/libfx-pack.json")[0].filename')" /tmp/libfx-package.tgz
+          mkdir -p /tmp/libfx-native
+          for package in sdk/dist/libfx-*/; do npm pack "./$package" --ignore-scripts --pack-destination /tmp/libfx-native; done
+
+      # With the platform package, Node.js loads no WebAssembly host code;
+      # with only the macOS package, libfx names the Linux one it needs.
+      - name: Check what Node.js loads from libfx
+        run: node sdk/tests/test-node-load-graph.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native
+
+      - name: Check browser bundles
+        run: node sdk/tests/test-browser-bundles.mjs /tmp/libfx-package.tgz
+
+      - name: Check package sizes
+        run: node sdk/tests/test-package-size.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native
+
+      # The subpaths other than libfx and libfx/node have always been ES
+      # modules only, which require() loads on the Node.js versions libfx
+      # supports.
+      - name: Lint the package and its types
+        run: |
+          sdk/tests/tools/node_modules/.bin/publint /tmp/libfx-package.tgz
+          sdk/tests/tools/node_modules/.bin/attw /tmp/libfx-package.tgz --profile node16 --ignore-rules cjs-resolves-to-esm
 
   sdk-browser-wasm:
     name: SDK (Browser + WASM)
@@ -511,6 +666,91 @@ jobs:
         env:
           CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
         run: npm run --prefix sdk test:browser-wasm
+
+  # The MCP engine and host models, and the drivers that run src/mcp/ and
+  # fx along them. Their planted bugs stay local (tests/tla/mcp/check.sh):
+  # they measure the checks, not the code.
+  tla-mcp:
+    name: TLA+ MCP models and drivers
+    needs: [build, ci-need]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download fx
+        uses: actions/download-artifact@v4
+        with:
+          name: fx-linux-x86_64
+          path: zig-out/bin
+      - name: Restore executable mode
+        run: chmod +x zig-out/bin/fx
+      # The MCP driver builds its labs against src/mcp/.
+      - name: Setup Zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.0"
+          cache-key: ci-tla-mcp
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Install tmux
+        run: |
+          command -v tmux >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y tmux; }
+          printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
+          tmux -V
+      - name: Model-check the MCP engine and host, and drive the code along the models
+        if: needs.ci-need.outputs.mcp == 'true'
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
+          export TLA2TOOLS_JAR="$jar"
+          python3 tests/tla/mcp/run.py check
+          tests/tla/mcp_host/check.sh
+          bun tests/tla/drivers/mcp/driver.ts
+          bun test ./tests/tla/drivers/mcp_host/
+
+  # The transcript window model and the window's core driven along it both
+  # ways. Its planted bugs and the run of a built fx along the model stay local
+  # (tests/tla/transcript_window/check.sh without --ci): the first measure the
+  # checks, not the code, and the second drives fx through tmux.
+  tla-transcript-window:
+    name: TLA+ transcript window model
+    needs: ci-need
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+        if: needs.ci-need.outputs.transcript_window == 'true'
+      # The core's tests and the drivers' harness build against
+      # src/ui/transcript/transcript_window.zig.
+      - name: Setup Zig
+        if: needs.ci-need.outputs.transcript_window == 'true'
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.0"
+          cache-key: ci-tla-transcript-window
+      - name: Setup Bun
+        if: needs.ci-need.outputs.transcript_window == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Model-check the transcript window and drive its core along the model
+        if: needs.ci-need.outputs.transcript_window == 'true'
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
+          TLA2TOOLS_JAR="$jar" tests/tla/transcript_window/check.sh --ci
 
   e2e_mode:
     name: E2E (deterministic, shard ${{ matrix.shard.label }})
@@ -568,6 +808,8 @@ jobs:
           missing=()
           command -v tmux >/dev/null 2>&1 || missing+=(tmux)
           command -v zsh >/dev/null 2>&1 || missing+=(zsh)
+          # cli.test.ts runs the fish completion script only where fish is installed.
+          command -v fish >/dev/null 2>&1 || missing+=(fish)
           if [ "${#missing[@]}" -gt 0 ]; then
             retry() {
               local attempt
@@ -602,6 +844,7 @@ jobs:
           printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
           tmux -V
           zsh --version
+          fish --version
 
       - name: Install E2E dependencies
         run: bun install --frozen-lockfile
@@ -651,14 +894,6 @@ jobs:
 
       - name: Restore executable mode
         run: chmod +x zig-out/bin/fx
-
-      # The client-request-state scenario builds a Zig dispatcher fixture.
-      - name: Setup Zig
-        id: zig
-        uses: ./.github/actions/setup-zig
-        with:
-          version: "0.17.0"
-          cache-key: ci-mcp-fixtures
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -712,9 +947,12 @@ jobs:
         run: |
           scripts=(
             benchmarks/startup.sh
+            scripts/check-agents-boundary.sh
             scripts/check-compactor-boundary.sh
             scripts/check-indexer-boundary.sh
             scripts/check-public-surface.sh
+            scripts/check-recovery-boundary.sh
+            scripts/detect-ci-need.sh
             scripts/detect-macos-need.sh
             scripts/smoke-binary.sh
             tests/e2e/ci-run-files.sh

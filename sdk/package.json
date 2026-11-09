@@ -89,15 +89,24 @@
   },
   "files": [
     "browser.js",
+    "browser-agent.js",
+    "browser-terminal.js",
     "node.js",
     "node.cjs",
+    "node-wasm.js",
+    "bundled-asset.js",
     "fx-sdk.js",
+    "engine.js",
+    "xterm.js",
+    "wasm-runtime.js",
+    "wasm-terminal.js",
     "tool-observation.js",
     "durable.js",
     "fx-harness.js",
     "durable/local.mjs",
     "durable/vercel.mjs",
     "durable/world.mjs",
+    "durable/*.mjs.map",
     "types/*.d.ts",
     "types/*.d.cts",
     "wasm-module.js",
@@ -115,12 +124,12 @@
     "skills-node.js",
     "fx-core.wasm",
     "fx-term.wasm",
-    "*.node",
     "README.md",
     "LICENSE"
   ],
+  "sideEffects": false,
   "engines": {
-    "node": ">=20"
+    "node": "^20.19.0 || >=22.12.0"
   },
   "publishConfig": {
     "access": "public",

@@ -7,7 +7,6 @@ const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const elicitation = @import("elicitation.zig");
 const mcp_json = @import("mcp_json.zig");
 const mrtr = @import("mrtr.zig");
-const protocol_negotiation = @import("protocol_negotiation.zig");
 const tools_feature = @import("features/tools.zig");
 
 const tool_content = @import("../tooling/tool_content.zig");
@@ -131,88 +130,6 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
             };
         },
     };
-}
-
-pub fn protocol_diagnostic_alloc(
-    alloc: Allocator,
-    code: i64,
-    message: []const u8,
-    data_json: ?[]const u8,
-) ![]u8 {
-    var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer mem_utils.deinit_arena(scratch_state);
-    const scratch = scratch_state.allocator();
-    var raw: std.Io.Writer.Allocating = .init(scratch);
-    try write_protocol_diagnostic(
-        scratch,
-        &raw.writer,
-        code,
-        message,
-        data_json,
-    );
-    return try alloc.dupe(u8, raw.writer.buffered());
-}
-
-pub fn format_protocol_error(
-    alloc: Allocator,
-    protocol_error: protocol_negotiation.ProtocolError,
-) ![]u8 {
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer mem_utils.deinit_arena(arena_state);
-    const arena = arena_state.allocator();
-    var raw: std.Io.Writer.Allocating = .init(arena);
-
-    try raw.writer.print("MCP protocol error {d}: ", .{protocol_error.code});
-    const safe_message = try text_utils.sanitizeModelText(
-        arena,
-        protocol_error.message,
-    );
-    try raw.writer.writeAll(try text_utils.maskSecrets(arena, safe_message));
-    if (protocol_error.data) |data| {
-        try raw.writer.writeAll("; data=");
-        try writeJsonProjection(arena, &raw.writer, data, true);
-    }
-    return try alloc.dupe(u8, raw.writer.buffered());
-}
-
-pub fn frame_too_large_result(
-    alloc: Allocator,
-    server_name: []const u8,
-    tool_name: []const u8,
-    cap_bytes: usize,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"server\":");
-    try std.json.Stringify.value(server_name, .{}, &out.writer);
-    try out.writer.writeAll(",\"tool\":");
-    try std.json.Stringify.value(tool_name, .{}, &out.writer);
-    try out.writer.writeAll(",\"error\":{\"kind\":\"response_frame_too_large\",\"message\":\"MCP response frame exceeded the raw pre-parse cap\",\"cap_bytes\":");
-    try out.writer.print("{d}", .{cap_bytes});
-    try out.writer.writeAll("}}");
-    return try out.toOwnedSlice();
-}
-
-/// A tool call that could not run because its stopped server failed to
-/// start again. `failure` is the server's recorded startup failure.
-pub fn restart_failed_result(
-    alloc: Allocator,
-    server_name: []const u8,
-    tool_name: []const u8,
-    failure: []const u8,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try out.writer.writeAll("{\"server\":");
-    try std.json.Stringify.value(server_name, .{}, &out.writer);
-    try out.writer.writeAll(",\"tool\":");
-    try std.json.Stringify.value(tool_name, .{}, &out.writer);
-    try out.writer.writeAll(",\"error\":{\"kind\":\"server_restart_failed\",\"message\":");
-    const message = try alloc.print("MCP server stopped and could not be restarted: {s}", .{failure});
-    defer alloc.free(message);
-    try std.json.Stringify.value(message, .{}, &out.writer);
-    try out.writer.writeAll("}}");
-    return try out.toOwnedSlice();
 }
 
 fn legacy_url_required(
@@ -556,22 +473,6 @@ test "tool result extracts all content" {
     try std.testing.expectEqualStrings("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=", result.images[0].data);
     try std.testing.expectEqualStrings("image/png", result.images[0].mime_type);
     try std.testing.expectEqualStrings("world", content[2].object.get("text").?.string);
-}
-
-test "a tool call whose server could not restart carries the startup failure" {
-    const alloc = std.testing.allocator;
-    const output = try restart_failed_result(
-        alloc,
-        "fixture",
-        "mcp_fixture_echo",
-        "MCP server exited with code 5 before completing startup: \"relaunch\" blocked",
-    );
-    defer alloc.free(output);
-    try std.testing.expectEqualStrings(
-        "{\"server\":\"fixture\",\"tool\":\"mcp_fixture_echo\",\"error\":{\"kind\":\"server_restart_failed\"," ++
-            "\"message\":\"MCP server stopped and could not be restarted: MCP server exited with code 5 before completing startup: \\\"relaunch\\\" blocked\"}}",
-        output,
-    );
 }
 
 test "tool result retains protocol error diagnostics" {

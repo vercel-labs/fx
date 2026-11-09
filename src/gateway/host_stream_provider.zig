@@ -19,6 +19,10 @@ pub const Transport = struct {
     close_fn: *const fn (?*anyopaque, i32) void,
     // Optional logical-completion signal, independent of HTTP EOF or close.
     consumed_fn: ?*const fn (?*anyopaque, i32) void = null,
+    // Optional: an opened response's Retry-After in whole seconds, or -1 when
+    // it has none. Read once its status is ready; a host without it leaves
+    // waits on fx's own backoff.
+    retry_after_fn: ?*const fn (?*anyopaque, i32) i32 = null,
 
     fn open(self: Transport, method: []const u8, url: []const u8, headers: []const u8, body: []const u8) !i32 {
         return self.open_fn(self.context, method, url, headers, body);
@@ -167,12 +171,15 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     if (opened.status != .ok) {
         const body = try readErrorBody(alloc, transport, opened.handle, request);
         // Gateway reports the last provider it tried, so a provider's size
-        // rejection can arrive as a 400 from a later fallback.
-        const kind = failureKind(opened.status);
+        // rejection can arrive as a 400 from a later fallback. A 429 whose
+        // body names a used-up quota is not a rate limit a wait outlives.
+        const kind = gateway_client.httpFailureKind(alloc, stream_provider.FailureKind.fromHttpStatus(opened.status), body);
         const size_rejected = kind == .invalid_request and vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body);
         return .{ .failed = .{
             .kind = if (size_rejected) .request_too_large else kind,
+            .http_status = opened.status,
             .detail = try withoutCredential(alloc, body, request.credential.secret()),
+            .retry_after_seconds = opened.retry_after_seconds,
             .ownership = .owned,
         } };
     }
@@ -190,9 +197,9 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         alloc,
         &reader.interface,
         &events,
-        EventBridge.content,
-        EventBridge.toolStart,
-        EventBridge.reasoning,
+        stream_provider.EventSink.onContentChunk,
+        stream_provider.EventSink.onToolStart,
+        stream_provider.EventSink.onReasoningChunk,
         request.cancel_flag,
         request.content_capture_limit,
     ) catch |err| switch (err) {
@@ -209,6 +216,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
 pub const OpenedPost = struct {
     handle: i32,
     status: std.http.Status,
+    retry_after_seconds: ?u64 = null,
 };
 
 /// Admits the request, sends one POST through the host and waits for its HTTP
@@ -244,7 +252,56 @@ pub fn openPost(
         try pulse(request.cooperative_pulse);
     }
     const http_status = httpStatus(status_code) orelse return error.HostStreamFailed;
-    return .{ .handle = handle, .status = http_status };
+    const retry_after: ?u64 = if (transport.retry_after_fn) |read| blk: {
+        const seconds = read(transport.context, handle);
+        break :blk if (seconds < 0) null else @intCast(seconds);
+    } else null;
+    return .{ .handle = handle, .status = http_status, .retry_after_seconds = retry_after };
+}
+
+pub const GetResponse = struct {
+    status: std.http.Status,
+    /// Owned by the caller.
+    body: []u8,
+};
+
+/// Sends one GET through the host and reads its whole body, up to
+/// `max_body_bytes`. Checks `cancel_flag` and `deadline` before every host
+/// call, and pulses while the host has nothing ready, so a single-threaded
+/// runtime keeps serving input meanwhile. Headers reach the host as a JSON
+/// list of `{name, value}` objects. The handle is closed before returning.
+pub fn get(
+    alloc: Allocator,
+    transport: Transport,
+    url: []const u8,
+    headers: []const std.http.Header,
+    max_body_bytes: usize,
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: ?std.Io.Clock.Timestamp,
+    cooperative_pulse: ?stream_provider.CooperativePulse,
+) !GetResponse {
+    var headers_json: std.Io.Writer.Allocating = .init(alloc);
+    defer headers_json.deinit();
+    try std.json.Stringify.value(headers, .{}, &headers_json.writer);
+
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    const handle = try transport.open("GET", url, headers_json.writer.buffered(), "");
+    if (handle < 0) return error.HostStreamFailed;
+    defer transport.close(handle);
+
+    var status_code: u16 = 0;
+    while (true) {
+        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (deadlineExpired(deadline)) return error.Timeout;
+        const status_result = transport.status(handle, &status_code);
+        if (status_result == 1) break;
+        if (status_result == -2) return error.Cancelled;
+        if (status_result < 0) return error.HostStreamFailed;
+        try pulse(cooperative_pulse);
+    }
+    const http_status = httpStatus(status_code) orelse return error.HostStreamFailed;
+    const body = try readBody(alloc, transport, handle, max_body_bytes, cancel_flag, deadline, cooperative_pulse);
+    return .{ .status = http_status, .body = body };
 }
 
 /// `body` with the request's own key masked, as fx masks a configured
@@ -264,7 +321,7 @@ pub fn readErrorBody(
     handle: i32,
     request: stream_provider.ModelRequest,
 ) ![]u8 {
-    return readBody(alloc, transport, handle, request.cancel_flag, request.deadline, request.cooperative_pulse);
+    return readBody(alloc, transport, handle, max_error_body_bytes, request.cancel_flag, request.deadline, request.cooperative_pulse);
 }
 
 pub const ReadFailure = error{ Timeout, Cancelled, HostStreamFailed };
@@ -394,7 +451,7 @@ test "host provider signals logical consumption only after valid uncancelled com
         .{ .body = text ++ stop, .status = 1024, .expected_error = error.HostStreamFailed },
         .{ .body = text ++ stop, .status = 65535, .expected_error = error.HostStreamFailed },
         .{ .body = text, .read_error = -1, .expected_error = error.HostStreamFailed },
-        .{ .body = "data: {not-json}\n\n", .expected_error = error.InvalidGatewaySseEvent },
+        .{ .body = "data: {not-json}\n\n", .expected_error = error.MalformedGatewaySseEvent },
     };
     for (cases, 0..) |case, index| {
         var fake: FakeTransport = .{
@@ -456,39 +513,6 @@ fn buildRequest(
     return context.build_fn(alloc, request);
 }
 
-const EventBridge = struct {
-    fn sink(raw: *anyopaque) *stream_provider.EventSink {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn content(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .content_delta = chunk });
-    }
-
-    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .reasoning_delta = chunk });
-    }
-
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
-    }
-};
-
-fn failureKind(status: std.http.Status) stream_provider.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
-}
-
 fn pulse(value: ?stream_provider.CooperativePulse) !void {
     if (value) |callback| try callback.pulse();
 }
@@ -499,10 +523,13 @@ pub fn deadlineExpired(deadline: ?std.Io.Clock.Timestamp) bool {
     return !std.Io.Clock.Timestamp.compare(now, .lt, value);
 }
 
+/// Reads a response body whole, failing once it exceeds `max_bytes`. The
+/// caller owns the bytes.
 fn readBody(
     alloc: Allocator,
     transport: Transport,
     handle: i32,
+    max_bytes: usize,
     cancel_flag: *std.atomic.Value(bool),
     deadline: ?std.Io.Clock.Timestamp,
     cooperative_pulse: ?stream_provider.CooperativePulse,
@@ -522,7 +549,7 @@ fn readBody(
         if (count < 0) return error.HostStreamFailed;
         if (count == 0) break;
         const len: usize = @intCast(count);
-        if (len > max_error_body_bytes - out.items.len) return error.HostStreamFailed;
+        if (len > max_bytes - out.items.len) return error.HostStreamFailed;
         try out.appendSlice(alloc, chunk[0..len]);
     }
     return out.toOwnedSlice(alloc);
@@ -671,8 +698,146 @@ test "error response bodies are bounded" {
 
     try std.testing.expectError(
         error.HostStreamFailed,
-        readBody(std.testing.allocator, transport, 1, &cancel_flag, null, null),
+        readBody(std.testing.allocator, transport, 1, max_error_body_bytes, &cancel_flag, null, null),
     );
+}
+
+/// A host that answers one GET as a test scripts it.
+const ScriptedGet = struct {
+    pending_statuses: usize = 0,
+    status_result: i32 = 1,
+    not_ready_reads: usize = 0,
+    chunks: []const []const u8 = &.{},
+    chunk: usize = 0,
+    opens: usize = 0,
+    closes: usize = 0,
+    method: []const u8 = "",
+    headers_buf: [256]u8 = undefined,
+    headers: []const u8 = "",
+    body_len: usize = 0,
+
+    fn transport(self: *ScriptedGet) Transport {
+        return .{ .context = self, .open_fn = open, .status_fn = status, .next_fn = next, .close_fn = close };
+    }
+
+    fn open(raw: ?*anyopaque, method: []const u8, _: []const u8, headers: []const u8, body: []const u8) anyerror!i32 {
+        const self: *ScriptedGet = @ptrCast(@alignCast(raw.?));
+        self.opens += 1;
+        self.method = method;
+        @memcpy(self.headers_buf[0..headers.len], headers);
+        self.headers = self.headers_buf[0..headers.len];
+        self.body_len = body.len;
+        return 7;
+    }
+
+    fn status(raw: ?*anyopaque, _: i32, status_out: *u16) i32 {
+        const self: *ScriptedGet = @ptrCast(@alignCast(raw.?));
+        if (self.pending_statuses > 0) {
+            self.pending_statuses -= 1;
+            return 0;
+        }
+        status_out.* = 200;
+        return self.status_result;
+    }
+
+    fn next(raw: ?*anyopaque, _: i32, out: []u8) i32 {
+        const self: *ScriptedGet = @ptrCast(@alignCast(raw.?));
+        if (self.not_ready_reads > 0) {
+            self.not_ready_reads -= 1;
+            return -3;
+        }
+        if (self.chunk == self.chunks.len) return 0;
+        const bytes = self.chunks[self.chunk];
+        self.chunk += 1;
+        @memcpy(out[0..bytes.len], bytes);
+        return @intCast(bytes.len);
+    }
+
+    fn close(raw: ?*anyopaque, _: i32) void {
+        const self: *ScriptedGet = @ptrCast(@alignCast(raw.?));
+        self.closes += 1;
+    }
+};
+
+/// Counts pulses, and sets `cancel_flag` on the first when one is given.
+const CountingPulse = struct {
+    count: usize = 0,
+    cancel_flag: ?*std.atomic.Value(bool) = null,
+
+    fn run(raw: *anyopaque) anyerror!void {
+        const self: *CountingPulse = @ptrCast(@alignCast(raw));
+        self.count += 1;
+        if (self.cancel_flag) |flag| flag.store(true, .seq_cst);
+    }
+
+    fn callback(self: *CountingPulse) stream_provider.CooperativePulse {
+        return .{ .ctx = self, .run = run };
+    }
+};
+
+test "a host GET waits for its status and body while pulsing, then closes" {
+    var host: ScriptedGet = .{ .pending_statuses = 2, .not_ready_reads = 1, .chunks = &.{ "hello ", "world" } };
+    var pulses: CountingPulse = .{};
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const response = try get(
+        std.testing.allocator,
+        host.transport(),
+        "https://usage.example.test/v1/report",
+        &.{.{ .name = "authorization", .value = "Bearer test-key" }},
+        64,
+        &cancel_flag,
+        null,
+        pulses.callback(),
+    );
+    defer std.testing.allocator.free(response.body);
+
+    try std.testing.expectEqual(std.http.Status.ok, response.status);
+    try std.testing.expectEqualStrings("hello world", response.body);
+    try std.testing.expectEqualStrings("GET", host.method);
+    try std.testing.expectEqualStrings("[{\"name\":\"authorization\",\"value\":\"Bearer test-key\"}]", host.headers);
+    try std.testing.expectEqual(@as(usize, 0), host.body_len);
+    // Two pending statuses and one read with nothing ready.
+    try std.testing.expectEqual(@as(usize, 3), pulses.count);
+    try std.testing.expectEqual(@as(usize, 1), host.closes);
+}
+
+test "a host GET stops at its limit, on cancellation, on a failed status and at its deadline" {
+    const io = std.testing.io;
+    const Case = struct {
+        host: ScriptedGet,
+        max_body_bytes: usize = 64,
+        cancelled_before: bool = false,
+        cancel_on_pulse: bool = false,
+        expired: bool = false,
+        expected: anyerror,
+    };
+    const cases = [_]Case{
+        .{ .host = .{ .chunks = &.{ "hello ", "world" } }, .max_body_bytes = 5, .expected = error.HostStreamFailed },
+        .{ .host = .{}, .cancelled_before = true, .expected = error.Cancelled },
+        .{ .host = .{ .pending_statuses = 1 }, .cancel_on_pulse = true, .expected = error.Cancelled },
+        .{ .host = .{ .status_result = -1 }, .expected = error.HostStreamFailed },
+        .{ .host = .{ .status_result = -2 }, .expected = error.Cancelled },
+        .{ .host = .{ .pending_statuses = 1 }, .expired = true, .expected = error.Timeout },
+    };
+    for (cases) |case| {
+        var host = case.host;
+        var cancel_flag = std.atomic.Value(bool).init(case.cancelled_before);
+        var pulses: CountingPulse = .{ .cancel_flag = if (case.cancel_on_pulse) &cancel_flag else null };
+        const deadline: ?std.Io.Clock.Timestamp = if (case.expired) std.Io.Clock.Timestamp.now(io, .awake) else null;
+        try std.testing.expectError(case.expected, get(
+            std.testing.allocator,
+            host.transport(),
+            "https://usage.example.test/v1/report",
+            &.{},
+            case.max_body_bytes,
+            &cancel_flag,
+            deadline,
+            pulses.callback(),
+        ));
+        // A request that was sent is always closed, once.
+        try std.testing.expectEqual(host.opens, host.closes);
+        try std.testing.expectEqual(@as(usize, if (case.cancelled_before) 0 else 1), host.opens);
+    }
 }
 
 test "a key quoted in a gateway error never reaches the failure detail" {
@@ -853,4 +1018,78 @@ test "host stream reader throttles cooperative pulses" {
     try std.testing.expectEqual(@as(usize, 1), trace.calls);
     try reader.pulseIfDueAt(awake_timestamp(200));
     try std.testing.expectEqual(@as(usize, 2), trace.calls);
+}
+
+test "a host's Retry-After and status reach the failure, and a host without one leaves the wait to fx" {
+    const FakeTransport = struct {
+        retry_after: i32,
+        admitted: usize = 0,
+        cancel_flag: std.atomic.Value(bool) = .init(false),
+
+        fn build(_: Allocator, _: stream_provider.RequestData) ![]u8 {
+            return error.UnexpectedRequest;
+        }
+        fn open(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8) !i32 {
+            return 3;
+        }
+        fn status(_: ?*anyopaque, _: i32, status_out: *u16) i32 {
+            status_out.* = 529;
+            return 1;
+        }
+        fn next(_: ?*anyopaque, _: i32, out: []u8) i32 {
+            _ = out;
+            return 0;
+        }
+        fn close(_: ?*anyopaque, _: i32) void {}
+        fn retryAfter(raw: ?*anyopaque, _: i32) i32 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.retry_after;
+        }
+        fn emit(_: *anyopaque, _: stream_provider.Event) void {}
+        fn admit(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.admitted += 1;
+        }
+    };
+    const cases = [_]struct { retry_after: i32, callback: bool, expected: ?u64 }{
+        .{ .retry_after = 7, .callback = true, .expected = 7 },
+        .{ .retry_after = 0, .callback = true, .expected = 0 },
+        .{ .retry_after = std.math.maxInt(i32), .callback = true, .expected = std.math.maxInt(i32) },
+        .{ .retry_after = -1, .callback = true, .expected = null },
+        .{ .retry_after = 7, .callback = false, .expected = null },
+    };
+    for (cases) |case| {
+        var fake: FakeTransport = .{ .retry_after = case.retry_after };
+        var context = initContext(FakeTransport.build, .{ .fixed = "https://example.invalid" }, .{
+            .context = &fake,
+            .open_fn = FakeTransport.open,
+            .status_fn = FakeTransport.status,
+            .next_fn = FakeTransport.next,
+            .close_fn = FakeTransport.close,
+            .retry_after_fn = if (case.callback) FakeTransport.retryAfter else null,
+        });
+        var delivery: stream_provider.DeliveryCertainty = .init();
+        var attempt: stream_provider.AttemptEvidence = .{};
+        var result = try stream(&context, std.testing.allocator, .{
+            .credential = .host_managed,
+            .model = "fixture-model",
+            .retry_count = 0,
+            .messages = &.{},
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .prepared_request_body = "{}",
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &attempt,
+            .events = .{ .context = &fake, .emit_fn = FakeTransport.emit },
+            .admission = .{ .context = &fake, .admit_fn = FakeTransport.admit },
+            .cancel_flag = &fake.cancel_flag,
+        });
+        defer result.deinit(std.testing.allocator);
+        const failure = result.failed;
+        try std.testing.expectEqual(stream_provider.FailureKind.server_error, failure.kind);
+        try std.testing.expectEqual(@as(?std.http.Status, @fromBackingInt(529)), failure.http_status);
+        try std.testing.expectEqual(case.expected, failure.retry_after_seconds);
+    }
 }

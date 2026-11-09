@@ -385,10 +385,13 @@ fn supportedIn(config: Config, failure: wire.Failure) Listed {
 
 /// The event for the answer to the current probe. A result without a
 /// `supportedVersions` list isn't a DiscoverResult, so it counts as legacy,
-/// like every error that isn't a recognized modern one.
+/// like every error that isn't a recognized modern one. So does a result whose
+/// `resultType` isn't complete: an unknown one is invalid, and a discover
+/// result is never input_required (WIRE-07).
 pub fn classifyDiscover(config: Config, body: @FieldType(wire.Response, "body")) Event {
     switch (body) {
         .result => |result| {
+            if (result.kind != .complete) return .legacy_answer;
             var found: [1]?[]const u8 = undefined;
             wire.objectFields(result.raw, &.{"supportedVersions"}, &found) catch return .legacy_answer;
             return .{ .discover_result = listedIn(config, found[0] orelse return .legacy_answer) catch return .legacy_answer };
@@ -866,6 +869,10 @@ test "classifies answers by their content" {
     const cases = [_]struct { []const u8, Event }{
         .{ "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"supportedVersions\":[\"2027-01-01\",\"2025-11-25\"]}}", .{ .discover_result = .{ .preferred = 0b10, .legacy = true } } },
         .{ "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}", .legacy_answer },
+        // Only a complete result is a DiscoverResult.
+        .{ "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2025-11-25\"]}}", .{ .discover_result = .{ .legacy = true } } },
+        .{ "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"input_required\",\"supportedVersions\":[\"2027-01-01\"]}}", .legacy_answer },
+        .{ "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"bogus\",\"supportedVersions\":[\"2027-01-01\"]}}", .legacy_answer },
         .{ "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32022,\"message\":\"x\",\"data\":{\"supported\":[\"2026-07-28\"]}}}", .{ .unsupported_version = .{ .preferred = 1 } } },
         .{ "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32022,\"message\":\"x\"}}", .{ .unsupported_version = .{} } },
         .{ "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32021,\"message\":\"x\"}}", .modern_rejection },

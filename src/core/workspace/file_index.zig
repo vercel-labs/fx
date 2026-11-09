@@ -868,7 +868,6 @@ fn loadGeneration(
 /// config, so a listing built under one config is never reused under another.
 pub fn snapshotPath(alloc: Allocator, roots: []const []const u8) Allocator.Error!?[]const u8 {
     const home = io_mod.homeDir() orelse return null;
-    if (!std.Io.Dir.path.isAbsolute(home)) return null;
     var config_environment: [indexer.config_environment_names.len]?[]const u8 = undefined;
     for (indexer.config_environment_names, &config_environment) |name, *value| value.* = io_mod.getenv(name);
     return try snapshotPathIn(alloc, home, roots, &config_environment);
@@ -4238,7 +4237,7 @@ test "deinit cancels and joins one loader while suppressing queued refresh" {
 
 test "file index raw-list and Unicode query bytes remain bounded" {
     try std.testing.fuzz({}, fuzzRawListAndQuery, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             "safe.txt\x00ärger",
             "escape-\x1b[2J.txt\x00\xff",
             "Ärger-file.txt\x00ärger",
@@ -4247,7 +4246,7 @@ test "file index raw-list and Unicode query bytes remain bounded" {
             "docs/Cafe\u{0301}.txt\x00e\u{0301}",
             "src/axaya.zig\x00aaa",
             "truncated.txt\x00\xc3",
-        },
+        }) ++ @import("fuzz_corpus").file_index.*),
     });
 }
 

@@ -1,7 +1,3 @@
-//! Written for the next MCP-v2 version: it does not build against this
-//! checkout's src/mcp/ until that version lands, so the driver runs its
-//! scenarios only with --next.
-//!
 //! U12 lab: runs a script of host actions against `mcp.engine`, playing the
 //! host: its permission answers, its stderr sink, and what it does with each
 //! event. One run traces every server's machines into one file, the engine
@@ -10,6 +6,7 @@
 //!
 //! Usage: engine_lab <trace-path> <script> [--deny TOOL]... [--capabilities JSON]
 //!          [--max-attempts N] [--no-listen] [--preferred V1,V2] [--probe-ms N]
+//!          [--timeout-ms IDLE] [--hard-ms N] [--start-ms N]
 //!          [--define NAME=VALUE]... (each {NAME} in the script becomes VALUE)
 //!
 //! Script, one action per line (blank lines and lines starting with # are skipped):
@@ -121,6 +118,7 @@ const Lab = struct {
             .phase => |p| lab.arena.print("{s}.phase.{s}", .{ s, @tagName(p) }),
             .called => |c| lab.arena.print("{s}.called.{d}.{s}", .{ s, lab.number(c.call), @tagName(c.outcome) }),
             .input => |q| lab.arena.print("{s}.input.{d}", .{ s, lab.number(q.call) }),
+            .progress => |p| lab.arena.print("{s}.progress.{d}", .{ s, lab.number(p.call) }),
             .server => |v| switch (v) {
                 .tools => |t| lab.arena.print("{s}.tools.{s}", .{ s, if (t.ok) "ok" else "fail" }),
                 else => lab.arena.print("{s}.{s}", .{ s, @tagName(v) }),
@@ -137,12 +135,13 @@ const Lab = struct {
             .called => |c| {
                 const answer: ?[]const u8 = if (c.answer) |a| switch (a) {
                     .result => |r| r.content,
-                    .failure => |f| try lab.arena.print("error {d}", .{f.code}),
+                    .failure => |f| try lab.arena.print("error {d} {s}", .{ f.code, f.message }),
                     else => @tagName(a),
                 } else null;
                 try lab.print("event", .{ .tag = t, .maybe_ran = c.maybe_ran, .timed_out = c.timed_out, .answer = answer });
             },
             .input => |q| try lab.print("event", .{ .tag = t, .requests = q.requests.len }),
+            .progress => |p| try lab.print("event", .{ .tag = t, .progress = p.progress, .total = p.total, .message = p.message }),
             .server => |v| switch (v) {
                 .tools => {
                     const list = try e.toolList(event.server);
@@ -178,6 +177,12 @@ const Lab = struct {
         const list = try lab.arena.alloc(engine.Status, e.len());
         for (list, 0..) |*s, i| s.* = e.status(i);
         try lab.print("status", list);
+        const tails = try lab.arena.alloc(?[]const u8, e.len());
+        for (tails, 0..) |*t, i| {
+            const buf = try lab.arena.create([mcp.stdio.tail_max]u8);
+            t.* = if (e.stderrTail(i, buf)) |tail| try lab.arena.dupe(u8, tail) else null;
+        }
+        try lab.print("stderr_tails", tails);
     }
 
     fn run(lab: *Lab, line: []const u8) !bool {
@@ -320,6 +325,10 @@ pub fn main(init: std.process.Init) !void {
             options.era.probe_timeout_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--timeout-ms")) {
             options.timeouts.idle_ms = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--hard-ms")) {
+            options.timeouts.hard_ms = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--start-ms")) {
+            options.timeouts.start_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--preferred")) {
             var list: std.ArrayList([]const u8) = .empty;
             var it = std.mem.splitScalar(u8, value, ',');

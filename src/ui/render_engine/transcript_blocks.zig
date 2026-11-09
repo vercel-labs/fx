@@ -108,6 +108,10 @@ pub const FullPresentationSink = struct {
     append_override: *const fn (context: *anyopaque, entry: TranscriptEntry, out: *std.Io.Writer.Allocating) anyerror!bool,
     before_entry: *const fn (context: *anyopaque, entry_id: u32, out: *std.Io.Writer.Allocating) anyerror!void,
     append_detail: *const fn (context: *anyopaque, entry_id: u32, out: *std.Io.Writer.Allocating) anyerror!FullDetailAppend,
+    /// Whether an overridden entry starts on the row under the block before
+    /// it, with no blank row between: a model call's line under the text
+    /// the call wrote.
+    attaches_below: *const fn (context: *anyopaque, entry: TranscriptEntry, previous: TranscriptBlockKind) bool,
 };
 
 pub const AssistantTurnSegments = struct {
@@ -1694,6 +1698,32 @@ const NoticeLine = struct {
 
 const notice_osc8_prefix = "\x1b]8;";
 const notice_osc8_close = "\x1b]8;;\x1b\\";
+const notice_link_underline = "\x1b[4m";
+const notice_link_underline_off = "\x1b[24m";
+
+/// Copies a notice's text, underlining what an OSC 8 link in it covers, as
+/// fx underlines every link. `linked`: a link from the row before goes on.
+fn appendNoticeText(out: *std.ArrayList(u8), alloc: Allocator, text: []const u8, linked: bool) !void {
+    var link: ?[]const u8 = if (linked) "" else null;
+    if (linked) try out.appendSlice(alloc, notice_link_underline);
+    var copied: usize = 0;
+    while (std.mem.findPos(u8, text, copied, notice_osc8_prefix)) |start| {
+        const end = display_width.ansiSequenceEnd(text, start);
+        if (end <= start or end > text.len) break;
+        const was = link != null;
+        updateNoticeHyperlinkState(text[start..end], &link);
+        if (was and link == null) {
+            try out.appendSlice(alloc, text[copied..start]);
+            try out.appendSlice(alloc, notice_link_underline_off);
+            try out.appendSlice(alloc, text[start..end]);
+        } else {
+            try out.appendSlice(alloc, text[copied..end]);
+            if (!was and link != null) try out.appendSlice(alloc, notice_link_underline);
+        }
+        copied = end;
+    }
+    try out.appendSlice(alloc, text[copied..]);
+}
 
 fn updateNoticeHyperlinkState(fragment: []const u8, active: *?[]const u8) void {
     var offset: usize = 0;
@@ -1820,12 +1850,15 @@ fn appendNoticeRow(
     }
     if (end > label_end) {
         try out.appendSlice(alloc, styles.system_notice_text_style);
-        try out.appendSlice(alloc, logical[@max(start, label_end)..end]);
+        try appendNoticeText(out, alloc, logical[@max(start, label_end)..end], active_hyperlink.* != null);
         try out.appendSlice(alloc, styles.reset_style);
     }
     if (start == end) try out.appendSlice(alloc, styles.reset_style);
     updateNoticeHyperlinkState(logical[start..end], active_hyperlink);
-    if (active_hyperlink.* != null) try out.appendSlice(alloc, notice_osc8_close);
+    if (active_hyperlink.* != null) {
+        try out.appendSlice(alloc, notice_link_underline_off);
+        try out.appendSlice(alloc, notice_osc8_close);
+    }
 }
 
 /// Returns an owned semantic notice block without surrounding blank rows.
@@ -2061,7 +2094,8 @@ pub fn renderEntriesForFullPresentationInterruptible(
         }
 
         if (sink.override_kind(sink.context, entry)) |kind| {
-            try out.writer.splatByteAll('\n', sequence.separatorNewlineCountBefore(kind));
+            const attached = if (sequence.previous_kind) |previous| sink.attaches_below(sink.context, entry, previous) else false;
+            try out.writer.splatByteAll('\n', if (attached) sequence.attachedNewlineCountBefore() else sequence.separatorNewlineCountBefore(kind));
             try sink.before_entry(sink.context, entry_id, out);
             const override_ends_with_newline = try sink.append_override(sink.context, entry, out);
             const detail = try sink.append_detail(sink.context, entry_id, out);
@@ -2166,6 +2200,10 @@ test "full presentation composition keeps normal block gaps around detail" {
             try out.writer.writeAll("\n  input\n  FULL_DETAIL\n");
             return .{ .attached = true, .ends_with_newline = true };
         }
+
+        fn attaches_below(_: *anyopaque, _: TranscriptEntry, _: TranscriptBlockKind) bool {
+            return false;
+        }
     };
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -2178,6 +2216,7 @@ test "full presentation composition keeps normal block gaps around detail" {
         .append_override = Context.append_override,
         .before_entry = Context.before,
         .append_detail = Context.append_detail,
+        .attaches_below = Context.attaches_below,
     };
     try renderEntriesForFullPresentationInterruptible(
         alloc,
@@ -2277,6 +2316,12 @@ const BlockSequenceState = struct {
         return blockSeparatorNewlineCount(self.previous_kind.?, next_kind) -| @intFromBool(self.previous_ends_with_newline);
     }
 
+    /// The newlines that start a block on the row under the last one.
+    fn attachedNewlineCountBefore(self: BlockSequenceState) u16 {
+        if (!self.emitted_any) return 0;
+        return 1 -| @intFromBool(self.previous_ends_with_newline);
+    }
+
     fn observe(
         self: *BlockSequenceState,
         kind: TranscriptBlockKind,
@@ -2306,6 +2351,12 @@ const RenderEntriesOptions = struct {
     summary_transcript_indices: []usize = &.{},
     line_provenance: ?*std.ArrayList(LineProvenance) = null,
     entry_overrides: []const EntryRenderOverride = &.{},
+    /// Continue after this prefix instead of rendering from the first entry.
+    resume_from: ?*const PreparationResume = null,
+    /// Save the renderer's state before the entry at this index (or after the
+    /// last entry) into `captured`.
+    capture_at: ?usize = null,
+    captured: ?*?PreparationResume = null,
 
     fn resetSummaryIndices(self: RenderEntriesOptions) void {
         std.debug.assert(self.summary_entry_ids.len == self.summary_transcript_indices.len);
@@ -2347,15 +2398,118 @@ const RenderEntriesOptions = struct {
     }
 };
 
+/// Where one rendered entry begins in a prepared flow.
+pub const PreparationMark = struct {
+    entry_id: u32,
+    start_line: usize,
+    start_byte: usize,
+    finalized_prefix_bytes: ?usize,
+};
+
+/// The preparation renderer's state after the first `entry_count` entries,
+/// so a later preparation of the same entries renders only the ones after
+/// them. The flow up to this point is `bytes`; `finish` has not run, so the
+/// closing newlines are not part of it.
+pub const PreparationResume = struct {
+    entry_count: usize,
+    bytes: []u8,
+    has_provenance: bool,
+    line_provenance: []LineProvenance,
+    sequence: BlockSequenceState,
+    line_index: usize,
+    marks: []PreparationMark,
+    mark_by_id: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+
+    pub fn deinit(self: *PreparationResume, alloc: Allocator) void {
+        alloc.free(self.bytes);
+        alloc.free(self.line_provenance);
+        alloc.free(self.marks);
+        self.mark_by_id.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn mark(self: *const PreparationResume, entry_id: u32) ?PreparationMark {
+        const index = self.mark_by_id.get(entry_id) orelse return null;
+        return self.marks[index];
+    }
+};
+
 const RenderEntriesBuilder = struct {
     out: std.ArrayList(u8) = .empty,
     sequence: BlockSequenceState = .{},
     line_index: usize = 0,
     target_entry_start_line: ?usize = null,
     target_entry_start_byte: ?usize = null,
+    record_marks: bool = false,
+    marks: std.ArrayList(PreparationMark) = .empty,
 
     fn deinit(self: *RenderEntriesBuilder, alloc: Allocator) void {
         self.out.deinit(alloc);
+        self.marks.deinit(alloc);
+    }
+
+    /// Restores the state `prefix` saved, and the outputs its entries wrote:
+    /// the target positions, finality floors, and folded-summary lines.
+    fn resumeFrom(
+        self: *RenderEntriesBuilder,
+        alloc: Allocator,
+        prefix: *const PreparationResume,
+        options: RenderEntriesOptions,
+    ) !void {
+        std.debug.assert(prefix.has_provenance == (options.line_provenance != null));
+        try self.out.appendSlice(alloc, prefix.bytes);
+        self.sequence = prefix.sequence;
+        self.line_index = prefix.line_index;
+        if (options.line_provenance) |lines| try lines.appendSlice(alloc, prefix.line_provenance);
+        if (self.record_marks) try self.marks.appendSlice(alloc, prefix.marks);
+        if (options.target_entry_id) |entry_id| {
+            if (prefix.mark(entry_id)) |found| self.target_entry_start_line = found.start_line;
+        }
+        if (options.target_byte_entry_id) |entry_id| {
+            if (prefix.mark(entry_id)) |found| self.target_entry_start_byte = found.start_byte;
+        }
+        for (options.finality_entry_ids, 0..) |entry_id, index| {
+            const found = prefix.mark(entry_id) orelse continue;
+            options.finality_entry_floor_bytes[index] = found.start_byte + (found.finalized_prefix_bytes orelse 0);
+        }
+        for (options.summary_entry_ids, 0..) |summary_entry_id, index| {
+            const entry_id = summary_entry_id orelse continue;
+            const found = prefix.mark(entry_id) orelse continue;
+            options.summary_transcript_indices[index] = found.start_line + 1;
+        }
+    }
+
+    fn capture(
+        self: *RenderEntriesBuilder,
+        alloc: Allocator,
+        options: RenderEntriesOptions,
+        entry_count: usize,
+    ) !void {
+        const out = options.captured orelse return;
+        const bytes = try alloc.dupe(u8, self.out.items);
+        errdefer alloc.free(bytes);
+        const provenance = try alloc.dupe(
+            LineProvenance,
+            if (options.line_provenance) |lines| lines.items else &.{},
+        );
+        errdefer alloc.free(provenance);
+        const marks = try alloc.dupe(PreparationMark, self.marks.items);
+        errdefer alloc.free(marks);
+        var by_id: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        errdefer by_id.deinit(alloc);
+        try by_id.ensureTotalCapacity(alloc, @intCast(marks.len));
+        for (marks, 0..) |found, index| by_id.putAssumeCapacity(found.entry_id, @intCast(index));
+        if (out.*) |*previous| previous.deinit(alloc);
+        out.* = .{
+            .entry_count = entry_count,
+            .bytes = bytes,
+            .has_provenance = options.line_provenance != null,
+            .line_provenance = provenance,
+            .sequence = self.sequence,
+            .line_index = self.line_index,
+            .marks = marks,
+            .mark_by_id = by_id,
+        };
     }
 
     fn appendSeparatorBefore(
@@ -2413,6 +2567,12 @@ const RenderEntriesBuilder = struct {
         try self.appendSeparatorBefore(alloc, block.kind, options.line_provenance);
 
         const entry_id = entry.id();
+        if (self.record_marks) try self.marks.append(alloc, .{
+            .entry_id = entry_id,
+            .start_line = self.line_index,
+            .start_byte = self.out.items.len,
+            .finalized_prefix_bytes = block.assistant_finalized_prefix_bytes,
+        });
         if (options.target_entry_id == entry_id) self.target_entry_start_line = self.line_index;
         if (options.target_byte_entry_id == entry_id) self.target_entry_start_byte = self.out.items.len;
         for (options.finality_entry_ids, 0..) |finality_entry_id, index| {
@@ -2443,6 +2603,8 @@ const RenderEntriesBuilder = struct {
 
     fn finish(self: *RenderEntriesBuilder, alloc: Allocator) !RenderedEntries {
         try self.out.appendNTimes(alloc, '\n', self.sequence.finalNewlineCount());
+        self.marks.deinit(alloc);
+        self.marks = .empty;
         return .{
             .bytes = try self.out.toOwnedSlice(alloc),
             .target_entry_start_line = self.target_entry_start_line,
@@ -2479,10 +2641,17 @@ fn renderEntriesInterruptible(
         std.debug.assert(options.entry_actions.len == entries.len);
     }
 
-    var builder: RenderEntriesBuilder = .{};
+    var builder: RenderEntriesBuilder = .{ .record_marks = options.capture_at != null };
     errdefer builder.deinit(alloc);
 
-    for (entries, 0..) |entry, entry_index| {
+    var first: usize = 0;
+    if (options.resume_from) |prefix| {
+        std.debug.assert(prefix.entry_count <= entries.len);
+        first = prefix.entry_count;
+        try builder.resumeFrom(alloc, prefix, options);
+    }
+    for (entries[first..], first..) |entry, entry_index| {
+        if (options.capture_at == entry_index) try builder.capture(alloc, options, entry_index);
         try build_checkpoint.tick(checkpoint);
         if (!isEntryVisibleInCompactPresentation(entry) or options.shouldOmit(entry_index, entry)) continue;
         if (options.overrideForEntry(entry_index, entry)) |override| {
@@ -2509,8 +2678,27 @@ fn renderEntriesInterruptible(
 
         try builder.appendBlock(alloc, entry, block, options, &.{}, checkpoint);
     }
+    if (options.capture_at == entries.len) try builder.capture(alloc, options, entries.len);
 
     return builder.finish(alloc);
+}
+
+/// `renderEntriesToBytes` that continues after `resume_from` and saves the
+/// renderer's state before entry `capture_at` into `captured`.
+pub fn renderEntriesToBytesResumable(
+    alloc: Allocator,
+    entries: []const TranscriptEntry,
+    cols: u16,
+    styles: Styles,
+    resume_from: ?*const PreparationResume,
+    capture_at: ?usize,
+    captured: ?*?PreparationResume,
+) ![]u8 {
+    return (try renderEntries(alloc, entries, cols, styles, .{
+        .resume_from = resume_from,
+        .capture_at = capture_at,
+        .captured = captured,
+    })).bytes;
 }
 
 pub fn renderEntriesToBytes(
@@ -2657,6 +2845,9 @@ pub const TranscriptPreparationOptions = struct {
     folded_summary_entry_ids: []const ?u32 = &.{},
     capture_provenance: bool = false,
     entry_overrides: []const EntryRenderOverride = &.{},
+    resume_from: ?*const PreparationResume = null,
+    capture_at: ?usize = null,
+    captured: ?*?PreparationResume = null,
 };
 
 pub fn renderEntriesForPreparation(
@@ -2707,6 +2898,9 @@ pub fn renderEntriesForPreparationInterruptible(
             .summary_transcript_indices = summary_indices,
             .line_provenance = if (options.capture_provenance) &line_provenance else null,
             .entry_overrides = options.entry_overrides,
+            .resume_from = options.resume_from,
+            .capture_at = options.capture_at,
+            .captured = options.captured,
         },
         checkpoint,
     );
@@ -3206,7 +3400,7 @@ test "semantic notice topics never render the tool-activity bullet or forced cap
     }
 }
 
-test "semantic notice keeps an OSC 8 target hidden and clickable" {
+test "semantic notice keeps an OSC 8 target hidden, clickable, and underlined" {
     const alloc = std.testing.allocator;
     const url = "https://fx.sh/feedback";
     const body = try alloc.print(
@@ -3234,6 +3428,7 @@ test "semantic notice keeps an OSC 8 target hidden and clickable" {
     try std.testing.expect(link_cell.style.hyperlink_id != 0);
     try std.testing.expectEqualStrings(url, grid.hyperlinkUrl(link_cell.style.hyperlink_id).?);
     try std.testing.expectEqual(@as(u32, 0), grid.cellAt(1, 31).?.style.hyperlink_id);
+    try expectUnderlinedExactlyWhereLinked(&grid);
 
     var narrow_grid = try vt_emulator.Grid.init(alloc, 9, 16);
     defer narrow_grid.deinit();
@@ -3258,6 +3453,18 @@ test "semantic notice keeps an OSC 8 target hidden and clickable" {
     }
     try std.testing.expectEqualStrings("Openfeedback form", linked_text.items);
     try std.testing.expectEqual(@as(u32, 0), narrow_grid.current_style.hyperlink_id);
+    // Each row a link wraps onto is underlined too, and nothing after it.
+    try expectUnderlinedExactlyWhereLinked(&narrow_grid);
+    try std.testing.expect(!narrow_grid.current_style.flags.underline);
+}
+
+fn expectUnderlinedExactlyWhereLinked(grid: *vt_emulator.Grid) !void {
+    for (1..grid.rows + 1) |row_index| {
+        for (1..grid.cols + 1) |col_index| {
+            const cell = grid.cellAt(@intCast(row_index), @intCast(col_index)).?;
+            try std.testing.expectEqual(cell.style.hyperlink_id != 0, cell.style.flags.underline);
+        }
+    }
 }
 
 test "background semantic notices render one topic for launch and failure" {
@@ -3822,7 +4029,7 @@ test "tool status preview reasserts ANSI before standalone continuations" {
     };
     const fixtures = [_]Fixture{
         .{ .source = "\x1b[38;5;243m●\x1b[0m\x1b[1m Running\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 243 },
-        .{ .source = "\x1b[38;5;252m■\x1b[0m\x1b[1m\x1b[38;5;255m Cancelled\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 252 },
+        .{ .source = "\x1b[38;5;252m▪\x1b[0m\x1b[1m\x1b[38;5;255m Cancelled\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 252 },
         .{ .source = "\x1b[38;5;252m●\x1b[0m\x1b[1m Ran\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 252 },
     };
 
@@ -4556,7 +4763,7 @@ test "renderEntriesToBytes reflows parser-rendered lists at paint-time cols" {
     const third = std.mem.find(u8, narrow, "third-").?;
     try std.testing.expect(first < second and second < third);
     try std.testing.expect(std.mem.find(u8, narrow, "\n    ") != null);
-    try std.testing.expect(std.mem.find(u8, narrow, "\n     ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n       ") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "\n      ") != null);
 
     var lines = std.mem.splitScalar(u8, narrow, '\n');
@@ -4578,7 +4785,7 @@ test "renderEntriesToBytes preserves parser-rendered list paragraph indentation"
     try appendAssistantTestEntry(&entries, alloc, 1, source.items);
     const narrow = try renderEntriesToBytes(alloc, entries.items, 18, .{});
     defer alloc.free(narrow);
-    try std.testing.expect(std.mem.find(u8, narrow, "     alpha beta\n     gamma delta") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "       alpha beta\n       gamma delta") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "    alpha beta\n    gamma delta") != null);
 }
 
@@ -4619,7 +4826,7 @@ test "renderEntriesToBytes reflows parser-rendered task lists at paint-time cols
     const nested = std.mem.find(u8, narrow, "nested-").?;
     try std.testing.expect(first < completed and completed < nested);
     try std.testing.expect(std.mem.find(u8, narrow, "\n    ") != null);
-    try std.testing.expect(std.mem.find(u8, narrow, "\n       ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n         ") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "\n      ") != null);
 
     var lines = std.mem.splitScalar(u8, narrow, '\n');
@@ -5212,4 +5419,69 @@ test "current compact rendering reflows user prompts without card background" {
     try std.testing.expect(std.mem.startsWith(u8, out, "\x1b[38;5;255m┃\x1b[0m \x1b[1mminimal prompt"));
     try std.testing.expect(std.mem.find(u8, out, "\x1b[48;") == null);
     try std.testing.expect(std.mem.find(u8, out, "\x1b[K") == null);
+}
+
+test "a preparation resumed after any prefix equals the full preparation" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendRawTestEntry(&entries, alloc, 1, "fx v0 · Run /help for commands\n", .welcome);
+    try appendUserTestEntry(&entries, alloc, 2, "Read the notes");
+    try appendRawTestEntry(&entries, alloc, 3, "● Read notes.txt\n", .tool_status);
+    try appendAssistantTestEntry(&entries, alloc, 4, "Here is **a** summary with a long line that wraps across the narrow width used here.");
+    try entries.append(alloc, .{ .assistant_thematic_rule = .{ .id = 5 } });
+    try appendRawTestEntry(&entries, alloc, 6, "0s (↑5 ↓5)\n", .turn_summary);
+    try appendSemanticNoticeTestEntry(&entries, alloc, 7, .{ .topic = "version", .tone = .neutral, .body = "0.0.16" });
+    try appendUserTestEntry(&entries, alloc, 8, "Run a command");
+    try appendRawTestEntry(&entries, alloc, 9, "● Ran printf 'hello'\n", .tool_status);
+    try appendRawTestEntry(&entries, alloc, 10, "hello\n", .command_output);
+    try appendAssistantTestEntry(&entries, alloc, 11, "TURN_TWO_DONE");
+
+    const finality_ids = [_]u32{ 3, 11 };
+    const summary_ids = [_]?u32{ 6, null, 9 };
+    const Run = struct {
+        fn prepare(
+            list: []const TranscriptEntry,
+            resume_from: ?*const PreparationResume,
+            capture_at: ?usize,
+            captured: ?*?PreparationResume,
+            floors: []?usize,
+        ) !TranscriptPreparationBytes {
+            @memset(floors, null);
+            return renderEntriesForPreparation(std.testing.allocator, list, 40, .{}, .{
+                .target_entry_id = 4,
+                .target_byte_entry_id = 9,
+                .finality_entry_ids = &finality_ids,
+                .finality_entry_floor_bytes = floors,
+                .folded_summary_entry_ids = &summary_ids,
+                .capture_provenance = true,
+                .resume_from = resume_from,
+                .capture_at = capture_at,
+                .captured = captured,
+            });
+        }
+    };
+    var full_floors: [finality_ids.len]?usize = undefined;
+    var full = try Run.prepare(entries.items, null, null, null, &full_floors);
+    defer full.deinit(alloc);
+    for (0..entries.items.len + 1) |at| {
+        var captured: ?PreparationResume = null;
+        defer if (captured) |*value| value.deinit(alloc);
+        var first_floors: [finality_ids.len]?usize = undefined;
+        var first = try Run.prepare(entries.items, null, at, &captured, &first_floors);
+        defer first.deinit(alloc);
+        try std.testing.expectEqualStrings(full.bytes, first.bytes);
+        try std.testing.expectEqual(at, captured.?.entry_count);
+
+        var floors: [finality_ids.len]?usize = undefined;
+        var resumed = try Run.prepare(entries.items, &captured.?, null, null, &floors);
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqualStrings(full.bytes, resumed.bytes);
+        try std.testing.expectEqualDeep(full.line_provenance, resumed.line_provenance);
+        try std.testing.expectEqualSlices(usize, full.folded_summary_indices, resumed.folded_summary_indices);
+        try std.testing.expectEqual(full.target_entry_start_line, resumed.target_entry_start_line);
+        try std.testing.expectEqual(full.target_entry_start_byte, resumed.target_entry_start_byte);
+        try std.testing.expectEqual(full.trailing_boundary_blank_rows, resumed.trailing_boundary_blank_rows);
+        try std.testing.expectEqualSlices(?usize, &full_floors, &floors);
+    }
 }

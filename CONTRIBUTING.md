@@ -54,6 +54,17 @@ These rules apply to every change:
 
 If a coding agent helps with your change, point it at AGENTS.md. Any prose the agent writes for your contribution, including pull request titles and descriptions, commit messages, documentation, and issues, must follow the `technical-writer` skill in `.fx/skills/technical-writer/`.
 
+### Add or change a command, flag, or setting
+
+Commands, flags, settings, environment variables, slash commands, and `--json` output are what people and scripts rely on, so fx gives them all one shape. Someone who knows git and the Unix command line should be able to guess what a control is called, where it goes, and which source wins when two disagree:
+
+- Each concept has one name, written in each surface's case: `permission_mode` in settings and JSON, `--permission-mode` as a flag, and `FX_PERMISSION_MODE` as an environment variable.
+- A subcommand is an action, a flag changes one run and never saves, a setting persists, and an environment variable carries context from CI, a wrapper script, or a test.
+- Results go to stdout and diagnostics to stderr, `--json` fields are only added, and a usage error exits with 2.
+- A rename keeps the old spelling working with a warning that names its replacement and the release that drops it.
+
+The `fx-cli-shape` skill in `.fx/skills/fx-cli-shape/` has the full rules, the names that are already decided, and a script that lists the controls a diff adds or removes. Read it before you add, rename, or remove a control, and point your coding agent at it too. CI's `python3 -m scripts.check_cli_shape` fails when code reads an `FX_*` variable, compares a flag by hand, or parses a setting that its registries don't list. A new top-level command, a new stable environment variable, or a new project-safe setting needs a maintainer's approval in the pull request.
+
 ## Test your change
 
 Run the tests that cover your change, build fx, and then use `./zig-out/bin/fx` to exercise the change yourself. Tests don't always start the full runtime, attach a terminal, or spawn background threads, so a passing suite can still miss a startup crash or a rendering regression. Confirm that fx didn't abort, that stderr is clean, and that the behavior matches what you'll describe in the pull request.
@@ -71,11 +82,12 @@ Zig unit tests sit in `test` blocks inside the source file they cover, and `zig 
 
 ### Add an end-to-end test file
 
-Every root `tests/e2e/*.test.ts` file needs an entry in the first two files below, and in the third only when it branches on the platform. CI fails when a required entry is missing or stale:
+Every root `tests/e2e/*.test.ts` file needs an entry in the first three files below, and in the fourth only when it branches on the platform. CI fails when a required entry is missing or stale:
 
 | File | Entry |
 | --- | --- |
 | `scripts/pgso/corpus.json` | Exactly one classification: training, verification-only, or intentional exclusion |
+| `scripts/pgso/tests/test_corpus.py` | The same file in the matching training, verification, or exclusion list, in `corpus.json` order |
 | `tests/e2e/ci-shard-weights.json` | A weight that balances the four CI shards |
 | `tests/e2e/macos-platform-tests.json` | Needed only when the file branches on `process.platform` or `platform()` being `darwin` or `linux` |
 
@@ -98,6 +110,33 @@ fx prints into your terminal's scrollback instead of taking over the screen, so 
 
 When a tmux test or a tape exposes a bug, reproduce it as a Zig unit test before you fix it, so the fix lands with its regression test.
 
+### Fuzz a parser
+
+A fuzz test is a `test` block that calls `std.testing.fuzz`. `tests/fuzz/targets.json` lists each one as a target, with its exact test name and the module that holds it. `zig build test` runs every fuzz test once on its inline seeds and on each file in `tests/fuzz/corpus/<target>/`. `zig build fuzz` builds only the fuzz tests, and with `--fuzz` Zig searches for new inputs that fail:
+
+```bash
+zig build fuzz -Dfuzz-target=sse_framing               # replay the saved inputs
+zig build fuzz -Dfuzz-target=sse_framing --fuzz=200K   # try 200,000 new inputs
+```
+
+When the search finds a failure, Zig 0.17 prints `error: test '...'` but still exits with status 0, so read the output. Without a limit, `--fuzz` runs until you stop it and opens Zig's web interface.
+
+The Fuzz workflow fuzzes each target on `main` every night for about 20 minutes, and for two minutes on a pull request that changes the fuzzing setup. When the nightly run finds a failure, it uploads the failing input as an artifact and opens an issue titled `Nightly fuzz failure: <target>`, or comments on that issue if it is already open. To fix the failure, copy the input into `tests/fuzz/corpus/<target>/` and run `zig build fuzz -Dfuzz-target=<target>` to reproduce it. That build uses Debug by default, which adds allocation stack traces to leak reports. Keep the input file in the fix's pull request, so `zig build test` replays it on every pull request after that.
+
+A saved input holds the values the test reads from its `std.testing.Smith`, in order. For example, a test that calls `smith.slice` reads a 4-byte little-endian length and then that many bytes. Inputs that the fuzzer saves are already in this form. Inline seeds go through `@import("fuzz_seed").slices`, which writes each one in this form for a test whose first read is `smith.slice`. A seed written as a plain string would lose its first four bytes to the length.
+
+To add a target, write the fuzz test in the file it covers and add an entry to `tests/fuzz/targets.json`. For a target outside the session manager, also import its file in `src/fuzz_targets.zig`. Pass the seeds and saved inputs to the test with `.corpus = &(@import("fuzz_seed").slices(.{ <seeds> }) ++ @import("fuzz_corpus").<target>.*)`. The session manager imports nothing from fx, so its targets keep their seeds as files in `tests/fuzz/corpus/<target>/` and pass `.corpus = &(.{""} ++ @import("build_options").fuzz_corpus_<target>.*)`. Set `iterations` so that one round of `--fuzz` takes about 30 seconds on a developer machine. `scripts/tests/test_fuzz_nightly.py` fails when an entry names a test that doesn't exist or that `zig build fuzz` can't reach. The MCP engine in `src/mcp/` imports only the standard library, so its targets live in `src/core/mcp_host/wire_tests.zig`. A file that holds only tests, like that one, is also imported from the test block in `src/main.zig`.
+
+### Find data races
+
+`-Dsanitize-thread=true` builds fx and its tests with ThreadSanitizer, which reports two threads touching the same memory without synchronization. The build is slow and large, so install it to its own prefix:
+
+```bash
+TSAN_OPTIONS=halt_on_error=0:abort_on_error=0 zig build test -Dsanitize-thread=true -p /tmp/fx-tsan
+```
+
+Without those options, the sanitizer aborts a test binary once it has reported a race, so that binary's later tests don't run. The Thread Sanitizer workflow runs the unit tests this way on `main` every night and lists each race in its job summary. It reports races without failing. A sanitized suite runs slower, so a few tests that depend on timing fail in it, such as the `command_runner` tests of output read after a command exits. Those failures aren't races.
+
 ### Check startup performance
 
 The `Startup Latency` check fails a pull request when any benchmarked command takes longer than 2 ms on the Linux CI runner. To measure before you push, run:
@@ -114,7 +153,7 @@ python3 benchmarks/first_frame.py --binary /tmp/fx-before --binary ./zig-out/bin
 
 ### Check a TLA+ model
 
-`tests/tla/` holds TLA+ models of fx, such as the session manager, the MCP engine and host, ACP, `/usage`, the shell tool, the workspace indexer, and libfx. Most come with Bun drivers that run the real binary and have TLC check what it did. CI runs the libfx model; run the matching checker yourself when you change behavior that one of the others describes. You need Java and `tla2tools.jar`, and `tests/tla/README.md` lists every model and covers setup.
+`tests/tla/` holds TLA+ models of fx, such as the session manager, the MCP engine and host, ACP, `/usage`, the shell tool, the workspace indexer, and libfx. Most come with Bun drivers that run the real binary and have TLC check what it did. CI runs the libfx and MCP models on `main` and on pull requests that change the code they cover; run the matching checker yourself when you change behavior that one of the others describes. You need Java and `tla2tools.jar`, and `tests/tla/README.md` lists every model and covers setup.
 
 ```bash
 tests/tla/session_manager/check.sh SessionLog
@@ -131,6 +170,16 @@ cd tests/evals
 bun install
 bun test
 ```
+
+`prompt-cache-ab.test.ts` compares how two fx builds keep the provider's prompt cache through mid-session changes: a branch switch, a permission change, folder rules, a restart, and a named skill. A recording proxy keeps every request, and for each run it reports the requests that break the cached prefix, the new and cached input tokens, and whether the answers are right. It runs only when the variables name two builds and the models to try:
+
+```bash
+cd tests/evals
+FX_CACHE_AB_BASELINE_BIN=/abs/path/to/base/fx FX_CACHE_AB_CANDIDATE_BIN=/abs/path/to/zig-out/bin/fx \
+  FX_CACHE_AB_MODELS=anthropic/claude-haiku-5.5,openai/gpt-6.1-sol bun test prompt-cache-ab.test.ts
+```
+
+`FX_CACHE_AB_SCENARIOS` picks scenarios by name, and `FX_CACHE_AB_OUTPUT_DIR` keeps each run's requests and summary. One run per scenario varies, so compare several.
 
 ## Open a pull request
 
@@ -164,7 +213,7 @@ These five checks must pass before a pull request merges:
 
 | Check | What it runs |
 | --- | --- |
-| `Build & Test` | Formatting, the PGSO corpus, the public-surface, compactor-boundary, and indexer-boundary checks, the ReleaseSafe unit tests, and the SDK package jobs |
+| `Build & Test` | Formatting, the PGSO corpus, the public-surface, compactor-boundary, and indexer-boundary checks, the ReleaseSafe unit tests, and the SDK package jobs, including the libfx durable-session model check when the change needs it |
 | `E2E (deterministic)` | Every end-to-end file, split across four weighted shards, plus the MCP conformance baseline |
 | `Shellcheck` | `bash -n` and `shellcheck` on the scripts listed in the job, such as `benchmarks/startup.sh` and `scripts/detect-macos-need.sh` |
 | `Startup Latency` | The benchmarked CLI commands on a ReleaseSafe build, each held to 2 ms, plus the interactive performance test in `tests/e2e/tui-performance.test.ts` |
@@ -183,20 +232,46 @@ CI retries a failed end-to-end file once. A file that passes only on the retry g
 
 When the detector can't read the change, the `macOS arm64` check fails instead of passing.
 
+`scripts/detect-ci-need.sh` decides whether a pull request runs CI's three model checks. The libfx durable-session model check takes about 40 minutes and runs when the change touches:
+
+- `sdk/`
+- The SDK models in `tests/tla/sdk/` or their drivers in `tests/tla/drivers/*.mjs`
+- The Node-API or WebAssembly core entry point
+- `src/acp/`, `src/core/hosts/`, or `src/core/session_manager/`
+
+The `TLA+ MCP models and drivers` job takes about 20 minutes and runs its checks when the change touches:
+
+- `src/mcp/`, `src/core/mcp_host/`, or `src/core/mcp/`
+- The models in `tests/tla/mcp/` or `tests/tla/mcp_host/`, or their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, or `tests/tla/drivers/lib/`
+- The `tests/e2e/fixtures/mcp-*` servers, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`
+
+The `TLA+ transcript window model` job takes about 4 minutes and runs its checks when the change touches:
+
+- `src/ui/transcript/transcript_window*`
+- The model in `tests/tla/transcript_window/` or its drivers in `tests/tla/drivers/transcript_window/`
+- The driver code those drivers share: `tests/tla/drivers/lib/` and `tests/tla/drivers/graph.mjs`
+
+All three run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
+
 Other workflows and benchmark jobs also report on pull requests, such as the `Examples` workflow when `examples/` changes and the `Shell command overhead` benchmark. Only the five checks above are required to merge, but look into any check that fails. Two of the others need more explanation:
 
 - The binary size workflow builds each release target for the pull request and its base commit on native runners, reports the size change, and smoke-tests every target's binary. Growth of 52,429 bytes (0.05 MiB) or more on a platform adds a warning. Investigate growth you can't explain.
 - The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline itself changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. Stable releases always run it. [scripts/pgso/README.md](scripts/pgso/README.md) explains the pipeline and its acceptance gates.
+- The Linux arm64 PGSO workflow runs on the same pull request paths, with `.github/workflows/pgso-linux-arm64.yml` in place of the macOS workflow file. It qualifies a Linux candidate in one job, which takes several hours. The stable release always runs it and ships its candidate as the Linux arm64 binary. `.github/workflows/pgso-linux-x86_64.yml` qualifies a Linux x86_64 candidate the same way, and the stable release ships it as the Linux x86_64 binary.
 
 Other runs start only on request:
 
 | Run | Command |
 | --- | --- |
 | macOS checks | `gh workflow run macos.yml --ref your-branch`, or add the `ci:macos` label |
+| libfx durable-session and MCP model checks | `gh workflow run ci.yml --ref your-branch` |
 | PGSO qualification | `gh workflow run pgso-macos-arm64.yml --ref your-branch` |
+| Linux PGSO qualification | `gh workflow run pgso-linux-arm64.yml --ref your-branch` or `pgso-linux-x86_64.yml` |
 | Live ACP suite | `gh workflow run ci.yml --ref your-branch -f acp_live=true` |
 | Long-turn memory benchmark | `gh workflow run bench.yml --ref your-branch -f long_turn_memory=true` |
 | libfx runtime benchmark | `gh workflow run bench.yml --ref your-branch -f libfx_runtime=true` |
+| Fuzzing of one target | `gh workflow run fuzz.yml --ref your-branch -f target=<target>` |
+| Unit tests with ThreadSanitizer | `gh workflow run tsan.yml --ref your-branch` |
 
 Only maintainers can start these runs or add the `ci:macos` label. If you're an outside contributor and your change needs one of them, ask in the pull request and a maintainer will start it. If CI doesn't start at all on your first pull request, a maintainer may need to approve the workflow run.
 

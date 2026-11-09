@@ -721,3 +721,105 @@ test "web_fetch cross host redirect returns reinvocation result without followin
     try std.testing.expectEqual(.follow, www.kind);
     try std.testing.expectEqualStrings("www.example.com", www.target.?.canonical_host);
 }
+
+test "url policy admits only URLs it reads back the same way" {
+    try std.testing.fuzz({}, fuzzUrlPolicy, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").url_policy.*),
+    });
+}
+
+const fuzz_url_pieces = [_][]const u8{
+    "https://",       "http://",       "HTTPS://",        "ftp://", "https:", "//",  "/",             "?",         "#",
+    "@",              ":",             ".",               "[",      "]",      "%",   "%2e",           "%2F",       "%41",
+    "..",             "example.com",   "WWW.Example.COM", "www.",   "a",      "b-c", "xn--bcher-kva", "localhost", "internal",
+    "local",          "127.0.0.1",     "8.8.8.8",         "0x7f",   "010",    "1",   "256",           "::1",       "2606:4700::1",
+    "::ffff:8.8.8.8", "fe80::1%25en0", ":443",            ":80",    ":8080",  ":0",  ":65536",        "user:pass", "q=1&r=2",
+    " ",              "\\",            "\xc3\xa9",        "~",
+};
+
+fn appendFuzzUrl(alloc: Allocator, smith: *std.testing.Smith, out: *std.ArrayList(u8)) !void {
+    for (0..smith.valueRangeAtMost(u8, 0, 16)) |_| {
+        if (smith.valueRangeAtMost(u8, 0, 7) == 0) {
+            try out.append(alloc, smith.value(u8));
+        } else {
+            try out.appendSlice(alloc, fuzz_url_pieces[smith.index(fuzz_url_pieces.len)]);
+        }
+    }
+}
+
+fn fuzzUrlPolicy(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    try appendFuzzUrl(alloc, smith, &raw);
+    var url = normalize(alloc, raw.items) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer url.deinit(alloc);
+    try expectFuzzAdmittedUrl(alloc, url);
+
+    var location: std.ArrayList(u8) = .empty;
+    defer location.deinit(alloc);
+    try appendFuzzUrl(alloc, smith, &location);
+    var redirect = redirectTarget(alloc, url, location.items) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer redirect.deinit(alloc);
+    switch (redirect.kind) {
+        .follow => {
+            const target = redirect.target orelse return error.TestExpectedRedirectTarget;
+            try expectFuzzAdmittedUrl(alloc, target);
+            try std.testing.expectEqual(url.port, target.port);
+            try std.testing.expect(sameHostOrOptionalWww(url.canonical_host, target.canonical_host));
+        },
+        .cross_host => {
+            const reported = redirect.cross_host_url orelse return error.TestExpectedCrossHostUrl;
+            var other = try normalize(alloc, reported);
+            defer other.deinit(alloc);
+            try std.testing.expectEqualStrings(reported, other.retrieval_url);
+        },
+    }
+}
+
+fn expectFuzzAdmittedUrl(alloc: Allocator, url: ValidatedUrl) !void {
+    try std.testing.expectEqual(Scheme.https, url.scheme);
+    if (url.literal_address) |address| try std.testing.expect(isPublicAddress(address));
+
+    // Reading the retrieval URL again gives the same URL.
+    var again = try normalize(alloc, url.retrieval_url);
+    defer again.deinit(alloc);
+    try std.testing.expectEqualStrings(url.canonical_host, again.canonical_host);
+    try std.testing.expectEqual(url.port, again.port);
+    try std.testing.expectEqual(url.explicit_port, again.explicit_port);
+    try std.testing.expectEqualStrings(url.path_query, again.path_query);
+    try std.testing.expectEqualStrings(url.retrieval_url, again.retrieval_url);
+    try std.testing.expectEqual(url.literal_address == null, again.literal_address == null);
+
+    // The request target starts with a slash and holds nothing that would
+    // split a request line.
+    try std.testing.expect(url.path_query.len > 0 and url.path_query[0] == '/');
+    for (url.path_query) |byte| try std.testing.expect(byte > ' ' and byte != 0x7f and byte != '#');
+
+    // The host is lowercase ASCII with nothing that would end or change an
+    // authority. IPv6 literals keep their colons and nothing else.
+    for (url.canonical_host) |byte| {
+        try std.testing.expect(byte > ' ' and byte < 0x7f and !std.ascii.isUpper(byte));
+        try std.testing.expect(std.mem.findScalar(u8, "/?#@[]%\\", byte) == null);
+    }
+
+    // std.Uri reads the same host and port from the retrieval URL.
+    const uri = try std.Uri.parse(url.retrieval_url);
+    try std.testing.expectEqualStrings("https", uri.scheme);
+    try std.testing.expect(uri.user == null and uri.password == null);
+    try std.testing.expectEqual(url.explicit_port, uri.port);
+    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const uri_host = try (uri.host orelse return error.TestExpectedUriHost).toRaw(&host_buffer);
+    if (std.mem.findScalar(u8, url.canonical_host, ':') != null) {
+        try std.testing.expect(uri_host.len == url.canonical_host.len + 2 and uri_host[0] == '[' and uri_host[uri_host.len - 1] == ']');
+        try std.testing.expectEqualStrings(url.canonical_host, uri_host[1 .. uri_host.len - 1]);
+    } else {
+        try std.testing.expectEqualStrings(url.canonical_host, uri_host);
+    }
+}

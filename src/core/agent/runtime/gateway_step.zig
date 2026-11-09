@@ -142,7 +142,7 @@ fn recordProviderResultMetric(
     runtime_telemetry.recordGatewayCallMetricWithDiagnostics(
         model,
         started_at_ms,
-        if (failure) |value| failureMetricCode(value.kind) else 200,
+        if (failure) |value| if (value.http_status) |status| @backingInt(status) else failureMetricCode(value.kind) else 200,
         truncated_bytes,
         input_tokens,
         output_tokens,
@@ -154,6 +154,7 @@ fn recordProviderResultMetric(
         .{
             .schema = if (failure) |value| value.diagnostics.schema orelse "" else "",
             .request_shape = if (failure) |value| value.diagnostics.request_shape orelse "" else "",
+            .provider_stop_reason = completion.finish_reason_raw.slice(),
         },
     );
 }
@@ -240,7 +241,7 @@ fn failureMetricCode(kind: agent_stream_provider.FailureKind) u16 {
         .unauthorized => 401,
         .forbidden => 403,
         .request_too_large => 413,
-        .rate_limited => 429,
+        .rate_limited, .quota_exhausted => 429,
         .server_error => 500,
         .bad_gateway => 502,
         .unavailable => 503,

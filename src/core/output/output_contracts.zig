@@ -1,7 +1,9 @@
 const std = @import("std");
+const profile_paths = @import("../shared/profile_paths.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const doctor_runtime = @import("../cli/doctor_runtime.zig");
+const io_mod = @import("../shared/io.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -22,6 +24,8 @@ const update_notes = @import("../upgrade/update_notes.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
+const settings_entries = @import("../config/settings_entries.zig");
+const settings_keys = @import("../config/settings_keys.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -37,6 +41,11 @@ pub const OutputFormat = enum {
     text,
     json,
 };
+
+/// Process exit status when the command line itself is wrong: an unknown
+/// command, an unknown or invalid flag, or a missing or bad argument. Work
+/// that fails after the command line is accepted exits 1.
+pub const usage_exit_code: u8 = 2;
 
 pub const CommandFailureSnapshot = struct {
     kind: []const u8,
@@ -415,11 +424,165 @@ pub fn workspaceErrorMessage(err: anyerror) ?[]const u8 {
         error.UnknownAdditionalDirectory => "directory is not configured as an additional workspace",
         error.PrimaryDirectory => "the primary workspace cannot be added or removed",
         error.TooManyDirectories => "additional directory limit reached",
-        error.HomeNotSet => "HOME is not set",
+        error.HomeNotSet => io_mod.no_home_dir_reason,
         error.SettingsStoreUnavailable => "settings are unavailable",
         error.DurablePathUnsafe, error.PrivateStatePermissionsUnsupported => "settings path is unsafe",
         else => "workspace update failed",
     };
+}
+
+pub const ConfigUnknownSetting = struct {
+    key: settings_keys.UnknownKey,
+    /// Where the key is: `~/.fx/settings.json` or `.fx.json`.
+    file: []const u8,
+    suggestion: ?[]const u8 = null,
+};
+
+/// `fx config list` and `fx config get` in git's format: one `key=value`
+/// per line, lowest precedence first, with the origin first and a tab when
+/// asked.
+pub const ConfigSnapshot = struct {
+    entries: []const settings_entries.Entry,
+    /// Keys fx doesn't know. The JSON form lists them; the text form leaves
+    /// them to the warnings on stderr.
+    unknown: []const ConfigUnknownSetting = &.{},
+    workspace_root: []const u8,
+    show_origin: bool = false,
+    /// `fx config get` of one plain key prints the value alone.
+    value_only: bool = false,
+
+    pub fn render(self: ConfigSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    fn renderText(self: ConfigSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        for (self.entries) |entry| {
+            if (self.show_origin) {
+                switch (entry.origin) {
+                    .project => try out.writer.writeAll("file:.fx.json"),
+                    .global => try out.writer.writeAll(profile_paths.displayText("file:~/.fx/settings.json")),
+                    .workspace => {
+                        try out.writer.writeAll("workspace:");
+                        try writeTerminalSafe(&out.writer, alloc, self.workspace_root);
+                    },
+                    .env => try out.writer.print("env:{s}", .{entry.variable.?}),
+                    .default => try out.writer.writeAll("default"),
+                }
+                try out.writer.writeByte('\t');
+            }
+            if (!self.value_only) {
+                try writeTerminalSafe(&out.writer, alloc, entry.key);
+                try out.writer.writeByte('=');
+            }
+            try writeConfigValue(&out.writer, alloc, entry.value);
+            try out.writer.writeByte('\n');
+        }
+        return try out.toOwnedSlice();
+    }
+
+    fn renderJson(self: ConfigSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"config\",\"entries\":[");
+        for (self.entries, 0..) |entry, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"key\":");
+            try std.json.Stringify.value(entry.key, .{}, &out.writer);
+            try out.writer.writeAll(",\"value\":");
+            try std.json.Stringify.value(entry.value, .{}, &out.writer);
+            try out.writer.print(",\"origin\":\"{s}\"", .{@tagName(entry.origin)});
+            if (entry.origin == .env) {
+                try out.writer.writeAll(",\"variable\":");
+                try std.json.Stringify.value(entry.variable.?, .{}, &out.writer);
+            } else if (entry.origin != .default) {
+                try out.writer.writeAll(",\"file\":");
+                try std.json.Stringify.value(if (entry.origin == .project) ".fx.json" else profile_paths.displayText("~/.fx/settings.json"), .{}, &out.writer);
+            }
+            if (entry.origin == .workspace) {
+                try out.writer.writeAll(",\"workspace\":");
+                try std.json.Stringify.value(self.workspace_root, .{}, &out.writer);
+            }
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("],\"unknown\":[");
+        for (self.unknown, 0..) |unknown, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"key\":\"");
+            if (unknown.key.parent) |parent| try std.json.Stringify.encodeJsonStringChars(parent, .{}, &out.writer);
+            if (unknown.key.parent != null) try out.writer.writeByte('.');
+            try std.json.Stringify.encodeJsonStringChars(unknown.key.name, .{}, &out.writer);
+            try out.writer.writeAll("\",\"file\":");
+            try std.json.Stringify.value(unknown.file, .{}, &out.writer);
+            try out.writer.writeAll(",\"workspace\":");
+            try std.json.Stringify.value(unknown.key.workspace, .{}, &out.writer);
+            try out.writer.writeAll(",\"suggestion\":");
+            try std.json.Stringify.value(unknown.suggestion, .{}, &out.writer);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("]}");
+        return try out.toOwnedSlice();
+    }
+};
+
+/// What `fx config set` or `fx config unset` did to the profile settings, as
+/// one line naming the key, the value, and the file, like other setters.
+pub const ConfigChangeSnapshot = struct {
+    unset: bool,
+    key: []const u8,
+    /// The saved value; null for `unset`.
+    value: ?std.json.Value = null,
+    changed: bool,
+
+    pub fn render(self: ConfigChangeSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        switch (format) {
+            .text => {
+                try writeTerminalSafe(&out.writer, alloc, self.key);
+                if (self.unset) {
+                    try out.writer.writeAll(if (self.changed) profile_paths.displayText(" removed from ~/.fx/settings.json.\n") else profile_paths.displayText(" isn't set in ~/.fx/settings.json.\n"));
+                } else {
+                    try out.writer.writeAll(if (self.changed) " set to " else " is already ");
+                    try writeConfigValue(&out.writer, alloc, self.value orelse .null);
+                    try out.writer.writeAll(if (self.changed) profile_paths.displayText(" in ~/.fx/settings.json.\n") else ".\n");
+                }
+            },
+            .json => {
+                try out.writer.print("{{\"kind\":\"config\",\"action\":\"{s}\",\"key\":", .{if (self.unset) "unset" else "set"});
+                try std.json.Stringify.value(self.key, .{}, &out.writer);
+                try out.writer.writeAll(",\"value\":");
+                try std.json.Stringify.value(self.value orelse .null, .{}, &out.writer);
+                try out.writer.print(",\"changed\":{},\"file\":", .{self.changed});
+                try std.json.Stringify.value(profile_paths.displayText("~/.fx/settings.json"), .{}, &out.writer);
+                try out.writer.writeByte('}');
+            },
+        }
+        return try out.toOwnedSlice();
+    }
+};
+
+/// A settings value as `fx config` prints it: text and numbers as they are,
+/// lists and objects as compact JSON.
+fn writeConfigValue(writer: *std.Io.Writer, alloc: Allocator, value: std.json.Value) !void {
+    switch (value) {
+        .string => |text| try writeTerminalSafe(writer, alloc, text),
+        .number_string => |text| try writeTerminalSafe(writer, alloc, text),
+        .bool => |flag| try writer.writeAll(if (flag) "true" else "false"),
+        .integer => |number| try writer.print("{d}", .{number}),
+        .float => |number| try writer.print("{d}", .{number}),
+        .null => try writer.writeAll("null"),
+        .array, .object => {
+            var json: std.Io.Writer.Allocating = .init(alloc);
+            defer json.deinit();
+            try std.json.Stringify.value(value, .{}, &json.writer);
+            try writeTerminalSafe(writer, alloc, json.written());
+        },
+    }
 }
 
 pub const WorkspaceSnapshot = struct {
@@ -572,6 +735,16 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
     try writer.writeAll(encoded.bytes);
 }
 
+/// A terminal-safe copy of `raw`, allocated with `alloc`.
+fn safeText(alloc: Allocator, raw: []const u8) ![]const u8 {
+    return (try text_utils.encodeTerminalSafe(alloc, raw, std.math.maxInt(usize))).bytes;
+}
+
+/// How many entries a panel list holds, or `none`.
+fn countText(alloc: Allocator, count: usize) ![]const u8 {
+    return if (count == 0) "none" else alloc.print("{d}", .{count});
+}
+
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
     return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription and source != .configured);
@@ -689,16 +862,90 @@ pub const StatusSnapshot = struct {
     /// when the caller has a mode registry with modes.
     modes: ?SessionModes = null,
     workspace_root: []const u8,
+    /// The interactive shell's session, which only the `/status` panel
+    /// shows. `fx status` runs outside any session and leaves it null.
+    session: ?ShellSession = null,
+    /// Why the profile settings could not be read, for the `/status` panel.
+    /// The credential they select is then unknown, so no auth row is shown.
+    settings_error: ?[]const u8 = null,
+    /// fx's folder: `$FX_HOME`, or `~/.fx` expanded. Shown when set.
+    fx_home: ?[]const u8 = null,
     history_turns: usize,
     session_permission_grants: usize,
     agent_step_limit: usize,
-    /// Requested Ultra mode. The serving provider may still fall back.
+    /// Requested Ultrafast mode. The serving provider may still fall back.
     ultrafast_requested: bool = false,
 
     pub const SessionModes = struct {
         current: []const u8,
         all: []const mode_contract.ModeSpec,
     };
+
+    pub const ShellSession = union(enum) {
+        /// No session could be created, so the shell saves nothing.
+        unavailable,
+        open: struct {
+            id: []const u8,
+            /// `fx --resume <id>` opens it now: its log is on disk (D90).
+            saved: bool,
+        },
+    };
+
+    /// The `/status` panel's rows, in order, the session first. Everything
+    /// is allocated with `alloc`, which should be an arena.
+    pub fn panelRows(self: StatusSnapshot, alloc: Allocator) ![]PanelRow {
+        var rows: std.ArrayList(PanelRow) = .empty;
+        if (self.session) |session| try rows.append(alloc, .{ .label = "Session", .value = switch (session) {
+            .unavailable => "none · this shell can't save sessions",
+            .open => |open| try alloc.print("{s} · {s}", .{
+                try safeText(alloc, open.id),
+                if (open.saved) "saved" else "not saved yet",
+            }),
+        } });
+        try rows.append(alloc, .{ .label = "Model", .value = try safeText(alloc, self.model) });
+        if (self.provider != .gateway) {
+            // A configured provider's name lives in `self.provider`, this
+            // call's copy, so it is copied out with the rest.
+            try rows.append(alloc, .{ .label = "Provider", .value = try safeText(alloc, providerDisplayName(&self.provider)) });
+        }
+        if (self.provider_endpoint) |endpoint| {
+            try rows.append(alloc, .{ .label = "Endpoint", .value = try safeText(alloc, endpoint) });
+        }
+        if (self.provider != .gateway) {
+            var connections: std.Io.Writer.Allocating = .init(alloc);
+            try self.writeConnections(&connections.writer);
+            try rows.append(alloc, .{ .label = "Connected", .value = try safeText(alloc, connections.written()) });
+        }
+        if (self.settings_error) |error_name| {
+            try rows.append(alloc, .{ .label = "Settings", .value = try alloc.print("couldn't be read: {s}", .{error_name}) });
+        } else {
+            var auth: std.Io.Writer.Allocating = .init(alloc);
+            try writeTerminalSafe(&auth.writer, alloc, self.auth.activeSourceLabel());
+            if (self.auth.expired) try auth.writer.writeAll(" · expired");
+            if (self.auth.refreshable()) try auth.writer.writeAll(" · refreshable");
+            try rows.append(alloc, .{ .label = "Auth", .value = auth.written() });
+            if (self.auth_help) |help| try rows.append(alloc, .{ .label = "Auth help", .value = try safeText(alloc, help) });
+            if (self.auth.team) |team| try rows.append(alloc, .{ .label = "Team", .value = try safeText(alloc, team) });
+        }
+        try rows.append(alloc, .{ .label = "Permissions", .value = permissions.permissionModeDisplayLabel(self.permission_mode) });
+        try rows.append(alloc, .{ .label = "Workspace", .value = try safeText(alloc, self.workspace_root) });
+        try rows.append(alloc, .{ .label = "Turns", .value = try alloc.print("{d}", .{self.history_turns}) });
+        try rows.append(alloc, .{ .label = "Session grants", .value = try alloc.print("{d}", .{self.session_permission_grants}) });
+        try rows.append(alloc, .{
+            .label = "Step limit",
+            .value = if (self.agent_step_limit == 0) "unlimited" else try alloc.print("{d}", .{self.agent_step_limit}),
+        });
+        try rows.append(alloc, .{ .label = "Ultrafast", .value = if (self.ultrafast_requested) "requested" else "not requested" });
+        try rows.append(alloc, .{ .label = "Updates", .value = try safeText(alloc, self.update_channel) });
+        try rows.append(alloc, .{
+            .label = "Build",
+            .value = if (self.build_revision.len > 0)
+                try alloc.print("{s} · {s}", .{ try safeText(alloc, self.build_channel), try safeText(alloc, self.build_revision) })
+            else
+                try safeText(alloc, self.build_channel),
+        });
+        return rows.toOwnedSlice(alloc);
+    }
 
     pub fn render(self: StatusSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -756,43 +1003,12 @@ pub const StatusSnapshot = struct {
         }
         try out.writer.print("[status] permission_mode={s}\n", .{permissions.permissionModeDisplayLabel(self.permission_mode)});
         try out.writer.print("[status] workspace={s}\n", .{self.workspace_root});
+        if (self.fx_home) |path| try out.writer.print("[status] fx_home={s}\n", .{path});
         try out.writer.print("[status] history_turns={d}\n", .{self.history_turns});
         try out.writer.print("[status] session_permission_grants={d}\n", .{self.session_permission_grants});
         try out.writer.print("[status] agent_step_limit={d}\n", .{self.agent_step_limit});
         try out.writer.print("[status] ultrafast_requested={}\n", .{self.ultrafast_requested});
         if (self.mcp) |mcp| try mcp.writeText(&out.writer, alloc, "status");
-        return try out.toOwnedSlice();
-    }
-
-    pub fn renderInteractiveBody(self: StatusSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("model={s}\n", .{self.model});
-        if (self.provider != .gateway) {
-            try out.writer.print("model_source={s}\n", .{providerDisplayName(&self.provider)});
-        }
-        if (self.provider_endpoint) |endpoint| try out.writer.print("provider_endpoint={s}\n", .{endpoint});
-        try out.writer.print("update_channel={s}\n", .{self.update_channel});
-        try out.writer.print("build_channel={s}\n", .{self.build_channel});
-        if (self.build_revision.len > 0) {
-            try out.writer.print("build_revision={s}\n", .{self.build_revision});
-        }
-        try out.writer.print("auth={s}\n", .{self.auth.activeSourceLabel()});
-        if (self.provider != .gateway) {
-            try out.writer.writeAll("connected_providers=");
-            try self.writeConnections(&out.writer);
-            try out.writer.writeByte('\n');
-        }
-        try out.writer.print("auth_refreshable={}\n", .{self.auth.refreshable()});
-        if (self.auth.expired) try out.writer.writeAll("auth_expired=true\n");
-        if (self.auth_help) |help| try out.writer.print("auth_help={s}\n", .{help});
-        if (self.auth.team) |team| try out.writer.print("team={s}\n", .{team});
-        try out.writer.print("permission_mode={s}\n", .{permissions.permissionModeDisplayLabel(self.permission_mode)});
-        try out.writer.print("workspace={s}\n", .{self.workspace_root});
-        try out.writer.print("history_turns={d}\n", .{self.history_turns});
-        try out.writer.print("session_permission_grants={d}\n", .{self.session_permission_grants});
-        try out.writer.print("agent_step_limit={d}\nultrafast_requested={}", .{ self.agent_step_limit, self.ultrafast_requested });
         return try out.toOwnedSlice();
     }
 
@@ -911,6 +1127,10 @@ pub const StatusSnapshot = struct {
         }
         try writer.writeAll(",\"workspace\":");
         try std.json.Stringify.value(self.workspace_root, .{}, writer);
+        if (self.fx_home) |path| {
+            try writer.writeAll(",\"fx_home\":");
+            try std.json.Stringify.value(path, .{}, writer);
+        }
         try writer.print(",\"history_turns\":{d}", .{self.history_turns});
         try writer.print(",\"session_permission_grants\":{d}", .{self.session_permission_grants});
         try writer.print(",\"agent_step_limit\":{d}", .{self.agent_step_limit});
@@ -923,12 +1143,34 @@ pub const StatusSnapshot = struct {
     }
 };
 
+/// One line of a read-only footer panel, such as `/status` and
+/// `/permissions` open. Both texts are terminal-safe.
+pub const PanelRow = struct {
+    /// Empty for an entry of a list.
+    label: []const u8,
+    value: []const u8,
+    /// An entry of the list the labeled row above it counts, drawn as a
+    /// bullet under its value.
+    item: bool = false,
+};
+
 pub const PermissionsSnapshot = struct {
     workspace_root: []const u8,
     mode: types.PermissionMode,
     grants: []const types.PermissionGrant,
     rules: types.PermissionRuleSet = .{},
     runtime_grants_available: bool = true,
+    /// The open saved session's remembered rules, which only the
+    /// `/permissions` panel shows. `fx permissions` leaves it null.
+    saved_rules: ?[]const SavedRule = null,
+
+    pub const SavedRule = struct {
+        /// What `/permissions revoke` takes.
+        id: u64,
+        decision: []const u8,
+        /// The tool and arguments the rule matches, as it was remembered.
+        identity: []const u8,
+    };
 
     pub fn render(self: PermissionsSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -958,31 +1200,33 @@ pub const PermissionsSnapshot = struct {
         return try out.toOwnedSlice();
     }
 
-    pub fn renderInteractiveBody(self: PermissionsSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("mode={s}\n", .{permissions.permissionModeDisplayLabel(self.mode)});
-        if (self.rules.rules.len == 0) {
-            try out.writer.writeAll("configured rules: (none)\n");
-        } else {
-            try out.writer.writeAll("configured rules:\n");
-            for (self.rules.rules) |rule| {
-                try out.writer.print(" - {s} {s} -> {s}\n", .{ @tagName(rule.action), rule.permission, rule.pattern });
-            }
+    /// The `/permissions` panel's rows, in order: the mode, each list with
+    /// its count and entries, and how to change them. Everything is
+    /// allocated with `alloc`, which should be an arena.
+    pub fn panelRows(self: PermissionsSnapshot, alloc: Allocator) ![]PanelRow {
+        var rows: std.ArrayList(PanelRow) = .empty;
+        try rows.append(alloc, .{ .label = "Mode", .value = permissions.permissionModeDisplayLabel(self.mode) });
+        try rows.append(alloc, .{ .label = "Configured rules", .value = try countText(alloc, self.rules.rules.len) });
+        for (self.rules.rules) |rule| try rows.append(alloc, .{ .label = "", .item = true, .value = try safeText(alloc, try alloc.print(
+            "{s} {s} → {s}",
+            .{ @tagName(rule.action), rule.permission, rule.pattern },
+        )) });
+        try rows.append(alloc, .{ .label = "Session grants", .value = try countText(alloc, self.grants.len) });
+        for (self.grants) |grant| try rows.append(alloc, .{ .label = "", .item = true, .value = try safeText(alloc, try alloc.print(
+            "{s} → {s}",
+            .{ grant.tool_name, try displayGrantTarget(alloc, self.workspace_root, grant) },
+        )) });
+        if (self.saved_rules) |saved| {
+            try rows.append(alloc, .{ .label = "Saved rules", .value = try countText(alloc, saved.len) });
+            for (saved) |rule| try rows.append(alloc, .{ .label = "", .item = true, .value = try safeText(alloc, try alloc.print(
+                "{d} {s} {s}",
+                .{ rule.id, rule.decision, rule.identity },
+            )) });
         }
-        if (self.grants.len == 0) {
-            try out.writer.writeAll("session grants: (none)");
-            return try out.toOwnedSlice();
-        }
-        try out.writer.writeAll("session grants:\n");
-        for (self.grants, 0..) |grant, index| {
-            const display_target = try displayGrantTarget(alloc, self.workspace_root, grant);
-            defer alloc.free(display_target);
-            try out.writer.print(" - {s} -> {s}", .{ grant.tool_name, display_target });
-            if (index + 1 < self.grants.len) try out.writer.writeByte('\n');
-        }
-        return try out.toOwnedSlice();
+        try rows.append(alloc, .{ .label = "Change mode", .value = "/permissions ask, auto, full-access, or reset" });
+        try rows.append(alloc, .{ .label = "Remember", .value = "/permissions remember allow|deny <tool-name> <arguments-json>" });
+        try rows.append(alloc, .{ .label = "Revoke", .value = "/permissions revoke <rule-id>" });
+        return rows.toOwnedSlice(alloc);
     }
 
     pub fn renderJson(self: PermissionsSnapshot, alloc: Allocator) ![]u8 {
@@ -2283,7 +2527,7 @@ test "command failure snapshot renders stable escaped json" {
 test "core status snapshot text and json stay stable" {
     const snapshot = StatusSnapshot{
         .model = "alpha",
-        .auth_help = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
+        .auth_help = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.",
         .permission_mode = .ask,
         .workspace_root = "/tmp/fx",
         .history_turns = 3,
@@ -2294,14 +2538,14 @@ test "core status snapshot text and json stay stable" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n[status] ultrafast_requested=false\n",
+        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n[status] ultrafast_requested=false\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24,\"ultrafast_requested\":false}",
+        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24,\"ultrafast_requested\":false}",
         json,
     );
 }
@@ -2424,7 +2668,7 @@ test "status JSON lists the session modes after the permission mode" {
     try std.testing.expect(std.mem.find(
         u8,
         json,
-        "\"permission_mode\":\"yolo\",\"mode\":\"open\",\"modes\":[{\"id\":\"careful\",\"name\":\"Careful\",\"description\":\"Asks first\"},{\"id\":\"open\",\"name\":\"Open\",\"description\":\"\"}],\"workspace\":",
+        "\"permission_mode\":\"full-access\",\"mode\":\"open\",\"modes\":[{\"id\":\"careful\",\"name\":\"Careful\",\"description\":\"Asks first\"},{\"id\":\"open\",\"name\":\"Open\",\"description\":\"\"}],\"workspace\":",
     ) != null);
 
     const text = try snapshot.renderText(std.testing.allocator);
@@ -2435,6 +2679,22 @@ test "status JSON lists the session modes after the permission mode" {
     const plain = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(plain);
     try std.testing.expect(std.mem.find(u8, plain, "\"modes\"") == null);
+}
+
+test "config entries from the environment name their variable" {
+    const alloc = std.testing.allocator;
+    const entries = [_]settings_entries.Entry{
+        .{ .key = "max_agent_steps", .value = .{ .integer = 5 }, .origin = .global },
+        .{ .key = "max_agent_steps", .value = .{ .integer = 20 }, .origin = .env, .variable = "FX_MAX_AGENT_STEPS" },
+    };
+    const snapshot: ConfigSnapshot = .{ .entries = &entries, .workspace_root = "/w", .show_origin = true };
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("file:~/.fx/settings.json\tmax_agent_steps=5\nenv:FX_MAX_AGENT_STEPS\tmax_agent_steps=20\n", text);
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "{\"key\":\"max_agent_steps\",\"value\":20,\"origin\":\"env\",\"variable\":\"FX_MAX_AGENT_STEPS\"}") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"origin\":\"global\",\"file\":\"~/.fx/settings.json\"") != null);
 }
 
 test "MCP config diagnostic renders in status text and JSON but not interactive body" {
@@ -2464,9 +2724,11 @@ test "MCP config diagnostic renders in status text and JSON but not interactive 
         "\"mcp_config_error\":\"McpConfigInvalidJson\"",
     ) != null);
 
-    const interactive = try snapshot.renderInteractiveBody(std.testing.allocator);
-    defer std.testing.allocator.free(interactive);
-    try std.testing.expect(std.mem.find(u8, interactive, "mcp_config_error") == null);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (try snapshot.panelRows(arena.allocator())) |row| {
+        try std.testing.expect(std.mem.find(u8, row.value, "McpConfigInvalidJson") == null);
+    }
 }
 
 test "MCP config warning renders bounded status text and JSON" {

@@ -34,10 +34,6 @@ if (requestedProtocol && !supportedProtocols.has(requestedProtocol)) {
   console.error(`unsupported conformance protocol: ${requestedProtocol}`);
   process.exit(2);
 }
-const conformanceEnv = {
-  ...process.env,
-  FX_MCP_PROTOCOL_VERSION: requestedProtocol ?? "2026-07-28",
-};
 let configuredServerUrl = serverUrl;
 let legacyProbeProxy: LegacyProbeProxy | null = null;
 if (requestedProtocol && requestedProtocol !== "2026-07-28") {
@@ -52,34 +48,6 @@ const scenarioContext = process.env.MCP_CONFORMANCE_CONTEXT
     toolCalls?: Array<{ name: string; arguments: Record<string, unknown> }>;
   }
   : {};
-if (scenario === "sep-2322-client-request-state") {
-  const repoRoot = resolve(import.meta.dirname, "../../..");
-  const child = Bun.spawn(
-    [
-      "zig",
-      "build",
-      "run-mcp-stdio-dispatcher-e2e",
-      "--",
-      "runtime-http-mrtr",
-      configuredServerUrl,
-    ],
-    {
-      cwd: repoRoot,
-      env: conformanceEnv,
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-    child.exited,
-  ]);
-  process.stdout.write(stdout);
-  process.stderr.write(stderr);
-  await legacyProbeProxy?.stop();
-  process.exit(exitCode);
-}
 const toolCalls = scenarioContext.toolCalls ?? scenarioToolCalls(scenario);
 const permission: Record<string, "allow"> = {};
 for (const call of toolCalls) {
@@ -123,62 +91,70 @@ writeFileSync(
   }),
 );
 
-const gatewaySteps = toolCalls.flatMap((call, index) => {
-  const name = `mcp_conformance_${call.name}`;
-  return [
-    fakeGatewayToolCall(`select_conformance_tool_${index}`, "mcp_select_tool", {
-      name,
-    }),
-    fakeGatewayToolCall(`call_conformance_tool_${index}`, name, call.arguments),
-  ];
-});
-if (toolCalls.length === 0) {
-  gatewaySteps.push(fakeGatewayToolCall(
-    "search_conformance_server",
-    "capability_search",
-    { query: "conformance" },
-  ));
+// A scripted model for one ask: a Response can be read only once.
+function gatewaySteps() {
+  const steps = toolCalls.flatMap((call, index) => {
+    const name = `mcp_conformance_${call.name}`;
+    return [
+      fakeGatewayToolCall(`select_conformance_tool_${index}`, "mcp_select_tool", {
+        name,
+      }),
+      fakeGatewayToolCall(`call_conformance_tool_${index}`, name, call.arguments),
+    ];
+  });
+  if (toolCalls.length === 0) {
+    steps.push(fakeGatewayToolCall(
+      "search_conformance_server",
+      "capability_search",
+      { query: "conformance" },
+    ));
+  }
+  steps.push(fakeGatewayFinalText("MCP conformance client finished."));
+  return steps;
 }
-gatewaySteps.push(fakeGatewayFinalText("MCP conformance client finished."));
-const gateway = startFakeGateway(gatewaySteps);
 
-try {
-  const child = Bun.spawn(
-    [
-      fxBin,
-      "ask",
-      "--json",
-      "--auto",
-      "--no-save",
-      "Call the conformance add_numbers MCP tool with a=2 and b=3.",
-    ],
-    {
-      cwd: workspace,
-      env: {
-        ...conformanceEnv,
-        HOME: home,
-        AI_GATEWAY_API_KEY: "mcp-conformance-placeholder",
-        VERCEL_OIDC_TOKEN: "",
-        FX_AUTO_UPGRADE: "0",
-        FX_DISABLE_KEYCHAIN: "1",
-        FX_E2E_MCP_AUTH_AUTOMATE: "1",
-        ...(scenarioContext.client_secret
-          ? {
-              FX_MCP_CONFORMANCE_CLIENT_SECRET:
-                scenarioContext.client_secret,
-            }
-          : {}),
-        FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_MODEL: FAKE_GATEWAY_MODEL,
-        FX_SKIP_ONBOARDING: "1",
-        FX_SOUND: "0",
-        NO_COLOR: "1",
-      },
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
+// fx signs in through the browser with fx mcp login. For the auth scenarios
+// this browser follows the authorization URL's redirects back to fx's
+// loopback callback, as a user approving it would. On Linux fx opens a
+// browser only when a display is set, so these scenarios also set DISPLAY.
+const authScenario = scenario.startsWith("auth/");
+const fakeBin = join(root, "bin");
+if (authScenario) {
+  mkdirSync(fakeBin, { recursive: true });
+  const opener =
+    '#!/bin/sh\nnohup curl --location --silent --show-error "$1" >/dev/null 2>&1 &\nexit 0\n';
+  for (const name of ["open", "xdg-open"]) {
+    writeFileSync(join(fakeBin, name), opener, { mode: 0o755 });
+  }
+}
+const fxEnv = {
+  ...process.env,
+  HOME: home,
+  PATH: authScenario ? `${fakeBin}:${process.env.PATH ?? ""}` : process.env.PATH,
+  ...(authScenario ? { DISPLAY: process.env.DISPLAY || ":0" } : {}),
+  AI_GATEWAY_API_KEY: "mcp-conformance-placeholder",
+  VERCEL_OIDC_TOKEN: "",
+  FX_AUTO_UPGRADE: "0",
+  FX_DISABLE_KEYCHAIN: "1",
+  ...(scenarioContext.client_secret
+    ? {
+        FX_MCP_CONFORMANCE_CLIENT_SECRET:
+          scenarioContext.client_secret,
+      }
+    : {}),
+  FX_MODEL: FAKE_GATEWAY_MODEL,
+  FX_TEST_SKIP_ONBOARDING: "1",
+  FX_SOUND: "0",
+  NO_COLOR: "1",
+};
+
+async function runFx(args: string[], extraEnv: Record<string, string> = {}) {
+  const child = Bun.spawn([fxBin, ...args], {
+    cwd: workspace,
+    env: { ...fxEnv, ...extraEnv },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
@@ -186,9 +162,126 @@ try {
   ]);
   process.stdout.write(stdout);
   process.stderr.write(stderr);
-  process.exitCode = exitCode;
+  return { stdout, stderr, exitCode };
+}
+
+// Each ask gets its own scripted model.
+async function ask() {
+  const gateway = startFakeGateway(gatewaySteps());
+  try {
+    const result = await runFx(
+      [
+        "ask",
+        "--json",
+        "--auto",
+        "--no-save",
+        "Call the conformance add_numbers MCP tool with a=2 and b=3.",
+      ],
+      { FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    );
+    // What fx told the model: a call ended because the server needs a
+    // login. The --json result carries only each call's status.
+    const needsLogin = gateway.requests.some((r) => r.body.includes("needs a login"));
+    return { ...result, needsLogin };
+  } finally {
+    gateway.stop();
+  }
+}
+
+// A server that asks questions needs a client that can take them, and a
+// headless fx ask declares none: such scenarios run through fx acp, as an ACP
+// client that takes form questions and answers each with its defaults.
+const asksQuestions = scenario === "sep-2322-client-request-state";
+
+async function askOverAcp() {
+  const gateway = startFakeGateway(gatewaySteps());
+  const child = Bun.spawn([fxBin, "acp"], {
+    cwd: workspace,
+    env: { ...fxEnv, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "inherit",
+  });
+  const send = (message: object) => {
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+    child.stdin.flush();
+  };
+  const waiting = new Map<number, (message: any) => void>();
+  let nextId = 1;
+  const request = (method: string, params: object) =>
+    new Promise<any>((resolve) => {
+      const id = nextId++;
+      waiting.set(id, resolve);
+      send({ jsonrpc: "2.0", id, method, params });
+    });
+  const reading = (async () => {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for await (const chunk of child.stdout) {
+      buffer += decoder.decode(chunk, { stream: true });
+      for (let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
+        const line = buffer.slice(0, end).trim();
+        buffer = buffer.slice(end + 1);
+        if (!line) continue;
+        const message = JSON.parse(line);
+        if (message.method === undefined) {
+          waiting.get(message.id)?.(message);
+          waiting.delete(message.id);
+        } else if (message.method === "elicitation/create" && message.id !== undefined) {
+          send({ jsonrpc: "2.0", id: message.id, result: { action: "accept", content: formDefaults(message.params?.requestedSchema) } });
+        } else if (message.method === "session/request_permission" && message.id !== undefined) {
+          send({ jsonrpc: "2.0", id: message.id, result: { outcome: { outcome: "selected", optionId: "allow_once" } } });
+        }
+      }
+    }
+  })();
+  try {
+    await request("initialize", { protocolVersion: 1, clientCapabilities: { elicitation: { form: {} } } });
+    // An ACP client names its session's servers.
+    const created = await request("session/new", {
+      cwd: workspace,
+      mcpServers: [{ type: "http", name: "conformance", url: configuredServerUrl, headers: [] }],
+    });
+    const sessionId = created.result.sessionId;
+    await request("session/set_mode", { sessionId, modeId: "auto" });
+    const prompted = await request("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "Call the conformance MCP tools." }],
+    });
+    return { exitCode: prompted.error === undefined ? 0 : 1, needsLogin: false };
+  } finally {
+    child.stdin.end();
+    child.kill();
+    await child.exited;
+    await reading.catch(() => {});
+    gateway.stop();
+  }
+}
+
+// Each property's default, else a value its type allows.
+function formDefaults(schema: any): Record<string, unknown> {
+  const content: Record<string, unknown> = {};
+  for (const [key, property] of Object.entries<any>(schema?.properties ?? {})) {
+    if (property.default !== undefined) content[key] = property.default;
+    else if (Array.isArray(property.enum)) content[key] = property.enum[0];
+    else if (property.type === "boolean") content[key] = true;
+    else if (property.type === "number" || property.type === "integer") content[key] = property.minimum ?? 0;
+    else if (property.type === "string") content[key] = "x".repeat(property.minLength ?? 0);
+  }
+  return content;
+}
+
+try {
+  if (authScenario) await runFx(["mcp", "login", "conformance"]);
+  let result = asksQuestions ? await askOverAcp() : await ask();
+  // A server that asks for more scope at call time: sign in again once,
+  // then ask once more.
+  if (authScenario && result.needsLogin) {
+    await runFx(["mcp", "login", "conformance"]);
+    result = await ask();
+  }
+  process.exitCode = result.exitCode;
 } finally {
-  gateway.stop();
   await legacyProbeProxy?.stop();
   rmSync(root, { recursive: true, force: true });
 }

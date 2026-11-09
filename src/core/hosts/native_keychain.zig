@@ -23,9 +23,10 @@ const FindGenericPasswordFn = *const fn (
 ) callconv(.c) i32;
 
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
-const mcp_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V1";
-/// The sign-in credentials MCP-v2 hands fx to keep, a different format.
-const mcp_host_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V2";
+/// The sign-in credentials the MCP engine hands fx to keep, a different format.
+/// Not `FX_MCP_OAUTH_CREDENTIALS_V2`: fx builds that still run read and
+/// rewrite that item (`mcp_host/credentials.zig` says why).
+pub const mcp_host_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V3";
 pub const oauth_session_service_name = "FX_OAUTH_SESSION_V1";
 
 /// Backing store for a resolved account name. Must outlive any argv built from it.
@@ -34,9 +35,12 @@ pub const AccountBuffer = [256]u8;
 const passwd_scratch_bytes = 2048;
 const max_mcp_credentials_bytes: usize = 1024 * 1024;
 const max_oauth_session_bytes: usize = 64 * 1024;
-const keychain_process_timeout: std.Io.Timeout = .{
+/// How long one Keychain call may take, in milliseconds; leased locks held
+/// across Keychain calls allow each call this much (`shared/leased_lock.zig`).
+pub const keychain_call_ms: i64 = 10_000;
+pub const keychain_process_timeout: std.Io.Timeout = .{
     .duration = .{
-        .raw = .{ .nanoseconds = 10 * std.time.ns_per_s },
+        .raw = .{ .nanoseconds = keychain_call_ms * std.time.ns_per_ms },
         .clock = .awake,
     },
 };
@@ -200,23 +204,8 @@ fn containsService(service: []const u8) Error!host.SecretStorePresence {
     return error.KeychainReadFailed;
 }
 
-pub fn loadMcpCredentials(alloc: std.mem.Allocator) !?[]u8 {
-    return loadMcpValueMacControlled(alloc, mcp_credentials_service_name, null);
-}
-
 pub fn loadOAuthSession(alloc: std.mem.Allocator) !?[]u8 {
     return loadMcpValueMacControlled(alloc, oauth_session_service_name, null);
-}
-
-pub fn loadMcpCredentialsCancellable(
-    alloc: std.mem.Allocator,
-    cancel_flag: *const std.atomic.Value(bool),
-) !?[]u8 {
-    return loadMcpValueMacControlled(
-        alloc,
-        mcp_credentials_service_name,
-        cancel_flag,
-    );
 }
 
 fn loadFromService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
@@ -379,46 +368,12 @@ pub fn storeValue(value: []const u8) Error!void {
     return error.UnsupportedPlatform;
 }
 
-pub fn storeMcpCredentials(value: []const u8) Error!void {
-    return storeMcpCredentialsControlled(value, null);
-}
-
 pub fn storeOAuthSession(value: []const u8) Error!void {
     if (!isAvailable()) return error.UnsupportedPlatform;
     if (value.len == 0 or value.len > max_oauth_session_bytes) {
         return error.KeychainWriteFailed;
     }
     return storeMcpValueMac(oauth_session_service_name, value);
-}
-
-pub fn storeMcpCredentialsCancellable(
-    value: []const u8,
-    cancel_flag: *const std.atomic.Value(bool),
-) Error!void {
-    return storeMcpCredentialsControlled(value, cancel_flag);
-}
-
-fn storeMcpCredentialsControlled(
-    value: []const u8,
-    cancel_flag: ?*const std.atomic.Value(bool),
-) Error!void {
-    if (!isAvailable()) return error.UnsupportedPlatform;
-    if (value.len == 0 or value.len > max_mcp_credentials_bytes) {
-        return error.KeychainWriteFailed;
-    }
-
-    if (comptime builtin.target.os.tag == .macos) {
-        return storeMcpValueMacControlled(
-            mcp_credentials_service_name,
-            value,
-            cancel_flag,
-        );
-    }
-    return error.UnsupportedPlatform;
-}
-
-pub fn deleteMcpCredentials(alloc: std.mem.Allocator) Error!bool {
-    return deleteMcpValueMac(alloc, mcp_credentials_service_name);
 }
 
 pub fn deleteOAuthSession(alloc: std.mem.Allocator) Error!bool {
@@ -659,6 +614,71 @@ const McpStoreEvent = union(enum) {
     watch: std.Io.Cancelable!select_watch.Outcome,
 };
 
+const McpStoreInputEvent = union(enum) {
+    write: anyerror!void,
+    watch: std.Io.Cancelable!select_watch.Outcome,
+};
+
+fn writeMcpStoreInputAll(input: std.Io.File, value: []const u8) anyerror!void {
+    return input.writeStreamingAll(io_mod.getIo(), value);
+}
+
+/// Writes `value` to the store child's stdin by `deadline`. A child that
+/// stops reading is killed then, which ends the write; nothing has waited on
+/// it yet, so its pid is still its own. The caller's `child.kill` reaps it.
+fn writeMcpStoreInput(
+    child: *std.process.Child,
+    input: std.Io.File,
+    value: []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    deadline: std.Io.Clock.Timestamp,
+) Error!void {
+    const pid = child.id orelse return writeFailed("native_write_start", error.ProcessNotFound);
+    const io = io_mod.getIo();
+    var watch: KeychainWatch = .{};
+    var select_buffer: [2]McpStoreInputEvent = undefined;
+    var select: std.Io.Select(McpStoreInputEvent) = .init(io, &select_buffer);
+    select.concurrent(.watch, KeychainWatch.run, .{
+        &watch,
+        select.io,
+        KeychainCondition{ .cancel_flag = cancel_flag, .deadline = deadline },
+    }) catch |err| return writeFailed("native_timeout_start", err);
+    select.concurrent(.write, writeMcpStoreInputAll, .{ input, value }) catch |err| {
+        watch.finish(&select);
+        return writeFailed("native_write_start", err);
+    };
+    const event = select.await() catch |err| {
+        stopMcpStoreInput(&select, &watch, pid);
+        return writeFailed("native_write", err);
+    };
+    switch (event) {
+        .write => |result| {
+            watch.finish(&select);
+            return result catch |err| writeFailed("native_write", err);
+        },
+        .watch => |result| {
+            stopMcpStoreInput(&select, &watch, pid);
+            const outcome = result catch |err| return writeFailed("native_timeout", err);
+            if (outcome == .deadline) return writeFailed("native_write", error.Timeout);
+            return error.Cancelled;
+        },
+    }
+}
+
+/// Kills the store child, which ends a write it stopped reading, then takes
+/// the write's result.
+fn stopMcpStoreInput(
+    select: *std.Io.Select(McpStoreInputEvent),
+    watch: *KeychainWatch,
+    pid: std.posix.pid_t,
+) void {
+    watch.stop(select.io);
+    std.posix.kill(pid, .KILL) catch |err| {
+        debug_trace.logf("keychain", "store write kill failed err={s}", .{@errorName(err)});
+    };
+    while (select.cancel()) |_| {}
+}
+
 fn waitForMcpStoreChild(child: *std.process.Child) anyerror!std.process.Child.Term {
     return child.wait(io_mod.getIo());
 }
@@ -690,10 +710,10 @@ fn abandonMcpStore(
 fn waitForMcpStore(
     child: *std.process.Child,
     cancel_flag: ?*const std.atomic.Value(bool),
+    deadline: std.Io.Clock.Timestamp,
 ) Error!std.process.Child.Term {
     const pid = child.id orelse return writeFailed("native_wait_start", error.ProcessNotFound);
     const io = io_mod.getIo();
-    const deadline = std.Io.Clock.Timestamp.fromNow(io, keychain_process_timeout.duration);
     var watch: KeychainWatch = .{};
     var select_buffer: [2]McpStoreEvent = undefined;
     var select: std.Io.Select(McpStoreEvent) = .init(io, &select_buffer);
@@ -736,6 +756,8 @@ fn storeMcpValueMacControlled(
     var account_buf: AccountBuffer = undefined;
     const account = try accountName(&account_buf);
     const argv = mcpScriptArgv("store", account, service);
+    // One deadline for the call: writing the value and waiting for the child.
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), keychain_process_timeout.duration);
     var child = std.process.spawn(io_mod.getIo(), .{
         .argv = &argv,
         .stdin = .pipe,
@@ -748,12 +770,11 @@ fn storeMcpValueMacControlled(
     child.stdin = null;
     var input_open = true;
     defer if (input_open) input.close(io_mod.getIo());
-    input.writeStreamingAll(io_mod.getIo(), value) catch |err|
-        return writeFailed("native_write", err);
+    try writeMcpStoreInput(&child, input, value, cancel_flag, deadline);
     input.close(io_mod.getIo());
     input_open = false;
 
-    const term = try waitForMcpStore(&child, cancel_flag);
+    const term = try waitForMcpStore(&child, cancel_flag, deadline);
     if (term != .exited or term.exited != 0) {
         return writeFailedTerm("native_exit", term);
     }
@@ -972,13 +993,40 @@ test "cancellable MCP Keychain store wait interrupts a stalled child" {
     const started_ms = io_mod.milliTimestamp();
     try std.testing.expectError(
         error.Cancelled,
-        waitForMcpStore(&child, &cancel),
+        waitForMcpStore(&child, &cancel, std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), keychain_process_timeout.duration)),
     );
     thread.join();
     try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
     // The cancelled wait clears child.id, so the deferred kill does nothing.
     // The store must have killed and reaped the child itself.
     try std.testing.expectEqual(@as(std.c.pid_t, -1), std.c.waitpid(pid, null, std.c.W.NOHANG));
+}
+
+test "a store value written to a child that doesn't read it ends at the deadline" {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "exec sleep 60" },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(std.testing.io);
+    const pid = child.id orelse return error.TestUnexpectedResult;
+    const input = child.stdin orelse return error.TestUnexpectedResult;
+    child.stdin = null;
+    defer input.close(std.testing.io);
+    // Larger than any pipe's buffer, so the write blocks on a reader that never reads.
+    const value = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(value);
+    @memset(value, 'x');
+    const started_ms = io_mod.milliTimestamp();
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .raw = .fromMilliseconds(100), .clock = .awake });
+    try std.testing.expectError(error.KeychainWriteFailed, writeMcpStoreInput(&child, input, value, null, deadline));
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 2_000);
+    // Killed, not yet reaped: the store's deferred kill reaps it.
+    try std.testing.expectEqual(pid, child.id.?);
 }
 
 test "Keychain value store uses a bounded PTY bridge without a secret argument" {

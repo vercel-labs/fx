@@ -19,7 +19,12 @@ export const repetitions = Number(process.env.FX_TLA_REPEAT ?? "1");
 
 /// The checkout's tests/e2e/tmux-helpers.ts: tmux sessions and fake gateways.
 export async function targetHelpers() {
-  const path = join(worktree, "tests", "e2e", "tmux-helpers.ts");
+  return await targetModule("tmux-helpers.ts");
+}
+
+/// A helper module from the checkout's tests/e2e/, such as shell-sessions.ts.
+export async function targetModule(name: string) {
+  const path = join(worktree, "tests", "e2e", name);
   if (!existsSync(path)) throw new Error(`missing ${path}`);
   return await import(pathToFileURL(path).href);
 }

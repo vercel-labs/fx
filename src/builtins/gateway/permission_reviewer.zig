@@ -5,6 +5,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const types = @import("../../core/shared/types.zig");
 const stream_provider = @import("../../core/agent/stream_provider.zig");
 const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
+const vercel_model_policy = @import("../../gateway/vercel_model_policy.zig");
 const typesafe_permission_reviewer = @import("typesafe_permission_reviewer.zig");
 
 const Allocator = std.mem.Allocator;
@@ -87,7 +88,7 @@ fn reviewGatewayConfig(
 fn buildGatewayReview(
     _: *anyopaque,
     alloc: Allocator,
-    _: []const u8,
+    model: []const u8,
     tools_json: []const u8,
     instructions: []const types.ChatMessage,
     messages: []const types.ChatMessage,
@@ -95,13 +96,18 @@ fn buildGatewayReview(
     deadline: std.Io.Clock.Timestamp,
     cancel_flag: *std.atomic.Value(bool),
 ) ![]u8 {
+    // No later request shares a review's prefix: the review data sits inside
+    // the policy instructions. A cache write would only add its premium.
     return vercel_protocol.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
         alloc,
         tools_json,
         instructions,
         messages,
         target_call_id,
-        .{},
+        .{
+            .skip_cache_writes = vercel_model_policy.takesPromptCacheOptions(model),
+            .single_system_message = vercel_model_policy.singleSystemMessage(model),
+        },
         2048,
         deadline,
         cancel_flag,
@@ -396,6 +402,57 @@ fn testConfig(fake: *FakeStream, cancel_flag: ?*std.atomic.Value(bool)) GatewayC
         .stream_ctx = @ptrCast(fake),
         .stream_fn = FakeStream.execute,
     };
+}
+
+test "gateway review asks GPT-5.6 and later to skip cache writes" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1000),
+    });
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Review the pending call." }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "review_context_kind: normal\n" },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "call", .name = "shell", .arguments_json = "{}" }} },
+    };
+    for ([_]struct { model: []const u8, skip: bool }{
+        .{ .model = reviewer_model, .skip = true },
+        .{ .model = "openai/gpt-6.1-sol", .skip = true },
+        .{ .model = "openai/gpt-5", .skip = false },
+        .{ .model = "anthropic/claude-haiku-5.5", .skip = false },
+    }) |case| {
+        var unused: u8 = 0;
+        const body = try buildGatewayReview(@ptrCast(&unused), std.testing.allocator, case.model, "[]", &instructions, &messages, "call", deadline, &cancel);
+        defer std.testing.allocator.free(body);
+        try std.testing.expectEqual(case.skip, std.mem.find(u8, body, "\"promptCacheOptions\":{\"mode\":\"explicit\"}") != null);
+        // A review never asks the Gateway to cache.
+        try std.testing.expect(std.mem.find(u8, body, "\"caching\"") == null);
+    }
+}
+
+test "gateway review sends Qwen its instructions as one system message" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1000),
+    });
+    const instructions = [_]types.ChatMessage{
+        .{ .role = .system, .content = "Review the pending call." },
+        .{ .role = .system, .content = "Review policy details." },
+    };
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "review_context_kind: normal\n" },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "call", .name = "shell", .arguments_json = "{}" }} },
+    };
+    for ([_]struct { model: []const u8, systems: usize }{
+        .{ .model = "alibaba/qwen3.8-max", .systems = 1 },
+        .{ .model = "zai/glm-5.3", .systems = 2 },
+    }) |case| {
+        var unused: u8 = 0;
+        const body = try buildGatewayReview(@ptrCast(&unused), std.testing.allocator, case.model, "[]", &instructions, &messages, "call", deadline, &cancel);
+        defer std.testing.allocator.free(body);
+        try std.testing.expectEqual(case.systems, std.mem.count(u8, body, "{\"role\":\"system\""));
+    }
 }
 
 test "gateway reviewer transport carries the resolved review-model override" {

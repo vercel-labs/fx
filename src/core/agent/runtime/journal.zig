@@ -57,7 +57,7 @@ const compactor = @import("../../compactor/compactor.zig");
 const Allocator = std.mem.Allocator;
 
 /// The newest event version this fx reads and writes.
-pub const version: u8 = 3;
+pub const version: u8 = 4;
 /// The version of an event that needs none of the later additions.
 const plain_version: u8 = 1;
 /// The version of a `tool_result` and of a progress that extends another.
@@ -67,6 +67,10 @@ const delta_version: u8 = 2;
 /// fx that reads only up to version 2 reports a newer journal instead of an
 /// invalid one.
 const naming_version: u8 = 3;
+/// The version of an event that holds a turn with context notes or a saved
+/// runtime context (D93, D94), whatever else it holds, so an fx that reads
+/// only up to version 3 reports a newer journal instead of an invalid one.
+const notes_version: u8 = 4;
 /// The most event bytes one load accepts, and the most bytes one snapshot
 /// holds: each travels as one host attachment, and an attachment holds at
 /// most one kernel checkpoint. Longer sessions need snapshots.
@@ -144,9 +148,12 @@ pub const Event = union(EventType) {
     turn_yielded,
     tool_result: ToolResult,
 
-    /// The version `Cursor.write` gives the event: `naming_version` when it
-    /// names an image, one `stored` holds or one the session dropped.
+    /// The version `Cursor.write` gives the event: `notes_version` when it
+    /// holds a turn with context notes or a saved runtime context, and
+    /// `naming_version` when it names an image, one `stored` holds or one the
+    /// session dropped.
     fn eventVersion(self: Event, stored: ?*const session_codec.StoredImages) u8 {
+        if (eventUsesNotesSchema(self)) return notes_version;
         if (eventNamesImages(self, stored)) return naming_version;
         return switch (self) {
             .tool_result => delta_version,
@@ -269,6 +276,19 @@ pub const Cursor = struct {
     }
 };
 
+/// Whether `event` holds a turn that `session_codec` writes as execution
+/// schema 11 or 12.
+fn eventUsesNotesSchema(event: Event) bool {
+    return switch (event) {
+        .turn_committed => |turn| session_codec.turnUsesNotesSchema(turn),
+        .turn_progress => |progress| session_codec.executionUsesNotesSchema(progress.checkpoint.execution),
+        .history_replaced => |history| for (history) |turn| {
+            if (session_codec.turnUsesNotesSchema(turn)) break true;
+        } else false,
+        .tool_result, .tool_intent, .turn_progress_cleared, .input_accepted, .input_withdrawn, .turn_yielded => false,
+    };
+}
+
 /// Whether writing `event` names an image: one `stored` holds, or one the
 /// session dropped.
 fn eventNamesImages(event: Event, stored: ?*const session_codec.StoredImages) bool {
@@ -299,6 +319,9 @@ const snapshot_version: u8 = 2;
 /// Version 2's layout, with an open turn that names images: ones the host
 /// stored, or ones the session dropped.
 const snapshot_naming_version: u8 = 3;
+/// Version 2's layout, with an open turn that has context notes or a saved
+/// runtime context (D93, D94), whether or not it names images.
+const snapshot_notes_version: u8 = 4;
 const snapshot_header_bytes = snapshot_magic.len + 1 + 8 + 8 + 1;
 
 pub const Snapshot = struct {
@@ -325,7 +348,7 @@ pub fn encodeSnapshot(
     open_turn: ?[]const u8,
     checkpoint: []const u8,
 ) error{ OutOfMemory, SnapshotTooLarge }![]u8 {
-    return encodeSnapshotWith(alloc, seq, turn, last_turn_id, open_turn, checkpoint, false);
+    return encodeSnapshotWith(alloc, seq, turn, last_turn_id, open_turn, checkpoint, snapshot_version);
 }
 
 /// Like `encodeSnapshot`, for an `open_turn` that names at least one image
@@ -338,9 +361,24 @@ pub fn encodeSnapshotNamingImages(
     open_turn: []const u8,
     checkpoint: []const u8,
 ) error{ OutOfMemory, SnapshotTooLarge }![]u8 {
-    return encodeSnapshotWith(alloc, seq, turn, last_turn_id, open_turn, checkpoint, true);
+    return encodeSnapshotWith(alloc, seq, turn, last_turn_id, open_turn, checkpoint, snapshot_naming_version);
 }
 
+/// Like `encodeSnapshot`, for an `open_turn` whose progress has context notes
+/// or a saved runtime context (`session_codec.executionUsesNotesSchema`),
+/// whether or not it names images.
+pub fn encodeSnapshotWithNotes(
+    alloc: Allocator,
+    seq: u64,
+    turn: u64,
+    last_turn_id: ?[]const u8,
+    open_turn: []const u8,
+    checkpoint: []const u8,
+) error{ OutOfMemory, SnapshotTooLarge }![]u8 {
+    return encodeSnapshotWith(alloc, seq, turn, last_turn_id, open_turn, checkpoint, snapshot_notes_version);
+}
+
+/// `open_turn_version` is the version a snapshot with an open turn gets.
 fn encodeSnapshotWith(
     alloc: Allocator,
     seq: u64,
@@ -348,7 +386,7 @@ fn encodeSnapshotWith(
     last_turn_id: ?[]const u8,
     open_turn: ?[]const u8,
     checkpoint: []const u8,
-    open_turn_names_images: bool,
+    open_turn_version: u8,
 ) error{ OutOfMemory, SnapshotTooLarge }![]u8 {
     const id = last_turn_id orelse "";
     std.debug.assert(id.len <= max_turn_id_bytes);
@@ -356,12 +394,7 @@ fn encodeSnapshotWith(
     if (open_turn) |open| if (open.len > std.math.maxInt(u32)) return error.SnapshotTooLarge;
     const bytes = try alloc.alloc(u8, snapshot_header_bytes + id.len + open_bytes + checkpoint.len);
     @memcpy(bytes[0..snapshot_magic.len], snapshot_magic);
-    bytes[snapshot_magic.len] = if (open_turn == null)
-        snapshot_version_quiet
-    else if (open_turn_names_images)
-        snapshot_naming_version
-    else
-        snapshot_version;
+    bytes[snapshot_magic.len] = if (open_turn == null) snapshot_version_quiet else open_turn_version;
     std.mem.writeInt(u64, bytes[snapshot_magic.len + 1 ..][0..8], seq, .little);
     std.mem.writeInt(u64, bytes[snapshot_magic.len + 9 ..][0..8], turn, .little);
     bytes[snapshot_header_bytes - 1] = @intCast(id.len);
@@ -381,7 +414,7 @@ pub fn parseSnapshot(bytes: []const u8) LoadError!Snapshot {
         return error.InvalidJournal;
     }
     const found_version = bytes[snapshot_magic.len];
-    if (found_version > snapshot_naming_version) return error.UnsupportedJournalVersion;
+    if (found_version > snapshot_notes_version) return error.UnsupportedJournalVersion;
     if (found_version == 0) return error.InvalidJournal;
     const has_open_turn = found_version != snapshot_version_quiet;
     const seq = std.mem.readInt(u64, bytes[snapshot_magic.len + 1 ..][0..8], .little);
@@ -1413,7 +1446,7 @@ test "a journal from a newer fx or with a malformed event is rejected" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(
         error.UnsupportedJournalVersion,
-        fold(alloc, "[{\"v\":4,\"seq\":1,\"turn\":1,\"type\":\"turn_progress_cleared\"}]"),
+        fold(alloc, "[{\"v\":5,\"seq\":1,\"turn\":1,\"type\":\"turn_progress_cleared\"}]"),
     );
     const malformed = [_][]const u8{
         "{}",
@@ -1792,7 +1825,7 @@ test "a snapshot that is not one, or comes from a newer fx, is refused" {
     try std.testing.expectError(error.InvalidJournal, parseSnapshot(zero));
     const newer = try encodeSnapshot(alloc, 3, 2, null, null, "");
     defer alloc.free(newer);
-    newer[snapshot_magic.len] = snapshot_naming_version + 1;
+    newer[snapshot_magic.len] = snapshot_notes_version + 1;
     try std.testing.expectError(error.UnsupportedJournalVersion, parseSnapshot(newer));
 }
 
@@ -1904,6 +1937,59 @@ test "an event that names no image is version 1, byte for byte" {
     _ = try (Cursor{}).writeNamingImages(&named.writer, .{ .turn_committed = turn }, &stored);
     try std.testing.expectEqualStrings(plain.written(), named.written());
     try std.testing.expect(std.mem.startsWith(u8, named.written(), "{\"v\":1,"));
+}
+
+test "a turn with context notes or a saved runtime context is a version 4 event an older fx reports as newer (D93, D94)" {
+    const alloc = std.testing.allocator;
+    const plain_turn = try testTurn(alloc, "prompt", "answer");
+    defer types.freeHistoryTurn(alloc, plain_turn);
+    var with_context = try testTurn(alloc, "prompt", "answer");
+    defer types.freeHistoryTurn(alloc, with_context);
+    const runtime_context = try alloc.alloc([]u8, 1);
+    runtime_context[0] = try alloc.dupe(u8, "Runtime context: permission mode is auto.");
+    with_context.assistant.execution.runtime_context = runtime_context;
+    var with_note = try testTurn(alloc, "prompt", "answer");
+    defer types.freeHistoryTurn(alloc, with_note);
+    const notes = try alloc.alloc(types.PersistedContextNote, 1);
+    notes[0] = .{ .text = try alloc.dupe(u8, "<scoped-rules from=\"sub/AGENTS.md\" scope=\"sub\">\nR\n</scoped-rules>"), .after_tool_step_count = 0 };
+    with_note.assistant.execution.context_notes = notes;
+
+    var plain: std.Io.Writer.Allocating = .init(alloc);
+    defer plain.deinit();
+    _ = try (Cursor{}).write(&plain.writer, .{ .turn_committed = plain_turn });
+    try std.testing.expect(std.mem.startsWith(u8, plain.written(), "{\"v\":1,"));
+    for ([_]types.HistoryTurn{ with_context, with_note }) |turn| {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeByte('[');
+        _ = try (Cursor{}).write(&out.writer, .{ .turn_committed = turn });
+        try out.writer.writeByte(']');
+        // An fx that reads up to version 3 returns UnsupportedJournalVersion
+        // for it, which libfx reports as FxJournalVersionError.
+        try std.testing.expect(std.mem.startsWith(u8, out.written(), "[{\"v\":4,"));
+        var folded = try fold(alloc, out.written());
+        defer folded.deinit(alloc);
+        try std.testing.expect(session_codec.turnUsesNotesSchema(folded.history[0]));
+    }
+    var replaced: std.Io.Writer.Allocating = .init(alloc);
+    defer replaced.deinit();
+    _ = try (Cursor{}).write(&replaced.writer, .{ .history_replaced = &.{ plain_turn, with_note } });
+    try std.testing.expect(std.mem.startsWith(u8, replaced.written(), "{\"v\":4,"));
+
+    // A checkpoint of that history, and a snapshot whose open turn has them.
+    const plain_checkpoint = try checkpoint_codec.encode(alloc, &.{plain_turn}, .{}, .{});
+    defer alloc.free(plain_checkpoint);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, plain_checkpoint[4..6], .little));
+    const noted_checkpoint = try checkpoint_codec.encode(alloc, &.{ plain_turn, with_context }, .{}, .{});
+    defer alloc.free(noted_checkpoint);
+    try std.testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, noted_checkpoint[4..6], .little));
+    var decoded = try checkpoint_codec.decode(alloc, noted_checkpoint);
+    defer decoded.deinit(alloc);
+    try std.testing.expect(decoded.history[1].assistant.execution.runtime_context != null);
+    const snapshot = try encodeSnapshotWithNotes(alloc, 2, 2, null, "{}", noted_checkpoint);
+    defer alloc.free(snapshot);
+    try std.testing.expectEqual(snapshot_notes_version, snapshot[snapshot_magic.len]);
+    try std.testing.expectEqualStrings("{}", (try parseSnapshot(snapshot)).open_turn.?);
 }
 
 test "one fold names every image the host did not stage" {

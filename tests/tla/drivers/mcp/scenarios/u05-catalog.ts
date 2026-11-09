@@ -143,6 +143,33 @@ export const scenarios: Scenario[] = [
     check: (lines, _, log) => same(events(lines), ["fail", "fail"], "catalog results") ?? same(received(log), ["server/discover", "tools/list", "tools/list"], "requests"),
   }),
   catalogScenario({
+    name: "u05-page-expires-during-listing",
+    description: "A page whose TTL runs out before the listing ends leaves the list stale at once: each page is fresh for its own TTL from its own arrival",
+    rules: [
+      discover,
+      { method: "tools/list", cursor: null, result: page(["a"], { nextCursor: "p2", ttlMs: 100 }) },
+      { method: "tools/list", cursor: "p2", delayMs: 300, result: page(["b"], { ttlMs: 60000 }) },
+    ],
+    script: [...START, "tools", "expect catalog-stale 3000", "tools", "expect catalog-stale 3000", ...STOP],
+    check: (lines, _, log) =>
+      same(events(lines), ["publish (not cached) a,b", "publish (not cached) a,b"], "catalog results") ??
+      same(received(log).filter((m) => m.startsWith("tools/list")).length, 4, "tools/list requests"),
+  }),
+  catalogScenario({
+    name: "u05-failed-refresh-keeps-last",
+    description: "A re-list that fails after list_changed hands the waiters the last list, still stale, and every next need lists again",
+    rules: [
+      discover,
+      { method: "tools/list", times: 1, result: page(["a"], { ttlMs: 60000 }) },
+      ping([LIST_CHANGED]),
+      { method: "tools/list", error: { code: -32603, message: "Internal error" } },
+    ],
+    script: [...START, "tools", "expect catalog-fresh", "request ping", "outcome 3 result", "expect catalog-stale", "tools", "expect catalog-stale", "tools", "expect catalog-stale", ...STOP],
+    check: (lines, _, log) =>
+      same(events(lines), ["publish a", "serve_last (not cached) a", "serve_last (not cached) a"], "catalog results") ??
+      same(received(log), ["server/discover", "tools/list", "ping", "tools/list", "tools/list"], "requests"),
+  }),
+  catalogScenario({
     name: "u05-needs-join",
     description: "A need while a listing runs joins it instead of starting another",
     rules: [discover, { method: "tools/list", delayMs: 300, result: page(["a"], { ttlMs: 60000 }) }],

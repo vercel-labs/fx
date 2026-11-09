@@ -23,6 +23,20 @@ const DecodeError = error{
     InvalidEnum,
 };
 
+/// Fields each action takes. The flat model schema for this tool in
+/// src/builtins/tools.zig advertises exactly these, which a test there checks.
+pub const message_fields = [_][]const u8{ "action", "agent", "instructions", "message", "report", "model", "effort", "profile" };
+pub const wait_fields = [_][]const u8{"action"};
+pub const status_fields = [_][]const u8{ "action", "agent" };
+pub const stop_fields = [_][]const u8{ "action", "agent" };
+pub const close_fields = [_][]const u8{ "action", "agent" };
+
+/// Where a rejected call went wrong, so the correction can name it.
+const Problem = struct {
+    field: []const u8 = "",
+    action: []const u8 = "",
+};
+
 pub fn decode(
     ctx: tool_dispatch.DispatchContext,
     args_json: []const u8,
@@ -32,19 +46,21 @@ pub fn decode(
     const arena = arena_state.allocator();
 
     var parsed = std.json.parseFromSlice(std.json.Value, arena, args_json, .{}) catch {
-        return decodeFailure(ctx, "invalid_json") catch return error.OutOfMemory;
+        return decodeFailure(ctx, "invalid_json", null) catch return error.OutOfMemory;
     };
     defer parsed.deinit();
 
-    const request_input = parseRoot(parsed.value) catch |err| {
+    var problem: Problem = .{};
+    const request_input = parseRoot(parsed.value, &problem) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        debug_trace.logf("subagent", "request decode rejected code={s}", .{decodeErrorCode(err)});
-        return decodeFailure(ctx, decodeErrorCode(err)) catch return error.OutOfMemory;
+        debug_trace.logf("subagent", "request decode rejected code={s} field={s}", .{ decodeErrorCode(err), problem.field });
+        const correction = try problemText(arena, err, problem);
+        return decodeFailure(ctx, decodeErrorCode(err), correction) catch return error.OutOfMemory;
     };
     const request = model_contract.validateRequest(ctx.allocator, request_input) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("subagent", "request validation rejected code={s}", .{validationErrorCode(err)});
-        return decodeFailure(ctx, validationErrorCode(err)) catch return error.OutOfMemory;
+        return decodeFailure(ctx, validationErrorCode(err), null) catch return error.OutOfMemory;
     };
     errdefer {
         var owned = request;
@@ -65,11 +81,40 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
 fn decodeFailure(
     ctx: tool_dispatch.DispatchContext,
     code: []const u8,
+    correction: ?[]const u8,
 ) !tool_dispatch.DecodeResult {
     return .{ .failure = try model_contract.encodeResultAlloc(ctx.allocator, .{
         .ok = false,
+        .result = correction,
         .error_code = code,
     }) };
+}
+
+/// Pure: the correction a model sees for a call that failed to decode.
+fn problemText(arena: Allocator, err: DecodeError, problem: Problem) Allocator.Error![]const u8 {
+    const fields = "message takes agent, message, instructions, report, model, effort, and profile; wait takes nothing; status takes an optional agent; stop and close take agent.";
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidEnum => "action must be \"message\", \"wait\", \"status\", \"stop\", or \"close\".",
+        error.MissingField => if (std.mem.eql(u8, problem.field, "action"))
+            "action is required: \"message\" with agent and message, \"wait\", \"status\", or \"stop\" or \"close\" with agent."
+        else if (std.mem.eql(u8, problem.action, "stop"))
+            "stop needs agent."
+        else if (std.mem.eql(u8, problem.action, "close"))
+            "close needs agent."
+        else
+            "message needs agent and message.",
+        error.UnknownField => if (problem.action.len == 0)
+            try arena.print("{s} cannot sit beside request. Put every field at the top level without request.", .{problem.field})
+        else
+            try arena.print("{s} does not apply to {s}. " ++ fields, .{ problem.field, problem.action }),
+        error.InvalidFieldType => if (problem.field.len == 0)
+            "subagent arguments must be a JSON object."
+        else if (std.mem.eql(u8, problem.field, "request"))
+            "request must be an object. Put the fields at the top level instead."
+        else
+            try arena.print("{s} must be a string.", .{problem.field}),
+    };
 }
 
 fn decodeErrorCode(err: DecodeError) []const u8 {
@@ -85,40 +130,60 @@ fn decodeErrorCode(err: DecodeError) []const u8 {
 fn validationErrorCode(err: model_contract.ValidationError) []const u8 {
     return switch (err) {
         error.OutOfMemory => unreachable,
-        error.InvalidTask => "invalid_task",
         error.InvalidAgent => "invalid_agent",
+        error.InvalidReport => "invalid_report",
+        error.InvalidParentMessage => "invalid_parent_message",
         error.InvalidInstructions => "invalid_instructions",
         error.InvalidMessage => "invalid_message",
         error.InvalidModel => "invalid_model",
         error.InvalidEffort => "invalid_effort",
+        error.InvalidProfile => "invalid_profile",
     };
 }
 
-fn parseRoot(value: std.json.Value) DecodeError!model_contract.RequestInput {
+fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contract.RequestInput {
     const root = try objectValue(value);
     const request = if (root.get("request")) |request_value| blk: {
-        try rejectUnknown(root, &.{"request"});
-        break :blk try objectValue(request_value);
+        try rejectUnknown(root, &.{"request"}, problem);
+        problem.field = "request";
+        const object = try objectValue(request_value);
+        problem.field = "";
+        break :blk object;
     } else root;
-    const action = try requiredString(request, "action");
+    const action = try requiredString(request, "action", problem);
 
-    if (std.mem.eql(u8, action, "run")) {
-        try rejectUnknown(request, &.{ "action", "task", "model", "effort" });
-        return .{ .run = .{
-            .task = try requiredString(request, "task"),
-            .model = try optionalString(request, "model"),
-            .effort = try optionalString(request, "effort"),
+    if (std.mem.eql(u8, action, "message")) {
+        problem.action = "message";
+        try rejectUnknown(request, &message_fields, problem);
+        return .{ .message = .{
+            .agent = try requiredString(request, "agent", problem),
+            .instructions = try optionalString(request, "instructions", problem),
+            .message = try requiredString(request, "message", problem),
+            .report = try optionalString(request, "report", problem),
+            .model = try optionalString(request, "model", problem),
+            .effort = try optionalString(request, "effort", problem),
+            .profile = try optionalString(request, "profile", problem),
         } };
     }
-    if (std.mem.eql(u8, action, "message")) {
-        try rejectUnknown(request, &.{ "action", "agent", "instructions", "message", "model", "effort" });
-        return .{ .message = .{
-            .agent = try requiredString(request, "agent"),
-            .instructions = try optionalString(request, "instructions"),
-            .message = try requiredString(request, "message"),
-            .model = try optionalString(request, "model"),
-            .effort = try optionalString(request, "effort"),
-        } };
+    if (std.mem.eql(u8, action, "wait")) {
+        problem.action = "wait";
+        try rejectUnknown(request, &wait_fields, problem);
+        return .wait;
+    }
+    if (std.mem.eql(u8, action, "status")) {
+        problem.action = "status";
+        try rejectUnknown(request, &status_fields, problem);
+        return .{ .status = .{ .agent = try optionalString(request, "agent", problem) } };
+    }
+    if (std.mem.eql(u8, action, "stop")) {
+        problem.action = "stop";
+        try rejectUnknown(request, &stop_fields, problem);
+        return .{ .stop = .{ .agent = try requiredString(request, "agent", problem) } };
+    }
+    if (std.mem.eql(u8, action, "close")) {
+        problem.action = "close";
+        try rejectUnknown(request, &close_fields, problem);
+        return .{ .close = .{ .agent = try requiredString(request, "agent", problem) } };
     }
     return error.InvalidEnum;
 }
@@ -134,7 +199,9 @@ fn stringValue(value: std.json.Value) DecodeError![]const u8 {
 fn requiredString(
     object: std.json.ObjectMap,
     key: []const u8,
+    problem: *Problem,
 ) DecodeError![]const u8 {
+    problem.field = key;
     const value = object.get(key) orelse return error.MissingField;
     return stringValue(value);
 }
@@ -142,7 +209,9 @@ fn requiredString(
 fn optionalString(
     object: std.json.ObjectMap,
     key: []const u8,
+    problem: *Problem,
 ) DecodeError!?[]const u8 {
+    problem.field = key;
     const value = object.get(key) orelse return null;
     return try stringValue(value);
 }
@@ -150,12 +219,16 @@ fn optionalString(
 fn rejectUnknown(
     object: std.json.ObjectMap,
     allowed: []const []const u8,
+    problem: *Problem,
 ) DecodeError!void {
     var fields = object.iterator();
     while (fields.next()) |entry| {
         for (allowed) |name| {
             if (std.mem.eql(u8, entry.key_ptr.*, name)) break;
-        } else return error.UnknownField;
+        } else {
+            problem.field = entry.key_ptr.*;
+            return error.UnknownField;
+        }
     }
 }
 
@@ -199,8 +272,12 @@ pub fn call(
     };
 }
 
-pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
-    return false;
+/// `wait` and `status` change nothing.
+pub fn readsOnly(erased: tool_dispatch.ToolInput) bool {
+    return switch (erased.as(Input).request) {
+        .wait, .status => true,
+        .message, .stop, .close => false,
+    };
 }
 
 pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
@@ -268,7 +345,7 @@ test "call executes a validated managed request through the provider" {
     const alloc = std.testing.allocator;
     const decoded = try decode(
         .{ .allocator = alloc, .tool_call_id = "call-1" },
-        "{\"request\":{\"action\":\"run\",\"task\":\"review this\"}}",
+        "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review this\"}}",
     );
     var fixture = Fixture{};
     switch (decoded) {
@@ -293,37 +370,74 @@ test "call executes a validated managed request through the provider" {
                 .failure => return error.TestUnexpectedResult,
             }
             try std.testing.expect(fixture.request.? == &input.as(Input).request);
-            try std.testing.expectEqual(model_contract.Action.run, fixture.request.?.action());
+            try std.testing.expectEqual(model_contract.Action.message, fixture.request.?.action());
             try std.testing.expectEqualStrings("call-1", fixture.invocation_id.?);
         },
     }
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
 
-test "decode accepts only delegation intents" {
-    try expectRequestTag("{\"request\":{\"action\":\"run\",\"task\":\"do it\"}}", .run);
+test "decode accepts the five actions and nothing else" {
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"instructions\":\"Review strictly.\",\"message\":\"next\"}}", .message);
-    try expectRequestTag("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"model\":\"gpt-5.6-sol-fast\",\"effort\":\"medium\"}}", .run);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"model\":\"gpt-5.6-sol-fast\"}}", .message);
-    try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"effort\":\"high\"}}", .message);
-    try expectDecodeFailure("{\"request\":{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
-    try expectDecodeFailure("{\"request\":{\"action\":\"stop\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
+    try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"effort\":\"high\",\"report\":\"never\"}}", .message);
+    try expectRequestTag("{\"action\":\"wait\"}", .wait);
+    try expectRequestTag("{\"action\":\"status\"}", .status);
+    try expectRequestTag("{\"action\":\"status\",\"agent\":\"reviewer\"}", .status);
+    try expectRequestTag("{\"action\":\"stop\",\"agent\":\"reviewer\"}", .stop);
+    try expectRequestTag("{\"action\":\"close\",\"agent\":\"reviewer\"}", .close);
+    try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\"}}", "invalid_enum");
+    try expectDecodeFailure("{\"request\":{\"action\":\"stop\",\"child_id\":\"01J00000000000000000000000\"}}", "unknown_field");
     try expectDecodeFailure("{\"request\":{\"action\":\"cancel\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
 }
 
-test "decode rejects invalid creation overrides" {
-    try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"model\":\"\"}}", "invalid_model");
-    try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"effort\":\"not an effort!\"}}", "invalid_effort");
+fn expectCorrection(args_json: []const u8, code: []const u8, correction: []const u8) !void {
+    const alloc = std.testing.allocator;
+    try expectDecodeFailure(args_json, code);
+    const result = try decode(.{ .allocator = alloc }, args_json);
+    const body = switch (result) {
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |message| message,
+    };
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const text = parsed.value.object.get("result").?.string;
+    try std.testing.expect(std.mem.find(u8, text, correction) != null);
+}
+
+test "decode accepts flat calls and names what a rejected call got wrong" {
+    try expectRequestTag("{\"action\":\"message\",\"agent\":\"reviewer\",\"instructions\":\"Review strictly.\",\"message\":\"next\"}", .message);
+    try expectCorrection("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"task\":\"x\"}", "unknown_field", "task does not apply to message. message takes agent");
+    try expectCorrection("{\"action\":\"wait\",\"agent\":\"reviewer\"}", "unknown_field", "agent does not apply to wait.");
+    try expectCorrection("{\"action\":\"stop\"}", "missing_field", "stop needs agent.");
+    try expectCorrection("{\"action\":\"close\"}", "missing_field", "close needs agent.");
+    try expectCorrection("{\"action\":\"message\",\"agent\":\"reviewer\"}", "missing_field", "message needs agent and message.");
+    try expectCorrection("{\"task\":\"x\"}", "missing_field", "action is required");
+    try expectCorrection("{\"request\":{\"action\":\"wait\"},\"task\":\"y\"}", "unknown_field", "task cannot sit beside request");
+    try expectCorrection("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":7}", "invalid_field_type", "message must be a string.");
+    try expectCorrection("{\"request\":null}", "invalid_field_type", "request must be an object");
+    try expectCorrection("[]", "invalid_field_type", "must be a JSON object");
+    try expectCorrection("{\"action\":\"run\"}", "invalid_enum", "action must be \"message\", \"wait\", \"status\", \"stop\", or \"close\"");
+}
+
+test "decode rejects invalid creation overrides and report rules" {
+    try expectDecodeFailure("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"do it\",\"model\":\"\"}}", "invalid_model");
+    try expectDecodeFailure("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"do it\",\"effort\":\"not an effort!\"}}", "invalid_effort");
     try expectDecodeFailure("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"model\":7}}", "invalid_field_type");
-    try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"provider\":\"gateway\"}}", "unknown_field");
+    try expectDecodeFailure("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"do it\",\"provider\":\"gateway\"}}", "unknown_field");
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"do it\",\"report\":\"often\"}", "invalid_report");
+    try expectDecodeFailure("{\"action\":\"message\",\"agent\":\"parent\",\"message\":\"done\",\"report\":\"never\"}", "invalid_parent_message");
 }
 
 test "decode rejects manager input cross-action fields and unknown actions" {
     try expectDecodeFailure("{\"command\":{\"create\":{\"name\":\"worker\"}}}", "missing_field");
-    try expectDecodeFailure("{\"request\":{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\",\"task\":\"wrong\"}}", "invalid_enum");
+    try expectDecodeFailure("{\"request\":{\"action\":\"wait\",\"child_id\":\"01J00000000000000000000000\",\"task\":\"wrong\"}}", "unknown_field");
     try expectDecodeFailure("{\"request\":{\"action\":\"inspect\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
-    try expectDecodeFailure("{\"request\":{\"action\":\"wait\"}}", "invalid_enum");
     try expectDecodeFailure("{\"request\":null}", "invalid_field_type");
 }
 
@@ -331,7 +445,7 @@ test "call reports compact host unavailability" {
     const alloc = std.testing.allocator;
     const decoded = try decode(
         .{ .allocator = alloc },
-        "{\"request\":{\"action\":\"run\",\"task\":\"do it\"}}",
+        "{\"request\":{\"action\":\"wait\"}}",
     );
     switch (decoded) {
         .failure => |reason| {

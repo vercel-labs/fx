@@ -136,15 +136,18 @@ export function interpret(body: string, sid: string | null): Pick<ObservedCall, 
 
 function sessionResults(home: string): Map<string, string> {
   const results = new Map<string, string>();
-  const root = join(home, ".fx", "sessions");
+  const root = join(home, ".fx", "sessions", "v2");
   for (const id of existsSync(root) ? readdirSync(root) : []) {
-    const events = join(root, id, "events.jsonl");
-    if (!existsSync(events)) continue;
-    for (const line of readFileSync(events, "utf8").split("\n").filter(Boolean)) {
-      const result = JSON.parse(line).event?.tool_result;
-      if (!result?.call_id) continue;
-      const artifact = result.artifact_ref ? join(root, id, "tool-results", result.artifact_ref) : "";
-      results.set(result.call_id, artifact && existsSync(artifact) ? readFileSync(artifact, "utf8") : String(result.preview ?? ""));
+    const log = join(root, id, "log.jsonl");
+    if (!existsSync(log)) continue;
+    for (const line of readFileSync(log, "utf8").split("\n").filter(Boolean)) {
+      const record = JSON.parse(line);
+      if (record.type !== "tool_result" || !record.data?.call_id) continue;
+      // A v2 session keeps each tool output in blobs/<hash>, named by its
+      // artifact_ref "result-<hash>.txt".
+      const hash = /^result-([0-9a-f]+)\.txt$/.exec(record.data.artifact_ref ?? "")?.[1];
+      const blob = hash ? join(root, id, "blobs", hash) : "";
+      results.set(record.data.call_id, blob && existsSync(blob) ? readFileSync(blob, "utf8") : String(record.data.preview ?? ""));
     }
   }
   return results;
@@ -188,9 +191,9 @@ export async function runTurn(ctx: RunContext, spec: TurnSpec): Promise<Observed
   const env = {
     PATH: "/usr/bin:/bin:/usr/sbin:/sbin", HOME: home, TMPDIR: root, SHELL: "/bin/zsh", LANG: "en_US.UTF-8",
     AI_GATEWAY_API_KEY: "synthetic-shell-contract", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
-    FX_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: helpers.FAKE_GATEWAY_MODEL,
+    FX_TEST_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: helpers.FAKE_GATEWAY_MODEL,
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     FX_TRACE_LOG: join(root, "trace.log"), FX_TRACE_SCOPES: "tool,terminal",
   };
   const child = Bun.spawn([ctx.binary, "ask", "--json", "--full-access", "fixture"], {

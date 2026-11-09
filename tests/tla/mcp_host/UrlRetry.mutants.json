@@ -1,0 +1,38 @@
+[
+  {
+    "description": "A question that takes a slot a waiting URL held leaves the URL on it, so its completion counts",
+    "old": "    /\\ slotOf' = IF Guard THEN [j \\in Js |-> IF slotOf[j] = s THEN NoSlot ELSE slotOf[j]] ELSE slotOf",
+    "new": "    /\\ slotOf' = slotOf",
+    "invariant": "CountsOwnCompletions"
+  },
+  {
+    "description": "The first completion completes the signal",
+    "old": "            /\\ signal' = IF phase = \"waiting\" /\\ \\A j \\in Js : seen'[j] THEN \"completed\" ELSE signal",
+    "new": "            /\\ signal' = IF phase = \"waiting\" /\\ \\E j \\in Js : seen'[j] THEN \"completed\" ELSE signal",
+    "invariant": "SignalTruth"
+  },
+  {
+    "description": "A completion that came before consent is not counted when the user accepts",
+    "old": "           seen1 == [j \\in Js |-> seen[j] \\/ slotOf[j] \\in early]",
+    "new": "           seen1 == seen",
+    "invariant": "SeenWhenDone"
+  },
+  {
+    "description": "A declined consent calls again",
+    "old": "    /\\ phase' = \"done\"\n    /\\ ended' = how\n    /\\ UNCHANGED <<calls, slotOf, seen, truly, signal, consented, said, retriedBy, proof>>",
+    "new": "    /\\ Again(\"manual\", said)\n    /\\ ended' = ended\n    /\\ UNCHANGED <<truly, consented, said>>",
+    "invariant": "RetryOnlyAfterProof"
+  },
+  {
+    "description": "Cancel on the waiting question calls again",
+    "old": "    /\\ said' = \"cancel\"\n    /\\ phase' = \"done\"\n    /\\ ended' = \"cancelled\"\n    /\\ UNCHANGED <<calls, slotOf, seen, eng, ownCall, ownUrl, truly, signal, consented, retriedBy, proof>>",
+    "new": "    /\\ said' = \"cancel\"\n    /\\ Again(\"manual\", \"cancel\")\n    /\\ UNCHANGED <<eng, ownCall, ownUrl, truly, consented, ended>>",
+    "invariant": "RetryOnlyAfterProof"
+  },
+  {
+    "description": "The waiting question has no deadline, so a call whose URLs never complete waits forever",
+    "old": "    /\\ WF_vars(UserCancels)\n",
+    "new": "",
+    "property": "HeldCallEnds"
+  }
+]

@@ -118,14 +118,20 @@ pub fn update(alloc: Allocator, profile_path: []const u8, file: File, path: []co
     }
 }
 
-/// The file's text, or null when it doesn't exist; owned by `alloc`.
+/// The most of an MCP config file `read` takes; a larger one fails with
+/// StreamTooLong.
+pub const max_read_bytes: usize = 1024 * 1024;
+
+/// The file's text, or null when it doesn't exist; owned by `alloc`. A path
+/// that isn't a regular file, such as a fifo, fails with DurablePathUnsafe
+/// instead of waiting for a writer.
 pub fn read(alloc: Allocator, path: []const u8) !?[]u8 {
-    var f = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| switch (err) {
+    var f = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), path, .follow) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer f.close(io_mod.getIo());
-    return try io_mod.readFileToEnd(alloc, &f, 1024 * 1024);
+    return try io_mod.readFileToEnd(alloc, &f, max_read_bytes);
 }
 
 const profile_lock_deadline_ms: u64 = 2_000;
@@ -158,7 +164,15 @@ fn profileDir(profile_path: []const u8) !io_mod.VerifiedDir {
 fn write(alloc: Allocator, file: File, path: []const u8, text: []const u8) !void {
     switch (file) {
         .profile => try replaceProfile(alloc, path, text),
-        .project => try io_mod.writeFileAtomic(alloc, path, text),
+        .project => {
+            // A link isn't replaced, which forks the file it points to, nor
+            // followed, which could write outside the project.
+            // The profile's own replace refuses one too.
+            if (std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false })) |stat| {
+                if (stat.kind == .sym_link or stat.nlink > 1) return error.Linked;
+            } else |err| if (err != error.FileNotFound) return err;
+            try io_mod.writeFileAtomic(alloc, path, text);
+        },
     }
 }
 
@@ -325,4 +339,91 @@ test "remove drops one entry, keeps the rest in order, and returns its url" {
     try testing.expect(stdio.url == null);
     try testing.expect(try remove(a, .profile, before, "missing") == null);
     try testing.expect(try remove(a, .project, "{\"mcp\":{\"a\":{}}}", "a") == null);
+}
+
+test "a linked config file is never edited, whether a symlink or a hard link" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "shared.json", .data = "{}" });
+    try tmp.dir.symLink(io, "shared.json", "soft.json", .{});
+    try tmp.dir.hardLink("shared.json", tmp.dir, "hard.json", io, .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "plain.json", .data = "{}" });
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const Case = struct { name: []const u8, want: enum { linked, written, no_dir } };
+    for ([_]Case{
+        .{ .name = "soft.json", .want = .linked },
+        .{ .name = "hard.json", .want = .linked },
+        .{ .name = "plain.json", .want = .written },
+        .{ .name = "missing.json", .want = .written },
+        .{ .name = "no-dir/mcp.json", .want = .no_dir },
+    }) |case| {
+        const path = try std.Io.Dir.path.join(alloc, &.{ root, case.name });
+        defer alloc.free(path);
+        const text = "{\"mcpServers\":{}}";
+        switch (case.want) {
+            .linked => try testing.expectError(error.Linked, write(alloc, .project, path, text)),
+            .written => {
+                try write(alloc, .project, path, text);
+                const got = try tmp.dir.readFileAlloc(io, case.name, alloc, .limited(64));
+                defer alloc.free(got);
+                try testing.expectEqualStrings(text, got);
+            },
+            .no_dir => try testing.expectError(error.FileNotFound, write(alloc, .project, path, text)),
+        }
+    }
+    // The file the links point to is as it was.
+    const shared = try tmp.dir.readFileAlloc(io, "shared.json", alloc, .limited(64));
+    defer alloc.free(shared);
+    try testing.expectEqualStrings("{}", shared);
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+test "read returns a file's text, follows a symlink, and refuses a fifo without blocking" {
+    if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "plain.json", .data = "{\"mcp\":{}}" });
+    try tmp.dir.symLink(io, "plain.json", "soft.json", .{});
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    for ([_][]const u8{ "plain.json", "soft.json" }) |name| {
+        const path = try std.Io.Dir.path.join(alloc, &.{ root, name });
+        defer alloc.free(path);
+        const text = (try read(alloc, path)).?;
+        defer alloc.free(text);
+        try testing.expectEqualStrings("{\"mcp\":{}}", text);
+    }
+
+    const missing = try std.Io.Dir.path.join(alloc, &.{ root, "missing.json" });
+    defer alloc.free(missing);
+    try testing.expect(try read(alloc, missing) == null);
+
+    // Opening a fifo for reading waits for a writer that never comes.
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const fifo = try std.mem.printSentinel(&path_buf, "{s}/{s}", .{ root, "fifo.json" }, 0);
+    if (mkfifo(fifo, 0o600) != 0) return error.SkipZigTest;
+    try testing.expectError(error.DurablePathUnsafe, read(alloc, fifo));
+}
+
+test "the profile's first write creates ~/.fx readable only by its owner" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const path = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "mcp.json" });
+    defer alloc.free(path);
+    try write(alloc, .profile, path, "{\"mcpServers\":{}}");
+    const dir = try tmp.dir.statFile(io, ".fx", .{});
+    try testing.expectEqual(@as(std.posix.mode_t, 0o700), dir.permissions.toMode() & 0o777);
+    const file = try tmp.dir.statFile(io, ".fx/mcp.json", .{});
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), file.permissions.toMode() & 0o777);
 }

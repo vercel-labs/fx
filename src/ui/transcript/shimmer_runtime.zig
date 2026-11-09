@@ -25,6 +25,8 @@ pub const ActivityPaintInput = struct {
 
 pub const ActivityPaintStyle = enum {
     thinking,
+    /// `thinking`'s bullet and color with the bullet always shown.
+    live,
     tool_marker,
     neutral,
     warning,
@@ -196,12 +198,12 @@ fn paintPlannedActivityRow(
     else
         surface.plan.activity_band.bottom -| row +| 1;
     const static_status = switch (input.style) {
-        .neutral, .warning, .success, .danger => true,
+        .live, .neutral, .warning, .success, .danger => true,
         .thinking, .tool_marker => false,
     };
     const preserve_trailing_context = switch (input.style) {
         .warning, .danger => true,
-        .thinking, .tool_marker, .neutral, .success => false,
+        .thinking, .live, .tool_marker, .neutral, .success => false,
     };
     const preview = if (static_status)
         try wrappedStaticActivityLabel(
@@ -216,7 +218,7 @@ fn paintPlannedActivityRow(
     defer preview.deinit(surface.alloc);
     var buf: [4096]u8 = undefined;
     const text = switch (input.style) {
-        .thinking => writeThinkingBlinkText(
+        .thinking, .live => writeThinkingBlinkText(
             &buf,
             preview.bytes,
             input.thinking_blink orelse markerBlinkVisible(input.shimmer_pos),
@@ -793,6 +795,38 @@ test "activity surface painter honors the thinking blink override" {
 
     try std.testing.expectEqual(@as(u21, ' '), hidden.surface.cellAt(4, 1).?.codepoint);
     try std.testing.expectEqual(@as(u21, '•'), visible.surface.cellAt(4, 1).?.codepoint);
+}
+
+test "activity surface painter blinks the live bullet with the thinking row" {
+    const plan = testPlan(
+        .{ .transient_row = .{ .row = 4, .gap_above_rows = 0 } },
+        .{ .top = 4, .bottom = 4, .owner = .activity },
+    );
+    var hidden = try testSurface(plan);
+    defer hidden.surface.deinit();
+    defer hidden.shadow.deinit();
+    var visible = try testSurface(plan);
+    defer visible.surface.deinit();
+    defer visible.shadow.deinit();
+
+    // A retry status blinks its bullet in step with the thinking row, and
+    // its text holds still.
+    _ = try paintActivityIntoSurface(&hidden.surface, .{
+        .label = "• Gateway error · retrying · attempt 2",
+        .style = .live,
+        .shimmer_pos = -render_request.animation_padding,
+        .thinking_blink = false,
+    });
+    _ = try paintActivityIntoSurface(&visible.surface, .{
+        .label = "• Gateway error · retrying · attempt 2",
+        .style = .live,
+        .shimmer_pos = 4,
+        .thinking_blink = true,
+    });
+    try std.testing.expectEqual(@as(u21, ' '), hidden.surface.cellAt(4, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '•'), visible.surface.cellAt(4, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'G'), hidden.surface.cellAt(4, 3).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'G'), visible.surface.cellAt(4, 3).?.codepoint);
 }
 
 test "activity surface painter rejects activity over footer" {

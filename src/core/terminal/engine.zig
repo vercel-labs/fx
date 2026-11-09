@@ -10,12 +10,14 @@ const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const checkpoint_schema_revision: u16 = 2;
+pub const checkpoint_schema_revision: u16 = 3;
 const checkpoint_legacy_revision: u16 = 1;
+/// The first revision that saves the cells a last-column character replaced.
+const checkpoint_last_column_revision: u16 = 3;
 const checkpoint_magic = "FXTE";
 
 pub fn supportsCheckpointRevision(revision: u16) bool {
-    return revision == checkpoint_legacy_revision or revision == checkpoint_schema_revision;
+    return revision >= checkpoint_legacy_revision and revision <= checkpoint_schema_revision;
 }
 pub const max_reply_effects: usize = 16;
 pub const max_reply_effect_bytes: usize = 256;
@@ -232,6 +234,7 @@ const SavedScreen = struct {
         grid.current_style = saved.current_style;
         grid.active_hyperlink_params = saved.active_hyperlink_params;
         grid.last_printable_idx = saved.last_printable_idx;
+        grid.last_column_write = null;
         grid.scroll_top = saved.scroll_top;
         grid.scroll_bottom = saved.scroll_bottom;
         grid.origin_mode = saved.origin_mode;
@@ -267,6 +270,19 @@ test "grid failures preserve exact error types and identities" {
     try std.testing.expectError(error.InvalidGridSize, invalid);
     try std.testing.expectError(error.OutOfMemory, failGrid(error.OutOfMemory));
 }
+
+/// What writing printable text can fail with.
+const PrintError = Allocator.Error || error{CombiningPoolCapacityExceeded};
+
+/// The cells a one-cell character in the last column wrote over. If a later
+/// read widens the character to two cells, they are put back, so it wraps or
+/// moves left as it would have had it arrived in one read.
+const LastColumnWrite = struct {
+    /// The character's cell.
+    idx: usize,
+    /// The cells of the last two columns, or a blank and the only column.
+    replaced: [2]Cell,
+};
 
 pub const Grid = struct {
     alloc: Allocator,
@@ -348,6 +364,9 @@ pub const Grid = struct {
     /// Lead cell written by the most recent printable input byte
     /// sequence. A following width-zero codepoint modifies this cell.
     last_printable_idx: ?usize = null,
+    /// What a one-cell character in the last column wrote over. Current only
+    /// while `last_printable_idx` names that character.
+    last_column_write: ?LastColumnWrite = null,
     feed_stats: ?*FeedStats = null,
     feed_mode: FeedMode = .journal_replay,
     feed_result: ?*FeedResult = null,
@@ -622,6 +641,8 @@ pub const Grid = struct {
         while (i < bytes.len) {
             const b = bytes[i];
             if (b == 0x18 or b == 0x1a) {
+                // A character split across reads ends here, as it would in one read.
+                if (self.utf8_len != 0) try self.writePendingUtf8();
                 self.cancelControlSequence();
                 i += 1;
                 continue;
@@ -640,7 +661,9 @@ pub const Grid = struct {
                         continue;
                     }
                     const expected = std.unicode.utf8ByteSequenceLength(b) catch 1;
-                    if (expected > 1 and i + expected > bytes.len) {
+                    // Keep only a sequence the next read can still complete;
+                    // anything else is written now, so no text after it waits.
+                    if (expected > 1 and i + expected > bytes.len and allUtf8Continuations(bytes[i + 1 ..])) {
                         const tail = bytes[i..];
                         @memcpy(self.utf8_buffer[0..tail.len], tail);
                         self.utf8_len = @intCast(tail.len);
@@ -808,29 +831,31 @@ pub const Grid = struct {
 
     fn completePendingUtf8(self: *Grid, bytes: []const u8) !usize {
         if (bytes.len == 0) return 0;
-        if (bytes[0] & 0xc0 != 0x80) {
-            self.utf8_len = 0;
-            self.utf8_expected = 0;
-            _ = try self.writeByte("\xef\xbf\xbd", 0);
-            return 0;
-        }
+        // Only continuation bytes extend the sequence. Any other byte, such
+        // as the ESC of a following escape sequence, interrupts it.
         const needed = self.utf8_expected - self.utf8_len;
-        const count = @min(bytes.len, needed);
+        var count: usize = 0;
+        while (count < @min(bytes.len, needed) and bytes[count] & 0xc0 == 0x80) count += 1;
         @memcpy(
             self.utf8_buffer[self.utf8_len .. self.utf8_len + count],
             bytes[0..count],
         );
         self.utf8_len += @intCast(count);
-        if (self.utf8_len != self.utf8_expected) return count;
-        const complete = self.utf8_buffer[0..self.utf8_len];
+        if (self.utf8_len == self.utf8_expected or count < bytes.len) try self.writePendingUtf8();
+        return count;
+    }
+
+    /// Writes the pending bytes as they would be written had they arrived in
+    /// one read: a valid sequence as its character, and a broken or
+    /// interrupted one as one replacement character per byte.
+    fn writePendingUtf8(self: *Grid) !void {
+        var pending: @TypeOf(self.utf8_buffer) = undefined;
+        const len = self.utf8_len;
+        @memcpy(pending[0..len], self.utf8_buffer[0..len]);
         self.utf8_len = 0;
         self.utf8_expected = 0;
-        if (!std.unicode.utf8ValidateSlice(complete)) {
-            _ = try self.writeByte("\xef\xbf\xbd", 0);
-        } else {
-            _ = try self.writeByte(complete, 0);
-        }
-        return count;
+        var index: usize = 0;
+        while (index < len) index += try self.writeByte(pending[0..len], index);
     }
 
     fn dispatchDcsAndFinish(self: *Grid) !void {
@@ -947,7 +972,11 @@ pub const Grid = struct {
         defer self.alloc.free(remap);
         @memset(remap, 0);
 
+        self.last_column_write = self.currentLastColumnWrite();
         for (self.cells) |cell| try markHyperlinkId(remap, cell.style.hyperlink_id);
+        if (self.last_column_write) |write| {
+            for (write.replaced) |cell| try markHyperlinkId(remap, cell.style.hyperlink_id);
+        }
         try markHyperlinkId(remap, self.current_style.hyperlink_id);
         if (self.saved_cursor) |cursor| try markHyperlinkId(remap, cursor.style.hyperlink_id);
         if (self.saved_normal_screen) |saved| {
@@ -976,6 +1005,9 @@ pub const Grid = struct {
         self.hyperlink_pool_bytes = retained_bytes;
 
         for (self.cells) |*cell| applyHyperlinkRemap(&cell.style, remap);
+        if (self.last_column_write) |*write| {
+            for (&write.replaced) |*cell| applyHyperlinkRemap(&cell.style, remap);
+        }
         applyHyperlinkRemap(&self.current_style, remap);
         if (self.saved_cursor) |*cursor| applyHyperlinkRemap(&cursor.style, remap);
         if (self.saved_normal_screen) |*saved| {
@@ -1151,6 +1183,7 @@ pub const Grid = struct {
             },
         }
 
+        if (try self.joinLastPrintable(bytes, start)) |joined| return joined;
         const unit = display_width.displayUnitAt(bytes, start);
         const decoded = decodeUtf8(bytes, start);
         const codepoint = decoded.codepoint;
@@ -1172,19 +1205,23 @@ pub const Grid = struct {
         }
         self.pending_wrap = false;
 
-        // Wide char that doesn't fit: wrap early (autowrap) or clamp.
+        // Wide char that doesn't fit: wrap early (autowrap) or clamp. One
+        // wider than the terminal fits on no line, so it is dropped.
         if (self.cursor_col + width - 1 > self.cols) {
+            if (width > self.cols) return consumed;
             if (self.autowrap) {
                 self.cursor_col = 1;
                 self.advanceRowOrScroll();
-            } else if (self.cols >= width) {
-                self.cursor_col = self.cols - width + 1;
             } else {
-                return consumed;
+                self.cursor_col = self.cols - width + 1;
             }
         }
 
         if (self.cursor_row >= 1 and self.cursor_row <= self.rows and self.cursor_col >= 1 and self.cursor_col <= self.cols) {
+            const last_column_write: ?LastColumnWrite = if (width == 1 and self.cursor_col == self.cols) .{
+                .idx = self.cellIndex(self.cursor_row, self.cursor_col),
+                .replaced = self.lastColumnCells(self.cursor_row),
+            } else null;
             if (self.insert_mode) self.insertCells(width);
             self.markTouchedRow(self.cursor_row);
             const idx = self.cellIndex(self.cursor_row, self.cursor_col);
@@ -1199,6 +1236,7 @@ pub const Grid = struct {
                 try self.appendCombiningSuffix(idx, bytes[start + decoded.len .. start + consumed]);
             }
             self.last_printable_idx = idx;
+            self.last_column_write = last_column_write;
             if (width == 2 and self.cursor_col < self.cols) {
                 self.cells[idx + 1] = .{
                     .codepoint = 0,
@@ -1218,6 +1256,82 @@ pub const Grid = struct {
         }
 
         return consumed;
+    }
+
+    fn lastColumnCells(self: Grid, row: u16) [2]Cell {
+        const last = self.cells[self.cellIndex(row, self.cols)];
+        if (self.cols == 1) return .{ .{}, last };
+        return .{ self.cells[self.cellIndex(row, self.cols - 1)], last };
+    }
+
+    fn currentLastColumnWrite(self: Grid) ?LastColumnWrite {
+        const write = self.last_column_write orelse return null;
+        const idx = self.last_printable_idx orelse return null;
+        return if (idx == write.idx) write else null;
+    }
+
+    /// Joins the bytes at `start` to the character written last when they
+    /// continue it, as they do when a read ends inside an emoji, a keycap, or
+    /// a flag, so its cell matches the one a single read would have written.
+    /// Returns the bytes consumed, or null when they begin a new character.
+    fn joinLastPrintable(self: *Grid, bytes: []const u8, start: usize) PrintError!?usize {
+        // Within one read, the character already took every byte it could.
+        // An ASCII byte never continues one.
+        if (bytes[start] < 0x80) return null;
+        const idx = self.last_printable_idx orelse return null;
+        const cell = self.cells[idx];
+        const lookahead_bytes = 16;
+        var joined: [4 + contracts.max_cell_text_bytes + lookahead_bytes]u8 = undefined;
+        var known: usize = std.unicode.utf8Encode(cell.codepoint, &joined) catch return null;
+        if (self.combiningSuffix(cell.combining_suffix_id)) |suffix| {
+            @memcpy(joined[known..][0..suffix.len], suffix);
+            known += suffix.len;
+        }
+        const lookahead = bytes[start..@min(bytes.len, start + lookahead_bytes)];
+        @memcpy(joined[known..][0..lookahead.len], lookahead);
+        const unit = display_width.displayUnitAt(joined[0 .. known + lookahead.len], 0);
+        if (unit.byte_len <= known) return null;
+        const added = bytes[start .. start + unit.byte_len - known];
+        if (unit.cell_width <= cell.width) {
+            try self.appendCombiningSuffix(idx, added);
+        } else {
+            try self.widenLastPrintable(idx, joined[0..unit.byte_len], added);
+        }
+        return added.len;
+    }
+
+    /// Widens the one-cell character at `idx` into the two-cell `unit`, whose
+    /// last bytes are `added`, writing what a single read would have written.
+    fn widenLastPrintable(self: *Grid, idx: usize, unit: []const u8, added: []const u8) PrintError!void {
+        if (self.currentLastColumnWrite()) |write| {
+            // A single read would have wrapped the wider character, or moved
+            // it left without autowrap, and left the last columns as they were.
+            if (self.cellIndex(self.cursor_row, self.cols) != idx) return self.appendCombiningSuffix(idx, added);
+            if (self.cols > 1) self.cells[self.cellIndex(self.cursor_row, self.cols - 1)] = write.replaced[0];
+            self.cells[idx] = write.replaced[1];
+            self.last_printable_idx = null;
+            self.last_column_write = null;
+            self.pending_wrap = false;
+            _ = try self.writeByte(unit, 0);
+            return;
+        }
+        if (self.cursor_col < 2 or self.cellIndex(self.cursor_row, self.cursor_col - 1) != idx) {
+            return self.appendCombiningSuffix(idx, added);
+        }
+        const col = self.cursor_col - 1;
+        if (self.insert_mode) self.insertCells(1);
+        self.markTouchedRow(self.cursor_row);
+        self.clearWideGlyphAt(self.cursor_row, col + 1);
+        self.cells[idx].width = 2;
+        try self.appendCombiningSuffix(idx, added);
+        self.last_printable_idx = idx;
+        self.cells[idx + 1] = .{ .codepoint = 0, .width = 0, .style = self.cells[idx].style };
+        if (col + 2 <= self.cols) {
+            self.cursor_col = col + 2;
+        } else {
+            self.cursor_col = self.cols;
+            if (self.autowrap) self.pending_wrap = true;
+        }
     }
 
     fn advanceRowOrScroll(self: *Grid) void {
@@ -1547,8 +1661,9 @@ pub const Grid = struct {
             return;
         }
         if (report != 6) return;
+        // DECRC and VPA can leave the cursor above the top margin.
         const row = if (self.origin_mode)
-            self.cursor_row - self.scroll_top + 1
+            (self.cursor_row -| self.scroll_top) + 1
         else
             self.cursor_row;
         var buffer: [64]u8 = undefined;
@@ -1779,6 +1894,10 @@ pub const Grid = struct {
                 else => {},
             }
             i += 1;
+        }
+        if (!colors_enabled) {
+            self.current_style.fg = .default;
+            self.current_style.bg = .default;
         }
     }
 
@@ -2095,6 +2214,24 @@ pub const Grid = struct {
         return grid;
     }
 
+    /// The saved cells must belong to a one-cell character in the last column
+    /// and put back a valid row.
+    fn validateLastColumnWrite(self: Grid, write: LastColumnWrite) !void {
+        const cols: usize = self.cols;
+        if (write.idx % cols != cols - 1 or self.cells[write.idx].width != 1) {
+            return error.InvalidEngineCheckpoint;
+        }
+        const row_start = write.idx - (cols - 1);
+        const row = try self.alloc.dupe(Cell, self.cells[row_start .. row_start + cols]);
+        defer self.alloc.free(row);
+        if (cols > 1) row[cols - 2] = write.replaced[0];
+        row[cols - 1] = write.replaced[1];
+        const hyperlinks = self.hyperlink_pool.items.len;
+        const suffixes = self.combining_suffix_pool.items.len;
+        try validateCells(row, self.cols, 1, hyperlinks, suffixes);
+        if (cols == 1) try validateCells(write.replaced[0..1], 1, 1, hyperlinks, suffixes);
+    }
+
     fn validateCheckpointState(self: Grid) !void {
         if (self.rows == 0 or self.cols == 0 or
             self.cells.len != @as(usize, self.rows) * @as(usize, self.cols) or
@@ -2143,6 +2280,7 @@ pub const Grid = struct {
                 return error.InvalidEngineCheckpoint;
             }
         }
+        if (self.currentLastColumnWrite()) |write| try self.validateLastColumnWrite(write);
         if (self.saved_cursor) |saved| try validateSavedCursor(saved, self);
         if (self.saved_normal_screen) |saved| {
             if (saved.rows != self.rows or saved.cols != self.cols or
@@ -2435,12 +2573,23 @@ pub const Grid = struct {
                 // With DECAWM disabled, terminals can drop suffix codepoints
                 // from a display unit whose base ends at the right margin.
                 if (guard_margin_suffix) try out.writeAll("\x1b[?7h");
+                const disputed_width = suffix != null and hasVariationSelector(suffix.?);
+                // A terminal that draws this glyph one cell narrow never writes
+                // its second cell, so clear both first.
+                if (disputed_width and cell.width == 2) try out.writeAll("\x1b[2X");
                 try emitCodepoint(out, cell.codepoint);
                 if (suffix) |bytes| {
                     try out.writeAll(bytes);
                 }
                 if (guard_margin_suffix) try out.writeAll("\x1b[?7l");
                 col += cell.width;
+                // Terminals disagree on how wide a variation selector makes a
+                // glyph: Ghostty draws U+26A1 U+FE0E in one cell, tmux in two.
+                // Re-anchor the cursor so the cells after it land where this
+                // grid put them, or a later repaint misses one.
+                if (col <= last and disputed_width) {
+                    try out.print("\x1b[{d}G", .{col});
+                }
             }
         }
 
@@ -2601,7 +2750,11 @@ fn encodeGridState(encoder: *CheckpointEncoder, grid: Grid) !void {
     try encoder.sizedBytes(grid.osc_buffer.items);
     try encoder.boolean(grid.dcs_saw_esc);
     try encoder.sizedBytes(grid.dcs_buffer.items);
-    try encoder.bytes(&grid.utf8_buffer);
+    // Only the pending bytes are state. The rest of the buffer can still hold
+    // bytes of a sequence that already finished.
+    var pending_utf8: @TypeOf(grid.utf8_buffer) = @splat(0);
+    @memcpy(pending_utf8[0..grid.utf8_len], grid.utf8_buffer[0..grid.utf8_len]);
+    try encoder.bytes(&pending_utf8);
     try encoder.int(u8, grid.utf8_len);
     try encoder.int(u8, grid.utf8_expected);
     try encodeHyperlinkPool(encoder, grid.hyperlink_pool.items);
@@ -2611,6 +2764,9 @@ fn encodeGridState(encoder: *CheckpointEncoder, grid: Grid) !void {
     if (grid.saved_normal_screen) |saved| try encodeSavedScreen(encoder, saved);
     try encodeOptionalSavedCursor(encoder, grid.saved_cursor);
     try encodeOptionalIndex(encoder, grid.last_printable_idx);
+    const last_column_write = grid.currentLastColumnWrite();
+    try encoder.boolean(last_column_write != null);
+    if (last_column_write) |write| try encodeCells(encoder, &write.replaced);
 }
 
 fn encodeCells(encoder: *CheckpointEncoder, cells: []const Cell) !void {
@@ -2810,6 +2966,14 @@ fn decodeGridState(
     }
     grid.saved_cursor = try decodeOptionalSavedCursor(decoder);
     grid.last_printable_idx = try decodeOptionalIndex(decoder);
+    if (revision >= checkpoint_last_column_revision and try decoder.boolean()) {
+        var replaced: [2]Cell = undefined;
+        try decodeCells(decoder, &replaced);
+        grid.last_column_write = .{
+            .idx = grid.last_printable_idx orelse return error.InvalidEngineCheckpoint,
+            .replaced = replaced,
+        };
+    }
     return grid;
 }
 
@@ -3202,6 +3366,12 @@ fn cellsEqual(a_grid: Grid, a: Cell, b_grid: Grid, b: Cell) bool {
     return std.mem.eql(u8, a_url, b_url) and std.mem.eql(u8, a_params, b_params);
 }
 
+/// Whether a cell's combining suffix holds VS15 or VS16, which terminals
+/// size differently.
+fn hasVariationSelector(suffix: []const u8) bool {
+    return std.mem.find(u8, suffix, "\u{FE0E}") != null or std.mem.find(u8, suffix, "\u{FE0F}") != null;
+}
+
 fn hasShiftedWideCellOverlap(
     prev: Grid,
     next: Grid,
@@ -3284,6 +3454,13 @@ fn emitSgrTransition(out: *std.Io.Writer, next: Style) !void {
     try emitColor(out, next.bg, .bg);
 }
 
+/// Whether SGR colors land on cells. The interactive session turns it off once
+/// at startup, before any other thread runs, when `NO_COLOR` is set.
+/// Cells then keep bold, dim, italic, underline, reverse, and strikethrough but
+/// never take a color, so every grid, and every diff between grids, agrees on
+/// colorless cells.
+pub var colors_enabled: bool = true;
+
 const ColorChannel = enum { fg, bg };
 
 fn emitColor(out: *std.Io.Writer, color: Color, channel: ColorChannel) !void {
@@ -3332,6 +3509,13 @@ fn clampSub(v: u16, sub: u16, lo: u16) u16 {
 }
 
 const DecodedRune = struct { codepoint: u21, len: usize };
+
+fn allUtf8Continuations(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (byte & 0xc0 != 0x80) return false;
+    }
+    return true;
+}
 
 fn decodeUtf8(bytes: []const u8, start: usize) DecodedRune {
     const b = bytes[start];
@@ -3418,6 +3602,23 @@ fn expectWideCellInvariant(grid: Grid) !void {
             }
         }
     }
+}
+
+test "with colors off, cells keep emphasis and serialized rows carry no color" {
+    var g = try Grid.init(testing.allocator, 12, 1);
+    defer g.deinit();
+    colors_enabled = false;
+    defer colors_enabled = true;
+    try g.feed("\x1b[1;38;5;196;48;2;1;2;3mHot\x1b[0m");
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try g.rowStyledTextTrimmed(1, &out.writer);
+    const text = out.written();
+    try testing.expect(std.mem.find(u8, text, "Hot") != null);
+    try testing.expect(std.mem.find(u8, text, "\x1b[1m") != null);
+    try testing.expect(std.mem.find(u8, text, "38;") == null);
+    try testing.expect(std.mem.find(u8, text, "48;") == null);
 }
 
 test "plain writes land on the grid" {
@@ -3756,6 +3957,24 @@ test "DSR 6n is swallowed without side effects" {
     try expectRow(g, 1, "ok");
 }
 
+test "DSR 6n in origin mode reports row 1 for a cursor above the top margin" {
+    const cases = [_][]const u8{
+        // DECRC restores a row saved before the top margin moved down.
+        "\x1b[6r\x1b[?6h\x1b7\x1b[7r\x1b8",
+        // VPA moves to an absolute row.
+        "\x1b[3r\x1b[?6h\x1b[1d",
+    };
+    for (cases) |setup| {
+        var g = try Grid.init(testing.allocator, 10, 9);
+        defer g.deinit();
+        try g.feed(setup);
+        var result = try g.feedMode("\x1b[6n", .native_live);
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 1), result.replies.items.len);
+        try testing.expectEqualStrings("\x1b[1;1R", result.replies.items[0].bytes);
+    }
+}
+
 test "resize grows keeping top-left content" {
     var g = try Grid.init(testing.allocator, 4, 2);
     defer g.deinit();
@@ -3786,6 +4005,22 @@ test "resize narrowing clears a wide glyph clipped at the right edge" {
     try g.resize(3, 1);
     try expectWideCellInvariant(g);
     try expectRow(g, 1, "ab");
+}
+
+test "a one-column terminal drops wide characters and still checkpoints" {
+    for ([_][]const u8{ "界", "a界b", "\x1b[?7la界b" }) |bytes| {
+        var g = try Grid.init(testing.allocator, 1, 3);
+        defer g.deinit();
+        try g.feed(bytes);
+        try expectWideCellInvariant(g);
+        const payload = try g.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(payload);
+    }
+    var g = try Grid.init(testing.allocator, 1, 3);
+    defer g.deinit();
+    try g.feed("a界b");
+    try expectRow(g, 1, "a");
+    try expectRow(g, 2, "b");
 }
 
 test "writes clear any complete wide glyph overlapping the destination" {
@@ -3844,6 +4079,37 @@ test "repeated scroll rotations preserve logical rows through clone resize and e
     try expectRow(grid, 3, "five");
     try expectRow(grid, 4, "");
     try testing.expectEqual(@as(u16, 0), grid.row_origin);
+}
+
+test "diff re-anchors the cursor after a glyph with a variation selector" {
+    // The status line: a text-presentation lightning bolt, then a right-hand
+    // notice placed after it. A terminal that draws the bolt one cell narrow
+    // must still put the notice, and later its erasure, in the same cells.
+    var previous = try Grid.init(testing.allocator, 20, 1);
+    defer previous.deinit();
+    var target = try Grid.init(testing.allocator, 20, 1);
+    defer target.deinit();
+    try target.feed("a \u{26A1}\u{FE0E}\x1b[12G13 MCP");
+
+    var diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer diff.deinit();
+    try Grid.diffTo(previous, target, &diff.writer);
+    // Both of its cells are cleared first, so a narrow drawing leaves no stale
+    // second cell, then the cursor is re-anchored after it.
+    try testing.expect(std.mem.find(u8, diff.written(), "\x1b[2X\u{26A1}\u{FE0E}\x1b[5G") != null);
+    try previous.feed(diff.written());
+    try testing.expect(gridsEqual(previous, target));
+
+    // A glyph without a selector needs no anchor.
+    var plain_prev = try Grid.init(testing.allocator, 20, 1);
+    defer plain_prev.deinit();
+    var plain = try Grid.init(testing.allocator, 20, 1);
+    defer plain.deinit();
+    try plain.feed("a \u{26A1} b");
+    var plain_diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer plain_diff.deinit();
+    try Grid.diffTo(plain_prev, plain, &plain_diff.writer);
+    try testing.expect(std.mem.find(u8, plain_diff.written(), "G") == null);
 }
 
 test "diff compares logical rows across different physical origins" {
@@ -4563,6 +4829,164 @@ test "tabs alternate screen and fragmented UTF-8 preserve cell invariants" {
     try expectWideCellInvariant(grid);
 }
 
+fn expectSameScreen(expected: Grid, actual: Grid) !void {
+    try testing.expect(gridsEqual(expected, actual));
+    try testing.expectEqual(expected.cursor_row, actual.cursor_row);
+    try testing.expectEqual(expected.cursor_col, actual.cursor_col);
+    try testing.expectEqual(expected.pending_wrap, actual.pending_wrap);
+}
+
+test "a character a later read continues renders as if it arrived in one read" {
+    const characters = [_][]const u8{
+        "\u{2600}\u{fe0f}",
+        "#\u{fe0f}\u{20e3}",
+        "\u{1f1fa}\u{1f1f8}\u{1f1eb}",
+        "\u{1f44d}\u{1f3fd}",
+        "e\u{301}",
+    };
+    // The character lands mid-row, in the last column, over the right half of
+    // a wide character, without autowrap, in insert mode, and in one column.
+    const setups = [_]struct { cols: u16, prefix: []const u8 }{
+        .{ .cols = 6, .prefix = "ab" },
+        .{ .cols = 6, .prefix = "abcde" },
+        .{ .cols = 6, .prefix = "abcd\u{754c}\r\x1b[5C" },
+        .{ .cols = 6, .prefix = "\x1b[?7labcde" },
+        .{ .cols = 6, .prefix = "xxxxxx\r\x1b[4hab" },
+        .{ .cols = 6, .prefix = "xxxxxx\r\x1b[4habcde" },
+        .{ .cols = 1, .prefix = "" },
+        .{ .cols = 1, .prefix = "\x1b[?7l" },
+    };
+    for (setups) |setup| {
+        for (characters) |character| {
+            const bytes = try std.mem.concat(testing.allocator, u8, &.{ setup.prefix, character, "z" });
+            defer testing.allocator.free(bytes);
+            var whole = try Grid.init(testing.allocator, setup.cols, 3);
+            defer whole.deinit();
+            try whole.feed(bytes);
+            for (setup.prefix.len + 1..setup.prefix.len + character.len) |split| {
+                var parts = try Grid.init(testing.allocator, setup.cols, 3);
+                defer parts.deinit();
+                try parts.feed(bytes[0..split]);
+                try parts.feed(bytes[split..]);
+                try expectSameScreen(whole, parts);
+            }
+        }
+    }
+}
+
+test "a checkpoint before a last-column character is widened restores what it covered" {
+    var live = try Grid.init(testing.allocator, 4, 2);
+    defer live.deinit();
+    // The sun replaces the right half of the wide character in column 4.
+    try live.feed("ab\u{754c}\r\x1b[3C\u{2600}");
+    const payload = try live.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+    var restored = try Grid.restoreCheckpoint(testing.allocator, payload);
+    defer restored.deinit();
+
+    try live.feed("\u{fe0f}z");
+    try restored.feed("\u{fe0f}z");
+    try expectRow(live, 1, "ab\u{754c}");
+    try expectRow(live, 2, "\u{2600}\u{fe0f}z");
+    const expected = try live.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(expected);
+    const actual = try restored.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualSlices(u8, expected, actual);
+}
+
+test "revision two checkpoint restores without saved last-column cells" {
+    var grid = try Grid.init(testing.allocator, 4, 1);
+    defer grid.deinit();
+    try grid.feed("abc");
+    const current = try grid.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(current);
+
+    // Revision two ends before the flag for saved last-column cells.
+    try testing.expectEqual(@as(u8, 0), current[current.len - 1]);
+    const legacy = try testing.allocator.dupe(u8, current[0 .. current.len - 1]);
+    defer testing.allocator.free(legacy);
+    std.mem.writeInt(u16, legacy[4..6], 2, .little);
+    var restored = try Grid.restoreCheckpoint(testing.allocator, legacy);
+    defer restored.deinit();
+    const repeated = try restored.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(repeated);
+    try testing.expectEqualSlices(u8, current, repeated);
+}
+
+test "checkpoints reject saved last-column cells that would break the row" {
+    var grid = try Grid.init(testing.allocator, 4, 1);
+    defer grid.deinit();
+    try grid.feed("abcd");
+    var write = grid.currentLastColumnWrite() orelse return error.TestExpectedLastColumnWrite;
+    // A continuation cell needs a two-cell character before it.
+    write.replaced[1] = .{ .codepoint = 0, .width = 0 };
+    grid.last_column_write = write;
+    try testing.expectError(error.InvalidEngineCheckpoint, grid.checkpointPayload(testing.allocator));
+}
+
+test "text after broken UTF-8 at the end of a read appears at once" {
+    var grid = try Grid.init(testing.allocator, 8, 1);
+    defer grid.deinit();
+    // Latin-1 `é` is a UTF-8 lead byte that no continuation byte follows.
+    try grid.feed("caf\xe9!");
+    try expectRow(grid, 1, "caf\u{fffd}!");
+    const payload = try grid.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+}
+
+test "an escape sequence after broken UTF-8 split across reads still runs" {
+    var grid = try Grid.init(testing.allocator, 8, 1);
+    defer grid.deinit();
+    try grid.feed("\xe7");
+    try grid.feed("\x95\x1b[31mx");
+    try expectRow(grid, 1, "\u{fffd}\u{fffd}x");
+    try testing.expect(grid.cellAt(1, 3).?.style.fg.eql(.{ .indexed = 1 }));
+}
+
+test "UTF-8 gives the same state however the output is split into reads" {
+    const cases = [_][]const u8{
+        "caf\xe9!",
+        "\xe7\x95\x1b[31mx",
+        "\xe2a",
+        "\xe2\x80A",
+        "\xe0\x80\x80x",
+        "\xed\xa0\x80x",
+        "\xf0\x9f\x98",
+        "\xe7\x95\x8c\xbaz",
+        "\xe7\x95\x8c",
+        "e\xcc\x81!",
+        // CAN and SUB interrupt a character like any other control byte.
+        "a\xd6\x18",
+        "\xe7\x18\x95\x8cz",
+        "\xe7\x95\x1a\x8cz",
+    };
+    for (cases) |bytes| {
+        var whole = try Grid.init(testing.allocator, 8, 1);
+        defer whole.deinit();
+        try whole.feed(bytes);
+        const expected = try whole.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(expected);
+
+        for (1..bytes.len) |split| {
+            var parts = try Grid.init(testing.allocator, 8, 1);
+            defer parts.deinit();
+            try parts.feed(bytes[0..split]);
+            try parts.feed(bytes[split..]);
+            const actual = try parts.checkpointPayload(testing.allocator);
+            defer testing.allocator.free(actual);
+            try testing.expectEqualSlices(u8, expected, actual);
+        }
+
+        var single_bytes = try Grid.init(testing.allocator, 8, 1);
+        defer single_bytes.deinit();
+        for (bytes) |byte| try single_bytes.feed(&.{byte});
+        const actual = try single_bytes.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(actual);
+        try testing.expectEqualSlices(u8, expected, actual);
+    }
+}
+
 test "fragmented native queries emit one ordered reply and observational modes emit none" {
     var native = try Grid.init(testing.allocator, 80, 24);
     defer native.deinit();
@@ -4706,14 +5130,16 @@ test "revision one checkpoint restores URI-only links without params" {
     const current = try grid.checkpointPayload(alloc);
     defer alloc.free(current);
 
-    // Revision one encoded only the URI; remove the revision-two empty params length.
+    // Revision one encoded only the URI; remove the revision-two empty params
+    // length and the revision-three flag for saved last-column cells.
     const uri_start = std.mem.find(u8, current, uri) orelse return error.MissingTestUri;
     const uri_end = uri_start + uri.len;
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, current[uri_end .. uri_end + 4]);
-    const legacy = try alloc.alloc(u8, current.len - 4);
+    try testing.expectEqual(@as(u8, 0), current[current.len - 1]);
+    const legacy = try alloc.alloc(u8, current.len - 5);
     defer alloc.free(legacy);
     @memcpy(legacy[0..uri_end], current[0..uri_end]);
-    @memcpy(legacy[uri_end..], current[uri_end + 4 ..]);
+    @memcpy(legacy[uri_end..], current[uri_end + 4 .. current.len - 1]);
     std.mem.writeInt(u16, legacy[4..6], checkpoint_legacy_revision, .little);
 
     var restored = try Grid.restoreCheckpoint(alloc, legacy);
@@ -4858,6 +5284,191 @@ test "bounded deterministic parser and checkpoint fuzz" {
         defer testing.allocator.free(repeated);
         try testing.expectEqualSlices(u8, payload, repeated);
     }
+}
+
+/// Pieces of terminal output for the grid fuzz test: text and UTF-8 of every
+/// shape, controls, escape sequences, and broken bytes.
+const fuzz_terminal_pieces = [_][]const u8{
+    "a",                   "Hello",              " ",
+    "\u{e9}",              "\u{754c}",           "\u{1f600}",
+    "e\u{301}",            "\u{1f44d}\u{1f3fd}", "\u{1f1fa}\u{1f1f8}",
+    "\u{2600}\u{fe0f}",    "\xff",               "\xe7\x95",
+    "\r",                  "\n",                 "\t",
+    "\x08",                "\x07",               "\x1b7",
+    "\x1b8",               "\x1bM",              "\x1bD",
+    "\x1bE",               "\x1bc",              "\x1b[?1049h",
+    "\x1b[?1049l",         "\x1b[?7l",           "\x1b[?7h",
+    "\x1b[?6h",            "\x1b[?6l",           "\x1b[4h",
+    "\x1b[4l",             "\x1b[?25l",          "\x1b]8;;https://e.x/1\x1b\\",
+    "\x1b]8;;\x1b\\",      "\x1b]0;title\x07",   "\x1bPq#0\x1b\\",
+    "\x1b[38;2;10;20;30m", "\x1b[48;5;236m",     "\x1b",
+};
+
+/// CSI final bytes the grid fuzz test pairs with generated parameters.
+const fuzz_csi_finals = "ABCDEFGHJKSTXdfmr@LMPhlnsu";
+
+fn appendFuzzTerminalBytes(alloc: Allocator, smith: *std.testing.Smith, out: *std.ArrayList(u8)) !void {
+    for (0..smith.valueRangeAtMost(u8, 0, 48)) |_| {
+        switch (smith.valueRangeAtMost(u8, 0, 9)) {
+            0...5 => try out.appendSlice(alloc, fuzz_terminal_pieces[smith.index(fuzz_terminal_pieces.len)]),
+            6...8 => {
+                try out.appendSlice(alloc, "\x1b[");
+                if (smith.boolWeighted(1, 5)) try out.append(alloc, '?');
+                for (0..smith.valueRangeAtMost(u8, 0, 3)) |index| {
+                    if (index > 0) try out.append(alloc, ';');
+                    var number: [8]u8 = undefined;
+                    try out.appendSlice(alloc, try std.mem.print(&number, "{d}", .{smith.valueRangeAtMost(u16, 0, 300)}));
+                }
+                try out.append(alloc, fuzz_csi_finals[smith.index(fuzz_csi_finals.len)]);
+            },
+            else => try out.append(alloc, smith.value(u8)),
+        }
+    }
+}
+
+fn feedFuzzFragments(grid: *Grid, bytes: []const u8, smith: *std.testing.Smith) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const length = @min(bytes.len - offset, @as(usize, smith.valueRangeAtMost(u8, 1, 16)));
+        try grid.feed(bytes[offset .. offset + length]);
+        offset += length;
+    }
+}
+
+/// The checkpoint `grid` saves once its combining suffix pool holds only the
+/// suffixes its cells use, in cell order. The pool keeps every suffix a cell
+/// ever had, so equal states can reach different pools.
+fn fuzzCanonicalCheckpoint(grid: Grid) ![]u8 {
+    const alloc = testing.allocator;
+    const payload = try grid.checkpointPayload(alloc);
+    defer alloc.free(payload);
+    var copy = try Grid.restoreCheckpoint(alloc, payload);
+    defer copy.deinit();
+
+    var pool: std.ArrayList([]u8) = .empty;
+    defer {
+        for (pool.items) |suffix| alloc.free(suffix);
+        pool.deinit(alloc);
+    }
+    var cells: std.ArrayList(*Cell) = .empty;
+    defer cells.deinit(alloc);
+    for (copy.cells) |*cell| try cells.append(alloc, cell);
+    if (copy.saved_normal_screen) |*saved| for (saved.cells) |*cell| try cells.append(alloc, cell);
+    if (copy.last_column_write) |*write| for (&write.replaced) |*cell| try cells.append(alloc, cell);
+    for (cells.items) |cell| {
+        const suffix = copy.combiningSuffix(cell.combining_suffix_id) orelse continue;
+        const position = for (pool.items, 0..) |existing, i| {
+            if (std.mem.eql(u8, existing, suffix)) break i;
+        } else appended: {
+            try pool.append(alloc, try alloc.dupe(u8, suffix));
+            break :appended pool.items.len - 1;
+        };
+        cell.combining_suffix_id = @intCast(position + 1);
+    }
+
+    for (copy.combining_suffix_pool.items) |suffix| alloc.free(suffix);
+    copy.combining_suffix_pool.clearRetainingCapacity();
+    copy.combining_pool_bytes = 0;
+    for (pool.items) |suffix| {
+        try copy.combining_suffix_pool.append(alloc, suffix);
+        copy.combining_pool_bytes += suffix.len;
+    }
+    pool.clearRetainingCapacity();
+    return copy.checkpointPayload(alloc);
+}
+
+/// Whether two grids show the same cells. Separate grids keep separate pools,
+/// so links compare by target and suffixes by text, not by pool index.
+fn fuzzScreensEqual(a: Grid, b: Grid) bool {
+    if (a.rows != b.rows or a.cols != b.cols) return false;
+    var row: u16 = 1;
+    while (row <= a.rows) : (row += 1) {
+        var col: u16 = 1;
+        while (col <= a.cols) : (col += 1) {
+            var x = a.cellAt(row, col).?;
+            var y = b.cellAt(row, col).?;
+            const x_link = x.style.hyperlink_id;
+            const y_link = y.style.hyperlink_id;
+            if ((x_link == 0) != (y_link == 0)) return false;
+            if (x_link != 0) {
+                const x_url = a.hyperlinkUrl(x_link) orelse return false;
+                const y_url = b.hyperlinkUrl(y_link) orelse return false;
+                const x_params = a.hyperlinkParams(x_link) orelse return false;
+                const y_params = b.hyperlinkParams(y_link) orelse return false;
+                if (!std.mem.eql(u8, x_url, y_url) or !std.mem.eql(u8, x_params, y_params)) return false;
+            }
+            const x_suffix = a.combiningSuffix(x.combining_suffix_id) orelse "";
+            const y_suffix = b.combiningSuffix(y.combining_suffix_id) orelse "";
+            if (!std.mem.eql(u8, x_suffix, y_suffix)) return false;
+            x.style.hyperlink_id = 0;
+            y.style.hyperlink_id = 0;
+            x.combining_suffix_id = 0;
+            y.combining_suffix_id = 0;
+            if (!cellsEqual(a, x, b, y)) return false;
+        }
+    }
+    return true;
+}
+
+/// Repaints `screen`, a model of the user's terminal, to show `to` the way the
+/// renderer does: from a diff against the model, whose pen is the terminal's.
+fn expectFuzzRepaint(screen: *Grid, to: Grid) !void {
+    var diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer diff.deinit();
+    try Grid.diffTo(screen.*, to, &diff.writer);
+    try screen.feed(diff.written());
+    try testing.expect(fuzzScreensEqual(screen.*, to));
+}
+
+fn fuzzGridFeed(_: void, smith: *std.testing.Smith) !void {
+    const alloc = testing.allocator;
+    const cols = smith.valueRangeAtMost(u16, 1, 40);
+    const rows = smith.valueRangeAtMost(u16, 1, 10);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(alloc);
+    try appendFuzzTerminalBytes(alloc, smith, &bytes);
+    const split = smith.index(bytes.items.len + 1);
+
+    // Output split into reads of any size reaches the same state.
+    var whole = try Grid.init(alloc, cols, rows);
+    defer whole.deinit();
+    var pieces = try Grid.init(alloc, cols, rows);
+    defer pieces.deinit();
+    const pieces_fed = feedFuzzFragments(&pieces, bytes.items, smith);
+    whole.feed(bytes.items) catch |err| return testing.expectError(err, pieces_fed);
+    try pieces_fed;
+    const state = whole.checkpointPayload(alloc) catch |err| return testing.expectError(err, pieces.checkpointPayload(alloc));
+    defer alloc.free(state);
+    const canonical = try fuzzCanonicalCheckpoint(whole);
+    defer alloc.free(canonical);
+    const pieces_canonical = try fuzzCanonicalCheckpoint(pieces);
+    defer alloc.free(pieces_canonical);
+    try testing.expectEqualSlices(u8, canonical, pieces_canonical);
+
+    // A restored checkpoint saves the same state again.
+    var restored = try Grid.restoreCheckpoint(alloc, state);
+    defer restored.deinit();
+    const repeated = try restored.checkpointPayload(alloc);
+    defer alloc.free(repeated);
+    try testing.expectEqualSlices(u8, state, repeated);
+
+    // A terminal in its default modes shows each frame after its repaint.
+    var live = try Grid.init(alloc, cols, rows);
+    defer live.deinit();
+    try live.feed(bytes.items[0..split]);
+    var previous = try live.clone(alloc);
+    defer previous.deinit();
+    try live.feed(bytes.items[split..]);
+    var screen = try Grid.init(alloc, cols, rows);
+    defer screen.deinit();
+    try expectFuzzRepaint(&screen, previous);
+    try expectFuzzRepaint(&screen, live);
+}
+
+test "terminal grid state survives fragmented feeds, checkpoints, and repaints" {
+    try std.testing.fuzz({}, fuzzGridFeed, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").terminal_grid.*),
+    });
 }
 
 test "bounded deterministic corrupt checkpoint fuzz" {

@@ -337,19 +337,59 @@ fn requestHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The fx logo's shapes on a 180 by 180 canvas.
+const logo_shapes = "<rect width=\"180\" height=\"180\" rx=\"37\" fill=\"#000\"/>" ++
+    "<g transform=\"translate(34 33.95) scale(0.7186) translate(-166.241 0)\"><path fill=\"#fff\" d=\"" ++
+    "M237.892 0C243.178 0 249.383 1.419 253.025 3.074L255.093 4.014L250.076 18.63L247.677 17.746" ++
+    "C244.901 16.723 241.938 15.8 238.491 15.8C234.984 15.8 232.787 16.56 231.08 18.321" ++
+    "C229.231 20.23 227.629 23.64 226.229 29.758L225.136 34.851H241.669L260.432 34.95L260.694 34.951" ++
+    "L260.842 35.169L278.854 61.633L296.736 34.95H320.866L291.676 76.74L322.102 119.75H299.331" ++
+    "L299.182 119.546L241.144 40.478L239.35 49.4H222.069L205.688 127.208C203.927 135.709 201.185 142.838 196.777 147.866" ++
+    "C192.27 153.008 186.201 155.75 178.342 155.75C174.181 155.75 170.746 155.109 167.909 154.107L166.241 153.519V137.182" ++
+    "L166.899 137.4L169.531 138.278C172.182 139.162 174.414 139.8 177.142 139.8C178.528 139.8 179.703 139.526 180.732 138.98" ++
+    "C181.764 138.434 182.677 137.6 183.52 136.442C185.304 133.989 186.716 130.135 187.897 124.672L203.76 49.4H189.874" ++
+    "L191.759 39.438L192.039 39.346L206.818 34.467L208.154 28.642C210.516 18.207 213.772 10.938 218.708 6.318" ++
+    "C223.737 1.612 230.127 0 237.892 0ZM273.987 99.084L260.073 120.25H234.541L261.003 82.022L273.987 99.084Z" ++
+    "\"/></g>";
+
+/// The fx logo, inline so the page needs no image request under its CSP.
+const callback_logo = "<svg class=\"brand\" width=\"64\" height=\"64\" viewBox=\"0 0 180 180\" fill=\"none\" " ++
+    "xmlns=\"http://www.w3.org/2000/svg\" role=\"img\" aria-label=\"fx\">" ++ logo_shapes ++ "</svg>";
+
+/// The same logo as the tab icon, a data URL because the callback server
+/// serves nothing else and the CSP allows only `data:` images.
+const callback_icon = blk: {
+    const svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 180 180\">" ++ logo_shapes ++ "</svg>";
+    const encoder = std.base64.standard.Encoder;
+    var encoded: [encoder.calcSize(svg.len)]u8 = undefined;
+    @setEvalBranchQuota(20_000);
+    _ = encoder.encode(&encoded, svg);
+    const final = encoded;
+    break :blk "data:image/svg+xml;base64," ++ final;
+};
+
 fn callbackPage(comptime title: []const u8, comptime detail: []const u8) []const u8 {
     return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
+        "<meta name=\"theme-color\" content=\"#000000\">" ++
+        "<link rel=\"icon\" href=\"" ++ callback_icon ++ "\">" ++
         "<title>fx</title><style>" ++
-        ":root{color-scheme:light dark}" ++
-        "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;" ++
-        "background:#fff;color:#111;" ++
-        "font:15px/1.6 ui-sans-serif,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}" ++
-        "@media(prefers-color-scheme:dark){body{background:#0b0b0c;color:#f4f4f5}}" ++
-        "main{text-align:center;padding:2rem;max-width:26rem}" ++
-        "h1{margin:0 0 .5rem;font-size:1.125rem;font-weight:600;letter-spacing:-.01em}" ++
-        "p{margin:0;font-size:.875rem;opacity:.62}" ++
-        "</style></head><body><main><h1>" ++ title ++ "</h1><p>" ++ detail ++ "</p></main></body></html>";
+        ":root{color-scheme:dark;font-family:\"Geist Mono\",ui-monospace,SFMono-Regular,Menlo,monospace;" ++
+        "font-size:15px;line-height:1.75}" ++
+        "*{box-sizing:border-box}" ++
+        "::selection{background:#ededed;color:#000}" ++
+        "body{margin:0;min-height:100vh;min-height:100svh;display:flex;flex-direction:column;" ++
+        "background:#000;color:#ededed;-webkit-font-smoothing:antialiased}" ++
+        "main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px 24px;text-align:center}" ++
+        ".brand{display:block;width:56px;height:56px;margin:0 auto 24px}" ++
+        "h1{margin:0 0 2px;font-size:17px;font-weight:700}" ++
+        "p{margin:0;color:#a1a1a1}" ++
+        "footer{display:flex;justify-content:flex-end;padding:32px 32px 40px;font-size:14px;color:#a1a1a1}" ++
+        "footer a{color:inherit;text-decoration:none;transition:color .15s}" ++
+        "footer a:hover,footer a:focus-visible{color:#ededed}" ++
+        "</style></head><body><main>" ++ callback_logo ++
+        "<h1>" ++ title ++ "</h1><p>" ++ detail ++ "</p></main>" ++
+        "<footer><a href=\"https://vercel.com/labs\">Vercel Labs</a></footer></body></html>";
 }
 
 pub fn writeResponse(stream: std.Io.net.Stream, outcome: Response, cors_origin: ?[]const u8) !void {
@@ -358,7 +398,7 @@ pub fn writeResponse(stream: std.Io.net.Stream, outcome: Response, cors_origin: 
             .status = "200 OK",
             .body = comptime callbackPage(
                 "Authorization complete",
-                "Returning you to fx. You can close this tab.",
+                "You can close this tab and return to fx.",
             ),
         },
         .failed => .{
@@ -380,7 +420,7 @@ pub fn writeResponse(stream: std.Io.net.Stream, outcome: Response, cors_origin: 
         try writer.interface.print("Access-Control-Allow-Origin: {s}\r\nVary: Origin\r\n", .{origin});
     }
     try writer.interface.print(
-        "Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        "Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; img-src data:; style-src 'unsafe-inline'; frame-ancestors 'none'\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ reply.body.len, reply.body },
     );
     try writer.interface.flush();
@@ -427,6 +467,18 @@ fn setSocketTimeouts(socket: std.posix.socket_t) void {
         const err = std.posix.errno(send_rc);
         debug_trace.logf("auth", "OAuth callback send timeout setup failed errno={s}", .{@tagName(err)});
     }
+}
+
+test "callback tab icon decodes to the fx logo" {
+    const prefix = "data:image/svg+xml;base64,";
+    try std.testing.expect(std.mem.startsWith(u8, callback_icon, prefix));
+    const encoded = callback_icon[prefix.len..];
+    const decoder = std.base64.standard.Decoder;
+    var svg: [4096]u8 = undefined;
+    const len = try decoder.calcSizeForSlice(encoded);
+    try decoder.decode(svg[0..len], encoded);
+    try std.testing.expect(std.mem.startsWith(u8, svg[0..len], "<svg xmlns=\"http://www.w3.org/2000/svg\""));
+    try std.testing.expect(std.mem.find(u8, svg[0..len], logo_shapes) != null);
 }
 
 fn bindTestListener() !std.Io.net.Server {
@@ -697,7 +749,7 @@ const CorsCallbackProbe = struct {
     port: u16,
     preflight_response: [1024]u8 = undefined,
     preflight_len: usize = 0,
-    callback_response: [4096]u8 = undefined,
+    callback_response: [16384]u8 = undefined,
     callback_len: usize = 0,
     failed: bool = false,
 
@@ -780,5 +832,10 @@ test "browser callback permits the xAI CORS private-network preflight" {
     try std.testing.expect(std.mem.find(u8, callback, "Access-Control-Allow-Origin: https://accounts.x.ai\r\n") != null);
     try std.testing.expect(std.mem.find(u8, callback, "Content-Type: text/html; charset=utf-8\r\n") != null);
     try std.testing.expect(std.mem.find(u8, callback, "<h1>Authorization complete</h1>") != null);
-    try std.testing.expect(std.mem.find(u8, callback, "prefers-color-scheme:dark") != null);
+    try std.testing.expect(std.mem.find(u8, callback, "background:#000") != null);
+    try std.testing.expect(std.mem.find(u8, callback, "Content-Security-Policy: default-src 'none'; img-src data:;") != null);
+    try std.testing.expect(std.mem.find(u8, callback, "<link rel=\"icon\" href=\"data:image/svg+xml;base64,") != null);
+    try std.testing.expect(std.mem.find(u8, callback, "<svg class=\"brand\"") != null);
+    try std.testing.expect(std.mem.find(u8, callback, "</p></main><footer>") != null);
+    try std.testing.expect(std.mem.endsWith(u8, callback, "<a href=\"https://vercel.com/labs\">Vercel Labs</a></footer></body></html>"));
 }

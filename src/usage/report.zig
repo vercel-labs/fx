@@ -2,6 +2,7 @@
 //! parses response bodies; the caller owns all I/O.
 
 const std = @import("std");
+const sort_utils = @import("../core/shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -275,7 +276,7 @@ pub fn parseModelRows(gpa: Allocator, body: []const u8) ParseError!Rows {
         if (rows.items.len == max_models) return error.InvalidResponse;
         try rows.append(alloc, .{ .model = model, .totals = totals });
     }
-    std.mem.sort(ModelRow, rows.items, {}, costDescending);
+    sort_utils.sort(ModelRow, rows.items, {}, costDescending);
     return .{ .arena = arena, .models = rows.items };
 }
 

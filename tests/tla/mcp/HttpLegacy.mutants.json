@@ -76,5 +76,11 @@
     "old": "    /\\ req' = [req EXCEPT ![r] = End(r, \"result\")]\n",
     "new": "    /\\ req' = [req EXCEPT ![r] = [End(r, \"result\") EXCEPT !.stream = TRUE]]\n",
     "invariant": "StreamOnlyWhileOpen"
+  },
+  {
+    "description": "An answer over the message limit is resumed like a broken stream",
+    "old": "    /\\ req' = [req EXCEPT ![r] = End(r, \"lost\")]\n    /\\ UNCHANGED <<session, nextEvent, listen, deleted, ghosts>>\n\n\\* A status without",
+    "new": "    /\\ req' = [req EXCEPT ![r] = IF req[r].ev /\\ req[r].resumes < MaxResumes\n                                 THEN [@ EXCEPT !.st = \"broken\", !.stream = FALSE]\n                                 ELSE End(r, \"lost\")]\n    /\\ UNCHANGED <<session, nextEvent, listen, deleted, ghosts>>\n\n\\* A status without",
+    "property": "TooLargeEnds"
   }
 ]

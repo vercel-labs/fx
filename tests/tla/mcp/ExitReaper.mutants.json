@@ -1,0 +1,38 @@
+[
+ {
+  "description": "Fx never tells the helper a reaped group is gone, so its id, come round for a stranger, is killed",
+  "old": "    /\\ st' = [st EXCEPT ![i] = \"reaped\"]\n    /\\ pipe' = Append(pipe, <<\"-\", i>>)",
+  "new": "    /\\ st' = [st EXCEPT ![i] = \"reaped\"]\n    /\\ pipe' = pipe",
+  "invariant": "NoStrayKill"
+ },
+ {
+  "description": "The helper acts on the close without reading the rest of the pipe",
+  "old": "    /\\ helper = \"reading\" /\\ fx = \"gone\" /\\ pipe = <<>>",
+  "new": "    /\\ helper = \"reading\" /\\ fx = \"gone\"",
+  "invariant": "NoStrayKill"
+ },
+ {
+  "description": "The helper sends no SIGTERM, so after a crash a server is killed without one",
+  "old": "    /\\ termed' = [i \\in Inst |-> termed[i] \\/ (i \\in list /\\ st[i] = \"alive\")]",
+  "new": "    /\\ termed' = termed",
+  "property": "KillOnlyAfterTerm"
+ },
+ {
+  "description": "A server starts before the helper, so its group is never told",
+  "old": "Spawn(i) ==\n    /\\ Running /\\ helper # \"none\" /\\ st[i] = \"unborn\"",
+  "new": "Spawn(i) ==\n    /\\ Running /\\ st[i] = \"unborn\"",
+  "property": "NoSurvivor"
+ },
+ {
+  "description": "The helper ignores new groups",
+  "old": "         list' = IF m[1] = \"+\" THEN list \\cup {m[2]} ELSE list \\ {m[2]}",
+  "new": "         list' = IF m[1] = \"+\" THEN list ELSE list \\ {m[2]}",
+  "property": "NoSurvivor"
+ },
+ {
+  "description": "The exit watcher may reap a server before its \"+\" is written",
+  "old": "    /\\ Running /\\ st[i] = \"zombie\" /\\ told[i]",
+  "new": "    /\\ Running /\\ st[i] = \"zombie\"",
+  "invariant": "NoStrayKill"
+ }
+]

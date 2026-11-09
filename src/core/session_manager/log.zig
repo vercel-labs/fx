@@ -773,10 +773,7 @@ test "any prefix of a valid log scans to its last complete line" {
 }
 
 test "scanning never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzScan, .{ .corpus = &.{
-        "{\"v\":1,\"seq\":1,\"ts\":0,\"kind\":\"item\",\"crc\":\"00000000\"}\n",
-        "\n\n\n",
-    } });
+    try testing.fuzz({}, fuzzScan, .{ .corpus = &(.{""} ++ @import("build_options").fuzz_corpus_session_log_scan.*) });
 }
 
 fn fuzzScan(_: void, smith: *testing.Smith) anyerror!void {

@@ -19,6 +19,12 @@
 (* support, resolved, notified, and pending are `abstract(state)` in the   *)
 (* code. out is the effects the step returned, and act is the event the    *)
 (* step took, recorded so the laws can name it.                            *)
+(*                                                                         *)
+(* A request's user images are split by when they arrived: user_images     *)
+(* are the ones attached this turn, and earlier_images are the ones from   *)
+(* earlier turns that the history still holds. Only images attached this  *)
+(* turn can fail a request. Earlier ones, like tool images, are attached   *)
+(* or withheld with a notice, so an old image never blocks a new turn.     *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences
 
@@ -31,11 +37,11 @@ Reasons == {"capability_unknown", "no_native_image"}
 Views == [kind: {"listed"}, vision: BOOLEAN, file_input: BOOLEAN]
          \cup [kind: {"missing", "down"}, vision: {FALSE}, file_input: {FALSE}]
 
-Requests == {r \in [user_images: BOOLEAN, pending_images: BOOLEAN, tool_images: BOOLEAN,
-                    fallback: BOOLEAN, catalog_down: BOOLEAN] :
+Requests == {r \in [user_images: BOOLEAN, earlier_images: BOOLEAN, pending_images: BOOLEAN,
+                    tool_images: BOOLEAN, fallback: BOOLEAN, catalog_down: BOOLEAN] :
                r.pending_images => r.user_images}
 
-Sends == [kind: {"send"}, route: Routes, mode: Modes, tool_images: ToolImages]
+Sends == [kind: {"send"}, route: Routes, mode: Modes, tool_images: ToolImages, earlier_images: ToolImages]
 Effects == [kind: {"resolve", "notify"}] \cup Sends \cup [kind: {"fail"}, reason: Reasons]
 
 \* At most one request; the core's `?Request`.
@@ -53,6 +59,12 @@ vars == <<support, resolved, notified, pending, out, act>>
 \* `supportFromCatalog`.
 Derive(v) == IF v.kind = "listed" THEN (IF v.vision THEN "native" ELSE "non_native") ELSE "unknown"
 
+\* `held`: how images already in the history travel under support s on
+\* route. Tool images and earlier user images follow this one rule.
+Held(s, route) == CASE s = "native" -> "attached"
+                    [] s = "unknown" -> "withheld_unknown"
+                    [] OTHER -> IF route = "fallback" THEN "withheld_fallback" ELSE "withheld_dead_end"
+
 \* `decision`.
 Decide(s, r) ==
     LET route == CASE s = "native" -> "native"
@@ -60,14 +72,15 @@ Decide(s, r) ==
                    [] OTHER -> IF r.fallback THEN "fallback" ELSE "unavailable"
         mode == IF route # "fallback" THEN "unavailable"
                 ELSE IF r.pending_images THEN "required" ELSE "optional"
-        tool == IF ~r.tool_images THEN "none"
-                ELSE CASE s = "native" -> "attached"
-                       [] s = "unknown" -> "withheld_unknown"
-                       [] OTHER -> IF route = "fallback" THEN "withheld_fallback" ELSE "withheld_dead_end"
-    IN [kind |-> "send", route |-> route, mode |-> mode, tool_images |-> tool]
+        tool == IF ~r.tool_images THEN "none" ELSE Held(s, route)
+        earlier == IF ~r.earlier_images THEN "none" ELSE Held(s, route)
+    IN [kind |-> "send", route |-> route, mode |-> mode, tool_images |-> tool, earlier_images |-> earlier]
+
+\* Whether send e withholds some image as unconfirmed.
+WithholdsUnknown(e) == e.tool_images = "withheld_unknown" \/ e.earlier_images = "withheld_unknown"
 
 Unroutable(s, r) == r.user_images /\ Decide(s, r).route = "unavailable"
-Notifies(s, r, n) == ~Unroutable(s, r) /\ Decide(s, r).tool_images = "withheld_unknown" /\ r.catalog_down /\ ~n
+Notifies(s, r, n) == ~Unroutable(s, r) /\ WithholdsUnknown(Decide(s, r)) /\ r.catalog_down /\ ~n
 
 \* `decide`: the effects of deciding r under s, and the next notified flag.
 DecideOut(s, r, n) ==
@@ -78,7 +91,9 @@ DecideOut(s, r, n) ==
 
 DecideNotified(s, r, n) == n \/ Notifies(s, r, n)
 
-NeedsResolve(r) == support = "unknown" /\ ~resolved /\ (r.user_images \/ r.tool_images)
+HasImages(r) == r.user_images \/ r.earlier_images \/ r.tool_images
+
+NeedsResolve(r) == support = "unknown" /\ ~resolved /\ HasImages(r)
 
 Init ==
     /\ support = "unknown"
@@ -175,16 +190,18 @@ VisionImpliesNative ==
         /\ act.view.kind # "listed" => support = "unknown"
 
 \* L5: no image goes to a model the catalog has not confirmed.
-UnknownNeverInline == \A e \in SendsOut : e.tool_images = "attached" => support = "native"
+UnknownNeverInline ==
+    \A e \in SendsOut : (e.tool_images = "attached" \/ e.earlier_images = "attached") => support = "native"
 
-\* L4: route, mode, and tool images all follow the one support value the
-\* state holds after the step.
+\* L4: route, mode, tool images, and earlier images all follow the one
+\* support value the state holds after the step.
 OneSnapshot ==
     \A e \in SendsOut :
         /\ (e.route = "native") <=> (support = "native")
-        /\ e.tool_images = "withheld_unknown" => support = "unknown"
-        /\ e.tool_images = "withheld_fallback" => (support = "non_native" /\ e.route = "fallback")
-        /\ e.tool_images = "withheld_dead_end" => (support = "non_native" /\ e.route = "unavailable")
+        /\ \A h \in {e.tool_images, e.earlier_images} :
+              /\ h = "withheld_unknown" => support = "unknown"
+              /\ h = "withheld_fallback" => (support = "non_native" /\ e.route = "fallback")
+              /\ h = "withheld_dead_end" => (support = "non_native" /\ e.route = "unavailable")
 
 \* L2: the vision tool is offered exactly on the fallback route.
 RouteModeCoherent == \A e \in SendsOut : (e.route = "fallback") <=> (e.mode # "unavailable")
@@ -192,15 +209,20 @@ RouteModeCoherent == \A e \in SendsOut : (e.route = "fallback") <=> (e.mode # "u
 \* L3: native delivery and the vision tool never meet.
 NativeExcludesFallback == \A e \in SendsOut : support = "native" => (e.route = "native" /\ e.mode = "unavailable")
 
-\* L6: tool images are attached or withheld with a notice; never neither.
+\* L6: tool images and earlier images are attached or withheld with a
+\* notice; never neither.
 NoSilentWithhold ==
-    \A e \in SendsOut : Decided # <<>> /\ (Head(Decided).tool_images <=> e.tool_images # "none")
+    \A e \in SendsOut :
+        /\ Decided # <<>>
+        /\ Head(Decided).tool_images <=> e.tool_images # "none"
+        /\ Head(Decided).earlier_images <=> e.earlier_images # "none"
 
 \* L6: the vision tool is required exactly while user images wait.
 RequiredWhenPending ==
     \A e \in SendsOut : e.route = "fallback" => ((e.mode = "required") <=> Head(Decided).pending_images)
 
-\* L7: user images without a route fail the request; nothing else does.
+\* L7: images attached this turn without a route fail the request; nothing
+\* else does, so earlier images never block a turn.
 FailExactlyWhenUnroutable ==
     /\ \A e \in FailsOut :
           /\ Decided # <<>>
@@ -214,13 +236,19 @@ ResolveOnlyWhenNeeded ==
     HasKind("resolve") =>
         /\ act.name = "RequestReady"
         /\ support = "unknown"
-        /\ (act.req.user_images \/ act.req.tool_images)
+        /\ HasImages(act.req)
         /\ pending = <<act.req>>
 
-\* L9: the user hears about a down catalog only for tool images it withholds.
+\* L15: support is judged unknown, by withholding images as unconfirmed or
+\* failing for it, only after the turn asked the catalog.
+AskedBeforeUnknown ==
+    /\ \A e \in SendsOut : WithholdsUnknown(e) => resolved
+    /\ \A e \in FailsOut : e.reason = "capability_unknown" => resolved
+
+\* L9: the user hears about a down catalog only for images it withholds.
 NotifyOnlyWhenDown ==
     HasKind("notify") =>
-        /\ \E e \in SendsOut : e.tool_images = "withheld_unknown"
+        /\ \E e \in SendsOut : WithholdsUnknown(e)
         /\ Head(Decided).catalog_down
 
 \* L13: a decision comes only once no reply is owed.

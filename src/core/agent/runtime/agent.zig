@@ -82,11 +82,7 @@ pub const Agent = struct {
     }
 
     pub fn observeUsage(self: *Agent, usage: types.Usage) void {
-        addOptional(&self.turn_usage.input_tokens, usage.input_tokens);
-        addOptional(&self.turn_usage.output_tokens, usage.output_tokens);
-        addOptional(&self.turn_usage.cache_read_tokens, usage.cache_read_tokens);
-        addOptional(&self.turn_usage.cache_write_tokens, usage.cache_write_tokens);
-        addOptional(&self.turn_usage.reasoning_tokens, usage.reasoning_tokens);
+        self.turn_usage.add(usage);
     }
 
     pub fn appendHistoryEntry(
@@ -213,11 +209,6 @@ pub const RequestTokenCalibrationState = struct {
         return self.model[0..self.model_len];
     }
 };
-
-fn addOptional(total: *?u64, value: ?u64) void {
-    const amount = value orelse return;
-    total.* = std.math.add(u64, total.* orelse 0, amount) catch std.math.maxInt(u64);
-}
 
 test "Agent request token calibration survives startTurn and dies with cleared history" {
     const alloc = std.testing.allocator;

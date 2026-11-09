@@ -54,7 +54,7 @@ The main model, compaction, review, vision, and title paths report distinct
 purposes without synthesizing user turns for auxiliary calls. Review retries
 have separate model-call IDs. Title tasks borrow an observer only while their
 owner guarantees a join before releasing it. MCP instrumentation stays in fx's
-host boundary; the isolated MCP-v2 engine has no tracing imports.
+host boundary; the isolated MCP engine has no tracing imports.
 
 Native child runtimes allocate a fresh execution observer and carry the existing
 durable message/work identity. They don't retain a pointer to a parent's
@@ -93,7 +93,7 @@ appends. `sdk/tests/test-types.mjs` checks the public types across Node, CommonJ
 browser, and explicit Wasm entry points. The gateway unit fixture exercises model
 start/end pairing through success, transport failure, and cancellation.
 
-The focused ACP fixtures exercise real command approval, MCP-v1/v2 calls and
+The focused ACP fixtures exercise real command approval, MCP calls and
 elicitation, and native child execution. Core fixtures cover question outcomes,
 review retries, title generation, and batched vision calls. SDK fixtures cover
 host-owned input effects, MCP correlation, and child engines on both backends.

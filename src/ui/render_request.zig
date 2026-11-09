@@ -360,11 +360,13 @@ pub const RenderRequestState = struct {
     }
 };
 
+/// Pending work that can change what a file approval shows. Every change to an
+/// approval's request, review, choice, or scroll position requests `.modal`, so
+/// footer, transcript, and subagent panel frames only repaint around the
+/// approval and must not hold back the user's answer.
 fn reasonsAffectApproval(reasons: ReasonSet) bool {
-    var relevant = reasons;
-    relevant.remove(.animation);
-    relevant.remove(.notification);
-    return relevant.count() > 0;
+    return reasons.contains(.modal) or reasons.contains(.resize) or
+        reasons.contains(.external_damage) or reasons.contains(.first_frame);
 }
 
 test "compaction revisions request footer repaint without restarting animation" {
@@ -621,6 +623,25 @@ test "approval settlement ignores animation and notification presentation work" 
     try std.testing.expect(state.settledForApproval());
 
     state.observeResizeSignal(1_200, 80);
+    try std.testing.expect(!state.settledForApproval());
+}
+
+test "approval settlement ignores footer, transcript, and subagent panel work" {
+    var state = RenderRequestState{};
+    for ([_]Reason{ .footer, .transcript, .subagent_panel }) |reason| {
+        state.request(reason);
+        try std.testing.expect(state.settledForApproval());
+        state.clearReason(reason);
+    }
+    for ([_]Reason{ .modal, .resize, .external_damage, .first_frame }) |reason| {
+        state.request(reason);
+        try std.testing.expect(!state.settledForApproval());
+        state.clearReason(reason);
+    }
+
+    // Unrelated work queued with an approval change still waits for the change.
+    state.request(.footer);
+    state.request(.modal);
     try std.testing.expect(!state.settledForApproval());
 }
 

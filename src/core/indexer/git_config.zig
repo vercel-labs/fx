@@ -20,6 +20,15 @@ const Allocator = std.mem.Allocator;
 
 const max_config_file_bytes: usize = 1024 * 1024;
 const max_include_depth: usize = 10;
+/// Config files one load reads or looks for, includes and missing files
+/// counted. The depth limit stops one chain of includes, but a file that
+/// includes itself several times would be read about that many times to the
+/// tenth power, so past this the load follows no more includes.
+const max_config_files: usize = 64;
+/// Config bytes one load parses across every file it reads: no more than the
+/// largest one file it accepts, so a large file included many times stays
+/// cheap too. Real configs are a few KiB.
+const max_config_total_bytes: usize = max_config_file_bytes;
 
 pub const Entry = struct {
     /// Lowercase.
@@ -332,8 +341,14 @@ const Loader = struct {
     entries: std.ArrayList(LoadedEntry) = .empty,
     unavailable: std.ArrayList(Unavailable) = .empty,
     paths: std.ArrayList(ReadPath) = .empty,
+    files_seen: usize = 0,
+    bytes_parsed: usize = 0,
+    stopped: bool = false,
 
     fn readFile(self: *Loader, path: []const u8, scope: Scope, depth: usize) Allocator.Error!void {
+        if (self.stopped) return;
+        if (self.files_seen == max_config_files) return self.stop(path, "include_limit");
+        self.files_seen += 1;
         if (depth > max_include_depth) return self.markUnavailable(path, "include_depth");
         // git reads /dev/null as an empty file; it is commonly used to
         // disable a config level.
@@ -351,6 +366,8 @@ const Loader = struct {
             .missing => return,
             .unavailable => |reason| return self.markUnavailable(path, reason),
         };
+        if (content.len > max_config_total_bytes - self.bytes_parsed) return self.stop(path, "config_bytes_limit");
+        self.bytes_parsed += content.len;
         const parsed = parse(self.arena, content) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidConfig => return self.markUnavailable(path, "invalid_config"),
@@ -373,6 +390,13 @@ const Loader = struct {
 
     fn markUnavailable(self: *Loader, path: []const u8, reason: []const u8) Allocator.Error!void {
         try self.unavailable.append(self.arena, .{ .path = path, .reason = reason });
+    }
+
+    /// Ends the load where it is: `path` and every later file go unread.
+    fn stop(self: *Loader, path: []const u8, reason: []const u8) Allocator.Error!void {
+        self.stopped = true;
+        debug_trace.logf("indexer", "config load stopped reason={s} files={d} bytes={d} path={s}", .{ reason, self.files_seen, self.bytes_parsed, path });
+        return self.markUnavailable(path, reason);
     }
 
     /// git's include path handling: `~/` from HOME, relative to the

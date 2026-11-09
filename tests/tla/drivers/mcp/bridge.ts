@@ -1,4 +1,4 @@
-// Trace bridge for the MCP-v2 engine models in tests/tla/mcp/.
+// Trace bridge for the MCP engine models in tests/tla/mcp/.
 //
 // Turns a JSONL step trace into a generated TLA+ module (TraceObs) and asks TLC
 // whether it is a behavior of the machine's model, using a hand-written trace

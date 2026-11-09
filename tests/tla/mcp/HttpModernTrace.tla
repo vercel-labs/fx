@@ -1,6 +1,4 @@
 ---- MODULE HttpModernTrace ----
-\* Updated for the next MCP-v2 version: it can describe behavior that src/mcp/
-\* does not have yet, so its traces from the current src/mcp/ may not match.
 \* Trace wrapper for HttpModern.tla (U06). tests/bun/bridge.ts generates TraceObs
 \* from the records of one logical request (one instance, such as "x3").
 \*
@@ -24,6 +22,7 @@ Step(r) ==
       [] r.event = "answer" -> Answer(r.data.answer)
       [] r.event = "http_failure" -> HttpFailure
       [] r.event = "stream_broken" -> StreamBroken
+      [] r.event = "too_large" -> TooLarge
       [] r.event = "relisted" -> Relisted(r.data.ok)
       [] r.event = "cancel" -> Cancel
       [] OTHER -> FALSE

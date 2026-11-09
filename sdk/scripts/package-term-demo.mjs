@@ -6,46 +6,40 @@ import { fileURLToPath } from "node:url";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const repoRoot = resolve(scriptDir, "../..");
+const sdkDir = resolve(repoRoot, "sdk");
 const outputDir = resolve(process.argv[2] || resolve(repoRoot, "sdk/dist/term-demo"));
 const htmlPath = resolve(repoRoot, "sdk/term-demo.html");
-const browserPath = resolve(repoRoot, "sdk/browser.js");
-const sdkPath = resolve(repoRoot, "sdk/fx-sdk.js");
-const coreOutputPath = resolve(repoRoot, "sdk/core-output.js");
-const wasmModulePath = resolve(repoRoot, "sdk/wasm-module.js");
-const toolObservationPath = resolve(repoRoot, "sdk/tool-observation.js");
 const wasmPath = resolve(repoRoot, "zig-out/bin/fx-term.wasm");
-
-const [htmlSource, browserBytes, sdkSource, coreOutputBytes, wasmModuleBytes, wasmBytes, toolObservationBytes] = await Promise.all([
-  readFile(htmlPath, "utf8"),
-  readFile(browserPath),
-  readFile(sdkPath),
-  readFile(coreOutputPath),
-  readFile(wasmModulePath),
-  readFile(wasmPath),
-  readFile(toolObservationPath),
-]);
 
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const integrity = (bytes) => `sha256-${createHash("sha256").update(bytes).digest("base64")}`;
-const coreOutputHash = digest(coreOutputBytes);
-const coreOutputName = `core-output.${coreOutputHash}.js`;
-const wasmModuleHash = digest(wasmModuleBytes);
-const wasmModuleName = `wasm-module.${wasmModuleHash}.js`;
-const toolObservationHash = digest(toolObservationBytes);
-const toolObservationName = `tool-observation.${toolObservationHash}.js`;
-const sdkBytes = Buffer.from(sdkSource.toString()
-  .replace('from "./core-output.js";', `from "./${coreOutputName}";`)
-  .replace('from "./wasm-module.js";', `from "./${wasmModuleName}";`)
-  .replace('from "./tool-observation.js";', `from "./${toolObservationName}";`));
-const sdkHash = digest(sdkBytes);
+const immutable = [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }];
+// Static and dynamic imports of a sibling module: `from "./x.js"` and `import("./x.js")`.
+const relativeImport = /(\bfrom\s*|\bimport\s*\(\s*)"\.\/([a-z0-9-]+\.js)"/g;
+
+// Every module the page loads, named by the hash of its content after its own
+// imports name their hashed files, so a module's name changes whenever
+// anything it loads changes. The SDK's modules import no cycle.
+const modules = new Map();
+async function packageModule(name, chain = []) {
+  if (chain.includes(name)) throw new Error(`import cycle: ${[...chain, name].join(" -> ")}`);
+  const packaged = modules.get(name);
+  if (packaged) return packaged.file;
+  const source = await readFile(resolve(sdkDir, name), "utf8");
+  const imports = [...new Set([...source.matchAll(relativeImport)].map((match) => match[2]))];
+  const files = new Map();
+  for (const dependency of imports) files.set(dependency, await packageModule(dependency, [...chain, name]));
+  const bytes = Buffer.from(source.replace(relativeImport, (_, keyword, dependency) => `${keyword}"./${files.get(dependency)}"`));
+  const sha256 = digest(bytes);
+  const file = `${basename(name, ".js")}.${sha256}.js`;
+  modules.set(name, { file, sha256, bytes });
+  return file;
+}
+
+const [htmlSource, wasmBytes] = await Promise.all([readFile(htmlPath, "utf8"), readFile(wasmPath)]);
+const browserName = await packageModule("browser.js");
 const wasmHash = digest(wasmBytes);
-const sdkName = `fx-sdk.${sdkHash}.js`;
 const wasmName = `fx-term.${wasmHash}.wasm`;
-const packagedBrowser = Buffer.from(
-  browserBytes.toString().replace('from "./fx-sdk.js";', `from "./${sdkName}";`),
-);
-const browserHash = digest(packagedBrowser);
-const browserName = `browser.${browserHash}.js`;
 
 const replacements = [
   ['const fxWasmAsset = "./fx-term.wasm";', `const fxWasmAsset = "./${wasmName}";`],
@@ -73,27 +67,8 @@ const vercelConfig = {
       source: "/index.html",
       headers: [{ key: "Cache-Control", value: "public, max-age=0, must-revalidate" }],
     },
-    {
-      source: `/${browserName}`,
-      headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
-    },
-    {
-      source: `/${sdkName}`,
-      headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
-    },
-    {
-      source: `/${coreOutputName}`,
-      headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
-    },
-    {
-      source: `/${wasmModuleName}`,
-      headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
-    },
-    {
-      source: `/${wasmName}`,
-      headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
-    },
-    { source: `/${toolObservationName}`, headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }] },
+    ...[...modules.values()].map(({ file }) => ({ source: `/${file}`, headers: immutable })),
+    { source: `/${wasmName}`, headers: immutable },
     {
       source: "/manifest.json",
       headers: [{ key: "Cache-Control", value: "no-store" }],
@@ -102,29 +77,27 @@ const vercelConfig = {
 };
 await Promise.all([
   writeFile(resolve(outputDir, "index.html"), html),
-  writeFile(resolve(outputDir, browserName), packagedBrowser),
-  writeFile(resolve(outputDir, sdkName), sdkBytes),
-  writeFile(resolve(outputDir, coreOutputName), coreOutputBytes),
-  writeFile(resolve(outputDir, wasmModuleName), wasmModuleBytes),
-  writeFile(resolve(outputDir, toolObservationName), toolObservationBytes),
+  ...[...modules.values()].map(({ file, bytes }) => writeFile(resolve(outputDir, file), bytes)),
   writeFile(resolve(outputDir, wasmName), wasmBytes),
   writeFile(resolve(outputDir, "vercel.json"), `${JSON.stringify(vercelConfig, null, 2)}\n`),
 ]);
 
+const entry = (name) => {
+  const { file, sha256, bytes } = modules.get(name);
+  return { file, sha256, bytes: bytes.byteLength };
+};
 const manifest = {
   html: "index.html",
-  browser: { file: browserName, sha256: digest(packagedBrowser), bytes: packagedBrowser.byteLength },
-  sdk: { file: sdkName, sha256: sdkHash, bytes: sdkBytes.byteLength },
-  coreOutput: { file: coreOutputName, sha256: coreOutputHash, bytes: coreOutputBytes.byteLength },
-  wasmModule: { file: wasmModuleName, sha256: wasmModuleHash, bytes: wasmModuleBytes.byteLength },
-  toolObservation: { file: toolObservationName, sha256: toolObservationHash, bytes: toolObservationBytes.byteLength },
+  browser: entry("browser.js"),
+  terminal: entry("browser-terminal.js"),
+  coreOutput: entry("core-output.js"),
+  wasmModule: entry("wasm-module.js"),
+  toolObservation: entry("tool-observation.js"),
+  modules: Object.fromEntries([...modules.keys()].sort().map((name) => [name, entry(name)])),
   wasm: { file: wasmName, sha256: wasmHash, integrity: integrity(wasmBytes), bytes: wasmBytes.byteLength },
 };
 await writeFile(resolve(outputDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 
 console.log(`packaged ${basename(outputDir)}`);
-console.log(`  ${browserName}`);
-console.log(`  ${sdkName}`);
-console.log(`  ${coreOutputName}`);
-console.log(`  ${wasmModuleName}`);
+for (const { file } of modules.values()) console.log(`  ${file}`);
 console.log(`  ${wasmName}`);

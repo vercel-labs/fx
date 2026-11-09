@@ -2,7 +2,9 @@ const std = @import("std");
 const observation = @import("../../core/agent/runtime/observation.zig");
 const question_answer = @import("../../core/agent/question_answer.zig");
 const core_types = @import("../../core/shared/types.zig");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
@@ -15,6 +17,10 @@ pub const cancel_sentinel = "(user cancelled the question)";
 pub const not_available_sentinel = "(ask_user_question is only available in the interactive shell; ask the user freeform instead)";
 
 const invalid_args_sentinel = "(ask_user_question: invalid arguments; provide {questions})";
+const question_count_sentinel = std.fmt.comptimePrint(
+    "(ask_user_question: provide 1 to {d} questions)",
+    .{question_answer.max_questions},
+);
 
 const QuestionBatchParseError = Allocator.Error || error{
     InvalidArguments,
@@ -179,11 +185,16 @@ fn parseQuestionBatch(arena: Allocator, args_json: []const u8) QuestionBatchPars
     if (parsed.value != .object) return error.InvalidArguments;
     const args = parsed.value.object;
 
-    const questions_value = args.get("questions") orelse return error.MissingQuestions;
+    var questions_value = args.get("questions") orelse return error.MissingQuestions;
+    // Some models send the array as JSON text. It names the same batch.
+    tool_args.normalizeCompositeArrayValue(arena, &questions_value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.QuestionsNotArray,
+    };
     if (questions_value != .array) return error.QuestionsNotArray;
 
     const questions_arr = questions_value.array;
-    if (questions_arr.items.len < 1 or questions_arr.items.len > 4) return error.QuestionCount;
+    if (questions_arr.items.len < 1 or questions_arr.items.len > question_answer.max_questions) return error.QuestionCount;
 
     var entries_buf: std.ArrayList(core_types.QuestionBatchEntry) = .empty;
     try entries_buf.ensureTotalCapacity(arena, questions_arr.items.len);
@@ -253,7 +264,7 @@ fn invalidArgsBody(alloc: Allocator, err: QuestionBatchParseError) Allocator.Err
         error.InvalidArguments => invalid_args_sentinel,
         error.MissingQuestions => "(ask_user_question: missing required array \"questions\")",
         error.QuestionsNotArray => "(ask_user_question: \"questions\" must be an array)",
-        error.QuestionCount => "(ask_user_question: provide 1 to 4 questions)",
+        error.QuestionCount => question_count_sentinel,
         error.QuestionNotObject => "(ask_user_question: each question must be an object with a \"question\" and \"options\")",
         error.MissingQuestionText => "(ask_user_question: each question requires a \"question\" string)",
         error.QuestionTextNotString => "(ask_user_question: question \"question\" must be a string)",
@@ -368,7 +379,7 @@ test "ask_user_question validates arguments and returns active sentinels" {
     try expectRequesterOutput("[]", invalid_args_sentinel);
     try expectRequesterOutput("{}", "(ask_user_question: missing required array \"questions\")");
     try expectRequesterOutput("{\"questions\":{}}", "(ask_user_question: \"questions\" must be an array)");
-    try expectRequesterOutput("{\"questions\":[]}", "(ask_user_question: provide 1 to 4 questions)");
+    try expectRequesterOutput("{\"questions\":[]}", "(ask_user_question: provide 1 to 20 questions)");
     try expectRequesterOutput("{\"questions\":[1]}", "(ask_user_question: each question must be an object with a \"question\" and \"options\")");
     try expectRequesterOutput("{\"questions\":[{}]}", "(ask_user_question: each question requires a \"question\" string)");
     try expectRequesterOutput("{\"questions\":[{\"question\":1}]}", "(ask_user_question: question \"question\" must be a string)");
@@ -402,6 +413,60 @@ test "ask_user_question normalizes descriptions and encodes ordered answers" {
     try std.testing.expectEqualStrings("[{\"question\":\"Choose?\",\"answer\":\"Yes\"}]", output);
 }
 
+test "ask_user_question accepts the questions array sent as JSON text" {
+    const alloc = std.testing.allocator;
+    var fake = FakeRequester{};
+    const output = try executeWithRequester(
+        alloc,
+        "{\"questions\":\"[{\\\"question\\\":\\\" Choose? \\\",\\\"options\\\":[{\\\"label\\\":\\\" Yes \\\"},{\\\"label\\\":\\\"No\\\"}]}]\"}",
+        .{
+            .ctx = &fake,
+            .response_alloc = alloc,
+            .request = FakeRequester.request,
+        },
+    );
+    defer alloc.free(output);
+
+    try std.testing.expect(fake.called);
+    try std.testing.expectEqualStrings("[{\"question\":\"Choose?\",\"answer\":\"Yes\"}]", output);
+    try expectRequesterOutput("{\"questions\":\"not json\"}", "(ask_user_question: \"questions\" must be an array)");
+    try expectRequesterOutput("{\"questions\":\"{}\"}", "(ask_user_question: \"questions\" must be an array)");
+}
+
+const max_fuzz_questions_text_bytes: usize = 16 * 1024;
+
+fn fuzzQuestionsText(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [max_fuzz_questions_text_bytes + 1]u8 = undefined;
+    const text = buffer[0..smith.slice(&buffer)];
+    // Text that is not UTF-8 fails the argument parse before questions is
+    // read, so it never reaches the JSON-text decode this target covers.
+    if (!std.unicode.utf8ValidateSlice(text)) return;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args_json = try std.json.Stringify.valueAlloc(arena, .{ .questions = text }, .{});
+    if (parseQuestionBatch(arena, args_json)) |entries| {
+        try std.testing.expect(entries.len >= 1 and entries.len <= question_answer.max_questions);
+    } else |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {},
+    }
+}
+
+test "ask_user_question questions sent as JSON text decode or refuse arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzQuestionsText, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "[{\"question\":\"Pick one?\",\"options\":[{\"label\":\"A\"},{\"label\":\"B\"}]}]",
+            "[{\"question\":\"Pick one?\",\"options\":[{\"label\":\"A\"}]}]",
+            "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+            "{}",
+            "[",
+        }) ++ @import("fuzz_corpus").ask_questions_text.*),
+    });
+}
+
 test "ask_user_question flattens model-controlled prompt text for terminal display" {
     const alloc = std.testing.allocator;
     var requester = TerminalSafeRequester{};
@@ -422,6 +487,140 @@ test "ask_user_question flattens model-controlled prompt text for terminal displ
         "[{\"question\":\"Q \\\\x1b[31m?\",\"answer\":\"Alpha Fake\"}]",
         output,
     );
+}
+
+const batch_option_count = 6;
+
+/// Writes `ask_user_question` arguments with `count` questions of six options
+/// each. The caller owns the returned slice.
+fn questionBatchArgs(alloc: Allocator, count: usize) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"questions\":[");
+    for (0..count) |question| {
+        if (question > 0) try out.writer.writeByte(',');
+        try out.writer.print("{{\"question\":\"Question {d}?\",\"options\":[", .{question + 1});
+        for (0..batch_option_count) |option| {
+            if (option > 0) try out.writer.writeByte(',');
+            try out.writer.print(
+                "{{\"label\":\"Q{d} option {d}\",\"description\":\"Consequence {d}.{d}\"}}",
+                .{ question + 1, option + 1, question + 1, option + 1 },
+            );
+        }
+        try out.writer.writeAll("]}");
+    }
+    try out.writer.writeAll("]}");
+    return out.toOwnedSlice();
+}
+
+/// Answers question `i` with option `i % 6` and records whether every entry
+/// arrived in order with all of its options.
+const FullBatchRequester = struct {
+    calls: usize = 0,
+    entry_count: usize = 0,
+    entries_in_order: bool = true,
+
+    fn request(raw_ctx: ?*anyopaque, alloc: Allocator, entries: []const core_types.QuestionBatchEntry) anyerror!?[][]u8 {
+        const self: *FullBatchRequester = @ptrCast(@alignCast(raw_ctx.?));
+        self.calls += 1;
+        self.entry_count = entries.len;
+        for (entries, 0..) |entry, index| {
+            var expected_buf: [32]u8 = undefined;
+            const expected = try std.mem.print(&expected_buf, "Question {d}?", .{index + 1});
+            if (!std.mem.eql(u8, entry.question, expected) or entry.options.len != batch_option_count) {
+                self.entries_in_order = false;
+            }
+        }
+
+        const answers = try alloc.alloc([]u8, entries.len);
+        errdefer alloc.free(answers);
+        var filled: usize = 0;
+        errdefer for (answers[0..filled]) |answer| alloc.free(answer);
+        while (filled < entries.len) : (filled += 1) {
+            answers[filled] = try alloc.dupe(u8, entries[filled].options[filled % batch_option_count].label);
+        }
+        return answers;
+    }
+};
+
+test "ask_user_question accepts a full batch and rejects one more question" {
+    const alloc = std.testing.allocator;
+    const full_args = try questionBatchArgs(alloc, question_answer.max_questions);
+    defer alloc.free(full_args);
+
+    var requester = FullBatchRequester{};
+    const output = try executeWithRequester(alloc, full_args, .{
+        .ctx = &requester,
+        .response_alloc = alloc,
+        .request = FullBatchRequester.request,
+    });
+    defer alloc.free(output);
+
+    try std.testing.expectEqual(@as(usize, 1), requester.calls);
+    try std.testing.expectEqual(@as(usize, question_answer.max_questions), requester.entry_count);
+    try std.testing.expect(requester.entries_in_order);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const answers = (try question_answer.decodeJson(arena_state.allocator(), output)).?;
+    try std.testing.expectEqual(@as(usize, question_answer.max_questions), answers.len);
+    for (answers, 0..) |pair, index| {
+        var question_buf: [32]u8 = undefined;
+        var answer_buf: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            try std.mem.print(&question_buf, "Question {d}?", .{index + 1}),
+            pair.question,
+        );
+        try std.testing.expectEqualStrings(
+            try std.mem.print(&answer_buf, "Q{d} option {d}", .{ index + 1, index % batch_option_count + 1 }),
+            pair.answer,
+        );
+    }
+
+    const oversized_args = try questionBatchArgs(alloc, question_answer.max_questions + 1);
+    defer alloc.free(oversized_args);
+    var oversized_requester = FullBatchRequester{};
+    const rejected = try executeWithRequester(alloc, oversized_args, .{
+        .ctx = &oversized_requester,
+        .response_alloc = alloc,
+        .request = FullBatchRequester.request,
+    });
+    defer alloc.free(rejected);
+    try std.testing.expectEqualStrings("(ask_user_question: provide 1 to 20 questions)", rejected);
+    try std.testing.expectEqual(@as(usize, 0), oversized_requester.calls);
+}
+
+test "ask_user_question full batch frees every allocation when any allocation fails" {
+    const args = try questionBatchArgs(std.testing.allocator, question_answer.max_questions);
+    defer std.testing.allocator.free(args);
+
+    // Sweep each allocation of a full batch, parse through answer encoding,
+    // until a run completes without an injected failure.
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = fail_index });
+        const alloc = failing.allocator();
+        var requester = FullBatchRequester{};
+        const completed = if (executeWithRequester(alloc, args, .{
+            .ctx = &requester,
+            .response_alloc = alloc,
+            .request = FullBatchRequester.request,
+        })) |output| blk: {
+            alloc.free(output);
+            break :blk !failing.has_induced_failure;
+        } else |err| switch (err) {
+            // The answer encoder reports allocation failure as a write failure.
+            error.OutOfMemory, error.WriteFailed => blk: {
+                try std.testing.expect(failing.has_induced_failure);
+                break :blk false;
+            },
+            else => return err,
+        };
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (completed) break;
+    }
+    // The requester alone allocates one answer per question.
+    try std.testing.expect(fail_index > question_answer.max_questions);
 }
 
 test "ask_user_question cancellation returns sentinel" {

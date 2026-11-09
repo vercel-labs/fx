@@ -51,10 +51,11 @@ pub fn Runtime(
 
         pub fn dispatchAttentionRequired(
             app: *App,
+            session_id: ?[]const u8,
             turn_id: u64,
             kind: hooks.AttentionKind,
         ) void {
-            provider.dispatch_attention_required(app, turn_id, kind);
+            provider.dispatch_attention_required(app, session_id, turn_id, kind);
         }
     };
 }
@@ -70,6 +71,7 @@ test "notification runtime routes the full contract through its provider" {
         flush_count: usize = 0,
         played_cue: ?Cue = null,
         played_max_cue: ?Cue = null,
+        attention_session_id: ?[]const u8 = null,
         attention_turn_id: ?u64 = null,
         attention_kind: ?hooks.AttentionKind = null,
 
@@ -134,10 +136,12 @@ test "notification runtime routes the full contract through its provider" {
 
         fn dispatchAttentionRequiredProvider(
             raw: *anyopaque,
+            session_id: ?[]const u8,
             turn_id: u64,
             kind: hooks.AttentionKind,
         ) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.attention_session_id = session_id;
             self.attention_turn_id = turn_id;
             self.attention_kind = kind;
         }
@@ -180,7 +184,8 @@ test "notification runtime routes the full contract through its provider" {
     try std.testing.expectEqual(Cue.bloom, app.played_cue.?);
     try std.testing.expectEqual(Cue.toggle, app.played_max_cue.?);
 
-    TestRuntime.dispatchAttentionRequired(&app, 42, .permission);
+    TestRuntime.dispatchAttentionRequired(&app, "background-session", 42, .permission);
+    try std.testing.expectEqualStrings("background-session", app.attention_session_id.?);
     try std.testing.expectEqual(@as(u64, 42), app.attention_turn_id.?);
     try std.testing.expectEqual(hooks.AttentionKind.permission, app.attention_kind.?);
 }

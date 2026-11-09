@@ -1061,14 +1061,14 @@ test "parseSkillFile rejects indented continuations for recognized metadata" {
 
 test "parseSkillFile keeps fuzzed borrowed slices inside the input" {
     try std.testing.fuzz({}, fuzzParseSkillFile, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             "",
             "plain body",
             "---\nname: valid\n---\nbody",
             "---\r\nname: \"valid\"\r\n---\r\nbody",
             "---\nname: quoted\ndescription: 'single line'\n---\nbody",
             "---\nname: block\ndescription: >-\n  first line\n  second line\n---\nbody",
-        },
+        }) ++ @import("fuzz_corpus").skill_file.*),
     });
 }
 

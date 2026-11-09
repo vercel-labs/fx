@@ -3,7 +3,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const default_startup_timeout_ms: u32 = 30_000;
-pub const default_operation_timeout_ms: u32 = 60_000;
+/// How long a request may go without an answer or progress. Tools such as
+/// browser automation run for minutes without reporting progress.
+pub const default_operation_timeout_ms: u32 = 5 * 60_000;
 pub const default_elicitation_timeout_ms: u32 = 30 * 60_000;
 pub const default_restart_limit: u8 = 1;
 
@@ -103,81 +105,6 @@ pub const ProgressSink = struct {
     context: *anyopaque,
     callback: *const fn (*anyopaque, Progress) void,
 };
-
-/// Receives a borrowed, validated JSON-RPC notification object. Implementations
-/// must return promptly and must not retain pointers into the value.
-pub const NotificationSink = struct {
-    context: *anyopaque,
-    callback: *const fn (*anyopaque, std.json.Value) void,
-};
-
-/// Observes one borrowed, validated JSON-RPC response before the transport
-/// publishes it to the requesting thread. Implementations must return promptly
-/// and must not retain pointers into the value.
-pub const ResponseObserver = struct {
-    context: *anyopaque,
-    callback: *const fn (*anyopaque, Allocator, std.json.Value) anyerror!void,
-};
-
-/// Receives one owned-lifetime JSON-RPC server request frame. Transports invoke
-/// the optional preparation callback on the reader before dispatching later
-/// frames, so it must return promptly. They invoke the main callback outside
-/// reader and state locks so it may wait for input and write the response.
-pub const ServerRequestSink = struct {
-    context: *anyopaque,
-    prepare_callback: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!void = null,
-    callback: *const fn (*anyopaque, Allocator, []const u8) anyerror!void,
-};
-
-/// Acquires the final authorization guard immediately before a transport
-/// commits request bytes, then releases it as soon as commitment completes.
-pub const TransportPrecommit = struct {
-    context: *anyopaque,
-    acquire_callback: *const fn (*anyopaque) anyerror!void,
-    release_callback: *const fn (*anyopaque) void,
-    acquired: bool = false,
-
-    pub fn acquire(self: *TransportPrecommit) !void {
-        if (self.acquired) return;
-        try self.acquire_callback(self.context);
-        self.acquired = true;
-    }
-
-    pub fn release(self: *TransportPrecommit) void {
-        if (!self.acquired) return;
-        self.acquired = false;
-        self.release_callback(self.context);
-    }
-};
-
-test "transport precommit acquires and releases exactly once" {
-    const State = struct {
-        acquisitions: usize = 0,
-        releases: usize = 0,
-
-        fn acquire(raw: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.acquisitions += 1;
-        }
-
-        fn release(raw: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.releases += 1;
-        }
-    };
-    var state = State{};
-    var precommit = TransportPrecommit{
-        .context = &state,
-        .acquire_callback = State.acquire,
-        .release_callback = State.release,
-    };
-    try precommit.acquire();
-    try precommit.acquire();
-    precommit.release();
-    precommit.release();
-    try std.testing.expectEqual(@as(usize, 1), state.acquisitions);
-    try std.testing.expectEqual(@as(usize, 1), state.releases);
-}
 
 pub const McpTransport = enum { stdio, http, sse };
 

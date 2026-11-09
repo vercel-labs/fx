@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("workspace_access.zig");
@@ -119,6 +120,38 @@ pub const InstructionFiles = union(enum) {
     host_unreadable,
     /// No workspace exists, so there are no instruction files to read.
     none,
+
+    /// A stamp of the instruction file at `path` as this source reads it, so
+    /// a later turn can tell whether the file changed since a context note
+    /// delivered it (D93). A local file is stamped by the metadata of the file
+    /// the rules come from, through a symlink too, as the indexer stamps its
+    /// sources: inode, size, and modification and change times. A host file
+    /// has no metadata here, so it is stamped by the bytes the host returns.
+    /// Never 0; returns 0 when the file cannot be read.
+    pub fn sourceStamp(self: InstructionFiles, alloc: Allocator, path: []const u8) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        switch (self) {
+            .filesystem => {
+                const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = true }) catch return 0;
+                const fields = [_]u64{
+                    stat.size,
+                    @bitCast(@as(i64, @truncate(stat.mtime.nanoseconds))),
+                    @bitCast(@as(i64, @truncate(stat.ctime.nanoseconds))),
+                    @intCast(stat.inode),
+                };
+                hasher.update(std.mem.sliceAsBytes(&fields));
+            },
+            .host => |host_files| {
+                const file = (host_files.reader.read(alloc, path, host_files.reader.max_read_bytes) catch return 0) orelse return 0;
+                defer alloc.free(file.bytes);
+                hasher.update(std.mem.asBytes(&file.total_bytes));
+                hasher.update(file.bytes);
+            },
+            .host_unreadable, .none => return 0,
+        }
+        // 53 bits stay exact for any JSON reader of the saved session.
+        return (hasher.final() & ((@as(u64, 1) << 53) - 1)) | 1;
+    }
 };
 
 pub const ContextOmissionInput = struct {
@@ -179,8 +212,6 @@ pub const InitialContextInput = struct {
     targets: []const ApplicableTarget = &.{},
     omissions: []const ContextOmissionInput = &.{},
     omission_summary: ?ContextOmissionSummary = null,
-    /// Internal request reconstruction only; ordinary gathers retain their work limits.
-    bounded_reconstruction: bool = false,
     context_limits: context_limits.Values = .{},
     /// Assigned by `Registry` from its composition when routed through it.
     instruction_files: InstructionFiles = .filesystem,
@@ -192,6 +223,9 @@ pub const LaterContextInput = struct {
     targets: []const ApplicableTarget,
     delivered_sources: []const []const u8,
     evaluated_endpoints: []const []const u8,
+    /// Delivered sources that may get a reminder when a target reaches them:
+    /// rules an earlier turn's note delivered and this turn has not reminded.
+    remind_sources: []const []const u8 = &.{},
     context_limits: context_limits.Values = .{},
     /// Assigned by `Registry` from its composition when routed through it.
     instruction_files: InstructionFiles = .filesystem,
@@ -204,14 +238,22 @@ pub const ProviderContext = struct {
     delivered_sources: [][]u8 = &.{},
     evaluated_endpoints: [][]u8 = &.{},
     notices: [][]u8 = &.{},
+    /// One reminder line per `reminded_sources` entry: the targets reached
+    /// rules from `LaterContextInput.remind_sources` again.
+    reminders: ?[]u8 = null,
+    reminded_sources: [][]u8 = &.{},
 
     pub fn deinit(self: *ProviderContext, alloc: Allocator) void {
         if (self.content) |content| {
             if (content.len > 0) alloc.free(content);
         }
+        if (self.reminders) |reminders| {
+            if (reminders.len > 0) alloc.free(reminders);
+        }
         freeOwnedStrings(alloc, self.delivered_sources);
         freeOwnedStrings(alloc, self.evaluated_endpoints);
         freeOwnedStrings(alloc, self.notices);
+        freeOwnedStrings(alloc, self.reminded_sources);
         self.* = .{};
     }
 
@@ -304,9 +346,6 @@ pub const TransientContextInput = struct {
     access_scope: ?workspace_access.AccessScope = null,
     interactive: bool,
     permission_mode: types.PermissionMode,
-    /// True when the resumed session history references shell execution handles
-    /// the current process does not own; the model must not reuse them.
-    stale_shell_handles: bool = false,
 };
 
 pub const Provider = struct {
@@ -1045,4 +1084,52 @@ test "gathered context snapshot cleans partial allocation failures" {
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+test "an instruction file's stamp follows a symlink to its rules and reads a host's bytes (D93)" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "CLAUDE.md", .data = "V1" });
+    tmp.dir.symLink(std.testing.io, "CLAUDE.md", "AGENTS.md", .{ .is_directory = false }) catch |err| {
+        if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
+        return err;
+    };
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const link = try std.Io.Dir.path.join(alloc, &.{ root, "AGENTS.md" });
+    defer alloc.free(link);
+    const missing = try std.Io.Dir.path.join(alloc, &.{ root, "missing", "AGENTS.md" });
+    defer alloc.free(missing);
+
+    const local: InstructionFiles = .filesystem;
+    const first = local.sourceStamp(alloc, link);
+    try std.testing.expect(first != 0);
+    try std.testing.expectEqual(first, local.sourceStamp(alloc, link));
+    // Editing the file the link names changes the stamp, though the link
+    // itself is untouched.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "CLAUDE.md", .data = "V2 edited" });
+    try std.testing.expect(local.sourceStamp(alloc, link) != first);
+    try std.testing.expectEqual(@as(u64, 0), local.sourceStamp(alloc, missing));
+
+    // A host path need not exist on this disk: the host's bytes stamp it.
+    const Host = struct {
+        var text: []const u8 = "H1";
+        fn read(read_alloc: Allocator, path: []const u8, max_bytes: usize) InstructionFileError!?InstructionFile {
+            if (!std.mem.eql(u8, path, "/host/work/AGENTS.md")) return null;
+            return .{ .bytes = try read_alloc.dupe(u8, text[0..@min(text.len, max_bytes)]), .total_bytes = text.len };
+        }
+    };
+    const host: InstructionFiles = .{ .host = .{
+        .home = "/host",
+        .reader = .{ .read_fn = Host.read, .max_read_bytes = 1024 },
+    } };
+    const host_first = host.sourceStamp(alloc, "/host/work/AGENTS.md");
+    try std.testing.expect(host_first != 0);
+    try std.testing.expectEqual(host_first, host.sourceStamp(alloc, "/host/work/AGENTS.md"));
+    Host.text = "H2";
+    try std.testing.expect(host.sourceStamp(alloc, "/host/work/AGENTS.md") != host_first);
+    try std.testing.expectEqual(@as(u64, 0), host.sourceStamp(alloc, "/host/work/sub/AGENTS.md"));
+    try std.testing.expectEqual(@as(u64, 0), (InstructionFiles{ .host_unreadable = {} }).sourceStamp(alloc, link));
 }

@@ -1,6 +1,8 @@
 const std = @import("std");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
+const effort_menu = @import("effort_menu.zig");
+const info_panel = @import("info_panel.zig");
 const usage_menu = @import("../session/usage_menu.zig");
 const workspace_menu = @import("../workspace/workspace_menu.zig");
 const composer_deletion = @import("composer_deletion.zig");
@@ -38,6 +40,8 @@ pub const Runtime = struct {
     help_menu: command_specs.HelpMenu = .{},
     settings_menu: settings_catalog.Menu = .{},
     statusline_menu: settings_catalog.StatuslineMenu = .{},
+    info_panel: info_panel.State = .{},
+    effort_menu: effort_menu.State = .{},
     usage_menu: usage_menu.State = .{},
     workspace_menu: workspace_menu.State = .{},
     composer_history: composer_history.State = .{},
@@ -66,6 +70,8 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
         input_reset.resetPendingTextScalarWithTrace(&self.text_scalar, "shutdown");
         self.paste.deinit(alloc);
+        self.info_panel.close();
+        self.effort_menu.close(alloc);
         self.usage_menu.close();
         self.edit_state.deinit(alloc);
         self.picker.deinit(alloc);
@@ -221,6 +227,10 @@ test "runtime initInto preserves defaults without copying file picker scratch bu
     var expected: Runtime = .{};
     @memset(expected.picker.file_completion.raw_query[0..], 0xa5);
     @memset(expected.picker.file_completion.lookup_query[0..], 0xa5);
+    // The effort menu's options are undefined past `option_count`, so both
+    // get the same defined value instead of comparing undefined bytes.
+    @memset(expected.effort_menu.options[expected.effort_menu.option_count..], .auto);
+    @memset(actual.effort_menu.options[actual.effort_menu.option_count..], .auto);
 
     try std.testing.expectEqualDeep(expected, actual);
 }

@@ -1,5 +1,5 @@
 name: Setup PGSO tools
-description: Install the pinned tools required by one distributed PGSO phase
+description: Install the pinned tools required by one PGSO phase on macOS or Linux
 
 inputs:
   zig:
@@ -22,33 +22,94 @@ inputs:
 outputs:
   llvm-bin:
     description: Absolute LLVM bin directory
-    value: ${{ steps.llvm.outputs.path }}
+    value: ${{ steps.llvm.outputs.path || steps.llvm-linux.outputs.path }}
   bun-bin:
     description: Absolute Bun executable
-    value: ${{ steps.runtime.outputs.bun }}
+    value: ${{ steps.runtime.outputs.bun || steps.runtime-linux.outputs.bun }}
   hyperfine-bin:
     description: Absolute Hyperfine executable
-    value: ${{ steps.hyperfine.outputs.path }}
+    value: ${{ steps.hyperfine.outputs.path || steps.hyperfine-linux.outputs.path }}
 
 runs:
   using: composite
   steps:
     - name: Setup Zig
-      if: inputs.zig == 'true' || inputs.llvm == 'true'
+      if: runner.os == 'macOS' && (inputs.zig == 'true' || inputs.llvm == 'true')
       uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       with:
         version: "0.17.0"
         cache-key: pgso-macos-arm64
 
+    - name: Setup Zig
+      if: runner.os == 'Linux' && (inputs.zig == 'true' || inputs.llvm == 'true')
+      uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      with:
+        version: "0.17.0"
+        cache-key: ${{ runner.arch == 'ARM64' && 'pgso-linux-arm64' || 'pgso-linux-x86_64' }}
+
     - name: Install pinned LLVM
       id: llvm
-      if: inputs.llvm == 'true'
+      if: runner.os == 'macOS' && inputs.llvm == 'true'
       shell: bash
       run: |
         brew install llvm@22
         llvm_bin="$(brew --prefix llvm@22)/bin"
         "$llvm_bin/opt" --version | grep -F "version 22.1.8"
         echo "path=$llvm_bin" >> "$GITHUB_OUTPUT"
+
+    # The Linux release ships no libLLVM.so, which scripts/pgso/ir_size.py
+    # loads, so this links one from the release's own static archives.
+    - name: Install pinned LLVM
+      id: llvm-linux
+      if: runner.os == 'Linux' && inputs.llvm == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq --no-install-recommends g++ zlib1g-dev libzstd-dev libxml2-dev
+        case "$RUNNER_ARCH" in
+          ARM64)
+            name=LLVM-22.1.8-Linux-ARM64
+            digest=805efad2bb91cb4967fa569e0881d10c0f69c04461cf671cccbae19f547acc34
+            ;;
+          X64)
+            name=LLVM-22.1.8-Linux-X64
+            digest=df0e1ecf16caf3489a272a5eea4eec9b0d82878f6477fa309504f918a0006384
+            ;;
+          *)
+            echo "::error::no pinned LLVM for Linux $RUNNER_ARCH"
+            exit 1
+            ;;
+        esac
+        archive="$RUNNER_TEMP/$name.tar.xz"
+        curl -fsSL \
+          "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/$name.tar.xz" \
+          -o "$archive"
+        printf '%s  %s\n' "$digest" "$archive" | sha256sum -c -
+        llvm="$RUNNER_TEMP/llvm"
+        mkdir -p "$llvm"
+        tar -xJf "$archive" -C "$llvm" --strip-components=1
+        rm "$archive"
+        "$llvm/bin/opt" --version | grep -F "version 22.1.8"
+        config="$llvm/bin/llvm-config"
+        read -r -a deps <<<"$("$config" --link-static --libfiles core bitreader bitwriter target)"
+        read -r -a raw_system <<<"$("$config" --link-static --system-libs)"
+        # The release names its builder's static libzstd.a, which is not PIC.
+        system=()
+        for item in "${raw_system[@]}"; do
+          if [[ "$item" == /*/lib*.a ]]; then
+            name="$(basename "$item" .a)"
+            system+=("-l${name#lib}")
+          else
+            system+=("$item")
+          fi
+        done
+        "$llvm/bin/clang++" -shared -fuse-ld=lld -o "$llvm/lib/libLLVM.so" \
+          -Wl,--whole-archive \
+          "$llvm/lib/libLLVMCore.a" "$llvm/lib/libLLVMBitReader.a" \
+          "$llvm/lib/libLLVMBitWriter.a" "$llvm/lib/libLLVMTarget.a" \
+          -Wl,--no-whole-archive "${deps[@]}" "${system[@]}" -Wl,--no-undefined
+        python3 -c 'import ctypes, sys; ctypes.CDLL(sys.argv[1]).LLVMParseBitcodeInContext2' "$llvm/lib/libLLVM.so"
+        echo "path=$llvm/bin" >> "$GITHUB_OUTPUT"
 
     - name: Setup Bun
       if: inputs.bun == 'true'
@@ -58,7 +119,7 @@ runs:
 
     - name: Install tmux and record Bun
       id: runtime
-      if: inputs.bun == 'true'
+      if: runner.os == 'macOS' && inputs.bun == 'true'
       shell: bash
       run: |
         brew install tmux
@@ -66,9 +127,21 @@ runs:
         tmux -V
         echo "bun=$(which bun)" >> "$GITHUB_OUTPUT"
 
+    - name: Install tmux and record Bun
+      id: runtime-linux
+      if: runner.os == 'Linux' && inputs.bun == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq --no-install-recommends \
+          tmux zsh file procps less jq lsof netcat-openbsd build-essential
+        test "$(bun --version)" = "1.3.14"
+        tmux -V
+        echo "bun=$(which bun)" >> "$GITHUB_OUTPUT"
+
     - name: Install pinned Hyperfine
       id: hyperfine
-      if: inputs.hyperfine == 'true'
+      if: runner.os == 'macOS' && inputs.hyperfine == 'true'
       shell: bash
       run: |
         archive="$RUNNER_TEMP/hyperfine-v1.20.0-aarch64-apple-darwin.tar.gz"
@@ -80,5 +153,34 @@ runs:
           "$archive" | shasum -a 256 -c -
         tar -xzf "$archive" -C "$RUNNER_TEMP"
         binary="$RUNNER_TEMP/hyperfine-v1.20.0-aarch64-apple-darwin/hyperfine"
+        test "$("$binary" --version)" = "hyperfine 1.20.0"
+        echo "path=$binary" >> "$GITHUB_OUTPUT"
+
+    - name: Install pinned Hyperfine
+      id: hyperfine-linux
+      if: runner.os == 'Linux' && inputs.hyperfine == 'true'
+      shell: bash
+      run: |
+        case "$RUNNER_ARCH" in
+          ARM64)
+            name=hyperfine-v1.20.0-aarch64-unknown-linux-gnu
+            digest=90875cb1db7a1d797c311174d061728361e58fc70e3b62262a00635ac3b1997c
+            ;;
+          X64)
+            name=hyperfine-v1.20.0-x86_64-unknown-linux-gnu
+            digest=63ad53934062118f5b0be11785e0bb1603d4b91667d1921f2fd8df9a8712040a
+            ;;
+          *)
+            echo "::error::no pinned Hyperfine for Linux $RUNNER_ARCH"
+            exit 1
+            ;;
+        esac
+        archive="$RUNNER_TEMP/$name.tar.gz"
+        curl -fsSL \
+          "https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/$name.tar.gz" \
+          -o "$archive"
+        printf '%s  %s\n' "$digest" "$archive" | sha256sum -c -
+        tar -xzf "$archive" -C "$RUNNER_TEMP"
+        binary="$RUNNER_TEMP/$name/hyperfine"
         test "$("$binary" --version)" = "hyperfine 1.20.0"
         echo "path=$binary" >> "$GITHUB_OUTPUT"

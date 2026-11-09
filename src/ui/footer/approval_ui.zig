@@ -2194,6 +2194,27 @@ test "file approval affirmative readiness requires settled committed geometry" {
     try std.testing.expect(fileApprovalAffirmativeReady(&shell, prompt.projection().?));
 }
 
+test "inline file approval stays answerable through footer work but not a pending approval change" {
+    const alloc = std.testing.allocator;
+    var prompt = ApprovalPrompt{};
+    defer prompt.deinit(alloc);
+    const preview = diff_mod.FileChangePreview{ .path = "note.txt", .lines = &.{.{ .op = .addition, .new_line = 1, .text = "after" }}, .additions = 1, .deletions = 0, .truncated = false };
+    try std.testing.expect(try prompt.syncRequest(alloc, .{ .id = 41, .label = "ignored", .file = .{ .kind = .edit, .intent = .mutation, .preview = preview, .scope = .workspace_files } }));
+    var shell = TranscriptRuntime{ .layout = .{ .rows = 24, .cols = 96, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 } };
+    defer shell.deinit(alloc);
+    shell.footer_viewport.has_frame = true;
+    shell.footer_viewport.geometry = .{ .top = 1, .top_divider = 1, .input_base = 2, .bottom_divider = fileApprovalDesiredRows(preview), .hint = fileApprovalDesiredRows(preview) };
+    try std.testing.expect(fileApprovalAffirmativeReady(&shell, prompt.projection().?));
+
+    // A status update, such as a new session title, repaints the footer.
+    shell.render_requests.request(.footer);
+    try std.testing.expect(fileApprovalAffirmativeReady(&shell, prompt.projection().?));
+
+    // A changed request or review asks for a modal frame and must paint first.
+    shell.render_requests.request(.modal);
+    try std.testing.expect(!fileApprovalAffirmativeReady(&shell, prompt.projection().?));
+}
+
 test "approval panel renders request context and numbered choices" {
     var prompt = ApprovalPrompt{};
     defer prompt.deinit(std.testing.allocator);

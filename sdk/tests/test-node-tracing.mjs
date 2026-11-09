@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
-import { cp, mkdir, mkdtemp, rename, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
@@ -9,6 +9,10 @@ import { serializeError } from "./package-report.mjs";
 
 const packageDir = resolve(process.argv[2]);
 const { nodeFileTrace } = createRequire(import.meta.url)(resolve(process.argv[3]));
+// The platform packages to install beside libfx: at least the one for this
+// machine, whose addon must be the only one traced.
+const nativePackageDirs = process.argv.slice(4).map((path) => resolve(path));
+assert.ok(nativePackageDirs.length, "usage: test-node-tracing.mjs <libfx-dir> <nft> <platform-package-dir>...");
 const artifactRoot = process.env.LIBFX_TEST_ARTIFACT_ROOT || tmpdir();
 await mkdir(artifactRoot, { recursive: true });
 const root = await mkdtemp(join(artifactRoot, "libfx-trace-"));
@@ -72,7 +76,7 @@ async function exercise(sdk) {
 }
 
 async function run(entry, cwd, name) {
-  const child = spawnSync(process.execPath, ["--no-experimental-require-module", entry], {
+  const child = spawnSync(process.execPath, [entry], {
     cwd, encoding: "utf8", timeout: 30_000,
     env: { PATH: process.env.PATH, NODE_PATH: "", NODE_OPTIONS: "", FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1" },
   });
@@ -88,6 +92,10 @@ try {
     const isolated = join(root, `${format}-isolated`);
     const entry = format === "esm" ? "entry.mjs" : "entry.cjs";
     await cp(packageDir, join(source, "node_modules/libfx"), { recursive: true });
+    for (const dir of nativePackageDirs) {
+      const { name } = JSON.parse(await readFile(join(dir, "package.json"), "utf8"));
+      await cp(dir, join(source, "node_modules", name), { recursive: true });
+    }
     const load = format === "esm" ? 'import * as sdk from "libfx";' : 'const sdk = require("libfx");';
     await writeFile(join(source, entry), `${load}\n(${exercise.toString()})(sdk).catch(error => { console.error(error); process.exitCode = 1; });\n`);
     const result = { format, control: await run(entry, source, `${format}-control`) };
@@ -95,7 +103,10 @@ try {
     const trace = await nodeFileTrace([join(source, entry)], { base: source, processCwd: source });
     result.files = [...trace.fileList].sort();
     result.warnings = [...trace.warnings].map(String);
-    if (format === "cjs") assert.ok(!result.files.includes("node_modules/libfx/node.js"), "CJS tracing must not be rescued by an ESM import");
+    // require("libfx") runs node.js through node.cjs, so the trace follows both.
+    if (format === "cjs") {
+      for (const file of ["node_modules/libfx/node.cjs", "node_modules/libfx/node.js"]) assert.ok(result.files.includes(file), `CJS trace is missing ${file}`);
+    }
     for (const file of result.files) {
       const from = resolve(source, file);
       const to = resolve(isolated, file);
@@ -105,7 +116,12 @@ try {
     }
     await rename(source, `${source}-unavailable`);
     result.isolated = await run(entry, isolated, `${format}-isolated`);
-    assert.ok(result.files.some((file) => file.endsWith(`/libfx.${process.platform}-${process.arch}.node`)));
+    // One addon, from the platform package node.js resolves for this machine.
+    const addons = result.files.filter((file) => file.endsWith(".node"));
+    result.wasm = result.files.filter((file) => file.endsWith(".wasm"));
+    assert.equal(addons.length, 1, `expected exactly one traced addon: ${addons.join(", ")}`);
+    assert.match(addons[0], /^node_modules\/@libfx\/libfx-[a-z0-9-]+\/libfx\.node$/);
+    result.addon = addons[0];
     console.log(`${format} traced native and auto agent turns passed`);
   }
 } catch (error) { failure = error; }

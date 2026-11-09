@@ -2,7 +2,7 @@
 
 These instructions apply to work under `sdk/` and supplement the repository-level `AGENTS.md`.
 
-This file is maintainer guidance, not consumer documentation. Keep setup and the supported public surface in `sdk/README.md`. Keep exact API shapes in `sdk/fx-sdk.js`, its tests, and the declarations in `sdk/types/`. Add details here only when they help an agent choose the right owner, preserve a non-obvious invariant, or run the right proof. The native Node-API architecture and security model are documented in `sdk/NAPI.md`.
+This file is maintainer guidance, not consumer documentation. Keep setup and the supported public surface in `sdk/README.md`. Keep exact API shapes in the SDK modules, their tests, and the declarations in `sdk/types/`. Add details here only when they help an agent choose the right owner, preserve a non-obvious invariant, or run the right proof. The native Node-API architecture and security model are documented in `sdk/NAPI.md`.
 
 ## Start from the correct owner
 
@@ -10,15 +10,21 @@ The SDK has two WebAssembly surfaces and one shared JavaScript host layer:
 
 | Concern | Source of truth |
 | --- | --- |
-| Shared loader, host imports, adapters, and public JavaScript exports | `sdk/fx-sdk.js` |
+| The engine both backends share: options, sessions, journals and checkpoints, prompts, tools, and errors | `sdk/engine.js` |
+| The WebAssembly host: WASI, host imports, and instantiation | `sdk/wasm-runtime.js` and `sdk/wasm-module.js` |
+| The terminal on WebAssembly | `sdk/wasm-terminal.js` |
+| The xterm.js adapter | `sdk/xterm.js` |
+| `libfx/wasm`, which exports the engine and terminal on WebAssembly | `sdk/fx-sdk.js` |
+| `libfx/browser`, and which `.wasm` a browser build emits | `sdk/browser.js`, which only re-exports; `sdk/browser-agent.js` names `fx-core.wasm` and `sdk/browser-terminal.js` names `fx-term.wasm` |
 | Headless ACP composition for `fx-core.wasm` | `src/wasm_core_main.zig` |
 | Interactive terminal entry point for `fx-term.wasm` | `src/wasm_term_main.zig` and `runWasmTerminal` in `src/main.zig` |
 | Native and WebAssembly capability policy | `src/core/hosts/runtime_profile.zig` |
-| Host-backed terminal session persistence | `src/core/app/app_session_runtime.zig` and `sdk/fx-sdk.js` |
+| Host-backed terminal session persistence | `src/core/app/app_session_runtime.zig` and `sdk/wasm-runtime.js` |
 | Browser workspace contract and `shell.run` bridge | `src/core/hosts/js_host_workspace.zig` and `src/tools/shell/browser_shell.zig` |
-| Browser workspace AGENTS.md reads | `src/core/hosts/js_host_workspace.zig`, `src/builtins/context.zig`, and `sdk/fx-sdk.js` |
+| Browser workspace AGENTS.md reads | `src/core/hosts/js_host_workspace.zig`, `src/builtins/context.zig`, and `sdk/wasm-runtime.js` |
 | Browser device login, OAuth session persistence, and URL opening | `src/core/auth/js_host_auth.zig`, `src/core/auth/oauth_session.zig`, and `src/core/hosts/js_host_url_opener.zig` |
 | WASI target, optimization mode, threading, and artifact names | `build.zig` |
+| The `wasm-opt -Oz` pass on the modules CI tests and the package ships | `sdk/scripts/optimize-wasm.mjs`, with binaryen pinned in `sdk/tools` |
 | Core browser fixture and its automation contract | `sdk/index.html` and `sdk/tests/test-core-browser.mjs` |
 | Terminal fixture and static packaging contract | `sdk/term-demo.html` and `sdk/scripts/package-term-demo.mjs` |
 | Durable sessions: log, leases, queue, deadlines, UI stream, and the harness contract | `sdk/durable.js` (no fx imports) |
@@ -28,14 +34,17 @@ The SDK has two WebAssembly surfaces and one shared JavaScript host layer:
 | TypeScript declarations for every entry point | `sdk/types/`, checked by `sdk/tests/test-types.mjs` |
 | Checkpoint format, including the libfx version, tool set, and model each checkpoint records | `src/core/agent/runtime/checkpoint.zig` |
 | Images a session saves once, by name: naming in journal events and checkpoints, and the two-phase open | `src/core/session/session_codec.zig`, `src/acp/libfx_journal.zig`, and `src/acp/server.zig` |
-| A session's image store (the internal `persistenceImages` key) and storing before sending | `sdk/fx-sdk.js`; a durable session's images are World streams in `sdk/durable.js` |
+| A session's image store (the internal `persistenceImages` key) and storing before sending | `sdk/engine.js`; a durable session's images are World streams in `sdk/durable.js` |
 | Commands required by CI | `.github/workflows/ci.yml` |
 
 Do not treat the demos or this file as the implementation contract. When prose and behavior disagree, establish the current behavior from code and focused tests before changing either.
 
 ## Preserve these invariants
 
-- Keep `sdk/fx-sdk.js` a dependency-free ECMAScript module. A bundler, framework, or runtime package must not become necessary to load the SDK.
+- Keep `sdk/fx-sdk.js` and every module it imports dependency-free ECMAScript modules. A bundler, framework, or runtime package must not become necessary to load the SDK.
+- Keep `sdk/engine.js` free of the WebAssembly host. The native backend runs the same engine, so `engine.js` must never import `wasm-runtime.js`, `wasm-terminal.js`, or `wasm-module.js`; each caller passes the engine its runtime.
+- Keep `sdk/node.js` free of the WebAssembly host. It imports `node-wasm.js` with a plain dynamic `import()` only when the WebAssembly backend is used, so bundlers split it into a chunk that shares the engine. Put `webpackIgnore` or `turbopackIgnore` only on imports of caller-supplied files and self-contained single-file assets such as `durable/*.mjs`, never on libfx's own modules.
+- Keep `sdk/browser.js` a module of `export { ... } from` lines, and name each `.wasm` only in the module of the factory that loads it. Bundlers copy the `.wasm` of every module they compile, and Rolldown's lazy barrel optimization skips an unused re-export only in a module with no exports of its own. Importing `libfx/browser` must do no work, because servers render client components that import it. `sdk/tests/test-browser-import.mjs` checks all three.
 - Keep the core and terminal surfaces distinct. `fx-core.wasm` starts the headless ACP server; `fx-term.wasm` starts the interactive terminal. Shared loader changes must be validated against both.
 - Detect JavaScript Promise Integration (JSPI) by capability through `supportsJspi()`. Do not replace feature detection with browser or version sniffing. Keep loader errors, demo fallback states, and the compatibility statement in `sdk/README.md` consistent.
 - Treat JavaScript host stores as durable contracts. Session and OAuth snapshots are opaque bytes with optimistic revisions. Preserve `FX_SESSION_REVISION_CONFLICT` and `FX_OAUTH_SESSION_REVISION_CONFLICT`. Persist configuration only after fx accepts it, and do not collapse prompt-history outcomes into generic success.
@@ -56,6 +65,8 @@ Do not treat the demos or this file as the implementation contract. When prose a
 | Live Gateway request or model-catalog translation | Core tests plus the opt-in live smoke test when a credential is available |
 | How a session saves images: naming, the image store, staging at open | Core and terminal builds, `bun sdk/tests/test-journal.mjs native wasm` and `wasm native`, `test-checkpoint.mjs` both ways, the Zig tests of `checkpoint.zig` and `journal.zig`, then `tests/tla/sdk/check.sh` and `bun tests/tla/drivers/drive-images.mjs` with `--backend native` and `wasm`, which walks the graph of `ImageStore.tla`; change the spec with the code. For durable sessions, also the durable sessions row |
 | Terminal adapter, input encoding, resize, cleanup, config, or prompt history | Terminal build and the headless terminal suite |
+| `libfx/browser` modules, the `.wasm` they name, or what they do on import | `sdk/tests/test-browser-import.mjs`, then `test-next-package.mjs` with each bundler, which builds a client page |
+| What Node.js or a browser bundle loads from libfx, the package's size, or its manifest and types | Package with every platform addon, then run what CI's SDK package guards job runs: `test-node-load-graph.mjs`, `test-browser-bundles.mjs` after `npm ci --prefix sdk/tests/tools`, `test-package-size.mjs`, publint, and attw. Raise a budget in `sdk/tests/package-size-budgets.json` only for a change that has to grow the package |
 | Terminal session persistence or browser device login | Terminal build plus `sdk/tests/test-term-session-resume.mjs` or `sdk/tests/test-term-login.mjs` |
 | Browser workspace metadata, permissions, execution, limits, or cancellation | Terminal build plus `sdk/node/test-term-workspace.mjs` |
 | Browser workspace AGENTS.md reads | Terminal build plus `sdk/node/test-term-agents-md.mjs` |
