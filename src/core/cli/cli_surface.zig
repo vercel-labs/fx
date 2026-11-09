@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const testing_pty = @import("../shared/testing_pty.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
@@ -2521,7 +2522,15 @@ fn readMaskedKeyDefault(
 ) ![]u8 {
     var raw = try MaskedKeyRawMode.enable();
     defer raw.disable();
+    return readMaskedKeyFrom(raw.fd, alloc, write_mask, write_ctx);
+}
 
+fn readMaskedKeyFrom(
+    fd: std.posix.fd_t,
+    alloc: Allocator,
+    write_mask: WriteFn,
+    write_ctx: ?*anyopaque,
+) ![]u8 {
     var input: std.ArrayList(u8) = .empty;
     errdefer {
         if (input.capacity > 0) secret.zeroAndFree(alloc, input.allocatedSlice());
@@ -2529,7 +2538,7 @@ fn readMaskedKeyDefault(
 
     while (input.items.len < 8 * 1024) {
         var byte: [1]u8 = undefined;
-        if (try std.posix.read(std.posix.STDIN_FILENO, &byte) == 0) return error.SetupCancelled;
+        if (try std.posix.read(fd, &byte) == 0) return error.SetupCancelled;
         switch (byte[0]) {
             '\r', '\n' => {
                 if (input.items.len == 0) continue;
@@ -2559,6 +2568,7 @@ fn readMaskedKeyDefault(
 const MaskedKeyRawMode = struct {
     original: std.posix.termios = undefined,
     active: bool = false,
+    fd: std.posix.fd_t = std.posix.STDIN_FILENO,
 
     fn enable() !MaskedKeyRawMode {
         if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or
@@ -2600,10 +2610,80 @@ const MaskedKeyRawMode = struct {
 
     fn disable(self: *MaskedKeyRawMode) void {
         if (!self.active) return;
-        io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        // The terminal may be gone by now: revoked, hung up, or closed
+        // (`tests/tla/shell_runtime/TerminalRevoke.tla` CleanupNeverCrashes).
+        io_mod.tcsetattrBestEffort(self.fd, .FLUSH, self.original) catch {};
         self.active = false;
     }
 };
+
+fn ignoreMask(_: ?*anyopaque, _: []const u8) anyerror!void {}
+
+test "masked key prompt ends at a read of 0" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const fd = try testing_pty.pipeAtEndOfInput("");
+    defer testing_pty.closeFd(fd);
+    try std.testing.expectError(error.SetupCancelled, readMaskedKeyFrom(fd, std.testing.allocator, ignoreMask, null));
+}
+
+test "masked key prompt ends at a read of 0 in the middle of a key and frees what was typed" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const fd = try testing_pty.pipeAtEndOfInput("ab");
+    defer testing_pty.closeFd(fd);
+    try std.testing.expectError(error.SetupCancelled, readMaskedKeyFrom(fd, std.testing.allocator, ignoreMask, null));
+}
+
+test "masked key prompt returns the key typed before Enter" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const fd = try testing_pty.pipeAtEndOfInput("ab\r");
+    defer testing_pty.closeFd(fd);
+    const key = try readMaskedKeyFrom(fd, std.testing.allocator, ignoreMask, null);
+    defer secret.zeroAndFree(std.testing.allocator, key);
+    try std.testing.expectEqualStrings("ab", key);
+}
+
+test "masked key prompt restore returns for a descriptor that is not open" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    var raw = MaskedKeyRawMode{
+        .original = std.mem.zeroes(std.posix.termios),
+        .active = true,
+        .fd = testing_pty.closed_fd,
+    };
+    raw.disable();
+    try std.testing.expect(!raw.active);
+}
+
+test "masked key prompt restore puts the original settings back on a live terminal" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    defer pty.close();
+    const original = try pty.flipEcho();
+
+    var raw = MaskedKeyRawMode{ .original = original, .active = true, .fd = pty.slave };
+    raw.disable();
+
+    try std.testing.expect(!raw.active);
+    const restored = try io_mod.tcgetattr(pty.slave);
+    try std.testing.expectEqual(original.lflag, restored.lflag);
+}
+
+test "masked key prompt restore returns for a revoked terminal" {
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    defer pty.close();
+    const original = try io_mod.tcgetattr(pty.slave);
+    try pty.revokeSlave();
+
+    var raw = MaskedKeyRawMode{ .original = original, .active = true, .fd = pty.slave };
+    raw.disable();
+    try std.testing.expect(!raw.active);
+}
 
 fn writeConfigDiagnostics(
     alloc: Allocator,

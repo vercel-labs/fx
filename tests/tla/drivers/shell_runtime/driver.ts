@@ -1,0 +1,1334 @@
+// Runs the built fx binary along tests/tla/shell_runtime/TerminalRevoke.tla and
+// has TLC check every run it observes (TerminalRevokeTrace.tla).
+//
+// Each run starts fx on a pseudo-terminal the driver owns
+// (tests/e2e/pty-session.ts), against a local fake gateway, waits for the
+// composer, and then does one thing to fx's terminal while the terminal's
+// other side stays open:
+//
+//   quit                  type /quit
+//   hangup                close the other side
+//   revoke-idle           revoke(2) the terminal while fx waits in its poll
+//   revoke-stopped        stop fx, revoke, and continue it, so the revoke
+//                         lands between two polls
+//   revoke-after-typing   type text, wait for it on screen, then revoke as
+//                         revoke-stopped does
+//   revoke-during-burst   revoke after the first 64 KB of a 256 KB paste
+//   revoke-after-quit     type /quit and revoke at once, racing the cleanup
+//   revoke-idle-eio       revoke-idle, answered the way macos-15-arm64 answers
+//                         a revoked controlling terminal: stdin-eio.c makes
+//                         the revoked stdin poll as readable and fail reads
+//                         with EIO, so only tcgetattr shows it is gone
+//   revoke-stopped-eio    revoke-stopped, answered the same way
+//   live-eio              stdin-eio.c fails reads with EIO on the terminal
+//                         while it is still there, as for a background read
+//                         that SIGTTIN does not stop, and the driver types a key
+//
+// Two more runs start fx teams on the PTY and revoke the terminal while its
+// team picker waits for a key, the first answered the macOS 15 way as
+// revoke-idle-eio is:
+//
+//   team-picker-revoke-eio  the picker's read fails with EIO, fx teams returns
+//                         its error, and the picker's restore meets a terminal
+//                         that is gone: it must stay quiet (no unexpected errno)
+//   team-picker-revoke      the same revoke with no interposer: this machine
+//                         answers a read of 0, the end of input, which the
+//                         picker must end on, within 2 s and without burning
+//                         CPU, and not read again (NoReadAfterEof)
+//
+// Three more runs start fx login vercel on the PTY, which waits for browser
+// authorization against a local fake issuer, and take its terminal away while
+// it waits. Between polls of the issuer the wait offers to open the browser on
+// a key, and it must go on waiting, and polling the issuer, at low CPU:
+//
+//   sign-in-revoke-stopped  revoke the terminal while the issuer holds fx's
+//                         second token request, so fx is in a request and not
+//                         in its wait for a key: every later poll of stdin
+//                         reports POLLNVAL alone, which the wait took as no key
+//                         and returned on at once, spinning at full CPU
+//   sign-in-revoke-idle   revoke while fx waits for a key: the poll wakes with
+//                         POLLIN and POLLHUP, which is a key
+//   sign-in-hangup        close the other side: the same answer
+//
+// A fake open on PATH records the browser launches, so none starts.
+//
+// Three more runs start fx mcp login --no-browser web on the PTY, against the
+// fake OAuth server that tests/tla/drivers/mcp/fakes/http.ts serves, and take
+// the terminal away while the login waits for a pasted address. Nothing ever
+// approves the login, so only the terminal can end it:
+//
+//   mcp-login-revoke-eio  stdin-eio.c gives the revoked stdin the macOS 15
+//                         answer (polled readable, every read fails with EIO).
+//                         The paste wait went round its loop at once, at full
+//                         CPU, and never ended; it must stop with status 1 and
+//                         a short message, save nothing, and redeem no code
+//                         (NoBusyLoop, GoneReadStopsLogin)
+//   mcp-login-revoke      the same revoke with no interposer: this machine
+//                         answers POLLNVAL and a read of 0, the end of input,
+//                         and the wait keeps waiting for the browser, asleep
+//                         between its polls (no spin)
+//   mcp-login-hangup      close the other side: POLLHUP and a read of 0, the
+//                         same wait
+//   mcp-login-complete-revoke-eio
+//                         the browser's callback finishes the sign-in, and the
+//                         driver revokes the terminal as soon as the login is
+//                         saved, so the revoke lands in the same 100 ms slice
+//                         as the sign-in, with the macOS 15 answer. The sign-in
+//                         finished, so fx must report it as done: status 0,
+//                         the server signed in after one token exchange. A
+//                         handler of the failed read that did not look again
+//                         said "the terminal is gone" with status 1
+//                         (FinishedSignInNeverFails). It runs three times, as
+//                         the revoke misses the slice when the login finishes
+//                         at its very end.
+//
+// --race N adds N more of that run, after the normal ones, with the callback
+// and the revoke at random offsets of 0 to 300 ms in either order. Each is
+// judged on its own, not replayed through TLC (the order of its events is not
+// known): fx ends with status 0, the server signed in after one token
+// exchange, and nothing on stderr; or with status 1, the terminal-gone line,
+// and nothing saved. Anything else is a wrong exit, the first being a server
+// that is signed in after fx said it was not.
+//
+// Two more runs start fx from an interactive bash in tmux and take it through
+// Ctrl+Z, bg, fg, and /quit: job-control with SIGTTIN and SIGTTOU at their
+// default, and job-control-signals-ignored with fx started with both ignored.
+//
+// A revoke that lands while fx waits in poll wakes that poll as a hang-up; one
+// that lands between polls leaves every later poll reporting POLLNVAL alone,
+// which fx before the change ignored and so spun. --random N adds N seeded
+// runs of the revoke scenarios after a random delay. In the PTY runs fx has no
+// controlling terminal, so no SIGHUP reaches it: what the terminal reports is
+// all it sees. For each run the driver records what it did, how fx ended (status 0,
+// status 1 with an fx error, crashed, still running and burning CPU, or
+// something else), and what the cleanup left: the terminal's settings after a
+// quit, or whether stderr reports an unexpected errno once the terminal is
+// gone. TLC
+// replays every run through the model's own actions. --self-check also replays
+// them through the model of fx before the change (Bug = "today"), which must
+// reject them, and the team picker run through the model of fx before the
+// prompts' fix (Bug = "prompts_strict"), and through the model of fx where the
+// team picker reads again after a read of 0 (Bug = "picker_ignores_eof"),
+// which must reject them too, and the sign-in run that revoked the terminal in
+// a request through the model of fx before the sign-in wait's fix (Bug =
+// "sign_in_spins") and through the model of a fix that misses POLLNVAL alone
+// (Bug = "sign_in_nval"), and the fx mcp login run that ended through the
+// model of fx before the paste wait's fix (Bug = "mcp_login_spins") and
+// through the model of a fix that only sleeps (Bug = "mcp_login_sleeps"). A
+// recorded outcome of fx before the sign-in re-check (the sign-in finished,
+// and fx reported it as failed) must be rejected by the design and accepted by
+// the model of that fx (Bug = "mcp_login_done_ignored"); the driver writes it
+// down by hand, because the fixed fx never produces it.
+//
+// revoke(2) exists only on macOS here, so the driver runs only there.
+//
+// Usage (from the repository root, after zig build):
+//   bun tests/tla/drivers/shell_runtime/driver.ts
+//   bun tests/tla/drivers/shell_runtime/driver.ts --self-check
+//   bun tests/tla/drivers/shell_runtime/driver.ts --random 20 --seed 7
+//   bun tests/tla/drivers/shell_runtime/driver.ts --scenario team-picker-revoke
+//   bun tests/tla/drivers/shell_runtime/driver.ts --scenario mcp-login-complete-revoke-eio --race 250
+//
+// Exit codes: 0 every run accepted (and the self-check rejected), 1 a run the
+// model cannot produce, 2 a toolchain, build, or harness failure.
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { binary, targetHelpers, targetModule, worktree } from "../lib/context";
+import { TLA_ROOT, outDir, runTlc, writeJson } from "../lib/tlc";
+import { fixture, redemptions, runFx, startFake, storePath, waitFor, writeProfile } from "../mcp_host/driver";
+
+type Event = "Type" | "Quit" | "Revoke" | "RevokeStopped" | "Hangup" | "Suspend" | "Bg" | "Fg" | "Background" | "Complete";
+type End = "exited" | "failed" | "crashed" | "spinning" | "waiting" | "other";
+type Restore = "restored" | "quiet" | "clean" | "error" | "lost" | "none";
+type Site = "shell" | "team_picker" | "sign_in" | "mcp_login";
+type Scenario =
+  | "quit"
+  | "hangup"
+  | "revoke-idle"
+  | "revoke-stopped"
+  | "revoke-after-typing"
+  | "revoke-during-burst"
+  | "revoke-after-quit"
+  | "revoke-idle-eio"
+  | "revoke-stopped-eio"
+  | "live-eio"
+  | "team-picker-revoke-eio"
+  | "team-picker-revoke"
+  | "sign-in-revoke-stopped"
+  | "sign-in-revoke-idle"
+  | "sign-in-hangup"
+  | "mcp-login-revoke-eio"
+  | "mcp-login-revoke"
+  | "mcp-login-hangup"
+  | "mcp-login-complete-revoke-eio"
+  | "job-control"
+  | "job-control-signals-ignored";
+type Observation = {
+  id: string;
+  scenario: Scenario;
+  delay_ms: number;
+  events: Event[];
+  end: End;
+  restore: Restore;
+  eio: boolean;
+  stops: boolean;
+  site: Site;
+  evidence: {
+    exit: { code: number | null; signal: string | null } | null;
+    exited_after_ms: number | null;
+    cpu_seconds_after: number | null;
+    stderr: string;
+    gateway: { models: number; chat: number };
+    issuer: string[];
+    interposer: string[];
+    job_states: Array<string | null>;
+    trace_errors: string[];
+  };
+};
+type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
+// What TLC replays of a run.
+type Replayed = Pick<Observation, "events" | "end" | "restore" | "eio" | "stops" | "site">;
+
+const SCENARIOS: Scenario[] = [
+  "quit",
+  "hangup",
+  "revoke-idle",
+  "revoke-stopped",
+  "revoke-after-typing",
+  "revoke-during-burst",
+  "revoke-after-quit",
+  "revoke-idle-eio",
+  "revoke-stopped-eio",
+  "live-eio",
+  "team-picker-revoke-eio",
+  "team-picker-revoke",
+  "sign-in-revoke-stopped",
+  "sign-in-revoke-idle",
+  "sign-in-hangup",
+  "mcp-login-revoke-eio",
+  "mcp-login-revoke",
+  "mcp-login-hangup",
+  ...Array<Scenario>(3).fill("mcp-login-complete-revoke-eio"),
+  "job-control",
+  "job-control-signals-ignored",
+];
+const RANDOM_SCENARIOS: Scenario[] = [
+  "revoke-idle",
+  "revoke-stopped",
+  "revoke-after-typing",
+  "revoke-during-burst",
+  "revoke-idle-eio",
+  "revoke-stopped-eio",
+];
+const EIO_MODE: Partial<Record<Scenario, "revoked" | "live">> = {
+  "revoke-idle-eio": "revoked",
+  "revoke-stopped-eio": "revoked",
+  "live-eio": "live",
+  "team-picker-revoke-eio": "revoked",
+  "mcp-login-revoke-eio": "revoked",
+  "mcp-login-complete-revoke-eio": "revoked",
+};
+// The team picker's run must end this fast, and not burn CPU while it waits.
+const PICKER_EXIT_WAIT_MS = 2_000;
+const tlaDir = join(TLA_ROOT, "shell_runtime");
+// An fx error line on stderr: `fx: ...`, or `fx <command>: ...`.
+const FX_ERROR = /^fx(?: [\w-]+)?: /m;
+// What fx mcp login says when its terminal is gone.
+const MCP_LOGIN_STOPPED = /^Couldn't sign in to web: the terminal is gone\.$/m;
+// How long fx has to exit after its terminal goes away, and how long a run that
+// is still going is watched for CPU use before it counts as spinning.
+const EXIT_WAIT_MS = 3_000;
+const RACE_EXIT_WAIT_MS = 6_000;
+const SPIN_WINDOW_MS = 1_000;
+const SPIN_CPU_SECONDS = 0.5;
+// A wait that sleeps its 100 ms slice polls ten times a second; one that spins
+// makes tens of thousands of passes.
+const SPIN_PASSES = 100;
+
+function option(name: string, fallback: number): number {
+  const at = process.argv.indexOf(name);
+  if (at < 0) return fallback;
+  const value = Number(process.argv[at + 1]);
+  if (!Number.isInteger(value) || value < 0) throw new Error(`${name} takes a whole number`);
+  return value;
+}
+
+function scenarioOption(): Scenario | null {
+  const at = process.argv.indexOf("--scenario");
+  if (at < 0) return null;
+  const name = process.argv[at + 1] as Scenario;
+  if (!SCENARIOS.includes(name)) throw new Error(`--scenario takes one of: ${SCENARIOS.join(", ")}`);
+  return name;
+}
+
+const options = {
+  selfCheck: process.argv.includes("--self-check"),
+  scenario: scenarioOption(),
+  random: option("--random", 6),
+  seed: option("--seed", 1),
+  race: option("--race", 0),
+};
+
+// mulberry32: a small seeded generator, so a failing random run replays.
+function generator(seed: number) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function sameFlags(a: Record<string, number>, b: Record<string, number>): boolean {
+  return Object.keys(a).every((key) => a[key] === b[key]);
+}
+
+let stdinEio: string | null = null;
+// tests/e2e/fixtures/stdin-eio.c, built once per run.
+function stdinEioLibrary(out: string): string {
+  if (stdinEio) return stdinEio;
+  const library = join(out, "stdin-eio.dylib");
+  const source = join(worktree, "tests", "e2e", "fixtures", "stdin-eio.c");
+  const built = Bun.spawnSync(["clang", "-dynamiclib", "-O2", "-Wall", "-Wextra", source, "-o", library]);
+  if (built.exitCode !== 0) throw new Error(`building stdin-eio.c failed: ${built.stderr.toString()}`);
+  return (stdinEio = library);
+}
+
+function fxEnv(helpers: any, gateway: any, root: string): Record<string, string> {
+  return {
+    HOME: join(root, "home"),
+    PATH: "/usr/bin:/bin",
+    TERM: "xterm-256color",
+    FX_HOME: join(root, "fx-home"),
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_SOUND: "0",
+    FX_AUTO_UPGRADE: "0",
+    FX_TEST_SKIP_ONBOARDING: "1",
+    FX_TEST_INPUT_LOOP_NETWORK_GUARD: "1",
+    AI_GATEWAY_API_KEY: "fake-terminal-revoke-key",
+    FX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_MODEL: helpers.FAKE_GATEWAY_MODEL,
+  };
+}
+
+async function waitForModels(gateway: any, before: number): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  while (gateway.modelRequests.length <= before) {
+    if (Date.now() > deadline) throw new Error("fx never asked the fake gateway for its models");
+    await Bun.sleep(10);
+  }
+}
+
+function readLines(path: string): string[] {
+  return existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean) : [];
+}
+
+async function runScenario(
+  helpers: any,
+  pty: any,
+  gateway: any,
+  id: string,
+  scenario: Scenario,
+  delayMs: number,
+  scratch: string,
+  out: string,
+): Promise<Observation> {
+  const root = mkdtempSync(join(scratch, `${id}-`));
+  for (const dir of ["home", "fx-home", "workspace", "pty"]) mkdirSync(join(root, dir));
+  const modelsBefore = gateway.modelRequests.length;
+  const chatBefore = gateway.requests.length;
+  const eioMode = EIO_MODE[scenario];
+  const eioRecord = join(root, "stdin-eio.record");
+  const eioArm = join(root, "stdin-eio.arm");
+  const env = fxEnv(helpers, gateway, root);
+  if (eioMode) {
+    env.DYLD_INSERT_LIBRARIES = stdinEioLibrary(out);
+    env.FX_STDIN_EIO_MODE = eioMode;
+    env.FX_STDIN_EIO_RECORD = eioRecord;
+    env.FX_STDIN_EIO_ARM = eioArm;
+  }
+  const session = await pty.PtySession.launch({
+    bin: binary,
+    cwd: join(root, "workspace"),
+    dir: join(root, "pty"),
+    env,
+  });
+  try {
+    if (!(await session.waitForOutput((text: string) => text.includes("┃"), 15_000))) {
+      throw new Error(`${id}: fx never drew its composer; stderr: ${session.stderr()}`);
+    }
+    if (eioMode) {
+      // Act only once fx waits in its input loop.
+      await waitForModels(gateway, modelsBefore);
+      await session.waitForQuietOutput(300, 15_000);
+    }
+    if (delayMs > 0) await Bun.sleep(delayMs);
+    const events: Event[] = [];
+    let gone = false;
+    switch (scenario) {
+      case "quit":
+        session.write("/quit\r");
+        events.push("Quit");
+        break;
+      case "hangup":
+        session.hangUp();
+        events.push("Hangup");
+        gone = true;
+        break;
+      case "revoke-idle":
+      case "revoke-idle-eio":
+        session.revoke();
+        events.push("Revoke");
+        gone = true;
+        break;
+      case "revoke-stopped":
+      case "revoke-stopped-eio":
+        await session.revokeBetweenPolls();
+        events.push("RevokeStopped");
+        gone = true;
+        break;
+      case "live-eio":
+        writeFileSync(eioArm, "");
+        events.push("Background");
+        session.write("x");
+        events.push("Type");
+        break;
+      case "revoke-after-typing":
+        session.write("hello terminal");
+        if (!(await session.waitForOutput((text: string) => text.includes("hello terminal"), 5_000))) {
+          throw new Error(`${id}: typed text never reached the screen`);
+        }
+        events.push("Type");
+        await session.revokeBetweenPolls();
+        events.push("RevokeStopped");
+        gone = true;
+        break;
+      case "revoke-during-burst": {
+        const chunk = "x".repeat(4096);
+        for (let sent = 0; sent < 256 * 1024; sent += chunk.length) {
+          if (sent === 64 * 1024) {
+            session.revoke();
+            events.push("Type", "Revoke");
+            gone = true;
+          }
+          try {
+            session.write(chunk);
+          } catch {
+            break;
+          }
+        }
+        break;
+      }
+      case "revoke-after-quit":
+        session.write("/quit\r");
+        events.push("Quit");
+        if (!session.exited()) {
+          session.revoke();
+          events.push("Revoke");
+          gone = true;
+        }
+        break;
+    }
+    const started = performance.now();
+    const exit = await session.waitForExit(EXIT_WAIT_MS);
+    const exitedAfter = exit ? Math.round(performance.now() - started) : null;
+    let end: End;
+    let restore: Restore = "none";
+    let cpuAfter: number | null = null;
+    const stderr = () => session.stderr();
+    if (exit) {
+      if (exit.code === 0) end = "exited";
+      else if (exit.signal === "SIGABRT" || /panic/.test(stderr())) end = "crashed";
+      else if (exit.code === 1 && /^fx: /m.test(stderr())) end = "failed";
+      else end = "other";
+      if (end === "exited" || end === "failed") {
+        if (/unexpected errno/.test(stderr())) restore = "error";
+        else if (gone) restore = "quiet";
+        else restore = sameFlags(session.flagsBefore, session.flagsNow()) ? "restored" : "lost";
+      }
+    } else {
+      const before = session.cpuSeconds();
+      await Bun.sleep(SPIN_WINDOW_MS);
+      cpuAfter = session.cpuSeconds();
+      const burned = before !== null && cpuAfter !== null ? cpuAfter - before : 0;
+      end = burned >= SPIN_CPU_SECONDS ? "spinning" : "other";
+    }
+    const interposer = readLines(eioRecord);
+    if (eioMode && !interposer.some((line) => line.startsWith("read-eio"))) {
+      throw new Error(`${id}: stdin-eio.c never failed a read, so the run did not reach the EIO path`);
+    }
+    return {
+      id,
+      scenario,
+      delay_ms: delayMs,
+      events,
+      end,
+      restore,
+      eio: eioMode === "revoked",
+      stops: eioMode !== "live",
+      site: "shell",
+      evidence: {
+        exit,
+        exited_after_ms: exitedAfter,
+        cpu_seconds_after: cpuAfter,
+        stderr: stderr().slice(0, 2_000),
+        gateway: {
+          models: gateway.modelRequests.length - modelsBefore,
+          chat: gateway.requests.length - chatBefore,
+        },
+        issuer: [],
+        interposer: [...new Set(interposer)],
+        job_states: [],
+        trace_errors: [],
+      },
+    };
+  } finally {
+    await session.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// fx teams on the PTY, revoked while its team picker waits for a key. A local
+// fake issuer answers the one request for the account's two teams. With
+// `emulateEio`, stdin-eio.c makes the revoked stdin fail reads with EIO, as
+// macos-15-arm64 answers; without it this machine answers a read of 0, the end
+// of input. Either way the picker returns its error and the restore on its way
+// out meets a terminal that is gone.
+async function runTeamPicker(
+  helpers: any,
+  pty: any,
+  gateway: any,
+  id: string,
+  emulateEio: boolean,
+  scratch: string,
+  out: string,
+): Promise<Observation> {
+  const root = mkdtempSync(join(scratch, `${id}-`));
+  for (const dir of ["home", "fx-home", "workspace", "pty"]) mkdirSync(join(root, dir));
+  const modelsBefore = gateway.modelRequests.length;
+  const chatBefore = gateway.requests.length;
+  const issuerRequests: string[] = [];
+  const issuer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const url = new URL(request.url);
+      issuerRequests.push(`${request.method} ${url.pathname}`);
+      if (url.pathname !== "/v2/teams") return new Response("not found", { status: 404 });
+      return Response.json({
+        teams: [
+          { id: "team_1", slug: "example-one", name: "Example One" },
+          { id: "team_2", slug: "example-two", name: "Example Two" },
+        ],
+      });
+    },
+  });
+  const issuerUrl = `http://127.0.0.1:${issuer.port}`;
+  writeFileSync(
+    join(root, "fx-home", "auth.json"),
+    JSON.stringify({
+      version: 1,
+      issuer: issuerUrl,
+      client_id: "test-client",
+      access_token: "fake-access-token",
+      refresh_token: "fake-refresh-token",
+      expires_at_ms: Date.now() + 3_600_000,
+      scope: "openid offline_access use:ai-gateway",
+      token_type: "Bearer",
+      team_id: "team_1",
+      team_slug: "example-one",
+    }) + "\n",
+    { mode: 0o600 },
+  );
+  const eioRecord = join(root, "stdin-eio.record");
+  const session = await pty.PtySession.launch({
+    bin: binary,
+    args: ["teams"],
+    cwd: join(root, "workspace"),
+    dir: join(root, "pty"),
+    env: {
+      ...fxEnv(helpers, gateway, root),
+      FX_TEST_OAUTH_ISSUER_URL: issuerUrl,
+      ...(emulateEio
+        ? {
+            DYLD_INSERT_LIBRARIES: stdinEioLibrary(out),
+            FX_STDIN_EIO_MODE: "revoked",
+            FX_STDIN_EIO_RECORD: eioRecord,
+          }
+        : {}),
+    },
+  });
+  try {
+    if (!(await session.waitForOutput((text: string) => text.includes("Example Two"), 15_000))) {
+      throw new Error(`${id}: fx teams never drew its team picker; stderr: ${session.stderr()}`);
+    }
+    // The picker is waiting for a key.
+    await session.waitForQuietOutput(300, 15_000);
+    session.revoke();
+    const started = performance.now();
+    const exit = await session.waitForExit(PICKER_EXIT_WAIT_MS);
+    const exitedAfter = exit ? Math.round(performance.now() - started) : null;
+    const stderr = session.stderr();
+    let end: End;
+    let restore: Restore = "none";
+    let cpuAfter: number | null = null;
+    if (exit) {
+      if (exit.code === 0) end = "exited";
+      else if (exit.signal === "SIGABRT" || /panic/.test(stderr)) end = "crashed";
+      else if (exit.code === 1 && FX_ERROR.test(stderr)) end = "failed";
+      else end = "other";
+      if (end === "exited" || end === "failed") restore = /unexpected errno/.test(stderr) ? "error" : "quiet";
+    } else {
+      const before = session.cpuSeconds();
+      await Bun.sleep(SPIN_WINDOW_MS);
+      cpuAfter = session.cpuSeconds();
+      const burned = before !== null && cpuAfter !== null ? cpuAfter - before : 0;
+      end = burned >= SPIN_CPU_SECONDS ? "spinning" : "other";
+    }
+    const interposer = readLines(eioRecord);
+    if (emulateEio && !interposer.some((line) => line.startsWith("read-eio"))) {
+      throw new Error(`${id}: stdin-eio.c never failed a read, so the run did not reach the EIO path`);
+    }
+    return {
+      id,
+      scenario: emulateEio ? "team-picker-revoke-eio" : "team-picker-revoke",
+      delay_ms: 0,
+      events: ["Revoke"],
+      end,
+      restore,
+      eio: emulateEio,
+      stops: true,
+      site: "team_picker",
+      evidence: {
+        exit,
+        exited_after_ms: exitedAfter,
+        cpu_seconds_after: cpuAfter,
+        stderr: stderr.slice(0, 2_000),
+        gateway: {
+          models: gateway.modelRequests.length - modelsBefore,
+          chat: gateway.requests.length - chatBefore,
+        },
+        issuer: issuerRequests,
+        interposer: [...new Set(interposer)],
+        job_states: [],
+        trace_errors: [],
+      },
+    };
+  } finally {
+    await session.dispose();
+    issuer.stop(true);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// fx login vercel on the PTY, waiting for browser authorization. A local fake
+// issuer answers the device flow and keeps every token request pending. For
+// sign-in-revoke-stopped it holds the second token request until the driver
+// has revoked the terminal, so the revoke lands while fx is in a request. fx
+// then goes on, with a terminal whose every poll reports POLLNVAL alone. The
+// wait must neither exit nor burn CPU, and the sign-in must poll the issuer
+// again. A fake `open` first on PATH records browser launches.
+async function runSignIn(
+  helpers: any,
+  pty: any,
+  gateway: any,
+  id: string,
+  scenario: Scenario,
+  scratch: string,
+): Promise<Observation> {
+  const root = mkdtempSync(join(scratch, `${id}-`));
+  for (const dir of ["home", "fx-home", "workspace", "pty", "bin"]) mkdirSync(join(root, dir));
+  const modelsBefore = gateway.modelRequests.length;
+  const chatBefore = gateway.requests.length;
+  const openedPath = join(root, "opened.log");
+  writeFileSync(join(root, "bin", "open"), `#!/bin/sh\nprintf '%s\\n' "$@" >> '${openedPath}'\n`, { mode: 0o755 });
+  let tokenRequests = 0;
+  let holdAt: number | null = scenario === "sign-in-revoke-stopped" ? 2 : null;
+  let held = false;
+  let release: () => void = () => {};
+  const released = new Promise<void>((resolve) => (release = resolve));
+  const issuer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const base = `http://127.0.0.1:${issuer.port}`;
+      if (url.pathname === "/.well-known/openid-configuration") {
+        return Response.json({
+          issuer: base,
+          device_authorization_endpoint: `${base}/oauth/device`,
+          token_endpoint: `${base}/oauth/token`,
+        });
+      }
+      if (url.pathname === "/oauth/device") {
+        return Response.json({
+          device_code: "device-code",
+          user_code: "TEST-CODE",
+          verification_uri: `${base}/verify`,
+          verification_uri_complete: `${base}/verify?code=TEST-CODE`,
+          expires_in: 600,
+          interval: 1,
+        });
+      }
+      if (url.pathname === "/oauth/token") {
+        tokenRequests += 1;
+        if (tokenRequests === holdAt) {
+          held = true;
+          await released;
+        }
+        return Response.json({ error: "authorization_pending" }, { status: 400 });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  const session = await pty.PtySession.launch({
+    bin: binary,
+    args: ["login", "vercel"],
+    cwd: join(root, "workspace"),
+    dir: join(root, "pty"),
+    env: {
+      ...fxEnv(helpers, gateway, root),
+      PATH: join(root, "bin"),
+      FX_TEST_OAUTH_ISSUER_URL: `http://127.0.0.1:${issuer.port}`,
+    },
+  });
+  try {
+    if (!(await session.waitForOutput((text: string) => text.includes("Waiting for authentication"), 15_000))) {
+      throw new Error(`${id}: fx login never said it waits for authentication; stderr: ${session.stderr()}`);
+    }
+    const events: Event[] = [];
+    const untilTokenRequests = async (count: number) => {
+      const deadline = Date.now() + 15_000;
+      while (tokenRequests < count) {
+        if (Date.now() > deadline) throw new Error(`${id}: fx made fewer than ${count} token requests`);
+        await Bun.sleep(10);
+      }
+    };
+    switch (scenario) {
+      case "sign-in-revoke-stopped":
+        {
+          const deadline = Date.now() + 15_000;
+          while (!held) {
+            if (Date.now() > deadline) throw new Error(`${id}: fx never made its second token request`);
+            await Bun.sleep(10);
+          }
+        }
+        session.revoke();
+        events.push("RevokeStopped");
+        holdAt = null;
+        release();
+        break;
+      case "sign-in-revoke-idle":
+        // Wait until fx has answered a token request and is in its wait for a key.
+        await untilTokenRequests(1);
+        await Bun.sleep(350);
+        session.revoke();
+        events.push("Revoke");
+        break;
+      case "sign-in-hangup":
+        await untilTokenRequests(1);
+        await Bun.sleep(350);
+        session.hangUp();
+        events.push("Hangup");
+        break;
+    }
+    const requestsAtEvent = tokenRequests;
+    const eventAt = performance.now();
+    await Bun.sleep(300);
+    const exit = session.exited();
+    let end: End;
+    let cpuAfter: number | null = null;
+    if (exit) {
+      if (exit.code === 0) end = "exited";
+      else if (exit.signal === "SIGABRT" || /panic/.test(session.stderr())) end = "crashed";
+      else if (exit.code === 1 && FX_ERROR.test(session.stderr())) end = "failed";
+      else end = "other";
+    } else {
+      const before = session.cpuSeconds();
+      await Bun.sleep(SPIN_WINDOW_MS);
+      cpuAfter = session.cpuSeconds();
+      const burned = before !== null && cpuAfter !== null ? cpuAfter - before : 0;
+      end = burned >= SPIN_CPU_SECONDS ? "spinning" : "waiting";
+    }
+    if (end === "waiting") {
+      // The sign-in goes on polling the issuer, as it does when no key is pressed.
+      const deadline = Date.now() + 5_000;
+      while (tokenRequests <= requestsAtEvent && Date.now() < deadline) await Bun.sleep(50);
+      if (tokenRequests <= requestsAtEvent) throw new Error(`${id}: fx waited but never polled the issuer again`);
+    }
+    const opened = readLines(openedPath).length;
+    return {
+      id,
+      scenario,
+      delay_ms: 0,
+      events,
+      end,
+      restore: "none",
+      eio: false,
+      stops: true,
+      site: "sign_in",
+      evidence: {
+        exit,
+        exited_after_ms: exit ? Math.round(performance.now() - eventAt) : null,
+        cpu_seconds_after: cpuAfter,
+        stderr: session.stderr().slice(0, 2_000),
+        gateway: {
+          models: gateway.modelRequests.length - modelsBefore,
+          chat: gateway.requests.length - chatBefore,
+        },
+        issuer: [`token_requests=${tokenRequests}`, `after_event=${tokenRequests - requestsAtEvent}`, `browser_opens=${opened}`],
+        interposer: [],
+        job_states: [],
+        trace_errors: [],
+      },
+    };
+  } finally {
+    release();
+    await session.dispose();
+    issuer.stop(true);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// fx mcp login --no-browser web on the PTY, waiting for a pasted address. The
+// fake OAuth server answers discovery and registration, so fx shows the
+// address and waits, and nothing approves it. The driver revokes the terminal,
+// or hangs it up. With `mcp-login-revoke-eio`, stdin-eio.c gives the revoked
+// stdin the macos-15-arm64 answer: it polls readable and every read fails with
+// EIO. The wait must stop with status 1 and a short message, redeem no code,
+// and not spin. Without it this machine answers a read of 0, the end of input,
+// for a revoked terminal and for a hung-up one, and the wait goes on asleep
+// between its polls, waiting for the browser. A fake open first on PATH means
+// no browser starts.
+//
+// `mcp-login-complete-revoke-eio` also plays the browser: it approves at the
+// fake server and delivers the callback to fx's listener, so the sign-in
+// finishes. Without `race` the driver revokes the terminal as soon as the
+// login is saved. With it, the callback and the revoke follow each other at the
+// offsets `race` gives.
+type Race = { revokeFirst: boolean; offsetMs: number };
+
+// The address of the sign-in as the browser would take it: the fake server's
+// authorize endpoint answers with the redirect to fx's listener.
+async function callbackUrl(session: any): Promise<string> {
+  const address = (session.output().match(/https?:\/\/[^\s]*\/authorize\?[^\s]*/) ?? [])[0];
+  if (!address) throw new Error(`fx mcp login showed no authorize address: ${JSON.stringify(session.output().slice(0, 300))}`);
+  const approved = await fetch(address, { redirect: "manual" });
+  const back = approved.headers.get("location");
+  if (!back) throw new Error(`the fake server's authorize answered ${approved.status} with no redirect`);
+  return back;
+}
+
+// The browser arriving at fx's listener. A refused connection, because fx is
+// gone, is an answer too.
+async function deliver(url: string): Promise<void> {
+  try {
+    await (await fetch(url)).text();
+  } catch {}
+}
+
+async function runMcpLogin(
+  helpers: any,
+  pty: any,
+  gateway: any,
+  id: string,
+  scenario: Scenario,
+  scratch: string,
+  out: string,
+  race: Race | null = null,
+): Promise<Observation> {
+  const emulateEio = scenario === "mcp-login-revoke-eio" || scenario === "mcp-login-complete-revoke-eio";
+  const completes = scenario === "mcp-login-complete-revoke-eio";
+  const f = fixture(scratch, id);
+  for (const dir of ["pty", "bin"]) mkdirSync(join(f.base, dir));
+  writeFileSync(join(f.base, "bin", "open"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const modelsBefore = gateway.modelRequests.length;
+  const chatBefore = gateway.requests.length;
+  const fake = await startFake(f);
+  writeProfile(f, { web: { type: "http", url: fake.url } });
+  const eioRecord = join(f.base, "stdin-eio.record");
+  const env = {
+    ...fxEnv(helpers, gateway, f.base),
+    FX_HOME: join(f.home, ".fx"),
+    PATH: `${join(f.base, "bin")}:/usr/bin:/bin`,
+  };
+  const session = await pty.PtySession.launch({
+    bin: binary,
+    args: ["mcp", "login", "--no-browser", "web"],
+    cwd: f.workspace,
+    dir: join(f.base, "pty"),
+    env: {
+      ...env,
+      ...(emulateEio
+        ? {
+            DYLD_INSERT_LIBRARIES: stdinEioLibrary(out),
+            FX_STDIN_EIO_MODE: "revoked",
+            FX_STDIN_EIO_RECORD: eioRecord,
+          }
+        : {}),
+    },
+  });
+  try {
+    if (!(await session.waitForOutput((text: string) => text.includes("paste the address"), 15_000))) {
+      throw new Error(`${id}: fx mcp login never showed its address; stderr: ${session.stderr()}`);
+    }
+    // The wait is polling stdin for a pasted address.
+    await session.waitForQuietOutput(300, 15_000);
+    const events: Event[] = [];
+    let started: number;
+    if (!completes) {
+      events.push(scenario === "mcp-login-hangup" ? "Hangup" : "Revoke");
+      if (scenario === "mcp-login-hangup") session.hangUp();
+      else session.revoke();
+      started = performance.now();
+    } else if (race?.revokeFirst) {
+      const back = await callbackUrl(session);
+      session.revoke();
+      started = performance.now();
+      await Bun.sleep(race.offsetMs);
+      await deliver(back);
+    } else if (race) {
+      const back = await callbackUrl(session);
+      const delivered = deliver(back);
+      await Bun.sleep(race.offsetMs);
+      session.revoke();
+      started = performance.now();
+      await delivered;
+    } else {
+      // As soon as the login is saved the sign-in is finished, and the revoke
+      // lands in the slice that the callback fell into, unless fx has already
+      // ended it, which the model replays without the revoke.
+      const back = await callbackUrl(session);
+      const delivered = deliver(back);
+      await waitFor("the login to be saved", () => existsSync(storePath(f)), 15_000, 1);
+      events.push("Complete");
+      if (session.exited() === null) {
+        events.push("Revoke");
+        session.revoke();
+      }
+      started = performance.now();
+      await delivered;
+    }
+    const exit = await session.waitForExit(race ? RACE_EXIT_WAIT_MS : EXIT_WAIT_MS);
+    const exitedAfter = exit ? Math.round(performance.now() - started) : null;
+    const stderr = session.stderr();
+    let end: End;
+    let restore: Restore = "none";
+    let cpuAfter: number | null = null;
+    if (exit) {
+      if (exit.code === 0) end = "exited";
+      else if (exit.signal === "SIGABRT" || /panic/.test(stderr)) end = "crashed";
+      else if (exit.code === 1 && MCP_LOGIN_STOPPED.test(stderr)) end = "failed";
+      else end = "other";
+      if (end === "exited" || end === "failed") restore = /unexpected errno/.test(stderr) ? "error" : "quiet";
+    } else {
+      // A spin shows in CPU, and, because stdin-eio.c appends to its record on
+      // every call and a slow disk throttles that, in how many passes fx made.
+      const before = session.cpuSeconds();
+      const passesBefore = readLines(eioRecord).length;
+      await Bun.sleep(SPIN_WINDOW_MS);
+      cpuAfter = session.cpuSeconds();
+      const burned = before !== null && cpuAfter !== null ? cpuAfter - before : 0;
+      const passes = readLines(eioRecord).length - passesBefore;
+      end = burned >= SPIN_CPU_SECONDS || passes >= SPIN_PASSES ? "spinning" : "waiting";
+    }
+    const interposer = readLines(eioRecord);
+    if (emulateEio && !interposer.some((line) => line.startsWith("read-eio"))) {
+      // A run that ended by the sign-in before the revoke reached fx never
+      // fails a read.
+      if (!(completes && end === "exited")) {
+        throw new Error(`${id}: stdin-eio.c never failed a read, so the run did not reach the EIO path`);
+      }
+    }
+    const issuer = [`token_exchanges=${redemptions(fake.entries()).length}`];
+    if (completes) {
+      // What the server says now, through the same fx and profile.
+      const listed = await runFx(binary, f, ["mcp", "list", "--json"], env);
+      issuer.push(`status=${(JSON.parse(listed.stdout).servers?.[0]?.status as string | undefined) ?? "unknown"}`);
+    }
+    return {
+      id,
+      scenario,
+      delay_ms: 0,
+      events,
+      end,
+      restore,
+      eio: emulateEio,
+      stops: true,
+      site: "mcp_login",
+      evidence: {
+        exit,
+        exited_after_ms: exitedAfter,
+        cpu_seconds_after: cpuAfter,
+        stderr: stderr.slice(0, 2_000),
+        gateway: {
+          models: gateway.modelRequests.length - modelsBefore,
+          chat: gateway.requests.length - chatBefore,
+        },
+        issuer,
+        interposer: [...new Set(interposer)],
+        job_states: [],
+        trace_errors: [],
+      },
+    };
+  } finally {
+    await session.dispose();
+    fake.stop();
+    rmSync(f.base, { recursive: true, force: true });
+  }
+}
+
+// fx from an interactive bash in tmux, through Ctrl+Z, bg, fg, and /quit.
+async function runJobControl(
+  helpers: any,
+  jobs: any,
+  gateway: any,
+  id: string,
+  scenario: Scenario,
+  scratch: string,
+): Promise<Observation> {
+  const ignore = scenario === "job-control-signals-ignored";
+  const root = mkdtempSync(join(scratch, `${id}-`));
+  for (const dir of ["home", "fx-home", "workspace"]) mkdirSync(join(root, dir));
+  const stderrPath = join(root, "stderr.log");
+  const modelsBefore = gateway.modelRequests.length;
+  const chatBefore = gateway.requests.length;
+  const session = await helpers.TmuxSession.create({
+    cmd: jobs.JOB_SHELL,
+    cwd: join(root, "workspace"),
+    isolated: true,
+    width: 100,
+    height: 30,
+    env: {
+      ...fxEnv(helpers, gateway, root),
+      ...jobs.JOB_SHELL_ENV,
+      FX_TRACE_LOG: join(root, "trace.log"),
+      VERCEL_OIDC_TOKEN: undefined,
+    },
+  });
+  try {
+    const events: Event[] = [];
+    const states: Array<string | null> = [];
+    const traceErrors = () =>
+      readLines(join(root, "trace.log"))
+        .filter((line) => /error|InputOutput|read_failed/.test(line) && !/tmux_clear/.test(line))
+        .map((line) => line.replace(/^\d+ /, ""))
+        .slice(-4);
+    const observation = (end: End, code: number | null, stderr: string): Observation => ({
+      id,
+      scenario,
+      delay_ms: 0,
+      events,
+      end,
+      restore: /unexpected errno/.test(stderr) ? "error" : "clean",
+      eio: false,
+      stops: !ignore,
+      site: "shell",
+      evidence: {
+        exit: code === null ? null : { code, signal: null },
+        exited_after_ms: null,
+        cpu_seconds_after: null,
+        stderr: stderr.slice(0, 2_000),
+        gateway: {
+          models: gateway.modelRequests.length - modelsBefore,
+          chat: gateway.requests.length - chatBefore,
+        },
+        issuer: [],
+        interposer: [],
+        job_states: states,
+        trace_errors: traceErrors(),
+      },
+    });
+    await session.waitForText(/^\$/m, 15_000);
+    await session.sendText(jobs.launchLine(binary, stderrPath, ignore));
+    await session.waitForComposer(15_000);
+    await waitForModels(gateway, modelsBefore);
+    await session.waitForStableComposer(15_000, 500);
+
+    await session.sendKeys("C-z");
+    events.push("Suspend");
+    await session.waitForText("Stopped", 15_000);
+    states.push(await jobs.waitForFxState(session, binary, jobs.stopped, 15_000));
+
+    // With the default signals fx stops again at its resume's tcsetattr; with
+    // them ignored it runs on in the background, where its repaint clears the
+    // shell's lines.
+    await session.sendText("bg");
+    events.push("Bg");
+    if (!ignore) await session.waitForText(/ &$/m, 15_000);
+    // A run where fx is gone in the background is an observation too.
+    const background = ignore ? (state: string | null) => !jobs.stopped(state) : jobs.stopped;
+    const afterBg = await jobs.waitForFxState(session, binary, background, 15_000, 500);
+    states.push(afterBg);
+    if (afterBg === null) {
+      const stderr = readFileSync(stderrPath, "utf8");
+      return observation(/^fx: /m.test(stderr) ? "failed" : "other", null, stderr);
+    }
+
+    await session.sendText("fg; echo fx-exit=$?");
+    if (ignore) {
+      // fx in the background reads this line too. That read fails with EIO
+      // on a terminal that is still there, which ends fx with an error, as
+      // before the change, unless the shell's fg wins the race.
+      events.push("Type");
+      const next = await jobs.waitForFxState(session, binary, (state: string | null) => state === null || jobs.inForeground(state), 15_000);
+      if (next === null) {
+        states.push(null);
+        const stderr = readFileSync(stderrPath, "utf8");
+        return observation(/^fx: /m.test(stderr) ? "failed" : "other", null, stderr);
+      }
+    }
+    events.push("Fg");
+    states.push(await jobs.waitForFxState(session, binary, jobs.inForeground, 15_000));
+    if (!ignore) await session.waitForStableComposer(15_000, 500);
+    await session.sendText("/quit");
+    events.push("Quit");
+    const pane = await session.waitForText(/fx-exit=\d+/, 15_000);
+    const code = Number(pane.match(/fx-exit=(\d+)/)![1]);
+    const stderr = readFileSync(stderrPath, "utf8");
+    return observation(code === 0 ? "exited" : code === 1 && /^fx: /m.test(stderr) ? "failed" : "other", code, stderr);
+  } finally {
+    await session.kill();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const MCP_LOGIN_GONE_LINE = "Couldn't sign in to web: the terminal is gone.\n";
+
+// What a run of mcp-login-complete-revoke-eio may end with: status 0 with the
+// server signed in after one token exchange and nothing on stderr, or status 1
+// with the terminal-gone line and nothing saved. A server that is signed in
+// after fx said it was not is the wrong exit that FinishedSignInNeverFails rules out.
+function wrongExit(o: Observation): string | null {
+  const [exchanges, state] = o.evidence.issuer;
+  const status = state?.replace(/^status=/, "");
+  const stderr = o.evidence.stderr;
+  const seen = `${exchanges} status=${status} stderr=${JSON.stringify(stderr)}`;
+  if (o.end === "exited") {
+    return exchanges === "token_exchanges=1" && status === "signed_in" && stderr === "" ? null : `exit 0 with ${seen}`;
+  }
+  if (o.end === "failed") {
+    return status !== "signed_in" && stderr === MCP_LOGIN_GONE_LINE ? null : `exit 1 with ${seen}`;
+  }
+  return `${o.end} with ${seen}`;
+}
+
+function tlaString(value: string): string {
+  return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
+function observedModule(observations: Replayed[]): string {
+  const records = observations.map((o) =>
+    `    [events |-> <<${o.events.map(tlaString).join(", ")}>>, end |-> ${tlaString(o.end)}, ` +
+      `restore |-> ${tlaString(o.restore)}, eio |-> ${o.eio ? "TRUE" : "FALSE"}, stops |-> ${o.stops ? "TRUE" : "FALSE"}, ` +
+      `site |-> ${tlaString(o.site)}]`
+  );
+  return [
+    "---------------------- MODULE TerminalRevokeObserved ----------------------",
+    "EXTENDS Sequences",
+    "Observed == <<",
+    records.join(",\n"),
+    ">>",
+    "=============================================================================",
+    "",
+  ].join("\n");
+}
+
+async function check(dir: string, observations: Replayed[], bug: string): Promise<{ verdict: Verdict; states: number | null }> {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "TerminalRevokeObserved.tla"), observedModule(observations));
+  writeFileSync(
+    join(dir, "trace.cfg"),
+    [
+      "CONSTANTS",
+      "    MaxSpins = 2",
+      "    MaxIntr = 2",
+      `    Bug = "${bug}"`,
+      "INIT TraceInit",
+      "NEXT TraceNext",
+      "INVARIANT NotAllMatched",
+      "CHECK_DEADLOCK FALSE",
+      "",
+    ].join("\n"),
+  );
+  const run = await runTlc(dir, "TerminalRevokeTrace", "trace.cfg", ["TerminalRevoke.tla", "TerminalRevokeTrace.tla"], tlaDir);
+  const verdict: Verdict = run.violated === "NotAllMatched"
+    ? "ACCEPTED"
+    : run.exitCode === 0
+    ? "REJECTED"
+    : "TOOL_ERROR";
+  return { verdict, states: run.distinctStates };
+}
+
+async function main(): Promise<number> {
+  if (process.platform !== "darwin") {
+    console.error("this driver needs revoke(2), which only macOS has here");
+    return 2;
+  }
+  const helpers = await targetHelpers();
+  const pty = await targetModule("pty-session.ts");
+  const jobs = await targetModule("job-control.ts");
+  const out = outDir("shell-runtime");
+  const scratch = realpathSync(mkdtempSync(join(tmpdir(), "fx-tla-terminal-revoke-")));
+  const gateway = helpers.startFakeGateway([]);
+  const runs: Array<{ scenario: Scenario; delay: number }> = (options.scenario ? [options.scenario] : SCENARIOS).map(
+    (scenario) => ({ scenario, delay: 0 }),
+  );
+  const next = generator(options.seed);
+  for (let i = 0; i < (options.scenario ? 0 : options.random); i++) {
+    runs.push({
+      scenario: RANDOM_SCENARIOS[Math.floor(next() * RANDOM_SCENARIOS.length)]!,
+      delay: Math.floor(next() * 800),
+    });
+  }
+  const observations: Observation[] = [];
+  const wrongExits: string[] = [];
+  try {
+    for (const [index, run] of runs.entries()) {
+      const id = `run${index + 1}`;
+      const observation = run.scenario.startsWith("job-control")
+        ? await runJobControl(helpers, jobs, gateway, id, run.scenario, scratch)
+        : run.scenario.startsWith("team-picker-revoke")
+        ? await runTeamPicker(helpers, pty, gateway, id, run.scenario === "team-picker-revoke-eio", scratch, out)
+        : run.scenario.startsWith("sign-in-")
+        ? await runSignIn(helpers, pty, gateway, id, run.scenario, scratch)
+        : run.scenario.startsWith("mcp-login-")
+        ? await runMcpLogin(helpers, pty, gateway, id, run.scenario, scratch, out)
+        : await runScenario(helpers, pty, gateway, id, run.scenario, run.delay, scratch, out);
+      observations.push(observation);
+      const { gateway: counted, issuer, exited_after_ms, cpu_seconds_after, interposer, job_states, trace_errors } = observation.evidence;
+      console.log(
+        `${observation.id} ${observation.scenario} delay=${observation.delay_ms}ms events=${observation.events.join(",")} ` +
+          `end=${observation.end} restore=${observation.restore} exited_after_ms=${exited_after_ms} ` +
+          `cpu_after=${cpu_seconds_after} gateway_models=${counted.models} gateway_chat=${counted.chat}` +
+          (issuer.length ? ` issuer=${issuer.join(",")}` : "") +
+          (interposer.length ? ` stdin_eio=${interposer.join(",")}` : "") +
+          (job_states.length ? ` fx_states=${job_states.join(",")}` : "") +
+          (trace_errors.length ? ` trace=${JSON.stringify(trace_errors.join(" | ").slice(0, 200))}` : "") +
+          (observation.end !== "exited" ? ` stderr=${JSON.stringify(observation.evidence.stderr.slice(0, 120))}` : ""),
+      );
+      // A shell run asks the fake gateway for its models once; fx teams never does.
+      const expectedModels = observation.site === "shell" ? 1 : 0;
+      if (counted.models !== expectedModels || counted.chat !== 0) {
+        console.error(`${observation.id}: expected the fake gateway to count ${expectedModels} models request and no chat request`);
+        return 2;
+      }
+      const completes = observation.scenario === "mcp-login-complete-revoke-eio";
+      if (observation.site === "mcp_login" && issuer[0] !== `token_exchanges=${completes ? 1 : 0}`) {
+        console.error(`${observation.id}: expected the fake OAuth server to redeem ${completes ? "one code" : "no code"}, saw ${issuer.join(",") || "none"}`);
+        return 2;
+      }
+      const wrong = completes ? wrongExit(observation) : null;
+      if (wrong) wrongExits.push(`${observation.id} ${wrong}`);
+      if (observation.site === "team_picker" && issuer.join(",") !== "GET /v2/teams") {
+        console.error(`${observation.id}: expected the fake issuer to count one teams request, saw ${issuer.join(",") || "none"}`);
+        return 2;
+      }
+    }
+    // The race: the callback and the revoke at random offsets, in either order.
+    const tally: Record<string, number> = {};
+    for (let i = 0; i < options.race; i++) {
+      const revokeFirst = next() < 0.35;
+      const race: Race = { revokeFirst, offsetMs: Math.floor(next() * (revokeFirst ? 31 : 301)) };
+      const attempt = await runMcpLogin(helpers, pty, gateway, `race${i + 1}`, "mcp-login-complete-revoke-eio", scratch, out, race);
+      const [exchanges, state] = attempt.evidence.issuer;
+      const key = `${attempt.end} ${state} ${exchanges}`;
+      tally[key] = (tally[key] ?? 0) + 1;
+      const { models, chat } = attempt.evidence.gateway;
+      if (models !== 0 || chat !== 0) {
+        console.error(`${attempt.id}: expected the fake gateway to count no request, saw ${models} models and ${chat} chat`);
+        return 2;
+      }
+      const wrong = wrongExit(attempt);
+      if (wrong) {
+        wrongExits.push(`${attempt.id} (${revokeFirst ? "revoke first" : "callback first"}, offset ${race.offsetMs} ms) ${wrong}`);
+      }
+    }
+    if (options.race > 0) console.log(`race: ${options.race} attempts ${JSON.stringify(tally)}`);
+  } finally {
+    gateway.stop();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+  writeJson(join(out, "observations.json"), observations);
+  for (const wrong of wrongExits) console.error(`WRONG EXIT ${wrong}`);
+  if (options.race > 0) console.log(`race: ${wrongExits.length} wrong exits`);
+
+  const design = await check(join(out, "design"), observations, "none");
+  console.log(`TLC TerminalRevokeTrace Bug=none: ${design.verdict} (${design.states} distinct states)`);
+  let status = design.verdict === "ACCEPTED" ? 0 : design.verdict === "REJECTED" ? 1 : 2;
+  if (wrongExits.length > 0 && status === 0) status = 1;
+  if (options.selfCheck) {
+    const today = await check(join(out, "today"), observations, "today");
+    console.log(`TLC TerminalRevokeTrace Bug=today: ${today.verdict} (must be REJECTED)`);
+    if (today.verdict === "TOOL_ERROR") status = 2;
+    else if (today.verdict !== "REJECTED" && status === 0) status = 1;
+    // The team picker runs alone. Through fx before the prompts' fix, the
+    // restore reported an unexpected errno, so a quiet restore must not fit;
+    // through fx where the picker reads again after a read of 0, the plain
+    // revoke would have spun, so a run that ended must not fit.
+    const prompts = observations.filter((o) => o.site === "team_picker");
+    for (const [name, bug] of [["prompts-strict", "prompts_strict"], ["picker-ignores-eof", "picker_ignores_eof"]]) {
+      if (prompts.length === 0) break;
+      const replay = await check(join(out, name!), prompts, bug!);
+      console.log(`TLC TerminalRevokeTrace Bug=${bug} (prompt runs only): ${replay.verdict} (must be REJECTED)`);
+      if (replay.verdict === "TOOL_ERROR") status = 2;
+      else if (replay.verdict !== "REJECTED" && status === 0) status = 1;
+    }
+    // The sign-in wait. The run that revoked the terminal in a request leaves
+    // every poll of stdin reporting POLLNVAL alone: through fx before the wait's
+    // fix, and through a fix that misses POLLNVAL, that run spins, so a run that
+    // kept waiting must not fit.
+    const signIn = observations.filter((o) => o.site === "sign_in" && o.events.includes("RevokeStopped"));
+    for (const [name, bug] of [["sign-in-spins", "sign_in_spins"], ["sign-in-nval", "sign_in_nval"]]) {
+      if (signIn.length === 0) break;
+      const replay = await check(join(out, name!), signIn, bug!);
+      console.log(`TLC TerminalRevokeTrace Bug=${bug} (sign-in revoke run only): ${replay.verdict} (must be REJECTED)`);
+      if (replay.verdict === "TOOL_ERROR") status = 2;
+      else if (replay.verdict !== "REJECTED" && status === 0) status = 1;
+    }
+    // The paste wait. The run that ended must not fit fx before the wait's fix,
+    // which went round again at once on a failed read, nor a fix that only
+    // sleeps, which never ends the wait on a gone terminal.
+    const mcpLogin = observations.filter((o) => o.site === "mcp_login" && o.end === "failed");
+    for (const [name, bug] of [["mcp-login-spins", "mcp_login_spins"], ["mcp-login-sleeps", "mcp_login_sleeps"]]) {
+      if (mcpLogin.length === 0) break;
+      const replay = await check(join(out, name!), mcpLogin, bug!);
+      console.log(`TLC TerminalRevokeTrace Bug=${bug} (fx mcp login run that ended only): ${replay.verdict} (must be REJECTED)`);
+      if (replay.verdict === "TOOL_ERROR") status = 2;
+      else if (replay.verdict !== "REJECTED" && status === 0) status = 1;
+    }
+    // The sign-in that finished while the terminal went. The fixed fx never
+    // reports it as failed, so the outcome of fx before the re-check is written
+    // down here: the design must reject it, and the model of that fx, where
+    // the handler of the failed read does not look again, must accept it.
+    const beforeRecheck: Replayed = {
+      events: ["Complete", "Revoke"],
+      end: "failed",
+      restore: "quiet",
+      eio: true,
+      stops: true,
+      site: "mcp_login",
+    };
+    for (const [name, bug, wanted] of [["recheck-design", "none", "REJECTED"], ["recheck-head", "mcp_login_done_ignored", "ACCEPTED"]] as const) {
+      const replay = await check(join(out, name), [beforeRecheck], bug);
+      console.log(`TLC TerminalRevokeTrace Bug=${bug} (a sign-in that finished, reported as failed): ${replay.verdict} (must be ${wanted})`);
+      if (replay.verdict === "TOOL_ERROR") status = 2;
+      else if (replay.verdict !== wanted && status === 0) status = 1;
+    }
+  }
+  console.log(`output: ${out}`);
+  return status;
+}
+
+try {
+  process.exitCode = await main();
+} catch (error) {
+  console.error(error);
+  process.exitCode = 2;
+}

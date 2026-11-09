@@ -21,6 +21,7 @@ import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { startIdleDropProxy } from "./fixtures/idle-drop-proxy";
 import { startLegacyStreamableHttpFixture } from "./fixtures/mcp-legacy-remote";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
+import { PtySession, revokeAvailable } from "./pty-session";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -1007,6 +1008,73 @@ describe("MCP login", () => {
     expect(existsSync(root.openLog)).toBe(false);
     expect(auth.tokenExchanges).toBe(1);
   }, 40_000);
+
+  // revoke(2) takes fx's terminal away, as a logout can. macOS 15 then polls
+  // the terminal as readable and fails every read with EIO; stdin-eio.c gives
+  // newer macOS the same answer, so the run reaches the paste wait's failed
+  // read everywhere. The wait used to go round again at once, at full CPU,
+  // until the login's own deadline (`tests/tla/shell_runtime/TerminalRevoke.tla`
+  // NoBusyLoop). It must stop with status 1, save nothing, and start no
+  // authorization.
+  test.skipIf(!revokeAvailable())("a revoked terminal ends fx mcp login --no-browser instead of spinning", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const dir = join(root.root, "pty");
+    mkdirSync(dir);
+    const library = join(dir, "stdin-eio.dylib");
+    const built = Bun.spawnSync(["cc", "-dynamiclib", "-O2", "-Wall", "-Wextra", join(import.meta.dirname, "fixtures", "stdin-eio.c"), "-o", library]);
+    expect(built.stderr.toString()).toBe("");
+    expect(built.exitCode).toBe(0);
+    const eioRecord = join(dir, "stdin-eio.record");
+    // A fake `open` first on PATH, so nothing can start a browser.
+    const pty = await PtySession.launch({
+      bin: FX_BIN,
+      args: ["mcp", "login", "--no-browser", "fixture"],
+      cwd: root.workspace,
+      dir,
+      env: {
+        HOME: root.home,
+        PATH: [root.bin, "/usr/bin", "/bin"].join(delimiter),
+        TERM: "xterm-256color",
+        FX_HOME: join(root.home, ".fx"),
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SOUND: "0",
+        FX_AUTO_UPGRADE: "0",
+        AI_GATEWAY_API_KEY: "fake-mcp-login-revoked-key",
+        DYLD_INSERT_LIBRARIES: library,
+        FX_STDIN_EIO_MODE: "revoked",
+        FX_STDIN_EIO_RECORD: eioRecord,
+      },
+    });
+    try {
+      expect(await pty.waitForOutput((text) => text.includes("paste the address"), 15_000)).toBe(true);
+      // fx waits for a pasted address.
+      expect(await pty.waitForQuietOutput(300, 15_000)).toBe(true);
+      pty.revoke();
+      const exit = await pty.waitForExit(3_000);
+      // A spin shows in CPU, and, because stdin-eio.c appends to its record on
+      // every call and a slow disk throttles that, in how many passes fx made.
+      const passes = () => (existsSync(eioRecord) ? readFileSync(eioRecord, "utf8").split("\n").length : 0);
+      let spinning = false;
+      if (!exit) {
+        const cpuBefore = pty.cpuSeconds() ?? 0;
+        const passesBefore = passes();
+        await Bun.sleep(1_000);
+        spinning = (pty.cpuSeconds() ?? 0) - cpuBefore >= 0.5 || passes() - passesBefore >= 100;
+      }
+      expect({ exit, spinning }).toEqual({ exit: { code: 1, signal: null }, spinning: false });
+      expect(pty.stderr()).toBe("Couldn't sign in to fixture: the terminal is gone.\n");
+      expect(readFileSync(eioRecord, "utf8")).toContain("read-eio-revoked");
+      // The sign-in never got past its address: nothing was approved or exchanged, and nothing was saved.
+      expect(auth.authorizationRequests).toBe(0);
+      expect(auth.tokenExchanges).toBe(0);
+      expect(existsSync(root.openLog)).toBe(false);
+      expect(await statusOf(root)).not.toBe("signed_in");
+    } finally {
+      await pty.dispose();
+    }
+  }, 60_000);
 
   test("fx mcp login takes only its own return: a stray return and a silent connection don't end or hold up the sign-in", async () => {
     upstream = startModernMcpHttpFixture("json");

@@ -38,6 +38,8 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
+import { PtySession, revokeAvailable, revokeTerminal } from "./pty-session";
+import { inForeground, JOB_SHELL, JOB_SHELL_ENV, launchLine, stopped, waitForFxState } from "./job-control";
 import { commandReplays, logLines, onlySessionId, savedSessionIds, savedText, sessionDir, storeRoot } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
@@ -765,6 +767,369 @@ test("Linux tmux fallbacks preserve exact ASCII and replay alignment", () => {
     "linux",
   )).toBe(false);
 });
+
+// revoke(2) takes fx's terminal away, as a logout can. A revoke that lands
+// while fx waits in poll wakes that poll as a hang-up; one that lands between
+// two polls leaves every later poll reporting POLLNVAL alone, at once, which
+// fx missed and so spun at full CPU (`tests/tla/shell_runtime/TerminalRevoke.tla`
+// NoBusyLoop). The cleanup then restores a terminal that is gone, which must
+// stay quiet (GoneQuietly).
+function revokedTerminalEnv(
+  home: string,
+  gateway: ReturnType<typeof startFakeGateway>,
+): Record<string, string> {
+  return {
+    HOME: home,
+    PATH: "/usr/bin:/bin",
+    TERM: "xterm-256color",
+    FX_HOME: join(home, ".fx"),
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_SOUND: "0",
+    FX_AUTO_UPGRADE: "0",
+    FX_TEST_SKIP_ONBOARDING: "1",
+    FX_TEST_INPUT_LOOP_NETWORK_GUARD: "1",
+    AI_GATEWAY_API_KEY: "fake-revoked-terminal-key",
+    FX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_MODEL: FAKE_GATEWAY_MODEL,
+  };
+}
+
+/// fx asks the gateway for its models once at startup. Revoking before that
+/// request lands the revoke in startup rather than in the input loop these
+/// tests cover; a revoke there still ends fx, but with status 1.
+async function waitForStartupModels(gateway: ReturnType<typeof startFakeGateway>): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  while (gateway.modelRequests.length < 1) {
+    if (Date.now() > deadline) throw new Error("fx never asked the fake gateway for its models");
+    await Bun.sleep(10);
+  }
+}
+
+/// fx on a PTY whose other side stays open and that is not fx's controlling
+/// terminal, so no SIGHUP reaches it: the terminal is all fx sees.
+async function withRevocablePty(
+  prefix: string,
+  body: (pty: PtySession, gateway: ReturnType<typeof startFakeGateway>) => Promise<void>,
+): Promise<void> {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  for (const dir of ["home", "workspace", "pty"]) mkdirSync(join(root, dir));
+  const gateway = startFakeGateway([]);
+  const pty = await PtySession.launch({
+    bin: FX_BIN,
+    cwd: join(root, "workspace"),
+    dir: join(root, "pty"),
+    env: revokedTerminalEnv(join(root, "home"), gateway),
+  });
+  try {
+    expect(await pty.waitForOutput((text) => text.includes("┃"), TIMEOUT)).toBe(true);
+    await waitForStartupModels(gateway);
+    expect(await pty.waitForQuietOutput(300, TIMEOUT)).toBe(true);
+    await body(pty, gateway);
+    expect(gateway.modelRequests).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(0);
+  } finally {
+    await pty.dispose();
+    gateway.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test.skipIf(!revokeAvailable())("fx exits cleanly when its terminal is revoked between polls", async () => {
+  await withRevocablePty("fx-revoked-pty-", async (pty) => {
+    await pty.revokeBetweenPolls();
+    const exit = await pty.waitForExit(5_000);
+    expect({ exit, stderr: pty.stderr() }).toEqual({ exit: { code: 0, signal: null }, stderr: "" });
+  });
+}, TIMEOUT * 2);
+
+test.skipIf(!revokeAvailable())("fx exits cleanly when its terminal is revoked during a paste", async () => {
+  await withRevocablePty("fx-revoked-paste-", async (pty) => {
+    // fx is reading and drawing when the terminal goes: the frame for what it
+    // read meets the revoked terminal.
+    const chunk = "x".repeat(4096);
+    for (let sent = 0; sent < 256 * 1024; sent += chunk.length) {
+      if (sent === 64 * 1024) pty.revoke();
+      try {
+        pty.write(chunk);
+      } catch {
+        break;
+      }
+    }
+    const exit = await pty.waitForExit(5_000);
+    expect({ exit, stderr: pty.stderr() }).toEqual({ exit: { code: 0, signal: null }, stderr: "" });
+  });
+}, TIMEOUT * 2);
+
+test.skipIf(!revokeAvailable() || !tmuxAvailable())("a revoked tmux pane ends fx with a clean exit", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-revoked-tmux-")));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const stderrPath = join(root, "stderr.log");
+  mkdirSync(home);
+  mkdirSync(workspace);
+  const gateway = startFakeGateway([]);
+  let session: TmuxSession | null = null;
+  try {
+    session = await TmuxSession.create({
+      cwd: workspace,
+      isolated: true,
+      remainOnExit: true,
+      stderrPath,
+      width: 100,
+      height: 30,
+      env: { ...revokedTerminalEnv(home, gateway), VERCEL_OIDC_TOKEN: undefined },
+    });
+    // Revoke while fx waits in its input loop: after its startup request and
+    // once the screen has settled.
+    await session.waitForComposer(TIMEOUT);
+    await waitForStartupModels(gateway);
+    await session.waitForStableComposer(TIMEOUT, 500);
+    const tty = execFileSync("ps", ["-o", "tty=", "-p", String(session.processPid())], {
+      encoding: "utf8",
+    }).trim();
+    revokeTerminal(`/dev/${tty}`);
+    await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+    expect({ status: session.paneStatus().status, stderr: readFileSync(stderrPath, "utf8") })
+      .toEqual({ status: 0, stderr: "" });
+    expect(gateway.modelRequests).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(0);
+  } finally {
+    await session?.kill();
+    gateway.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+// The team picker of fx teams reads keys on its own, with no poll. A revoked
+// terminal reads as 0 on this Mac and fails reads with EIO on macOS 15; the
+// picker once took a read of 0 as a key to ignore and read again at full CPU
+// (`tests/tla/shell_runtime/TerminalRevoke.tla` NoReadAfterEof). It must end
+// with status 1 and a short message, and restore the terminal quietly.
+test.skipIf(!revokeAvailable())("a revoked terminal ends the team picker instead of spinning", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-revoked-picker-")));
+  const home = join(root, "home");
+  for (const dir of ["home", "workspace", "pty"]) mkdirSync(join(root, dir));
+  const issuerRequests: string[] = [];
+  const issuer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const url = new URL(request.url);
+      issuerRequests.push(`${request.method} ${url.pathname}`);
+      if (url.pathname !== "/v2/teams") return new Response("not found", { status: 404 });
+      return Response.json({
+        teams: [
+          { id: "team_1", slug: "example-one", name: "Example One" },
+          { id: "team_2", slug: "example-two", name: "Example Two" },
+        ],
+      });
+    },
+  });
+  const issuerUrl = `http://127.0.0.1:${issuer.port}`;
+  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  writeFileSync(
+    join(home, ".fx", "auth.json"),
+    JSON.stringify({
+      version: 1,
+      issuer: issuerUrl,
+      client_id: "test-client",
+      access_token: "fake-access-token",
+      refresh_token: "fake-refresh-token",
+      expires_at_ms: Date.now() + 3_600_000,
+      scope: "openid offline_access use:ai-gateway",
+      token_type: "Bearer",
+      team_id: "team_1",
+      team_slug: "example-one",
+    }) + "\n",
+    { mode: 0o600 },
+  );
+  const gateway = startFakeGateway([]);
+  const pty = await PtySession.launch({
+    bin: FX_BIN,
+    args: ["teams"],
+    cwd: join(root, "workspace"),
+    dir: join(root, "pty"),
+    env: { ...revokedTerminalEnv(home, gateway), FX_TEST_OAUTH_ISSUER_URL: issuerUrl },
+  });
+  try {
+    expect(await pty.waitForOutput((text) => text.includes("Example Two"), TIMEOUT)).toBe(true);
+    // The picker waits for a key.
+    expect(await pty.waitForQuietOutput(300, TIMEOUT)).toBe(true);
+    pty.revoke();
+    const exit = await pty.waitForExit(2_000);
+    let burned = 0;
+    if (!exit) {
+      const before = pty.cpuSeconds() ?? 0;
+      await Bun.sleep(1_000);
+      burned = (pty.cpuSeconds() ?? 0) - before;
+    }
+    expect({ exit, lowCpu: burned < 0.5 }).toEqual({ exit: { code: 1, signal: null }, lowCpu: true });
+    expect(pty.stderr()).toMatch(/^fx teams: (no team selected|failed to switch team)\n$/);
+    expect(issuerRequests).toEqual(["GET /v2/teams"]);
+    expect(gateway.modelRequests).toHaveLength(0);
+    expect(gateway.requests).toHaveLength(0);
+  } finally {
+    await pty.dispose();
+    gateway.stop();
+    issuer.stop(true);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+// `fx login vercel` waits for browser authorization: it polls the issuer once a
+// second and, between polls, waits up to 100 ms at a time for a key that opens
+// the browser. A revoke that lands while fx is outside that wait, here in a
+// request to the issuer, leaves every later poll of stdin reporting POLLNVAL
+// alone, at once. The wait took that as "no key" and returned at once, so fx
+// went round its loop at full CPU until the code expired
+// (`tests/tla/shell_runtime/TerminalRevoke.tla` NoBusyLoop). The sign-in must
+// go on waiting and polling the issuer at low CPU.
+test.skipIf(!revokeAvailable())("a revoked terminal does not make the sign-in wait spin", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-revoked-sign-in-")));
+  for (const dir of ["home", "workspace", "pty", "bin"]) mkdirSync(join(root, dir));
+  // The wait opens the browser on a key, through `open`: a fake one on PATH
+  // means no browser starts.
+  writeFileSync(join(root, "bin", "open"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const tokenRequests: number[] = [];
+  let holdTokenRequest: number | null = 2;
+  let tokenRequestHeld = false;
+  let releaseTokenRequest: () => void = () => {};
+  const release = new Promise<void>((resolve) => (releaseTokenRequest = resolve));
+  const issuer = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const base = `http://127.0.0.1:${issuer.port}`;
+      if (url.pathname === "/.well-known/openid-configuration") {
+        return Response.json({
+          issuer: base,
+          device_authorization_endpoint: `${base}/oauth/device`,
+          token_endpoint: `${base}/oauth/token`,
+        });
+      }
+      if (url.pathname === "/oauth/device") {
+        return Response.json({
+          device_code: "device-code",
+          user_code: "TEST-CODE",
+          verification_uri: `${base}/verify`,
+          verification_uri_complete: `${base}/verify?code=TEST-CODE`,
+          expires_in: 600,
+          interval: 1,
+        });
+      }
+      if (url.pathname === "/oauth/token") {
+        tokenRequests.push(Date.now());
+        // Hold one answer: fx is then in a request, not in its wait for a key.
+        if (tokenRequests.length === holdTokenRequest) {
+          tokenRequestHeld = true;
+          await release;
+        }
+        return Response.json({ error: "authorization_pending" }, { status: 400 });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  const gateway = startFakeGateway([]);
+  const pty = await PtySession.launch({
+    bin: FX_BIN,
+    args: ["login", "vercel"],
+    cwd: join(root, "workspace"),
+    dir: join(root, "pty"),
+    env: {
+      ...revokedTerminalEnv(join(root, "home"), gateway),
+      PATH: join(root, "bin"),
+      FX_TEST_OAUTH_ISSUER_URL: `http://127.0.0.1:${issuer.port}`,
+    },
+  });
+  try {
+    expect(await pty.waitForOutput((text) => text.includes("Waiting for authentication"), TIMEOUT)).toBe(true);
+    const heldBy = Date.now() + TIMEOUT;
+    while (!tokenRequestHeld) {
+      if (Date.now() > heldBy) throw new Error("fx never made its second token request");
+      await Bun.sleep(10);
+    }
+    pty.revoke();
+    holdTokenRequest = null;
+    releaseTokenRequest();
+    const requestsAtRevoke = tokenRequests.length;
+
+    // fx is back in its loop with a terminal that is gone.
+    await Bun.sleep(300);
+    const before = pty.cpuSeconds() ?? 0;
+    await Bun.sleep(1_000);
+    const burned = (pty.cpuSeconds() ?? 0) - before;
+    expect({ exit: pty.exited(), lowCpu: burned < 0.5 }).toEqual({ exit: null, lowCpu: true });
+
+    // The sign-in goes on polling the issuer, as it does when no key is pressed.
+    const deadline = Date.now() + 5_000;
+    while (tokenRequests.length <= requestsAtRevoke && Date.now() < deadline) await Bun.sleep(50);
+    expect(tokenRequests.length).toBeGreaterThan(requestsAtRevoke);
+
+    expect(pty.stderr()).toBe("");
+    expect(gateway.modelRequests).toHaveLength(0);
+    expect(gateway.requests).toHaveLength(0);
+  } finally {
+    releaseTokenRequest();
+    await pty.dispose();
+    gateway.stop();
+    issuer.stop(true);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
+test.skipIf(!tmuxAvailable())("Ctrl+Z, bg, and fg keep fx alive", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-job-control-")));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const stderrPath = join(root, "stderr.log");
+  mkdirSync(home);
+  mkdirSync(workspace);
+  const gateway = startFakeGateway([]);
+  let session: TmuxSession | null = null;
+  try {
+    session = await TmuxSession.create({
+      cmd: JOB_SHELL,
+      cwd: workspace,
+      isolated: true,
+      width: 100,
+      height: 30,
+      env: { ...revokedTerminalEnv(home, gateway), ...JOB_SHELL_ENV, VERCEL_OIDC_TOKEN: undefined },
+    });
+    await session.waitForText(/^\$/m, TIMEOUT);
+    await session.sendText(launchLine(FX_BIN, stderrPath));
+    await session.waitForComposer(TIMEOUT);
+    await waitForStartupModels(gateway);
+    await session.waitForStableComposer(TIMEOUT, 500);
+
+    await session.sendKeys("C-z");
+    await session.waitForText("Stopped", TIMEOUT);
+    await waitForFxState(session, FX_BIN, stopped, TIMEOUT);
+
+    // In the background, fx's resume sets raw mode again, and SIGTTOU stops
+    // it there: it waits for fg instead of reading a terminal it can't use.
+    await session.sendText("bg");
+    await session.waitForText(/ &$/m, TIMEOUT);
+    await waitForFxState(session, FX_BIN, stopped, TIMEOUT, 500);
+
+    await session.sendText("fg; echo fx-exit=$?");
+    await waitForFxState(session, FX_BIN, inForeground, TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT, 500);
+    await session.sendText("/quit");
+    const pane = await session.waitForText(/fx-exit=\d+/, TIMEOUT);
+    expect({ exit: pane.match(/fx-exit=(\d+)/)?.[1], stderr: readFileSync(stderrPath, "utf8") })
+      .toEqual({ exit: "0", stderr: "" });
+    expect(gateway.modelRequests).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(0);
+  } finally {
+    await session?.kill();
+    gateway.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
 
 test("wrapped semantic rows join descriptions across full-transcript pages", () => {
   const vs15 = SEMANTIC_TABLE_ROWS.find((row) => row.type === "VS15")!;

@@ -48,6 +48,7 @@ test {
     _ = @import("tools/agent/ask_user_question.zig");
     _ = @import("tools/web/http_fetch.zig");
     _ = @import("tools/web/url_policy.zig");
+    _ = @import("ui/event_loop.zig");
     _ = @import("ui/resize_tests.zig");
     _ = @import("ui/transcript/frozen_prefix_tests.zig");
     _ = @import("ui/transcript/transcript_window_fuzz.zig");

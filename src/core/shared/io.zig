@@ -1081,6 +1081,94 @@ pub fn tcsetattr(
     };
 }
 
+/// Puts terminal attributes back on the way out, when the terminal may be
+/// gone. A descriptor that is closed (EBADF), hung up (EIO), or no longer a
+/// terminal (EINVAL, ENOTTY), or a terminal that macOS revoked (ENOENT), has
+/// nothing left to restore, so this returns quietly where `tcsetattr` would
+/// reach `unreachable` for EBADF and EINVAL. EINTR is retried. Linux issues
+/// the kernel ioctl for the reason `tcgetattr` gives
+/// (`tests/tla/shell_runtime/TerminalRevoke.tla` CleanupNeverCrashes and
+/// GoneQuietly).
+pub fn tcsetattrBestEffort(
+    fd: std.posix.fd_t,
+    action: std.posix.TCSA,
+    term: std.posix.termios,
+) std.posix.UnexpectedError!void {
+    if (builtin.target.os.tag != .linux) {
+        while (true) switch (std.posix.errno(std.posix.system.tcsetattr(fd, action, &term))) {
+            .INTR => continue,
+            .SUCCESS, .BADF, .INVAL, .IO, .NOTTY => return,
+            .NOENT => if (comptime builtin.target.os.tag.isDarwin()) return else return std.posix.unexpectedErrno(.NOENT),
+            else => |err| return std.posix.unexpectedErrno(err),
+        };
+    }
+    while (true) switch (std.os.linux.errno(std.os.linux.tcsetattr(fd, action, &term))) {
+        .INTR => continue,
+        .SUCCESS, .BADF, .INVAL, .IO, .NOTTY => return,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+}
+
+/// Whether the terminal behind `fd` is gone, asked after a read on it failed.
+/// A terminal that was revoked, closed, or hung up polls as POLLHUP, POLLERR,
+/// or POLLNVAL, or is no longer a terminal; macOS 15 can report a revoked
+/// controlling terminal as readable and fail the read with EIO, so only this
+/// second check shows it. A background read that SIGTTIN did not stop fails
+/// with the same errno on a terminal that passes both checks
+/// (`tests/tla/shell_runtime/TerminalRevoke.tla` InputClosedOnlyWhenGone and
+/// ReadErrorOnlyWhenLive).
+pub fn terminalGone(fd: std.posix.fd_t) bool {
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    if (std.posix.poll(&fds, 0)) |_| {
+        const closed = std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL;
+        if ((fds[0].revents & closed) != 0) return true;
+    } else |_| {}
+    const file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    return !(file.isTty(getIo()) catch true);
+}
+
+test "terminalGone is false for a live terminal, with input waiting or not" {
+    const testing_pty = @import("testing_pty.zig");
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    defer pty.close();
+    try std.testing.expect(!terminalGone(pty.slave));
+
+    // Typed input makes the slave poll as readable, as it does for a read that
+    // fails on a live terminal: a background read that SIGTTIN did not stop.
+    const typed = "x\n";
+    try std.testing.expectEqual(@as(isize, typed.len), std.c.write(pty.master, typed.ptr, typed.len));
+    try std.testing.expect(!terminalGone(pty.slave));
+}
+
+test "tcsetattrBestEffort returns for a descriptor that is not open" {
+    try tcsetattrBestEffort(std.math.maxInt(std.posix.fd_t), .FLUSH, std.mem.zeroes(std.posix.termios));
+}
+
+test "tcsetattrBestEffort returns for a pipe, which is no terminal" {
+    const testing_pty = @import("testing_pty.zig");
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    defer testing_pty.closeFd(fds[0]);
+    defer testing_pty.closeFd(fds[1]);
+    try tcsetattrBestEffort(fds[0], .FLUSH, std.mem.zeroes(std.posix.termios));
+}
+
+test "tcsetattrBestEffort returns for a terminal whose other side closed" {
+    const testing_pty = @import("testing_pty.zig");
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    // Linux hangs up a terminal when its master closes and answers EIO; macOS
+    // answers success or an error that is ignored. Each returns quietly.
+    const pty = try testing_pty.TestPty.open();
+    testing_pty.closeFd(pty.master);
+    defer testing_pty.closeFd(pty.slave);
+    try tcsetattrBestEffort(pty.slave, .FLUSH, std.mem.zeroes(std.posix.termios));
+}
+
 test "tcgetattr reports a regular file as not a terminal" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

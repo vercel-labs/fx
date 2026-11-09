@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const testing_pty = @import("../shared/testing_pty.zig");
 const builtin = @import("builtin");
 const credentials = @import("credentials.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
@@ -1222,23 +1223,69 @@ fn unavailableWaitForEnter(_: ?*anyopaque, _: u64) bool {
     return false;
 }
 
+/// What one poll of stdin said about the wait for a key.
+const StdinWait = enum { idle, key, gone };
+
+/// Input wins: a revoke or a hang-up that wakes a poll answers POLLIN with
+/// POLLHUP, and the read it leads to returns at once. POLLHUP, POLLERR, or
+/// POLLNVAL without POLLIN means no key can ever come. macOS answers POLLNVAL
+/// alone, at once, on every poll after it revoked the terminal outside the
+/// wait.
+fn classifyStdinPoll(ready: usize, revents: i16) StdinWait {
+    if (ready == 0) return .idle;
+    if ((revents & std.posix.POLL.IN) != 0) return .key;
+    if ((revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) return .gone;
+    return .idle;
+}
+
+/// Set once the trace says stdin is gone, so a sign-in that waits out many
+/// slices says it once.
+var stdin_gone_traced = std.atomic.Value(bool).init(false);
+
 fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
+    return waitForEnterOn(std.posix.STDIN_FILENO, timeout_ms);
+}
+
+/// Waits up to `timeout_ms` for a line on `fd` and discards it. Returns true
+/// when one arrived. When `fd` is gone, hung up or revoked or no longer open,
+/// no line will come, and poll answers at once from then on, so the wait
+/// sleeps out the rest of `timeout_ms` before it returns false: returning at
+/// once sent the sign-in loop round with no time passing, at full CPU
+/// (`tests/tla/shell_runtime/TerminalRevoke.tla` NoBusyLoop).
+fn waitForEnterOn(fd: std.posix.fd_t, timeout_ms: u64) bool {
     var fds = [_]std.posix.pollfd{.{
-        .fd = std.posix.STDIN_FILENO,
+        .fd = fd,
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
     const timeout: i32 = @intCast(@min(timeout_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
+    const started_ms = io_mod.milliTimestamp();
     const ready = std.posix.poll(&fds, timeout) catch return false;
-    if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) return false;
-    discardStdinLine();
-    return true;
+    switch (classifyStdinPoll(ready, fds[0].revents)) {
+        .idle => return false,
+        .key => {
+            discardLine(fd);
+            return true;
+        },
+        .gone => {
+            if (!stdin_gone_traced.swap(true, .monotonic)) {
+                debug_trace.logf(
+                    "auth",
+                    "sign-in wait: stdin is gone (poll answered 0x{x} without input); Enter can no longer open the browser, and each wait for a key sleeps out its slice",
+                    .{@as(u16, @bitCast(fds[0].revents))},
+                );
+            }
+            const elapsed_ms: u64 = @intCast(@max(io_mod.milliTimestamp() - started_ms, 0));
+            io_mod.sleep((timeout_ms -| elapsed_ms) *| std.time.ns_per_ms);
+            return false;
+        },
+    }
 }
 
-fn discardStdinLine() void {
+fn discardLine(fd: std.posix.fd_t) void {
     var buf: [256]u8 = undefined;
     while (true) {
-        const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return;
+        const n = std.posix.read(fd, &buf) catch return;
         if (n == 0) return;
         if (std.mem.findScalar(u8, buf[0..n], '\n') != null) return;
     }
@@ -1381,7 +1428,7 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
     try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
 
     while (true) {
-        switch (try readTeamPickerKey()) {
+        switch (try readTeamPickerKey(raw.fd)) {
             .up => {
                 selected = if (selected == 0) teams.len - 1 else selected - 1;
                 try renderTeamPicker(alloc, teams, selected, default_index, &first_render);
@@ -1435,23 +1482,29 @@ const TeamPickerKey = union(enum) {
     ignored,
 };
 
-fn readTeamPickerKey() !TeamPickerKey {
+fn readTeamPickerKey(fd: std.posix.fd_t) !TeamPickerKey {
     var buf: [8]u8 = undefined;
-    const first_read = try std.posix.read(std.posix.STDIN_FILENO, buf[0..1]);
-    if (first_read == 0) return .ignored;
+    const first_read = try std.posix.read(fd, buf[0..1]);
+    if (first_read == 0) {
+        // The end of input: a terminal that is gone reads 0. Cancelling ends
+        // the picker, where reading again would return at once, forever
+        // (`tests/tla/shell_runtime/TerminalRevoke.tla` NoReadAfterEof).
+        debug_trace.logf("auth", "team_picker_input_closed action=cancel", .{});
+        return .cancel;
+    }
 
     var len = first_read;
     if (buf[0] == 0x1b) {
         while (len < buf.len) {
             if (escapeSequenceComplete(buf[0..len])) break;
             var fds = [_]std.posix.pollfd{.{
-                .fd = std.posix.STDIN_FILENO,
+                .fd = fd,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
             const ready = try std.posix.poll(&fds, 25);
             if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) break;
-            const n = try std.posix.read(std.posix.STDIN_FILENO, buf[len .. len + 1]);
+            const n = try std.posix.read(fd, buf[len .. len + 1]);
             if (n == 0) break;
             len += n;
         }
@@ -1492,6 +1545,7 @@ fn parseEscapeTeamPickerKey(bytes: []const u8) TeamPickerKey {
 const TeamPickerRawMode = struct {
     original: std.posix.termios = undefined,
     active: bool = false,
+    fd: std.posix.fd_t = std.posix.STDIN_FILENO,
 
     fn enable() !TeamPickerRawMode {
         if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
@@ -1530,7 +1584,9 @@ const TeamPickerRawMode = struct {
 
     fn disable(self: *TeamPickerRawMode) void {
         if (!self.active) return;
-        io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        // The terminal may be gone by now: revoked, hung up, or closed
+        // (`tests/tla/shell_runtime/TerminalRevoke.tla` CleanupNeverCrashes).
+        io_mod.tcsetattrBestEffort(self.fd, .FLUSH, self.original) catch {};
         self.active = false;
     }
 };
@@ -1670,6 +1726,92 @@ test "single team selection does not allocate" {
     var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
 
     try std.testing.expect((try selectTeam(failing.allocator(), &teams, null)) != null);
+}
+
+test "team picker key: a read of 0 cancels the picker" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const fd = try testing_pty.pipeAtEndOfInput("");
+    defer testing_pty.closeFd(fd);
+    try std.testing.expectEqual(TeamPickerKey.cancel, try readTeamPickerKey(fd));
+    // The end of input stays the end of input.
+    try std.testing.expectEqual(TeamPickerKey.cancel, try readTeamPickerKey(fd));
+}
+
+test "team picker key: a read of 0 inside an escape sequence ends the key" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const fd = try testing_pty.pipeAtEndOfInput("\x1b");
+    defer testing_pty.closeFd(fd);
+    try std.testing.expectEqual(TeamPickerKey.cancel, try readTeamPickerKey(fd));
+    try std.testing.expectEqual(TeamPickerKey.cancel, try readTeamPickerKey(fd));
+}
+
+test "team picker key: arrows, digits, Enter, and Ctrl+C parse as before" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const fd = try testing_pty.pipeAtEndOfInput("\x1b[A\x1b[B3\r\x03");
+    defer testing_pty.closeFd(fd);
+    try std.testing.expectEqual(TeamPickerKey.up, try readTeamPickerKey(fd));
+    try std.testing.expectEqual(TeamPickerKey.down, try readTeamPickerKey(fd));
+    try std.testing.expectEqual(TeamPickerKey{ .number = 3 }, try readTeamPickerKey(fd));
+    try std.testing.expectEqual(TeamPickerKey.enter, try readTeamPickerKey(fd));
+    try std.testing.expectEqual(TeamPickerKey.cancel, try readTeamPickerKey(fd));
+}
+
+test "team picker restore returns for a descriptor that is not open" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    var raw = TeamPickerRawMode{
+        .original = std.mem.zeroes(std.posix.termios),
+        .active = true,
+        .fd = testing_pty.closed_fd,
+    };
+    raw.disable();
+    try std.testing.expect(!raw.active);
+}
+
+test "team picker restore puts the original settings back on a live terminal" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    defer pty.close();
+    const original = try pty.flipEcho();
+
+    var raw = TeamPickerRawMode{ .original = original, .active = true, .fd = pty.slave };
+    raw.disable();
+
+    try std.testing.expect(!raw.active);
+    const restored = try io_mod.tcgetattr(pty.slave);
+    try std.testing.expectEqual(original.lflag, restored.lflag);
+}
+
+test "team picker restore leaves a terminal alone when raw mode never became active" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    defer pty.close();
+    const original = try pty.flipEcho();
+    const other_settings = try io_mod.tcgetattr(pty.slave);
+
+    var raw = TeamPickerRawMode{ .original = original, .active = false, .fd = pty.slave };
+    raw.disable();
+
+    const after = try io_mod.tcgetattr(pty.slave);
+    try std.testing.expectEqual(other_settings.lflag, after.lflag);
+}
+
+test "team picker restore returns for a revoked terminal" {
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    defer pty.close();
+    const original = try io_mod.tcgetattr(pty.slave);
+    try pty.revokeSlave();
+
+    var raw = TeamPickerRawMode{ .original = original, .active = true, .fd = pty.slave };
+    raw.disable();
+    try std.testing.expect(!raw.active);
 }
 
 test "team selection stages an owned validation credential before commit" {
@@ -2681,6 +2823,141 @@ test "login polling disabled browser prompt still polls immediately" {
     for (state.sleep_calls.items) |sleep_ms| {
         try std.testing.expectEqual(@as(u64, 100), sleep_ms);
     }
+}
+
+/// A call to `waitForEnterOn` that returns false must have lasted the slice,
+/// whatever state the terminal is in: one that returns false at once on a
+/// terminal that is gone is the busy loop that
+/// `tests/tla/shell_runtime/TerminalRevoke.tla` NoBusyLoop rules out. Returns
+/// whether the call took a key.
+fn waitForEnterLastsSlice(fd: std.posix.fd_t, slice_ms: u64) !bool {
+    const clock_slack_ms = 20;
+    const started = io_mod.milliTimestamp();
+    const key = waitForEnterOn(fd, slice_ms);
+    const elapsed: u64 = @intCast(@max(io_mod.milliTimestamp() - started, 0));
+    if (!key) try std.testing.expect(elapsed + clock_slack_ms >= slice_ms);
+    return key;
+}
+
+test "sign-in wait: a poll that answers hang-up, error, or not open without input means stdin is gone" {
+    try std.testing.expectEqual(StdinWait.gone, classifyStdinPoll(1, std.posix.POLL.HUP));
+    try std.testing.expectEqual(StdinWait.gone, classifyStdinPoll(1, std.posix.POLL.ERR));
+    try std.testing.expectEqual(StdinWait.gone, classifyStdinPoll(1, std.posix.POLL.NVAL));
+    try std.testing.expectEqual(StdinWait.gone, classifyStdinPoll(1, std.posix.POLL.HUP | std.posix.POLL.ERR));
+}
+
+test "sign-in wait: input wins over hang-up, error, and not open" {
+    try std.testing.expectEqual(StdinWait.key, classifyStdinPoll(1, std.posix.POLL.IN));
+    try std.testing.expectEqual(StdinWait.key, classifyStdinPoll(1, std.posix.POLL.IN | std.posix.POLL.HUP));
+    try std.testing.expectEqual(StdinWait.key, classifyStdinPoll(
+        1,
+        std.posix.POLL.IN | std.posix.POLL.ERR | std.posix.POLL.NVAL,
+    ));
+}
+
+test "sign-in wait: a poll that answers nothing is idle" {
+    try std.testing.expectEqual(StdinWait.idle, classifyStdinPoll(0, 0));
+    try std.testing.expectEqual(StdinWait.idle, classifyStdinPoll(1, std.posix.POLL.OUT));
+}
+
+test "sign-in wait: a descriptor that is not open lasts the slice and returns false" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    try std.testing.expect(!try waitForEnterLastsSlice(testing_pty.closed_fd, 150));
+}
+
+test "sign-in wait: a zero timeout on a descriptor that is not open returns false at once" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const started = io_mod.milliTimestamp();
+    try std.testing.expect(!waitForEnterOn(testing_pty.closed_fd, 0));
+    try std.testing.expect(io_mod.milliTimestamp() - started < 100);
+}
+
+test "sign-in wait: a revoked terminal takes a key or lasts the slice" {
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    defer pty.close();
+    try pty.revokeSlave();
+    // Every poll after the revoke reports POLLNVAL alone, at once, on macOS 27;
+    // where a revoked terminal polls as readable instead, the wait takes it
+    // for a key. Either way it is no busy loop.
+    _ = try waitForEnterLastsSlice(pty.slave, 150);
+    _ = try waitForEnterLastsSlice(pty.slave, 150);
+}
+
+test "sign-in wait: a terminal whose other side closed takes a key or lasts the slice" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    // macOS polls it as readable and hung up, Linux as hung up alone.
+    const pty = try testing_pty.TestPty.open();
+    testing_pty.closeFd(pty.master);
+    defer testing_pty.closeFd(pty.slave);
+    _ = try waitForEnterLastsSlice(pty.slave, 150);
+}
+
+test "sign-in wait: a live terminal with no key lasts the slice and returns false" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    defer pty.close();
+    try std.testing.expect(!try waitForEnterLastsSlice(pty.slave, 150));
+}
+
+test "sign-in wait: a typed line returns true and is taken" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const pty = try testing_pty.TestPty.open();
+    defer pty.close();
+    const line = "x\n";
+    try std.testing.expectEqual(@as(isize, line.len), std.c.write(pty.master, line, line.len));
+    try std.testing.expect(waitForEnterOn(pty.slave, 1_000));
+    try std.testing.expect(!try waitForEnterLastsSlice(pty.slave, 50));
+}
+
+test "sign-in wait: the trace says stdin is gone once, however many slices follow" {
+    if (!testing_pty.supported) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "sign-in-wait.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "auth");
+    stdin_gone_traced.store(false, .monotonic);
+
+    for (0..3) |_| try std.testing.expect(!waitForEnterOn(testing_pty.closed_fd, 0));
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+    defer trace_file.close(io_mod.getIo());
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
+    defer alloc.free(trace);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "sign-in wait: stdin is gone"));
+}
+
+test "sign-in wait: the issuer is polled on schedule while stdin gives no key" {
+    const alloc = std.testing.allocator;
+    var state = LoginPollTestState.init(alloc, &.{ .pending, .pending, .success });
+    defer state.deinit();
+    var prompt = BrowserOpenPrompt{ .url = "https://vercel.test/oauth/device", .enabled = true };
+
+    // The fake wait passes its slice and reports no key, as the wait does on
+    // a terminal that is gone.
+    var token = try pollForTokenWithDeps(alloc, oauth_transport.unavailable_provider, testMetadata(), "client", testDevice(), &prompt, state.deps());
+    defer token.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), state.poll_index);
+    try std.testing.expectEqual(@as(usize, 20), state.wait_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.sleep_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.open_count);
+    try std.testing.expectEqual(@as(i64, 2_000), state.now_ms);
+    try std.testing.expect(!prompt.opened);
 }
 
 test "login polling rejects invalid provider timing values" {
