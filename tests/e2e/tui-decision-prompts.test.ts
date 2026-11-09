@@ -1631,7 +1631,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
-    "permission prompt growth preserves displaced transcript history",
+    "permission prompt holds the transcript rows it covers until it closes",
     async () => {
       const markers = Array.from(
         { length: 34 },
@@ -1682,16 +1682,21 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(pane).toContain("touch generic-preview-accepted.txt");
       expectApprovalSelection(pane, 1, COMMAND_YES_CHOICE);
 
+      // While the prompt is open, the rows it covers are held: no marker is in
+      // scrollback twice, and the missing ones are one band.
       const activeApproval = await waitForVisibleScrollback(
         ctx.session,
-        "complete approval scrollback replay",
+        "approval scrollback while the prompt is open",
         (scrollback) => markers.every((marker) =>
-          scrollback.split(marker).length - 1 === 1
+          scrollback.split(marker).length - 1 <= 1
         ),
         TIMEOUT,
       );
-      for (const marker of markers) {
-        expect(activeApproval.split(marker).length - 1).toBe(1);
+      const heldMarkers = markers.flatMap((marker, index) =>
+        activeApproval.split(marker).length - 1 === 0 ? [index] : []
+      );
+      if (heldMarkers.length > 0) {
+        expect(heldMarkers.at(-1)! - heldMarkers[0]! + 1).toBe(heldMarkers.length);
       }
       const promptTraceLines = readTrace(ctx.tracePath).split(/\r?\n/);
       const transitionDiagnostics = promptTraceLines.filter((line) =>
@@ -1699,19 +1704,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         line.includes("transcript_anchor_structured_rewrite") ||
         line.includes("[permission]")
       ).slice(-40).join("\n");
-      const promptPlanIndex = promptTraceLines.findIndex((line) =>
+      const promptPlan = promptTraceLines.find((line) =>
         line.includes("transcript_transition_plan") &&
-        line.includes("replay_displaced_footer_history=true") &&
-        /planned_rows=[1-9][0-9]*/.test(line)
+        line.includes("geometry_rebase=true") &&
+        /held_footer_rows=[1-9][0-9]* /.test(line)
       );
-      expect(promptPlanIndex, transitionDiagnostics).toBeGreaterThanOrEqual(0);
-      const promptCommit = promptTraceLines.slice(promptPlanIndex).find((line) =>
-        line.includes("[frame_diff] attempt_result") &&
-        /planned_scroll_rows=[1-9][0-9]*/.test(line)
-      );
-      expect(promptCommit).toMatch(
-        /planned_scroll_rows=([1-9][0-9]*) committed_scroll_rows=\1 .*unplanned_scroll_rows=0/,
-      );
+      expect(promptPlan, transitionDiagnostics).toBeDefined();
+      expect(promptPlan).toContain("semantic_rows=0 planned_rows=0");
       expect(ctx.gateway.classifierRequests).toHaveLength(0);
       expect(ctx.gateway.requests).toHaveLength(2);
 

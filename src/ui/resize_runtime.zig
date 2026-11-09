@@ -310,6 +310,40 @@ pub fn lifecycleIdle(shell: anytype) bool {
         !shell.terminal_dimensions_invalid;
 }
 
+/// Whether a resize is still moving toward its settled frame: signalled and
+/// not yet observed, observed and waiting for its settled replay, or queued
+/// for the terminal reset. Frames wait for it (`blocksFrameCommit`). An
+/// invalid terminal size is not in flight: nothing progresses until the size is
+/// valid again, so a caller that waits for the lifecycle must not wait for it.
+pub fn lifecycleInFlight(shell: anytype) bool {
+    if (shell.terminal_dimensions_invalid) return false;
+    return shell.render_requests.resizeLifecyclePending() or shell.pending_resize_observation != null;
+}
+
+/// Ends the debounce of a pending resize at `now_ms`: the wait that lets a
+/// window drag settle is not worth having when fx ends now, so the settled
+/// replay is due at once. An observation queued for the same deadline keeps
+/// matching it (`queuedObservationMatchesDeadline` and `finishPendingResizeProbe`
+/// compare the two), and one queued for an older deadline stays stale. A
+/// deadline already due, and a resize that is not pending, stay as they are
+/// (`tests/tla/transcript_window/spec/FooterReclaim.tla` ExitKeepsRows,
+/// SignalExit with a resize debounce pending).
+pub fn skipDebounce(shell: anytype, now_ms: i64) void {
+    const requests = &shell.render_requests;
+    if (!requests.resizeLifecyclePending()) return;
+    const deadline = requests.resize_apply_after_ms;
+    if (deadline <= now_ms) return;
+    requests.resize_apply_after_ms = now_ms;
+    if (shell.pending_resize_observation) |*observation| {
+        if (observation.apply_after_ms == deadline) observation.apply_after_ms = now_ms;
+    }
+    debug_trace.logf(
+        "resize",
+        "debounce_skipped reason=close apply_after_ms={d} now_ms={d}",
+        .{ deadline, now_ms },
+    );
+}
+
 pub fn blocksFrameCommit(shell: anytype) bool {
     return shell.render_requests.blocksFrameCommit() or
         resizeObservationAwaiting(shell.pending_resize_observation) or
@@ -1261,6 +1295,191 @@ test "request owner triggers deferred resize after debounce" {
     try std.testing.expect(shell.render_requests.shouldApplyDeferredResize(180));
     shell.render_requests.completeResizeGeometry(false);
     try std.testing.expect(!shell.render_requests.blocksFrameCommit());
+}
+
+test "skipDebounce makes a pending resize due now and keeps its observation deadline matched" {
+    var shell = TranscriptRuntime{};
+    defer shell.deinit(std.testing.allocator);
+    shell.render_requests.observeResizeSignal(100, 80);
+    shell.pending_resize_observation = .{
+        .layout = launchTestLayout(),
+        .apply_after_ms = 180,
+        .expected_row = 13,
+        .result = .awaiting,
+        .phase = .live,
+    };
+    try std.testing.expect(!shell.render_requests.shouldApplyDeferredResize(179));
+
+    skipDebounce(&shell, 179);
+
+    try std.testing.expect(shell.render_requests.shouldApplyDeferredResize(179));
+    try std.testing.expectEqual(@as(i64, 179), shell.render_requests.resize_apply_after_ms);
+    try std.testing.expectEqual(@as(i64, 179), shell.pending_resize_observation.?.apply_after_ms);
+
+    // A later skip never moves an earlier deadline forward.
+    skipDebounce(&shell, 500);
+    try std.testing.expectEqual(@as(i64, 179), shell.render_requests.resize_apply_after_ms);
+    try std.testing.expectEqual(@as(i64, 179), shell.pending_resize_observation.?.apply_after_ms);
+}
+
+test "skipDebounce leaves a due deadline, a stale observation, and an idle lifecycle alone" {
+    var shell = TranscriptRuntime{};
+    defer shell.deinit(std.testing.allocator);
+
+    // Due exactly at the deadline, and after it: nothing to skip.
+    shell.render_requests.observeResizeSignal(100, 80);
+    skipDebounce(&shell, 180);
+    try std.testing.expectEqual(@as(i64, 180), shell.render_requests.resize_apply_after_ms);
+    skipDebounce(&shell, 181);
+    try std.testing.expectEqual(@as(i64, 180), shell.render_requests.resize_apply_after_ms);
+
+    // A second resize signal re-armed the deadline after the observation was
+    // taken for the first: the skip ends the new deadline, and the observation
+    // keeps its older one, so it still reads as stale.
+    shell.render_requests.observeResizeSignal(200, 80);
+    shell.pending_resize_observation = .{
+        .layout = launchTestLayout(),
+        .apply_after_ms = 180,
+        .expected_row = 13,
+        .result = .awaiting,
+        .phase = .live,
+    };
+    skipDebounce(&shell, 210);
+    try std.testing.expectEqual(@as(i64, 210), shell.render_requests.resize_apply_after_ms);
+    try std.testing.expectEqual(@as(i64, 180), shell.pending_resize_observation.?.apply_after_ms);
+
+    // A lifecycle that is not pending keeps whatever deadline it has.
+    var idle = TranscriptRuntime{};
+    defer idle.deinit(std.testing.allocator);
+    idle.render_requests.resize_apply_after_ms = 500;
+    skipDebounce(&idle, 10);
+    try std.testing.expectEqual(@as(i64, 500), idle.render_requests.resize_apply_after_ms);
+}
+
+test "a resize is in flight from its signal to its reset commit, and not at an invalid size" {
+    var shell = TranscriptRuntime{};
+    defer shell.deinit(std.testing.allocator);
+    try std.testing.expect(!lifecycleInFlight(&shell));
+
+    shell.render_requests.observeResizeSignal(100, 80);
+    try std.testing.expect(lifecycleInFlight(&shell));
+
+    // Observed and applied live: the settled replay is still owed.
+    shell.render_requests.completeResizeGeometry(true);
+    try std.testing.expect(lifecycleInFlight(&shell));
+
+    // Queued for the terminal reset, with the owed replay acknowledged: the
+    // observation alone keeps it in flight until the reset frame commits.
+    shell.render_requests.acknowledgeSettledResizeCommit();
+    shell.pending_resize_observation = .{
+        .layout = launchTestLayout(),
+        .apply_after_ms = 180,
+        .expected_row = null,
+        .result = .unavailable,
+        .phase = .reset_queued,
+    };
+    try std.testing.expect(lifecycleInFlight(&shell));
+    shell.pending_resize_observation = null;
+    try std.testing.expect(!lifecycleInFlight(&shell));
+
+    // A size that cannot be read leaves nothing that can progress.
+    shell.render_requests.observeResizeSignal(300, 80);
+    shell.terminal_dimensions_invalid = true;
+    try std.testing.expect(!lifecycleInFlight(&shell));
+}
+
+test "skipDebounce keeps its laws for fuzzed lifecycle states and times" {
+    try std.testing.fuzz({}, fuzzSkipDebounce, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").resize_debounce.*),
+    });
+}
+
+/// The fields of the shell that `skipDebounce` and `lifecycleInFlight` read.
+const FuzzShell = struct {
+    render_requests: @import("render_request.zig").RenderRequestState = .{},
+    pending_resize_observation: ?ResizeObservation = null,
+    terminal_dimensions_invalid: bool = false,
+};
+
+fn fuzzSkipDebounce(_: void, smith: *std.testing.Smith) !void {
+    var shell = FuzzShell{};
+    shell.render_requests.resize_dirty = smith.value(bool);
+    shell.render_requests.pending_settled_width_reflow = smith.value(bool);
+    shell.terminal_dimensions_invalid = smith.value(bool);
+    const deadline: i64 = smith.valueRangeAtMost(u16, 0, 2_000);
+    const now: i64 = smith.valueRangeAtMost(u16, 0, 2_000);
+    shell.render_requests.resize_apply_after_ms = deadline;
+    if (smith.value(bool)) {
+        const same = smith.value(bool);
+        const other: i64 = smith.valueRangeAtMost(u16, 0, 2_000);
+        shell.pending_resize_observation = .{
+            .layout = launchTestLayout(),
+            .apply_after_ms = if (same) deadline else other,
+            .expected_row = null,
+            .result = .unavailable,
+            .phase = .live,
+        };
+    }
+    const pending = shell.render_requests.resizeLifecyclePending();
+    const observed_before: ?i64 = if (shell.pending_resize_observation) |observation| observation.apply_after_ms else null;
+    const matched_before = observed_before != null and observed_before.? == deadline;
+    const in_flight_before = lifecycleInFlight(&shell);
+
+    skipDebounce(&shell, now);
+
+    const after = shell.render_requests.resize_apply_after_ms;
+    const observed_after: ?i64 = if (shell.pending_resize_observation) |observation| observation.apply_after_ms else null;
+    if (!pending) {
+        // Nothing is waiting, so nothing changes.
+        try std.testing.expectEqual(deadline, after);
+        try std.testing.expectEqual(observed_before, observed_after);
+    } else {
+        // The wait ends: the replay is due now, and the deadline never moves later.
+        try std.testing.expectEqual(@min(deadline, now), after);
+        try std.testing.expectEqual(shell.render_requests.resize_dirty, shell.render_requests.shouldApplyDeferredResize(now));
+        // An observation for the ended deadline follows it; an older one stays stale and untouched.
+        if (matched_before) try std.testing.expectEqual(@as(?i64, after), observed_after);
+        if (!matched_before) try std.testing.expectEqual(observed_before, observed_after);
+    }
+    // The skip changes no part of what is in flight, and a second skip changes nothing.
+    try std.testing.expectEqual(in_flight_before, lifecycleInFlight(&shell));
+    skipDebounce(&shell, now);
+    try std.testing.expectEqual(after, shell.render_requests.resize_apply_after_ms);
+    const observed_twice: ?i64 = if (shell.pending_resize_observation) |observation| observation.apply_after_ms else null;
+    try std.testing.expectEqual(observed_after, observed_twice);
+}
+
+test "skipping the debounce lets the settled replay of a pending resize run at once" {
+    const alloc = std.testing.allocator;
+    const layout = launchTestLayout();
+    var shell = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+        .has_committed_frame = true,
+    };
+    defer shell.deinit(alloc);
+    try shell.enableShadowVt(alloc);
+    // A live resize is applied; its settled replay is due a minute from now.
+    shell.render_requests.completeResizeGeometry(true);
+    shell.render_requests.resize_apply_after_ms = io_mod.milliTimestamp() + 60_000;
+    var metrics = Metrics{};
+    var probe = cursor_probe.Parser{};
+    var resize_interlock = ResizeApprovalInterlock{};
+    const terminal = LiveResizeTerminal{ .layout = layout };
+
+    try collectResizeFacts(terminal, &shell, &metrics, &probe, &resize_interlock, 4, 80, true);
+    try std.testing.expect(!shell.terminal_reset_pending);
+    try std.testing.expectEqual(@as(usize, 0), metrics.debounced_resizes);
+    try std.testing.expect(lifecycleInFlight(&shell));
+
+    skipDebounce(&shell, io_mod.milliTimestamp());
+    try collectResizeFacts(terminal, &shell, &metrics, &probe, &resize_interlock, 4, 80, true);
+
+    try std.testing.expect(shell.terminal_reset_pending);
+    try std.testing.expectEqual(@as(usize, 1), metrics.debounced_resizes);
+    try std.testing.expectEqual(FrameCommit.reset, pendingFrameCommit(&shell, true));
+    acknowledgeFrameCommit(&shell, .reset);
+    try std.testing.expect(!lifecycleInFlight(&shell));
 }
 
 test "signal resize mode stays light during live resize" {

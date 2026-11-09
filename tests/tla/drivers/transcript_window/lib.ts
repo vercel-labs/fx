@@ -25,6 +25,15 @@ export const SPEC_FILES = [
   "MCTranscriptWindowSweepUnsaved.cfg",
   "TraceTranscriptWindow.tla",
   "TraceTranscriptWindow.cfg",
+  "FooterReclaim.tla",
+  "MCFooterReclaim.cfg",
+  "MCFooterReclaimToday.cfg",
+  "MCFooterReclaimSignalHead.cfg",
+  "MCFooterReclaimInvalidAnchorHead.cfg",
+  "MCFooterReclaimDebounceHead.cfg",
+  "MCFooterReclaimExitDebounceHead.cfg",
+  "TraceFooterReclaim.tla",
+  "TraceFooterReclaim.cfg",
 ];
 
 export type Config = { window: number; read_step: number; slice: number; saved: boolean };

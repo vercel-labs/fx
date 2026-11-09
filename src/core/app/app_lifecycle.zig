@@ -87,10 +87,12 @@ fn tmuxAbnormalExitHandler(sig: std.posix.SIG) callconv(.c) void {
 /// handler only wakes `closerMain`, which saves the model request in flight
 /// outside signal context, marked as a clean close, so the next launch
 /// resumes it without counting a crash (`RequestRecovery.closeActive`,
-/// `tests/tla/recovery/Resume.tla` NoFalseCrashQuestion). It then restores
-/// the terminal and re-raises as the handler did before. Without that
-/// thread, the handler restores and re-raises itself. A terminal that hangs
-/// up closes fx the same way (`closeOnHangup`).
+/// `tests/tla/recovery/Resume.tla` NoFalseCrashQuestion). It also asks the
+/// main thread for the exit frame that puts the rows a footer surface holds
+/// into scrollback (`SignalClose`). It then restores the terminal and
+/// re-raises as the handler did before. Without that thread, the handler
+/// restores and re-raises itself. A terminal that hangs up closes fx the same
+/// way (`closeOnHangup`).
 var close_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 var close_signal: std.atomic.Value(i32) = .init(0);
 var closer_tmux = false;
@@ -103,6 +105,72 @@ fn closeSignalHandler(sig: std.posix.SIG) callconv(.c) void {
     _ = std.c.write(close_pipe[1], &byte, 1);
 }
 
+/// How long `closerMain` waits for the main thread's exit frame before it
+/// restores the terminal anyway, and how long one pause of that wait is.
+const close_settle_wait_ms: u64 = 500;
+const close_settle_poll_ms: u64 = 2;
+
+/// The hand-off between `closerMain` and the main thread when SIGTERM or
+/// SIGHUP ends fx. The rows a footer surface holds above the screen belong to
+/// the main thread, so the closer asks it to draw the exit frame that
+/// releases them into native history, as /quit does
+/// (`tests/tla/transcript_window/spec/FooterReclaim.tla` SignalExit), and
+/// restores the terminal once the frame is drawn or the wait ends. The main
+/// thread's event loop checks `pending` on every pass.
+const SignalClose = struct {
+    requested: std.atomic.Value(bool) = .init(false),
+    answered: std.atomic.Value(bool) = .init(false),
+
+    fn ask(self: *SignalClose) void {
+        self.answered.store(false, .release);
+        self.requested.store(true, .release);
+    }
+
+    fn pending(self: *const SignalClose) bool {
+        return self.requested.load(.acquire) and !self.answered.load(.acquire);
+    }
+
+    /// The main thread drew the exit frame, or had nothing to draw.
+    fn answer(self: *SignalClose) void {
+        self.answered.store(true, .release);
+    }
+
+    /// Waits for `answer` for at most `wait_ms`, counted by what `clock.pause`
+    /// reports (at least 1 ms per pause, so a clock that stands still still
+    /// ends the wait). Returns whether the main thread answered.
+    fn awaitAnswer(self: *const SignalClose, clock: anytype, wait_ms: u64) bool {
+        var waited_ms: u64 = 0;
+        while (!self.answered.load(.acquire)) {
+            if (waited_ms >= wait_ms) return false;
+            waited_ms +|= @max(1, clock.pause(@min(close_settle_poll_ms, wait_ms - waited_ms)));
+        }
+        return true;
+    }
+};
+
+/// One pause of the closer's wait, in real time. Returns the milliseconds it
+/// took.
+const CloserClock = struct {
+    fn pause(_: CloserClock, ms: u64) u64 {
+        const started = io_mod.awakeMilliTimestamp();
+        io_mod.sleep(ms * std.time.ns_per_ms);
+        return @intCast(@max(0, io_mod.awakeMilliTimestamp() - started));
+    }
+};
+
+var signal_close: SignalClose = .{};
+
+/// Whether a signal close waits for the main thread's exit frame. The event
+/// loop calls it on every pass.
+pub fn signalClosePending() bool {
+    return signal_close.pending();
+}
+
+/// The main thread's answer to `signalClosePending`: the exit frame is drawn.
+pub fn answerSignalClose() void {
+    signal_close.answer();
+}
+
 fn closerMain() void {
     var byte: [1]u8 = undefined;
     while (true) {
@@ -112,8 +180,20 @@ fn closerMain() void {
         return;
     }
     const sig: std.posix.SIG = @fromBackingInt(@intCast(close_signal.load(.seq_cst)));
+    // Ask first, so the main thread draws the exit frame while the request in
+    // flight is saved.
+    signal_close.ask();
     const saved = request_recovery.RequestRecovery.closeActive();
     debug_trace.logf("app", "event=closing signal={d} records_saved={d}", .{ close_signal.load(.seq_cst), saved });
+    if (!signal_close.awaitAnswer(CloserClock{}, close_settle_wait_ms)) {
+        // The main thread is busy or gone: rows a footer surface holds stay
+        // out of scrollback; the session log and Ctrl+O keep them.
+        debug_trace.logf(
+            "app",
+            "event=signal_close_settle_unconfirmed signal={d} waited_ms={d} dropped=held_transcript_rows_from_scrollback_if_any reason=main_thread_did_not_answer",
+            .{ close_signal.load(.seq_cst), close_settle_wait_ms },
+        );
+    }
     if (closer_tmux) {
         abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, sig);
     } else {
@@ -149,7 +229,11 @@ fn startCloser(tmux: bool) bool {
     close_pipe = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch return false;
     closer_tmux = tmux;
     const thread = std.Thread.spawn(.{}, closerMain, .{}) catch |err| {
-        debug_trace.logf("app", "closer unavailable err={s}", .{@errorName(err)});
+        debug_trace.logf(
+            "app",
+            "closer unavailable err={s} dropped=held_transcript_rows_from_scrollback_on_signal reason=fallback_handlers_cannot_settle",
+            .{@errorName(err)},
+        );
         _ = std.c.close(close_pipe[0]);
         _ = std.c.close(close_pipe[1]);
         close_pipe = .{ -1, -1 };
@@ -2475,6 +2559,164 @@ test "terminal keyboard stack restore stays paired with enable policy" {
     try std.testing.expect(std.mem.find(u8, tmux_abnormal_exit_restore, "\x1b[<u") == null);
     try std.testing.expect(std.mem.find(u8, tmux_restore, "\x1b[?2004l") != null);
     try std.testing.expect(std.mem.find(u8, tmux_restore, "\x1b[>4;0m") != null);
+}
+
+/// A clock the test controls: `pause` moves it by what was asked, or by a
+/// fixed step, and answers the hand-off once `answer_at_ms` has passed.
+const SignalCloseTestClock = struct {
+    hand: *SignalClose,
+    answer_at_ms: ?u64 = null,
+    step_ms: ?u64 = null,
+    now_ms: u64 = 0,
+    counted_ms: u64 = 0,
+    pauses: u32 = 0,
+
+    fn pause(self: *SignalCloseTestClock, ms: u64) u64 {
+        self.pauses += 1;
+        const elapsed = self.step_ms orelse ms;
+        self.now_ms +|= elapsed;
+        self.counted_ms +|= @max(1, elapsed);
+        if (self.answer_at_ms) |at| {
+            if (self.now_ms >= at) self.hand.answer();
+        }
+        return elapsed;
+    }
+};
+
+test "signal close wait ends at the deadline whether the main thread answers just before or just after" {
+    // The wait is 500 ms in pauses of 2 ms. An answer that lands by the last
+    // pause counts; one that lands after it does not.
+    const cases = [_]struct { answer_at_ms: ?u64, answered: bool }{
+        .{ .answer_at_ms = 0, .answered = true },
+        .{ .answer_at_ms = 2, .answered = true },
+        .{ .answer_at_ms = 498, .answered = true },
+        .{ .answer_at_ms = 500, .answered = true },
+        .{ .answer_at_ms = 501, .answered = false },
+        .{ .answer_at_ms = null, .answered = false },
+    };
+    for (cases) |case| {
+        var hand: SignalClose = .{};
+        hand.ask();
+        var clock: SignalCloseTestClock = .{ .hand = &hand, .answer_at_ms = case.answer_at_ms };
+        try std.testing.expectEqual(case.answered, hand.awaitAnswer(&clock, close_settle_wait_ms));
+        try std.testing.expect(clock.now_ms <= close_settle_wait_ms);
+    }
+}
+
+test "signal close wait does not pause when the main thread already answered" {
+    var hand: SignalClose = .{};
+    hand.ask();
+    hand.answer();
+    var clock: SignalCloseTestClock = .{ .hand = &hand };
+    try std.testing.expect(hand.awaitAnswer(&clock, close_settle_wait_ms));
+    try std.testing.expectEqual(@as(u32, 0), clock.pauses);
+    try std.testing.expect(!hand.pending());
+}
+
+test "signal close wait gives up after one pause when the clock jumps past the deadline" {
+    var hand: SignalClose = .{};
+    hand.ask();
+    var clock: SignalCloseTestClock = .{ .hand = &hand, .step_ms = 10_000 };
+    try std.testing.expect(!hand.awaitAnswer(&clock, close_settle_wait_ms));
+    try std.testing.expectEqual(@as(u32, 1), clock.pauses);
+    // An answer that came during that long pause still counts.
+    var late: SignalClose = .{};
+    late.ask();
+    var late_clock: SignalCloseTestClock = .{ .hand = &late, .step_ms = 10_000, .answer_at_ms = 5_000 };
+    try std.testing.expect(late.awaitAnswer(&late_clock, close_settle_wait_ms));
+}
+
+test "signal close wait ends even when the clock stands still" {
+    var hand: SignalClose = .{};
+    hand.ask();
+    var clock: SignalCloseTestClock = .{ .hand = &hand, .step_ms = 0 };
+    try std.testing.expect(!hand.awaitAnswer(&clock, close_settle_wait_ms));
+    // Each pause counts at least 1 ms, so the wait is bounded by its length.
+    try std.testing.expectEqual(@as(u32, close_settle_wait_ms), clock.pauses);
+}
+
+test "signal close is pending from the request until the main thread answers" {
+    var hand: SignalClose = .{};
+    try std.testing.expect(!hand.pending());
+    hand.ask();
+    try std.testing.expect(hand.pending());
+    hand.answer();
+    try std.testing.expect(!hand.pending());
+}
+
+fn signalCloseMainSide(hand: *SignalClose, drawn: *u32, delay_us: u64) void {
+    // The event loop notices the request on its next pass, draws the exit
+    // frame (here a plain write that only the answer publishes), and answers.
+    while (!hand.pending()) io_mod.sleep(50 * std.time.ns_per_us);
+    io_mod.sleep(delay_us * std.time.ns_per_us);
+    drawn.* = 1;
+    hand.answer();
+}
+
+test "signal close hand-off holds across many thread interleavings" {
+    // The closer and a main thread agree through two atomics. The main
+    // thread's write before its answer must be visible to the closer after
+    // the wait returns; a ThreadSanitizer build reports it otherwise.
+    // The app installs its process Io before it starts a thread; a test's
+    // fallback Io does its one-time setup on first use, so do that here.
+    _ = io_mod.getIo();
+    var prng: std.Random.DefaultPrng = .init(20261109);
+    const random = prng.random();
+    for (0..300) |_| {
+        var hand: SignalClose = .{};
+        var drawn: u32 = 0;
+        hand.ask();
+        const delay_us = random.intRangeAtMost(u64, 0, 3000);
+        const main_side = try std.Thread.spawn(.{}, signalCloseMainSide, .{ &hand, &drawn, delay_us });
+        const answered = hand.awaitAnswer(CloserClock{}, 5_000);
+        try std.testing.expect(answered);
+        try std.testing.expectEqual(@as(u32, 1), drawn);
+        main_side.join();
+    }
+}
+
+test "signal close wait with a real clock ends near its bound when nobody answers" {
+    var hand: SignalClose = .{};
+    hand.ask();
+    const started = io_mod.awakeMilliTimestamp();
+    try std.testing.expect(!hand.awaitAnswer(CloserClock{}, 30));
+    const waited = io_mod.awakeMilliTimestamp() - started;
+    try std.testing.expect(waited >= 30 and waited < 2_000);
+}
+
+test "the signal close wait holds its laws for fuzzed answers, bounds and clocks" {
+    try std.testing.fuzz({}, fuzzSignalClose, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").signal_close.*),
+    });
+}
+
+fn fuzzSignalClose(_: void, smith: *std.testing.Smith) !void {
+    var hand: SignalClose = .{};
+    hand.ask();
+    const wait_ms = smith.valueRangeAtMost(u64, 0, 1_500);
+    const answered_first = smith.value(bool);
+    const step_ms: ?u64 = if (smith.value(bool)) smith.valueRangeAtMost(u64, 0, 3_000) else null;
+    const answer_at_ms: ?u64 = if (smith.value(bool)) smith.valueRangeAtMost(u64, 0, 3_000) else null;
+    if (answered_first) hand.answer();
+    var clock: SignalCloseTestClock = .{ .hand = &hand, .answer_at_ms = answer_at_ms, .step_ms = step_ms };
+    const answered = hand.awaitAnswer(&clock, wait_ms);
+
+    // The wait never ends in an answer nobody gave, and ends without one only
+    // after it counted its whole bound.
+    try std.testing.expectEqual(!hand.pending(), answered);
+    if (answered_first) {
+        try std.testing.expect(answered);
+        try std.testing.expectEqual(@as(u32, 0), clock.pauses);
+        return;
+    }
+    // Each pause counts at least 1 ms, so the wait is bounded by its length.
+    try std.testing.expect(clock.pauses <= wait_ms);
+    if (!answered) try std.testing.expect(clock.counted_ms >= wait_ms);
+    if (answered) try std.testing.expect(answer_at_ms != null and clock.now_ms >= answer_at_ms.?);
+    // With a clock that moves as asked, an answer due within the wait is seen.
+    if (step_ms == null and wait_ms > 0) {
+        if (answer_at_ms) |at| try std.testing.expectEqual(at <= wait_ms, answered) else try std.testing.expect(!answered);
+    }
 }
 
 test "launch scrollback push creates top-of-viewport space" {

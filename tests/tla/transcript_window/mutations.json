@@ -159,6 +159,78 @@
       "constants": "MCTranscriptWindowSweep",
       "find": "          THEN LET n == Min(Min(count, Step), Available(pendingDir))",
       "replace": "          THEN LET n == Min(count, Available(pendingDir))"
+    },
+    {
+      "id": "footer-release-current",
+      "bug": "History follows the footer on the screen, so a surface pushes the rows it covers into history and closing it leaves the footer above the bottom rows (main before the design).",
+      "law": "FooterAtBottom",
+      "spec": "FooterReclaim",
+      "constants": "MCFooterReclaim",
+      "find": "IF Release = \"base\" THEN Natural(n, FALSE, first) ELSE Natural(n, o, first)",
+      "replace": "Natural(n, o, first)"
+    },
+    {
+      "id": "footer-repaint-history",
+      "bug": "Closing a surface repaints the tail from rows already in native history, so scrollback shows them twice (the reclaim-by-reprint design).",
+      "law": "HistoryOnce",
+      "spec": "FooterReclaim",
+      "constants": "MCFooterReclaimToday",
+      "find": "        /\\ top' = Max(h, Natural(n, o, epochFirst))",
+      "replace": "        /\\ top' = Natural(n, o, epochFirst)"
+    },
+    {
+      "id": "footer-free-held",
+      "bug": "The shell frees a dropped entry while its rows are still held above the screen, so closing the surface has nothing to paint.",
+      "law": "OwedRowsHeld",
+      "spec": "FooterReclaim",
+      "constants": "MCFooterReclaim",
+      "find": "Freed(to, h) == Max(freed, Min(to, h))",
+      "replace": "Freed(to, h) == Max(freed, to)"
+    },
+    {
+      "id": "footer-exit-unsettled",
+      "bug": "Exit erases the footer while rows are held, so they never reach the terminal's scrollback.",
+      "law": "ExitKeepsRows",
+      "spec": "FooterReclaim",
+      "constants": "MCFooterReclaim",
+      "find": "    /\\ hist' = Max(hist, Natural(rows, open, epochFirst))\n    /\\ top' = Max(hist, Natural(rows, open, epochFirst))\n    /\\ freed' = Freed(dropTo, Max(hist, Natural(rows, open, epochFirst)))",
+      "replace": "    /\\ UNCHANGED <<hist, top, freed>>"
+    },
+    {
+      "id": "footer-sighup-exit-unsettled",
+      "bug": "SIGHUP restores the terminal at once instead of waiting for the main thread's exit frame (closeOnHangup, or the closer thread, ends fx first), so a closed window loses the rows a surface holds while SIGTERM keeps them.",
+      "law": "ExitKeepsRows",
+      "spec": "FooterReclaim",
+      "constants": "MCFooterReclaim",
+      "find": "    \\/ SignalExits = \"settle\"\n",
+      "replace": "    \\/ (SignalExits = \"settle\" /\\ name /= \"SigHup\")\n"
+    },
+    {
+      "id": "footer-exit-forgets-owed-rows",
+      "bug": "An invalid anchor has forgotten the rows it owes, so the exit frame after it counts them as history and releases none: a signal after a resize while a screen covers the main one ends fx with the rows a surface holds still held.",
+      "law": "ExitKeepsRows",
+      "spec": "FooterReclaim",
+      "constants": "MCFooterReclaim",
+      "find": "    /\\ hist' = Max(hist, Natural(rows, open, epochFirst))\n",
+      "replace": "    /\\ hist' = IF anchor = \"invalid\" THEN hist ELSE Max(hist, Natural(rows, open, epochFirst))\n"
+    },
+    {
+      "id": "footer-sighup-waits-for-debounce",
+      "bug": "SIGHUP's exit frame waits for a pending resize debounce, during which no frame commits, so a hang-up right after a resize ends fx with the rows a surface holds still held while SIGTERM keeps them.",
+      "law": "ExitKeepsRows",
+      "spec": "FooterReclaim",
+      "constants": "MCFooterReclaim",
+      "find": "    \\/ SignalExits = \"settle\"\n",
+      "replace": "    \\/ (SignalExits = \"settle\" /\\ ~(resizing /\\ name = \"SigHup\"))\n"
+    },
+    {
+      "id": "footer-exit-waits-for-debounce",
+      "bug": "/quit, suspend, and a fresh session draw the exit frame only when no resize debounce is pending, during which no frame commits, so one typed right after a resize erases the footer with the rows a surface holds still held while a signal keeps them.",
+      "law": "ExitKeepsRows",
+      "spec": "FooterReclaim",
+      "constants": "MCFooterReclaim",
+      "find": "ExitSettles(resizing) == ExitFrames = \"settle\" \\/ ~resizing",
+      "replace": "ExitSettles(resizing) == ~resizing"
     }
   ],
   "core": [
@@ -259,6 +331,138 @@
       "sweep": "MCTranscriptWindowSweep",
       "find": "            next.ctrlo.open = false;\n            next.ctrlo.pending = 0;",
       "replace": "            next.ctrlo.open = false;"
+    }
+  ],
+  "runtime": [
+    {
+      "id": "footer-runtime-release-current",
+      "bug": "The planner releases history up to the open footer's viewport, so a surface pushes the rows it covers into native history and its close leaves the footer above the bottom rows (main before the change).",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "            target_offset -| held_footer_rows;\n",
+      "replace": "            target_offset;\n"
+    },
+    {
+      "id": "footer-runtime-settle-skipped",
+      "bug": "Exit and suspend ask for the settle frame but the runtime never sets it, so the footer is erased while rows are held.",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "        self.settle_held_rows = true;\n        self.markTranscriptDirty();\n",
+      "replace": "        self.markTranscriptDirty();\n"
+    },
+    {
+      "id": "footer-runtime-reset-releases-held",
+      "bug": "A resize reprint with a surface open records the covered rows as held but scrolls them into native history, so its close paints them a second time.",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "(target.cursor_row +| scroll_facts.reset_held_rows);",
+      "replace": "target.cursor_row;"
+    },
+    {
+      "id": "footer-runtime-reset-holds-nothing",
+      "bug": "A resize reprint with a surface open releases the rows it covers, so its close leaves the footer above the bottom rows.",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "            const reset_held_rows = self.owedHeldRows(held_footer_rows, target_offset);\n",
+      "replace": "            const reset_held_rows: u16 = 0;\n"
+    },
+    {
+      "id": "footer-runtime-held-debt-unmarked",
+      "bug": "A frame that holds rows does not mark them as debt, so later output releases rows counted from the viewport and scrollback skips the held ones.",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "scroll_facts.finality_hold or scroll_facts.footer_rows_held",
+      "replace": "scroll_facts.finality_hold"
+    },
+    {
+      "id": "footer-runtime-recovery-releases-held",
+      "bug": "Recovery after a screen takeover restores history up to the open footer's viewport, so the rows a surface holds reach history twice: once by the recovery and once when they are painted back (tui-resume's shell approval handoff after Ctrl+O).",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "            if (anchor.normal_buffer_recovery_pending)\n                release_offset -| anchor.history_visual_offset\n",
+      "replace": "            if (anchor.normal_buffer_recovery_pending)\n                target_offset -| anchor.history_visual_offset\n"
+    },
+    {
+      "id": "footer-runtime-invalid-recovery-counts-held",
+      "bug": "Recovery from an invalid anchor counts every row above the viewport as history, so the rows a surface holds never reach scrollback.",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "                    .reset_held_rows = self.owedHeldRows(held_footer_rows, target_offset),\n",
+      "replace": "                    .reset_held_rows = 0,\n"
+    },
+    {
+      "id": "footer-runtime-settle-asks-stable-only",
+      "bug": "The settle request is made only by a stable anchor that holds rows, so an invalid or recovering anchor, which a resize while a screen covers the main one leaves, ends fx with the rows a surface holds still held (the head before the invalid-anchor repair).",
+      "file": "src/ui/transcript/runtime.zig",
+      "find": "            .invalid, .recovering => self.has_committed_frame,\n",
+      "replace": "            .invalid, .recovering => false,\n"
+    }
+  ],
+  "wiring": [
+    {
+      "id": "signal-close-never-asks",
+      "bug": "closerMain restores the terminal without asking the main thread for the exit frame, so SIGTERM and SIGHUP end fx with the rows a footer surface holds still held (the head before the repair).",
+      "file": "src/core/app/app_lifecycle.zig",
+      "find": "    signal_close.ask();\n",
+      "replace": "",
+      "proof": "driver"
+    },
+    {
+      "id": "signal-close-main-answers-unsettled",
+      "bug": "The main thread answers the closer's request without drawing the exit frame, so the closer restores the terminal with the held rows still held.",
+      "file": "src/core/app/app_render_runtime.zig",
+      "find": "                settleHeldTranscriptRows(app, flush_frame);\n            }\n            debug_trace.logf(\n                \"app\",\n                \"event=signal_close_settle",
+      "replace": "                _ = flush_frame;\n            }\n            debug_trace.logf(\n                \"app\",\n                \"event=signal_close_settle",
+      "proof": "driver"
+    },
+    {
+      "id": "signal-close-does-not-wait",
+      "bug": "closerMain does not wait for the main thread's answer, so it restores the terminal and ends fx before the exit frame is drawn.",
+      "file": "src/core/app/app_lifecycle.zig",
+      "find": "signal_close.awaitAnswer(CloserClock{}, close_settle_wait_ms)",
+      "replace": "signal_close.awaitAnswer(CloserClock{}, 0)",
+      "proof": "driver"
+    },
+    {
+      "id": "signal-close-keeps-full-transcript-open",
+      "bug": "The signal close draws the exit frame while Ctrl+O's full transcript screen is open, so the frame goes to the alternate screen and the held rows never reach scrollback.",
+      "file": "src/core/app/app_render_runtime.zig",
+      "find": "                _ = app_lifecycle.closeFullTranscriptIfActive(\n                    app.alloc,\n                    &app.terminal,\n                    &app.shell,\n                    &app.metrics,\n                ) catch |err| debug_trace.logf(\"render\", \"signal_close_full_transcript_failed err={s}\", .{@errorName(err)});\n",
+      "replace": "",
+      "proof": "e2e:SIGTERM with the full transcript screen"
+    },
+    {
+      "id": "hangup-close-does-not-settle",
+      "bug": "A hang-up with a turn running ends fx without drawing the exit frame (closeOnHangup skips releaseTerminal, which settles otherwise).",
+      "file": "src/main.zig",
+      "find": "        if (turn_running) self.settleHeldTranscriptRows();\n",
+      "replace": "",
+      "proof": "e2e:a terminal that hangs up"
+    },
+    {
+      "id": "signal-close-draws-the-approval",
+      "bug": "The exit frame of a signal close draws the open approval, which after a resize to a narrow window needs the whole main screen, so the transcript area is empty, the frame releases no row, and the scrollback is lost (the approval is moved to the review screen).",
+      "file": "src/core/app/app_render_runtime.zig",
+      "find": "            if (app_lifecycle.signalClosePending()) return null;\n",
+      "replace": "",
+      "proof": "e2e:after a resize moved the command approval to the review screen"
+    },
+    {
+      "id": "settle-skips-the-resize",
+      "bug": "The settle draws its frame without finishing a resize in flight, when no frame can commit, so /quit, Ctrl+Z and a signal right after a resize end or stop fx with the rows a footer surface holds still held (the head before the exit repair).",
+      "file": "src/core/app/app_render_runtime.zig",
+      "find": "            finishResizeBeforeSettle(app, flush_frame);\n",
+      "replace": "",
+      "proof": "e2e:/quit 0 ms after a resize"
+    },
+    {
+      "id": "signal-close-keeps-the-debounce",
+      "bug": "The settle waits out the resize debounce instead of ending it, so the exit frame waits for the deadline of a resize a drag keeps re-arming.",
+      "file": "src/core/app/app_render_runtime.zig",
+      "find": "                shell_runtime.skipResizeDebounce(&self.app.shell, io_mod.milliTimestamp());\n",
+      "replace": "",
+      "proof": "driver:9"
+    },
+    {
+      "id": "settle-gives-up-at-once",
+      "bug": "The settle's wait for a resize in flight has no time at all, so it draws its frame while the resize still blocks every frame, and /quit and Ctrl+Z right after a resize lose the rows a footer surface holds.",
+      "file": "src/core/app/app_render_runtime.zig",
+      "find": "const settle_resize_wait_ms: u64 = 300;\n",
+      "replace": "const settle_resize_wait_ms: u64 = 0;\n",
+      "proof": "e2e:Ctrl\\+Z 0 ms after a resize"
     }
   ]
 }

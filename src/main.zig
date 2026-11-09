@@ -1123,11 +1123,26 @@ const App = struct {
     /// Ends fx as a closed window while the main conversation's turn runs
     /// (`app_lifecycle.closeOnHangup`); returns when no turn is running.
     pub fn closeOnHangup(self: *App) void {
-        app_lifecycle.closeOnHangup(self.main_agent.worker.isProcessing());
+        const turn_running = self.main_agent.worker.isProcessing();
+        // Ending fx here skips `releaseTerminal`, which settles otherwise.
+        if (turn_running) self.settleHeldTranscriptRows();
+        app_lifecycle.closeOnHangup(turn_running);
+    }
+
+    /// Puts the rows a footer surface holds into native history before the
+    /// screen is handed off: exit, suspend, or a fresh session.
+    pub fn settleHeldTranscriptRows(self: *App) void {
+        RenderAppRuntime.settleHeldTranscriptRows(self, flushRequestedFrame);
+    }
+
+    /// Draws the exit frame a SIGTERM or SIGHUP close waits for.
+    pub fn settleForSignalClose(self: *App) void {
+        RenderAppRuntime.settleForSignalClose(self, flushRequestedFrame);
     }
 
     pub fn releaseTerminal(self: *App) void {
         if (!self.terminal.raw_enabled and !self.terminal.signal_handler_installed) return;
+        if (self.terminal.raw_enabled) self.settleHeldTranscriptRows();
         app_lifecycle.shutdownInteractiveShell(
             &self.terminal,
             &self.shell,
@@ -1142,6 +1157,7 @@ const App = struct {
 
     pub fn suspendToJobControl(self: *App) !void {
         try self.flushBeforeBlockingExternalWork();
+        self.settleHeldTranscriptRows();
         // Suspending clears fx's program status record; report it again on resume.
         defer self.program_status.invalidate();
         try SessionAppRuntime.suspendToJobControl(self, footer_rows);
@@ -3204,6 +3220,7 @@ const App = struct {
 
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        if (comptime !host_target.is_wasm) self.settleForSignalClose();
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self, self.screenAgent())) return;
 
         if (comptime !host_target.is_wasm) {
@@ -3262,26 +3279,7 @@ const App = struct {
         try self.processNextCooperativePrompt(self.screenAgent());
 
         const cols_before_resize = self.shell.layout.cols;
-        if (self.terminal_input_runtime.native_clear_probe.active() or
-            self.terminal_input_runtime.native_clear_probe.awaitingLateResponse())
-        {
-            try self.collectNativeClearProbeFacts();
-        } else {
-            shell_runtime.collectResizeFacts(
-                self.terminal,
-                &self.shell,
-                &self.metrics,
-                &self.terminal_input_runtime.terminal_cursor_probe,
-                &resize_interlock,
-                footer_rows,
-                resize_debounce_ms,
-                !InputAppRuntime.terminalPasteActive(self) and !self.auth.apiKeyEntryActive(),
-            ) catch |err| {
-                if (err != error.TerminalTooSmall and err != error.UnableToReadTerminalSize) {
-                    return err;
-                }
-            };
-        }
+        try self.collectResizeFactsPass();
         // Terminal width changed with the modal open, so the footer
         // panel needs to re-wrap labels and descriptions.
         if (self.screenAgent().question_prompt.isActive() and cols_before_resize != self.shell.layout.cols) {
@@ -3565,6 +3563,32 @@ const App = struct {
             try SessionAppRuntime.settlePendingLiveSessionTransition(self, self.screenAgent());
             if (try InputAppRuntime.flushDeferredSessionInput(self, input_limits, max_prompt_history)) try self.flushRequestedFrame();
         }
+    }
+
+    /// The resize step of a loop pass, which a settle outside the loop runs
+    /// too (`finishResizeBeforeSettle`). A native clear probe in flight owns
+    /// the cursor probe, so the pass collects its facts instead.
+    pub fn collectResizeFactsPass(self: *App) !void {
+        if (self.terminal_input_runtime.native_clear_probe.active() or
+            self.terminal_input_runtime.native_clear_probe.awaitingLateResponse())
+        {
+            try self.collectNativeClearProbeFacts();
+            return;
+        }
+        shell_runtime.collectResizeFacts(
+            self.terminal,
+            &self.shell,
+            &self.metrics,
+            &self.terminal_input_runtime.terminal_cursor_probe,
+            &resize_interlock,
+            footer_rows,
+            resize_debounce_ms,
+            !InputAppRuntime.terminalPasteActive(self) and !self.auth.apiKeyEntryActive(),
+        ) catch |err| {
+            if (err != error.TerminalTooSmall and err != error.UnableToReadTerminalSize) {
+                return err;
+            }
+        };
     }
 
     pub fn admitPendingApprovalResize(self: *App) bool {
@@ -5359,6 +5383,7 @@ test {
     _ = @import("core/app/app_upgrade_runtime.zig");
     _ = @import("core/app/app_worker_runtime.zig");
     _ = @import("ui/event_loop.zig");
+    _ = @import("ui/resize_runtime.zig");
     _ = @import("ui/resize_tests.zig");
     _ = @import("ui/transcript/transcript_window_fuzz.zig");
     _ = @import("ui/transcript/frozen_prefix_tests.zig");

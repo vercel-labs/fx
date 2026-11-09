@@ -417,6 +417,28 @@ noinline fn approvalScreenNeedsClear(
         prior.cols != layout.cols;
 }
 
+/// How long the settle waits for a window resize in flight to finish, counted
+/// by what the wait's clock reports, and the longest one pause of it lasts. The
+/// signal close's closer thread waits for the main thread's exit frame at most
+/// `app_lifecycle.close_settle_wait_ms`, which this stays under.
+const settle_resize_wait_ms: u64 = 300;
+const settle_resize_poll_ms: u64 = 5;
+
+const ResizeWaitOutcome = enum { finished, timed_out, failed };
+
+/// Runs `lifecycle.step()` while `lifecycle.inFlight()`, pausing `clock.pause`
+/// between steps, for at most `wait_ms`, counted by what each pause reports (at
+/// least 1 ms per pause, so a clock that stands still still ends the wait).
+fn waitForResize(lifecycle: anytype, clock: anytype, wait_ms: u64) ResizeWaitOutcome {
+    var waited_ms: u64 = 0;
+    while (lifecycle.inFlight()) {
+        if (waited_ms >= wait_ms) return .timed_out;
+        lifecycle.step() catch return .failed;
+        waited_ms +|= @max(1, clock.pause(@min(settle_resize_poll_ms, wait_ms - waited_ms)));
+    }
+    return .finished;
+}
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
@@ -943,6 +965,164 @@ pub fn Runtime(comptime App: type) type {
             return std.mem.eql(u8, pendingPickerSpeed(query, speed_index), "fast");
         }
 
+        /// Exit, suspend, and a fresh session hand off the screen, so before
+        /// they do, one frame (drawn by `flush_frame`, the App's one frame
+        /// flush) releases the rows a footer surface holds above the screen
+        /// into native history, from any anchor state
+        /// (`tests/tla/transcript_window/spec/FooterReclaim.tla` ExitKeepsRows).
+        /// A settle that no frame commits is logged as rows dropped from
+        /// scrollback, with their count when the anchor knows it; the session
+        /// log and Ctrl+O keep them. A window resize holds every frame back
+        /// until its settled replay is drawn, so a resize in flight is
+        /// finished first (`finishResizeBeforeSettle`), whoever settles.
+        pub fn settleHeldTranscriptRows(app: *App, flush_frame: *const fn (*App) anyerror!void) void {
+            if (!app.shell.requestHeldRowsSettle()) return;
+            finishResizeBeforeSettle(app, flush_frame);
+            flush_frame(app) catch |err| {
+                debug_trace.logf("render", "held_rows_settle_failed err={s}", .{@errorName(err)});
+            };
+            if (app.shell.heldRowsSettleOutstanding()) {
+                var count_buf: [16]u8 = undefined;
+                const held_rows = if (app.shell.heldTranscriptRowCount()) |rows|
+                    std.mem.print(&count_buf, "{d}", .{rows}) catch "unknown"
+                else
+                    "unknown";
+                debug_trace.logf(
+                    "render",
+                    "held_rows_settle_incomplete dropped=held_transcript_rows_from_scrollback reason=settle_frame_not_committed anchor={s} held_rows={s}",
+                    .{ @tagName(app.shell.transcriptCommitDiagnostic().state), held_rows },
+                );
+            }
+        }
+
+        /// SIGTERM and SIGHUP end fx from the closer thread, which cannot
+        /// touch the rows the main thread holds: it asks for the exit frame
+        /// (`app_lifecycle.signalClosePending`) and restores the terminal once
+        /// the main thread answers. The event loop calls this on every pass.
+        /// The settle is the one /quit draws, from any anchor state, and a
+        /// closed terminal logs its drop there
+        /// (`tests/tla/transcript_window/spec/FooterReclaim.tla` SignalExit).
+        /// Ctrl+O's full transcript screen and the approval review screen
+        /// cover the main screen and the rows it holds, and a resize while one
+        /// is open leaves the anchor invalid: they are left first, so the frame
+        /// draws on the main screen, and its recovery from that anchor
+        /// releases the held rows. A recovery request here would repaint a
+        /// restored screen whose anchor is still stable and show rows twice.
+        /// The settle finishes a resize in flight within its own wait, which
+        /// stays under the closer's.
+        pub fn settleForSignalClose(app: *App, flush_frame: *const fn (*App) anyerror!void) void {
+            if (!app_lifecycle.signalClosePending()) return;
+            const raw = app.terminal.raw_enabled;
+            if (raw) {
+                _ = app_lifecycle.closeFullTranscriptIfActive(
+                    app.alloc,
+                    &app.terminal,
+                    &app.shell,
+                    &app.metrics,
+                ) catch |err| debug_trace.logf("render", "signal_close_full_transcript_failed err={s}", .{@errorName(err)});
+                if (app.terminal.fileApprovalScreenActive()) {
+                    app_lifecycle.leaveApprovalScreen(&app.terminal, &app.shell, &app.metrics) catch |err|
+                        debug_trace.logf("render", "signal_close_review_screen_failed err={s}", .{@errorName(err)});
+                }
+                settleHeldTranscriptRows(app, flush_frame);
+            }
+            debug_trace.logf(
+                "app",
+                "event=signal_close_settle raw={s} held_rows_left={s}",
+                .{ if (raw) "true" else "false", if (app.shell.heldRowsSettleOutstanding()) "true" else "false" },
+            );
+            app_lifecycle.answerSignalClose();
+        }
+
+        /// Finishes a window resize that is still moving toward its settled
+        /// frame, so the settle's frame can commit. A resize signal the loop
+        /// has not admitted yet is admitted, and the debounce, which only lets
+        /// a window drag settle, ends now. The loop's own resize steps
+        /// (observe, light frame, settled reset) then run here, because the
+        /// settle runs after the loop ended (/quit) or while it is paused
+        /// (Ctrl+Z), when no pass would run them, and a signal's closer waits
+        /// on the pass that settles. The wait is bounded
+        /// (`settle_resize_wait_ms`), and one that ends unfinished leaves the
+        /// settle to log the rows it could not release.
+        /// (`tests/tla/transcript_window/spec/FooterReclaim.tla` ExitKeepsRows,
+        /// Exited with a resize debounce pending.)
+        fn finishResizeBeforeSettle(app: *App, flush_frame: *const fn (*App) anyerror!void) void {
+            if (comptime !@hasDecl(App, "collectResizeFactsPass")) return;
+            const lifecycle: ResizeLifecycle = .{ .app = app, .flush_frame = flush_frame };
+            if (!lifecycle.inFlight()) return;
+            debug_trace.logf("app", "event=settle_resize_wait reason=resize_in_flight", .{});
+            const outcome = waitForResize(lifecycle, SettleClock{ .app = app }, settle_resize_wait_ms);
+            debug_trace.logf("app", "event=settle_resize_wait_end outcome={s}", .{@tagName(outcome)});
+        }
+
+        /// The resize steps the settle runs in place of the event loop.
+        const ResizeLifecycle = struct {
+            app: *App,
+            flush_frame: *const fn (*App) anyerror!void,
+
+            /// Whether a resize is still in flight once any signal the loop
+            /// has not seen is admitted and the debounce is over.
+            fn inFlight(self: ResizeLifecycle) bool {
+                if (comptime @hasDecl(App, "admitPendingResizeSignal")) {
+                    _ = self.app.admitPendingResizeSignal("settle");
+                }
+                shell_runtime.skipResizeDebounce(&self.app.shell, io_mod.milliTimestamp());
+                return shell_runtime.resizeInFlight(&self.app.shell);
+            }
+
+            /// One pass of the loop's resize steps, then the frame they ask
+            /// for (the light frame, the settled reset).
+            fn step(self: ResizeLifecycle) !void {
+                self.app.collectResizeFactsPass() catch |err| {
+                    debug_trace.logf("render", "held_rows_settle_resize_failed step=facts err={s}", .{@errorName(err)});
+                    return err;
+                };
+                self.flush_frame(self.app) catch |err| {
+                    debug_trace.logf("render", "held_rows_settle_resize_failed step=frame err={s}", .{@errorName(err)});
+                    return err;
+                };
+            }
+        };
+
+        /// One pause of the settle's wait, in real time. The terminal answers
+        /// a resize's cursor position request on the input the loop reads, and
+        /// the loop is not reading, so a pause that finds that request pending
+        /// waits for the reply here, which also keeps it from reaching the
+        /// shell fx hands the terminal to. Returns the milliseconds it took.
+        const SettleClock = struct {
+            app: *App,
+
+            fn pause(self: SettleClock, ms: u64) u64 {
+                const started = io_mod.awakeMilliTimestamp();
+                if (!self.readCursorReply(ms)) io_mod.sleep(std.time.ns_per_ms);
+                return @intCast(@max(0, io_mod.awakeMilliTimestamp() - started));
+            }
+
+            /// Whether a cursor position request was pending, and waited for.
+            fn readCursorReply(self: SettleClock, ms: u64) bool {
+                if (comptime !@hasField(App, "terminal_input_runtime")) return false;
+                const probe = &self.app.terminal_input_runtime.terminal_cursor_probe;
+                if (!probe.interceptsInput()) return false;
+                const polled = self.app.terminal.pollInput(@intCast(@min(ms, std.math.maxInt(i32)))) catch return true;
+                if (!polled.readable) return true;
+                var buf: [64]u8 = undefined;
+                const read_len = self.app.terminal.read(&buf) catch return true;
+                for (buf[0..read_len]) |byte| {
+                    probe.noteInputActivity(io_mod.milliTimestamp());
+                    switch (probe.feed(byte)) {
+                        .pending, .late_response => {},
+                        .position => |position| shell_runtime.completeResizeCursorProbe(&self.app.shell, position),
+                        .forward => |forwarded| debug_trace.logf(
+                            "render",
+                            "held_rows_settle_input_dropped bytes={d} reason=exit_settle",
+                            .{forwarded.slice().len},
+                        ),
+                    }
+                }
+                return true;
+            }
+        };
+
         pub fn flushRequestedFrame(app: *App, agent: *AppAgent) !void {
             if (comptime @hasDecl(@TypeOf(app.shell), "sessionScrollbackHandoffPending")) {
                 if (app.shell.sessionScrollbackHandoffPending()) return;
@@ -1394,10 +1574,10 @@ pub fn Runtime(comptime App: type) type {
                 measurement.changesFooterReservation(presentation_shell)
             else
                 false;
-            const replay_displaced_footer_history = if (footer_measurement) |*measurement|
-                measurement.replaysDisplacedTranscriptHistory(presentation_shell)
+            const held_footer_rows: u16 = if (footer_measurement) |*measurement|
+                measurement.heldFooterRows()
             else
-                false;
+                0;
 
             var footer_frame: surface_frame.SurfaceFooterFrame = undefined;
             var footer_frame_initialized = false;
@@ -1458,7 +1638,7 @@ pub fn Runtime(comptime App: type) type {
                     .prepared_transcript = &prepared_transcript,
                     .resolved_target = &resolved_transcript_target,
                     .footer_reservation_changed = footer_reservation_changed,
-                    .replay_displaced_footer_history = replay_displaced_footer_history,
+                    .held_footer_rows = held_footer_rows,
                     .footer_measurement = if (footer_measurement) |*measurement| measurement else null,
                     .fallback_footer_rows = if (footer_measurement == null)
                         footer_frame.paint.footer
@@ -2061,6 +2241,11 @@ pub fn Runtime(comptime App: type) type {
         // returns when the list closes.
         fn shownApproval(app: *const App, agent: *AppAgent) ?approval_prompt.Projection {
             if (agentsMenuActive(app)) return null;
+            // A signal close draws its exit frame with the idle footer. An
+            // approval that a narrow window moved to the review screen would
+            // fill the main screen, leave the transcript no row, and so
+            // release none of the rows it holds.
+            if (app_lifecycle.signalClosePending()) return null;
             return agent.approval_prompt.projection();
         }
 
@@ -2153,7 +2338,7 @@ fn FixedPointTranscriptContext(comptime App: type) type {
         prepared_transcript: *?transcript_painter.PreparedTranscriptSurfacePaint,
         resolved_target: *?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget,
         footer_reservation_changed: bool,
-        replay_displaced_footer_history: bool,
+        held_footer_rows: u16,
         footer_measurement: ?*const surface_frame.SurfaceFooterMeasurement,
         fallback_footer_rows: ?render_engine.footer_layout.FooterRows,
         activity_projection: activity_runtime.ActivityProjection,
@@ -2196,7 +2381,7 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 source,
                 prepared,
                 self.footer_reservation_changed,
-                self.replay_displaced_footer_history,
+                self.held_footer_rows,
             );
             self.scroll_facts = scroll_facts;
             const canonical_occupied_rows = if (prepared.selection.last_visible_row >= canonical_area.top)
@@ -2553,6 +2738,130 @@ fn solveFixedPointForTest(
         FixedPointTestContext.prepareCandidate,
         FixedPointTestContext.resolveCandidate,
     );
+}
+
+/// A resize that finishes after `finish_after` steps (never when null), and a
+/// step that fails at `fail_at`.
+const FakeResizeLifecycle = struct {
+    finish_after: ?u32 = null,
+    fail_at: ?u32 = null,
+    steps: u32 = 0,
+
+    fn inFlight(self: *FakeResizeLifecycle) bool {
+        return if (self.finish_after) |after| self.steps < after else true;
+    }
+
+    fn step(self: *FakeResizeLifecycle) !void {
+        self.steps += 1;
+        if (self.fail_at == self.steps) return error.FakeStepFailed;
+    }
+};
+
+/// A clock the test controls: `pause` moves it by what was asked, or by a
+/// fixed step.
+const FakeWaitClock = struct {
+    step_ms: ?u64 = null,
+    now_ms: u64 = 0,
+    counted_ms: u64 = 0,
+    pauses: u32 = 0,
+
+    fn pause(self: *FakeWaitClock, ms: u64) u64 {
+        self.pauses += 1;
+        const elapsed = self.step_ms orelse ms;
+        self.now_ms +|= elapsed;
+        self.counted_ms +|= @max(1, elapsed);
+        return elapsed;
+    }
+};
+
+test "the settle's wait for a resize ends as soon as the resize finishes" {
+    var lifecycle: FakeResizeLifecycle = .{ .finish_after = 3 };
+    var clock: FakeWaitClock = .{};
+    try std.testing.expectEqual(ResizeWaitOutcome.finished, waitForResize(&lifecycle, &clock, settle_resize_wait_ms));
+    try std.testing.expectEqual(@as(u32, 3), lifecycle.steps);
+    try std.testing.expectEqual(@as(u32, 3), clock.pauses);
+
+    // A resize that is not in flight takes no step and no pause.
+    var idle: FakeResizeLifecycle = .{ .finish_after = 0 };
+    var idle_clock: FakeWaitClock = .{};
+    try std.testing.expectEqual(ResizeWaitOutcome.finished, waitForResize(&idle, &idle_clock, settle_resize_wait_ms));
+    try std.testing.expectEqual(@as(u32, 0), idle.steps);
+    try std.testing.expectEqual(@as(u32, 0), idle_clock.pauses);
+}
+
+test "the settle's wait for a resize gives up at its bound, not before" {
+    // 300 ms in pauses of 5 ms is 60 steps: a resize that finishes by then is
+    // seen, and one that needs a 61st step is left unfinished.
+    const steps_in_wait: u32 = settle_resize_wait_ms / settle_resize_poll_ms;
+    var in_time: FakeResizeLifecycle = .{ .finish_after = steps_in_wait };
+    var in_time_clock: FakeWaitClock = .{};
+    try std.testing.expectEqual(ResizeWaitOutcome.finished, waitForResize(&in_time, &in_time_clock, settle_resize_wait_ms));
+    try std.testing.expectEqual(settle_resize_wait_ms, in_time_clock.now_ms);
+
+    var late: FakeResizeLifecycle = .{ .finish_after = steps_in_wait + 1 };
+    var late_clock: FakeWaitClock = .{};
+    try std.testing.expectEqual(ResizeWaitOutcome.timed_out, waitForResize(&late, &late_clock, settle_resize_wait_ms));
+    try std.testing.expectEqual(steps_in_wait, late.steps);
+    try std.testing.expectEqual(settle_resize_wait_ms, late_clock.counted_ms);
+
+    // A resize that never finishes ends the wait too, with a clock that stands
+    // still and with one that jumps far past the bound.
+    var never: FakeResizeLifecycle = .{};
+    var still: FakeWaitClock = .{ .step_ms = 0 };
+    try std.testing.expectEqual(ResizeWaitOutcome.timed_out, waitForResize(&never, &still, settle_resize_wait_ms));
+    try std.testing.expectEqual(@as(u32, settle_resize_wait_ms), still.pauses);
+    var stuck: FakeResizeLifecycle = .{};
+    var jump: FakeWaitClock = .{ .step_ms = 10_000 };
+    try std.testing.expectEqual(ResizeWaitOutcome.timed_out, waitForResize(&stuck, &jump, settle_resize_wait_ms));
+    try std.testing.expectEqual(@as(u32, 1), jump.pauses);
+}
+
+test "the settle's wait for a resize ends at a step that fails" {
+    var lifecycle: FakeResizeLifecycle = .{ .fail_at = 2 };
+    var clock: FakeWaitClock = .{};
+    try std.testing.expectEqual(ResizeWaitOutcome.failed, waitForResize(&lifecycle, &clock, settle_resize_wait_ms));
+    try std.testing.expectEqual(@as(u32, 2), lifecycle.steps);
+    try std.testing.expectEqual(@as(u32, 1), clock.pauses);
+}
+
+test "the settle's wait for a resize holds its laws for fuzzed progress, bounds and clocks" {
+    try std.testing.fuzz({}, fuzzResizeWait, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").settle_resize_wait.*),
+    });
+}
+
+fn fuzzResizeWait(_: void, smith: *std.testing.Smith) !void {
+    const wait_ms = smith.valueRangeAtMost(u64, 0, 1_500);
+    var lifecycle: FakeResizeLifecycle = .{
+        .finish_after = if (smith.value(bool)) smith.valueRangeAtMost(u32, 0, 400) else null,
+        .fail_at = if (smith.value(bool)) smith.valueRangeAtMost(u32, 1, 400) else null,
+    };
+    const step_ms: ?u64 = if (smith.value(bool)) smith.valueRangeAtMost(u64, 0, 3_000) else null;
+    var clock: FakeWaitClock = .{ .step_ms = step_ms };
+    const outcome = waitForResize(&lifecycle, &clock, wait_ms);
+
+    // Each pause follows a step and counts at least 1 ms, so the wait is
+    // bounded by its length, and a wait that gives up counted all of it.
+    try std.testing.expectEqual(lifecycle.steps - @intFromBool(outcome == .failed), clock.pauses);
+    try std.testing.expect(clock.pauses <= wait_ms);
+    switch (outcome) {
+        // It ends finished only on a resize that is not in flight.
+        .finished => try std.testing.expect(!lifecycle.inFlight()),
+        .timed_out => {
+            try std.testing.expect(lifecycle.inFlight());
+            try std.testing.expect(clock.counted_ms >= wait_ms);
+        },
+        .failed => try std.testing.expectEqual(@as(?u32, lifecycle.steps), lifecycle.fail_at),
+    }
+    // With a clock that moves as asked, a resize due within the wait is seen,
+    // unless a step fails first.
+    if (step_ms == null) {
+        if (lifecycle.finish_after) |after| {
+            const steps_in_wait: u64 = wait_ms / settle_resize_poll_ms + @intFromBool(wait_ms % settle_resize_poll_ms != 0);
+            const fails_first = if (lifecycle.fail_at) |at| at <= after else false;
+            if (after <= steps_in_wait and !fails_first) try std.testing.expectEqual(ResizeWaitOutcome.finished, outcome);
+        }
+    }
 }
 
 test "pending prompt projection waits for a paintable terminal width" {
@@ -4761,9 +5070,13 @@ test "core.app_render_runtime paints a rebased terminal status after cancellatio
     try std.testing.expectEqualStrings(finished, quiet);
 }
 
+/// The screen width at which `checkRebasedNoticePublication` also holds a
+/// multi-line draft in the composer.
+const draft_publication_cols: u16 = 24;
+
 test "core.app_render_runtime rebased notice preserves the pin and publishes the finished result" {
     try checkRebasedNoticePublication(80, 12);
-    try checkRebasedNoticePublication(24, 10);
+    try checkRebasedNoticePublication(draft_publication_cols, 10);
 }
 
 fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
@@ -4786,7 +5099,7 @@ fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
     var history: std.ArrayList(u8) = .empty;
     defer history.deinit(alloc);
     var offset: u64 = 0;
-    if (cols == 24) try app.input_runtime.textReplacementState().replace(alloc, "draft one\ndraft two\ndraft three\ndraft four");
+    if (cols == draft_publication_cols) try app.input_runtime.textReplacementState().replace(alloc, "draft one\ndraft two\ndraft three\ndraft four");
     for (0..4) |index| {
         var line: [48]u8 = undefined;
         _ = try app.shell.appendRawTranscriptEntry(alloc, try std.mem.print(&line, "NOTICE_HISTORY_{d:0>2}\n", .{index}));
@@ -4827,6 +5140,9 @@ fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
     var finished = try app.shell.prepareTranscriptSource(alloc, null);
     defer finished.deinit(alloc);
     try std.testing.expect(finished.finality.mutation_pin_start == null);
+    // The draft holds the transcript rows it covers until it clears
+    // (`tests/tla/transcript_window/spec/FooterReclaim.tla` FooterAtBottom).
+    if (cols == draft_publication_cols) app.input_runtime.inputResetState().clearCurrent(alloc);
     var released: u32 = 0;
     for (0..4) |_| released += try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
     try std.testing.expect(released > 0);

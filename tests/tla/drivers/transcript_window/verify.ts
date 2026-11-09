@@ -12,32 +12,50 @@
 //   7. spec to code: every edge of both sweep graphs replayed on the real core;
 //   8. code to spec: scripted and random traces with real crashes and faulty
 //      log replies, saved and --no-save, checked by TLC;
-//   9. every planted bug in the spec caught by the law it names;
-//  10. every planted bug in the core caught by a conformance direction;
-//  11. traceability: DESIGN.md, the configs, the tests, and the bugs agree;
-//  12. binary to spec: the built fx binary through three compaction cycles,
+//   9. footer runtime to spec: event scripts (output, slash picker open and
+//      close, resizes, exit) through the real transcript runtime in the resize
+//      harness, checked by TLC against FooterReclaim.tla, with every row
+//      counted once in the bytes it wrote (footer-runtime-to-spec.ts);
+//  10. every planted bug in the spec caught by the law it names;
+//  11. every planted bug in the core caught by a conformance direction;
+//  12. every planted bug in the transcript runtime's footer reclaim rule
+//      caught by the footer reclaim tests or by step 9;
+//  13. traceability: DESIGN.md, the configs, the tests, and the bugs agree;
+//  14. binary to spec: the built fx binary through three compaction cycles,
 //      Ctrl+O, and a resume, its traced window steps replayed on the core and
 //      checked by TLC (binary-to-spec.ts). FX_BIN picks the binary.
+//  15. footer signal to spec: the built fx with the slash picker open over a
+//      long transcript, also after Ctrl+O and a resize, with an approval
+//      that a narrower window moved to the review screen, and right after a
+//      resize, ended by a real SIGTERM or SIGHUP, the rows its history and
+//      screen hold checked by TLC against FooterReclaim.tla
+//      (footer-signal-to-spec.ts);
+//  16. every planted bug in the signal close's wiring (a copy of src/ built and
+//      run by the signal driver or a tmux test) caught.
 //
-// With --ci, CI's TLA+ transcript window job leaves out steps 9, 10, and 12:
-// the planted bugs measure the checks rather than the code, and the binary
-// run needs a built fx and tmux.
+// With --ci, CI's TLA+ transcript window job leaves out steps 10, 11, 12, 14,
+// 15, and 16: the planted bugs measure the checks rather than the code, and
+// the binary runs need a built fx and tmux.
 //
 // Settings: FX_TRANSCRIPT_WINDOW_SEED (default 20261030),
 // FX_TRANSCRIPT_WINDOW_TRACES (random traces per session kind, default 200),
+// FX_FOOTER_RECLAIM_TRACES (random footer scripts, default 40),
 // FX_TLA_OUT (where the report goes).
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { REPO_ROOT, outDir, writeJson } from "../lib/tlc.ts";
 import { binaryToSpec } from "./binary-to-spec.ts";
 import { codeToSpec } from "./code-to-spec.ts";
+import { footerRuntimeToSpec } from "./footer-runtime-to-spec.ts";
 import { CORE_SOURCE, PINNED_TLC_VERSION, buildHarness, checkTlc, configConstants, pinnedToolchain, specFiles, type Config } from "./lib.ts";
-import { coreMutations, specMutations } from "./mutations.ts";
+import { coreMutations, runtimeMutations, specMutations, wiringMutations } from "./mutations.ts";
+import { footerSignalToSpec } from "./footer-signal-to-spec.ts";
 import { specToCode } from "./spec-to-code.ts";
 import { checkTraceability } from "./traceability.ts";
 
 const seed = Number(process.env.FX_TRANSCRIPT_WINDOW_SEED ?? "20261030");
 const randomTraces = Number(process.env.FX_TRANSCRIPT_WINDOW_TRACES ?? "200");
+const footerTraces = Number(process.env.FX_FOOTER_RECLAIM_TRACES ?? "40");
 const ci = process.argv.includes("--ci");
 const out = outDir("transcript-window");
 const report: Record<string, unknown> = { started: new Date().toISOString(), seed, randomTraces, ci, out };
@@ -73,6 +91,28 @@ try {
     models[cfg] = { verdict: run.verdict, property: run.property, distinct: run.distinct, depth: run.depth, ms: run.durationMs, tlc: run.tlcVersion };
     const pinned = run.tlcVersion === PINNED_TLC_VERSION;
     stage(`model ${cfg}`, run.verdict === "pass" && pinned, `${run.verdict}${run.property ? ` (${run.property})` : ""}, ${run.distinct} distinct states, depth ${run.depth}${pinned ? "" : `, TLC is ${run.tlcVersion}`}`);
+  }
+  // The footer: the design's config passes, main's rule before it (history
+  // follows the footer on the screen) fails FooterAtBottom, the head before
+  // the signal repair (SIGTERM and SIGHUP erase the footer without the exit
+  // frame) fails ExitKeepsRows, and so do the head before the
+  // invalid-anchor repair (the exit frame is drawn only from a stable anchor)
+  // the head before the debounce repair (no exit frame while a resize
+  // debounce is pending), and the head before the exit repair (the same for
+  // /quit, suspend, and a fresh session).
+  for (const [cfg, expected] of [
+    ["MCFooterReclaim", null],
+    ["MCFooterReclaimToday", "FooterAtBottom"],
+    ["MCFooterReclaimSignalHead", "ExitKeepsRows"],
+    ["MCFooterReclaimInvalidAnchorHead", "ExitKeepsRows"],
+    ["MCFooterReclaimDebounceHead", "ExitKeepsRows"],
+    ["MCFooterReclaimExitDebounceHead", "ExitKeepsRows"],
+  ] as const) {
+    const run = await checkTlc(join(out, "model", cfg), "FooterReclaim", `${cfg}.cfg`, specFiles());
+    models[cfg] = { verdict: run.verdict, property: run.property, distinct: run.distinct, depth: run.depth, ms: run.durationMs, tlc: run.tlcVersion };
+    const ok = expected === null ? run.verdict === "pass" : run.verdict === "violated" && run.property === expected;
+    stage(`model ${cfg}`, ok && run.tlcVersion === PINNED_TLC_VERSION,
+      `${run.verdict}${run.property ? ` (${run.property})` : ""}${expected ? `, expected ${expected} violated` : ""}, ${run.distinct} distinct states`);
   }
   report.models = models;
 
@@ -120,6 +160,13 @@ try {
   report.codeToSpec = traces;
   console.log(`  code to spec: ${elapsed(at)}`);
 
+  at = performance.now();
+  const footer = await footerRuntimeToSpec({ dir: join(out, "footer"), randomTraces: footerTraces, length: 30, seed });
+  report.footerRuntimeToSpec = { ...footer, tlc: footer.tlc ? { verdict: footer.tlc.verdict, property: footer.tlc.property, distinct: footer.tlc.distinct } : null };
+  stage("footer runtime to spec", footer.tlc?.verdict === "pass" && footer.problem === null,
+    `${footer.traces} traces, ${footer.steps} steps of the real transcript runtime, base footer ${footer.baseCap ?? "?"} rows, surface +${footer.extra ?? "?"}; TLC ${footer.tlc?.verdict ?? "not run"}${footer.tlc?.property ? ` (${footer.tlc.property})` : ""}${footer.problem ? `; ${footer.problem}` : ""}`);
+  console.log(`  footer runtime to spec: ${elapsed(at)}`);
+
   if (!ci) {
     at = performance.now();
     const spec = await specMutations(join(out, "mutations", "spec"));
@@ -128,7 +175,13 @@ try {
     const coreResults = await coreMutations(join(out, "mutations", "core"), graphs);
     const missedCore = coreResults.filter((result) => !result.caught);
     stage("core mutations", missedCore.length === 0, `${coreResults.length - missedCore.length} of ${coreResults.length} caught${missedCore.length ? `; missed ${missedCore.map((result) => `${result.id} (${result.detail})`).join(", ")}` : ""}`);
-    report.mutations = { spec, core: coreResults };
+    const runtimeResults = await runtimeMutations(join(out, "mutations", "runtime"));
+    const missedRuntime = runtimeResults.filter((result) => !result.caught);
+    stage("runtime mutations", missedRuntime.length === 0, `${runtimeResults.length - missedRuntime.length} of ${runtimeResults.length} caught${missedRuntime.length ? `; missed ${missedRuntime.map((result) => `${result.id} (${result.detail})`).join(", ")}` : ""}`);
+    const wiringResults = await wiringMutations(join(out, "mutations", "wiring"));
+    const missedWiring = wiringResults.filter((result) => !result.caught);
+    stage("signal wiring mutations", missedWiring.length === 0, `${wiringResults.length - missedWiring.length} of ${wiringResults.length} caught${missedWiring.length ? `; missed ${missedWiring.map((result) => `${result.id} (${result.detail})`).join(", ")}` : ""}`);
+    report.mutations = { spec, core: coreResults, runtime: runtimeResults, wiring: wiringResults };
     console.log(`  mutations: ${elapsed(at)}`);
   }
 
@@ -145,6 +198,13 @@ try {
     stage("binary to spec", binary.problem === null,
       `${binary.windows} windows, ${binary.steps} steps, ${binary.rejected} rejected, ${binary.archiveLoads} archive loads; TLC ${binary.tlc?.verdict ?? "not run"}${binary.problem ? `; ${binary.problem}` : ""}`);
     console.log(`  binary to spec: ${elapsed(at)}`);
+
+    at = performance.now();
+    const signal = await footerSignalToSpec({ dir: join(out, "footer-signal"), bin: fx });
+    report.footerSignalToSpec = { scenarios: signal.scenarios, steps: signal.steps, problems: signal.problems, tlc: signal.tlc ? { verdict: signal.tlc.verdict, property: signal.tlc.property, distinct: signal.tlc.distinct } : null };
+    stage("footer signal to spec", signal.tlc?.verdict === "pass" && signal.problems.length === 0,
+      `${signal.scenarios} runs of the built binary ended by SIGTERM or SIGHUP with the picker open, after Ctrl+O and a resize, after the approval moved to the review screen, or right after a resize, ${signal.steps} steps; TLC ${signal.tlc?.verdict ?? "not run"}${signal.tlc?.property ? ` (${signal.tlc.property})` : ""}${signal.problems.length ? `; ${signal.problems.join("; ")}` : ""}`);
+    console.log(`  footer signal to spec: ${elapsed(at)}`);
   }
 } catch (error) {
   stage("verify", false, error instanceof Error ? error.stack ?? error.message : String(error));

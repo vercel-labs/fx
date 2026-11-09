@@ -35,6 +35,8 @@ const transcript_runtime = @import("transcript/runtime.zig");
 const full_transcript_screen = @import("full_transcript_screen.zig");
 const vt_emulator = @import("../core/terminal/engine.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
+const json_decode = @import("../core/shared/json_decode.zig");
+const sort_utils = @import("../core/shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Layout = types.Layout;
@@ -269,8 +271,7 @@ pub const Harness = struct {
         var measurement = try surface_frame.measureSurfaceFooter(self.alloc, &self.shell, approval.projection(), ctx);
         defer measurement.deinit(self.alloc);
         const footer_reservation_changed = measurement.changesFooterReservation(&self.shell);
-        const replay_displaced_footer_history =
-            measurement.replaysDisplacedTranscriptHistory(&self.shell);
+        const held_footer_rows = measurement.heldFooterRows();
         var prepared: ?transcript_painter.PreparedTranscriptSurfacePaint = null;
         defer if (prepared) |*paint| paint.deinit(self.alloc);
         var resolved_target: ?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget = null;
@@ -298,7 +299,7 @@ pub const Harness = struct {
             &prepared,
             &resolved_target,
             footer_reservation_changed,
-            replay_displaced_footer_history,
+            held_footer_rows,
             invalidations,
         );
 
@@ -471,7 +472,7 @@ fn solveTestFrame(
     prepared: *?transcript_painter.PreparedTranscriptSurfacePaint,
     resolved_target: *?transcript_runtime.TranscriptRuntime.ResolvedTranscriptTarget,
     footer_reservation_changed: bool,
-    replay_displaced_footer_history: bool,
+    held_footer_rows: u16,
     attempt_invalidations: render_engine.paint_plan.FrameInvalidationSet,
 ) !render_engine.frame_fixed_point.FramePlan {
     var ctx = TestFrameSolveContext{
@@ -482,7 +483,7 @@ fn solveTestFrame(
         .measurement = measurement,
         .activity = activity,
         .footer_reservation_changed = footer_reservation_changed,
-        .replay_displaced_footer_history = replay_displaced_footer_history,
+        .held_footer_rows = held_footer_rows,
         .attempt_invalidations = attempt_invalidations,
     };
     return render_engine.frame_fixed_point.solve(
@@ -509,7 +510,7 @@ const TestFrameSolveContext = struct {
     measurement: *const surface_frame.SurfaceFooterMeasurement,
     activity: render_engine.frame_layout.ActivityState,
     footer_reservation_changed: bool,
-    replay_displaced_footer_history: bool,
+    held_footer_rows: u16,
     attempt_invalidations: render_engine.paint_plan.FrameInvalidationSet,
     scroll_facts: ?transcript_runtime.TranscriptScrollFacts = null,
 
@@ -538,7 +539,7 @@ const TestFrameSolveContext = struct {
                 self.source,
                 &self.prepared.*.?,
                 self.footer_reservation_changed,
-                self.replay_displaced_footer_history,
+                self.held_footer_rows,
             );
             self.scroll_facts = scroll_facts;
             inline_advance_rows = scroll_facts.planned_rows;
@@ -838,7 +839,7 @@ fn resolveAndSealTranscriptTransitionForTest(
         source,
         prepared,
         false,
-        false,
+        0,
     );
     const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
         shell.committed_frame_layout.transcript_area,
@@ -1134,6 +1135,14 @@ fn expectRowEmpty(h: *Harness, row: u16) !void {
         std.debug.print("expected row {d} empty, got: '{s}'\n", .{ row, buf.items });
         return error.TestExpectedEmptyRow;
     }
+}
+
+/// The trimmed text of one screen row. Caller frees.
+fn captureTrimmedRow(h: *Harness, row: u16) ![]u8 {
+    var line: std.ArrayList(u8) = .empty;
+    errdefer line.deinit(h.alloc);
+    try h.vt.rowTextTrimmed(row, &line);
+    return line.toOwnedSlice(h.alloc);
 }
 
 fn expectRowTrimmedEquals(h: *Harness, row: u16, expected: []const u8) !void {
@@ -3538,7 +3547,7 @@ test "question prompt footer state does not mutate transcript gaps" {
     try expectExactlyOneBlankRowBetween(&h, before_after_clear, after_after_clear);
 }
 
-test "question modal replays displaced transcript rows into history" {
+test "question modal holds the transcript rows it covers and paints them back on close" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 100, 24, 4);
     defer h.deinit();
@@ -3575,6 +3584,9 @@ test "question modal replays displaced transcript rows into history" {
     );
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
+    const idle_footer_top = h.shell.committed_frame_layout.footer_area.top;
+    const idle_top_row = try captureTrimmedRow(&h, 1);
+    defer alloc.free(idle_top_row);
 
     var ctx = defaultFooterContext(&input);
     ctx.question = question.projection();
@@ -3582,17 +3594,27 @@ test "question modal replays displaced transcript rows into history" {
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
 
-    const displaced_rows = h.last_frame.planned_scroll_rows;
-    try std.testing.expect(displaced_rows > 0);
-    try std.testing.expectEqual(displaced_rows, h.last_frame.committed_scroll_rows);
+    // The question covers the top transcript rows without scrolling them
+    // into native history.
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
-    try std.testing.expect(h.last_frame.document_append_bytes > 0);
-    try std.testing.expectEqual(
-        @as(?u16, displaced_rows),
-        h.last_frame.document_append_clear_rows,
-    );
+    try std.testing.expectEqual(@as(usize, 0), h.last_frame.document_append_bytes);
     try expectGridContains(&h, "question context 24");
     try expectGridContains(&h, "How should the inspection proceed?");
+    const open = h.shell.transcriptCommitDiagnostic();
+    try std.testing.expect(open.history_visual_offset < open.visual_offset);
+
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+    try expectGridNotContains(&h, "How should the inspection proceed?");
+    try std.testing.expectEqual(idle_footer_top, h.shell.committed_frame_layout.footer_area.top);
+    try expectRowTrimmedEquals(&h, 1, idle_top_row);
+    try expectGridContains(&h, "question context 24");
 }
 
 test "resized question cancellation keeps the idle footer bottom anchored" {
@@ -5725,7 +5747,7 @@ test "empty pre-paint defers scrolling until first content frame" {
     try expectRowPrefix(&h, 21, "FX12");
 }
 
-test "slash picker dismissal releases reserved picker rows" {
+test "slash picker dismissal paints the held picker rows back at the idle footer rows" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 100, 20, 4);
     defer h.deinit();
@@ -5754,19 +5776,15 @@ test "slash picker dismissal releases reserved picker rows" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try std.testing.expect(h.last_frame.planned_scroll_rows > 0);
-    try std.testing.expectEqual(
-        h.last_frame.planned_scroll_rows,
-        h.last_frame.committed_scroll_rows,
-    );
+    // The picker covers the top transcript rows without scrolling them into
+    // native history: they are held for its close.
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 9), h.shell.committed_frame_layout.footer_area.top);
     const picker_anchor = h.shell.stableTranscriptProjectionForFlow(
         h.shell.notebook.transcript.items,
     ) orelse return error.TestExpectedStableTranscript;
-    try std.testing.expectEqual(
-        picker_anchor.visual_offset,
-        picker_anchor.history_visual_offset,
-    );
+    try std.testing.expect(picker_anchor.history_visual_offset < picker_anchor.visual_offset);
 
     try std.testing.expect(input.deletionState(null).delete(
         alloc,
@@ -5785,11 +5803,13 @@ test "slash picker dismissal releases reserved picker rows" {
     try std.testing.expect(
         dismissed_anchor.history_visual_offset >= picker_anchor.history_visual_offset,
     );
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
+    try std.testing.expectEqual(dismissed_anchor.history_visual_offset, dismissed_anchor.visual_offset);
+    try std.testing.expectEqual(idle_footer_top, h.shell.committed_frame_layout.footer_area.top);
     try std.testing.expectEqual(
         h.shell.last_visible_transcript_last_row + 1,
         h.shell.committed_frame_layout.footer_area.top,
     );
+    try expectRowPrefix(&h, 1, "line 01");
 
     var tall = try Harness.init(alloc, 100, 32, 4);
     defer tall.deinit();
@@ -5827,7 +5847,7 @@ test "slash picker dismissal releases reserved picker rows" {
     try std.testing.expectEqual(@as(u16, 16), tall.shell.committed_frame_layout.footer_area.top);
 }
 
-test "slash picker dismissal resolves transcript extent before layout convergence" {
+test "slash picker dismissal resolves transcript extent at the idle footer rows" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 124, 75, 3);
     defer h.deinit();
@@ -5860,6 +5880,7 @@ test "slash picker dismissal resolves transcript extent before layout convergenc
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
     try std.testing.expectEqual(@as(u16, 71), h.shell.last_visible_transcript_last_row);
+    const idle_footer_top = h.shell.committed_frame_layout.footer_area.top;
 
     try input.textReplacementState().replace(alloc, "/");
     h.frame_redraw = true;
@@ -5873,11 +5894,14 @@ test "slash picker dismissal resolves transcript extent before layout convergenc
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
+    // The dismissed picker hands its rows back: the transcript extends to
+    // the row it reached before the picker opened, and the composer is on
+    // the idle footer rows at the bottom.
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 62), h.shell.last_visible_transcript_last_row);
-    try std.testing.expectEqual(@as(u16, 64), try findRowContaining(&h, "┃ /"));
-    try std.testing.expectEqual(@as(u16, 64), h.shell.committed_frame_layout.footer_area.top);
-    try std.testing.expectEqual(@as(u16, 66), h.shell.committed_frame_layout.footer_area.bottom);
+    try std.testing.expectEqual(@as(u16, 71), h.shell.last_visible_transcript_last_row);
+    try std.testing.expectEqual(idle_footer_top, try findRowContaining(&h, "┃ /"));
+    try std.testing.expectEqual(idle_footer_top, h.shell.committed_frame_layout.footer_area.top);
+    try std.testing.expectEqual(@as(u16, 75), h.shell.committed_frame_layout.footer_area.bottom);
     try std.testing.expectEqual(
         @as(usize, 1),
         try countGridOccurrences(&h, "ATOMIC_RENDER_LINE_080"),
@@ -5892,10 +5916,10 @@ test "slash picker dismissal resolves transcript extent before layout convergenc
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try std.testing.expectEqual(@as(u16, 62), h.shell.last_visible_transcript_last_row);
-    try std.testing.expectEqual(@as(u16, 64), try findRowContaining(&h, "┃ /x"));
-    try std.testing.expectEqual(@as(u16, 64), h.shell.committed_frame_layout.footer_area.top);
-    try std.testing.expectEqual(@as(u16, 66), h.shell.committed_frame_layout.footer_area.bottom);
+    try std.testing.expectEqual(@as(u16, 71), h.shell.last_visible_transcript_last_row);
+    try std.testing.expectEqual(idle_footer_top, try findRowContaining(&h, "┃ /x"));
+    try std.testing.expectEqual(idle_footer_top, h.shell.committed_frame_layout.footer_area.top);
+    try std.testing.expectEqual(@as(u16, 75), h.shell.committed_frame_layout.footer_area.bottom);
     try std.testing.expectEqual(
         @as(usize, 1),
         try countGridOccurrences(&h, "ATOMIC_RENDER_LINE_080"),
@@ -6020,7 +6044,7 @@ test "footer reservation release and cleanup invalidation keep the held transcri
     try std.testing.expectEqual(h.shell.committed_frame_layout.footer_area.top, released_footer_top);
 }
 
-test "compact picker dismissal preserves committed history floor" {
+test "compact picker dismissal with a notice keeps history moving forward" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 60, 12, 4);
     defer h.deinit();
@@ -6048,10 +6072,8 @@ test "compact picker dismissal preserves committed history floor" {
     const picker_anchor = h.shell.stableTranscriptProjectionForFlow(
         h.shell.notebook.transcript.items,
     ) orelse return error.TestExpectedStableTranscript;
-    try std.testing.expectEqual(
-        picker_anchor.visual_offset,
-        picker_anchor.history_visual_offset,
-    );
+    // The picker holds the row it covers instead of scrolling it away.
+    try std.testing.expect(picker_anchor.history_visual_offset < picker_anchor.visual_offset);
 
     try h.shell.writeNotice(
         alloc,
@@ -6086,15 +6108,19 @@ test "compact picker dismissal preserves committed history floor" {
         @as(?u16, h.last_frame.planned_scroll_rows),
         h.last_frame.document_append_clear_rows,
     );
+    // The notice pushes rows past the idle footer's release line; they enter
+    // history in the same frame, and the footer ends on the bottom row.
     const dismissed_anchor = h.shell.stableTranscriptProjectionForFlow(
         h.shell.notebook.transcript.items,
     ) orelse return error.TestExpectedStableTranscript;
     try std.testing.expect(
         dismissed_anchor.history_visual_offset >= picker_anchor.history_visual_offset,
     );
+    try std.testing.expectEqual(dismissed_anchor.history_visual_offset, dismissed_anchor.visual_offset);
+    try std.testing.expectEqual(h.shell.layout.rows, h.shell.committed_frame_layout.footer_area.bottom);
 }
 
-test "short notice after picker selection keeps footer compact" {
+test "short notice after picker selection returns the footer to its idle rows" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 125, 37, 4);
     defer h.deinit();
@@ -6140,17 +6166,25 @@ test "short notice after picker selection keeps footer compact" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
+    // The close paints the held rows back and releases, through the history
+    // replay, the rows the notice moved past the idle footer's release line.
+    try std.testing.expect(h.last_frame.planned_scroll_rows > 0);
+    try std.testing.expectEqual(h.last_frame.planned_scroll_rows, h.last_frame.committed_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+    try std.testing.expectEqual(idle_footer_top, h.shell.committed_frame_layout.footer_area.top);
+    try std.testing.expectEqual(h.shell.layout.rows, h.shell.committed_frame_layout.footer_area.bottom);
     try std.testing.expectEqual(
         h.shell.last_visible_transcript_last_row + 2,
         h.shell.committed_frame_layout.footer_area.top,
     );
+    const anchor = h.shell.stableTranscriptProjectionForFlow(
+        h.shell.notebook.transcript.items,
+    ) orelse return error.TestExpectedStableTranscript;
+    try std.testing.expectEqual(anchor.history_visual_offset, anchor.visual_offset);
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, notice));
 }
 
-test "long transcript picker filtering keeps footer anchored and close releases reservation" {
+test "long transcript picker filtering keeps footer anchored and close returns it to the bottom row" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 100, 24, 4);
     defer h.deinit();
@@ -6203,12 +6237,14 @@ test "long transcript picker filtering keeps footer anchored and close releases 
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
+    // Closing puts the footer back on its idle rows at the bottom, with the
+    // transcript directly above it (I815).
+    try std.testing.expectEqual(idle_footer_top, h.shell.committed_frame_layout.footer_area.top);
     try std.testing.expectEqual(
         h.shell.last_visible_transcript_last_row + 2,
         h.shell.committed_frame_layout.footer_area.top,
     );
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.bottom < h.shell.layout.rows);
+    try std.testing.expectEqual(h.shell.layout.rows, h.shell.committed_frame_layout.footer_area.bottom);
 
     h.shell.terminal_reset_pending = true;
     try h.shell.writeNotice(
@@ -6227,7 +6263,7 @@ test "long transcript picker filtering keeps footer anchored and close releases 
     try expectGridContains(&h, "Starting Vercel sign-in");
 }
 
-test "picker growth advances history while shrink and dismissal do not" {
+test "picker growth holds rows while shrink and dismissal paint them back without history scroll" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 125, 37, 4);
     defer h.deinit();
@@ -6257,17 +6293,14 @@ test "picker growth advances history while shrink and dismissal do not" {
     try h.flush();
     const slash_footer_top = h.shell.committed_frame_layout.footer_area.top;
     try std.testing.expect(slash_footer_top < idle_footer_top);
-    try std.testing.expect(h.last_frame.planned_scroll_rows > 0);
-    try std.testing.expectEqual(
-        h.last_frame.planned_scroll_rows,
-        h.last_frame.committed_scroll_rows,
-    );
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
     const slash_anchor = h.shell.stableTranscriptProjectionForFlow(
         h.shell.notebook.transcript.items,
     ) orelse return error.TestExpectedStableTranscript;
     try std.testing.expectEqual(
         slash_anchor.visual_offset,
-        slash_anchor.history_visual_offset,
+        slash_anchor.history_visual_offset + (idle_footer_top - slash_footer_top),
     );
 
     try input.textReplacementState().replace(alloc, "/model ");
@@ -6279,11 +6312,21 @@ test "picker growth advances history while shrink and dismissal do not" {
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, model_ctx);
     try h.flush();
 
-    try std.testing.expectEqual(
-        slash_footer_top,
-        h.shell.committed_frame_layout.footer_area.top,
-    );
+    // The shorter model picker hands rows back: the footer stays on the last
+    // row, and only the rows it still covers stay held.
+    const model_footer_top = h.shell.committed_frame_layout.footer_area.top;
+    try std.testing.expect(model_footer_top >= slash_footer_top);
+    try std.testing.expect(model_footer_top < idle_footer_top);
+    try std.testing.expectEqual(h.shell.layout.rows, h.shell.committed_frame_layout.footer_area.bottom);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    const model_anchor = h.shell.stableTranscriptProjectionForFlow(
+        h.shell.notebook.transcript.items,
+    ) orelse return error.TestExpectedStableTranscript;
+    try std.testing.expectEqual(slash_anchor.history_visual_offset, model_anchor.history_visual_offset);
+    try std.testing.expectEqual(
+        model_anchor.visual_offset,
+        model_anchor.history_visual_offset + (idle_footer_top - model_footer_top),
+    );
 
     input.picker.dismissInlinePicker(.model);
     h.frame_redraw = true;
@@ -6298,7 +6341,8 @@ test "picker growth advances history while shrink and dismissal do not" {
     try std.testing.expect(
         dismissed_anchor.history_visual_offset >= slash_anchor.history_visual_offset,
     );
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
+    try std.testing.expectEqual(dismissed_anchor.history_visual_offset, dismissed_anchor.visual_offset);
+    try std.testing.expectEqual(idle_footer_top, h.shell.committed_frame_layout.footer_area.top);
     try std.testing.expectEqual(
         h.shell.last_visible_transcript_last_row + 1,
         h.shell.committed_frame_layout.footer_area.top,
@@ -6608,7 +6652,9 @@ test "compact command completion keeps restored history footer stable" {
     defer approval.deinit(alloc);
 
     try h.shell.initViewport(&h.metrics, 1);
-    _ = try h.shell.appendRawTranscriptEntry(alloc, text_utils.repeat("history\n", 30));
+    // Taller than the idle screen: the approval holds the rows it covers and
+    // paints them back when it clears, so only overflow puts rows in history.
+    _ = try h.shell.appendRawTranscriptEntry(alloc, text_utils.repeat("history\n", 45));
     const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "command" };
     _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
         .id = id,
@@ -6658,7 +6704,7 @@ test "compact command completion keeps restored history footer stable" {
     try expectExactlyOneBlankRowBetween(&h, completed_thinking_row, completed_footer_row);
 }
 
-test "inline approval footer reflow replays displaced transcript history" {
+test "inline approval holds the transcript rows it covers and its close paints them back" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 120, 36, 4);
     defer h.deinit();
@@ -6697,15 +6743,14 @@ test "inline approval footer reflow replays displaced transcript history" {
     );
     try expectGridContains(&h, "Would you like to run the following command?");
     try std.testing.expectEqualStrings(transcript_before, h.shell.notebook.transcript.items);
-    const footer_history_rows = h.last_frame.planned_scroll_rows;
-    try std.testing.expect(footer_history_rows > 0);
-    try std.testing.expectEqual(footer_history_rows, h.last_frame.committed_scroll_rows);
+    // The approval replaces the composer and covers the top transcript rows;
+    // they are held, not scrolled into native history.
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
-    try std.testing.expect(h.last_frame.document_append_bytes > 0);
-    try std.testing.expectEqual(
-        @as(?u16, footer_history_rows),
-        h.last_frame.document_append_clear_rows,
-    );
+    try std.testing.expectEqual(@as(usize, 0), h.last_frame.document_append_bytes);
+    const open = h.shell.transcriptCommitDiagnostic();
+    try std.testing.expect(open.history_visual_offset < open.visual_offset);
 
     approval.clear(alloc);
     h.frame_redraw = true;
@@ -6723,6 +6768,11 @@ test "inline approval footer reflow replays displaced transcript history" {
     try std.testing.expectEqual(idle_footer_extra, h.shell.extra_input_rows);
     try std.testing.expectEqual(idle_footer_base_rows, h.shell.footer_reserved_base_rows);
     try expectGridNotContains(&h, "Would you like to run the following command?");
+    try std.testing.expectEqual(idle_footer_top, h.shell.committed_frame_layout.footer_area.top);
+    try std.testing.expectEqual(h.shell.layout.rows, h.shell.committed_frame_layout.footer_area.bottom);
+    const closed = h.shell.transcriptCommitDiagnostic();
+    try std.testing.expectEqual(open.history_visual_offset, closed.history_visual_offset);
+    try std.testing.expectEqual(closed.history_visual_offset, closed.visual_offset);
 }
 
 test "footer reflow rebases a same-height transcript rewrite without history scroll" {
@@ -6758,7 +6808,7 @@ test "footer reflow rebases a same-height transcript rewrite without history scr
     );
     defer prepared.deinit(alloc);
 
-    const facts = h.shell.planTranscriptScrollForFrame(&prepared, true, true);
+    const facts = h.shell.planTranscriptScrollForFrame(&prepared, true, 0);
     try std.testing.expect(!facts.source_compatible);
     try std.testing.expect(facts.geometry_rebase);
     try std.testing.expectEqual(@as(u32, 0), facts.semantic_rows);
@@ -6800,7 +6850,7 @@ test "footer reflow replays an unchanged displaced prefix across a later rewrite
         const compatible_facts = h.shell.planTranscriptScrollForFrame(
             &compatible,
             true,
-            true,
+            0,
         );
         break :replay_boundary transcript_painter.preparedTranscriptFlowOffsetForVisualOffset(
             &compatible,
@@ -6826,7 +6876,7 @@ test "footer reflow replays an unchanged displaced prefix across a later rewrite
     );
     defer prepared.deinit(alloc);
 
-    const facts = h.shell.planTranscriptScrollForFrame(&prepared, true, true);
+    const facts = h.shell.planTranscriptScrollForFrame(&prepared, true, 0);
     try std.testing.expect(!facts.source_compatible);
     try std.testing.expect(facts.geometry_rebase);
     try std.testing.expect(facts.semantic_rows > 0);
@@ -6853,6 +6903,7 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     try h.flush();
 
     const idle_footer_top = h.shell.committed_frame_layout.footer_area.top;
+    const idle_footer_gap = idle_footer_top - h.shell.last_visible_transcript_last_row;
     const append_one = "APPROVAL_MIXED_APPEND_01";
     const append_two = "APPROVAL_MIXED_APPEND_02";
     try std.testing.expect(try approval.syncRequest(alloc, .{
@@ -6863,16 +6914,14 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
+    // The approval covers the top transcript rows and holds them: nothing
+    // scrolls into native history when it opens.
     try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
-    const footer_history_rows =
-        idle_footer_top - h.shell.committed_frame_layout.footer_area.top;
-    try std.testing.expectEqual(footer_history_rows, h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(footer_history_rows, h.last_frame.committed_scroll_rows);
-    try std.testing.expect(h.last_frame.document_append_bytes > 0);
-    try std.testing.expectEqual(
-        @as(?u16, footer_history_rows),
-        h.last_frame.document_append_clear_rows,
-    );
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
+    try std.testing.expectEqual(@as(usize, 0), h.last_frame.document_append_bytes);
+    const open = h.shell.transcriptCommitDiagnostic();
+    try std.testing.expect(open.history_visual_offset < open.visual_offset);
     _ = try h.shell.streamAssistantChunk(
         alloc,
         &h.metrics,
@@ -6883,10 +6932,19 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     try h.flush();
 
     // Complete streamed rows are final even while the producer remains open,
-    // so they enter history instead of sliding the viewport by repaint.
-    try std.testing.expectEqual(@as(u16, 2), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 2), h.last_frame.committed_scroll_rows);
+    // so the rows they push past the idle footer's release line enter
+    // history, in order, through the history replay: the scroll is exactly
+    // the history advance.
+    const streamed = h.shell.transcriptCommitDiagnostic();
+    try std.testing.expect(h.last_frame.planned_scroll_rows > 0);
+    try std.testing.expect(h.last_frame.planned_scroll_rows <= 2);
+    try std.testing.expectEqual(h.last_frame.planned_scroll_rows, h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+    try std.testing.expectEqual(
+        open.history_visual_offset + h.last_frame.planned_scroll_rows,
+        streamed.history_visual_offset,
+    );
+    try std.testing.expectEqual(open.visual_offset + 2, streamed.visual_offset);
     try std.testing.expect(h.last_frame.document_append_bytes > 0);
     try std.testing.expectEqual(
         @as(usize, 1),
@@ -6914,18 +6972,25 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
+    // Any row still owed reaches history once on the close.
+    try std.testing.expectEqual(h.last_frame.planned_scroll_rows, h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
     try std.testing.expectEqual(
         render_engine.terminal_diff.ShadowCommitState.committed,
         h.last_frame.shadow_state,
     );
     try std.testing.expect(h.last_frame.transcript_history_floor_respected);
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
+    const closed = h.shell.transcriptCommitDiagnostic();
     try std.testing.expectEqual(
-        h.shell.last_visible_transcript_last_row + 2,
-        h.shell.committed_frame_layout.footer_area.top,
+        streamed.history_visual_offset + h.last_frame.planned_scroll_rows,
+        closed.history_visual_offset,
+    );
+    try std.testing.expectEqual(closed.history_visual_offset, closed.visual_offset);
+    // The close paints the held rows back: the footer is on its idle rows.
+    try std.testing.expectEqual(idle_footer_top, h.shell.committed_frame_layout.footer_area.top);
+    try std.testing.expectEqual(
+        idle_footer_gap,
+        h.shell.committed_frame_layout.footer_area.top - h.shell.last_visible_transcript_last_row,
     );
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_one));
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_two));
@@ -6950,6 +7015,7 @@ test "slash picker release keeps concurrent transcript progress single-painted" 
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
     const idle_footer_top = h.shell.committed_frame_layout.footer_area.top;
+    const idle_footer_gap = idle_footer_top - h.shell.last_visible_transcript_last_row;
 
     try input.edit_state.input.appendSlice(alloc, "/");
     input.edit_state.cursor = input.edit_state.input.items.len;
@@ -6973,20 +7039,23 @@ test "slash picker release keeps concurrent transcript progress single-painted" 
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
+    // The release paints the held rows back, and the two rows the output
+    // moved past the idle footer's release line enter history once, through
+    // the history replay, in the same frame.
+    try std.testing.expectEqual(@as(u16, 2), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 2), h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
-    try std.testing.expectEqual(@as(usize, 0), h.last_frame.document_append_bytes);
     const dismissed_anchor = h.shell.stableTranscriptProjectionForFlow(
         h.shell.notebook.transcript.items,
     ) orelse return error.TestExpectedStableTranscript;
     try std.testing.expect(
         dismissed_anchor.history_visual_offset >= picker_anchor.history_visual_offset,
     );
-    try std.testing.expect(h.shell.committed_frame_layout.footer_area.top < idle_footer_top);
+    try std.testing.expectEqual(dismissed_anchor.history_visual_offset, dismissed_anchor.visual_offset);
+    try std.testing.expectEqual(idle_footer_top, h.shell.committed_frame_layout.footer_area.top);
     try std.testing.expectEqual(
-        h.shell.last_visible_transcript_last_row + 2,
-        h.shell.committed_frame_layout.footer_area.top,
+        idle_footer_gap,
+        h.shell.committed_frame_layout.footer_area.top - h.shell.last_visible_transcript_last_row,
     );
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_one));
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_two));
@@ -8429,6 +8498,10 @@ test "failed fresh session scrollback handoff keeps the old transcript" {
 pub const PhysicalHistoryProbe = struct {
     grid: Grid,
     history: std.ArrayList(u8) = .empty,
+    /// Erase the recorded history on ESC[3J, as a terminal erases its
+    /// scrollback, so a resize reprint is counted once.
+    erases_history: bool = false,
+    last_bytes: [4]u8 = @splat(0),
 
     pub fn init(cols: u16, rows: u16) !PhysicalHistoryProbe {
         var grid = try Grid.init(std.testing.allocator, cols, rows);
@@ -8445,6 +8518,10 @@ pub const PhysicalHistoryProbe = struct {
         var top: std.ArrayList(u8) = .empty;
         defer top.deinit(std.testing.allocator);
         for (bytes) |byte| {
+            if (self.erases_history) {
+                self.last_bytes = .{ self.last_bytes[1], self.last_bytes[2], self.last_bytes[3], byte };
+                if (std.mem.eql(u8, &self.last_bytes, "\x1b[3J")) self.history.clearRetainingCapacity();
+            }
             top.clearRetainingCapacity();
             try self.grid.rowTextTrimmed(1, &top);
             var stats: vt_emulator.FeedStats = .{};
@@ -9310,4 +9387,615 @@ test "attaching a transcript slot and resetting the terminal shows only that tra
     try expectGridContains(&h, "main second");
     try expectGridNotContains(&h, "child");
     try std.testing.expect(std.mem.find(u8, hidden.notebook.transcript.items, "child second") != null);
+}
+
+// Footer reclaim: rows a footer surface pushes off the top of the screen are
+// held, not released into native history, until the surface closes and they
+// are painted back (`tests/tla/transcript_window/spec/FooterReclaim.tla`).
+
+const FooterReclaimRun = struct {
+    h: Harness,
+    probe: PhysicalHistoryProbe,
+    input: InputRuntime = .{},
+    approval: approval_prompt.ApprovalPrompt = .{},
+    written: u32 = 0,
+    open: bool = false,
+    exited: bool = false,
+    resizes: u32 = 0,
+
+    fn init(alloc: Allocator, cols: u16, rows: u16) !FooterReclaimRun {
+        var run: FooterReclaimRun = .{
+            .h = try Harness.init(alloc, cols, rows, 4),
+            .probe = try PhysicalHistoryProbe.init(cols, rows),
+        };
+        errdefer run.deinit();
+        run.probe.erases_history = true;
+        try run.h.shell.initViewport(&run.h.metrics, 1);
+        try run.frame();
+        return run;
+    }
+
+    fn deinit(self: *FooterReclaimRun) void {
+        self.input.deinit(self.h.alloc);
+        self.approval.deinit(self.h.alloc);
+        self.probe.deinit();
+        self.h.deinit();
+    }
+
+    fn frame(self: *FooterReclaimRun) !void {
+        self.h.frame_redraw = true;
+        try renderTestFooter(&self.h, &self.input, &self.approval, &self.h.frame_redraw);
+        try capturePhysicalFrame(&self.h, &self.probe);
+    }
+
+    /// Appends `count` one-row lines, each marked `R<number>|`.
+    fn writeRows(self: *FooterReclaimRun, count: u32) !void {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(self.h.alloc);
+        for (0..count) |_| {
+            self.written += 1;
+            var line_buf: [48]u8 = undefined;
+            try text.appendSlice(self.h.alloc, try std.mem.print(&line_buf, "R{d:0>5}| transcript row\n", .{self.written}));
+        }
+        try self.h.shell.writeTranscript(self.h.alloc, &self.h.metrics, text.items, true);
+    }
+
+    fn output(self: *FooterReclaimRun, count: u32) !void {
+        try self.writeRows(count);
+        try self.frame();
+    }
+
+    fn openPicker(self: *FooterReclaimRun) !void {
+        try self.input.edit_state.input.appendSlice(self.h.alloc, "/");
+        self.input.edit_state.cursor = self.input.edit_state.input.items.len;
+        self.open = true;
+        try self.frame();
+    }
+
+    fn closePicker(self: *FooterReclaimRun) !void {
+        self.input.inputResetState().clearCurrent(self.h.alloc);
+        self.open = false;
+        try self.frame();
+    }
+
+    /// A window resize one column wider and back, each applied first while
+    /// fx still debounces it (unsettled) and then settled, as the app does.
+    fn resize(self: *FooterReclaimRun) !void {
+        const cols = self.h.shell.layout.cols;
+        const rows = self.h.shell.layout.rows;
+        for ([_]u16{ cols + 1, cols }) |width| {
+            for ([_]bool{ false, true }) |settled| {
+                try self.h.vt.resize(width, rows);
+                try self.probe.grid.resize(width, rows);
+                try shell_runtime.applyResizeWithLayout(&self.h.shell, &self.h.metrics, layoutFor(width, rows, 4), settled);
+                try self.frame();
+            }
+        }
+        self.resizes += 1;
+    }
+
+    /// What Ctrl+O's full transcript leaves when the anchor is invalidated
+    /// while it is open: the anchor stays stable in normal-buffer recovery.
+    /// No frame is drawn at full depth; the harness has no alternate screen.
+    fn ctrlOTakeoverWithoutFrame(self: *FooterReclaimRun) !void {
+        _ = try self.h.shell.setTranscriptPresentationDepth(self.h.alloc, .full);
+        self.h.shell.invalidateTranscriptAnchor("footer_reclaim_ctrl_o_takeover");
+        _ = try self.h.shell.setTranscriptPresentationDepth(self.h.alloc, .inline_mode);
+    }
+
+    /// A Ctrl+O takeover, then the frame that gives the screen back.
+    fn ctrlOTakeover(self: *FooterReclaimRun) !void {
+        try self.ctrlOTakeoverWithoutFrame();
+        try self.frame();
+    }
+
+    /// What a takeover leaves when Ctrl+O is closed and nothing is published:
+    /// an invalid anchor, then the frame that recovers from it.
+    fn invalidAnchorTakeover(self: *FooterReclaimRun) !void {
+        self.h.shell.invalidateTranscriptAnchor("footer_reclaim_invalid_anchor");
+        try self.frame();
+    }
+
+    /// A window resize while an alternate screen covers the main one (Ctrl+O's
+    /// full transcript, the approval review screen): the settled resize
+    /// invalidates the anchor and asks for a terminal reset, and no frame
+    /// draws on the main screen to recover from either.
+    fn resizeWhileCovered(self: *FooterReclaimRun) !void {
+        const cols = self.h.shell.layout.cols;
+        const rows = self.h.shell.layout.rows;
+        for ([_]u16{ cols + 1, cols }) |width| {
+            for ([_]bool{ false, true }) |settled| {
+                try self.h.vt.resize(width, rows);
+                try self.probe.grid.resize(width, rows);
+                try shell_runtime.applyResizeWithLayout(&self.h.shell, &self.h.metrics, layoutFor(width, rows, 4), settled);
+            }
+        }
+        self.resizes += 1;
+    }
+
+    /// What exit, suspend, and a SIGTERM or SIGHUP close do before they erase
+    /// the footer: one frame that settles the held rows. A signal close asks
+    /// the main thread for it (`app_lifecycle.signalClosePending`), which
+    /// runs the same settle.
+    fn exit(self: *FooterReclaimRun) !void {
+        if (self.h.shell.requestHeldRowsSettle()) try self.frame();
+        self.exited = true;
+    }
+
+    /// How often each written row's marker is in native history plus the
+    /// screen, indexed by row number. Caller frees.
+    fn rowCopies(self: *FooterReclaimRun) ![]u32 {
+        const counts = try self.h.alloc.alloc(u32, self.written + 1);
+        errdefer self.h.alloc.free(counts);
+        @memset(counts, 0);
+        countRowMarkers(self.probe.history.items, counts);
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(self.h.alloc);
+        var row: u16 = 1;
+        while (row <= self.probe.grid.rows) : (row += 1) {
+            line.clearRetainingCapacity();
+            try self.probe.grid.rowTextTrimmed(row, &line);
+            countRowMarkers(line.items, counts);
+        }
+        return counts;
+    }
+
+    fn expectEveryRowOnce(self: *FooterReclaimRun) !void {
+        const counts = try self.rowCopies();
+        defer self.h.alloc.free(counts);
+        for (counts[1..], 1..) |copies, n| {
+            if (copies != 1) {
+                std.debug.print("row {d} is in history and on the screen {d} times\n", .{ n, copies });
+                return error.TestFooterReclaimRowCopies;
+            }
+        }
+    }
+
+    /// While a surface is open its held rows are in neither history nor
+    /// on the screen, but no row is in both.
+    fn expectNoRowTwice(self: *FooterReclaimRun) !void {
+        const counts = try self.rowCopies();
+        defer self.h.alloc.free(counts);
+        for (counts[1..], 1..) |copies, n| {
+            if (copies > 1) {
+                std.debug.print("row {d} is in history and on the screen {d} times\n", .{ n, copies });
+                return error.TestFooterReclaimRowCopies;
+            }
+        }
+    }
+
+    /// The transcript fills the rows above the footer whenever it has the
+    /// rows, and once it has more than fit, the footer ends on the last row
+    /// (FooterAtBottom). A short transcript keeps the footer right under it.
+    fn expectFooterAtBottom(self: *FooterReclaimRun) !void {
+        const layout = self.h.shell.committed_frame_layout;
+        const diagnostic = self.h.shell.transcriptCommitDiagnostic();
+        const cap: u32 = layout.footer_area.top -| 1;
+        try std.testing.expectEqual(@min(cap, diagnostic.total_visual_rows), diagnostic.total_visual_rows - diagnostic.visual_offset);
+        if (diagnostic.total_visual_rows > cap) {
+            try std.testing.expectEqual(self.h.shell.layout.rows, layout.footer_area.bottom);
+        }
+    }
+};
+
+fn countRowMarkers(text: []const u8, counts: []u32) void {
+    var index: usize = 0;
+    while (std.mem.findScalarPos(u8, text, index, 'R')) |at| {
+        index = at + 1;
+        if (at + 7 > text.len or text[at + 6] != '|') continue;
+        const n = std.fmt.parseInt(u32, text[at + 1 .. at + 6], 10) catch continue;
+        if (n < counts.len) counts[n] += 1;
+    }
+}
+
+test "closing the slash picker in a long transcript puts the footer back on the bottom row" {
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.output(1);
+    try run.output(29);
+    try run.expectFooterAtBottom();
+    try run.openPicker();
+    try run.closePicker();
+    try run.expectFooterAtBottom();
+    try run.expectEveryRowOnce();
+}
+
+test "output while the slash picker is open reaches history in order and close paints the held rows back" {
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.output(1);
+    try run.output(29);
+    for (0..3) |_| {
+        try run.openPicker();
+        try run.output(1);
+        try run.output(2);
+        try run.closePicker();
+        try run.expectFooterAtBottom();
+        try run.expectEveryRowOnce();
+    }
+}
+
+test "exit with the slash picker open leaves every row in history or on the screen once" {
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.output(1);
+    try run.output(29);
+    try run.openPicker();
+    try run.output(1);
+    try run.exit();
+    const diagnostic = run.h.shell.transcriptCommitDiagnostic();
+    try std.testing.expectEqual(diagnostic.visual_offset, diagnostic.history_visual_offset);
+    try run.expectEveryRowOnce();
+}
+
+test "rows a multi-line draft covers from the first frames reach history in order" {
+    // The draft grows the footer before the transcript fills the screen, so
+    // no footer change marks the held rows; output must still release rows
+    // from history, not from the viewport, or scrollback skips them.
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.input.edit_state.input.appendSlice(run.h.alloc, "draft one\ndraft two\ndraft three\ndraft four");
+    run.input.edit_state.cursor = run.input.edit_state.input.items.len;
+    try run.frame();
+    try run.output(1);
+    for (0..12) |_| {
+        try run.output(3);
+        try run.expectNoRowTwice();
+    }
+    run.input.inputResetState().clearCurrent(run.h.alloc);
+    try run.frame();
+    try run.expectFooterAtBottom();
+    try run.expectEveryRowOnce();
+}
+
+/// While the slash picker is open the rows it covers stay out of history: a
+/// takeover displaced none of them, so recovery must not count them.
+fn expectFooterReclaimRowsHeld(run: *FooterReclaimRun) !void {
+    const diagnostic = run.h.shell.transcriptCommitDiagnostic();
+    try std.testing.expect(diagnostic.history_visual_offset < diagnostic.visual_offset);
+}
+
+test "a Ctrl+O takeover with the slash picker open recovers only the rows it displaced" {
+    // Recovery after a takeover restores rows the takeover pushed into
+    // scrollback; the rows the picker holds were never pushed there, so
+    // releasing them writes them to history twice (tests/e2e/tui-resume.test.ts
+    // "a shell approval handoff does not duplicate a long Ctrl-O transcript
+    // in scrollback").
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.output(1);
+    try run.output(29);
+    try run.openPicker();
+    try run.ctrlOTakeoverWithoutFrame();
+    try std.testing.expect(run.h.shell.transcript_commit_state.stable.normal_buffer_recovery_pending);
+    try run.frame();
+    try expectFooterReclaimRowsHeld(&run);
+    for (0..3) |_| {
+        try run.output(2);
+        try run.expectNoRowTwice();
+        try expectFooterReclaimRowsHeld(&run);
+    }
+    try run.closePicker();
+    try run.expectFooterAtBottom();
+    try run.expectEveryRowOnce();
+}
+
+test "recovery from an invalid anchor with the slash picker open keeps the held rows owed" {
+    // Recovery counts the rows above the viewport as history; the rows the
+    // picker holds were never released, so counting them drops them from
+    // scrollback.
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.output(1);
+    try run.output(29);
+    try run.openPicker();
+    try run.invalidAnchorTakeover();
+    for (0..3) |_| {
+        try run.output(2);
+        try run.expectNoRowTwice();
+    }
+    try run.closePicker();
+    try run.expectFooterAtBottom();
+    try run.expectEveryRowOnce();
+}
+
+test "exit after a resize while a screen covers the slash picker leaves every row" {
+    // A resize while an alternate screen covers the main one (Ctrl+O, the
+    // approval review screen) leaves the anchor invalid with no frame to
+    // recover it, and a signal close asks for its exit frame from there. The
+    // invalid anchor has forgotten the rows the picker holds, so the settle
+    // must still release them
+    // (`tests/tla/transcript_window/spec/FooterReclaim.tla` ExitKeepsRows).
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.output(1);
+    try run.output(29);
+    try run.openPicker();
+    try run.resizeWhileCovered();
+    try std.testing.expectEqual(.invalid, run.h.shell.transcriptCommitDiagnostic().state);
+    try run.exit();
+    const diagnostic = run.h.shell.transcriptCommitDiagnostic();
+    try std.testing.expectEqual(diagnostic.visual_offset, diagnostic.history_visual_offset);
+    try run.expectEveryRowOnce();
+}
+
+test "exit after output and a resize while a screen covers the slash picker repeats no row" {
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.output(1);
+    try run.output(29);
+    try run.openPicker();
+    try run.output(3);
+    try run.resizeWhileCovered();
+    try run.exit();
+    try run.expectEveryRowOnce();
+}
+
+test "exit after a resize while a screen covers the idle footer repeats no row" {
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.output(1);
+    try run.output(29);
+    try run.resizeWhileCovered();
+    try run.exit();
+    try run.expectEveryRowOnce();
+}
+
+test "a resize with the slash picker open keeps the covered rows held for the close" {
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, 24);
+    defer run.deinit();
+    try run.output(1);
+    try run.output(29);
+    try run.openPicker();
+    try run.resize();
+    try run.closePicker();
+    try run.expectFooterAtBottom();
+    try run.expectEveryRowOnce();
+}
+
+test "footer reclaim keeps every row once on fuzzed event scripts" {
+    try std.testing.fuzz({}, fuzzFooterReclaim, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").footer_reclaim.*),
+    });
+}
+
+test "footer reclaim keeps every row once on seeded random event scripts" {
+    // The fuzz target's driver with a seeded generator in place of a fuzzer,
+    // so every test run walks many scripts, not only the corpus.
+    var prng: std.Random.DefaultPrng = .init(20261107);
+    for (0..40) |_| try driveFooterReclaim(FooterReclaimSeededDraws{ .random = prng.random() });
+}
+
+fn fuzzFooterReclaim(_: void, smith: *std.testing.Smith) !void {
+    try driveFooterReclaim(FooterReclaimSmithDraws{ .smith = smith });
+}
+
+const FooterReclaimSmithDraws = struct {
+    smith: *std.testing.Smith,
+
+    fn range(self: FooterReclaimSmithDraws, comptime T: type, lo: T, hi: T) T {
+        return self.smith.valueRangeAtMost(T, lo, hi);
+    }
+};
+
+const FooterReclaimSeededDraws = struct {
+    random: std.Random,
+
+    fn range(self: FooterReclaimSeededDraws, comptime T: type, lo: T, hi: T) T {
+        return self.random.intRangeAtMost(T, lo, hi);
+    }
+};
+
+/// Output, slash picker open and close, resizes, screen takeovers (Ctrl+O
+/// recovery and an invalid anchor), and resizes while a screen covers the main
+/// one, in a drawn order on a drawn screen height, then exit. After every step
+/// no row is in history and on the screen twice; whenever the picker is closed
+/// the footer is on the bottom row and every row is there once; after exit
+/// every row is.
+fn driveFooterReclaim(draws: anytype) !void {
+    var run = try FooterReclaimRun.init(std.testing.allocator, 100, draws.range(u16, 16, 40));
+    defer run.deinit();
+    try run.output(1);
+    try run.output(draws.range(u32, 1, 60));
+    for (0..draws.range(u8, 0, 16)) |_| {
+        switch (draws.range(u8, 0, 7)) {
+            0, 1 => try run.output(draws.range(u32, 1, 4)),
+            2, 3 => if (run.open) try run.closePicker() else try run.openPicker(),
+            4 => try run.resize(),
+            5 => try run.ctrlOTakeover(),
+            6 => try run.invalidAnchorTakeover(),
+            else => try run.resizeWhileCovered(),
+        }
+        try run.expectNoRowTwice();
+        if (!run.open) {
+            try run.expectFooterAtBottom();
+            try run.expectEveryRowOnce();
+        }
+    }
+    try run.exit();
+    try run.expectEveryRowOnce();
+}
+
+/// The model's action for an event that ends fx, or null for any other event.
+fn footerReclaimExitAct(event: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, event, "exit")) return "Exited";
+    if (std.mem.eql(u8, event, "sigterm")) return "SigTerm";
+    if (std.mem.eql(u8, event, "sighup")) return "SigHup";
+    return null;
+}
+
+const FooterReclaimState = struct {
+    rows: u32,
+    written: u32,
+    hist: u32,
+    top: u32,
+    open: bool,
+    exited: bool,
+    resizes: u32,
+    anchor: []const u8,
+    act: []const u8,
+    footer_bottom: u16,
+    screen_rows: u16,
+    cap: u16,
+};
+
+/// What the runtime committed, as the model's variables. An invalid anchor
+/// holds no offsets, so the screen and history stay as `previous` left them:
+/// no frame drew since.
+fn footerReclaimState(run: *FooterReclaimRun, act: []const u8, previous: ?FooterReclaimState) FooterReclaimState {
+    const diagnostic = run.h.shell.transcriptCommitDiagnostic();
+    const layout = run.h.shell.committed_frame_layout;
+    const kept = if (diagnostic.state == .invalid) previous else null;
+    return .{
+        .rows = if (kept) |state| state.rows else diagnostic.total_visual_rows,
+        .written = run.written,
+        .hist = if (kept) |state| state.hist else diagnostic.history_visual_offset,
+        .top = if (kept) |state| state.top else diagnostic.visual_offset,
+        .open = run.open,
+        .exited = run.exited,
+        .resizes = run.resizes,
+        .anchor = @tagName(diagnostic.state),
+        .act = act,
+        .footer_bottom = layout.footer_area.bottom,
+        .screen_rows = run.h.shell.layout.rows,
+        .cap = layout.footer_area.top -| 1,
+    };
+}
+
+const FooterReclaimTraceResult = struct {
+    states: []const FooterReclaimState,
+    /// Rows written that native history plus the screen hold other than once
+    /// after exit.
+    wrong_copies: []const u32,
+};
+
+// The driver for tests/tla/drivers/transcript_window/footer-runtime-to-spec.ts:
+// it walks the real TranscriptRuntime with the slash picker through each event
+// script in $FX_FOOTER_RECLAIM_EVENTS and writes what the runtime committed
+// after each step to $FX_FOOTER_RECLAIM_TRACE. Without those variables it does
+// nothing. Events: "o<k>" writes k rows, "open" and "close" the slash picker,
+// "resize" a window resize away and back, "takeover" a Ctrl+O takeover and
+// "invalidate" an invalid anchor as a takeover leaves them, "covered" a resize
+// while an alternate screen covers the main one (the anchor stays invalid and
+// no frame follows), and "exit" what exit and suspend do before they erase the
+// footer; "sigterm" and "sighup" are the same frame, which a signal close asks
+// the main thread for.
+test "footer reclaim runtime trace driver" {
+    io_mod.setLibcEnviron();
+    defer io_mod.resetEnvironForTest();
+    const events_path = io_mod.getenv("FX_FOOTER_RECLAIM_EVENTS") orelse return;
+    const trace_path = io_mod.getenv("FX_FOOTER_RECLAIM_TRACE") orelse return;
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var events_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), events_path, .{});
+    defer events_file.close(io_mod.getIo());
+    const events_text = try io_mod.readFileToEnd(arena, &events_file, 16 * 1024 * 1024);
+    const Input = struct { cols: u16, rows: u16, traces: []const []const []const u8 };
+    const input = try json_decode.parseFromSliceLeaky(Input, arena, events_text, .{});
+
+    var results: std.ArrayList(FooterReclaimTraceResult) = .empty;
+    for (input.traces) |events| {
+        var run = try FooterReclaimRun.init(alloc, input.cols, input.rows);
+        defer run.deinit();
+        var states: std.ArrayList(FooterReclaimState) = .empty;
+        try states.append(arena, footerReclaimState(&run, "Init", null));
+        for (events) |event| {
+            const act: []const u8 = if (std.mem.eql(u8, event, "open")) blk: {
+                try run.openPicker();
+                break :blk "Opened";
+            } else if (std.mem.eql(u8, event, "close")) blk: {
+                try run.closePicker();
+                break :blk "Closed";
+            } else if (std.mem.eql(u8, event, "resize")) blk: {
+                try run.resize();
+                break :blk "Resized";
+            } else if (std.mem.eql(u8, event, "takeover")) blk: {
+                try run.ctrlOTakeover();
+                break :blk "TookOver";
+            } else if (std.mem.eql(u8, event, "invalidate")) blk: {
+                try run.invalidAnchorTakeover();
+                break :blk "TookOver";
+            } else if (std.mem.eql(u8, event, "covered")) blk: {
+                try run.resizeWhileCovered();
+                break :blk "CoveredResize";
+            } else if (footerReclaimExitAct(event)) |exit_act| blk: {
+                try run.exit();
+                break :blk exit_act;
+            } else if (event.len > 1 and event[0] == 'o') blk: {
+                try run.output(try std.fmt.parseInt(u32, event[1..], 10));
+                break :blk "Output";
+            } else return error.UnknownFooterReclaimEvent;
+            try states.append(arena, footerReclaimState(&run, act, states.items[states.items.len - 1]));
+            if (run.exited) break;
+        }
+        var wrong: std.ArrayList(u32) = .empty;
+        if (run.exited) {
+            const counts = try run.rowCopies();
+            defer alloc.free(counts);
+            for (counts[1..], 1..) |copies, n| {
+                if (copies != 1) try wrong.append(arena, @intCast(n));
+            }
+        }
+        try results.append(arena, .{ .states = states.items, .wrong_copies = wrong.items });
+    }
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(results.items, .{}, &out.writer);
+    var trace_file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), trace_path, .{ .truncate = true });
+    defer trace_file.close(io_mod.getIo());
+    try trace_file.writeStreamingAll(io_mod.getIo(), out.written());
+}
+
+/// Median bytes and nanoseconds of an output frame while the slash picker is
+/// open and of the close frame, after `lines` transcript lines.
+fn footerReclaimFrameCost(alloc: Allocator, lines: u32) !struct { output_bytes: u64, close_bytes: u64, output_ns: u64, close_ns: u64 } {
+    var run = try FooterReclaimRun.init(alloc, 100, 24);
+    defer run.deinit();
+    // One row first: the first frame after an empty transcript has no stable
+    // anchor yet.
+    try run.output(1);
+    var written: u32 = 1;
+    while (written < lines) : (written += 1000) try run.output(@min(1000, lines - written));
+    var output_bytes: [5]u64 = undefined;
+    var close_bytes: [5]u64 = undefined;
+    var output_ns: [5]u64 = undefined;
+    var close_ns: [5]u64 = undefined;
+    for (0..5) |i| {
+        try run.openPicker();
+        const before_output = try run.h.file.length(io_mod.getIo());
+        const output_started = io_mod.nanoTimestamp();
+        try run.output(1);
+        output_ns[i] = @intCast(io_mod.nanoTimestamp() - output_started);
+        const before_close = try run.h.file.length(io_mod.getIo());
+        output_bytes[i] = before_close - before_output;
+        const close_started = io_mod.nanoTimestamp();
+        try run.closePicker();
+        close_ns[i] = @intCast(io_mod.nanoTimestamp() - close_started);
+        close_bytes[i] = try run.h.file.length(io_mod.getIo()) - before_close;
+    }
+    try run.expectEveryRowOnce();
+    for ([_]*[5]u64{ &output_bytes, &close_bytes, &output_ns, &close_ns }) |samples| {
+        sort_utils.sort(u64, samples, {}, std.sort.asc(u64));
+    }
+    return .{ .output_bytes = output_bytes[2], .close_bytes = close_bytes[2], .output_ns = output_ns[2], .close_ns = close_ns[2] };
+}
+
+test "footer reclaim frame bytes stay flat from 82 to 8200 transcript lines" {
+    const alloc = std.testing.allocator;
+    const small = try footerReclaimFrameCost(alloc, 82);
+    const large = try footerReclaimFrameCost(alloc, 8200);
+    io_mod.setLibcEnviron();
+    defer io_mod.resetEnvironForTest();
+    if (io_mod.getenv("FX_FOOTER_RECLAIM_METRICS") != null) {
+        std.debug.print(
+            "METRIC output_frame_bytes_82={d}\nMETRIC output_frame_bytes_8200={d}\nMETRIC close_frame_bytes_82={d}\nMETRIC close_frame_bytes_8200={d}\nMETRIC output_frame_ns_82={d}\nMETRIC output_frame_ns_8200={d}\nMETRIC close_frame_ns_82={d}\nMETRIC close_frame_ns_8200={d}\n",
+            .{ small.output_bytes, large.output_bytes, small.close_bytes, large.close_bytes, small.output_ns, large.output_ns, small.close_ns, large.close_ns },
+        );
+    }
+    // TUI-13: a frame writes what the screen needs, not the transcript.
+    try std.testing.expect(large.output_bytes * 2 <= small.output_bytes * 3);
+    try std.testing.expect(large.close_bytes * 2 <= small.close_bytes * 3);
 }

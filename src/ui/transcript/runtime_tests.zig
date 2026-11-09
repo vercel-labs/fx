@@ -51,7 +51,7 @@ fn resolveAndSealTranscriptTransitionForTest(
         source,
         prepared,
         false,
-        false,
+        0,
     );
     const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
         runtime.committed_frame_layout.transcript_area,
@@ -611,7 +611,7 @@ test "child full transcript finalizer consumes one complete transition" {
         &source,
     );
     defer prepared.deinit(alloc);
-    const facts = runtime.planTranscriptScrollForFrame(&prepared, false, false);
+    const facts = runtime.planTranscriptScrollForFrame(&prepared, false, 0);
     const scroll_plan = render_engine.frame_scroll_plan.merge(
         runtime.layout.rows,
         runtime.owned_top_row,
@@ -627,7 +627,7 @@ test "child full transcript finalizer consumes one complete transition" {
         &plan,
         scroll_plan,
         false,
-        false,
+        0,
     );
     defer transition.deinit(alloc);
 
@@ -7460,7 +7460,7 @@ test "same-width backward footer candidate retains one coherent stable anchor" {
         &source,
         &prepared,
         false,
-        false,
+        0,
     );
     const resolved = try runtime.resolveTranscriptTransitionTargetForFrame(
         alloc,
