@@ -8,11 +8,11 @@ const Allocator = std.mem.Allocator;
 
 const max_prompt_bytes: usize = 4 * 1024;
 const guidance =
-    "Configured MCP servers visible to this model turn are listed below.\n" ++
-    "A listed server is not a reason to use MCP. Use capability_search only when the task clearly needs a capability not already available locally. Pass the task and an optional exact server name. Call tools advertised after search directly. Use mcp_select_tool when a relevant result is not yet callable. Use returned identities and refine the query when needed.\n";
+    "Configured MCP servers are listed below; being listed is not a reason to use one.\n" ++
+    "When a task needs a capability not available locally, use capability_search with the task and an optional server name, then call the tools it returns. Use mcp_select_tool for a result that is not yet callable.\n";
 /// `fx mcp call` (`src/core/mcp_host/mcp_call_client.zig`), where it works.
 const file_guidance = if (mcp_call_capability.supported)
-    "When a tool's result would be large or needs filtering, run it from a shell command instead: fx mcp call TOOL_NAME '<JSON arguments>' > FILE. Only what the command prints returns to you.\n"
+    "For a large result or one you need to filter, run the tool in a shell instead: fx mcp call TOOL_NAME '<JSON arguments>' > FILE. Only what the command prints returns to you.\n"
 else
     "";
 const header = guidance ++ file_guidance ++ "<mcp_servers>\n";
@@ -349,8 +349,8 @@ test "render exposes sorted server summaries without tool metadata" {
     defer section.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "Configured MCP servers visible to this model turn are listed below.\n" ++
-            "A listed server is not a reason to use MCP. Use capability_search only when the task clearly needs a capability not already available locally. Pass the task and an optional exact server name. Call tools advertised after search directly. Use mcp_select_tool when a relevant result is not yet callable. Use returned identities and refine the query when needed.\n" ++
+        "Configured MCP servers are listed below; being listed is not a reason to use one.\n" ++
+            "When a task needs a capability not available locally, use capability_search with the task and an optional server name, then call the tools it returns. Use mcp_select_tool for a result that is not yet callable.\n" ++
             file_guidance ++
             "<mcp_servers>\n" ++
             "  <server name=\"alpha\" state=\"ready\" tools=\"2\" />\n" ++

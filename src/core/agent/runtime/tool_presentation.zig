@@ -1463,9 +1463,11 @@ fn failureStatusDetail(
             const failure_prefix = " failed: ";
             const remainder = safe_result[call.name.len..];
             if (std.mem.startsWith(u8, remainder, failure_prefix)) {
-                const actionable = remainder[failure_prefix.len..];
+                // Lines after the first carry detail for the model, such as
+                // the text a failed edit most likely meant.
+                const reason = remainder[failure_prefix.len..];
+                const actionable = reason[0 .. std.mem.findScalar(u8, reason, '\n') orelse reason.len];
                 if (actionable.len > 0 and
-                    std.mem.findScalar(u8, actionable, '\n') == null and
                     std.mem.findScalar(u8, actionable, '\r') == null)
                 {
                     const masked = try text_utils.maskSecrets(arena, actionable);
@@ -3266,6 +3268,25 @@ test "failure status detail masks the actionable edit failure reason" {
     const failure_output = "edit_file failed: MY_NOTE_" ++ "TOKEN=abcdefgh";
     const detail = (try failureStatusDetail(arena, call, result, failure_output, &.{})).?;
     try std.testing.expectEqualStrings("MY_NOTE_" ++ "TOKEN=[redacted]", detail);
+}
+
+test "failure status detail shows the first line of a multi-line edit failure" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call: ToolCall = .{
+        .id = "call_edit_fail",
+        .name = "edit_file",
+        .arguments_json = "{}",
+    };
+    const result: ToolExecutionResult = .{
+        .model_output = "",
+        .status = .failure,
+        .status_detail = "preflight failed",
+    };
+    const failure_output = "edit_file failed: old_string not found in file; the closest match is line 2.\nIt currently reads:\nconst limit = 3;\nIf the change is already applied, do not retry this edit.";
+    const detail = (try failureStatusDetail(arena, call, result, failure_output, &.{})).?;
+    try std.testing.expectEqualStrings("old_string not found in file; the closest match is line 2.", detail);
 }
 
 test "failure status detail terminal-encodes the actionable edit failure reason" {
