@@ -1016,8 +1016,18 @@ fn authorizeBridgeCall(
     if (!outcome.decision.isDenied() and outcome.tool_failure == null) {
         return .{ .allow = .{ .binding = resolved.mcp_binding } };
     }
-    return .{ .deny = outcome.tool_failure orelse outcome.feedback orelse
-        try arena.print("Permission to run {s} was not granted ({s}).", .{ tool, @tagName(outcome.decision) }) };
+    if (outcome.tool_failure orelse outcome.feedback) |message| return .{ .deny = message };
+    // Say why, as a direct call would: a held review's reason and advice tell
+    // the calling command what to change, such as an action too large to
+    // review in full.
+    const reason = outcome.denial_reason orelse outcome.decision.denialReason() orelse .user_denied;
+    return .{ .deny = try tool_result_errors.permissionDenialText(
+        arena,
+        tool,
+        reason,
+        if (outcome.auto_review_result) |result| result.rationale else null,
+        outcome.auto_review_failure,
+    ) };
 }
 
 /// The review schema a selected MCP tool would carry: its name,
