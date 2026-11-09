@@ -255,8 +255,15 @@ pub fn isChildInvocationRaw(raw_args: []const [*:0]const u8) bool {
 
 /// The sandbox child's whole life, from `mainC` before any other startup
 /// work. Returns the process exit code.
+extern "c" fn tzset() void;
+
 pub fn runChild(gpa: std.mem.Allocator, io: std.Io, raw_args: []const [*:0]const u8) u8 {
     const limits = parseLimits(raw_args[2..]) orelse return @backingInt(ChildExit.bad_arguments);
+    // Load the local time zone while files can still be opened: the engine's
+    // local-time Date methods need it, and libc keeps it after the first
+    // load. Confined, the zone file's open would stop the child on Linux and
+    // leave it on UTC on macOS.
+    tzset();
     confine.confine(.{
         .address_space_bytes = addressSpaceBytes(limits),
         .cpu_seconds = limits.time_ms / 1000 + 2,
@@ -322,12 +329,15 @@ fn writeOutcome(gpa: std.mem.Allocator, writer: *std.Io.Writer, outcome: engine.
     try writeFrame(writer, json.written());
 }
 
+/// Runs `source` in a real child. A run that fails fails the test here, so a
+/// test that reads its result's value sees a run that got as far as a result.
 fn runForTest(source: []const u8, limits: Limits) !Result {
     if (!supported) return error.SkipZigTest;
     const result = try run(std.testing.allocator, std.testing.io, source, limits);
-    switch (result) {
-        .failed => |text| std.debug.print("sandboxed run failed: {s}\n", .{text}),
-        else => {},
+    if (result == .failed) {
+        std.debug.print("sandboxed run failed: {s}\n", .{result.failed});
+        result.deinit(std.testing.allocator);
+        return error.TestUnexpectedResult;
     }
     return result;
 }
@@ -336,6 +346,14 @@ test "a sandboxed program returns its value" {
     const result = try runForTest("return [1, 2].map((x) => x * 2);", .{});
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("[2,4]", result.returned.?);
+}
+
+test "a sandboxed program can read the local time" {
+    const result = try runForTest("return [new Date(0).getTimezoneOffset(), new Date(2020, 0, 1).getFullYear()];", .{});
+    defer result.deinit(std.testing.allocator);
+    const offset_end = std.mem.findScalar(u8, result.returned.?, ',') orelse return error.TestUnexpectedResult;
+    _ = try std.fmt.parseInt(i32, result.returned.?[1..offset_end], 10);
+    try std.testing.expectEqualStrings(",2020]", result.returned.?[offset_end..]);
 }
 
 test "a sandboxed program's error names what went wrong" {
