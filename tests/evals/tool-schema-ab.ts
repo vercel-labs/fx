@@ -162,8 +162,9 @@ export function parseStreamUsage(stream: string): Usage | null {
 function startProxy(variant: Variant, testKey: string, transform?: Transform) {
   const requests: RecordedRequest[] = [];
   const pending: Promise<void>[] = [];
-  // A transform that throws fails its run: the request gets a 502 and the
-  // stream ends with an error, and runOne marks the run failed with the message.
+  // A transform that throws fails its run: the request gets a 501, which fx
+  // does not retry, or the stream ends with an error, and runOne marks the run
+  // failed with the message.
   const transformErrors: string[] = [];
   const transformFailed = (message: string) => {
     transformErrors.push(message);
@@ -177,6 +178,10 @@ function startProxy(variant: Variant, testKey: string, transform?: Transform) {
       const url = new URL(req.url);
       if ((req.headers.get("authorization") ?? "") !== `Bearer ${testKey}`) {
         return new Response("tool-schema-ab: refusing a key other than AI_GATEWAY_TEST_API_KEY", { status: 401 });
+      }
+      // After a transform fails, end the run at once: fx does not retry a 501.
+      if (transformErrors.length) {
+        return new Response(`tool-schema-ab: transform ${transformErrors[0]}`, { status: 501 });
       }
       let raw = req.method === "GET" || req.method === "HEAD" ? undefined : await req.text();
       const model = req.headers.get("ai-language-model-id") ?? "";
@@ -195,12 +200,14 @@ function startProxy(variant: Variant, testKey: string, transform?: Transform) {
               if (tool.type === "function" && typeof tool.name === "string") record.toolProps[tool.name] = Object.keys(schema?.properties ?? {});
             }
             record.prompt = transform?.request ? structuredClone(body.prompt as Array<Record<string, unknown>>) : (body.prompt as Array<Record<string, unknown>>);
+            // The body is serialized inside the same try, so a transform that
+            // leaves a body that cannot be sent fails the run as well.
             try {
               transform?.request?.(body, model);
+              raw = JSON.stringify(body);
             } catch (error) {
-              requestTransformError = `request() threw: ${error}`;
+              requestTransformError = `request() failed: ${error}`;
             }
-            raw = JSON.stringify(body);
             const toolsJson = JSON.stringify(body.tools);
             record.toolsBytes = toolsJson.length;
             record.toolsHash = createHash("sha256").update(toolsJson).digest("hex").slice(0, 12);
@@ -210,8 +217,8 @@ function startProxy(variant: Variant, testKey: string, transform?: Transform) {
       }
       if (requestTransformError) {
         transformFailed(requestTransformError);
-        record.status = 502;
-        return new Response(`tool-schema-ab: transform ${requestTransformError}`, { status: 502 });
+        record.status = 501;
+        return new Response(`tool-schema-ab: transform ${requestTransformError}`, { status: 501 });
       }
       const headers = new Headers(req.headers);
       for (const name of ["host", "content-length", "accept-encoding"]) headers.delete(name);
@@ -1651,7 +1658,8 @@ async function main(): Promise<void> {
     let changed = 0;
     for (const r of results) {
       const task = TASKS.find((t) => t.id === r.task);
-      if (!task || !wanted.has(r.task)) continue;
+      // A run whose transform failed stays failed; its oracle never judged a transformed run.
+      if (!task || !wanted.has(r.task) || r.transformErrors?.length) continue;
       const verdict = task.check({
         output: r.output,
         calls: r.calls,

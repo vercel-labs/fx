@@ -42,6 +42,23 @@ describe("tool schema A/B helpers", () => {
     expect(await new Response(passthrough).text()).toBe("data: [DONE]\n");
   });
 
+  test("a stream split inside a line and inside a character is rewritten whole", async () => {
+    const bytes = new TextEncoder().encode('data: {"delta":"café"}\ndata: {"delta":"ok"}\n');
+    const cut = [9, bytes.indexOf(0xc3) + 1, bytes.length - 3];
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        let from = 0;
+        for (const to of [...cut, bytes.length]) {
+          controller.enqueue(bytes.slice(from, to));
+          from = to;
+        }
+        controller.close();
+      },
+    });
+    const upper = { event: (part: Record<string, unknown>) => ({ delta: String(part.delta).toUpperCase() }) };
+    expect(await new Response(source.pipeThrough(transformStream(upper, "m"))).text()).toBe('data: {"delta":"CAFÉ"}\ndata: {"delta":"OK"}\n');
+  });
+
   test("a variant replaces only the named function tools and text in system messages", () => {
     const body: Record<string, unknown> = {
       tools: [
