@@ -378,7 +378,9 @@ const zsh_capture_script =
 // replay leaves out a `_` function only when `declare -F`, with `extdebug`
 // on, reports such a file; the name alone does not decide. Under `extdebug`
 // a DEBUG trap that fails skips the next command, so the trap is cleared
-// first.
+// first. bash parses a function's patterns when it reads the definition, so
+// the replay sets options such as `extglob` before the functions that use
+// them.
 const bash_capture_script =
     \\{
     \\\unset -f builtin
@@ -387,6 +389,9 @@ const bash_capture_script =
     \\\builtin printf 'FXSNAP:@NONCE@:NAMES\0'
     \\\builtin printf '%s\0' $(\builtin compgen -a) $(\builtin compgen -A function)
     \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
+    \\for __fx_snapshot_name in extglob nullglob dotglob globstar nocaseglob failglob nocasematch globasciiranges; do
+    \\  \builtin shopt -p "$__fx_snapshot_name" 2>/dev/null
+    \\done
     \\\builtin trap - DEBUG
     \\\builtin shopt -s extdebug
     \\__fx_snapshot_sources=$(\builtin declare -F $(\builtin compgen -A function))
@@ -397,9 +402,6 @@ const bash_capture_script =
     \\  \builtin declare -f -- "$__fx_snapshot_name"
     \\done <<< "$__fx_snapshot_sources"
     \\\builtin alias -p
-    \\for __fx_snapshot_name in extglob nullglob dotglob globstar nocaseglob failglob nocasematch globasciiranges; do
-    \\  \builtin shopt -p "$__fx_snapshot_name" 2>/dev/null
-    \\done
     \\\builtin printf '\0FXSNAP:@NONCE@:END\0'
     \\} 2>/dev/null
 ;
