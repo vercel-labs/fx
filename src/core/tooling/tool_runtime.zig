@@ -990,10 +990,10 @@ fn authorizeBridgeCall(
     const state: *McpCallBridgeState = @ptrCast(@alignCast(raw));
     const ctx = state.runtime;
     if (ctx.tool_registry.lookup(tool) != null) {
-        return .{ .deny = try arena.print("{s} is a built-in tool; fx mcp call runs MCP tools only.", .{tool}) };
+        return .{ .deny = try arena.print("{f} is a built-in tool; fx mcp call runs MCP tools only.", .{text_utils.terminalSafe(tool)}) };
     }
     const resolved = (try resolveUnselectedMcpTool(ctx, arena, tool)) orelse {
-        return .{ .deny = try arena.print("No MCP tool named {s} is available to this agent. Find tool names with capability_search.", .{tool}) };
+        return .{ .deny = try arena.print("No MCP tool named {f} is available to this agent. Find tool names with capability_search.", .{text_utils.terminalSafe(tool)}) };
     };
     const call: ToolCall = .{ .id = request_id, .name = tool, .arguments_json = arguments_json };
     var check = ctx;
@@ -1017,7 +1017,7 @@ fn authorizeBridgeCall(
         return .{ .allow = .{ .binding = resolved.mcp_binding } };
     }
     return .{ .deny = outcome.tool_failure orelse outcome.feedback orelse
-        try arena.print("Permission to run {s} was not granted ({s}).", .{ tool, @tagName(outcome.decision) }) };
+        try arena.print("Permission to run {f} was not granted ({s}).", .{ text_utils.terminalSafe(tool), @tagName(outcome.decision) }) };
 }
 
 /// The review schema a selected MCP tool would carry: its name,
@@ -1127,8 +1127,8 @@ fn callBridgeTool(
         .access = ctx.mcp_access,
     }) catch |err| {
         if (err == error.OutOfMemory) return err;
-        return .{ .status = .failed, .bytes = try arena.print("The MCP call to {s} failed: {s}", .{ tool, @errorName(err) }) };
-    }) orelse return .{ .status = .failed, .bytes = try arena.print("No MCP tool named {s} is available.", .{tool}) };
+        return .{ .status = .failed, .bytes = try arena.print("The MCP call to {f} failed: {s}", .{ text_utils.terminalSafe(tool), @errorName(err) }) };
+    }) orelse return .{ .status = .failed, .bytes = try arena.print("No MCP tool named {f} is available.", .{text_utils.terminalSafe(tool)}) };
     return switch (result.status) {
         .success => .{ .status = .ok, .bytes = try bridgeResultData(arena, result.model_output) },
         .tool_failure => .{ .status = .tool_error, .bytes = try bridgeResultData(arena, result.model_output) },
@@ -1203,14 +1203,14 @@ fn lookupBridge(
     switch (question) {
         .help => |tool| {
             if (ctx.tool_registry.lookup(tool) != null) {
-                return .{ .status = .failed, .bytes = try arena.print("{s} is a built-in tool; fx mcp call runs MCP tools only.", .{tool}) };
+                return .{ .status = .failed, .bytes = try arena.print("{f} is a built-in tool; fx mcp call runs MCP tools only.", .{text_utils.terminalSafe(tool)}) };
             }
             const resolved = (try resolveUnselectedMcpTool(ctx, arena, tool)) orelse {
-                return .{ .status = .failed, .bytes = try arena.print("No MCP tool named {s} is available to this agent. Find tool names with fx mcp call search.", .{tool}) };
+                return .{ .status = .failed, .bytes = try arena.print("No MCP tool named {f} is available to this agent. Find tool names with fx mcp call search.", .{text_utils.terminalSafe(tool)}) };
             };
             mcp_tool_lookup.writeHelp(arena, &out.writer, resolved.schema_json) catch |err| switch (err) {
                 error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
-                error.InvalidToolSchema => return .{ .status = .failed, .bytes = try arena.print("The schema of {s} could not be read.", .{tool}) },
+                error.InvalidToolSchema => return .{ .status = .failed, .bytes = try arena.print("The schema of {f} could not be read.", .{text_utils.terminalSafe(tool)}) },
             };
         },
         .list, .search => |text| {
@@ -1286,6 +1286,44 @@ test "bridge result data unwraps a structured result that is only one result str
     try std.testing.expectEqualStrings("{\"results\":\"a\"}\n", try bridgeResultData(arena,
         \\{"server":"s","tool":"t","result":{"content":[],"structuredContent":{"results":"a"}}}
     ));
+}
+
+/// The bridge's messages carry the tool name a command typed. They go to the
+/// command's output, so a control byte in the name must show as an escape.
+fn expectBridgeNameQuoted(message: []const u8) !void {
+    try std.testing.expect(std.mem.find(u8, message, "mcp_s_\\x1b]0;x\\x07\\x00t") != null);
+    for (message) |byte| try std.testing.expect(byte >= 0x20 and byte != 0x7f);
+}
+
+test "bridge messages name a requested tool as visible escapes, not raw bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The name is a word from a command line, so it can hold any byte.
+    const name = "mcp_s_\x1b]0;x\x07\x00t";
+    var marker: u8 = 0;
+    var missing = TestRuntime{ .mcp_ctx = @ptrCast(&marker), .mcp_call_tool = McpFixture.callNull };
+    defer missing.deinit(std.testing.allocator);
+    var failing = TestRuntime{ .mcp_ctx = @ptrCast(&marker), .mcp_call_tool = McpFixture.callFailure };
+    defer failing.deinit(std.testing.allocator);
+    var cancel: std.atomic.Value(bool) = .init(false);
+
+    var state = McpCallBridgeState{ .runtime = missing.context() };
+    const denied = try authorizeBridgeCall(@ptrCast(&state), arena, "call-1", name, "{}");
+    try std.testing.expect(denied == .deny);
+    try expectBridgeNameQuoted(denied.deny);
+
+    const help = try lookupBridge(@ptrCast(&state), arena, .{ .help = name }, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, help.status);
+    try expectBridgeNameQuoted(help.bytes);
+
+    const gone = try callBridgeTool(missing.context(), arena, "call-1", name, "{}", .{}, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, gone.status);
+    try expectBridgeNameQuoted(gone.bytes);
+
+    const failed = try callBridgeTool(failing.context(), arena, "call-1", name, "{}", .{}, &cancel);
+    try std.testing.expectEqual(mcp_call_capability.CallStatus.failed, failed.status);
+    try expectBridgeNameQuoted(failed.bytes);
 }
 
 const RunCommandBackendState = struct {
