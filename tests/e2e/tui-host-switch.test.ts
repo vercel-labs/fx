@@ -42,6 +42,13 @@ function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean
 // rest by their latest reply, and its rows can move while it is open, so each
 // step reads the rows again instead of counting them.
 async function showAgent(session: TmuxSession, agent: string) {
+  await selectAgent(session, agent);
+  await session.sendKeys("Enter");
+  await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+}
+
+// Opens the agent list and moves its highlight to `agent`'s row.
+async function selectAgent(session: TmuxSession, agent: string) {
   await session.sendKeys("C-x");
   await session.waitForText(LIST_HINT, 10_000);
   const deadline = Date.now() + 15_000;
@@ -59,8 +66,6 @@ async function showAgent(session: TmuxSession, agent: string) {
       rows = agentRows(await session.capturePaneEscapes());
     } while (JSON.stringify(rows) === before && Date.now() < step);
   }
-  await session.sendKeys("Enter");
-  await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
 }
 
 function text(id: string, delta: string): Response {
@@ -573,6 +578,103 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         }, () => {}, false, { FX_TEST_SUBAGENT_END_HELD: endHeld, FX_TEST_SUBAGENT_END_RELEASE: endRelease });
       } finally {
         first.release();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // Main starts subagent `worker`, whose first turn the start hold
+  // (src/core/subagent/start_test_controls.zig) stops before its worker
+  // attaches, then messages it SWITCH_START_NOTE, which waits for that turn
+  // to begin. `noteAnswer` is what main heard back.
+  function startGapGateway(state: { noteCalled: boolean; noteAnswer: string }) {
+    return (body: string) => {
+      if (!isMainRequest(body)) return text("child_answer", "SWITCH_CHILD_RAN");
+      if (body.includes("SWITCH_AFTER_ESC")) return text("main_next", "SWITCH_MAIN_NEXT");
+      if (body.includes('"main_note"')) {
+        if (!state.noteAnswer) {
+          state.noteAnswer = body.includes("child_closing") ? "closing"
+            : body.includes("Sent into the subagent's running turn") ? "joined"
+            : body.includes("is busy, so the message waits") ? "waits" : "other";
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }
+      if (body.includes('"main_sub"')) {
+        state.noteCalled = true;
+        return toolCall("main_note", "subagent", { request: { action: "message", agent: "worker", message: "SWITCH_START_NOTE" } });
+      }
+      return toolCall("main_sub", "subagent", { request: { action: "message", agent: "worker", message: "SWITCH_START_TASK" } });
+    };
+  }
+
+  test(
+    "Esc on main while its message waits for a subagent's start ends main's turn at once",
+    async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "fx-start-esc-")));
+      const startHeld = join(dir, "start-held");
+      const startRelease = join(dir, "start-release");
+      const state = { noteCalled: false, noteAnswer: "" };
+      try {
+        await withFx(startGapGateway(state), async (session) => {
+          await session.sendText("SWITCH_USER");
+          await until("the held start", () => existsSync(`${startHeld}.1`), 20_000);
+          await until("main's message", () => state.noteCalled, 20_000);
+          await Bun.sleep(300);
+          const stopped = Date.now();
+          await session.sendKeys("Escape");
+          await session.waitForText("esc again to interrupt", 10_000);
+          await session.sendKeys("Escape");
+          await session.waitForText("What can fx do differently?", 15_000);
+          await session.sendText("SWITCH_AFTER_ESC");
+          await session.waitForText("SWITCH_MAIN_NEXT", 15_000);
+          // Main's turn ended with the stop, not when the 30 s wait ran out.
+          expect(Date.now() - stopped).toBeLessThan(10_000);
+          expect(state.noteAnswer).toBe("");
+        }, () => {}, false, {
+          FX_TEST_SUBAGENT_START_HELD: startHeld,
+          FX_TEST_SUBAGENT_START_RELEASE: startRelease,
+          FX_TEST_SUBAGENT_START_WAIT_MS: "30000",
+        });
+      } finally {
+        writeFileSync(startRelease, "");
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "closing a subagent while main's message waits for its start refuses the message",
+    async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "fx-start-close-")));
+      const startHeld = join(dir, "start-held");
+      const startRelease = join(dir, "start-release");
+      const state = { noteCalled: false, noteAnswer: "" };
+      try {
+        await withFx(startGapGateway(state), async (session) => {
+          await session.sendText("SWITCH_USER");
+          await until("the held start", () => existsSync(`${startHeld}.1`), 20_000);
+          await until("main's message", () => state.noteCalled, 20_000);
+          await Bun.sleep(300);
+          await selectAgent(session, "worker");
+          await session.sendKeys("BSpace");
+          await session.waitForText("press delete again to close this subagent", 10_000);
+          await session.sendKeys("BSpace");
+          await session.waitForPane((pane) => !/^ {4}worker \u00b7 /m.test(pane) && pane.includes("esc back"), 15_000);
+          await session.sendKeys("Escape");
+          await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+          // The close refused the message; it neither joined the closed
+          // work nor waited for a turn the close ruled out.
+          expect(state.noteAnswer).toBe("closing");
+          expect(await session.capturePane()).not.toContain("subagent working");
+        }, () => {}, false, {
+          FX_TEST_SUBAGENT_START_HELD: startHeld,
+          FX_TEST_SUBAGENT_START_RELEASE: startRelease,
+          FX_TEST_SUBAGENT_START_WAIT_MS: "30000",
+        });
+      } finally {
+        writeFileSync(startRelease, "");
         rmSync(dir, { recursive: true, force: true });
       }
     },

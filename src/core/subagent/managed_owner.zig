@@ -12,6 +12,7 @@ const live_metrics = @import("live_metrics.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const end_test_controls = @import("end_test_controls.zig");
+const start_test_controls = @import("start_test_controls.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -77,6 +78,11 @@ pub const FeedbackResult = union(enum) {
     /// A stop has ended the child's turn, which is still ending: the message
     /// waits for the child's next turn.
     stopping,
+    /// The child's work is running but its turn has not begun: the worker
+    /// has not attached, or has not started the turn. The message waits for
+    /// the turn to begin and joins it (`tests/tla/subagent/StopMessage.tla`
+    /// JoinsStartingWork).
+    starting,
     unavailable,
     cancelled,
     conflict,
@@ -260,8 +266,11 @@ pub const Owner = struct {
         // quit, the user's close, and any other cancel still refuse it.
         if (slot.stopped_by_parent or slot.stopped_by_user) return .stopping;
         if (slot.cancel.load(.seq_cst)) return .cancelled;
-        const worker = slot.worker orelse return .waiting;
-        if (!std.mem.eql(u8, slot.work_id orelse return .waiting, work_id)) return .waiting;
+        // The work's turn has not begun, so nothing can take the message
+        // yet; it belongs to this work, not the next one.
+        const worker = slot.worker orelse return .starting;
+        if (!std.mem.eql(u8, slot.work_id orelse return .starting, work_id)) return .waiting;
+        if (!worker.isProcessing()) return .starting;
         // The limit is this child's unread messages at one moment. A read
         // one stays only for a replay of its call, so it never counts.
         if (self.unreadFeedbackLocked(child_id) >= max_unread_feedback) return .capacity;
@@ -754,6 +763,36 @@ test "child feedback counts each child's unread messages alone, and a close forg
     try std.testing.expect(owner.feedbackReplay("second-0", fingerprint) != null);
 }
 
+test "a work whose turn has not begun answers starting until its worker processes the turn" {
+    const alloc = std.testing.allocator;
+    var worker = worker_runtime.WorkerRuntime{};
+    var owner = Owner{ .alloc = alloc, .children = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
+    const slot = try alloc.create(Slot);
+    slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, "child"), .worker = null, .work_id = null };
+    try owner.slots.append(alloc, slot);
+    defer {
+        slot.worker = null;
+        worker.deinit(alloc);
+        owner.deinit();
+    }
+    const fingerprint: [32]u8 = @splat(1);
+
+    // The slot has no worker yet, then one that has not begun the turn.
+    try std.testing.expect((try owner.steer("child", "work", "before-attach", fingerprint, "text")) == .starting);
+    slot.worker = &worker;
+    slot.work_id = "work";
+    try std.testing.expect((try owner.steer("child", "work", "before-begin", fingerprint, "text")) == .starting);
+    try std.testing.expectEqual(@as(usize, 0), worker.queuedPromptCount());
+
+    // Once the worker processes the turn, the message joins it.
+    try std.testing.expect(worker.beginDirectProcessing(1));
+    try std.testing.expectEqual(types.SteeringDelivery.queued, (try owner.steer("child", "work", "after-begin", fingerprint, "text")).receipt);
+
+    // A work that has ended still leaves a message for the next turn.
+    slot.completion = .{ .published = .{ .phase = .finished, .outcome = .cancelled } };
+    try std.testing.expect((try owner.steer("child", "work", "after-end", fingerprint, "text")) == .waiting);
+}
+
 test "a stopped turn that is still ending takes no message, and its stop counts the unread ones once" {
     const alloc = std.testing.allocator;
     var parent_worker = worker_runtime.WorkerRuntime{};
@@ -929,6 +968,9 @@ fn runOne(slot: *Slot) OneOutcome {
         .work_id = work_id,
         .outcome = .cancelled,
     } else failedOutcome(work_id, "hosted_agent", err);
+    // A test can hold the start here, after the turn is built and before its
+    // worker attaches (src/core/subagent/start_test_controls.zig).
+    if (start_test_controls.armed()) start_test_controls.holdStart(slot.child_id, &slot.cancel);
     owner.mutex.lockUncancelable(io_mod.getIo());
     slot.worker = turn.workerRuntime();
     slot.hosted = turn.hosted_worker != null;

@@ -14,6 +14,7 @@ const agent_frame = @import("../shared/agent_frame.zig");
 const live_metrics = @import("live_metrics.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const model_contract = @import("model_contract.zig");
+const start_test_controls = @import("start_test_controls.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -207,6 +208,10 @@ pub const Runtime = struct {
     closed_unseen: std.ArrayList([]u8) = .empty,
     /// Whether `closed_unseen` holds a child, read without the lock.
     closed_waiting: std.atomic.Value(bool) = .init(false),
+    /// Messages waiting for a starting work's turn to begin. A close of
+    /// their child marks them, so the message is refused instead of
+    /// outliving the close. Guarded by `admission_mutex`.
+    start_waits: std.ArrayList(*StartWait) = .empty,
     waiter_mutex: std.Io.Mutex = .init,
     /// The owner's worker while it waits in `wait`.
     waiter: ?*worker_runtime.WorkerRuntime = null,
@@ -281,6 +286,7 @@ pub const Runtime = struct {
         self.closing.deinit(self.alloc);
         for (self.closed_unseen.items) |id| self.alloc.free(id);
         self.closed_unseen.deinit(self.alloc);
+        self.start_waits.deinit(self.alloc);
         self.approvals.deinit();
         if (self.profile_cache) |*cache| cache.deinit();
         self.alloc.free(self.root_id);
@@ -552,13 +558,48 @@ pub const Runtime = struct {
                         if (self.closingIndexLocked(target.child_id) != null) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_closing" });
                         var turned_away = false;
                         if (!self.hasPendingLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) {
-                            const result = try self.managed.steer(target.child_id, target.work_id, operation_id, fingerprint, request.message.message);
+                            var result = try self.managed.steer(target.child_id, target.work_id, operation_id, fingerprint, request.message.message);
+                            // The work main started has not begun its turn: wait
+                            // for it with the lock released, so other calls and
+                            // ends go on, then send the message into that turn
+                            // (`tests/tla/subagent/StopMessage.tla`
+                            // JoinsStartingWork). Only a stuck start reaches the
+                            // limit, which leaves the message for the next turn.
+                            if (result == .starting) {
+                                var start_wait: StartWait = .{ .child_id = target.child_id };
+                                try self.start_waits.append(self.alloc, &start_wait);
+                                defer self.removeStartWaitLocked(&start_wait);
+                                debug_trace.eventf("mailbox", "message_waits_start", .{}, "child={s} work_id={s}", .{ target.child_id, target.work_id });
+                                const limit_ms = start_test_controls.waitLimitMs();
+                                const deadline = io_mod.milliTimestamp() +| @as(i64, @intCast(@min(limit_ms, std.math.maxInt(i64))));
+                                while (result == .starting) {
+                                    if (io_mod.milliTimestamp() >= deadline) {
+                                        debug_trace.eventf("mailbox", "message_start_wait_expired", .{}, "child={s} work_id={s} limit_ms={d}", .{ target.child_id, target.work_id, limit_ms });
+                                        result = .waiting;
+                                        break;
+                                    }
+                                    self.admission_mutex.unlock(io_mod.getIo());
+                                    io_mod.sleep(start_wait_poll_ns);
+                                    self.admission_mutex.lockUncancelable(io_mod.getIo());
+                                    // Main's turn was cancelled, or fx is quitting.
+                                    if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
+                                    // The child may have been closed, or a message may
+                                    // have queued for it, while the lock was free.
+                                    if (start_wait.closed or self.closingIndexLocked(target.child_id) != null) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_closing" });
+                                    if (self.hasPendingLocked(target.child_id) or self.inTurnWorkLocked(target.child_id)) {
+                                        result = .waiting;
+                                        break;
+                                    }
+                                    result = try self.managed.steer(target.child_id, target.work_id, operation_id, fingerprint, request.message.message);
+                                }
+                            }
                             switch (result) {
                                 .receipt => |delivery| break :steer delivery,
                                 // An ended work, or one a stop is ending, takes the
                                 // message as its next turn: the stop told the
-                                // parent the turn ended.
-                                .waiting, .stopping => turned_away = true,
+                                // parent the turn ended. A start past the limit
+                                // does the same.
+                                .waiting, .stopping, .starting => turned_away = true,
                                 .capacity => {
                                     var buf: [sent_result_bytes]u8 = undefined;
                                     return self.encodeManaged(alloc, .{ .ok = false, .error_code = "feedback_capacity", .result = capacityResult(&buf, agent) });
@@ -589,7 +630,7 @@ pub const Runtime = struct {
                         var buf: [sent_result_bytes]u8 = undefined;
                         return self.encodeManaged(alloc, .{ .ok = true, .result = queuedResult(&buf, agent) });
                     };
-                    debug_trace.eventf("mailbox", "message", .{}, "child={s} work_id={s} delivery=joined receipt={s}", .{ target.child_id, target.work_id, @tagName(delivery) });
+                    debug_trace.eventf("mailbox", "message", .{}, "child={s} work_id={s} delivery=joined receipt={s} operation={s}", .{ target.child_id, target.work_id, @tagName(delivery), operation_id });
                     if (options.observer) |observer| observer.emit(.{ .delegation = .{
                         .call_id = options.invocation_id,
                         .child_id = target.child_id,
@@ -1461,6 +1502,11 @@ pub const Runtime = struct {
             try self.closing.ensureUnusedCapacity(self.alloc, 1);
             try self.closed_unseen.ensureUnusedCapacity(self.alloc, 1);
             const dropped = self.dropPendingLocked(child_id, "closed");
+            // A message waiting for the closed child's start is refused by
+            // its own call, so the close does not count it.
+            for (self.start_waits.items) |wait| {
+                if (std.mem.eql(u8, wait.child_id, child_id)) wait.closed = true;
+            }
             // A user's close tells the parent what it dropped, as a stop does.
             if (by == .user) self.noteUserDropLocked(child_id, dropped, true);
             // The parent's close drops the closed turn's unread messages
@@ -1537,6 +1583,14 @@ pub const Runtime = struct {
         self.closed_unseen.clearRetainingCapacity();
         self.closed_waiting.store(false, .release);
         return ids;
+    }
+
+    fn removeStartWaitLocked(self: *Runtime, wait: *StartWait) void {
+        for (self.start_waits.items, 0..) |item, index| {
+            if (item != wait) continue;
+            _ = self.start_waits.swapRemove(index);
+            return;
+        }
     }
 
     fn closingIndexLocked(self: *const Runtime, child_id: []const u8) ?usize {
@@ -3216,6 +3270,14 @@ fn terminalResult(
     };
 }
 
+/// How often a message that waits for a starting work's turn asks again.
+const start_wait_poll_ns = 5 * std.time.ns_per_ms;
+
+/// One message waiting for its child's starting turn (`Runtime.start_waits`).
+const StartWait = struct {
+    child_id: []const u8,
+    closed: bool = false,
+};
 const sent_result_bytes = 256 + domain.max_agent_name_bytes;
 
 /// `message`'s answer when the child takes it now.
