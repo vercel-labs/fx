@@ -1112,4 +1112,20 @@ describe("web_fetch behind a proxy fx cannot use names the proxy to the model", 
       closer.close();
     }
   }, TIMEOUT);
+
+  test("a proxy that answers CONNECT with bytes that are not HTTP is named, and the error name is the one a model request gets", async () => {
+    const proxy = await startConnectProxy({ garbage: true });
+    try {
+      const { run, toolResult } = await fetchBehind(proxy.url());
+      expect(run.code, show(run)).toBe(0);
+      expect(proxy.log.map(entry => entry.requestLine), show(run)).toEqual([`CONNECT ${FETCH_ADDRESS}:443 HTTP/1.1`]);
+      expect(toolResult, show(run)).toContain("web_fetch transport failed");
+      expect(toolResult, show(run)).toContain(`proxy 127.0.0.1:${proxy.port} answered CONNECT to ${FETCH_ADDRESS}:443 with bytes that are not HTTP`);
+      // The failure is a protocol one, as the model request's is; it is not turned into an unreachable host.
+      expect(toolResult, show(run)).toContain("ProtocolUnsupportedBySystem");
+      expect(toolResult, show(run)).not.toContain("HostUnreachable");
+    } finally {
+      proxy.close();
+    }
+  }, TIMEOUT);
 });

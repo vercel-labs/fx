@@ -31,7 +31,8 @@
 //   bun tests/tla/drivers/net_proxy/driver.ts
 //   bun tests/tla/drivers/net_proxy/driver.ts --self-check
 //   bun tests/tla/drivers/net_proxy/driver.ts --walks 500 --steps 14 --seed 7
-//   bun tests/tla/drivers/net_proxy/driver.ts --binary-only   (just the built fx)
+//   bun tests/tla/drivers/net_proxy/driver.ts --binary-only   (just the built fx and the web_fetch lab)
+//   bun tests/tla/drivers/net_proxy/driver.ts --fetch-lab-only (just the web_fetch lab, which needs no built fx)
 //   bun tests/tla/drivers/net_proxy/driver.ts --no-binary     (just the core)
 //
 // Exit codes: 0 every walk matched, 1 a mismatch (or a self-check that was
@@ -40,7 +41,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseValue } from "../graph.mjs";
 import { REPO_ROOT, TLA_ROOT, outDir, runTlc } from "../lib/tlc";
-import { runBinaryScenarios } from "./binary";
+import { runBinaryScenarios, runFetchLabScenarios } from "./binary";
 
 type Model = Record<string, any>;
 type Edge = { to: string; label: string };
@@ -75,6 +76,7 @@ function option(name: string, fallback: number): number {
 const options = {
   selfCheck: flag("--self-check"),
   binaryOnly: flag("--binary-only"),
+  fetchLabOnly: flag("--fetch-lab-only"),
   noBinary: flag("--no-binary"),
   walks: option("--walks", 200),
   steps: option("--steps", 14),
@@ -383,6 +385,11 @@ function envCheck(walks: Walk[], graph: Graph, results: EnvResult[]): Outcome {
 
 const out = outDir("net-proxy-driver");
 const started = performance.now();
+if (options.fetchLabOnly) {
+  const passed = await runFetchLabScenarios(out, options.selfCheck);
+  console.log(`${passed ? "ok" : "FAIL"} in ${Math.round(performance.now() - started)} ms; output in ${out}`);
+  process.exit(passed ? 0 : 1);
+}
 if (options.binaryOnly) {
   const passed = await runBinaryScenarios(out, options.selfCheck);
   console.log(`${passed ? "ok" : "FAIL"} in ${Math.round(performance.now() - started)} ms; output in ${out}`);

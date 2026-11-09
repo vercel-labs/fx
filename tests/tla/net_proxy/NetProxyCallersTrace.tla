@@ -11,6 +11,9 @@ writes what it saw as NetProxyCallersObserved, a module with one record:
   proxy   "set" when the run had a proxy variable, else "unset"
   cause   "at_proxy" when the failed request failed at the proxy, else
           "elsewhere"
+  earlier TRUE when an earlier address of the same request failed at the proxy
+          and a later one opened its tunnel (a web_fetch to a name with two
+          addresses), else FALSE
   name    the error the failed dial returned at the proxy, when the run can tell
           ("answered", "refused", "unexpected_close", "other"), else "any"
   text    "proxy" when the error text names the proxy, "default" when it is the
@@ -26,6 +29,7 @@ Matches(o) ==
     /\ caller = o.caller
     /\ proxy = o.proxy
     /\ cause = o.cause
+    /\ earlier = o.earlier
     /\ (o.name = "any" \/ name = o.name)
     /\ text = o.text
 

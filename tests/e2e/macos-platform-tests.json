@@ -3,6 +3,7 @@
   "file-tool-permissions.test.ts",
   "gateway-stream-lifecycle.test.ts",
   "mcp-auth.test.ts",
+  "net-proxy.test.ts",
   "oauth-keychain-migration.test.ts",
   "sessions.test.ts",
   "tui-auth-source-selection.test.ts",

@@ -26,6 +26,16 @@
 // (the platform's own name: macOS polls a refused connect as HUP alone, which
 // web_fetch's dialer reads as error.UnexpectedClose).
 //
+// The fifth kind is web_fetch to a name with two admitted addresses, which a run of
+// the built fx cannot make without DNS: fetch_lab.ts builds lab_fetch.zig, which
+// calls web_fetch's real fetch with a resolver that admits two public addresses, behind
+// a local proxy that refuses the first and opens a tunnel for the second, which stays
+// silent; that refuses both; and that answers with bytes that are not HTTP. TLC checks
+// whether the error text names the proxy, against the design (a failure held for an
+// earlier address is cleared when a later address opens its tunnel: LaterAddressClears),
+// and a run of 120 fetches with 64 open files allowed checks that none leaks a socket
+// or shows a sentence left by an earlier one.
+//
 // With --self-check every observation is also checked against two models of
 // older connectors. The connector as first written refuses interim heads, says
 // only that the network is down when it retries, keeps slices of the
@@ -36,7 +46,11 @@
 // fx upgrade. Two more models are web_fetch before its dial mapped every failure
 // to a name the claim lists, and the same with the list grown by the one name
 // macOS gave. Each must reject what the repaired fx did in every scenario where
-// the two differ, and accept the rest, so the check cannot pass for any fx.
+// the two differ, and accept the rest, so the check cannot pass for any fx. The lab
+// adds two more: web_fetch before its dial cleared an earlier address's sentence, and
+// a dial that clears on every return. Three bugs are also planted in a copy of the
+// source (an earlier address's sentence kept, a clear on every return, a name the claim
+// lists turned into HostUnreachable), and the lab's run of each must be caught.
 //
 // Everything is local: loopback proxies, a loopback provider, a fake AI Gateway,
 // a temporary FX_HOME, and FX_SOUND=0. No model is called.
@@ -47,6 +61,7 @@ import { join } from "node:path";
 import { completion } from "../../../e2e/fixtures/chat-completions";
 import { startConnectProxy, type ProxyOptions } from "../../../e2e/fixtures/net-proxy/proxy";
 import { TLA_ROOT, fxBin, runTlc } from "../lib/tlc";
+import { buildFetchLab, copySource, runFetchLab, withPlantedBug, type LabRun, type LabScenario } from "./fetch_lab";
 
 const TARGET = "proxy-target.test";
 
@@ -68,7 +83,7 @@ const ENV_FIRST = {
 /** The callers' design: the version lookup, fx upgrade, and web_fetch take the proxy's sentence. */
 const CALLERS_DESIGN = {
   VersionClaims: "TRUE", UpgradeClaims: "TRUE", FetchStepNames: "TRUE", ListsUnexpectedClose: "FALSE",
-  ClearsAtStart: "TRUE", NamesWithoutFailure: "FALSE",
+  ClearsAtStart: "TRUE", NamesWithoutFailure: "FALSE", FetchClears: "\"on_open\"",
 };
 /** fx before they did: both show fixed text. */
 const CALLERS_HEAD = { ...CALLERS_DESIGN, VersionClaims: "FALSE", UpgradeClaims: "FALSE" };
@@ -76,6 +91,10 @@ const CALLERS_HEAD = { ...CALLERS_DESIGN, VersionClaims: "FALSE", UpgradeClaims:
 const CALLERS_FETCH_HEAD = { ...CALLERS_DESIGN, FetchStepNames: "FALSE" };
 /** The same, with the claim's list grown by error.UnexpectedClose: a fix by name. */
 const CALLERS_FETCH_BY_NAME = { ...CALLERS_FETCH_HEAD, ListsUnexpectedClose: "TRUE" };
+/** web_fetch before its dial cleared the sentence of an earlier address when a later one opens its tunnel. */
+const CALLERS_NO_CLEAR = { ...CALLERS_DESIGN, FetchClears: "\"never\"" };
+/** A fix that clears on every return of the dial, failures included. */
+const CALLERS_CLEAR_ON_RETURN = { ...CALLERS_DESIGN, FetchClears: "\"on_return\"" };
 
 type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 type Run = { code: number | null; stdout: string; stderr: string; ms: number };
@@ -276,7 +295,7 @@ const retryNotices = (stderr: string) =>
 
 type ConnObservation = { target: string; answer: string; phase: string; shown: string; notice: string };
 type EnvObservation = { cls: string; accepted: boolean; reason: string };
-type CallerObservation = { caller: string; proxy: string; cause: string; name: string; text: string };
+type CallerObservation = { caller: string; proxy: string; cause: string; earlier: boolean; name: string; text: string };
 
 async function observeConnection(root: string, scenario: Connection): Promise<{ observation: ConnObservation; evidence: string }> {
   const gateway = serveGateway();
@@ -408,7 +427,7 @@ async function observeCaller(root: string, scenario: CallerScenario): Promise<{ 
     // describes.
     const text = ended(run) && namesProxy ? "proxy" : ended(run) && fixed.includes(shown) ? "default" : "unread";
     return {
-      observation: { caller: scenario.caller, proxy: scenario.proxy, cause: scenario.cause, name: "any", text },
+      observation: { caller: scenario.caller, proxy: scenario.proxy, cause: scenario.cause, earlier: false, name: "any", text },
       evidence: `exit ${run.code} after ${Math.round(run.ms)} ms; shown ${JSON.stringify(shown)}; stderr ${JSON.stringify(run.stderr.slice(-200))}`,
     };
   } finally {
@@ -481,7 +500,7 @@ async function observeFetch(root: string, scenario: FetchScenario): Promise<{ ob
     // model describes.
     const text = run.code === 0 && names ? "proxy" : run.code === 0 && second.includes("web_fetch transport failed") ? "default" : "unread";
     return {
-      observation: { caller: "fetch", proxy: "set", cause: scenario.cause, name: scenario.cause === "at_proxy" ? dialName(trace) : "any", text },
+      observation: { caller: "fetch", proxy: "set", cause: scenario.cause, earlier: false, name: scenario.cause === "at_proxy" ? dialName(trace) : "any", text },
       evidence: `exit ${run.code} after ${Math.round(run.ms)} ms; requests ${gateway.bodies.length}; tool error ${JSON.stringify(/web_fetch transport failed.{0,260}/.exec(second)?.[0] ?? "")}; trace ${JSON.stringify(trace.slice(-300))}; stderr ${JSON.stringify(run.stderr.slice(-200))}`,
     };
   } finally {
@@ -523,9 +542,146 @@ async function trace(dir: string, module: "NetProxyTrace" | "NetProxyEnvTrace" |
 const connRecord = (o: ConnObservation) =>
   `Observed == [target |-> ${quote(o.target)}, answer |-> ${quote(o.answer)}, phase |-> ${quote(o.phase)}, shown |-> ${quote(o.shown)}, notice |-> ${quote(o.notice)}]`;
 const callerRecord = (o: CallerObservation) =>
-  `ObservedCallers == [caller |-> ${quote(o.caller)}, proxy |-> ${quote(o.proxy)}, cause |-> ${quote(o.cause)}, name |-> ${quote(o.name)}, text |-> ${quote(o.text)}]`;
+  `ObservedCallers == [caller |-> ${quote(o.caller)}, proxy |-> ${quote(o.proxy)}, cause |-> ${quote(o.cause)}, earlier |-> ${o.earlier ? "TRUE" : "FALSE"}, name |-> ${quote(o.name)}, text |-> ${quote(o.text)}]`;
 const envRecord = (o: EnvObservation) =>
   `ObservedEnv == [cls |-> ${quote(o.cls)}, accepted |-> ${o.accepted ? "TRUE" : "FALSE"}, reason |-> ${quote(o.reason)}]`;
+
+// ---- web_fetch's real fetch to a name with two admitted addresses (lab_fetch.zig) ----
+
+const FIRST_ADDRESS = "93.184.216.34";
+const SECOND_ADDRESS = "93.184.216.35";
+
+/** A fetch of the lab, in NetProxyCallers.tla's words: the error it must end with and what the proxy must have seen. */
+type LabCase = {
+  name: string;
+  scenario: LabScenario;
+  error: string;
+  cause: "at_proxy" | "elsewhere";
+  /** An earlier address failed at the proxy and a later one opened its tunnel. */
+  earlier: boolean;
+  connects: string[];
+  /** What the sentence holds when one is shown. */
+  shows: string;
+  /** Whether web_fetch before its dial cleared the sentence shows the same text, so that model must accept the observation. */
+  sameAsNoClear: boolean;
+  /** Whether a dial that clears on every return shows the same text. */
+  sameAsOnReturn: boolean;
+};
+
+const connectLine = (address: string) => `CONNECT ${address}:443 HTTP/1.1`;
+
+const labCases: LabCase[] = [
+  { name: "web_fetch to a name with two addresses, the first refused at the proxy and the second opening a tunnel that stays silent",
+    scenario: "two_addresses", error: "Timeout", cause: "elsewhere", earlier: true,
+    connects: [connectLine(FIRST_ADDRESS), connectLine(SECOND_ADDRESS)], shows: `refused CONNECT to ${FIRST_ADDRESS}:443`,
+    sameAsNoClear: false, sameAsOnReturn: true },
+  { name: "web_fetch to a name with two addresses, both refused at the proxy",
+    scenario: "both_refused", error: "ConnectionRefused", cause: "at_proxy", earlier: false,
+    connects: [connectLine(FIRST_ADDRESS), connectLine(SECOND_ADDRESS)], shows: `refused CONNECT to ${SECOND_ADDRESS}:443`,
+    sameAsNoClear: true, sameAsOnReturn: false },
+  { name: "web_fetch behind a proxy that answers with bytes that are not HTTP",
+    scenario: "not_http", error: "ProtocolUnsupportedBySystem", cause: "at_proxy", earlier: false,
+    connects: [connectLine(FIRST_ADDRESS)], shows: "with bytes that are not HTTP",
+    sameAsNoClear: true, sameAsOnReturn: false },
+];
+
+/** What a lab run showed, in the model's words, and what in it is not what the case describes. */
+function labObservation(kase: LabCase, run: LabRun): { observation: CallerObservation; problems: string[] } {
+  const round = run.rounds[0];
+  const problems: string[] = [];
+  if (run.code !== 0 || run.rounds.length !== 1 || !round) problems.push(`the lab ended with code ${run.code} and ${run.rounds.length} rounds; stderr ${JSON.stringify(run.stderr)}`);
+  if (round && round.error !== kase.error) problems.push(`the fetch ended with ${round.error}, not ${kase.error}`);
+  if (JSON.stringify(run.connects) !== JSON.stringify(kase.connects)) problems.push(`the proxy saw ${JSON.stringify(run.connects)}, not ${JSON.stringify(kase.connects)}`);
+  // A sentence that is shown is the one of the failure the case describes; whether it is shown at all is the model's to judge.
+  if (round?.shown != null && !round.shown.includes(kase.shows)) problems.push(`the sentence ${JSON.stringify(round.shown)} does not hold ${JSON.stringify(kase.shows)}`);
+  return {
+    observation: {
+      caller: "fetch", proxy: "set", cause: kase.cause, earlier: kase.earlier,
+      name: kase.cause === "at_proxy" ? "answered" : "any", text: round?.shown != null ? "proxy" : "default",
+    },
+    problems,
+  };
+}
+
+const callersTrace = (dir: string, observation: CallerObservation, constants: Record<string, string>) =>
+  trace(dir, "NetProxyCallersTrace", "NetProxyCallersObserved", callerRecord(observation), constants);
+
+/** The lines of `connectThroughProxy` that clear an earlier address's sentence when the tunnel opens. */
+const CLEAR_WHEN_OPEN = 'net_proxy_io.clearRequestFailure();\n    debug_trace.logf("tool", "web_fetch tunnel open';
+const KEEP_WHEN_OPEN = 'debug_trace.logf("tool", "web_fetch tunnel open';
+const DIAL_HEAD = "fn connectThroughProxy(ctx: *anyopaque, address: IpAddress, options: FetchOptions) anyerror!posix.fd_t {\n";
+const KEEP_NAMES = "        => |e| e,\n        else => error.HostUnreachable,";
+
+/**
+ * Bugs planted in a copy of the source, each with the case whose run must show it. The run is
+ * "caught" when the design model rejects what it showed (or, for a lost name, the case's own
+ * check fails), and the model of that bug accepts it, so the lab tells the bugs from the fix.
+ */
+const labBugs: { name: string; file: string; target: string; planted: string; case: number; model: Record<string, string> | null }[] = [
+  { name: "web_fetch's dial keeps an earlier address's sentence when a later address opens its tunnel", file: "tools/web/http_fetch.zig",
+    target: CLEAR_WHEN_OPEN, planted: KEEP_WHEN_OPEN, case: 0, model: CALLERS_NO_CLEAR },
+  { name: "web_fetch's dial clears on every return, failures included", file: "tools/web/http_fetch.zig",
+    target: DIAL_HEAD, planted: `${DIAL_HEAD}    defer net_proxy_io.clearRequestFailure();\n`, case: 1, model: CALLERS_CLEAR_ON_RETURN },
+  { name: "a name the claim lists leaves the dial as HostUnreachable", file: "core/shared/net_proxy.zig",
+    target: KEEP_NAMES, planted: "        => |e| if (e == error.ProtocolUnsupportedBySystem) error.HostUnreachable else e,\n        else => error.HostUnreachable,", case: 2, model: null },
+];
+
+/** Runs the lab's cases, a stress run of the two-address case, and, with selfCheck, the planted bugs. */
+export async function runFetchLabScenarios(out: string, selfCheck: boolean): Promise<boolean> {
+  const say = (message: string) => console.log(message);
+  const tree = realpathSync(mkdtempSync(join(tmpdir(), "fx-net-proxy-fetch-lab-")));
+  const src = copySource(tree);
+  say("web_fetch lab: the real fetch, a resolver with two public addresses, a local proxy");
+  const bin = buildFetchLab(src, tree, "web_fetch_lab");
+  let ok = true;
+  for (const [index, kase] of labCases.entries()) {
+    const { observation, problems } = labObservation(kase, await runFetchLab(bin, kase.scenario, 1, 600, 256));
+    const dir = join(out, `binary-fetch-lab-${index}`);
+    const verdict = await callersTrace(join(dir, "design"), observation, CALLERS_DESIGN);
+    say(`${kase.name}: ${JSON.stringify(observation)} -> design ${verdict}`);
+    if (verdict !== "ACCEPTED" || problems.length > 0) {
+      say(`  problems: ${JSON.stringify(problems)}`);
+      ok = false;
+    }
+    if (selfCheck) {
+      const noClear = await callersTrace(join(dir, "no-clear"), observation, CALLERS_NO_CLEAR);
+      const wantNoClear: Verdict = kase.sameAsNoClear ? "ACCEPTED" : "REJECTED";
+      say(`  self-check: web_fetch before its dial cleared the sentence ${noClear} (must be ${wantNoClear})`);
+      if (noClear !== wantNoClear) ok = false;
+      const onReturn = await callersTrace(join(dir, "on-return"), observation, CALLERS_CLEAR_ON_RETURN);
+      const wantOnReturn: Verdict = kase.sameAsOnReturn ? "ACCEPTED" : "REJECTED";
+      say(`  self-check: a dial that clears on every return ${onReturn} (must be ${wantOnReturn})`);
+      if (onReturn !== wantOnReturn) ok = false;
+    }
+  }
+
+  // 120 fetches with 64 open files allowed: a socket a dial leaves open ends a later
+  // fetch in a descriptor-limit error, and a sentence left behind shows in a later round.
+  const stress = await runFetchLab(bin, "two_addresses", 120, 200, 64);
+  const unclean = stress.rounds.filter(round => round.error !== "Timeout" || round.shown !== null);
+  const stressed = stress.code === 0 && stress.rounds.length === 120 && unclean.length === 0 && stress.connects.length === 240;
+  say(`web_fetch lab, 120 fetches of the two-address case with 64 open files allowed: ${stressed ? "every one ended in Timeout and showed no sentence" : "FAIL"}`);
+  if (!stressed) {
+    say(`  code ${stress.code}; rounds ${stress.rounds.length}; CONNECTs ${stress.connects.length}; first unclean ${JSON.stringify(unclean[0] ?? null)}; stderr ${JSON.stringify(stress.stderr)}`);
+    ok = false;
+  }
+
+  if (selfCheck) {
+    for (const [index, bug] of labBugs.entries()) {
+      const kase = labCases[bug.case]!;
+      const run = await withPlantedBug(src, bug.file, bug.target, bug.planted, async () =>
+        runFetchLab(buildFetchLab(src, tree, `web_fetch_lab_bug_${index}`), kase.scenario, 1, 600, 256));
+      const { observation, problems } = labObservation(kase, run);
+      const dir = join(out, `binary-fetch-lab-bug-${index}`);
+      const design = await callersTrace(join(dir, "design"), observation, CALLERS_DESIGN);
+      const model = bug.model ? await callersTrace(join(dir, "bug"), observation, bug.model) : "ACCEPTED";
+      const caught = (design === "REJECTED" || problems.length > 0) && model === "ACCEPTED";
+      say(`self-check: ${bug.name}: design ${design}, its own model ${model}, problems ${problems.length} -> ${caught ? "caught" : "NOT caught"}`);
+      if (!caught) ok = false;
+    }
+  }
+  return ok;
+}
 
 /** Runs every scenario; returns whether every observation was accepted (and, with selfCheck, discriminated). */
 export async function runBinaryScenarios(out: string, selfCheck: boolean): Promise<boolean> {
@@ -611,5 +767,6 @@ export async function runBinaryScenarios(out: string, selfCheck: boolean): Promi
       if (byName !== wantByName) ok = false;
     }
   }
+  if (!(await runFetchLabScenarios(out, selfCheck))) ok = false;
   return ok;
 }

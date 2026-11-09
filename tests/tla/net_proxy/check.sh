@@ -54,19 +54,29 @@
 # as error.UnexpectedClose, which macOS's poll answers a refused connect with, or
 # a lookup failure for a proxy host that does not resolve, and the claim lists
 # neither (FetchNamesProxy). The design maps every failure at the proxy to an
-# error the claim lists, by the step and not by the name.
+# error the claim lists, by the step and not by the name. web_fetch also tries
+# each address a name resolved to, and an address that fails at the proxy holds a
+# sentence: net-proxy-callers-no-clear is web_fetch before its dial cleared it, where a
+# later address that opens its tunnel keeps the sentence of an earlier one, so a
+# silent server is shown as the proxy's refusal (LaterAddressClears). The design
+# clears it when the tunnel opens.
 #
 #   no-step               web_fetch returns the platform's name for a failed dial  FetchNamesProxy
 #   mutation-stale        a request does not clear what an earlier one left      OwnFailureOnly
 #   mutation-fixed-text   a caller prints a proxy sentence with no proxy set     NoProxyKeepsDefault
 #   mutation-by-name      the claim's list grows by UnexpectedClose, the one name  FetchNamesProxy
 #                         macOS gave, and any other name still drops the sentence
+#   mutation-clear-on-return  web_fetch's dial clears on every return, as a      FetchNamesProxy
+#                         deferred clear would, so a failure at the proxy is
+#                         not shown either
 #
 # tests/tla/drivers/net_proxy/driver.ts walks net_proxy.zig along the first two
 # models' state graphs, and runs the built fx through a proxy that sends 102
 # before its 200, a proxy that is down, a proxy host with an underscore, a Grok
 # version lookup, fx upgrade, and web_fetch, with TLC checking what it saw against
-# the design.
+# the design. A Zig lab, tests/tla/drivers/net_proxy/lab_fetch.zig, runs web_fetch's
+# real fetch against a proxy that refuses the first of two addresses and opens a
+# silent tunnel for the second, which no run of the built fx can do without DNS.
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
 set -eu
@@ -102,4 +112,6 @@ NetProxyCallers net-proxy-callers-no-step FetchNamesProxy
 NetProxyCallers net-proxy-callers-mutation-stale OwnFailureOnly
 NetProxyCallers net-proxy-callers-mutation-fixed-text NoProxyKeepsDefault
 NetProxyCallers net-proxy-callers-mutation-by-name FetchNamesProxy
+NetProxyCallers net-proxy-callers-no-clear LaterAddressClears
+NetProxyCallers net-proxy-callers-mutation-clear-on-return FetchNamesProxy
 VERDICTS

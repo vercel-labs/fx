@@ -719,15 +719,21 @@ pub fn isProxyFailureError(err: anyerror) bool {
     };
 }
 
-/// What a failure toward the proxy ends with: errors `isProxyFailureError` lists.
+/// What a failure toward the proxy ends with: the errors `isProxyFailureError`
+/// lists that a dial can return, so a name that is already a proxy failure name
+/// is never changed. Three it lists are not a dial's: `ConnectionTimedOut` and
+/// `ConnectionSetupTimedOut` end a model request, and `ProviderVersionUnavailable`
+/// ends the Grok version lookup. `connectIp` returns `IpAddress.ConnectError`,
+/// which holds none of them, and web_fetch's dial reads ETIMEDOUT as `Timeout`.
 const ProxyFailureError = error{
+    AccessDenied,
+    ProtocolUnsupportedBySystem,
     ConnectionRefused,
+    ConnectionResetByPeer,
+    Timeout,
     HostUnreachable,
     NetworkUnreachable,
     NetworkDown,
-    Timeout,
-    AccessDenied,
-    ConnectionResetByPeer,
 };
 
 /// The error a connection that failed at the proxy ends with, chosen by the
@@ -737,17 +743,20 @@ const ProxyFailureError = error{
 /// resolve ends in a lookup error on every platform; neither name is one
 /// `isProxyFailureError` lists, so the request would drop the sentence it holds
 /// for the proxy (`tests/tla/net_proxy/NetProxyCallers.tla` FetchNamesProxy).
-/// A listed name passes unchanged and any other becomes HostUnreachable. A
-/// cancellation is not a failure of the proxy: callers keep it as it is.
+/// A listed name passes unchanged, such as ProtocolUnsupportedBySystem for a
+/// proxy that answers with bytes that are not HTTP, and any other becomes
+/// HostUnreachable. A cancellation is not a failure of the proxy: callers keep
+/// it as it is.
 pub fn proxyFailureError(err: anyerror) ProxyFailureError {
     return switch (err) {
+        error.AccessDenied,
+        error.ProtocolUnsupportedBySystem,
         error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.Timeout,
         error.HostUnreachable,
         error.NetworkUnreachable,
         error.NetworkDown,
-        error.Timeout,
-        error.AccessDenied,
-        error.ConnectionResetByPeer,
         => |e| e,
         else => error.HostUnreachable,
     };
@@ -763,6 +772,7 @@ const dial_error_names = [_]anyerror{
     error.HostUnreachable,
     error.NetworkDown,
     error.Timeout,
+    error.ProtocolUnsupportedBySystem,
     error.AccessDenied,
     error.UnexpectedClose,
     error.ConnectionFailed,
@@ -1158,17 +1168,26 @@ test "a failure toward the proxy ends with a name the claim lists, whatever name
     for (dial_error_names) |name| {
         try std.testing.expect(isProxyFailureError(proxyFailureError(name)));
     }
-    // A name the claim already lists passes unchanged.
+    // A name the claim already lists and a dial can return passes unchanged:
+    // web_fetch's error for a proxy that answers with bytes that are not HTTP
+    // stays ProtocolUnsupportedBySystem, as the model request's is.
     for ([_]anyerror{
+        error.AccessDenied,
+        error.ProtocolUnsupportedBySystem,
         error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.Timeout,
         error.HostUnreachable,
         error.NetworkUnreachable,
         error.NetworkDown,
-        error.Timeout,
-        error.AccessDenied,
-        error.ConnectionResetByPeer,
     }) |name| {
+        try std.testing.expect(isProxyFailureError(name));
         try std.testing.expect(proxyFailureError(name) == name);
+    }
+    // The two lists cannot drift apart: every name `proxyFailureError` can
+    // return is one the claim lists.
+    inline for (@typeInfo(ProxyFailureError).error_set.error_names.?) |error_name| {
+        try std.testing.expect(isProxyFailureError(@field(ProxyFailureError, error_name)));
     }
     // The names the platforms disagree on become one that retries like a refusal.
     try std.testing.expect(proxyFailureError(error.UnexpectedClose) == error.HostUnreachable);
@@ -1764,8 +1783,9 @@ fn fuzzEnvironment(_: void, smith: *std.testing.Smith) !void {
     if (again == .tunnel) try std.testing.expectEqualStrings(kept_host, again.tunnel.host);
 
     // A failure toward the proxy ends with a name the claim lists, whatever
-    // name the platform gave the dial.
+    // name the platform gave the dial, and a name it already lists is kept.
     try std.testing.expect(isProxyFailureError(proxyFailureError(dial_error)));
+    if (isProxyFailureError(dial_error)) try std.testing.expect(proxyFailureError(dial_error) == dial_error);
 
     // With REQUEST_METHOD set, an uppercase HTTP_PROXY alone proxies nothing.
     var cgi_env: Snapshot = undefined;

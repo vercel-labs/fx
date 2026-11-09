@@ -514,6 +514,13 @@ fn connectThroughProxy(ctx: *anyopaque, address: IpAddress, options: FetchOption
         net_proxy_io.holdForRequest(failure);
         return net_proxy.connectError(&failure);
     }
+    // The proxy did its part for this address. An earlier address of the same
+    // request may have failed at the proxy (a 502 sends the dial on to the next
+    // address), and the sentence held for it is not why a failure from here on
+    // happens: it was traced when it was held, and a request that ends in a name
+    // the claim lists would show it for a silent server or a reset
+    // (`tests/tla/net_proxy/NetProxyCallers.tla` LaterAddressClears).
+    net_proxy_io.clearRequestFailure();
     debug_trace.logf("tool", "web_fetch tunnel open host={s} target={s}:{d} proxy={s}:{d}", .{ tunnel.host, target_host, target_port, proxy.host, proxy.port });
     return fd;
 }
@@ -4478,4 +4485,129 @@ test "web_fetch behind a proxy that never answers CONNECT ends at the hop deadli
     var expected_buf: [160]u8 = undefined;
     const expected = try std.mem.print(&expected_buf, "proxy 127.0.0.1:{d} did not answer CONNECT to 93.184.216.34:443", .{proxy_port});
     try std.testing.expectEqualStrings(expected, net_proxy_io.takeRequestFailure(error.Timeout, &buf).?);
+}
+
+/// Answers each CONNECT it accepts with the next of `answers`. After a 200 it
+/// holds the tunnel open and silent until the client closes it, as a server
+/// that never speaks does.
+fn serveScripted(p: *TestTunnelProxy, answers: []const []const u8) void {
+    const io = std.testing.io;
+    for (answers) |answer| {
+        const stream = p.server.accept(io) catch return;
+        defer stream.close(io);
+        _ = p.accepted.fetchAdd(1, .acq_rel);
+        var read_buf: [512]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        var head: [512]u8 = undefined;
+        var head_len: usize = 0;
+        if (!TestTunnelProxy.readHead(&reader.interface, &head, &head_len)) return;
+        var write_buf: [512]u8 = undefined;
+        var writer = stream.writer(io, &write_buf);
+        writer.interface.writeAll(answer) catch return;
+        writer.interface.flush() catch return;
+        if (!std.mem.startsWith(u8, answer, "HTTP/1.1 200")) continue;
+        while (true) _ = reader.interface.takeByte() catch break;
+    }
+}
+
+var test_tunnel_pair: [2]IpAddress = undefined;
+
+fn resolveTestTunnelPair(_: *anyopaque, alloc: Allocator, _: []const u8, port: u16, _: FetchOptions) anyerror![]IpAddress {
+    const out = try alloc.alloc(IpAddress, 2);
+    out[0] = test_tunnel_pair[0];
+    out[1] = test_tunnel_pair[1];
+    out[0].setPort(port);
+    out[1].setPort(port);
+    return out;
+}
+
+/// A host that resolved to two public addresses, which the dial tries in order.
+fn testTunnelPairTransport() Transport {
+    test_tunnel_pair = .{
+        .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } },
+        .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 35 }, .port = 0 } },
+    };
+    return .{
+        .resolver = .{ .ctx = @ptrCast(&default_resolver_ctx), .resolve = resolveTestTunnelPair },
+        .connector = defaultTransport().connector,
+    };
+}
+
+test "web_fetch behind a proxy shows no refusal of an earlier address when a later address opens its tunnel and fails" {
+    const alloc = std.testing.allocator;
+    var proxy = try TestTunnelProxy.init("");
+    defer proxy.deinit();
+    var url_buf: [64]u8 = undefined;
+    net_proxy_io.useSnapshotForTest(TestProxyEnv{ .proxy = try proxy.url(&url_buf) });
+    defer net_proxy_io.resetSnapshotForTest();
+    net_proxy_io.clearRequestFailure();
+    defer net_proxy_io.clearRequestFailure();
+    const answers = [_][]const u8{ "HTTP/1.1 502 Bad Gateway\r\n\r\n", "HTTP/1.1 200 Connection established\r\n\r\n" };
+    var server = try std.testing.io.concurrent(serveScripted, .{ &proxy, &answers });
+    var target = try url_policy.normalize(alloc, "https://public.example/docs");
+    defer target.deinit(alloc);
+    // The proxy refuses the first address and opens a tunnel to the second, which
+    // never speaks, so the fetch ends at its deadline in an open tunnel.
+    const options: FetchOptions = .{ .deadline = .{ .deadline_ms = monotonicMillis() + 2000 } };
+    const err = failedFetchError(alloc, target, options, testTunnelPairTransport()) orelse return error.TestExpectedFetchToFail;
+    server.await(std.testing.io);
+    try std.testing.expectEqual(@as(u32, 2), proxy.accepted.load(.acquire));
+    try std.testing.expect(err == error.Timeout);
+    // `Timeout` is a name the claim lists, so a sentence the dial still held
+    // would be shown for it (`tests/tla/net_proxy/NetProxyCallers.tla`
+    // LaterAddressClears).
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(net_proxy_io.takeRequestFailure(err, &buf) == null);
+}
+
+test "web_fetch behind a proxy that refuses every address names the last one it tried" {
+    const alloc = std.testing.allocator;
+    var proxy = try TestTunnelProxy.init("");
+    defer proxy.deinit();
+    var url_buf: [64]u8 = undefined;
+    net_proxy_io.useSnapshotForTest(TestProxyEnv{ .proxy = try proxy.url(&url_buf) });
+    defer net_proxy_io.resetSnapshotForTest();
+    net_proxy_io.clearRequestFailure();
+    defer net_proxy_io.clearRequestFailure();
+    const answers = [_][]const u8{ "HTTP/1.1 502 Bad Gateway\r\n\r\n", "HTTP/1.1 502 Bad Gateway\r\n\r\n" };
+    var server = try std.testing.io.concurrent(serveScripted, .{ &proxy, &answers });
+    var target = try url_policy.normalize(alloc, "https://public.example/docs");
+    defer target.deinit(alloc);
+    const err = failedFetchError(alloc, target, testTunnelOptions(), testTunnelPairTransport()) orelse return error.TestExpectedFetchToFail;
+    server.await(std.testing.io);
+    try std.testing.expectEqual(@as(u32, 2), proxy.accepted.load(.acquire));
+    try std.testing.expect(err == error.ConnectionRefused);
+    var buf: [256]u8 = undefined;
+    var expected_buf: [160]u8 = undefined;
+    const expected = try std.mem.print(&expected_buf, "proxy 127.0.0.1:{d} refused CONNECT to 93.184.216.35:443: 502 Bad Gateway", .{proxy.server.socket.address.getPort()});
+    try std.testing.expectEqualStrings(expected, net_proxy_io.takeRequestFailure(err, &buf).?);
+}
+
+/// A dial that fails at the proxy and then outlasts the deadline, so the next
+/// address is never tried.
+fn failPastDeadlineDialer(_: *anyopaque, address: IpAddress, options: FetchOptions) anyerror!posix.fd_t {
+    const proxy: net_proxy.Proxy = .{ .host = "127.0.0.1", .port = 3128, .authorization = null, .variable = "HTTPS_PROXY" };
+    var host_buf: [64]u8 = undefined;
+    net_proxy_io.holdForRequest(net_proxy_io.unreachableProxyFailure(proxy, addressHost(address, &host_buf), address.getPort(), error.ConnectionRefused));
+    while (monotonicMillis() < options.deadline.?.deadline_ms) io_mod.sleep(5 * std.time.ns_per_ms);
+    return error.ConnectionRefused;
+}
+
+test "web_fetch keeps the refusal of an address when the deadline passes before it tries the next" {
+    net_proxy_io.clearRequestFailure();
+    defer net_proxy_io.clearRequestFailure();
+    const addresses = [_]IpAddress{
+        .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 443 } },
+        .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 35 }, .port = 443 } },
+    };
+    var ctx: u8 = 0;
+    const dialer: Dialer = .{ .ctx = @ptrCast(&ctx), .connect_fn = failPastDeadlineDialer };
+    const options: FetchOptions = .{ .deadline = .{ .deadline_ms = monotonicMillis() + 20 } };
+    try std.testing.expectError(error.Timeout, connectAdmitted(&addresses, options, dialer));
+    // No tunnel ever opened, so the refusal is still why the fetch failed.
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "could not connect to proxy 127.0.0.1:3128 (connection refused)",
+        net_proxy_io.takeRequestFailure(error.Timeout, &buf).?,
+    );
 }
