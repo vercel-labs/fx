@@ -105,14 +105,17 @@ const linux_filter = struct {
 
     /// What the engine, the allocator, and the frame I/O on stdin and stdout
     /// need. Opening, networking, process, and signal calls are all absent.
+    /// The static musl build's `malloc` is Zig's `SmpAllocator`, which counts
+    /// CPUs with `sched_getaffinity` the first time each size class is used,
+    /// so that call reads a CPU mask and nothing else.
     const allowed = [_]SYS{
-        .read,            .write,         .readv,           .writev,
-        .close,           .exit,          .exit_group,      .rt_sigreturn,
-        .rt_sigprocmask,  .sigaltstack,   .mmap,            .munmap,
-        .mremap,          .brk,           .madvise,         .mprotect,
-        .futex,           .clock_gettime, .clock_nanosleep, .nanosleep,
-        .getrandom,       .sched_yield,   .getpid,          .gettid,
-        .restart_syscall,
+        .read,            .write,             .readv,           .writev,
+        .close,           .exit,              .exit_group,      .rt_sigreturn,
+        .rt_sigprocmask,  .sigaltstack,       .mmap,            .munmap,
+        .mremap,          .brk,               .madvise,         .mprotect,
+        .futex,           .clock_gettime,     .clock_nanosleep, .nanosleep,
+        .getrandom,       .sched_yield,       .getpid,          .gettid,
+        .restart_syscall, .sched_getaffinity,
     };
 
     /// A classic BPF instruction, `struct sock_filter`.
@@ -208,6 +211,18 @@ test "a confined process can still compute and use its pipes" {
             @memset(bytes, 7);
             // A write to stderr stands in for the frame pipe.
             return bytes[bytes.len - 1] == 7 and std.c.write(2, "", 0) == 0;
+        }
+    }.attempt));
+}
+
+test "a confined process can count its CPUs" {
+    // The static musl build's `malloc` counts CPUs the first time it hands out
+    // each size of block. macOS uses the system's `malloc`, which doesn't.
+    if (native_os != .linux) return error.SkipZigTest;
+    try std.testing.expectEqual(Verdict.allowed, try runConfined(struct {
+        fn attempt() bool {
+            const count = std.Thread.getCpuCount() catch return false;
+            return count > 0;
         }
     }.attempt));
 }
