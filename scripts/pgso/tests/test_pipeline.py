@@ -10,6 +10,7 @@ import unittest
 
 from scripts.pgso import macos
 from scripts.pgso.model import PgsoError, sha256_file
+from scripts.pgso.runner import CommandResult
 from scripts.pgso.macos import (
     CandidateMetadata,
     MacosLinkContract,
@@ -37,6 +38,7 @@ from scripts.pgso.pipeline import (
     USE_FLAGS,
     ArtifactSpec,
     PipelinePaths,
+    _discover_compiler_runtime,
     _outline_excluding_dropped_outputs,
     _outline_without_folded_constants,
     apply_profile,
@@ -225,6 +227,101 @@ class PgsoPipelineTests(unittest.TestCase):
         self.assertEqual(1, probe.count("-###"))
         self.assertIn("-O2", probe)
         self.assertIn("-s", probe)
+
+    def record_macos_control_link(self, stderr: str) -> None:
+        macos.record_control_build(
+            self.toolchain,
+            CommandResult(("zig",), 0, "", stderr, 1.0),
+            self.paths,
+        )
+
+    def test_macos_links_add_the_objects_the_control_linked(self) -> None:
+        c_object = self.root / "cache" / "o" / "c0ffee" / "quickjs.o"
+        archive = self.root / "cache" / "o" / "beef" / "libextra.a"
+        runtime = self.root / "global" / "o" / "feed" / "libcompiler_rt.a"
+        for path in (c_object, archive, runtime):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(path.name.encode())
+        # Zig prints the link under its build step, after "error: ".
+        self.record_macos_control_link(
+            "install\n+- install fx\n   +- compile exe fx safe aarch64-macos failure\n"
+            "error: zig ld -dynamic -platform_version macos 13.0 15.0 -dead_strip -e _main "
+            f"-o /cache/o/abc/fx {c_object} /cache/o/abc/fx_zcu.o {archive} -lSystem {runtime}\n"
+        )
+
+        record = json.loads((self.paths.logs / "control-link.json").read_text())
+        self.assertEqual("/cache/o/abc/fx_zcu.o", record["zig_object"])
+        self.assertEqual(
+            {"control/link-inputs/beef-libextra.a", "control/link-inputs/c0ffee-quickjs.o"},
+            set(record["inputs"]),
+        )
+        inputs = macos.control_link_inputs(self.paths)
+        self.assertEqual(
+            (
+                self.paths.control_link_inputs / "beef-libextra.a",
+                self.paths.control_link_inputs / "c0ffee-quickjs.o",
+            ),
+            inputs,
+        )
+        self.assertEqual([b"libextra.a", b"quickjs.o"], [path.read_bytes() for path in inputs])
+
+        contract = MacosLinkContract(1, "13.3", "26.4", 16 * 1024 * 1024, ())
+        for command, after in (
+            (
+                instrumented_link_argv(self.toolchain, self.paths, self.root / "rt.o", "13.0", inputs),
+                self.paths.instrumented_object,
+            ),
+            (candidate_link_argv(self.toolchain, self.paths, inputs), self.paths.profile_use_object),
+            (candidate_runtime_probe_argv(self.toolchain, self.paths, inputs), self.paths.profile_use_object),
+            (
+                temporal_candidate_link_argv(
+                    self.toolchain, self.paths, self.root / "rt.o", contract, self.root / "stub.tbd", inputs,
+                ),
+                self.paths.profile_use_object,
+            ),
+        ):
+            at = command.index(str(after))
+            self.assertEqual(tuple(map(str, inputs)), command[at + 1:at + 3])
+            self.assertNotIn(str(runtime), command)
+
+        inputs[1].write_bytes(b"changed")
+        with self.assertRaisesRegex(PgsoError, "control link input changed"):
+            macos.control_link_inputs(self.paths)
+        benchmark = PipelinePaths.create(self.root / "benchmark", selector="file_index")
+        self.assertEqual((), macos.control_link_inputs(benchmark))
+        with self.assertRaisesRegex(PgsoError, "missing or invalid control link record"):
+            macos.control_link_inputs(PipelinePaths.create(self.root / "unrecorded"))
+
+    def test_runtime_probe_resolves_the_objects_the_link_takes(self) -> None:
+        # Zig's `-###` resolves symbols, so a probe without the control's C
+        # fails on undefined symbols just as the link would.
+        actions = self.root / "probe-argv.txt"
+        runtime = self.root / "libcompiler_rt.a"
+        runtime.write_bytes(b"compiler runtime")
+        zig = self.write_executable(
+            "zig-runtime-probe",
+            f"""import pathlib,sys
+pathlib.Path({str(actions)!r}).write_text('\\n'.join(sys.argv[1:]))
+print('zig ld -platform_version macos 13.0.0 26.4 {runtime}')""",
+        )
+        inputs = (self.root / "c0ffee-quickjs.o",)
+        archive = _discover_compiler_runtime(self.replace_toolchain(zig=zig), self.paths, inputs)
+        self.assertEqual(runtime, archive)
+        argv = actions.read_text().splitlines()
+        self.assertIn("-###", argv)
+        at = argv.index(str(self.paths.instrumented_object))
+        self.assertEqual(str(inputs[0]), argv[at + 1])
+
+    def test_macos_control_link_refuses_what_its_links_would_drop(self) -> None:
+        for stderr, message in (
+            ("install\n", "one final zig ld link, found 0"),
+            ("zig ld /c/fx_zcu.o -o a -lSystem\nzig ld /c/fx_zcu.o -o b -lSystem\n", "found 2"),
+            ("zig ld /c/x.o -o /c/fx -lSystem\n", "one Zig object"),
+            ("zig ld /c/fx_zcu.o -o /c/fx -lSystem -lz\n", "only libSystem"),
+            ("zig ld /c/fx_zcu.o -o /c/fx -lSystem -framework Security\n", "only libSystem"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(PgsoError, message):
+                self.record_macos_control_link(stderr)
 
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory(
@@ -840,6 +937,8 @@ print('{{}}')""",
         self.paths.merged_profile.write_bytes(b"temporal profile")
         self.paths.control_binary.parent.mkdir(parents=True)
         self.paths.control_binary.write_bytes(b"control")
+        # A control that linked only Zig's object, as a build without C does.
+        self.record_macos_control_link("zig ld /cache/fx_zcu.o -o /cache/fx -lSystem\n")
         artifact_tool = self.write_executable(
             "artifact-tool",
             f"""import pathlib,sys

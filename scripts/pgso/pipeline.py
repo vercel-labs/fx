@@ -285,6 +285,12 @@ class PipelinePaths:
         """The startup functions in first-use order, for the candidate link."""
         return self.logs / "startup-order.txt"
 
+    @property
+    def control_link_inputs(self) -> pathlib.Path:
+        """Copies of the objects the control linked beside Zig's own, on
+        platforms whose links add them to their own commands."""
+        return self.control_prefix / "link-inputs"
+
 
 @dataclasses.dataclass(frozen=True)
 class CandidateEvidence:
@@ -697,7 +703,10 @@ def validate_archive_unchanged(
 def _discover_compiler_runtime(
     toolchain: Toolchain,
     paths: PipelinePaths,
+    inputs: Sequence[pathlib.Path] = (),
 ) -> pathlib.Path:
+    # Zig's `-###` still resolves symbols, so the probe needs every object
+    # the link it stands in for takes.
     result = run_checked(
         (
             str(toolchain.zig),
@@ -706,6 +715,7 @@ def _discover_compiler_runtime(
             toolchain.target,
             "-###",
             str(paths.instrumented_object),
+            *map(str, inputs),
             str(toolchain.profile_runtime),
             "-o",
             str(paths.instrumented / "runtime-probe"),
