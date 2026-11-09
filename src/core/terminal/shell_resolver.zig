@@ -381,6 +381,11 @@ const zsh_capture_script =
     \\} 2>/dev/null
 ;
 
+// The replay shell starts with extglob off, and bash parses an extglob pattern,
+// such as `@(a|b)` in a function body, only while extglob is on. bash-completion
+// turns extglob on while it defines its `_*` functions, so the replay turns it
+// on before the first body. The `shopt -p` lines after the functions then set
+// extglob the way the startup files left it, before the command runs.
 const bash_capture_script =
     \\{
     \\\unset -f builtin
@@ -389,6 +394,7 @@ const bash_capture_script =
     \\\builtin printf 'FXSNAP:@NONCE@:NAMES\0'
     \\\builtin printf '%s\0' $(\builtin compgen -a) $(\builtin compgen -A function)
     \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
+    \\\builtin printf '%s\n' 'shopt -s extglob'
     \\for __fx_snapshot_name in $(\builtin compgen -A function); do
     \\  case $__fx_snapshot_name in __fx_snapshot_*) continue;; esac
     \\  \builtin declare -f -- "$__fx_snapshot_name"

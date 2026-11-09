@@ -1907,3 +1907,86 @@ test "snapshot capture reads a real bash login shell" {
             "fx_snapshot_function() { echo function-ok; }\n",
     );
 }
+
+/// Startup file for the bash replay test. extglob is on while the functions are
+/// defined, as bash-completion leaves it while it loads, and the file then
+/// leaves it as the user wants it.
+fn extglobStartupFile(comptime leave_on: bool) []const u8 {
+    return "shopt -s extglob\n" ++
+        "_fx_ext_helper() { case $1 in @(a|b)) echo helper-matched;; esac; }\n" ++
+        "fx_ext_public() { case $1 in @(a|b)) echo public-matched;; esac; }\n" ++
+        "fx_ext_wrapper() { echo wrapper-ran; _fx_ext_helper a; fx_ext_public b; }\n" ++
+        (if (leave_on) "" else "shopt -u extglob\n");
+}
+
+/// Captures a real bash login shell whose startup file defines functions with
+/// extglob patterns, runs a command through the replay as `command_runner`
+/// starts it, and expects what the login shell itself prints for that command,
+/// which includes the user's extglob setting.
+fn expectBashExtglobReplay(comptime leave_on: bool) !void {
+    const shell_path = "/bin/bash";
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), shell_path, .{}) catch return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const home = try io_mod.dirRealpathAlloc(scratch, tmp.dir, ".");
+    try writeTestFile(tmp.dir, ".bash_profile", extglobStartupFile(leave_on));
+
+    var environ = Environ.Map.init(scratch);
+    try environ.put("HOME", home);
+    try environ.put("PATH", "/usr/bin:/bin");
+    try environ.put("TERM", "dumb");
+    const generation = try captureForTest(shell_path, home, &environ);
+    defer generation.destroy();
+
+    // `shopt -p` exits 1 for an option that is off.
+    const command = "fx_ext_wrapper; shopt -p extglob || :";
+    const login = try std.process.run(scratch, io_mod.getIo(), .{
+        .argv = &.{ shell_path, "-l", "-i", "-c", command },
+        .environ_map = &environ,
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try expectExitedZero(login.term);
+    try testing.expect(std.mem.startsWith(u8, login.stdout, "wrapper-ran\n"));
+    try testing.expect(std.mem.endsWith(u8, login.stdout, if (leave_on) "shopt -s extglob\n" else "shopt -u extglob\n"));
+
+    const failure_marker = shell_resolver.snapshot_replay_failure_prefix ++ "0123456789abcdef0123456789abcdef";
+    const invocation = try shell_resolver.snapshotInvocation(scratch, shell_path, failure_marker);
+    const script = try shell_resolver.snapshotScript(scratch, .bash, generation.replay, command);
+    try writeTestFile(tmp.dir, "replay.sh", script);
+    const script_path = try std.Io.Dir.path.join(scratch, &.{ home, "replay.sh" });
+    const shell_command = try std.mem.concat(scratch, u8, &.{
+        try shell_resolver.formatInvocationCommand(scratch, &invocation),
+        " < '",
+        script_path,
+        "'",
+    });
+    const replayed = try std.process.run(scratch, io_mod.getIo(), .{
+        .argv = &.{ "/bin/sh", "-c", shell_command },
+        .environ_map = &generation.environ,
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    // A replay that stops early exits 125 and writes the failure marker.
+    try testing.expectEqualStrings("", replayed.stderr);
+    try expectExitedZero(replayed.term);
+    try testing.expectEqualStrings(login.stdout, replayed.stdout);
+    // extglob is on before the first function body, so every body parses.
+    try testing.expect(std.mem.startsWith(u8, generation.replay, "shopt -s extglob\n"));
+    try testing.expect(std.mem.find(u8, generation.replay, "_fx_ext_helper ()") != null);
+}
+
+fn expectExitedZero(term: std.process.Child.Term) !void {
+    switch (term) {
+        .exited => |code| try testing.expectEqual(@as(u8, 0), code),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "snapshot replay in bash parses extglob helpers and gives the user's extglob setting back" {
+    try expectBashExtglobReplay(false);
+    try expectBashExtglobReplay(true);
+}
