@@ -5525,6 +5525,7 @@ test {
     _ = @import("core/tooling/tool_result_errors.zig");
     _ = @import("core/tooling/tool_runtime.zig");
     _ = @import("core/tooling/tool_specs.zig");
+    _ = @import("core/tooling/toolbox.zig");
     _ = @import("builtins/commands.zig");
     _ = @import("builtins/mcp.zig");
     _ = @import("builtins/modes.zig");
@@ -5543,6 +5544,9 @@ test {
     _ = @import("tools/session/read_tool_result.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");
+    _ = @import("tools/skills/skill_search.zig");
+    _ = @import("tools/capabilities/capability_search.zig");
+    _ = @import("tools/capabilities/toolbox.zig");
     _ = @import("core/upgrade/upgrade_helpers.zig");
     _ = @import("core/upgrade/upgrade_runtime.zig");
     _ = @import("core/shared/types.zig");
