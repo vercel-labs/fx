@@ -30,6 +30,8 @@ const image_commands = @import("../images/image_commands.zig");
 const app_mcp_runtime = @import("app_mcp_runtime.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const app_agents_runtime = @import("app_agents_runtime.zig");
+const subagent_tool_host = @import("../subagent/tool_host.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const skill_commands = @import("../skills/skill_commands.zig");
@@ -1589,6 +1591,7 @@ fn buildTraceReport(app: anytype) ![]u8 {
     try writeCompactionSummary(&out.writer, app.alloc);
     try writeLastInterruptedDetail(&out.writer, agents.screenAgentOf(app).session.agent.history.items, app.alloc);
     try writeSessionTitleSummary(&out.writer, app, app.alloc);
+    try writeSubagentsSummary(&out.writer, app, app.alloc);
     try writeNetworkCallsSummary(&out.writer);
     try writeModelCatalogSummary(&out.writer, app);
     try writeToolCallsSummary(&out.writer, app.alloc, agents.screenAgentOf(app).session.agent.history.items);
@@ -2102,6 +2105,228 @@ fn writeSessionTitleSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
     if (last.detail.len > 0) try writer.print(" detail={s}", .{last.detail});
     if (last.elapsed_ms >= 0) try writer.print(" elapsed={d}ms", .{last.elapsed_ms});
     try writer.writeByte('\n');
+}
+
+/// Turns the Subagents section lists under one subagent, newest first.
+const trace_subagent_max_turns: usize = 8;
+/// Bytes kept of a subagent's title, status row, and failure reason.
+const trace_subagent_max_text_bytes: usize = 400;
+
+/// What the Subagents section reads.
+const SubagentsInput = struct {
+    /// The app's subagents, in the order they started.
+    rows: []const app_agents_runtime.TraceRow = &.{},
+    /// Their hosts' registry entries.
+    registry: []const subagent_tool_host.Runtime.TraceChild = &.{},
+    /// Set when a host's registry could not be read.
+    registry_error: ?anyerror = null,
+    /// The kept subagent turns, oldest first.
+    turns: []const diagnostics.SubagentTurn = &.{},
+    turns_total: u64 = 0,
+    /// The tool-call window, oldest first.
+    calls: []const diagnostics.ToolCallMetric = &.{},
+};
+
+fn writeSubagentsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
+    const App = @TypeOf(app.*);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var input: SubagentsInput = .{};
+    if (comptime @hasField(App, "child_agents")) {
+        var rows: std.ArrayList(app_agents_runtime.TraceRow) = .empty;
+        try app_agents_runtime.Runtime(App).traceRows(app, arena, &rows);
+        input.rows = rows.items;
+        var hosts: std.ArrayList(*subagent_tool_host.Runtime) = .empty;
+        var registry: std.ArrayList(subagent_tool_host.Runtime.TraceChild) = .empty;
+        for (rows.items) |row| {
+            const subagent_host = row.host orelse continue;
+            if (containsHost(hosts.items, subagent_host)) continue;
+            try hosts.append(arena, subagent_host);
+            const listing = subagent_host.traceChildren(arena) catch |err| {
+                input.registry_error = err;
+                continue;
+            };
+            try registry.appendSlice(arena, listing);
+        }
+        input.registry = registry.items;
+    }
+    const turns = try arena.alloc(diagnostics.SubagentTurn, diagnostics.subagent_turn_capacity);
+    input.turns = turns[0..diagnostics.snapshotSubagentTurns(turns)];
+    input.turns_total = diagnostics.subagentTurnTotal();
+    const calls = try arena.alloc(diagnostics.ToolCallMetric, diagnostics.tool_call_ring_capacity);
+    input.calls = calls[0..diagnostics.snapshotToolCalls(calls)];
+    try writeSubagentsSection(writer, arena, input);
+}
+
+fn containsHost(hosts: []const *subagent_tool_host.Runtime, wanted: *subagent_tool_host.Runtime) bool {
+    for (hosts) |seen| if (seen == wanted) return true;
+    return false;
+}
+
+/// Writes the Subagents section: each subagent with its state, task, and
+/// turns, so a `subagent#N` in a tool line names one subagent.
+fn writeSubagentsSection(writer: *std.Io.Writer, alloc: std.mem.Allocator, input: SubagentsInput) !void {
+    try writer.writeAll("\n## Subagents\n");
+    if (input.rows.len == 0 and input.turns.len == 0) {
+        try writer.writeAll("(none)\n");
+        return;
+    }
+    try writer.print("children={d} turns_kept={d} of {d}\n", .{ input.rows.len, input.turns.len, input.turns_total });
+    try writer.writeAll("note: each subagent#N in a tool or network line, and each subagent_id=N in a compaction event or log line, is one turn of one subagent below; a session ID names that subagent's folder in the session store\n");
+    if (input.registry_error) |err| {
+        try writer.print("registry: unreadable ({s}); work and last outcome are unknown\n", .{@errorName(err)});
+    }
+    for (input.rows) |row| {
+        try writer.writeAll("- ");
+        try writeSubagentWord(writer, if (row.name.len > 0) row.name else "(one-off)");
+        try writer.writeAll(" session=");
+        try writeSubagentWord(writer, row.id);
+        try writer.writeAll(" profile=");
+        try writeSubagentWord(writer, row.profile);
+        try writer.print(" state={s}", .{row.state});
+        if (findTraceChild(input.registry, row.id)) |child| {
+            try writer.print(" work={s} last={s}", .{
+                if (child.closing) "closing" else @tagName(child.phase),
+                if (child.last_outcome) |outcome| @tagName(outcome) else "none",
+            });
+            if (child.last_failure.len > 0) {
+                try writer.writeAll(" reason=");
+                try writeSubagentText(writer, alloc, child.last_failure, trace_subagent_max_text_bytes);
+            }
+        } else {
+            try writer.writeAll(" work=unknown last=unknown");
+        }
+        try writer.writeAll("\n  model=");
+        try writeSubagentWord(writer, row.model);
+        try writer.writeAll(" effort=");
+        try writeSubagentWord(writer, row.effort);
+        try writer.writeByte('\n');
+        if (row.title.len > 0) {
+            try writer.writeAll("  title: ");
+            try writeSubagentText(writer, alloc, row.title, trace_subagent_max_text_bytes);
+            try writer.writeByte('\n');
+        }
+        if (row.status.len > 0) {
+            try writer.writeAll("  status: ");
+            try writeSubagentText(writer, alloc, row.status, trace_subagent_max_text_bytes);
+            try writer.writeByte('\n');
+        }
+        try writeSubagentTurns(writer, alloc, input, row.id);
+    }
+
+    // A session with kept turns and no open subagent, such as a closed one.
+    var index = input.turns.len;
+    while (index > 0) {
+        index -= 1;
+        const session_id = input.turns[index].sessionId();
+        if (findTraceRow(input.rows, session_id)) continue;
+        if (sessionListedAfter(input.turns, index, session_id)) continue;
+        try writer.writeAll("- (not open) session=");
+        try writeSubagentWord(writer, session_id);
+        try writer.writeByte('\n');
+        try writeSubagentTurns(writer, alloc, input, session_id);
+    }
+
+    // A number in the window whose turn is no longer kept.
+    var unmatched: usize = 0;
+    for (input.calls, 0..) |call, call_index| {
+        if (call.subagent_id == 0 or findTurn(input.turns, call.subagent_id) != null) continue;
+        if (numberSeenBefore(input.calls[0..call_index], call.subagent_id)) continue;
+        if (unmatched == 0) try writer.writeAll("window subagent numbers with no kept turn:");
+        try writer.print(" subagent#{d}", .{call.subagent_id});
+        unmatched += 1;
+    }
+    if (unmatched > 0) try writer.writeByte('\n');
+}
+
+/// Writes subagent `session_id`'s task, its kept turns newest first, and
+/// its calls in the tool-call window.
+fn writeSubagentTurns(writer: *std.Io.Writer, alloc: std.mem.Allocator, input: SubagentsInput, session_id: []const u8) !void {
+    var kept: usize = 0;
+    var index = input.turns.len;
+    while (index > 0) {
+        index -= 1;
+        const turn = &input.turns[index];
+        if (!std.mem.eql(u8, turn.sessionId(), session_id)) continue;
+        if (kept == 0) {
+            try writer.writeAll("  task: ");
+            try writeSubagentText(writer, alloc, turn.prompt(), trace_subagent_max_text_bytes);
+            if (turn.prompt_total_bytes > turn.prompt().len) {
+                try writer.print(" ... ({d} bytes)", .{turn.prompt_total_bytes});
+            }
+            try writer.writeByte('\n');
+        }
+        kept += 1;
+        if (kept > trace_subagent_max_turns) continue;
+        try writer.print("  turn subagent#{d} outcome=", .{turn.subagent_id});
+        try writeSubagentWord(writer, turn.outcome());
+        try writer.writeAll(" model=");
+        try writeSubagentWord(writer, turn.model());
+        try writer.writeAll(" effort=");
+        try writeSubagentWord(writer, turn.effort());
+        try writer.writeAll(" started=");
+        try writeTraceTimestampUtc(writer, turn.started_at_ms);
+        if (turn.ended_at_ms != 0) try writer.print(" duration={d}ms", .{@max(turn.ended_at_ms - turn.started_at_ms, 0)});
+        try writer.writeByte('\n');
+    }
+    if (kept == 0) try writer.writeAll("  turns: none kept\n");
+    if (kept > trace_subagent_max_turns) try writer.print("  ... {d} older kept turns\n", .{kept - trace_subagent_max_turns});
+
+    var calls: usize = 0;
+    var not_succeeded: usize = 0;
+    for (input.calls) |call| {
+        if (call.subagent_id == 0) continue;
+        const turn = findTurn(input.turns, call.subagent_id) orelse continue;
+        if (!std.mem.eql(u8, turn.sessionId(), session_id)) continue;
+        calls += 1;
+        if (call.outcome != .succeeded) not_succeeded += 1;
+    }
+    try writer.print("  window tool calls: {d} ({d} not succeeded)\n", .{ calls, not_succeeded });
+}
+
+/// Writes a value such as a model or session ID as one line, or `(none)`
+/// when it is empty.
+fn writeSubagentWord(writer: *std.Io.Writer, text: []const u8) !void {
+    try diagnostics.writeSubagentTextLine(writer, if (text.len > 0) text else "(none)");
+}
+
+/// Writes `text` with secrets masked, as one line, cut to `max_bytes` on a
+/// UTF-8 boundary.
+fn writeSubagentText(writer: *std.Io.Writer, alloc: std.mem.Allocator, text: []const u8, max_bytes: usize) !void {
+    const masked = try text_utils.maskSecrets(alloc, text);
+    defer if (masked.ptr != text.ptr) alloc.free(masked);
+    const kept = text_utils.utf8PrefixByBytes(masked, max_bytes);
+    try diagnostics.writeSubagentTextLine(writer, kept);
+    if (kept.len < masked.len) try writer.print(" ... ({d} bytes)", .{masked.len});
+}
+
+fn findTraceChild(registry: []const subagent_tool_host.Runtime.TraceChild, id: []const u8) ?*const subagent_tool_host.Runtime.TraceChild {
+    for (registry) |*child| if (std.mem.eql(u8, child.id, id)) return child;
+    return null;
+}
+
+fn findTraceRow(rows: []const app_agents_runtime.TraceRow, id: []const u8) bool {
+    for (rows) |row| if (std.mem.eql(u8, row.id, id)) return true;
+    return false;
+}
+
+fn findTurn(turns: []const diagnostics.SubagentTurn, subagent_id: u64) ?*const diagnostics.SubagentTurn {
+    for (turns) |*turn| if (turn.subagent_id == subagent_id) return turn;
+    return null;
+}
+
+/// Whether a turn newer than `index` ran for `session_id`, so that session
+/// is listed already.
+fn sessionListedAfter(turns: []const diagnostics.SubagentTurn, index: usize, session_id: []const u8) bool {
+    for (turns[index + 1 ..]) |*turn| if (std.mem.eql(u8, turn.sessionId(), session_id)) return true;
+    return false;
+}
+
+fn numberSeenBefore(calls: []const diagnostics.ToolCallMetric, subagent_id: u64) bool {
+    for (calls) |call| if (call.subagent_id == subagent_id) return true;
+    return false;
 }
 
 /// The MCP servers, one line each; false when there is no host to ask.
@@ -4069,6 +4294,146 @@ test "trace session title summary reports the retained generation outcome" {
     try writeSessionTitleSummary(&installed.writer, &app, alloc);
     try std.testing.expect(std.mem.find(u8, installed.written(), "title: Fix renderer lag") != null);
     try std.testing.expect(std.mem.find(u8, installed.written(), "generation: status=installed") != null);
+}
+
+fn testSubagentTurn(subagent_id: u64, session_id: []const u8, outcome: []const u8, prompt: []const u8) diagnostics.SubagentTurn {
+    var turn: diagnostics.SubagentTurn = .{ .subagent_id = subagent_id, .started_at_ms = 1_000 * @as(i64, @intCast(subagent_id)) };
+    @memcpy(turn.session_id_buf[0..session_id.len], session_id);
+    turn.session_id_len = @intCast(session_id.len);
+    @memcpy(turn.model_buf[0.."openai/gpt-5".len], "openai/gpt-5");
+    turn.model_len = "openai/gpt-5".len;
+    @memcpy(turn.effort_buf[0.."high".len], "high");
+    turn.effort_len = "high".len;
+    const kept = prompt[0..@min(prompt.len, turn.prompt_buf.len)];
+    @memcpy(turn.prompt_buf[0..kept.len], kept);
+    turn.prompt_len = @intCast(kept.len);
+    turn.prompt_total_bytes = @intCast(prompt.len);
+    if (outcome.len > 0) {
+        @memcpy(turn.outcome_buf[0..outcome.len], outcome);
+        turn.outcome_len = @intCast(outcome.len);
+        turn.ended_at_ms = turn.started_at_ms + 25;
+    }
+    return turn;
+}
+
+fn testSubagentRow(id: []const u8, name: []const u8) app_agents_runtime.TraceRow {
+    return .{
+        .id = id,
+        .name = name,
+        .profile = "agent",
+        .title = "",
+        .state = "idle",
+        .model = "openai/gpt-5",
+        .effort = "high",
+        .status = "",
+        .host = null,
+    };
+}
+
+fn testSubagentsSection(input: SubagentsInput) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    errdefer out.deinit();
+    try writeSubagentsSection(&out.writer, arena_state.allocator(), input);
+    return out.toOwnedSlice();
+}
+
+test "trace subagents section says none when no subagent ran" {
+    const text = try testSubagentsSection(.{});
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("\n## Subagents\n(none)\n", text);
+}
+
+test "trace subagents section names each subagent with its registry state and turns" {
+    var failure = "model request failed:\nHTTP 400 token=sk-live-0123456789abcdef0123456789".*;
+    var cards_id = "child-cards".*;
+    var ship_id = "child-ship".*;
+    const registry = [_]subagent_tool_host.Runtime.TraceChild{
+        .{ .id = &cards_id, .phase = .idle, .last_outcome = .completed, .last_failure = &.{}, .closing = false },
+        .{ .id = &ship_id, .phase = .idle, .last_outcome = .failed, .last_failure = &failure, .closing = true },
+    };
+    var ship = testSubagentRow("child-ship", "ship");
+    ship.state = "needs_you";
+    ship.status = "\xe2\x9a\xa0 The provider rejected this request\n\xc2\xb7 press Esc";
+    ship.effort = "";
+    const rows = [_]app_agents_runtime.TraceRow{ testSubagentRow("child-cards", "cards"), ship, testSubagentRow("child-lost", "") };
+    const turns = [_]diagnostics.SubagentTurn{
+        testSubagentTurn(1, "child-cards", "completed", "check the card title"),
+        testSubagentTurn(2, "child-ship", "failed", "pin the\navatar"),
+        testSubagentTurn(3, "child-cards", "", "check it again"),
+    };
+    const calls = [_]diagnostics.ToolCallMetric{
+        .{ .subagent_id = 1, .outcome = .command_failed },
+        .{ .subagent_id = 3, .outcome = .succeeded },
+        .{ .subagent_id = 0, .outcome = .tool_failed },
+    };
+    const text = try testSubagentsSection(.{
+        .rows = &rows,
+        .registry = &registry,
+        .registry_error = error.AccessDenied,
+        .turns = &turns,
+        .turns_total = 5,
+        .calls = &calls,
+    });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.startsWith(u8, text, "\n## Subagents\nchildren=3 turns_kept=3 of 5\nnote: "));
+    try std.testing.expect(std.mem.find(u8, text, "registry: unreadable (AccessDenied); work and last outcome are unknown\n") != null);
+    try std.testing.expect(std.mem.find(u8, text,
+        \\- cards session=child-cards profile=agent state=idle work=idle last=completed
+        \\  model=openai/gpt-5 effort=high
+        \\  task: check it again
+        \\  turn subagent#3 outcome=running model=openai/gpt-5 effort=high started=[1970-01-01T00:00:03.000Z]
+        \\  turn subagent#1 outcome=completed model=openai/gpt-5 effort=high started=[1970-01-01T00:00:01.000Z] duration=25ms
+        \\  window tool calls: 2 (1 not succeeded)
+        \\
+    ) != null);
+    // A closing subagent, its failure on one masked line, and its status row.
+    try std.testing.expect(std.mem.find(u8, text, "- ship session=child-ship profile=agent state=needs_you work=closing last=failed reason=model request failed: HTTP 400 ") != null);
+    try std.testing.expect(std.mem.find(u8, text, "sk-live-0123456789abcdef0123456789") == null);
+    try std.testing.expect(std.mem.find(u8, text, "  model=openai/gpt-5 effort=(none)\n  status: \xe2\x9a\xa0 The provider rejected this request \xc2\xb7 press Esc\n  task: pin the avatar\n") != null);
+    // A one-off with no registry entry and no kept turn.
+    try std.testing.expect(std.mem.find(u8, text, "- (one-off) session=child-lost profile=agent state=idle work=unknown last=unknown\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "  turns: none kept\n  window tool calls: 0 (0 not succeeded)\n") != null);
+}
+
+test "trace subagents section lists closed sessions and numbers with no kept turn" {
+    var turns: [trace_subagent_max_turns + 3]diagnostics.SubagentTurn = undefined;
+    for (&turns, 0..) |*turn, index| turn.* = testSubagentTurn(index + 10, "child-gone", "completed", "old work");
+    const calls = [_]diagnostics.ToolCallMetric{
+        .{ .subagent_id = 7, .outcome = .succeeded },
+        .{ .subagent_id = 12, .outcome = .rejected },
+        .{ .subagent_id = 7, .outcome = .tool_failed },
+        .{ .subagent_id = 4, .outcome = .succeeded },
+    };
+    const text = try testSubagentsSection(.{ .turns = &turns, .turns_total = turns.len, .calls = &calls });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.find(u8, text, "children=0 turns_kept=11 of 11\n") != null);
+    // Listed once, newest turn first, with the older ones counted.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "- (not open) session=child-gone\n"));
+    try std.testing.expect(std.mem.find(u8, text, "  task: old work\n  turn subagent#20 outcome=completed ") != null);
+    try std.testing.expect(std.mem.find(u8, text, "turn subagent#13 ") != null);
+    try std.testing.expect(std.mem.find(u8, text, "turn subagent#12 ") == null);
+    try std.testing.expect(std.mem.find(u8, text, "  ... 3 older kept turns\n  window tool calls: 1 (1 not succeeded)\n") != null);
+    // Each number is listed once, in window order.
+    try std.testing.expect(std.mem.endsWith(u8, text, "window subagent numbers with no kept turn: subagent#7 subagent#4\n"));
+}
+
+test "trace subagents section cuts a long task and keeps each line whole" {
+    const long_task = text_utils.repeat("\xc3\xa9", 300);
+    const turn = testSubagentTurn(5, "child-long", "completed", long_task);
+    var row = testSubagentRow("child-long", "long");
+    row.title = "a\x1b[31m red title\r\n";
+    const text = try testSubagentsSection(.{ .rows = &.{row}, .turns = &.{turn}, .turns_total = 1 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+    try std.testing.expect(std.mem.find(u8, text, "  title: a\\x1b[31m red title  \n") != null);
+    try std.testing.expect(std.mem.find(u8, text, " ... (600 bytes)\n") != null);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| try std.testing.expect(line.len <= 1024);
 }
 
 test "trace tool calls preserve outcomes and mask obvious secrets" {

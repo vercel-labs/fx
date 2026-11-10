@@ -1788,6 +1788,182 @@ describe("effect-aware command permissions", () => {
     TIMEOUT,
   );
 
+  // Main messages two named subagents. cards runs a shell command that fails;
+  // ship answers, or, with `shipFails`, its model request gets HTTP 400 and
+  // ship waits for the user.
+  async function traceTwoSubagents(shipFails: boolean) {
+    const root = createIsolatedRoot();
+    const stderrPath = join(root.root, "stderr.log");
+    writeFileSync(stderrPath, "");
+    installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+    const rootPrompt = "Run the subagent trace fixture.";
+    const cardsTask = "cards task: check the card title";
+    const shipTask = "ship task: pin the avatar";
+    const reported = new Set<string>();
+    const gateway = startDynamicFakeGateway(async (body) => {
+      // A subagent never carries main's prompt.
+      if (!body.includes(rootPrompt)) {
+        if (body.includes(cardsTask)) {
+          if (!body.includes('"toolCallId":"cards_shell"')) return toolCall("echo cards-start; exit 3", {}, "cards_shell");
+          return finalText("cards done");
+        }
+        if (body.includes(shipTask)) {
+          if (shipFails) {
+            return new Response(JSON.stringify({ error: { message: "ship request rejected" } }), {
+              status: 400,
+              headers: { "content-type": "application/json" },
+            });
+          }
+          return finalText("ship done");
+        }
+        return finalText("unexpected request");
+      }
+      if (currentUserText(body).startsWith("Subagent report")) {
+        for (const name of ["cards", "ship"]) {
+          if (body.includes(`\\"agent\\":\\"${name}\\"`)) reported.add(name);
+        }
+        return finalText(`report noted ${reported.size}`);
+      }
+      if (!body.includes('"toolCallId":"msg_cards"')) {
+        return gatewayToolCall("subagent", { request: { action: "message", agent: "cards", message: cardsTask } }, "msg_cards");
+      }
+      if (!body.includes('"toolCallId":"msg_ship"')) {
+        return gatewayToolCall("subagent", { request: { action: "message", agent: "ship", message: shipTask } }, "msg_ship");
+      }
+      return finalText("dispatched both");
+    });
+
+    activeSession = await TmuxSession.create({
+      cmd: FX_BIN,
+      cwd: root.workspace,
+      env: gatewayEnv(root, gateway, {
+        PATH: hostilePath(root),
+        TMPDIR: root.root,
+        FX_PERMISSION_MODE: "yolo",
+        FX_TRACE: "0",
+        FX_TRACE_LOG: undefined,
+        FX_TRACE_STDERR: "0",
+      }),
+      stderrPath,
+      width: 120,
+      height: 40,
+    });
+    await activeSession.waitForComposer(TIMEOUT);
+    await activeSession.sendText(rootPrompt);
+    if (shipFails) {
+      await activeSession.waitForText("report noted 1", TIMEOUT * 2);
+      await activeSession.waitForText("ship needs you", TIMEOUT);
+    } else {
+      await activeSession.waitForText("report noted 2", TIMEOUT * 2);
+    }
+    await activeSession.waitForComposer(TIMEOUT);
+
+    await activeSession.sendText("/trace");
+    await activeSession.waitForText(
+      process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+      TIMEOUT,
+    );
+    const report = readFileSync(latestTraceReportPath(root), "utf8");
+    const subagents = report.split("## Subagents\n")[1]?.split("\n## ")[0];
+    expect(subagents).toBeDefined();
+    const entry = (name: string) => {
+      const start = subagents!.indexOf(`- ${name} session=`);
+      expect(start).toBeGreaterThanOrEqual(0);
+      const next = subagents!.indexOf("\n- ", start + 1);
+      return subagents!.slice(start, next < 0 ? undefined : next);
+    };
+    const cards = entry("cards");
+    const ship = entry("ship");
+    expect(subagents).toMatch(/^children=2 turns_kept=\d+ of \d+\n/);
+    expect(cards).toContain(`task: ${cardsTask}`);
+    expect(ship).toContain(`task: ${shipTask}`);
+    expect(cards).toMatch(/ profile=\S+ state=(idle|finished) work=\S+ last=completed\n/);
+    expect(cards).toContain("window tool calls: 1 (1 not succeeded)");
+
+    // The number on cards' failed command is one of cards' turns.
+    const failedCall = report.match(/name=shell outcome=command_failed duration=\d+ms source=subagent#(\d+)/);
+    expect(failedCall).not.toBeNull();
+    expect(cards).toMatch(new RegExp(`\\n  turn subagent#${failedCall![1]} outcome=completed model=${MODEL} `));
+
+    // Each session ID is that subagent's own session folder.
+    for (const text of [cards, ship]) {
+      const id = text.match(/ session=(\S+)/)![1]!;
+      expect(existsSync(join(storeRoot(root.home), id, "log.jsonl"))).toBe(true);
+    }
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+    await activeSession.sendText("/quit");
+    expect(await activeSession.waitForSessionEnd()).toBe(true);
+    await activeSession.kill();
+    activeSession = null;
+    return { ship };
+  }
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace names each subagent, its task, its state, and its turns",
+    async () => {
+      const { ship } = await traceTwoSubagents(false);
+      expect(ship).toMatch(/ state=(idle|finished) work=\S+ last=completed\n/);
+      expect(ship).toMatch(/\n  turn subagent#\d+ outcome=completed /);
+    },
+    TIMEOUT * 4,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace shows a subagent whose model request failed",
+    async () => {
+      const { ship } = await traceTwoSubagents(true);
+      // Its request failed and waits for the user, as the agent list says.
+      expect(ship).toMatch(/ state=needs_you work=running last=none\n/);
+      expect(ship).toMatch(/\n  status: \S/);
+      expect(ship).toMatch(/\n  turn subagent#\d+ outcome=running /);
+    },
+    TIMEOUT * 4,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace says a session started no subagents",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      const gateway = startDynamicFakeGateway(async () => finalText("nothing to delegate"));
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Say hello.");
+      await activeSession.waitForText("nothing to delegate", TIMEOUT);
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const report = readFileSync(latestTraceReportPath(root), "utf8");
+      expect(report).toContain("\n## Subagents\n(none)\n");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT * 2,
+  );
+
   test.skipIf(!tmuxAvailable())(
     "TUI writes Gateway schema diagnostics to a trace after Gateway 400",
     async () => {
