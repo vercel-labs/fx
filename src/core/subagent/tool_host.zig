@@ -1670,16 +1670,26 @@ pub const Runtime = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const agent = if (from_root) "" else self.childName(arena.allocator(), options.caller_id) catch options.caller_id;
+        // What the user typed in the turn that sends it, from that turn's
+        // own worker, so the parent sees the user's own words.
+        const typed: []const []const u8 = if (options.caller_worker) |worker|
+            worker.typedThisTurn(arena.allocator()) catch |err| blk: {
+                debug_trace.logf("mailbox", "typed lines unavailable from={s} err={s}", .{ options.caller_id, @errorName(err) });
+                break :blk &.{};
+            }
+        else
+            &.{};
         sink.post(self, .{ .message = .{
             .to = if (from_root) .owners_parent else .owner,
             .agent = agent,
             .child_id = options.caller_id,
             .text = text,
+            .user_typed = typed,
         } }) catch |err| return self.encodeManaged(alloc, .{
             .ok = false,
             .error_code = if (err == error.QueueFull) "queue_full" else "no_parent",
         });
-        debug_trace.eventf("mailbox", "post", .{}, "from={s} to={s}", .{ options.caller_id, if (from_root) "owners_parent" else self.ownerName() });
+        debug_trace.eventf("mailbox", "post", .{}, "from={s} to={s} typed={d}", .{ options.caller_id, if (from_root) "owners_parent" else self.ownerName(), typed.len });
         return self.encodeManaged(alloc, .{ .ok = true, .result = "Sent to your parent. It arrives as your message, never as the user's." });
     }
 
@@ -3045,6 +3055,112 @@ test "the root has no parent to message" {
     defer runtime.deinit();
     const body = try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-1", null);
     try std.testing.expect(std.mem.find(u8, body, "no_parent") != null);
+}
+
+test "a subagent's message to its parent carries what the user typed in the turn that sends it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    const Capture = struct {
+        posts: usize = 0,
+        lines: std.ArrayList([]u8) = .empty,
+        fn post(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.posts += 1;
+            for (self.lines.items) |line| std.testing.allocator.free(line);
+            self.lines.clearRetainingCapacity();
+            for (delivery.message.user_typed) |line| {
+                const owned = try std.testing.allocator.dupe(u8, line);
+                self.lines.append(std.testing.allocator, owned) catch |err| {
+                    std.testing.allocator.free(owned);
+                    return err;
+                };
+            }
+        }
+    };
+    var capture: Capture = .{};
+    defer {
+        for (capture.lines.items) |line| alloc.free(line);
+        capture.lines.deinit(alloc);
+    }
+    runtime.report_sink = .{ .context = &capture, .post_fn = Capture.post };
+
+    // The sending turn's own worker, as helper's is when helper messages
+    // lead: its lines, never another agent's.
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    worker.worker_processing = true;
+    worker.active_turn_id = 3;
+    worker.typed_turn_id = 3;
+    try worker.typed_this_turn.append(alloc, try alloc.dupe(u8, "tell lead the schema changed"));
+    for ([_]?*worker_runtime.WorkerRuntime{ &worker, null }) |caller_worker| {
+        var request = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "parent", .message = "the user says the schema changed" } });
+        defer request.deinit(alloc);
+        const result = try runtime.executeManaged(arena, &request, .{
+            .caller_id = "helper-1",
+            .invocation_id = "call-1",
+            .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+            .max_result_bytes = 4096,
+            .timestamp_ms = 1,
+            .caller_worker = caller_worker,
+        });
+        try std.testing.expect(std.mem.find(u8, result.body, "Sent to your parent") != null);
+        if (caller_worker != null) {
+            try std.testing.expectEqual(@as(usize, 1), capture.lines.items.len);
+            try std.testing.expectEqualStrings("tell lead the schema changed", capture.lines.items[0]);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), capture.lines.items.len);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), capture.posts);
+}
+
+test "a subagent's message its parent can't take says so, and keeps nothing of what the user typed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    const Full = struct {
+        fn post(_: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
+            if (delivery.message.user_typed.len == 0) return error.AgentGone;
+            return error.QueueFull;
+        }
+    };
+    runtime.report_sink = .{ .context = null, .post_fn = Full.post };
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    worker.worker_processing = true;
+    worker.active_turn_id = 1;
+    worker.typed_turn_id = 1;
+    try worker.typed_this_turn.append(alloc, try alloc.dupe(u8, "tell main hi"));
+    var request = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "parent", .message = "hi from the user" } });
+    defer request.deinit(alloc);
+    const result = try runtime.executeManaged(arena, &request, .{
+        .caller_id = "helper-1",
+        .invocation_id = "call-1",
+        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .caller_worker = &worker,
+    });
+    try std.testing.expect(std.mem.find(u8, result.body, "queue_full") != null);
+    // The worker still has the turn's lines for a later message.
+    try std.testing.expectEqual(@as(usize, 1), worker.typed_this_turn.items.len);
 }
 
 /// Waits, in a test, until no child of `runtime` works.

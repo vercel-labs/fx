@@ -429,7 +429,7 @@ fn postAskReport(
     const text = switch (delivery) {
         .report => |report| try subagent_reports.message(alloc, report, ctx.max_tool_result_bytes),
         // Its children share this host, so their parent is the ask's own agent.
-        .message => |message| try subagent_reports.messageText(alloc, message.agent, message.child_id, message.text, ctx.max_tool_result_bytes, null),
+        .message => |message| try subagent_reports.messageText(alloc, message.agent, message.child_id, message.text, ctx.max_tool_result_bytes, null, message.user_typed),
     };
     ctx.worker.postMail(alloc, .{
         .prompt = text,

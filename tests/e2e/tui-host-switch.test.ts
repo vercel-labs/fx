@@ -788,9 +788,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "a subagent knows who started it, so a turn typed on its screen can message main, which sees the user started that turn",
+    "a subagent knows who started it, so a turn typed on its screen can message main, which sees the user started that turn and what the user typed",
     async () => {
       let markedByUser = false;
+      let typed: unknown = null;
       await withFx((body) => {
         if (!isMainRequest(body)) {
           if (latestUserText(body).includes("SWITCH_TELL_MAIN") || body.includes('"child_up"')) {
@@ -808,7 +809,11 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           return text("child_answer", "SWITCH_CHILD_FIRST");
         }
         if (body.includes("SWITCH_HI_FROM_CHILD")) {
-          markedByUser = userTexts(body).some((t) => t.includes("SWITCH_HI_FROM_CHILD") && t.includes('"started_by":"user"'));
+          const frame = userTexts(body).find((t) => t.includes("SWITCH_HI_FROM_CHILD")) ?? "";
+          markedByUser = frame.includes('"started_by":"user"');
+          // fx adds the words the user typed in the turn that sent it, which
+          // the subagent can't write, so main can check the relay.
+          typed = JSON.parse(frame.slice(frame.indexOf("{"))).user_typed ?? null;
           return text("main_got_hi", "SWITCH_MAIN_GOT_HI");
         }
         if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
@@ -831,6 +836,143 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForText("SWITCH_MAIN_GOT_HI", 30_000);
       });
       expect(markedByUser).toBe(true);
+      expect(typed).toEqual(["SWITCH_TELL_MAIN tell main I said hi"]);
+    },
+    TIMEOUT,
+  );
+  test(
+    "a line typed on a subagent's screen that joins main's work reaches main with the subagent's next message, and a message before it carries none",
+    async () => {
+      let release = () => {};
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const frames: { before?: Record<string, unknown>; joined?: Record<string, unknown> } = {};
+      const frameWith = (body: string, marker: string) => {
+        const frame = userTexts(body).find((t) => t.includes(marker) && t.includes('"child_id"'));
+        return frame ? (JSON.parse(frame.slice(frame.indexOf("{"))) as Record<string, unknown>) : undefined;
+      };
+      const until = async (done: () => boolean, ms: number) => {
+        const end = Date.now() + ms;
+        while (!done()) {
+          if (Date.now() > end) throw new Error("timed out");
+          await Bun.sleep(50);
+        }
+      };
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          if (!body.includes('"child_before"')) {
+            return toolCall("child_before", "subagent", {
+              request: { action: "message", agent: "parent", message: "SWITCH_RELAY_BEFORE" },
+            });
+          }
+          if (!body.includes("SWITCH_JOINED_LINE")) {
+            // Held until the user has typed on its screen, so the line joins this turn.
+            await held;
+            return text("child_waited", "SWITCH_CHILD_WAITED");
+          }
+          if (!body.includes('"child_after"')) {
+            return toolCall("child_after", "subagent", {
+              request: { action: "message", agent: "parent", message: "SWITCH_RELAY_JOINED" },
+            });
+          }
+          return text("child_done", "SWITCH_CHILD_DONE");
+        }
+        frames.before ??= frameWith(body, "SWITCH_RELAY_BEFORE");
+        frames.joined ??= frameWith(body, "SWITCH_RELAY_JOINED");
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "SWITCH_TASK wait for the user" },
+          });
+        }
+        return text("main_ok", "SWITCH_MAIN_OK");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await until(() => frames.before !== undefined, 30_000);
+        await showAgent(session, "reviewer");
+        await session.waitForComposer(15_000);
+        await session.sendText("SWITCH_JOINED_LINE tell main the deploy is off");
+        await session.waitForText("SWITCH_JOINED_LINE", 15_000);
+        release();
+        await until(() => frames.joined !== undefined, 30_000);
+      });
+      // Before the user typed, the message carries no words of the user's.
+      expect(frames.before?.user_typed).toBeUndefined();
+      expect(frames.before?.started_by).toBeUndefined();
+      // Main started the turn, so started_by stays empty; the joined line is the user's.
+      expect(frames.joined?.user_typed).toEqual(["SWITCH_JOINED_LINE tell main the deploy is off"]);
+      expect(frames.joined?.started_by).toBeUndefined();
+    },
+    TIMEOUT,
+  );
+  test(
+    "after a kill and a resume, main's saved message from a subagent still carries what the user typed",
+    async () => {
+      let resumedTyped: unknown = null;
+      await withFx((body) => {
+        if (!isMainRequest(body)) {
+          if (latestUserText(body).includes("SWITCH_TELL_MAIN")) {
+            if (!body.includes('"child_up"')) {
+              return toolCall("child_up", "subagent", {
+                request: { action: "message", agent: "parent", message: "SWITCH_HI_FROM_CHILD" },
+              });
+            }
+            return text("child_told", "SWITCH_CHILD_TOLD_MAIN");
+          }
+          return text("child_answer", "SWITCH_CHILD_FIRST");
+        }
+        if (latestUserText(body).includes("SWITCH_AFTER_RESUME")) {
+          const frame = userTexts(body).find((t) => t.includes("SWITCH_HI_FROM_CHILD")) ?? "";
+          resumedTyped = frame ? JSON.parse(frame.slice(frame.indexOf("{"))).user_typed ?? null : null;
+          return text("main_resumed", "SWITCH_MAIN_RESUMED");
+        }
+        if (body.includes("SWITCH_HI_FROM_CHILD")) return text("main_got_hi", "SWITCH_MAIN_GOT_HI");
+        if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look for nothing" },
+          });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session, { home, launch }) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
+        await session.waitForComposer(15_000);
+        await showAgent(session, "reviewer");
+        await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("SWITCH_TELL_MAIN tell main I said hi");
+        await session.waitForText("SWITCH_CHILD_TOLD_MAIN", 30_000);
+        await showAgent(session, "main");
+        await session.waitForText("SWITCH_MAIN_GOT_HI", 30_000);
+
+        // Once main's session holds its answer to the message, kill fx as a
+        // crash would.
+        const sessions = join(home, ".fx", "sessions", "v2");
+        const holds = (path: string, marker: string): boolean => readdirSync(path).some((entry) => {
+          const full = join(path, entry);
+          return statSync(full).isDirectory() ? holds(full, marker) : readFileSync(full, "latin1").includes(marker);
+        });
+        const mainSessions = () => readdirSync(sessions).filter((id) =>
+          !id.startsWith(".") && statSync(join(sessions, id)).isDirectory() && holds(join(sessions, id), "SWITCH_MAIN_GOT_HI"));
+        const deadline = Date.now() + 15_000;
+        while (mainSessions().length === 0 && Date.now() < deadline) await Bun.sleep(50);
+        expect(mainSessions()).toHaveLength(1);
+        const pid = session.processPid();
+        process.kill(pid, "SIGKILL");
+        const gone = Date.now() + 10_000;
+        while (Date.now() < gone) {
+          try { process.kill(pid, 0); } catch { break; }
+          await Bun.sleep(25);
+        }
+        await session.kill();
+
+        const resumed = await launch(`--resume ${mainSessions()[0]}`);
+        await resumed.waitForComposer(15_000);
+        await resumed.sendText("SWITCH_AFTER_RESUME");
+        await resumed.waitForText("SWITCH_MAIN_RESUMED", 30_000);
+      });
+      expect(resumedTyped).toEqual(["SWITCH_TELL_MAIN tell main I said hi"]);
     },
     TIMEOUT,
   );
