@@ -11,7 +11,10 @@
 (* command with what it saw, an edit of the startup file the shell reads   *)
 (* between commands, or an edit of it while a capture runs (window_edit).  *)
 (* The driver holds the capture after the shell read the file, so it knows *)
-(* the edit came inside the capture.                                       *)
+(* the edit came inside the capture. A startup file that renews itself at   *)
+(* every start makes an edit inside each capture, and the command that     *)
+(* follows shows whether it ran from a snapshot or with the full startup   *)
+(* (`full`, from the login flag of its shell).                             *)
 (*                                                                          *)
 (* Cases are replayed in order. The index k advances only when the model   *)
 (* has produced every event of the case in exactly the observed way. The   *)
@@ -36,6 +39,7 @@ InitWith(c) ==
     /\ startVer = [d \in Dirs |-> 0]
     /\ readVer = 0
     /\ failed = FALSE
+    /\ cmdCaps = 0
 
 ResetTo(c) ==
     /\ shell' = c.shell
@@ -50,6 +54,7 @@ ResetTo(c) ==
     /\ startVer' = [d \in Dirs |-> 0]
     /\ readVer' = 0
     /\ failed' = FALSE
+    /\ cmdCaps' = 0
 
 TraceInit == k = 1 /\ pos = 1 /\ InitWith(Observed[1])
 
@@ -79,11 +84,19 @@ TWindowEdit ==
     /\ pos' = pos + 1
     /\ UNCHANGED k
 
+\* What a probe shows of a run. The model's record also keeps how many captures
+\* the command started.
+Shown(r) ==
+    [callable |-> r.callable, z |-> r.z, zexp |-> r.zexp, fresh |-> r.fresh,
+     captures |-> r.captures, full |-> r.full]
+
+\* A command runs from the snapshot, or with the full startup once the bound is
+\* reached.
 TRun ==
     /\ Pending
     /\ Event.kind = "run"
-    /\ Run
-    /\ seen'[Len(seen')] = Event.saw
+    /\ Run \/ RunFull
+    /\ Shown(seen'[Len(seen')]) = Event.saw
     /\ pos' = pos + 1
     /\ UNCHANGED k
 

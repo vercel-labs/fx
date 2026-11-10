@@ -46,6 +46,19 @@
 (* before the repair of that state: it compared the failure's stamps, laid *)
 (* out for the generation's ZDOTDIR, with stamps laid out for none, so it  *)
 (* saw a change that never happened and captured before every command.     *)
+(*                                                                          *)
+(* A command waits for the capture it starts, and for the recapture a stale *)
+(* result calls for. A startup file can renew the files fx watches at every *)
+(* start: a new folder with a new .zshrc, a .zshrc rewritten, or a HOME     *)
+(* file that touches itself. Every capture then ends stale. cmdCaps counts  *)
+(* the captures the waiting command started. After the capture and one      *)
+(* recapture (MaxCaptures) a snapshot that is still stale no longer holds   *)
+(* the command: RunFull runs it with the full startup, and the next command *)
+(* may capture again. "unbounded" is fx before that bound: the command kept *)
+(* waiting for as long as the files kept changing. "zero_bound" plants a    *)
+(* bound of zero, which never captures. The model has one command at a time;*)
+(* the code counts per `acquire` call, so concurrent commands each keep     *)
+(* their own count.                                                         *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -53,7 +66,7 @@ CONSTANTS FilterRule, ZdotdirRule, MaxEdits, MaxRuns
 
 ASSUME FilterRule \in {"fixed", "old", "keep_completion", "keep_private"}
 ASSUME ZdotdirRule \in {"fixed", "env_only", "no_restore", "restore_exported", "stamp_late",
-                         "failed_layout"}
+                         "failed_layout", "unbounded", "zero_bound"}
 ASSUME MaxEdits \in Nat /\ MaxRuns \in Nat \ {0}
 
 Funcs == {"wrap", "_helper", "__dunder", "_comp", "__fx_snapshot_x"}
@@ -74,8 +87,8 @@ None == "none"
 NoSnap == [replay |-> {}, names |-> {}, zdotdir |-> None, zval |-> None,
            zexp |-> FALSE, watched |-> {}, stamps |-> [d \in Dirs |-> 0], read |-> 0]
 
-VARIABLES shell, inherited, zmode, fstate, ver, snap, captures, seen, phase, startVer, readVer, failed
-vars == <<shell, inherited, zmode, fstate, ver, snap, captures, seen, phase, startVer, readVer, failed>>
+VARIABLES shell, inherited, zmode, fstate, ver, snap, captures, seen, phase, startVer, readVer, failed, cmdCaps
+vars == <<shell, inherited, zmode, fstate, ver, snap, captures, seen, phase, startVer, readVer, failed, cmdCaps>>
 
 \* idle: no capture runs. started: fx stamped the folders it knows and the
 \* shell has not read the startup file yet. read: the shell read it, and fx
@@ -154,6 +167,15 @@ StampDiffers == \E d \in snap.watched : snap.stamps[d] # ver[d]
 
 Changed == snap # NoSnap /\ (LayoutMismatch \/ StampDiffers)
 
+\* No capture runs and the snapshot is missing or out of date: the waiting
+\* command needs a capture.
+Stale == phase = "idle" /\ (snap = NoSnap \/ Changed)
+
+\* The most captures one command starts: the capture and one recapture.
+MaxCaptures == 2
+Bound == IF ZdotdirRule = "zero_bound" THEN 0 ELSE MaxCaptures
+BoundReached == ZdotdirRule # "unbounded" /\ cmdCaps >= Bound
+
 \* --- Actions ---------------------------------------------------------------
 Init ==
     /\ shell \in {"zsh", "bash"}
@@ -168,14 +190,16 @@ Init ==
     /\ startVer = [d \in Dirs |-> 0]
     /\ readVer = 0
     /\ failed = FALSE
+    /\ cmdCaps = 0
 
 \* The first capture, or a new one after a watched file changed, starts.
 BeginCapture ==
-    /\ phase = "idle"
-    /\ snap = NoSnap \/ Changed
+    /\ Stale
+    /\ ~BoundReached
     /\ phase' = "started"
     /\ startVer' = ver
     /\ failed' = FALSE
+    /\ cmdCaps' = cmdCaps + 1
     /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, snap, captures, seen, readVer>>
 
 \* The login shell reads the startup file of ReadDir.
@@ -183,7 +207,7 @@ ReadFile ==
     /\ phase = "started"
     /\ phase' = "read"
     /\ readVer' = ver[ReadDir]
-    /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, snap, captures, seen, startVer, failed>>
+    /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, snap, captures, seen, startVer, failed, cmdCaps>>
 
 \* fx installs the snapshot the shell reported.
 FinishCapture ==
@@ -198,7 +222,7 @@ FinishCapture ==
                 read |-> readVer]
     /\ captures' = captures + 1
     /\ phase' = "idle"
-    /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, seen, startVer, readVer, failed>>
+    /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, seen, startVer, readVer, failed, cmdCaps>>
 
 \* The user edits a startup file in folder d, between commands or while a
 \* capture runs.
@@ -206,7 +230,7 @@ Edit(d) ==
     /\ snap # NoSnap \/ phase # "idle"
     /\ ver[d] < MaxEdits
     /\ ver' = [ver EXCEPT ![d] = @ + 1]
-    /\ UNCHANGED <<shell, inherited, zmode, fstate, snap, captures, seen, phase, startVer, readVer, failed>>
+    /\ UNCHANGED <<shell, inherited, zmode, fstate, snap, captures, seen, phase, startVer, readVer, failed, cmdCaps>>
 
 \* A command runs from the snapshot once no capture runs and no watched file
 \* changed.
@@ -217,7 +241,23 @@ Run ==
     /\ ~Changed
     /\ Len(seen) < MaxRuns
     /\ seen' = Append(seen, [callable |-> snap.replay, z |-> snap.zval, zexp |-> snap.zexp,
-                             fresh |-> snap.read = ver[ReadDir], captures |-> captures])
+                             fresh |-> snap.read = ver[ReadDir], captures |-> captures,
+                             full |-> FALSE, cmdCaps |-> cmdCaps])
+    /\ cmdCaps' = 0
+    /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, snap, captures, phase, startVer, readVer, failed>>
+
+\* The waiting command has started the capture and one recapture, and the
+\* snapshot is still stale: it runs with the full startup. Its own login shell
+\* reads the startup files as they are, so it sees every function they define
+\* and ZDOTDIR as they leave it, and the files load once more (captures + 1).
+RunFull ==
+    /\ Stale
+    /\ BoundReached
+    /\ Len(seen) < MaxRuns
+    /\ seen' = Append(seen, [callable |-> {f \in Funcs : fstate[f] # "absent"}, z |-> LoginZ,
+                             zexp |-> LoginZExported, fresh |-> TRUE, captures |-> captures + 1,
+                             full |-> TRUE, cmdCaps |-> cmdCaps])
+    /\ cmdCaps' = 0
     /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, snap, captures, phase, startVer, readVer, failed>>
 
 \* The restored shell rejects the replay while no watched file changed: commands
@@ -228,9 +268,10 @@ ReplayFails ==
     /\ ~failed
     /\ ~Changed
     /\ failed' = TRUE
+    /\ cmdCaps' = 0
     /\ UNCHANGED <<shell, inherited, zmode, fstate, ver, snap, captures, seen, phase, startVer, readVer>>
 
-Next == BeginCapture \/ ReadFile \/ FinishCapture \/ Run \/ ReplayFails \/ \E d \in Dirs : Edit(d)
+Next == BeginCapture \/ ReadFile \/ FinishCapture \/ Run \/ RunFull \/ ReplayFails \/ \E d \in Dirs : Edit(d)
 Spec == Init /\ [][Next]_vars
 
 \* --- Rules -----------------------------------------------------------------
@@ -242,6 +283,7 @@ TypeOK ==
     /\ startVer \in [Dirs -> 0..MaxEdits]
     /\ readVer \in 0..MaxEdits
     /\ failed \in BOOLEAN
+    /\ cmdCaps \in Nat
 
 \* Every function the startup files define and load, except a completion
 \* function, can be called in a command, so a wrapper that calls `_` or `__`
@@ -279,4 +321,18 @@ FailedChangeIsReal == (failed /\ Changed) => StampDiffers
 \* A command sees ZDOTDIR as the login shell left it, exported or not.
 ZdotdirAsLogin ==
     \A i \in 1..Len(seen) : seen[i].z = LoginZ /\ seen[i].zexp = LoginZExported
+
+\* A command waits for at most the capture and one recapture, however often the
+\* startup files change the files fx watches.
+CapturesBounded == cmdCaps <= MaxCaptures
+
+\* A command runs with the full startup only after the capture and one recapture
+\* left the snapshot stale: fx always tries before it gives up.
+FullOnlyAfterRecapture ==
+    \A i \in 1..Len(seen) : seen[i].full => seen[i].cmdCaps = MaxCaptures
+
+\* A witness, not a rule: its config must fail. Under fx's rules a command does
+\* run with the full startup when the files change at every capture, so the bound
+\* holds the command and does not strand it.
+NoFullRun == \A i \in 1..Len(seen) : ~seen[i].full
 =============================================================================

@@ -6,7 +6,9 @@
 //! shell restored from that snapshot, so startup files run once per process
 //! instead of once per command. A changed startup file or an explicit reload
 //! marks the snapshot dirty: the next command recaptures it, and the approval
-//! epoch advances so remembered shell approvals stop matching.
+//! epoch advances so remembered shell approvals stop matching. A command waits
+//! for at most the capture and one recapture; when the startup files change
+//! again after both, it runs with the full startup.
 //!
 //! Snapshot contents stay in memory. They reach a command only through its
 //! environment and the supervisor's stdin script, and are never logged.
@@ -29,6 +31,12 @@ const Environ = std.process.Environ;
 const capture_timeout_ms: i64 = 10_000;
 /// Largest captured payload accepted; larger states fall back to full startup.
 const max_capture_bytes: usize = 8 * 1024 * 1024;
+
+/// Most captures one command starts: the capture and one recapture. Every
+/// capture a startup file leaves stale counts, so a file that renews its own
+/// watched files at every start cannot hold a command for ever
+/// (`tests/tla/terminal/ShellSnapshotCapture.tla` CapturesBounded).
+const max_captures_per_command: u32 = 2;
 
 const wait_poll_ns: u64 = 2 * std.time.ns_per_ms;
 const read_poll_ms: i64 = 100;
@@ -392,6 +400,11 @@ pub const Owner = struct {
     /// capture, or reports that the command must use full startup. Blocks
     /// only while a capture is running; cancellation and the deadline end the
     /// wait without cancelling the capture.
+    ///
+    /// One call starts at most `max_captures_per_command` captures. A startup
+    /// file that renews the files fx watches at every start leaves each capture
+    /// stale, and the call then returns `.full_startup` instead of waiting for
+    /// ever; the next call may capture again.
     pub fn acquire(
         self: *Owner,
         shell_path: []const u8,
@@ -399,9 +412,10 @@ pub const Owner = struct {
         control: WaitControl,
     ) AcquireError!Acquired {
         const io = io_mod.getIo();
+        var captures_started: u32 = 0;
         while (true) {
             self.mutex.lockUncancelable(io);
-            const decision = self.decideLocked(shell_path, cwd);
+            const decision = self.decideLocked(shell_path, cwd, &captures_started);
             self.mutex.unlock(io);
             switch (decision) {
                 .lease => |generation| return .{ .snapshot = .{
@@ -575,7 +589,8 @@ pub const Owner = struct {
         }
     }
 
-    fn decideLocked(self: *Owner, shell_path: []const u8, cwd: []const u8) Decision {
+    /// `captures_started` counts the captures the calling `acquire` has started.
+    fn decideLocked(self: *Owner, shell_path: []const u8, cwd: []const u8, captures_started: *u32) Decision {
         self.noteChangesLocked(shell_path);
         switch (self.state) {
             .capturing => return .wait,
@@ -587,13 +602,33 @@ pub const Owner = struct {
             .failed => if (!self.dirty) return .full_startup,
             .empty => {},
         }
+        if (captures_started.* >= max_captures_per_command) {
+            // The files changed again after every capture this command started.
+            // The owner stays dirty, so the next command captures again.
+            debug_trace.logf(
+                "core",
+                "shell snapshot kept changing; command runs with full startup captures={d} zdotdir={s}",
+                .{ captures_started.*, self.movedZdotdirLocked() orelse "none" },
+            );
+            return .full_startup;
+        }
         self.startCaptureLocked(shell_path, cwd) catch |err| {
             debug_trace.logf("core", "shell snapshot capture could not start err={s}", .{@errorName(err)});
             const fingerprint = currentFingerprint(shell_path, null);
             self.recordFailureLocked(shell_path, null, &fingerprint, .spawn_failed);
             return .full_startup;
         };
+        captures_started.* += 1;
         return .wait;
+    }
+
+    /// The folder the startup files of the last capture moved ZDOTDIR to.
+    fn movedZdotdirLocked(self: *const Owner) ?[]const u8 {
+        return switch (self.state) {
+            .ready => self.active.?.zdotdir,
+            .failed => if (self.failed_zdotdir_len) |len| self.failed_zdotdir[0..len] else null,
+            .empty, .capturing => null,
+        };
     }
 
     fn noteChangesLocked(self: *Owner, shell_path: []const u8) void {
@@ -1192,6 +1227,8 @@ const fuzz_payload_markers = [_][]const u8{
     "FXSNAP:" ++ fuzz_payload_nonce ++ ":REPLAY",
     "\x00FXSNAP:" ++ fuzz_payload_nonce ++ ":END\x00",
 };
+const fuzz_zdotdir_marker = fuzz_payload_markers[1];
+const fuzz_end_marker = fuzz_payload_markers[4];
 
 /// Expands a fuzz input into a payload. Byte 0x01 and the byte after it
 /// insert one of the section markers, so the fuzzer reaches every section
@@ -1226,7 +1263,7 @@ fn fuzzSnapshotPayload(_: void, smith: *std.testing.Smith) anyerror!void {
     };
 
     // The replay ends at the first end marker, so it never holds one.
-    try testing.expect(std.mem.find(u8, generation.replay, fuzz_payload_markers[4]) == null);
+    try testing.expect(std.mem.find(u8, generation.replay, fuzz_end_marker) == null);
     var entries = generation.environ.iterator();
     while (entries.next()) |entry| {
         const key = entry.key_ptr.*;
@@ -1243,7 +1280,7 @@ fn fuzzSnapshotPayload(_: void, smith: *std.testing.Smith) anyerror!void {
     // A ZDOTDIR comes only from the entry right after its section marker.
     if (generation.zdotdir) |zdotdir| {
         try testing.expect(zdotdir.len != 0);
-        const entry = try std.mem.concat(scratch, u8, &.{ fuzz_payload_markers[1], "\x00", zdotdir, "\x00" });
+        const entry = try std.mem.concat(scratch, u8, &.{ fuzz_zdotdir_marker, "\x00", zdotdir, "\x00" });
         try testing.expect(std.mem.find(u8, payload, entry) != null);
     }
 }
@@ -1637,6 +1674,12 @@ const MovedZdotdirCapture = struct {
     var edit_call: u32 = 0;
     /// The capture with this index fails.
     var fail_call: ?u32 = null;
+    /// What the startup files do at every start, in `renew_dir`: rewrite
+    /// `moved/.zshrc`, or make a new folder with a new `.zshrc` and move
+    /// ZDOTDIR there.
+    const Renewal = enum { none, rewrite_moved, fresh_folder };
+    var renewal: Renewal = .none;
+    var renew_dir: ?std.Io.Dir = null;
 
     fn reset(moved_folder: []const u8) void {
         calls.store(0, .seq_cst);
@@ -1644,6 +1687,8 @@ const MovedZdotdirCapture = struct {
         edit_dir = null;
         edit_call = 0;
         fail_call = null;
+        renewal = .none;
+        renew_dir = null;
     }
 
     fn capture(request: CaptureRequest) CaptureOutcome {
@@ -1658,14 +1703,43 @@ const MovedZdotdirCapture = struct {
             generation.destroy();
             return .{ .failed = .out_of_memory };
         };
-        if (folder.len != 0) {
-            generation.zdotdir = alloc.dupe(u8, folder) catch {
+        var zdotdir = folder;
+        if (renew_dir) |dir| switch (renewal) {
+            .none => {},
+            .rewrite_moved => rewriteMovedFile(dir, call) catch {},
+            .fresh_folder => zdotdir = freshFolder(alloc, dir, call) catch {
+                generation.destroy();
+                return .{ .failed = .out_of_memory };
+            },
+        };
+        if (zdotdir.len != 0) {
+            generation.zdotdir = alloc.dupe(u8, zdotdir) catch {
                 generation.destroy();
                 return .{ .failed = .out_of_memory };
             };
         }
         generation.replay = "alias ll='ls -l'\n";
         return .{ .ready = generation };
+    }
+
+    /// Rewrites `moved/.zshrc` longer than the capture before, so no two
+    /// versions share a stamp.
+    fn rewriteMovedFile(dir: std.Io.Dir, call: u32) !void {
+        var data: [128]u8 = undefined;
+        const length: usize = @min(call + 17, data.len - 1);
+        @memset(data[0..length], '#');
+        data[length] = '\n';
+        try writeTestFile(dir, "moved/.zshrc", data[0 .. length + 1]);
+    }
+
+    /// Makes the folder `fresh<call>` with its own `.zshrc` and returns its path.
+    fn freshFolder(alloc: Allocator, dir: std.Io.Dir, call: u32) ![]const u8 {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.mem.print(&name_buffer, "fresh{d}", .{call});
+        try dir.createDir(io_mod.getIo(), name, .default_dir);
+        var file_buffer: [48]u8 = undefined;
+        try writeTestFile(dir, try std.mem.print(&file_buffer, "{s}/.zshrc", .{name}), "alias ll='ls -l'\n");
+        return io_mod.dirRealpathAlloc(alloc, dir, name);
     }
 };
 
@@ -1997,6 +2071,90 @@ test "a failed recapture keeps stamps the next check can compare" {
     // The recapture fails; nothing changed since, so no command captures again.
     for (0..2) |_| try testing.expect((try owner.acquire("/bin/zsh", "/tmp", .{})) == .full_startup);
     try testing.expectEqual(@as(u32, 2), MovedZdotdirCapture.calls.load(.seq_cst));
+}
+
+/// Acquires with a deadline, so a wait that never ends fails the test instead
+/// of hanging it, and expects the command to run with full startup.
+fn expectFullStartup(owner: *Owner) !void {
+    const acquired = try owner.acquire("/bin/zsh", "/tmp", .{ .deadline_ms = io_mod.milliTimestamp() + 10_000 });
+    const full_startup = acquired == .full_startup;
+    if (acquired == .snapshot) acquired.snapshot.release();
+    try testing.expect(full_startup);
+}
+
+test "a moved ZDOTDIR rewritten at every capture leaves the command on full startup after two captures" {
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    var folders = try MovedFolders.init(scratch_state.allocator());
+    defer folders.tmp.cleanup();
+    try writeTestFile(folders.tmp.dir, "moved/.zshrc", "alias ll='ls -l'\n");
+    MovedZdotdirCapture.reset(folders.moved);
+    MovedZdotdirCapture.renewal = .rewrite_moved;
+    MovedZdotdirCapture.renew_dir = folders.tmp.dir;
+    // Every file is at or after the capture start.
+    FakeClock.now_ns = 0;
+    var owner: Owner = .{ .capture_fn = MovedZdotdirCapture.capture, .clock_fn = FakeClock.read };
+    defer owner.deinit();
+
+    // The capture and one recapture, each stale as soon as it ends.
+    try expectFullStartup(&owner);
+    try testing.expectEqual(@as(u32, 2), MovedZdotdirCapture.calls.load(.seq_cst));
+    // The next command tries again, and gives up the same way.
+    try expectFullStartup(&owner);
+    try testing.expectEqual(@as(u32, 4), MovedZdotdirCapture.calls.load(.seq_cst));
+}
+
+test "a new ZDOTDIR folder at every capture leaves the command on full startup after two captures" {
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    var folders = try MovedFolders.init(scratch_state.allocator());
+    defer folders.tmp.cleanup();
+    MovedZdotdirCapture.reset(folders.moved);
+    MovedZdotdirCapture.renewal = .fresh_folder;
+    MovedZdotdirCapture.renew_dir = folders.tmp.dir;
+    FakeClock.now_ns = 0;
+    var owner: Owner = .{ .capture_fn = MovedZdotdirCapture.capture, .clock_fn = FakeClock.read };
+    defer owner.deinit();
+
+    try expectFullStartup(&owner);
+    try testing.expectEqual(@as(u32, 2), MovedZdotdirCapture.calls.load(.seq_cst));
+    try expectFullStartup(&owner);
+    try testing.expectEqual(@as(u32, 4), MovedZdotdirCapture.calls.load(.seq_cst));
+}
+
+test "many commands at once start at most two captures each while the startup files keep changing" {
+    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_state.deinit();
+    var folders = try MovedFolders.init(scratch_state.allocator());
+    defer folders.tmp.cleanup();
+    MovedZdotdirCapture.reset(folders.moved);
+    MovedZdotdirCapture.renewal = .fresh_folder;
+    MovedZdotdirCapture.renew_dir = folders.tmp.dir;
+    FakeClock.now_ns = 0;
+    var owner: Owner = .{ .capture_fn = MovedZdotdirCapture.capture, .clock_fn = FakeClock.read };
+    defer owner.deinit();
+
+    const callers = 32;
+    const rounds = 4;
+    const Worker = struct {
+        fn run(target: *Owner, full_startup: *bool) void {
+            const acquired = target.acquire("/bin/zsh", "/tmp", .{ .deadline_ms = io_mod.milliTimestamp() + 30_000 }) catch return;
+            switch (acquired) {
+                .snapshot => |lease| lease.release(),
+                .full_startup => full_startup.* = true,
+            }
+        }
+    };
+    for (0..rounds) |_| {
+        var results: [callers]bool = @splat(false);
+        var threads: [callers]std.Thread = undefined;
+        for (&threads, &results) |*thread, *result| thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &owner, result });
+        for (threads) |thread| thread.join();
+        // Every command ran with full startup: none waited for ever, and none got a snapshot.
+        for (results) |full_startup| try testing.expect(full_startup);
+    }
+    // No command started more than the capture and one recapture.
+    try testing.expect(MovedZdotdirCapture.calls.load(.seq_cst) <= 2 * callers * rounds);
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
