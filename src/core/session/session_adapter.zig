@@ -348,6 +348,17 @@ pub const Store = struct {
 
     /// A child's whole history, read without its lock: every turn, oldest
     /// first. Free with `types.freeHistoryTurnSlice`.
+    /// A child's stored title, read without opening it; null when it has
+    /// none yet. Caller owns it.
+    pub fn childTitle(store: *Store, alloc: Allocator, child_id: []const u8) !?[]u8 {
+        var peeked = try store.manager.peek(alloc, child_id);
+        defer peeked.deinit(alloc);
+        const raw = peeked.state.title orelse return null;
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        return try alloc.dupe(u8, try json_decode.parseFromSliceLeaky([]const u8, scratch.allocator(), raw, .{}));
+    }
+
     pub fn childHistory(store: *Store, alloc: Allocator, child_id: []const u8) ![]types.HistoryTurn {
         var history: std.ArrayList(types.HistoryTurn) = .empty;
         errdefer {

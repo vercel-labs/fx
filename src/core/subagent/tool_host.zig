@@ -391,6 +391,12 @@ pub const Runtime = struct {
         return self.children.parent.store.childHistory(alloc, child_id);
     }
 
+    /// A child's saved title, read without opening it; null when it has
+    /// none. Caller owns it.
+    pub fn childTitle(self: *Runtime, alloc: Allocator, child_id: []const u8) !?[]u8 {
+        return self.children.parent.store.childTitle(alloc, child_id);
+    }
+
     /// What a turn the user starts on a subagent's own screen runs under.
     pub const UserTurnAdmission = struct {
         admission: domain.AdmissionSnapshot,

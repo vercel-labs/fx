@@ -924,6 +924,7 @@ pub fn Runtime(comptime App: type) type {
                         defer types.freeHistoryTurnSlice(app.alloc, history);
                         const restored_child = try addChild(app, entry.id);
                         restored_child.saved_reply_at_ms = latestReplyAt(history);
+                        try showSavedTitle(app, host, restored_child);
                         break :restored restored_child;
                     };
                     if (child.name.len == 0 and entry.name.len > 0) child.name = try app.alloc.dupe(u8, entry.name);
@@ -933,6 +934,17 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             orderByListing(app.child_agents.items, order.items);
+        }
+
+        /// Gives a subagent restored from before a restart its saved title,
+        /// so its row in the list names it before its conversation opens.
+        fn showSavedTitle(app: *App, host: *subagent_tool_host.Runtime, child: *ChildAgent) !void {
+            const title = host.childTitle(app.alloc, child.id) catch |err| {
+                debug_trace.logf("host", "saved title unavailable agent={s} err={s}", .{ child.id, @errorName(err) });
+                return;
+            } orelse return;
+            defer app.alloc.free(title);
+            try app_session_runtime.Runtime(App).setCachedSessionTitle(app, &child.agent, title);
         }
 
         /// The switch order, with each instance's subagents sorted
