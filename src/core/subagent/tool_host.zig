@@ -196,6 +196,11 @@ pub const Runtime = struct {
     /// parent's messages waiting for them the stop dropped, until the
     /// stopped work's report or notice says so (`userStopped`).
     user_dropped: std.ArrayList(UserDrop) = .empty,
+    /// The names of subagents the user closed, until main's message starts
+    /// a new one under the name: main's status lists them, and that message
+    /// says so, since the new one has none of the old one's history. Under
+    /// `admission_mutex`.
+    user_closed: std.ArrayList([]u8) = .empty,
     /// Children working on a turn their parent didn't start, as a work in
     /// the parent's log (`beginTurnWork`): the user's, typed on the child's
     /// screen, or one its own child's report woke.
@@ -278,6 +283,8 @@ pub const Runtime = struct {
         self.work_calls.deinit(self.alloc);
         for (self.user_dropped.items) |drop| self.alloc.free(drop.child_id);
         self.user_dropped.deinit(self.alloc);
+        for (self.user_closed.items) |name| self.alloc.free(name);
+        self.user_closed.deinit(self.alloc);
         for (self.turn_works.items) |*work| work.deinit(self.alloc);
         self.turn_works.deinit(self.alloc);
         for (self.closing.items) |id| {
@@ -653,7 +660,12 @@ pub const Runtime = struct {
                     keep_call = true;
                     if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
                     var buf: [sent_result_bytes]u8 = undefined;
-                    return self.encodeManaged(alloc, .{ .ok = true, .result = sentResult(&buf, agent) });
+                    const sent = sentResult(&buf, agent);
+                    const result = if (ready.created and self.forgetUserClosed(agent))
+                        try alloc.print("{s} The user closed the earlier {s}, so this one starts with no history.", .{ sent, agent })
+                    else
+                        sent;
+                    return self.encodeManaged(alloc, .{ .ok = true, .result = result });
                 },
                 .completed => |completed| {
                     if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = completed.child_id, .work_id = operation_id, .phase = .replayed } });
@@ -983,6 +995,28 @@ pub const Runtime = struct {
             self.alloc.free(owned);
             return self.logLostDrop(child_id, dropped);
         };
+    }
+
+    /// Keeps `name`, a subagent the user closed, for main's status and the
+    /// message that starts a new one under it. Hold the admission mutex.
+    fn noteUserClosedLocked(self: *Runtime, name: []const u8) void {
+        for (self.user_closed.items) |known| if (std.mem.eql(u8, known, name)) return;
+        self.user_closed.ensureUnusedCapacity(self.alloc, 1) catch return lostUserClose(name);
+        const owned = self.alloc.dupe(u8, name) catch return lostUserClose(name);
+        self.user_closed.appendAssumeCapacity(owned);
+    }
+
+    /// Forgets `name`, which a new subagent now has. True when the user had
+    /// closed one under it.
+    fn forgetUserClosed(self: *Runtime, name: []const u8) bool {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        for (self.user_closed.items, 0..) |known, index| {
+            if (!std.mem.eql(u8, known, name)) continue;
+            self.alloc.free(self.user_closed.swapRemove(index));
+            return true;
+        }
+        return false;
     }
 
     fn logLostDrop(_: *Runtime, child_id: []const u8, dropped: usize) void {
@@ -1419,6 +1453,12 @@ pub const Runtime = struct {
             try out.writer.print(", reports {s}", .{@tagName(child.report_rule)});
             listed += 1;
         }
+        for (self.user_closed.items) |name| {
+            if (agent) |wanted| if (!std.mem.eql(u8, wanted, name)) continue;
+            if (listed > 0) try out.writer.writeByte('\n');
+            try out.writer.print("{s}: closed by the user; a message to it starts a new one with no history", .{name});
+            listed += 1;
+        }
         if (agent != null and listed == 0) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_unavailable" });
         if (listed == 0) try out.writer.writeAll("No subagents yet.");
         return self.encodeManaged(alloc, .{ .ok = true, .result = out.written() });
@@ -1485,13 +1525,17 @@ pub const Runtime = struct {
     /// that the user closed it. The app drops the child's agent once it
     /// takes the child from `takeClosed`. False when there is no such child.
     pub fn closeChild(self: *Runtime, child_id: []const u8, by: CloseBy) !?Closed {
-        {
+        var name_buf: [domain.max_agent_name_bytes]u8 = undefined;
+        const name: ?[]const u8 = blk: {
             var lock = self.managed.state_store.acquireLock();
             defer lock.release();
             var registry = try self.managed.state_store.load(self.alloc);
             defer registry.deinit(self.alloc);
-            if (registry.findById(child_id) == null) return null;
-        }
+            const child = registry.findById(child_id) orelse return null;
+            const value = child.agentName() orelse break :blk null;
+            @memcpy(name_buf[0..value.len], value);
+            break :blk name_buf[0..value.len];
+        };
         const result: Closed, const settle_now = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
@@ -1510,6 +1554,7 @@ pub const Runtime = struct {
             }
             // A user's close tells the parent what it dropped, as a stop does.
             if (by == .user) self.noteUserDropLocked(child_id, dropped, true);
+            if (by == .user) if (name) |value| self.noteUserClosedLocked(value);
             // The parent's close drops the closed turn's unread messages
             // and counts them, as its stop does.
             var unread: usize = 0;
@@ -2058,6 +2103,10 @@ pub const Runtime = struct {
         };
     }
 };
+
+fn lostUserClose(name: []const u8) void {
+    debug_trace.logf("mailbox", "user close not noted agent={s} reason=out_of_memory", .{name});
+}
 
 fn operationIdAlloc(
     alloc: Allocator,
@@ -2891,6 +2940,43 @@ test "the user's close tells main how many of its messages waiting for the subag
     try std.testing.expect(std.mem.find(u8, report, "The user closed it before it finished.") != null);
     try std.testing.expect(std.mem.endsWith(u8, report, " dropped=1"));
     try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+}
+
+test "after the user closes a subagent, main's status and the message that starts a new one under its name say so, once" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "tester", .message = "first" } }, "call-2", null);
+    try waitUntilQuiet(runtime);
+    _ = (try runtime.closeChild(try reviewerId(runtime, arena), .user)).?;
+    // Main's own close is no news to main.
+    {
+        var registry = try runtime.managed.state_store.load(arena);
+        _ = (try runtime.closeChild(registry.findPersistent("tester").?.id, .parent)).?;
+    }
+    const status = try callTool(runtime, arena, .{ .status = .{} }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, status, "reviewer: closed by the user") != null);
+    try std.testing.expect(std.mem.find(u8, status, "tester") == null);
+    const sent = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-4", null);
+    try std.testing.expect(std.mem.find(u8, sent, "The user closed the earlier reviewer, so this one starts with no history.") != null);
+    try waitUntilQuiet(runtime);
+    const later = try callTool(runtime, arena, .{ .status = .{} }, "call-5", null);
+    try std.testing.expect(std.mem.find(u8, later, "closed by the user") == null);
+    const taken = try runtime.takeClosed(alloc);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
 }
 
 test "an idle subagent closes at once, and its name then starts a new one" {
