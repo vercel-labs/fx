@@ -269,7 +269,8 @@ test("fault: add and remove fail cleanly when the project folder is read-only, o
   expect(sha(s.paths.profile)).toBe(large);
 }, 240_000);
 
-test("fault: a write the system refuses leaves the profile as it was, and an entry the reader skips never reaches the write", async () => {
+// The shim is built with macOS calls (F_GETPATH, renameatx_np), so this runs on macOS only; CI's TLA job is Linux.
+test.skipIf(process.platform !== "darwin")("fault: a write the system refuses leaves the profile as it was, and an entry the reader skips never reaches the write", async () => {
   const s = new Scenario("config-edit-refused-write", { st: "ok", ent: { a: "ok" } }, NONE);
   const folder = realpathSync(join(s.f.home, ".fx"));
   const arm = join(s.f.base, "armed");
