@@ -2,6 +2,7 @@ const std = @import("std");
 const observation = @import("../agent/runtime/observation.zig");
 const capability_retrieval = @import("capability_retrieval.zig");
 const types = @import("../shared/types.zig");
+const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const context_limits = @import("../config/context_limits.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -415,11 +416,22 @@ fn callAdvertisedDynamicTool(
         input.options,
     );
 }
+/// The result of a direct call of an MCP tool the request didn't send. The
+/// name is the model's, so it is written as visible text.
 pub fn notSelectedOutput(arena: Allocator, name: []const u8) ![]const u8 {
+    const shown = model_context_encoding.scalar(name);
     return arena.print(
-        "Dynamic MCP tool not selected for this model step: {s}. Use capability_search or mcp_select_tool to load its definition; the selected tool can be called on the next model step after its schema is advertised.",
-        .{name},
+        "{f} is not one of the tools in this request. Open it with toolbox to see its arguments, then call toolbox with run: \"{f}\" and those arguments.",
+        .{ shown, shown },
     );
+}
+
+test "a direct call of a tool the request didn't send names it as visible text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const text = try notSelectedOutput(arena_state.allocator(), "mcp_x\x00y");
+    try std.testing.expect(std.mem.find(u8, text, "mcp_x&#x00;y is not one of the tools") != null);
+    for (text) |byte| try std.testing.expect(byte >= 0x20);
 }
 test "MCP advertised dynamic tool executes only through its supplied capability" {
     var fixture = Fixture.CountingContext{};

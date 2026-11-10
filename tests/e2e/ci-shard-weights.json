@@ -20,6 +20,7 @@
   { "file": "mcp-http.test.ts", "weight": 8 },
   { "file": "mcp-legacy-remote.test.ts", "weight": 90 },
   { "file": "mcp-stdio.test.ts", "weight": 129 },
+  { "file": "toolbox.test.ts", "weight": 12 },
   { "file": "mcp-verbs.test.ts", "weight": 23 },
   { "file": "notifications.test.ts", "weight": 9 },
   { "file": "oauth-keychain-migration.test.ts", "weight": 30 },

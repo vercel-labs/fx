@@ -5055,9 +5055,9 @@ test "processQueuedPrompt places transient overlay before history and current pr
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
 
-test "processQueuedPrompt keeps search advertised after an empty search" {
+test "processQueuedPrompt keeps toolbox advertised after an empty search" {
     const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("search_empty", "capability_search", "{\"query\":\"missing capability\"}")};
+    const calls = [_]ToolCall{toolCall("search_empty", "toolbox", "{\"search\":\"missing capability\"}")};
     const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Final" } };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -5067,8 +5067,8 @@ test "processQueuedPrompt keeps search advertised after an empty search" {
     hooks.exec_plans = &.{.{ .result = .{ .model_output = "{\"state\":\"no_match\",\"skills\":[],\"tools\":[]}" } }};
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.advertised_tool_names = &.{ "capability_search", "skill" };
-    config.advertised_functions = &.{ builtin_tools.capability_search.model_schema, builtin_tools.skill.model_schema };
+    config.advertised_tool_names = &.{"toolbox"};
+    config.advertised_functions = &.{builtin_tools.toolbox.model_schema};
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
@@ -5078,7 +5078,7 @@ test "processQueuedPrompt keeps search advertised after an empty search" {
         var found = false;
         for (parsed.value.object.get("tools").?.array.items) |tool| {
             const name = tool.object.get("name") orelse continue;
-            if (name == .string and std.mem.eql(u8, name.string, "capability_search")) found = true;
+            if (name == .string and std.mem.eql(u8, name.string, "toolbox")) found = true;
         }
         if (!found) return if (index == 0) error.MissingInitialSearchSchema else error.SearchSchemaLostAfterNoMatch;
     }
@@ -5098,8 +5098,8 @@ test "processQueuedPrompt retains complete skill content without granting ordina
         const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
         defer alloc.free(result_dir);
         const calls = [_]ToolCall{
-            toolCall("skill_one", "skill", "{\"location\":\"/skills/one\"}"),
-            toolCall("skill_two", "skill", "{\"location\":\"/skills/two\"}"),
+            toolCall("skill_one", "toolbox", "{\"open\":\"/skills/one\"}"),
+            toolCall("skill_two", "toolbox", "{\"open\":\"/skills/two\"}"),
         };
         const count: usize = if (case.parallel) 2 else 1;
         const completions = [_]FakeCompletion{
@@ -5119,8 +5119,8 @@ test "processQueuedPrompt retains complete skill content without granting ordina
         var fixture = PromptFixture{};
         var config = fixture.config();
         config.tool_result_dir = result_dir;
-        config.advertised_tool_names = &.{"skill"};
-        config.advertised_functions = &.{builtin_tools.skill.model_schema};
+        config.advertised_tool_names = &.{"toolbox"};
+        config.advertised_functions = &.{builtin_tools.toolbox.model_schema};
         try runFakePrompt(&gateway, &hooks, config, fixture.job());
         try std.testing.expectEqual(count, hooks.executed_names.items.len);
         try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
