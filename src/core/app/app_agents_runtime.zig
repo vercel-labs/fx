@@ -1045,7 +1045,8 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// The switch order, with each instance's subagents sorted
-        /// (`sortSubagentGroups`).
+        /// (`sortSubagentGroups`) and each subagent's own right under it
+        /// (`nestSubagents`).
         pub fn switchList(app: *App, out: *std.ArrayList(?*ChildAgent)) !void {
             const hosted = app.child_agents.items;
             const entries = try app.alloc.alloc(OrderEntry, hosted.len);
