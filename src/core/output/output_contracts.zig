@@ -1667,7 +1667,7 @@ pub const SessionDetailSnapshot = struct {
         if (self.address) |address| try out.writer.print("address: {s}\n", .{address});
         try out.writer.print("created_at_ms: {d}\n", .{state.created_at_ms});
         try out.writer.print("updated_at_ms: {d}\n", .{state.updated_at_ms});
-        try out.writer.print("language: {s}\n", .{state.conversation_language.view()});
+        try out.writer.print("language: {f}\n", .{text_utils.terminalSafe(state.conversation_language.view())});
         try out.writer.print("history_len: {d}\n", .{state.history.len});
         if (self.tail != null) try out.writer.print("first_turn: {d}\n", .{first + 1});
 
@@ -1678,7 +1678,7 @@ pub const SessionDetailSnapshot = struct {
 
         for (state.history[first..], first..) |turn, i| {
             try out.writer.print("\n[turn {d}]\n", .{i + 1});
-            try writeSessionHistoryTurnText(&out.writer, turn);
+            try writeSessionHistoryTurnText(&out.writer, alloc, turn);
         }
 
         return try out.toOwnedSlice();
@@ -1761,6 +1761,53 @@ test "--tail keeps the last turns under their own numbers for every length and c
     }
 }
 
+test "session detail text shows saved control bytes as escapes and keeps lines and tabs" {
+    const alloc = std.testing.allocator;
+    var user_text = "ask \x1b]0;owned\x07\r\nline two\ttab".*;
+    var assistant_text = "answer \x1b[2J".*;
+    var step_text = "step \x9b".*;
+    var call_id = "call\x1b".*;
+    var tool_name = "shell\x07".*;
+    var output = "out \xc2\x9b2J".*;
+    var path = "dir/\x1b[31mname".*;
+    var calls = [_]types.ToolCall{.{ .id = &call_id, .name = &tool_name, .arguments_json = "{\"x\":\"\x1b\"}" }};
+    var results = [_]types.PersistedToolResult{.{ .tool_call_id = &call_id, .tool_name = &tool_name, .status = .success, .output = &output, .output_bytes = output.len, .stored_output_bytes = output.len }};
+    var steps = [_]types.ToolExecutionStep{.{ .assistant = &step_text, .tool_calls = &calls, .tool_results = &results }};
+    var files = [_]types.FileEvidence{.{ .path = &path, .tool_call_id = &call_id, .tool_name = &tool_name }};
+    var completed = [_][]u8{&tool_name};
+    var history = [_]types.HistoryTurn{
+        .{ .assistant = .{ .user = .{ .text = &user_text }, .assistant = &assistant_text, .execution = .{ .tool_steps = &steps, .files = &files } } },
+        .{ .interrupted = .{ .user = .{ .text = &user_text }, .tool_call = calls[0], .completed_tool_names = &completed } },
+    };
+    var model = "m".*;
+    const snapshot: SessionDetailSnapshot = .{ .state = .{
+        .id = @constCast("abc"),
+        .origin_workspace_root = @constCast("/Users/example/w"),
+        .workspace_root = @constCast("/Users/example/w"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = types.ConversationLanguage.default(),
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .history = &history,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    }, .tail = 1 };
+    for ([_]SessionDetailSnapshot{ snapshot, .{ .state = snapshot.state } }) |shown| {
+        const text = try shown.renderText(alloc);
+        defer alloc.free(text);
+        try std.testing.expect(text_utils.isTerminalSafeText(text));
+        // Lines and tabs stay, and a CRLF ends a line.
+        try std.testing.expect(std.mem.find(u8, text, "ask \\x1b]0;owned\\x07\nline two\ttab\n") != null);
+        try std.testing.expect(std.mem.find(u8, text, "tool_name: shell\\x07\n") != null);
+        try std.testing.expect(std.mem.find(u8, text, "completed_tools: shell\\x07\n") != null);
+    }
+    const whole = try (SessionDetailSnapshot{ .state = snapshot.state }).renderText(alloc);
+    defer alloc.free(whole);
+    for ([_][]const u8{ "answer \\x1b[2J\n", "step \\x9b\n", "tool_call: call\\x1b shell\\x07\n", "tool_result: call\\x1b shell\\x07 success\noutput:\nout \\u{009b}2J\n", "dir/\\x1b[31mname\n" }) |expected| {
+        try std.testing.expect(std.mem.find(u8, whole, expected) != null);
+    }
+}
+
 /// `fx sessions --live`: each session an fx process has open now, with its
 /// subagents, nested under the subagent that started them.
 pub const LiveSessionListSnapshot = struct {
@@ -1783,7 +1830,8 @@ pub const LiveSessionListSnapshot = struct {
             try out.writer.writeAll(" - ");
             try writeTerminalSafe(&out.writer, alloc, entry.summary.title orelse session_display_metadata.fallback_title);
             try out.writer.print("\n   id={s} | {s} | ", .{ entry.summary.id, @tagName(entry.state) });
-            try writeTerminalSafe(&out.writer, alloc, entry.model orelse "unknown model");
+            try out.writer.writeAll("saved model ");
+            try writeTerminalSafe(&out.writer, alloc, entry.saved_model orelse "unknown");
             try out.writer.writeAll(" | updated ");
             try writeLocalTimestamp(&out.writer, entry.summary.updated_at_ms);
             try out.writer.writeByte('\n');
@@ -1809,8 +1857,8 @@ pub const LiveSessionListSnapshot = struct {
             try std.json.Stringify.value(entry.summary.title orelse session_display_metadata.fallback_title, .{}, &out.writer);
             try out.writer.writeAll(",\"workspace_root\":");
             try std.json.Stringify.value(entry.summary.workspace_root, .{}, &out.writer);
-            try out.writer.writeAll(",\"model\":");
-            try std.json.Stringify.value(entry.model, .{}, &out.writer);
+            try out.writer.writeAll(",\"saved_model\":");
+            try std.json.Stringify.value(entry.saved_model, .{}, &out.writer);
             try out.writer.print(",\"state\":\"{s}\",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"agents\":", .{ @tagName(entry.state), entry.summary.created_at_ms, entry.summary.updated_at_ms });
             try writeLiveAgentsJson(&out.writer, entry.agents);
             try out.writer.writeByte('}');
@@ -1853,7 +1901,7 @@ test "a live listing prints each subagent under the one that started it, and esc
     const lead: session_store.LiveAgent = .{ .name = "lead", .address = "abc/lead", .id = "l1", .state = .idle, .agents = &.{helper} };
     const sessions = [_]session_store.LiveSession{.{
         .summary = .{ .id = @constCast("abc"), .title = @constCast("Fix \x1b[31mred"), .workspace_root = @constCast("/Users/example/w"), .created_at_ms = 1, .updated_at_ms = 2, .conversation_language = types.ConversationLanguage.default(), .history_len = 0 },
-        .model = "openai/gpt-5",
+        .saved_model = "openai/gpt-5",
         .state = .working,
         .agents = &.{lead},
     }};
@@ -1861,7 +1909,7 @@ test "a live listing prints each subagent under the one that started it, and esc
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.startsWith(u8, text, "[sessions] 1 live\n - Fix "));
     try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
-    try std.testing.expect(std.mem.find(u8, text, "   id=abc | working | openai/gpt-5 | updated ") != null);
+    try std.testing.expect(std.mem.find(u8, text, "   id=abc | working | saved model openai/gpt-5 | updated ") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "   workspace=/Users/example/w\n   - lead | idle | abc/lead\n     - helper | working | abc/lead/helper\n"));
     const json = try (LiveSessionListSnapshot{ .sessions = &sessions }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
@@ -2525,32 +2573,32 @@ fn checkStatusLabel(status: doctor_runtime.CheckStatus) []const u8 {
     };
 }
 
-fn writeSessionHistoryTurnText(writer: *std.Io.Writer, turn: types.HistoryTurn) !void {
+fn writeSessionHistoryTurnText(writer: *std.Io.Writer, alloc: Allocator, turn: types.HistoryTurn) !void {
     switch (turn) {
         .compacted_summary => |entry| {
             try writer.print("[compacted] removed_turns={d} compactions={d}\n", .{ entry.removed_turn_count, entry.compaction_count });
-            var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            var arena_state = std.heap.ArenaAllocator.init(alloc);
             defer arena_state.deinit();
             const rendered = compactor.modelText(arena_state.allocator(), entry.summary) catch null;
-            try writeTextBlock(writer, rendered orelse entry.summary);
+            try writeTextBlock(writer, alloc, rendered orelse entry.summary);
         },
         .assistant => |entry| {
-            try writeSessionUserTurnText(writer, entry.user);
-            try writeSessionExecutionText(writer, entry.execution);
+            try writeSessionUserTurnText(writer, alloc, entry.user);
+            try writeSessionExecutionText(writer, alloc, entry.execution);
             try writer.writeAll("[assistant]\n");
-            try writeTextBlock(writer, entry.assistant);
+            try writeTextBlock(writer, alloc, entry.assistant);
         },
         .interrupted => |entry| {
-            try writeSessionUserTurnText(writer, entry.user);
-            try writeSessionExecutionText(writer, entry.execution);
+            try writeSessionUserTurnText(writer, alloc, entry.user);
+            try writeSessionExecutionText(writer, alloc, entry.execution);
             if (entry.assistant) |assistant| {
                 try writer.writeAll("[assistant]\n");
-                try writeTextBlock(writer, assistant);
+                try writeTextBlock(writer, alloc, assistant);
             }
             try writer.writeAll("[interrupted]\n");
             if (entry.tool_call) |tool_call| {
-                try writer.print("tool_call_id: {s}\n", .{tool_call.id});
-                try writer.print("tool_name: {s}\n", .{tool_call.name});
+                try writer.print("tool_call_id: {f}\n", .{text_utils.terminalSafe(tool_call.id)});
+                try writer.print("tool_name: {f}\n", .{text_utils.terminalSafe(tool_call.name)});
             } else {
                 try writer.writeAll("tool: (none)\n");
             }
@@ -2558,7 +2606,7 @@ fn writeSessionHistoryTurnText(writer: *std.Io.Writer, turn: types.HistoryTurn) 
                 try writer.writeAll("completed_tools: ");
                 for (entry.completed_tool_names, 0..) |name, i| {
                     if (i > 0) try writer.writeAll(", ");
-                    try writer.writeAll(name);
+                    try writer.print("{f}", .{text_utils.terminalSafe(name)});
                 }
                 try writer.writeByte('\n');
             }
@@ -2566,56 +2614,62 @@ fn writeSessionHistoryTurnText(writer: *std.Io.Writer, turn: types.HistoryTurn) 
     }
 }
 
-fn writeSessionExecutionText(writer: *std.Io.Writer, execution: types.ExecutionMemory) !void {
+fn writeSessionExecutionText(writer: *std.Io.Writer, alloc: Allocator, execution: types.ExecutionMemory) !void {
     if (execution.isEmpty()) return;
 
     try writer.writeAll("[execution]\n");
     for (execution.tool_steps) |step| {
         if (step.assistant) |assistant| {
             try writer.writeAll("assistant:\n");
-            try writeTextBlock(writer, assistant);
+            try writeTextBlock(writer, alloc, assistant);
         }
         for (step.tool_calls) |call| {
-            try writer.print("tool_call: {s} {s}\n", .{ call.id, call.name });
+            try writer.print("tool_call: {f} {f}\n", .{ text_utils.terminalSafe(call.id), text_utils.terminalSafe(call.name) });
             try writer.writeAll("arguments:\n");
-            try writeTextBlock(writer, call.arguments_json);
+            try writeTextBlock(writer, alloc, call.arguments_json);
         }
         for (step.tool_results) |result| {
             try writer.print(
-                "tool_result: {s} {s} {s}\n",
-                .{ result.tool_call_id, result.tool_name, @tagName(result.status) },
+                "tool_result: {f} {f} {s}\n",
+                .{ text_utils.terminalSafe(result.tool_call_id), text_utils.terminalSafe(result.tool_name), @tagName(result.status) },
             );
             try writer.writeAll("output:\n");
-            try writeTextBlock(writer, result.output);
+            try writeTextBlock(writer, alloc, result.output);
         }
     }
     for (execution.files) |file| {
         try writer.print(
-            "file: {s} {s} {s}\n",
-            .{ @tagName(file.action), @tagName(file.status), file.path },
+            "file: {s} {s} {f}\n",
+            .{ @tagName(file.action), @tagName(file.status), text_utils.terminalSafe(file.path) },
         );
     }
 }
 
-fn writeSessionUserTurnText(writer: *std.Io.Writer, user: types.UserTurn) !void {
+fn writeSessionUserTurnText(writer: *std.Io.Writer, alloc: Allocator, user: types.UserTurn) !void {
     try writer.writeAll("[user]\n");
-    try writeTextBlock(writer, user.text);
+    try writeTextBlock(writer, alloc, user.text);
     if (user.images.len > 0) {
         try writer.print("[images] {d}\n", .{user.images.len});
         for (user.images) |image| {
-            try writer.print(" - {s} ({s})\n", .{ image.path, image.media_type });
+            try writer.print(" - {f} ({f})\n", .{ text_utils.terminalSafe(image.path), text_utils.terminalSafe(image.media_type) });
         }
     }
 }
 
-fn writeTextBlock(writer: *std.Io.Writer, text: []const u8) !void {
+/// Saved text as a terminal can show it: lines and tabs stay, and every
+/// other control byte becomes a visible escape, so a model's or a tool's
+/// own sequences never reach the terminal.
+fn writeTextBlock(writer: *std.Io.Writer, alloc: Allocator, text: []const u8) !void {
     if (text.len == 0) {
         try writer.writeAll("(empty)\n");
         return;
     }
 
-    try writer.writeAll(text);
-    if (text[text.len - 1] != '\n') try writer.writeByte('\n');
+    var safe: std.ArrayList(u8) = .empty;
+    defer safe.deinit(alloc);
+    try text_utils.appendTerminalSafeText(alloc, &safe, text);
+    try writer.writeAll(safe.items);
+    if (safe.items.len == 0 or safe.items[safe.items.len - 1] != '\n') try writer.writeByte('\n');
 }
 
 fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) !void {

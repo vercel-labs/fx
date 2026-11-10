@@ -137,7 +137,7 @@ pub const LiveSession = struct {
     summary: SessionSummary,
     /// The model saved with the session, null when none can be read. A run
     /// can use another, such as through `FX_MODEL`, without saving it.
-    model: ?[]const u8,
+    saved_model: ?[]const u8,
     state: LiveState,
     agents: []const LiveAgent,
 };

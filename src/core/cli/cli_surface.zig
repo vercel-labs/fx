@@ -3534,11 +3534,18 @@ fn runSessionDetail(
             return writeRootDetail(alloc, deps, &store, page.summaries.items[0].id, format, tail);
         },
         .id => |id| {
-            const address = session_adapter.parseAgentAddress(id) catch |err| {
+            const parsed = session_adapter.parseSessionTarget(id) catch |err| {
                 try writeLookupFailure(alloc, deps, "session", err, format);
                 return .handled_failure;
-            } orelse return writeRootDetail(alloc, deps, &store, id, format, tail);
-            return writeAgentDetail(alloc, deps, &store, id, address, format, tail);
+            };
+            switch (parsed) {
+                .session => return writeRootDetail(alloc, deps, &store, id, format, tail),
+                .agent => |address| return writeAgentDetail(alloc, deps, &store, id, address, format, tail),
+                .invalid => |problem| {
+                    try writeAgentAddressInvalid(alloc, deps, id, problem, format);
+                    return .handled_failure;
+                },
+            }
         },
     }
 }
@@ -3588,6 +3595,22 @@ fn writeAgentDetail(
     };
     defer resumed.deinit(alloc);
     return writeSessionDetail(alloc, deps, resumed.state, format, tail, target);
+}
+
+/// `text` is an agent address no subagent can have: says which part is at
+/// fault and why.
+fn writeAgentAddressInvalid(
+    alloc: Allocator,
+    deps: RunDeps,
+    text: []const u8,
+    problem: session_adapter.AddressProblem,
+    format: output_contracts.OutputFormat,
+) !void {
+    var message: std.Io.Writer.Allocating = .init(alloc);
+    defer message.deinit();
+    try problem.describe(&message.writer, text);
+    if (format == .json) return writeJsonCommandFailureCode(alloc, deps, "session", "InvalidAgentAddress", message.written());
+    try writeStderrLine(alloc, deps, "fx session: {s}\n", message.written());
 }
 
 /// No subagent of `parent` goes by `name`: says so, with the names its

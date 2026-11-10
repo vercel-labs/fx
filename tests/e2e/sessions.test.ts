@@ -3491,7 +3491,7 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
       // A session in its first turn has no title yet.
       title: "Untitled session",
       workspace_root: fixture.workspace,
-      model: savedModel(fixture, working!),
+      saved_model: savedModel(fixture, working!),
       state: "working",
       created_at_ms: expect.any(Number),
       updated_at_ms: expect.any(Number),
@@ -3511,11 +3511,11 @@ test("fx sessions --live lists the sessions other fx processes hold, with their 
     expect(text.stdout.replace(/updated [^\n]+/g, "updated <time>")).toBe([
       "[sessions] 2 live",
       " - Delegate the live review.",
-      `   id=${delegating} | idle | ${savedModel(fixture, delegating!)} | updated <time>`,
+      `   id=${delegating} | idle | saved model ${savedModel(fixture, delegating!)} | updated <time>`,
       `   workspace=${other}`,
       `   - reviewer | working | ${delegating}/reviewer`,
       " - Untitled session",
-      `   id=${working} | working | ${savedModel(fixture, working!)} | updated <time>`,
+      `   id=${working} | working | saved model ${savedModel(fixture, working!)} | updated <time>`,
       `   workspace=${fixture.workspace}`,
       "",
     ].join("\n"));
@@ -3600,6 +3600,33 @@ test("fx session --tail prints the last turns of a held session under their own 
   }
 }, TIMEOUT * 3);
 
+test("fx session shows saved control bytes as visible escapes, with --tail and without", async () => {
+  const fixture = createFixture("fx-v2-escape-");
+  const saved = "TITLE \x1b]0;owned\x07 CLEAR \x1b[2J\nSECOND\tLINE";
+  const gateway = replyToLatest([
+    ["Escape turn one.", "PLAIN_ANSWER"],
+    ["Escape turn two.", saved],
+  ]);
+  try {
+    const id = JSON.parse((await ask(fixture, gateway, ["Escape turn one."])).stdout).session_id;
+    expect((await ask(fixture, gateway, ["--resume", id, "Escape turn two."])).code).toBe(0);
+    for (const args of [["session", id], ["session", id, "--tail", "1"]]) {
+      const shown = await command(fixture, gateway, args);
+      expect(shown.code).toBe(0);
+      expect(shown.stderr).toBe("");
+      // The terminal gets no escape or bell, and lines and tabs stay.
+      expect(shown.stdout).not.toMatch(/[\x1b\x07]/);
+      expect(shown.stdout).toContain("TITLE \\x1b]0;owned\\x07 CLEAR \\x1b[2J\nSECOND\tLINE\n");
+    }
+    // JSON keeps the saved text as it is.
+    const json = JSON.parse((await command(fixture, gateway, ["session", id, "--tail", "1", "--json"])).stdout);
+    expect(json.history[0].assistant).toBe(saved);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 2);
+
 test("fx session <id>/<agent> reads a subagent by the name its parent gave it", async () => {
   const fixture = createFixture("fx-v2-agent-read-");
   let round: 1 | 2 = 1;
@@ -3645,12 +3672,26 @@ test("fx session <id>/<agent> reads a subagent by the name its parent gave it", 
     const deeper = await command(fixture, gateway, ["session", `${id}/reviewer/helper`, "--json"]);
     expect(deeper.code).toBe(1);
     expect(JSON.parse(deeper.stdout).error).toBe(`session ${id}/reviewer has no agent named helper; it has no agents`);
-    // An address with an empty part names no session.
-    for (const target of [`${id}/`, "/reviewer", `${id}//reviewer`]) {
-      const bad = await command(fixture, gateway, ["session", target, "--json"]);
+    // A part no subagent can have is named, with the rule it breaks.
+    const rule = 'agent names are lowercase letters, digits, "_", and "-", start with a letter or digit, and are at most 64 bytes';
+    for (const [target, message] of [
+      [`${id}/Reviewer`, `Reviewer is not an agent name; ${rule}`],
+      [`${id}/reviewer/x.y`, `x.y is not an agent name; ${rule}`],
+      [`${id}/`, `${id}/ has an empty agent name`],
+      [`${id}//reviewer`, `${id}//reviewer has an empty agent name`],
+      [`${id}/a/b/c/d/e`, `${id}/a/b/c/d/e goes more than 4 agents deep`],
+    ]) {
+      const bad = await command(fixture, gateway, ["session", target!, "--json"]);
       expect(bad.code).toBe(1);
-      expect(JSON.parse(bad.stdout).code).toBe("InvalidSessionId");
+      expect(JSON.parse(bad.stdout)).toMatchObject({ kind: "session", code: "InvalidAgentAddress", error: message });
+      const badText = await command(fixture, gateway, ["session", target!]);
+      expect(badText.code).toBe(1);
+      expect(badText.stderr).toBe(`fx session: ${message}\n`);
     }
+    // A root that is not a session id is still an invalid session id.
+    const noRoot = await command(fixture, gateway, ["session", "/reviewer", "--json"]);
+    expect(noRoot.code).toBe(1);
+    expect(JSON.parse(noRoot.stdout).code).toBe("InvalidSessionId");
     // A child is still reached only through its parent.
     const direct = await command(fixture, gateway, ["session", childId, "--json"]);
     expect(direct.code).toBe(1);
@@ -3750,7 +3791,7 @@ test("fx sessions --live lists a live session whose log is damaged, skips a fold
     const listed = await liveSessions(fixture, gateway);
     const byId = new Map(listed.sessions.map((entry: any) => [entry.id, entry]));
     expect([...byId.keys()].sort()).toEqual([damaged, delegating].sort());
-    expect(byId.get(damaged)).toMatchObject({ state: "unknown", model: null, agents: [] });
+    expect(byId.get(damaged)).toMatchObject({ state: "unknown", saved_model: null, agents: [] });
     expect((byId.get(delegating!) as any).agents).toEqual([
       { name: "checker", address: `${delegating}/checker`, id: childId, state: "working", agents: [] },
     ]);
