@@ -1224,6 +1224,7 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             }
             if (try routeMcpHostMenuByte(app, byte)) return true;
+            if (try routeForkQuestionByte(app, agent, byte)) return true;
             if (activeCompactCommandMenu(app)) |menu| {
                 if (byte >= 0x80) {
                     input_reset.resetPendingTextScalarWithTrace(
@@ -1441,7 +1442,7 @@ pub fn Runtime(comptime App: type) type {
                     if (try submitSlashPickerSelection(app, agent)) return;
                     if (comptime runtime_profile.allows(App, .durable_sessions)) {
                         if (try submitSessionPickerSelection(app, agent)) return;
-                        if (try submitForkMenuSelection(app, agent, max_input_len)) return;
+                        if (try submitForkMenuSelection(app, agent, null, max_input_len)) return;
                     }
                     if (try completion_rt.submitFilePickerOnEnter(app, agent, max_input_len)) |result| {
                         if (result == .limit_exceeded) {
@@ -1805,16 +1806,23 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Forks before the selected prompt and puts its text in the composer.
-        fn submitForkMenuSelection(app: *App, agent: *AppAgent, max_input_len: usize) !bool {
-            if (comptime !@hasDecl(App, "forkBeforeSelectedPrompt")) return false;
+        /// Enter on `/fork`'s prompts (`bring` null), or the answer to its
+        /// question whether the fork takes copies of the subagents (D97).
+        fn submitForkMenuSelection(app: *App, agent: *AppAgent, bring: ?bool, max_input_len: usize) !bool {
+            if (comptime !@hasDecl(App, "submitForkMenu")) return false;
             if (!forkMenuActive(agent)) return false;
-            const prompt = app.forkBeforeSelectedPrompt(agent) catch |err| {
+            const forked = app.submitForkMenu(agent, bring) catch |err| {
                 debug_trace.logf("session", "fork failed err={s}", .{@errorName(err)});
                 try app.writeDomainNotice(.{
                     .topic = "session",
                     .tone = .@"error",
                     .body = "Unable to fork the session.",
                 }, true);
+                app.shell.render_requests.request(.footer);
+                return true;
+            };
+            // The menu asks its question first.
+            const prompt = forked orelse {
                 app.shell.render_requests.request(.footer);
                 return true;
             };
@@ -1869,6 +1877,45 @@ pub fn Runtime(comptime App: type) type {
         fn sessionMenuActive(agent: *AppAgent) bool {
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
             return agent.session_persistence.session_picker.active;
+        }
+
+        /// While `/fork` asks whether the fork takes copies of the session's
+        /// subagents (D97), Enter or y answers yes and n answers no; Esc
+        /// also answers no (`answerForkQuestionOnEscape`). Other printable
+        /// bytes are dropped with a trace line, so a stray key never forks;
+        /// control bytes pass, so Ctrl+C still works.
+        fn routeForkQuestionByte(app: *App, agent: *AppAgent, byte: u8) !bool {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (!agent.session_persistence.fork_menu.asking()) return false;
+            const bring: ?bool = switch (byte) {
+                '\r', 'y', 'Y' => true,
+                'n', 'N' => false,
+                else => null,
+            };
+            if (bring) |yes| {
+                _ = try submitForkMenuSelection(app, agent, yes, forkPromptLimit());
+                return true;
+            }
+            if (byte < 0x20) return false;
+            if (byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(&app.input_runtime.text_scalar, "fork_question");
+            debug_trace.logf("input", "fork question ignored byte=0x{x} reason=not_an_answer", .{byte});
+            return true;
+        }
+
+        fn answerForkQuestionOnEscape(app: *App, agent: *AppAgent) !bool {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (!agent.session_persistence.fork_menu.asking()) return false;
+            return submitForkMenuSelection(app, agent, false, forkPromptLimit());
+        }
+
+        /// The composer's limit, which the fork's restored prompt keeps.
+        fn forkPromptLimit() usize {
+            return if (comptime @hasDecl(App, "input_limits"))
+                App.input_limits.composer_bytes
+            else
+                std.math.maxInt(usize);
         }
 
         fn forkMenuActive(agent: *AppAgent) bool {
@@ -2871,6 +2918,12 @@ pub fn Runtime(comptime App: type) type {
             if (try backAgentsMenu(app)) {
                 _ = disarmEscapeClear(app);
                 _ = disarmEscapeInterrupt(app, "menu");
+                return;
+            }
+            // Esc answers `/fork`'s question: fork without the subagents (D97).
+            if (try answerForkQuestionOnEscape(app, agent)) {
+                _ = disarmEscapeClear(app);
+                _ = disarmEscapeInterrupt(app, "fork_question");
                 return;
             }
             if (was_cancel_pending) {
