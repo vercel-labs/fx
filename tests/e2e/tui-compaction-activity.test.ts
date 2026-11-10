@@ -13,6 +13,7 @@ const {
   fakeShellRun, heldFakeGatewayFinalText, startDynamicFakeGateway,
   hasEmptyComposer, tmuxAvailable,
 } = await import("./tmux-helpers");
+const { HAS_API_KEY } = await import("../evals/eval-helpers");
 
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const HEAD = "HISTORY_HEAD_29b7";
@@ -762,4 +763,156 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       if (passed) rmSync(root, { recursive: true, force: true });
     }
   }, 90_000);
+});
+
+// A real model writes the summary of an automatic compaction that starts in
+// the middle of a turn. Opt in with FX_E2E_REAL_API=1 and an AI Gateway
+// credential; FX_COMPACTION_LIVE_MODEL picks another model.
+const LIVE_MODEL = process.env.FX_COMPACTION_LIVE_MODEL ?? "anthropic/claude-haiku-4.5";
+const LIVE = process.env.FX_E2E_REAL_API === "1" && HAS_API_KEY;
+// The turn row names its phase: thinking, running a tool, or generating.
+const LIVE_TURN_CLOCK = /(?:Thinking|Running|Generating) \(((?:\d+h)?(?:\d+m)?\d+s)\)/;
+// The summary line a finished turn leaves after it, such as `  12s (↑34 ↓433)`.
+const TURN_SUMMARY_LINE = /^  (?:\d+s|\d+m \d+s|\d+h \d{2}m)(?: \(↑[^\n]*\))?$/m;
+const LIVE_PROMPT = "Use read_file to read part1.txt, then part2.txt, then part3.txt, one file per step. Then reply with the single word DONE.";
+
+describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live model", () => {
+  test("live: compaction in the middle of a turn counts from zero with its step, and the turn clock goes on from where it stopped", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-live-compaction-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    // The earlier turn holds about 5k tokens and each part about 6k, so the
+    // turn's first request stays under 10% of the model's usable input and a
+    // later request in the same turn crosses it.
+    const body = (tag: string, lines: number) => Array.from({ length: lines }, (_, line) =>
+      `${tag} ${line}: notes on the river survey, gauge readings, and weather by the bank`).join("\n");
+    writeFileSync(join(workspace, "seed.txt"), body("seed", 200));
+    for (const part of [1, 2, 3]) {
+      writeFileSync(join(workspace, `part${part}.txt`), `${body(`part${part}`, 300)}\n`);
+    }
+    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+      model: LIVE_MODEL, auto_compact_percent: 10, auto_upgrade: false, startup_scrollback: false,
+    }));
+    // A local gateway plays the earlier turn, so only this turn and its
+    // compaction reach the live model.
+    const seedGateway = startDynamicFakeGateway((raw) => raw.includes('"seed-read"')
+      ? fakeGatewayFinalText("SEED_OK")
+      : fakeGatewayToolCall("seed-read", "read_file", { path: "seed.txt" }),
+    { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 200000, max_tokens: 64000 }] });
+    const stderrPath = join(root, "terminal.stderr");
+    const tracePath = join(root, "terminal.trace");
+    let terminal: InstanceType<typeof TmuxSession> | undefined;
+    const samples: { at: number; turn?: number; compaction?: number; step?: string }[] = [];
+    let passed = false;
+    try {
+      const seed = Bun.spawn([binary, "ask", "--json", "--auto", "Read seed.txt."], {
+        cwd: workspace, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root, AI_GATEWAY_API_KEY: "synthetic-seed-key",
+          FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_SOUND: "0",
+          FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: seedGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: seedGateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: seedGateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${seedGateway.baseUrl}/coding-agent/v1/models`,
+        },
+      });
+      const [seedCode, seedOut] = await Promise.all([seed.exited, new Response(seed.stdout).text()]);
+      expect(seedCode).toBe(0);
+      const sessionId = JSON.parse(seedOut).session_id as string;
+
+      terminal = await TmuxSession.create({
+        cmd: `${shellQuote(binary)} --resume ${shellQuote(sessionId)}`,
+        cwd: workspace,
+        env: {
+          HOME: home, TMPDIR: root,
+          AI_GATEWAY_API_KEY: process.env.AI_GATEWAY_API_KEY,
+          VERCEL_OIDC_TOKEN: process.env.VERCEL_OIDC_TOKEN,
+          FX_E2E_DISABLE_DOTENV: "1", FX_AUTO_UPGRADE: "0", FX_MODEL: LIVE_MODEL,
+          FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "compaction,worker",
+        },
+        isolated: true, width: 100, height: 32, stderrPath, startupWaitMs: 0,
+      });
+      await terminal.waitForStableComposer(30_000);
+      const sent = Date.now();
+      await terminal.sendText(LIVE_PROMPT);
+      let pane = "";
+      // The model may take more or fewer steps; the test waits for the turn
+      // to end, which leaves its summary line after the prompt.
+      const finished = (text: string) => {
+        const prompt = text.lastIndexOf("one file per step");
+        return prompt >= 0 && TURN_SUMMARY_LINE.test(text.slice(prompt)) && hasEmptyComposer(text);
+      };
+      while (Date.now() - sent < 240_000) {
+        pane = await terminal.capturePane();
+        const turn = LIVE_TURN_CLOCK.exec(pane);
+        const compaction = COMPACTION_CLOCK.exec(pane);
+        samples.push({
+          at: Date.now() - sent,
+          turn: turn ? clockSeconds(turn[1]!) : undefined,
+          compaction: compaction ? clockSeconds(compaction[1]!) : undefined,
+          step: compaction?.[2],
+        });
+        if (finished(pane)) break;
+        await Bun.sleep(100);
+      }
+      expect(finished(pane)).toBe(true);
+
+      // Each stretch of compaction rows, with the turn clock's last reading
+      // before it, how long before the stretch that was, and the turn
+      // clock's first reading after it.
+      type Episode = { before?: number; gap: number; first: number; most: number; steps: Set<string>; after?: number };
+      const episodes: Episode[] = [];
+      let lastTurn: { seconds: number; at: number } | undefined;
+      let compacting = false;
+      for (const sample of samples) {
+        if (sample.compaction !== undefined) {
+          if (!compacting) {
+            episodes.push({
+              before: lastTurn?.seconds, gap: lastTurn ? sample.at - lastTurn.at : 0,
+              first: sample.compaction, most: sample.compaction, steps: new Set(),
+            });
+          }
+          compacting = true;
+          const episode = episodes.at(-1)!;
+          episode.most = Math.max(episode.most, sample.compaction);
+          if (sample.step) episode.steps.add(sample.step);
+          continue;
+        }
+        compacting = false;
+        if (sample.turn === undefined) continue;
+        const open = episodes.at(-1);
+        if (open && open.after === undefined) open.after = sample.turn;
+        lastTurn = { seconds: sample.turn, at: sample.at };
+      }
+      console.log(`live compaction with ${LIVE_MODEL}: ${JSON.stringify(episodes.map((e) => ({ ...e, steps: [...e.steps] })))}`);
+      expect(episodes.length).toBeGreaterThan(0);
+      // At least one compaction came after the turn had shown its clock.
+      expect(episodes.some((episode) => episode.before !== undefined && episode.after !== undefined)).toBe(true);
+      for (const episode of episodes) {
+        expect(episode.first).toBeLessThanOrEqual(1);
+        expect(episode.steps.size).toBeGreaterThan(0);
+        if (episode.before === undefined || episode.after === undefined) continue;
+        // The turn goes on from where it stopped: at most the seconds from
+        // its last reading to the compaction, plus one for each sampling
+        // edge. The compaction's own seconds are not in it.
+        expect(episode.after).toBeGreaterThanOrEqual(episode.before);
+        expect(episode.after).toBeLessThanOrEqual(episode.before + Math.ceil(episode.gap / 1000) + 2);
+      }
+      expect(checkpoints(readFileSync(join(sessionDir(home, sessionId), "log.jsonl")))).toBeGreaterThan(0);
+      await terminal.sendText("/quit");
+      expect(await terminal.waitForSessionEnd(10_000)).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      passed = true;
+    } finally {
+      if (!passed) {
+        writeFileSync(join(root, "samples.json"), JSON.stringify(samples, null, 2));
+        if (terminal) writeFileSync(join(root, "failure.scrollback.txt"), await terminal.captureFullScrollback());
+        console.error(`live compaction evidence retained: ${root}`);
+      }
+      await terminal?.kill();
+      seedGateway.stop();
+      if (passed) rmSync(root, { recursive: true, force: true });
+    }
+  }, 300_000);
 });
