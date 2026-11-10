@@ -42,6 +42,16 @@ pub const StartCapturedInput = struct {
     /// `yield_time_ms`: the command is waiting on an `fx mcp call` whose
     /// owner is this call, which must not end before the answer does.
     yield_hold: ?*const std.atomic.Value(u32) = null,
+    /// Told once, on the command's worker thread, when its process has
+    /// ended, as `mcp_call_bridge.commandEnded` ends the command's
+    /// `fx mcp call` owner. `exitNoticeId` finds its id for a later wait.
+    on_exit: ?ExitNotice = null,
+};
+
+/// What a command's starter asks to be told when its process ends.
+pub const ExitNotice = struct {
+    id: u64,
+    notify: *const fn (id: u64) void,
 };
 
 pub const TtyCursor = struct {
@@ -192,6 +202,7 @@ const Entry = struct {
     output_chunk_ctx: ?*anyopaque = null,
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
     extra_environment: []const command_runner.EnvironmentVariable = &.{},
+    on_exit: ?ExitNotice = null,
     output_handle: ?[]const u8 = null,
     output_framed_bytes: usize = 0,
     stdout_bytes: usize = 0,
@@ -288,6 +299,7 @@ const Entry = struct {
             .output_chunk_ctx = input.output_chunk_ctx,
             .on_output_chunk = input.on_output_chunk,
             .extra_environment = extra_environment,
+            .on_exit = input.on_exit,
         };
         return entry;
     }
@@ -442,6 +454,9 @@ const Entry = struct {
             .captured => |*value| value,
             .tty, .tombstone => return,
         };
+        // After the final state is set, on every path, and before the
+        // thread exits, so nothing has freed the entry yet.
+        defer if (self.on_exit) |notice| notice.notify(notice.id);
         const started_ms = io_mod.milliTimestamp();
         const routed = execution_router.executePreparedRoute(.{
             .max_command_output_bytes = self.max_output_bytes,
@@ -877,6 +892,19 @@ pub const Runtime = struct {
         wait_ceiling_ms: u32,
         cancel_flag: ?*std.atomic.Value(bool),
     ) !PreparedSnapshot {
+        return self.waitHeld(alloc, execution_id, wait_ceiling_ms, cancel_flag, null);
+    }
+
+    /// `wait`, which also waits past `wait_ceiling_ms` while `hold` is above
+    /// zero, as `StartCapturedInput.yield_hold` does for the run call.
+    pub fn waitHeld(
+        self: *Runtime,
+        alloc: Allocator,
+        execution_id: []const u8,
+        wait_ceiling_ms: u32,
+        cancel_flag: ?*std.atomic.Value(bool),
+        hold: ?*const std.atomic.Value(u32),
+    ) !PreparedSnapshot {
         if (wait_ceiling_ms > contract.max_wait_ceiling_ms) {
             return error.InvalidWaitCeiling;
         }
@@ -908,10 +936,20 @@ pub const Runtime = struct {
             if (cancel_flag) |flag| {
                 if (flag.load(.seq_cst)) return error.Cancelled;
             }
-            if (io_mod.milliTimestamp() - started_ms >= wait_ceiling_ms) break;
+            const held = if (hold) |count| count.load(.acquire) > 0 else false;
+            if (io_mod.milliTimestamp() - started_ms >= wait_ceiling_ms and !held) break;
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
         return self.prepareSnapshotForEntry(alloc, entry);
+    }
+
+    /// The id of the exit notice the command `execution_id` started with,
+    /// or null for a command without one or no such command.
+    pub fn exitNoticeId(self: *Runtime, execution_id: []const u8) ?u64 {
+        const entry = self.acquireEntry(execution_id) orelse return null;
+        defer self.releaseEntry(entry);
+        const notice = entry.on_exit orelse return null;
+        return notice.id;
     }
 
     pub fn stop(

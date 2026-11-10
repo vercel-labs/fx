@@ -8,6 +8,7 @@
 //!
 //!   in:  {"event":"started","token":"t1"}
 //!        {"event":"request","token":"t1","version":1}
+//!        {"event":"lent","owner":"child"}
 //!        {"event":"authorized","id":0,"allow":true}
 //!        {"event":"call_finished","id":0,"outcome":"ok"}
 //!   out: {"state":{"open":true,"next":1,"registered":[...],"entries":[...]},"out":[...]}
@@ -31,7 +32,7 @@ const Input = struct {
     delivered: ?bool = null,
 };
 
-const RegisteredJson = struct { owner: []const u8, token: []const u8 };
+const RegisteredJson = struct { owner: []const u8, token: []const u8, lent: bool };
 const EntryJson = struct { id: u64, owner: []const u8, stage: mcp_call.Stage };
 const StateJson = struct {
     open: bool,
@@ -91,6 +92,8 @@ fn event(input: Input) InputError!mcp_call.Event {
         .token = try token(try need([]const u8, input.token)),
     } };
     if (std.mem.eql(u8, name, "owner_removed")) return .{ .owner_removed = try owner(try need([]const u8, input.owner)) };
+    if (std.mem.eql(u8, name, "lent")) return .{ .lent = try owner(try need([]const u8, input.owner)) };
+    if (std.mem.eql(u8, name, "lend_ended")) return .{ .lend_ended = try owner(try need([]const u8, input.owner)) };
     if (std.mem.eql(u8, name, "request")) return .{ .request = .{
         .token = try token(try need([]const u8, input.token)),
         .version = try need(u32, input.version),
@@ -107,6 +110,7 @@ fn effectJson(effect: mcp_call.Effect) EffectJson {
     return switch (effect) {
         .refuse => |reason| .{ .kind = "refuse", .reason = reason },
         .authorize => |work| .{ .kind = "authorize", .id = @backingInt(work.id), .owner = ownerName(work.owner) },
+        .wait => |work| .{ .kind = "wait", .id = @backingInt(work.id), .owner = ownerName(work.owner) },
         .call => |work| .{ .kind = "call", .id = @backingInt(work.id), .owner = ownerName(work.owner) },
         .withdraw => |id| .{ .kind = "withdraw", .id = @backingInt(id) },
         .cancel => |id| .{ .kind = "cancel", .id = @backingInt(id) },
@@ -118,7 +122,7 @@ fn effectJson(effect: mcp_call.Effect) EffectJson {
 fn writeLine(writer: *std.Io.Writer, state: *const mcp_call.State, effects: []const mcp_call.Effect) !void {
     const view = mcp_call.abstract(state);
     var registered: [mcp_call.max_owners]RegisteredJson = undefined;
-    for (view.owners(), 0..) |registration, index| registered[index] = .{ .owner = ownerName(registration.id), .token = tokenName(registration.token) };
+    for (view.owners(), 0..) |registration, index| registered[index] = .{ .owner = ownerName(registration.id), .token = tokenName(registration.token), .lent = registration.lent };
     var entries: [mcp_call.max_slots]EntryJson = undefined;
     for (view.entries(), 0..) |entry, index| entries[index] = .{ .id = @backingInt(entry.id), .owner = ownerName(entry.owner), .stage = entry.stage };
     var out: [mcp_call.max_effects]EffectJson = undefined;

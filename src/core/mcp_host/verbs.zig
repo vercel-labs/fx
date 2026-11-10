@@ -344,9 +344,11 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
             \\  help prints the arguments TOOL takes and what it does.
             \\  Works only in a command that fx's shell tool runs, while it runs, and
             \\  asks permission as a direct call of TOOL would; list, search, and
-            \\  help need none and show only the tools that agent may use.
+            \\  help need none and show only the tools that agent may use. In a
+            \\  command left running in the background, a call waits until the
+            \\  agent watches the command again.
             \\  Exits 0 on success, 1 when the call fails, 2 for a usage mistake,
-            \\  3 outside a running fx shell call, 4 when too many calls are
+            \\  3 outside a running fx shell command, 4 when too many calls are
             \\  running, 5 when permission is not granted, and 6 when the tool
             \\  returns an error.
             \\

@@ -116,8 +116,8 @@
     {
       "id": "S17",
       "breaks": "An admission takes an id past the next one.",
-      "find": "LET e == [id |-> next, owner",
-      "replace": "LET e == [id |-> next + 1, owner",
+      "find": "e == [id |-> next, owner |-> o",
+      "replace": "e == [id |-> next + 1, owner |-> o",
       "expect": "IdsBelowNext"
     },
     {
@@ -126,6 +126,34 @@
       "find": "[] Holds(i, {\"abandoned_auth\"}) ->\n              /\\ entries' = Remove(i)",
       "replace": "[] Holds(i, {\"abandoned_auth\"}) ->\n              /\\ entries' = entries",
       "expect": "Drained"
+    },
+    {
+      "id": "S19",
+      "breaks": "A request of an owner that no shell call lends to starts its permission check.",
+      "find": "/\\ out' = IF IsLent(o) THEN",
+      "replace": "/\\ out' = IF TRUE THEN",
+      "expect": "AuthorizeOnlyWhileLent"
+    },
+    {
+      "id": "S20",
+      "breaks": "A lend leaves the owner's waiting requests waiting.",
+      "find": "/\\ entries' = {IF e \\in waiting THEN [e EXCEPT !.stage = \"authorizing\"] ELSE e : e \\in entries}",
+      "replace": "/\\ entries' = entries",
+      "expect": "WaitingOnlyUnlent"
+    },
+    {
+      "id": "S21",
+      "breaks": "A command's end leaves its waiting requests waiting.",
+      "find": "CASE e.stage \\in {\"waiting\", \"authorizing\"} -> [e EXCEPT !.stage = \"abandoned_auth\"]",
+      "replace": "CASE e.stage = \"authorizing\" -> [e EXCEPT !.stage = \"abandoned_auth\"]",
+      "expect": "WaitingOnlyUnlent"
+    },
+    {
+      "id": "S22",
+      "breaks": "A lend that ended leaves the owner lent.",
+      "find": "THEN registered' = SetLent(o, FALSE)",
+      "replace": "THEN registered' = registered",
+      "expect": "LendFollowsLender"
     }
   ],
   "code": [
@@ -254,6 +282,34 @@
       "find": "    const id: RequestId = @fromBackingInt(state.next);\n",
       "replace": "    const id: RequestId = @fromBackingInt(state.next + 1);\n",
       "expect": "IdsBelowNext"
+    },
+    {
+      "id": "C19",
+      "breaks": "A request of an owner that no shell call lends to starts its permission check.",
+      "find": "    out.push(if (lent) .{ .authorize = work } else .{ .wait = work });\n",
+      "replace": "    out.push(.{ .authorize = work });\n",
+      "expect": "AuthorizeOnlyWhileLent"
+    },
+    {
+      "id": "C20",
+      "breaks": "A lend leaves the owner's waiting requests waiting.",
+      "find": "        entry.stage = .authorizing;\n        out.push(.{ .authorize = .{ .id = entry.id, .owner = owner } });\n",
+      "replace": "",
+      "expect": "WaitingOnlyUnlent"
+    },
+    {
+      "id": "C21",
+      "breaks": "A command's end leaves its waiting requests waiting.",
+      "find": "        .waiting, .authorizing => {\n            entry.stage = .abandoned_auth;\n            out.push(.{ .withdraw = entry.id });\n        },\n",
+      "replace": "        .waiting => {},\n        .authorizing => {\n            entry.stage = .abandoned_auth;\n            out.push(.{ .withdraw = entry.id });\n        },\n",
+      "expect": "WaitingOnlyUnlent"
+    },
+    {
+      "id": "C22",
+      "breaks": "A lend that ended leaves the owner lent.",
+      "find": "out.state.owners[index].?.lent = false;",
+      "replace": "out.state.owners[index].?.lent = true;",
+      "expect": "LendFollowsLender"
     }
   ]
 }

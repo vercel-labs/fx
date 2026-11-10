@@ -1,8 +1,10 @@
 //! What a running tool call lends the `fx mcp call` bridge
 //! (`src/core/mcp_host/mcp_call_bridge.zig`): the permission check and the
-//! MCP call of that tool call's own context. A shell command's `fx mcp call`
-//! therefore meets the same rules, prompt, automatic review, and MCP access
-//! as a direct call by the agent that ran the command, a subagent included.
+//! MCP call of that tool call's own context. The shell run call that starts
+//! a command lends its own, and so does each later interact that watches
+//! the command. A shell command's `fx mcp call` therefore meets the same
+//! rules, prompt, automatic review, and MCP access as a direct call by the
+//! agent that ran the command, a subagent included.
 //!
 //! `tool_runtime` builds one for each tool call it dispatches. It is valid
 //! only while that tool call runs.

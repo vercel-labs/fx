@@ -19,7 +19,7 @@ export const CAPACITY = 2;
 export const PINNED_JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88";
 export const PINNED_TLC_VERSION = "TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)";
 
-export type Registered = { owner: string; token: string };
+export type Registered = { owner: string; token: string; lent: boolean };
 export type Entry = { id: number; owner: string; stage: string };
 export type Effect = { kind: string; id?: number; owner?: string; reason?: string; outcome?: string; what?: string };
 export type CoreState = { open: boolean; next: number; registered: Registered[]; entries: Entry[] };
@@ -28,7 +28,7 @@ export type Act =
   | { name: "Init" | "Stopped" | "Crash" }
   | { name: "Started"; token: string }
   | { name: "OwnerAdded"; owner: string; token: string }
-  | { name: "OwnerRemoved"; owner: string }
+  | { name: "OwnerRemoved" | "Lent" | "LendEnded"; owner: string }
   | { name: "Request"; token: string; version: number }
   | { name: "Authorized"; id: number; allow: boolean }
   | { name: "CallFinished"; id: number; outcome: string }
@@ -38,7 +38,7 @@ export type Event =
   | { event: "stopped" | "crash" }
   | { event: "started"; token: string }
   | { event: "owner_added"; owner: string; token: string }
-  | { event: "owner_removed"; owner: string }
+  | { event: "owner_removed" | "lent" | "lend_ended"; owner: string }
   | { event: "request"; token: string; version: number }
   | { event: "authorized"; id: number; allow: boolean }
   | { event: "call_finished"; id: number; outcome: string }
@@ -233,6 +233,8 @@ export function eventFor(act: Act): Event {
     case "Stopped": return { event: "stopped" };
     case "OwnerAdded": return { event: "owner_added", owner: act.owner, token: act.token };
     case "OwnerRemoved": return { event: "owner_removed", owner: act.owner };
+    case "Lent": return { event: "lent", owner: act.owner };
+    case "LendEnded": return { event: "lend_ended", owner: act.owner };
     case "Request": return { event: "request", token: act.token, version: act.version };
     case "Authorized": return { event: "authorized", id: act.id, allow: act.allow };
     case "CallFinished": return { event: "call_finished", id: act.id, outcome: act.outcome };
@@ -250,6 +252,8 @@ export function actFor(event: Event): Act {
     case "stopped": return { name: "Stopped" };
     case "owner_added": return { name: "OwnerAdded", owner: event.owner, token: event.token };
     case "owner_removed": return { name: "OwnerRemoved", owner: event.owner };
+    case "lent": return { name: "Lent", owner: event.owner };
+    case "lend_ended": return { name: "LendEnded", owner: event.owner };
     case "request": return { name: "Request", token: event.token, version: event.version };
     case "authorized": return { name: "Authorized", id: event.id, allow: event.allow };
     case "call_finished": return { name: "CallFinished", id: event.id, outcome: event.outcome };
