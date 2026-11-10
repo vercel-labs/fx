@@ -15,6 +15,7 @@
 //! learn its arguments the same way.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const capability_mod = @import("../tooling/mcp_call_capability.zig");
 const mcp_call = @import("mcp_call.zig");
 const wire = @import("mcp_call_wire.zig");
@@ -124,7 +125,6 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
         .search => |query| .{ .search = query },
         .help => |tool| .{ .help = tool },
     };
-    const tool = operation.subject();
     const socket_path = io_mod.getenv(wire.socket_env) orelse return unavailable(err);
     const token = wire.parseToken(io_mod.getenv(wire.token_env) orelse "") orelse return unavailable(err);
 
@@ -140,6 +140,13 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
         },
         else => return unavailable(err),
     };
+    return printReply(arena, io, out, err, operation, reply);
+}
+
+/// Shows the bridge's reply: the data on `out`, anything else on `err`.
+/// Returns the exit code.
+fn printReply(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, operation: wire.Operation, reply: Reply) !u8 {
+    const tool = operation.subject();
     switch (reply.header.status) {
         .ok => {
             try out.writeAll(reply.bytes);
@@ -150,7 +157,7 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
             return exit.ok;
         },
         .tool_error => {
-            try err.print("fx mcp call: {s} returned an error:\n", .{tool});
+            try err.print("fx mcp call: {f} returned an error:\n", .{text_utils.terminalSafe(tool)});
             try writeLine(err, reply.bytes);
             return exit.tool_error;
         },
@@ -160,7 +167,7 @@ pub fn run(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, command: Co
             return exit.failed;
         },
         .denied => {
-            try err.print("fx mcp call: {s} did not run. ", .{tool});
+            try err.print("fx mcp call: {f} did not run. ", .{text_utils.terminalSafe(tool)});
             try writeLine(err, reply.bytes);
             return exit.denied;
         },
@@ -313,6 +320,31 @@ test "fx mcp call outside a shell call reports it is unavailable" {
     try std.testing.expectEqual(exit.usage, try run(arena_state.allocator(), std.testing.io, &out.writer, &err.writer, .{ .call = .{ .tool = "mcp_s_t", .arguments = "[1]" } }));
     // A lookup outside a shell call is unavailable too.
     try std.testing.expectEqual(exit.unavailable, try run(arena_state.allocator(), std.testing.io, &out.writer, &err.writer, .{ .list = "linear" }));
+}
+
+test "a tool error and a denial name the tool as visible escapes, not raw bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The name is a word from the command line, so it can hold any byte.
+    const asked: wire.Operation = .{ .call = .{ .tool = "mcp_s_\x1b]0;x\x07\x00t", .arguments_json = "{}" } };
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+
+    try std.testing.expectEqual(exit.denied, try printReply(arena, std.testing.io, &out.writer, &err.writer, asked, .{
+        .header = .{ .status = .denied, .bytes = 4 },
+        .bytes = "Nope",
+    }));
+    try std.testing.expectEqual(exit.tool_error, try printReply(arena, std.testing.io, &out.writer, &err.writer, asked, .{
+        .header = .{ .status = .tool_error, .bytes = 4 },
+        .bytes = "Boom",
+    }));
+    try std.testing.expectEqualStrings(
+        "fx mcp call: mcp_s_\\x1b]0;x\\x07\\x00t did not run. Nope\n" ++
+            "fx mcp call: mcp_s_\\x1b]0;x\\x07\\x00t returned an error:\nBoom\n",
+        err.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
 }
 
 test "a shape summary of one item names sizes, keys, and types, not values" {

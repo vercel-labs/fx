@@ -1,4 +1,5 @@
 const std = @import("std");
+const toolbox = @import("../tooling/toolbox.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const std_builtin = @import("builtin");
@@ -51,7 +52,6 @@ const output_contracts = @import("../output/output_contracts.zig");
 const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
 const mcp_elicitation = @import("../mcp/elicitation.zig");
 const mcp_access_policy = @import("../mcp/access_policy.zig");
-const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_host = @import("../mcp_host/host.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -264,6 +264,7 @@ pub const Config = struct {
     mode_registry: mode_registry.Registry,
     load_mcp_host: ?mcp_host.LoadFn = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
+    tool_placement_overrides: []const config_runtime.tool_placement.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
 };
@@ -284,10 +285,12 @@ fn runAskChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .behind_toolbox = ctx.toolbox_behind.slice(),
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
     return subagent_agent_adapter.run(.{
+        .toolbox_behind = ctx.toolbox_behind.slice(),
         .host = ctx.subagent_host orelse return error.ProviderFailed,
         .tool_context = ctx.toolContext(),
         .provider_set = ctx.cfg.provider_set,
@@ -622,6 +625,8 @@ const AskContext = struct {
     max_tool_result_bytes: usize = 64 * 1024,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
+    /// The built-in tools offered through toolbox, fixed for the run.
+    toolbox_behind: config_runtime.tool_placement.Behind = config_runtime.tool_placement.behindToolbox(.{}, &.{}),
     fast_mode: bool = false,
     /// Profile preference used only when creating a new durable session.
     /// Process and CLI overrides remain per-run and never rewrite this value.
@@ -1046,6 +1051,8 @@ const AskContext = struct {
             self.alloc.destroy(children);
             return;
         };
+        // A child whose profile lists a tool kept behind toolbox keeps toolbox.
+        self.subagent_host.?.authority_resolver.toolbox_behind = &self.toolbox_behind;
         self.v2_children = children;
         self.subagent_host.?.report_sink = .{ .context = self, .post_fn = postAskReport };
         // What a restart left owed runs as this run's next turns.
@@ -1663,6 +1670,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.auto_compact_percent = startup.auto_compact_percent;
     ctx.context_limits = startup.context_limits;
     ctx.context_limits.applyCommandLine(cfg.context_limit_overrides);
+    ctx.toolbox_behind = config_runtime.tool_placement.behindToolbox(startup.tool_placement, cfg.tool_placement_overrides);
     ctx.fast_mode = startup.fast_mode;
     ctx.persisted_ultrafast_mode = startup.configured_ultrafast_mode;
     ctx.ultrafast_mode = startup.ultrafast_mode;
@@ -1823,12 +1831,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     loaded_skills.dir = &.{};
     if (startup.context_enabled) {
         try ctx.checkCancellation();
-        const context_targets = try context_contract.applicableTargetsForImages(alloc, current_images);
-        defer if (context_targets.len > 0) alloc.free(context_targets);
         ctx.context_snapshot = try ctx.deps.context_registry.gatherDefaultSnapshot(alloc, .{
             .workspace_root = startup.workspace_root,
             .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
-            .targets = context_targets,
             .context_limits = ctx.context_limits,
         });
         try ctx.checkCancellation();
@@ -1846,6 +1851,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
+        .behind_toolbox = ctx.toolbox_behind.slice(),
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 
@@ -1891,10 +1897,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         options.save_session and ctx.requested_resume == null,
     );
     defer if (title_task) |task| completeAskTitleTask(&ctx, task);
+    var toolbox_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer toolbox_arena_state.deinit();
+    const toolbox_mcp_servers = try toolboxMcpServerNames(toolbox_arena_state.allocator(), &ctx);
     const turn_config: agent_runtime.Config = .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
         .skill_catalog = .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
+        .toolbox_mcp_servers = toolbox_mcp_servers,
+        .toolbox_behind = ctx.toolbox_behind.slice(),
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
         .advertised_tool_names = tool_projection.advertised_names,
@@ -2130,6 +2141,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
+        .image_folder_rules = true,
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
@@ -2137,7 +2149,6 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .validate_tool_call = validateToolCall,
         .snapshot_mcp_definition = snapshotMcpDefinition,
         .resolve_unselected_mcp_tool = resolveUnselectedMcpTool,
-        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
@@ -2326,16 +2337,15 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Arr
     try ctx.deps.context_registry.appendDefaultStatic(.{
         .project_context = ctx.modelVisibleProjectContext(),
     }, arena, messages);
-    var snapshot = if (ctx.mcp_host) |h|
-        try h.catalog.modelSnapshot(arena)
-    else
-        try mcp_model_catalog.Snapshot.empty(arena);
-    defer snapshot.deinit(arena);
-    const section = try mcp_model_catalog.render(arena, snapshot);
-    if (section.text.len > 0) {
-        try messages.append(arena, .{ .role = .system, .content = section.text });
-    }
-    if (section.notice) |notice| try pushContextNotice(raw_ctx, notice);
+    // The toolbox menu lists the MCP servers (toolboxMcpServerNames), so
+    // there is no MCP block here.
+}
+
+/// The configured MCP servers by name, for the toolbox menu. The names are
+/// allocated in `arena`.
+fn toolboxMcpServerNames(arena: Allocator, ctx: *AskContext) ![]const []const u8 {
+    const live_host = ctx.mcp_host orelse return &.{};
+    return live_host.catalog.serverNames(arena);
 }
 
 fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
@@ -2359,11 +2369,6 @@ fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agen
 fn checkToolAvailability(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.checkToolAvailability(ctx.toolContext(), arena, call);
-}
-
-fn prepareSkillCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    return tool_runtime.prepareSkillCall(ctx.toolContext(), arena, call, locations);
 }
 
 fn cliAdmissionContext(
@@ -2844,16 +2849,25 @@ fn appendToolCallRecord(
     ctx.tool_call_records_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.tool_call_records_mutex.unlock(io_mod.getIo());
 
-    const name = try ctx.alloc.dupe(u8, call.name);
-    errdefer ctx.alloc.free(name);
-    const owned_status = try ctx.alloc.dupe(u8, status);
-    errdefer ctx.alloc.free(owned_status);
     var scratch_state = std.heap.ArenaAllocator.init(ctx.alloc);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
-    const is_shell = std.mem.eql(u8, call.name, "shell");
+    // A toolbox run reports the tool that ran, with that tool's arguments, so
+    // a script reading the JSON sees mcp_linear_create_issue, or shell and its
+    // command, not toolbox.
+    const ran: ToolCall = if (try toolbox.carriedCall(scratch, call.name, call.arguments_json)) |carried| ran: {
+        var effective = call;
+        effective.name = carried.name;
+        effective.arguments_json = carried.arguments_json;
+        break :ran effective;
+    } else call;
+    const name = try ctx.alloc.dupe(u8, ran.name);
+    errdefer ctx.alloc.free(name);
+    const owned_status = try ctx.alloc.dupe(u8, status);
+    errdefer ctx.alloc.free(owned_status);
+    const is_shell = std.mem.eql(u8, ran.name, "shell");
     const action = if (is_shell and error_category != null)
-        shell_action_for_call(scratch, call)
+        shell_action_for_call(scratch, ran)
     else
         null;
     const error_code = if (is_shell and error_category != null)
@@ -2876,7 +2890,7 @@ fn appendToolCallRecord(
     else
         null;
     errdefer if (command_result_json) |json| ctx.alloc.free(json);
-    const ask_question_text = try questionTextForAskCall(ctx.alloc, call);
+    const ask_question_text = try questionTextForAskCall(ctx.alloc, ran);
     errdefer if (ask_question_text) |text| ctx.alloc.free(text);
 
     try ctx.tool_call_records.append(ctx.alloc, .{
@@ -4740,6 +4754,8 @@ const TestContextRegistryFixture = struct {
     var gather_error: ?context_contract.ProviderError = null;
     var expected_target_paths: []const []const u8 = &.{};
     var targets_match: bool = false;
+    var expected_queued_image: ?[]const u8 = null;
+    var queued_image_folder_rules: bool = false;
     var expected_static_context: ?[]const u8 = null;
     var expected_gather_calls: usize = 0;
     var transient_permission_mode: ?PermissionMode = null;
@@ -4750,6 +4766,8 @@ const TestContextRegistryFixture = struct {
         gather_error = null;
         expected_target_paths = &.{};
         targets_match = false;
+        expected_queued_image = null;
+        queued_image_folder_rules = false;
         expected_static_context = expected_static;
         expected_gather_calls = expected_calls;
         transient_permission_mode = null;
@@ -4806,6 +4824,13 @@ const TestContextRegistryFixture = struct {
         try std.testing.expect(semantic_presentation == null);
         try std.testing.expectEqual(expected_gather_calls, gather_calls);
         if (expected_gather_calls > 0) try std.testing.expect(targets_match);
+        queued_image_folder_rules = deps.image_folder_rules;
+        if (expected_queued_image) |path| {
+            try std.testing.expectEqual(@as(usize, 1), job.images.len);
+            try std.testing.expectEqualStrings(path, job.images[0].path);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), job.images.len);
+        }
         const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
         if (expected_static_context != null) {
             const contribution = ctx.context_snapshot.contribution orelse return error.TestExpectedEqual;
@@ -4839,15 +4864,15 @@ const TestContextRegistryFixture = struct {
             transient_permission_mode orelse return error.TestExpectedEqual,
         );
 
+        // The toolbox menu lists the MCP servers, so no MCP block follows
+        // the static context.
         if (expected_static_context) |expected_static| {
-            try std.testing.expectEqual(@as(usize, 3), messages.items.len);
-            try std.testing.expectEqualStrings(expected_static, messages.items[0].content.?);
-            try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
-            try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[2].content.?);
-        } else {
             try std.testing.expectEqual(@as(usize, 2), messages.items.len);
-            try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "<mcp_servers>") != null);
+            try std.testing.expectEqualStrings(expected_static, messages.items[0].content.?);
             try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[1].content.?);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+            try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[0].content.?);
         }
 
         try testPushAssistantText(deps, "assistant text");
@@ -7939,6 +7964,56 @@ test "fx ask JSON records permission-denied tool calls as error status" {
     );
 }
 
+test "fx ask JSON names a toolbox run by the tool it ran, with that tool's fields, at any size" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    var ctx = AskContext.init(alloc, testConfig(), .{
+        .context_registry = test_no_context_registry,
+        .tool_set = builtin_tools.advertisement_set,
+    }, root);
+    defer ctx.deinit();
+    ctx.output_mode = .json;
+
+    // Bigger than any fixed parse buffer.
+    const padding: [20 * 1024]u8 = @splat('x');
+    const arguments = try alloc.print(
+        "{{\"run\":\"shell\",\"arguments\":{{\"action\":\"interact\",\"session_id\":\"shell-missing\",\"note\":\"{s}\"}}}}",
+        .{&padding},
+    );
+    defer alloc.free(arguments);
+    captureToolExecutionError(&ctx, .{
+        .call_allocator = alloc,
+        .result_allocator = alloc,
+        .call = .{ .id = "toolbox-shell", .name = "toolbox", .arguments_json = arguments },
+        .authority = .ordinary,
+        .session_grants = &.{},
+        .advertised_dynamic_tool_names = &.{},
+        .max_tool_result_bytes = 4096,
+    }, error.ExecutionNotFound);
+
+    const records = try takeToolCallRecords(&ctx, alloc);
+    const result = PromptRunResult{
+        .exit_code = 1,
+        .assistant_output = try alloc.dupe(u8, ""),
+        .tool_calls = records,
+    };
+    defer result.deinit(alloc);
+    const rendered = try renderFinalJsonResult(alloc, result);
+    defer alloc.free(rendered);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rendered, .{});
+    defer parsed.deinit();
+    const record = parsed.value.object.get("tool_calls").?.array.items[0].object;
+    try std.testing.expectEqualStrings("shell", record.get("name").?.string);
+    try std.testing.expectEqualStrings("interact", (record.get("action") orelse return error.TestExpectedEqual).string);
+    const failure = (record.get("error") orelse return error.TestExpectedEqual).object;
+    try std.testing.expectEqualStrings("ExecutionNotFound", failure.get("code").?.string);
+}
+
 test "fx ask JSON preserves shell action and runtime error identity" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8423,7 +8498,7 @@ test "fx ask carries resolved auto mode and initial registry context into the qu
     );
 }
 
-test "default fx ask passes canonical image paths as initial context targets" {
+test "default fx ask keeps image paths out of the initial context and has the runtime carry their folders' rules" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8443,7 +8518,7 @@ test "default fx ask passes canonical image paths as initial context targets" {
     defer stderr_capture.deinit(alloc);
 
     TestContextRegistryFixture.reset(test_registry_static_context, 1);
-    TestContextRegistryFixture.expected_target_paths = &.{image_path};
+    TestContextRegistryFixture.expected_queued_image = image_path;
     var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup);
     deps.context_registry = test_cli_context_registry;
     deps.process_queued_prompt = TestContextRegistryFixture.process;
@@ -8458,7 +8533,11 @@ test "default fx ask passes canonical image paths as initial context targets" {
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqual(@as(usize, 1), TestContextRegistryFixture.gather_calls);
     try std.testing.expectEqual(@as(usize, 1), TestContextRegistryFixture.process_calls);
+    // The instructions' context names no target, so an image never changes
+    // them; the turn carries the image's path and the runtime delivers its
+    // folder's rules as a note.
     try std.testing.expect(TestContextRegistryFixture.targets_match);
+    try std.testing.expect(TestContextRegistryFixture.queued_image_folder_rules);
 }
 
 test "default fx ask omits disabled registry context without gathering" {

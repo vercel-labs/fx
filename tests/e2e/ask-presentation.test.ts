@@ -15,6 +15,7 @@ import {
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { EVAL_ERROR_PREFIX } from "./shell-eval-error";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -1096,10 +1097,10 @@ describe("fx ask shell startup files", () => {
     );
 
     expect(result.code).toBe(0);
-    // The snapshot runs the command through eval, so zsh reports the error as
-    // `(eval):1:` and bash as `/dev/fd/0: eval:` instead of under the shell's name.
+    // The snapshot runs the command through eval, so each shell reports the
+    // error under `eval` instead of under its own name; see shell-eval-error.ts.
     expect(result.stderr).not.toContain("shell snapshot unavailable");
-    expect(gateway.requests[1]!.body).toMatch(/\(eval\):1:|\/dev\/fd\/0: eval:/);
+    expect(gateway.requests[1]!.body).toMatch(EVAL_ERROR_PREFIX);
     expect(gateway.requests[1]!.body).toContain("The shell could not parse this command");
   }, TIMEOUT);
 

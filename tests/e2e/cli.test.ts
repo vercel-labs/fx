@@ -1150,6 +1150,56 @@ describe("cli: status", () => {
   );
 
   test(
+    "tool placement moves built-in tools through fx config and --tool-placement",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-tool-placement-")));
+      try {
+        const home = join(root, "home");
+        const cwd = join(root, "workspace");
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(cwd);
+        const settingsPath = join(home, ".fx", "settings.json");
+        writeFileSync(settingsPath, "{}\n", { mode: 0o600 });
+        const env = { ...NO_GATEWAY_AUTH, ...NO_SETTING_ENV, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
+        const settings = () => JSON.parse(readFileSync(settingsPath, "utf8"));
+
+        const help = await runFx(["--help"], { cwd, env });
+        expect(help.stdout).toContain("--tool-placement <spec>");
+
+        const defaults = await runFx(["config", "get", "tool_placement.install_skill"], { cwd, env });
+        expect([defaults.code, defaults.stdout]).toEqual([0, "toolbox\n"]);
+        const set = await runFx(["config", "set", "tool_placement.web_search", "Toolbox"], { cwd, env });
+        expect([set.code, set.stdout, set.stderr]).toEqual([0, "tool_placement.web_search set to toolbox in ~/.fx/settings.json.\n", ""]);
+        const direct = await runFx(["config", "set", "tool_placement.install_skill", "direct"], { cwd, env });
+        expect(direct.code).toBe(0);
+        expect(settings()).toEqual({ tool_placement: { web_search: "toolbox", install_skill: "direct" } });
+        const origin = await runFx(["config", "get", "tool_placement.web_search", "--show-origin"], { cwd, env });
+        expect(origin.stdout).toBe("file:~/.fx/settings.json\ttoolbox\n");
+        const unset = await runFx(["config", "unset", "tool_placement.web_search"], { cwd, env });
+        expect([unset.code, unset.stdout]).toEqual([0, "tool_placement.web_search removed from ~/.fx/settings.json.\n"]);
+        expect(settings()).toEqual({ tool_placement: { install_skill: "direct" } });
+
+        // vision stays where fx puts it, and a placement is toolbox or direct.
+        const fixed = await runFx(["config", "set", "tool_placement.vision", "toolbox"], { cwd, env });
+        expect(fixed.code).toBe(2);
+        expect(fixed.stderr).toContain("set tool_placement.<tool> to toolbox or direct, for one of glob_files,");
+        const value = await runFx(["config", "set", "tool_placement.shell", "hidden"], { cwd, env });
+        expect([value.code, value.stderr]).toEqual([2, "fx config: invalid value for tool_placement.shell: hidden (use toolbox or direct)\n"]);
+        expect(settings()).toEqual({ tool_placement: { install_skill: "direct" } });
+
+        const badTool = await runFx(["--tool-placement", "vision=toolbox", "help"], { cwd, env });
+        expect(badTool.code).toBe(2);
+        expect(badTool.stderr).toStartWith("fx: --tool-placement names a built-in tool that can move: glob_files,");
+        const badSpec = await runFx(["--tool-placement", "shell", "help"], { cwd, env });
+        expect(badSpec.stderr).toStartWith("fx: --tool-placement takes <tool>=toolbox or <tool>=direct\n");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "status and doctor share the missing auth snapshot",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-status-noauth-"));

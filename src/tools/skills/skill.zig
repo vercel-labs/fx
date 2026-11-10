@@ -91,10 +91,6 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
     alloc.destroy(input);
 }
 
-pub fn validate(_: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!?[]u8 {
-    return null;
-}
-
 pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
     const resource = skill_contract.resource_path_or_main(if (args.get("resource")) |value| resource: {
         if (value != .string) return null;
@@ -111,20 +107,6 @@ pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
         .completed_action_label = "Read skill resource",
         .label_arg_kind = if (std.mem.eql(u8, resource, "SKILL.md")) .none else .resource,
         .label_arg_default = "SKILL.md",
-    };
-}
-
-pub fn prepare(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_dispatch.DispatchError!skill_contract.CallPreparation {
-    const decoded = try decode(ctx, args_json);
-    const input = switch (decoded) {
-        .failure => |reason| return .{ .failure = .{ .model_output = reason } },
-        .input => |value| value,
-    };
-    defer input.deinit(ctx.allocator);
-    return prepareInput(ctx, input.as(Input)) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Cancelled => return error.Cancelled,
-        else => return .{ .failure = .{ .model_output = try ctx.allocator.print("skill failed: {s}. Refresh available skills and retry with an exact advertised location.", .{@errorName(err)}) } },
     };
 }
 
@@ -169,7 +151,6 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
 
 fn loadInput(ctx: tool_dispatch.DispatchContext, input: *const Input) !skill_invocation.ExecuteResult {
     if (ctx.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
-    if (ctx.resolved_skill) |skill| return loadSelected(ctx, input, skill.*);
     const preparation = try prepareInput(ctx, input);
     return switch (preparation) {
         .failure => |output| .{ .failure = output },
@@ -189,76 +170,19 @@ fn loadSelected(ctx: tool_dispatch.DispatchContext, input: *const Input, prepare
     return skill_invocation.loadWholeByLocation(ctx.allocator, catalog, skill.path, input.resource, ctx.context_limits, ctx.max_tool_result_bytes, ctx.cancel_flag);
 }
 
-pub fn execute(arena: Allocator, workspace_root: []const u8, skills_dir: []const u8, args_json: []const u8) ![]u8 {
-    const result = try executeForSession(arena, workspace_root, skills_dir, args_json);
-    return skill_invocation.takeModelOutput(arena, result);
-}
-
-pub fn executeForSession(
-    arena: Allocator,
-    workspace_root: []const u8,
-    skills_dir: []const u8,
-    args_json: []const u8,
-) !skill_invocation.ExecuteResult {
-    const args = try tool_args.parseToolArgsObject(arena, args_json);
-    const name = try tool_args.requiredStringArg(args, "name");
-    const location = if (args.get("location")) |value| blk: {
-        if (value != .string) return error.InvalidToolArguments;
-        break :blk value.string;
-    } else null;
-    const resource = if (args.get("resource")) |value| blk: {
-        if (value != .string) return error.InvalidToolArguments;
-        break :blk value.string;
-    } else null;
-    const offset = if (args.get("offset")) |value| blk: {
-        if (value != .integer or value.integer < 0) return error.InvalidToolArguments;
-        break :blk std.math.cast(usize, value.integer) orelse return error.InvalidToolArguments;
-    } else 0;
-    return loadByIdentity(
-        arena,
-        workspace_root,
-        skills_dir,
-        name,
-        location,
-        resource,
-        offset,
-        .{},
-        tool_result_limits.default_max_tool_result_bytes,
-    );
-}
-
-fn loadByIdentity(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    skills_dir: []const u8,
-    name: []const u8,
-    location: ?[]const u8,
-    resource: ?[]const u8,
-    offset: usize,
-    limits: context_limits.Values,
-    max_tool_result_bytes: ?usize,
-) !skill_invocation.ExecuteResult {
-    var discovery = try builtin_skills.loadVisibleSkillsForTool(alloc, workspace_root, skills_dir);
-    defer discovery.deinit(alloc);
-    skill_runtime.traceDiagnostics("skill_tool", discovery.diagnostics);
-    return skill_invocation.loadByIdentity(
-        alloc,
-        .{ .skills = discovery.skills, .diagnostics = discovery.diagnostics },
-        name,
-        location,
-        resource,
-        offset,
-        limits,
-        max_tool_result_bytes,
-    );
-}
-
-pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
-    return false;
-}
-
-pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
-    return false;
+/// Decodes `args_json` and prepares the skill it names, as a call does.
+fn prepareForTest(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_dispatch.DispatchError!skill_contract.CallPreparation {
+    const decoded = try decode(ctx, args_json);
+    const input = switch (decoded) {
+        .failure => |reason| return .{ .failure = .{ .model_output = reason } },
+        .input => |value| value,
+    };
+    defer input.deinit(ctx.allocator);
+    return prepareInput(ctx, input.as(Input)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Cancelled => return error.Cancelled,
+        else => return .{ .failure = .{ .model_output = try ctx.allocator.print("skill failed: {s}. Refresh available skills and retry with an exact advertised location.", .{@errorName(err)}) } },
+    };
 }
 
 fn expectDecodeFailure(args_json: []const u8, expected: []const u8) !void {
@@ -321,8 +245,8 @@ test "skill preparation binds retained aliases and canonical paths before readin
     for ([_][]const u8{ "skill:0000000000000007:0/workflow", path }) |location| {
         const args = try std.json.Stringify.valueAlloc(alloc, .{ .location = location }, .{});
         defer alloc.free(args);
-        var ctx: tool_dispatch.DispatchContext = .{ .allocator = alloc, .workspace_root = root, .skills_dir = skills_dir, .skill_locations = &locations };
-        const preparation = try prepare(ctx, args);
+        const ctx: tool_dispatch.DispatchContext = .{ .allocator = alloc, .workspace_root = root, .skills_dir = skills_dir, .skill_locations = &locations };
+        const preparation = try prepareForTest(ctx, args);
         defer skill_invocation.freeCallPreparation(alloc, preparation);
         const selected = switch (preparation) {
             .selected => |value| value,
@@ -330,7 +254,6 @@ test "skill preparation binds retained aliases and canonical paths before readin
         };
         try std.testing.expectEqualStrings("original", selected.skill.name);
         try std.testing.expectEqual(@as(usize, 1), selected.diagnostics.len);
-        ctx.resolved_skill = &selected;
         const decoded = try decode(ctx, args);
         defer decoded.input.deinit(alloc);
         const result = try loadInput(ctx, decoded.input.as(Input));
@@ -338,16 +261,11 @@ test "skill preparation binds retained aliases and canonical paths before readin
         try std.testing.expect(result == .failure);
         try std.testing.expect(std.mem.find(u8, result.modelOutput(), "REPLACEMENT BODY") == null);
         try std.testing.expect(std.mem.find(u8, result.diagnosticNotice().?, "metadata is invalid (missing_name)") != null);
-        ctx.resolved_skill = null;
-        const direct = try loadInput(ctx, decoded.input.as(Input));
-        defer skill_invocation.freeExecuteResult(alloc, direct);
-        try std.testing.expect(direct == .failure);
-        try std.testing.expect(std.mem.find(u8, direct.modelOutput(), "REPLACEMENT BODY") == null);
     }
-    const stale = try prepare(.{ .allocator = alloc, .skill_locations = &locations }, "{\"location\":\"skill:0000000000000006:0/workflow\"}");
+    const stale = try prepareForTest(.{ .allocator = alloc, .skill_locations = &locations }, "{\"location\":\"skill:0000000000000006:0/workflow\"}");
     defer skill_invocation.freeCallPreparation(alloc, stale);
     try std.testing.expect(std.mem.find(u8, stale.failure.model_output, "StaleSkillLocation") != null);
-    const mismatch = try prepare(.{ .allocator = alloc, .skill_locations = &locations }, "{\"name\":\"renamed\",\"location\":\"skill:0000000000000007:0/workflow\"}");
+    const mismatch = try prepareForTest(.{ .allocator = alloc, .skill_locations = &locations }, "{\"name\":\"renamed\",\"location\":\"skill:0000000000000007:0/workflow\"}");
     defer skill_invocation.freeCallPreparation(alloc, mismatch);
     try std.testing.expect(std.mem.find(u8, mismatch.failure.model_output, "does not match") != null);
 }
@@ -369,7 +287,7 @@ test "skill preparation discovers canonical locations added after the catalog" {
     const args = try std.json.Stringify.valueAlloc(alloc, .{ .location = path }, .{});
     defer alloc.free(args);
     const empty_catalog: skill_contract.Locations = .{ .namespace = 3 };
-    const preparation = try prepare(.{ .allocator = alloc, .workspace_root = root, .skills_dir = managed, .skill_locations = &empty_catalog }, args);
+    const preparation = try prepareForTest(.{ .allocator = alloc, .workspace_root = root, .skills_dir = managed, .skill_locations = &empty_catalog }, args);
     defer skill_invocation.freeCallPreparation(alloc, preparation);
     const selected = switch (preparation) {
         .selected => |value| value,

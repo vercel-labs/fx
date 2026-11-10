@@ -161,11 +161,9 @@ const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.web_fetch,
     builtin_tools.web_search,
     builtin_tools.shell,
-    builtin_tools.capability_search,
-    builtin_tools.skill,
     builtin_tools.install_skill,
     builtin_tools.subagent,
-    builtin_tools.mcp_select_tool,
+    builtin_tools.toolbox,
     builtin_tools.ask_user_question,
     builtin_tools.read_tool_result,
 };
@@ -457,6 +455,7 @@ pub const FakeAgentRuntimeDeps = struct {
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
+    image_folder_rules: bool = false,
     root_permission_mode: ?PermissionMode = null,
     cache_warmer: ?*cache_warmer.Warmer = null,
     /// Records each usage the agent loop saves, as a saved session would.
@@ -755,6 +754,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .tool_activity_recorder = self.tool_activity_recorder,
             .context_registry = self.context_registry,
             .context_enabled = self.context_enabled,
+            .image_folder_rules = self.image_folder_rules,
             .snapshot_root_permission_mode = if (self.root_permission_mode != null)
                 snapshotRootPermissionMode
             else
@@ -1122,7 +1122,10 @@ pub const FakeAgentRuntimeDeps = struct {
                 advertised_dynamic_tool_names,
             );
         }
-        try self.permission_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
+        // The name the rules decide: a toolbox open or search is decided as
+        // the tool it replaced.
+        const permission_name = if (call.toolbox_lookup) |lookup| lookup.permission else call.name;
+        try self.permission_names.append(self.alloc, try self.alloc.dupe(u8, permission_name));
         try self.permission_call_ids.append(self.alloc, try self.alloc.dupe(u8, call.id));
         try self.permission_user_intent_contexts.append(
             self.alloc,

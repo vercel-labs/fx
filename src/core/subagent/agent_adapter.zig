@@ -18,9 +18,9 @@ const tool_presentation = @import("../tooling/tool_presentation.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
+const toolbox = @import("../tooling/toolbox.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
-const model_catalog = @import("../mcp/model_catalog.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
@@ -64,6 +64,9 @@ pub const Config = struct {
     system_prompt: []const u8,
     model_prompt_overlay: ?[]const u8 = null,
     skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
+    /// The built-in tools the parent offers through toolbox; the child offers
+    /// the same.
+    toolbox_behind: []const []const u8 = &toolbox.default_behind,
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     custom_tool_guidance: []const u8 = "",
@@ -264,13 +267,13 @@ pub fn run(
         arena,
         config.advertised_tool_names,
         config.tool_context.tool_registry,
-        .{ .profile = profile },
+        .{ .profile = .{ .value = profile, .behind = config.toolbox_behind } },
     );
     const child_functions = try childFunctions(
         arena,
         config.advertised_functions,
         config.tool_context.tool_registry,
-        .{ .profile = profile },
+        .{ .profile = .{ .value = profile, .behind = config.toolbox_behind } },
     );
     // This engine never gives a child subagents of its own, so main
     // started every child it runs.
@@ -292,6 +295,10 @@ pub fn run(
             turn.active_work_id orelse "unknown",
         },
     );
+    // The child's toolbox menu lists the MCP servers its view may use.
+    var toolbox_arena_state = std.heap.ArenaAllocator.init(turn.alloc);
+    defer toolbox_arena_state.deinit();
+    const arena_for_toolbox = toolbox_arena_state.allocator();
     const deps = runtimeDeps(&context);
     agent_runtime.processAgentPrompt(
         &turn.sessionRuntime().agent,
@@ -311,6 +318,11 @@ pub fn run(
             .system_prompt = child_system_prompt,
             .model_prompt_overlay = config.model_prompt_overlay,
             .skill_catalog = config.skill_catalog,
+            .toolbox_behind = config.toolbox_behind,
+            .toolbox_mcp_servers = try viewServerNames(
+                arena_for_toolbox,
+                if (admission.mcp_view) |*view| view else null,
+            ),
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
             .advertised_tool_names = child_tool_names,
@@ -415,8 +427,9 @@ pub fn childSystemPrompt(
 /// integrations instead.
 pub const Shown = union(enum) {
     /// The old engine's: the ones its profile allows, never `subagent`,
-    /// because it has no host for a child's own subagents.
-    profile: ?*const profiles.Profile,
+    /// because it has no host for a child's own subagents. `behind` names
+    /// the built-in tools the run offers through toolbox.
+    profile: struct { value: ?*const profiles.Profile, behind: []const []const u8 },
     /// The interactive app's: the ones its run was admitted with, its
     /// parent's narrowed by its profile, so it is never shown a tool its
     /// parent lacks. `subagent` is among them
@@ -429,9 +442,9 @@ fn childSees(registry: tool_dispatch.Registry, shown: Shown, name: []const u8) b
     switch (shown) {
         .profile => |profile| {
             if (subagent) return false;
-            const value = profile orelse return true;
+            const value = profile.value orelse return true;
             if (registry.lookup(name) == null) return true;
-            return profiles.allowsTool(value, name);
+            return profiles.allowsTool(value, name, profile.behind);
         },
         .admitted => |admitted| {
             if (subagent and !admitted.starts_subagents) return false;
@@ -483,8 +496,8 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
         .snapshot_mcp_definition = snapshotMcpDefinition,
-        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
+        .resolve_unselected_mcp_tool = resolveUnselectedMcpTool,
         .request_tool_permission = requestToolPermission,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermission,
         .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
@@ -736,49 +749,30 @@ fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayLi
     try context.config.context_registry.appendDefaultStatic(.{
         .project_context = context.config.project_context,
     }, arena, messages);
-    var snapshot = try snapshotModelCatalogForView(
-        arena,
-        if (context.admission.mcp_view) |*view| view else null,
-    );
-    defer snapshot.deinit(arena);
-    const section = try model_catalog.render(arena, snapshot);
-    if (section.text.len > 0) {
-        try messages.append(arena, .{ .role = .system, .content = section.text });
-    }
-    if (section.notice) |notice| try pushLiveNotice(raw, notice);
+    // The toolbox menu lists the child's MCP servers (its config's
+    // toolbox_mcp_servers), so there is no MCP block here.
 }
 
-fn snapshotModelCatalogForView(
-    alloc: Allocator,
-    maybe_view: ?*const mcp_access.View,
-) !model_catalog.Snapshot {
-    const view = maybe_view orelse return model_catalog.Snapshot.empty(alloc);
-    const servers = try alloc.alloc(model_catalog.ServerSummary, view.servers.len);
+/// The names of the MCP servers in the child's captured view, for its
+/// toolbox menu. `alloc` owns the slice and each name.
+fn viewServerNames(alloc: Allocator, maybe_view: ?*const mcp_access.View) ![]const []const u8 {
+    const view = maybe_view orelse return &.{};
+    const names = try alloc.alloc([]const u8, view.servers.len);
     var initialized: usize = 0;
     errdefer {
-        for (servers[0..initialized]) |server| alloc.free(server.name);
-        alloc.free(servers);
+        for (names[0..initialized]) |name| alloc.free(name);
+        alloc.free(names);
     }
-    for (view.servers, 0..) |server, index| {
-        var tool_count: usize = 0;
-        for (view.tools) |tool| {
-            if (std.mem.eql(u8, tool.server_name, server.name)) tool_count += 1;
-        }
-        // Generation 0: the server's list hadn't loaded when the view was
-        // taken, so it starts when the subagent first needs it.
-        const on_demand = tool_count == 0 and server.catalog_generation == 0;
-        servers[index] = .{
-            .name = try alloc.dupe(u8, server.name),
-            .availability = if (on_demand) .available_on_demand else .ready,
-            .tool_count = if (on_demand) null else tool_count,
-        };
+    for (view.servers, names) |server, *name| {
+        name.* = try alloc.dupe(u8, server.name);
         initialized += 1;
     }
-    return .{ .servers = servers };
+    return names;
 }
 
-test "subagent model catalog counts the captured view's tools and offers servers not yet listed" {
-    const alloc = std.testing.allocator;
+test "a subagent's toolbox lists every server in its captured view" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
     var servers = [_]mcp_access.ServerIdentity{ .{
         .name = @constCast("chrome-devtools"),
         .source = .profile,
@@ -794,28 +788,19 @@ test "subagent model catalog counts the captured view's tools and offers servers
         .catalog_generation = 0,
         .auth_generation = 0,
     } };
-    var tools = [_]mcp_access.ToolIdentity{
-        .{ .name = @constCast("mcp_chrome_one"), .server_name = @constCast("chrome-devtools") },
-        .{ .name = @constCast("mcp_chrome_two"), .server_name = @constCast("chrome-devtools") },
-    };
     const view = mcp_access.View{
         .runtime_generation = 1,
         .owner_id = @constCast("child"),
         .parent_id = @constCast("parent"),
         .servers = &servers,
-        .tools = &tools,
+        .tools = &.{},
     };
-
-    var snapshot = try snapshotModelCatalogForView(alloc, &view);
-    defer snapshot.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 2), snapshot.servers.len);
-    try std.testing.expectEqualStrings("chrome-devtools", snapshot.servers[0].name);
-    try std.testing.expectEqual(model_catalog.Availability.ready, snapshot.servers[0].availability);
-    try std.testing.expectEqual(@as(?usize, 2), snapshot.servers[0].tool_count);
-    // A server whose list hadn't loaded is offered, not shown as empty.
-    try std.testing.expectEqual(model_catalog.Availability.available_on_demand, snapshot.servers[1].availability);
-    try std.testing.expectEqual(@as(?usize, null), snapshot.servers[1].tool_count);
+    const names = try viewServerNames(arena_state.allocator(), &view);
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("chrome-devtools", names[0]);
+    // A server whose list hadn't loaded is listed too: it starts on demand.
+    try std.testing.expectEqualStrings("later", names[1]);
+    try std.testing.expectEqual(@as(usize, 0), (try viewServerNames(arena_state.allocator(), null)).len);
 }
 
 test "subagent inherits model capabilities" {
@@ -849,14 +834,16 @@ fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !ag
     return tool_runtime.validateToolCall(context.toolContext(), arena, call);
 }
 
+/// An MCP tool the child's request didn't send, for a toolbox run that carries
+/// it: the child runs it as its own direct call, under its MCP access.
+fn resolveUnselectedMcpTool(raw: *anyopaque, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_runtime.resolveUnselectedMcpTool(context.toolContext(), arena, name);
+}
+
 fn checkToolAvailability(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !?[]const u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.checkToolAvailability(context.toolContext(), arena, call);
-}
-
-fn prepareSkillCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    return tool_runtime.prepareSkillCall(context.toolContext(), arena, call, locations);
 }
 
 fn admissionContext(
