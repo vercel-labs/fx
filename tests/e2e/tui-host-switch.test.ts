@@ -1100,6 +1100,61 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "an idle agent waits only on its own subagents: main shows no wait row for lead's helper, and lead's screen does",
+    async () => {
+      const helper = held();
+      let helperAsked = false;
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            if (userTexts(body).some((text) => text.includes("WAIT_HELPER_TASK"))) {
+              helperAsked = true;
+              await helper.promise;
+              return text("helper", "WAIT_HELPER_DONE");
+            }
+            if (body.includes("WAIT_HELPER_DONE")) return text("lead_after", "WAIT_LEAD_SAW_HELPER");
+            if (!body.includes('"lead_sub"')) {
+              return toolCall("lead_sub", "subagent", {
+                request: { action: "message", agent: "helper", message: "WAIT_HELPER_TASK" },
+              });
+            }
+            return text("lead_started", "WAIT_LEAD_STARTED");
+          }
+          if (body.includes("WAIT_LEAD_SAW_HELPER")) return text("main_after", "WAIT_MAIN_SAW_LEAD_AFTER");
+          if (body.includes("WAIT_LEAD_STARTED")) return text("main_idle", "WAIT_MAIN_IDLE");
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", {
+              request: { action: "message", agent: "lead", message: "WAIT_LEAD_TASK" },
+            });
+          }
+          return text("main_done", "WAIT_MAIN_DONE");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          // Lead's turn has ended and main has read its report, so neither
+          // works; only lead's helper does, held until the checks are done.
+          await session.waitForText("WAIT_MAIN_IDLE", 30_000);
+          await until("the helper's request", () => helperAsked);
+          // Main waits on nothing of its own. The footer note and the wait
+          // row come from the same frame, so a frame that counts the helper
+          // working without the row shows main's count is 0.
+          const mainScreen = await session.waitForPane((pane) => pane.includes("1 subagent working") && !pane.includes("waiting on"), 15_000);
+          expect(mainScreen).not.toContain("waiting on");
+          // Lead, the helper's parent, waits on it.
+          await showAgent(session, "lead");
+          await session.waitForPane((pane) => /\u2022 waiting on 1 subagent \(\d+s\) \u00b7 \u2193 to view/.test(pane), 15_000);
+          helper.release();
+          // The helper's report wakes lead, and lead's row goes once
+          // nothing it started still works.
+          await session.waitForPane((pane) => pane.includes("WAIT_LEAD_SAW_HELPER") && !pane.includes("waiting on"), 30_000);
+        });
+      } finally {
+        helper.release();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "main's stop ends a turn typed on a subagent's screen, which then owes no report",
     async () => {
       const typed = held();

@@ -487,6 +487,23 @@ fn latestReplyAt(history: []const types.HistoryTurn) i64 {
     return 0;
 }
 
+/// When the agent's newest turn ended, from its saved turn summary, or 0
+/// when that turn saved no end time, as a stopped or failed turn does. Unlike
+/// `latestReplyAt`, it never falls back to an older turn, so a clock started
+/// from it never counts time from before the newest turn.
+fn newestTurnEndedAt(history: []const types.HistoryTurn) i64 {
+    var index = history.len;
+    while (index > 0) {
+        index -= 1;
+        const summary = types.historyTurnSummary(history[index]) orelse switch (history[index]) {
+            .compacted_summary => continue,
+            .assistant, .interrupted => return 0,
+        };
+        return summary.completed_at_ms;
+    }
+    return 0;
+}
+
 /// The switch order over the first instance and `entries`, written to
 /// `out` as positions: 0 for the first instance, k + 1 for `entries[k]`. The
 /// instances come in launch order, each followed by the subagents in its
@@ -1188,14 +1205,16 @@ pub fn Runtime(comptime App: type) type {
         /// The activity row for an agent on screen whose turn ended while its
         /// own subagents still work, such as "• waiting on 3 subagents (12s)
         /// · ↓ to view", so an idle parent does not look stopped. The clock
-        /// counts from the agent's last reply. Empty label otherwise.
+        /// counts from when the agent's newest turn ended, and is left out
+        /// when that turn saved no end time, such as a stopped or failed one.
+        /// Empty label otherwise.
         pub fn subagentWaitStatus(app: *App) SubagentWait {
             const count = subagentWaitCount(app);
             if (count == 0) return .{};
             const screen = agents.screenAgentOf(app);
             const now_ms = io_mod.milliTimestamp();
-            const replied_at = latestReplyAt(screen.session.agent.history.items);
-            const since_ms: i64 = if (replied_at > 0 and replied_at <= now_ms) replied_at else 0;
+            const ended_at = newestTurnEndedAt(screen.session.agent.history.items);
+            const since_ms: i64 = if (ended_at > 0 and ended_at <= now_ms) ended_at else 0;
             var out: std.Io.Writer = .fixed(&app.instances.subagent_wait_buf);
             out.print("• waiting on {d} subagent{s}", .{ count, if (count == 1) "" else "s" }) catch return .{};
             if (since_ms > 0) {
@@ -2846,4 +2865,27 @@ test "latest reply timestamp ignores interrupted turns and empty or untimed repl
     try std.testing.expectEqual(@as(i64, 200), latestReplyAt(&history));
     try std.testing.expectEqual(@as(i64, 0), latestReplyAt(&.{}));
     try std.testing.expectEqual(@as(i64, 0), latestReplyAt(history[2..]));
+}
+
+test "the newest turn's end time never falls back to an older turn" {
+    const user: types.UserTurn = .{ .text = @constCast("task") };
+    const compacted: types.HistoryTurn = .{ .compacted_summary = .{ .summary = @constCast("earlier"), .removed_turn_count = 1, .compaction_count = 1 } };
+    const replied: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("reply"), .execution = .{ .turn_summary = .{ .completed_at_ms = 200 } } } };
+    const tool_only: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast(""), .execution = .{ .turn_summary = .{ .completed_at_ms = 300 } } } };
+    const stopped: types.HistoryTurn = .{ .interrupted = .{ .user = user } };
+    const failed: types.HistoryTurn = .{ .interrupted = .{ .user = user, .terminal_reason = .failed } };
+    const untimed: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("old session") } };
+
+    try std.testing.expectEqual(@as(i64, 200), newestTurnEndedAt(&.{replied}));
+    // A completed turn counts even when it ended without reply text.
+    try std.testing.expectEqual(@as(i64, 300), newestTurnEndedAt(&.{ replied, tool_only }));
+    // Compaction is not a turn: the turn before it still ended then.
+    try std.testing.expectEqual(@as(i64, 200), newestTurnEndedAt(&.{ replied, compacted }));
+    // A stopped or failed turn saves no end time, so there is no clock,
+    // rather than one counting from the reply before it.
+    try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{ replied, stopped }));
+    try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{ replied, failed }));
+    try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{ replied, untimed }));
+    try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{compacted}));
+    try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{}));
 }
