@@ -147,7 +147,7 @@ const category_labels = [_][]const u8{
     "edit",
     "open",
     "command",
-    "subagent",
+    "subagent call",
     "browser",
     "MCP call",
 };
@@ -588,7 +588,7 @@ fn formatGroupSummary(alloc: std.mem.Allocator, summary: Summary) ![]u8 {
         const count = summary.categories[index];
         const label = if (count == 1) category_labels[index] else switch (index) {
             command_category_index => "commands",
-            subagent_category_index => "subagents",
+            subagent_category_index => "subagent calls",
             mcp_category_index => "MCP calls",
             else => category_labels[index],
         };
@@ -1512,7 +1512,7 @@ test "grouped subagent status keeps the vertical continuation for middle rows" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 4 tool calls · 4 subagents\n" ++
+        "● 4 tool calls · 4 subagent calls\n" ++
             "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
             "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
             "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
@@ -1528,14 +1528,14 @@ test "group summary uses singular and plural subagent labels" {
     summary.categories[subagent_category_index] = 1;
     const single = try formatGroupSummary(alloc, summary);
     defer alloc.free(single);
-    try std.testing.expectEqualStrings("● 2 tool calls · 1 command · 1 subagent", single);
+    try std.testing.expectEqualStrings("● 2 tool calls · 1 command · 1 subagent call", single);
 
     summary = .{ .total = 5 };
     summary.categories[command_category_index] = 2;
     summary.categories[subagent_category_index] = 3;
     const plural = try formatGroupSummary(alloc, summary);
     defer alloc.free(plural);
-    try std.testing.expectEqualStrings("● 5 tool calls · 3 subagents · 2 commands", plural);
+    try std.testing.expectEqualStrings("● 5 tool calls · 3 subagent calls · 2 commands", plural);
 }
 
 test "small minimal tool groups surface canonical action targets" {

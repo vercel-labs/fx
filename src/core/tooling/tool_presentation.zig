@@ -69,17 +69,17 @@ pub fn subagentAction(
         else => return null,
     } else outer;
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
-    // A close names the subagent it removes, with nothing to preview.
-    if (std.mem.eql(u8, action, "close")) {
-        const raw_closed = tool_args.optionalStringArg(args, "agent") orelse return null;
-        const closed = try text_utils.encodeTerminalSafe(scratch, raw_closed, 64);
+    // Every other action says what it does to whom, with nothing to preview.
+    if (actionWords(action)) |words| {
+        const raw_target = tool_args.optionalStringArg(args, "agent") orelse words.no_agent orelse return null;
+        const target = try text_utils.encodeTerminalSafe(scratch, raw_target, 64);
         const label = switch (state) {
-            .active, .pending => try alloc.print("closing {s}", .{closed.bytes}),
+            .active, .pending => try alloc.print("{s} {s}", .{ words.doing, target.bytes }),
             .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
-                try alloc.print("couldn't close {s}", .{closed.bytes})
+                try alloc.print("couldn't {s} {s}", .{ words.verb, target.bytes })
             else
-                try alloc.print("{s} {s}", .{ reason, closed.bytes }),
-            .identity, .completed, .feedback => try alloc.print("closed {s}", .{closed.bytes}),
+                try alloc.print("{s} {s} interrupted", .{ words.verb, target.bytes }),
+            .identity, .completed, .feedback => try alloc.print("{s} {s}", .{ words.done, target.bytes }),
         };
         errdefer alloc.free(label);
         return .{ .label = label, .detail = try alloc.dupe(u8, "") };
@@ -117,6 +117,21 @@ pub fn subagentAction(
     else
         try alloc.print("· {s}", .{preview});
     return .{ .label = label, .detail = detail };
+}
+
+/// How a subagent row words an action other than a message, and what it
+/// names when the call names no agent.
+const ActionWords = struct { verb: []const u8, doing: []const u8, done: []const u8, no_agent: ?[]const u8 = null };
+
+fn actionWords(action: []const u8) ?ActionWords {
+    const table = [_]struct { []const u8, ActionWords }{
+        .{ "close", .{ .verb = "close", .doing = "closing", .done = "closed" } },
+        .{ "stop", .{ .verb = "stop", .doing = "stopping", .done = "stopped" } },
+        .{ "status", .{ .verb = "check", .doing = "checking", .done = "checked", .no_agent = "subagents" } },
+        .{ "wait", .{ .verb = "wait for", .doing = "waiting for", .done = "waited for", .no_agent = "subagents" } },
+    };
+    for (table) |entry| if (std.mem.eql(u8, entry[0], action)) return entry[1];
+    return null;
 }
 
 /// The preview a subagent row shows for `raw`: runs of whitespace, line
@@ -207,6 +222,13 @@ test "subagent rows project request identity state and bounded safe previews" {
         .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .completed, .label = "closed tester", .detail = "" },
         .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .active, .label = "closing tester", .detail = "" },
         .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .{ .stopped = "Failed" }, .label = "couldn't close tester", .detail = "" },
+        .{ .args = "{\"action\":\"stop\",\"agent\":\"tester\"}", .state = .active, .label = "stopping tester", .detail = "" },
+        .{ .args = "{\"action\":\"stop\",\"agent\":\"tester\"}", .state = .completed, .label = "stopped tester", .detail = "" },
+        .{ .args = "{\"action\":\"wait\"}", .state = .active, .label = "waiting for subagents", .detail = "" },
+        .{ .args = "{\"action\":\"wait\"}", .state = .completed, .label = "waited for subagents", .detail = "" },
+        .{ .args = "{\"action\":\"wait\"}", .state = .{ .stopped = "Cancelled" }, .label = "wait for subagents interrupted", .detail = "" },
+        .{ .args = "{\"action\":\"status\"}", .state = .completed, .label = "checked subagents", .detail = "" },
+        .{ .args = "{\"action\":\"status\",\"agent\":\"tester\"}", .state = .{ .stopped = "Failed" }, .label = "couldn't check tester", .detail = "" },
     };
     for (cases) |case| {
         const action = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = case.args }, case.state)).?;
@@ -214,7 +236,7 @@ test "subagent rows project request identity state and bounded safe previews" {
         try std.testing.expectEqualStrings(case.label, action.label);
         try std.testing.expectEqualStrings(case.detail, action.detail);
     }
-    for ([_][]const u8{ "{", "[]", "{\"request\":null}", "{\"action\":\"inspect\"}", "{\"action\":\"message\",\"message\":\"hello\"}", "{\"action\":\"run\",\"task\":\"gone\"}", "{\"action\":\"wait\"}" }) |args| {
+    for ([_][]const u8{ "{", "[]", "{\"request\":null}", "{\"action\":\"inspect\"}", "{\"action\":\"message\",\"message\":\"hello\"}", "{\"action\":\"run\",\"task\":\"gone\"}", "{\"action\":\"stop\"}" }) |args| {
         try std.testing.expectEqual(@as(?SubagentAction, null), try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = args }, .active));
     }
     const unsafe = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"a\\u001b[2J\",\"message\":\"Check 日本語\\u001b[31m\"}" }, .active)).?;
