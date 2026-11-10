@@ -1090,6 +1090,34 @@ describe("fx ask shell startup files", () => {
     expect(result.stderr).not.toContain("shell snapshot unavailable");
   }, TIMEOUT);
 
+  // A startup file that renews the files fx watches at every start, as a tool
+  // that regenerates its own startup file does, makes every capture stale.
+  test("a startup file that rewrites itself at every start still runs the first command", async () => {
+    const root = createRoot();
+    writeStartupFiles(
+      root.home,
+      "printf 'loaded\\n' >> \"$HOME/rc.log\"\n" +
+        "export FX_REWRITE_MARK=ran\n" +
+        "touch \"$HOME/.zshrc\" \"$HOME/.bash_profile\"\n",
+    );
+    const gateway = startFakeGateway([
+      userShellRun("rewritten", "echo \"mark=$FX_REWRITE_MARK\""),
+      fakeGatewayFinalText("Rewriting startup file checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "Run the command."],
+      { cwd: root.workspace, env: { ...gatewayEnv(root.home, gateway), FX_SOUND: "0" }, timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    expect(gateway.requests.length).toBe(2);
+    expect(gateway.requests[1]!.body).toContain("mark=ran");
+    // The capture, one recapture, and the command's own full startup.
+    expect(startupLoads(root.home)).toBe(3);
+  }, TIMEOUT);
+
   test.skipIf(!passwdShell().endsWith("/zsh"))(
     "an edit in a ZDOTDIR that startup files set without exporting it reaches the next command",
     async () => {

@@ -17,13 +17,23 @@
 // that moment and lets the shell go on. The first probe then shows whether fx
 // noticed the edit made inside the capture.
 //
+// A churn case has a startup file that touches itself at every start, so every
+// capture ends stale, as when a tool regenerates its own startup file. fx must
+// not wait for ever: after the capture and one recapture the command runs with
+// the full startup, and the probe shows that (the login flag of its shell, and
+// one more load of the startup files). The case has a deadline; a command that
+// never ran fails the driver (exit 1).
+//
 // TLC replays the cases through the model's own actions under fx's rules.
 // --self-check also replays them under the rules of fx before the ZDOTDIR
 // change (every `_` function dropped, ZDOTDIR read only from the environment)
 // and under the rules before the capture-start rule (the moved folder stamped
 // when the capture ends), which must reject them. --rules old and --rules head
 // swap the two: run against a binary built before the change (FX_BIN), those
-// rules must accept its cases and today's must reject them.
+// rules must accept its cases and today's must reject them. Those binaries have
+// no bound on the captures, so the churn cases are left out of those runs. The
+// self-check also replays the cases under the rules before the bound, which
+// accept every case but the churn ones.
 //
 // fx runs the login shell from the passwd entry, so the cases are zsh's or
 // bash's, whichever this machine has.
@@ -36,7 +46,8 @@
 //   FX_BIN=/path/to/fx-before-the-capture-start-rule bun tests/tla/drivers/terminal/capture.ts --rules head
 //
 // Exit codes: 0 every run accepted (and the self-check rejected), 1 a run the
-// model cannot produce, 2 a toolchain, build, or harness failure.
+// model cannot produce or a churn command that never ran, 2 a toolchain, build,
+// or harness failure.
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { binary, targetHelpers, testEnvironment } from "../lib/context";
@@ -46,7 +57,7 @@ type Shell = "zsh" | "bash";
 type FState = "absent" | "stub" | "loaded";
 type ZMode = "keep" | "unset" | "export_moved" | "local_moved" | "assign_moved";
 type Dir = "home" | "inherited" | "moved";
-type Saw = { callable: string[]; z: string; zexp: boolean; fresh: boolean; captures: number };
+type Saw = { callable: string[]; z: string; zexp: boolean; fresh: boolean; captures: number; full: boolean };
 type Event = { kind: "run"; saw: Saw } | { kind: "edit" } | { kind: "window_edit" };
 type Case = {
   id: string;
@@ -56,8 +67,13 @@ type Case = {
   fstate: Record<string, FState>;
   // The edit lands while the capture runs, not between two commands.
   window: boolean;
+  // The startup file touches itself at every start, so every capture ends stale.
+  churn: boolean;
 };
-type Observation = Case & { events: Event[]; evidence: { exit: number; requests: number; seconds: number; tail: string } };
+type Observation = Case & {
+  events: Event[];
+  evidence: { exit: number; requests: number; seconds: number; tail: string; timedOut: boolean };
+};
 type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 type Rules = { filter: string; zdotdir: string };
 
@@ -67,6 +83,9 @@ type Rules = { filter: string; zdotdir: string };
 const FUNCS = ["wrap", "_helper", "__dunder", "_comp", "__fx_snapshot_x"];
 const ZMODES: ZMode[] = ["keep", "unset", "export_moved", "local_moved", "assign_moved"];
 const tlaDir = join(TLA_ROOT, "terminal");
+// A churn case runs a few login shells and finishes in about a second; fx before
+// the bound waits for ever.
+const CHURN_DEADLINE_MS = 20_000;
 const SPECS = ["ShellSnapshotCapture.tla", "ShellSnapshotCaptureTrace.tla"];
 
 function option(name: string, fallback: number): number {
@@ -77,13 +96,15 @@ function option(name: string, fallback: number): number {
   return value;
 }
 
-type RuleSet = "fixed" | "old" | "head";
+type RuleSet = "fixed" | "old" | "head" | "unbounded";
 const RULES: Record<RuleSet, Rules> = {
   fixed: { filter: "fixed", zdotdir: "fixed" },
   // fx before the ZDOTDIR change.
   old: { filter: "old", zdotdir: "env_only" },
   // fx with the ZDOTDIR watch, before the capture-start rule.
   head: { filter: "fixed", zdotdir: "stamp_late" },
+  // fx before the bound on the captures one command starts.
+  unbounded: { filter: "fixed", zdotdir: "unbounded" },
 };
 
 function rulesOption(): RuleSet {
@@ -144,7 +165,7 @@ function cases(shell: Shell): Case[] {
   for (const fstate of patterns) {
     for (const zmode of modes) {
       for (const inherited of inherit) {
-        result.push({ id: `case${result.length}`, shell, inherited, zmode, fstate, window: false });
+        result.push({ id: `case${result.length}`, shell, inherited, zmode, fstate, window: false, churn: false });
       }
     }
   }
@@ -153,7 +174,17 @@ function cases(shell: Shell): Case[] {
   // have stamped before the capture.
   for (const zmode of modes) {
     for (const inherited of inherit) {
-      result.push({ id: `case${result.length}`, shell, inherited, zmode, fstate: all("loaded"), window: true });
+      result.push({ id: `case${result.length}`, shell, inherited, zmode, fstate: all("loaded"), window: true, churn: false });
+    }
+  }
+  // A startup file that touches itself at every start, for every place the
+  // startup files can send ZDOTDIR. Binaries from before the bound never run
+  // these commands.
+  if (options.rules === "fixed") {
+    for (const zmode of modes) {
+      for (const inherited of inherit) {
+        result.push({ id: `case${result.length}`, shell, inherited, zmode, fstate: all("loaded"), window: false, churn: true });
+      }
     }
   }
   const next = generator(options.seed);
@@ -163,7 +194,7 @@ function cases(shell: Shell): Case[] {
     const zmode = modes[Math.floor(next() * modes.length)]!;
     const inherited = inherit[Math.floor(next() * inherit.length)]!;
     const window = next() < 0.3;
-    result.push({ id: `case${result.length}`, shell, inherited, zmode, fstate, window });
+    result.push({ id: `case${result.length}`, shell, inherited, zmode, fstate, window, churn: false });
   }
   return result;
 }
@@ -192,7 +223,11 @@ const WINDOW_GATE = [
   "fi",
 ].join("\n");
 
-function startupFile(c: Case): string {
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function startupFile(c: Case, rcPath: string): string {
   const lines = ["printf '%s\\n' loaded >> \"$HOME/rc.log\"", "export FX_CAPTURE_MARK=0"];
   if (c.shell === "zsh") lines.push("fpath=(\"$HOME/fn\" $fpath)");
   for (const f of FUNCS) {
@@ -220,6 +255,8 @@ function startupFile(c: Case): string {
   // The window case's shell says it read this file and waits for the driver to
   // edit it. A later capture finds the release file and goes on.
   if (c.window) lines.push(WINDOW_GATE);
+  // New times on the file at every start; its contents never change.
+  if (c.churn) lines.push(`touch ${shellQuote(rcPath)}`);
   return `${lines.join("\n")}\n`;
 }
 
@@ -242,7 +279,7 @@ function writeCase(root: string, c: Case) {
   } else {
     rcPath = join(home, ".bash_profile");
   }
-  writeFileSync(rcPath, startupFile(c));
+  writeFileSync(rcPath, startupFile(c, rcPath));
   return { home, dirs, rcPath, workspace: join(root, "workspace"), fxHome: join(root, "fxhome") };
 }
 
@@ -253,6 +290,10 @@ const PROBE = [
   "if printenv ZDOTDIR >/dev/null; then echo zexp=1; else echo zexp=0; fi",
   "printf 'mark=%s\\n' \"$FX_CAPTURE_MARK\"",
   "printf 'loads=%s\\n' \"$(wc -l < \"$HOME/rc.log\" | tr -d ' ')\"",
+  // fx runs a command from a snapshot in a shell that is not a login shell, and
+  // with the full startup in one that is.
+  "if [ -n \"$ZSH_VERSION\" ]; then if [[ -o login ]]; then echo login=1; else echo login=0; fi; " +
+  "else if shopt -q login_shell; then echo login=1; else echo login=0; fi; fi",
 ].join("; ");
 
 // The command output in shell tool result `callId` of a request fx sent to
@@ -281,7 +322,10 @@ function readSaw(output: string, dirs: Record<Dir, string>, version: number): Sa
   const zexp = /zexp=([01])/.exec(output)?.[1];
   const mark = /mark=([^\n]*)/.exec(output)?.[1];
   const loads = /loads=(\d+)/.exec(output)?.[1];
-  if (zdotdir === undefined || zexp === undefined || mark === undefined || loads === undefined) return null;
+  const login = /login=([01])/.exec(output)?.[1];
+  if (zdotdir === undefined || zexp === undefined || mark === undefined || loads === undefined || login === undefined) {
+    return null;
+  }
   const named = (Object.entries(dirs) as Array<[Dir, string]>).find(([, path]) => path === zdotdir)?.[0];
   return {
     callable,
@@ -289,6 +333,7 @@ function readSaw(output: string, dirs: Record<Dir, string>, version: number): Sa
     zexp: zexp === "1",
     fresh: mark === String(version),
     captures: Number(loads),
+    full: login === "1",
   };
 }
 
@@ -317,6 +362,8 @@ async function runCase(helpers: any, c: Case, scratch: string): Promise<Observat
   const gateway = helpers.startFakeGateway(
     c.window
       ? [call("probe_window"), helpers.fakeGatewayFinalText("CAPTURE_CASE_DONE")]
+      : c.churn
+      ? [call("probe_churn"), helpers.fakeGatewayFinalText("CAPTURE_CASE_DONE")]
       : [
         call("probe_before"),
         () => {
@@ -347,7 +394,12 @@ async function runCase(helpers: any, c: Case, scratch: string): Promise<Observat
       stdout: "pipe",
       stderr: "pipe",
     });
-    const timer = setTimeout(() => child.kill(9), 90_000);
+    // A churn command that has not run by now never will.
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill(9);
+    }, c.churn ? CHURN_DEADLINE_MS : 90_000);
     let over = false;
     const edited = c.window ? holdAndEdit(home, rcPath, () => over) : Promise.resolve(false);
     const [stdout, stderr, exit] = await Promise.all([
@@ -358,7 +410,13 @@ async function runCase(helpers: any, c: Case, scratch: string): Promise<Observat
     over = true;
     clearTimeout(timer);
     const events: Event[] = [];
-    if (c.window) {
+    if (c.churn) {
+      // Every capture of the case ends stale by what the startup file does, so
+      // the edit lands inside each of the two captures, and the command follows.
+      const churn = gateway.requests[1] ? toolResult(gateway.requests[1].body, "probe_churn") : null;
+      const saw = churn === null ? null : readSaw(churn, dirs, 0);
+      if (saw) events.push({ kind: "window_edit" }, { kind: "window_edit" }, { kind: "run", saw });
+    } else if (c.window) {
       // One probe, after the edit made inside the capture.
       const window = gateway.requests[1] ? toolResult(gateway.requests[1].body, "probe_window") : null;
       const saw = window === null ? null : readSaw(window, dirs, 1);
@@ -380,6 +438,7 @@ async function runCase(helpers: any, c: Case, scratch: string): Promise<Observat
         requests: gateway.requests.length,
         seconds: Math.round((performance.now() - started) / 100) / 10,
         tail: `${stdout.slice(-400)}\n${stderr.slice(-400)}`,
+        timedOut,
       },
     };
   } finally {
@@ -397,12 +456,12 @@ function tlaSet(values: string[]): string {
 
 function tlaSaw(saw: Saw): string {
   return `[callable |-> ${tlaSet(saw.callable)}, z |-> ${tlaString(saw.z)}, zexp |-> ${saw.zexp ? "TRUE" : "FALSE"}, ` +
-    `fresh |-> ${saw.fresh ? "TRUE" : "FALSE"}, captures |-> ${saw.captures}]`;
+    `fresh |-> ${saw.fresh ? "TRUE" : "FALSE"}, captures |-> ${saw.captures}, full |-> ${saw.full ? "TRUE" : "FALSE"}]`;
 }
 
 // Edit events, between commands or inside a capture, carry a placeholder, so
 // every event record has the same fields.
-const NO_SAW: Saw = { callable: [], z: "none", zexp: false, fresh: true, captures: 0 };
+const NO_SAW: Saw = { callable: [], z: "none", zexp: false, fresh: true, captures: 0, full: false };
 
 function observedModule(observations: Observation[]): string {
   const cases = observations.map((o) => {
@@ -432,7 +491,8 @@ async function runTrace(observations: Observation[], rules: Rules, parent: strin
     "CONSTANTS",
     `  FilterRule = ${tlaString(rules.filter)}`,
     `  ZdotdirRule = ${tlaString(rules.zdotdir)}`,
-    "  MaxEdits = 1",
+    // A churn case edits the folder the shell reads once inside each capture.
+    "  MaxEdits = 2",
     "  MaxRuns = 2",
     "INVARIANT NotAllMatched",
     "CHECK_DEADLOCK FALSE",
@@ -483,12 +543,26 @@ async function main(): Promise<number> {
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
   console.log(`${observations.length} ${shell} cases of ${binary} in ${seconds}s`);
   console.log(`observations: ${join(out, "observations.json")}`);
+  // A churn command that never ran is what the bound on the captures prevents:
+  // fx kept capturing while the startup file kept changing its own files.
+  const stuck = observations.filter((o) => o.churn && o.events.length === 0 && o.evidence.timedOut);
+  if (stuck.length > 0) {
+    console.log(
+      `FAIL: ${stuck.length} churn cases never ran their command in ${CHURN_DEADLINE_MS / 1000}s: ` +
+        stuck.map((o) => o.id).join(", "),
+    );
+    console.log(`first: ${JSON.stringify(stuck[0])}`);
+    return 1;
+  }
   // A window case has one probe and two events: the edit inside the capture,
-  // then the run. The others have two probes and three events: run, edit, run.
-  // Every request reaches the fake gateway: the probes and the answer.
+  // then the run. A churn case has one probe and three: an edit inside each of
+  // the two captures, then the run. The others have two probes and three
+  // events: run, edit, run. Every request reaches the fake gateway: the probes
+  // and the answer.
   const broken = observations.find((o) => {
-    const probes = o.window ? 1 : 2;
-    return o.events.length !== probes + 1 || o.evidence.exit !== 0 || o.evidence.requests !== probes + 1;
+    const probes = o.window || o.churn ? 1 : 2;
+    const events = o.window ? 2 : 3;
+    return o.events.length !== events || o.evidence.exit !== 0 || o.evidence.requests !== probes + 1;
   });
   if (broken) {
     console.log(`TOOL_ERROR: case ${broken.id} did not finish both probes: ${JSON.stringify(broken)}`);
@@ -499,10 +573,11 @@ async function main(): Promise<number> {
     fixed: "the rules with the change",
     old: "the rules of fx before the ZDOTDIR change",
     head: "the rules of fx before the capture-start rule",
+    unbounded: "the rules of fx before the bound on the captures",
   };
-  // Rules that must reject what this binary did: the fixed binary against both
+  // Rules that must reject what this binary did: the fixed binary against the
   // older rule sets, an older binary against the fixed rules.
-  const others: RuleSet[] = options.rules === "fixed" ? ["old", "head"] : ["fixed"];
+  const others: RuleSet[] = options.rules === "fixed" ? ["old", "head", "unbounded"] : ["fixed"];
   const design = await runTrace(observations, RULES[options.rules]!, out);
   console.log(`${label[options.rules]}: ${design.verdict} (TLC work ${design.dir})`);
   if (design.verdict === "TOOL_ERROR") return 2;
@@ -518,12 +593,18 @@ async function main(): Promise<number> {
       if (check.verdict !== "REJECTED") return check.verdict === "TOOL_ERROR" ? 2 : 1;
     }
     if (options.rules === "fixed") {
-      // The window cases alone are what the rules before the capture-start rule
-      // cannot produce: every case without an edit inside a capture they accept.
-      const plain = observations.filter((o) => !o.window);
+      // The window and churn cases alone are what the rules before the
+      // capture-start rule cannot produce: every case without an edit inside a
+      // capture they accept.
+      const plain = observations.filter((o) => !o.window && !o.churn);
       const check = await runTrace(plain, RULES.head, out);
       console.log(`self-check, ${label.head} on the ${plain.length} cases without a window edit: ${check.verdict} (must be ACCEPTED)`);
       if (check.verdict !== "ACCEPTED") return check.verdict === "TOOL_ERROR" ? 2 : 1;
+      // The churn cases alone are what the rules before the bound cannot produce.
+      const bounded = observations.filter((o) => !o.churn);
+      const before = await runTrace(bounded, RULES.unbounded, out);
+      console.log(`self-check, ${label.unbounded} on the ${bounded.length} cases without churn: ${before.verdict} (must be ACCEPTED)`);
+      if (before.verdict !== "ACCEPTED") return before.verdict === "TOOL_ERROR" ? 2 : 1;
     }
   }
   console.log("ACCEPTED");
