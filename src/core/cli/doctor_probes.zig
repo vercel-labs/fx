@@ -598,7 +598,7 @@ pub fn serverStatusChecks(checks: *std.ArrayList(Check), alloc: Allocator, statu
         },
         .waiting_for_approval => try appendCheck(checks, alloc, "mcp", .warn, try alloc.print("{s} is waiting for approval", .{s.name}), try statusCommand(alloc, "approve", s)),
         .missing_env, .invalid_env => {
-            const variable = try command_lex.quoteWord(alloc, s.missing orelse "the variable");
+            const variable = if (s.missing) |name| try command_lex.quoteWord(alloc, name) else try alloc.dupe(u8, "the variable");
             defer alloc.free(variable);
             try appendCheck(checks, alloc, "mcp", .fail, try alloc.print("{s} needs {s}", .{ s.name, s.missing orelse "an environment variable" }), try alloc.print("set {s}, then run fx doctor again", .{variable}));
         },
@@ -926,6 +926,7 @@ test "every fix line passes a name from a config file to a shell as one word" {
         .{ .name = "it's", .source = .profile, .transport = .sse, .state = .unsupported },
         .{ .name = "$(id)", .source = .profile, .transport = .stdio, .state = .failed },
         .{ .name = "env", .source = .profile, .transport = .stdio, .state = .missing_env, .missing = "A`id`" },
+        .{ .name = "unnamed", .source = .profile, .transport = .stdio, .state = .invalid_env },
     });
     var login_reader: ChildStatusReader = undefined;
     answer(&login_reader, "{\"status\":\"needs_login\"}");
@@ -939,6 +940,7 @@ test "every fix line passes a name from a config file to a shell as one word" {
         "give 'it'\\''s' a stdio command or an HTTP URL, or run fx mcp remove 'it'\\''s'",
         "fx mcp show '$(id)'",
         "set 'A`id`', then run fx doctor again",
+        "set the variable, then run fx doctor again",
         "fx mcp login 'a b'",
         "fx mcp show '`id`'",
     };
