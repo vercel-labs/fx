@@ -4,7 +4,9 @@
 // Each case is one `fx ask` against a local fake gateway, with a temporary
 // HOME, FX_HOME, and ZDOTDIR. The startup files define the model's functions
 // in the state the case gives (loaded, an autoload stub, or absent) and do one
-// of the model's ZDOTDIR moves, from an inherited ZDOTDIR or from HOME. fx runs
+// of the model's ZDOTDIR moves, from an inherited ZDOTDIR or from HOME. The
+// completion function is loaded from a file of its own name that zsh
+// autoloads, or from a file under `completion/` that bash sources. fx runs
 // a probe command, the driver edits the startup file the login shell reads,
 // and fx runs the probe again. Each probe reports which functions it can call,
 // ZDOTDIR and whether it is exported, the marker the startup file exports, and
@@ -60,7 +62,8 @@ type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
 type Rules = { filter: string; zdotdir: string };
 
 // The model's functions: a public wrapper, `_` and `__` helpers it calls, a
-// completion function, and one of fx's own capture names.
+// completion function, and one of fx's own capture names. The completion
+// function is the one the model puts in its `Completion` set.
 const FUNCS = ["wrap", "_helper", "__dunder", "_comp", "__fx_snapshot_x"];
 const ZMODES: ZMode[] = ["keep", "unset", "export_moved", "local_moved", "assign_moved"];
 const tlaDir = join(TLA_ROOT, "terminal");
@@ -196,8 +199,16 @@ function startupFile(c: Case): string {
     const body = f === "wrap" ? "_helper; __dunder" : `printf '%s\\n' ${f}-ran`;
     switch (c.fstate[f]) {
       case "loaded":
-        // A completion function is loaded through autoload, as on first use.
-        lines.push(f === "_comp" && c.shell === "zsh" ? "autoload -Uz _comp; _comp >/dev/null" : `${f}() { ${body}; }`);
+        if (f === "_comp" && c.shell === "zsh") {
+          // zsh loads a completion function through autoload from a file of its
+          // own name, as on first use.
+          lines.push("autoload -Uz _comp; _comp >/dev/null");
+        } else if (f === "_comp") {
+          // bash gets it from a completion script, whose path says so.
+          lines.push(". \"$HOME/completion/_comp.bash\"");
+        } else {
+          lines.push(`${f}() { ${body}; }`);
+        }
         break;
       case "stub":
         lines.push(`autoload -Uz ${f}`);
@@ -220,6 +231,10 @@ function writeCase(root: string, c: Case) {
     mkdirSync(dir, { recursive: true });
   }
   for (const f of FUNCS) writeFileSync(join(home, "fn", f), `printf '%s\\n' ${f}-ran\n`);
+  if (c.shell === "bash") {
+    mkdirSync(join(home, "completion"), { recursive: true });
+    writeFileSync(join(home, "completion", "_comp.bash"), "_comp() { printf '%s\\n' _comp-ran; }\n");
+  }
   let rcPath: string;
   if (c.shell === "zsh") {
     writeFileSync(join(c.inherited ? dirs.inherited : home, ".zshenv"), ZSHENV[c.zmode]);

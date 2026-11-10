@@ -1768,6 +1768,8 @@ fn writeTestFile(dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
     try dir.writeFile(io_mod.getIo(), .{ .sub_path = path, .data = data });
 }
 
+const TestFile = struct { path: []const u8, data: []const u8 };
+
 /// Runs the real capture for `shell_path` with `environ`. Caller destroys the
 /// generation.
 fn captureForTest(shell_path: []const u8, cwd: []const u8, environ: *const Environ.Map) !*Generation {
@@ -1782,16 +1784,11 @@ fn captureForTest(shell_path: []const u8, cwd: []const u8, environ: *const Envir
     };
 }
 
-/// Startup-file helpers every real capture replays: loaded `_` and `__`
-/// functions, and one whose body reads like an autoload stub. fx's own
-/// `__fx_snapshot_` names stay out.
-const real_capture_helpers =
-    "_fx_snapshot_helper() { printf 'helper-ok\\n'; }\n" ++
-    "__fxsnap_dunder() { printf 'dunder-ok\\n'; }\n" ++
-    "_fx_snapshot_literal() { printf 'builtin autoload -XU\\n'; }\n" ++
-    "__fx_snapshot_private() { :; }\n";
-
-fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []const u8) !void {
+/// Captures `shell_path` as a login shell in an isolated HOME that holds
+/// `files`, and skips the test when the shell is missing. A `.bashrc` also
+/// gets a `.bash_profile` that sources it. The caller destroys the returned
+/// generation.
+fn captureRealShell(shell_path: []const u8, files: []const TestFile) !*Generation {
     std.Io.Dir.accessAbsolute(io_mod.getIo(), shell_path, .{}) catch return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1799,14 +1796,12 @@ fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
     const home = try io_mod.dirRealpathAlloc(scratch, tmp.dir, ".");
-    try writeTestFile(tmp.dir, file_name, try std.mem.concat(scratch, u8, &.{ contents, real_capture_helpers }));
-    const zsh = std.mem.eql(u8, file_name, ".zshrc");
-    if (zsh) {
-        // An autoloaded completion function that the startup files call.
-        try tmp.dir.createDirPath(io_mod.getIo(), "fn");
-        try writeTestFile(tmp.dir, "fn/_fx_loaded_later", "print -r -- loaded-later\n");
-    } else {
-        try writeTestFile(tmp.dir, ".bash_profile", ". \"$HOME/.bashrc\"\n");
+    for (files) |file| {
+        if (std.Io.Dir.path.dirname(file.path)) |parent| try tmp.dir.createDirPath(io_mod.getIo(), parent);
+        try writeTestFile(tmp.dir, file.path, file.data);
+        if (std.mem.eql(u8, file.path, ".bashrc")) {
+            try writeTestFile(tmp.dir, ".bash_profile", ". \"$HOME/.bashrc\"\n");
+        }
     }
 
     var environ = Environ.Map.init(scratch);
@@ -1815,7 +1810,28 @@ fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []
     try environ.put("PATH", "/usr/bin:/bin");
     try environ.put("TERM", "dumb");
 
-    const generation = try captureForTest(shell_path, home, &environ);
+    return captureForTest(shell_path, home, &environ);
+}
+
+// Both checks name the text in the test output without a direct write.
+fn expectReplayHas(generation: *const Generation, needles: []const []const u8) !void {
+    for (needles) |needle| {
+        if (std.mem.find(u8, generation.replay, needle) == null) {
+            try testing.expectEqualStrings(needle, "(missing from the replay)");
+        }
+    }
+}
+
+fn expectReplayLacks(generation: *const Generation, needles: []const []const u8) !void {
+    for (needles) |needle| {
+        if (std.mem.find(u8, generation.replay, needle) != null) {
+            try testing.expectEqualStrings("(absent from the replay)", needle);
+        }
+    }
+}
+
+fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []const u8) !void {
+    const generation = try captureRealShell(shell_path, &.{.{ .path = file_name, .data = contents }});
     defer generation.destroy();
     try testing.expectEqualStrings("captured-from-startup", generation.environ.get("FX_TEST_SNAPSHOT_MARKER").?);
     try testing.expect(std.mem.startsWith(u8, generation.environ.get("PATH").?, "/opt/fx-snapshot-marker/bin:"));
@@ -1825,19 +1841,10 @@ fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []
     try testing.expect(std.mem.find(u8, generation.replay, "fx_snapshot_function") != null);
     try testing.expect(std.mem.find(u8, generation.replay, "fxll") != null);
     try testing.expect(std.mem.find(u8, generation.replay, "startup chatter") == null);
-    inline for (.{ "_fx_snapshot_helper", "__fxsnap_dunder", "_fx_snapshot_literal" }) |name| {
-        try testing.expect(std.mem.find(u8, generation.replay, name ++ " ()") != null);
-    }
-    try testing.expect(std.mem.find(u8, generation.replay, "__fx_snapshot_private") == null);
-    if (zsh) {
-        // An exported ZDOTDIR is still watched.
-        try testing.expectEqualStrings(home, generation.zdotdir orelse "");
-        // Unloaded completion stubs stay out of the replay but count as
-        // defined names; public stubs and loaded `_` functions are replayed.
-        try testing.expect(generation.defines("_fx_unloaded"));
-        try testing.expect(std.mem.find(u8, generation.replay, "_fx_unloaded") == null);
-        try testing.expect(std.mem.find(u8, generation.replay, "fx_public_unloaded ()") != null);
-        try testing.expect(std.mem.find(u8, generation.replay, "_fx_loaded_later ()") != null);
+    // The test environment exports ZDOTDIR as HOME. zsh reports it in its own
+    // payload section; bash has none.
+    if (std.mem.endsWith(u8, shell_path, "zsh")) {
+        try testing.expectEqualStrings(generation.environ.get("HOME").?, generation.zdotdir orelse "");
     } else {
         try testing.expect(generation.zdotdir == null);
     }
@@ -1852,10 +1859,76 @@ test "snapshot capture reads a real zsh login shell" {
             "export PATH=\"/opt/fx-snapshot-marker/bin:$PATH\"\n" ++
             "alias fxll='print -r -- alias-ok'\n" ++
             "fx_snapshot_function() { print -r -- function-ok; }\n" ++
-            "fpath=(\"$HOME/fn\" $fpath)\n" ++
-            "autoload -Uz _fx_unloaded fx_public_unloaded _fx_loaded_later\n" ++
-            "_fx_loaded_later >/dev/null\n",
+            "_fx_completion_helper() { :; }\n",
     );
+}
+
+test "snapshot capture reads a real bash login shell" {
+    try expectRealCapture(
+        "/bin/bash",
+        ".bashrc",
+        "echo 'startup chatter'\n" ++
+            "export FX_TEST_SNAPSHOT_MARKER=captured-from-startup\n" ++
+            "export PATH=\"/opt/fx-snapshot-marker/bin:$PATH\"\n" ++
+            "alias fxll='echo alias-ok'\n" ++
+            "fx_snapshot_function() { echo function-ok; }\n",
+    );
+}
+
+// A wrapper such as Socket Firewall's `pnpm` calls a helper whose name starts
+// with `_`, so the replay needs that helper. Completion functions also start
+// with `_`, but come from autoload files and stay out of the replay.
+test "snapshot capture keeps zsh underscore helpers and skips completion functions" {
+    const generation = try captureRealShell("/bin/zsh", &.{
+        .{
+            .path = ".zshrc",
+            .data = "fpath=(\"$HOME/completions\" $fpath)\n" ++
+                "_fx_wrap_helper() { print -r -- \"FX_WRAPPED_HELPER_OK $*\"; }\n" ++
+                "fxwrapped() { _fx_wrap_helper fxwrapped \"$@\"; }\n" ++
+                "eval '_fx_eval_helper() { print -r -- FX_EVAL_HELPER_OK; }'\n" ++
+                // compinit registers each completion function this way.
+                "autoload -Uz \"$HOME/completions/_fx_comp_stub\"\n" ++
+                "autoload -Uz _fx_comp_unresolved\n" ++
+                "autoload -Uz +X _fx_comp_loaded\n" ++
+                "prompt_fxtheme_setup() { print -r -- FX_PROMPT_THEME_BODY; }\n" ++
+                "__fx_snapshot_probe() { print -r -- FX_SNAPSHOT_PREFIX_BODY; }\n",
+        },
+        .{ .path = "completions/_fx_comp_stub", .data = "print -r -- FX_COMPLETION_STUB_BODY\n" },
+        .{ .path = "completions/_fx_comp_unresolved", .data = "print -r -- FX_COMPLETION_UNRESOLVED_BODY\n" },
+        .{ .path = "completions/_fx_comp_loaded", .data = "print -r -- FX_COMPLETION_LOADED_BODY\n" },
+    });
+    defer generation.destroy();
+    try expectReplayHas(generation, &.{ "FX_WRAPPED_HELPER_OK", "FX_EVAL_HELPER_OK" });
+    try expectReplayLacks(generation, &.{
+        "_fx_comp_stub",
+        "_fx_comp_unresolved",
+        "_fx_comp_loaded",
+        "FX_COMPLETION_LOADED_BODY",
+        "FX_PROMPT_THEME_BODY",
+        "FX_SNAPSHOT_PREFIX_BODY",
+    });
+    try testing.expect(generation.defines("_fx_comp_stub"));
+}
+
+test "snapshot capture keeps bash underscore helpers and skips completion-file functions" {
+    const generation = try captureRealShell("/bin/bash", &.{
+        .{
+            .path = ".bashrc",
+            .data = "_fx_wrap_helper() { echo \"FX_WRAPPED_HELPER_OK $*\"; }\n" ++
+                "fxwrapped() { _fx_wrap_helper fxwrapped \"$@\"; }\n" ++
+                // The defining file decides, not a name that mentions completion.
+                "_fx_completion_helper() { echo FX_NAMED_HELPER_OK; }\n" ++
+                ". \"$HOME/bash-completion/fx.bash\"\n" ++
+                // Under extdebug, a failing DEBUG trap skips the next command.
+                "trap false DEBUG\n",
+        },
+        .{ .path = "bash-completion/fx.bash", .data = "_fx_complete() { echo FX_COMPLETION_FILE_BODY; }\n" ++
+            "complete -F _fx_complete fxwrapped\n" },
+    });
+    defer generation.destroy();
+    try expectReplayHas(generation, &.{ "FX_WRAPPED_HELPER_OK", "FX_NAMED_HELPER_OK" });
+    try expectReplayLacks(generation, &.{"FX_COMPLETION_FILE_BODY"});
+    try testing.expect(generation.defines("_fx_complete"));
 }
 
 test "snapshot capture records a ZDOTDIR the startup files set without exporting it" {
@@ -1894,18 +1967,6 @@ test "snapshot capture records a ZDOTDIR the startup files set without exporting
     defer unset.destroy();
     try testing.expect(unset.zdotdir == null);
     try testing.expect(std.mem.find(u8, unset.replay, "ZDOTDIR=") == null);
-}
-
-test "snapshot capture reads a real bash login shell" {
-    try expectRealCapture(
-        "/bin/bash",
-        ".bashrc",
-        "echo 'startup chatter'\n" ++
-            "export FX_TEST_SNAPSHOT_MARKER=captured-from-startup\n" ++
-            "export PATH=\"/opt/fx-snapshot-marker/bin:$PATH\"\n" ++
-            "alias fxll='echo alias-ok'\n" ++
-            "fx_snapshot_function() { echo function-ok; }\n",
-    );
 }
 
 /// Startup file for the bash replay test. extglob is on while the functions are

@@ -1880,6 +1880,9 @@ fn shellParseRetryGuidance(output: []const u8, whole_output: bool) ?[]const u8 {
 // snapshot, bash names the script it sources from `/dev/fd/0`
 // (`snapshotScript` in shell_resolver.zig), followed by `eval:`. Anchoring
 // bash to that path keeps the `eval` errors of a script the command runs out.
+// bash 3.2 evaluates the snapshot script instead of sourcing it
+// (`snapshotInvocation`), so it names the shell, which the basename match
+// covers.
 fn shellErrorFamily(line: []const u8) ?ShellFamily {
     const colon = std.mem.findScalar(u8, line, ':') orelse return null;
     const token = line[0..colon];
@@ -2970,6 +2973,11 @@ test "failure guidance detectors match only their signatures" {
     try std.testing.expectEqual(
         line_shell_parse_retry_guidance,
         failureRetryGuidance(1, "/dev/fd/0: eval: line 40: unexpected EOF while looking for matching `\"'\n", true),
+    );
+    // bash 3.2 evaluates the snapshot script, so it names the shell instead.
+    try std.testing.expectEqual(
+        line_shell_parse_retry_guidance,
+        failureRetryGuidance(1, "/bin/bash: eval: line 11: unexpected EOF while looking for matching `\"'\n/bin/bash: eval: line 12: syntax error: unexpected end of file\n", true),
     );
     try std.testing.expectEqual(
         line_shell_parse_retry_guidance,

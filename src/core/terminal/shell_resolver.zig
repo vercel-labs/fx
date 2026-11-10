@@ -276,10 +276,20 @@ pub fn snapshotInvocation(
         .zsh => .{ "\\builtin exec 9>&2 2>/dev/null; ", "\\builtin exec 2>&9 9>&-; " },
         .bash => .{ "exec 9>&2 2>/dev/null; ", "\\builtin unset -f exec; exec 2>&9 9>&-; " },
     };
+    // bash 3.2, macOS's /bin/bash, sources a pipe only as far as the bytes it
+    // holds at that moment, about 64 KB, so a larger replay would lose its
+    // end. That bash reads the whole script with a command substitution and
+    // evaluates it. bash 4 and later read a pipe to its end.
+    const load_replay: []const u8 = switch (kind) {
+        .zsh => "\\builtin source /dev/fd/0; ",
+        .bash => "if (( BASH_VERSINFO[0] < 4 )); then \\builtin eval -- \"$(< /dev/fd/0)\"; " ++
+            "else \\builtin source /dev/fd/0; fi; ",
+    };
     var bootstrap: std.ArrayList(u8) = .empty;
     errdefer bootstrap.deinit(alloc);
     try bootstrap.appendSlice(alloc, park_stderr);
-    try bootstrap.appendSlice(alloc, "\\builtin source /dev/fd/0; __fx_snapshot_status=$?; ");
+    try bootstrap.appendSlice(alloc, load_replay);
+    try bootstrap.appendSlice(alloc, "__fx_snapshot_status=$?; ");
     try bootstrap.appendSlice(alloc, restore_stderr);
     try bootstrap.appendSlice(
         alloc,
@@ -339,11 +349,14 @@ pub const snapshot_marker_prefix = "FXSNAP:";
 // environment does not show it. The replay restores it with a plain
 // assignment, which leaves it unexported unless the environment exports it.
 //
-// Functions named `_*` are mostly completion functions that compinit only
-// marks for autoloading. Commands never run completion, so those stubs stay
-// out of the replay, which runs before every command. A `_*` function the
-// startup files defined or loaded, such as a helper a public wrapper calls,
-// is replayed.
+// Completion functions start with `_`, a setup often has a thousand of them,
+// and a command never uses them, so the replay leaves them out. zsh autoloads
+// each one from a file of the same name, as compinit does for every
+// `#compdef` file, so a `_` function is left out only when
+// `functions_source` names no file or a file with the function's name. A `_`
+// helper that a startup file defines, such as the one a `pnpm` wrapper
+// calls, is replayed. zsh before 5.4 has no `functions_source`, so it leaves
+// out every `_` function.
 const zsh_capture_script =
     \\{
     \\\builtin zmodload zsh/parameter 2>/dev/null
@@ -356,16 +369,12 @@ const zsh_capture_script =
     \\\builtin print -r -- '\builtin unalias -a; \builtin unalias -as'
     \\\builtin typeset -p fpath
     \\if [[ -n ${ZDOTDIR+set} ]]; then \builtin print -r -- "ZDOTDIR=${(qq)ZDOTDIR}"; fi
-    \\\builtin typeset -A __fx_snapshot_unloaded
-    \\__fx_snapshot_unloaded=()
-    \\for __fx_snapshot_name in ${(f)"$(\builtin functions -u +)"}; do
-    \\  __fx_snapshot_unloaded[$__fx_snapshot_name]=1
-    \\done
     \\for __fx_snapshot_name in ${(ko)functions}; do
-    \\  case $__fx_snapshot_name in
-    \\    (prompt_*|__fx_snapshot_*) continue;;
-    \\    (_*) (( ${+__fx_snapshot_unloaded[$__fx_snapshot_name]} )) && continue;;
-    \\  esac
+    \\  case $__fx_snapshot_name in (prompt_*|__fx_snapshot_*) continue;; esac
+    \\  if [[ $__fx_snapshot_name == _* ]]; then
+    \\    __fx_snapshot_file=${functions_source[$__fx_snapshot_name]-}
+    \\    if [[ -z $__fx_snapshot_file || ${__fx_snapshot_file:t} == "$__fx_snapshot_name" ]]; then continue; fi
+    \\  fi
     \\  \builtin functions -- $__fx_snapshot_name
     \\done
     \\\builtin alias -L
@@ -381,11 +390,16 @@ const zsh_capture_script =
     \\} 2>/dev/null
 ;
 
-// The replay shell starts with extglob off, and bash parses an extglob pattern,
-// such as `@(a|b)` in a function body, only while extglob is on. bash-completion
-// turns extglob on while it defines its `_*` functions, so the replay turns it
-// on before the first body. The `shopt -p` lines after the functions then set
-// extglob the way the startup files left it, before the command runs.
+// bash has no autoload. bash-completion and git's completion script define
+// their `_` functions in files whose path contains `completion`, so the
+// replay leaves out a `_` function only when `declare -F`, with `extdebug`
+// on, reports such a file; the name alone does not decide. Under `extdebug`
+// a DEBUG trap that fails skips the next command, so the trap is cleared
+// first. bash parses a function's patterns when it reads the definition, and
+// the replay shell starts with extglob off, so the replay turns extglob on
+// before the first function. The `shopt -p` lines after the aliases then set
+// the options the way the startup files left them, before the command runs,
+// even for a file that had extglob on only while it defined its functions.
 const bash_capture_script =
     \\{
     \\\unset -f builtin
@@ -395,10 +409,15 @@ const bash_capture_script =
     \\\builtin printf '%s\0' $(\builtin compgen -a) $(\builtin compgen -A function)
     \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
     \\\builtin printf '%s\n' 'shopt -s extglob'
-    \\for __fx_snapshot_name in $(\builtin compgen -A function); do
-    \\  case $__fx_snapshot_name in __fx_snapshot_*) continue;; esac
+    \\\builtin trap - DEBUG
+    \\\builtin shopt -s extdebug
+    \\__fx_snapshot_sources=$(\builtin declare -F $(\builtin compgen -A function))
+    \\\builtin shopt -u extdebug
+    \\while \builtin read -r __fx_snapshot_name __fx_snapshot_line __fx_snapshot_file; do
+    \\  case $__fx_snapshot_name in __fx_snapshot_*|'') continue;; esac
+    \\  case $__fx_snapshot_name in _*) case $__fx_snapshot_file in *completion*) continue;; esac;; esac
     \\  \builtin declare -f -- "$__fx_snapshot_name"
-    \\done
+    \\done <<< "$__fx_snapshot_sources"
     \\\builtin alias -p
     \\for __fx_snapshot_name in extglob nullglob dotglob globstar nocaseglob failglob nocasematch globasciiranges; do
     \\  \builtin shopt -p "$__fx_snapshot_name" 2>/dev/null
@@ -730,7 +749,8 @@ test "snapshot bootstrap hides replay errors and restores stderr afterwards" {
 
     const bash = try snapshotInvocation(arena, "/bin/bash", "marker");
     try std.testing.expectEqualStrings(
-        "exec 9>&2 2>/dev/null; \\builtin source /dev/fd/0; __fx_snapshot_status=$?; " ++
+        "exec 9>&2 2>/dev/null; if (( BASH_VERSINFO[0] < 4 )); then \\builtin eval -- \"$(< /dev/fd/0)\"; " ++
+            "else \\builtin source /dev/fd/0; fi; __fx_snapshot_status=$?; " ++
             "\\builtin unset -f exec; exec 2>&9 9>&-; " ++ tail,
         bash.argv()[bash.argv().len - 1],
     );

@@ -19,21 +19,40 @@ import {
 const TIMEOUT = 90_000;
 const LIST_HINT = "enter switch";
 
-// Directions follow the current menu order; a number selects that stable fx
-// instance regardless of where working state or completed replies put its row.
+// The agent list's row for instance `number`, and for subagent `name`, which
+// sits under its instance behind a branch.
+function instanceRow(number: number): RegExp {
+  return new RegExp(`^ {2}fx ${number} {2,}`, "m");
+}
+
+function subagentRow(name: string): RegExp {
+  return new RegExp(`^ {2}[\u251c\u2514] ${name} {2,}`, "m");
+}
+
+// The agent list's rows, top to bottom, from a capture with its escapes: each
+// one's name, such as "fx 2" or a subagent's own, and whether it is the
+// selected row, which the list draws bold and the others dim.
+function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean }> {
+  const rows: Array<{ name: string; selected: boolean }> = [];
+  for (const line of paneEscapes.split("\n")) {
+    const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
+    const row = /^ {2}(?:(fx \d+|main)|[\u251c\u2514] (\S+)) {2,}\S/.exec(plain);
+    if (row) rows.push({ name: (row[1] ?? row[2])!, selected: line.includes("\x1b[1m") });
+  }
+  return rows;
+}
+
+// Directions follow the list's order: the instances as they started, each
+// followed by its own subagents. A number selects that fx instance.
 async function switchAgent(session: TmuxSession, target: "next" | "previous" | number) {
   await session.sendKeys("C-x");
-  const pane = await session.waitForText(LIST_HINT, 10_000);
-  const lines = pane.split("\n");
-  const hint = lines.findIndex((line) => line.includes(LIST_HINT));
-  // The rows sit between the two rules above the hint.
-  let top = hint - 2;
-  while (top > 0 && !lines[top - 1].trimStart().startsWith("\u2500")) top -= 1;
-  const rows = lines.slice(top, hint - 1);
-  const from = rows.findIndex((row) => row.includes("(on screen)"));
+  await session.waitForText(LIST_HINT, 10_000);
+  const pane = await session.capturePaneEscapes();
+  const rows = agentRows(pane);
+  const from = rows.findIndex((row) => row.selected);
   if (from < 0 || rows.length < 2) throw new Error(`no agent list in:\n${pane}`);
   const to = typeof target === "number"
-    ? rows.findIndex((row) => new RegExp(`\\bfx ${target}(?: \\(on screen\\))? ·`).test(row))
+    ? rows.findIndex((row) => row.name === `fx ${target}`)
     : target === "next" ? (from + 1) % rows.length : (from + rows.length - 1) % rows.length;
   if (to < 0) throw new Error(`no fx ${target} row in:\n${pane}`);
   for (let step = 0; step < Math.abs(to - from); step += 1) await session.sendKeys(to > from ? "Down" : "Up");
@@ -1578,22 +1597,29 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendText("/status");
         await session.waitForPane((pane) => pane.includes("Step limit"), 15_000);
         await session.sendKeys("C-x");
-        const list = await session.waitForPane((pane) => pane.includes("fx 3 ·"), 15_000);
+        const list = await session.waitForPane((pane) => instanceRow(3).test(pane), 15_000);
         expect(list).not.toContain("Step limit");
-        expect(list).toContain("fx 1 (on screen) ·");
-        expect(list).toContain("fx 2 · new session · main · idle");
-        expect(list).toContain("fx 3 · new session · main · idle");
+        expect(list).toContain("Agents 3");
+        expect(list).toMatch(instanceRow(1));
+        expect(list).toMatch(/^ {2}fx 2 {2,}new session {2,}idle {2,}main {2,}\S/m);
+        expect(list).toMatch(/^ {2}fx 3 {2,}new session {2,}idle {2,}main {2,}\S/m);
         expect(list).toContain(LIST_HINT);
+        // The list opens on the agent on screen.
+        expect(agentRows(await session.capturePaneEscapes())).toEqual([
+          { name: "fx 1", selected: true },
+          { name: "fx 2", selected: false },
+          { name: "fx 3", selected: false },
+        ]);
         // Esc closes it.
         await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("fx 3 ·"), 15_000);
+        await session.waitForPane((pane) => !instanceRow(3).test(pane), 15_000);
         // ↓↓ previews fx 3, and Enter keeps it.
         await session.sendText("/agents");
-        await session.waitForPane((pane) => pane.includes("fx 3 ·"), 15_000);
+        await session.waitForPane((pane) => instanceRow(3).test(pane), 15_000);
         await session.sendKeys("Down");
         await session.sendKeys("Down");
         await session.sendKeys("Enter");
-        await session.waitForPane((pane) => pane.includes("fx 3/3") && !pane.includes("fx 3 ·"), 15_000);
+        await session.waitForPane((pane) => pane.includes("fx 3/3") && !instanceRow(3).test(pane), 15_000);
         await session.waitForComposer(15_000);
       });
     },
@@ -1606,15 +1632,15 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       await withHost(answerByLetter, {}, async ({ session }) => {
         await session.sendKeys("Down");
         await Bun.sleep(500);
-        expect(await session.capturePane()).not.toContain("fx 1 (on screen)");
+        expect(await session.capturePane()).not.toContain(LIST_HINT);
         await session.sendText("/launch");
         await session.waitForPane((pane) => pane.includes("fx 2/2 \u2193"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendKeys("Down");
-        const list = await session.waitForPane((pane) => pane.includes("fx 2 (on screen) ·"), 15_000);
-        expect(list).toContain("fx 1 ·");
+        const list = await session.waitForPane((pane) => instanceRow(2).test(pane), 15_000);
+        expect(list).toMatch(instanceRow(1));
         await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("fx 2 (on screen) ·"), 15_000);
+        await session.waitForPane((pane) => !instanceRow(2).test(pane), 15_000);
 
         // In a draft of several lines, down stays in the draft and Option+Up
         // moves up a paragraph.
@@ -1626,7 +1652,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("M-Up");
         await session.sendLiteral("Z");
         const moved = await session.waitForPane((pane) => pane.includes("Z"), 10_000);
-        expect(moved).not.toContain("(on screen) ·");
+        expect(moved).not.toContain(LIST_HINT);
         expect(moved).not.toContain("secondZ");
       });
     },
@@ -1634,7 +1660,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
-    "the agent list puts each instance's subagents under it and marks the agent on screen",
+    "the agent list puts each instance's subagents under it and opens on the agent on screen",
     async () => {
       await withHost((body) => {
         const texts = userTexts(body).join("\n");
@@ -1654,14 +1680,15 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await switchAgent(session, "next");
         await session.waitForPane((pane) => pane.includes("helper \u00b7 "), 15_000);
         await session.sendKeys("C-x");
-        const list = await session.waitForPane((pane) => pane.includes("helper (on screen) ·"), 15_000);
-        const rows = list.split("\n");
-        const first = rows.findIndex((row) => row.includes("fx 1 ·"));
-        const helper = rows.findIndex((row) => row.includes("    helper (on screen) ·"));
-        const second = rows.findIndex((row) => row.includes("fx 2 ·"));
-        expect(first).toBeGreaterThanOrEqual(0);
-        expect(helper).toBe(first + 1);
-        expect(second).toBe(helper + 1);
+        const list = await session.waitForPane((pane) => subagentRow("helper").test(pane) && pane.includes(LIST_HINT), 15_000);
+        expect(list).toContain("Agents 3");
+        // The helper's branch ends at it: fx 1 has no other subagent.
+        expect(list).toMatch(/^ {2}\u2514 helper {2,}/m);
+        expect(agentRows(await session.capturePaneEscapes())).toEqual([
+          { name: "fx 1", selected: false },
+          { name: "helper", selected: true },
+          { name: "fx 2", selected: false },
+        ]);
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("helper \u00b7 "), 15_000);
       });
@@ -1685,8 +1712,8 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
         await session.waitForPane((pane) => pane.includes("fx 2 finished · fx 1/2 \u2193"), 15_000);
         await session.sendText("/agents");
-        const list = await session.waitForPane((pane) => pane.includes("fx 2 ·"), 15_000);
-        expect(list).toMatch(/fx 2 · .* · main · finished/);
+        const list = await session.waitForPane((pane) => instanceRow(2).test(pane), 15_000);
+        expect(list).toMatch(/^ {2}fx 2 {2,}.* {2,}finished {2,}main {2,}\S/m);
         await session.sendKeys("Escape");
         // Showing it clears the note.
         await switchAgent(session, "next");
@@ -1717,8 +1744,8 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await switchAgent(session, "previous");
         await session.waitForPane((pane) => pane.includes("fx 1/2") && pane.includes("fx 2 needs you · fx 1/2 \u2193"), 15_000);
         await session.sendText("/agents");
-        const list = await session.waitForPane((pane) => pane.includes("fx 2 ·"), 15_000);
-        expect(list).toMatch(/fx 2 · .* · main · needs you/);
+        const list = await session.waitForPane((pane) => instanceRow(2).test(pane), 15_000);
+        expect(list).toMatch(/^ {2}fx 2 {2,}.* {2,}needs you {2,}main {2,}\S/m);
         await session.sendKeys("Escape");
         // Esc on its own screen ends the request, and the note goes.
         await switchAgent(session, "next");

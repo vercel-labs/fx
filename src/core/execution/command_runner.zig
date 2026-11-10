@@ -2309,9 +2309,7 @@ test "bash user profile commands reuse one startup-file snapshot" {
         ".bash_profile",
         "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
             "alias fxsnap_alias='printf alias-ok'\n" ++
-            "fxsnap_fn() { _fxsnap_helper; }\n" ++
-            "_fxsnap_helper() { __fxsnap_helper; }\n" ++
-            "__fxsnap_helper() { printf function-ok; }\n" ++
+            "fxsnap_fn() { printf function-ok; }\n" ++
             "export PATH=\"$HOME/marker-bin:$PATH\"\n" ++
             "export FXSNAP_EXPORT=exported\n",
     );
@@ -2348,6 +2346,39 @@ test "bash user profile commands reuse one startup-file snapshot" {
     try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
+test "bash user profile snapshot restores a helper that needs extglob" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // bash parses `@(a|b)` only with extglob on, so a replay that defines
+    // the helper before it restores the option fails as a whole.
+    const paths = try writeSnapshotTestShellFor(
+        arena,
+        &tmp,
+        "bash",
+        ".bash_profile",
+        "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
+            "shopt -s extglob\n" ++
+            "_fxsnap_glob_helper() { case $1 in @(a|b)) printf 'glob-ok\\n';; esac; }\n",
+    );
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    for (0..2) |_| {
+        const result = try executeCommandInEnvironment(config, arena, "_fxsnap_glob_helper a", paths.workspace, .{ .user = paths.shell });
+        try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nglob-ok\n</stdout>\n", result.output);
+    }
+    // Both commands ran from the snapshot, so startup ran only for its capture.
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+}
+
 test "user profile commands reuse one startup-file snapshot" {
     if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
@@ -2365,9 +2396,7 @@ test "user profile commands reuse one startup-file snapshot" {
         &tmp,
         "print -r -- loaded >> \"$HOME/rc-loads.log\"\n" ++
             "alias fxsnap_alias='print -r -- alias-ok'\n" ++
-            "fxsnap_fn() { _fxsnap_helper; }\n" ++
-            "_fxsnap_helper() { __fxsnap_helper; }\n" ++
-            "__fxsnap_helper() { print -r -- function-ok; }\n" ++
+            "fxsnap_fn() { print -r -- function-ok; }\n" ++
             "export PATH=\"$HOME/marker-bin:$PATH\"\n" ++
             "export FXSNAP_EXPORT=exported\n" ++
             "for i in {1..3000}; do eval \"fxsnap_bulk_$i() { print -r -- bulk-$i; }\"; done\n",
@@ -2415,6 +2444,39 @@ test "user profile commands reuse one startup-file snapshot" {
     try std.testing.expectEqualStrings("loaded\n", loads);
 }
 
+test "bash user profile snapshot restores a replay larger than the pipe buffer" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // bash 3.2, macOS's /bin/bash, sources a pipe only as far as the bytes
+    // it holds at that moment. Thousands of functions push the replay well
+    // past that, so a partial read would lose the last ones and the command.
+    const paths = try writeSnapshotTestShellFor(
+        arena,
+        &tmp,
+        "bash",
+        ".bash_profile",
+        "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
+            "for i in {1..3000}; do eval \"fxsnap_bulk_$i() { printf 'bulk-$i\\n'; }\"; done\n",
+    );
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    for (0..2) |_| {
+        const result = try executeCommandInEnvironment(config, arena, "fxsnap_bulk_2999", paths.workspace, .{ .user = paths.shell });
+        try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nbulk-2999\n</stdout>\n", result.output);
+    }
+    // Both commands ran from the snapshot, so startup ran only for its capture.
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+}
+
 test "zsh user profile snapshot restores a function that replaces a default alias" {
     if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
@@ -2440,6 +2502,50 @@ test "zsh user profile snapshot restores a function that replaces a default alia
     for (0..2) |_| {
         const result = try executeCommandInEnvironment(config, arena, "run-help", paths.workspace, .{ .user = paths.shell });
         try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nrun-help-function\n</stdout>\n", result.output);
+    }
+    // Both commands ran from the snapshot, so startup ran only for its capture.
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+}
+
+test "bash user profile snapshot restores a helper from a startup file that turned extglob off again" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The file has extglob on only while it defines the helper, so the replay
+    // shell, which starts with it off, must turn it on for the definition and
+    // give the file's setting back before the command.
+    const paths = try writeSnapshotTestShellFor(
+        arena,
+        &tmp,
+        "bash",
+        ".bash_profile",
+        "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
+            "shopt -s extglob\n" ++
+            "_fxsnap_glob_helper() { case $1 in @(a|b)) printf 'glob-ok\\n';; *) printf 'no-match\\n';; esac; }\n" ++
+            "shopt -u extglob\n",
+    );
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    for (0..2) |_| {
+        const result = try executeCommandInEnvironment(
+            config,
+            arena,
+            "shopt -p extglob; _fxsnap_glob_helper a; shopt -s extglob; _fxsnap_glob_helper a",
+            paths.workspace,
+            .{ .user = paths.shell },
+        );
+        try std.testing.expectEqualStrings(
+            "exit_code=0\n<stdout>\nshopt -u extglob\nno-match\nglob-ok\n</stdout>\n",
+            result.output,
+        );
     }
     // Both commands ran from the snapshot, so startup ran only for its capture.
     const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
