@@ -942,10 +942,16 @@ pub fn Runtime(comptime App: type) type {
         /// screen. Brings in the subagents main's session started before a
         /// restart first.
         pub fn hasAnotherAgent(app: *App) bool {
+            listRestoredSubagents(app);
+            return openAgentCount(app) > 1;
+        }
+
+        /// Puts the subagents of every instance's session in the switch
+        /// list, those started before a restart too (`syncChildList`).
+        pub fn listRestoredSubagents(app: *App) void {
             syncChildList(app) catch |err| {
                 debug_trace.logf("host", "child list sync failed err={s}", .{@errorName(err)});
             };
-            return openAgentCount(app) > 1;
         }
 
         /// How many agents are open: the instances, the first one included,
@@ -1325,9 +1331,7 @@ pub fn Runtime(comptime App: type) type {
         /// Opens the agent list with the agent on screen highlighted.
         pub fn openMenu(app: *App) !void {
             if (comptime !@hasField(App, "instances")) return;
-            syncChildList(app) catch |err| {
-                debug_trace.logf("host", "child list sync failed err={s}", .{@errorName(err)});
-            };
+            listRestoredSubagents(app);
             var order: std.ArrayList(?*ChildAgent) = .empty;
             defer order.deinit(app.alloc);
             try switchList(app, &order);

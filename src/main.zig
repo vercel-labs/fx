@@ -1500,6 +1500,10 @@ const App = struct {
         SessionAppRuntime.startResumedSessionWarmup(self);
     }
 
+    pub fn listRestoredSubagents(self: *App) void {
+        AgentsAppRuntime.listRestoredSubagents(self);
+    }
+
     /// Sends the request a resumed session left unfinished, once the worker
     /// runs.
     pub fn startPendingResume(self: *App, agent: *agents.Agent) void {
