@@ -5221,7 +5221,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
     const alloc = std.testing.allocator;
     // `frames` is how many frames publish the history: one, unless its rows
     // hold more bytes than one frame of a resumed transcript writes.
-    const cases = [_]struct { origin: u16, rows: u16, post_top: u16, frames: u8 = 1 }{
+    const cases = [_]struct { origin: u16, rows: u32, post_top: u16, frames: u8 = 1 }{
         .{ .origin = 1, .rows = 3, .post_top = 1 },
         .{ .origin = 5, .rows = 3, .post_top = 5 },
         .{ .origin = 5, .rows = 6, .post_top = 4 },
@@ -5233,6 +5233,8 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         .{ .origin = 1, .rows = 500, .post_top = 1 },
         .{ .origin = 5, .rows = 500, .post_top = 1 },
         .{ .origin = 5, .rows = 40_000, .post_top = 1, .frames = 2 },
+        // More history rows than one frame's scroll count holds.
+        .{ .origin = 5, .rows = 70_000, .post_top = 1, .frames = 3 },
     };
     for (cases) |case| {
         errdefer std.debug.panic("resume origin={d} rows={d}", .{ case.origin, case.rows });
@@ -5289,7 +5291,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         }
         var first_stats: vt_emulator.FeedStats = .{};
         try physical.feedWithStats(first, &first_stats);
-        var physical_scroll_rows = first_stats.scroll_rows;
+        var physical_scroll_rows: u32 = first_stats.scroll_rows;
         try std.testing.expectEqual(case.post_top, app.shell.owned_top_row);
         try std.testing.expectEqual(case.post_top, app.shell.committed_frame_layout.transcript_area.top);
 
@@ -5309,8 +5311,8 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         var expected_buf: [32]u8 = undefined;
         try std.testing.expectEqualStrings(try std.mem.print(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{first_history}), row.items);
 
-        if (case.frames > 1) {
-            try std.testing.expectEqual(.recovering, diagnostic.state);
+        for (1..case.frames) |_| {
+            try std.testing.expectEqual(.recovering, app.shell.transcriptCommitDiagnostic().state);
             const receipt = app.shell.transcript_commit_state.recovering;
             try std.testing.expect(receipt.materialized_flow_len != null);
             app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
@@ -5326,6 +5328,8 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
             var next_stats: vt_emulator.FeedStats = .{};
             try physical.feedWithStats(next, &next_stats);
             physical_scroll_rows += next_stats.scroll_rows;
+        }
+        if (case.frames > 1) {
             row.clearRetainingCapacity();
             try physical.rowTextTrimmed(case.post_top, &row);
             try std.testing.expectEqualStrings(try std.mem.print(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{history_rows}), row.items);

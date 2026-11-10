@@ -8755,17 +8755,16 @@ pub const TranscriptRuntime = struct {
             .invalid => {
                 // Materialize authoritative pre-viewport rows into native scrollback.
                 if (self.pendingResumeFlow().len > 0) {
-                    const semantic_rows: u32 = frameInlineScrollBudget(0, target_offset);
                     return .{
                         .target_visual_offset = target_offset,
-                        .semantic_rows = semantic_rows,
-                        .semantic_progress_rows = semantic_rows,
+                        .semantic_rows = target_offset,
+                        .semantic_progress_rows = target_offset,
                         .planned_rows = self.plannedTranscriptRows(
                             prepared,
                             0,
                             0,
-                            semantic_rows,
-                            semantic_rows,
+                            target_offset,
+                            target_offset,
                         ),
                         .source_compatible = true,
                         .recovery_progress_compatible = true,
@@ -13759,7 +13758,7 @@ test "oversized resume publication starts without a prior committed frame" {
 
     const facts = runtime.planTranscriptScroll(&prepared);
     try std.testing.expect(facts.target_visual_offset > std.math.maxInt(u16));
-    try std.testing.expectEqual(@as(u32, std.math.maxInt(u16)), facts.semantic_rows);
+    try std.testing.expectEqual(facts.target_visual_offset, facts.semantic_rows);
     try std.testing.expectEqual(
         @as(u16, std.math.maxInt(u16)),
         facts.planned_rows,
@@ -13779,8 +13778,11 @@ test "oversized resume publication starts without a prior committed frame" {
         facts.semantic_rows,
         facts.semantic_progress_rows,
     );
-    try std.testing.expectEqual(facts.semantic_rows, accepted.semantic_rows);
-    try std.testing.expect(accepted.semantic_rows < facts.target_visual_offset);
+    try std.testing.expectEqual(
+        @as(u32, std.math.maxInt(u16)),
+        accepted.semantic_rows,
+    );
+    try std.testing.expect(accepted.semantic_rows < facts.semantic_rows);
 
     const append_base = (try runtime.resolveTransitionAppendBase(
         &prepared,
@@ -14114,14 +14116,6 @@ test "transition commit keeps unplanned physical scroll as recovery debt" {
     const diagnostic = runtime.transcriptCommitDiagnostic();
     try std.testing.expectEqual(TranscriptCommitDiagnosticState.recovering, diagnostic.state);
     try std.testing.expectEqual(@as(u16, 1), diagnostic.remaining_unplanned_scroll_rows);
-}
-
-fn frameInlineScrollBudget(resize_reflow_rows: u16, semantic_rows: u32) u16 {
-    return frameInlineScrollBudgetCapped(
-        resize_reflow_rows,
-        semantic_rows,
-        std.math.maxInt(u32),
-    );
 }
 
 /// The scroll plan for the first frame of a resumed transcript whose saved
