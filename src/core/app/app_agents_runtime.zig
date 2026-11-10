@@ -275,7 +275,6 @@ pub const ReportPost = struct {
     end: subagent_child_state.EndFacts = .{},
     /// A message's lines the user typed in the turn that sent it.
     typed_lines: [][]u8 = &.{},
-    typed_cut: bool = false,
 
     fn create(host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) !*ReportPost {
         const post = try handoff_alloc.create(ReportPost);
@@ -305,35 +304,30 @@ pub const ReportPost = struct {
         if (delivery == .message) {
             // The others are freed by their own errdefers above.
             errdefer handoff_alloc.free(post.text);
-            const typed = delivery.message.typed;
-            const lines = try handoff_alloc.alloc([]u8, typed.lines.len);
+            const typed = delivery.message.user_typed;
+            const lines = try handoff_alloc.alloc([]u8, typed.len);
             var copied: usize = 0;
             errdefer {
                 for (lines[0..copied]) |line| handoff_alloc.free(line);
                 handoff_alloc.free(lines);
             }
-            for (typed.lines) |line| {
+            for (typed) |line| {
                 lines[copied] = try handoff_alloc.dupe(u8, line);
                 copied += 1;
             }
             post.typed_lines = lines;
-            post.typed_cut = typed.cut;
         }
         return post;
     }
 
     fn destroy(self: *ReportPost) void {
-        self.freeOwned();
-        handoff_alloc.destroy(self);
-    }
-
-    fn freeOwned(self: *ReportPost) void {
         handoff_alloc.free(self.agent);
         handoff_alloc.free(self.child_id);
         handoff_alloc.free(self.work_id);
         handoff_alloc.free(self.text);
         for (self.typed_lines) |line| handoff_alloc.free(line);
         handoff_alloc.free(self.typed_lines);
+        handoff_alloc.destroy(self);
     }
 };
 
@@ -342,7 +336,7 @@ test "a message's hand-off keeps its own copy of what the user typed" {
     var first = "tell main hi".*;
     var second = "and bye".*;
     const lines = [_][]const u8{ &first, &second };
-    const post = try ReportPost.create(&host, .{ .message = .{ .to = .owner, .agent = "reviewer", .child_id = "c1", .text = "hi", .typed = .{ .lines = &lines, .cut = true } } });
+    const post = try ReportPost.create(&host, .{ .message = .{ .to = .owner, .agent = "reviewer", .child_id = "c1", .text = "hi", .user_typed = &lines } });
     defer post.destroy();
     // The sender's buffers change once the post is made.
     @memset(&first, 'x');
@@ -350,7 +344,6 @@ test "a message's hand-off keeps its own copy of what the user typed" {
     try std.testing.expectEqual(@as(usize, 2), post.typed_lines.len);
     try std.testing.expectEqualStrings("tell main hi", post.typed_lines[0]);
     try std.testing.expectEqualStrings("and bye", post.typed_lines[1]);
-    try std.testing.expect(post.typed_cut);
 }
 
 test "a report's hand-off keeps the count a user's stop dropped, and who started and stopped its work" {
@@ -1998,7 +1991,7 @@ pub fn Runtime(comptime App: type) type {
                     .dropped = post.dropped,
                     .end = post.end,
                 }, limit),
-                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, started_by, .{ .lines = post.typed_lines, .cut = post.typed_cut }) catch |err| {
+                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, started_by, post.typed_lines) catch |err| {
                     target.worker.releaseAgentMessage();
                     return err;
                 },

@@ -1672,24 +1672,24 @@ pub const Runtime = struct {
         const agent = if (from_root) "" else self.childName(arena.allocator(), options.caller_id) catch options.caller_id;
         // What the user typed in the turn that sends it, from that turn's
         // own worker, so the parent sees the user's own words.
-        const typed: worker_runtime.WorkerRuntime.TypedLines = if (options.caller_worker) |worker|
+        const typed: []const []const u8 = if (options.caller_worker) |worker|
             worker.typedThisTurn(arena.allocator()) catch |err| blk: {
                 debug_trace.logf("mailbox", "typed lines unavailable from={s} err={s}", .{ options.caller_id, @errorName(err) });
-                break :blk .{ .cut = true };
+                break :blk &.{};
             }
         else
-            .{};
+            &.{};
         sink.post(self, .{ .message = .{
             .to = if (from_root) .owners_parent else .owner,
             .agent = agent,
             .child_id = options.caller_id,
             .text = text,
-            .typed = .{ .lines = typed.lines, .cut = typed.cut },
+            .user_typed = typed,
         } }) catch |err| return self.encodeManaged(alloc, .{
             .ok = false,
             .error_code = if (err == error.QueueFull) "queue_full" else "no_parent",
         });
-        debug_trace.eventf("mailbox", "post", .{}, "from={s} to={s} typed={d} cut={}", .{ options.caller_id, if (from_root) "owners_parent" else self.ownerName(), typed.lines.len, typed.cut });
+        debug_trace.eventf("mailbox", "post", .{}, "from={s} to={s} typed={d}", .{ options.caller_id, if (from_root) "owners_parent" else self.ownerName(), typed.len });
         return self.encodeManaged(alloc, .{ .ok = true, .result = "Sent to your parent. It arrives as your message, never as the user's." });
     }
 
@@ -3072,20 +3072,18 @@ test "a subagent's message to its parent carries what the user typed in the turn
     const Capture = struct {
         posts: usize = 0,
         lines: std.ArrayList([]u8) = .empty,
-        cut: bool = false,
         fn post(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.posts += 1;
             for (self.lines.items) |line| std.testing.allocator.free(line);
             self.lines.clearRetainingCapacity();
-            for (delivery.message.typed.lines) |line| {
+            for (delivery.message.user_typed) |line| {
                 const owned = try std.testing.allocator.dupe(u8, line);
                 self.lines.append(std.testing.allocator, owned) catch |err| {
                     std.testing.allocator.free(owned);
                     return err;
                 };
             }
-            self.cut = delivery.message.typed.cut;
         }
     };
     var capture: Capture = .{};
@@ -3121,7 +3119,6 @@ test "a subagent's message to its parent carries what the user typed in the turn
         } else {
             try std.testing.expectEqual(@as(usize, 0), capture.lines.items.len);
         }
-        try std.testing.expect(!capture.cut);
     }
     try std.testing.expectEqual(@as(usize, 2), capture.posts);
 }
@@ -3140,7 +3137,7 @@ test "a subagent's message its parent can't take says so, and keeps nothing of w
     defer runtime.deinit();
     const Full = struct {
         fn post(_: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
-            if (delivery.message.typed.lines.len == 0) return error.AgentGone;
+            if (delivery.message.user_typed.len == 0) return error.AgentGone;
             return error.QueueFull;
         }
     };

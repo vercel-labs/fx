@@ -105,6 +105,10 @@ pub const SteeringMessage = struct {
 };
 
 /// Frees boundary messages and the slice, all from `alloc`.
+fn typedLineDropped(turn_id: u64, text: []const u8) void {
+    debug_trace.eventf("worker", "typed_line_dropped", .{ .turn_id = turn_id }, "bytes={d} reason=out_of_memory", .{text.len});
+}
+
 pub fn freeSteeringMessages(alloc: std.mem.Allocator, messages: []SteeringMessage) void {
     for (messages) |message| alloc.free(message.text);
     alloc.free(messages);
@@ -649,12 +653,10 @@ pub const WorkerRuntime = struct {
     /// wrote it, then each of the user's lines that joined it, newest last.
     /// A subagent's message to its parent carries them (`typedThisTurn`), so
     /// the parent sees the user's own words. Owned by the queue's allocator,
-    /// under `worker_mutex`; at most `typed_line_cap` lines of
-    /// `typed_line_bytes` each.
+    /// under `worker_mutex`: the newest `typed_line_cap`, each cut to
+    /// `typed_line_bytes`.
     typed_this_turn: std.ArrayList([]u8) = .empty,
     typed_turn_id: u64 = 0,
-    /// Whether the turn's lines lost any to the caps.
-    typed_cut: bool = false,
     pending_question_shared: ?OwnedQuestionBatch = null,
     pending_question_response: QuestionResponse = .pending,
     agent_turn_settings: AgentTurnSettings = .{},
@@ -1499,19 +1501,13 @@ pub const WorkerRuntime = struct {
     pub const typed_line_cap = 8;
     pub const typed_line_bytes = 2048;
 
-    /// What the user typed in the turn going now (`typed_this_turn`), copied
-    /// for a subagent's message to its parent. Empty while no turn the user
-    /// typed into is going. The caller owns the lines and the slice.
-    pub const TypedLines = struct {
-        lines: []const []const u8 = &.{},
-        /// Whether lines were dropped or cut to the caps.
-        cut: bool = false,
-    };
-
-    pub fn typedThisTurn(self: *WorkerRuntime, alloc: std.mem.Allocator) !TypedLines {
+    /// A copy of what the user typed in the turn going now
+    /// (`typed_this_turn`), for a subagent's message to its parent; empty
+    /// while no turn is going. The caller owns the lines and the slice.
+    pub fn typedThisTurn(self: *WorkerRuntime, alloc: std.mem.Allocator) ![]const []const u8 {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
-        if (!self.worker_processing or self.typed_turn_id != self.active_turn_id or self.typed_this_turn.items.len == 0) return .{};
+        if (!self.worker_processing or self.typed_turn_id != self.active_turn_id) return &.{};
         const lines = try alloc.alloc([]const u8, self.typed_this_turn.items.len);
         var copied: usize = 0;
         errdefer {
@@ -1522,43 +1518,23 @@ pub const WorkerRuntime = struct {
             lines[copied] = try alloc.dupe(u8, line);
             copied += 1;
         }
-        return .{ .lines = lines, .cut = self.typed_cut };
+        return lines;
     }
 
     /// Adds `text`, which the user typed, to turn `turn_id`'s lines, after
-    /// dropping another turn's. Keeps the newest `typed_line_cap` lines, each
-    /// cut to `typed_line_bytes` on a UTF-8 boundary. Never fails: a line it
-    /// can't keep marks the turn's lines cut.
+    /// dropping another turn's. Never fails: a line it can't copy is left
+    /// out.
     fn noteTypedLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, turn_id: u64, text: []const u8) void {
         if (self.typed_turn_id != turn_id) {
             for (self.typed_this_turn.items) |line| alloc.free(line);
             self.typed_this_turn.clearRetainingCapacity();
             self.typed_turn_id = turn_id;
-            self.typed_cut = false;
         }
         if (text.len == 0) return;
-        var end = @min(text.len, typed_line_bytes);
-        while (end > 0 and end < text.len and (text[end] & 0xC0) == 0x80) end -= 1;
-        if (end < text.len) {
-            self.typed_cut = true;
-            debug_trace.eventf("worker", "typed_line_cut", .{ .turn_id = turn_id }, "bytes={d} kept={d}", .{ text.len, end });
-        }
-        const line = alloc.dupe(u8, text[0..end]) catch {
-            self.typed_cut = true;
-            debug_trace.eventf("worker", "typed_line_dropped", .{ .turn_id = turn_id }, "bytes={d} reason=out_of_memory", .{text.len});
-            return;
-        };
-        if (self.typed_this_turn.items.len == typed_line_cap) {
-            const oldest = self.typed_this_turn.orderedRemove(0);
-            debug_trace.eventf("worker", "typed_line_dropped", .{ .turn_id = turn_id }, "bytes={d} reason=cap", .{oldest.len});
-            alloc.free(oldest);
-            self.typed_cut = true;
-        }
-        self.typed_this_turn.append(alloc, line) catch {
-            alloc.free(line);
-            self.typed_cut = true;
-            debug_trace.eventf("worker", "typed_line_dropped", .{ .turn_id = turn_id }, "bytes={d} reason=out_of_memory", .{text.len});
-        };
+        if (self.typed_this_turn.items.len == typed_line_cap) alloc.free(self.typed_this_turn.orderedRemove(0));
+        self.typed_this_turn.ensureUnusedCapacity(alloc, 1) catch return typedLineDropped(turn_id, text);
+        const line = alloc.dupe(u8, text[0..text_utils.utf8BackwardBoundary(text, typed_line_bytes)]) catch return typedLineDropped(turn_id, text);
+        self.typed_this_turn.appendAssumeCapacity(line);
     }
 
     fn takeSteeringLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, result_alloc: std.mem.Allocator, turn_id: u64) ![]SteeringMessage {
@@ -1586,7 +1562,6 @@ pub const WorkerRuntime = struct {
             if (prompt.delivery.activeTurnId() != turn_id) continue;
             messages[copied] = .{ .text = try result_alloc.dupe(u8, prompt.prompt), .author = prompt.author };
             copied += 1;
-            if (typedByUser(prompt)) self.noteTypedLocked(alloc, turn_id, prompt.prompt);
             if (prompt.steering_receipt == null) {
                 const text = try alloc.dupe(u8, prompt.prompt);
                 events[event_count] = if (prompt.author == .child)
@@ -1613,6 +1588,7 @@ pub const WorkerRuntime = struct {
                 receipt.state.store(.applied, .seq_cst);
                 debug_trace.eventf("subagent", "feedback_applied", .{}, "operation={s}", .{receipt.operation_id});
             }
+            if (typedByUser(prompt)) self.noteTypedLocked(alloc, turn_id, prompt.prompt);
             freeQueuedPrompt(alloc, prompt);
         }
         self.queued_prompts.shrinkRetainingCapacity(kept);
@@ -5862,9 +5838,9 @@ test "a turn takes in only the messages right behind it, so none passes older wo
     try std.testing.expectEqualStrings("third", guidance[0].text);
 }
 
-fn expectTyped(expected: []const []const u8, typed: WorkerRuntime.TypedLines) !void {
-    try std.testing.expectEqual(expected.len, typed.lines.len);
-    for (expected, typed.lines) |want, got| try std.testing.expectEqualStrings(want, got);
+fn expectTyped(expected: []const []const u8, typed: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, typed.len);
+    for (expected, typed) |want, got| try std.testing.expectEqualStrings(want, got);
 }
 
 test "a turn keeps what the user typed into it: its prompt and the user's lines that join it, never another agent's" {
@@ -5918,31 +5894,27 @@ test "a turn's typed lines keep the newest within their caps, each cut on a UTF-
     runtime.active_turn_id = 5;
     var buf: [16]u8 = undefined;
     // Far past the cap, as a long session of typing into one turn.
-    for (0..500) |index| {
-        runtime.noteTypedLocked(alloc, 5, try std.mem.print(&buf, "line {d}", .{index}));
-    }
+    for (0..500) |index| runtime.noteTypedLocked(alloc, 5, try std.mem.print(&buf, "line {d}", .{index}));
     var typed = try runtime.typedThisTurn(arena);
-    try std.testing.expectEqual(@as(usize, WorkerRuntime.typed_line_cap), typed.lines.len);
-    try std.testing.expectEqualStrings("line 492", typed.lines[0]);
-    try std.testing.expectEqualStrings("line 499", typed.lines[typed.lines.len - 1]);
-    try std.testing.expect(typed.cut);
+    try std.testing.expectEqual(@as(usize, WorkerRuntime.typed_line_cap), typed.len);
+    try std.testing.expectEqualStrings("line 492", typed[0]);
+    try std.testing.expectEqualStrings("line 499", typed[typed.len - 1]);
 
-    // The next turn starts whole, and a long line keeps whole characters.
+    // The next turn starts with none, and a long line keeps whole characters:
+    // "a", then 1500 two-byte characters, so the cap falls inside one.
     runtime.active_turn_id = 6;
     try expectTyped(&.{}, try runtime.typedThisTurn(arena));
-    // "a", then 1500 two-byte characters, so the cap falls inside one.
     var long: [1 + 2 * 1500]u8 = undefined;
     long[0] = 'a';
     for (0..1500) |index| @memcpy(long[1 + 2 * index ..][0..2], "\u{e9}");
     runtime.noteTypedLocked(alloc, 6, &long);
     typed = try runtime.typedThisTurn(arena);
-    try std.testing.expectEqual(@as(usize, 1), typed.lines.len);
-    try std.testing.expectEqual(WorkerRuntime.typed_line_bytes - 1, typed.lines[0].len);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(typed.lines[0]));
-    try std.testing.expect(typed.cut);
+    try std.testing.expectEqual(@as(usize, 1), typed.len);
+    try std.testing.expectEqual(WorkerRuntime.typed_line_bytes - 1, typed[0].len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(typed[0]));
 }
 
-test "a turn's typed lines survive failed allocations: a copy fails whole, and a line it can't keep marks them cut" {
+test "a turn's typed lines survive failed allocations: a copy fails whole, and a line it can't copy is left out" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
@@ -5954,18 +5926,15 @@ test "a turn's typed lines survive failed allocations: a copy fails whole, and a
     for (0..3) |fail_index| {
         var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
         if (runtime.typedThisTurn(failing.allocator())) |typed| {
-            for (typed.lines) |line| failing.allocator().free(line);
-            failing.allocator().free(typed.lines);
+            for (typed) |line| failing.allocator().free(line);
+            failing.allocator().free(typed);
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
     }
-    // A line it can't store is left out, and the turn's lines say so.
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     runtime.noteTypedLocked(failing.allocator(), 2, "lost");
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const typed = try runtime.typedThisTurn(arena_state.allocator());
-    try expectTyped(&.{ "first", "second" }, typed);
-    try std.testing.expect(typed.cut);
+    try expectTyped(&.{ "first", "second" }, try runtime.typedThisTurn(arena_state.allocator()));
 }
 
 test "a parent's message joins the running turn only while nothing older waits" {
