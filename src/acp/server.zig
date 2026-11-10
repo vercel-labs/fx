@@ -334,6 +334,14 @@ pub const ServerState = struct {
     selected_model: []u8 = &.{},
     provider: model_provider.ProviderId = .gateway,
     configured_model: []u8 = &.{},
+    /// The gateway providers to prefer, in order, from the profile or the
+    /// project's `.fx.json`, and whether only they may serve a request. Every
+    /// gateway turn applies them, as the TUI's turns do. Owned by `alloc`.
+    provider_order: []const []const u8 = &.{},
+    provider_strict: bool = false,
+    /// The `auto` reviewer's model from the `review_model` setting; empty for
+    /// the reviewer's default. Owned by `alloc`.
+    review_model: []u8 = &.{},
     process_model_override: bool = false,
     process_provider_override: bool = false,
     permission_mode: types.PermissionMode = .ask,
@@ -413,6 +421,9 @@ pub const ServerState = struct {
         if (self.account_id) |account_id| self.alloc.free(account_id);
         if (self.selected_model.len > 0) self.alloc.free(self.selected_model);
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
+        for (self.provider_order) |slug| self.alloc.free(slug);
+        if (self.provider_order.len > 0) self.alloc.free(self.provider_order);
+        if (self.review_model.len > 0) self.alloc.free(self.review_model);
         self.permission_rules.deinit(self.alloc);
         self.skills.deinit(self.alloc);
         self.context_snapshot.deinit(self.alloc);
@@ -2940,6 +2951,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.cfg.provider_set.definitions = state.configured_providers.definitions;
     state.gateway_source_preference = startup.credential_source_preference;
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
+    state.provider_order = startup.provider_order;
+    startup.provider_order = &.{};
+    state.provider_strict = startup.provider_strict;
+    state.review_model = startup.takeReviewModel();
 
     if (state.cfg.auth_mode == .host_managed or hostManagesRoute(state.cfg, state.provider)) {
         state.api_key = &.{};
