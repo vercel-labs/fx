@@ -627,8 +627,8 @@ pub fn Runtime(comptime App: type) type {
                 );
             }
 
-            // The open agent list takes every key first: the agent it shows
-            // is a preview.
+            // The open agent list takes every key first, ahead of the agent
+            // on screen.
             if (ingress.event) |event| {
                 if (try routeAgentsMenuInput(app, event)) return ingress.replay_byte_after_routing;
             }
@@ -1753,13 +1753,12 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// While the agent list is open it takes every key, ahead of the
-        /// prompts and composer of the agent it shows, which is a preview:
-        /// ↑ and ↓ move and preview, Enter keeps the agent shown, and Esc,
-        /// Ctrl+X, and Ctrl+C go back to the one it opened on. A paste keeps
-        /// the agent shown and lands in its composer, and mouse input passes
-        /// through. Any other key does nothing, so none edits the previewed
-        /// agent's draft or answers its prompt. Returns whether the list
-        /// took `event`.
+        /// prompts and composer of the agent on screen: ↑ and ↓ move the
+        /// highlight, Enter shows the highlighted agent, and Esc, Ctrl+X, and
+        /// Ctrl+C close the list. A paste closes it too, keeping the agent on
+        /// screen, and lands in its composer; mouse input passes through. Any
+        /// other key does nothing, so none edits the agent's draft or answers
+        /// its prompt behind the list. Returns whether the list took `event`.
         fn routeAgentsMenuInput(app: *App, event: input_action.TerminalInputEvent) !bool {
             if (!agentsMenuActive(app)) return false;
             const agent = agents.screenAgentOf(app);
@@ -1794,7 +1793,7 @@ pub fn Runtime(comptime App: type) type {
                         _ = disarmEscapeClear(app);
                     },
                     .paste_start => {
-                        _ = try submitAgentsMenuSelection(app);
+                        _ = try backAgentsMenu(app);
                         return false;
                     },
                     // Replayed as the byte it stands for, which comes back here.
@@ -2868,8 +2867,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn resolveEscape(app: *App, agent: *AppAgent, was_cancel_pending: bool, now: i64) !void {
             if (try full_transcript_rt.routeAction(app, agent, .escape)) return;
-            // Ahead of the prompts: the open agent list shows `agent` only as
-            // a preview, and Esc goes back from it.
+            // Ahead of the prompts: Esc closes the open agent list first.
             if (try backAgentsMenu(app)) {
                 _ = disarmEscapeClear(app);
                 _ = disarmEscapeInterrupt(app, "menu");
