@@ -298,6 +298,9 @@ pub const DispatchContext = struct {
     web_search_backend: ?WebSearchBackend = null,
     tool_call_id: []const u8 = "",
     tool_call_name: []const u8 = "",
+    /// `ToolCall.carried_by`: the tool the model called when this is the call
+    /// a `toolbox {run}` carries. Null for a direct call.
+    tool_call_carried_by: ?[]const u8 = null,
     web_search_progress_ctx: ?*anyopaque = null,
     on_web_search_progress: ?WebSearchProgressFn = null,
     web_fetch_progress_ctx: ?*anyopaque = null,

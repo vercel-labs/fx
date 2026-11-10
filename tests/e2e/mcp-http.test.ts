@@ -739,7 +739,11 @@ describe("modern MCP Streamable HTTP", () => {
     // call and refuses it unsent (CAT-05). Waits for N31.
     expect(calls.map((entry) => entry.message.params?.name)).toEqual(["fresh"]);
     expect(fixture.toolsListCalls).toBe(2);
-    expect(() => toolResultText(gateway.requests[2]!.body, "call_old", "error-text")).not.toThrow();
+    // The run's result says the tool is gone in toolbox's words, not the
+    // generic unsupported-tool text a direct call of it gets.
+    expect(toolResultText(gateway.requests[2]!.body, "call_old", "error-text")).toBe(
+      `${TOOL_NAME} is no longer available. Use toolbox search to find current tools.`,
+    );
     expect(gateway.requests.some((entry) => entry.body.includes(freshTool)))
       .toBe(true);
   }, 30_000);

@@ -813,7 +813,7 @@ fn resolveToolDispatchPrelude(
             try tool_mcp_runtime.notSelectedOutput(arena, call.name),
         ) },
         .unsupported => .{ .completed = semanticFailure(
-            try arena.print("Unsupported tool: {s}", .{call.name}),
+            try tool_mcp_registry.unsupportedOutput(arena, call.name, call.carried_by),
         ) },
     };
 }
@@ -947,7 +947,7 @@ fn executeRegisteredTool(
     }
     if (mcp_execution_error) |err| {
         dispatched.deinit(arena);
-        if (err == error.McpAdvertisedToolChanged) return refreshChangedMcpTool(ctx, arena, call.name, call.carried_by != null);
+        if (err == error.McpAdvertisedToolChanged) return refreshChangedMcpTool(ctx, arena, call);
         return err;
     }
 
@@ -1552,10 +1552,12 @@ fn lookupToolboxMcpTool(ctx: Context, arena: Allocator, name: []const u8) !Toolb
 
 /// The result of an MCP call refused because the tool's definition changed
 /// between admission and execution. A sent tool gets its current schema in
-/// the next request; a toolbox run's schema never joins the tools, so its
-/// result says how to see the current arguments instead. The name is the model's,
-/// so a run's result writes it as visible text.
-fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8, toolbox_run: bool) !ToolExecutionResult {
+/// the next request; a toolbox run's (`call.carried_by`) schema never joins
+/// the tools, so its result says how to see the current arguments instead. The
+/// name is the model's, so a run's result writes it as visible text.
+fn refreshChangedMcpTool(ctx: Context, arena: Allocator, call: ToolCall) !ToolExecutionResult {
+    const name = call.name;
+    const toolbox_run = call.carried_by != null;
     const shown = model_context_encoding.scalar(name);
     var unavailable_output: []const u8 = if (toolbox_run)
         try arena.print("{f}'s definition changed before it ran, and it is no longer available. Use toolbox search to find current tools.", .{shown})
@@ -1622,19 +1624,19 @@ test "a toolbox run whose MCP definition changed before it ran says to open it a
     defer rt.deinit(std.testing.allocator);
 
     // A run's schema never joins the tools, so its result can't say it is loaded.
-    const run = try refreshChangedMcpTool(rt.context(), arena, "mcp_fixture\x07echo", true);
+    const run = try refreshChangedMcpTool(rt.context(), arena, .{ .id = "1", .name = "mcp_fixture\x07echo", .arguments_json = "{}", .carried_by = "toolbox" });
     try std.testing.expect(run.status == .failure);
     try std.testing.expectEqualStrings(
         "mcp_fixture&#x07;echo's definition changed before it ran, so it didn't run. Open it with toolbox to see its current arguments, then call toolbox with run: \"mcp_fixture&#x07;echo\" and those arguments.",
         run.model_output,
     );
     // A sent tool's call keeps its message: the next request sends the current schema.
-    const sent = try refreshChangedMcpTool(rt.context(), arena, "mcp_fixture_echo", false);
+    const sent = try refreshChangedMcpTool(rt.context(), arena, .{ .id = "2", .name = "mcp_fixture_echo", .arguments_json = "{}" });
     try std.testing.expectEqualStrings("MCP tool definition changed before execution. Its current schema is loaded; review it before issuing a new call.", sent.model_output);
     try std.testing.expectEqual(@as(usize, 1), sent.selected_dynamic_tools.len);
 
     rt.mcp_tool_schema = goneMcpSchema;
-    const gone = try refreshChangedMcpTool(rt.context(), arena, "mcp_fixture_echo", true);
+    const gone = try refreshChangedMcpTool(rt.context(), arena, .{ .id = "3", .name = "mcp_fixture_echo", .arguments_json = "{}", .carried_by = "toolbox" });
     try std.testing.expectEqualStrings("mcp_fixture_echo's definition changed before it ran, and it is no longer available. Use toolbox search to find current tools.", gone.model_output);
 }
 
@@ -1788,6 +1790,7 @@ fn typedDispatchContextForCall(
     var dispatch = typedDispatchContext(ctx, arena);
     dispatch.tool_call_id = call.id;
     dispatch.tool_call_name = call.name;
+    dispatch.tool_call_carried_by = call.carried_by;
     return dispatch;
 }
 
@@ -6994,6 +6997,44 @@ test "MCP unadvertised dynamic names stay unsupported without a runtime call" {
     var no_rt = TestRuntime{};
     defer no_rt.deinit(std.testing.allocator);
     try expectToolOutput(no_rt.context(), "mcp_unknown", "{}", "Unsupported tool: mcp_unknown");
+}
+
+test "a toolbox run of an MCP tool the server removed says it is no longer available" {
+    var marker: u8 = 0;
+    const advertised = [_][]const u8{ "mcp_fixture\x07echo", "mcp_fixture_echo" };
+    // The host no longer has an admitted tool, so its call comes back empty.
+    var gone_rt = TestRuntime{
+        .mcp_ctx = @ptrCast(&marker),
+        .mcp_has_tool = McpFixture.hasTrue,
+        .mcp_call_tool = McpFixture.callNull,
+        .advertised_dynamic_tool_names = &advertised,
+    };
+    defer gone_rt.deinit(std.testing.allocator);
+    // Without an MCP runtime the call is unsupported before it dispatches.
+    var no_rt = TestRuntime{};
+    defer no_rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const run_message = "mcp_fixture&#x07;echo is no longer available. Use toolbox search to find current tools.";
+    const cases = [_]struct { rt: *TestRuntime, name: []const u8, carried_by: ?[]const u8, message: []const u8 }{
+        .{ .rt = &gone_rt, .name = "mcp_fixture\x07echo", .carried_by = "toolbox", .message = run_message },
+        .{ .rt = &no_rt, .name = "mcp_fixture\x07echo", .carried_by = "toolbox", .message = run_message },
+        // A direct call of the same tool keeps the generic message on both paths.
+        .{ .rt = &gone_rt, .name = "mcp_fixture_echo", .carried_by = null, .message = "Unsupported tool: mcp_fixture_echo" },
+        .{ .rt = &no_rt, .name = "mcp_fixture_echo", .carried_by = null, .message = "Unsupported tool: mcp_fixture_echo" },
+    };
+    for (cases) |case| {
+        const result = try executeToolCall(case.rt.context(), arena, .{
+            .id = "1",
+            .name = case.name,
+            .arguments_json = "{}",
+            .carried_by = case.carried_by,
+        });
+        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+        try std.testing.expectEqualStrings(case.message, result.model_output);
+    }
 }
 
 test "MCP dynamic tool executes after its schema was advertised" {
