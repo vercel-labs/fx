@@ -4,6 +4,7 @@
     {"name": "vision_json", "module": "fx", "test": "Vision JSON parsers tolerate arbitrary bounded bytes", "iterations": 1200000},
     {"name": "host_record_decode", "module": "fx", "test": "a host record file decodes or is refused on fuzzed bytes", "iterations": 1500000},
     {"name": "mcp_store_lock_wait", "module": "fx", "test": "the store and refresh locks' wait rules hold for fuzzed stamps and times", "iterations": 1000000},
+    {"name": "mcp_call_lend", "module": "fx", "test": "the bridge core keeps its lend laws on fuzzed event sequences", "iterations": 2000000},
     {"name": "host_restore", "module": "fx", "test": "restoring holds for fuzzed sets of records", "iterations": 2000000},
     {"name": "switch_order", "module": "fx", "test": "the switch order holds for fuzzed hosts", "iterations": 4000000},
     {"name": "agents_menu_selection", "module": "fx", "test": "the agent list's highlight and the agent on screen hold for fuzzed steps", "iterations": 20000},

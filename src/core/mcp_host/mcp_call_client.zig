@@ -7,8 +7,10 @@
 //! it without first inspecting it.
 //!
 //! The call meets the same permission rules, prompt, and review as a direct
-//! call of the tool by the agent that ran the command. It works only while
-//! that shell call runs.
+//! call of the tool by the agent that ran the command. It works while that
+//! command runs. Once the shell call that started the command returns, a
+//! call waits until the agent watches the command again with shell
+//! interact.
 //!
 //! `fx mcp call list SERVER`, `search QUERY`, and `help TOOL` print plain
 //! text about the tools that agent may use, so a command can find a tool and
@@ -30,8 +32,8 @@ pub const exit = struct {
     pub const failed: u8 = 1;
     /// A usage mistake, as for every `fx mcp` verb.
     pub const usage: u8 = 2;
-    /// No running fx shell call to reach: outside fx, after the shell call
-    /// ended, or another fx version.
+    /// No running fx shell command to reach: outside fx, after the command
+    /// that started this one ended, or another fx version.
     pub const unavailable: u8 = 3;
     /// Too many calls are running; nothing ran.
     pub const busy: u8 = 4;
@@ -294,7 +296,7 @@ fn repeatedValues(items: []const std.json.Value, key: []const u8, out: *[max_hin
 }
 
 fn unavailable(err: *Writer) !u8 {
-    try err.writeAll("fx mcp call: no running fx shell call to reach. It works only in a command that fx's shell tool runs, while that call runs.\n");
+    try err.writeAll("fx mcp call: no running fx shell command to reach. It works only in a command that fx's shell tool runs, while that command runs.\n");
     return exit.unavailable;
 }
 
@@ -316,7 +318,7 @@ test "fx mcp call outside a shell call reports it is unavailable" {
     if (io_mod.getenv(wire.socket_env) != null) return error.SkipZigTest;
     try std.testing.expectEqual(exit.unavailable, try run(arena_state.allocator(), std.testing.io, &out.writer, &err.writer, .{ .call = .{ .tool = "mcp_s_t", .arguments = null } }));
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
-    try std.testing.expect(std.mem.find(u8, err.written(), "no running fx shell call") != null);
+    try std.testing.expect(std.mem.find(u8, err.written(), "no running fx shell command") != null);
     try std.testing.expectEqual(exit.usage, try run(arena_state.allocator(), std.testing.io, &out.writer, &err.writer, .{ .call = .{ .tool = "mcp_s_t", .arguments = "[1]" } }));
     // A lookup outside a shell call is unavailable too.
     try std.testing.expectEqual(exit.unavailable, try run(arena_state.allocator(), std.testing.io, &out.writer, &err.writer, .{ .list = "linear" }));

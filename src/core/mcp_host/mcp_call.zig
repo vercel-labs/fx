@@ -30,14 +30,15 @@ pub const max_slots = 16;
 /// fewer.
 pub const default_capacity: u8 = 8;
 
-/// The bridge's own registration and the shell calls it serves at once. The
+/// The bridge's own registration and the commands it serves at once. The
 /// bridge refuses a shell call past it (`mcp_call_bridge.zig` `register`).
 pub const max_owners = 1 + 256;
 
 /// A bearer secret the shell makes for one owner: 32 random bytes.
 pub const Token = [32]u8;
 
-/// Who a request acts for: the session itself, or one of its subagents.
+/// Who a request acts for: the session itself, or one command its shell
+/// runs, from the shell call that starts it until its process ends.
 pub const OwnerId = enum(u32) {
     main = 0,
     _,
@@ -50,14 +51,17 @@ pub const RequestId = enum(u64) {
 };
 
 pub const Stage = enum {
+    /// No shell call lends the owner a permission check: the agent is not
+    /// watching the command now. The request waits for one.
+    waiting,
     /// The permission check is deciding.
     authorizing,
     /// The MCP call is running.
     calling,
     /// The reply is being written.
     replying,
-    /// The client or its owner left while the check was deciding; the shell
-    /// still owes its answer.
+    /// The client or its owner left while the check was deciding, or while
+    /// the request waited for one; the shell still owes its answer.
     abandoned_auth,
     /// The client or its owner left while the call ran; the shell still owes
     /// its end.
@@ -88,6 +92,10 @@ pub const Drop = enum {
 pub const Owner = struct {
     id: OwnerId,
     token: Token,
+    /// A shell call of the owner's agent lends it that call's permission
+    /// check and MCP call: the run call that started the command, or an
+    /// interact that watches it. The session's own owner is always lent.
+    lent: bool = true,
 };
 
 pub const Entry = struct {
@@ -117,10 +125,16 @@ pub const Event = union(enum) {
     started: Token,
     /// The session ended: quit, `/new`, or `/resume`.
     stopped,
-    /// A subagent started and got its own token.
+    /// A command started with its own token, lent by the shell call that
+    /// runs it.
     owner_added: struct { owner: OwnerId, token: Token },
-    /// A subagent ended.
+    /// The command ended.
     owner_removed: OwnerId,
+    /// A shell call lends the owner its permission check and MCP call.
+    lent: OwnerId,
+    /// The lending shell call returns while the command still runs. Work it
+    /// already started keeps its lender until that work ends.
+    lend_ended: OwnerId,
     /// A client sent one complete request line.
     request: struct { token: Token, version: u32 },
     /// The permission check answered. A withdrawn prompt answers `deny`.
@@ -141,6 +155,9 @@ pub const Effect = union(enum) {
     refuse: Refusal,
     /// Ask the permission check about this request's call, as its owner.
     authorize: Work,
+    /// Hold this request until a shell call lends to its owner. Nothing
+    /// runs yet; a later `authorize` or `withdraw` names it.
+    wait: Work,
     /// Run this request's MCP call, with its owner's access.
     call: Work,
     /// Take back this request's permission prompt.
@@ -177,6 +194,8 @@ pub fn step(state: State, event: Event) Output {
         .stopped => onStopped(state),
         .owner_added => |added| onOwnerAdded(state, added.owner, added.token),
         .owner_removed => |owner| onOwnerRemoved(state, owner),
+        .lent => |owner| onLent(state, owner),
+        .lend_ended => |owner| onLendEnded(state, owner),
         .request => |request| onRequest(state, request.token, request.version),
         .authorized => |answer| onAuthorized(state, answer.id, answer.decision),
         .call_finished => |finished| onCallFinished(state, finished.id, finished.outcome),
@@ -236,6 +255,33 @@ fn onOwnerRemoved(state: State, owner: OwnerId) Output {
     return out;
 }
 
+/// Every request the owner holds waiting moves on to the permission check.
+/// The session's own owner is always lent.
+fn onLent(state: State, owner: OwnerId) Output {
+    if (owner == .main) return quiet(state);
+    const index = ownerSlot(state, owner) orelse return quiet(state);
+    if (state.owners[index].?.lent) return quiet(state);
+    var out: Output = .{ .state = state };
+    out.state.owners[index].?.lent = true;
+    for (&out.state.slots) |*slot| {
+        const entry = if (slot.*) |*held_entry| held_entry else continue;
+        if (entry.owner != owner or entry.stage != .waiting) continue;
+        entry.stage = .authorizing;
+        out.push(.{ .authorize = .{ .id = entry.id, .owner = owner } });
+    }
+    return out;
+}
+
+/// Later requests wait. Work in flight keeps going: the shell keeps the
+/// lender until that work ends.
+fn onLendEnded(state: State, owner: OwnerId) Output {
+    if (owner == .main) return quiet(state);
+    const index = ownerSlot(state, owner) orelse return quiet(state);
+    var out: Output = .{ .state = state };
+    out.state.owners[index].?.lent = false;
+    return out;
+}
+
 /// The first check a request fails, if any.
 fn refusal(state: State, owner: ?OwnerId, version: u32) ?Refusal {
     if (!state.open) return .closed;
@@ -254,8 +300,12 @@ fn onRequest(state: State, token: Token, version: u32) Output {
     }
     const id: RequestId = @fromBackingInt(state.next);
     out.state.next = state.next + 1;
-    out.state.slots[freeSlot(state)] = .{ .id = id, .owner = owner.?, .stage = .authorizing };
-    out.push(.{ .authorize = .{ .id = id, .owner = owner.? } });
+    // With no shell call lending to its owner, the request waits for one,
+    // and nothing asks the permission check yet.
+    const lent = isLent(state, owner.?);
+    out.state.slots[freeSlot(state)] = .{ .id = id, .owner = owner.?, .stage = if (lent) .authorizing else .waiting };
+    const work: Work = .{ .id = id, .owner = owner.? };
+    out.push(if (lent) .{ .authorize = work } else .{ .wait = work });
     return out;
 }
 
@@ -275,6 +325,7 @@ fn onAuthorized(state: State, id: RequestId, decision: Decision) Output {
             },
         },
         .abandoned_auth => out.state.slots[index] = null,
+        .waiting => return logged(state, id, .stale),
         .calling, .replying, .abandoned_call => return logged(state, id, .stale),
     }
     return out;
@@ -292,6 +343,7 @@ fn onCallFinished(state: State, id: RequestId, outcome: Outcome) Output {
             out.state.slots[index] = null;
             if (outcome != .failed) out.push(.{ .log = .{ .id = id, .drop = .result_dropped } });
         },
+        .waiting => return logged(state, id, .stale),
         .authorizing, .replying, .abandoned_auth => return logged(state, id, .stale),
     }
     return out;
@@ -323,11 +375,13 @@ fn abandonWhere(out: *Output, owner: ?OwnerId) void {
 }
 
 /// A waiting prompt is withdrawn and a running call cancelled. The request
-/// keeps its slot until the shell reports that its work ended.
+/// keeps its slot until the shell reports that its work ended. A request
+/// that waits for a lender is withdrawn too, and the shell answers it
+/// without a check.
 fn letGo(out: *Output, index: usize) void {
     const entry = &out.state.slots[index].?;
     switch (entry.stage) {
-        .authorizing => {
+        .waiting, .authorizing => {
             entry.stage = .abandoned_auth;
             out.push(.{ .withdraw = entry.id });
         },
@@ -356,6 +410,12 @@ fn ownerOf(state: State, token: Token) ?OwnerId {
         if (std.crypto.timing_safe.eql(Token, owner.token, token)) found = owner.id;
     }
     return found;
+}
+
+/// Whether a shell call lends to `owner`, which the caller found registered.
+fn isLent(state: State, owner: OwnerId) bool {
+    const index = ownerSlot(state, owner) orelse return false;
+    return state.owners[index].?.lent;
 }
 
 fn ownerSlot(state: State, owner: OwnerId) ?usize {
@@ -389,7 +449,7 @@ fn freeSlot(state: State) usize {
 }
 
 /// The state as the model's variables: `open`, `next`, the registrations by
-/// owner, and the entries by id.
+/// owner with whether each is lent, and the entries by id.
 pub const Abstract = struct {
     open: bool,
     next: u64,
@@ -557,6 +617,66 @@ test "a result whose client is gone is dropped and logged, and so is a reply tha
     try testing.expectEqual(Effect{ .log = .{ .id = rid(0), .drop = .reply_lost } }, single(step(replying.state, .{ .reply_done = .{ .id = rid(0), .delivery = .lost } })));
 }
 
+test "a request of a command no shell call lends to waits, and its check starts once one lends" {
+    const unlent = run(State.init(2), &.{
+        .{ .started = main_token },
+        .{ .owner_added = .{ .owner = child, .token = child_token } },
+        .{ .lend_ended = child },
+    });
+    // The command's call waits: nothing asks the permission check.
+    const waiting = step(unlent, .{ .request = .{ .token = child_token, .version = 1 } });
+    try testing.expectEqual(Effect{ .wait = .{ .id = rid(0), .owner = child } }, single(waiting));
+    try testing.expectEqual(Stage.waiting, waiting.state.slots[0].?.stage);
+    // An answer the shell was never asked for is stale.
+    try testing.expectEqual(Effect{ .log = .{ .id = rid(0), .drop = .stale } }, single(step(waiting.state, .{ .authorized = .{ .id = rid(0), .decision = .allow } })));
+    // The session's own owner is always lent.
+    const main_ended = step(waiting.state, .{ .lend_ended = .main });
+    try testing.expectEqual(Effect{ .authorize = .{ .id = rid(1), .owner = .main } }, single(step(main_ended.state, .{ .request = .{ .token = main_token, .version = 1 } })));
+    // An interact lends: the waiting request moves on to the check, once.
+    const lent = step(waiting.state, .{ .lent = child });
+    try testing.expectEqual(Effect{ .authorize = .{ .id = rid(0), .owner = child } }, single(lent));
+    try testing.expectEqual(Stage.authorizing, lent.state.slots[0].?.stage);
+    try testing.expectEqual(@as(usize, 0), step(lent.state, .{ .lent = child }).len);
+    // A later request of the lent command goes straight to its check.
+    try testing.expectEqual(Effect{ .authorize = .{ .id = rid(1), .owner = child } }, single(step(lent.state, .{ .request = .{ .token = child_token, .version = 1 } })));
+}
+
+test "a lend that ends keeps work in flight, and the command's later requests wait" {
+    const calling = run(State.init(3), &.{
+        .{ .started = main_token },
+        .{ .owner_added = .{ .owner = child, .token = child_token } },
+        .{ .request = .{ .token = child_token, .version = 1 } },
+        .{ .authorized = .{ .id = rid(0), .decision = .allow } },
+    });
+    const ended = step(calling, .{ .lend_ended = child });
+    try testing.expectEqual(@as(usize, 0), ended.len);
+    try testing.expectEqual(Stage.calling, ended.state.slots[0].?.stage);
+    try testing.expectEqual(Effect{ .reply = .{ .id = rid(0), .outcome = .ok } }, single(step(ended.state, .{ .call_finished = .{ .id = rid(0), .outcome = .ok } })));
+    try testing.expectEqual(Effect{ .wait = .{ .id = rid(1), .owner = child } }, single(step(ended.state, .{ .request = .{ .token = child_token, .version = 1 } })));
+}
+
+test "a command's end or its client's leaving lets a waiting request go, with no check" {
+    const waiting = run(State.init(2), &.{
+        .{ .started = main_token },
+        .{ .owner_added = .{ .owner = child, .token = child_token } },
+        .{ .lend_ended = child },
+        .{ .request = .{ .token = child_token, .version = 1 } },
+        .{ .request = .{ .token = child_token, .version = 1 } },
+    });
+    // The client leaves: the request is withdrawn, and the shell's answer
+    // frees its slot without a check.
+    const gone = step(waiting, .{ .client_gone = rid(0) });
+    try testing.expectEqual(Effect{ .withdraw = rid(0) }, single(gone));
+    try testing.expectEqual(Stage.abandoned_auth, gone.state.slots[0].?.stage);
+    try testing.expectEqual(@as(usize, 0), step(gone.state, .{ .authorized = .{ .id = rid(0), .decision = .deny } }).len);
+    // The command ends: its other waiting request goes the same way, and a
+    // later lend has no owner to lend to.
+    const ended = step(gone.state, .{ .owner_removed = child });
+    try testing.expectEqual(Effect{ .withdraw = rid(1) }, single(ended));
+    try testing.expectEqual(@as(usize, 0), step(ended.state, .{ .lent = child }).len);
+    try testing.expectEqual(Effect{ .refuse = .unauthorized }, single(step(ended.state, .{ .request = .{ .token = child_token, .version = 1 } })));
+}
+
 test "abstract lists registrations by owner and entries by id" {
     const state = run(State.init(3), &.{
         .{ .started = main_token },
@@ -578,7 +698,7 @@ test "abstract lists registrations by owner and entries by id" {
 /// Seeded random events over a small id range, with the answers the model's
 /// environment can give: late, duplicated, and for requests never admitted.
 fn randomEvent(random: std.Random) Event {
-    const pick = random.uintLessThan(u8, 10);
+    const pick = random.uintLessThan(u8, 12);
     const any_id = rid(random.uintLessThan(u64, 6));
     const tokens = [_]Token{ main_token, child_token, forged_token };
     return switch (pick) {
@@ -589,6 +709,8 @@ fn randomEvent(random: std.Random) Event {
         5 => .{ .authorized = .{ .id = any_id, .decision = if (random.boolean()) .allow else .deny } },
         6 => .{ .call_finished = .{ .id = any_id, .outcome = random.enumValue(Outcome) } },
         7 => .{ .reply_done = .{ .id = any_id, .delivery = if (random.boolean()) .delivered else .lost } },
+        8 => .{ .lent = if (random.uintLessThan(u8, 8) == 0) .main else child },
+        9 => .{ .lend_ended = if (random.uintLessThan(u8, 8) == 0) .main else child },
         else => .{ .client_gone = any_id },
     };
 }
@@ -615,13 +737,25 @@ test "seeded random event sequences keep the bounds and run at most one call per
                     try testing.expect(!called[n]);
                     called[n] = true;
                 },
-                .authorize => |work| try testing.expectEqual(before.next, @backingInt(work.id)),
+                .authorize => |work| {
+                    // A check starts on an admission, for the new id, or on a
+                    // lend, for a request that waited; always for a lent owner.
+                    if (event == .request) {
+                        try testing.expectEqual(before.next, @backingInt(work.id));
+                    } else {
+                        try testing.expect(event == .lent);
+                        try testing.expectEqual(Stage.waiting, before.slots[slotOf(before, work.id).?].?.stage);
+                    }
+                    try testing.expect(isLent(state, work.owner));
+                },
                 else => {},
             };
             for (state.slots) |slot| {
                 const entry = slot orelse continue;
                 try testing.expect(@backingInt(entry.id) < state.next);
                 if (entry.stage == .authorizing or entry.stage == .calling) try testing.expect(ownerSlot(state, entry.owner) != null);
+                // A request waits only for a registered owner that nothing lends to.
+                if (entry.stage == .waiting) try testing.expect(ownerSlot(state, entry.owner) != null and !isLent(state, entry.owner));
             }
         }
     }

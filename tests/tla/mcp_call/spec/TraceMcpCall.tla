@@ -5,9 +5,10 @@
 (* tests/tla/drivers/mcp_call/code-to-spec.ts runs event sequences through *)
 (* the harness around src/core/mcp_host/mcp_call.zig, with crashes (the    *)
 (* process is killed), forged and revoked tokens, duplicated, late, and    *)
-(* garbage answers, disconnects at every stage, lost replies, and stops    *)
-(* and subagent ends mid-call. It writes each run as one sequence of       *)
-(* states into TraceData.tla. Each state is what the core showed           *)
+(* garbage answers, disconnects at every stage, lost replies, stops and    *)
+(* command ends mid-call, and lends that end and start again. It writes    *)
+(* each run as one sequence of states into TraceData.tla. Each state is    *)
+(* what the core showed                                                    *)
 (* (abstract(state) and the effects of the step) plus the event the driver *)
 (* sent. The harness prints sets as JSON arrays; Load reads them as sets.  *)
 (*                                                                         *)
@@ -65,6 +66,7 @@ Bounded == MC!Bounded
 IdsBelowNext == MC!IdsBelowNext
 EffectsCarryEntryOwner == MC!EffectsCarryEntryOwner
 LiveWorkHasOwner == MC!LiveWorkHasOwner
+WaitingOnlyUnlent == MC!WaitingOnlyUnlent
 ClosedIsQuiet == MC!ClosedIsQuiet
 CrashResets == MC!CrashResets
 AdmitOnlyValid == MC!AdmitOnlyValid
@@ -76,4 +78,6 @@ OneReplyPerRequest == MC!OneReplyPerRequest
 ReplyMatchesOutcome == MC!ReplyMatchesOutcome
 StaleIsQuiet == MC!StaleIsQuiet
 DroppedStateIsLogged == MC!DroppedStateIsLogged
+AuthorizeOnlyWhileLent == MC!AuthorizeOnlyWhileLent
+LendFollowsLender == MC!LendFollowsLender
 =============================================================================

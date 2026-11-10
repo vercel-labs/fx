@@ -7,8 +7,10 @@
 // what the core shows, mixed with every fault the model allows: a crash at
 // any step (the process is killed), forged and revoked tokens, other
 // versions, an answer delivered twice, late, or for a request that is gone or
-// was never admitted, a disconnect at any stage, a lost reply, and the
-// session stopping or a subagent ending mid-call.
+// was never admitted, a disconnect at any stage, a lost reply, the
+// session stopping or a command ending mid-call, and the shell call that
+// lends a command its permission check returning, or a later one lending,
+// at any step.
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Harness, actFor, checkTlc, seededRandom, specFiles, toTla, type CheckedTlc, type Event, type Shown } from "./lib.ts";
@@ -17,6 +19,8 @@ const start = (token = "t1"): Event => ({ event: "started", token });
 const stop: Event = { event: "stopped" };
 const add = (token = "t2", owner = "child"): Event => ({ event: "owner_added", owner, token });
 const remove = (owner = "child"): Event => ({ event: "owner_removed", owner });
+const lend = (owner = "child"): Event => ({ event: "lent", owner });
+const unlend = (owner = "child"): Event => ({ event: "lend_ended", owner });
 const request = (token = "t1", version = 1): Event => ({ event: "request", token, version });
 const allow = (id: number): Event => ({ event: "authorized", id, allow: true });
 const deny = (id: number): Event => ({ event: "authorized", id, allow: false });
@@ -44,6 +48,14 @@ export const scripted: Record<string, Event[]> = {
   "a crash mid-call starts the next process from nothing": [start(), request(), allow(0), crash, finish(0), start(), request(), allow(0), finish(0, "failed")],
   "a lost reply is logged": [start(), request(), allow(0), finish(0), replied(0, false), replied(0)],
   "answers for ids never issued are stale": [start(), allow(5), finish(7), replied(9), gone(3), request(), finish(1), allow(0)],
+  "a command's calls wait while nothing lends, and run once interact lends": [
+    start(), add(), request("t2"), allow(0), unlend(), request("t2"), allow(1), request("t2"), lend(), lend(), allow(1), deny(2), finish(0), finish(1),
+  ],
+  "a lend that ends keeps the call in flight": [start(), add(), request("t2"), allow(0), unlend(), finish(0, "tool_error"), replied(0), request("t2"), unlend(), lend()],
+  "a waiting call whose client leaves, or whose command ends, runs no check": [
+    start(), add(), unlend(), request("t2"), request("t2"), gone(0), deny(0), remove(), allow(1), lend(), request("t2"),
+  ],
+  "the session's own owner stays lent": [start(), unlend("main"), request(), lend("main"), allow(0), add(), unlend(), request("t2"), lend(), stop, lend()],
 };
 
 function pick<T>(random: () => number, items: T[]): T {
@@ -73,8 +85,10 @@ function randomEvent(random: () => number, shown: Shown, previous: Event | undef
   if (roll < 0.78) return gone(anyId());
   if (roll < 0.84) return add(pick(random, ["t1", "t2"]), random() < 0.9 ? "child" : "main");
   if (roll < 0.89) return remove(random() < 0.9 ? "child" : "main");
-  if (roll < 0.93) return stop;
-  if (roll < 0.96) return start(pick(random, ["t1", "t2"]));
+  if (roll < 0.915) return lend(random() < 0.9 ? "child" : "main");
+  if (roll < 0.93) return unlend(random() < 0.9 ? "child" : "main");
+  if (roll < 0.945) return stop;
+  if (roll < 0.965) return start(pick(random, ["t1", "t2"]));
   return crash;
 }
 

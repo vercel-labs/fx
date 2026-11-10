@@ -7,18 +7,26 @@
 (* still open.                                                             *)
 (*                                                                         *)
 (* Each core event is one action with the same name: Started, Stopped,     *)
-(* OwnerAdded, OwnerRemoved, Request, Authorized, CallFinished, ReplyDone, *)
-(* and ClientGone. The environment acts through the values those events    *)
-(* carry and through Crash:                                                *)
+(* OwnerAdded, OwnerRemoved, Lent, LendEnded, Request, Authorized,         *)
+(* CallFinished, ReplyDone, and ClientGone. The environment acts through   *)
+(* the values those events carry and through Crash:                        *)
 (*   - a client can present any token: the current one, one revoked by a  *)
-(*     restart or a subagent's end, or a forged one, and any version;      *)
+(*     restart or a command's end, or a forged one, and any version;       *)
 (*   - every answer the shell owes can be late, duplicated, or name a      *)
 (*     request that is gone or was never admitted (a garbage peer);        *)
 (*   - a client can disconnect at any step, and a reply can be lost;       *)
-(*   - the session can stop, and a subagent can end, mid-call;             *)
+(*   - the session can stop, and an owner's command can end, mid-call;     *)
+(*   - the shell call that lends an owner its permission check can return, *)
+(*     and a later one can lend again, at any step;                        *)
 (*   - the process can crash at any step, which drops all core state.      *)
 (* A second process is not modeled: the core lives in one fx process, and  *)
 (* a second fx process has its own bridge, socket, and tokens.             *)
+(*                                                                         *)
+(* An owner is one command fx's shell runs, from its shell call until its  *)
+(* process ends. It is lent while a shell call of its agent (the run call  *)
+(* that started it, or an interact that watches it) lends it that call's   *)
+(* permission check and MCP call. A request of an owner that no call lends *)
+(* to waits.                                                               *)
 (*                                                                         *)
 (* open, registered, next, and entries are `abstract(state)` in the code.  *)
 (* out is the effects the step returned, and act is the event the step     *)
@@ -36,17 +44,17 @@ Tokens == {"t1", "t2"}
 Presented == Tokens \cup {"forged"}
 Versions == {1, 2}
 Ids == 0..(MaxIds - 1)
-Stages == {"authorizing", "calling", "replying", "abandoned_auth", "abandoned_call"}
+Stages == {"waiting", "authorizing", "calling", "replying", "abandoned_auth", "abandoned_call"}
 Outcomes == {"ok", "tool_error", "failed"}
 ReplyOutcomes == Outcomes \cup {"denied"}
 Reasons == {"closed", "unauthorized", "unsupported_version", "busy"}
 Drops == {"stale", "result_dropped", "reply_lost"}
 
 Entries == [id: Ids, owner: Owners, stage: Stages]
-Registrations == [owner: Owners, token: Tokens]
+Registrations == [owner: Owners, token: Tokens, lent: BOOLEAN]
 
 Effects == [kind: {"refuse"}, reason: Reasons]
-           \cup [kind: {"authorize", "call"}, id: Ids, owner: Owners]
+           \cup [kind: {"authorize", "wait", "call"}, id: Ids, owner: Owners]
            \cup [kind: {"withdraw", "cancel"}, id: Ids]
            \cup [kind: {"reply"}, id: Ids, outcome: ReplyOutcomes]
            \cup [kind: {"log"}, id: Ids, what: Drops]
@@ -54,7 +62,7 @@ Effects == [kind: {"refuse"}, reason: Reasons]
 Acts == [name: {"Init", "Stopped", "Crash"}]
         \cup [name: {"Started"}, token: Tokens]
         \cup [name: {"OwnerAdded"}, owner: Owners, token: Tokens]
-        \cup [name: {"OwnerRemoved"}, owner: Owners]
+        \cup [name: {"OwnerRemoved", "Lent", "LendEnded"}, owner: Owners]
         \cup [name: {"Request"}, token: Presented, version: Versions]
         \cup [name: {"Authorized"}, id: Ids, allow: BOOLEAN]
         \cup [name: {"CallFinished"}, id: Ids, outcome: Outcomes]
@@ -70,6 +78,8 @@ Entry(i) == CHOOSE e \in entries : e.id = i
 Holds(i, stages) == i \in EntryIds /\ Entry(i).stage \in stages
 InUse == {r.token : r \in registered}
 RegOwners == {r.owner : r \in registered}
+IsLent(o) == \E r \in registered : r.owner = o /\ r.lent
+SetLent(o, b) == {IF r.owner = o THEN [r EXCEPT !.lent = b] ELSE r : r \in registered}
 \* Only a planted bug admits a token nobody holds; it then acts as main, so
 \* AdmitOnlyValid reports the bug instead of TLC failing on an empty CHOOSE.
 TokenOwner(t) == IF \E r \in registered : r.token = t
@@ -81,11 +91,13 @@ Remove(i) == {e \in entries : e.id # i}
 Log(i, what) == [kind |-> "log", id |-> i, what |-> what]
 
 \* Work in flight is let go: a waiting prompt is withdrawn and a running call
-\* cancelled. Each keeps its slot until the shell reports it ended.
-Abandon(e) == CASE e.stage = "authorizing" -> [e EXCEPT !.stage = "abandoned_auth"]
+\* cancelled. Each keeps its slot until the shell reports it ended. A request
+\* still waiting for a lender is withdrawn too: the shell answers it without
+\* a check.
+Abandon(e) == CASE e.stage \in {"waiting", "authorizing"} -> [e EXCEPT !.stage = "abandoned_auth"]
                 [] e.stage = "calling" -> [e EXCEPT !.stage = "abandoned_call"]
                 [] OTHER -> e
-LetGo(e) == CASE e.stage = "authorizing" -> {[kind |-> "withdraw", id |-> e.id]}
+LetGo(e) == CASE e.stage \in {"waiting", "authorizing"} -> {[kind |-> "withdraw", id |-> e.id]}
               [] e.stage = "calling" -> {[kind |-> "cancel", id |-> e.id]}
               [] OTHER -> {}
 AbandonAll(S) ==
@@ -116,7 +128,7 @@ Started(t) ==
     /\ IF open
        THEN UNCHANGED <<open, registered>>
        ELSE /\ open' = TRUE
-            /\ registered' = {[owner |-> "main", token |-> t]}
+            /\ registered' = {[owner |-> "main", token |-> t, lent |-> TRUE]}
     /\ UNCHANGED <<next, entries>>
 
 \* The session ends (quit, /new, /resume): every token is revoked and all
@@ -131,16 +143,16 @@ Stopped ==
             /\ UNCHANGED <<open, registered, entries>>
     /\ UNCHANGED next
 
-\* A subagent starts and gets its own token.
+\* A command starts with its own token, lent by the shell call that runs it.
 OwnerAdded(o, t) ==
     /\ act' = [name |-> "OwnerAdded", owner |-> o, token |-> t]
     /\ out' = {}
     /\ IF open /\ o \notin RegOwners /\ t \notin InUse
-       THEN registered' = registered \cup {[owner |-> o, token |-> t]}
+       THEN registered' = registered \cup {[owner |-> o, token |-> t, lent |-> TRUE]}
        ELSE UNCHANGED registered
     /\ UNCHANGED <<open, next, entries>>
 
-\* A subagent ends: its token is revoked and its work let go. The session's
+\* A command ends: its token is revoked and its work let go. The session's
 \* own owner leaves only with Stopped.
 OwnerRemoved(o) ==
     /\ act' = [name |-> "OwnerRemoved", owner |-> o]
@@ -151,7 +163,34 @@ OwnerRemoved(o) ==
             /\ UNCHANGED <<registered, entries>>
     /\ UNCHANGED <<open, next>>
 
-\* A client sent one complete request line.
+\* A shell call lends an owner its permission check and MCP call: an interact
+\* that watches the owner's command. Each request the owner holds waiting
+\* moves on to the check. The session's own owner is always lent, since no
+\* command holds its token.
+Lent(o) ==
+    /\ act' = [name |-> "Lent", owner |-> o]
+    /\ IF o # "main" /\ o \in RegOwners /\ ~IsLent(o)
+       THEN LET waiting == {e \in entries : e.owner = o /\ e.stage = "waiting"} IN
+            /\ registered' = SetLent(o, TRUE)
+            /\ entries' = {IF e \in waiting THEN [e EXCEPT !.stage = "authorizing"] ELSE e : e \in entries}
+            /\ out' = {[kind |-> "authorize", id |-> e.id, owner |-> o] : e \in waiting}
+       ELSE /\ out' = {}
+            /\ UNCHANGED <<registered, entries>>
+    /\ UNCHANGED <<open, next>>
+
+\* The lending shell call returns while the command still runs. Work it
+\* already started keeps its lender until that work ends, because the shell
+\* waits for it; later requests wait.
+LendEnded(o) ==
+    /\ act' = [name |-> "LendEnded", owner |-> o]
+    /\ out' = {}
+    /\ IF o # "main" /\ o \in RegOwners /\ IsLent(o)
+       THEN registered' = SetLent(o, FALSE)
+       ELSE UNCHANGED registered
+    /\ UNCHANGED <<open, next, entries>>
+
+\* A client sent one complete request line. A request of an owner no shell
+\* call lends to waits for one, with no permission check yet.
 Request(t, v) ==
     /\ next < MaxIds
     /\ act' = [name |-> "Request", token |-> t, version |-> v]
@@ -159,10 +198,12 @@ Request(t, v) ==
        IF reason # "none"
        THEN /\ out' = {[kind |-> "refuse", reason |-> reason]}
             /\ UNCHANGED <<open, registered, next, entries>>
-       ELSE LET e == [id |-> next, owner |-> TokenOwner(t), stage |-> "authorizing"] IN
+       ELSE LET o == TokenOwner(t)
+                e == [id |-> next, owner |-> o, stage |-> IF IsLent(o) THEN "authorizing" ELSE "waiting"] IN
             /\ entries' = entries \cup {e}
             /\ next' = next + 1
-            /\ out' = {[kind |-> "authorize", id |-> e.id, owner |-> e.owner]}
+            /\ out' = IF IsLent(o) THEN {[kind |-> "authorize", id |-> e.id, owner |-> e.owner]}
+                                  ELSE {[kind |-> "wait", id |-> e.id, owner |-> e.owner]}
             /\ UNCHANGED <<open, registered>>
 
 \* The permission check answered.
@@ -209,7 +250,7 @@ ReplyDone(i, delivered) ==
 \* The client's connection closed: the command ended or was cancelled.
 ClientGone(i) ==
     /\ act' = [name |-> "ClientGone", id |-> i]
-    /\ IF Holds(i, {"authorizing", "calling"})
+    /\ IF Holds(i, {"waiting", "authorizing", "calling"})
        THEN /\ entries' = {IF e.id = i THEN Abandon(e) ELSE e : e \in entries}
             /\ out' = LetGo(Entry(i))
        ELSE /\ entries' = entries
@@ -231,6 +272,8 @@ Next ==
     \/ Stopped
     \/ \E o \in Owners, t \in Tokens : OwnerAdded(o, t)
     \/ \E o \in Owners : OwnerRemoved(o)
+    \/ \E o \in Owners : Lent(o)
+    \/ \E o \in Owners : LendEnded(o)
     \/ \E t \in Presented, v \in Versions : Request(t, v)
     \/ \E i \in Ids, a \in BOOLEAN : Authorized(i, a)
     \/ \E i \in Ids, o \in Outcomes : CallFinished(i, o)
@@ -244,8 +287,12 @@ Next ==
 Answer(i) == Holds(i, {"authorizing", "abandoned_auth"}) /\ \E a \in BOOLEAN : Authorized(i, a)
 Finish(i) == Holds(i, {"calling", "abandoned_call"}) /\ \E o \in Outcomes : CallFinished(i, o)
 Deliver(i) == Holds(i, {"replying"}) /\ \E d \in BOOLEAN : ReplyDone(i, d)
+\* A waiting request moves on once its agent watches the command again. The
+\* model assumes the agent does, or that the command or its client ends,
+\* which lets the request go instead.
+Resume(i) == Holds(i, {"waiting"}) /\ Lent(Entry(i).owner)
 
-Spec == Init /\ [][Next]_vars /\ \A i \in Ids : WF_vars(Answer(i)) /\ WF_vars(Finish(i)) /\ WF_vars(Deliver(i))
+Spec == Init /\ [][Next]_vars /\ \A i \in Ids : WF_vars(Answer(i)) /\ WF_vars(Finish(i)) /\ WF_vars(Deliver(i)) /\ WF_vars(Resume(i))
 
 -----------------------------------------------------------------------------
 (* Laws. DESIGN.md names each one and where it is enforced. Each is stated *)
@@ -254,7 +301,8 @@ Spec == Init /\ [][Next]_vars /\ \A i \in Ids : WF_vars(Answer(i)) /\ WF_vars(Fi
 
 Live == {"authorizing", "calling"}
 Advances == {<<s, s>> : s \in Stages}
-            \cup {<<"authorizing", "calling">>, <<"authorizing", "replying">>,
+            \cup {<<"waiting", "authorizing">>, <<"waiting", "abandoned_auth">>,
+                  <<"authorizing", "calling">>, <<"authorizing", "replying">>,
                   <<"authorizing", "abandoned_auth">>, <<"calling", "replying">>,
                   <<"calling", "abandoned_call">>}
 \* The events whose arrival ends an entry, by the stage it ends from.
@@ -262,7 +310,8 @@ Ends == {<<"Authorized", "abandoned_auth">>, <<"CallFinished", "abandoned_call">
 \* The events each stage waits for.
 Expected == {<<"Authorized", "authorizing">>, <<"Authorized", "abandoned_auth">>,
              <<"CallFinished", "calling">>, <<"CallFinished", "abandoned_call">>,
-             <<"ReplyDone", "replying">>, <<"ClientGone", "authorizing">>, <<"ClientGone", "calling">>}
+             <<"ReplyDone", "replying">>, <<"ClientGone", "waiting">>, <<"ClientGone", "authorizing">>,
+             <<"ClientGone", "calling">>}
 IdEvents == {"Authorized", "CallFinished", "ReplyDone", "ClientGone"}
 
 TypeOK ==
@@ -278,7 +327,7 @@ TypeOK ==
 Bounded ==
     /\ Cardinality(entries) <= MaxInFlight
     /\ Cardinality(out) <= MaxInFlight
-    /\ Cardinality(out) > 1 => act.name \in {"Stopped", "OwnerRemoved"}
+    /\ Cardinality(out) > 1 => act.name \in {"Stopped", "OwnerRemoved", "Lent"}
     /\ \A i \in EntryIds : Cardinality({e \in entries : e.id = i}) = 1
     /\ \A o \in Owners : Cardinality({r \in registered : r.owner = o}) <= 1
     /\ \A t \in Tokens : Cardinality({r \in registered : r.token = t}) <= 1
@@ -286,9 +335,10 @@ Bounded ==
 \* L3: every id the table holds was issued in this process.
 IdsBelowNext == \A i \in EntryIds : i < next
 
-\* L8: authorize and call effects carry the owner their request was admitted for.
+\* L8: authorize, wait, and call effects carry the owner their request was
+\* admitted for.
 EffectsCarryEntryOwner ==
-    \A e \in out : e.kind \in {"authorize", "call"} =>
+    \A e \in out : e.kind \in {"authorize", "wait", "call"} =>
         \E x \in entries : x.id = e.id /\ x.owner = e.owner
 
 \* L9: no prompt waits and no call runs for an owner whose token is revoked.
@@ -302,7 +352,8 @@ CrashResets == act.name \in {"Init", "Crash"} => (~open /\ registered = {} /\ ne
 
 \* L1: a request is admitted only on an open bridge, with a token in force,
 \* the supported version, and a free slot. Its entry waits for the permission
-\* check, as the token's owner.
+\* check, as the token's owner, or for a lender when no shell call lends to
+\* that owner.
 AdmitOnlyValid ==
     [][\A i \in {e.id : e \in entries'} \ EntryIds :
           /\ act'.name = "Request"
@@ -311,8 +362,9 @@ AdmitOnlyValid ==
           /\ act'.version = 1
           /\ Cardinality(entries) < MaxInFlight
           /\ \E e \in entries' : /\ e.id = i
-                                 /\ e.stage = "authorizing"
-                                 /\ \E r \in registered : r.token = act'.token /\ r.owner = e.owner]_vars
+                                 /\ \E r \in registered : /\ r.token = act'.token
+                                                         /\ r.owner = e.owner
+                                                         /\ e.stage = IF r.lent THEN "authorizing" ELSE "waiting"]_vars
 
 \* L2: a refused request changes nothing and gets one reason, the first check
 \* it failed in the order closed, unauthorized, version, busy. A client without
@@ -329,11 +381,12 @@ RefusalsAreQuiet ==
                 /\ (reason = "unsupported_version") => (open /\ known /\ act'.version # 1)
                 /\ (reason = "busy") => (open /\ known /\ act'.version = 1 /\ Cardinality(entries) >= MaxInFlight)]_vars
 
-\* L3: each admission takes the next id, and only an admission or a new
-\* process moves it.
+\* L3: each admission takes the next id, which no request holds, and only an
+\* admission or a new process moves it.
 FreshIds ==
-    [][/\ \A e \in out' : e.kind = "authorize" => (e.id = next /\ next' = next + 1 /\ e.id \notin EntryIds)
-       /\ next' # next => (act'.name = "Crash" \/ \E e \in out' : e.kind = "authorize")]_vars
+    [][LET admitted == {e.id : e \in entries'} \ EntryIds IN
+       /\ admitted # {} => (admitted = {next} /\ next' = next + 1)
+       /\ next' # next => (act'.name = "Crash" \/ admitted = {next})]_vars
 
 \* L4: a call starts only when the permission check allows a request that is
 \* waiting for it, on that step, and the request moves to calling. With
@@ -381,6 +434,31 @@ DroppedStateIsLogged ==
              => [kind |-> "log", id |-> act'.id, what |-> "reply_lost"] \in out']_vars
 
 \* L15: every request the core admits leaves the table, given the answers the
-\* shell owes.
+\* shell owes and a lender for each waiting request (Resume).
 Drained == \A i \in Ids : (i \in EntryIds) ~> (i \notin EntryIds)
+
+\* L16: a permission check starts only for an owner a shell call lends to,
+\* on its admission or on the lend, and its request then waits for the check.
+AuthorizeOnlyWhileLent ==
+    [][\A e \in out' : e.kind = "authorize" =>
+          /\ act'.name \in {"Request", "Lent"}
+          /\ \E r \in registered' : r.owner = e.owner /\ r.lent
+          /\ \E y \in entries' : y.id = e.id /\ y.stage = "authorizing"]_vars
+
+\* L17: a request waits for a lender only while its owner is registered and
+\* no shell call lends to it: a lend moves it on, and the owner's end lets it
+\* go.
+WaitingOnlyUnlent ==
+    \A x \in entries : x.stage = "waiting" => \E r \in registered : r.owner = x.owner /\ ~r.lent
+
+\* L18: a command's owner is lent from the step a shell call lends to it, or
+\* registers it, until the step that call returns; nothing else changes it.
+\* The session's own owner is always lent.
+LendFollowsLender ==
+    [][\A r \in registered, s \in registered' :
+          (r.owner = s.owner /\ r.token = s.token) =>
+              s.lent = CASE r.owner = "main" -> TRUE
+                         [] act'.name = "Lent" /\ act'.owner = r.owner -> TRUE
+                         [] act'.name = "LendEnded" /\ act'.owner = r.owner -> FALSE
+                         [] OTHER -> r.lent]_vars
 =============================================================================

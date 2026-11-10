@@ -743,8 +743,10 @@ fn callRun(
     var execution_id_buffer: [64]u8 = undefined;
     const execution_id = runtime.generatedId(&execution_id_buffer) catch |err|
         return runtimeFailure(ctx, err);
-    // While this call runs, its command can reach the session's MCP tools
-    // with `fx mcp call`, as this agent (`mcp_call_bridge.zig`).
+    // The command can reach the session's MCP tools with `fx mcp call`, as
+    // this agent, until its process ends (`mcp_call_bridge.zig`). While this
+    // call waits for it, its calls run as this call; once this call returns,
+    // they wait for the next interact that watches the command.
     const bridge_registration: ?*mcp_call_bridge.Registration = if (comptime mcp_call_bridge.supported) registration: {
         const capability = ctx.mcp_call_capability orelse break :registration null;
         break :registration mcp_call_bridge.register(capability) catch |err| {
@@ -752,7 +754,10 @@ fn callRun(
             break :registration null;
         };
     } else null;
-    defer if (comptime mcp_call_bridge.supported) if (bridge_registration) |registration| mcp_call_bridge.unregister(registration);
+    var command_running = false;
+    defer if (comptime mcp_call_bridge.supported) if (bridge_registration) |registration| {
+        if (command_running) mcp_call_bridge.release(registration) else mcp_call_bridge.unregister(registration);
+    };
     var prepared = runtime.startCaptured(ctx.allocator, .{
         .execution_id = execution_id,
         .command = command,
@@ -773,6 +778,7 @@ fn callRun(
         .on_output_chunk = ctx.on_output_chunk,
         .yield_time_ms = input.yield_time_ms,
         .cancel_flag = ctx.cancel_flag,
+        .on_exit = if (bridge_registration) |registration| .{ .id = registration.id, .notify = mcp_call_bridge.commandEnded } else null,
     }) catch |err| {
         if (err == error.Cancelled and
             ctx.cancel_flag != null and
@@ -783,6 +789,7 @@ fn callRun(
         return runtimeFailure(ctx, err);
     };
     defer prepared.deinit(ctx.allocator);
+    command_running = prepared.snapshot.state == .running;
     const result = try finishPrepared(ctx, runtime, &prepared, .command);
     return attachSnapshotNotice(ctx.allocator, result) catch |err| {
         result.deinit(ctx.allocator);
@@ -845,11 +852,21 @@ fn callInteract(
         return callTtyInteract(ctx, input, yield_time_ms);
     }
     if (chars.len != 0) return runtimeFailure(ctx, error.InvalidBackend);
-    var prepared = runtime.wait(
+    // While this call waits, the command's `fx mcp call` runs as this call
+    // (`mcp_call_bridge.zig` `lend`), and the wait does not end while one
+    // of those calls runs.
+    const lent: ?*mcp_call_bridge.Registration = if (comptime mcp_call_bridge.supported) lent: {
+        const capability = ctx.mcp_call_capability orelse break :lent null;
+        const id = runtime.exitNoticeId(session_id) orelse break :lent null;
+        break :lent mcp_call_bridge.lend(id, capability);
+    } else null;
+    defer if (comptime mcp_call_bridge.supported) if (lent) |registration| mcp_call_bridge.release(registration);
+    var prepared = runtime.waitHeld(
         ctx.allocator,
         session_id,
         yield_time_ms,
         ctx.cancel_flag,
+        if (lent) |registration| &registration.hold else null,
     ) catch |err| return runtimeFailure(ctx, err);
     defer prepared.deinit(ctx.allocator);
     return finishPrepared(ctx, runtime, &prepared, .command);

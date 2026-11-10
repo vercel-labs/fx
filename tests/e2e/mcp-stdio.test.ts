@@ -4019,6 +4019,160 @@ describe("fx mcp call", () => {
     expect(toolCalls(root)).toHaveLength(0);
   }, 60_000);
 
+  // A command can outlive the shell call that started it: the call stops
+  // waiting at its yield, and the command keeps running in the background.
+  // Its calls wait while no shell call of the agent watches it, and run while
+  // shell interact does (`src/core/mcp_host/mcp_call_bridge.zig` `lend`).
+  const loopCommand = (calls: number, pause: number) =>
+    `for i in $(seq 1 ${calls}); do "${FX_BIN}" mcp call ${TOOL_NAME} "{\\"text\\":\\"loop$i\\"}" > out$i.txt 2> err$i.txt; echo "call$i=$?"; sleep ${pause}; done`;
+  const waitForFile = async (path: string, timeoutMs: number) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!existsSync(path)) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${path}`);
+      await Bun.sleep(25);
+    }
+  };
+  const sessionOf = (result: string) => /"session_id":"([^"]+)"/.exec(result)?.[1] ?? "missing";
+
+  test("a command left running after its shell call yields keeps calling while the agent watches it", async () => {
+    const root = bridgeRoot("bridge-background");
+    let started = "";
+    let callsBeforeWatch = -1;
+    let seen = "";
+    gateway = startFakeGateway([
+      // The command starts calling only after the run call stopped waiting.
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command: `sleep 2; ${loopCommand(3, 1)}`, yield_time_ms: 500 }),
+      async (body: string) => {
+        started = toolResultText(body, "run_call");
+        // Its first call starts while no shell call watches the command: it
+        // waits and reaches nothing.
+        await waitForFile(join(root.workspace, "err1.txt"), 15_000);
+        await Bun.sleep(1_000);
+        callsBeforeWatch = toolCalls(root).length;
+        return fakeGatewayToolCall("wait_call", "shell", { action: "interact", session_id: sessionOf(started), yield_time_ms: 30_000 });
+      },
+      (body: string) => {
+        seen = toolResultText(body, "wait_call");
+        return fakeGatewayFinalText("BRIDGE_BACKGROUND_DONE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Poll the job."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 80_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_BACKGROUND_DONE");
+    expect(started).toContain('"state":"running"');
+    expect(callsBeforeWatch).toBe(0);
+    // Once interact watches the command, the waiting call and the later ones run.
+    expect(seen).toContain("call1=0");
+    expect(seen).toContain("call2=0");
+    expect(seen).toContain("call3=0");
+    expect(readFileSync(join(root.workspace, "out3.txt"), "utf8").trimEnd().endsWith("BRIDGE_TAIL:loop3")).toBe(true);
+    expect(toolCalls(root)).toHaveLength(3);
+  }, 120_000);
+
+  test("a stopped command's waiting call reaches nothing, and its token ends with it", async () => {
+    const root = bridgeRoot("bridge-background-stop");
+    // The first command keeps its token, then waits in a call no shell call
+    // serves. The second presents that token after the first was stopped.
+    const first = `echo "$FX_MCP_CALL_TOKEN" > token.txt; sleep 2; "${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"late"}' > late.txt 2> late_err.txt; echo "late=$?" > late_code.txt`;
+    const second = `FX_MCP_CALL_TOKEN="$(cat token.txt)" "${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"stale"}' > stale.txt 2> stale_err.txt; echo "stale=$?"; cat stale_err.txt`;
+    let started = "";
+    let callsBeforeStop = -1;
+    let stopped = "";
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command: first, yield_time_ms: 500 }),
+      async (body: string) => {
+        started = toolResultText(body, "run_call");
+        await waitForFile(join(root.workspace, "late_err.txt"), 15_000);
+        await Bun.sleep(1_000);
+        callsBeforeStop = toolCalls(root).length;
+        return fakeGatewayToolCall("stop_call", "shell", { action: "stop", session_id: sessionOf(started) });
+      },
+      (body: string) => {
+        stopped = toolResultText(body, "stop_call");
+        return fakeGatewayToolCall("second_call", "shell", { action: "run", command: second });
+      },
+      (body: string) => {
+        seen = toolResultText(body, "second_call");
+        return fakeGatewayFinalText("BRIDGE_STOP_DONE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Stop the job."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 80_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_STOP_DONE");
+    expect(callsBeforeStop).toBe(0);
+    expect(stopped).toContain('"state":"stopped"');
+    // The stopped command's call never finished, and never ran.
+    const lateCode = join(root.workspace, "late_code.txt");
+    expect(existsSync(lateCode) ? readFileSync(lateCode, "utf8") : "").not.toContain("late=0");
+    // A later command that presents the stopped command's token is refused.
+    expect(seen).toContain("stale=3");
+    expect(seen).toContain("the command that started it has ended");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 120_000);
+
+  test("an interact whose wait ends while one of the command's calls runs returns after that call", async () => {
+    // The MCP call stalls until fx gives up on it after 15 s, well past the
+    // interact's own 5 s wait. The command prints a line about 9 s in,
+    // after that wait would have ended and before the call does.
+    const root = bridgeRoot("bridge-background-stall", {}, { mode: "stall_operation", operationTimeoutMs: 15_000 });
+    let started = "";
+    let watchedAt = 0;
+    let returnedAt = 0;
+    let first = "";
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command: `sleep 2; (sleep 9; echo tick) & ${callTo("out.txt", "stall")}`, yield_time_ms: 500 }),
+      async (body: string) => {
+        started = toolResultText(body, "run_call");
+        await waitForFile(join(root.workspace, "err.txt"), 15_000);
+        await Bun.sleep(500);
+        watchedAt = Date.now();
+        return fakeGatewayToolCall("wait_call", "shell", { action: "interact", session_id: sessionOf(started), yield_time_ms: 5_000 });
+      },
+      (body: string) => {
+        returnedAt = Date.now();
+        first = toolResultText(body, "wait_call");
+        // The command prints the call's exit code just after the reply
+        // that let the first wait end, so a second wait reads it.
+        return fakeGatewayToolCall("wait_again", "shell", { action: "interact", session_id: sessionOf(started), yield_time_ms: 5_000 });
+      },
+      (body: string) => {
+        seen = first + toolResultText(body, "wait_again");
+        return fakeGatewayFinalText("BRIDGE_STALL_DONE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Wait for the job."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 80_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_STALL_DONE");
+    // The wait outlasted its own 5 s until the call ended, which fx gives
+    // up on after 15 s, and the command saw the call fail rather than lose
+    // its connection.
+    expect(returnedAt - watchedAt).toBeGreaterThan(12_000);
+    // Its result shows the command as it was when the call ended.
+    expect(first).toContain("tick");
+    expect(seen).toContain("exit=1");
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 120_000);
+
   // Runs one shell command through the built binary and returns what the
   // model saw of it.
   const runBridgeCommand = async (root: FixtureRoot, shellCommand: string) => {
@@ -4128,7 +4282,7 @@ describe("fx mcp call", () => {
   test("outside a shell call, or against another fx version, a call exits 3", async () => {
     const outside = await runClient({});
     expect(outside.code).toBe(3);
-    expect(outside.stderr).toContain("no running fx shell call to reach");
+    expect(outside.stderr).toContain("no running fx shell command to reach");
     expect(outside.stdout).toBe("");
 
     await withFakeBridge('{"v":999,"status":"ok","bytes":0}\n', async (env) => {
