@@ -229,6 +229,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_NET_PROXY_LOOPBACK": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_OAUTH_ISSUER_URL": {
       "job": "test",
       "stability": "internal"
@@ -371,6 +375,7 @@
   },
   "external_env": [
     "AI_GATEWAY_API_KEY",
+    "ALL_PROXY",
     "CMUX_WORKSPACE_ID",
     "COLORFGBG",
     "COLORTERM",
@@ -383,9 +388,13 @@
     "HERDR_PANE_ID",
     "HERDR_SOCKET_PATH",
     "HOME",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
     "LANG",
     "NO_COLOR",
+    "NO_PROXY",
     "PATH",
+    "REQUEST_METHOD",
     "SHELL",
     "SSH_CONNECTION",
     "TERM",
@@ -399,7 +408,11 @@
     "USERPROFILE",
     "WAYLAND_DISPLAY",
     "XDG_CONFIG_HOME",
-    "ZDOTDIR"
+    "ZDOTDIR",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy"
   ],
   "hand_parsed_flags": {
     "--help": "Detects a help request before any command parser runs.",

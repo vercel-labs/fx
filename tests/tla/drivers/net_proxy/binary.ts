@@ -1,0 +1,772 @@
+// Runs the built fx through proxies that answer in the ways the repair of
+// PR #1728 is about, and has TLC check what fx did against the design
+// (tests/tla/net_proxy/NetProxyTrace.tla, NetProxyEnvTrace.tla, and
+// NetProxyCallersTrace.tla).
+//
+// Each scenario is one environment action in the model's words: a proxy that
+// sends 102 or 100 before its 200, one that sends 101, one that answers 502,
+// one that answers 407, one that is down, or a proxy URL whose host has an
+// underscore or another class. The driver runs fx once with that proxy and a
+// local provider, reads what fx did (did the request reach the provider
+// through the tunnel, what did the retry notices and the final error say), and
+// writes it as a one-record module. TLC says whether the model can produce it.
+//
+// A third kind of scenario is a caller that fails and shows an error text: a Grok
+// client version lookup that ends `fx ask`, and `fx upgrade`. Each runs behind a
+// proxy that is down, one that refuses CONNECT, one that works while the server
+// fails, and no proxy at all, and the driver reads whether the text names the
+// proxy (NetProxyCallers.tla: a caller names the proxy for its own failure at
+// the proxy, and never otherwise).
+//
+// The fourth kind is web_fetch, which dials the proxy itself: a model call to
+// web_fetch behind a proxy that is down, a proxy host that never resolves, a
+// proxy that refuses CONNECT, and a relay that closes after the tunnel opens. The
+// driver reads whether the tool's error, in the model's next request, names the
+// proxy, and which error the dial returned, from the sentence fx traces for it
+// (the platform's own name: macOS polls a refused connect as HUP alone, which
+// web_fetch's dialer reads as error.UnexpectedClose).
+//
+// The fifth kind is web_fetch to a name with two admitted addresses, which a run of
+// the built fx cannot make without DNS: fetch_lab.ts builds lab_fetch.zig, which
+// calls web_fetch's real fetch with a resolver that admits two public addresses, behind
+// a local proxy that refuses the first and opens a tunnel for the second, which stays
+// silent; that refuses both; and that answers with bytes that are not HTTP. TLC checks
+// whether the error text names the proxy, against the design (a failure held for an
+// earlier address is cleared when a later address opens its tunnel: LaterAddressClears),
+// and a run of 120 fetches with 64 open files allowed checks that none leaks a socket
+// or shows a sentence left by an earlier one.
+//
+// With --self-check every observation is also checked against two models of
+// older connectors. The connector as first written refuses interim heads, says
+// only that the network is down when it retries, keeps slices of the
+// environment, and refuses underscores. The connector as pushed before the short
+// notice puts the whole sentence into the retry notice, which leaves no room for
+// the wait when the sentence is long. A third model is fx before the callers took
+// the proxy's sentence, which shows fixed text for the version lookup and for
+// fx upgrade. Two more models are web_fetch before its dial mapped every failure
+// to a name the claim lists, and the same with the list grown by the one name
+// macOS gave. Each must reject what the repaired fx did in every scenario where
+// the two differ, and accept the rest, so the check cannot pass for any fx. The lab
+// adds two more: web_fetch before its dial cleared an earlier address's sentence, and
+// a dial that clears on every return. Three bugs are also planted in a copy of the
+// source (an earlier address's sentence kept, a clear on every return, a name the claim
+// lists turned into HostUnreachable), and the lab's run of each must be caught.
+//
+// Everything is local: loopback proxies, a loopback provider, a fake AI Gateway,
+// a temporary FX_HOME, and FX_SOUND=0. No model is called.
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import net from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { completion } from "../../../e2e/fixtures/chat-completions";
+import { startConnectProxy, type ProxyOptions } from "../../../e2e/fixtures/net-proxy/proxy";
+import { TLA_ROOT, fxBin, runTlc } from "../lib/tlc";
+import { buildFetchLab, copySource, runFetchLab, withPlantedBug, type LabRun, type LabScenario } from "./fetch_lab";
+
+const TARGET = "proxy-target.test";
+
+const DESIGN = {
+  UseProxy: "TRUE", AuthOnConnect: "TRUE", TlsAfterConnect: "TRUE", NoFallback: "TRUE", SharedFlag: "FALSE",
+  PinFetchIp: "TRUE", DetailMode: "\"own_target\"", InterimMode: "\"skip_not_101\"", NoticeMode: "\"own_target\"",
+  NoticeForm: "\"short\"", LongHost: "FALSE",
+};
+const FIRST = { ...DESIGN, InterimMode: "\"refuse\"", NoticeMode: "\"generic\"" };
+/** The connector as pushed before the short notice: the whole sentence in the notice. */
+const PUSHED = { ...DESIGN, NoticeForm: "\"full\"" };
+const ENV_DESIGN = {
+  Guard: "\"upper_only\"", BorrowHost: "FALSE", BorrowNoProxy: "FALSE", AcceptsUnderscore: "TRUE", AcceptsBang: "FALSE", NamesReasons: "TRUE",
+};
+const ENV_FIRST = {
+  Guard: "\"none\"", BorrowHost: "TRUE", BorrowNoProxy: "TRUE", AcceptsUnderscore: "FALSE", AcceptsBang: "FALSE", NamesReasons: "FALSE",
+};
+
+/** The callers' design: the version lookup, fx upgrade, and web_fetch take the proxy's sentence. */
+const CALLERS_DESIGN = {
+  VersionClaims: "TRUE", UpgradeClaims: "TRUE", FetchStepNames: "TRUE", ListsUnexpectedClose: "FALSE",
+  ClearsAtStart: "TRUE", NamesWithoutFailure: "FALSE", FetchClears: "\"on_open\"",
+};
+/** fx before they did: both show fixed text. */
+const CALLERS_HEAD = { ...CALLERS_DESIGN, VersionClaims: "FALSE", UpgradeClaims: "FALSE" };
+/** web_fetch before its dial mapped a failure at the proxy to a name the claim lists. */
+const CALLERS_FETCH_HEAD = { ...CALLERS_DESIGN, FetchStepNames: "FALSE" };
+/** The same, with the claim's list grown by error.UnexpectedClose: a fix by name. */
+const CALLERS_FETCH_BY_NAME = { ...CALLERS_FETCH_HEAD, ListsUnexpectedClose: "TRUE" };
+/** web_fetch before its dial cleared the sentence of an earlier address when a later one opens its tunnel. */
+const CALLERS_NO_CLEAR = { ...CALLERS_DESIGN, FetchClears: "\"never\"" };
+/** A fix that clears on every return of the dial, failures included. */
+const CALLERS_CLEAR_ON_RETURN = { ...CALLERS_DESIGN, FetchClears: "\"on_return\"" };
+
+type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
+type Run = { code: number | null; stdout: string; stderr: string; ms: number };
+
+/** What the proxy does, in the model's words, and what fx should then do. */
+type Connection = {
+  name: string;
+  /** The model's word for the answer. */
+  answer: string;
+  /** "down": nothing listens at the proxy's port. */
+  proxy: "down" | ProxyOptions;
+  /** The request reaches a local provider through the tunnel, as opposed to a host nothing serves. */
+  completes: boolean;
+  /** Whether fx's retry notices or its error name the proxy with this text; null when the run ends in success. */
+  sentence: ((proxyPort: number) => string) | null;
+  /** Whether fx retries (notices) or ends (error). */
+  retried: boolean;
+  /** Whether the connector as first written did the same, so the model of it must accept the observation. */
+  sameAsFirst: boolean;
+  /** Whether the connector as pushed before the short notice did the same. */
+  sameAsPushed: boolean;
+  /** A proxy host name that never resolves, in place of 127.0.0.1:<port>; its port is 3128. */
+  host?: string;
+};
+
+/** Three labels of 61 letters, one of 59, and .invalid: a 253-byte host that never resolves. */
+const LONG_HOST = ["a".repeat(61), "b".repeat(61), "c".repeat(61), "d".repeat(59)].join(".") + ".invalid";
+
+const connections: Connection[] = [
+  { name: "interim 102 before 200", answer: "interim", proxy: { interim: 102 }, completes: true, sentence: null, retried: false, sameAsFirst: false, sameAsPushed: true },
+  { name: "interim 100 before 200", answer: "interim", proxy: { interim: 100 }, completes: true, sentence: null, retried: false, sameAsFirst: false, sameAsPushed: true },
+  { name: "101 before 200", answer: "switching", proxy: { status: 101 }, completes: false, sentence: p => `proxy 127.0.0.1:${p} refused CONNECT to ${TARGET}:443: 101`, retried: false, sameAsFirst: true, sameAsPushed: true },
+  { name: "407", answer: "auth", proxy: { status: 407 }, completes: false, sentence: p => `proxy 127.0.0.1:${p} refused CONNECT to ${TARGET}:443: 407`, retried: false, sameAsFirst: true, sameAsPushed: true },
+  { name: "502", answer: "refused", proxy: { status: 502 }, completes: false, sentence: null, retried: true, sameAsFirst: false, sameAsPushed: false },
+  { name: "a proxy that is down", answer: "dead", proxy: "down", completes: false, sentence: null, retried: true, sameAsFirst: false, sameAsPushed: true },
+  { name: "a proxy host of 253 bytes that never resolves", answer: "dead", proxy: "down", host: LONG_HOST, completes: false, sentence: null, retried: true, sameAsFirst: false, sameAsPushed: false },
+];
+
+/** A host class in the proxy URL, the way NetProxyEnv.tla names it. */
+type HostClass = { cls: string; url: string; sameAsFirst: boolean };
+const hostClasses: HostClass[] = [
+  { cls: "letters", url: "http://squid-proxy.invalid:3128", sameAsFirst: true },
+  { cls: "underscore", url: "http://squid_proxy.invalid:3128", sameAsFirst: false },
+  { cls: "bang", url: "http://bad_host!:3128", sameAsFirst: false },
+  { cls: "no_host", url: "http:///path", sameAsFirst: false },
+  { cls: "bad_port", url: "http://proxy.invalid:99999", sameAsFirst: false },
+];
+
+/** A caller that fails and shows an error text, in NetProxyCallers.tla's words. */
+type CallerScenario = {
+  name: string;
+  caller: "version" | "upgrade";
+  proxy: "set" | "unset";
+  cause: "at_proxy" | "elsewhere";
+  /** The proxy the run has: down, refusing CONNECT (from the first, or after one relayed), working, or none. */
+  via: "down" | "refuses" | "refuses_after_first" | "works" | "none";
+  /** Whether fx before the callers took the sentence showed the same text, so that model must accept the observation. */
+  sameAsHead: boolean;
+};
+
+/** A web_fetch call, in NetProxyCallers.tla's words. */
+type FetchScenario = {
+  name: string;
+  cause: "at_proxy" | "elsewhere";
+  /** The proxy the run has: down, a name that never resolves, refusing CONNECT, or relaying to a server that closes. */
+  via: "down" | "unresolved" | "refuses" | "relay_closes";
+};
+
+const fetchScenarios: FetchScenario[] = [
+  { name: "web_fetch behind a proxy that is down", cause: "at_proxy", via: "down" },
+  { name: "web_fetch behind a proxy host that never resolves", cause: "at_proxy", via: "unresolved" },
+  { name: "web_fetch behind a proxy that refuses CONNECT", cause: "at_proxy", via: "refuses" },
+  { name: "web_fetch whose relay closes after the tunnel opens", cause: "elsewhere", via: "relay_closes" },
+];
+
+/** web_fetch's target: an address literal its public-address rule admits without DNS. */
+const FETCH_ADDRESS = "93.184.216.34";
+const FETCH_URL = `https://${FETCH_ADDRESS}/docs`;
+/** A proxy host that never resolves, with a port nothing needs to listen on. */
+const UNRESOLVED_PROXY = "never-resolves-proxy.invalid";
+
+const callerScenarios: CallerScenario[] = [
+  { name: "a Grok version lookup behind a proxy that is down", caller: "version", proxy: "set", cause: "at_proxy", via: "down", sameAsHead: false },
+  { name: "a Grok version lookup behind a proxy that refuses CONNECT", caller: "version", proxy: "set", cause: "at_proxy", via: "refuses", sameAsHead: false },
+  { name: "a Grok version lookup that fails behind a proxy that works", caller: "version", proxy: "set", cause: "elsewhere", via: "works", sameAsHead: true },
+  { name: "a Grok version lookup that fails with no proxy", caller: "version", proxy: "unset", cause: "elsewhere", via: "none", sameAsHead: true },
+  { name: "fx upgrade behind a proxy that is down", caller: "upgrade", proxy: "set", cause: "at_proxy", via: "down", sameAsHead: false },
+  { name: "fx upgrade behind a proxy that refuses the download", caller: "upgrade", proxy: "set", cause: "at_proxy", via: "refuses_after_first", sameAsHead: false },
+  { name: "fx upgrade whose download fails behind a proxy that works", caller: "upgrade", proxy: "set", cause: "elsewhere", via: "works", sameAsHead: true },
+  { name: "fx upgrade whose download fails with no proxy", caller: "upgrade", proxy: "unset", cause: "elsewhere", via: "none", sameAsHead: true },
+];
+
+function serveLocal(handle: (request: Request, path: string) => Response | Promise<Response>) {
+  const remotePorts: number[] = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    idleTimeout: 0,
+    async fetch(request, srv) {
+      remotePorts.push(srv.requestIP(request)?.port ?? -1);
+      return handle(request, new URL(request.url).pathname);
+    },
+  });
+  return { port: server.port!, base: `http://127.0.0.1:${server.port}`, remotePorts, stop: () => server.stop(true) };
+}
+
+/** A fake AI Gateway, so a run that starts on the default provider's catalog stays local. */
+function serveGateway() {
+  const gateway = serveLocal(async (request, path) => {
+    if (path === "/coding-agent/v1/models") return Response.json({ data: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    if (request.method !== "POST") return new Response("not found", { status: 404 });
+    await request.text();
+    return new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+  });
+  return { ...gateway, env: { FX_GATEWAY_BASE_URL: gateway.base, FX_GATEWAY_CHAT_URL: `${gateway.base}/v4/ai/language-model` } };
+}
+
+async function closedPort(): Promise<number> {
+  const server = net.createServer();
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as net.AddressInfo).port;
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  return port;
+}
+
+function profile(root: string, name: string, baseUrl: string): string {
+  const home = mkdtempSync(join(root, `${name}-`));
+  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+    provider: "custom",
+    auto_upgrade: false,
+    permission_mode: "ask",
+    providers: {
+      custom: {
+        protocol: "openai-chat-completions",
+        base_url: baseUrl,
+        auth: { type: "none" },
+        model_metadata: { "custom-model": { context_window: 262144, max_output_tokens: 8192, supports_tool_use: true } },
+      },
+    },
+    models: { custom: "custom-model" },
+  }), { mode: 0o600 });
+  return home;
+}
+
+const customAsk = ["ask", "--provider", "custom", "--model", "custom-model", "--no-save", "hi"];
+
+/** Runs fx with exactly `env`; `until` sees the stderr so far and stops the run once it holds. */
+async function runFx(env: Record<string, string>, until: ((stderr: string) => boolean) | null, timeoutMs: number, argv: string[] = customAsk): Promise<Run> {
+  const started = performance.now();
+  const child = Bun.spawn([fxBin(), ...argv], {
+    cwd: env.HOME, env, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+  });
+  const out = { stdout: "", stderr: "" };
+  const pump = async (stream: ReadableStream<Uint8Array>, key: "stdout" | "stderr") => {
+    const decoder = new TextDecoder();
+    const reader = stream.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      out[key] += decoder.decode(value, { stream: true });
+    }
+  };
+  const pumps = Promise.all([pump(child.stdout, "stdout"), pump(child.stderr, "stderr")]);
+  const timer = setTimeout(() => child.kill(), timeoutMs);
+  const poll = until ? setInterval(() => {
+    if (!until(out.stderr)) return;
+    clearInterval(poll);
+    setTimeout(() => child.kill(), 500);
+  }, 50) : undefined;
+  const code = await child.exited;
+  await pumps;
+  clearTimeout(timer);
+  if (poll) clearInterval(poll);
+  return { code: child.signalCode ? null : code, stdout: out.stdout, stderr: out.stderr, ms: performance.now() - started };
+}
+
+function environment(home: string, gatewayEnv: Record<string, string>, extra: Record<string, string>): Record<string, string> {
+  return {
+    HOME: home,
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    TMPDIR: process.env.TMPDIR ?? "/tmp",
+    FX_HOME: join(home, ".fx"),
+    FX_SOUND: "0",
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_AUTO_UPGRADE: "0",
+    FX_TEST_SKIP_ONBOARDING: "1",
+    NO_COLOR: "1",
+    AI_GATEWAY_API_KEY: "fake-net-proxy-driver-key",
+    ...gatewayEnv,
+    ...extra,
+  };
+}
+
+/** The retry notices: the status lines fx prints while it waits, and a line that has lost its cause to a long note. */
+const retryNotices = (stderr: string) =>
+  stderr.split("\n").filter(line => /^\[notice\] (Offline|Connection lost|Gateway error|Unreadable reply|Rate limited|could not connect|proxy )/.test(line));
+
+type ConnObservation = { target: string; answer: string; phase: string; shown: string; notice: string };
+type EnvObservation = { cls: string; accepted: boolean; reason: string };
+type CallerObservation = { caller: string; proxy: string; cause: string; earlier: boolean; name: string; text: string };
+
+async function observeConnection(root: string, scenario: Connection): Promise<{ observation: ConnObservation; evidence: string }> {
+  const gateway = serveGateway();
+  const provider = serveLocal(() => completion("custom-model", "NET_PROXY_DRIVER_OK"));
+  const dead = scenario.proxy === "down" ? await closedPort() : 0;
+  const proxy = scenario.proxy === "down" ? null : await startConnectProxy(scenario.proxy);
+  const port = proxy ? proxy.port : dead;
+  try {
+    const home = profile(root, "conn", scenario.completes ? `${provider.base}/v1` : `https://${TARGET}/v1`);
+    const env = environment(home, gateway.env, {
+      HTTPS_PROXY: scenario.host ? `http://${scenario.host}:3128` : `http://127.0.0.1:${port}`,
+      ...(scenario.completes ? { FX_TEST_NET_PROXY_LOOPBACK: "1" } : {}),
+    });
+    const run = await runFx(env, scenario.retried ? stderr => stderr.includes("retrying") : null, 30_000);
+    const sentence = scenario.sentence ? scenario.sentence(port) : null;
+    const through = provider.remotePorts.length > 0 && proxy !== null && provider.remotePorts.every(p => proxy.upstreamPorts.has(p));
+    const phase = scenario.completes && run.code === 0 && run.stdout.includes("NET_PROXY_DRIVER_OK") && through ? "sent" : "failed";
+    // A line names the proxy when it carries the scenario's sentence, or, for
+    // a scenario with none, when it says which proxy it means.
+    const mark = scenario.host ? `proxy ${scenario.host.slice(0, 12)}` : `proxy 127.0.0.1:${port}`;
+    const names = (line: string) => (sentence !== null ? line.includes(sentence) : line.includes(mark));
+    // A retry notice names the proxy and keeps its wait part, or has lost it.
+    const keepsWait = (line: string) => /next try in|retrying/.test(line);
+    const notices = retryNotices(run.stderr);
+    const notice = notices.length === 0 ? "unread"
+      : !notices.every(line => line.includes(mark)) ? "generic"
+      : notices.every(keepsWait) ? "proxy" : "proxy_cut";
+    const ended = run.code === 1;
+    const errors = run.stderr.split("\n").filter(line => line.startsWith("fx: "));
+    const shown = !ended ? "unread" : errors.some(names) ? "proxy" : "none";
+    return {
+      observation: { target: "routed", answer: scenario.answer, phase, shown, notice },
+      evidence: `exit ${run.code} after ${Math.round(run.ms)} ms; notices ${notices.length}; stderr ${JSON.stringify(run.stderr.slice(-300))}`,
+    };
+  } finally {
+    proxy?.close();
+    provider.stop();
+    gateway.stop();
+  }
+}
+
+async function observeHostClass(root: string, hostClass: HostClass): Promise<{ observation: EnvObservation; evidence: string }> {
+  const gateway = serveGateway();
+  try {
+    const home = profile(root, "env", `https://${TARGET}/v1`);
+    const run = await runFx(environment(home, gateway.env, { HTTPS_PROXY: hostClass.url }),
+      stderr => /\[notice\] (Offline|Connection lost)|fx: HTTPS_PROXY/.test(stderr), 20_000);
+    // fx took the URL when it went on to connect and retry, and refused it
+    // when it ended the run with a message about the variable.
+    const refusal = /fx: HTTPS_PROXY (.*)/.exec(run.stderr)?.[1] ?? "";
+    const accepted = refusal === "" && /\[notice\] (Offline|Connection lost)/.test(run.stderr);
+    const reason = accepted ? "none"
+      : /^has no host name/.test(refusal) ? "no_host"
+      : /^has a host name fx cannot use/.test(refusal) ? "bad_host"
+      : /^has a port fx cannot use/.test(refusal) ? "bad_port"
+      : /^is not a proxy URL fx can read/.test(refusal) ? "unreadable"
+      : "unknown";
+    return {
+      observation: { cls: hostClass.cls, accepted, reason },
+      evidence: `exit ${run.code} after ${Math.round(run.ms)} ms; stderr ${JSON.stringify(run.stderr.slice(-300))}`,
+    };
+  } finally {
+    gateway.stop();
+  }
+}
+
+/** A profile with a valid Grok sign-in, so `fx ask` goes straight to its version lookup. */
+function grokProfile(root: string, name: string): string {
+  const home = mkdtempSync(join(root, `${name}-`));
+  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ auto_upgrade: false, permission_mode: "ask" }), { mode: 0o600 });
+  writeFileSync(join(home, ".fx", "grok-auth.json"), JSON.stringify({
+    version: 1,
+    access_token: "grok-fresh",
+    refresh_token: "grok-refresh",
+    expires_at_ms: Date.now() + 3_600_000,
+    account_id: "acct_net_proxy_driver",
+  }) + "\n", { mode: 0o600 });
+  return home;
+}
+
+async function observeCaller(root: string, scenario: CallerScenario): Promise<{ observation: CallerObservation; evidence: string }> {
+  // The server the caller talks to. A Grok version lookup fails with a 500; fx
+  // upgrade finds a latest version and no archive, so its download fails.
+  const server = scenario.caller === "version"
+    ? serveLocal(() => new Response("no release", { status: 500 }))
+    : serveLocal((_request, path) => (path === "/latest.txt" ? new Response("9.9.9\n") : new Response("missing", { status: 404 })));
+  const dead = scenario.via === "down" ? await closedPort() : 0;
+  const proxy = scenario.via === "refuses" ? await startConnectProxy({ status: 407 })
+    : scenario.via === "refuses_after_first" ? await startConnectProxy({ refuseAfter: 1 })
+    : scenario.via === "works" ? await startConnectProxy()
+    : null;
+  const port = proxy ? proxy.port : dead;
+  try {
+    const routed = scenario.via !== "none"
+      ? { HTTPS_PROXY: `http://127.0.0.1:${port}`, FX_TEST_NET_PROXY_LOOPBACK: "1" }
+      : {};
+    const home = scenario.caller === "version" ? grokProfile(root, "caller-version") : profile(root, "caller-upgrade", "http://127.0.0.1:9/v1");
+    const env = scenario.caller === "version"
+      ? environment(home, {}, {
+        FX_PROVIDER: "grok",
+        FX_MODEL: "grok-4.20",
+        // Every Grok endpoint is the local server, so nothing can leave the machine.
+        FX_TEST_GROK_VERSION_URL: `${server.base}/version`,
+        FX_TEST_XAI_GROK_RESPONSES_URL: `${server.base}/responses`,
+        FX_TEST_XAI_GROK_MODELS_URL: `${server.base}/models`,
+        FX_TEST_XAI_GROK_MODALITIES_URL: `${server.base}/modalities`,
+        FX_TEST_GROK_TOKEN_URL: `${server.base}/token`,
+        FX_TEST_GROK_USERINFO_URL: `${server.base}/userinfo`,
+        ...routed,
+      })
+      : environment(home, {}, { FX_TEST_UPGRADE_BASE_URL: server.base, ...routed });
+    delete env.AI_GATEWAY_API_KEY;
+    const run = await runFx(env, null, 40_000, scenario.caller === "version" ? ["ask", "--no-save", "hi"] : ["upgrade"]);
+    // The text the run ended with: an error line on stderr for fx ask, the
+    // error on stdout for fx upgrade.
+    const shown = scenario.caller === "version"
+      ? run.stderr.split("\n").filter(line => line.startsWith("fx: ")).join("\n")
+      : run.stdout.split("\n").filter(line => line.startsWith("error: ")).join("\n");
+    // What each caller said before it took the proxy's sentence: fixed text.
+    const fixed = scenario.caller === "version"
+      ? ["fx: provider version unavailable"]
+      : ["error: failed to fetch latest version from CDN", "error: failed to download release archive", "error: failed to fetch checksum from CDN"];
+    const namesProxy = proxy !== null || scenario.via === "down"
+      ? shown.includes(`proxy 127.0.0.1:${port}`)
+      : false;
+    // "proxy" when the text names the proxy; "default" only when it is exactly
+    // one of the caller's fixed texts; anything else is not a run the model
+    // describes.
+    const text = ended(run) && namesProxy ? "proxy" : ended(run) && fixed.includes(shown) ? "default" : "unread";
+    return {
+      observation: { caller: scenario.caller, proxy: scenario.proxy, cause: scenario.cause, earlier: false, name: "any", text },
+      evidence: `exit ${run.code} after ${Math.round(run.ms)} ms; shown ${JSON.stringify(shown)}; stderr ${JSON.stringify(run.stderr.slice(-200))}`,
+    };
+  } finally {
+    proxy?.close();
+    server.stop();
+  }
+}
+
+/**
+ * A fake AI Gateway whose first completion is a web_fetch call and whose second
+ * ends the turn; `bodies` holds the requests, the second with the tool's result.
+ */
+function serveFetchGateway() {
+  const bodies: string[] = [];
+  const gateway = serveLocal(async (request, path) => {
+    if (path === "/coding-agent/v1/models") return Response.json({ data: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    if (request.method !== "POST") return new Response("not found", { status: 404 });
+    bodies.push(await request.text());
+    const events = bodies.length === 1
+      ? [{ type: "tool-call", toolCallId: "fetch_1", toolName: "web_fetch", input: { url: FETCH_URL } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } }]
+      : [{ type: "text-delta", id: "t", delta: "DONE_AFTER_FETCH" },
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: { inputTokens: { total: 3 }, outputTokens: { total: 2 } } }];
+    return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+  });
+  return { ...gateway, bodies, env: { FX_GATEWAY_BASE_URL: gateway.base, FX_GATEWAY_CHAT_URL: `${gateway.base}/v4/ai/language-model` } };
+}
+
+/** What the platform called the failed dial, read from the sentence fx traced for it. */
+function dialName(trace: string): string {
+  const failed = trace.split("\n").filter(line => line.includes("[net_proxy] result=failed"));
+  if (failed.length === 0) return "any";
+  const line = failed[failed.length - 1]!;
+  if (/proxy \S+ (refused|answered) CONNECT|did not answer CONNECT/.test(line)) return "answered";
+  if (/could not connect to proxy \S+ \(connection refused\)/.test(line)) return "refused";
+  if (/could not connect to proxy \S+ \(unexpected close\)/.test(line)) return "unexpected_close";
+  return "other";
+}
+
+async function observeFetch(root: string, scenario: FetchScenario): Promise<{ observation: CallerObservation; evidence: string }> {
+  const gateway = serveFetchGateway();
+  // The relay's far side takes a connection and closes it, so the TLS handshake fails after the tunnel opened.
+  const closer = net.createServer(socket => socket.destroy());
+  if (scenario.via === "relay_closes") await new Promise<void>(resolve => closer.listen(0, "127.0.0.1", resolve));
+  const dead = scenario.via === "down" ? await closedPort() : 0;
+  const proxy = scenario.via === "refuses" ? await startConnectProxy({ status: 407 })
+    : scenario.via === "relay_closes" ? await startConnectProxy({ routes: { [`${FETCH_ADDRESS}:443`]: (closer.address() as net.AddressInfo).port } })
+    : null;
+  const label = scenario.via === "unresolved" ? `${UNRESOLVED_PROXY}:3128` : `127.0.0.1:${proxy ? proxy.port : dead}`;
+  try {
+    const home = mkdtempSync(join(root, "fetch-"));
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+      auto_upgrade: false,
+      permission: { web_fetch: { [`domain:${FETCH_ADDRESS}`]: "allow" } },
+    }), { mode: 0o600 });
+    const tracePath = join(home, "trace.log");
+    const env = environment(home, gateway.env, {
+      FX_MODEL: "openai/gpt-5",
+      HTTPS_PROXY: `http://${label}`,
+      FX_TRACE_LOG: tracePath,
+      FX_TRACE_SCOPES: "net_proxy",
+    });
+    const run = await runFx(env, null, 40_000, ["ask", "--auto", "--json", "--no-save", "Fetch the page."]);
+    const second = gateway.bodies[1] ?? "";
+    const trace = await Bun.file(tracePath).text().catch(() => "");
+    const names = second.includes(`proxy ${label}`);
+    // "proxy" when the tool's error names the proxy; "default" only when it is
+    // the tool's own transport error without it; anything else is not a run the
+    // model describes.
+    const text = run.code === 0 && names ? "proxy" : run.code === 0 && second.includes("web_fetch transport failed") ? "default" : "unread";
+    return {
+      observation: { caller: "fetch", proxy: "set", cause: scenario.cause, earlier: false, name: scenario.cause === "at_proxy" ? dialName(trace) : "any", text },
+      evidence: `exit ${run.code} after ${Math.round(run.ms)} ms; requests ${gateway.bodies.length}; tool error ${JSON.stringify(/web_fetch transport failed.{0,260}/.exec(second)?.[0] ?? "")}; trace ${JSON.stringify(trace.slice(-300))}; stderr ${JSON.stringify(run.stderr.slice(-200))}`,
+    };
+  } finally {
+    proxy?.close();
+    closer.close();
+    gateway.stop();
+  }
+}
+
+/** The run ended on its own with a failure, rather than succeeding or being killed. */
+const ended = (run: Run) => run.code === 1;
+
+const quote = (value: string) => JSON.stringify(value);
+
+function cfg(constants: Record<string, string>, extra: string[]): string {
+  return ["INIT Init", "NEXT Next", "CONSTANTS", ...Object.entries(constants).map(([k, v]) => `    ${k} = ${v}`),
+    "INVARIANT NotObserved", ...extra, "CHECK_DEADLOCK FALSE", ""].join("\n");
+}
+
+async function trace(dir: string, module: "NetProxyTrace" | "NetProxyEnvTrace" | "NetProxyCallersTrace", observedModule: string, observed: string, constants: Record<string, string>): Promise<Verdict> {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${observedModule}.tla`), [
+    `---- MODULE ${observedModule} ----`,
+    "(* Generated by tests/tla/drivers/net_proxy/binary.ts. Do not edit. *)",
+    observed,
+    "====",
+    "",
+  ].join("\n"));
+  writeFileSync(join(dir, "trace.cfg"), cfg(constants, []));
+  const base = module === "NetProxyTrace" ? ["NetProxy.tla", "NetProxyTrace.tla"]
+    : module === "NetProxyEnvTrace" ? ["NetProxyEnv.tla", "NetProxyEnvTrace.tla"]
+    : ["NetProxyCallers.tla", "NetProxyCallersTrace.tla"];
+  const run = await runTlc(dir, module, "trace.cfg", base, join(TLA_ROOT, "net_proxy"));
+  if (run.violated === "NotObserved") return "ACCEPTED";
+  if (run.exitCode === 0 && run.output.includes("Model checking completed. No error has been found.")) return "REJECTED";
+  return "TOOL_ERROR";
+}
+
+const connRecord = (o: ConnObservation) =>
+  `Observed == [target |-> ${quote(o.target)}, answer |-> ${quote(o.answer)}, phase |-> ${quote(o.phase)}, shown |-> ${quote(o.shown)}, notice |-> ${quote(o.notice)}]`;
+const callerRecord = (o: CallerObservation) =>
+  `ObservedCallers == [caller |-> ${quote(o.caller)}, proxy |-> ${quote(o.proxy)}, cause |-> ${quote(o.cause)}, earlier |-> ${o.earlier ? "TRUE" : "FALSE"}, name |-> ${quote(o.name)}, text |-> ${quote(o.text)}]`;
+const envRecord = (o: EnvObservation) =>
+  `ObservedEnv == [cls |-> ${quote(o.cls)}, accepted |-> ${o.accepted ? "TRUE" : "FALSE"}, reason |-> ${quote(o.reason)}]`;
+
+// ---- web_fetch's real fetch to a name with two admitted addresses (lab_fetch.zig) ----
+
+const FIRST_ADDRESS = "93.184.216.34";
+const SECOND_ADDRESS = "93.184.216.35";
+
+/** A fetch of the lab, in NetProxyCallers.tla's words: the error it must end with and what the proxy must have seen. */
+type LabCase = {
+  name: string;
+  scenario: LabScenario;
+  error: string;
+  cause: "at_proxy" | "elsewhere";
+  /** An earlier address failed at the proxy and a later one opened its tunnel. */
+  earlier: boolean;
+  connects: string[];
+  /** What the sentence holds when one is shown. */
+  shows: string;
+  /** Whether web_fetch before its dial cleared the sentence shows the same text, so that model must accept the observation. */
+  sameAsNoClear: boolean;
+  /** Whether a dial that clears on every return shows the same text. */
+  sameAsOnReturn: boolean;
+};
+
+const connectLine = (address: string) => `CONNECT ${address}:443 HTTP/1.1`;
+
+const labCases: LabCase[] = [
+  { name: "web_fetch to a name with two addresses, the first refused at the proxy and the second opening a tunnel that stays silent",
+    scenario: "two_addresses", error: "Timeout", cause: "elsewhere", earlier: true,
+    connects: [connectLine(FIRST_ADDRESS), connectLine(SECOND_ADDRESS)], shows: `refused CONNECT to ${FIRST_ADDRESS}:443`,
+    sameAsNoClear: false, sameAsOnReturn: true },
+  { name: "web_fetch to a name with two addresses, both refused at the proxy",
+    scenario: "both_refused", error: "ConnectionRefused", cause: "at_proxy", earlier: false,
+    connects: [connectLine(FIRST_ADDRESS), connectLine(SECOND_ADDRESS)], shows: `refused CONNECT to ${SECOND_ADDRESS}:443`,
+    sameAsNoClear: true, sameAsOnReturn: false },
+  { name: "web_fetch behind a proxy that answers with bytes that are not HTTP",
+    scenario: "not_http", error: "ProtocolUnsupportedBySystem", cause: "at_proxy", earlier: false,
+    connects: [connectLine(FIRST_ADDRESS)], shows: "with bytes that are not HTTP",
+    sameAsNoClear: true, sameAsOnReturn: false },
+];
+
+/** What a lab run showed, in the model's words, and what in it is not what the case describes. */
+function labObservation(kase: LabCase, run: LabRun): { observation: CallerObservation; problems: string[] } {
+  const round = run.rounds[0];
+  const problems: string[] = [];
+  if (run.code !== 0 || run.rounds.length !== 1 || !round) problems.push(`the lab ended with code ${run.code} and ${run.rounds.length} rounds; stderr ${JSON.stringify(run.stderr)}`);
+  if (round && round.error !== kase.error) problems.push(`the fetch ended with ${round.error}, not ${kase.error}`);
+  if (JSON.stringify(run.connects) !== JSON.stringify(kase.connects)) problems.push(`the proxy saw ${JSON.stringify(run.connects)}, not ${JSON.stringify(kase.connects)}`);
+  // A sentence that is shown is the one of the failure the case describes; whether it is shown at all is the model's to judge.
+  if (round?.shown != null && !round.shown.includes(kase.shows)) problems.push(`the sentence ${JSON.stringify(round.shown)} does not hold ${JSON.stringify(kase.shows)}`);
+  return {
+    observation: {
+      caller: "fetch", proxy: "set", cause: kase.cause, earlier: kase.earlier,
+      name: kase.cause === "at_proxy" ? "answered" : "any", text: round?.shown != null ? "proxy" : "default",
+    },
+    problems,
+  };
+}
+
+const callersTrace = (dir: string, observation: CallerObservation, constants: Record<string, string>) =>
+  trace(dir, "NetProxyCallersTrace", "NetProxyCallersObserved", callerRecord(observation), constants);
+
+/** The lines of `connectThroughProxy` that clear an earlier address's sentence when the tunnel opens. */
+const CLEAR_WHEN_OPEN = 'net_proxy_io.clearRequestFailure();\n    debug_trace.logf("tool", "web_fetch tunnel open';
+const KEEP_WHEN_OPEN = 'debug_trace.logf("tool", "web_fetch tunnel open';
+const DIAL_HEAD = "fn connectThroughProxy(ctx: *anyopaque, address: IpAddress, options: FetchOptions) anyerror!posix.fd_t {\n";
+const KEEP_NAMES = "        => |e| e,\n        else => error.HostUnreachable,";
+
+/**
+ * Bugs planted in a copy of the source, each with the case whose run must show it. The run is
+ * "caught" when the design model rejects what it showed (or, for a lost name, the case's own
+ * check fails), and the model of that bug accepts it, so the lab tells the bugs from the fix.
+ */
+const labBugs: { name: string; file: string; target: string; planted: string; case: number; model: Record<string, string> | null }[] = [
+  { name: "web_fetch's dial keeps an earlier address's sentence when a later address opens its tunnel", file: "tools/web/http_fetch.zig",
+    target: CLEAR_WHEN_OPEN, planted: KEEP_WHEN_OPEN, case: 0, model: CALLERS_NO_CLEAR },
+  { name: "web_fetch's dial clears on every return, failures included", file: "tools/web/http_fetch.zig",
+    target: DIAL_HEAD, planted: `${DIAL_HEAD}    defer net_proxy_io.clearRequestFailure();\n`, case: 1, model: CALLERS_CLEAR_ON_RETURN },
+  { name: "a name the claim lists leaves the dial as HostUnreachable", file: "core/shared/net_proxy.zig",
+    target: KEEP_NAMES, planted: "        => |e| if (e == error.ProtocolUnsupportedBySystem) error.HostUnreachable else e,\n        else => error.HostUnreachable,", case: 2, model: null },
+];
+
+/** Runs the lab's cases, a stress run of the two-address case, and, with selfCheck, the planted bugs. */
+export async function runFetchLabScenarios(out: string, selfCheck: boolean): Promise<boolean> {
+  const say = (message: string) => console.log(message);
+  const tree = realpathSync(mkdtempSync(join(tmpdir(), "fx-net-proxy-fetch-lab-")));
+  const src = copySource(tree);
+  say("web_fetch lab: the real fetch, a resolver with two public addresses, a local proxy");
+  const bin = buildFetchLab(src, tree, "web_fetch_lab");
+  let ok = true;
+  for (const [index, kase] of labCases.entries()) {
+    const { observation, problems } = labObservation(kase, await runFetchLab(bin, kase.scenario, 1, 600, 256));
+    const dir = join(out, `binary-fetch-lab-${index}`);
+    const verdict = await callersTrace(join(dir, "design"), observation, CALLERS_DESIGN);
+    say(`${kase.name}: ${JSON.stringify(observation)} -> design ${verdict}`);
+    if (verdict !== "ACCEPTED" || problems.length > 0) {
+      say(`  problems: ${JSON.stringify(problems)}`);
+      ok = false;
+    }
+    if (selfCheck) {
+      const noClear = await callersTrace(join(dir, "no-clear"), observation, CALLERS_NO_CLEAR);
+      const wantNoClear: Verdict = kase.sameAsNoClear ? "ACCEPTED" : "REJECTED";
+      say(`  self-check: web_fetch before its dial cleared the sentence ${noClear} (must be ${wantNoClear})`);
+      if (noClear !== wantNoClear) ok = false;
+      const onReturn = await callersTrace(join(dir, "on-return"), observation, CALLERS_CLEAR_ON_RETURN);
+      const wantOnReturn: Verdict = kase.sameAsOnReturn ? "ACCEPTED" : "REJECTED";
+      say(`  self-check: a dial that clears on every return ${onReturn} (must be ${wantOnReturn})`);
+      if (onReturn !== wantOnReturn) ok = false;
+    }
+  }
+
+  // 120 fetches with 64 open files allowed: a socket a dial leaves open ends a later
+  // fetch in a descriptor-limit error, and a sentence left behind shows in a later round.
+  const stress = await runFetchLab(bin, "two_addresses", 120, 200, 64);
+  const unclean = stress.rounds.filter(round => round.error !== "Timeout" || round.shown !== null);
+  const stressed = stress.code === 0 && stress.rounds.length === 120 && unclean.length === 0 && stress.connects.length === 240;
+  say(`web_fetch lab, 120 fetches of the two-address case with 64 open files allowed: ${stressed ? "every one ended in Timeout and showed no sentence" : "FAIL"}`);
+  if (!stressed) {
+    say(`  code ${stress.code}; rounds ${stress.rounds.length}; CONNECTs ${stress.connects.length}; first unclean ${JSON.stringify(unclean[0] ?? null)}; stderr ${JSON.stringify(stress.stderr)}`);
+    ok = false;
+  }
+
+  if (selfCheck) {
+    for (const [index, bug] of labBugs.entries()) {
+      const kase = labCases[bug.case]!;
+      const run = await withPlantedBug(src, bug.file, bug.target, bug.planted, async () =>
+        runFetchLab(buildFetchLab(src, tree, `web_fetch_lab_bug_${index}`), kase.scenario, 1, 600, 256));
+      const { observation, problems } = labObservation(kase, run);
+      const dir = join(out, `binary-fetch-lab-bug-${index}`);
+      const design = await callersTrace(join(dir, "design"), observation, CALLERS_DESIGN);
+      const model = bug.model ? await callersTrace(join(dir, "bug"), observation, bug.model) : "ACCEPTED";
+      const caught = (design === "REJECTED" || problems.length > 0) && model === "ACCEPTED";
+      say(`self-check: ${bug.name}: design ${design}, its own model ${model}, problems ${problems.length} -> ${caught ? "caught" : "NOT caught"}`);
+      if (!caught) ok = false;
+    }
+  }
+  return ok;
+}
+
+/** Runs every scenario; returns whether every observation was accepted (and, with selfCheck, discriminated). */
+export async function runBinaryScenarios(out: string, selfCheck: boolean): Promise<boolean> {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-net-proxy-driver-")));
+  let ok = true;
+  const say = (message: string) => console.log(message);
+  say(`binary: ${fxBin()}`);
+  for (const [index, scenario] of connections.entries()) {
+    const { observation, evidence } = await observeConnection(root, scenario);
+    const dir = join(out, `binary-conn-${index}`);
+    const longHost = { LongHost: scenario.host ? "TRUE" : "FALSE" };
+    const verdict = await trace(join(dir, "design"), "NetProxyTrace", "NetProxyObserved", connRecord(observation), { ...DESIGN, ...longHost });
+    say(`binary ${scenario.name}: ${JSON.stringify(observation)} -> design ${verdict}`);
+    if (verdict !== "ACCEPTED") {
+      say(`  evidence: ${evidence}`);
+      ok = false;
+    }
+    if (selfCheck) {
+      const first = await trace(join(dir, "first"), "NetProxyTrace", "NetProxyObserved", connRecord(observation), { ...FIRST, ...longHost });
+      const want: Verdict = scenario.sameAsFirst ? "ACCEPTED" : "REJECTED";
+      say(`  self-check: the connector as first written ${first} (must be ${want})`);
+      if (first !== want) ok = false;
+      const pushed = await trace(join(dir, "pushed"), "NetProxyTrace", "NetProxyObserved", connRecord(observation), { ...PUSHED, ...longHost });
+      const wantPushed: Verdict = scenario.sameAsPushed ? "ACCEPTED" : "REJECTED";
+      say(`  self-check: the connector before the short notice ${pushed} (must be ${wantPushed})`);
+      if (pushed !== wantPushed) ok = false;
+    }
+  }
+  for (const [index, hostClass] of hostClasses.entries()) {
+    const { observation, evidence } = await observeHostClass(root, hostClass);
+    const dir = join(out, `binary-env-${index}`);
+    const verdict = await trace(join(dir, "design"), "NetProxyEnvTrace", "NetProxyEnvObserved", envRecord(observation), ENV_DESIGN);
+    say(`binary proxy host ${hostClass.cls} (${hostClass.url}): ${JSON.stringify(observation)} -> design ${verdict}`);
+    if (verdict !== "ACCEPTED") {
+      say(`  evidence: ${evidence}`);
+      ok = false;
+    }
+    if (selfCheck) {
+      const first = await trace(join(dir, "first"), "NetProxyEnvTrace", "NetProxyEnvObserved", envRecord(observation), ENV_FIRST);
+      const want: Verdict = hostClass.sameAsFirst ? "ACCEPTED" : "REJECTED";
+      say(`  self-check: the connector as first written ${first} (must be ${want})`);
+      if (first !== want) ok = false;
+    }
+  }
+  for (const [index, scenario] of callerScenarios.entries()) {
+    const { observation, evidence } = await observeCaller(root, scenario);
+    const dir = join(out, `binary-caller-${index}`);
+    const verdict = await trace(join(dir, "design"), "NetProxyCallersTrace", "NetProxyCallersObserved", callerRecord(observation), CALLERS_DESIGN);
+    say(`binary ${scenario.name}: ${JSON.stringify(observation)} -> design ${verdict}`);
+    if (verdict !== "ACCEPTED") {
+      say(`  evidence: ${evidence}`);
+      ok = false;
+    }
+    if (selfCheck) {
+      const head = await trace(join(dir, "head"), "NetProxyCallersTrace", "NetProxyCallersObserved", callerRecord(observation), CALLERS_HEAD);
+      const want: Verdict = scenario.sameAsHead ? "ACCEPTED" : "REJECTED";
+      say(`  self-check: fx before the callers took the proxy's sentence ${head} (must be ${want})`);
+      if (head !== want) ok = false;
+    }
+  }
+  for (const [index, scenario] of fetchScenarios.entries()) {
+    const { observation, evidence } = await observeFetch(root, scenario);
+    const dir = join(out, `binary-fetch-${index}`);
+    const verdict = await trace(join(dir, "design"), "NetProxyCallersTrace", "NetProxyCallersObserved", callerRecord(observation), CALLERS_DESIGN);
+    say(`binary ${scenario.name}: ${JSON.stringify(observation)} -> design ${verdict}`);
+    if (verdict !== "ACCEPTED") {
+      say(`  evidence: ${evidence}`);
+      ok = false;
+    }
+    if (selfCheck) {
+      // The run showed the sentence for a dial whose error the claim may not list. A
+      // model of web_fetch that returns the platform's name cannot produce that,
+      // and one with the list grown by UnexpectedClose cannot for any other name.
+      const listedHead = ["any", "answered", "refused"].includes(observation.name);
+      const head = await trace(join(dir, "head"), "NetProxyCallersTrace", "NetProxyCallersObserved", callerRecord(observation), CALLERS_FETCH_HEAD);
+      const wantHead: Verdict = listedHead ? "ACCEPTED" : "REJECTED";
+      say(`  self-check: web_fetch before its dial mapped a failure ${head} (must be ${wantHead})`);
+      if (head !== wantHead) ok = false;
+      const listedByName = listedHead || observation.name === "unexpected_close";
+      const byName = await trace(join(dir, "by-name"), "NetProxyCallersTrace", "NetProxyCallersObserved", callerRecord(observation), CALLERS_FETCH_BY_NAME);
+      const wantByName: Verdict = listedByName ? "ACCEPTED" : "REJECTED";
+      say(`  self-check: a fix that lists only UnexpectedClose ${byName} (must be ${wantByName})`);
+      if (byName !== wantByName) ok = false;
+    }
+  }
+  if (!(await runFetchLabScenarios(out, selfCheck))) ok = false;
+  return ok;
+}

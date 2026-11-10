@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const net_proxy_io = @import("../shared/net_proxy_io.zig");
 const update_target = @import("update_target.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -229,7 +230,13 @@ fn fetchTextBounded(
     if (controlCancelled(control)) return error.Cancelled;
     const uri = std.Uri.parse(url) catch return error.FetchFailed;
 
-    var req = client.request(.GET, uri, .{}) catch return error.FetchFailed;
+    // A connection that fails at a proxy leaves its sentence on this thread
+    // for whoever shows the error (`upgrade_runtime.zig`).
+    const proxy_mark = net_proxy_io.beginOpen();
+    var req = client.request(.GET, uri, .{}) catch |err| {
+        net_proxy_io.noteOpenFailure(uri, proxy_mark, err);
+        return error.FetchFailed;
+    };
     defer req.deinit();
 
     if (req.connection) |conn| setRecvTimeout(conn);
@@ -279,7 +286,11 @@ pub fn downloadFileStreamingWithProgress(client: *std.http.Client, url: []const 
     var file_writer: std.Io.File.Writer = .initStreaming(file, io_mod.getIo(), &write_buf);
 
     const uri = std.Uri.parse(url) catch return error.DownloadFailed;
-    var req = client.request(.GET, uri, .{}) catch return error.DownloadFailed;
+    const proxy_mark = net_proxy_io.beginOpen();
+    var req = client.request(.GET, uri, .{}) catch |err| {
+        net_proxy_io.noteOpenFailure(uri, proxy_mark, err);
+        return error.DownloadFailed;
+    };
     defer req.deinit();
 
     if (req.connection) |conn| setRecvTimeout(conn);

@@ -136,6 +136,7 @@
     {"name": "verify-ultrafast-fake-gateway", "argv": ["bun", "test", "--max-concurrency", "1", "./ultrafast-fake-gateway.test.ts"], "test_file": "ultrafast-fake-gateway.test.ts"},
     {"name": "verify-web-fetch-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-fetch-permission-progress.test.ts"], "test_file": "web-fetch-permission-progress.test.ts", "requires_tmux": false},
     {"name": "verify-web-search-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-search-permission-progress.test.ts"], "test_file": "web-search-permission-progress.test.ts", "requires_tmux": false},
-    {"name": "verify-yolo-permission-mode", "argv": ["bun", "test", "--max-concurrency", "1", "./yolo-permission-mode.test.ts"], "test_file": "yolo-permission-mode.test.ts"}
+    {"name": "verify-yolo-permission-mode", "argv": ["bun", "test", "--max-concurrency", "1", "./yolo-permission-mode.test.ts"], "test_file": "yolo-permission-mode.test.ts"},
+    {"name": "verify-net-proxy", "argv": ["bun", "test", "--max-concurrency", "1", "./net-proxy.test.ts"], "test_file": "net-proxy.test.ts"}
   ]
 }

@@ -42,6 +42,8 @@
     {"name": "markdown_lists", "module": "fx", "test": "Markdown lists render the same however assistant text is split", "iterations": 900000},
     {"name": "url_policy", "module": "fx", "test": "url policy admits only URLs it reads back the same way", "iterations": 2400000},
     {"name": "http_response", "module": "fx", "test": "web_fetch response parser reads a response the same however it is split", "iterations": 1500000},
+    {"name": "net_proxy_answer", "module": "fx", "test": "the CONNECT answer reader stays inside the head on fuzzed bytes", "iterations": 2000000},
+    {"name": "net_proxy_environment", "module": "fx", "test": "proxy variables and NO_PROXY lists route fuzzed hosts without leaking credentials", "iterations": 300000},
     {"name": "acp_jsonrpc", "module": "fx", "test": "ACP frames stay one parseable line and read the same however they are split", "iterations": 400000},
     {"name": "mcp_wire", "module": "fx", "test": "MCP wire decoding returns only whole JSON values from valid input", "iterations": 900000},
     {"name": "shell_parity", "module": "fx", "test": "shell parity holds for generated commands", "iterations": 600},

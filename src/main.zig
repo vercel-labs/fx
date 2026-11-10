@@ -5446,6 +5446,8 @@ test {
     _ = @import("core/shared/io.zig");
     _ = @import("core/shared/leased_lock.zig");
     _ = @import("core/shared/message.zig");
+    _ = @import("core/shared/net_proxy.zig");
+    _ = @import("core/shared/net_proxy_io.zig");
     _ = @import("core/shared/token_estimate.zig");
     _ = @import("core/shell_command/command_effect.zig");
     _ = @import("core/shell_command/safe_git.zig");
@@ -5531,7 +5533,9 @@ test {
     _ = @import("gateway/web_search.zig");
     _ = @import("gateway/web_search_types.zig");
     _ = @import("tools/web/content.zig");
+    _ = @import("tools/web/fetch.zig");
     _ = @import("tools/web/html_to_markdown.zig");
+    _ = @import("tools/web/http_fetch.zig");
     _ = @import("tools/filesystem/read_file.zig");
     _ = @import("tools/session/read_tool_result.zig");
     _ = @import("tools/skills/install_skill.zig");
