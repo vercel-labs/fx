@@ -462,7 +462,7 @@ const App = struct {
 
     pub fn slashRegistry(self: *const Self) command_specs.SlashRegistry {
         var registry = builtin_commands.slash_registry;
-        registry.arguments = self.mcp.host_completion;
+        registry.argument_groups = .{ self.mcp.host_completion, self.launch_completion.entries };
         return registry;
     }
 
@@ -620,6 +620,8 @@ const App = struct {
 
     upgrader: auto_upgrade.AutoUpgrade = .{},
     mcp: app_mcp_runtime.State = .{},
+    /// The profiles `/launch` completes.
+    launch_completion: app_profile_runtime.LaunchCompletion = .{},
     skills: skill_runtime.Runtime = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
@@ -1118,6 +1120,7 @@ const App = struct {
         main_agent.diff_entries.deinit(std.heap.c_allocator);
         self.mcp.deinit();
         shutdown_trace.mark("mcp_deinit");
+        self.launch_completion.deinit();
         self.skills.deinit(std.heap.c_allocator);
         main_agent.context_snapshot.deinit(self.alloc);
         self.main_agent.profile.deinit();
@@ -3261,6 +3264,9 @@ const App = struct {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         try app_commands.Handlers(App).collectMcpHostFacts(self, self.screenAgent());
+        if (self.launch_completion.refresh(self.alloc, self.input_runtime.edit_state.input.items, io_mod.homeDir(), self.workspace_root, self.instances.seed.launchDefaults())) {
+            RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
+        }
         try app_commands.Handlers(App).collectShellSnapshotFacts(self);
         try app_commands.Handlers(App).collectCreditsFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {

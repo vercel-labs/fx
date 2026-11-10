@@ -1831,10 +1831,6 @@ pub const ChatMessage = struct {
     /// The instruction files a context note delivers. Borrowed; never sent
     /// to a provider.
     context_note_sources: []const ContextNoteSource = &.{},
-    /// What a save of the turn records for this context note instead of
-    /// `content`, which only this turn's requests send: a named skill's text
-    /// is saved as a short note (D95). Borrowed.
-    context_note_saved_text: ?[]const u8 = null,
     // Source provenance for compaction, never permission authority.
     context_origin: enum { ordinary, user_turn, handoff } = .ordinary,
     standalone_response: bool = false,

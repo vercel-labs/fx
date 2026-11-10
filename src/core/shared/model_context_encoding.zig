@@ -229,8 +229,9 @@ test "decodeScalarAlloc leaves other ampersands as they are" {
 
 /// The names of the blocks fx adds to the conversation: the folder rules it
 /// delivers and their reminders (`scoped-rules-reminder`, D93), a changed
-/// runtime context (D94), and the note a named skill's turn saves (D95). Their
-/// writers take the names from here, so every carried block is escaped.
+/// runtime context (D94), and the short note an older fx saved for a named
+/// skill's turn (D95). Their writers take the names from here, so every
+/// carried block is escaped.
 pub const scoped_rules_tag = "scoped-rules";
 pub const context_update_tag = "fx-context-update";
 pub const skill_used_tag = "fx-skill-used";
