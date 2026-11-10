@@ -7011,7 +7011,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           await session.waitForText(`ROW_REPORT_READ_${index + 1}`, TIMEOUT);
         }
         const compact = await session.captureFullScrollback();
-        expect(compact).toContain("● 5 tool calls · 4 subagents · 1 read");
+        expect(compact).toContain("● 5 tool calls · 4 subagent calls · 1 read");
         expect(compact).toContain("Invalid Agent failed · Check failure visibility");
         expect(compact).not.toContain("sent to Invalid Agent");
         for (let index = 0; index < tasks.length; index += 1) {
@@ -7045,7 +7045,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
         await session.waitForText("ROW_REPORT_READ_3", TIMEOUT);
         const resumed = await session.captureFullScrollback();
-        expect(resumed).toContain("● 5 tool calls · 4 subagents · 1 read");
+        expect(resumed).toContain("● 5 tool calls · 4 subagent calls · 1 read");
         expect(resumed).toContain("Invalid Agent failed · Check failure visibility");
         expect(resumed).toContain("sent to helper · Check one-off cleanup");
         expect(resumed).toContain("sent to checker · Check replay again");
@@ -7127,6 +7127,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         // The frame is the subagent's, never drawn as the user's prompt.
         expect(live).not.toContain(header);
         expect(live).not.toContain("REPORT_NEVER_JOINED");
+        // Main's waits say what they did, not the tool's name.
+        expect(live).toContain("waited for subagents");
+        expect(live).not.toContain("Managed subagent");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -7138,6 +7141,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         const resumed = await session.captureFullScrollback();
         expect(countOccurrences(resumed, row)).toBe(1);
         expect(resumed).not.toContain(header);
+        expect(resumed).toContain("waited for subagents");
         // The saved turn kept the report, in its own frame.
         await session.sendText("AFTER_RESUME_PROMPT");
         await session.waitForText("AFTER_RESUME_DONE", TIMEOUT);
