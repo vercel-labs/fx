@@ -11,11 +11,22 @@ const Allocator = std.mem.Allocator;
 
 // ---- Challenge ----
 
+/// The longest `error` a challenge keeps.
+pub const max_error_bytes = 64;
+/// The longest `error_description` a challenge keeps. A server chooses these
+/// words, and fx shows them to the person, so they are cut where they are kept.
+pub const max_description_bytes = 240;
+
 pub const Challenge = struct {
     resource_metadata: ?[]const u8 = null,
     scope: ?[]const u8 = null,
     /// `error="insufficient_scope"`: a step-up.
     insufficient_scope: bool = false,
+    /// The `error` the server names for a refused token, such as
+    /// `invalid_token`, cut at `max_error_bytes`.
+    error_code: ?[]const u8 = null,
+    /// Its `error_description`, cut at `max_description_bytes`.
+    description: ?[]const u8 = null,
 };
 
 /// Reads the Bearer challenge in a `WWW-Authenticate` value, which may hold
@@ -66,6 +77,9 @@ pub fn parseChallenge(a: Allocator, value: []const u8) Allocator.Error!?Challeng
                 c.scope = param;
             } else if (std.ascii.eqlIgnoreCase(name, "error")) {
                 c.insufficient_scope = std.mem.eql(u8, param, "insufficient_scope");
+                c.error_code = cut(param, max_error_bytes);
+            } else if (std.ascii.eqlIgnoreCase(name, "error_description")) {
+                c.description = cut(param, max_description_bytes);
             }
         } else {
             // A scheme name starts a challenge; only the first Bearer counts.
@@ -75,6 +89,15 @@ pub fn parseChallenge(a: Allocator, value: []const u8) Allocator.Error!?Challeng
         }
     }
     return if (found) c else null;
+}
+
+/// `text` cut to at most `max` bytes, at the start of a character when it is
+/// UTF-8.
+fn cut(text: []const u8, max: usize) []const u8 {
+    if (text.len <= max) return text;
+    var end = max;
+    while (end > 0 and text[end] & 0xC0 == 0x80) end -= 1;
+    return text[0..end];
 }
 
 fn isSeparator(c: u8) bool {
@@ -382,6 +405,46 @@ test "reads the Bearer challenge among others, quoted or not" {
     // Parameters of a later scheme aren't the Bearer challenge's.
     const later = (try parseChallenge(a, "Bearer scope=\"a\", DPoP scope=\"b\"")).?;
     try testing.expectEqualStrings("a", later.scope.?);
+}
+
+fn repeated(a: Allocator, text: []const u8, n: usize) ![]u8 {
+    const out = try a.alloc(u8, text.len * n);
+    for (0..n) |k| @memcpy(out[k * text.len ..][0..text.len], text);
+    return out;
+}
+
+test "a challenge keeps the error and description a server names, cut at their bounds" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const named = (try parseChallenge(a, "Bearer error=\"invalid_token\", error_description=\"No authorization provided\", resource_metadata=\"https://x.example/prm\"")).?;
+    try testing.expectEqualStrings("invalid_token", named.error_code.?);
+    try testing.expectEqualStrings("No authorization provided", named.description.?);
+    try testing.expect(!named.insufficient_scope);
+    // A step-up still names its error, and is one.
+    const step = (try parseChallenge(a, "Bearer error=\"insufficient_scope\", scope=\"a\"")).?;
+    try testing.expect(step.insufficient_scope);
+    try testing.expectEqualStrings("insufficient_scope", step.error_code.?);
+    try testing.expectEqual(@as(?[]const u8, null), step.description);
+    // The error alone, the description alone, neither, and another scheme's.
+    try testing.expectEqual(@as(?[]const u8, null), (try parseChallenge(a, "Bearer error=\"invalid_token\"")).?.description);
+    try testing.expectEqual(@as(?[]const u8, null), (try parseChallenge(a, "Bearer error_description=\"x\"")).?.error_code);
+    try testing.expectEqual(@as(?[]const u8, null), (try parseChallenge(a, "Bearer resource_metadata=\"u\"")).?.error_code);
+    try testing.expectEqual(@as(?[]const u8, null), (try parseChallenge(a, "Basic realm=\"x\", Bearer scope=\"a\", DPoP error=\"nope\"")).?.error_code);
+    // The Bearer challenge's, after another scheme's, with escapes unwrapped.
+    const later = (try parseChallenge(a, "Basic realm=\"x\", Bearer error=\"invalid_token\", error_description=\"a \\\"b\\\" c\"")).?;
+    try testing.expectEqualStrings("a \"b\" c", later.description.?);
+    // Cut at the bounds, never inside a character.
+    const long = try a.print("Bearer error=\"{s}\", error_description=\"{s}\"", .{ try repeated(a, "e", 200), try repeated(a, "d", 1000) });
+    const cutoff = (try parseChallenge(a, long)).?;
+    try testing.expectEqual(@as(usize, max_error_bytes), cutoff.error_code.?.len);
+    try testing.expectEqual(@as(usize, max_description_bytes), cutoff.description.?.len);
+    const wide = try a.print("Bearer error_description=\"{s}\"", .{try repeated(a, "é", 200)});
+    const wide_cut = (try parseChallenge(a, wide)).?.description.?;
+    try testing.expectEqual(@as(usize, max_description_bytes), wide_cut.len);
+    try testing.expect(std.unicode.utf8ValidateSlice(wide_cut));
+    const odd = try a.print("Bearer error_description=\"x{s}\"", .{try repeated(a, "é", 200)});
+    try testing.expect(std.unicode.utf8ValidateSlice((try parseChallenge(a, odd)).?.description.?));
 }
 
 test "canonical URIs and the resource check" {

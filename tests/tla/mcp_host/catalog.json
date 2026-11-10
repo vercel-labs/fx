@@ -17,8 +17,15 @@
     "module": "SignIn",
     "smoke": "SignIn.cfg",
     "stress": "SignIn.stress.cfg",
-    "findings": [],
-    "repair": []
+    "findings": [
+      { "config": "SignIn.findings.cfg", "invariant": "SignedInOnlyAfterCheck" },
+      { "config": "SignIn.findings-saved.cfg", "invariant": "RefusedNeverSaved" },
+      { "config": "SignIn.findings-taken.cfg", "invariant": "NeverTakeRefused" },
+      { "config": "SignIn.findings-unread.cfg", "invariant": "RefusedNeverSaved" }
+    ],
+    "repair": [
+      "SignIn.repair.cfg"
+    ]
   },
   {
     "module": "ElicitationRouting",

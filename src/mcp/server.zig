@@ -138,11 +138,17 @@ pub const Event = union(enum) {
     input: struct { handle: Handle, requests: []const mrtr.Request },
     /// Requests need a sign-in: after a 401 a refresh can't fix, or a
     /// 403 asking for more scopes (`step_up`). `refused` is the refresh the
-    /// token endpoint refused, when that ended the login.
-    auth_required: struct { step_up: bool, refused: ?oauth.Refusal = null },
+    /// token endpoint refused, when that ended the login. `rejected` is why
+    /// the server refused the token the request carried, with the words its
+    /// 401 named. They borrow the sign-in's buffers: the host copies them as it
+    /// reads the event, before it calls into the engine again.
+    auth_required: struct { step_up: bool, refused: ?oauth.Refusal = null, rejected: ?auth_client.Rejected = null },
     /// The host opens this URL in a browser, and passes the URL it comes back
     /// to to `finishSignIn`.
     authorize: []const u8,
+    /// The tokens a sign-in brought are held, not saved: send a request with
+    /// them, and `saveCredential` once the server has answered it.
+    /// `discardLogin` forgets them when it refuses them.
     signed_in,
     /// `message` is the authorization server's own, from a checked response
     /// or from its token endpoint.
@@ -636,6 +642,14 @@ pub const Server = struct {
     pub fn signOut(r: *Server) Error!void {
         if (r.stdio) return error.NotReady;
         try r.auth.signOut();
+        try r.runAuth(null);
+    }
+
+    /// The tokens a sign-in brought are forgotten, with nothing revoked and
+    /// nothing saved: the server refused them.
+    pub fn discardLogin(r: *Server) Error!void {
+        if (r.stdio) return error.NotReady;
+        try r.auth.discardLogin();
         try r.runAuth(null);
     }
 
@@ -1883,7 +1897,7 @@ pub const Server = struct {
                     else => return err,
                 },
                 .give_up => |g| try r.authGaveUp(g.key, g.why),
-                .needs_sign_in => |n| r.emit(.{ .auth_required = .{ .step_up = n.step_up, .refused = n.refused } }),
+                .needs_sign_in => |n| r.emit(.{ .auth_required = .{ .step_up = n.step_up, .refused = n.refused, .rejected = n.rejected } }),
                 .authorize => |url| r.emit(.{ .authorize = url }),
                 .signed_in => r.emit(.signed_in),
                 .sign_in_failed => |f| r.emit(.{ .sign_in_failed = .{ .why = f.why, .message = f.message } }),

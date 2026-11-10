@@ -28,6 +28,7 @@ const diagnostics = @import("../workspace/diagnostics.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const image_commands = @import("../images/image_commands.zig");
 const app_mcp_runtime = @import("app_mcp_runtime.zig");
+const login_words = @import("../mcp_host/login_words.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -2142,12 +2143,13 @@ fn writeMcpHostProblems(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
     const statuses = (try app.mcpHostStatuses(arena.allocator())) orelse return 0;
     var count: usize = 0;
     for (statuses) |s| {
-        const what = switch (s.state) {
+        // A server that waits for a login says so, in the words `/mcp` uses, whatever its state.
+        const what: []const u8 = if (s.needs_login) login_words.attention(s.reason) else switch (s.state) {
             .failed => "failed",
             .retrying => "retrying",
             .missing_env => "missing a variable",
             .invalid_env => "can't use a variable",
-            else => if (s.needs_login) "needs login" else continue,
+            else => continue,
         };
         count += 1;
         try writer.print("- mcp server {s} name={s}", .{ what, s.name });

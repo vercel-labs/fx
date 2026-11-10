@@ -65,5 +65,65 @@
     "old": "ReloadKeeps == alive[cur] /\\ UNCHANGED vars",
     "new": "ReloadKeeps == ReloadDrops",
     "property": "KeptSignInGoesOn"
+  },
+  {
+    "description": "The token exchange saves and reports the login before the check request, as fx did before the fix",
+    "old": "          /\\ IF ok /\\ CheckFirst\n",
+    "new": "          /\\ IF FALSE\n",
+    "invariant": "SignedInOnlyAfterCheck"
+  },
+  {
+    "description": "A refused login is saved with the accepted ones",
+    "old": "          /\\ saved' = IF a # \"refuse\" THEN saved \\cup {k} ELSE saved\n",
+    "new": "          /\\ saved' = saved \\cup {k}\n",
+    "invariant": "RefusedNeverSaved"
+  },
+  {
+    "description": "A refused login is reported as signed in",
+    "old": "![k].notified = (a # \"refuse\")]",
+    "new": "![k].notified = TRUE]",
+    "invariant": "NoticeMatchesAnswer"
+  },
+  {
+    "description": "An accepted login isn't saved once the check request ends: the held save is lost",
+    "old": "          /\\ saved' = IF a # \"refuse\" THEN saved \\cup {k} ELSE saved\n",
+    "new": "          /\\ saved' = saved\n",
+    "invariant": "AnsweredKeptAndReported"
+  },
+  {
+    "description": "A check request that gets no answer in time never ends the sign-in (no timeout)",
+    "old": "    /\\ phase[k] = \"confirming\" /\\ alive[hostOf[k]]\n    /\\ LET h == hostOf[k]\n           \\* What the host acts on",
+    "new": "    /\\ phase[k] = \"confirming\" /\\ alive[hostOf[k]] /\\ ck[k].srv # \"fail\"\n    /\\ LET h == hostOf[k]\n           \\* What the host acts on",
+    "property": "ConfirmingEnds"
+  },
+  {
+    "description": "A host's end leaves the login waiting for its check request",
+    "old": "Gone(h, ph) == [k \\in Logins |-> IF hostOf[k] = h /\\ Pending(k) THEN",
+    "new": "Gone(h, ph) == [k \\in Logins |-> IF hostOf[k] = h /\\ Open(k) THEN",
+    "invariant": "NoPendingWithoutHost"
+  },
+  {
+    "description": "A second login starts while the first one's check request runs",
+    "old": "SigningIn(h) == live[h] # 0 /\\ Pending(live[h])",
+    "new": "SigningIn(h) == live[h] # 0 /\\ Open(live[h])",
+    "invariant": "OneSignInPerHost"
+  },
+  {
+    "description": "A re-read of the store takes a login in place of the one a sign-in holds",
+    "old": "    /\\ alive[cur] /\\ ~SigningIn(cur)\n    /\\ unread' \\in {unread, FALSE}",
+    "new": "    /\\ alive[cur]\n    /\\ unread' \\in {unread, FALSE}",
+    "invariant": "HeldNeverReplaced"
+  },
+  {
+    "description": "The branch for an unreadable store answers a sign-in's check request first and swallows a refusal",
+    "old": "a == IF UnreadFirst /\\ unread /\\ ck[k].srv = \"refuse\"",
+    "new": "a == IF unread /\\ ck[k].srv = \"refuse\"",
+    "invariant": "NoticeMatchesAnswer"
+  },
+  {
+    "description": "A logout leaves the login that waits for its check request going: the answer saves and reports it",
+    "old": "            /\\ phase' = Ended(live[cur])\n            /\\ live' = [live EXCEPT ![cur] = 0]\n            /\\ indicator' = FALSE\n       ELSE UNCHANGED <<gone, phase, live, indicator>>",
+    "new": "            /\\ phase' = phase\n            /\\ live' = live\n            /\\ indicator' = indicator\n       ELSE UNCHANGED <<gone, phase, live, indicator>>",
+    "invariant": "LoggedOutNeverSaved"
   }
 ]

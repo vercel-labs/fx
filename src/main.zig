@@ -5316,6 +5316,7 @@ test {
     _ = @import("core/mcp_host/mcp_call_bridge.zig");
     _ = @import("core/mcp_host/mcp_call_client.zig");
     _ = @import("core/mcp_host/verbs.zig");
+    _ = @import("core/mcp_host/login_words.zig");
     _ = @import("core/mcp/tool_lookup.zig");
     _ = @import("core/recovery/recovery.zig");
     _ = @import("napi_fetch_state.zig");

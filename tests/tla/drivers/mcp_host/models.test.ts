@@ -30,9 +30,12 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // IndicatorClears. UrlRetry's finding is the code before the held call:
   // it ended the call at the -32042 error. HostLifecycle's AtMostOneOwner
   // became the code once a reload kept its host: its smoke and stress
-  // configs check it.
-  expect(count("finding", "FINDING")).toBe(2);
-  expect(count("repair", "PASS")).toBe(1);
+  // configs check it. SignIn's four findings are fx before the check request
+  // (a login reported as signed in before the server took it, a refused login
+  // saved, a refused login another fx takes) and the branch for an unreadable
+  // store answering a sign-in's check request first; its repair witness is the code.
+  expect(count("finding", "FINDING")).toBe(6);
+  expect(count("repair", "PASS")).toBe(2);
 }, 1_800_000);
 
 const controls: { name: string; module: string; constants: Record<string, never> | Record<string, unknown>; good: TraceRecord[]; bad: TraceRecord[]; badAt: number }[] = [
@@ -71,10 +74,11 @@ const controls: { name: string; module: string; constants: Record<string, never>
   },
   {
     name: "sign-in", module: "SignIn",
-    constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false },
+    constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false, ObsCheckFirst: true },
     good: [
       { event: "login" }, { event: "authorize", data: { login: 1 } }, { event: "probe", data: { login: 1, result: "open" } },
       { event: "callback", data: { login: 1, state: 1, kind: "get" } }, { event: "redeem", data: { login: 1 } },
+      { event: "check", data: { login: 1, result: "accept" } },
       { event: "signed_in", data: { login: 1 } }, { event: "probe", data: { login: 1, result: "closed" } },
     ],
     // A code redeemed for a callback whose state fx never made.
@@ -188,6 +192,6 @@ test("bridge control (refresh lease): going ahead behind a frozen holder on time
 }, 300_000);
 
 test("bridge control: an empty trace is INCONCLUSIVE, never a pass", async () => {
-  const v = await checkTrace({ module: "SignIn", records: [], constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false }, dir: join(artifacts, "bridge", "empty") });
+  const v = await checkTrace({ module: "SignIn", records: [], constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false, ObsCheckFirst: true }, dir: join(artifacts, "bridge", "empty") });
   expect(v.verdict).toBe("INCONCLUSIVE");
 });
