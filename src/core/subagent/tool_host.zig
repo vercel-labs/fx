@@ -1890,9 +1890,6 @@ pub const Runtime = struct {
         var admitted = try self.admitManagedWork(alloc, request, operation_id, options, resolved_model);
         errdefer admitted.deinit(alloc);
         if (admitted == .ready) {
-            if (admitted.ready.created) if (request.agentName()) |name| {
-                admitted.ready.user_closed = self.forgetUserClosedLocked(name);
-            };
             const child_id = admitted.ready.child_id;
             try self.markBusyLocked(child_id);
             _ = self.managed.start(child_id) catch |err| {
@@ -1900,10 +1897,10 @@ pub const Runtime = struct {
                 self.clearBusyLocked(child_id);
                 return err;
             };
-            if (admitted.ready.created)
-                debug_trace.eventf("mailbox", "launch", .{}, "child={s} work_id={s}", .{ child_id, operation_id })
-            else
-                debug_trace.eventf("mailbox", "message", .{}, "child={s} work_id={s} delivery=next_turn", .{ child_id, operation_id });
+            if (admitted.ready.created) {
+                debug_trace.eventf("mailbox", "launch", .{}, "child={s} work_id={s}", .{ child_id, operation_id });
+                if (request.agentName()) |name| admitted.ready.user_closed = self.forgetUserClosedLocked(name);
+            } else debug_trace.eventf("mailbox", "message", .{}, "child={s} work_id={s} delivery=next_turn", .{ child_id, operation_id });
         }
         return admitted;
     }
