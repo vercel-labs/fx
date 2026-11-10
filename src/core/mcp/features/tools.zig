@@ -200,6 +200,108 @@ fn checkValueBounds(value: std.json.Value, depth: usize, remaining: *usize) erro
     }
 }
 
+/// The types an argument written as text can be sent as.
+pub const RepairType = enum { number, integer, boolean, array, object };
+
+pub const RepairedField = struct {
+    name: []const u8,
+    json_type: RepairType,
+};
+
+pub const RepairedArguments = struct {
+    arguments_json: []const u8,
+    /// The top-level fields sent as their schema's type, in argument order.
+    fields: []const RepairedField,
+};
+
+/// Some models write a number, boolean, array, or object argument as JSON
+/// text, such as `"40"` for a `number` field, and a server that checks types
+/// rejects the call. For each top-level argument whose property schema has a
+/// single `type` other than `string`, a string that is exactly a value of
+/// that type is sent as that value. A schema with such a `type` never accepts
+/// a string there, so no value the schema accepts changes. Every other value
+/// is left as the model wrote it, and numbers keep their text.
+///
+/// Null when nothing changes or either input isn't a JSON object, so the
+/// caller sends the model's own bytes. Otherwise the arguments to send and
+/// the fields that changed, allocated in `arena`.
+/// (`tests/e2e/mcp-stdio.test.ts` "typed MCP arguments the model wrote as
+/// text reach the server as their schema's types")
+pub fn repairArgumentTypes(arena: Allocator, input_schema_json: []const u8, arguments_json: []const u8) Allocator.Error!?RepairedArguments {
+    const limits: Limits = .{};
+    if (arguments_json.len > limits.max_argument_bytes or input_schema_json.len > limits.max_schema_bytes) return null;
+    var arguments = try parseRepairInput(arena, arguments_json) orelse return null;
+    if (arguments != .object) return null;
+    const schema = try parseRepairInput(arena, input_schema_json) orelse return null;
+    if (schema != .object) return null;
+    const properties = schema.object.get("properties") orelse return null;
+    if (properties != .object) return null;
+
+    var fields: std.ArrayList(RepairedField) = .empty;
+    var entries = arguments.object.iterator();
+    while (entries.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        const property = properties.object.get(entry.key_ptr.*) orelse continue;
+        const json_type = singleRepairType(property) orelse continue;
+        entry.value_ptr.* = try decodeAs(arena, entry.value_ptr.string, json_type) orelse continue;
+        try fields.append(arena, .{ .name = entry.key_ptr.*, .json_type = json_type });
+    }
+    if (fields.items.len == 0) return null;
+    // The arguments sent stay within the bounds the model's had to meet.
+    var remaining: usize = 4096;
+    checkValueBounds(arguments, 0, &remaining) catch return null;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    std.json.Stringify.value(arguments, .{}, &out.writer) catch return error.OutOfMemory;
+    if (out.written().len > limits.max_argument_bytes) return null;
+    return .{ .arguments_json = out.written(), .fields = fields.items };
+}
+
+/// Parses JSON with every number kept as its text. Null for text that isn't
+/// JSON.
+fn parseRepairInput(arena: Allocator, text: []const u8) Allocator.Error!?std.json.Value {
+    return std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{
+        .parse_numbers = false,
+        .allocate = .alloc_always,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+}
+
+/// The property's one `type`, when it names a type other than `string`. A
+/// list of types, a missing `type`, and `string` or `null` give null.
+fn singleRepairType(property: std.json.Value) ?RepairType {
+    if (property != .object) return null;
+    const kind = property.object.get("type") orelse return null;
+    if (kind != .string) return null;
+    return std.meta.stringToEnum(RepairType, kind.string);
+}
+
+/// `text` as a value of `json_type`, or null when it is not exactly one.
+fn decodeAs(arena: Allocator, text: []const u8, json_type: RepairType) Allocator.Error!?std.json.Value {
+    switch (json_type) {
+        .number, .integer => {
+            const number = json_number.Number.parse(arena, text, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return null,
+            };
+            if (json_type == .integer and !number.isInteger()) return null;
+            return .{ .number_string = text };
+        },
+        .boolean => {
+            if (std.mem.eql(u8, text, "true")) return .{ .bool = true };
+            if (std.mem.eql(u8, text, "false")) return .{ .bool = false };
+            return null;
+        },
+        .array, .object => {
+            const decoded = try parseRepairInput(arena, text) orelse return null;
+            const wanted: std.meta.Tag(std.json.Value) = if (json_type == .array) .array else .object;
+            if (std.meta.activeTag(decoded) != wanted) return null;
+            return decoded;
+        },
+    }
+}
+
 fn prepareSchema(schema: std.json.Value, object_root: bool) Error!void {
     if (schema != .object) return error.InvalidSchema;
     if (object_root) {
@@ -673,4 +775,247 @@ test "a text item may be as large as the whole result, and other fields keep the
     const over = try alloc.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}}}", .{huge});
     defer alloc.free(over);
     try std.testing.expectError(error.InvalidContent, parseCallOutcome(alloc, over, .modern, null, limits.max_content_text_bytes, limits));
+}
+
+const repair_test_schema =
+    \\{"type":"object","properties":{
+    \\"text":{"type":"string"},"limit":{"type":"number"},"count":{"type":"integer"},"verbose":{"type":"boolean"},
+    \\"queries":{"type":"array","items":{"oneOf":[{"type":"string"},{"type":"object"}]}},"filter":{"type":"object"},
+    \\"either":{"type":["string","number"]},"nullable":{"type":["integer","null"]},
+    \\"branches":{"anyOf":[{"type":"number"},{"type":"boolean"}]},"untyped":{},"nothing":{"type":"null"}}}
+;
+
+/// Repairs `arguments` against `repair_test_schema` and compares the
+/// arguments sent with `expected`; null expects the model's own bytes.
+fn expectRepair(arguments: []const u8, expected: ?[]const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const repaired = try repairArgumentTypes(arena_state.allocator(), repair_test_schema, arguments);
+    if (expected) |wanted| {
+        const sent = repaired orelse {
+            std.debug.print("no repair of {s}\n", .{arguments});
+            return error.TestExpectedRepair;
+        };
+        try std.testing.expectEqualStrings(wanted, sent.arguments_json);
+    } else if (repaired) |sent| {
+        std.debug.print("unexpected repair of {s} to {s}\n", .{ arguments, sent.arguments_json });
+        return error.TestUnexpectedRepair;
+    }
+}
+
+/// `{"<field>":"<text>"}`, with the text escaped as a JSON string.
+fn oneStringArgument(alloc: Allocator, field: []const u8, text: []const u8) ![]u8 {
+    return alloc.print("{{\"{s}\":{f}}}", .{ field, std.json.fmt(text, .{}) });
+}
+
+test "MCP argument repair sends text as the one non-string type its schema names" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const repaired = (try repairArgumentTypes(arena_state.allocator(), repair_test_schema,
+        \\{"text":"40","limit":"40","count":"7","verbose":"true","queries":"[\"sum:a{*}\"]","filter":"{\"env\":\"prod\"}"}
+    )).?;
+    try std.testing.expectEqualStrings(
+        \\{"text":"40","limit":40,"count":7,"verbose":true,"queries":["sum:a{*}"],"filter":{"env":"prod"}}
+    , repaired.arguments_json);
+    const fields = [_]RepairedField{
+        .{ .name = "limit", .json_type = .number },
+        .{ .name = "count", .json_type = .integer },
+        .{ .name = "verbose", .json_type = .boolean },
+        .{ .name = "queries", .json_type = .array },
+        .{ .name = "filter", .json_type = .object },
+    };
+    try std.testing.expectEqual(fields.len, repaired.fields.len);
+    for (fields, repaired.fields) |wanted, field| {
+        try std.testing.expectEqualStrings(wanted.name, field.name);
+        try std.testing.expectEqual(wanted.json_type, field.json_type);
+    }
+
+    try expectRepair("{\"limit\":\"4.5\",\"count\":\"4.0\"}", "{\"limit\":4.5,\"count\":4.0}");
+    try expectRepair("{\"limit\":\"-0\",\"count\":\"1e3\"}", "{\"limit\":-0,\"count\":1e3}");
+    try expectRepair("{\"verbose\":\"false\"}", "{\"verbose\":false}");
+    // A number keeps every digit the model wrote.
+    try expectRepair(
+        "{\"count\":\"123456789012345678901234567890\",\"limit\":\"1.000000000000000000001\"}",
+        "{\"count\":123456789012345678901234567890,\"limit\":1.000000000000000000001}",
+    );
+    try expectRepair("{\"queries\":\"[]\",\"filter\":\"{}\"}", "{\"queries\":[],\"filter\":{}}");
+}
+
+test "MCP argument repair keeps text that isn't exactly a value of the field's type" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const kept = [_]struct { []const u8, []const []const u8 }{
+        .{ "limit", &.{ "", " 40", "40 ", "0x10", "NaN", "Infinity", "+1", "01", "1.", ".5", "forty", "1e", "--1" } },
+        .{ "count", &.{ "4.5", "1e-1", "7 ", "seven" } },
+        .{ "verbose", &.{ "True", "TRUE", "yes", "1", "", " true", "null" } },
+        .{ "queries", &.{ "[1", "{}", "1", "null", "\"[]\"", "" } },
+        .{ "filter", &.{ "[1]", "{", "null", "\"x\"", "{\"a\":1}x", "" } },
+    };
+    for (kept) |case| {
+        for (case[1]) |text| try expectRepair(try oneStringArgument(arena, case[0], text), null);
+    }
+}
+
+test "MCP argument repair keeps every string its schema could accept" {
+    // A string field, a type list, anyOf branches, no type, a null type, and
+    // a field the schema doesn't name.
+    try expectRepair(
+        \\{"text":"40","either":"40","nullable":"40","branches":"40","untyped":"true","nothing":"null","unknown":"40"}
+    , null);
+    // Nested text stays as written, even where it holds a number.
+    try expectRepair("{\"queries\":[\"40\",{\"count\":\"7\"}],\"filter\":{\"limit\":\"40\"}}", null);
+    try expectRepair("{\"queries\":\"[\\\"40\\\"]\"}", "{\"queries\":[\"40\"]}");
+}
+
+test "MCP argument repair sends the model's bytes when nothing changes" {
+    try expectRepair("{\"limit\":40,\"count\":7,\"verbose\":true,\"queries\":[],\"filter\":{}}", null);
+    try expectRepair("{}", null);
+    try expectRepair("[\"40\"]", null);
+    try expectRepair("\"40\"", null);
+    try expectRepair("{\"limit\":\"40\"", null);
+    try expectRepair("", null);
+
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const arguments = "{\"limit\":\"40\"}";
+    for ([_][]const u8{ "", "{", "[]", "{\"type\":\"object\"}", "{\"type\":\"object\",\"properties\":[]}", "{\"properties\":{\"limit\":\"number\"}}" }) |schema| {
+        try std.testing.expect((try repairArgumentTypes(arena, schema, arguments)) == null);
+    }
+}
+
+test "MCP argument repair keeps a decoded value past the argument bounds" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // 64 levels of arrays fit under the top-level object; 65 do not.
+    for ([_]struct { usize, bool }{ .{ 64, true }, .{ 65, false } }) |case| {
+        const depth, const fits = case;
+        var text: std.ArrayList(u8) = .empty;
+        try text.appendNTimes(arena, '[', depth);
+        try text.appendNTimes(arena, ']', depth);
+        const repaired = try repairArgumentTypes(arena, repair_test_schema, try oneStringArgument(arena, "queries", text.items));
+        try std.testing.expectEqual(fits, repaired != null);
+    }
+    // 4096 values in all.
+    for ([_]struct { usize, bool }{ .{ 4094, true }, .{ 4095, false } }) |case| {
+        const items, const fits = case;
+        var text: std.ArrayList(u8) = .empty;
+        try text.append(arena, '[');
+        for (0..items) |index| try text.appendSlice(arena, if (index == 0) "0" else ",0");
+        try text.append(arena, ']');
+        const repaired = try repairArgumentTypes(arena, repair_test_schema, try oneStringArgument(arena, "queries", text.items));
+        try std.testing.expectEqual(fits, repaired != null);
+    }
+}
+
+fn repairArgumentTypesAllocationFailures(alloc: Allocator) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    _ = try repairArgumentTypes(arena_state.allocator(), repair_test_schema,
+        \\{"limit":"40","count":"7","verbose":"true","queries":"[\"a\",{\"b\":[1]}]","filter":"{\"env\":\"prod\"}","text":"x"}
+    );
+}
+
+test "MCP argument repair reports running out of memory instead of sending the model's text" {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, repairArgumentTypesAllocationFailures, .{});
+}
+
+const fuzz_repair_schema =
+    \\{"type":"object","properties":{"s":{"type":"string"},"n":{"type":"number"},"i":{"type":"integer"},
+    \\"b":{"type":"boolean"},"a":{"type":"array"},"o":{"type":"object"},"l":{"type":["string","number"]},"u":{}}}
+;
+const fuzz_repair_fields = [_][]const u8{ "s", "n", "i", "b", "a", "o", "l", "u", "x" };
+const fuzz_repair_pieces = [_][]const u8{
+    "40", "-0",        "4.5", "4.0",       "1e3", "1e-1", "01",   " 40",   "0x10", "true",                           "false",     "True",
+    "[]", "[1,\"a\"]", "{}",  "{\"a\":1}", "[",   "{",    "null", "\"x\"", "NaN",  "123456789012345678901234567890", "[[[[1]]]]", "",
+};
+
+fn fuzzArgumentRepair(_: void, smith: *std.testing.Smith) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var raw: [512]u8 = undefined;
+    const text = raw[0..smith.slice(&raw)];
+    // The bytes as the arguments, and as a schema.
+    try expectRepairLaws(arena, fuzz_repair_schema, text);
+    try expectRepairLaws(arena, text, "{\"n\":\"40\",\"a\":\"[]\"}");
+
+    // Each field gets nothing, the bytes or a piece as a string, or a piece as
+    // JSON when it is JSON.
+    var arguments: std.Io.Writer.Allocating = .init(arena);
+    try arguments.writer.writeByte('{');
+    var first = true;
+    for (fuzz_repair_fields) |field| {
+        const choice = smith.valueRangeAtMost(u8, 0, 3);
+        if (choice == 0) continue;
+        const piece = fuzz_repair_pieces[smith.index(fuzz_repair_pieces.len)];
+        const value = switch (choice) {
+            1 => try jsonStringAlloc(arena, text),
+            2 => try jsonStringAlloc(arena, piece),
+            else => if ((try parseRepairInput(arena, piece)) != null) piece else try jsonStringAlloc(arena, piece),
+        };
+        if (!first) try arguments.writer.writeByte(',');
+        first = false;
+        try arguments.writer.print("\"{s}\":{s}", .{ field, value });
+    }
+    try arguments.writer.writeByte('}');
+    try expectRepairLaws(arena, fuzz_repair_schema, arguments.written());
+}
+
+fn jsonStringAlloc(arena: Allocator, text: []const u8) ![]u8 {
+    return arena.print("{f}", .{std.json.fmt(text, .{})});
+}
+
+/// What holds for every repair: an object goes out with the same fields in
+/// the same order; only the fields it names change, each from text to a
+/// value of the one non-string type its schema names; the rest are as the
+/// model wrote them; and repairing the result changes nothing more.
+fn expectRepairLaws(arena: Allocator, schema_json: []const u8, arguments_json: []const u8) !void {
+    const repaired = try repairArgumentTypes(arena, schema_json, arguments_json) orelse return;
+    try std.testing.expect(repaired.fields.len > 0);
+    const before = (try parseRepairInput(arena, arguments_json)).?;
+    const after = (try parseRepairInput(arena, repaired.arguments_json)) orelse return error.TestRepairNotJson;
+    try std.testing.expect(before == .object and after == .object);
+    try std.testing.expectEqual(before.object.count(), after.object.count());
+    const properties = (try parseRepairInput(arena, schema_json)).?.object.get("properties").?.object;
+    var changed: usize = 0;
+    for (before.object.keys(), before.object.values(), after.object.keys(), after.object.values()) |name, old, new_name, new| {
+        try std.testing.expectEqualStrings(name, new_name);
+        const field = for (repaired.fields) |candidate| {
+            if (std.mem.eql(u8, candidate.name, name)) break candidate;
+        } else null;
+        if (field) |repair| {
+            changed += 1;
+            try std.testing.expect(old == .string);
+            try std.testing.expectEqual(singleRepairType(properties.get(name).?).?, repair.json_type);
+            try std.testing.expect(switch (repair.json_type) {
+                .number, .integer => new == .number_string and std.mem.eql(u8, new.number_string, old.string),
+                .boolean => new == .bool,
+                .array => new == .array,
+                .object => new == .object,
+            });
+        } else {
+            var old_text: std.Io.Writer.Allocating = .init(arena);
+            var new_text: std.Io.Writer.Allocating = .init(arena);
+            try std.json.Stringify.value(old, .{}, &old_text.writer);
+            try std.json.Stringify.value(new, .{}, &new_text.writer);
+            try std.testing.expectEqualStrings(old_text.written(), new_text.written());
+        }
+    }
+    try std.testing.expectEqual(repaired.fields.len, changed);
+    try std.testing.expect((try repairArgumentTypes(arena, schema_json, repaired.arguments_json)) == null);
+}
+
+test "MCP argument repair keeps its laws on fuzzed schemas and arguments" {
+    try std.testing.fuzz({}, fuzzArgumentRepair, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "40",
+            "{\"n\":\"40\",\"i\":\"4.5\",\"b\":\"true\",\"a\":\"[1]\",\"o\":\"{}\",\"s\":\"40\",\"l\":\"40\"}",
+            "{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"number\"},\"a\":{\"type\":\"array\"}}}",
+            "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+        }) ++ @import("fuzz_corpus").mcp_argument_repair.*),
+    });
 }

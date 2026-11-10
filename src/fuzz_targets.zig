@@ -21,6 +21,7 @@ test {
     _ = @import("core/images/image_data.zig");
     _ = @import("core/images/image_route.zig");
     _ = @import("core/mcp/elicitation.zig");
+    _ = @import("core/mcp/features/tools.zig");
     _ = @import("core/tooling/toolbox.zig");
     _ = @import("core/mcp/tool_search.zig");
     _ = @import("core/output/diff.zig");
