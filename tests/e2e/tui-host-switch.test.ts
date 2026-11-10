@@ -2063,6 +2063,46 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "after the user closes an idle subagent, main's next message to its name says the new one starts with no history",
+    async () => {
+      let noted = false;
+      await withFx((body) => {
+        if (!isMainRequest(body)) return text("child_answer", "NOTE_CHILD_DONE");
+        if (latestUserText(body).includes("SWITCH_USER again")) {
+          if (!body.includes('"main_again"')) {
+            return toolCall("main_again", "subagent", { request: { action: "message", agent: "reviewer", message: "Look once more" } });
+          }
+          noted = toolResultText(body, "main_again").includes("The user closed the earlier reviewer, so this one starts with no history.");
+          return text("main_again_done", "NOTE_MAIN_AGAIN");
+        }
+        if (body.includes("NOTE_CHILD_DONE")) return text("main_done", "NOTE_MAIN_DONE");
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "reviewer", message: "Review src/parser.zig" } });
+        }
+        return text("main_wait", "NOTE_MAIN_WAITING");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER review it");
+        await session.waitForText("NOTE_MAIN_DONE", 30_000);
+        await session.waitForComposer(15_000);
+        await session.sendKeys("Down");
+        await session.waitForText("esc back", 10_000);
+        await session.sendKeys("Down");
+        await session.waitForText("delete close", 10_000);
+        await session.sendKeys("BSpace");
+        await session.waitForText("press delete again to close this subagent", 10_000);
+        await session.sendKeys("BSpace");
+        await session.waitForPane((pane) => !subagentRow("reviewer").test(pane) && pane.includes("esc back"), 15_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+        await session.sendText("SWITCH_USER again");
+        await session.waitForText("NOTE_MAIN_AGAIN", 30_000);
+      });
+      expect(noted).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "closing the middle row of the agent list keeps the highlight on the agent shown, and the first Delete warns at once",
     async () => {
       let reviewerReported = false;
