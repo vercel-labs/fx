@@ -534,7 +534,8 @@ fn writeCommandRows(
             try writer.print("\x1b[{d};1H", .{start_row + painted_rows});
             try writer.writeAll(ui_render.tag_style);
             try writer.writeAll(if (visual_row == 0) "  $ " else "    ");
-            try writer.writeAll(segment);
+            var at_row_start = true;
+            try display_width.writeRowPart(writer, segment, &at_row_start);
             try writer.writeAll(ui_render.reset_style);
             try writer.writeAll("\x1b[K");
             painted_rows += 1;
@@ -2479,4 +2480,46 @@ test "command review hint keeps enter and esc guidance at narrow widths" {
     try std.testing.expect(std.mem.find(u8, minimal.written(), "esc cancel") != null);
     try std.testing.expect(std.mem.find(u8, minimal.written(), "wheel scroll") == null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(minimal.written()) <= 40);
+}
+
+test "command approval screen draws a command that starts with a bare mark on a dotted circle in a cell of its own" {
+    const alloc = std.testing.allocator;
+    var screen_state = interaction_state.ApprovalScreenState{};
+
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    try std.testing.expect(try approval.syncRequest(alloc, .{
+        .label = "shell.run bare mark command...",
+        .command = "\u{0E49}abc\naaaa\n\u{0E49}bbb",
+    }));
+
+    var rendered = try paintTest(
+        alloc,
+        approval.projection().?,
+        &screen_state,
+        &.{},
+        .{},
+        testLayout(16, 80),
+        true,
+    );
+    defer rendered.deinit(alloc);
+
+    var grid = try vt_emulator.Grid.init(alloc, 80, 16);
+    defer grid.deinit();
+    try grid.feed(rendered.bytes);
+
+    // The command draws after "  $ " or the four-cell indent of a later row,
+    // which is no base for a mark, so a mark that starts a row takes a circle
+    // of its own.
+    var row_text: std.ArrayList(u8) = .empty;
+    defer row_text.deinit(alloc);
+    const screen_layout = commandScreenLayout(16);
+    try grid.rowTextTrimmed(screen_layout.command_start_row, &row_text);
+    try std.testing.expectEqualStrings("  $ \u{25CC}\u{0E49}abc", row_text.items);
+    row_text.clearRetainingCapacity();
+    try grid.rowTextTrimmed(screen_layout.command_start_row + 1, &row_text);
+    try std.testing.expectEqualStrings("    aaaa", row_text.items);
+    row_text.clearRetainingCapacity();
+    try grid.rowTextTrimmed(screen_layout.command_start_row + 2, &row_text);
+    try std.testing.expectEqualStrings("    \u{25CC}\u{0E49}bbb", row_text.items);
 }

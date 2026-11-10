@@ -240,7 +240,7 @@ pub noinline fn displayUnitAt(text: []const u8, index: usize) DisplayUnit {
         (first_byte >= '0' and first_byte <= '9')) and
         hasRgiKeycapSuffix(text, index + 1);
     if (first_byte < 0x80 and !may_start_keycap) {
-        const cell_width: usize = if (first_byte == 0 or first_byte < 32 or first_byte == 0x7f) 0 else 1;
+        const cell_width: usize = if (isControlByte(first_byte)) 0 else 1;
         return .{ .byte_len = 1, .cell_width = cell_width };
     }
 
@@ -444,7 +444,7 @@ pub fn rowUnitAt(text: []const u8, index: usize, column: usize) DisplayUnit {
 }
 
 /// Where the bare mark of a row is, in the text that starts the row.
-pub const BareMark = struct {
+const BareMark = struct {
     /// The mark's first byte: `bare_mark_base` is drawn before it.
     start: usize,
     /// The first byte after the mark and the zero-width characters stacked on
@@ -485,6 +485,12 @@ fn isVariationSelector(codepoint: u21) bool {
 /// circle under a bare mark counts.
 pub fn rowWidth(row: []const u8) usize {
     return visibleWidth(row) +| @intFromBool(bareMarkInRow(row) != null);
+}
+
+/// `rowWidth` of a `row` whose escape sequences, after its first cell, take no
+/// cell.
+pub fn rowWidthIgnoringAnsi(row: []const u8) usize {
+    return visibleWidthIgnoringAnsi(row) +| @intFromBool(bareMarkInRow(row) != null);
 }
 
 /// `prefixByWidth` of `row`, which starts at content column 0: a bare mark
@@ -532,7 +538,7 @@ fn isCombining(codepoint: u21) bool {
         (codepoint >= 0x1dc0 and codepoint <= 0x1dff) or
         (codepoint >= 0x20d0 and codepoint <= 0x20ff) or
         (codepoint >= 0xfe20 and codepoint <= 0xfe2f) or
-        (codepoint >= 0xfe00 and codepoint <= 0xfe0f) or
+        isVariationSelector(codepoint) or
         isInRanges(codepoint, &thai_nonspacing_ranges);
 }
 
@@ -903,6 +909,15 @@ test "rowWidth and rowPrefixByWidth count the circle of a bare mark" {
     try std.testing.expectEqualStrings("a\u{0E49}b", rowPrefixByWidth("a\u{0E49}bc", 2));
 }
 
+test "rowWidthIgnoringAnsi counts the circle of a bare mark and skips escapes" {
+    try std.testing.expectEqual(@as(usize, 4), rowWidthIgnoringAnsi("\u{0E49}abc"));
+    try std.testing.expectEqual(@as(usize, 4), rowWidthIgnoringAnsi("\u{200B}\u{0E49}\u{0E48}abc"));
+    try std.testing.expectEqual(@as(usize, 3), rowWidthIgnoringAnsi("a\u{0E49}bc"));
+    try std.testing.expectEqual(@as(usize, 2), rowWidthIgnoringAnsi("a\x1b[1mb\x1b[0m"));
+    try std.testing.expectEqual(@as(usize, 5), rowWidthIgnoringAnsi("\u{0E49}a\x1b[1mbc\x1b[0md"));
+    try std.testing.expectEqual(@as(usize, 0), rowWidthIgnoringAnsi(""));
+}
+
 test "rowWrapCutIgnoringAnsi spends a cell on the circle of a bare mark" {
     // A row with no bare mark is cut as wrapCutIgnoringAnsi cuts it.
     try std.testing.expectEqualStrings("ab", rowWrapCutIgnoringAnsi("ab cd", 4));
@@ -1229,6 +1244,11 @@ fn fuzzDisplayUnitBoundaries(_: void, smith: *std.testing.Smith) !void {
         index += unit.byte_len;
     }
     try std.testing.expectEqual(column, rowWidth(text));
+    try std.testing.expect(rowWidthIgnoringAnsi(text) >= visibleWidthIgnoringAnsi(text));
+    try std.testing.expect(rowWidthIgnoringAnsi(text) <= visibleWidthIgnoringAnsi(text) +| 1);
+    if (std.mem.findScalar(u8, text, 0x1b) == null) {
+        try std.testing.expectEqual(rowWidth(text), rowWidthIgnoringAnsi(text));
+    }
     for (budgets) |budget| {
         const prefix = rowPrefixByWidth(text, budget);
         try std.testing.expect(isDisplayUnitBoundary(text, prefix.len));

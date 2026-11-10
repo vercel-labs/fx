@@ -3088,6 +3088,96 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "question header and option description draw a bare mark on a dotted circle in a cell of its own",
+    async () => {
+      const header = `\u0E49${QUESTION_PROMPT}`;
+      const ctx = await launchScenario([
+        outerToolCalls([
+          {
+            id: "question_bare_header_1",
+            name: "ask_user_question",
+            input: {
+              questions: [
+                {
+                  question: header,
+                  options: [
+                    { label: "Run tests", description: "\u0E49abc" },
+                    { label: "Skip tests" },
+                  ],
+                },
+              ],
+            },
+          },
+        ]),
+        outerText("question bare header handled"),
+      ]);
+
+      await ctx.session.sendText("Ask me which path to take.");
+      await ctx.session.waitForText(QUESTION_PROMPT, TIMEOUT);
+      // The header draws after a two-cell indent, and the description in its
+      // own column after the label (37 cells in at this width). Neither is a
+      // base for a mark, so each mark is drawn on a circle of its own.
+      await waitForGridState(ctx.session, "question bare header circle", (grid) =>
+        grid.some((line) => line.trimEnd() === `  \u25CC\u0E49${QUESTION_PROMPT}`),
+      );
+      await waitForGridState(ctx.session, "question bare description circle", (grid) =>
+        grid.some((line) =>
+          line.startsWith("    1) Run tests") &&
+          line.indexOf("\u25CC") === 37 &&
+          line.trimEnd().endsWith("\u25CC\u0E49abc")
+        ),
+      );
+
+      // The circle is only drawn: the model gets no circle.
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.waitForText("question bare header handled", TIMEOUT);
+      const body = ctx.gateway.requests[1]?.body ?? "";
+      expect(body.includes("\u25CC")).toBe(false);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "approval command draws a bare mark on a dotted circle in a cell of its own",
+    async () => {
+      const ctx = await launchScenario([
+        outerToolCalls([
+          {
+            id: "command_bare_mark_1",
+            name: "shell",
+            input: {
+              request: {
+                action: "run",
+                command: "\u0E49abc",
+                yield_time_ms: 30_000,
+                timeout_ms: 600_000,
+              },
+            },
+          },
+        ]),
+        outerText("approval command bare mark handled"),
+      ]);
+
+      await ctx.session.sendText("Run the bare mark command.");
+      await ctx.session.waitForText(APPROVAL_PROMPT, TIMEOUT);
+      // The command starts a row after a hard newline and a four-cell indent,
+      // which is no base for a mark, so the mark is drawn on a circle of its own.
+      await waitForGridState(ctx.session, "approval command bare mark circle", (grid) =>
+        grid.some((line) => line.trimEnd() === "    \u25CC\u0E49abc"),
+      );
+
+      // 3 declines the command, and the model answers.
+      await ctx.session.sendKeys("3");
+      await ctx.session.waitForText("approval command bare mark handled", TIMEOUT);
+      const body = ctx.gateway.requests[1]?.body ?? "";
+      expect(body.includes("\u25CC")).toBe(false);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "long question content wraps onto aligned continuation rows",
     async () => {
       const finalMarker = "long question answer handled";

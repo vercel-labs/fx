@@ -304,14 +304,11 @@ pub const CommandSegmentIterator = struct {
             return "";
         }
 
-        const hard_cut = text_utils.prefixTerminalSafeByWidth(
-            line,
-            self.content_width,
-        );
+        const hard_cut = rowHardCut(line, self.content_width);
         if (hard_cut.len == 0) return error.CommandDoesNotFit;
 
         const segment = if (hard_cut.len < line.len) blk: {
-            const soft_cut = display_width.wrapCutIgnoringAnsi(
+            const soft_cut = display_width.rowWrapCutIgnoringAnsi(
                 line,
                 self.content_width,
             );
@@ -340,6 +337,17 @@ pub const CommandSegmentIterator = struct {
     }
 };
 
+/// The longest prefix of `line`, which starts a row after the command's
+/// prefix cells, that fits `max_width` cells and ends between terminal-safe
+/// tokens. A bare mark with the marks stacked on it takes one cell for its
+/// circle and stays whole in the row, as in `display_width.rowPrefixByWidth`.
+fn rowHardCut(line: []const u8, max_width: usize) []const u8 {
+    const bare = display_width.bareMarkInRow(line) orelse
+        return text_utils.prefixTerminalSafeByWidth(line, max_width);
+    if (max_width == 0) return line[0..0];
+    return line[0 .. bare.end + text_utils.prefixTerminalSafeByWidth(line[bare.end..], max_width - 1).len];
+}
+
 fn inlineCommandRows(encoded: []const u8, width: u16) !u16 {
     if (encoded.len == 0) return 1;
     var segments = CommandSegmentIterator.init(encoded, width);
@@ -361,7 +369,13 @@ fn composeInlineCommandRow(
     errdefer row.deinit(alloc);
     try row.appendSlice(alloc, ui_render.tag_style);
     try row.appendSlice(alloc, if (command_row == 0) "  $ " else "    ");
-    try row.appendSlice(alloc, segment);
+    // The segment draws after a prefix, which is no base for a mark, so a mark
+    // that starts it is drawn on a circle of its own.
+    var writer = std.Io.Writer.Allocating.fromArrayList(alloc, &row);
+    errdefer row = writer.toArrayList();
+    var at_row_start = true;
+    try display_width.writeRowPart(&writer.writer, segment, &at_row_start);
+    row = writer.toArrayList();
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
@@ -3074,4 +3088,77 @@ test "permission hints use compact ask modal language" {
     ) != null);
     try std.testing.expect(std.mem.find(u8, file.text.items, "wheel scroll") != null);
     try std.testing.expect(std.mem.find(u8, file.text.items, "tab amend") != null);
+}
+
+fn inlineCommandPanelTextForTest(alloc: Allocator, command: []const u8, width: u16) ![]u8 {
+    var prompt = ApprovalPrompt{};
+    defer prompt.deinit(alloc);
+    try std.testing.expect(try prompt.syncRequest(alloc, .{
+        .label = "shell.run bare mark command...",
+        .command = command,
+    }));
+
+    const request = prompt.request.?.view();
+    const row_count = try inlineApprovalPanelRowsForCommand(alloc, request.label, request.command, width, 24);
+    var panel: std.ArrayList(u8) = .empty;
+    errdefer panel.deinit(alloc);
+    var row_index: u16 = 0;
+    while (row_index < row_count) : (row_index += 1) {
+        var row = try composeInlineApprovalPanelRow(alloc, prompt.projection().?, width, 24, row_index);
+        defer row.deinit(alloc);
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
+        try panel.appendSlice(alloc, row.items);
+        try panel.append(alloc, '\n');
+    }
+    return panel.toOwnedSlice(alloc);
+}
+
+test "inline command panel draws a command that starts with a bare mark on a dotted circle in a cell of its own" {
+    const alloc = std.testing.allocator;
+
+    // The command draws after "  $ " or the four-cell indent of a later row,
+    // which is no base for a mark, so a mark that starts a row takes a circle
+    // of its own. A mark on a base gets none. A hard newline starts a row.
+    const bare = try inlineCommandPanelTextForTest(alloc, "\u{0E49}abc", 60);
+    defer alloc.free(bare);
+    try std.testing.expect(std.mem.find(u8, bare, "  $ \u{25CC}\u{0E49}abc") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bare, "\u{25CC}"));
+
+    const stacked = try inlineCommandPanelTextForTest(alloc, "\u{0E49}\u{0E48}abc", 60);
+    defer alloc.free(stacked);
+    try std.testing.expect(std.mem.find(u8, stacked, "  $ \u{25CC}\u{0E49}\u{0E48}abc") != null);
+
+    const on_base = try inlineCommandPanelTextForTest(alloc, "a\u{0E49}bc", 60);
+    defer alloc.free(on_base);
+    try std.testing.expect(std.mem.find(u8, on_base, "  $ a\u{0E49}bc") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, on_base, "\u{25CC}"));
+
+    const lines = try inlineCommandPanelTextForTest(alloc, "echo\n\u{0E49}abc", 60);
+    defer alloc.free(lines);
+    try std.testing.expect(std.mem.find(u8, lines, "  $ echo") != null);
+    try std.testing.expect(std.mem.find(u8, lines, "    \u{25CC}\u{0E49}abc") != null);
+
+    // A soft break at the space starts the next row with the mark, which gets
+    // its circle there.
+    const soft = try inlineCommandPanelTextForTest(alloc, "aaaa \u{0E49}bbb", 11);
+    defer alloc.free(soft);
+    try std.testing.expect(std.mem.find(u8, soft, "  $ aaaa") != null);
+    try std.testing.expect(std.mem.find(u8, soft, "    \u{25CC}\u{0E49}bbb") != null);
+}
+
+test "inline command panel counts a bare mark's circle in its rows at every width" {
+    const alloc = std.testing.allocator;
+    const command = "\u{0E49}abcdefghijklmnopqrstuvwxyz0123456789";
+
+    // The circle takes one of the cells after the prefix, so each row keeps
+    // inside the width, the circle is drawn once, no letter is lost, and the
+    // rows the panel measures are the rows it paints.
+    var width: u16 = 6;
+    while (width <= 50) : (width += 1) {
+        const panel = try inlineCommandPanelTextForTest(alloc, command, width);
+        defer alloc.free(panel);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, panel, "\u{25CC}"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, panel, "q"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, panel, "z"));
+    }
 }

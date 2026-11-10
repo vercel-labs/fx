@@ -946,18 +946,18 @@ test "modelMenuProjection mirrors cache-owned catalog state" {
 
 fn wrappedStatusRowCount(label: []const u8, cols: u16, max_rows: u16) u16 {
     if (max_rows <= 1 or cols == 0) return 1;
-    if (display_width.visibleWidthIgnoringAnsi(label) <= cols) return 1;
 
     const safe_cols = @max(@as(usize, cols), 1);
     const prefix_end = display_width.statusPrefixEnd(label);
     const prefix_width = display_width.visibleWidthIgnoringAnsi(label[0..prefix_end]);
+    if (prefix_width + display_width.rowWidthIgnoringAnsi(label[prefix_end..]) <= cols) return 1;
     var remaining = label[prefix_end..];
     var row_count: u16 = 0;
     var first = true;
     while (remaining.len > 0 and row_count < max_rows) {
         const indent_width = if (first) prefix_width else @max(prefix_width, 1);
         const available = if (safe_cols > indent_width) safe_cols - indent_width else 1;
-        var chunk = display_width.wrapCutIgnoringAnsi(remaining, available);
+        var chunk = display_width.rowWrapCutIgnoringAnsi(remaining, available);
         if (chunk.len == 0) {
             const unit = display_width.displayUnitAt(remaining, 0);
             chunk = remaining[0..unit.byte_len];
@@ -1365,6 +1365,32 @@ test "static turn status wraps at word boundaries" {
 
     try std.testing.expectEqual(@as(u16, 3), activityProjectionRows(projection, 12));
     try std.testing.expectEqual(@as(u16, 1), activityProjectionRows(projection, 30));
+}
+
+test "static turn status counts the circle of a bare mark that starts a row" {
+    // The text after the status sign starts its first row, and so does the
+    // text after a soft break at a space. A mark that starts such a row has no
+    // base, so it takes the cell of a circle, which the rows must count.
+    const first: ActivityProjection = .{ .turn_thinking = .{
+        .label = "⚠ \u{0E49}aaaaaaaaaa",
+        .tone = .danger,
+    } };
+    try std.testing.expectEqual(@as(u16, 2), activityProjectionRows(first, 12));
+    try std.testing.expectEqual(@as(u16, 1), activityProjectionRows(first, 13));
+
+    const soft: ActivityProjection = .{ .turn_thinking = .{
+        .label = "⚠ aaaa \u{0E49}bbbbbb",
+        .tone = .warning,
+    } };
+    try std.testing.expectEqual(@as(u16, 3), activityProjectionRows(soft, 8));
+    try std.testing.expectEqual(@as(u16, 2), activityProjectionRows(soft, 9));
+
+    // A mark on a base is no bare mark, so it adds no cell.
+    const on_base: ActivityProjection = .{ .turn_thinking = .{
+        .label = "⚠ a\u{0E49}aaaaaaaaa",
+        .tone = .danger,
+    } };
+    try std.testing.expectEqual(@as(u16, 1), activityProjectionRows(on_base, 12));
 }
 
 test "frame-owned activity uses clipped command activity label" {

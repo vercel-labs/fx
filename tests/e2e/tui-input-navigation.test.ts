@@ -870,12 +870,15 @@ tmuxTest(
     expect(first.split("\n").filter((line) => line.trimEnd() === card)).toHaveLength(1);
 
     // The same after a zero-width space. tmux does not keep the space in its
-    // capture of the card, so the row is read without it.
+    // capture of the card, so the row is read without it. The composer's draft
+    // row reads the same as the card until Enter is handled, so the card counts
+    // only once the gateway has the second request, which the test asserts next.
     await typeLiteral(active, `${ZERO_WIDTH_SPACE}${THAI_MAI_THO}xyz`);
     await active.sendKeys("Enter");
     const zeroWidthCard = `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}xyz`;
     await active.waitForPane(
       (pane) =>
+        gateway?.requests.length === 2 &&
         pane.split("\n").some((line) =>
           line.replaceAll(ZERO_WIDTH_SPACE, "").trimEnd() === zeroWidthCard
         ),
