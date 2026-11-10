@@ -4201,7 +4201,7 @@ const DoctorProbes = struct {
     /// One line on a terminal's stderr while doctor waits on its network
     /// checks, so a slow one does not look like a hang.
     fn writeWaitNotice(self: *const DoctorProbes, alloc: Allocator, deps: RunDeps, provider: model_provider.ProviderId, deadline_ms: i64) !void {
-        if (builtin.is_test or !(std.Io.File.stderr().isTty(io_mod.getIo()) catch false)) return;
+        if (builtin.is_test or !stderrIsTerminal()) return;
         var servers: usize = 0;
         for (self.processes.items[0..self.server_children]) |probe| {
             if (!probe.not_started and probe.spawn_error == null) servers += 1;
@@ -4227,6 +4227,11 @@ const DoctorProbes = struct {
         if (self.gh) |gh| try doctor_probes.ghCheck(out, alloc, gh, deadline_ms);
     }
 };
+
+/// Whether doctor's stderr is a terminal, for its wait notice.
+fn stderrIsTerminal() bool {
+    return std.Io.File.stderr().isTty(io_mod.getIo()) catch false;
+}
 
 /// The local checks with the probe checks after them. The provider's answer
 /// replaces the local auth line, which only saw a credential; a credential
