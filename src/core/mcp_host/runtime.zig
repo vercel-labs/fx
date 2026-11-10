@@ -20,6 +20,7 @@ const url_opener = @import("../hosts/url_opener.zig");
 const secret = @import("../auth/secret.zig");
 const config = @import("config.zig");
 const credentials = @import("credentials.zig");
+const login_words = @import("login_words.zig");
 const loopback = @import("login.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
@@ -30,6 +31,9 @@ const engine = mcp.engine;
 
 /// A login waits this long for the browser to come back.
 const login_timeout_ms: i64 = 5 * 60 * 1000;
+/// A new login waits this long for the server to answer a request with it,
+/// past the engine's own start timeout: the owner ends the sign-in then.
+const confirm_wait_ms: i64 = 45 * 1000;
 /// The longest the owner sleeps; a `wake` ends it sooner.
 const idle_wait_ms: u32 = 1000;
 /// How long a logout waits for its revocation, as the engine's `close` does.
@@ -97,8 +101,12 @@ pub const Status = struct {
     needs_login: bool = false,
     signed_in: bool = false,
     /// A login is under way: from `/mcp login` until it signs in, fails,
-    /// or expires, through the requests before its address comes.
+    /// or expires, through the requests before its address comes, and the
+    /// request that checks the new login.
     signing_in: bool = false,
+    /// Why the server needs a login, once it does. Its words come from
+    /// `login_words`; `last_error` holds them for a refused login.
+    reason: login_words.Reason = .{},
     /// The variable a `missing_env` or `invalid_env` server names.
     missing: ?[]const u8 = null,
     /// What the server told fx to tell the model about it.
@@ -170,6 +178,9 @@ pub const Notice = union(enum) {
     /// The URL to sign in at; opened in the browser when the login asked for that.
     authorize: struct { server: []const u8, url: []const u8 },
     signed_in: []const u8,
+    /// The login is new and kept, but the server gave no answer to the
+    /// request that checks it: a failure that isn't a refusal.
+    signed_in_unchecked: []const u8,
     sign_in_failed: struct { server: []const u8, reason: []const u8 },
     needs_login: []const u8,
     /// A new login couldn't be saved: it works in this process only.
@@ -375,7 +386,15 @@ const Login = struct {
     /// The authorization address, once the engine made it, for a login
     /// asked for again: it shows the same one.
     url: ?[]u8 = null,
+    /// The token exchange is done and the engine holds the new tokens, unsaved.
+    /// The login waits for the server's answer to a request with them
+    /// (`concludeSignIn`), and `deadline_ms` is that wait's end.
+    confirming: bool = false,
 };
+
+/// How a sign-in ends once its tokens are held: the server took them, it
+/// couldn't be asked (a failure that isn't a refusal), or it refused them.
+const SignInEnd = union(enum) { accepted, unchecked, refused: login_words.Reason };
 
 /// What a `reload` did.
 pub const Reloaded = struct {
@@ -469,6 +488,8 @@ pub const Runtime = struct {
         /// Its tools were asked for again with a login read after a 401, so
         /// the listing that 401 ended answers no waits; the next one does.
         relisting: bool = false,
+        /// Why the server needs a login, while `needs_login`.
+        login: login_words.Held = .{},
     };
 
     /// A refresh the engine said was due: waiting for its login's refresh lock,
@@ -602,8 +623,24 @@ pub const Runtime = struct {
             if (s.last_error) |e| o.last_error = try alloc.dupe(u8, e);
             if (s.missing) |m| o.missing = try alloc.dupe(u8, m);
             if (s.instructions) |t| o.instructions = try alloc.dupe(u8, t);
+            o.reason = try login_words.copy(alloc, s.reason);
         }
         return out;
+    }
+
+    /// What server `name` says about a login it refused, copied into `alloc`
+    /// (`login_words.errorText`): null when it isn't waiting for a login, or
+    /// waits for one for another reason.
+    pub fn refusedLogin(r: *Runtime, alloc: Allocator, name: []const u8) Allocator.Error!?[]const u8 {
+        _ = r.active.fetchAdd(1, .acq_rel);
+        defer _ = r.active.fetchSub(1, .acq_rel);
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        for (r.snapshot) |s| if (std.mem.eql(u8, s.name, name)) {
+            if (!s.needs_login or s.reason.kind != .login_refused) return null;
+            return try alloc.dupe(u8, s.last_error orelse return null);
+        };
+        return null;
     }
 
     /// Server `name`'s instructions, copied into `alloc`; null when it gave
@@ -1086,6 +1123,14 @@ pub const Runtime = struct {
                     debug_trace.logf("mcp", "MCP logout also revokes server={s} reason=another fx saved a newer login", .{s.name});
                     try r.engine.signOut(s.name);
                 };
+                // A new login that waits for its check request goes with the logout: its tokens
+                // are gone, so the answer would have nothing to save, and "Signed in" would follow
+                // a logout (`tests/tla/mcp_host/SignIn.tla` Logout, LoggedOutNeverSaved).
+                if (r.confirmingLogin(i)) {
+                    debug_trace.logf("mcp", "MCP login dropped server={s} reason=signed out while it waited for the server", .{s.name});
+                    r.endLogin(i);
+                    r.notify(.{ .sign_in_failed = .{ .server = s.name, .reason = "signed out before the server answered" } });
+                }
                 r.flags[i] = .{};
                 // A program that exits next would lose a revocation still on
                 // its way, so the logout ends when it's answered. Until then,
@@ -1106,6 +1151,8 @@ pub const Runtime = struct {
         // flow, so no sign-in could finish
         // (`tests/tla/mcp_host/SignIn.tla` FlowHasListener).
         if (r.loginFor(i)) |l| {
+            // Its browser is done: the server is being asked about the new login.
+            if (l.confirming) return r.finish(req, .ok);
             l.open_browser = l.open_browser or open_browser;
             if (l.url) |url| {
                 r.notify(.{ .authorize = .{ .server = s.name, .url = url } });
@@ -1153,6 +1200,59 @@ pub const Runtime = struct {
             return err;
         };
         r.finish(req, .ok);
+    }
+
+    fn confirmingLogin(r: *const Runtime, server: usize) bool {
+        const l = r.loginFor(server) orelse return false;
+        return l.confirming;
+    }
+
+    /// The reason an `auth_required` event gives.
+    fn reasonOf(required: anytype) login_words.Reason {
+        if (required.step_up) return .{ .kind = .more_scopes };
+        if (required.refused) |refused| return .{ .kind = .refresh_refused, .code = refused.code };
+        if (required.rejected) |rejected| return .{ .kind = .login_refused, .code = rejected.code, .description = rejected.description };
+        return .{};
+    }
+
+    /// An error the server named, for a log line: only a plain token, never its prose.
+    fn logCode(code: ?[]const u8) []const u8 {
+        const text = code orelse return "unnamed";
+        return if (login_words.isLogSafeCode(text)) text else "unnamed";
+    }
+
+    /// The server answered the request that checks server `i`'s new login, or
+    /// couldn't (`SignInEnd`). An accepted login, and one that couldn't be
+    /// checked, is saved, then reported. A refused one is forgotten with
+    /// nothing saved, and the sign-in fails with the server's words, so no
+    /// other fx can take it (`tests/tla/mcp_host/SignIn.tla`
+    /// `SignedInOnlyAfterCheck`, `RefusedNeverSaved`, `NeverTakeRefused`).
+    fn concludeSignIn(r: *Runtime, i: usize, how: SignInEnd) !void {
+        if (!r.confirmingLogin(i)) return;
+        const name = r.resolved.servers[i].name;
+        switch (how) {
+            .accepted, .unchecked => {
+                if (how == .unchecked) debug_trace.logf("mcp", "MCP login kept server={s} reason=the server gave no answer to check it", .{name});
+                try r.saveCredential(i);
+                r.flags[i] = .{ .signed_in = true };
+                r.endLogin(i);
+                r.notify(if (how == .accepted) .{ .signed_in = name } else .{ .signed_in_unchecked = name });
+            },
+            .refused => |reason| {
+                debug_trace.logf("mcp", "MCP new login dropped server={s} reason=server refused the new login status=401 error={s}", .{ name, logCode(reason.code) });
+                r.engine.discardLogin(name) catch |err| debug_trace.logf("mcp", "MCP new login not forgotten server={s} err={s}", .{ name, @errorName(err) });
+                // Nothing was saved, so there is nothing to say beyond the sign-in's failure.
+                r.flags[i] = .{ .needs_login = true };
+                var arena: std.heap.ArenaAllocator = .init(r.gpa);
+                defer arena.deinit();
+                const words = (login_words.refusal(arena.allocator(), name, reason, .new) catch null) orelse "the server refused the new login";
+                var buffer: [512]u8 = undefined;
+                const text = std.mem.print(&buffer, "{s}", .{words}) catch words[0..@min(words.len, buffer.len)];
+                r.endLogin(i);
+                r.notify(.{ .sign_in_failed = .{ .server = name, .reason = text } });
+                r.endToolWaiters(i, .needs_login);
+            },
+        }
     }
 
     /// The login task: waits for the browser, then hands its address to the owner.
@@ -1214,6 +1314,15 @@ pub const Runtime = struct {
                 continue;
             }
             const name = r.resolved.servers[l.server].name;
+            if (l.confirming) {
+                // The engine's own timeouts should have ended it; the sign-in doesn't wait longer.
+                debug_trace.logf("mcp", "MCP login check ended server={s} reason=no answer in time", .{name});
+                r.concludeSignIn(l.server, .unchecked) catch |err| {
+                    debug_trace.logf("mcp", "MCP login not concluded server={s} err={s}", .{ name, @errorName(err) });
+                    r.endLogin(l.server);
+                };
+                continue;
+            }
             r.engine.cancelSignIn(name) catch {};
             r.notify(.{ .sign_in_failed = .{ .server = name, .reason = "the browser didn't come back within 5 minutes" } });
             r.endLogin(l.server);
@@ -1243,7 +1352,11 @@ pub const Runtime = struct {
         switch (event.kind) {
             // A failed attempt ends the waits for tools with its reason; the
             // engine keeps trying, so a later request may still get them.
-            .phase => |phase| if (phase == .backoff or phase == .failed) r.endToolWaiters(i, .failed),
+            .phase => |phase| if (phase == .backoff or phase == .failed) {
+                r.endToolWaiters(i, .failed);
+                // The request that checks a new login failed to get an answer: not a refusal.
+                try r.concludeSignIn(i, .unchecked);
+            },
             .called => |c| {
                 const entry = r.calls.fetchRemove(c.call) orelse return r.releaseRequired(i);
                 const req = entry.value;
@@ -1337,8 +1450,24 @@ pub const Runtime = struct {
                     else if (r.lastError(w.request.alloc, i)) |why| .{ .failed = why } else |err| err;
                     r.finish(w.request, if (result) |ok| .{ .tools = ok } else |err| .{ .failed = err });
                 }
+                // The request that checks a new login: what the server says to
+                // the new tokens ends the sign-in. A refusal comes as `auth_required`.
+                if (r.confirmingLogin(i)) {
+                    if (t.ok) try r.concludeSignIn(i, .accepted) else if (!t.needs_auth) try r.concludeSignIn(i, .unchecked);
+                }
+            },
+            .failed => |why| if (r.confirmingLogin(i)) switch (why) {
+                // The refusal arrives as `auth_required`.
+                .needs_auth => {},
+                else => try r.concludeSignIn(i, .unchecked),
             },
             .auth_required => |required| {
+                // A new login waits for the answer to its check request: that answer ends the
+                // sign-in, before the branch for an unreadable store below can take it.
+                if (r.confirmingLogin(i)) {
+                    // The server wants more scopes than the new login has: it knew the token.
+                    if (required.step_up) try r.concludeSignIn(i, .accepted) else return r.concludeSignIn(i, .{ .refused = reasonOf(required) });
+                }
                 // The store this fx couldn't read at the start may hold the
                 // login: it's read again first. While it still can't be read,
                 // a sign-in couldn't be saved either, so the server is down
@@ -1352,6 +1481,9 @@ pub const Runtime = struct {
                     if (r.store_unread) |err| {
                         r.flags[i].needs_login = true;
                         r.flags[i].signed_in = false;
+                        // Why the server refused is kept for when the store reads: the status
+                        // says the store can't be read until then.
+                        r.flags[i].login.set(reasonOf(required));
                         debug_trace.logf("mcp", "MCP login not asked for server={s} reason=saved logins not read err={s}", .{ name, @errorName(err) });
                         return r.endToolWaiters(i, .failed);
                     }
@@ -1360,8 +1492,12 @@ pub const Runtime = struct {
                 // Only a step-up keeps the login working for what it had;
                 // otherwise the saved one, if any, doesn't sign anything in.
                 if (!required.step_up) r.flags[i].signed_in = false;
+                const reason = reasonOf(required);
+                r.flags[i].login.set(reason);
                 if (required.refused) |refused| {
                     debug_trace.logf("mcp", "MCP login dropped server={s} reason=refresh refused status={d} error={s}", .{ name, refused.status, refused.code });
+                } else if (required.rejected) |rejected| {
+                    debug_trace.logf("mcp", "MCP login refused server={s} reason=server refused the saved login status={d} error={s}", .{ name, rejected.status, logCode(rejected.code) });
                 } else {
                     debug_trace.logf("mcp", "MCP login needed server={s} reason={s}", .{ name, if (required.step_up) "more scopes" else "sign-in required" });
                 }
@@ -1383,9 +1519,20 @@ pub const Runtime = struct {
                 };
             },
             .signed_in => {
-                r.flags[i] = .{ .signed_in = true };
-                r.endLogin(i);
-                r.notify(.{ .signed_in = name });
+                // The engine holds the new tokens, unsaved. The server hasn't
+                // taken them yet: it is asked, and its answer ends the sign-in.
+                const l = r.loginFor(i) orelse {
+                    try r.saveCredential(i);
+                    r.flags[i] = .{ .signed_in = true };
+                    return r.notify(.{ .signed_in = name });
+                };
+                l.confirming = true;
+                l.deadline_ms = r.nowMs() + confirm_wait_ms;
+                // A list kept from an earlier login would answer without asking.
+                r.engine.reconnect(name) catch |err| {
+                    debug_trace.logf("mcp", "MCP login check not sent server={s} err={s}", .{ name, @errorName(err) });
+                    try r.concludeSignIn(i, .unchecked);
+                };
             },
             .sign_in_failed => |f| {
                 // The message can point into the callback address the login
@@ -1396,7 +1543,9 @@ pub const Runtime = struct {
                 r.notify(.{ .sign_in_failed = .{ .server = name, .reason = reason } });
             },
             .tools_stale => _ = r.tools_epochs[i].fetchAdd(1, .release),
-            .credential => try r.saveCredential(i),
+            // A new login's tokens are saved once the server has taken them
+            // (`concludeSignIn`); a refresh meanwhile is saved with them.
+            .credential => if (!r.confirmingLogin(i)) try r.saveCredential(i),
             .refresh_due => try r.refreshDue(i),
             .refresh_ended => r.endRefresh(i),
             .elicit => |x| {
@@ -1965,6 +2114,11 @@ pub const Runtime = struct {
                 o.needs_login = false;
                 o.last_error = why;
             }
+            if (o.needs_login) {
+                o.reason = try login_words.copy(a, r.flags[i].login.view());
+                // A refused login is what `last_error` says, for every surface that shows it.
+                if (try login_words.errorText(a, s.name, o.reason)) |text| o.last_error = text;
+            }
             if (r.engine.instructions(s.name)) |t| o.instructions = try a.dupe(u8, t);
         }
         r.mutex.lockUncancelable(r.io);
@@ -2170,6 +2324,7 @@ pub const Runtime = struct {
         if (s.transport != .http or s.held != null or r.loginFor(i) != null) return false;
         if (!try r.takeSaved(i)) return false;
         r.flags[i].needs_login = false;
+        r.flags[i].login.clear();
         r.flags[i].signed_in = true;
         debug_trace.logf("mcp", "MCP login saved by another fx taken server={s}", .{s.name});
         r.notify(.{ .signed_in = s.name });

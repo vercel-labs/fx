@@ -19,6 +19,12 @@
 \*     30 s keeps them and fails the requests waiting. A request the host
 \*     cancels leaves the refresh running for the next one.
 \*   - Signing in brings a new token; signing out cancels the refresh in flight.
+\*   - A request that ends needing sign-in says why (`why`): it carried no token
+\*     (`no_token`), the server refused the token it carried (`refused`: its 401
+\*     challenge's error and description are kept, client.zig `ended`), the
+\*     refresh that would have fixed it was refused (`refresh_refused`), or the
+\*     user signed out (`signed_out`). One words function in the host turns the
+\*     reason into the text each surface shows (src/core/mcp_host/login_words.zig).
 EXTENDS Naturals
 
 CONSTANTS
@@ -28,6 +34,7 @@ CONSTANTS
 ASSUME MaxGen \in Nat \ {0}
 
 Phases == {"idle", "sent", "waiting", "done", "needs_sign_in", "failed", "cancelled"}
+Whys == {"none", "no_token", "refused", "refresh_refused", "signed_out"}
 
 VARIABLES
     gen,          \* generation of the newest token, 0 before the first
@@ -35,7 +42,8 @@ VARIABLES
     refreshable,  \* a refresh token is held
     rt,           \* the refresh token held, by the generation that brought it
     inflight,     \* refreshes in flight
-    req,          \* [Keys -> [phase, g: the token it carries, again: a second send]]
+    req,          \* [Keys -> [phase, g: the token it carries, again: a second send,
+                  \*   why: what ended it needing sign-in]]
     \* Server.
     valid,        \* generations the server accepts; 0 when it needs no token
     serverRt,     \* the refresh token the authorization server accepts
@@ -53,7 +61,7 @@ Init ==
     /\ refreshable = FALSE
     /\ rt = 0
     /\ inflight = 0
-    /\ req = [k \in Keys |-> [phase |-> "idle", g |-> 0, again |-> FALSE]]
+    /\ req = [k \in Keys |-> [phase |-> "idle", g |-> 0, again |-> FALSE, why |-> "none"]]
     /\ valid \in {{}, {0}}
     /\ serverRt = 0
     /\ deadRt = {}
@@ -93,7 +101,7 @@ Reject(k) ==
     /\ req[k].g \notin valid
     /\ rejectedG' = [rejectedG EXCEPT ![k] = req[k].g]
     /\ IF req[k].again
-       THEN /\ req' = [req EXCEPT ![k].phase = "needs_sign_in"]
+       THEN /\ req' = [req EXCEPT ![k].phase = "needs_sign_in", ![k].why = "refused"]
             /\ UNCHANGED <<inflight, usedRt, sends>>
        ELSE IF Token > req[k].g
        THEN \* A newer token arrived since it went out.
@@ -108,7 +116,8 @@ Reject(k) ==
             /\ inflight' = 1
             /\ usedRt' = rt
             /\ UNCHANGED sends
-       ELSE /\ req' = [req EXCEPT ![k].phase = "needs_sign_in"]
+       ELSE /\ req' = [req EXCEPT ![k].phase = "needs_sign_in",
+                                   ![k].why = IF req[k].g = 0 THEN "no_token" ELSE "refused"]
             /\ UNCHANGED <<inflight, usedRt, sends>>
     /\ UNCHANGED <<gen, held, refreshable, rt, valid, serverRt, deadRt>>
 
@@ -150,7 +159,7 @@ RefreshRefused ==
     /\ held' = FALSE
     /\ refreshable' = FALSE
     /\ inflight' = 0
-    /\ req' = [k \in Keys |-> IF req[k].phase = "waiting" THEN [req[k] EXCEPT !.phase = "needs_sign_in"] ELSE req[k]]
+    /\ req' = [k \in Keys |-> IF req[k].phase = "waiting" THEN [req[k] EXCEPT !.phase = "needs_sign_in", !.why = "refresh_refused"] ELSE req[k]]
     /\ UNCHANGED <<gen, rt, valid, serverRt, usedRt, sends, rejectedG>>
 
 \* A 429, a 5xx, or no answer: the refresh token may work later, so the
@@ -190,7 +199,7 @@ SignOut ==
     /\ held' = FALSE
     /\ refreshable' = FALSE
     /\ inflight' = 0
-    /\ req' = [k \in Keys |-> IF req[k].phase = "waiting" THEN [req[k] EXCEPT !.phase = "needs_sign_in"] ELSE req[k]]
+    /\ req' = [k \in Keys |-> IF req[k].phase = "waiting" THEN [req[k] EXCEPT !.phase = "needs_sign_in", !.why = "signed_out"] ELSE req[k]]
     /\ UNCHANGED <<gen, rt, valid, serverRt, deadRt, usedRt, sends, rejectedG>>
 
 Answer(k) == Accept(k) \/ Reject(k)
@@ -218,7 +227,7 @@ TypeOK ==
     /\ gen \in 0..MaxGen
     /\ held \in BOOLEAN /\ refreshable \in BOOLEAN
     /\ inflight \in Nat
-    /\ \A k \in Keys : req[k].phase \in Phases /\ req[k].g \in 0..MaxGen /\ req[k].again \in BOOLEAN
+    /\ \A k \in Keys : req[k].phase \in Phases /\ req[k].g \in 0..MaxGen /\ req[k].again \in BOOLEAN /\ req[k].why \in Whys
     /\ valid \subseteq 0..MaxGen
     /\ deadRt \subseteq 0..MaxGen
 
@@ -240,6 +249,15 @@ NewerOnResend == \A k \in Keys : (req[k].phase = "sent" /\ req[k].again) => req[
 
 \* A request waits only while a refresh is in flight, so nothing waits forever.
 WaitingHasRefresh == (\E k \in Keys : req[k].phase = "waiting") => inflight > 0
+
+\* A request that ends needing sign-in says why, and says what happened: it
+\* names a refusal only when the server rejected a token it carried, no token
+\* only when it carried none, and a refused refresh only after one was refused
+\* for good.
+RefusalNamed == \A k \in Keys : req[k].phase = "needs_sign_in" => req[k].why # "none"
+RefusedMeansTokenRejected == \A k \in Keys : req[k].why = "refused" => rejectedG[k] > 0
+NoTokenMeansNoneRejected == \A k \in Keys : (req[k].phase = "needs_sign_in" /\ req[k].why = "no_token") => rejectedG[k] = 0
+RefreshRefusedMeansDead == \A k \in Keys : req[k].why = "refresh_refused" => deadRt # {}
 
 \* Every request ends: accepted, needing sign-in, failed, or cancelled.
 EveryRequestEnds == \A k \in Keys : req[k].phase \in {"sent", "waiting"} ~> req[k].phase \in {"done", "needs_sign_in", "failed", "cancelled"}

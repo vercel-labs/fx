@@ -258,3 +258,55 @@ fn expectFuzzMethod(line: []const u8, method: []const u8) !void {
     try testing.expect(@intFromPtr(method.ptr) > @intFromPtr(line.ptr));
     try testing.expectEqual(@as(u8, '"'), (method.ptr - 1)[0]);
 }
+
+test "a WWW-Authenticate challenge is read within its bounds on fuzzed bytes" {
+    try testing.fuzz({}, fuzzChallenge, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "Bearer error=\"invalid_token\", error_description=\"No authorization provided\", resource_metadata=\"https://x.example/.well-known/oauth-protected-resource\"",
+            "Basic realm=\"a\", Bearer error=\"insufficient_scope\", scope=\"a b\"",
+            "Bearer error_description=\"a \\\"quoted\\\" \\\\ b\"",
+            "Bearer resource_metadata=\"u\"",
+            "Bearer error=, error_description=\"unterminated",
+        }) ++ @import("fuzz_corpus").mcp_challenge.*),
+    });
+}
+
+/// What a server's challenge can make the engine keep, whatever its bytes:
+/// every value lies inside the header, the error and its description stay
+/// under their bounds, a step-up is named only when the header says so, and
+/// reading the same header twice gives the same answer. The words shown to
+/// the person are made terminal-safe at the place they are printed
+/// (`login_words.zig`), not here.
+fn fuzzChallenge(_: void, smith: *testing.Smith) anyerror!void {
+    const discovery = mcp.auth.discovery;
+    var buffer: [2048]u8 = undefined;
+    const value = buffer[0..smith.slice(&buffer)];
+    var first: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer first.deinit();
+    var second: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer second.deinit();
+    const a = try discovery.parseChallenge(first.allocator(), value);
+    const b = try discovery.parseChallenge(second.allocator(), value);
+    try testing.expectEqual(a == null, b == null);
+    const c = a orelse return;
+    const d = b.?;
+    try expectSameText(c.resource_metadata, d.resource_metadata, value.len);
+    try expectSameText(c.scope, d.scope, value.len);
+    try testing.expectEqual(c.insufficient_scope, d.insufficient_scope);
+    // The error a server names and its description, kept for the words fx shows:
+    // bounded where they are kept, so a huge header can't fill a screen or a log.
+    try expectSameText(c.error_code, d.error_code, discovery.max_error_bytes);
+    try expectSameText(c.description, d.description, discovery.max_description_bytes);
+    try testing.expectEqual(@as(usize, 240), discovery.max_description_bytes);
+    // Cut at a character, never inside one, when the bytes were UTF-8.
+    if (c.description) |text| if (std.unicode.utf8ValidateSlice(value)) try testing.expect(std.unicode.utf8ValidateSlice(text));
+    if (c.insufficient_scope) try testing.expect(std.mem.find(u8, value, "insufficient_scope") != null);
+}
+
+fn expectSameText(x: ?[]const u8, y: ?[]const u8, bound: usize) !void {
+    try testing.expectEqual(x == null, y == null);
+    if (x) |text| {
+        try testing.expectEqualStrings(y.?, text);
+        try testing.expect(text.len <= bound);
+    }
+}

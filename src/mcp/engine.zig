@@ -336,6 +336,12 @@ pub const Engine = struct {
         try (try e.ensureServer(try e.find(name))).signOut();
     }
 
+    /// Forgets the tokens a sign-in brought and the server refused: nothing
+    /// is revoked or saved.
+    pub fn discardLogin(e: *Engine, name: []const u8) Error!void {
+        try (try e.ensureServer(try e.find(name))).discardLogin();
+    }
+
     /// What server `name` said to tell the model about it, from its
     /// last discover or initialize result; null when it said nothing. Valid
     /// until the next call into the engine.

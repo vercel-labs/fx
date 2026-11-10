@@ -66,6 +66,17 @@ pub const Failure = enum {
     metadata_not_json,
 };
 
+/// Why the server refused a token fx sent: the status, and the `error` and
+/// `error_description` its challenge named, if it named them. Both are the
+/// server's words, cut at `discovery.max_error_bytes` and
+/// `discovery.max_description_bytes`, and borrow the `Auth` that gave them:
+/// copy them before the next call into it.
+pub const Rejected = struct {
+    status: u16,
+    code: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+};
+
 pub const Action = union(enum) {
     /// Post request `key`, again if it went out before, with the token of
     /// generation `token`: its header is `authorization(token)`.
@@ -74,11 +85,14 @@ pub const Action = union(enum) {
     give_up: struct { key: u64, why: core.GiveUp },
     /// Requests need a sign-in: a 401 a refresh can't fix, or a 403 asking for
     /// more scopes (`step_up`). `refused` is the refresh that ended the
-    /// login, when one did.
-    needs_sign_in: struct { step_up: bool, refused: ?oauth.Refusal = null },
+    /// login, when one did. `rejected` is why the server refused the token
+    /// the request carried, when it did and no refresh refusal says more.
+    needs_sign_in: struct { step_up: bool, refused: ?oauth.Refusal = null, rejected: ?Rejected = null },
     /// The host opens this authorization URL; it stays valid until the next
     /// sign-in starts.
     authorize: []const u8,
+    /// The tokens are held, but not yet saved: the host sends a request with
+    /// them, and saves the credential once the server has answered it.
     signed_in,
     /// `message` is the authorization server's error, only from a response
     /// that passed the checks, or the token endpoint's when it
@@ -174,6 +188,14 @@ pub const Auth = struct {
     /// The refresh refusal that ended the login, until a sign-in or a
     /// restored credential brings another.
     refusal: ?oauth.Refusal = null,
+    /// The 401 that refused a token fx sent, until a sign-in, a restored
+    /// credential, a sign-out, or an answer the server accepts. Kept in
+    /// place, so keeping it can't fail: status 0 is none.
+    rejection_status: u16 = 0,
+    rejection_code: [discovery.max_error_bytes]u8 = undefined,
+    rejection_code_len: u8 = 0,
+    rejection_text: [discovery.max_description_bytes]u8 = undefined,
+    rejection_text_len: u16 = 0,
     /// The revocation a sign-out sent, until its answer: closing waits for it.
     revoke_key: u64 = 0,
     /// The status that revocation was answered with, 0 when it couldn't be
@@ -231,12 +253,16 @@ pub const Auth = struct {
     pub fn ended(a: *Auth, key: u64, how: Ending) Error!bool {
         switch (how) {
             .answered => {
+                a.rejection_status = 0;
                 try a.stepGate(.{ .accepted = key });
                 if (a.flow.auths > 0 and a.flow.token_issuer != 0) try a.stepFlow(.accepted);
             },
             .forgotten => try a.stepGate(.{ .forget = key }),
             .rejected => |r| {
                 const c = try a.takeChallenge(r.challenge);
+                // A refused token is named only when the request carried one:
+                // a request that went out with none is the lack of a login.
+                if (r.status == 401) if (a.gate.find(key)) |sent| if (sent.g > 0) a.keepRejection(r.status, c);
                 if (r.status == 403) {
                     if (!c.insufficient_scope) {
                         try a.stepGate(.{ .accepted = key });
@@ -306,7 +332,39 @@ pub const Auth = struct {
     fn announce(a: *Auth, step_up: bool) Allocator.Error!void {
         if (a.announced) return;
         a.announced = true;
-        try a.actions.append(a.gpa, .{ .needs_sign_in = .{ .step_up = step_up, .refused = if (step_up) null else a.refusal } });
+        try a.actions.append(a.gpa, .{
+            .needs_sign_in = .{
+                .step_up = step_up,
+                .refused = if (step_up) null else a.refusal,
+                // A refused refresh says more than the token it would have replaced.
+                .rejected = if (step_up or a.refusal != null) null else a.rejection(),
+            },
+        });
+    }
+
+    /// Keeps what the 401's challenge said about the refused token.
+    fn keepRejection(a: *Auth, status: u16, c: discovery.Challenge) void {
+        a.rejection_status = status;
+        a.rejection_code_len = 0;
+        a.rejection_text_len = 0;
+        if (c.error_code) |code| {
+            a.rejection_code_len = @intCast(@min(code.len, a.rejection_code.len));
+            @memcpy(a.rejection_code[0..a.rejection_code_len], code[0..a.rejection_code_len]);
+        }
+        if (c.description) |text| {
+            a.rejection_text_len = @intCast(@min(text.len, a.rejection_text.len));
+            @memcpy(a.rejection_text[0..a.rejection_text_len], text[0..a.rejection_text_len]);
+        }
+    }
+
+    /// Why the server refused the token, if it did since the login came.
+    fn rejection(a: *const Auth) ?Rejected {
+        if (a.rejection_status == 0) return null;
+        return .{
+            .status = a.rejection_status,
+            .code = if (a.rejection_code_len > 0) a.rejection_code[0..a.rejection_code_len] else null,
+            .description = if (a.rejection_text_len > 0) a.rejection_text[0..a.rejection_text_len] else null,
+        };
     }
 
     fn startRefresh(a: *Auth) Error!void {
@@ -417,7 +475,18 @@ pub const Auth = struct {
             };
         };
         a.dropTokens();
+        a.rejection_status = 0;
         try a.actions.append(a.gpa, .save);
+        try a.stepFlow(.signed_out);
+        try a.stepGate(.signed_out);
+    }
+
+    /// Forgets the tokens a sign-in just brought, which the server refused:
+    /// nothing is revoked and nothing is saved, so the login the store holds
+    /// stays as it was. Registrations stay.
+    pub fn discardLogin(a: *Auth) Error!void {
+        a.dropTokens();
+        a.rejection_status = 0;
         try a.stepFlow(.signed_out);
         try a.stepGate(.signed_out);
     }
@@ -492,6 +561,7 @@ pub const Auth = struct {
         // announced too, with its own reason.
         a.announced = false;
         a.refusal = null;
+        a.rejection_status = 0;
         try a.stepGate(.{ .signed_in = .{ .refreshable = a.refresh_token != null } });
         return true;
     }
@@ -521,6 +591,7 @@ pub const Auth = struct {
             .signed_in => {
                 a.announced = false;
                 a.refusal = null;
+                a.rejection_status = 0;
                 try a.stepGate(.{ .signed_in = .{ .refreshable = a.refresh_token != null } });
                 try a.actions.append(a.gpa, .signed_in);
             },
@@ -782,7 +853,8 @@ pub const Auth = struct {
         };
         a.dropTokens();
         try a.storeTokens(token);
-        try a.actions.append(a.gpa, .save);
+        // Not saved here: the host saves the sign-in's login once the server
+        // has answered a request that carries it (`tests/tla/mcp_host/SignIn.tla`).
     }
 
     /// A refresh token that comes back replaces the one held; none
@@ -1102,6 +1174,105 @@ test "a request a sign-in is needed for gives up only after the sign-in is annou
         else => {},
     };
     try testing.expect(announced.? < gave_up.?);
+}
+
+const unrefreshable_login = "{\"access\":\"at\",\"refresh\":null,\"expires_at_ms\":4102444800000,\"skew_ms\":30000,\"token_endpoint\":\"https://as/token\",\"revocation_endpoint\":null,\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\",\"scope\":[\"a\"],\"step_up\":[]}";
+
+fn neededSignIn(a: *Auth) ?@FieldType(Action, "needs_sign_in") {
+    for (a.actions.items) |x| if (x == .needs_sign_in) return x.needs_sign_in;
+    return null;
+}
+
+test "a 401 to a token fx sent is kept with the server's words; one to a request with no token is not" {
+    const testing = std.testing;
+    var client: http.Client = undefined;
+    try client.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:9/mcp" });
+    defer client.deinit();
+    var a: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{}, null);
+    defer a.deinit();
+    try testing.expect(try a.restore(unrefreshable_login));
+    try a.beforeSend(1);
+    a.actions.clearRetainingCapacity();
+    _ = try a.ended(1, .{ .rejected = .{ .status = 401, .challenge = "Bearer error=\"invalid_token\", error_description=\"No authorization provided\", resource_metadata=\"https://x.example/prm\"" } });
+    const refused = neededSignIn(&a).?;
+    try testing.expect(!refused.step_up);
+    try testing.expectEqual(@as(?oauth.Refusal, null), refused.refused);
+    try testing.expectEqual(@as(u16, 401), refused.rejected.?.status);
+    try testing.expectEqualStrings("invalid_token", refused.rejected.?.code.?);
+    try testing.expectEqualStrings("No authorization provided", refused.rejected.?.description.?);
+
+    // A challenge that names nothing still says the token was refused.
+    try testing.expect(try a.restore(unrefreshable_login));
+    try a.beforeSend(2);
+    a.actions.clearRetainingCapacity();
+    _ = try a.ended(2, .{ .rejected = .{ .status = 401, .challenge = "" } });
+    const bare = neededSignIn(&a).?.rejected.?;
+    try testing.expectEqual(@as(?[]const u8, null), bare.code);
+    try testing.expectEqual(@as(?[]const u8, null), bare.description);
+
+    // The server's words are cut at the bounds, never inside a character.
+    try testing.expect(try a.restore(unrefreshable_login));
+    try a.beforeSend(3);
+    a.actions.clearRetainingCapacity();
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(testing.allocator);
+    try long.appendSlice(testing.allocator, "Bearer error=\"");
+    try long.appendNTimes(testing.allocator, 'e', 100);
+    try long.appendSlice(testing.allocator, "\", error_description=\"");
+    for (0..300) |_| try long.appendSlice(testing.allocator, "é");
+    try long.append(testing.allocator, '"');
+    _ = try a.ended(3, .{ .rejected = .{ .status = 401, .challenge = long.items } });
+    const cut = neededSignIn(&a).?.rejected.?;
+    try testing.expectEqual(@as(usize, discovery.max_error_bytes), cut.code.?.len);
+    try testing.expect(cut.description.?.len <= discovery.max_description_bytes);
+    try testing.expect(std.unicode.utf8ValidateSlice(cut.description.?));
+
+    // A request that went out with no token is the lack of a login, not a refusal.
+    var none: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{}, null);
+    defer none.deinit();
+    try none.beforeSend(1);
+    none.actions.clearRetainingCapacity();
+    _ = try none.ended(1, .{ .rejected = .{ .status = 401, .challenge = "Bearer error=\"invalid_token\", error_description=\"No authorization provided\"" } });
+    try testing.expectEqual(@as(?Rejected, null), neededSignIn(&none).?.rejected);
+}
+
+test "a refused refresh keeps its own reason, a server's acceptance clears the refusal, and discarding a login saves nothing" {
+    const testing = std.testing;
+    var client: http.Client = undefined;
+    try client.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:9/mcp" });
+    defer client.deinit();
+    var a: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{ .refresh_via_host = true }, null);
+    defer a.deinit();
+    const refreshable = "{\"access\":\"at\",\"refresh\":\"rt\",\"expires_at_ms\":4102444800000,\"skew_ms\":30000,\"token_endpoint\":\"https://as/token\",\"revocation_endpoint\":null,\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\",\"scope\":[\"a\"],\"step_up\":[]}";
+    try testing.expect(try a.restore(refreshable));
+    try a.beforeSend(1);
+    _ = try a.ended(1, .{ .rejected = .{ .status = 401, .challenge = "Bearer error=\"invalid_token\"" } });
+    // The host sends the refresh, and the authorization server refuses it for good.
+    a.actions.clearRetainingCapacity();
+    a.refresh_due = false;
+    a.refresh_key = a.newKey();
+    _ = try a.fetched(a.refresh_key, 400, "application/json", null, "{\"error\":\"invalid_grant\"}");
+    const refresh_refused = neededSignIn(&a).?;
+    try testing.expectEqualStrings("invalid_grant", refresh_refused.refused.?.code);
+    // The refusal that ended the login says more than the token it would have replaced.
+    try testing.expectEqual(@as(?Rejected, null), refresh_refused.rejected);
+
+    // A server that takes a request clears what an earlier one was refused for.
+    try testing.expect(try a.restore(unrefreshable_login));
+    try a.beforeSend(2);
+    _ = try a.ended(2, .{ .rejected = .{ .status = 401, .challenge = "Bearer error=\"invalid_token\"" } });
+    try testing.expect(a.rejection() != null);
+    try a.beforeSend(3);
+    _ = try a.ended(3, .answered);
+    try testing.expectEqual(@as(?Rejected, null), a.rejection());
+
+    // Discarding the tokens a sign-in brought saves nothing and revokes nothing: the saved login stays.
+    try testing.expect(try a.restore(unrefreshable_login));
+    a.actions.clearRetainingCapacity();
+    try a.discardLogin();
+    for (a.actions.items) |x| try testing.expect(x != .save);
+    try testing.expectEqual(@as(?[]u8, null), a.access);
+    try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
 }
 
 test "a step-up is saved with the login, so a sign-in in a new process asks for it with the scopes held" {

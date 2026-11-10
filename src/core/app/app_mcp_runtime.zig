@@ -454,9 +454,15 @@ pub const State = struct {
                     sink.endSignIn(server);
                     sink.report(server, a.print("Signed in to {s}.", .{safeText(aa, server, 160)}) catch return, false);
                 },
+                // The login is kept, but the server didn't answer the request that checks it.
+                .signed_in_unchecked => |server| {
+                    sink.endSignIn(server);
+                    sink.report(server, a.print("Signed in to {s}, but fx couldn't reach it to check the login.", .{safeText(aa, server, 160)}) catch return, false);
+                },
+                // A refusal carries the server's own error, which can run past 240.
                 .sign_in_failed => |n| {
                     sink.endSignIn(n.server);
-                    sink.report(n.server, a.print("Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, 240) }) catch return, true);
+                    sink.report(n.server, a.print("Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, 600) }) catch return, true);
                 },
                 // The status line says so for as long as it's true.
                 .needs_login => {},

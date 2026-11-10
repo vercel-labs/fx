@@ -708,7 +708,11 @@ pub const Catalog = struct {
     /// null when nothing keeps its tools from the model.
     fn unavailableText(c: *Catalog, alloc: Allocator, s: config.Server, l: List) !?[]u8 {
         return switch (l.state) {
-            .needs_login => try needsLoginText(alloc, s.name, signIn(c.runtime.options.slash_commands, s.source)),
+            .needs_login => blk: {
+                const refused = try c.runtime.refusedLogin(alloc, s.name);
+                defer if (refused) |text| alloc.free(text);
+                break :blk try needsLoginText(alloc, s.name, signIn(c.runtime.options.slash_commands, s.source), refused);
+            },
             .failed => try alloc.print("MCP server '{s}' is unavailable: {s}", .{ s.name, l.failure orelse "it did not start" }),
             else => if (s.held == .missing_env)
                 try alloc.print("MCP server '{s}' needs {s} set before fx starts.", .{ s.name, s.missing orelse "a variable" })
@@ -742,7 +746,12 @@ pub const Catalog = struct {
                 const step = try signInStep(alloc, s.name, signIn(c.runtime.options.slash_commands, s.source));
                 defer alloc.free(step);
                 step[0] = std.ascii.toUpper(step[0]);
-                const guidance = try alloc.print("{s}, then search again.", .{step});
+                const refused = try c.runtime.refusedLogin(alloc, s.name);
+                defer if (refused) |text| alloc.free(text);
+                const guidance = if (refused) |why|
+                    try alloc.print("{s} {s}, then search again.", .{ why, step })
+                else
+                    try alloc.print("{s}, then search again.", .{step});
                 defer alloc.free(guidance);
                 return try tool_search.writeAuthenticationRequired(alloc, s.name, .{ .oauth = guidance });
             }
@@ -859,7 +868,7 @@ fn ended(arena: Allocator, server: []const u8, name: []const u8, e: @FieldType(r
     if (e.outcome == .cancelled and !e.timed_out) return error.Cancelled;
     const why = switch (e.outcome) {
         .needs_auth => return .{
-            .model_output = try tool_result_limits.prepareModelOutput(arena, name, try needsLoginText(arena, server, how), max_bytes),
+            .model_output = try tool_result_limits.prepareModelOutput(arena, name, try needsLoginText(arena, server, how, null), max_bytes),
             .status = .tool_failure,
         },
         .lost => "the server went away",
@@ -888,9 +897,12 @@ fn ended(arena: Allocator, server: []const u8, name: []const u8, e: @FieldType(r
     return .{ .model_output = try tool_result_limits.prepareModelOutput(arena, name, text, max_bytes), .status = .protocol_failure };
 }
 
-fn needsLoginText(alloc: Allocator, server: []const u8, how: SignIn) ![]u8 {
+/// `refused` is `Runtime.refusedLogin`: when the server refused the saved
+/// login, the model hears that and the server's error.
+fn needsLoginText(alloc: Allocator, server: []const u8, how: SignIn, refused: ?[]const u8) ![]u8 {
     const step = try signInStep(alloc, server, how);
     defer alloc.free(step);
+    if (refused) |why| return alloc.print("MCP server '{s}' needs a login: {s} Ask the user to {s}, then try again.", .{ server, why, step });
     return alloc.print("MCP server '{s}' needs a login. Ask the user to {s}, then try again.", .{ server, step });
 }
 

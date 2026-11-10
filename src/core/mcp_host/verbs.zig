@@ -685,6 +685,11 @@ fn safe(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
     return (try text_utils.encodeTerminalSafeInline(arena, raw, 240)).bytes;
 }
 
+/// A refusal's reason carries the server's own error, which runs past `safe`'s bound.
+fn safeLong(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
+    return (try text_utils.encodeTerminalSafeInline(arena, raw, 600)).bytes;
+}
+
 /// A sign-in address is only useful whole, so it isn't shortened.
 fn safeUrl(arena: Allocator, raw: []const u8) Allocator.Error![]const u8 {
     return (try text_utils.encodeTerminalSafeInline(arena, raw, 16 * 1024)).bytes;
@@ -1027,6 +1032,8 @@ const Waiter = struct {
     authorize: ?[]u8 = null,
     shown: bool = false,
     done: ?bool = null,
+    /// The login is kept, but the server gave no answer to the request that checks it.
+    unchecked: bool = false,
     reason: ?[]u8 = null,
     /// Why the new login wasn't saved, if it wasn't.
     not_saved: ?[]u8 = null,
@@ -1047,6 +1054,10 @@ const Waiter = struct {
                 w.authorize = w.gpa.dupe(u8, a.url) catch null;
             },
             .signed_in => |server| if (std.mem.eql(u8, server, w.name)) {
+                w.done = true;
+            },
+            .signed_in_unchecked => |server| if (std.mem.eql(u8, server, w.name)) {
+                w.unchecked = true;
                 w.done = true;
             },
             .sign_in_failed => |f| if (std.mem.eql(u8, f.server, w.name)) {
@@ -1118,12 +1129,14 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
     var line: std.ArrayList(u8) = .empty;
     while (true) {
         var done: ?bool = null;
+        var unchecked = false;
         var url: ?[]const u8 = null;
         var not_saved: ?[]const u8 = null;
         {
             waiter.mutex.lockUncancelable(io);
             defer waiter.mutex.unlock(io);
             done = waiter.done;
+            unchecked = waiter.unchecked;
             if (waiter.not_saved) |why| not_saved = try arena.dupe(u8, why);
             if (!waiter.shown and waiter.authorize != null) {
                 waiter.shown = true;
@@ -1146,10 +1159,12 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
                 return 1;
             };
             if (ok) {
-                try c.out.print("Signed in to {s}.\n", .{try safe(arena, name)});
+                if (unchecked) {
+                    try c.out.print("Signed in to {s}, but fx couldn't reach it to check the login.\n", .{try safe(arena, name)});
+                } else try c.out.print("Signed in to {s}.\n", .{try safe(arena, name)});
                 return 0;
             }
-            try c.err.print("Couldn't sign in to {s}: {s}.\n", .{ try safe(arena, name), try safe(arena, waiter.reason orelse "the server refused") });
+            try c.err.print("Couldn't sign in to {s}: {s}.\n", .{ try safe(arena, name), try safeLong(arena, waiter.reason orelse "the server refused") });
             return 1;
         }
         if (!open and waiter.shown) {
