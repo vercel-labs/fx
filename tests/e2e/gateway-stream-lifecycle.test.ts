@@ -10773,6 +10773,98 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 60_000);
 
+  test.skipIf(!tmuxAvailable())("an empty reply that stops normally gives way to a subagent's report, with no Done. in the history", async () => {
+    const root = createFixtureRoot("stop-empty-report");
+    const child = heldFakeGatewayFinalText();
+    const parentHold: { started: boolean; release?: () => void } = { started: false };
+    // Holds the parent's reply open until the child's report is queued, then ends it empty.
+    const heldEmptyOther = () => {
+      const encoder = new TextEncoder();
+      let timer: ReturnType<typeof setInterval> | undefined;
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          parentHold.started = true;
+          timer = setInterval(() => controller.enqueue(encoder.encode(": hold\n\n")), 50);
+          parentHold.release = () => {
+            clearInterval(timer);
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: { inputTokens: { total: 3 }, outputTokens: { total: 8 } },
+            })}\n\ndata: [DONE]\n\n`));
+            controller.close();
+          };
+        },
+        cancel() {
+          clearInterval(timer);
+        },
+      }), { headers: { "content-type": "text/event-stream" } });
+    };
+    const parentBodies: string[] = [];
+    let childRequests = 0;
+    const gateway = startDynamicFakeGateway(raw => {
+      const body = JSON.parse(raw);
+      const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+      if (latest.includes("EMPTY_REPORT_TASK")) {
+        childRequests++;
+        return child.response;
+      }
+      parentBodies.push(raw);
+      if (parentBodies.length === 1) {
+        return fakeGatewayToolCall("empty-report-delegation", "subagent", { request: { action: "message", agent: "reporter", message: "EMPTY_REPORT_TASK" } });
+      }
+      if (parentBodies.length === 2) return heldEmptyOther();
+      return fakeGatewayFinalText("EMPTY_REPORT_ALL_DONE");
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const tracePath = join(root.root, "trace.log");
+    const stderrPath = join(root.root, "stderr.log");
+    const trace = () => existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+    const assistants = (raw: string) => (JSON.parse(raw).prompt as PromptMessage[]).filter(message => message.role === "assistant");
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await TmuxSession.create({
+        cmd: JSON.stringify(FX_BIN), cwd: root.workspace, isolated: true, remainOnExit: true, stderrPath,
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root.home,
+          AI_GATEWAY_API_KEY: "fake-empty-report-key", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TEST_SKIP_ONBOARDING: "1", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "subagent,mailbox,worker,agent,tool",
+        },
+      });
+      await tui.waitForStableComposer(15000);
+      await tui.sendText("EMPTY_REPORT_START");
+      await tui.waitForPane(() => childRequests === 1 && parentBodies.length === 2 && parentHold.started, 10000);
+      // The child finishes while the parent's reply is still open, so its
+      // report waits for the step to end instead of interrupting the model.
+      child.release("CHILD_REPORT_TEXT");
+      await tui.waitForPane(() => trace().includes("event=report_queued "), 10000);
+      parentHold.release!();
+      await tui.waitForText("EMPTY_REPORT_ALL_DONE", 10000);
+
+      expect(childRequests).toBe(1);
+      expect(parentBodies).toHaveLength(3);
+      // The report continues the turn after the empty reply: no nudge, no
+      // "Done." the model never wrote, and no empty assistant message.
+      const next = parentBodies[2]!;
+      expect(next).toContain("CHILD_REPORT_TEXT");
+      expect(next).not.toContain(EMPTY_REPLY_NUDGE);
+      expect(assistants(next).map(message => contentText(message.content))).not.toContain("Done.");
+      expect(assistants(next).filter(message => Array.isArray(message.content) && message.content.length === 0)).toHaveLength(0);
+      await tui.sendText("/quit");
+      await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
+      expect(tui.paneStatus().status).toBe(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(JSON.stringify(logLines(root.home, rootSessionIds(root.home)[0]!))).not.toContain("\"Done.\"");
+    } finally {
+      child.dispose();
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("commands with the same output get their own handles, and each reads back after resume", async () => {
     const root = createFixtureRoot("distinct-replay-handles");
     const tracePath = join(root.root, "trace.log");
