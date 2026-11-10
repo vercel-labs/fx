@@ -13,6 +13,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const credits_lookup = @import("credits_lookup.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
@@ -1389,6 +1390,17 @@ pub fn Handlers(comptime App: type) type {
                 .tone = if (snapshot.err_message == null) .neutral else .@"error",
                 .body = text,
             }, true);
+            // The Gateway reports no Token Pass balance, so point at the
+            // dashboard tab that shows it.
+            if (comptime @hasField(App, "model_cache")) {
+                if (snapshot.err_message == null and app.model_cache.tokenPassStatus() == .active) {
+                    try app.writeDomainNotice(.{
+                        .topic = "credits",
+                        .tone = .neutral,
+                        .body = "Token Pass credit is a separate balance. See it in the Token Pass tab: " ++ token_pass.dashboard_url,
+                    }, true);
+                }
+            }
         }
 
         fn commandPasteClipboard(ctx: *anyopaque) !void {

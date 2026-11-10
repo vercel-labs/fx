@@ -1330,6 +1330,11 @@ pub fn Runtime(comptime App: type) type {
                         try handlers.semantic_notice(handlers.ctx, notice);
                     },
                     .model_call => |record| {
+                        if (comptime @hasField(App, "model_cache")) {
+                            if (record.outcome == .completed) {
+                                if (record.served_by) |served_by| app.model_cache.observeServedBy(served_by);
+                            }
+                        }
                         // After the text the call wrote. The line shows only
                         // in Ctrl+O, so it waits for text still being paced
                         // out instead of showing that text early, as in

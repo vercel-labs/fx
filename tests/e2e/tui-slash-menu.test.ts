@@ -18,6 +18,7 @@ import {
   composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewaySse,
   fakeGatewayToolCall,
   hasEmptyComposer,
   heldFakeGatewayFinalText,
@@ -3266,6 +3267,177 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       } finally {
         held.dispose();
       }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model picker keeps Token Pass models on Token Pass credit",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const tokenPassModel = "zai/glm-5.3";
+      const fastModel = "provider/fast-model";
+      const plainModel = "provider/plain-model";
+      const covers = "Token Pass covers this model: https://vercel.com/docs/ai-gateway/token-pass";
+      const fastWarning = "Fast mode bills AI Gateway credits, not Token Pass. Run /fast off to use Token Pass credit.";
+      const creditsRequests: string[] = [];
+      gateway = startFakeGateway([
+        fakeGatewaySse([
+          { type: "text-delta", id: "answer_1", delta: "TOKEN_PASS_REPLY" },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: { inputTokens: { total: 3 }, outputTokens: { total: 5 } },
+            providerMetadata: {
+              gateway: { routing: { resolvedProvider: "token-pass", finalProvider: "token-pass" } },
+            },
+          },
+        ]),
+      ], {
+        models: [
+          {
+            id: tokenPassModel,
+            type: "language",
+            released: 300,
+            tags: ["reasoning", "tool-use"],
+            reasoning_options: [{ type: "effort", values: ["high"] }],
+            fast_options: [{ type: "toggle" }],
+            context_window: 200_000,
+          },
+          {
+            id: fastModel,
+            type: "language",
+            released: 200,
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+            context_window: 128_000,
+          },
+          {
+            id: plainModel,
+            type: "language",
+            released: 100,
+            tags: ["tool-use"],
+            context_window: 128_000,
+          },
+        ],
+        usage: (url) => {
+          if (url.pathname !== "/coding-agent/v1/credits") return null;
+          creditsRequests.push(url.pathname);
+          return Response.json({ balance: "12.50", total_used: "1.25" });
+        },
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-token-pass-picker-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+          FX_MODEL: plainModel,
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      const readSettings = () =>
+        JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { fast_mode?: boolean };
+      const scrollbackCount = async (text: string) =>
+        (await session!.captureFullScrollback()).split(text).length - 1;
+      const waitForScrollbackCount = async (text: string, count: number) => {
+        const deadline = Date.now() + 5_000;
+        let seen = await scrollbackCount(text);
+        while (seen !== count && Date.now() < deadline) {
+          await Bun.sleep(50);
+          seen = await scrollbackCount(text);
+        }
+        expect(seen).toBe(count);
+      };
+      // Opens the menu on `query` and walks every stage with Enter, or types
+      // `speed` at the speed stage.
+      const pickModel = async (query: string, model: string, stages: "effort" | "speed", speed?: string) => {
+        await session!.sendKeys("C-p");
+        await waitForModelsMenu(session!, 3);
+        await session!.sendLiteralText(query);
+        await session!.waitForPane(
+          (pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes(model)),
+          5_000,
+        );
+        await session!.sendKeys("Enter");
+        if (stages === "effort") {
+          await session!.waitForPane(
+            (pane) => composerContains(pane, `/model ${model}`) && pane.includes("high"),
+            5_000,
+          );
+          await session!.sendKeys("Enter");
+        }
+        await session!.waitForPane((pane) => pane.includes("normal") && pane.includes("fast"), 5_000);
+        if (speed) await session!.sendLiteralText(speed);
+        await session!.sendKeys("Enter");
+      };
+
+      // The menu tags only the Token Pass model.
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 3);
+      const row = (model: string) => menu.find((line) => line.includes(model)) ?? "";
+      expect(row(tokenPassModel)).toContain("Token Pass · 200K context · Fast mode");
+      expect(row(fastModel)).not.toContain("Token Pass");
+      expect(row(plainModel)).not.toContain("Token Pass");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+
+      // A Token Pass model starts its speed stage on normal speed, and names
+      // Token Pass while fx has not seen this team use it.
+      await pickModel("glm", tokenPassModel, "effort");
+      await session.waitForText(`Switched to ${tokenPassModel} (effort: default, speed: normal)`, 5_000);
+      await session.waitForText(covers, 5_000);
+      expect(readSettings().fast_mode).toBe(false);
+
+      // Other models still start on Fast.
+      await pickModel("fast-model", fastModel, "speed");
+      await session.waitForPane(
+        (pane) => pane.split("\n").some((line) => line.includes(`Switched to ${fastModel}`) && line.includes("speed: fast")),
+        5_000,
+      );
+      expect(readSettings().fast_mode).toBe(true);
+
+      // Fast is still a choice for a Token Pass model, with a warning, and
+      // the speed stage starts on normal even with Fast mode on.
+      await pickModel("glm", tokenPassModel, "effort", "fast");
+      await session.waitForText(`Switched to ${tokenPassModel} (effort: default, speed: fast)`, 5_000);
+      await session.waitForText(fastWarning, 5_000);
+      expect(await scrollbackCount(covers)).toBe(1);
+
+      await session.sendText("/fast off");
+      const deadline = Date.now() + 5_000;
+      while (readSettings().fast_mode !== false && Date.now() < deadline) await Bun.sleep(50);
+      expect(readSettings().fast_mode).toBe(false);
+      await session.sendText("/fast on");
+      await waitForScrollbackCount(fastWarning, 2);
+      await session.sendText("/fast off");
+
+      // A response Token Pass served shows the team has it: the next switch
+      // does not name Token Pass again, and /credits points at its balance.
+      await session.sendText("Use Token Pass.");
+      await session.waitForText("TOKEN_PASS_REPLY", 10_000);
+      await pickModel("glm", tokenPassModel, "effort");
+      await waitForScrollbackCount(`Switched to ${tokenPassModel} (effort: default, speed: normal)`, 2);
+      expect(await scrollbackCount(covers)).toBe(1);
+
+      await session.sendText("/credits");
+      await session.waitForText("Token Pass credit is a separate balance.", 10_000);
+      expect(creditsRequests).toHaveLength(1);
+
+      expect(gateway.requests).toHaveLength(1);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
     },
     TEST_TIMEOUT,
   );

@@ -6,6 +6,7 @@ const collections = @import("../shared/collections.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const token_pass_mod = @import("../gateway/token_pass.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const io_mod = @import("../shared/io.zig");
@@ -415,6 +416,11 @@ pub const Runtime = struct {
     outcome: CatalogOutcome = .{},
     from_profile_settings: bool = false,
     menu: ModelMenu = .{},
+    /// Whether this credential's team has Token Pass, learned from the
+    /// provider that served its requests. It resets with the catalog, since
+    /// both belong to one credential and team. Main thread only, so the
+    /// mutex does not guard it.
+    token_pass: token_pass_mod.Tracker = .{},
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
         return .{
@@ -585,6 +591,21 @@ pub const Runtime = struct {
         self.requested_access = null;
         self.mutex.unlock(io_mod.getIo());
         self.cancel_requested.store(false, .seq_cst);
+        if (self.token_pass.status != .unknown) {
+            debug_trace.logf("catalog", "token pass status reset reason=credential_changed", .{});
+        }
+        self.token_pass = .{};
+    }
+
+    /// Records the provider that served one of this credential's requests.
+    pub fn observeServedBy(self: *Self, served_by: []const u8) void {
+        if (self.token_pass.observeServedBy(served_by)) {
+            debug_trace.logf("catalog", "token pass status=active served_by={s}", .{served_by});
+        }
+    }
+
+    pub fn tokenPassStatus(self: *const Self) token_pass_mod.Status {
+        return self.token_pass.status;
     }
 
     pub fn resetForProviderChange(self: *Self) void {

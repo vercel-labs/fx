@@ -3,6 +3,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
 const model_capabilities = @import("../../core/config/model_capabilities.zig");
+const token_pass = @import("../../core/gateway/token_pass.zig");
 const ui_render = @import("../render.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
@@ -290,7 +291,7 @@ fn modelFactsColumn(projection: ModelMenuProjection, width: u16) ?usize {
     var facts_width: usize = 0;
     var longest_name_width: usize = 8;
     for (projection.items) |item| {
-        facts_width = @max(facts_width, compactFactsWidth(item.capabilities));
+        facts_width = @max(facts_width, compactFactsWidth(item.id, item.capabilities));
         longest_name_width = @max(longest_name_width, display_width.visibleWidth(item.id));
     }
     if (facts_width == 0 or content_width < indent_width + 8 + 2 + facts_width) return null;
@@ -313,7 +314,7 @@ fn composeTitleRow(
 
     var facts: std.ArrayList(u8) = .empty;
     defer facts.deinit(alloc);
-    try appendCompactFacts(alloc, &facts, item.capabilities);
+    try appendCompactFacts(alloc, &facts, item.id, item.capabilities);
 
     const prefix_width = display_width.visibleWidthIgnoringAnsi(row.items);
     const content_width = @as(usize, width);
@@ -335,8 +336,10 @@ fn composeTitleRow(
 fn appendCompactFacts(
     alloc: Allocator,
     facts: *std.ArrayList(u8),
+    model_id: []const u8,
     capabilities: model_capabilities.Capabilities,
 ) !void {
+    if (token_pass.isFeaturedModel(model_id)) try appendMetadataFact(alloc, facts, token_pass_fact);
     if (capabilities.context_window) |tokens| try appendTokenFact(alloc, facts, tokens, "context");
     if (capabilities.max_output_tokens) |tokens| try appendTokenFact(alloc, facts, tokens, "output");
     if (capabilities.intrinsic_fast) try appendMetadataFact(alloc, facts, fast_fact);
@@ -349,9 +352,12 @@ fn appendCompactFacts(
 const fast_fact = "Fast";
 const fast_mode_fact = "Fast mode";
 const ultrafast_mode_fact = "Ultrafast mode";
+// Listed first, so a narrow row cuts the other facts and keeps this one.
+const token_pass_fact = "Token Pass";
 
-fn compactFactsWidth(capabilities: model_capabilities.Capabilities) usize {
+fn compactFactsWidth(model_id: []const u8, capabilities: model_capabilities.Capabilities) usize {
     var width: usize = 0;
+    if (token_pass.isFeaturedModel(model_id)) width += display_width.visibleWidth(token_pass_fact);
     if (capabilities.context_window) |tokens| {
         if (width > 0) width += display_width.visibleWidth(" · ");
         width += tokenFactWidth(tokens, "context");
@@ -922,4 +928,35 @@ test "model menu labels -fast models Fast and models that offer Fast mode as Fas
     defer fast_with_option.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, fast_with_option.items, "xai/grok-4.7-fast") != null);
     try std.testing.expect(std.mem.find(u8, fast_with_option.items, "1M context · Fast · Fast mode") != null);
+}
+
+test "model menu tags Token Pass models first and no other model" {
+    const alloc = std.testing.allocator;
+    const items = [_]model_cache_runtime.ModelMenuItem{
+        .{
+            .id = @constCast("zai/glm-5.3"),
+            .provider = "zai",
+            .capabilities = .{ .context_window = 200_000, .supports_fast_mode = true },
+        },
+        .{
+            .id = @constCast("zai/glm-5.3-fast"),
+            .provider = "zai",
+            .capabilities = .{ .context_window = 200_000 },
+        },
+    };
+    const projection: ModelMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .items = &items,
+    };
+    const rows = menuRowCount(projection, 100, 20);
+
+    var featured = try composeModelMenuRow(alloc, projection, 2, 100, rows);
+    defer featured.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, featured.items, "Token Pass · 200K context · Fast mode") != null);
+
+    var other = try composeModelMenuRow(alloc, projection, 3, 100, rows);
+    defer other.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, other.items, "zai/glm-5.3-fast") != null);
+    try std.testing.expect(std.mem.find(u8, other.items, "Token Pass") == null);
 }
