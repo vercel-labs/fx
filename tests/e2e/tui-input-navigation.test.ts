@@ -8,6 +8,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
@@ -280,16 +281,40 @@ async function waitForExactComposerRow(
 ): Promise<void> {
   const started = Date.now();
   let lastMatches: string[] = [];
+  let lastBars: string[] = [];
   while (Date.now() - started < READY_TIMEOUT) {
-    lastMatches = (await active.capturePaneGrid())
-      .map((line) => line.trimEnd())
-      .filter((line) => line === expected);
+    const rows = (await active.capturePaneGrid()).map((line) => line.trimEnd());
+    lastMatches = rows.filter((line) => line === expected);
+    lastBars = rows.filter((line) => line.startsWith("┃"));
     if (lastMatches.length === 1) return;
     await delay(25);
   }
   throw new Error(
-    `Timed out waiting for composer row ${JSON.stringify(expected)}; matches=${lastMatches.length}`,
+    `Timed out waiting for composer row ${JSON.stringify(expected)}; matches=${lastMatches.length}; rows with the bar: ${JSON.stringify(lastBars)}`,
   );
+}
+
+/// The pane grid and cursor once neither has changed for `steadyMs`.
+async function waitForSettledPane(
+  active: TmuxSession,
+  steadyMs = 300,
+): Promise<{ grid: string[]; cursor: { row: number; col: number } }> {
+  const started = Date.now();
+  let lastKey = "";
+  let steadySince = Date.now();
+  while (Date.now() - started < READY_TIMEOUT) {
+    const grid = await active.capturePaneGrid();
+    const cursor = active.cursorPosition();
+    const key = `${cursor.row}:${cursor.col}\n${grid.join("\n")}`;
+    if (key !== lastKey) {
+      lastKey = key;
+      steadySince = Date.now();
+    } else if (Date.now() - steadySince >= steadyMs) {
+      return { grid, cursor };
+    }
+    await delay(25);
+  }
+  throw new Error(`Timed out waiting for the pane to settle; last=${lastKey}`);
 }
 
 async function typeTwoRowDraft(active: TmuxSession): Promise<void> {
@@ -525,6 +550,398 @@ tmuxTest(
     );
     rows = footer.split("\n");
     expect(rowContaining(rows, `${control_prefix}👩‍💻Z`).line).toContain("👩‍💻Z");
+
+    expectCleanStderr();
+    expect(active.isAlive()).toBe(true);
+  },
+  TIMEOUT,
+);
+
+// กั้ง: ก with MAI HAN-AKAT and MAI THO, then ง. ที่นี่: two bases, each with
+// SARA II and MAI EK. A terminal draws every nonspacing mark on the cell
+// before it, so each cluster takes one cell.
+const THAI_KANG = "\u0E01\u0E31\u0E49\u0E07";
+const THAI_KAN = "\u0E01\u0E31\u0E49";
+const THAI_THI = "\u0E17\u0E35\u0E48";
+const THAI_NI = "\u0E19\u0E35\u0E48";
+const THAI_MAI_THO = "\u0E49";
+// A nonspacing mark with no base character before it, at the start of its row
+// or after nothing but zero-width characters, is drawn on U+25CC DOTTED
+// CIRCLE, in a cell of its own.
+const DOTTED_CIRCLE = "\u25CC";
+// One terminal cell holds at most 64 bytes of text, its base included: a
+// three-byte base takes 20 three-byte marks, 63 bytes, and a 21st would make 66.
+const CELL_MARKS = 20;
+
+tmuxTest(
+  "Thai nonspacing marks keep the composer cursor and repaint on the terminal's columns",
+  async () => {
+    const active = await startFx(60, 24);
+
+    await typeLiteral(active, `${THAI_KANG}abc`);
+    await waitForExactComposerRow(active, `┃ ${THAI_KANG}abc`);
+    const start = await active.waitForCursor((position) => position.col === 7, READY_TIMEOUT);
+
+    // Text typed after the marks lands right after them, with no gap.
+    await typeLiteral(active, `${THAI_THI}${THAI_NI}ok`);
+    await waitForExactComposerRow(active, `┃ ${THAI_KANG}abc${THAI_THI}${THAI_NI}ok`);
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 11,
+      READY_TIMEOUT,
+    );
+
+    // Left steps over a base and its marks at once.
+    await active.sendKeys("Left Left Left");
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 8,
+      READY_TIMEOUT,
+    );
+    await active.sendKeys("Left");
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 7,
+      READY_TIMEOUT,
+    );
+
+    // Backspace removes a base together with its marks.
+    await active.sendKeys("End BSpace BSpace BSpace");
+    await waitForExactComposerRow(active, `┃ ${THAI_KANG}abc${THAI_THI}`);
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 8,
+      READY_TIMEOUT,
+    );
+
+    // A mark with no base has no character to sit on, and the prompt's space
+    // cell is not one. It is drawn on a dotted circle in a cell of its own, so
+    // the cursor after "a" is one cell further than it is for "a" alone.
+    await active.sendKeys("C-u");
+    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
+    await typeLiteral(active, `${THAI_MAI_THO}a`);
+    await waitForExactComposerRow(active, `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}a`);
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 4,
+      READY_TIMEOUT,
+    );
+
+    // Marks after a bare mark stack on its circle: one cell, one cursor stop.
+    await active.sendKeys("C-u");
+    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
+    await typeLiteral(active, `${THAI_MAI_THO}\u0E31\u0E48a`);
+    await waitForExactComposerRow(active, `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}\u0E31\u0E48a`);
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 4,
+      READY_TIMEOUT,
+    );
+    await active.sendKeys("Left Left");
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 2,
+      READY_TIMEOUT,
+    );
+    await active.sendKeys("End BSpace BSpace");
+    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
+
+    // A mark after a base still takes no cell.
+    await typeLiteral(active, `a${THAI_MAI_THO}b`);
+    await waitForExactComposerRow(active, `┃ a${THAI_MAI_THO}b`);
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 4,
+      READY_TIMEOUT,
+    );
+
+    // A cluster in the last cell of a row wraps the character after it, not
+    // the cluster: "┃ " leaves 58 cells, 57 of them "a".
+    await active.sendKeys("C-u");
+    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
+    const fill = "a".repeat(57);
+    await typeLiteral(active, `${fill}${THAI_KANG}`);
+    const footer = await waitForActiveFooter(
+      active,
+      (text) => text.split("\n").some((line) => line.trimEnd() === "┃ \u0E07"),
+    );
+    const rows = footer.split("\n").map((line) => line.trimEnd());
+    const full = rows.indexOf(`┃ ${fill}${THAI_KAN}`);
+    expect(full).toBeGreaterThanOrEqual(0);
+    expect(rows[full + 1]).toBe("┃ \u0E07");
+    const wrapped = await active.waitForCursor((position) => position.col === 3, READY_TIMEOUT);
+    const grid = await active.capturePaneGrid();
+    expect(grid[wrapped.row]!.trimEnd()).toBe("┃ \u0E07");
+
+    // A Latin accent in the last cell stays on its letter too.
+    await active.sendKeys("C-u");
+    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
+    await typeLiteral(active, `${fill}e\u0301b`);
+    const latin = await waitForActiveFooter(
+      active,
+      (text) => text.split("\n").some((line) => line.trimEnd() === "┃ b"),
+    );
+    const latinRows = latin.split("\n").map((line) => line.trimEnd());
+    const accented = latinRows.indexOf(`┃ ${fill}e\u0301`);
+    expect(accented).toBeGreaterThanOrEqual(0);
+    expect(latinRows[accented + 1]).toBe("┃ b");
+
+    expectCleanStderr();
+    expect(active.isAlive()).toBe(true);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "a 2,000-cluster Thai draft wraps by cell and keeps the cursor on the terminal's column",
+  async () => {
+    // 2,000 clusters of three code points each, typed 100 clusters at a
+    // time, so the composer stays below the large-paste threshold and the
+    // text stays inline. Each row holds 58 clusters after "┃ ".
+    const active = await startFx(60, 24);
+    let typed = 0;
+    while (typed < 2_000) {
+      await typeLiteral(active, THAI_KAN.repeat(100));
+      typed += 100;
+      const tail = typed % 58;
+      await waitForExactComposerRow(active, `┃ ${THAI_KAN.repeat(tail)}`);
+      // The same row also shows up while earlier keys are still drawing, so
+      // check it only once the pane and the cursor have stopped changing.
+      const { grid, cursor } = await waitForSettledPane(active);
+      expect(cursor.col).toBe(2 + tail);
+      expect(grid[cursor.row]!.trimEnd()).toBe(`┃ ${THAI_KAN.repeat(tail)}`);
+      expect(grid[cursor.row - 1]!.trimEnd()).toBe(`┃ ${THAI_KAN.repeat(58)}`);
+    }
+
+    expectCleanStderr();
+    expect(active.isAlive()).toBe(true);
+  },
+  120_000,
+);
+
+/**
+ * Waits for `work`. When it fails because fx exited, the error says so and
+ * quotes what fx wrote to stderr.
+ */
+async function failIfExited<T>(active: TmuxSession, work: Promise<T>): Promise<T> {
+  return work.catch((error: unknown) => {
+    if (active.isAlive()) throw error;
+    throw new Error(`fx exited; stderr: ${readFileSync(stderrPath!, "utf8").trim()}`);
+  });
+}
+
+/**
+ * The composer row fx drew last, read back from its own recording. tmux keeps
+ * about 21 bytes of text per cell, so only fx's replay shows how many marks fx
+ * kept on a cell.
+ */
+function replayedComposerRow(active: TmuxSession, prefix: string): Promise<string> {
+  return active.kill().then(() => {
+    const tape = join(testHome!, "session.fxtape");
+    const golden = join(testHome!, "golden.txt");
+    const replay = spawnSync(FX_BIN, ["replay", tape, "--golden", golden], {
+      encoding: "utf8",
+      env: {
+        HOME: testHome!,
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        FX_SOUND: "0",
+        FX_DISABLE_KEYCHAIN: "1",
+      },
+    });
+    expect(replay.status).toBe(0);
+    // The golden file frames each screen row between two "|".
+    const rows = readFileSync(golden, "utf8")
+      .split("\n")
+      .map((row) => row.replace(/^\|/, "").replace(/\|$/, "").trimEnd())
+      .filter((row) => row.startsWith(prefix));
+    expect(rows).toHaveLength(1);
+    return rows[0]!;
+  });
+}
+
+// A cell keeps at most 64 bytes of text and drops the marks past that instead
+// of ending fx. 22 marks on one base ended fx before the drop existed, and 100
+// are far past it.
+for (const count of [CELL_MARKS, CELL_MARKS + 1, 22, 100]) {
+  tmuxTest(
+    `one base with ${count} stacked Thai marks keeps fx alive and the cell within 64 bytes`,
+    async () => {
+      const active = await startFx(60, 24, false, true);
+      await typeLiteral(active, `\u0E01${THAI_MAI_THO.repeat(count)}b`);
+      // "┃ " is two cells, then the base and b: the marks take no cell.
+      const at = await failIfExited(
+        active,
+        active.waitForCursor((position) => position.col === 4, READY_TIMEOUT),
+      );
+      const stacked = (await active.capturePaneGrid())[at.row]!.trimEnd();
+      expect(stacked.startsWith("┃ \u0E01")).toBe(true);
+      expect(stacked.endsWith(`${THAI_MAI_THO}b`)).toBe(true);
+      expect(active.isAlive()).toBe(true);
+      expectCleanStderr();
+      expect(await replayedComposerRow(active, "┃ \u0E01")).toBe(
+        `┃ \u0E01${THAI_MAI_THO.repeat(CELL_MARKS)}b`,
+      );
+    },
+    TIMEOUT,
+  );
+}
+
+tmuxTest(
+  "3,000 marks with no base arriving at once draw one circle, one cell wide, and keep fx alive",
+  async () => {
+    // Raw text, as `tmux paste-buffer` sends it, so the marks reach the
+    // composer instead of collapsing to a pasted-text placeholder. The bare
+    // marks stack on one circle: its 3 bytes and 20 marks fill 63 of the 64
+    // bytes, and the rest are dropped.
+    const active = await startFx(60, 24, false, true);
+    await typeLiteral(active, THAI_MAI_THO.repeat(3_000));
+    const { grid, cursor } = await failIfExited(active, waitForSettledPane(active));
+    expect(cursor.col).toBe(3);
+    const rows = grid.map((line) => line.trimEnd()).filter((line) => line.startsWith("┃"));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.startsWith(`┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}`)).toBe(true);
+    expect(active.isAlive()).toBe(true);
+    expectCleanStderr();
+    expect(await replayedComposerRow(active, `┃ ${DOTTED_CIRCLE}`)).toBe(
+      `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO.repeat(CELL_MARKS)}`,
+    );
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "a mark after a newline is drawn on its own circle and a mark after a base takes no cell",
+  async () => {
+    const active = await startFx(60, 24);
+    await active.pasteText(`a\n${THAI_MAI_THO}b\nc${THAI_MAI_THO}`);
+    await waitForExactComposerRow(active, "┃ a");
+    await waitForExactComposerRow(active, `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}b`);
+    await waitForExactComposerRow(active, `┃ c${THAI_MAI_THO}`);
+    // The cursor is after the mark on c: "┃ " and c.
+    await active.waitForCursor((position) => position.col === 3, READY_TIMEOUT);
+
+    // Up twice reaches the circle's row at the column of its cell.
+    await active.sendKeys("Home Up");
+    await active.waitForCursor((position) => position.col === 2, READY_TIMEOUT);
+    await active.sendKeys("Right");
+    await active.waitForCursor((position) => position.col === 3, READY_TIMEOUT);
+
+    expectCleanStderr();
+    expect(active.isAlive()).toBe(true);
+  },
+  TIMEOUT,
+);
+
+// U+200B ZERO WIDTH SPACE takes no cell and is no base for a mark.
+const ZERO_WIDTH_SPACE = "\u200B";
+
+tmuxTest(
+  "a mark after a zero-width space gets its own circle, and a sent message keeps its bare mark on a circle in its card",
+  async () => {
+    const active = await startFx(60, 24, true, false, 2);
+
+    // The mark follows only a zero-width character, so it has no base: it is
+    // drawn on a circle in a cell of its own, as a mark alone is, and the
+    // cursor after "a" is one cell further than it is for "a" alone.
+    await typeLiteral(active, `${ZERO_WIDTH_SPACE}${THAI_MAI_THO}a`);
+    await waitForExactComposerRow(
+      active,
+      `┃ ${ZERO_WIDTH_SPACE}${DOTTED_CIRCLE}${THAI_MAI_THO}a`,
+    );
+    const start = await active.waitForCursor((position) => position.col === 4, READY_TIMEOUT);
+
+    // The zero-width space, the mark, and the circle are one cursor stop.
+    await active.sendKeys("Left Left");
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 2,
+      READY_TIMEOUT,
+    );
+    await active.sendKeys("Right");
+    await active.waitForCursor(
+      (position) => position.row === start.row && position.col === 3,
+      READY_TIMEOUT,
+    );
+
+    // A sent message that starts with a bare mark keeps it, on a circle, in
+    // its card: the rail's space cell is not a base.
+    await active.sendKeys("End C-u");
+    await active.waitForPane(hasEmptyComposer, READY_TIMEOUT);
+    await typeLiteral(active, `${THAI_MAI_THO}abc`);
+    await waitForExactComposerRow(active, `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}abc`);
+    await active.sendKeys("Enter");
+    await active.waitForText("history prompt complete", READY_TIMEOUT);
+    const card = `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}abc`;
+    const first = await active.waitForPane(
+      (pane) => pane.split("\n").some((line) => line.trimEnd() === card),
+      READY_TIMEOUT,
+    );
+    expect(first.split("\n").filter((line) => line.trimEnd() === card)).toHaveLength(1);
+
+    // The same after a zero-width space. tmux does not keep the space in its
+    // capture of the card, so the row is read without it. The composer's draft
+    // row reads the same as the card until Enter is handled, so the card counts
+    // only once the gateway has the second request, which the test asserts next.
+    await typeLiteral(active, `${ZERO_WIDTH_SPACE}${THAI_MAI_THO}xyz`);
+    await active.sendKeys("Enter");
+    const zeroWidthCard = `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}xyz`;
+    await active.waitForPane(
+      (pane) =>
+        gateway?.requests.length === 2 &&
+        pane.split("\n").some((line) =>
+          line.replaceAll(ZERO_WIDTH_SPACE, "").trimEnd() === zeroWidthCard
+        ),
+      READY_TIMEOUT,
+    );
+
+    // The circle is only drawn: the model gets the bytes that were typed.
+    expect(gateway?.requests).toHaveLength(2);
+    const sent = (index: number): string => {
+      const messages = JSON.parse(gateway!.requests[index]!.body).prompt as Array<{
+        role: string;
+        content: Array<{ type: string; text?: string }>;
+      }>;
+      return messages[messages.length - 1]!.content[0]!.text!;
+    };
+    expect(sent(0)).toBe(`${THAI_MAI_THO}abc`);
+    expect(sent(1)).toBe(`${ZERO_WIDTH_SPACE}${THAI_MAI_THO}xyz`);
+
+    expectCleanStderr();
+    expect(active.isAlive()).toBe(true);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "in a window three columns wide the one content cell holds a bare mark's circle and the letter wraps",
+  async () => {
+    const active = await startFx(3, 24);
+    await typeLiteral(active, `${THAI_MAI_THO}a`);
+    await waitForExactComposerRow(active, `┃ ${DOTTED_CIRCLE}${THAI_MAI_THO}`);
+    await waitForExactComposerRow(active, "┃ a");
+    // The text ends at the right margin, where fx keeps the cursor on the last
+    // cell, column 2 of three.
+    await active.waitForCursor((position) => position.col === 2, READY_TIMEOUT);
+
+    expectCleanStderr();
+    expect(active.isAlive()).toBe(true);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "Thai marks in a window two columns wide leave the composer row as the bar alone",
+  async () => {
+    // "┃ " takes two cells, so the composer has no cell for a character and
+    // none for a mark. Twelve clusters carry 24 marks, 72 bytes, which is past
+    // the 64 bytes of combining text one terminal cell holds.
+    const active = await startFx(2, 24);
+    await typeLiteral(active, THAI_KAN.repeat(12));
+
+    const { grid } = await waitForSettledPane(active).catch((error: unknown) => {
+      if (active.isAlive()) throw error;
+      throw new Error(
+        `fx exited while the Thai marks were typed; stderr: ${readFileSync(stderrPath!, "utf8").trim()}`,
+      );
+    });
+    const rows = grid.map((line) => line.trimEnd()).filter((line) => line.startsWith("┃"));
+    expect(rows).toEqual(["┃"]);
+    expect(active.isAlive()).toBe(true);
+
+    // The draft is intact: a wider window draws all twelve clusters.
+    await active.resizeWindow(60, 24, 300);
+    await waitForExactComposerRow(active, `┃ ${THAI_KAN.repeat(12)}`);
 
     expectCleanStderr();
     expect(active.isAlive()).toBe(true);

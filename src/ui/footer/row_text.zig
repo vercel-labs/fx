@@ -59,15 +59,30 @@ const EllipsisPlacement = enum {
 };
 
 pub fn appendSingleLineEllipsized(alloc: Allocator, out: *std.ArrayList(u8), text: []const u8, width: usize) !void {
-    return appendProjectedSingleLine(alloc, out, text, width, .trailing);
+    return appendProjectedSingleLine(alloc, out, text, width, .trailing, false);
 }
 
 pub fn appendSingleLineMiddleEllipsized(alloc: Allocator, out: *std.ArrayList(u8), text: []const u8, width: usize) !void {
-    return appendProjectedSingleLine(alloc, out, text, width, .middle);
+    return appendProjectedSingleLine(alloc, out, text, width, .middle, false);
+}
+
+/// `appendSingleLineMiddleEllipsized` for a title that starts its row after a
+/// prefix cell, such as an indent, which is no base for a mark: a mark that
+/// starts the title is drawn on a circle of its own, which takes one of the
+/// `width` cells. `rowSingleLineWidth` measures what this draws.
+pub fn appendRowSingleLineMiddleEllipsized(alloc: Allocator, out: *std.ArrayList(u8), text: []const u8, width: usize) !void {
+    return appendProjectedSingleLine(alloc, out, text, width, .middle, true);
 }
 
 pub fn appendSingleLinePrefixBiasedEllipsized(alloc: Allocator, out: *std.ArrayList(u8), text: []const u8, width: usize) !void {
-    return appendProjectedSingleLine(alloc, out, text, width, .prefix_biased);
+    return appendProjectedSingleLine(alloc, out, text, width, .prefix_biased, false);
+}
+
+/// The cells `appendRowSingleLineMiddleEllipsized` draws for `text` when it
+/// fits: a newline reads as a space there, so a mark after one is no bare mark.
+pub fn rowSingleLineWidth(text: []const u8) usize {
+    const head = text[0 .. std.mem.findAny(u8, text, "\r\n") orelse text.len];
+    return display_width.visibleWidth(text) +| @intFromBool(display_width.bareMarkInRow(head) != null);
 }
 
 fn appendProjectedSingleLine(
@@ -76,6 +91,7 @@ fn appendProjectedSingleLine(
     text: []const u8,
     width: usize,
     placement: EllipsisPlacement,
+    comptime row_start: bool,
 ) !void {
     if (width == 0) return;
 
@@ -83,6 +99,16 @@ fn appendProjectedSingleLine(
     defer normalized.deinit(alloc);
     for (text) |byte| {
         try normalized.append(alloc, if (byte == '\n' or byte == '\r') ' ' else byte);
+    }
+    if (row_start and display_width.bareMarkInRow(normalized.items) != null) {
+        // The circle is a cell of the row, and the marks after it take none,
+        // so the cuts below keep them with it.
+        var drawn: std.Io.Writer.Allocating = .init(alloc);
+        defer drawn.deinit();
+        var at_row_start = true;
+        try display_width.writeRowPart(&drawn.writer, normalized.items, &at_row_start);
+        normalized.clearRetainingCapacity();
+        try normalized.appendSlice(alloc, drawn.written());
     }
 
     if (display_width.visibleWidth(normalized.items) <= width) {
@@ -260,4 +286,42 @@ test "single line ellipsis projections preserve semantic tails" {
     defer zero.deinit(alloc);
     try appendSingleLineMiddleEllipsized(alloc, &zero, "abcdef", 0);
     try std.testing.expectEqual(@as(usize, 0), zero.items.len);
+}
+
+test "row start title draws the circle of a bare mark in a cell of its own" {
+    const alloc = std.testing.allocator;
+
+    // A mark that starts the title has no base, so it takes a circle of its
+    // own, which counts in the width. A mark on a base gets none, and a mark
+    // after a newline, which reads as a space, is no bare mark.
+    var bare: std.ArrayList(u8) = .empty;
+    defer bare.deinit(alloc);
+    try appendRowSingleLineMiddleEllipsized(alloc, &bare, "\u{0E49}abc", 10);
+    try std.testing.expectEqualStrings("\u{25CC}\u{0E49}abc", bare.items);
+    try std.testing.expectEqual(@as(usize, 4), rowSingleLineWidth("\u{0E49}abc"));
+
+    var on_base: std.ArrayList(u8) = .empty;
+    defer on_base.deinit(alloc);
+    try appendRowSingleLineMiddleEllipsized(alloc, &on_base, "a\u{0E49}bc", 10);
+    try std.testing.expectEqualStrings("a\u{0E49}bc", on_base.items);
+    try std.testing.expectEqual(@as(usize, 3), rowSingleLineWidth("a\u{0E49}bc"));
+
+    var after_newline: std.ArrayList(u8) = .empty;
+    defer after_newline.deinit(alloc);
+    try appendRowSingleLineMiddleEllipsized(alloc, &after_newline, "a\n\u{0E49}b", 10);
+    try std.testing.expectEqualStrings("a \u{0E49}b", after_newline.items);
+    try std.testing.expectEqual(@as(usize, 2), rowSingleLineWidth("a\n\u{0E49}b"));
+
+    // The cut keeps the circle with its marks in the head and counts its cell.
+    var cut: std.ArrayList(u8) = .empty;
+    defer cut.deinit(alloc);
+    try appendRowSingleLineMiddleEllipsized(alloc, &cut, "\u{0E49}abcdefgh", 5);
+    try std.testing.expectEqualStrings("\u{25CC}\u{0E49}a\u{2026}gh", cut.items);
+    try std.testing.expectEqual(@as(usize, 5), display_width.visibleWidth(cut.items));
+
+    // The plain projection leaves the mark where it is.
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(alloc);
+    try appendSingleLineMiddleEllipsized(alloc, &plain, "\u{0E49}abc", 10);
+    try std.testing.expectEqualStrings("\u{0E49}abc", plain.items);
 }

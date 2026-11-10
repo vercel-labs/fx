@@ -2635,11 +2635,11 @@ pub const Grid = struct {
                 if (cell.codepoint == '│') try out.print("\x1b[{d}G", .{col});
                 const suffix = next.combiningSuffix(cell.combining_suffix_id);
                 const guard_margin_suffix = !prev.autowrap and
-                    cell.width == 2 and
-                    col + 1 == next.cols and
+                    @as(u32, col) + cell.width - 1 == next.cols and
                     suffix != null;
                 // With DECAWM disabled, terminals can drop suffix codepoints
-                // from a display unit whose base ends at the right margin.
+                // from a display unit whose base ends at the right margin,
+                // one cell wide or two.
                 if (guard_margin_suffix) try out.writeAll("\x1b[?7h");
                 const disputed_width = suffix != null and hasVariationSelector(suffix.?);
                 // A terminal that draws this glyph one cell narrow never writes
@@ -4764,6 +4764,46 @@ test "diffBand temporarily enables autowrap for a suffixed wide cell at the marg
     try Grid.diffBand(non_margin_prev, non_margin, 1, 1, &non_margin_diff.writer);
     try testing.expect(std.mem.find(u8, non_margin_diff.written(), "\x1b[?7h") == null);
     try testing.expect(std.mem.find(u8, non_margin_diff.written(), "👩‍💻") != null);
+}
+
+test "diffBand temporarily enables autowrap for a suffixed one-cell base at the margin" {
+    // A Latin letter with an accent and a Thai consonant with its vowel and
+    // tone mark, each in the last column: the terminal keeps the marks only
+    // when autowrap is on while they are written.
+    for ([_][]const u8{ "e\u{0301}", "\u{0E01}\u{0E31}\u{0E49}" }) |unit| {
+        var prev = try Grid.init(testing.allocator, 6, 2);
+        defer prev.deinit();
+        prev.autowrap = false;
+
+        var next = try Grid.init(testing.allocator, 6, 2);
+        defer next.deinit();
+        next.autowrap = false;
+        try next.feed("\x1b[1;6H");
+        try next.feed(unit);
+        try next.feed("\x1b[2;1HZ");
+
+        var diff: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer diff.deinit();
+        try Grid.diffBand(prev, next, 1, 2, &diff.writer);
+        const guarded = try std.mem.concat(testing.allocator, u8, &.{ "\x1b[?7h", unit, "\x1b[?7l" });
+        defer testing.allocator.free(guarded);
+        try testing.expect(std.mem.find(u8, diff.written(), guarded) != null);
+
+        var non_margin_prev = try Grid.init(testing.allocator, 6, 1);
+        defer non_margin_prev.deinit();
+        non_margin_prev.autowrap = false;
+        var non_margin = try Grid.init(testing.allocator, 6, 1);
+        defer non_margin.deinit();
+        non_margin.autowrap = false;
+        try non_margin.feed("\x1b[1;5H");
+        try non_margin.feed(unit);
+
+        var non_margin_diff: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer non_margin_diff.deinit();
+        try Grid.diffBand(non_margin_prev, non_margin, 1, 1, &non_margin_diff.writer);
+        try testing.expect(std.mem.find(u8, non_margin_diff.written(), "\x1b[?7h") == null);
+        try testing.expect(std.mem.find(u8, non_margin_diff.written(), unit) != null);
+    }
 }
 
 test "diffTo emits \\x1b[0m at end when last style was non-default" {

@@ -2193,6 +2193,32 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "approval amendment draws a bare mark on a dotted circle in a cell of its own",
+    async () => {
+      const ctx = await openApprovalPrompt("approval bare mark");
+
+      // The mark has no base: the space after "Yes," is not one, so the mark
+      // is drawn on a circle that takes a cell of its own.
+      const feedback = "\u0E49abc";
+      await ctx.session.sendKeys("Tab");
+      await ctx.session.sendLiteralText(feedback);
+      await waitForGridState(ctx.session, "approval bare mark circle", (grid) =>
+        grid.some((line) => line.includes("Yes, \u25CC\u0E49abc")),
+      );
+      expect(ctx.gateway.requests).toHaveLength(1);
+
+      // The circle is only drawn: the model gets the bytes that were typed.
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.waitForText("approval bare mark handled", TIMEOUT);
+      const body = ctx.gateway.requests[1]?.body ?? "";
+      expect(requestContainsExactString(body, feedback)).toBe(true);
+      expect(body.includes("\u25CC")).toBe(false);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "approval prompt discards bracketed paste controls and nested markers",
     async () => {
       const ctx = await openApprovalPrompt("approval paste");
@@ -2980,6 +3006,172 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.waitForText("question freeform digits handled", TIMEOUT);
       const body = ctx.gateway.requests[1]?.body ?? "";
       expect(requestContainsExactString(body, "42")).toBe(true);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "question freeform answer draws a bare mark on a dotted circle in a cell of its own",
+    async () => {
+      const ctx = await openQuestionPrompt("question bare mark");
+
+      await ctx.session.sendLiteralText("3");
+      await waitForQuestionPane(ctx.session, "question bare mark selected", (value) =>
+        hasQuestionSelection(value, 3, ""),
+      );
+      // The mark has no base: the space after "3)" is not one, so the mark
+      // is drawn on a circle that takes a cell of its own.
+      const answer = "\u0E49abc";
+      await ctx.session.sendLiteralText(answer);
+      const row = "    3) \u25CC\u0E49abc";
+      await waitForGridState(ctx.session, "question bare mark circle", (grid) =>
+        grid.some((line) => line.trimEnd() === row),
+      );
+
+      // The circle is only drawn: the model gets the bytes that were typed.
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.waitForText("question bare mark handled", TIMEOUT);
+      const body = ctx.gateway.requests[1]?.body ?? "";
+      expect(requestContainsExactString(body, answer)).toBe(true);
+      expect(body.includes("\u25CC")).toBe(false);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "question option label and resolved answer draw a bare mark on a dotted circle in a cell of its own",
+    async () => {
+      const label = "\u0E49abc";
+      const ctx = await launchScenario([
+        outerToolCalls([
+          {
+            id: "question_bare_label_1",
+            name: "ask_user_question",
+            input: {
+              questions: [
+                {
+                  question: QUESTION_PROMPT,
+                  options: [{ label }, { label: "Run tests" }],
+                },
+              ],
+            },
+          },
+        ]),
+        outerText("question bare label handled"),
+      ]);
+
+      await ctx.session.sendText("Ask me which path to take.");
+      await ctx.session.waitForText(QUESTION_PROMPT, TIMEOUT);
+      // The mark has no base: the space after "1)" is not one, so the mark is
+      // drawn on a circle that takes a cell of its own.
+      await waitForGridState(ctx.session, "question bare label circle", (grid) =>
+        grid.some((line) => line.trimEnd() === "    1) \u25CC\u0E49abc"),
+      );
+
+      // The answer is the label. The row it leaves in the transcript has the
+      // same circle, after a five-cell indent.
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.waitForText("question bare label handled", TIMEOUT);
+      await waitForGridState(ctx.session, "resolved bare mark circle", (grid) =>
+        grid.some((line) => line.trimEnd() === "     \u25CC\u0E49abc"),
+      );
+
+      // The circle is only drawn: the model gets the bytes of the label.
+      const body = ctx.gateway.requests[1]?.body ?? "";
+      expect(requestContainsExactString(body, label)).toBe(true);
+      expect(body.includes("\u25CC")).toBe(false);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "question header and option description draw a bare mark on a dotted circle in a cell of its own",
+    async () => {
+      const header = `\u0E49${QUESTION_PROMPT}`;
+      const ctx = await launchScenario([
+        outerToolCalls([
+          {
+            id: "question_bare_header_1",
+            name: "ask_user_question",
+            input: {
+              questions: [
+                {
+                  question: header,
+                  options: [
+                    { label: "Run tests", description: "\u0E49abc" },
+                    { label: "Skip tests" },
+                  ],
+                },
+              ],
+            },
+          },
+        ]),
+        outerText("question bare header handled"),
+      ]);
+
+      await ctx.session.sendText("Ask me which path to take.");
+      await ctx.session.waitForText(QUESTION_PROMPT, TIMEOUT);
+      // The header draws after a two-cell indent, and the description in its
+      // own column after the label (37 cells in at this width). Neither is a
+      // base for a mark, so each mark is drawn on a circle of its own.
+      await waitForGridState(ctx.session, "question bare header circle", (grid) =>
+        grid.some((line) => line.trimEnd() === `  \u25CC\u0E49${QUESTION_PROMPT}`),
+      );
+      await waitForGridState(ctx.session, "question bare description circle", (grid) =>
+        grid.some((line) =>
+          line.startsWith("    1) Run tests") &&
+          line.indexOf("\u25CC") === 37 &&
+          line.trimEnd().endsWith("\u25CC\u0E49abc")
+        ),
+      );
+
+      // The circle is only drawn: the model gets no circle.
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.waitForText("question bare header handled", TIMEOUT);
+      const body = ctx.gateway.requests[1]?.body ?? "";
+      expect(body.includes("\u25CC")).toBe(false);
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "approval command draws a bare mark on a dotted circle in a cell of its own",
+    async () => {
+      const ctx = await launchScenario([
+        outerToolCalls([
+          {
+            id: "command_bare_mark_1",
+            name: "shell",
+            input: {
+              request: {
+                action: "run",
+                command: "\u0E49abc",
+                yield_time_ms: 30_000,
+                timeout_ms: 600_000,
+              },
+            },
+          },
+        ]),
+        outerText("approval command bare mark handled"),
+      ]);
+
+      await ctx.session.sendText("Run the bare mark command.");
+      await ctx.session.waitForText(APPROVAL_PROMPT, TIMEOUT);
+      // The command starts a row after a hard newline and a four-cell indent,
+      // which is no base for a mark, so the mark is drawn on a circle of its own.
+      await waitForGridState(ctx.session, "approval command bare mark circle", (grid) =>
+        grid.some((line) => line.trimEnd() === "    \u25CC\u0E49abc"),
+      );
+
+      // 3 declines the command, and the model answers.
+      await ctx.session.sendKeys("3");
+      await ctx.session.waitForText("approval command bare mark handled", TIMEOUT);
+      const body = ctx.gateway.requests[1]?.body ?? "";
+      expect(body.includes("\u25CC")).toBe(false);
       await assertProcessAliveAndClean(ctx);
     },
     TIMEOUT,

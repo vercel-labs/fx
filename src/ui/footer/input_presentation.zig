@@ -91,8 +91,19 @@ pub fn appendMessageLayoutRow(
     var safe = try text_utils.encodeTerminalSafe(alloc, normalized, std.math.maxInt(usize));
     defer safe.deinit(alloc);
     const ellipsis = layout.truncated and index + 1 == layout.row_count and layout.content_width > 0;
-    try row_text.appendClipped(alloc, row, safe.bytes, layout.content_width - @as(u16, @intFromBool(ellipsis)));
+    try appendRowClipped(alloc, row, safe.bytes, layout.content_width - @as(u16, @intFromBool(ellipsis)));
     if (ellipsis) try row.appendSlice(alloc, "…");
+}
+
+/// `row_text.appendClipped` for text that draws after a prefix cell, which is
+/// no base for a mark: a mark that starts the row is drawn on a circle that
+/// takes one of the `width` cells, as `steering_message_layout` counts it.
+fn appendRowClipped(alloc: Allocator, row: *std.ArrayList(u8), bytes: []const u8, width: u16) !void {
+    const bare = display_width.bareMarkInRow(bytes) orelse return row_text.appendClipped(alloc, row, bytes, width);
+    try row_text.appendClipped(alloc, row, bytes[0..bare.start], width);
+    if (width == 0) return;
+    try row.appendSlice(alloc, display_width.bare_mark_base);
+    try row_text.appendClipped(alloc, row, bytes[bare.start..], width - 1);
 }
 
 test "steering rows use the dotted rail without an escape hint" {
@@ -169,6 +180,42 @@ test "steering preview truncates after the second wide glyph" {
     try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
     try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "┋ 界") != null);
     try std.testing.expect(std.mem.find(u8, rows.rows.items[1].items, "┋ 海…") != null);
+}
+
+test "steering row draws a bare mark on a dotted circle in a cell of its own" {
+    const alloc = std.testing.allocator;
+    const rail = "┋ ";
+
+    // A mark that starts the message has no base: the rail's space is not
+    // one, so the mark is drawn on a circle that takes a cell of its own.
+    var bare = try composeSteeringMessageRows(alloc, "\u{0E49}abc", 20, 2, true);
+    defer bare.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), bare.rows.items.len);
+    const bare_row = bare.rows.items[0].items;
+    try std.testing.expectEqualStrings(
+        rail ++ "\u{25CC}\u{0E49}abc",
+        bare_row[ui_render.dim_style.len .. bare_row.len - ui_render.reset_style.len],
+    );
+
+    // A mark on a base gets no circle.
+    var on_base = try composeSteeringMessageRows(alloc, "a\u{0E49}bc", 20, 2, true);
+    defer on_base.deinit(alloc);
+    const base_row = on_base.rows.items[0].items;
+    try std.testing.expectEqualStrings(
+        rail ++ "a\u{0E49}bc",
+        base_row[ui_render.dim_style.len .. base_row.len - ui_render.reset_style.len],
+    );
+
+    // The message wraps after the circle: width 6 leaves four cells after the
+    // rail, and the second row starts with no mark, so it has no circle.
+    var wrapped = try composeSteeringMessageRows(alloc, "\u{0E49}abcdef", 6, 2, true);
+    defer wrapped.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), wrapped.rows.items.len);
+    const expected = [_][]const u8{ rail ++ "\u{25CC}\u{0E49}abc", rail ++ "def" };
+    for (wrapped.rows.items, expected) |row, text| {
+        try std.testing.expectEqualStrings(text, row.items[ui_render.dim_style.len .. row.items.len - ui_render.reset_style.len]);
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 6);
+    }
 }
 
 test "steering rows visibly escape terminal control bytes" {
@@ -982,6 +1029,7 @@ pub fn composeVisibleInputRows(
                 unit.row_index == window.first_row and window.first_row > 0,
                 &row_started,
                 &remaining_cells,
+                &omitted_positive_unit,
             );
             try appendLayoutUnit(alloc, &current, source, unit, &remaining_cells, &omitted_positive_unit);
         },
@@ -996,6 +1044,7 @@ pub fn composeVisibleInputRows(
                 row.index == window.first_row and window.first_row > 0,
                 &row_started,
                 &remaining_cells,
+                &omitted_positive_unit,
             );
             try finishComposedInputRow(alloc, &current, source.terminal_cols);
             try result.rows.append(alloc, current);
@@ -1038,6 +1087,7 @@ fn startComposedInputRow(
     hidden_above: bool,
     started: *bool,
     remaining_cells: *usize,
+    omitted_positive_unit: *bool,
 ) !void {
     if (started.*) return;
     started.* = true;
@@ -1048,6 +1098,9 @@ fn startComposedInputRow(
     if (!hidden_above and width > 1) try row_text.appendClipped(alloc, row, " ", width - 1);
     const width_usize: usize = width;
     remaining_cells.* = if (width_usize > prefix.cell_width) width_usize - prefix.cell_width else 0;
+    // A row with no content cells, in a window as wide as its prefix or
+    // narrower, draws no character, so it draws no mark either.
+    omitted_positive_unit.* = remaining_cells.* == 0;
 }
 
 fn appendLayoutUnit(
@@ -1058,7 +1111,15 @@ fn appendLayoutUnit(
     remaining_cells: *usize,
     omitted_positive_unit: *bool,
 ) !void {
-    if (remaining_cells.* == 0) return;
+    // A full row still takes the zero-width units after its last character,
+    // such as Thai vowel and tone marks, which draw on that character's cell.
+    // A unit with cells that it has no room for is not drawn, and the marks
+    // after it go with it.
+    const zero_width_text = unit.kind == .text and unit.cell_width == 0;
+    if (remaining_cells.* == 0 and !zero_width_text) {
+        if (unit.cell_width > 0) omitted_positive_unit.* = true;
+        return;
+    }
 
     const selected = if (source.selection) |selection|
         unit.raw_start < selection.end and unit.raw_end > selection.start
@@ -1099,6 +1160,15 @@ fn appendLayoutUnitContent(
             } else {
                 omitted_positive_unit.* = true;
             }
+        },
+        .bare_mark => {
+            // The mark has no base to sit on, so it gets the circle and one
+            // cell, and the marks after it stack there. A full row never gets
+            // here: appendLayoutUnit returns first and flags the omission.
+            try row.appendSlice(alloc, display_width.bare_mark_base);
+            try row.appendSlice(alloc, source.input[unit.raw_start..unit.raw_end]);
+            remaining_cells.* -= unit.cell_width;
+            omitted_positive_unit.* = false;
         },
         .paste_placeholder => {
             const emit_cells = @min(unit.cell_width, remaining_cells.*);
@@ -1272,6 +1342,107 @@ test "composeVisibleInputRows paints selected input without changing visible wid
         display_width.visibleWidthIgnoringAnsi(plain_rows.rows.items[0].items),
         display_width.visibleWidthIgnoringAnsi(rows.rows.items[0].items),
     );
+}
+
+/// Composes every row of `input` in a window `cols` wide and requires each
+/// row's text, with its escape sequences removed, to be the matching entry of
+/// `expected`.
+fn expectComposedRows(input: []const u8, cols: u16, expected: []const []const u8) !void {
+    const alloc = std.testing.allocator;
+    const source = visual_layout.Source{ .input = input, .cursor = input.len, .terminal_cols = cols };
+    const summary = visual_layout.summarize(source, null);
+    const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, summary.total_rows);
+    var composed = try composeVisibleInputRows(alloc, source, window);
+    defer composed.deinit(alloc);
+
+    try std.testing.expectEqual(expected.len, composed.rows.items.len);
+    for (expected, composed.rows.items) |want, row| {
+        var plain: std.ArrayList(u8) = .empty;
+        defer plain.deinit(alloc);
+        var i: usize = 0;
+        while (i < row.items.len) {
+            if (row.items[i] == 0x1b and i + 1 < row.items.len and row.items[i + 1] == '[') {
+                i += 2;
+                while (i < row.items.len and (row.items[i] < 0x40 or row.items[i] > 0x7e)) i += 1;
+                i += 1;
+                continue;
+            }
+            try plain.append(alloc, row.items[i]);
+            i += 1;
+        }
+        try std.testing.expectEqualStrings(want, plain.items);
+    }
+}
+
+test "composer row with no content cells holds no mark of an undrawn character" {
+    const alloc = std.testing.allocator;
+    // "┃ " takes two cells, so a window two columns wide or narrower leaves a
+    // row no cell for a character. Every unit stays on that one row, and the
+    // marks of the characters it cannot draw must not land on the prefix.
+    var twelve: std.ArrayList(u8) = .empty;
+    defer twelve.deinit(alloc);
+    for (0..12) |_| try twelve.appendSlice(alloc, "\u{0E01}\u{0E31}\u{0E49}");
+    const drafts = [_][]const u8{
+        "\u{0E01}\u{0E31}\u{0E49}\u{0E07}\u{0E19}\u{0E49}\u{0E33}",
+        // Marks with no base come before the first character.
+        "\u{0E31}\u{0E49}\u{0E01}\u{0E31}",
+        "e\u{0301}a\u{0300}",
+        "\u{754C}\u{0301}",
+        // A space hangs past the margin and has no cell either.
+        "a \u{0301}b",
+        twelve.items,
+    };
+    for (drafts) |draft| {
+        try expectComposedRows(draft, 1, &.{"┃"});
+        try expectComposedRows(draft, 2, &.{"┃ "});
+    }
+}
+
+test "composer row with one content cell keeps the marks of the character it draws" {
+    // Three columns leave one cell after "┃ ": กั้ takes it and ง wraps to the
+    // next row. A mark with no base takes that cell on a dotted circle, and the
+    // letter after it wraps. 界 needs two cells, so it is not drawn and its
+    // accent goes with it.
+    try expectComposedRows("\u{0E01}\u{0E31}\u{0E49}\u{0E07}", 3, &.{ "┃ \u{0E01}\u{0E31}\u{0E49}", "┃ \u{0E07}" });
+    try expectComposedRows("\u{0E31}\u{0E01}\u{0E49}", 3, &.{ "┃ \u{25CC}\u{0E31}", "┃ \u{0E01}\u{0E49}" });
+    try expectComposedRows("\u{754C}\u{0301}\u{0E01}", 3, &.{ "┃ ", "┃ \u{0E01}" });
+}
+
+test "composer row draws a mark with no base on a dotted circle of its own cell" {
+    // A mark at the start of the draft, or after a newline, has no character
+    // to sit on, and the prompt's space cell is not one. It takes a cell on
+    // U+25CC, and the marks after it stack on that cell.
+    try expectComposedRows("\u{0E49}a", 60, &.{"┃ \u{25CC}\u{0E49}a"});
+    try expectComposedRows("\u{0301}a", 60, &.{"┃ \u{25CC}\u{0301}a"});
+    try expectComposedRows("\u{0E31}\u{0E49}a", 60, &.{"┃ \u{25CC}\u{0E31}\u{0E49}a"});
+    try expectComposedRows("a\n\u{0E49}b", 60, &.{ "┃ a", "┃ \u{25CC}\u{0E49}b" });
+    // After a base, a mark takes no cell.
+    try expectComposedRows("a\u{0E49}b", 60, &.{"┃ a\u{0E49}b"});
+    // Three columns leave one cell: the circle takes it and the letter wraps.
+    try expectComposedRows("\u{0E49}a", 3, &.{ "┃ \u{25CC}\u{0E49}", "┃ a" });
+}
+
+test "composer row draws a mark after zero-width characters on a circle of its own cell" {
+    // A zero-width space, a joiner, and a byte order mark take no cell, so the
+    // mark after them has no base: it gets the circle, as a mark alone does.
+    try expectComposedRows("\u{200B}\u{0E49}a", 60, &.{"┃ \u{200B}\u{25CC}\u{0E49}a"});
+    try expectComposedRows("\u{200D}\u{0E49}\u{0E48}a", 60, &.{"┃ \u{200D}\u{25CC}\u{0E49}\u{0E48}a"});
+    try expectComposedRows("\u{FEFF}\u{0301}a", 60, &.{"┃ \u{FEFF}\u{25CC}\u{0301}a"});
+    try expectComposedRows("a\n\u{200B}\u{0E49}b", 60, &.{ "┃ a", "┃ \u{200B}\u{25CC}\u{0E49}b" });
+    // After a base, the same zero-width character leaves the mark on that base.
+    try expectComposedRows("a\u{200B}\u{0E49}b", 60, &.{"┃ a\u{200B}\u{0E49}b"});
+    // A variation selector has no glyph of its own: it gets no circle.
+    try expectComposedRows("\u{FE0F}a", 60, &.{"┃ \u{FE0F}a"});
+    // Three columns leave one cell: the circle takes it and the letter wraps.
+    try expectComposedRows("\u{200B}\u{0E49}a", 3, &.{ "┃ \u{200B}\u{25CC}\u{0E49}", "┃ a" });
+}
+
+test "composer row drops the marks after a unit that does not fit a full row" {
+    // Two content cells: "ab" fills the row, the space hangs past the margin
+    // and is not drawn, and the accent that follows belongs to the space. It
+    // must not move onto b. An accent on b itself stays.
+    try expectComposedRows("ab \u{0301}", 4, &.{"┃ ab"});
+    try expectComposedRows("ab\u{0301}", 4, &.{"┃ ab\u{0301}"});
 }
 
 test "inline completion suffix uses dim style and clips to the current row" {

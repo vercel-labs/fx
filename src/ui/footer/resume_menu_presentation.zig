@@ -337,7 +337,7 @@ fn matchingColumns(projection: SessionMenuProjection) MetadataColumns {
         const age = session_catalog.relativeActivityAgeCompact(&age_buf, summary.updated_at_ms, projection.now_ms);
         var turns_buf: [32]u8 = undefined;
         const turns = sessionTurnsText(&turns_buf, summary.history_len);
-        cols.title = @max(cols.title, display_width.visibleWidth(session_catalog.displayTitle(summary)));
+        cols.title = @max(cols.title, row_text.rowSingleLineWidth(session_catalog.displayTitle(summary)));
         cols.workspace = @max(cols.workspace, display_width.visibleWidth(sessionWorkspaceLabel(summary)));
         cols.age = @max(cols.age, display_width.visibleWidth(age));
         cols.turns = @max(cols.turns, display_width.visibleWidth(turns));
@@ -377,7 +377,7 @@ fn composeTitleRow(
     const metadata_overhead = prefix_width + picker_presentation.inline_picker_column_gap_width + metadata_width;
     const available_title_width = content_width -| metadata_overhead;
     const show_metadata = metadata_width > 0 and available_title_width >= minimum_title_column_width;
-    const measured_title_width = @max(columns.title, display_width.visibleWidth(session_catalog.displayTitle(summary)));
+    const measured_title_width = @max(columns.title, row_text.rowSingleLineWidth(session_catalog.displayTitle(summary)));
     const title_col = if (show_metadata)
         @min(measured_title_width, available_title_width)
     else
@@ -391,7 +391,7 @@ fn composeTitleRow(
     // Selection is signaled by brightness: bold bright white when selected,
     // dim gray otherwise, so the two are clearly distinct. No marker glyph.
     try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
-    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, session_catalog.displayTitle(summary), title_budget);
+    try row_text.appendRowSingleLineMiddleEllipsized(alloc, &row, session_catalog.displayTitle(summary), title_budget);
     try row.appendSlice(alloc, ui_render.reset_style);
 
     if (show_metadata) {
@@ -1011,4 +1011,137 @@ test "resume menu keeps the selected paginated action visible in two rows" {
     var selected_load_more = try composeSessionMenuRow(alloc, projection, 1, 80, 2);
     defer selected_load_more.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected_load_more.items, "Load more") != null);
+}
+
+test "resume menu draws a title that starts with a bare mark on a dotted circle in a cell of its own" {
+    const alloc = std.testing.allocator;
+    const summaries = [_]session_store.SessionSummary{
+        .{
+            .id = @constCast("one"),
+            .workspace_root = @constCast("/tmp/resume-catalog"),
+            .title = @constCast("\u{0E49}abcd"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1_000,
+            .conversation_language = .literal("en"),
+            .history_len = 1,
+        },
+        .{
+            .id = @constCast("two"),
+            .workspace_root = @constCast("/tmp/resume-catalog"),
+            .title = @constCast("abcd"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1_000,
+            .conversation_language = .literal("en"),
+            .history_len = 1,
+        },
+        .{
+            .id = @constCast("three"),
+            .workspace_root = @constCast("/tmp/resume-catalog"),
+            .title = @constCast("a\u{0E49}bc"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1_000,
+            .conversation_language = .literal("en"),
+            .history_len = 1,
+        },
+    };
+    const projection: SessionMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .summaries = &summaries,
+        .scope = .current_workspace,
+        .now_ms = 1_000 + 8 * std.time.ms_per_min,
+    };
+
+    // The title draws after a two-cell indent, which is no base for a mark, so
+    // a mark that starts it takes a circle of its own. A mark on a base gets
+    // none. The circle's cell counts in the title column, so every row's
+    // metadata starts in the same column.
+    var bare = try composeSessionMenuRow(alloc, projection, 2, 120, 6);
+    defer bare.deinit(alloc);
+    var plain = try composeSessionMenuRow(alloc, projection, 3, 120, 6);
+    defer plain.deinit(alloc);
+    var on_base = try composeSessionMenuRow(alloc, projection, 4, 120, 6);
+    defer on_base.deinit(alloc);
+
+    try std.testing.expect(std.mem.find(u8, bare.items, "\u{25CC}\u{0E49}abcd") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, plain.items, "\u{25CC}"));
+    try std.testing.expect(std.mem.find(u8, on_base.items, "a\u{0E49}bc") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, on_base.items, "\u{25CC}"));
+
+    const bare_title = std.mem.find(u8, bare.items, "\u{25CC}") orelse return error.TestMissingCircle;
+    try std.testing.expectEqual(@as(usize, 2), display_width.visibleWidthIgnoringAnsi(bare.items[0..bare_title]));
+
+    const bare_meta = std.mem.find(u8, bare.items, "resume-catalog") orelse return error.TestMissingMetadata;
+    const plain_meta = std.mem.find(u8, plain.items, "resume-catalog") orelse return error.TestMissingMetadata;
+    const base_meta = std.mem.find(u8, on_base.items, "resume-catalog") orelse return error.TestMissingMetadata;
+    const column = display_width.visibleWidthIgnoringAnsi(bare.items[0..bare_meta]);
+    try std.testing.expectEqual(column, display_width.visibleWidthIgnoringAnsi(plain.items[0..plain_meta]));
+    try std.testing.expectEqual(column, display_width.visibleWidthIgnoringAnsi(on_base.items[0..base_meta]));
+
+    // A row measured alone, with no shared columns, sizes its own title column
+    // by the circle as well: its metadata starts one cell after the metadata
+    // of a title of the same letters with no mark.
+    var bare_alone = try composeTitleRow(alloc, summaries[0], false, projection.now_ms, .{}, 120);
+    defer bare_alone.deinit(alloc);
+    var plain_alone = try composeTitleRow(alloc, summaries[1], false, projection.now_ms, .{}, 120);
+    defer plain_alone.deinit(alloc);
+    const bare_alone_meta = std.mem.find(u8, bare_alone.items, "resume-catalog") orelse return error.TestMissingMetadata;
+    const plain_alone_meta = std.mem.find(u8, plain_alone.items, "resume-catalog") orelse return error.TestMissingMetadata;
+    try std.testing.expectEqual(
+        display_width.visibleWidthIgnoringAnsi(plain_alone.items[0..plain_alone_meta]) + 1,
+        display_width.visibleWidthIgnoringAnsi(bare_alone.items[0..bare_alone_meta]),
+    );
+}
+
+test "resume menu keeps a title that starts with a bare mark inside the width" {
+    const alloc = std.testing.allocator;
+    // The longest title a session can have is 240 bytes: 80 marks.
+    var marks: std.ArrayList(u8) = .empty;
+    defer marks.deinit(alloc);
+    for (0..80) |_| try marks.appendSlice(alloc, "\u{0E49}");
+    const summaries = [_]session_store.SessionSummary{
+        .{
+            .id = @constCast("one"),
+            .workspace_root = @constCast("/tmp/resume-catalog"),
+            .title = @constCast("\u{0E49}abcdefghijklmnopqrstuvwxyz"),
+            .created_at_ms = 1,
+            .updated_at_ms = 1_000,
+            .conversation_language = .literal("en"),
+            .history_len = 1,
+        },
+        .{
+            .id = @constCast("two"),
+            .workspace_root = @constCast("/tmp/resume-catalog"),
+            .title = marks.items,
+            .created_at_ms = 1,
+            .updated_at_ms = 1_000,
+            .conversation_language = .literal("en"),
+            .history_len = 1,
+        },
+    };
+    const projection: SessionMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .summaries = &summaries,
+        .scope = .current_workspace,
+        .now_ms = 1_000 + 8 * std.time.ms_per_min,
+    };
+
+    // The circle takes one cell of the title's budget, so the row never
+    // passes the width with or without the metadata cluster, and the circle
+    // is drawn once at the start of the title.
+    var width: u16 = 8;
+    while (width <= 80) : (width += 1) {
+        var row = try composeSessionMenuRow(alloc, projection, 2, width, 6);
+        defer row.deinit(alloc);
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, row.items, "\u{25CC}"));
+        try std.testing.expect(std.mem.find(u8, row.items, "\u{25CC}\u{0E49}a") != null);
+
+        // A title of marks alone is one circle with every mark stacked on it.
+        var stacked = try composeSessionMenuRow(alloc, projection, 3, width, 6);
+        defer stacked.deinit(alloc);
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(stacked.items) <= width);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, stacked.items, "\u{25CC}"));
+    }
 }

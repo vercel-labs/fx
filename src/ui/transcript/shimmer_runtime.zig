@@ -71,21 +71,48 @@ fn previewActivityRowLabel(alloc: std.mem.Allocator, label: []const u8, cols: u1
     return .{ .bytes = allocation, .allocation = allocation };
 }
 
+/// A static status row whose text, after the status sign, starts the row: a
+/// mark that starts it has no base, since the sign's space is none, so
+/// `display_width.writeRowPart` draws it on a circle of its own.
+fn previewStaticActivityRow(alloc: std.mem.Allocator, row: []const u8, cols: u16) !ActivityLabelPreview {
+    const text_start = display_width.statusPrefixEnd(row);
+    if (display_width.bareMarkInRow(row[text_start..]) == null) return previewActivityRowLabel(alloc, row, cols);
+
+    var drawn: std.Io.Writer.Allocating = .init(alloc);
+    errdefer drawn.deinit();
+    try drawn.writer.writeAll(row[0..text_start]);
+    var at_row_start = true;
+    try display_width.writeRowPart(&drawn.writer, row[text_start..], &at_row_start);
+    const with_circle = try drawn.toOwnedSlice();
+    errdefer alloc.free(with_circle);
+
+    // The circle is a cell of the row, and the marks after it take none, so
+    // the cut keeps them with it.
+    const preview = try previewActivityRowLabel(alloc, with_circle, cols);
+    if (preview.allocation != null) {
+        alloc.free(with_circle);
+        return preview;
+    }
+    return .{ .bytes = preview.bytes, .allocation = with_circle };
+}
+
 fn appendStaticActivityLine(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayList(u8),
+    out: *std.Io.Writer,
     prefix: []const u8,
     continuation_indent_width: usize,
     chunk: []const u8,
     first: bool,
 ) !void {
-    if (!first) try out.append(alloc, '\n');
+    if (!first) try out.writeByte('\n');
     if (first) {
-        try out.appendSlice(alloc, prefix);
+        try out.writeAll(prefix);
     } else {
-        try out.appendNTimes(alloc, ' ', continuation_indent_width);
+        try out.splatByteAll(' ', continuation_indent_width);
     }
-    try out.appendSlice(alloc, chunk);
+    // The chunk starts a row after the sign or the indent, neither of which is
+    // a base for a mark.
+    var at_row_start = true;
+    try display_width.writeRowPart(out, chunk, &at_row_start);
 }
 
 fn wrappedStaticActivityLabel(
@@ -96,17 +123,17 @@ fn wrappedStaticActivityLabel(
     preserve_trailing_context: bool,
 ) !ActivityLabelPreview {
     const row = activityRowLabel(label);
-    if (max_rows <= 1 or display_width.visibleWidthIgnoringAnsi(row) <= cols) {
-        return previewActivityRowLabel(alloc, row, cols);
-    }
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-
-    const safe_cols = @max(@as(usize, cols), 1);
     const prefix_end = display_width.statusPrefixEnd(row);
     const prefix = row[0..prefix_end];
     const prefix_width = display_width.visibleWidthIgnoringAnsi(prefix);
+    if (max_rows <= 1 or prefix_width + display_width.rowWidthIgnoringAnsi(row[prefix_end..]) <= cols) {
+        return previewStaticActivityRow(alloc, row, cols);
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+
+    const safe_cols = @max(@as(usize, cols), 1);
     const continuation_indent_width = @max(prefix_width, 1);
     var remaining = row[prefix_end..];
     var row_count: u16 = 0;
@@ -115,38 +142,43 @@ fn wrappedStaticActivityLabel(
         const indent_width = if (first) prefix_width else continuation_indent_width;
         const available = if (safe_cols > indent_width) safe_cols - indent_width else 1;
         const last_row = row_count + 1 == max_rows;
-        if (last_row and display_width.visibleWidthIgnoringAnsi(remaining) > available) {
+        if (last_row and display_width.rowWidthIgnoringAnsi(remaining) > available) {
             const marker = omissionMarker(@intCast(@min(available, std.math.maxInt(u16))));
             const content_width = available -| marker.len;
             if (preserve_trailing_context) {
                 const suffix = display_width.suffixByWidthIgnoringAnsi(remaining, content_width);
-                try appendStaticActivityLine(alloc, &out, prefix, continuation_indent_width, marker, first);
-                try out.appendSlice(alloc, suffix);
+                try appendStaticActivityLine(&out.writer, prefix, continuation_indent_width, marker, first);
+                try out.writer.writeAll(suffix);
             } else {
-                var chunk = display_width.wrapCutIgnoringAnsi(remaining, content_width);
+                // A bare mark stays whole on its row, so with no cell left for
+                // text the row holds the omission marker alone.
+                var chunk = if (content_width == 0)
+                    remaining[0..0]
+                else
+                    display_width.rowWrapCutIgnoringAnsi(remaining, content_width);
                 if (chunk.len == 0 and content_width > 0) {
                     const unit = display_width.displayUnitAt(remaining, 0);
                     chunk = remaining[0..unit.byte_len];
                 }
-                try appendStaticActivityLine(alloc, &out, prefix, continuation_indent_width, chunk, first);
-                try out.appendSlice(alloc, marker);
+                try appendStaticActivityLine(&out.writer, prefix, continuation_indent_width, chunk, first);
+                try out.writer.writeAll(marker);
             }
             remaining = "";
         } else {
-            var chunk = display_width.wrapCutIgnoringAnsi(remaining, available);
+            var chunk = display_width.rowWrapCutIgnoringAnsi(remaining, available);
             if (chunk.len == 0) {
                 const unit = display_width.displayUnitAt(remaining, 0);
                 chunk = remaining[0..unit.byte_len];
             }
-            try appendStaticActivityLine(alloc, &out, prefix, continuation_indent_width, chunk, first);
+            try appendStaticActivityLine(&out.writer, prefix, continuation_indent_width, chunk, first);
             remaining = display_width.trimBreakWhitespace(remaining[chunk.len..]);
         }
         row_count += 1;
         first = false;
     }
 
-    if (row.len == 0) try out.appendSlice(alloc, row);
-    const allocation = try out.toOwnedSlice(alloc);
+    if (row.len == 0) try out.writer.writeAll(row);
+    const allocation = try out.toOwnedSlice();
     return .{ .bytes = allocation, .allocation = allocation };
 }
 
@@ -616,6 +648,106 @@ test "activity surface painter breaks static status rows at word boundaries" {
     try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(3, 10).?.codepoint);
     try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(4, 2).?.codepoint);
     try std.testing.expectEqual(@as(u21, 'b'), fixtures.surface.cellAt(4, 3).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'b'), fixtures.surface.cellAt(4, 6).?.codepoint);
+    try fixtures.surface.validate();
+}
+
+test "static status row that starts with a bare mark is drawn on a dotted circle in a cell of its own" {
+    const alloc = std.testing.allocator;
+
+    // The text after the status sign starts its row after a cell that is no
+    // base for a mark, so a mark that starts it takes a circle of its own, and
+    // so does one that starts a row after a soft break at a space. A mark on a
+    // base gets none.
+    const first = try wrappedStaticActivityLabel(alloc, "⚠ \u{0E49}abc", 40, 3, false);
+    defer first.deinit(alloc);
+    try std.testing.expectEqualStrings("⚠ \u{25CC}\u{0E49}abc", first.bytes);
+
+    const on_base = try wrappedStaticActivityLabel(alloc, "⚠ a\u{0E49}bc", 40, 3, false);
+    defer on_base.deinit(alloc);
+    try std.testing.expectEqualStrings("⚠ a\u{0E49}bc", on_base.bytes);
+
+    const soft = try wrappedStaticActivityLabel(alloc, "⚠ aaaa \u{0E49}bbb", 8, 3, false);
+    defer soft.deinit(alloc);
+    try std.testing.expectEqualStrings("⚠ aaaa\n  \u{25CC}\u{0E49}bbb", soft.bytes);
+
+    // The same for a label that is cut with an omission marker.
+    const cut = try wrappedStaticActivityLabel(alloc, "⚠ \u{0E49}abcdefghijklmnopqrstuvwxyz", 12, 1, false);
+    defer cut.deinit(alloc);
+    try std.testing.expectEqualStrings("⚠ \u{25CC}\u{0E49}abcdef...", cut.bytes);
+}
+
+test "static status counts the circle of a bare mark in its rows at every width" {
+    const alloc = std.testing.allocator;
+    const label = "⚠ \u{0E49}abcdefghijklmnopqrstuvwxyz0123456789";
+
+    // The circle takes one of the cells after the sign, so each row keeps
+    // inside the width, the circle is drawn once, and no letter is lost.
+    var cols: u16 = 4;
+    while (cols <= 48) : (cols += 1) {
+        const preview = try wrappedStaticActivityLabel(alloc, label, cols, 40, false);
+        defer preview.deinit(alloc);
+        var lines = std.mem.splitScalar(u8, preview.bytes, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+        }
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview.bytes, "\u{25CC}"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview.bytes, "a"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview.bytes, "z"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview.bytes, "9"));
+    }
+
+    // A label cut after its second row keeps inside the width as well, down to
+    // a row with no cell left for text after the omission marker.
+    cols = 4;
+    while (cols <= 48) : (cols += 1) {
+        for ([_]bool{ false, true }) |preserve_trailing_context| {
+            const preview = try wrappedStaticActivityLabel(alloc, label, cols, 2, preserve_trailing_context);
+            defer preview.deinit(alloc);
+            var lines = std.mem.splitScalar(u8, preview.bytes, '\n');
+            var line_count: usize = 0;
+            while (lines.next()) |line| : (line_count += 1) {
+                try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+            }
+            try std.testing.expect(line_count <= 2);
+            if (cols <= 20) try std.testing.expectEqual(@as(usize, 2), line_count);
+        }
+    }
+
+    // The bare mark of a row after a soft break is the last row's whole text
+    // when the row has no cell left for text after the omission marker.
+    cols = 4;
+    while (cols <= 8) : (cols += 1) {
+        const preview = try wrappedStaticActivityLabel(alloc, "⚠ aaa \u{0E49}bbbbbb", cols, 2, false);
+        defer preview.deinit(alloc);
+        var lines = std.mem.splitScalar(u8, preview.bytes, '\n');
+        while (lines.next()) |line| {
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+        }
+    }
+}
+
+test "activity surface painter draws a status row that starts with a bare mark on a circle" {
+    var plan = testPlan(
+        .{ .transient_row = .{ .row = 3, .row_count = 2, .gap_above_rows = 0 } },
+        .{ .top = 3, .bottom = 4, .owner = .activity },
+    );
+    plan.layout.cols = 8;
+    var fixtures = try testSurface(plan);
+    defer fixtures.surface.deinit();
+    defer fixtures.shadow.deinit();
+
+    const result = try paintActivityIntoSurface(&fixtures.surface, .{
+        .label = "⚠ aaaa \u{0E49}bbb",
+        .shimmer_pos = -8,
+        .style = .danger,
+    });
+
+    try std.testing.expect(result.painted);
+    try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(4, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), fixtures.surface.cellAt(4, 2).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 0x25CC), fixtures.surface.cellAt(4, 3).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'b'), fixtures.surface.cellAt(4, 4).?.codepoint);
     try std.testing.expectEqual(@as(u21, 'b'), fixtures.surface.cellAt(4, 6).?.codepoint);
     try fixtures.surface.validate();
 }

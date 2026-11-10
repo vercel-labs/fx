@@ -2,6 +2,7 @@ const std = @import("std");
 const question_state = @import("../../core/agent/question_prompt.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const permission_request = @import("../../core/permissions/permission_request.zig");
 const approval_prompt = @import("../../core/permissions/approval_prompt.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
@@ -1284,6 +1285,70 @@ fn expectFrameCellForeground(frame: *const footer_viewport.ComposedFooterFrame, 
     return error.TestUnexpectedResult;
 }
 
+/// The footer frame for `draft` typed into the composer of a window `cols`
+/// wide, and the screen row of the composer's first row.
+const DraftFrame = struct {
+    frame: footer_viewport.ComposedFooterFrame,
+    input_row: u16,
+
+    fn deinit(self: *DraftFrame, alloc: Allocator) void {
+        self.frame.deinit(alloc);
+    }
+};
+
+fn composeDraftFrame(alloc: Allocator, draft: []const u8, cols: u16) !DraftFrame {
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    try input.textReplacementState().replace(alloc, draft);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 18,
+            .cols = cols,
+            .content_bottom = 12,
+            .divider_top_row = 13,
+            .input_row = 14,
+            .divider_bottom_row = 15,
+            .hint_row = 16,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 8,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    const ctx = testContext(&input);
+    const geometry = input_presentation.measureRawInputGeometry(
+        ctx,
+        shell.layout.cols,
+        shell.layout.content_bottom,
+        true,
+        false,
+        false,
+        false,
+    );
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = geometry.input_extra,
+        .input_visible = true,
+        .composer_top_chrome_rows = composerTopChromeRows(),
+        .picker_rows = 0,
+        .banner_active = false,
+        .input_summary = geometry.summary,
+        .input_window = geometry.window,
+        .total_lines = geometry.total_lines,
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    return .{
+        .frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint),
+        .input_row = frame_plan.paint.footer.input_base,
+    };
+}
+
 test "transcript viewer footer is its keys alone on one row" {
     const alloc = std.testing.allocator;
     var input = InputRuntime{};
@@ -1467,6 +1532,246 @@ test "footer paints an inline completion suffix without moving the composer curs
         shell.layout.cols,
         frame.cursor.col,
         .{ .indexed = 245 },
+    );
+}
+
+test "composer cursor follows Thai clusters on the VT grid" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    // Each Thai base carries its nonspacing marks in its own cell, so the
+    // cursor lands one cell past the last character, as terminals draw it.
+    const Case = struct { text: []const u8, cursor_col: u16, cells: []const u21 };
+    const cases = [_]Case{
+        // กั้งabc
+        .{
+            .text = "\u{0E01}\u{0E31}\u{0E49}\u{0E07}abc",
+            .cursor_col = 8,
+            .cells = &.{ 0x0E01, 0x0E07, 'a', 'b', 'c' },
+        },
+        // กั้งabcที่นี่ok
+        .{
+            .text = "\u{0E01}\u{0E31}\u{0E49}\u{0E07}abc\u{0E17}\u{0E35}\u{0E48}\u{0E19}\u{0E35}\u{0E48}ok",
+            .cursor_col = 12,
+            .cells = &.{ 0x0E01, 0x0E07, 'a', 'b', 'c', 0x0E17, 0x0E19, 'o', 'k' },
+        },
+        // น้ำ: SARA AM takes its own cell.
+        .{
+            .text = "\u{0E19}\u{0E49}\u{0E33}",
+            .cursor_col = 5,
+            .cells = &.{ 0x0E19, 0x0E33 },
+        },
+    };
+
+    for (cases) |case| {
+        var draft = try composeDraftFrame(alloc, case.text, 40);
+        defer draft.deinit(alloc);
+
+        try std.testing.expectEqual(draft.input_row, draft.frame.cursor.row);
+        try std.testing.expectEqual(case.cursor_col, draft.frame.cursor.col);
+
+        var grid = try paintedRowGrid(alloc, &draft, draft.input_row, 40);
+        defer grid.deinit();
+        for (case.cells, 0..) |codepoint, index| {
+            const cell = grid.cellAt(1, @intCast(3 + index)) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(codepoint, cell.codepoint);
+        }
+        const after = grid.cellAt(1, case.cursor_col) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u21, ' '), after.codepoint);
+    }
+}
+
+test "composer keeps the marks of a Thai cluster in the last column" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    // "┃ " leaves 38 of 40 cells: 37 "a", then กั้ in the last one, then ง
+    // on the next row.
+    const fill: [37]u8 = @splat('a');
+    const text = fill ++ "\u{0E01}\u{0E31}\u{0E49}\u{0E07}".*;
+    var draft = try composeDraftFrame(alloc, &text, 40);
+    defer draft.deinit(alloc);
+
+    // The cursor sits after ง on the second row; the full row is above it.
+    try std.testing.expectEqual(draft.input_row, draft.frame.cursor.row);
+    try std.testing.expectEqual(@as(u16, 4), draft.frame.cursor.col);
+    var grid = try paintedRowGrid(alloc, &draft, draft.frame.cursor.row - 1, 40);
+    defer grid.deinit();
+    const before = grid.cellAt(1, 39) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, 'a'), before.codepoint);
+    try std.testing.expectEqual(@as(u32, 0), before.combining_suffix_id);
+    const last = grid.cellAt(1, 40) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, 0x0E01), last.codepoint);
+    try std.testing.expectEqualStrings("\u{0E31}\u{0E49}", grid.combiningSuffix(last.combining_suffix_id) orelse "");
+}
+
+/// The VT grid that screen row `screen_row` of `drawn` paints, `cols` cells
+/// wide. The frame's `input_row` is the composer's last row, the cursor's.
+fn paintedRowGrid(alloc: Allocator, drawn: *const DraftFrame, screen_row: u16, cols: u16) !vt_emulator.Grid {
+    var grid = try vt_emulator.Grid.init(alloc, cols, 1);
+    errdefer grid.deinit();
+    var fed = false;
+    for (drawn.frame.rows.items) |row| {
+        if (row.row != screen_row) continue;
+        try grid.feed(row.text.items);
+        fed = true;
+    }
+    if (!fed) return error.TestUnexpectedResult;
+    return grid;
+}
+
+/// Paints `draft` in a window `cols` wide and requires the composer's first
+/// row to hold the bar and nothing else: no character and no combining mark.
+fn expectBarAlone(alloc: Allocator, draft: []const u8, cols: u16) !void {
+    var drawn = try composeDraftFrame(alloc, draft, cols);
+    defer drawn.deinit(alloc);
+    var grid = try paintedRowGrid(alloc, &drawn, drawn.input_row, cols);
+    defer grid.deinit();
+
+    try std.testing.expectEqual(@as(u21, 0x2503), (grid.cellAt(1, 1) orelse return error.TestUnexpectedResult).codepoint);
+    var col: u16 = 1;
+    while (col <= cols) : (col += 1) {
+        const cell = grid.cellAt(1, col) orelse return error.TestUnexpectedResult;
+        if (col > 1) try std.testing.expectEqual(@as(u21, ' '), cell.codepoint);
+        try std.testing.expectEqual(@as(u32, 0), cell.combining_suffix_id);
+    }
+}
+
+test "composer in a window with no content cells draws the bar alone" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    // "┃ " takes two cells, so in a window two columns wide or narrower a row
+    // has no cell for a character, and the marks of the characters it cannot
+    // draw must not pile up on the prefix.
+    var twelve: std.ArrayList(u8) = .empty;
+    defer twelve.deinit(alloc);
+    for (0..12) |_| try twelve.appendSlice(alloc, "\u{0E01}\u{0E31}\u{0E49}");
+    const drafts = [_][]const u8{
+        "\u{0E01}\u{0E31}\u{0E49}\u{0E07}\u{0E19}\u{0E49}\u{0E33}",
+        // Marks with no base come before the first character.
+        "\u{0E31}\u{0E49}\u{0E01}\u{0E31}",
+        "e\u{0301}a\u{0300}",
+        "\u{754C}\u{0301}",
+        // A space hangs past the margin and has no cell either.
+        "a \u{0301}b",
+        twelve.items,
+    };
+    for ([_]u16{ 1, 2 }) |cols| {
+        for (drafts) |draft| try expectBarAlone(alloc, draft, cols);
+    }
+}
+
+test "composer with one content cell keeps the marks of the character it draws" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    // Three columns leave one cell after "┃ ": กั้ takes it and ง wraps to the
+    // next row; 界 needs two cells, is not drawn, and takes its accent with it.
+    const Cell = struct { codepoint: u21, marks: []const u8 };
+    const Case = struct { text: []const u8, rows: []const Cell };
+    const cases = [_]Case{
+        .{
+            .text = "\u{0E01}\u{0E31}\u{0E49}\u{0E07}",
+            .rows = &.{ .{ .codepoint = 0x0E01, .marks = "\u{0E31}\u{0E49}" }, .{ .codepoint = 0x0E07, .marks = "" } },
+        },
+        .{
+            .text = "\u{754C}\u{0301}\u{0E01}",
+            .rows = &.{ .{ .codepoint = ' ', .marks = "" }, .{ .codepoint = 0x0E01, .marks = "" } },
+        },
+    };
+    for (cases) |case| {
+        var drawn = try composeDraftFrame(alloc, case.text, 3);
+        defer drawn.deinit(alloc);
+        const first_row = drawn.input_row - @as(u16, @intCast(case.rows.len - 1));
+        for (case.rows, 0..) |expected, index| {
+            var grid = try paintedRowGrid(alloc, &drawn, first_row + @as(u16, @intCast(index)), 3);
+            defer grid.deinit();
+            const cell = grid.cellAt(1, 3) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(expected.codepoint, cell.codepoint);
+            const marks = if (cell.combining_suffix_id == 0) "" else grid.combiningSuffix(cell.combining_suffix_id) orelse "";
+            try std.testing.expectEqualStrings(expected.marks, marks);
+        }
+    }
+}
+
+test "composer paints a mark with no base on a dotted circle and leaves the prefix cell bare" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    // "┃ ": the bar is column 1 and the prompt's space cell column 2. The mark
+    // at the start of the draft gets the circle in column 3, the letter after
+    // it sits in column 4, and the cursor after it in column 5.
+    var drawn = try composeDraftFrame(alloc, "\u{0E49}a", 40);
+    defer drawn.deinit(alloc);
+    try std.testing.expectEqual(drawn.input_row, drawn.frame.cursor.row);
+    try std.testing.expectEqual(@as(u16, 5), drawn.frame.cursor.col);
+
+    var grid = try paintedRowGrid(alloc, &drawn, drawn.input_row, 40);
+    defer grid.deinit();
+    const space = grid.cellAt(1, 2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, ' '), space.codepoint);
+    try std.testing.expectEqual(@as(u32, 0), space.combining_suffix_id);
+    const circle = grid.cellAt(1, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, 0x25CC), circle.codepoint);
+    try std.testing.expectEqualStrings("\u{0E49}", grid.combiningSuffix(circle.combining_suffix_id) orelse "");
+    const letter = grid.cellAt(1, 4) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, 'a'), letter.codepoint);
+    try std.testing.expectEqual(@as(u32, 0), letter.combining_suffix_id);
+}
+
+test "composer paints a mark after a zero-width space on a dotted circle and keeps it off the prefix cell" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    // The zero-width space takes no cell, so the mark after it has no base:
+    // the circle is in column 3, the letter in column 4, and the cursor
+    // after it in column 5, exactly as for a mark alone.
+    var drawn = try composeDraftFrame(alloc, "\u{200B}\u{0E49}a", 40);
+    defer drawn.deinit(alloc);
+    try std.testing.expectEqual(drawn.input_row, drawn.frame.cursor.row);
+    try std.testing.expectEqual(@as(u16, 5), drawn.frame.cursor.col);
+
+    var grid = try paintedRowGrid(alloc, &drawn, drawn.input_row, 40);
+    defer grid.deinit();
+    const space = grid.cellAt(1, 2) orelse return error.TestUnexpectedResult;
+    const space_text = if (space.combining_suffix_id == 0) "" else grid.combiningSuffix(space.combining_suffix_id) orelse "";
+    try std.testing.expect(std.mem.find(u8, space_text, "\u{0E49}") == null);
+    const circle = grid.cellAt(1, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, 0x25CC), circle.codepoint);
+    try std.testing.expectEqualStrings("\u{0E49}", grid.combiningSuffix(circle.combining_suffix_id) orelse "");
+    const letter = grid.cellAt(1, 4) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, 'a'), letter.codepoint);
+}
+
+test "composer paints a long run of marks with no base on one circle within the cell's limit" {
+    const alloc = std.testing.allocator;
+    ui_render.initTheme(false, null);
+    defer ui_render.initTheme(false, null);
+
+    // 3,000 marks have no base. The first takes the circle's cell, the rest
+    // stack on it, the cell keeps at most 64 bytes of text, and painting it
+    // does not fail.
+    const marks = text_utils.repeat("\u{0E49}", 3_000);
+    var drawn = try composeDraftFrame(alloc, marks, 60);
+    defer drawn.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 4), drawn.frame.cursor.col);
+
+    var grid = try paintedRowGrid(alloc, &drawn, drawn.input_row, 60);
+    defer grid.deinit();
+    const space = grid.cellAt(1, 2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 0), space.combining_suffix_id);
+    const circle = grid.cellAt(1, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u21, 0x25CC), circle.codepoint);
+    try std.testing.expectEqualStrings(
+        text_utils.repeat("\u{0E49}", 20),
+        grid.combiningSuffix(circle.combining_suffix_id) orelse "",
     );
 }
 

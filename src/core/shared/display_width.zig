@@ -35,6 +35,7 @@ const wide_ranges = packRanges(&unicode_data.wide_ranges);
 const emoji_presentation_ranges = packRanges(&unicode_data.emoji_presentation_ranges);
 const emoji_modifier_ranges = packRanges(&unicode_data.emoji_modifier_ranges);
 const variation_bases = packRanges(&unicode_data.variation_bases);
+const thai_nonspacing_ranges = packRanges(&unicode_data.thai_nonspacing_ranges);
 
 const RgiNode = packed struct(u32) {
     edge_start: u13,
@@ -239,7 +240,7 @@ pub noinline fn displayUnitAt(text: []const u8, index: usize) DisplayUnit {
         (first_byte >= '0' and first_byte <= '9')) and
         hasRgiKeycapSuffix(text, index + 1);
     if (first_byte < 0x80 and !may_start_keycap) {
-        const cell_width: usize = if (first_byte == 0 or first_byte < 32 or first_byte == 0x7f) 0 else 1;
+        const cell_width: usize = if (isControlByte(first_byte)) 0 else 1;
         return .{ .byte_len = 1, .cell_width = cell_width };
     }
 
@@ -373,8 +374,17 @@ pub noinline fn wrapCutIgnoringAnsi(text: []const u8, max_width: usize) []const 
     const prefix = prefixByWidthIgnoringAnsi(text, max_width);
     if (prefix.len == text.len) return prefix;
 
+    if (lastBreakSpace(prefix, 0)) |space_index| {
+        if (space_index > 0) return text[0..space_index];
+    }
+    return prefix;
+}
+
+/// The last space or tab of `prefix` at or after `from`, outside an escape
+/// sequence.
+fn lastBreakSpace(prefix: []const u8, from: usize) ?usize {
     var last_space: ?usize = null;
-    var index: usize = 0;
+    var index = from;
     while (index < prefix.len) {
         // A space inside an escape, such as an OSC 8 URL, is not a break.
         if (prefix[index] == 0x1b) {
@@ -385,10 +395,7 @@ pub noinline fn wrapCutIgnoringAnsi(text: []const u8, max_width: usize) []const 
         if (prefix[index] == ' ' or prefix[index] == '\t') last_space = index;
         index += unit.byte_len;
     }
-    if (last_space) |space_index| {
-        if (space_index > 0) return text[0..space_index];
-    }
-    return prefix;
+    return last_space;
 }
 
 pub noinline fn trimBreakWhitespace(text: []const u8) []const u8 {
@@ -397,13 +404,142 @@ pub noinline fn trimBreakWhitespace(text: []const u8) []const u8 {
     return text[index..];
 }
 
+/// Whether the code point at `index` is a nonspacing mark: a combining mark,
+/// a variation selector, or a Thai vowel or tone mark, which a terminal draws
+/// on the cell before it. Controls and the other zero-width characters, such
+/// as a zero-width space, a joiner, or a byte order mark, are not.
+fn isNonspacingMarkAt(text: []const u8, index: usize) bool {
+    if (index >= text.len or text[index] < 0x80) return false;
+    return isCombining(decodeNextRune(text, index).codepoint);
+}
+
+/// What a bare mark is drawn on: U+25CC DOTTED CIRCLE.
+pub const bare_mark_base = "\u{25CC}";
+
+/// The unit at `index` as a bare mark, for a caller that has found `index` at
+/// content column 0 of its row, with nothing that takes a cell before it on the
+/// row. A nonspacing mark there has no base to sit on, and the prefix cell
+/// before the row is not one, so a surface that draws text after a prefix cell
+/// draws the mark on `bare_mark_base`, which takes the one cell that the unit
+/// returned counts. The unit's `byte_len` is the mark's alone: the marks after
+/// it take no cell and stack on the circle. Zero-width characters before the
+/// mark, such as a zero-width space, a joiner, or a byte order mark, take no
+/// cell and are no base. A variation selector has no glyph of its own to draw
+/// on a circle, so it is no bare mark. `tests/tla/display_width/DisplayWidth.tla`
+/// `BareCol0` models the rule.
+pub fn bareMarkUnitAt(text: []const u8, index: usize) ?DisplayUnit {
+    if (!isNonspacingMarkAt(text, index)) return null;
+    if (isVariationSelector(decodeNextRune(text, index).codepoint)) return null;
+    const unit = displayUnitAt(text, index);
+    if (unit.cell_width != 0) return null;
+    return .{ .byte_len = unit.byte_len, .cell_width = 1 };
+}
+
+/// `displayUnitAt` for the unit at content column `column` of its row.
+pub fn rowUnitAt(text: []const u8, index: usize, column: usize) DisplayUnit {
+    if (column == 0) {
+        if (bareMarkUnitAt(text, index)) |bare| return bare;
+    }
+    return displayUnitAt(text, index);
+}
+
+/// Where the bare mark of a row is, in the text that starts the row.
+const BareMark = struct {
+    /// The mark's first byte: `bare_mark_base` is drawn before it.
+    start: usize,
+    /// The first byte after the mark and the zero-width characters stacked on
+    /// it, up to a control byte. Together they take the one cell of the circle.
+    end: usize,
+};
+
+/// The bare mark that `row` holds, when `row` starts at content column 0 and
+/// only zero-width characters come before the mark.
+pub fn bareMarkInRow(row: []const u8) ?BareMark {
+    var index: usize = 0;
+    while (index < row.len) {
+        if (bareMarkUnitAt(row, index)) |bare| {
+            var end = index + bare.byte_len;
+            while (end < row.len and !isControlByte(row[end])) {
+                const stacked = displayUnitAt(row, end);
+                if (stacked.cell_width != 0) break;
+                end += @max(stacked.byte_len, 1);
+            }
+            return .{ .start = index, .end = @min(end, row.len) };
+        }
+        const unit = displayUnitAt(row, index);
+        if (unit.cell_width != 0) return null;
+        index += @max(unit.byte_len, 1);
+    }
+    return null;
+}
+
+fn isControlByte(byte: u8) bool {
+    return byte < 0x20 or byte == 0x7f;
+}
+
+fn isVariationSelector(codepoint: u21) bool {
+    return codepoint >= 0xfe00 and codepoint <= 0xfe0f;
+}
+
+/// `visibleWidth` of `row`, which starts at content column 0: the cell of the
+/// circle under a bare mark counts.
+pub fn rowWidth(row: []const u8) usize {
+    return visibleWidth(row) +| @intFromBool(bareMarkInRow(row) != null);
+}
+
+/// `rowWidth` of a `row` whose escape sequences, after its first cell, take no
+/// cell.
+pub fn rowWidthIgnoringAnsi(row: []const u8) usize {
+    return visibleWidthIgnoringAnsi(row) +| @intFromBool(bareMarkInRow(row) != null);
+}
+
+/// `prefixByWidth` of `row`, which starts at content column 0: a bare mark
+/// with the marks stacked on it takes one cell, so the prefix holds them
+/// whenever it holds any cell.
+pub fn rowPrefixByWidth(row: []const u8, max_width: usize) []const u8 {
+    const bare = bareMarkInRow(row) orelse return prefixByWidth(row, max_width);
+    if (max_width == 0) return row[0..0];
+    return row[0 .. bare.end + prefixByWidth(row[bare.end..], max_width - 1).len];
+}
+
+/// `wrapCutIgnoringAnsi` of `text`, which starts a row: a bare mark with the
+/// marks stacked on it takes one cell for its circle and stays whole on the
+/// row, however narrow the row is, and a space right after it is a break.
+pub fn rowWrapCutIgnoringAnsi(text: []const u8, max_width: usize) []const u8 {
+    const bare = bareMarkInRow(text) orelse return wrapCutIgnoringAnsi(text, max_width);
+    const tail = prefixByWidthIgnoringAnsi(text[bare.end..], max_width -| 1);
+    const prefix = text[0 .. bare.end + tail.len];
+    if (prefix.len == text.len) return prefix;
+    if (lastBreakSpace(prefix, bare.end)) |space_index| return text[0..space_index];
+    return prefix;
+}
+
+/// Writes `text`, which continues a row, with `bare_mark_base` before the bare
+/// mark that starts the row when `text` holds it. `at_row_start` says whether
+/// nothing with a cell was written on the row yet, and is cleared once `text`
+/// has put a cell on it.
+pub fn writeRowPart(writer: *std.Io.Writer, text: []const u8, at_row_start: *bool) std.Io.Writer.Error!void {
+    if (at_row_start.*) {
+        if (bareMarkInRow(text)) |bare| {
+            try writer.writeAll(text[0..bare.start]);
+            try writer.writeAll(bare_mark_base);
+            try writer.writeAll(text[bare.start..]);
+            at_row_start.* = false;
+            return;
+        }
+        if (visibleWidth(text) > 0) at_row_start.* = false;
+    }
+    try writer.writeAll(text);
+}
+
 fn isCombining(codepoint: u21) bool {
     return (codepoint >= 0x0300 and codepoint <= 0x036f) or
         (codepoint >= 0x1ab0 and codepoint <= 0x1aff) or
         (codepoint >= 0x1dc0 and codepoint <= 0x1dff) or
         (codepoint >= 0x20d0 and codepoint <= 0x20ff) or
         (codepoint >= 0xfe20 and codepoint <= 0xfe2f) or
-        (codepoint >= 0xfe00 and codepoint <= 0xfe0f);
+        isVariationSelector(codepoint) or
+        isInRanges(codepoint, &thai_nonspacing_ranges);
 }
 
 fn isZeroWidthContinuation(codepoint: u21) bool {
@@ -501,6 +637,7 @@ test "packed display ranges preserve every scalar classification" {
         try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.emoji_presentation_ranges), isInRanges(codepoint, &emoji_presentation_ranges));
         try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.emoji_modifier_ranges), isInRanges(codepoint, &emoji_modifier_ranges));
         try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.variation_bases), isInRanges(codepoint, &variation_bases));
+        try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.thai_nonspacing_ranges), isInRanges(codepoint, &thai_nonspacing_ranges));
     }
 }
 
@@ -623,6 +760,225 @@ test "runeWidth preserves current width table semantics" {
     try std.testing.expectEqual(@as(usize, 1), runeWidth('a'));
     try std.testing.expectEqual(@as(usize, 1), runeWidth(' '));
     try std.testing.expectEqual(@as(usize, 0), runeWidth(0x09));
+}
+
+test "Thai nonspacing marks measure zero cells and spacing Thai measures one" {
+    // Thai's nonspacing marks (general category Mn) are U+0E31,
+    // U+0E34-U+0E3A, and U+0E47-U+0E4E. Terminals draw each one on the
+    // cell before it. Every other Thai code point takes a cell, U+0E33
+    // SARA AM included.
+    const Case = struct { codepoint: u21, width: usize };
+    const boundaries = [_]Case{
+        .{ .codepoint = 0x0E01, .width = 1 },
+        .{ .codepoint = 0x0E30, .width = 1 },
+        .{ .codepoint = 0x0E31, .width = 0 },
+        .{ .codepoint = 0x0E32, .width = 1 },
+        .{ .codepoint = 0x0E33, .width = 1 },
+        .{ .codepoint = 0x0E34, .width = 0 },
+        .{ .codepoint = 0x0E3A, .width = 0 },
+        .{ .codepoint = 0x0E3B, .width = 1 },
+        .{ .codepoint = 0x0E3F, .width = 1 },
+        .{ .codepoint = 0x0E46, .width = 1 },
+        .{ .codepoint = 0x0E47, .width = 0 },
+        .{ .codepoint = 0x0E4E, .width = 0 },
+        .{ .codepoint = 0x0E4F, .width = 1 },
+    };
+    for (boundaries) |case| {
+        try std.testing.expectEqual(case.width, runeWidth(case.codepoint));
+    }
+
+    var codepoint: u21 = 0x0E00;
+    while (codepoint <= 0x0E7F) : (codepoint += 1) {
+        const nonspacing = codepoint == 0x0E31 or
+            (codepoint >= 0x0E34 and codepoint <= 0x0E3A) or
+            (codepoint >= 0x0E47 and codepoint <= 0x0E4E);
+        const expected: usize = if (nonspacing) 0 else 1;
+        try std.testing.expectEqual(expected, runeWidth(codepoint));
+    }
+}
+
+test "Thai nonspacing marks join their base in visibleWidth" {
+    // กั้ง: ก with MAI HAN-AKAT and MAI THO, then ง.
+    try std.testing.expectEqual(@as(usize, 2), visibleWidth("\u{0E01}\u{0E31}\u{0E49}\u{0E07}"));
+    // น้ำ: the tone mark sits on น, and SARA AM takes its own cell.
+    try std.testing.expectEqual(@as(usize, 2), visibleWidth("\u{0E19}\u{0E49}\u{0E33}"));
+    // กั้งabc and ที่นี่ok, as typed in the composer.
+    try std.testing.expectEqual(@as(usize, 5), visibleWidth("\u{0E01}\u{0E31}\u{0E49}\u{0E07}abc"));
+    try std.testing.expectEqual(@as(usize, 4), visibleWidth("\u{0E17}\u{0E35}\u{0E48}\u{0E19}\u{0E35}\u{0E48}ok"));
+    // A mark with no base measures no cell here. The composer gives it one of
+    // its own on a dotted circle (`peekRawUnit` in src/ui/input/visual_layout.zig).
+    try std.testing.expectEqual(@as(usize, 0), visibleWidth("\u{0E49}"));
+    // Stacked marks stay on their base however many there are.
+    const mark = "\u{0E49}";
+    var stacked: [3 + 25 * mark.len]u8 = undefined;
+    @memcpy(stacked[0..3], "\u{0E01}");
+    for (0..25) |index| @memcpy(stacked[3 + index * mark.len ..][0..mark.len], mark);
+    try std.testing.expectEqual(@as(usize, 1), visibleWidth(&stacked));
+    // Mixed with a Latin combining mark and a wide character.
+    try std.testing.expectEqual(@as(usize, 5), visibleWidth("e\u{0301}\u{754C}\u{0E01}\u{0E31}\u{0E49}a"));
+}
+
+test "isNonspacingMarkAt finds combining marks and Thai marks and nothing else" {
+    const marks = [_][]const u8{ "\u{0301}", "\u{0E31}", "\u{0E49}", "\u{0E4E}", "\u{1AB0}", "\u{20D0}", "\u{FE0F}", "\u{FE22}" };
+    for (marks) |mark| try std.testing.expect(isNonspacingMarkAt(mark, 0));
+    // Found in the middle of a text, and only at the start of its code point.
+    try std.testing.expect(isNonspacingMarkAt("a\u{0E49}b", 1));
+    try std.testing.expect(!isNonspacingMarkAt("a\u{0E49}b", 2));
+    try std.testing.expect(!isNonspacingMarkAt("a\u{0E49}b", 0));
+
+    const others = [_][]const u8{
+        "a",        "\u{0E01}", "\u{0E33}",  "\u{754C}",  "\u{1F600}",
+        // Zero-width, but not marks.
+        "\x01",     "\x7f",     "\u{0085}",  "\u{200B}",  "\u{200D}",
+        "\u{FEFF}", "\u{202E}", "\u{E0061}", "\u{1F3FD}",
+        // Not valid UTF-8.
+        "\xff",
+        "\xe0\xb9",
+    };
+    for (others) |text| try std.testing.expect(!isNonspacingMarkAt(text, 0));
+    try std.testing.expect(!isNonspacingMarkAt("", 0));
+    try std.testing.expect(!isNonspacingMarkAt("\u{0301}", 2));
+    try std.testing.expect(!isNonspacingMarkAt("\u{0301}", 100));
+}
+
+test "bareMarkUnitAt gives a mark with no base the one cell of its circle" {
+    try std.testing.expectEqual(@as(?DisplayUnit, .{ .byte_len = 3, .cell_width = 1 }), bareMarkUnitAt("\u{0E49}a", 0));
+    try std.testing.expectEqual(@as(?DisplayUnit, .{ .byte_len = 2, .cell_width = 1 }), bareMarkUnitAt("\u{0301}", 0));
+    try std.testing.expectEqual(@as(?DisplayUnit, .{ .byte_len = 3, .cell_width = 1 }), bareMarkUnitAt("a\u{0E49}", 1));
+
+    // Not a mark: a base, a zero-width character, a control, text that is not
+    // UTF-8, and an index past the end.
+    const others = [_][]const u8{
+        "a", "\u{0E01}", "\u{0E33}", "\u{754C}", "\u{200B}", "\u{200D}", "\u{FEFF}", "\x01", "\xff", "",
+    };
+    for (others) |text| try std.testing.expectEqual(@as(?DisplayUnit, null), bareMarkUnitAt(text, 0));
+    try std.testing.expectEqual(@as(?DisplayUnit, null), bareMarkUnitAt("\u{0301}", 5));
+
+    // A variation selector has no glyph of its own to draw on a circle.
+    for ([_][]const u8{ "\u{FE00}", "\u{FE0E}", "\u{FE0F}" }) |selector| {
+        try std.testing.expect(isNonspacingMarkAt(selector, 0));
+        try std.testing.expectEqual(@as(?DisplayUnit, null), bareMarkUnitAt(selector, 0));
+    }
+    // The other marks of that block are marks.
+    try std.testing.expect(bareMarkUnitAt("\u{FE20}", 0) != null);
+
+    // The caller says whether the unit is at content column 0.
+    try std.testing.expectEqual(DisplayUnit{ .byte_len = 3, .cell_width = 1 }, rowUnitAt("\u{0E49}", 0, 0));
+    try std.testing.expectEqual(DisplayUnit{ .byte_len = 3, .cell_width = 0 }, rowUnitAt("\u{0E49}", 0, 1));
+    try std.testing.expectEqual(DisplayUnit{ .byte_len = 1, .cell_width = 1 }, rowUnitAt("a", 0, 0));
+}
+
+test "bareMarkInRow finds the mark that starts a row after zero-width characters only" {
+    const plain = bareMarkInRow("\u{0E49}\u{0E48}ab").?;
+    try std.testing.expectEqual(@as(usize, 0), plain.start);
+    try std.testing.expectEqual(@as(usize, 6), plain.end);
+
+    // A zero-width space, a joiner, and a byte order mark are no base.
+    inline for ([_][]const u8{ "\u{200B}", "\u{200D}", "\u{FEFF}", "\u{200B}\u{FEFF}" }) |zero_width| {
+        const spaced = bareMarkInRow(zero_width ++ "\u{0E49}a").?;
+        try std.testing.expectEqual(zero_width.len, spaced.start);
+        try std.testing.expectEqual(zero_width.len + 3, spaced.end);
+    }
+
+    // A variation selector takes no cell either, so the mark after it is bare.
+    try std.testing.expectEqual(@as(usize, 3), bareMarkInRow("\u{FE0F}\u{0E49}").?.start);
+
+    // The marks and zero-width characters stacked on it end at a cell or a control.
+    try std.testing.expectEqual(@as(usize, 9), bareMarkInRow("\u{0E49}\u{200B}\u{0E48}a").?.end);
+    try std.testing.expectEqual(@as(usize, 3), bareMarkInRow("\u{0E49}\x1b[1mx").?.end);
+
+    // A mark that sits on a base or a space is not bare, and neither is a row
+    // with no mark or a bare selector.
+    for ([_][]const u8{ "a\u{0E49}", " \u{0E49}", "a\u{200B}\u{0E49}", "abc", "", "\u{200B}", "\u{FE0F}a" }) |row| {
+        try std.testing.expectEqual(@as(?BareMark, null), bareMarkInRow(row));
+    }
+}
+
+test "rowWidth and rowPrefixByWidth count the circle of a bare mark" {
+    try std.testing.expectEqual(@as(usize, 3), visibleWidth("\u{0E49}abc"));
+    try std.testing.expectEqual(@as(usize, 4), rowWidth("\u{0E49}abc"));
+    try std.testing.expectEqual(@as(usize, 4), rowWidth("\u{200B}\u{0E49}\u{0E48}abc"));
+    try std.testing.expectEqual(@as(usize, 3), rowWidth("abc"));
+    try std.testing.expectEqual(@as(usize, 1), rowWidth("a\u{0E49}"));
+    try std.testing.expectEqual(@as(usize, 0), rowWidth(""));
+
+    try std.testing.expectEqualStrings("\u{0E49}ab", rowPrefixByWidth("\u{0E49}abc", 3));
+    try std.testing.expectEqualStrings("\u{0E49}\u{0E48}", rowPrefixByWidth("\u{0E49}\u{0E48}abc", 1));
+    try std.testing.expectEqualStrings("", rowPrefixByWidth("\u{0E49}abc", 0));
+    try std.testing.expectEqualStrings("ab", rowPrefixByWidth("abc", 2));
+    try std.testing.expectEqualStrings("a\u{0E49}b", rowPrefixByWidth("a\u{0E49}bc", 2));
+}
+
+test "rowWidthIgnoringAnsi counts the circle of a bare mark and skips escapes" {
+    try std.testing.expectEqual(@as(usize, 4), rowWidthIgnoringAnsi("\u{0E49}abc"));
+    try std.testing.expectEqual(@as(usize, 4), rowWidthIgnoringAnsi("\u{200B}\u{0E49}\u{0E48}abc"));
+    try std.testing.expectEqual(@as(usize, 3), rowWidthIgnoringAnsi("a\u{0E49}bc"));
+    try std.testing.expectEqual(@as(usize, 2), rowWidthIgnoringAnsi("a\x1b[1mb\x1b[0m"));
+    try std.testing.expectEqual(@as(usize, 5), rowWidthIgnoringAnsi("\u{0E49}a\x1b[1mbc\x1b[0md"));
+    try std.testing.expectEqual(@as(usize, 0), rowWidthIgnoringAnsi(""));
+}
+
+test "rowWrapCutIgnoringAnsi spends a cell on the circle of a bare mark" {
+    // A row with no bare mark is cut as wrapCutIgnoringAnsi cuts it.
+    try std.testing.expectEqualStrings("ab", rowWrapCutIgnoringAnsi("ab cd", 4));
+    try std.testing.expectEqualStrings("a\u{0E49}bc", rowWrapCutIgnoringAnsi("a\u{0E49}bcde", 3));
+
+    // The circle takes one of the cells: the plain cut at 5 would keep five
+    // letters, and this one keeps four.
+    try std.testing.expectEqualStrings("\u{0E49}abcd", rowWrapCutIgnoringAnsi("\u{0E49}abcdefg", 5));
+    try std.testing.expectEqualStrings("\u{0E49}abcdefg", wrapCutIgnoringAnsi("\u{0E49}abcdefg", 7));
+    try std.testing.expectEqualStrings("\u{0E49}abcdefg", rowWrapCutIgnoringAnsi("\u{0E49}abcdefg", 8));
+    try std.testing.expectEqualStrings("\u{0E49}abcdef", rowWrapCutIgnoringAnsi("\u{0E49}abcdefg", 7));
+
+    // A text that fits with its circle is kept whole, and a break at a space
+    // is taken after the word that fits, or right after the circle.
+    try std.testing.expectEqualStrings("\u{0E49}abcd", rowWrapCutIgnoringAnsi("\u{0E49}abcd", 5));
+    try std.testing.expectEqualStrings("\u{0E49}ab", rowWrapCutIgnoringAnsi("\u{0E49}ab cde", 5));
+    try std.testing.expectEqualStrings("\u{0E49}", rowWrapCutIgnoringAnsi("\u{0E49} abc", 3));
+    try std.testing.expectEqualStrings("\u{200B}\u{0E49}ab", rowWrapCutIgnoringAnsi("\u{200B}\u{0E49}abcd", 3));
+
+    // However narrow the row is, the circle keeps the mark and the marks
+    // stacked on it, and an escape sequence is never cut.
+    try std.testing.expectEqualStrings("\u{0E49}\u{0E48}", rowWrapCutIgnoringAnsi("\u{0E49}\u{0E48}ab", 1));
+    try std.testing.expectEqualStrings("\u{0E49}\u{0E48}", rowWrapCutIgnoringAnsi("\u{0E49}\u{0E48}ab", 0));
+    try std.testing.expectEqualStrings("\u{0E49}\x1b[1ma", rowWrapCutIgnoringAnsi("\u{0E49}\x1b[1mabc", 2));
+    try std.testing.expectEqualStrings("\u{0E49}\x1b]8;;a b\x07a", rowWrapCutIgnoringAnsi("\u{0E49}\x1b]8;;a b\x07abc", 2));
+}
+
+test "writeRowPart draws the circle before the mark that starts the row only" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    var at_row_start = true;
+    try writeRowPart(&out.writer, "\u{200B}", &at_row_start);
+    try std.testing.expect(at_row_start);
+    try writeRowPart(&out.writer, "\u{0E49}\u{0E48}a", &at_row_start);
+    try std.testing.expect(!at_row_start);
+    // The row has a cell now, so the next mark is not bare.
+    try writeRowPart(&out.writer, "\u{0E49}", &at_row_start);
+    try std.testing.expectEqualStrings("\u{200B}\u{25CC}\u{0E49}\u{0E48}a\u{0E49}", out.written());
+
+    // Text with a cell and no mark ends the start of the row too.
+    out.clearRetainingCapacity();
+    at_row_start = true;
+    try writeRowPart(&out.writer, "a", &at_row_start);
+    try writeRowPart(&out.writer, "\u{0E49}", &at_row_start);
+    try std.testing.expectEqualStrings("a\u{0E49}", out.written());
+}
+
+test "Thai nonspacing marks are zero-width display units" {
+    const word = "\u{0E01}\u{0E31}\u{0E49}\u{0E07}";
+    try std.testing.expectEqual(DisplayUnit{ .byte_len = 3, .cell_width = 1 }, displayUnitAt(word, 0));
+    try std.testing.expectEqual(DisplayUnit{ .byte_len = 3, .cell_width = 0 }, displayUnitAt(word, 3));
+    try std.testing.expectEqual(DisplayUnit{ .byte_len = 3, .cell_width = 0 }, displayUnitAt(word, 6));
+    try std.testing.expectEqual(DisplayUnit{ .byte_len = 3, .cell_width = 1 }, displayUnitAt(word, 9));
+
+    const sara_am = "\u{0E19}\u{0E49}\u{0E33}";
+    try std.testing.expectEqual(DisplayUnit{ .byte_len = 3, .cell_width = 1 }, displayUnitAt(sara_am, 6));
+
+    // Clipping keeps the marks with their base.
+    try std.testing.expectEqualStrings("\u{0E01}\u{0E31}\u{0E49}", prefixByWidth(word, 1));
+    try std.testing.expectEqualStrings(word, suffixByWidth(word, 2));
 }
 
 test "decodeNextRune preserves boundary and invalid-byte behavior" {
@@ -835,6 +1191,10 @@ test "fuzz display unit boundaries" {
             "\u{2600}\u{FE0E}\u{2600}\u{FE0F}",
             "\u{1F44D}\u{1F3FD}\u{1F1FA}\u{1F1F8}",
             "#\u{FE0F}\u{20E3}\u{1F469}\u{200D}\u{1F4BB}",
+            "\u{0E01}\u{0E31}\u{0E49}\u{0E07}abc\u{0E17}\u{0E35}\u{0E48}\u{0E19}\u{0E35}\u{0E48}ok",
+            "\u{0E49}\u{0E19}\u{0E49}\u{0E33}\u{0E4E}\u{0E4F}\u{0E3A}\u{0E3B}e\u{0301}\u{754C}",
+            "\u{200B}\u{0E49}\u{0E48}a\u{200B}\u{0E49}",
+            "\u{FE0F}\u{200D}\u{FEFF}\u{0301}\x1b[1mb\u{0301}",
         }) ++ @import("fuzz_corpus").display_width.*),
     });
 }
@@ -870,6 +1230,49 @@ fn fuzzDisplayUnitBoundaries(_: void, smith: *std.testing.Smith) !void {
         try std.testing.expect(isDisplayUnitBoundary(text, text.len - suffix.len));
         try std.testing.expect(visibleWidth(prefix) <= budget);
         try std.testing.expect(visibleWidth(suffix) <= budget);
+    }
+
+    // A row that starts at content column 0 counts the circle of a bare mark
+    // once, and the prefix that holds it ends at a unit boundary.
+    var column: usize = 0;
+    index = 0;
+    while (index < text.len) {
+        const unit = rowUnitAt(text, index, column);
+        try std.testing.expect(unit.byte_len > 0);
+        try std.testing.expect(unit.cell_width <= 2);
+        column +|= unit.cell_width;
+        index += unit.byte_len;
+    }
+    try std.testing.expectEqual(column, rowWidth(text));
+    try std.testing.expect(rowWidthIgnoringAnsi(text) >= visibleWidthIgnoringAnsi(text));
+    try std.testing.expect(rowWidthIgnoringAnsi(text) <= visibleWidthIgnoringAnsi(text) +| 1);
+    if (std.mem.findScalar(u8, text, 0x1b) == null) {
+        try std.testing.expectEqual(rowWidth(text), rowWidthIgnoringAnsi(text));
+    }
+    for (budgets) |budget| {
+        const prefix = rowPrefixByWidth(text, budget);
+        try std.testing.expect(isDisplayUnitBoundary(text, prefix.len));
+        try std.testing.expect(rowWidth(prefix) <= budget);
+    }
+    if (bareMarkInRow(text)) |bare| {
+        try std.testing.expect(bare.start < bare.end and bare.end <= text.len);
+        try std.testing.expect(isDisplayUnitBoundary(text, bare.start));
+        try std.testing.expect(isDisplayUnitBoundary(text, bare.end));
+        try std.testing.expectEqual(@as(usize, 0), visibleWidth(text[0..bare.end]));
+    }
+
+    // The cut of a row keeps the whole head of a bare mark and fits the rest
+    // in the cells left after its circle; a row with no bare mark is cut as
+    // the plain wrap cuts it.
+    for (budgets) |budget| {
+        const cut = rowWrapCutIgnoringAnsi(text, budget);
+        try std.testing.expect(isDisplayUnitBoundary(text, cut.len));
+        if (bareMarkInRow(text)) |bare| {
+            try std.testing.expect(cut.len >= bare.end);
+            try std.testing.expect(visibleWidthIgnoringAnsi(cut[bare.end..]) <= budget -| 1);
+        } else {
+            try std.testing.expectEqualStrings(wrapCutIgnoringAnsi(text, budget), cut);
+        }
     }
 }
 

@@ -149,3 +149,17 @@ test "fork menu lists prompts oldest first and opens on the newest at the bottom
         try std.testing.expectEqualStrings(step.bottom, bottom.text);
     }
 }
+
+test "fork menu draws a prompt that starts with a bare mark on a dotted circle in a cell of its own" {
+    const points = [_]ForkPoint{
+        .{ .turn = 1, .prompt = @constCast("\u{0E49}abc") },
+        .{ .turn = 2, .prompt = @constCast("a\u{0E49}bc") },
+    };
+    const projection: ForkMenuProjection = .{ .points = &points, .selected = 1, .window_start = 0 };
+    const expected = [_][]const u8{ "  \u{25CC}\u{0E49}abc", "  a\u{0E49}bc" };
+    for (expected, 0..) |text, row_index| {
+        const row = try testRow(projection, @intCast(row_index), 20, max_inline_rows);
+        defer std.testing.allocator.free(row.text);
+        try std.testing.expectEqualStrings(text, row.text);
+    }
+}

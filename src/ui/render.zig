@@ -491,8 +491,15 @@ fn copyVisualRowToBuffer(source: visual_layout.Source, target_row: usize, out: [
         .unit => |unit| {
             if (unit.row_index < target_row) continue;
             if (unit.row_index > target_row) break;
-            startVisualRow(source.terminal_cols, target_row, out, &len, &row_started, &remaining_cells);
-            if (remaining_cells == 0) continue;
+            startVisualRow(source.terminal_cols, target_row, out, &len, &row_started, &remaining_cells, &omitted_positive_unit);
+            // A full row still takes the zero-width text after its last
+            // character, and a unit with cells it has no room for is not
+            // drawn, so the marks after it go with it.
+            const zero_width_text = unit.kind == .text and unit.cell_width == 0;
+            if (remaining_cells == 0 and !zero_width_text) {
+                if (unit.cell_width > 0) omitted_positive_unit = true;
+                continue;
+            }
             switch (unit.kind) {
                 .text => {
                     if (unit.cell_width == 0) {
@@ -504,6 +511,13 @@ fn copyVisualRowToBuffer(source: visual_layout.Source, target_row: usize, out: [
                     } else {
                         omitted_positive_unit = true;
                     }
+                },
+                .bare_mark => {
+                    // A full row never gets here: it continued above.
+                    appendBytesToBuffer(out, &len, display_width.bare_mark_base);
+                    appendBytesToBuffer(out, &len, source.input[unit.raw_start..unit.raw_end]);
+                    remaining_cells -= unit.cell_width;
+                    omitted_positive_unit = false;
                 },
                 .paste_placeholder => {
                     const visible = display_width.prefixByWidth(
@@ -539,14 +553,14 @@ fn copyVisualRowToBuffer(source: visual_layout.Source, target_row: usize, out: [
         },
         .row_end => |row| {
             if (row.index < target_row) continue;
-            if (row.index == target_row) startVisualRow(source.terminal_cols, target_row, out, &len, &row_started, &remaining_cells);
+            if (row.index == target_row) startVisualRow(source.terminal_cols, target_row, out, &len, &row_started, &remaining_cells, &omitted_positive_unit);
             break;
         },
     };
     return out[0..len];
 }
 
-fn startVisualRow(width: u16, row_index: usize, out: []u8, len: *usize, started: *bool, remaining_cells: *usize) void {
+fn startVisualRow(width: u16, row_index: usize, out: []u8, len: *usize, started: *bool, remaining_cells: *usize, omitted_positive_unit: *bool) void {
     if (started.*) return;
     started.* = true;
     const prefix = visual_layout.inputPrefix(row_index);
@@ -554,6 +568,8 @@ fn startVisualRow(width: u16, row_index: usize, out: []u8, len: *usize, started:
     appendBytesToBuffer(out, len, clipped);
     const width_usize: usize = width;
     remaining_cells.* = if (width_usize > prefix.cell_width) width_usize - prefix.cell_width else 0;
+    // A row with no content cells draws no character, so it draws no mark.
+    omitted_positive_unit.* = remaining_cells.* == 0;
 }
 
 fn appendBytesToBuffer(out: []u8, len: *usize, bytes: []const u8) void {
@@ -575,6 +591,80 @@ test "input line wraps to the cursor row" {
     const view = buildInputLine("abcdefghijklmnopqrstuvwxyz", 26, 16, &buf);
     try std.testing.expectEqualStrings("  opqrstuvwxyz", view.line);
     try std.testing.expectEqual(@as(u16, 15), view.cursor_col);
+}
+
+test "input line keeps the marks of a character in the last column" {
+    var buf: [64]u8 = undefined;
+    // "❯ " leaves two cells: ab fills the row, and the accent and the Thai
+    // marks belong to the character before them.
+    const latin = buildInputLine("ab\u{0301}", "ab\u{0301}".len, 4, &buf);
+    try std.testing.expectEqualStrings("❯ ab\u{0301}", latin.line);
+    const thai = buildInputLine("a\u{0E01}\u{0E31}\u{0E49}", "a\u{0E01}\u{0E31}\u{0E49}".len, 4, &buf);
+    try std.testing.expectEqualStrings("❯ a\u{0E01}\u{0E31}\u{0E49}", thai.line);
+}
+
+test "input line holds no mark of a character it does not draw" {
+    var buf: [128]u8 = undefined;
+    // A window two columns wide or narrower leaves the row no content cells,
+    // so no character is drawn and no mark with it.
+    const drafts = [_][]const u8{
+        "\u{0E01}\u{0E31}\u{0E49}\u{0E07}\u{0E19}\u{0E49}\u{0E33}",
+        "\u{0E31}\u{0E49}\u{0E01}\u{0E31}",
+        "e\u{0301}a\u{0300}",
+        "\u{754C}\u{0301}",
+    };
+    for (drafts) |draft| {
+        try std.testing.expectEqualStrings("❯ ", buildInputLine(draft, draft.len, 2, &buf).line);
+        try std.testing.expectEqualStrings("❯", buildInputLine(draft, draft.len, 1, &buf).line);
+    }
+
+    // Two content cells: ab fills the row, the space hangs past the margin
+    // and is not drawn, and the accent after it belongs to the space.
+    const hanging = buildInputLine("ab \u{0301}", "ab \u{0301}".len, 4, &buf);
+    try std.testing.expectEqualStrings("❯ ab", hanging.line);
+
+    // One content cell: 界 needs two, so it is not drawn and its accent goes
+    // with it.
+    const wide = "\u{754C}\u{0301}\u{0E01}";
+    const first = buildInputLineForRow(wide, wide.len, 0, 2, 3, &buf);
+    try std.testing.expectEqualStrings("❯ ", first.line);
+}
+
+test "input line draws a mark with no base on a dotted circle in a cell of its own" {
+    var buf: [64]u8 = undefined;
+    // The mark and the marks after it stack on the circle, which takes one
+    // cell: "❯ ", the circle, and a, so the cursor is in column 5.
+    const bare = "\u{0E49}\u{0E48}a";
+    const view = buildInputLine(bare, bare.len, 20, &buf);
+    try std.testing.expectEqualStrings("❯ \u{25CC}\u{0E49}\u{0E48}a", view.line);
+    try std.testing.expectEqual(@as(u16, 5), view.cursor_col);
+
+    // After a base a mark takes no cell.
+    const after = "a\u{0E49}";
+    const based = buildInputLine(after, after.len, 20, &buf);
+    try std.testing.expectEqualStrings("❯ a\u{0E49}", based.line);
+    try std.testing.expectEqual(@as(u16, 4), based.cursor_col);
+
+    // One content cell: the circle takes it, and nothing else fits.
+    const narrow = buildInputLineForRow(bare, bare.len, 0, 2, 3, &buf);
+    try std.testing.expectEqualStrings("❯ \u{25CC}\u{0E49}\u{0E48}", narrow.line);
+}
+
+test "input line draws a mark after a zero-width space on a dotted circle in a cell of its own" {
+    var buf: [64]u8 = undefined;
+    // The zero-width space takes no cell, so the mark after it has no base:
+    // "❯ ", the space, the circle with the marks, and a, so the cursor is in
+    // column 5.
+    const bare = "\u{200B}\u{0E49}\u{0E48}a";
+    const view = buildInputLine(bare, bare.len, 20, &buf);
+    try std.testing.expectEqualStrings("❯ \u{200B}\u{25CC}\u{0E49}\u{0E48}a", view.line);
+    try std.testing.expectEqual(@as(u16, 5), view.cursor_col);
+
+    // After a base the same character leaves the mark on that base.
+    const based = "a\u{200B}\u{0E49}";
+    const kept = buildInputLine(based, based.len, 20, &buf);
+    try std.testing.expectEqualStrings("❯ a\u{200B}\u{0E49}", kept.line);
+    try std.testing.expectEqual(@as(u16, 4), kept.cursor_col);
 }
 
 test "input line wraps without cutting emoji bytes" {
