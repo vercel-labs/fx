@@ -731,6 +731,108 @@ function expectOnlyLeadingSystemMessages(body: string): void {
   }
 }
 
+// Claude Fable 5.1 and later check each thinking block a request sends back:
+// the tools and every prompt message before the block must be exactly what
+// came before it when the model wrote it. This gateway runs that check on
+// signed reasoning and answers a failed check with the provider's 400, so a
+// rebuilt history that edits an earlier turn fails the run. Signatures name
+// themselves `SIG_<label>`.
+const SIGNATURE_PATTERN = /SIG_[A-Za-z0-9_]+/g;
+
+type ReplayProvider = {
+  name: string;
+  model: string;
+  signed: (signature: string) => Record<string, unknown>;
+};
+
+const REPLAY_PROVIDERS: ReplayProvider[] = [
+  { name: "anthropic", model: "anthropic/claude-fable-5.2", signed: (signature) => ({ anthropic: { signature } }) },
+  { name: "openai", model: MODEL, signed: (signature) => ({ openai: { reasoningEncryptedContent: signature } }) },
+  { name: "vertex", model: MODEL, signed: (signature) => ({ vertex: { thoughtSignature: signature } }) },
+];
+
+type PrefixEdit = { request: number; signature: string; at: number };
+
+function firstDifference(expected: unknown[], actual: unknown[]): number {
+  const length = Math.max(expected.length, actual.length);
+  for (let index = 0; index < length; index += 1) {
+    if (!Bun.deepEquals(expected[index], actual[index], true)) return index;
+  }
+  return length;
+}
+
+function startPreservedThinkingGateway(
+  provider: ReplayProvider,
+  respond: (request: number) => object[] | Promise<object[]>,
+) {
+  const origins = new Map<string, { prompt: PromptMessage[]; tools: unknown }>();
+  const edits: PrefixEdit[] = [];
+  let count = 0;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    const request = count++;
+    const { prompt, tools } = gatewayRequest(body);
+    for (const [index, message] of prompt.entries()) {
+      if (message.role !== "assistant") continue;
+      for (const signature of JSON.stringify(message.content).match(SIGNATURE_PATTERN) ?? []) {
+        const origin = origins.get(signature);
+        if (!origin) continue;
+        const before = prompt.slice(0, index);
+        if (Bun.deepEquals(before, origin.prompt, true) && Bun.deepEquals(tools, origin.tools, true)) continue;
+        const at = firstDifference(origin.prompt, before);
+        edits.push({ request, signature, at });
+        return new Response(JSON.stringify({
+          error: {
+            type: "invalid_request_error",
+            message: `messages.${index}: Invalid \`signature\` in \`thinking\` block. The block is bound to a different conversation; the content before it changed at prompt.${at}.`,
+          },
+        }), { status: 400, headers: { "content-type": "application/json" } });
+      }
+    }
+    const events = await respond(request);
+    for (const signature of JSON.stringify(events).match(SIGNATURE_PATTERN) ?? []) {
+      origins.set(signature, { prompt, tools });
+    }
+    return fakeGatewaySse(events);
+  }, {
+    classifierDecision: "clear",
+    models: [{ id: provider.model, type: "language", tags: ["tool-use"] }],
+  });
+  return { gateway, edits };
+}
+
+function signedReasoning(provider: ReplayProvider, label: string, text: string): object[] {
+  const id = `reasoning_${label}`;
+  return [
+    { type: "reasoning-start", id },
+    { type: "reasoning-delta", id, delta: text },
+    { type: "reasoning-end", id, providerMetadata: provider.signed(`SIG_${label}`) },
+  ];
+}
+
+function signedToolStep(provider: ReplayProvider, label: string, name: string, input: object): object[] {
+  return [
+    ...signedReasoning(provider, label, `Call ${name}.`),
+    { type: "tool-call", toolCallId: `call_${label}`, toolName: name, input },
+    { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_use" } },
+  ];
+}
+
+function signedFinalStep(provider: ReplayProvider, label: string, text: string | null): object[] {
+  return [
+    ...signedReasoning(provider, label, "Answer now."),
+    ...(text === null ? [] : [{ type: "text-delta", id: `answer_${label}`, delta: text }]),
+    {
+      type: "finish",
+      finishReason: { unified: "stop", raw: "end_turn" },
+      usage: { inputTokens: { total: 3 }, outputTokens: { total: 5 } },
+    },
+  ];
+}
+
+function signaturesIn(body: string): string[] {
+  return body.match(SIGNATURE_PATTERN) ?? [];
+}
+
 function promptText(body: string): string {
   return gatewayRequest(body).prompt.map((message) => contentText(message.content)).join("\n");
 }
@@ -4293,6 +4395,214 @@ describe("gateway stream lifecycle", () => {
       rmSync(root.root, { recursive: true, force: true });
     }
   });
+
+  for (const provider of REPLAY_PROVIDERS) {
+    test(`saved ask sends a tool turn unchanged before its signed final reply (${provider.name})`, async () => {
+      const root = createFixtureRoot(`signed-history-${provider.name}`);
+      writeFileSync(join(root.workspace, "notes.txt"), "SIGNED_HISTORY_NOTES\n");
+      const steps = [
+        signedToolStep(provider, "read", "read_file", { path: "notes.txt" }),
+        signedFinalStep(provider, "first_reply", "The notes are read."),
+        signedFinalStep(provider, "second_reply", "Nothing else."),
+      ];
+      const { gateway, edits } = startPreservedThinkingGateway(provider, (request) =>
+        steps.shift() ?? signedFinalStep(provider, `extra_${request}`, "Extra reply.")
+      );
+      try {
+        const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: provider.model };
+        const first = await runFx(["ask", "--json", "--full-access", "Read notes.txt and say what it holds."], {
+          cwd: root.workspace,
+          env,
+          timeoutMs: 15_000,
+        });
+        expect(first.code).toBe(0);
+        const sessionId = parseAskJson(first.stdout).session_id;
+        const second = await runFx(["ask", "--json", "--full-access", "--resume", sessionId, "Anything else?"], {
+          cwd: root.workspace,
+          env,
+          timeoutMs: 15_000,
+        });
+        expect(edits).toEqual([]);
+        expect(second.code).toBe(0);
+        expect(gateway.requestCount()).toBe(3);
+        // The resumed request is the first turn's last request, that
+        // request's signed reply, and the new message, with nothing between.
+        const sent = gatewayRequest(gateway.requests[1]!.body).prompt;
+        const resumed = gatewayRequest(gateway.requests[2]!.body).prompt;
+        expect(resumed.slice(0, sent.length)).toEqual(sent);
+        expect(resumed[sent.length]!.role).toBe("assistant");
+        expect(signaturesIn(JSON.stringify(resumed[sent.length]!.content))).toEqual(["SIG_first_reply"]);
+        expect(resumed).toHaveLength(sent.length + 2);
+        expect(contentText(resumed[sent.length + 1]!.content)).toBe("Anything else?");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 45_000);
+  }
+
+  const SIGNED_TURN_SHAPES: Array<{
+    name: string;
+    steps: (provider: ReplayProvider) => object[][];
+    after?: (workspace: string) => void;
+  }> = [
+    {
+      name: "a read then an edit of the same file",
+      steps: (provider) => [
+        signedToolStep(provider, "read_config", "read_file", { path: "config.txt" }),
+        signedToolStep(provider, "edit_config", "edit_file", {
+          path: "config.txt",
+          old_string: "port=8080",
+          new_string: "port=9090",
+        }),
+        signedFinalStep(provider, "edited_reply", "The port is now 9090."),
+      ],
+      after: (workspace) => expect(readFileSync(join(workspace, "config.txt"), "utf8")).toBe("port=9090\n"),
+    },
+    {
+      name: "a file read whose final reply is only reasoning",
+      steps: (provider) => [
+        signedToolStep(provider, "read_config", "read_file", { path: "config.txt" }),
+        signedFinalStep(provider, "silent_reply", null),
+      ],
+    },
+    {
+      name: "a reply without tool calls",
+      steps: (provider) => [signedFinalStep(provider, "plain_reply", "No tools needed.")],
+    },
+  ];
+
+  for (const [shapeIndex, shape] of SIGNED_TURN_SHAPES.entries()) {
+    test(`saved ask keeps signed reasoning valid on the next turn after ${shape.name}`, async () => {
+      const provider = REPLAY_PROVIDERS[0]!;
+      const root = createFixtureRoot(`signed-turn-shape-${shapeIndex}`);
+      writeFileSync(join(root.workspace, "config.txt"), "port=8080\n");
+      const steps = shape.steps(provider);
+      const { gateway, edits } = startPreservedThinkingGateway(provider, (request) =>
+        steps.shift() ?? signedFinalStep(provider, `reply_${request}`, "Done.")
+      );
+      try {
+        const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: provider.model };
+        const first = await runFx(["ask", "--json", "--full-access", "Work on config.txt."], {
+          cwd: root.workspace,
+          env,
+          timeoutMs: 15_000,
+        });
+        const sessionId = parseAskJson(first.stdout).session_id;
+        expect(steps).toEqual([]);
+        shape.after?.(root.workspace);
+        const second = await runFx(["ask", "--json", "--full-access", "--resume", sessionId, "Anything else?"], {
+          cwd: root.workspace,
+          env,
+          timeoutMs: 15_000,
+        });
+        expect(edits).toEqual([]);
+        expect(second.code).toBe(0);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 45_000);
+  }
+
+  test("a turn killed after a file read resumes, and the turn after keeps it as the resume sent it", async () => {
+    const provider = REPLAY_PROVIDERS[0]!;
+    const root = createFixtureRoot("signed-crash-resume");
+    writeFileSync(join(root.workspace, "notes.txt"), "CRASH_NOTES\n");
+    let releaseHeld: (() => void) | undefined;
+    let heldArrived: () => void = () => {};
+    const arrived = new Promise<void>((resolve) => {
+      heldArrived = resolve;
+    });
+    const { gateway, edits } = startPreservedThinkingGateway(provider, async (request) => {
+      if (request === 0) return signedToolStep(provider, "crash_read", "read_file", { path: "notes.txt" });
+      if (request === 1) {
+        heldArrived();
+        await new Promise<void>((resolve) => {
+          releaseHeld = resolve;
+        });
+        return signedFinalStep(provider, "never_seen", "Too late.");
+      }
+      return signedFinalStep(provider, `after_crash_${request}`, "Recovered.");
+    });
+    try {
+      const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: provider.model, FX_SOUND: "0" };
+      const proc = Bun.spawn([FX_BIN, "ask", "--full-access", "--json", "Read notes.txt and say what it holds."], {
+        cwd: root.workspace,
+        env: { ...process.env, ...env },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      await arrived;
+      // fx dies while the step after its read waits on the gateway.
+      proc.kill("SIGKILL");
+      await proc.exited;
+      const sessionId = onlySessionId(root.home);
+      const resumed = await runFx(["ask", "--json", "--full-access", "--resume", sessionId, "Continue after the crash."], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 15_000,
+      });
+      expect(edits).toEqual([]);
+      expect(resumed.code).toBe(0);
+      expect(signaturesIn(gateway.requests[gateway.requests.length - 1]!.body)).toContain("SIG_crash_read");
+      // Once the resume is saved, the stopped turn is projected for a later
+      // resume; the next turn must still send it as the resume did.
+      const next = await runFx(["ask", "--json", "--full-access", "--resume", sessionId, "And now?"], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 15_000,
+      });
+      expect(edits).toEqual([]);
+      expect(next.code).toBe(0);
+    } finally {
+      releaseHeld?.();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("forty saved turns with file tools each resume without editing an earlier turn", async () => {
+    const provider = REPLAY_PROVIDERS[0]!;
+    const root = createFixtureRoot("signed-history-stress");
+    writeFileSync(join(root.workspace, "counter.txt"), "count=0\n");
+    const turns = 40;
+    let queue: object[][] = [];
+    const { gateway, edits } = startPreservedThinkingGateway(provider, (request) =>
+      queue.shift() ?? signedFinalStep(provider, `unexpected_${request}`, "Unexpected.")
+    );
+    try {
+      const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: provider.model };
+      let sessionId: string | undefined;
+      for (let turn = 1; turn <= turns; turn += 1) {
+        queue = [
+          signedToolStep(provider, `read_${turn}`, "read_file", { path: "counter.txt" }),
+          signedToolStep(provider, `edit_${turn}`, "edit_file", {
+            path: "counter.txt",
+            old_string: `count=${turn - 1}`,
+            new_string: `count=${turn}`,
+          }),
+          signedFinalStep(provider, `reply_${turn}`, `Count is ${turn}.`),
+        ];
+        const args = sessionId === undefined
+          ? ["ask", "--json", "--full-access", `Turn ${turn}.`]
+          : ["ask", "--json", "--full-access", "--resume", sessionId, `Turn ${turn}.`];
+        const result = await runFx(args, { cwd: root.workspace, env, timeoutMs: 30_000 });
+        expect(edits).toEqual([]);
+        expect(result.code).toBe(0);
+        expect(queue).toEqual([]);
+        sessionId ??= parseAskJson(result.stdout).session_id;
+      }
+      expect(readFileSync(join(root.workspace, "counter.txt"), "utf8")).toBe(`count=${turns}\n`);
+      // The last request carries every earlier turn's three signed steps and
+      // this turn's read and edit.
+      expect(signaturesIn(gateway.requests[gateway.requests.length - 1]!.body)).toHaveLength(turns * 3 - 1);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 240_000);
 
   test("saved ask replays standalone assistant replies without joining their metadata", async () => {
     for (const withReplay of [false, true]) {
