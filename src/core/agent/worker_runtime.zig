@@ -154,6 +154,13 @@ pub const QueuedPrompt = struct {
     skill_bindings: []SkillBinding = &.{},
     skill_display_spans: []SkillDisplaySpan = &.{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
+    /// The files this turn's attachments name by workspace path, and the
+    /// sources that were no files. The runtime delivers their folders' rules
+    /// as a note on the turn's own message. Borrowed from the host for the
+    /// turn: `freeQueuedPrompt` leaves it alone, so a prompt handed to the
+    /// worker queue carries none, and a turn that continues an earlier one
+    /// clears it.
+    attached_files: context_contract.AttachedFiles = .{},
     agent_settings: AgentTurnSettings = .{},
     snapshot_file_ownerships: []types.SnapshotFileOwnership = &.{},
     /// Present only when an explicit host action resumes a durable paused
@@ -1382,6 +1389,8 @@ pub const WorkerRuntime = struct {
 
     fn enqueuePromptLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, queued_value: QueuedPrompt) !void {
         var queued = queued_value;
+        // A queued prompt owns its fields; attached files are the host's.
+        std.debug.assert(queued.attached_files.isEmpty());
         // Feedback the last turn left goes back to the host before a run's
         // prompt is queued, so that prompt heads the queue with its own
         // history.

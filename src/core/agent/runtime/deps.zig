@@ -194,7 +194,8 @@ pub const AgentRuntimeDeps = struct {
     /// TUI and `fx ask`. The rules of each image's folder then reach the model
     /// the way a tool call's do: a note on the turn's own message, so the
     /// instructions stay as they were cached. Hosts whose images carry no
-    /// workspace path leave it false.
+    /// workspace path leave it false. Other attached files reach the model the
+    /// same way through the prompt's `attached_files`.
     image_folder_rules: bool = false,
     live_tool_authority: ?LiveToolAuthorityProvider = null,
     /// Samples host-owned root permission mode at an action boundary.

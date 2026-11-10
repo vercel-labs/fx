@@ -50,6 +50,21 @@ pub fn applicableTargetsForImages(
     return targets;
 }
 
+/// What a host's attachments bring to a turn's project context: the files the
+/// user named by absolute path, and the sources the host could not use as
+/// files, such as a remote URI. The runtime delivers them as a note on the
+/// turn's own message, not in the instructions, so the instructions stay as
+/// the provider cached them. The turn borrows the storage; the host owns it.
+pub const AttachedFiles = struct {
+    targets: []const ApplicableTarget = &.{},
+    omissions: []const ContextOmissionInput = &.{},
+    omission_summary: ?ContextOmissionSummary = null,
+
+    pub fn isEmpty(self: AttachedFiles) bool {
+        return self.targets.len == 0 and self.omissions.len == 0 and self.omission_summary == null;
+    }
+};
+
 pub const OmissionReason = enum {
     home_unavailable,
     home_outside_workspace,
@@ -226,6 +241,10 @@ pub const LaterContextInput = struct {
     /// Delivered sources that may get a reminder when a target reaches them:
     /// rules an earlier turn's note delivered and this turn has not reminded.
     remind_sources: []const []const u8 = &.{},
+    /// Attachments the host could not use as files, which the selection
+    /// reports with the rules it delivers.
+    omissions: []const ContextOmissionInput = &.{},
+    omission_summary: ?ContextOmissionSummary = null,
     context_limits: context_limits.Values = .{},
     /// Assigned by `Registry` from its composition when routed through it.
     instruction_files: InstructionFiles = .filesystem,

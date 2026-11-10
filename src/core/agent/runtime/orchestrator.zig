@@ -2841,25 +2841,31 @@ fn commitRulesNote(
     selected.content = null;
 }
 
-/// Queues the rules of the folders the turn's images come from as a note on
-/// the turn's own message, after the user's text, the way a tool call that
-/// reaches a folder delivers its rules (D93). The instructions never change
-/// when an image brings a folder the session has not seen, so the provider's
-/// cached prefix still matches. Rules an earlier note delivered are not sent
-/// again: a reminder line stands in for them, as for a tool call.
-fn queueImageFolderRules(
+/// Queues the rules of the folders the turn's attachments come from as a note
+/// on the turn's own message, after the user's text, the way a tool call that
+/// reaches a folder delivers its rules (D93). `images` are the images the host
+/// names by workspace path and `attached` the other files, with the sources
+/// that were no files. The instructions never change when an attachment brings
+/// a folder the session has not seen, so the provider's cached prefix still
+/// matches. Rules an earlier note delivered are not sent again: a reminder line
+/// stands in for them, as for a tool call.
+fn queueAttachedFolderRules(
     arena: Allocator,
     deps: *const AgentRuntimeDeps,
     registry: context_contract.Registry,
     config: Config,
     images: []const types.ImageAttachment,
+    attached: context_contract.AttachedFiles,
     context_delivery_state: *context_contract.DeliveryState,
     replaced_sources: []const []const u8,
     remind_sources: *std.ArrayList([]const u8),
     pending_notes: *std.ArrayList(ChatMessage),
 ) !void {
-    if (images.len == 0) return;
-    const targets = try context_contract.applicableTargetsForImages(arena, images);
+    if (images.len == 0 and attached.isEmpty()) return;
+    const targets = try std.mem.concat(arena, context_contract.ApplicableTarget, &.{
+        try context_contract.applicableTargetsForImages(arena, images),
+        attached.targets,
+    });
     var selected = try registry.selectDefaultApplicableContext(arena, .{
         .workspace_root = config.workspace_root,
         .access_scope = config.access_scope,
@@ -2867,13 +2873,20 @@ fn queueImageFolderRules(
         .delivered_sources = context_delivery_state.delivered_sources.items,
         .evaluated_endpoints = context_delivery_state.evaluated_endpoints.items,
         .remind_sources = remind_sources.items,
+        .omissions = attached.omissions,
+        .omission_summary = attached.omission_summary,
         .context_limits = config.context_limits,
     });
     defer selected.deinit(arena);
     for (selected.notices) |notice| try deps.pushContextNotice(notice);
     const queued_before = pending_notes.items.len;
     try commitContextNote(arena, pending_notes, context_delivery_state, registry.instruction_files, &selected, replaced_sources, remind_sources);
-    debug_trace.logf("context", "image folder rules images={d} notes_queued={d}", .{ images.len, pending_notes.items.len - queued_before });
+    debug_trace.logf("context", "attached folder rules images={d} files={d} omitted={d} notes_queued={d}", .{
+        images.len,
+        attached.targets.len,
+        attached.omissions.len,
+        pending_notes.items.len - queued_before,
+    });
 }
 
 /// Counts each instruction file a saved note delivered as delivered when the
@@ -7411,14 +7424,15 @@ fn processQueuedPromptLoop(
     // Notes the gate queued during a step; they join the turn at the next
     // step boundary.
     var pending_context_notes: std.ArrayList(ChatMessage) = .empty;
-    // The rules of the folders the turn's images come from join the turn's
-    // own message at its first boundary.
-    if (deps.context_enabled and deps.image_folder_rules) if (deps.context_registry) |registry| try queueImageFolderRules(
+    // The rules of the folders the turn's attachments come from join the
+    // turn's own message at its first boundary.
+    if (deps.context_enabled) if (deps.context_registry) |registry| try queueAttachedFolderRules(
         arena,
         deps,
         registry,
         config,
-        job.images,
+        if (deps.image_folder_rules) job.images else &.{},
+        job.attached_files,
         &context_delivery_state,
         replaced_note_sources.items,
         &remind_sources,
