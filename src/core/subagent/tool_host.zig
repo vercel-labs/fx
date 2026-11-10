@@ -1804,6 +1804,23 @@ pub const Runtime = struct {
         return self.encodeManaged(alloc, .{ .ok = true, .result = "Sent to your parent. It arrives as your message, never as the user's." });
     }
 
+    /// Tells the owner, as child `child_id`'s own message, that its request
+    /// failed and waits for a follow-up, which a message back gives it.
+    /// `reason` is the recovery's wording, such as "Sign-in expired".
+    pub fn noteChildWaiting(self: *Runtime, child_id: []const u8, reason: []const u8) void {
+        const sink = self.report_sink orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const text = a.print("fx: my last request failed and waits for a follow-up ({s}). A message from you sends it again; if it keeps failing, tell the user.", .{reason}) catch return;
+        sink.post(self, .{ .message = .{
+            .to = .owner,
+            .agent = self.childName(a, child_id) catch child_id,
+            .child_id = child_id,
+            .text = text,
+        } }) catch |err| debug_trace.logf("mailbox", "waiting note lost child={s} err={s}", .{ child_id, @errorName(err) });
+    }
+
     const ChildProfile = union(enum) {
         loaded: profiles.Profile,
         rejected: model_contract.Result,

@@ -1348,6 +1348,7 @@ pub fn Runtime(comptime App: type) type {
                         // recovered or failed; the error itself arrives on
                         // its own. The status line returns to normal activity.
                         const was_waiting_for_sign_in = app.shell.worker_status_state().waitsForSignIn();
+                        const was_waiting = app.shell.worker_status_state().waitsForUser();
                         if (status.kind == .recovered or status.kind == .failed) {
                             _ = app.shell.worker_status_state().clear_route_recovery();
                         } else {
@@ -1364,7 +1365,10 @@ pub fn Runtime(comptime App: type) type {
                         }
                         app.shell.render_requests.request(.footer);
                         try recordRouteRecoveryNotice(app, status);
-                        if (comptime agents.hasAgentField(App, "child_run")) app_agents_runtime.Runtime(App).noteChildFailure(app, agent, status);
+                        if (comptime agents.hasAgentField(App, "child_run")) {
+                            app_agents_runtime.Runtime(App).noteChildFailure(app, agent, status);
+                            if (!was_waiting and app.shell.worker_status_state().waitsForUser()) app_agents_runtime.Runtime(App).noteChildWaiting(app, agent, status);
+                        }
                     },
                     .clear_route_recovery_status => {
                         if (app.shell.worker_status_state().clear_route_recovery()) {

@@ -2590,6 +2590,18 @@ pub fn Runtime(comptime App: type) type {
             host.endUserWork(run.child_id, work_id, outcome, reply);
         }
 
+        /// A subagent's request that starts waiting for the user waits for
+        /// its parent too: the parent hears of it, and its message sends the
+        /// request again (`noteChildWaiting`).
+        pub fn noteChildWaiting(app: *App, agent: *AppAgent, status: types.RouteRecoveryStatus) void {
+            if (agent.role != .subagent) return;
+            const child = hostedOf(app, agent) orelse return;
+            const host = hostOf(app, child) orelse return;
+            // The part the parent can use, without the keys for the user.
+            const text = status.text.slice();
+            host.noteChildWaiting(child.id, if (std.mem.find(u8, text, " \u{b7} ")) |at| text[0..at] else text);
+        }
+
         /// Keeps a child's terminal provider error for the parent.
         pub fn noteChildFailure(app: *App, agent: *AppAgent, status: types.RouteRecoveryStatus) void {
             if (status.kind != .terminal_provider_error) return;
