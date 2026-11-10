@@ -1875,8 +1875,10 @@ test.skipIf(!tmuxAvailable())("a switch stops only a working subagent's task: ba
     const before = reports;
     await app.session.sendText("Keep prompt three.");
     await scrollbackContains(app.session, "KEEP_PARENT_THREE");
-    // The same subagent took the new work, with its old history.
-    expect(childBodies.at(-1)).toContain("KEEPER_FIRST_DONE");
+    // The same subagent took the new work, with its old history. Its request
+    // can come after the parent's reply.
+    await app.session.waitForPane(() => childBodies.some((body) => body.includes("KEEPER_THIRD")), TIMEOUT);
+    expect(childBodies.find((body) => body.includes("KEEPER_THIRD"))).toContain("KEEPER_FIRST_DONE");
     expect(new Set(childLines(fixture.home, source).map((line) => line.child)).size).toBe(1);
     await scrollbackContains(app.session, `KEEP_REPORT_${before + 1}`);
     await app.session.waitForStableComposer();
@@ -1993,8 +1995,11 @@ test.skipIf(!tmuxAvailable())("/fork asks once and copies the subagents made bef
     await app.session.sendKeys("C-u");
     await app.session.sendText("Use the helper in the fork.");
     await scrollbackContains(app.session, "COPY_PARENT_FORK");
-    expect(childBodies.at(-1)).toContain("HELPER_ONE_DONE");
-    expect(childBodies.at(-1)).not.toContain("HELPER_THREE_DONE");
+    // The copy's request can come after the parent's reply.
+    await app.session.waitForPane(() => childBodies.some((body) => body.includes("HELPER_FORK")), TIMEOUT);
+    const forkBody = childBodies.find((body) => body.includes("HELPER_FORK"))!;
+    expect(forkBody).toContain("HELPER_ONE_DONE");
+    expect(forkBody).not.toContain("HELPER_THREE_DONE");
     await app.session.waitForStableComposer();
     await quitApp(app);
     open = undefined;
@@ -2126,6 +2131,106 @@ test.skipIf(!tmuxAvailable())("a copy of a subagent whose turn runs across the f
     for (const id of savedSessionIds(fixture.home)) expectWholeLog(fixture, id);
   } finally {
     for (const release of releases) release();
+    await app?.session.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 6);
+
+test.skipIf(!tmuxAvailable())("a fork of a fork asks again at the fork's first prompt and copies the copy with its history", async () => {
+  const fixture = createFixture("fx-v2-app-fork-twice-");
+  const typed = ["Twice prompt one.", "Twice prompt two.", "Twice prompt three.", "Use the helper twice."];
+  const childBodies: string[] = [];
+  let reports = 0;
+  // A subagent answers only once the turn that sent it work has its final
+  // reply, so its report never joins that turn.
+  let sending = false;
+  const held: (() => void)[] = [];
+  const gateway = startDynamicFakeGateway((body) => {
+    if (isAppChildRequest(body, typed)) {
+      childBodies.push(body);
+      const reply = latestUserText(body).includes("HELPER_AGAIN") ? "TWICE_HELPER_AGAIN" : "TWICE_HELPER_ONE";
+      if (!sending) return fakeGatewayFinalText(reply);
+      return new Promise<Response>((resolve) => held.push(() => resolve(fakeGatewayFinalText(reply))));
+    }
+    if (isReportTurn(body)) {
+      reports += 1;
+      return fakeGatewayFinalText(`TWICE_REPORT_${reports}`);
+    }
+    const answered = answeredCall(body);
+    if (answered) {
+      sending = false;
+      queueMicrotask(() => held.splice(0).forEach((release) => release()));
+      return fakeGatewayFinalText(answered === "twice-one" ? "TWICE_PARENT_ONE" : "TWICE_PARENT_AGAIN");
+    }
+    const latest = latestUserText(body);
+    if (latest.includes("Twice prompt one.")) {
+      sending = true;
+      return delegate("twice-one", "helper", "Work on TWICE_ONE.");
+    }
+    if (latest.includes("Twice prompt two.")) return fakeGatewayFinalText("TWICE_PARENT_TWO");
+    if (latest.includes("Twice prompt three.")) return fakeGatewayFinalText("TWICE_PARENT_THREE");
+    if (latest.includes("Use the helper twice.")) {
+      sending = true;
+      return delegate("twice-again", "helper", "Work on HELPER_AGAIN.");
+    }
+    return fakeGatewayFinalText("UNEXPECTED_REQUEST");
+  }, { classifierDecision: "clear" });
+  let app: { session: TmuxSession; stderrPath: string } | undefined;
+  try {
+    app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "full-access" });
+    await app.session.sendText("Twice prompt one.");
+    await scrollbackContains(app.session, "TWICE_REPORT_1");
+    await app.session.waitForStableComposer();
+    await app.session.sendText("Twice prompt two.");
+    await scrollbackContains(app.session, "TWICE_PARENT_TWO");
+    await app.session.waitForStableComposer();
+    const source = rootSessionIds(fixture.home)[0]!;
+
+    // The first fork brings helper.
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await selectForkPrompt(app.session, "Twice prompt two.");
+    await app.session.sendKeys("Enter");
+    await app.session.waitForPane((pane) => pane.includes("Bring 1 subagent into the fork?"), TIMEOUT);
+    await app.session.sendKeys("Enter");
+    await waitForForkNotice(app.session, source, "Twice prompt two.");
+    const first = rootSessionIds(fixture.home).find((id) => id !== source)!;
+    const firstCopy = ownChildLines(fixture.home, first).find((line) => line.kind === "child_spawned")!.child;
+    await app.session.sendKeys("C-u");
+    await app.session.sendText("Twice prompt three.");
+    await scrollbackContains(app.session, "TWICE_PARENT_THREE");
+    await app.session.waitForStableComposer();
+
+    // Forking the fork before its first own prompt falls in the history it
+    // copied, where its copy of helper already stood.
+    await app.session.sendText("/fork");
+    await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
+    await selectForkPrompt(app.session, "Twice prompt three.");
+    await app.session.sendKeys("Enter");
+    await app.session.waitForPane((pane) => pane.includes("Bring 1 subagent into the fork?"), TIMEOUT);
+    await app.session.sendKeys("Enter");
+    await waitForForkNotice(app.session, first, "Twice prompt three.");
+    const second = rootSessionIds(fixture.home).find((id) => id !== source && id !== first)!;
+    const secondCopy = ownChildLines(fixture.home, second).find((line) => line.kind === "child_spawned")!.child;
+    const lines = logLines(fixture.home, secondCopy) as any[];
+    expect(lines[0].forked_from.id).toBe(firstCopy);
+    expect(JSON.stringify(lines)).toContain("TWICE_HELPER_ONE");
+
+    // The copy of the copy takes new work with helper's first answer in its history.
+    await app.session.sendKeys("C-u");
+    await app.session.sendText("Use the helper twice.");
+    await scrollbackContains(app.session, "TWICE_PARENT_AGAIN");
+    await app.session.waitForPane(() => childBodies.some((body) => body.includes("HELPER_AGAIN")), TIMEOUT);
+    expect(childBodies.find((body) => body.includes("HELPER_AGAIN"))).toContain("TWICE_HELPER_ONE");
+    await app.session.waitForPane(() => reports >= 2, TIMEOUT);
+    await scrollbackContains(app.session, "TWICE_REPORT_2");
+    await app.session.waitForStableComposer();
+    await quitApp(app);
+    app = undefined;
+    for (const id of savedSessionIds(fixture.home)) expectWholeLog(fixture, id);
+  } finally {
+    held.splice(0).forEach((release) => release());
     await app?.session.kill();
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });

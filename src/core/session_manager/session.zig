@@ -1973,8 +1973,10 @@ fn findChildCut(env: *const Env, source: []const u8, src: storage.File, end: u64
 }
 
 /// The source's state just past fork point `at`, as its fold stood then:
-/// which children it had, and how each one's newest work stood (D97). The
-/// caller frees it with `deinit`.
+/// which children it had, and how each one's newest work stood (D97). When
+/// the source is a fork and `at` falls in the history it copied, which ends
+/// before the fork registers its copies, each copy stands as its source
+/// child did at `at` (`addCopiesAt`). The caller frees it with `deinit`.
 pub fn stateAt(env: *const Env, source: []const u8, at: ForkPoint) ForkError!fold.State {
     const s = env.s;
     const gpa = env.gpa;
@@ -2001,7 +2003,85 @@ pub fn stateAt(env: *const Env, source: []const u8, at: ForkPoint) ForkError!fol
         }
         try fold.apply(gpa, &state, fork_seq, .{ .seq = line.header.seq, .offset = line.offset, .body = body });
     }
+    if (fork_seq > 0 and point.seq <= fork_seq) try addCopiesAt(env, src, end, point.seq, fork_seq, &state);
     return state;
+}
+
+/// A chain of copies is as long as the forks of forks that made it; the
+/// bound only keeps a damaged trail from looping.
+const max_copy_hops = 64;
+
+/// Adds to `state` the copies that fork `src` registered right after its
+/// copied lines, which end at `fork_seq`. Each one stands as its source
+/// child did at `point_seq` in those lines, and one whose source child they
+/// don't show there, or whose trail back to it is gone, is left out.
+fn addCopiesAt(env: *const Env, src: storage.File, end: u64, point_seq: u64, fork_seq: u64, state: *fold.State) ForkError!void {
+    const gpa = env.gpa;
+    // The children of the fork's own source at the point.
+    var inherited: fold.State = .{};
+    defer inherited.deinit(gpa);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Registered = struct { id: []const u8, seq: u64 };
+    var copies: std.ArrayList(Registered) = .empty;
+    var line_arena = std.heap.ArenaAllocator.init(gpa);
+    defer line_arena.deinit();
+    var reader = log_mod.ForwardReader.init(gpa, env.s, src, 0, end, 1);
+    defer reader.deinit();
+    while (reader.next() catch |err| return mapRead(err)) |line| {
+        const seq = line.header.seq;
+        if (seq > point_seq and seq <= fork_seq) continue;
+        const kind = line.header.kind orelse continue;
+        // The first batch ends with the copies' registrations.
+        if (seq > fork_seq and kind != .child_spawned and kind != .child_finished) break;
+        _ = line_arena.reset(.retain_capacity);
+        const body = schema.parseBody(line_arena.allocator(), kind, line.body()) catch return error.Corrupt;
+        if (seq <= point_seq) {
+            try fold.apply(gpa, &inherited, 0, .{ .seq = seq, .offset = line.offset, .body = body });
+        } else if (body == .child_spawned) {
+            try copies.append(arena, .{ .id = try arena.dupe(u8, body.child_spawned.child), .seq = seq });
+        }
+    }
+    for (copies.items) |copy| {
+        const stood = (try sourceChildOf(env, arena, &inherited, copy.id)) orelse continue;
+        try fold.apply(gpa, state, 0, .{ .seq = copy.seq, .offset = 0, .body = .{ .child_spawned = .{ .child = copy.id, .work_id = stood.work_id, .data = stood.spawn_data } } });
+        if (!stood.open) {
+            try fold.apply(gpa, state, 0, .{ .seq = copy.seq, .offset = 0, .body = .{ .child_finished = .{ .child = copy.id, .work_id = stood.work_id, .outcome = stood.outcome.?, .data = stood.finish_data } } });
+        }
+    }
+}
+
+/// The child of `inherited` that copy `id` was made from, followed back
+/// through each copy's `forked_from`; null when the trail reaches a
+/// session that is gone or damaged before it reaches such a child.
+fn sourceChildOf(env: *const Env, arena: std.mem.Allocator, inherited: *const fold.State, id: []const u8) ForkError!?fold.Child {
+    var at = id;
+    for (0..max_copy_hops) |_| {
+        const from = (try forkedFromOf(env, arena, at)) orelse return null;
+        for (inherited.children.items) |child| {
+            if (std.mem.eql(u8, child.id, from)) return child;
+        }
+        at = from;
+    }
+    return null;
+}
+
+/// Session `id`'s `forked_from` id, in `arena`; null when it has none or
+/// its log is gone or damaged.
+fn forkedFromOf(env: *const Env, arena: std.mem.Allocator, id: []const u8) ForkError!?[]const u8 {
+    const log = SourceLog.open(env, id) catch |err| switch (err) {
+        error.NotFound, error.Corrupt => return null,
+        else => |e| return e,
+    };
+    defer log.close(env.s);
+    var reader = log_mod.ForwardReader.init(env.gpa, env.s, log.file, 0, log.end, 1);
+    defer reader.deinit();
+    const line = (reader.next() catch |err| return mapRead(err)) orelse return null;
+    if (line.header.kind != .session_created) return null;
+    const body = schema.parseBody(arena, .session_created, line.body()) catch return null;
+    const origin = body.session_created.forked_from orelse return null;
+    return try arena.dupe(u8, origin.id);
 }
 
 fn forkError(err: AppendError) ForkError {
@@ -3214,6 +3294,94 @@ const session_tests = struct {
         const kid_after = try t.kinds(made.kid);
         defer gpa.free(kid_after);
         try testing.expectEqualSlices(schema.Kind, kid_before, kid_after);
+    }
+
+    test "a fork point inside a fork's copied history offers the fork's copies, and a fork of the fork copies them again (D97)" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const made = try parentWithChild(&t, false);
+        defer gpa.free(made.parent);
+        defer gpa.free(made.kid);
+
+        // F1 forks the parent after its second turn with a copy of kid.
+        var at2 = try session_mod.stateAt(&t.env, made.parent, .{ .turn = 2 });
+        defer at2.deinit(gpa);
+        const kid = at2.children.items[0];
+        const f1 = try session_mod.openForkWithChildren(&t.env, .{ .source = made.parent, .at = .{ .turn = 2 }, .workspace = "/w", .host = .app }, &.{
+            .{ .id = kid.id, .work_id = kid.work_id, .outcome = kid.outcome.?, .spawn_data = kid.spawn_data },
+        });
+        defer gpa.free(f1.copies);
+        const c1 = try gpa.dupe(u8, f1.copies[0].id());
+        defer gpa.free(c1);
+        try closeAndDestroy(f1.copies[0]);
+        _ = try f1.session.append(&.{ .turn_started, item, .turn_committed });
+        const f1_id = try gpa.dupe(u8, f1.session.id());
+        defer gpa.free(f1_id);
+        try closeAndDestroy(f1.session);
+
+        // At its own fork point, F1 has its copy as kid stood there.
+        var f1_at2 = try session_mod.stateAt(&t.env, f1_id, .{ .turn = 2 });
+        defer f1_at2.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), f1_at2.children.items.len);
+        try testing.expectEqualStrings(c1, f1_at2.children.items[0].id);
+        try testing.expectEqualStrings("w2", f1_at2.children.items[0].work_id);
+        try testing.expectEqual(@as(?schema.Outcome, .failed), f1_at2.children.items[0].outcome);
+        // Earlier in the copied history, the copy stands as kid did there.
+        var f1_at1 = try session_mod.stateAt(&t.env, f1_id, .{ .turn = 1 });
+        defer f1_at1.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), f1_at1.children.items.len);
+        const c1_at1 = f1_at1.children.items[0];
+        try testing.expectEqualStrings(c1, c1_at1.id);
+        try testing.expectEqualStrings("w1", c1_at1.work_id);
+        try testing.expect(!c1_at1.open);
+        try testing.expectEqual(@as(?schema.Outcome, .ok), c1_at1.outcome);
+        try testing.expectEqualStrings("{\"agent\":\"kid\"}", c1_at1.spawn_data.?);
+        // Before kid was spawned, F1 had no child.
+        var f1_at0 = try session_mod.stateAt(&t.env, f1_id, .{ .turn = 0 });
+        defer f1_at0.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), f1_at0.children.items.len);
+
+        // F2 forks F1 inside its copied history and copies c1 as it stood there.
+        const f2 = try session_mod.openForkWithChildren(&t.env, .{ .source = f1_id, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app }, &.{
+            .{ .id = c1_at1.id, .work_id = c1_at1.work_id, .outcome = c1_at1.outcome.?, .spawn_data = c1_at1.spawn_data },
+        });
+        defer gpa.free(f2.copies);
+        const c2 = try gpa.dupe(u8, f2.copies[0].id());
+        defer gpa.free(c2);
+        try testing.expectEqualStrings(c1, f2.copies[0].identity.forked_from.?.id);
+        try closeAndDestroy(f2.copies[0]);
+        // Kid's first turn, then the close.
+        try expectKinds(&t, c2, &.{ .session_created, .turn_started, .item, .turn_committed, .closed });
+        const f2_id = try gpa.dupe(u8, f2.session.id());
+        defer gpa.free(f2_id);
+        try closeAndDestroy(f2.session);
+
+        // F2's own fork point finds c2 through c1 back to kid.
+        var f2_at1 = try session_mod.stateAt(&t.env, f2_id, .{ .turn = 1 });
+        defer f2_at1.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), f2_at1.children.items.len);
+        try testing.expectEqualStrings(c2, f2_at1.children.items[0].id);
+        try testing.expectEqual(@as(?schema.Outcome, .ok), f2_at1.children.items[0].outcome);
+    }
+
+    test "a fork made without copies offers none inside its copied history (D97)" {
+        var t: TestEnv = undefined;
+        t.init(.{});
+        defer t.deinit();
+        const made = try parentWithChild(&t, false);
+        defer gpa.free(made.parent);
+        defer gpa.free(made.kid);
+        const forked = try session_mod.openForkWithChildren(&t.env, .{ .source = made.parent, .at = .{ .turn = 2 }, .workspace = "/w", .host = .app }, &.{});
+        defer gpa.free(forked.copies);
+        const fork_id = try gpa.dupe(u8, forked.session.id());
+        defer gpa.free(fork_id);
+        try closeAndDestroy(forked.session);
+        for ([_]u64{ 0, 1, 2 }) |turn| {
+            var at = try session_mod.stateAt(&t.env, fork_id, .{ .turn = turn });
+            defer at.deinit(gpa);
+            try testing.expectEqual(@as(usize, 0), at.children.items.len);
+        }
     }
 
     test "a copy cut inside a child's open turn ends that turn as cancelled (D97)" {

@@ -1817,7 +1817,12 @@ cached prompt prefix):
     is outside `Subagents.tla`'s `NoOrphanChild`; writing the fork first
     would instead leave the fork naming a copy that is missing. The source
     and its children are never written. A child's own subagents are not
-    copied.
+    copied. A fork's copies are registered after the lines it copied, so
+    when a fork is itself forked at a point inside those lines, such as
+    before its first own prompt, `stateAt` gives it each copy whose source
+    child those lines show at that point, standing as that child stood
+    there. It traces a copy of a copy back through each `forked_from`, and
+    leaves out a copy whose trail is gone.
   - **Why:** the switch fix sits in the one step all five commands share
     and reuses `/close`'s stop. The copy is made by the manager, as a fork
     is, so it adds no format beyond `forked_from` on a child, and stays
