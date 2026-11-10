@@ -42,8 +42,8 @@ async function start(name: string, mode: string, url: string) {
   }
   const { TmuxSession, startFakeGateway, fakeGatewayToolCall, fakeGatewayFinalText } = await targetHelpers();
   const gateway = startFakeGateway([
-    fakeGatewayToolCall("select", "mcp_select_tool", { name: TOOL }),
-    fakeGatewayToolCall("call", TOOL, { text: "hello" }),
+    fakeGatewayToolCall("open", "toolbox", { open: TOOL }),
+    fakeGatewayToolCall("call", "toolbox", { run: TOOL, arguments: { text: "hello" } }),
     fakeGatewayFinalText(DONE),
   ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
   const env = fxEnv(f, {

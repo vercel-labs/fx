@@ -29,6 +29,7 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const session_store = @import("../session/session_store.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const toolbox_core = @import("../tooling/toolbox.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -3616,6 +3617,15 @@ pub fn captureHostAuthorityWithMcpView(
         if (permissions.rulesDenyAllTargetsForTool(rules, registered_tool.name)) continue;
         try tool_names.append(alloc, registered_tool.name);
     }
+    // toolbox's open and search are decided under the names of the tools
+    // they replaced, so a child's profile can keep or drop each one.
+    const has_toolbox = for (tool_names.items) |name| {
+        if (std.mem.eql(u8, name, toolbox_core.tool_name)) break true;
+    } else false;
+    if (has_toolbox) for (toolbox_core.replaced) |name| {
+        if (permissions.rulesDenyAllTargetsForTool(rules, name)) continue;
+        try tool_names.append(alloc, name);
+    };
     return authority.HostAuthority.captureWithPermissionStateAndMcpView(
         alloc,
         tool_names.items,
@@ -3625,4 +3635,30 @@ pub fn captureHostAuthorityWithMcpView(
         permission_state,
         mcp_view,
     );
+}
+
+test "the root's authority names toolbox's open and search, less the ones a rule denies" {
+    const alloc = std.testing.allocator;
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const tools = [_]@import("../tooling/tool_dispatch.zig").Tool{ builtin_tools.read_file, builtin_tools.toolbox };
+    const with_toolbox = tool_set_contract.ToolSet{ .registry = .{ .tools = &tools }, .order = &.{ "read_file", "toolbox" }, .read_only_tool_names = &.{} };
+    var rules = [_]types.PermissionRule{.{ .permission = @constCast("skill"), .pattern = @constCast("*"), .action = .deny }};
+    var root = try captureHostAuthorityWithMcpView(alloc, .{ .tool_set = with_toolbox, .mode = .full }, &.{}, .{ .rules = &rules }, &.{}, .{}, null);
+    defer root.deinit(alloc);
+    const contains = struct {
+        fn in(names: []const []const u8, name: []const u8) bool {
+            for (names) |entry| if (std.mem.eql(u8, entry, name)) return true;
+            return false;
+        }
+    }.in;
+    for ([_][]const u8{ "read_file", "toolbox", "capability_search", "mcp_select_tool" }) |name| {
+        try std.testing.expect(contains(root.tools, name));
+    }
+    try std.testing.expect(!contains(root.tools, "skill"));
+
+    // Without toolbox there is nothing to open or search through.
+    const without = tool_set_contract.ToolSet{ .registry = .{ .tools = tools[0..1] }, .order = &.{"read_file"}, .read_only_tool_names = &.{} };
+    var plain = try captureHostAuthorityWithMcpView(alloc, .{ .tool_set = without, .mode = .full }, &.{}, .{}, &.{}, .{}, null);
+    defer plain.deinit(alloc);
+    for (toolbox_core.replaced) |name| try std.testing.expect(!contains(plain.tools, name));
 }

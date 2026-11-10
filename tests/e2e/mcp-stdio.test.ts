@@ -273,8 +273,8 @@ function fixtureEnv(root: FixtureRoot, activeGateway: ReturnType<typeof startFak
 
 function startToolGateway(finalText: string) {
   return startFakeGateway([
-    fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-    fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+    fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+    fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
     fakeGatewayFinalText(finalText),
   ], {
     models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -358,10 +358,10 @@ describe("modern MCP stdio compatibility", () => {
       const stderrPath = join(root.root, "stderr.log");
       const expectedArguments = '{"text":"mcp-live-human-active"}';
       const activeGateway = startFakeGateway([
-        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-        fakeGatewayToolCall("call_mcp", TOOL_NAME, {
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: {
           text: "mcp-live-human-active",
-        }),
+        } }),
         fakeGatewayFinalText("MCP approval denied without transport."),
       ], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -504,8 +504,8 @@ describe("modern MCP stdio compatibility", () => {
     writeFileSync(projectPath, JSON.stringify(project));
     gateway = startFakeGateway([
       fakeGatewayFinalText("WORKSPACE_MCP_SKIPPED"),
-      fakeGatewayToolCall("workspace_select", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("workspace_call", TOOL_NAME, { text: "workspace" }),
+      fakeGatewayToolCall("workspace_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("workspace_call", "toolbox", { run: TOOL_NAME, arguments: { text: "workspace" } }),
       fakeGatewayFinalText("WORKSPACE_MCP_READY"),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -615,8 +615,8 @@ describe("modern MCP stdio compatibility", () => {
       writeFileSync(profilePath, JSON.stringify(profile));
       let first = "";
       gateway = startFakeGateway([
-        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-        fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
         (body: string) => {
           first = toolResultText(body, "call_mcp");
           return fakeGatewayFinalText("OVERSIZED_REPLY_DONE");
@@ -643,8 +643,8 @@ describe("modern MCP stdio compatibility", () => {
       let stored = "";
       let read = "";
       gateway = startFakeGateway([
-        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-        fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
         (body: string) => {
           stored = toolResultText(body, "call_mcp");
           const handle = /<tool_result_handle>([^<]+)<\/tool_result_handle>/.exec(stored)?.[1] ?? "missing";
@@ -675,8 +675,8 @@ describe("modern MCP stdio compatibility", () => {
       const root = bigResultRoot("big-result-unsaved");
       let cut = "";
       gateway = startFakeGateway([
-        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-        fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
         (body: string) => {
           cut = toolResultText(body, "call_mcp");
           return fakeGatewayFinalText("BIG_RESULT_CUT");
@@ -1000,8 +1000,8 @@ describe("modern MCP stdio compatibility", () => {
   test("fresh and resumed native sessions reconstruct MCP from the current profile", async () => {
     const root = createRoot("resume-current-profile", MODERN_FIXTURE);
     const initialGateway = startFakeGateway([
-      fakeGatewayToolCall("fresh_select", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("fresh_call", TOOL_NAME, { text: "fresh" }),
+      fakeGatewayToolCall("fresh_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("fresh_call", "toolbox", { run: TOOL_NAME, arguments: { text: "fresh" } }),
       fakeGatewayFinalText("FRESH_PROFILE_MCP_READY"),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1029,8 +1029,8 @@ describe("modern MCP stdio compatibility", () => {
 
     const resumedTool = "mcp_fixture_sum";
     const resumedGateway = startFakeGateway([
-      fakeGatewayToolCall("resume_select", "mcp_select_tool", { name: resumedTool }),
-      fakeGatewayToolCall("resume_call", resumedTool, { text: "resumed" }),
+      fakeGatewayToolCall("resume_select", "toolbox", { open: resumedTool }),
+      fakeGatewayToolCall("resume_call", "toolbox", { run: resumedTool, arguments: { text: "resumed" } }),
       fakeGatewayFinalText("RESUMED_PROFILE_MCP_READY"),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1067,10 +1067,10 @@ describe("modern MCP stdio compatibility", () => {
       });
       const stderrPath = join(root.root, "stderr.log");
       const activeGateway = startFakeGateway([
-        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-        fakeGatewayToolCall("first_call", TOOL_NAME, { text: "first" }),
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("first_call", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } }),
         fakeGatewayFinalText("FIRST_TURN_DONE"),
-        fakeGatewayToolCall("later_call", TOOL_NAME, { text: "later" }),
+        fakeGatewayToolCall("later_call", "toolbox", { run: TOOL_NAME, arguments: { text: "later" } }),
         fakeGatewayFinalText("LATER_TURN_DONE"),
       ], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1142,7 +1142,7 @@ describe("modern MCP stdio compatibility", () => {
     const missingTool = "mcp_fixture_missing";
     const laterGateway = startFakeGateway([
       fakeGatewayToolCall("missing_call", missingTool, { text: "nothing" }),
-      fakeGatewayToolCall("later_call", TOOL_NAME, { text: "later" }),
+      fakeGatewayToolCall("later_call", "toolbox", { run: TOOL_NAME, arguments: { text: "later" } }),
       fakeGatewayFinalText("LATER_ASK_DONE"),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1237,9 +1237,7 @@ describe("modern MCP stdio compatibility", () => {
           return parentCompletion;
         }
         if (body.includes(childPrompt)) {
-          return fakeGatewayToolCall("scoped_refresh_search", "capability_search", {
-            query: "echo",
-          });
+          return fakeGatewayToolCall("scoped_refresh_search", "toolbox", { search: "echo" });
         }
         if (body.includes(parentPrompt)) {
           return fakeGatewayToolCall(
@@ -1305,19 +1303,13 @@ describe("modern MCP stdio compatibility", () => {
     });
     const freshTool = "mcp_fixture_fresh";
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_initial", "capability_search", {
-        query: "echo",
-      }),
+      fakeGatewayToolCall("search_initial", "toolbox", { search: "echo" }),
       async () => {
         await Bun.sleep(200);
-        return fakeGatewayToolCall("search_fresh", "capability_search", {
-          query: "fresh",
-        });
+        return fakeGatewayToolCall("search_fresh", "toolbox", { search: "fresh" });
       },
-      fakeGatewayToolCall("select_fresh", "mcp_select_tool", {
-        name: freshTool,
-      }),
-      fakeGatewayToolCall("call_fresh", freshTool, { text: "stdio" }),
+      fakeGatewayToolCall("select_fresh", "toolbox", { open: freshTool }),
+      fakeGatewayToolCall("call_fresh", "toolbox", { run: freshTool, arguments: { text: "stdio" } }),
       fakeGatewayFinalText("Live stdio cache refresh complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1357,20 +1349,14 @@ describe("modern MCP stdio compatibility", () => {
     });
     const freshTool = "mcp_fixture_fresh";
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_initial", "capability_search", {
-        query: "echo",
-      }),
+      fakeGatewayToolCall("search_initial", "toolbox", { search: "echo" }),
       async () => {
         writeFileSync(root.invalidationReleasePath, "ready");
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_fresh", "capability_search", {
-          query: "fresh",
-        });
+        return fakeGatewayToolCall("search_fresh", "toolbox", { search: "fresh" });
       },
-      fakeGatewayToolCall("select_fresh", "mcp_select_tool", {
-        name: freshTool,
-      }),
-      fakeGatewayToolCall("call_fresh", freshTool, { text: "legacy-stdio" }),
+      fakeGatewayToolCall("select_fresh", "toolbox", { open: freshTool }),
+      fakeGatewayToolCall("call_fresh", "toolbox", { run: freshTool, arguments: { text: "legacy-stdio" } }),
       fakeGatewayFinalText("Legacy stdio live refresh complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1495,8 +1481,8 @@ describe("modern MCP stdio compatibility", () => {
     test(`MCP image results ${supportsImages ? "reach the model as images" : "remain explicit for a text-only model"}`, async () => {
       const root = createRoot("image-output", MODERN_FIXTURE, { mode: "image_result" });
       gateway = startFakeGateway([
-        fakeGatewayToolCall("image_select", "mcp_select_tool", { name: TOOL_NAME }),
-        fakeGatewayToolCall("image_call", TOOL_NAME, { text: "screenshot" }),
+        fakeGatewayToolCall("image_select", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayToolCall("image_call", "toolbox", { run: TOOL_NAME, arguments: { text: "screenshot" } }),
         fakeGatewayFinalText("Image result observed."),
       ], { models: [{ id: MODEL, type: "language", tags: supportsImages ? ["tool-use", "vision", "file-input"] : ["tool-use"] }] });
       const result = await runFx(["ask", "--json", "--auto", "--no-save", "Get an image from the fixture"], {
@@ -1534,8 +1520,8 @@ describe("modern MCP stdio compatibility", () => {
     const original = solidPng(3420, 2224);
     const root = createRoot("wide-image-output", MODERN_FIXTURE, { mode: "image_result", image: original });
     gateway = startFakeGateway([
-      fakeGatewayToolCall("image_select", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("image_call", TOOL_NAME, { text: "screenshot" }),
+      fakeGatewayToolCall("image_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("image_call", "toolbox", { run: TOOL_NAME, arguments: { text: "screenshot" } }),
       fakeGatewayFinalText("Wide image result observed."),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use", "vision", "file-input"] }] });
     const result = await runFx(["ask", "--json", "--auto", "--no-save", "Get an image from the fixture"], {
@@ -1568,8 +1554,8 @@ describe("modern MCP stdio compatibility", () => {
     const root = createRoot("saved-image", MODERN_FIXTURE, { mode: "image_result" });
     const models = [{ id: MODEL, type: "language", tags: ["tool-use", "vision", "file-input"] }];
     gateway = startFakeGateway([
-      fakeGatewayToolCall("saved_select", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("saved_image", TOOL_NAME, { text: "screenshot" }),
+      fakeGatewayToolCall("saved_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("saved_image", "toolbox", { run: TOOL_NAME, arguments: { text: "screenshot" } }),
       fakeGatewayFinalText("Screenshot saved."),
     ], { models });
     const first = await runFx(["ask", "--json", "--auto", "Get a screenshot"], {
@@ -1615,10 +1601,10 @@ describe("modern MCP stdio compatibility", () => {
       mode: "tool_failure",
     });
     gateway = startFakeGateway([
-      fakeGatewayToolCall("retry_select", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("retry_call_1", TOOL_NAME, { text: "one" }),
-      fakeGatewayToolCall("retry_call_2", TOOL_NAME, { text: "two" }),
-      fakeGatewayToolCall("retry_call_3", TOOL_NAME, { text: "three" }),
+      fakeGatewayToolCall("retry_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("retry_call_1", "toolbox", { run: TOOL_NAME, arguments: { text: "one" } }),
+      fakeGatewayToolCall("retry_call_2", "toolbox", { run: TOOL_NAME, arguments: { text: "two" } }),
+      fakeGatewayToolCall("retry_call_3", "toolbox", { run: TOOL_NAME, arguments: { text: "three" } }),
       fakeGatewayFinalText("Bounded MCP retries complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1772,12 +1758,7 @@ describe("modern MCP stdio compatibility", () => {
       recordLaunchAttempts: true,
     });
     const activeGateway = startFakeGateway([
-      fakeGatewayToolCall("search_failed", "capability_search", {
-        kind: "mcp",
-        server: "fixture",
-        query: "fixture tools",
-        limit: 5,
-      }),
+      fakeGatewayToolCall("search_failed", "toolbox", { search: "fixture tools", server: "fixture" }),
       fakeGatewayFinalText("STARTUP_FAILURE_REPORTED"),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1821,8 +1802,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     writeFileSync(profilePath, JSON.stringify(profile));
     let sawFirstExit = true;
     const activeGateway = startFakeGateway([
-      fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("first_call", TOOL_NAME, { text: "first" }),
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("first_call", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } }),
       async () => {
         // Call again only after the first server has exited.
         const firstExited = () => {
@@ -1843,7 +1824,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
           }
           await Bun.sleep(20);
         }
-        return fakeGatewayToolCall("second_call", TOOL_NAME, { text: "second" });
+        return fakeGatewayToolCall("second_call", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } });
       },
       fakeGatewayFinalText("RESTART_FAILURE_REPORTED"),
     ], {
@@ -1892,9 +1873,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
         mode: malformed.mode,
       });
       gateway = startFakeGateway([
-        fakeGatewayToolCall("search_malformed", "capability_search", {
-          query: "fixture",
-        }),
+        fakeGatewayToolCall("search_malformed", "toolbox", { search: "fixture" }),
         fakeGatewayFinalText("Malformed stdio fixture isolated."),
       ], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -2057,9 +2036,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       writeFileSync(profilePath, JSON.stringify(profile));
       gateway = startFakeGateway([
         discovery === "select"
-          ? fakeGatewayToolCall("target_select", "mcp_select_tool", { name: TOOL_NAME })
-          : fakeGatewayToolCall("target_search", "capability_search", { server: "fixture", query: "echo" }),
-        fakeGatewayToolCall("target_call", TOOL_NAME, { text: "hello" }),
+          ? fakeGatewayToolCall("target_select", "toolbox", { open: TOOL_NAME })
+          : fakeGatewayToolCall("target_search", "toolbox", { search: "echo", server: "fixture" }),
+        fakeGatewayToolCall("target_call", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
         fakeGatewayFinalText("Targeted server works."),
       ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
       const result = await runFx(["ask", "--json", "--auto", "--no-save", "Use the fixture server"], {
@@ -2136,8 +2115,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       draft7Pattern: "^\\S+$",
     });
     const activeGateway = startFakeGateway([
-      fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "\u00A0" }),
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "\u00A0" } }),
       fakeGatewayFinalText("Legacy Draft 7 invalid complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -3482,7 +3461,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       mode: "stall_startup", startupTimeoutMs: 5_000, restartLimit: 0,
     });
     gateway = startFakeGateway([
-      fakeGatewayToolCall("cancel_startup", "capability_search", { server: "fixture", query: "echo" }),
+      fakeGatewayToolCall("cancel_startup", "toolbox", { search: "echo", server: "fixture" }),
       fakeGatewayFinalText("Unexpected continuation."),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     const proc = Bun.spawn([join(REPO_ROOT, "zig-out", "bin", "fx"), "ask", "--json", "--auto", "--no-save", "Find the fixture tool"], {
@@ -3682,9 +3661,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       restartLimit: 1,
     });
     const activeGateway = startFakeGateway([
-      fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("crashing_mcp", TOOL_NAME, { text: "first" }),
-      fakeGatewayToolCall("recovered_mcp", TOOL_NAME, { text: "second" }),
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("crashing_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } }),
+      fakeGatewayToolCall("recovered_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } }),
       fakeGatewayFinalText("Restarted MCP complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -3792,8 +3771,8 @@ describe("MCP stdio servers", () => {
   test("capability_search finds the tool under its fx name and the model calls it", async () => {
     const root = createRoot("v2-search", MODERN_FIXTURE);
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search", "capability_search", { query: "echo", server: "fixture" }),
-      fakeGatewayToolCall("call", TOOL_NAME, { text: "hello" }),
+      fakeGatewayToolCall("search", "toolbox", { search: "echo", server: "fixture" }),
+      fakeGatewayToolCall("call", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
       fakeGatewayFinalText("V2_SEARCH_DONE"),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     const result = await ask(root, "Find the echo tool and use it.");
@@ -3907,7 +3886,7 @@ describe("MCP stdio servers", () => {
   test("a search for a server that isn't configured says so", async () => {
     const root = createRoot("v2-not-found", MODERN_FIXTURE);
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search", "capability_search", { query: "echo", server: "nope" }),
+      fakeGatewayToolCall("search", "toolbox", { search: "echo", server: "nope" }),
       fakeGatewayFinalText("V2_NOT_FOUND_SEEN"),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     const result = await ask(root, "Find a tool on nope.");
@@ -4285,6 +4264,24 @@ describe("fx mcp call", () => {
     expect(seen).toContain("missing=1");
     expect(seen).toContain("No MCP server by that name is available to this agent.");
     expect(seen).toContain("server=1");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
+
+  test("a tool name with control bytes shows as visible escapes in a command's messages", async () => {
+    const root = bridgeRoot("bridge-odd-name");
+    // The name is a word the model wrote, so it can hold an escape sequence.
+    const seen = shellOutput(await runBridgeCommand(root, [
+      `name=$(printf 'mcp_fixture_\\033]0;x\\007nope')`,
+      `"${FX_BIN}" mcp call "$name" '{}' 2>&1; echo "call=$?"`,
+      `"${FX_BIN}" mcp call help "$name" 2>&1; echo "help=$?"`,
+    ].join("\n")));
+    const shown = "mcp_fixture_\\x1b]0;x\\x07nope";
+    expect(seen).toContain(`fx mcp call: ${shown} did not run. No MCP tool named ${shown} is available to this agent.`);
+    expect(seen).toContain("call=5");
+    expect(seen).toContain(`No MCP tool named ${shown} is available to this agent. Find tool names with fx mcp call search.`);
+    expect(seen).toContain("help=1");
+    expect(seen).not.toContain("\x1b");
+    expect(seen).not.toContain("\x07");
     expect(toolCalls(root)).toHaveLength(0);
   }, 90_000);
 

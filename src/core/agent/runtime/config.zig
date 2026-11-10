@@ -1,4 +1,5 @@
 const std = @import("std");
+const toolbox = @import("../../tooling/toolbox.zig");
 const skill_invocation = @import("../../skills/skill_invocation.zig");
 const types = @import("../../shared/types.zig");
 const tool_result_limits = @import("../../tooling/tool_result_limits.zig");
@@ -25,6 +26,10 @@ pub const Config = struct {
     model_prompt_overlay: ?[]const u8 = null,
     host_instructions: []const u8 = "",
     skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
+    /// The configured MCP servers the toolbox menu lists, by name.
+    toolbox_mcp_servers: []const []const u8 = &.{},
+    /// Built-in tools the toolbox menu lists instead of fx sending them.
+    toolbox_behind: []const []const u8 = &toolbox.default_behind,
     skill_bindings: []const skill_invocation.ExplicitBinding = &.{},
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,

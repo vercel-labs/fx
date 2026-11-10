@@ -519,6 +519,7 @@ pub const launch_wide_options = [_]command_specs.OptionDoc{
     .{ .flag = "--context-limit <spec>", .description = "" },
     .{ .flag = "--add-dir <path>", .description = "" },
     .{ .flag = "--no-additional-dirs", .description = "" },
+    .{ .flag = "--tool-placement <spec>", .description = "" },
 };
 
 /// The flags `fx` reads before a command or an interactive launch, in the
@@ -577,6 +578,10 @@ pub const top_level_flags = [_]TopLevelFlag{
     .{
         .usage = "--no-additional-dirs",
         .description = "Ignore saved additional directories",
+    },
+    .{
+        .usage = "--tool-placement <spec>",
+        .description = "Move a built-in tool: tool=toolbox or tool=direct; repeatable",
     },
     .{
         .usage = "--provider <name>",

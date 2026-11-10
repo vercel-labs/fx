@@ -42,8 +42,9 @@ pub const Name = enum {
 
 /// The skill catalog shows at most this many characters of each description
 /// while `skill_description_bytes` is not configured, so a profile with
-/// hundreds of skills does not fill every request. A configured value replaces
-/// it, and `capability_search` results keep the 1 KiB default above.
+/// hundreds of skills does not fill every request. The toolbox menu's skill
+/// entries follow it. A configured value replaces it, and `toolbox` search
+/// results keep the 1 KiB default above.
 pub const catalog_skill_description_characters: usize = 200;
 
 pub const Source = enum {
