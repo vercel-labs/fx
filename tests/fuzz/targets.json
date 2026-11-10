@@ -14,6 +14,7 @@
     {"name": "image_route", "module": "fx", "test": "the core keeps the model's laws on arbitrary event sequences", "iterations": 5000000},
     {"name": "earlier_image_notes", "module": "fx", "test": "earlier images withheld from a request always leave a note", "iterations": 100000},
     {"name": "mcp_elicitation", "module": "fx", "test": "elicitation request and response parsers stay bounded under fuzzed bytes", "iterations": 1500000},
+    {"name": "mcp_invalid_params_cause", "module": "fx", "test": "an invalid-params cause keeps its laws on fuzzed messages", "iterations": 200000},
     {"name": "mcp_search_page", "module": "fx", "test": "MCP search pages agree with the schemas they load under fuzzed tools and limits", "iterations": 50000},
     {"name": "session_optional_fields", "module": "fx", "test": "durable session optional fields handle fuzzed ownership paths", "iterations": 3000000},
     {"name": "session_work_provenance", "module": "fx", "test": "per-turn work provenance parser handles fuzzed ownership paths", "iterations": 2100000},
