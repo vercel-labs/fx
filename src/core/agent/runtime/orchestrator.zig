@@ -8708,6 +8708,7 @@ fn processQueuedPromptLoop(
                     };
                     defer summary_model.deinit();
                     var compaction_failure: ?compaction_activity.ErrorProvenance = null;
+                    const compaction_started_ms = io_mod.milliTimestamp();
                     const compaction_result = compactContext(arena, deps, .{
                         .activity_origin = if (overflow_pending) .provider_overflow else .automatic,
                         .failure_provenance = &compaction_failure,
@@ -8723,6 +8724,9 @@ fn processQueuedPromptLoop(
                             .trace_ctx = step_ctx,
                         },
                     });
+                    // The turn's duration leaves out the compaction, as its
+                    // live clock does.
+                    summary_accumulator.addCompaction(compaction_started_ms, io_mod.milliTimestamp());
                     // A summary request the provider rejected with 401 renewed
                     // the sign-in; the rest of the turn sends the renewed one.
                     // Taken first: renewing can free the credential the turn
