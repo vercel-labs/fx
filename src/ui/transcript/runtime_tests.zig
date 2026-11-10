@@ -15167,25 +15167,27 @@ fn installRetainedRowsReceiptForTest(
     alloc: Allocator,
     rebase_pending: bool,
 ) !void {
-    runtime.transcript_commit_state = .{ .recovering = .{
-        .accepted_visual_offset = 4,
-        .accepted_history_visual_offset = 4,
-        .attempt_visual_offset = 4,
-        .attempt_total_visual_rows = 8,
-        .materialized_visual_offset = 4,
-        .materialized_visual_rows = 4,
-        .materialized_flow_len = if (rebase_pending) null else rebase_retained_attempt_flow.len,
-        .remaining_semantic_rows = 4,
-        .remaining_semantic_progress_rows = if (rebase_pending) 0 else 4,
-        .attempt_cols = 20,
-        .projection_rebase_pending = rebase_pending,
-        .tracks_semantic_progress = !rebase_pending,
-        .flow = try alloc.dupe(u8, rebase_retained_attempt_flow),
-        .cursor_row = 4,
-        .cursor_col = 1,
-        // A rebase frame defers history it could not write.
-        .normal_buffer_recovery_pending = rebase_pending,
-    } };
+    runtime.transcript_commit_state = .{
+        .recovering = .{
+            .accepted_visual_offset = 4,
+            .accepted_history_visual_offset = 4,
+            .attempt_visual_offset = 4,
+            .attempt_total_visual_rows = 8,
+            .materialized_visual_offset = 4,
+            .materialized_visual_rows = 4,
+            .materialized_flow_len = if (rebase_pending) null else rebase_retained_attempt_flow.len,
+            .remaining_semantic_rows = 4,
+            .remaining_semantic_progress_rows = if (rebase_pending) 0 else 4,
+            .attempt_cols = 20,
+            .projection_rebase_pending = rebase_pending,
+            .tracks_semantic_progress = !rebase_pending,
+            .flow = try alloc.dupe(u8, rebase_retained_attempt_flow),
+            .cursor_row = 4,
+            .cursor_col = 1,
+            // A rebase frame defers history it could not write.
+            .normal_buffer_recovery_pending = rebase_pending,
+        },
+    };
 }
 
 test "rebase receipt without publication entries plans no retained scroll rows" {
