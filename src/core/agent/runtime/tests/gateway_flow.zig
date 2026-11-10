@@ -4164,10 +4164,11 @@ test "a named skill's text stays in the turn once after an in-turn compaction cu
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[2], "REQUESTED_SKILL_CONTENT"));
     try expectBodyContains(&gateway, 2, "Use $requested-workflow.\\n\\nExplicitly invoked skill content for this query:");
     try std.testing.expectEqualStrings("Completed from the observed result.", hooks.finish_assistant_text.?);
-    // The turn saves the short note in its place.
+    // The turn saves the text as it sent it.
     const saved = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
-    try std.testing.expect(std.mem.startsWith(u8, saved.context_notes[0].text, "<fx-skill-used>"));
+    try std.testing.expect(std.mem.startsWith(u8, saved.context_notes[0].text, "Explicitly invoked skill content for this query:\n"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, saved.context_notes[0].text, "REQUESTED_SKILL_CONTENT"));
 }
 
 test "automatic compaction summarizes a newest exchange larger than the input window" {

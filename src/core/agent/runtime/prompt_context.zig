@@ -363,7 +363,6 @@ test "buildProviderPrompt keeps compacted session context out of instructions" {
 
     var leading_summary_count: usize = 0;
     var late_summary_count: usize = 0;
-    var file_evidence_count: usize = 0;
     var interruption_count: usize = 0;
     for (prompt.instructions.items) |entry| try std.testing.expectEqual(types.ChatRole.system, entry.role);
     for (prompt.messages.items) |entry| {
@@ -377,12 +376,9 @@ test "buildProviderPrompt keeps compacted session context out of instructions" {
             try std.testing.expectEqual(types.ChatRole.user, entry.role);
             late_summary_count += 1;
         }
-        if (std.mem.find(u8, content, "src/portable.zig") != null and
-            std.mem.find(u8, content, "Session file evidence") != null)
-        {
-            try std.testing.expectEqual(types.ChatRole.user, entry.role);
-            file_evidence_count += 1;
-        }
+        // A saved turn's file list never joins the prompt: the turn never
+        // sent it, and its tool calls and results already name the files.
+        try std.testing.expect(std.mem.find(u8, content, "src/portable.zig") == null);
         if (std.mem.find(u8, content, "<turn_aborted>") != null) {
             try std.testing.expectEqual(types.ChatRole.user, entry.role);
             interruption_count += 1;
@@ -390,7 +386,6 @@ test "buildProviderPrompt keeps compacted session context out of instructions" {
     }
     try std.testing.expectEqual(@as(usize, 1), leading_summary_count);
     try std.testing.expectEqual(@as(usize, 1), late_summary_count);
-    try std.testing.expectEqual(@as(usize, 1), file_evidence_count);
     try std.testing.expectEqual(@as(usize, 1), interruption_count);
     try std.testing.expectEqualStrings("current portable prompt", prompt.messages.items[prompt.messages.items.len - 2].content.?);
     try std.testing.expectEqualStrings("within-turn suffix", prompt.messages.items[prompt.messages.items.len - 1].content.?);

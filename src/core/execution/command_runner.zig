@@ -2346,6 +2346,39 @@ test "bash user profile commands reuse one startup-file snapshot" {
     try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
+test "bash user profile snapshot restores a helper that needs extglob" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // bash parses `@(a|b)` only with extglob on, so a replay that defines
+    // the helper before it restores the option fails as a whole.
+    const paths = try writeSnapshotTestShellFor(
+        arena,
+        &tmp,
+        "bash",
+        ".bash_profile",
+        "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
+            "shopt -s extglob\n" ++
+            "_fxsnap_glob_helper() { case $1 in @(a|b)) printf 'glob-ok\\n';; esac; }\n",
+    );
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    for (0..2) |_| {
+        const result = try executeCommandInEnvironment(config, arena, "_fxsnap_glob_helper a", paths.workspace, .{ .user = paths.shell });
+        try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nglob-ok\n</stdout>\n", result.output);
+    }
+    // Both commands ran from the snapshot, so startup ran only for its capture.
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+}
+
 test "user profile commands reuse one startup-file snapshot" {
     if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
@@ -2409,6 +2442,39 @@ test "user profile commands reuse one startup-file snapshot" {
     const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
     const loads = try readAbsoluteFile(arena, loads_path, 4096);
     try std.testing.expectEqualStrings("loaded\n", loads);
+}
+
+test "bash user profile snapshot restores a replay larger than the pipe buffer" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // bash 3.2, macOS's /bin/bash, sources a pipe only as far as the bytes
+    // it holds at that moment. Thousands of functions push the replay well
+    // past that, so a partial read would lose the last ones and the command.
+    const paths = try writeSnapshotTestShellFor(
+        arena,
+        &tmp,
+        "bash",
+        ".bash_profile",
+        "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
+            "for i in {1..3000}; do eval \"fxsnap_bulk_$i() { printf 'bulk-$i\\n'; }\"; done\n",
+    );
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    for (0..2) |_| {
+        const result = try executeCommandInEnvironment(config, arena, "fxsnap_bulk_2999", paths.workspace, .{ .user = paths.shell });
+        try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nbulk-2999\n</stdout>\n", result.output);
+    }
+    // Both commands ran from the snapshot, so startup ran only for its capture.
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
 test "zsh user profile snapshot restores a function that replaces a default alias" {
@@ -4569,18 +4635,16 @@ test "detached session preserves replacement failure with a zero output budget" 
     );
 }
 
+const long_script_filler_line =
+    "# long script transport filler ............................................................................................................................\n";
+
 test "raw process execution transports long scripts without exposing stdin" {
     if (builtin.target.os.tag == .windows) return;
 
     const alloc = std.testing.allocator;
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(alloc);
-    for (0..160) |_| {
-        try script.appendSlice(
-            alloc,
-            "# long script transport filler ............................................................................................................................\n",
-        );
-    }
+    for (0..160) |_| try script.appendSlice(alloc, long_script_filler_line);
     try script.appendSlice(
         alloc,
         "if IFS= read -r value; then printf 'stdin=pipe:%s\\n' \"$value\"; else printf 'stdin=eof\\n'; fi\nprintf 'long-script-ok\\n'\n",
@@ -4595,6 +4659,29 @@ test "raw process execution transports long scripts without exposing stdin" {
     try std.testing.expect(std.mem.find(u8, result.output, "exit_code=0\n") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "stdin=eof\n") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "long-script-ok\n") != null);
+}
+
+test "raw process execution transports a script larger than any pipe buffer" {
+    if (builtin.target.os.tag == .windows) return;
+
+    // On macOS the target starts suspended, so a helper that writes the script
+    // before the target reads it hangs once the script outgrows the pipe. The
+    // test above fits an idle 64 KiB pipe whole; this one exceeds every pipe
+    // buffer.
+    const alloc = std.testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(alloc);
+    for (0..2048) |_| try script.appendSlice(alloc, long_script_filler_line);
+    try script.appendSlice(alloc, "printf 'huge-script-ok\\n'\n");
+    try std.testing.expect(script.items.len > 256 * 1024);
+
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 4096,
+    }, alloc, script.items, "/tmp");
+    defer alloc.free(result.output);
+
+    try std.testing.expect(std.mem.find(u8, result.output, "exit_code=0\n") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "huge-script-ok\n") != null);
 }
 
 test "large stdout writes command artifact and returns bounded preview" {
