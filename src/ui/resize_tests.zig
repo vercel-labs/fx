@@ -3595,7 +3595,7 @@ test "question modal replays displaced transcript rows into history" {
     try expectGridContains(&h, "How should the inspection proceed?");
 }
 
-test "resized question cancellation keeps the idle footer bottom anchored" {
+test "resized question cancellation keeps the footer in place through a repaint and the first edit" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 120, 36, 4);
     defer h.deinit();
@@ -3653,6 +3653,9 @@ test "resized question cancellation keeps the idle footer bottom anchored" {
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
+    const cancelled_screen = try captureTrimmedGrid(&h, alloc);
+    defer alloc.free(cancelled_screen);
+    const footer_after_cancel = h.shell.committed_frame_layout.footer_area;
 
     h.shell.render_requests.requestInvalidation(.{
         .reason = .external_clear,
@@ -3663,13 +3666,18 @@ test "resized question cancellation keeps the idle footer bottom anchored" {
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
 
+    // The repaint keeps every row where the cancel frame put it.
+    const repainted_screen = try captureTrimmedGrid(&h, alloc);
+    defer alloc.free(repainted_screen);
+    try std.testing.expectEqualStrings(cancelled_screen, repainted_screen);
+    try std.testing.expectEqual(footer_after_cancel, h.shell.committed_frame_layout.footer_area);
+    var top_row_text: std.ArrayList(u8) = .empty;
+    defer top_row_text.deinit(alloc);
+    try h.vt.rowTextTrimmed(1, &top_row_text);
+    try std.testing.expect(top_row_text.items.len > 0);
     const cancelled_row = try findRowContaining(&h, "▪ Cancelled");
     const footer_row = try findFirstDividerRowAfter(&h, cancelled_row);
     try expectExactlyOneBlankRowBetween(&h, cancelled_row, footer_row);
-    try std.testing.expectEqual(
-        h.shell.layout.rows,
-        h.shell.committed_frame_layout.footer_area.bottom,
-    );
     const footer_before_edit = h.shell.committed_frame_layout.footer_area;
 
     try input.insertionState().insertByte(alloc, 'x', .clear);
@@ -3682,6 +3690,158 @@ test "resized question cancellation keeps the idle footer bottom anchored" {
         h.shell.committed_frame_layout.footer_area,
     );
     try std.testing.expect(h.last_frame.transcript_history_floor_respected);
+}
+
+/// Resizes the way a terminal reports it: a live size first, then the
+/// settled one, each committed by a frame.
+fn resizeLiveThenSettled(
+    h: *Harness,
+    approval: *const approval_prompt.ApprovalPrompt,
+    ctx: render_input.RenderContext,
+    cols: u16,
+    rows: u16,
+) !void {
+    try h.vt.resize(cols, rows);
+    for ([_]bool{ false, true }) |settled| {
+        try shell_runtime.applyResizeWithLayout(&h.shell, &h.metrics, layoutFor(cols, rows, 4), settled);
+        h.frame_redraw = true;
+        try renderTestFooterWithContext(h, approval, &h.frame_redraw, ctx);
+        try h.flush();
+    }
+}
+
+const QuestionCancelResize = enum { none, before_question, while_question_open };
+
+/// A question tall enough to push transcript rows into scrollback, then
+/// cancelled. The rows that stayed on screen must not move when the question
+/// closes, with or without a resize: the freed rows go below the footer, and
+/// a later repaint and the first edit move nothing.
+fn checkQuestionCancelKeepsTranscriptInPlace(resize: QuestionCancelResize) !void {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 100, 30, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    var question = question_prompt.QuestionPrompt{};
+    defer question.deinit(alloc);
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Stop here", .description = "End the inspection." },
+        .{ .label = "Trace deeper", .description = "Read the surrounding runtime." },
+        .{ .label = "Run tests", .description = "Exercise the focused regressions." },
+        .{ .label = "Summarize", .description = "Report the findings." },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "How should the inspection proceed?",
+        .options = &options,
+    }};
+    try question.syncFrom(alloc, &entries);
+
+    try h.shell.initViewport(&h.metrics, 1);
+    _ = try h.shell.appendRawTranscriptEntry(
+        alloc,
+        "EARLY_01\nEARLY_02\nEARLY_03\nEARLY_04\nEARLY_05\nEARLY_06\nEARLY_07\n" ++
+            "EARLY_08\nEARLY_09\nEARLY_10\nEARLY_11\nEARLY_12\nEARLY_13\nEARLY_14\n" ++
+            "EARLY_15\nEARLY_16\nEARLY_17\nEARLY_18\nEARLY_19\nEARLY_20\n",
+    );
+    var ctx = defaultFooterContext(&input);
+    h.frame_redraw = true;
+    try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+    try h.flush();
+
+    if (resize == .before_question) {
+        try resizeLiveThenSettled(&h, &approval, ctx, 80, 30);
+        try resizeLiveThenSettled(&h, &approval, ctx, 100, 30);
+    }
+
+    _ = try h.shell.appendRawTranscriptEntry(
+        alloc,
+        "LATER_01\nLATER_02\nLATER_03\nLATER_04\nLATER_05\nLATER_06\nLATER_07\n" ++
+            "LATER_08\nLATER_09\nLATER_10\nLATER_11\nLATER_12\nLATER_13\nLATER_14\n" ++
+            "LATER_15\nLATER_16\nLATER_17\nLATER_18\nLATER_19\nLATER_20\n",
+    );
+    h.frame_redraw = true;
+    try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+    try h.flush();
+
+    ctx.question = question.projection();
+    h.frame_redraw = true;
+    try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+    try h.flush();
+    if (resize == .while_question_open) {
+        try resizeLiveThenSettled(&h, &approval, ctx, 80, 30);
+        try resizeLiveThenSettled(&h, &approval, ctx, 100, 30);
+    }
+    // The question displaced the rows above LATER_03 into scrollback.
+    try std.testing.expectEqual(@as(u16, 1), try findRowContaining(&h, "LATER_03"));
+    try expectGridContains(&h, "How should the inspection proceed?");
+
+    _ = try h.shell.appendReplaceableTranscriptLineClassified(
+        alloc,
+        &h.metrics,
+        "\x1b[2m▪ Cancelled\x1b[0m\n",
+        .question_resolution,
+    );
+    question.discard(alloc, "test_cleanup");
+    ctx.question = null;
+    h.frame_redraw = true;
+    try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+    try h.flush();
+
+    const expected_screen =
+        "LATER_03\nLATER_04\nLATER_05\nLATER_06\nLATER_07\nLATER_08\nLATER_09\n" ++
+        "LATER_10\nLATER_11\nLATER_12\nLATER_13\nLATER_14\nLATER_15\nLATER_16\n" ++
+        "LATER_17\nLATER_18\nLATER_19\nLATER_20\n" ++
+        "\n" ++
+        "▪ Cancelled\n" ++
+        "\n" ++
+        "┃\n" ++
+        "\n" ++
+        "ask · test-model\n" ++
+        "\n\n\n\n\n\n";
+    const cancelled_screen = try captureTrimmedGrid(&h, alloc);
+    defer alloc.free(cancelled_screen);
+    try std.testing.expectEqualStrings(expected_screen, cancelled_screen);
+    try std.testing.expect(h.last_frame.transcript_history_floor_respected);
+    const footer_after_cancel = h.shell.committed_frame_layout.footer_area;
+
+    h.shell.render_requests.requestInvalidation(.{
+        .reason = .external_clear,
+        .top = h.shell.committed_frame_layout.transcript_area.top,
+        .bottom = h.shell.layout.rows,
+    });
+    h.frame_redraw = true;
+    try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+    try h.flush();
+    const repainted_screen = try captureTrimmedGrid(&h, alloc);
+    defer alloc.free(repainted_screen);
+    try std.testing.expectEqualStrings(expected_screen, repainted_screen);
+    try std.testing.expectEqual(footer_after_cancel, h.shell.committed_frame_layout.footer_area);
+
+    try input.insertionState().insertByte(alloc, 'x', .clear);
+    h.frame_redraw = true;
+    try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
+    try h.flush();
+
+    try std.testing.expectEqual(footer_after_cancel, h.shell.committed_frame_layout.footer_area);
+    try std.testing.expectEqual(@as(u16, 1), try findRowContaining(&h, "LATER_03"));
+    try std.testing.expectEqual(@as(u16, 20), try findRowContaining(&h, "▪ Cancelled"));
+    try std.testing.expectEqual(@as(u16, 22), try findRowContaining(&h, "┃ x"));
+}
+
+test "question cancellation keeps the transcript in place through a repaint" {
+    try checkQuestionCancelKeepsTranscriptInPlace(.none);
+}
+
+test "question cancellation after an earlier resize keeps the transcript in place" {
+    try checkQuestionCancelKeepsTranscriptInPlace(.before_question);
+}
+
+test "question cancellation after a resize while the question is open keeps the transcript in place" {
+    try checkQuestionCancelKeepsTranscriptInPlace(.while_question_open);
 }
 
 test "live command output chunks remain one block outside the compact transcript" {

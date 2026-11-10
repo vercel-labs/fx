@@ -6,8 +6,39 @@ const session_codec = @import("../../session/session_codec.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const text_utils = @import("../../shared/text_utils.zig");
+const toolbox = @import("../../tooling/toolbox.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// A rendered toolbox menu kept inline, so the conversation's state stays a
+/// plain value: no allocation, no deinit work.
+pub const ToolboxMenu = struct {
+    bytes: [toolbox.max_lead_bytes + toolbox.max_menu_bytes]u8 = undefined,
+    len: usize = 0,
+    set: bool = false,
+    /// `toolbox.entriesHash` of what the menu lists, and of what the
+    /// conversation was last told the toolbox holds.
+    entries_hash: u64 = 0,
+    noted_hash: u64 = 0,
+
+    pub fn get(self: *const ToolboxMenu) ?[]const u8 {
+        return if (self.set) self.bytes[0..self.len] else null;
+    }
+
+    /// Keeps `lead` and then `menu`, which `toolbox.renderBounded` keeps
+    /// within the buffer, rendered from entries whose hash is `entries_hash`.
+    /// A lead past `toolbox.max_lead_bytes` is left out.
+    pub fn keep(self: *ToolboxMenu, lead: []const u8, menu: []const u8, entries_hash: u64) void {
+        std.debug.assert(menu.len <= toolbox.max_menu_bytes);
+        const kept_lead = if (lead.len <= toolbox.max_lead_bytes) lead else "";
+        @memcpy(self.bytes[0..kept_lead.len], kept_lead);
+        @memcpy(self.bytes[kept_lead.len..][0..menu.len], menu);
+        self.len = kept_lead.len + menu.len;
+        self.set = true;
+        self.entries_hash = entries_hash;
+        self.noted_hash = entries_hash;
+    }
+};
 
 /// The provider-neutral state for one conversation. Product session metadata,
 /// persistence, permissions, credentials, and host effects live outside it.
@@ -27,6 +58,11 @@ pub const Agent = struct {
     /// A request size limit learned from a provider rejection, kept for later
     /// requests to the same model in this conversation. Plain value state.
     request_byte_limit: ?RequestByteLimitState = null,
+    /// The toolbox menu this conversation sent first. Later requests send the
+    /// same bytes until the history is cleared, whatever the skills and MCP
+    /// servers do meanwhile (`tests/tla/toolbox/Toolbox.tla` MenuFixed).
+    /// Plain value state.
+    toolbox_menu: ToolboxMenu = .{},
 
     pub fn deinit(self: *Agent, alloc: Allocator) void {
         self.clearHistory(alloc);
@@ -102,6 +138,8 @@ pub const Agent = struct {
         // Cleared history no longer resembles the calibrated request.
         self.request_token_calibration = null;
         self.request_byte_limit = null;
+        // A new conversation lists what the toolbox holds now.
+        self.toolbox_menu = .{};
     }
 
     /// Returns the learned request size limit for `model`, if any.

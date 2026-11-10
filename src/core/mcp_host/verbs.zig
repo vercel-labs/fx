@@ -984,7 +984,7 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
         else => return notSignedOut(c, arena, name, store, err),
     };
     defer if (saved) |v| secret.zeroAndFree(arena, v);
-    const kept: ?anyerror = host.runtime.logout(name) catch |err| switch (err) {
+    const done: runtime_mod.Logout = host.runtime.logout(name) catch |err| switch (err) {
         // A held server isn't in the engine; its saved login still goes, and
         // when it can't, nothing changed.
         error.UnknownServer => held: {
@@ -993,12 +993,12 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
                 error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
                 else => return notSignedOut(c, arena, name, store, e),
             };
-            break :held null;
+            break :held .{};
         },
         error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
         else => return err,
     };
-    if (kept) |err| {
+    if (done.kept) |err| {
         if (saved == null and !was.signed_in) return notSignedOut(c, arena, name, store, err);
         var buffer: [320]u8 = undefined;
         try c.err.print("Signed out of {s} here, but couldn't remove its saved login: {s}. Sign out again once that's fixed.\n", .{
@@ -1007,7 +1007,14 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
         return 1;
     }
     if (saved != null or was.signed_in) {
-        try c.out.print("Signed out of {s}.\n", .{try safe(arena, name)});
+        const shown = try safe(arena, name);
+        switch (done.revocation) {
+            .confirmed => try c.out.print("Signed out of {s}.\n", .{shown}),
+            // The server never hears of a logout it wasn't sent: a copy of
+            // the tokens keeps working there.
+            .none => try c.out.print("Signed out of {s} here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n", .{shown}),
+            .unconfirmed => try c.out.print("Signed out of {s} here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n", .{shown}),
+        }
     } else {
         try c.out.print("{s} wasn't signed in.\n", .{try safe(arena, name)});
     }

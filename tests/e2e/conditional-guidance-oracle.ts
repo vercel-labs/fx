@@ -15,7 +15,32 @@ export const CANONICAL_BUILTIN_NAMES = [
   "web_search",
   "read_tool_result",
   "vision",
+  "toolbox",
 ] as const;
+
+// The built-in tools fx sends by default, in order. The rest of the registry
+// is reached through toolbox: skills and install_skill from its menu. The
+// names capability_search, mcp_select_tool, and skill stay in the canonical
+// list above so fx text naming those removed tools is still caught.
+export const DEFAULT_SERIALIZED_BUILTIN_NAMES = [
+  "read_file",
+  "glob_files",
+  "grep_files",
+  "edit_file",
+  "write_file",
+  "shell",
+  "subagent",
+  "toolbox",
+  "ask_user_question",
+  "web_fetch",
+  "web_search",
+  "read_tool_result",
+  "vision",
+] as const;
+
+// What a request that sends toolbox can reach through it, so fx text naming
+// them refers to something available.
+export const TOOLBOX_REACHABLE_NAMES = ["install_skill", "skill"] as const;
 
 export const READ_ONLY_SERIALIZED_TOOL_NAMES = [
   "read_file",
@@ -34,7 +59,7 @@ export const WEB_EXA_SERIALIZED_TOOL_NAMES = [
   "exa_search",
 ] as const;
 
-export const AUTO_EXA_SERIALIZED_TOOL_NAMES = CANONICAL_BUILTIN_NAMES.map(
+export const AUTO_EXA_SERIALIZED_TOOL_NAMES = DEFAULT_SERIALIZED_BUILTIN_NAMES.map(
   (name) => (name === "web_search" ? "exa_search" : name),
 );
 
@@ -196,6 +221,7 @@ export function findUnavailableCapabilityReferences(
   request: GatewayRequest,
 ): CapabilityReferenceFinding[] {
   const advertised = canonicalAdvertisedToolNames(request);
+  if (advertised.has("toolbox")) for (const name of TOOLBOX_REACHABLE_NAMES) advertised.add(name);
   const fragments = fxOwnedGuidanceFragments(request);
   const findings: CapabilityReferenceFinding[] = [];
 

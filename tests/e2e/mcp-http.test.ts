@@ -133,8 +133,8 @@ function fixtureEnv(
 
 function startToolGateway(finalText: string) {
   return startFakeGateway([
-    fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-    fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+    fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+    fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
     fakeGatewayFinalText(finalText),
   ], {
     models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -243,7 +243,7 @@ describe("modern MCP Streamable HTTP", () => {
       },
     }));
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_fixture", "capability_search", { query: "fixture", server: "fixture" }),
+      fakeGatewayToolCall("search_fixture", "toolbox", { search: "fixture", server: "fixture" }),
       fakeGatewayFinalText("Server failure observed."),
     ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     try {
@@ -402,8 +402,8 @@ describe("modern MCP Streamable HTTP", () => {
     expect((await runFx(["mcp", "remove", "quiet"], { cwd: root.workspace, env: { HOME: root.home, FX_AUTO_UPGRADE: "0" } })).code).toBe(0);
 
     gateway = startFakeGateway([
-      fakeGatewayToolCall("top_level_select", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("top_level_call", TOOL_NAME, { text: "hello" }),
+      fakeGatewayToolCall("top_level_select", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("top_level_call", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
       fakeGatewayFinalText("TOP_LEVEL_HTTP_MCP_READY"),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -477,10 +477,10 @@ describe("modern MCP Streamable HTTP", () => {
       // Each call comes after the proxy dropped every connection fx kept.
       const later = (id: string, text: string) => async () => {
         await Bun.sleep(600);
-        return fakeGatewayToolCall(id, TOOL_NAME, { text });
+        return fakeGatewayToolCall(id, "toolbox", { run: TOOL_NAME, arguments: { text } });
       };
       gateway = startFakeGateway([
-        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+        fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
         later("call_one", "one"),
         later("call_two", "two"),
         later("call_three", "three"),
@@ -514,19 +514,13 @@ describe("modern MCP Streamable HTTP", () => {
     const root = createRoot("cache-subscription", fixture);
     const freshTool = "mcp_fixture_fresh";
     gateway = startFakeGateway([
-      fakeGatewayToolCall("activate_subscription", "capability_search", {
-        query: "echo",
-      }),
+      fakeGatewayToolCall("activate_subscription", "toolbox", { search: "echo" }),
       async () => {
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_fresh", "capability_search", {
-          query: "fresh",
-        });
+        return fakeGatewayToolCall("search_fresh", "toolbox", { search: "fresh" });
       },
-      fakeGatewayToolCall("select_fresh", "mcp_select_tool", {
-        name: freshTool,
-      }),
-      fakeGatewayToolCall("call_fresh", freshTool, { text: "changed" }),
+      fakeGatewayToolCall("select_fresh", "toolbox", { open: freshTool }),
+      fakeGatewayToolCall("call_fresh", "toolbox", { run: freshTool, arguments: { text: "changed" } }),
       fakeGatewayFinalText("Live cache refresh complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -568,19 +562,13 @@ describe("modern MCP Streamable HTTP", () => {
     fixture = startModernMcpHttpFixture("cache_failed_refresh");
     const root = createRoot("cache-failed-refresh", fixture);
     gateway = startFakeGateway([
-      fakeGatewayToolCall("activate_failed_refresh", "capability_search", {
-        query: "echo",
-      }),
+      fakeGatewayToolCall("activate_failed_refresh", "toolbox", { search: "echo" }),
       async () => {
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_stale", "capability_search", {
-          query: "echo",
-        });
+        return fakeGatewayToolCall("search_stale", "toolbox", { search: "echo" });
       },
-      fakeGatewayToolCall("select_stale", "mcp_select_tool", {
-        name: TOOL_NAME,
-      }),
-      fakeGatewayToolCall("call_stale", TOOL_NAME, { text: "stale" }),
+      fakeGatewayToolCall("select_stale", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("call_stale", "toolbox", { run: TOOL_NAME, arguments: { text: "stale" } }),
       fakeGatewayFinalText("Stale cache fallback complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -620,15 +608,11 @@ describe("modern MCP Streamable HTTP", () => {
     const root = createRoot("cache-partial-ack", fixture);
     let callsAfterFirstSearch = 0;
     gateway = startFakeGateway([
-      fakeGatewayToolCall("activate_partial_ack", "capability_search", {
-        query: "echo",
-      }),
+      fakeGatewayToolCall("activate_partial_ack", "toolbox", { search: "echo" }),
       async () => {
         callsAfterFirstSearch = fixture!.toolsListCalls;
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_after_ttl", "capability_search", {
-          query: "echo",
-        });
+        return fakeGatewayToolCall("search_after_ttl", "toolbox", { search: "echo" });
       },
       fakeGatewayFinalText("TTL fallback complete."),
     ], {
@@ -655,15 +639,11 @@ describe("modern MCP Streamable HTTP", () => {
     const root = createRoot("cache-server-cancel", fixture);
     let callsAfterFirstSearch = 0;
     gateway = startFakeGateway([
-      fakeGatewayToolCall("activate_server_cancel", "capability_search", {
-        query: "echo",
-      }),
+      fakeGatewayToolCall("activate_server_cancel", "toolbox", { search: "echo" }),
       async () => {
         callsAfterFirstSearch = fixture!.toolsListCalls;
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_after_server_cancel", "capability_search", {
-          query: "echo",
-        });
+        return fakeGatewayToolCall("search_after_server_cancel", "toolbox", { search: "echo" });
       },
       fakeGatewayFinalText("Server cancellation TTL fallback complete."),
     ], {
@@ -693,15 +673,11 @@ describe("modern MCP Streamable HTTP", () => {
     const root = createRoot("cache-unexpected-ack", fixture);
     let callsAfterFirstSearch = 0;
     gateway = startFakeGateway([
-      fakeGatewayToolCall("activate_unexpected_ack", "capability_search", {
-        query: "echo",
-      }),
+      fakeGatewayToolCall("activate_unexpected_ack", "toolbox", { search: "echo" }),
       async () => {
         callsAfterFirstSearch = fixture!.toolsListCalls;
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_after_unexpected_ack", "capability_search", {
-          query: "echo",
-        });
+        return fakeGatewayToolCall("search_after_unexpected_ack", "toolbox", { search: "echo" });
       },
       fakeGatewayFinalText("Unexpected acknowledgement TTL fallback complete."),
     ], {
@@ -731,22 +707,16 @@ describe("modern MCP Streamable HTTP", () => {
     const root = createRoot("cache-invalidate-before-send", fixture);
     const freshTool = "mcp_fixture_fresh";
     gateway = startFakeGateway([
-      fakeGatewayToolCall("select_old", "mcp_select_tool", {
-        name: TOOL_NAME,
-      }),
+      fakeGatewayToolCall("select_old", "toolbox", { open: TOOL_NAME }),
       async () => {
         await fixture!.waitForSubscription();
         fixture!.invalidateTools();
         await Bun.sleep(100);
-        return fakeGatewayToolCall("call_old", TOOL_NAME, { text: "old" });
+        return fakeGatewayToolCall("call_old", "toolbox", { run: TOOL_NAME, arguments: { text: "old" } });
       },
-      fakeGatewayToolCall("search_fresh", "capability_search", {
-        query: "fresh",
-      }),
-      fakeGatewayToolCall("select_fresh", "mcp_select_tool", {
-        name: freshTool,
-      }),
-      fakeGatewayToolCall("call_fresh", freshTool, { text: "new" }),
+      fakeGatewayToolCall("search_fresh", "toolbox", { search: "fresh" }),
+      fakeGatewayToolCall("select_fresh", "toolbox", { open: freshTool }),
+      fakeGatewayToolCall("call_fresh", "toolbox", { run: freshTool, arguments: { text: "new" } }),
       fakeGatewayFinalText("Pre-send invalidation complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -769,7 +739,11 @@ describe("modern MCP Streamable HTTP", () => {
     // call and refuses it unsent (CAT-05). Waits for N31.
     expect(calls.map((entry) => entry.message.params?.name)).toEqual(["fresh"]);
     expect(fixture.toolsListCalls).toBe(2);
-    expect(() => toolResultText(gateway.requests[2]!.body, "call_old", "error-text")).not.toThrow();
+    // The run's result says the tool is gone in toolbox's words, not the
+    // generic unsupported-tool text a direct call of it gets.
+    expect(toolResultText(gateway.requests[2]!.body, "call_old", "error-text")).toBe(
+      `${TOOL_NAME} is no longer available. Use toolbox search to find current tools.`,
+    );
     expect(gateway.requests.some((entry) => entry.body.includes(freshTool)))
       .toBe(true);
   }, 30_000);
@@ -786,16 +760,12 @@ describe("modern MCP Streamable HTTP", () => {
       fixture = startModernMcpHttpFixture(cacheCase.mode);
       const root = createRoot(cacheCase.mode, fixture);
       gateway = startFakeGateway([
-        fakeGatewayToolCall("activate_cache", "capability_search", {
-          query: "echo",
-        }),
+        fakeGatewayToolCall("activate_cache", "toolbox", { search: "echo" }),
         // Servers start when first needed, so the first search loads the
         // list; the second shows whether it was kept.
         async () => {
           await Bun.sleep(cacheCase.delayMs);
-          return fakeGatewayToolCall("search_cache", "capability_search", {
-            query: "echo",
-          });
+          return fakeGatewayToolCall("search_cache", "toolbox", { search: "echo" });
         },
         fakeGatewayFinalText("Cache timing observed."),
       ], {
@@ -828,14 +798,10 @@ describe("modern MCP Streamable HTTP", () => {
     fixture = startModernMcpHttpFixture("cache_delayed_pagination");
     const root = createRoot("cache-delayed-pagination", fixture);
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_delayed_catalog", "capability_search", {
-        query: "second",
-      }),
+      fakeGatewayToolCall("search_delayed_catalog", "toolbox", { search: "second" }),
       // Right after the first list: fresh only if its expiry ran from the
       // last page, not the first (D42).
-      fakeGatewayToolCall("search_again", "capability_search", {
-        query: "second",
-      }),
+      fakeGatewayToolCall("search_again", "toolbox", { search: "second" }),
       fakeGatewayFinalText("Delayed pagination expiry observed."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -872,9 +838,7 @@ describe("modern MCP Streamable HTTP", () => {
     fixture = startModernMcpHttpFixture("cache_empty_cursor");
     const root = createRoot("cache-empty-cursor", fixture);
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_empty_cursor_catalog", "capability_search", {
-        query: "second",
-      }),
+      fakeGatewayToolCall("search_empty_cursor_catalog", "toolbox", { search: "second" }),
       fakeGatewayFinalText("Empty cursor pagination complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -951,8 +915,10 @@ describe("modern MCP Streamable HTTP", () => {
     expect(gateway.requests[2]?.body).toContain(
       `${MODERN_HTTP_TOOL_RESULT}:hello`,
     );
+    // The server's schema reaches the model as it wrote it, in toolbox's
+    // open result, where its quotes arrive escaped.
     expect(gateway.requests.some((request) =>
-      request.body.includes('"pattern":"^(?!blocked$).+$"')
+      request.body.includes("^(?!blocked$).+$")
     )).toBe(true);
     expect(fixture.requests.find((entry) => entry.message.method === "tools/call")?.message.params?.arguments).toEqual({
       text: "hello",
@@ -1153,9 +1119,7 @@ describe("modern MCP Streamable HTTP", () => {
     fixture = startModernMcpHttpFixture("invalid_header_schema");
     const root = createRoot("invalid-header-schema", fixture);
     gateway = startFakeGateway([
-      fakeGatewayToolCall("inspect_invalid_schema", "capability_search", {
-        query: "echo",
-      }),
+      fakeGatewayToolCall("inspect_invalid_schema", "toolbox", { search: "echo" }),
       fakeGatewayFinalText("Invalid modern schema isolated."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -1216,8 +1180,8 @@ describe("modern MCP Streamable HTTP", () => {
     // stream the server never ended must be closed by then, not at exit.
     let closedWhileRunning = -1;
     gateway = startFakeGateway([
-      fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
       async () => {
         await Bun.sleep(300);
         closedWhileRunning = heldOpen.cancelledCalls;
