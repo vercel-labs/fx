@@ -116,6 +116,20 @@ pub const Seed = struct {
         self.captured = true;
     }
 
+    /// What `/launch` shows an instance would start with besides its
+    /// profile, as `launchWith` applies the seed: `--model`, `--provider`,
+    /// or `FX_MODEL` pins the model as `initializePersistence` does, and
+    /// `--effort` wins over the profile's. Borrows the seed's slices.
+    pub fn launchDefaults(self: *const Seed) app_profile_runtime.LaunchCompletion.Defaults {
+        return .{
+            .model = self.selected_model,
+            .effort = self.agent_effort,
+            .model_override = if (self.model_source == .process_override or self.provider_process_override != null) self.selected_model else null,
+            .effort_override = self.effort_process_override,
+            .profile_name = self.profile_name orelse profiles.main_name,
+        };
+    }
+
     pub fn captureProfile(self: *Seed, alloc: Allocator, name: ?[]const u8) !void {
         const owned = if (name) |value| try alloc.dupe(u8, value) else null;
         if (self.profile_name) |old| alloc.free(old);

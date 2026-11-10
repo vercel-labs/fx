@@ -10355,6 +10355,7 @@ fn expectCancellableGatewayJsonCancellation(
     const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
 
     try std.testing.expectError(error.Cancelled, result);
+    try waitForOwnClientOpenJobs();
     if (fixture.failure) |err| return err;
     try std.testing.expect(fixture.reached_stage.load(.seq_cst));
     try std.testing.expect(elapsed_ms < max_elapsed_ms);
@@ -10414,6 +10415,7 @@ test "a gateway JSON request reports no connection while its TLS handshake stall
         error.Cancelled,
         fetchGatewayJsonAtUrlCancellable(std.testing.allocator, "test-key", null, models_url, &cancel_flag, gateway_json_fetch_timeout_ms, &connected),
     );
+    try waitForOwnClientOpenJobs();
     try std.testing.expect(fixture.reached_stage.load(.seq_cst));
     try std.testing.expect(!connected.load(.acquire));
     if (fixture.failure) |err| return err;
@@ -11034,6 +11036,7 @@ test "usage GET cancellation interrupts TLS setup" {
     fixture.deinit();
 
     try std.testing.expectError(error.Cancelled, result);
+    try waitForOwnClientOpenJobs();
     try std.testing.expect(elapsed_ms < 1000);
 }
 
@@ -11768,10 +11771,10 @@ test "two hundred Esc presses during stuck lookups leave no job or connection be
     try std.testing.expect(pool.freeConnectionCount() <= pool.client.connection_pool.free_size);
 }
 
-/// Waits until no open job on a client of its own is left, so the testing
-/// allocator's leak check sees what each job freed.
-/// Tests only: waits until no open job on a client of its own is running,
-/// so the testing allocator's leak check sees every job's client freed.
+/// Tests only: waits until no open job on a client of its own is running.
+/// A test that walks away from an open calls this before it returns, so the
+/// testing allocator's leak check sees the job's frees and none of them lands
+/// in the next test's allocator.
 pub fn waitForOwnClientOpenJobs() !void {
     var waited_ms: usize = 0;
     while (own_client_open_jobs.load(.acquire) != 0) : (waited_ms += 1) {

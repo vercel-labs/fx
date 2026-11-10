@@ -4635,18 +4635,16 @@ test "detached session preserves replacement failure with a zero output budget" 
     );
 }
 
+const long_script_filler_line =
+    "# long script transport filler ............................................................................................................................\n";
+
 test "raw process execution transports long scripts without exposing stdin" {
     if (builtin.target.os.tag == .windows) return;
 
     const alloc = std.testing.allocator;
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(alloc);
-    for (0..160) |_| {
-        try script.appendSlice(
-            alloc,
-            "# long script transport filler ............................................................................................................................\n",
-        );
-    }
+    for (0..160) |_| try script.appendSlice(alloc, long_script_filler_line);
     try script.appendSlice(
         alloc,
         "if IFS= read -r value; then printf 'stdin=pipe:%s\\n' \"$value\"; else printf 'stdin=eof\\n'; fi\nprintf 'long-script-ok\\n'\n",
@@ -4661,6 +4659,29 @@ test "raw process execution transports long scripts without exposing stdin" {
     try std.testing.expect(std.mem.find(u8, result.output, "exit_code=0\n") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "stdin=eof\n") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "long-script-ok\n") != null);
+}
+
+test "raw process execution transports a script larger than any pipe buffer" {
+    if (builtin.target.os.tag == .windows) return;
+
+    // On macOS the target starts suspended, so a helper that writes the script
+    // before the target reads it hangs once the script outgrows the pipe. The
+    // test above fits an idle 64 KiB pipe whole; this one exceeds every pipe
+    // buffer.
+    const alloc = std.testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(alloc);
+    for (0..2048) |_| try script.appendSlice(alloc, long_script_filler_line);
+    try script.appendSlice(alloc, "printf 'huge-script-ok\\n'\n");
+    try std.testing.expect(script.items.len > 256 * 1024);
+
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 4096,
+    }, alloc, script.items, "/tmp");
+    defer alloc.free(result.output);
+
+    try std.testing.expect(std.mem.find(u8, result.output, "exit_code=0\n") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "huge-script-ok\n") != null);
 }
 
 test "large stdout writes command artifact and returns bounded preview" {

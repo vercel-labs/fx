@@ -277,6 +277,18 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_SUBAGENT_START_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_START_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_START_WAIT_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_TERMINAL_BACKEND_CLEANUP_DELAY_MS": {
       "job": "test",
       "stability": "internal"
