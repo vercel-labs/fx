@@ -2839,6 +2839,41 @@ fn commitRulesNote(
     selected.content = null;
 }
 
+/// Queues the rules of the folders the turn's images come from as a note on
+/// the turn's own message, after the user's text, the way a tool call that
+/// reaches a folder delivers its rules (D93). The instructions never change
+/// when an image brings a folder the session has not seen, so the provider's
+/// cached prefix still matches. Rules an earlier note delivered are not sent
+/// again: a reminder line stands in for them, as for a tool call.
+fn queueImageFolderRules(
+    arena: Allocator,
+    deps: *const AgentRuntimeDeps,
+    registry: context_contract.Registry,
+    config: Config,
+    images: []const types.ImageAttachment,
+    context_delivery_state: *context_contract.DeliveryState,
+    replaced_sources: []const []const u8,
+    remind_sources: *std.ArrayList([]const u8),
+    pending_notes: *std.ArrayList(ChatMessage),
+) !void {
+    if (images.len == 0) return;
+    const targets = try context_contract.applicableTargetsForImages(arena, images);
+    var selected = try registry.selectDefaultApplicableContext(arena, .{
+        .workspace_root = config.workspace_root,
+        .access_scope = config.access_scope,
+        .targets = targets,
+        .delivered_sources = context_delivery_state.delivered_sources.items,
+        .evaluated_endpoints = context_delivery_state.evaluated_endpoints.items,
+        .remind_sources = remind_sources.items,
+        .context_limits = config.context_limits,
+    });
+    defer selected.deinit(arena);
+    for (selected.notices) |notice| try deps.pushContextNotice(notice);
+    const queued_before = pending_notes.items.len;
+    try commitContextNote(arena, pending_notes, context_delivery_state, registry.instruction_files, &selected, replaced_sources, remind_sources);
+    debug_trace.logf("context", "image folder rules images={d} notes_queued={d}", .{ images.len, pending_notes.items.len - queued_before });
+}
+
 /// Counts each instruction file a saved note delivered as delivered when the
 /// file has not changed since, by its stamp from `instruction_files`, so the
 /// gate does not deliver it again (D93). A changed or missing file goes to
@@ -7374,6 +7409,19 @@ fn processQueuedPromptLoop(
     // Notes the gate queued during a step; they join the turn at the next
     // step boundary.
     var pending_context_notes: std.ArrayList(ChatMessage) = .empty;
+    // The rules of the folders the turn's images come from join the turn's
+    // own message at its first boundary.
+    if (deps.context_enabled and deps.image_folder_rules) if (deps.context_registry) |registry| try queueImageFolderRules(
+        arena,
+        deps,
+        registry,
+        config,
+        job.images,
+        &context_delivery_state,
+        replaced_note_sources.items,
+        &remind_sources,
+        &pending_context_notes,
+    );
     const root_user_intent_context = switch (config.origin) {
         .subagent => if (config.current_prompt_is_root_authority)
             try auto_classifier_context.buildRootUserContextFromVerifiedRequests(
