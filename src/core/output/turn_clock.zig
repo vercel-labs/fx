@@ -12,8 +12,6 @@ const std = @import("std");
 /// Public for the driver's lab, which builds this file as its only module.
 pub const compaction_activity = @import("compaction_activity.zig");
 
-pub const ms_per_second: i64 = 1000;
-
 /// A clock's two marks, in milliseconds. `StreamState` keeps the turn's.
 pub const Marks = struct {
     /// When the clock started, moved forward past every finished wait.
@@ -61,7 +59,7 @@ pub fn elapsedMs(marks: Marks, now_ms: i64) ?i64 {
 
 /// Whole seconds the clock shows at `now_ms`, or null as for `elapsedMs`.
 pub fn seconds(marks: Marks, now_ms: i64) ?i64 {
-    return @divTrunc(elapsedMs(marks, now_ms) orelse return null, ms_per_second);
+    return @divTrunc(elapsedMs(marks, now_ms) orelse return null, std.time.ms_per_s);
 }
 
 /// A compaction's own clock. It starts when the compaction begins, whatever
@@ -221,12 +219,12 @@ fn fuzzClock(_: void, smith: *testing.Smith) !void {
         }
         if (running) {
             const now_shown = seconds(marks, now);
-            try testing.expectEqual(@as(?i64, @divTrunc(work_ms, ms_per_second)), now_shown);
+            try testing.expectEqual(@as(?i64, @divTrunc(work_ms, std.time.ms_per_s)), now_shown);
             if (shown) |before| try testing.expect(now_shown.? >= before);
             shown = now_shown;
         }
         if (activity.snapshot.operation) |op| if (op.active()) {
-            try testing.expectEqual(@as(?i64, @divTrunc(now - began_ms, ms_per_second)), seconds(compactionMarks(op), now));
+            try testing.expectEqual(@as(?i64, @divTrunc(now - began_ms, std.time.ms_per_s)), seconds(compactionMarks(op), now));
         };
     }
 }

@@ -408,7 +408,7 @@ if (options.selfCheck) {
     {
       name: "starts the compaction clock a second early",
       target: "return .{ .started_ms = operation.started_at_ms };",
-      planted: "return .{ .started_ms = operation.started_at_ms - ms_per_second };",
+      planted: "return .{ .started_ms = operation.started_at_ms - std.time.ms_per_s };",
     },
   ];
   let mutantsCaught = true;
