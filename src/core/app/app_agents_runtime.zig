@@ -126,6 +126,10 @@ pub const ChildAgent = struct {
 /// is doing now. The highlighted row's agent is the one on screen: moving
 /// through the list previews each agent, Enter keeps the one shown, and Esc
 /// or Ctrl+X go back to `origin`.
+/// A row Delete closes in the agent list: a subagent, or an instance with
+/// null for the first.
+const CloseTarget = struct { agent: ?*ChildAgent };
+
 pub const AgentsMenu = struct {
     open: bool = false,
     /// The selected agent's place in the switch list, from 0.
@@ -135,17 +139,23 @@ pub const AgentsMenu = struct {
     /// instance. Compared by address only, so it is never read after its
     /// agent closes. Meaningful while `open`.
     origin: ?*ChildAgent = null,
-    /// The subagent whose close the first x armed, until the second x
+    /// The agent whose close the first Delete armed, until the second
     /// closes it or another key disarms it. Compared by address only.
-    close_armed: ?*ChildAgent = null,
+    close_armed: ?CloseTarget = null,
     /// Backs the rows the last projection showed. Owned.
     rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
+    /// Backs the instance names in `rows`, such as "fx 12". Owned.
+    names: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *AgentsMenu, alloc: Allocator) void {
         self.rows.deinit(alloc);
+        self.names.deinit(alloc);
         self.* = .{};
     }
 };
+
+/// Room for an instance's name in the agent list, such as "fx 12".
+const instance_name_bytes = 24;
 
 /// What an instance is doing, as the instance list shows it, most urgent
 /// first.
@@ -166,6 +176,15 @@ const InstanceState = enum {
             .working => "working",
             .finished => "finished",
             .idle => "idle",
+        };
+    }
+
+    /// How bright the agent list draws it.
+    fn tone(self: InstanceState) render_input.AgentStateTone {
+        return switch (self) {
+            .needs_approval, .has_question, .needs_you => .needs_user,
+            .working, .finished => .active,
+            .idle => .idle,
         };
     }
 };
@@ -482,21 +501,35 @@ fn switchOrder(entries: []const OrderEntry, out: []usize) void {
     std.debug.assert(next == out.len);
 }
 
-/// Working agents retain their existing order; other agents show the newest
-/// reply first. Equal timestamps keep the original instance/tree order.
-fn sortMenuOrder(entries: []const OrderEntry, first: OrderEntry, order: []usize) void {
+/// Sorts each instance's subagents in switch order `order`: the working ones
+/// first in start order, then the rest by newest reply. Instances stay put.
+fn sortSubagentGroups(entries: []const OrderEntry, order: []usize) void {
     const Context = struct {
         entries: []const OrderEntry,
-        first: OrderEntry,
+
+        fn isSubagent(ctx: @This(), position: usize) bool {
+            return position != 0 and ctx.entries[position - 1].role == .subagent;
+        }
 
         fn lessThan(ctx: @This(), a: usize, b: usize) bool {
-            const left = if (a == 0) ctx.first else ctx.entries[a - 1];
-            const right = if (b == 0) ctx.first else ctx.entries[b - 1];
+            const left = ctx.entries[a - 1];
+            const right = ctx.entries[b - 1];
             if (left.working != right.working) return left.working;
             return !left.working and left.reply_at_ms > right.reply_at_ms;
         }
     };
-    sort_utils.sort(usize, order, Context{ .entries = entries, .first = first }, Context.lessThan);
+    const ctx: Context = .{ .entries = entries };
+    var start: usize = 0;
+    while (start < order.len) {
+        var end = start;
+        while (end < order.len and ctx.isSubagent(order[end])) end += 1;
+        if (end == start) {
+            start += 1;
+            continue;
+        }
+        sort_utils.sort(usize, order[start..end], ctx, Context.lessThan);
+        start = end;
+    }
 }
 
 fn appendGroup(entries: []const OrderEntry, root: usize, out: []usize, next: *usize) void {
@@ -902,8 +935,8 @@ pub fn Runtime(comptime App: type) type {
             orderByListing(app.child_agents.items, order.items);
         }
 
-        /// Working agents first in the existing instance/tree order, then
-        /// inactive agents by their most recent reply.
+        /// The switch order, with each instance's subagents sorted
+        /// (`sortSubagentGroups`).
         pub fn switchList(app: *App, out: *std.ArrayList(?*ChildAgent)) !void {
             const hosted = app.child_agents.items;
             const entries = try app.alloc.alloc(OrderEntry, hosted.len);
@@ -917,11 +950,7 @@ pub fn Runtime(comptime App: type) type {
             const order = try app.alloc.alloc(usize, hosted.len + 1);
             defer app.alloc.free(order);
             switchOrder(entries, order);
-            sortMenuOrder(entries, .{
-                .role = .instance,
-                .working = firstOpen(app) and instanceState(&app.main_agent, requestWaitsForUser(app, null)) == .working,
-                .reply_at_ms = if (firstOpen(app)) latestReplyAt(app.main_agent.session.agent.history.items) else 0,
-            }, order);
+            sortSubagentGroups(entries, order);
             try out.ensureUnusedCapacity(app.alloc, order.len);
             for (order) |position| {
                 if (position == 0 and !firstOpen(app)) continue;
@@ -1180,6 +1209,7 @@ pub fn Runtime(comptime App: type) type {
             menu.selected = positionIn(order.items, app.agent_on_screen) orelse 0;
             menu.window_start = 0;
             menu.origin = app.agent_on_screen;
+            menu.close_armed = null;
             menu.open = true;
             debug_trace.eventf("host", "agents_menu_opened", .{}, "agents={d} position={d} agent={s}", .{
                 order.items.len,
@@ -1202,6 +1232,7 @@ pub fn Runtime(comptime App: type) type {
             const menu = &app.instances.agents_menu;
             menu.open = false;
             menu.origin = null;
+            menu.close_armed = null;
             app.shell.render_requests.request(.footer);
         }
 
@@ -1272,38 +1303,45 @@ pub fn Runtime(comptime App: type) type {
             switchList(app, &order) catch return .{};
             menu.rows.clearRetainingCapacity();
             menu.rows.ensureTotalCapacity(app.alloc, order.items.len) catch return .{};
+            menu.names.clearRetainingCapacity();
+            menu.names.ensureTotalCapacity(app.alloc, order.items.len * instance_name_bytes) catch return .{};
             for (order.items) |target| {
                 const agent = targetAgent(app, target);
                 const subagent: ?*ChildAgent = if (target) |child| (if (child.agent.role == .subagent) child else null) else null;
                 const model = provider_runtime.modelOf(app, agent);
+                const state = instanceState(agent, requestWaitsForUser(app, target));
+                const name = noteName(app, target, menu.names.addManyAsArrayAssumeCapacity(instance_name_bytes));
                 menu.rows.appendAssumeCapacity(.{
-                    .number = if (subagent == null) instanceNumber(app, target) orelse 0 else 0,
-                    .subagent_name = if (subagent) |child| child.displayName() else "",
+                    .name = name,
+                    .subagent = subagent != null,
                     .title = agent.session_title.items,
                     // A subagent's own agent never loads its profile; its
                     // host's list says which one it runs in.
                     .profile = if (subagent) |child| (if (child.profile.len > 0) child.profile else profiles.main_name) else agent.profile.profile.name,
-                    .state = instanceState(agent, requestWaitsForUser(app, target)).label(),
-                    .on_screen = target == menu.origin,
+                    .state = state.label(),
+                    .state_tone = state.tone(),
                     .model = model,
                     .effort = effortLabel(app, agent, model),
                 });
             }
             if (menu.selected >= menu.rows.items.len) menu.selected = menu.rows.items.len -| 1;
-            const chosen: ?*ChildAgent = if (order.items.len > 0) order.items[@min(menu.selected, order.items.len - 1)] else null;
-            const closable = if (chosen) |child| child.agent.role == .subagent else false;
+            if (order.items.len == 0) return .{ .rows = menu.rows.items };
+            const chosen = order.items[@min(menu.selected, order.items.len - 1)];
+            const closable = deleteCloses(app, chosen);
             return .{
                 .rows = menu.rows.items,
                 .selected = menu.selected,
                 .window_start = menu.window_start,
                 .selected_closable = closable,
-                .close_armed = closable and menu.close_armed == chosen,
+                .selected_instance = isInstance(chosen),
+                .close_armed = closable and armedFor(menu, chosen),
             };
         }
 
-        /// Delete in the agent list: the first press on a subagent's row arms its
-        /// close, and the second closes it for good (`closeSubagent`).
-        /// Instances close with /close, so Delete on one does nothing.
+        /// Delete in the agent list: the first press on a row arms its close,
+        /// and the second closes it: a subagent for good (`closeSubagent`), an
+        /// instance as `/close` does (`closeInstanceFromMenu`). The last open
+        /// instance stays, since closing it would end fx.
         pub fn pressCloseKey(app: *App) !bool {
             if (!menuActive(app)) return false;
             var order: std.ArrayList(?*ChildAgent) = .empty;
@@ -1311,18 +1349,63 @@ pub fn Runtime(comptime App: type) type {
             try switchList(app, &order);
             if (order.items.len == 0) return true;
             const menu = &app.instances.agents_menu;
-            const target = order.items[@min(menu.selected, order.items.len - 1)] orelse return true;
-            if (target.agent.role != .subagent) return true;
-            if (menu.close_armed != target) {
-                menu.close_armed = target;
-                debug_trace.eventf("host", "agents_menu_close_armed", .{}, "agent={s}", .{target.id});
+            const target = order.items[@min(menu.selected, order.items.len - 1)];
+            if (!deleteCloses(app, target)) return true;
+            if (!armedFor(menu, target)) {
+                menu.close_armed = .{ .agent = target };
+                debug_trace.eventf("host", "agents_menu_close_armed", .{}, "agent={s}", .{if (target) |child| child.id else "first"});
                 // Its warning shows now, not at the next frame something else asks for.
                 app.shell.render_requests.request(.footer);
                 return true;
             }
             menu.close_armed = null;
-            try closeSubagent(app, target);
+            if (isInstance(target)) {
+                try closeInstanceFromMenu(app, target);
+            } else {
+                try closeSubagent(app, target.?);
+            }
             return true;
+        }
+
+        /// Whether `target`'s row is an instance's, null being the first.
+        fn isInstance(target: ?*ChildAgent) bool {
+            const child = target orelse return true;
+            return child.agent.role != .subagent;
+        }
+
+        /// Whether Delete closes `target`'s row: any subagent, and an instance
+        /// while another stays open.
+        fn deleteCloses(app: *App, target: ?*ChildAgent) bool {
+            return !isInstance(target) or openInstanceCount(app) > 1;
+        }
+
+        fn armedFor(menu: *const AgentsMenu, target: ?*ChildAgent) bool {
+            const armed = menu.close_armed orelse return false;
+            return armed.agent == target;
+        }
+
+        /// Closes instance `target`, null for the first, and every subagent in
+        /// its tree, as `/close` does on its screen. The next instance takes
+        /// its place on screen and as the agent Esc goes back to, and the list
+        /// stays open on it. Call only while another instance runs.
+        fn closeInstanceFromMenu(app: *App, target: ?*ChildAgent) !void {
+            const menu = &app.instances.agents_menu;
+            const next = if (target) |child| nextInstanceAfter(app, child) else instanceAfterFirst(app);
+            const root: *AppAgent = if (target) |child| &child.agent else &app.main_agent;
+            const origin_closes = if (menu.origin) |origin|
+                origin == target or (origin.agent.role == .subagent and rootInstance(app, origin) == root)
+            else
+                target == null;
+            if (origin_closes) menu.origin = next;
+            if (target) |child| try closeInstance(app, child) else try closeFirstInstance(app);
+            if (menuActive(app)) {
+                var order: std.ArrayList(?*ChildAgent) = .empty;
+                defer order.deinit(app.alloc);
+                try switchList(app, &order);
+                menu.selected = positionIn(order.items, app.agent_on_screen) orelse 0;
+                menu.window_start = @min(menu.window_start, menu.selected);
+                app.shell.render_requests.request(.footer);
+            }
         }
 
         /// Any key but Delete disarms a close the first Delete armed, and its warning
@@ -1452,10 +1535,10 @@ pub fn Runtime(comptime App: type) type {
         /// cancelled. `dropSet` drops them after.
         fn stopSet(app: *App, set: []const *ChildAgent, first_host: ?*subagent_tool_host.Runtime) void {
             const menu = &app.instances.agents_menu;
-            if (inBranch(set, menu.close_armed)) {
+            if (menu.close_armed) |armed| if (inBranch(set, armed.agent)) {
                 menu.close_armed = null;
                 debug_trace.eventf("host", "agents_menu_close_disarmed", .{}, "reason=closed", .{});
-            }
+            };
             if (inBranch(set, app.approval_lender)) _ = returnApproval(app);
             if (inBranch(set, app.question_lender)) _ = returnQuestion(app);
             if (comptime agents.hasAgentField(App, "session_persistence")) {
@@ -2638,7 +2721,7 @@ fn fuzzSwitchOrder(_: void, smith: *std.testing.Smith) !void {
     try expectSwitchOrder(buf[0..len], order[0 .. len + 1]);
 }
 
-test "working agents come first without changing the existing order within either group" {
+test "an instance's working subagents come first in the order they started, and the instance stays above them" {
     const entries = [_]OrderEntry{
         .{ .role = .subagent, .working = false },
         .{ .role = .instance, .working = true },
@@ -2647,17 +2730,13 @@ test "working agents come first without changing the existing order within eithe
     };
     var order: [entries.len + 1]usize = undefined;
     switchOrder(&entries, &order);
-    // Existing tree order: main, first child, last child, fx 2, its child.
+    // Start order: main, its first and last subagents, fx 2, its subagent.
     try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4, 2, 3 }, &order);
-    sortMenuOrder(&entries, .{ .role = .instance }, &order);
-    try std.testing.expectEqualSlices(usize, &.{ 4, 2, 3, 0, 1 }, &order);
-
-    switchOrder(&entries, &order);
-    sortMenuOrder(&entries, .{ .role = .instance, .working = true }, &order);
-    try std.testing.expectEqualSlices(usize, &.{ 0, 4, 2, 3, 1 }, &order);
+    sortSubagentGroups(&entries, &order);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 4, 1, 2, 3 }, &order);
 }
 
-test "inactive agents sort by latest reply while working agents and ties keep their order" {
+test "an instance's other subagents sort by latest reply, ties keep their order, and each instance sorts its own" {
     const entries = [_]OrderEntry{
         .{ .role = .subagent, .reply_at_ms = 100 },
         .{ .role = .subagent, .working = true, .reply_at_ms = 1 },
@@ -2665,11 +2744,50 @@ test "inactive agents sort by latest reply while working agents and ties keep th
         .{ .role = .subagent, .working = true, .reply_at_ms = 900 },
         .{ .role = .subagent, .reply_at_ms = 300 },
         .{ .role = .subagent },
+        // fx 2 replied last of all and stays below main's subagents.
+        .{ .role = .instance, .reply_at_ms = 999 },
+        .{ .role = .subagent, .root = 1, .reply_at_ms = 50 },
+        .{ .role = .subagent, .root = 1, .working = true },
     };
     var order: [entries.len + 1]usize = undefined;
     switchOrder(&entries, &order);
-    sortMenuOrder(&entries, .{ .role = .instance, .reply_at_ms = 200 }, &order);
-    try std.testing.expectEqualSlices(usize, &.{ 2, 4, 3, 5, 0, 1, 6 }, &order);
+    sortSubagentGroups(&entries, &order);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 4, 3, 5, 1, 6, 7, 9, 8 }, &order);
+}
+
+test "sorting subagents keeps every instance in place and every subagent under its own instance" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_50f7);
+    const random = prng.random();
+    var buf: [24]OrderEntry = undefined;
+    var order: [buf.len + 1]usize = undefined;
+    var sorted: [buf.len + 1]usize = undefined;
+    for (0..10_000) |_| {
+        const entries = randomEntries(random, &buf);
+        for (entries) |*entry| {
+            entry.working = random.boolean();
+            entry.reply_at_ms = random.uintAtMost(u8, 3);
+        }
+        const len = entries.len + 1;
+        switchOrder(entries, order[0..len]);
+        @memcpy(sorted[0..len], order[0..len]);
+        sortSubagentGroups(entries, sorted[0..len]);
+        var group_start: usize = 0;
+        for (order[0..len], sorted[0..len], 0..) |before, after, index| {
+            const instance = before == 0 or entries[before - 1].role == .instance;
+            if (instance) {
+                try std.testing.expectEqual(before, after);
+                group_start = index + 1;
+                continue;
+            }
+            try std.testing.expectEqual(entries[before - 1].root, entries[after - 1].root);
+            try std.testing.expect(std.mem.findScalar(usize, sorted[group_start..len], before) != null);
+            if (index == group_start) continue;
+            const above = entries[sorted[index - 1] - 1];
+            const here = entries[after - 1];
+            try std.testing.expect(above.working or !here.working);
+            if (!above.working) try std.testing.expect(above.reply_at_ms >= here.reply_at_ms);
+        }
+    }
 }
 
 test "latest reply timestamp ignores interrupted turns and empty or untimed replies" {

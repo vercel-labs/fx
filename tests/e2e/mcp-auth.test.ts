@@ -1834,6 +1834,52 @@ describe("MCP login", () => {
     expect(auth.tokenExchanges).toBe(1);
   }, 60_000);
 
+  // Before, a store fx couldn't read, here one a newer fx saved, left the
+  // server asking for a sign-in, which couldn't be saved there either.
+  test("a server whose saved logins fx can't read is down for that reason, not asked to sign in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
+    const why = "~/.fx/mcp-credentials/credentials-v3.json couldn't be read: a newer fx saved it, or it's damaged";
+
+    const shown = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(shown.stdout).toMatch(/status +failed/);
+    expect(shown.stdout).toContain(`error      ${why}`);
+    expect(shown.stdout).not.toContain("needs login");
+    expect(shown.stdout).not.toContain("login fixture");
+    expect(shown.code).toBe(1);
+    const json = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(JSON.parse(json.stdout)).toMatchObject({ name: "fixture", status: "failed", error: why, tools: [] });
+    expect(json.code).toBe(1);
+  }, 60_000);
+
+  // Before, a server a reload added read its login from a store fx could no
+  // longer read, found none, and asked for a sign-in that couldn't be saved.
+  test.skipIf(!tmuxAvailable())("a server a reload adds while fx can't read its saved logins is down for that reason, not asked to sign in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // The host read the store when it started; a newer fx saves it now.
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v3.json");
+    writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
+    await tui.sendText(`/mcp add --no-login web ${auth.url}`);
+    await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+    await tui.waitForText("web failed · /mcp", 15_000);
+    expect(await tui.capturePane()).not.toContain("web needs login");
+    expect(auth.authorizationRequests).toBe(0);
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("a login made by another fx process reaches a running shell", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
@@ -2450,6 +2496,44 @@ describe("MCP login", () => {
       unlinkSync(join(root.home, "Library", "Keychains"));
     }
   }, 150_000);
+
+  // Before, a Keychain read that hung past its budget when fx started left
+  // the server asking for a sign-in, though its login was saved. Now the
+  // store is read again when the server asks for one.
+  test.skipIf(process.platform !== "darwin")("a saved login the Keychain didn't give at the start is read again when the server asks for one", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    mkdirSync(join(root.home, "Library"), { recursive: true });
+    symlinkSync(join(homedir(), "Library", "Keychains"), join(root.home, "Library", "Keychains"), "dir");
+    const account = `${MCP_KEYCHAIN_ACCOUNT_PREFIX}${process.pid}-${randomUUID()}`;
+    const env = {
+      ...baseEnv(root), USER: account, FX_DISABLE_KEYCHAIN: undefined, DISPLAY: ":0", SSH_CONNECTION: undefined,
+      FX_NO_OPEN_BROWSER: undefined, FX_TRACE_SCOPES: "mcp,keychain",
+    };
+    let paused: number | null = null;
+    let watcher: { pid: Promise<number | null>; stop: () => void } | null = null;
+    try {
+      expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+      expect(mcpKeychainItem("load", account, root.home)).toContain(ACCESS_INITIAL);
+      // The next fx's first Keychain read hangs, and fx cuts it at its budget.
+      watcher = pauseNextKeychainRead(account);
+      const showing = runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 40_000 });
+      paused = await watcher.pid;
+      expect(paused).not.toBeNull();
+      const shown = await showing;
+      expect(shown.stdout).toMatch(/status +ready/);
+      expect(shown.stdout).not.toContain("needs login");
+      expect(shown.code).toBe(0);
+      expect(auth.tokenExchanges).toBe(1);
+    } finally {
+      releaseProcess(paused);
+      watcher?.stop();
+      try { mcpKeychainItem("delete", account, root.home); } catch (err) { console.log(String(err)); }
+      // Only the link goes, never the Keychains it points at.
+      unlinkSync(join(root.home, "Library", "Keychains"));
+    }
+  }, 60_000);
 
   test("a configured oauth.resource reaches the authorization server as written", async () => {
     upstream = startModernMcpHttpFixture("json");
