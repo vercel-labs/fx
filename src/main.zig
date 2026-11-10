@@ -1326,13 +1326,7 @@ const App = struct {
     }
 
     pub fn enqueuePromptWithSkillBindings(self: *App, agent: *agents.Agent, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
-        const context_targets = if (self.context_enabled)
-            try context_contract.applicableTargetsForImages(self.alloc, agent.pending_images.items)
-        else
-            &.{};
-        defer if (context_targets.len > 0) self.alloc.free(context_targets);
-
-        try AgentAppRuntime.refreshProjectContext(self, agent, context_targets);
+        try AgentAppRuntime.refreshProjectContext(self, agent);
         self.noteModelCatalogActivity();
         agent.session.setConversationLanguageFromUserMessage(prompt);
 
@@ -1386,12 +1380,7 @@ const App = struct {
         agent: *agents.Agent,
         draft: *const input_submit_runtime.PendingPromptDraft,
     ) !void {
-        const context_targets = if (self.context_enabled)
-            try context_contract.applicableTargetsForImages(self.alloc, draft.images)
-        else
-            &.{};
-        defer if (context_targets.len > 0) self.alloc.free(context_targets);
-        try AgentAppRuntime.refreshProjectContext(self, agent, context_targets);
+        try AgentAppRuntime.refreshProjectContext(self, agent);
         self.noteModelCatalogActivity();
         agent.session.setConversationLanguageFromUserMessage(draft.prompt);
 

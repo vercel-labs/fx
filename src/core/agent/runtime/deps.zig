@@ -190,6 +190,12 @@ pub const AgentRuntimeDeps = struct {
     tool_registry: tool_dispatch.Registry = .{},
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
+    /// True where a turn's images are files the user named by path, as in the
+    /// TUI and `fx ask`. The rules of each image's folder then reach the model
+    /// the way a tool call's do: a note on the turn's own message, so the
+    /// instructions stay as they were cached. Hosts whose images carry no
+    /// workspace path leave it false.
+    image_folder_rules: bool = false,
     live_tool_authority: ?LiveToolAuthorityProvider = null,
     /// Samples host-owned root permission mode at an action boundary.
     snapshot_root_permission_mode: ?*const fn (ctx: *anyopaque) PermissionMode = null,

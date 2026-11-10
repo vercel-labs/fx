@@ -1831,12 +1831,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     loaded_skills.dir = &.{};
     if (startup.context_enabled) {
         try ctx.checkCancellation();
-        const context_targets = try context_contract.applicableTargetsForImages(alloc, current_images);
-        defer if (context_targets.len > 0) alloc.free(context_targets);
         ctx.context_snapshot = try ctx.deps.context_registry.gatherDefaultSnapshot(alloc, .{
             .workspace_root = startup.workspace_root,
             .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
-            .targets = context_targets,
             .context_limits = ctx.context_limits,
         });
         try ctx.checkCancellation();
@@ -2144,6 +2141,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
+        .image_folder_rules = true,
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
@@ -4756,6 +4754,8 @@ const TestContextRegistryFixture = struct {
     var gather_error: ?context_contract.ProviderError = null;
     var expected_target_paths: []const []const u8 = &.{};
     var targets_match: bool = false;
+    var expected_queued_image: ?[]const u8 = null;
+    var queued_image_folder_rules: bool = false;
     var expected_static_context: ?[]const u8 = null;
     var expected_gather_calls: usize = 0;
     var transient_permission_mode: ?PermissionMode = null;
@@ -4766,6 +4766,8 @@ const TestContextRegistryFixture = struct {
         gather_error = null;
         expected_target_paths = &.{};
         targets_match = false;
+        expected_queued_image = null;
+        queued_image_folder_rules = false;
         expected_static_context = expected_static;
         expected_gather_calls = expected_calls;
         transient_permission_mode = null;
@@ -4822,6 +4824,13 @@ const TestContextRegistryFixture = struct {
         try std.testing.expect(semantic_presentation == null);
         try std.testing.expectEqual(expected_gather_calls, gather_calls);
         if (expected_gather_calls > 0) try std.testing.expect(targets_match);
+        queued_image_folder_rules = deps.image_folder_rules;
+        if (expected_queued_image) |path| {
+            try std.testing.expectEqual(@as(usize, 1), job.images.len);
+            try std.testing.expectEqualStrings(path, job.images[0].path);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), job.images.len);
+        }
         const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
         if (expected_static_context != null) {
             const contribution = ctx.context_snapshot.contribution orelse return error.TestExpectedEqual;
@@ -8489,7 +8498,7 @@ test "fx ask carries resolved auto mode and initial registry context into the qu
     );
 }
 
-test "default fx ask passes canonical image paths as initial context targets" {
+test "default fx ask keeps image paths out of the initial context and has the runtime carry their folders' rules" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8509,7 +8518,7 @@ test "default fx ask passes canonical image paths as initial context targets" {
     defer stderr_capture.deinit(alloc);
 
     TestContextRegistryFixture.reset(test_registry_static_context, 1);
-    TestContextRegistryFixture.expected_target_paths = &.{image_path};
+    TestContextRegistryFixture.expected_queued_image = image_path;
     var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup);
     deps.context_registry = test_cli_context_registry;
     deps.process_queued_prompt = TestContextRegistryFixture.process;
@@ -8524,7 +8533,11 @@ test "default fx ask passes canonical image paths as initial context targets" {
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqual(@as(usize, 1), TestContextRegistryFixture.gather_calls);
     try std.testing.expectEqual(@as(usize, 1), TestContextRegistryFixture.process_calls);
+    // The instructions' context names no target, so an image never changes
+    // them; the turn carries the image's path and the runtime delivers its
+    // folder's rules as a note.
     try std.testing.expect(TestContextRegistryFixture.targets_match);
+    try std.testing.expect(TestContextRegistryFixture.queued_image_folder_rules);
 }
 
 test "default fx ask omits disabled registry context without gathering" {

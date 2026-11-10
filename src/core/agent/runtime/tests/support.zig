@@ -455,6 +455,7 @@ pub const FakeAgentRuntimeDeps = struct {
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
+    image_folder_rules: bool = false,
     root_permission_mode: ?PermissionMode = null,
     cache_warmer: ?*cache_warmer.Warmer = null,
     /// Records each usage the agent loop saves, as a saved session would.
@@ -753,6 +754,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .tool_activity_recorder = self.tool_activity_recorder,
             .context_registry = self.context_registry,
             .context_enabled = self.context_enabled,
+            .image_folder_rules = self.image_folder_rules,
             .snapshot_root_permission_mode = if (self.root_permission_mode != null)
                 snapshotRootPermissionMode
             else
