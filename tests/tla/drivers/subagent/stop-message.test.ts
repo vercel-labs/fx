@@ -1,15 +1,18 @@
 // Runs the built fx along tests/tla/subagent/StopMessage.tla. The driver
 // plays main and every subagent: it writes main's steps from a walk, holds
-// every subagent turn until the walk finishes it, holds the end of every
-// stopped or closed work through FX_TEST_SUBAGENT_END_HELD until the walk
-// lets it go, and has TLC check that what fx answered is a behavior of the
-// model (StopMessageTrace.tla). The driver acts for a subagent only after
-// main's step has run and every answer is in, so each walk is one ordered
-// sequence of observations.
+// every subagent turn until the walk finishes it, holds the start of every
+// turn through FX_TEST_SUBAGENT_START_HELD and the end of every stopped or
+// closed work through FX_TEST_SUBAGENT_END_HELD until the walk lets it go,
+// and has TLC check that what fx answered is a behavior of the model
+// (StopMessageTrace.tla). The driver acts for a subagent only after main's
+// step has run and every answer is in, so each walk is one ordered sequence
+// of observations. The one exception is a message to a turn that is still
+// starting: fx holds main's call until the turn begins, so the driver lets
+// the start go once fx says the message waits for it.
 //
 //   bun test ./tests/tla/drivers/subagent/stop-message.test.ts
 //   FX_TLA_STOP_RANDOM=20 FX_TLA_STOP_SEED=7   adds 20 random walks
-//   FX_TLA_STOP_STRESS=40                       adds a walk that stops and messages 40 subagents in one step
+//   FX_TLA_STOP_STRESS=40                       adds walks that stop and message 40 subagents in one step, and that message 40 starting ones
 //   FX_TLA_REPEAT=3                             runs each walk 3 times
 //   FX_BIN=<binary>                             drives another build
 import { expect, test } from "bun:test";
@@ -25,8 +28,11 @@ type Op = "send" | "stop" | "close";
 type Msg = [string, number];
 type Call = { op: Op; sub: string; msg: Msg | null; id: string };
 type Planned = { op: Op; sub: string };
-type Action = { main: Planned[] } | { finish: string } | { end: string };
-type Walk = { name: string; subs: string[]; actions: Action[] };
+type Action = { main: Planned[] } | { finish: string } | { end: string } | { begin: string };
+// holdStarts keeps a new turn's start held until a message reaches it, a
+// begin action, or the end of the walk; otherwise each start is let go as
+// soon as main's step has answered.
+type Walk = { name: string; subs: string[]; actions: Action[]; holdStarts?: boolean };
 type Obs = {
   op: string;
   sub: string;
@@ -55,6 +61,7 @@ const close = (sub: string): Planned => ({ op: "close", sub });
 const main = (...calls: Planned[]): Action => ({ main: calls });
 const finish = (sub: string): Action => ({ finish: sub });
 const end = (sub: string): Action => ({ end: sub });
+const begin = (sub: string): Action => ({ begin: sub });
 
 // The named edge cases.
 const WALKS: Walk[] = [
@@ -72,6 +79,15 @@ const WALKS: Walk[] = [
   { name: "read-then-stop", subs: ["s1"], actions: [main(send("s1")), main(send("s1")), finish("s1"), main(stop("s1")), end("s1")] },
   { name: "second-stop-drops-waiting", subs: ["s1"], actions: [main(send("s1")), main(stop("s1")), main(send("s1")), main(stop("s1")), end("s1")] },
   { name: "close-working-then-message", subs: ["s1"], actions: [main(send("s1")), main(close("s1")), main(send("s1")), end("s1"), main(send("s1")), finish("s1")] },
+  // The start gap: main's message reaches a turn before it begins.
+  { name: "message-while-starting", subs: ["s1"], holdStarts: true, actions: [main(send("s1")), main(send("s1")), finish("s1")] },
+  { name: "two-messages-while-starting", subs: ["s1"], holdStarts: true, actions: [main(send("s1")), main(send("s1"), send("s1")), finish("s1")] },
+  { name: "two-subagents-starting", subs: ["s1", "s2"], holdStarts: true, actions: [main(send("s1"), send("s2")), main(send("s1"), send("s2")), finish("s1"), finish("s2")] },
+  { name: "begin-then-message", subs: ["s1"], holdStarts: true, actions: [main(send("s1")), begin("s1"), main(send("s1")), finish("s1")] },
+  { name: "stop-while-starting", subs: ["s1"], holdStarts: true, actions: [main(send("s1")), main(stop("s1")), end("s1"), main(send("s1")), finish("s1")] },
+  { name: "close-while-starting", subs: ["s1"], holdStarts: true, actions: [main(send("s1")), main(close("s1")), end("s1")] },
+  { name: "stop-and-message-while-starting", subs: ["s1"], holdStarts: true, actions: [main(send("s1")), main(stop("s1"), send("s1")), end("s1"), finish("s1")] },
+  { name: "message-then-stop-while-starting", subs: ["s1"], holdStarts: true, actions: [main(send("s1")), main(send("s1"), stop("s1")), end("s1")] },
 ];
 
 function rng(seed: number): () => number {
@@ -89,8 +105,13 @@ function randomWalk(seed: number): Walk {
   const subs = ["s1", "s2"];
   const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
   const actions: Action[] = [main(send("s1"), send("s2"))];
+  const holdStarts = next() < 0.5;
   for (let n = 0; n < 10; n += 1) {
     const roll = next();
+    if (holdStarts && next() < 0.15) {
+      actions.push(begin(pick(subs)));
+      continue;
+    }
     if (roll < 0.55) {
       const first: Planned = { op: next() < 0.6 ? "send" : next() < 0.9 ? "stop" : "close", sub: pick(subs) };
       const second: Planned = { op: next() < 0.6 ? "send" : "stop", sub: next() < 0.6 ? first.sub : pick(subs) };
@@ -101,7 +122,7 @@ function randomWalk(seed: number): Walk {
     } else if (roll < 0.8) actions.push(end(pick(subs)));
     else actions.push(finish(pick(subs)));
   }
-  return { name: `random-${seed}`, subs, actions };
+  return { name: `random-${seed}`, subs, actions, holdStarts };
 }
 
 function stressWalk(count: number): Walk {
@@ -111,6 +132,12 @@ function stressWalk(count: number): Walk {
     subs,
     actions: [main(...subs.map(send)), main(...subs.flatMap((s) => [stop(s), send(s)])), ...subs.map(end), ...subs.map(finish)],
   };
+}
+
+// Every subagent is started and held, then messaged while it starts.
+function stressStartWalk(count: number): Walk {
+  const subs = Array.from({ length: count }, (_, i) => `s${i + 1}`);
+  return { name: `stress-start-${count}`, subs, holdStarts: true, actions: [main(...subs.map(send)), main(...subs.map(send)), ...subs.map(finish)] };
 }
 
 const token = (msg: Msg) => `SMW-${msg[0]}-${msg[1]}`;
@@ -190,6 +217,12 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
   const ending = new Set<string>();
   const closing = new Set<string>();
   const running = new Set<string>();
+  // Subagents whose current turn is held at its start, and those whose turn
+  // began but whose first model request the driver has not looked at.
+  const starting = new Set<string>();
+  const firstPending = new Set<string>();
+  // The messages that joined each subagent's turns, in the order fx took them.
+  const joinedOrder = new Map<string, string[]>();
   // Messages that started a turn: the turn has them from its start, and a
   // stop can end it before it ever asks the model.
   const startTokens = new Set<string>();
@@ -217,6 +250,11 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
   const heldMarker = join(root, "end-held");
   const release = join(root, "end-release");
   const released = new Set<number>();
+  const startMarker = join(root, "start-held");
+  const startRelease = join(root, "start-release");
+  const startReleased = new Set<number>();
+  // Set while main's step runs; a background release stops once it is false.
+  let stepRunning = false;
   mkdirSync(join(home, ".fx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
   writeFileSync(join(home, ".fx", "settings.json"), "{}");
@@ -226,6 +264,24 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     if (queue && queue.length > 0) queue.shift()!(tokens);
     else arrivals.set(sub, [...(arrivals.get(sub) ?? []), tokens]);
   };
+  // The next request of `sub` within `ms`, or null: a turn a stop ended
+  // may never have asked the model.
+  const arrivalWithin = (sub: string, ms: number) => new Promise<string[] | null>((resolve) => {
+    const queued = arrivals.get(sub);
+    if (queued && queued.length > 0) {
+      resolve(queued.shift()!);
+      return;
+    }
+    const waiter = (tokens: string[]) => {
+      clearTimeout(timer);
+      resolve(tokens);
+    };
+    const timer = setTimeout(() => {
+      waiters.set(sub, (waiters.get(sub) ?? []).filter((w) => w !== waiter));
+      resolve(null);
+    }, ms);
+    waiters.set(sub, [...(waiters.get(sub) ?? []), waiter]);
+  });
   const nextArrival = (sub: string, ms = 15_000) => new Promise<string[]>((resolve, reject) => {
     const queued = arrivals.get(sub);
     if (queued && queued.length > 0) {
@@ -289,12 +345,97 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     }
     return held.sort((a, b) => a - b)[0];
   };
-  const push = (o: Partial<Obs> & { op: string }) => observations.push({
+  // The first held start of `sub` the walk has not released.
+  const heldStart = (sub: string): number | undefined => {
+    const ids = childIds(sub);
+    const held: number[] = [];
+    for (const name of readdirSync(root)) {
+      const match = /^start-held\.(\d+)$/.exec(name);
+      if (!match || startReleased.has(Number(match[1]))) continue;
+      const child = /child=(\S+)/.exec(readFileSync(join(root, name), "utf8"))?.[1];
+      if (child && ids.has(child)) held.push(Number(match[1]));
+    }
+    return held.sort((a, b) => a - b)[0];
+  };
+  // How many times fx said a message to `sub` waits for its turn to begin.
+  const waitsStart = (sub: string) => {
+    const log = join(root, "trace.log");
+    if (!existsSync(log)) return 0;
+    const ids = childIds(sub);
+    return [...readFileSync(log, "utf8").matchAll(/event=message_waits_start child=(\S+)/g)].filter((m) => ids.has(m[1]!)).length;
+  };
+  const releaseStart = async (sub: string) => {
+    const n = await poll(() => heldStart(sub), 15_000);
+    if (n === undefined) throw new Error(`${walk.name}: ${sub}'s turn never reached its start`);
+    startReleased.add(n);
+    writeFileSync(`${startRelease}.${n}`, "");
+    starting.delete(sub);
+  };
+  const row = (o: Partial<Obs> & { op: string }): Obs => ({
     sub: "none", msg: null, answer: "none", count: 0, calls: [], msgs: [], ...o,
   });
+  const push = (o: Partial<Obs> & { op: string }) => observations.push(row(o));
+  // A first request takes every message that joined its turn before it was
+  // sent, which can be in the middle of main's step: its read goes right
+  // after the last message it took, before a later stop of the same step.
+  const pushRead = (sub: string, tokens: string[]) => {
+    const taken = new Set(tokens.map((t) => JSON.stringify(parseToken(t))));
+    let at = -1;
+    observations.forEach((o, i) => {
+      if (o.op === "send" && o.sub === sub && o.answer === "joined" && taken.has(JSON.stringify(o.msg))) at = i;
+    });
+    const read = row({ op: "read", sub, msgs: tokens.map(parseToken) });
+    if (at === -1) observations.push(read);
+    else observations.splice(at + 1, 0, read);
+  };
 
-  // The stopped or closed work of `sub` ends; its next turn reads the
-  // messages waiting for it.
+  // The starting turn of `sub` begins: the driver lets its start go.
+  const beginAction = async (sub: string) => {
+    if (!starting.has(sub)) return;
+    await releaseStart(sub);
+    running.add(sub);
+    firstPending.add(sub);
+    push({ op: "begin", sub });
+  };
+  // The joined messages of `sub` that a turn took into a step
+  // (`feedback_applied` in fx's trace), matched to the joins in order: calls
+  // to one subagent run in order.
+  const appliedTokens = (sub: string): string[] => {
+    const log = join(root, "trace.log");
+    if (!existsSync(log)) return [];
+    const text = readFileSync(log, "utf8");
+    const ids = childIds(sub);
+    const ops = [...text.matchAll(/event=message child=(\S+) work_id=\S+ delivery=joined receipt=\S+ operation=(\S+)/g)]
+      .filter((m) => ids.has(m[1]!)).map((m) => m[2]!);
+    const applied = new Set([...text.matchAll(/event=feedback_applied operation=(\S+)/g)].map((m) => m[1]!));
+    return (joinedOrder.get(sub) ?? []).filter((_, i) => ops[i] !== undefined && applied.has(ops[i]!));
+  };
+  // A turn that began asks the model first; a message that joined it before
+  // that request is read by it. A turn a stop of the same step ended may
+  // have asked before the stop, or never; its step can also have taken a
+  // message just before the stop ended it, with no request sent.
+  const readFirst = async (sub: string) => {
+    if (!firstPending.delete(sub)) return;
+    const arrival = running.has(sub) ? await nextArrival(sub) : await arrivalWithin(sub, 1_000);
+    const fresh = (arrival ?? []).filter((t) => !startTokens.has(t));
+    if (!running.has(sub)) {
+      // Such a message is in the subagent's history from now on, so a later
+      // request that carries it brings nothing new.
+      for (const t of appliedTokens(sub)) {
+        if (readTokens.has(t) || fresh.includes(t)) continue;
+        fresh.push(t);
+        seen.get(sub)!.add(t);
+      }
+    }
+    if (fresh.length === 0) return;
+    for (const t of fresh) {
+      readTokens.add(t);
+      unread.get(sub)!.delete(t);
+    }
+    pushRead(sub, fresh);
+  };
+  // The stopped or closed work of `sub` ends; the messages waiting for it
+  // start its next turn, which starts held like any other.
   const endAction = async (sub: string) => {
     if (!ending.has(sub)) return;
     const before = finishedCount(sub);
@@ -303,16 +444,28 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     released.add(n);
     writeFileSync(`${release}.${n}`, "");
     if ((await poll(() => finishedCount(sub) > before, 15_000)) === undefined) throw new Error(`${walk.name}: ${sub}'s stopped work never finished`);
-    let msgs: string[] = [];
-    if (!closing.has(sub) && waiting.get(sub)!.size > 0) msgs = await nextRead(sub).catch(() => []);
-    if (msgs.length > 0) running.add(sub);
+    const msgs = closing.has(sub) ? [] : [...waiting.get(sub)!];
     ending.delete(sub);
     closing.delete(sub);
     waiting.get(sub)!.clear();
     push({ op: "end", sub, msgs: msgs.map(parseToken) });
+    if (msgs.length === 0) return;
+    starting.add(sub);
+    await releaseStart(sub);
+    running.add(sub);
+    push({ op: "begin", sub });
+    const tokens = await nextArrival(sub);
+    for (const t of msgs) {
+      if (!tokens.includes(t)) throw new Error(`${walk.name}: ${sub}'s next turn did not take ${t}`);
+      readTokens.add(t);
+    }
   };
   // The running turn of `sub` answers: it reads what joined it, or ends.
   const finishAction = async (sub: string) => {
+    if (starting.has(sub)) {
+      await beginAction(sub);
+      await readFirst(sub);
+    }
     if (!running.has(sub) || ending.has(sub)) return;
     const resolve = await poll(() => held.get(sub), 15_000);
     if (!resolve) throw new Error(`${walk.name}: ${sub}'s running turn sent no model request`);
@@ -334,6 +487,7 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
     push({ op: "finish", sub });
   };
   const takeAnswers = async (body: string, calls: Call[]) => {
+    stepRunning = false;
     const startedNow: string[] = [];
     for (const call of calls) {
       const text = toolResultText(body, call.id);
@@ -344,9 +498,12 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
         const t = token(call.msg!);
         if (answer === "started") {
           startTokens.add(t);
-          running.add(s);
+          starting.add(s);
           startedNow.push(s);
-        } else if (answer === "joined") unread.get(s)!.add(t);
+        } else if (answer === "joined") {
+          unread.get(s)!.add(t);
+          joinedOrder.set(s, [...(joinedOrder.get(s) ?? []), t]);
+        }
         else if (answer === "waits") waiting.get(s)!.add(t);
         else if (answer === "refused") refusedCount += 1;
       } else {
@@ -364,36 +521,32 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
           if (call.op === "close") closing.add(s);
           held.delete(s);
           running.delete(s);
+          // A stopped turn that never began: its start goes, with no begin.
+          if (starting.has(s)) await releaseStart(s);
         }
         unread.get(s)!.clear();
         waiting.get(s)!.clear();
       }
     }
-    // Each turn the step started asks the model first, unless a later call
-    // of the step ended it before it could. A message that joined it before
-    // that first request is read by it.
-    for (const s of startedNow) {
-      if (!running.has(s)) continue;
-      const fresh = (await nextArrival(s)).filter((t) => !startTokens.has(t));
-      if (fresh.length === 0) continue;
-      for (const t of fresh) {
-        readTokens.add(t);
-        unread.get(s)!.delete(t);
-      }
-      push({ op: "read", sub: s, msgs: fresh.map(parseToken) });
-    }
+    // A turn the step started begins now unless the walk holds starts. A
+    // turn that began during the step, or begins now, then reads what joined
+    // it before its first request.
+    for (const s of startedNow) if (!walk.holdStarts) await beginAction(s);
+    for (const s of walk.subs) if (!walk.holdStarts && starting.has(s)) await beginAction(s);
+    for (const s of walk.subs) await readFirst(s);
   };
   const settle = async () => {
     for (const s of walk.subs) {
       for (let guard = 0; guard < 20; guard += 1) {
         if (ending.has(s)) await endAction(s);
-        else if (running.has(s)) await finishAction(s);
+        else if (starting.has(s) || running.has(s)) await finishAction(s);
         else break;
       }
     }
   };
   const releaseAll = () => {
     writeFileSync(release, "");
+    writeFileSync(startRelease, "");
     for (const [s, resolve] of held) {
       held.delete(s);
       resolve(final(`WALKDONE ${s}`));
@@ -424,10 +577,23 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
           });
           push({ op: "step", calls: calls.map(({ op, sub, msg }) => ({ op, sub, msg })) });
           pending = calls;
+          stepRunning = true;
+          // fx holds a message to a starting turn until the turn begins:
+          // once it says so, the driver lets the start go.
+          for (const s of new Set(calls.filter((c) => c.op === "send" && starting.has(c.sub)).map((c) => c.sub))) {
+            const before = waitsStart(s);
+            void (async () => {
+              await poll(() => !stepRunning || waitsStart(s) > before, 20_000);
+              if (stepRunning && starting.has(s)) await beginAction(s);
+            })().catch((caught) => { error ??= String(caught); });
+          }
           return tools(calls);
         }
         if ("finish" in action) await finishAction(action.finish);
-        else await endAction(action.end);
+        else if ("begin" in action) {
+          await beginAction(action.begin);
+          await readFirst(action.begin);
+        } else await endAction(action.end);
       }
       await settle();
     } catch (caught) {
@@ -470,6 +636,8 @@ async function runWalk(walk: Walk, dir: string): Promise<Result> {
       FX_TRACE_SCOPES: "mailbox,subagent",
       FX_TEST_SUBAGENT_END_HELD: heldMarker,
       FX_TEST_SUBAGENT_END_RELEASE: release,
+      FX_TEST_SUBAGENT_START_HELD: startMarker,
+      FX_TEST_SUBAGENT_START_RELEASE: startRelease,
     }),
     stdin: "ignore",
     stdout: "pipe",
@@ -569,7 +737,7 @@ const stress = Number(process.env.FX_TLA_STOP_STRESS ?? "0");
 const walks = [
   ...WALKS,
   ...Array.from({ length: random }, (_, i) => randomWalk(seed + i)),
-  ...(stress > 0 ? [stressWalk(stress)] : []),
+  ...(stress > 0 ? [stressWalk(stress), stressStartWalk(stress)] : []),
 ];
 
 for (const walk of walks) {
@@ -601,6 +769,13 @@ test("the trace check rejects planted changes to a walk", async () => {
   planted.uncounted = base("message-then-stop-one-step").map((o) => o.op === "stop" ? { ...o, count: 0 } : o);
   // The stopped turn's end dropped the waiting message.
   planted["lost-at-end"] = base("stop-then-message").map((o) => o.op === "end" ? { ...o, msgs: [] } : o);
+  // A message to a starting turn waited for the next one, as fx did before.
+  planted["start-next-turn"] = base("message-while-starting").map((o) =>
+    o.op === "send" && o.answer === "joined" ? { ...o, answer: "waits" } : o);
+  // The message joined the turn before the turn began.
+  const early = base("message-while-starting");
+  const at = early.findIndex((o) => o.op === "begin");
+  planted["joined-before-begin"] = [...early.slice(0, at), early[at + 1]!, early[at]!, ...early.slice(at + 2)];
   for (const [name, observations] of Object.entries(planted)) {
     expect(`${name}: ${await checkTrace(observations, subs, join(dir, name))}`).toBe(`${name}: REJECTED`);
   }
