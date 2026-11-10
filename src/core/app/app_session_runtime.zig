@@ -1546,6 +1546,7 @@ pub fn Runtime(comptime App: type) type {
                 v2.close();
             }
             try restoreChildState(app, agent, resumed.state);
+            if (resumed.title) |title| if (cachedSessionTitle(agent) == null) try setCachedSessionTitle(app, agent, title);
             if (comptime @hasDecl(@TypeOf(agent.session), "configureWebFetchArtifactBlobs")) {
                 if (v2.childCapability()) |capability| {
                     agent.session.configureWebFetchArtifactBlobs(app.alloc, capability, v2.id());
