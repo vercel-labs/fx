@@ -4604,6 +4604,199 @@ describe("gateway stream lifecycle", () => {
     }
   }, 240_000);
 
+  // A turn that names a skill sends the skill's text with its message; every
+  // later request sends that turn exactly as it was sent (D95). The steps run
+  // a shell command, which leaves no saved file list on the turn.
+  function writeNamedSkill(workspace: string, name: string, body: string) {
+    const directory = join(workspace, ".agents", "skills", name);
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} fixture\n---\n${body}\n`);
+  }
+
+  function shellStep(provider: ReplayProvider, label: string): object[] {
+    return signedToolStep(provider, label, "shell", {
+      request: { yield_time_ms: 30_000, action: "run", command: `echo ${label}` },
+    });
+  }
+
+  const SKILL_USED_NOTE = "For that turn the user named the skill";
+
+  for (const provider of REPLAY_PROVIDERS) {
+    test(`a turn after a named skill sends that turn unchanged, skill text included (${provider.name})`, async () => {
+      const root = createFixtureRoot(`named-skill-${provider.name}`);
+      writeNamedSkill(root.workspace, "notes-workflow", "NAMED_SKILL_BODY");
+      const steps = [
+        shellStep(provider, "skill_shell"),
+        signedFinalStep(provider, "skill_reply", "Followed the skill."),
+        signedFinalStep(provider, "next_reply", "Nothing else."),
+      ];
+      const { gateway, edits } = startPreservedThinkingGateway(provider, (request) =>
+        steps.shift() ?? signedFinalStep(provider, `extra_${request}`, "Extra reply.")
+      );
+      try {
+        const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: provider.model };
+        const first = await runFx(["ask", "--json", "--full-access", "$notes-workflow check the notes."], {
+          cwd: root.workspace,
+          env,
+          timeoutMs: 15_000,
+        });
+        expect(first.code).toBe(0);
+        expect(gateway.requests[0]!.body.split("NAMED_SKILL_BODY")).toHaveLength(2);
+        const sessionId = parseAskJson(first.stdout).session_id;
+        const second = await runFx(["ask", "--json", "--full-access", "--resume", sessionId, "Anything else?"], {
+          cwd: root.workspace,
+          env,
+          timeoutMs: 15_000,
+        });
+        expect(edits).toEqual([]);
+        expect(second.code).toBe(0);
+        expect(gateway.requestCount()).toBe(3);
+        // The next request is the skill turn's last request, its signed
+        // reply, and the new message; the skill text is still there once.
+        const sent = gatewayRequest(gateway.requests[1]!.body).prompt;
+        const next = gatewayRequest(gateway.requests[2]!.body).prompt;
+        expect(next.slice(0, sent.length)).toEqual(sent);
+        expect(signaturesIn(JSON.stringify(next[sent.length]!.content))).toEqual(["SIG_skill_reply"]);
+        expect(gateway.requests[2]!.body.split("NAMED_SKILL_BODY")).toHaveLength(2);
+        expect(gateway.requests[2]!.body).not.toContain(SKILL_USED_NOTE);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 45_000);
+  }
+
+  const NAMED_SKILL_SHAPES: Array<{ name: string; prompt: string; bodies: string[] }> = [
+    { name: "two skills named in one turn", prompt: "$alpha-skill $beta-skill check both.", bodies: ["ALPHA_SKILL_BODY", "BETA_SKILL_BODY"] },
+    { name: "a named skill that does not load", prompt: "$missing-skill check it.", bodies: [] },
+  ];
+
+  for (const [shapeIndex, shape] of NAMED_SKILL_SHAPES.entries()) {
+    test(`a turn after ${shape.name} sends that turn unchanged`, async () => {
+      const provider = REPLAY_PROVIDERS[0]!;
+      const root = createFixtureRoot(`named-skill-shape-${shapeIndex}`);
+      writeNamedSkill(root.workspace, "alpha-skill", "ALPHA_SKILL_BODY");
+      writeNamedSkill(root.workspace, "beta-skill", "BETA_SKILL_BODY");
+      const steps = [shellStep(provider, "shape_shell"), signedFinalStep(provider, "shape_reply", "Done.")];
+      const { gateway, edits } = startPreservedThinkingGateway(provider, (request) =>
+        steps.shift() ?? signedFinalStep(provider, `after_${request}`, "Ok.")
+      );
+      try {
+        const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: provider.model };
+        const first = await runFx(["ask", "--json", "--full-access", shape.prompt], { cwd: root.workspace, env, timeoutMs: 15_000 });
+        const sessionId = parseAskJson(first.stdout).session_id;
+        const second = await runFx(["ask", "--json", "--full-access", "--resume", sessionId, "Anything else?"], {
+          cwd: root.workspace,
+          env,
+          timeoutMs: 15_000,
+        });
+        expect(edits).toEqual([]);
+        expect(second.code).toBe(0);
+        const last = gateway.requests[gateway.requests.length - 1]!.body;
+        for (const body of shape.bodies) expect(last.split(body)).toHaveLength(2);
+        expect(last).not.toContain(SKILL_USED_NOTE);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 45_000);
+  }
+
+  test("a named-skill turn killed after a tool step resumes, and the turn after keeps it as sent", async () => {
+    const provider = REPLAY_PROVIDERS[0]!;
+    const root = createFixtureRoot("named-skill-crash");
+    writeNamedSkill(root.workspace, "notes-workflow", "CRASH_SKILL_BODY");
+    let releaseHeld: (() => void) | undefined;
+    let heldArrived: () => void = () => {};
+    const arrived = new Promise<void>((resolve) => {
+      heldArrived = resolve;
+    });
+    const { gateway, edits } = startPreservedThinkingGateway(provider, async (request) => {
+      if (request === 0) return shellStep(provider, "crash_shell");
+      if (request === 1) {
+        heldArrived();
+        await new Promise<void>((resolve) => {
+          releaseHeld = resolve;
+        });
+        return signedFinalStep(provider, "never_seen", "Too late.");
+      }
+      return signedFinalStep(provider, `after_crash_${request}`, "Recovered.");
+    });
+    try {
+      const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: provider.model, FX_SOUND: "0" };
+      const proc = Bun.spawn([FX_BIN, "ask", "--full-access", "--json", "$notes-workflow check the notes."], {
+        cwd: root.workspace,
+        env: { ...process.env, ...env },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      await arrived;
+      // fx dies while the step after its shell call waits on the gateway.
+      proc.kill("SIGKILL");
+      await proc.exited;
+      const sessionId = onlySessionId(root.home);
+      const resumed = await runFx(["ask", "--json", "--full-access", "--resume", sessionId, "Continue after the crash."], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 15_000,
+      });
+      expect(edits).toEqual([]);
+      expect(resumed.code).toBe(0);
+      const next = await runFx(["ask", "--json", "--full-access", "--resume", sessionId, "And now?"], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 15_000,
+      });
+      expect(edits).toEqual([]);
+      expect(next.code).toBe(0);
+      const last = gateway.requests[gateway.requests.length - 1]!.body;
+      expect(signaturesIn(last)).toContain("SIG_crash_shell");
+      expect(last.split("CRASH_SKILL_BODY")).toHaveLength(2);
+      expect(last).not.toContain(SKILL_USED_NOTE);
+    } finally {
+      releaseHeld?.();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("thirty saved turns that each name a skill resume without editing an earlier turn", async () => {
+    const provider = REPLAY_PROVIDERS[0]!;
+    const root = createFixtureRoot("named-skill-stress");
+    writeNamedSkill(root.workspace, "notes-workflow", "STRESS_SKILL_BODY");
+    const turns = 30;
+    let queue: object[][] = [];
+    const { gateway, edits } = startPreservedThinkingGateway(provider, (request) =>
+      queue.shift() ?? signedFinalStep(provider, `unexpected_${request}`, "Unexpected.")
+    );
+    try {
+      const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: provider.model };
+      let sessionId: string | undefined;
+      for (let turn = 1; turn <= turns; turn += 1) {
+        queue = [shellStep(provider, `stress_shell_${turn}`), signedFinalStep(provider, `stress_reply_${turn}`, `Turn ${turn} done.`)];
+        const prompt = `$notes-workflow turn ${turn}.`;
+        const args = sessionId === undefined
+          ? ["ask", "--json", "--full-access", prompt]
+          : ["ask", "--json", "--full-access", "--resume", sessionId, prompt];
+        const result = await runFx(args, { cwd: root.workspace, env, timeoutMs: 30_000 });
+        expect(edits).toEqual([]);
+        expect(result.code).toBe(0);
+        expect(queue).toEqual([]);
+        sessionId ??= parseAskJson(result.stdout).session_id;
+      }
+      // The last request carries every skill turn's text once, and every
+      // earlier turn's two signed steps plus this turn's shell step.
+      const last = gateway.requests[gateway.requests.length - 1]!.body;
+      expect(last.split("STRESS_SKILL_BODY")).toHaveLength(turns + 1);
+      expect(signaturesIn(last)).toHaveLength(turns * 2 - 1);
+      expect(last).not.toContain(SKILL_USED_NOTE);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 240_000);
+
   test("saved ask replays standalone assistant replies without joining their metadata", async () => {
     for (const withReplay of [false, true]) {
       const root = createFixtureRoot(`standalone-replies-${withReplay}`);
