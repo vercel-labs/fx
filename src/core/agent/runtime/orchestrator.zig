@@ -9719,19 +9719,22 @@ fn processQueuedPromptLoop(
             }
 
             const empty_final: []const u8 = if (disposition == .length_limited) empty_length_limited_reply else "Done.";
-            // A stalled reply keeps no stand-in text, so steering or a subagent's
-            // report that continues the turn below never saves "Done." for it
-            // (`tests/e2e/gateway-stream-lifecycle.test.ts` "an empty reply that
-            // stops for another reason gives way to a subagent's report, with no
-            // Done.").
             const raw_final = if (has_content) partial_assistant else if (empty_other) "" else empty_final;
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
             const rendered = if (final_text.len > 0) final_text else empty_final;
             const history_text = try arena.dupe(u8, raw_final);
             const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
+            // An empty reply keeps no stand-in text when steering or a
+            // subagent's report continues the turn below, so the model is never
+            // told it said "Done." (`tests/e2e/gateway-stream-lifecycle.test.ts`
+            // "an empty reply that stops for another reason gives way to a
+            // subagent's report, with no Done." and "an empty reply that stops
+            // normally gives way to a subagent's report, with no Done. in the
+            // history").
+            const continued_text = if (has_content) history_text else "";
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, history_text, history_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
+                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, continued_text, history_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
