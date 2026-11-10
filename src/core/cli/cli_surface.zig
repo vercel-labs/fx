@@ -28,7 +28,6 @@ const app_profile_runtime = @import("../app/app_profile_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const doctor_probes = @import("doctor_probes.zig");
-const doctor_gh_hosts = @import("doctor_gh_hosts.zig");
 const mcp_runtime = @import("../mcp_host/runtime.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -4140,10 +4139,12 @@ fn parseDoctorArgs(args: []const [:0]const u8) !DoctorOptions {
 const DoctorProbes = struct {
     deadline: i64,
     catalog: ?*doctor_probes.CatalogProbe = null,
-    /// The MCP server children first, then gh.
+    /// The MCP server checks first, then gh.
     processes: std.ArrayList(*doctor_probes.ProcessProbe) = .empty,
     server_children: usize = 0,
-    gh: ?doctor_probes.Gh = null,
+    /// The MCP server checks, which `wait` starts from as slots free.
+    servers: doctor_probes.ServerChecks = .{},
+    gh: ?*doctor_probes.ProcessProbe = null,
     waiters: std.Io.Group = .init,
     mcp_statuses: []const mcp_runtime.Status = &.{},
     mcp_checked: bool = false,
@@ -4168,7 +4169,7 @@ const DoctorProbes = struct {
                 self.mcp_statuses = try loaded_host.runtime.statuses(probe_alloc);
                 const exe_path = try self_exe.pathForReexec(probe_alloc);
                 defer self.server_children = self.processes.items.len;
-                try doctor_probes.startServerChildren(probe_alloc, &self.waiters, &self.processes, self.mcp_statuses, exe_path, self.deadline);
+                self.servers = try doctor_probes.startServerChildren(probe_alloc, &self.waiters, &self.processes, self.mcp_statuses, exe_path, self.deadline, doctor_probes.serverCap());
                 self.mcp_checked = true;
             }
         }
@@ -4176,8 +4177,7 @@ const DoctorProbes = struct {
         // one, doctor does not run it, so gh writes nothing on its behalf. Unit
         // tests run inside this repository and must not reach GitHub.
         if (snapshot.in_git_repository and !builtin.is_test) {
-            const target = try doctor_gh_hosts.read(probe_alloc, workspace_root);
-            self.gh = try doctor_probes.startGh(probe_alloc, &self.waiters, &self.processes, target);
+            self.gh = try doctor_probes.startGh(probe_alloc, &self.waiters, &self.processes);
         }
     }
 
@@ -4210,7 +4210,7 @@ const DoctorProbes = struct {
     /// Waits for the checks until the deadline, then stops and joins them.
     /// The ending signal that stopped the checks, if one did.
     fn wait(self: *DoctorProbes) ?std.posix.SIG {
-        return doctor_probes.wait(self.deadline, self.catalog, self.processes.items, &self.waiters);
+        return doctor_probes.wait(self.deadline, self.catalog, self.processes.items, &self.waiters, &self.servers);
     }
 
     /// One line on a terminal's stderr while doctor waits on its network
@@ -4221,8 +4221,12 @@ const DoctorProbes = struct {
         for (self.processes.items[0..self.server_children]) |probe| {
             if (!probe.not_started and probe.spawn_error == null) servers += 1;
         }
-        const gh_started = if (self.gh) |gh| gh.probes.len > 0 else false;
-        const notice = try doctor_probes.waitNotice(alloc, if (self.catalog != null) provider else null, servers, gh_started, deadline_ms) orelse return;
+        const gh_started = if (self.gh) |gh| gh.spawn_error == null else false;
+        const notice = try doctor_probes.waitNotice(alloc, .{
+            .provider = if (self.catalog != null) provider else null,
+            .mcp_servers = servers,
+            .gh = if (gh_started) .checking else .not_checked,
+        }, deadline_ms) orelse return;
         defer alloc.free(notice);
         try writeStderr(deps, notice);
     }
@@ -4239,7 +4243,7 @@ const DoctorProbes = struct {
         if (self.catalog) |probe| try doctor_probes.catalogChecks(out, alloc, probe, provider, deadline_ms);
         try doctor_probes.serverStatusChecks(out, alloc, self.mcp_statuses);
         try doctor_probes.serverChildChecks(out, results, alloc, self.processes.items[0..self.server_children], deadline_ms);
-        if (self.gh) |gh| try doctor_probes.ghCheck(out, alloc, gh, deadline_ms);
+        try doctor_probes.ghCheck(out, alloc, self.gh, deadline_ms);
     }
 };
 

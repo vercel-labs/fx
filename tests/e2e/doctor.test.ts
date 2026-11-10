@@ -2,7 +2,7 @@
 // that works, fails, or hangs on purpose.
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { writeChatGptLogin, writeGrokLogin } from "./usage-fakes";
 import { createConfiguredProviderFixture } from "./fixtures/chat-completions";
 import { join } from "node:path";
@@ -120,18 +120,6 @@ function writeScript(path: string, body: string) {
 function gitRepo(r: Root, url: string | null = "https://github.com/example/repo.git") {
   expect(spawnSync("/usr/bin/git", ["init", "-q", r.workspace]).status).toBe(0);
   if (url) expect(spawnSync("/usr/bin/git", ["-C", r.workspace, "remote", "add", "origin", url]).status).toBe(0);
-}
-
-/** A gh that logs each call and is signed in only to `host`. */
-function signedInOnlyTo(r: Root, host: string): string {
-  const log = join(r.root, "gh.log");
-  writeScript(join(r.bin, "gh"), [
-    `echo "$*" >> '${log}'`,
-    `case " $* " in *" --hostname ${host} "*) exit 0 ;; esac`,
-    'echo "You are not logged into any accounts" >&2',
-    "exit 1",
-  ].join("\n"));
-  return log;
 }
 
 describe("fx doctor provider", () => {
@@ -333,70 +321,65 @@ describe("fx doctor local checks", () => {
     expect(away.stdout).toMatch(/^\[warn\] git: /m);
   }, TIMEOUT);
 
-  test("gh missing, signed out, and hanging are each a warning with a fix inside a repository", async () => {
-    const repo = (r: Root) => gitRepo(r);
+  test("gh repo view's exit code says whether gh can use the repository, and gh runs only inside one", async () => {
     const outside = makeRoot();
     const away = await doctor(outside, env(outside, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
     expect(away.stdout).not.toMatch(/^\[(ok|warn|fail)\] gh: /m);
 
     const missing = makeRoot();
-    repo(missing);
+    gitRepo(missing);
     const none = await doctor(missing, env(missing, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(none.stdout).toMatch(/^\[warn\] gh: .*not found/m);
+    expect(none.stdout).toContain("[warn] gh: GitHub CLI not found on PATH; fx pr --create and fx issue --create need it\n  fix: install gh from https://cli.github.com\n");
 
-    const signedOut = makeRoot();
-    repo(signedOut);
-    writeScript(join(signedOut.bin, "gh"), 'echo "You are not logged into any GitHub hosts." >&2; exit 1');
-    const out = await doctor(signedOut, env(signedOut, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(out.stdout).toMatch(/^\[warn\] gh: GitHub CLI is not signed in to github\.com, the host of remote origin; /m);
-    expect(out.stdout).toContain("  fix: gh auth login --hostname github.com");
-
-    // gh exits 1 when any host's account fails, unless asked about one host:
-    // signed in to github.com with another host failing is signed in.
-    const otherHost = makeRoot();
-    repo(otherHost);
-    writeScript(join(otherHost.bin, "gh"), [
-      'case " $* " in',
-      '  *" auth status --hostname github.com "*) exit 0 ;;',
-      '  *) echo "ghe.example.com: Failed to log in" >&2; exit 1 ;;',
-      "esac",
-    ].join("\n"));
-    const signedIn = await doctor(otherHost, env(otherHost, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(signedIn.stdout).toMatch(/^\[ok\] gh: GitHub CLI is signed in to github\.com, the host of remote origin$/m);
+    // gh's own exit codes (gh help exit-codes): 4 when the command needs a sign-in.
+    const cases: Array<[number, string]> = [
+      [0, "[ok] gh: gh can use this repository\n"],
+      [4, "[warn] gh: gh is not signed in for this repository\n  fix: gh auth login\n"],
+      [1, "[warn] gh: gh could not use this repository\n  fix: run gh repo view to see why\n"],
+    ];
+    for (const [code, line] of cases) {
+      const r = makeRoot();
+      gitRepo(r);
+      writeScript(join(r.bin, "gh"), `exit ${code}`);
+      const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
+      expect(result.stdout).toContain(line);
+      expect(result.code).toBe(0);
+    }
 
     // gh's own child holds nothing doctor waits for, and dies with it.
     const hanging = makeRoot();
-    repo(hanging);
+    gitRepo(hanging);
     const marker = "sleep 57.6543";
     writeScript(join(hanging.bin, "gh"), `/bin/${marker}\nexit 0`);
     const hung = await doctor(hanging, env(hanging, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key", FX_TEST_DOCTOR_DEADLINE_MS: "1000" }));
     expect(hung.ms).toBeLessThan(2_500);
-    expect(hung.stdout).toMatch(/^\[warn\] gh: .*did not answer/m);
+    expect(hung.stdout).toContain("[warn] gh: gh repo view did not answer in 1 s\n  fix: run gh repo view to see why\n");
     expect(running(marker)).toBe("");
   }, TIMEOUT);
 
-  test("gh is checked on the host of the repository's remote, and a repository with no remote says so", async () => {
-    const enterprise = makeRoot();
-    gitRepo(enterprise, "git@ghe.example.com:team/repo.git");
-    const enterpriseLog = signedInOnlyTo(enterprise, "ghe.example.com");
-    const onEnterprise = await doctor(enterprise, env(enterprise, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(onEnterprise.stdout).toMatch(/^\[ok\] gh: GitHub CLI is signed in to ghe\.example\.com, the host of remote origin$/m);
-    expect(readFileSync(enterpriseLog, "utf8")).toBe("auth status --hostname ghe.example.com\n");
-
-    // gh drops remotes on hosts it is not signed in to, so one is enough.
-    const both = makeRoot();
-    gitRepo(both, "https://ghe.example.com/team/repo.git");
-    expect(spawnSync("/usr/bin/git", ["-C", both.workspace, "remote", "add", "upstream", "https://github.com/org/repo.git"]).status).toBe(0);
-    signedInOnlyTo(both, "ghe.example.com");
-    const either = await doctor(both, env(both, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(either.stdout).toMatch(/^\[ok\] gh: GitHub CLI is signed in to ghe\.example\.com, the host of remote origin$/m);
-
-    const bare = makeRoot();
-    gitRepo(bare, null);
-    const bareLog = signedInOnlyTo(bare, "github.com");
-    const noRemote = await doctor(bare, env(bare, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(noRemote.stdout).toContain("[warn] gh: this repository has no git remote, so gh has nowhere to publish; fx pr --create and fx issue --create need it\n  fix: add the repository's remote with git remote add, then run fx doctor again\n");
-    expect(existsSync(bareLog)).toBe(false);
+  test("gh resolves the repository itself, gets the person's GH_HOST with prompts and update checks off, and nothing it prints reaches doctor's output", async () => {
+    const secret = "SECRET-TOKEN-1677";
+    for (const url of [`https://user:${secret}@github.com/org/repo.git`, `https://user:${secret}@[::1]:8443/org/repo.git`]) {
+      const r = makeRoot();
+      gitRepo(r, url);
+      const log = join(r.root, "gh.log");
+      // Like gh, it prints the remote it read, here with its token, on both
+      // streams.
+      writeScript(join(r.bin, "gh"), [
+        `{ echo "args=$*"; echo "cwd=$(/bin/pwd -P)"; echo "prompt=$GH_PROMPT_DISABLED"; echo "notifier=$GH_NO_UPDATE_NOTIFIER"; echo "host=$GH_HOST"; } > '${log}'`,
+        `echo '{"url":"${url}"}'`,
+        `echo "could not resolve ${url}" >&2`,
+        "exit 1",
+      ].join("\n"));
+      const trace = join(r.root, "trace.log");
+      const e = env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key", GH_HOST: "ghe.example.com", FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "doctor" });
+      const text = await doctor(r, e);
+      expect(text.stdout).toContain("[warn] gh: gh could not use this repository\n");
+      const json = await doctor(r, e, ["--json"]);
+      for (const out of [text.stdout, text.stderr, json.stdout, json.stderr, readFileSync(trace, "utf8")]) expect(out).not.toContain(secret);
+      const workspace = realpathSync(r.workspace);
+      expect(readFileSync(log, "utf8")).toBe(`args=repo view --json url\ncwd=${workspace}\nprompt=1\nnotifier=1\nhost=ghe.example.com\n`);
+    }
   }, TIMEOUT);
 
   test("a signal that ends doctor also ends the checks it started", async () => {
@@ -495,6 +478,7 @@ describe("fx doctor MCP", () => {
         "--help": { command: [process.execPath, MODERN_FIXTURE] },
         "-x": { command: [process.execPath, MODERN_FIXTURE] },
         "-s": { type: "sse", url: "https://mcp.invalid.example/rpc" },
+        "-h": { type: "http", url: "https://mcp.invalid.example/mcp", bearer_token_env: "NOPE_TOKEN_1677" },
         normal: { command: [process.execPath, MODERN_FIXTURE] },
       },
     }));
@@ -507,10 +491,12 @@ describe("fx doctor MCP", () => {
       expect(readFileSync(trace, "utf8")).not.toContain(`starting check ${name}`);
     }
     expect(result.stdout).toContain('[warn] mcp: -s uses a transport fx does not support\n  fix: rename the server in ~/.fx/mcp.json so its name does not start with "-"\n');
+    // Also in a state whose fix would otherwise name the variable to set.
+    expect(result.stdout).toContain('[fail] mcp: -h needs NOPE_TOKEN_1677\n  fix: rename the server in ~/.fx/mcp.json so its name does not start with "-"\n');
     expect(result.stdout).toContain('[warn] mcp: -w is waiting for approval\n  fix: rename the server in .mcp.json so its name does not start with "-"\n');
     expect(result.stdout).not.toMatch(/fix: fx mcp \w+ -/);
     expect(result.stdout).toMatch(/^\[ok\] mcp: normal ready, 1 tool$/m);
-    expect(result.code).toBe(0);
+    expect(result.code).toBe(1);
   }, TIMEOUT);
 
   test("a fix line passes a server name from .mcp.json to a shell as one word, and runs as written", async () => {
@@ -615,21 +601,33 @@ describe("fx doctor MCP", () => {
 
   test("servers doctor could not start before its deadline each get a line that says so", async () => {
     const r = makeRoot();
-    const marker = join(r.root, "late-server-started");
-    const late = { command: "/bin/sh", args: ["-c", `: > '${marker}'; /bin/sleep 30`] };
-    writeFileSync(join(r.home, ".fx", "mcp.json"), JSON.stringify({ mcp: { late1: late, late2: late } }));
-    // A 1 ms deadline passes while doctor loads its MCP host or starts its
-    // first child, so at least the later server is never started, and one
-    // that did start was stopped at the deadline.
+    // More servers than doctor checks at once (16 at most). A check of one
+    // never ends on its own, so no slot frees before the 1 ms deadline, and
+    // the servers past the cap are never started.
+    const names = Array.from({ length: 20 }, (_, i) => `late${i}`);
+    const mcp: Record<string, unknown> = {};
+    for (const name of names) mcp[name] = { command: "/bin/sh", args: ["-c", `: > '${join(r.root, name)}'; /bin/sleep 30`] };
+    writeFileSync(join(r.home, ".fx", "mcp.json"), JSON.stringify({ mcp }));
     const result = await doctor(r, env(r, { FX_TEST_DOCTOR_DEADLINE_MS: "1" }));
     expect(result.code).toBe(1);
-    const notChecked = ["late1", "late2"].filter((name) => {
+    const notChecked = names.filter((name) => {
       expect(result.stdout).toMatch(new RegExp(`^\\[fail\\] mcp: ${name} (was not checked: doctor reached its 1 s limit before it could start the check|did not start in 1 s)\\n  fix: fx mcp show ${name}$`, "m"));
       return result.stdout.includes(`[fail] mcp: ${name} was not checked`);
     });
-    expect(notChecked).toContain("late2");
-    if (notChecked.length === 2) expect(existsSync(marker)).toBe(false);
-  });
+    expect(notChecked.length).toBeGreaterThanOrEqual(names.length - 16);
+    for (const name of notChecked) expect(existsSync(join(r.root, name))).toBe(false);
+    spawnSync("/usr/bin/pkill", ["-KILL", "-f", `${r.root}/late`]);
+  }, TIMEOUT);
+
+  test("with more servers than doctor checks at once, each is checked as a slot frees", async () => {
+    const r = makeRoot();
+    const mcp: Record<string, unknown> = {};
+    for (let i = 0; i < 24; i++) mcp[`queued${i}`] = { command: [process.execPath, MODERN_FIXTURE] };
+    writeFileSync(join(r.home, ".fx", "mcp.json"), JSON.stringify({ mcp }));
+    const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key", FX_TEST_DOCTOR_DEADLINE_MS: "30000" }));
+    expect((result.stdout.match(/^\[ok\] mcp: queued\d+ ready, 1 tool$/gm) ?? []).length).toBe(24);
+    expect(result.code).toBe(0);
+  }, TIMEOUT);
 
   test("a healthy server with thousands of tools is ready, however long its answer", async () => {
     const r = makeRoot();

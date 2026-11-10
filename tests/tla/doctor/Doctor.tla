@@ -9,8 +9,13 @@
 (* that says so.                                                           *)
 (*                                                                         *)
 (* Children are processes (one `fx mcp show NAME --json` per MCP server,   *)
-(* and `gh auth status`). The main thread starts them one at a time: it    *)
-(* spawns a child, then adds it to the list that a stop reaches. A child   *)
+(* and `gh repo view`). The main thread starts them one at a time, and     *)
+(* only while fewer than Cap of them have a waiter still reading: a busy   *)
+(* child holds its slot until its waiter has reaped it, and the next       *)
+(* starts when one frees, until the deadline or the signal. In fx the cap  *)
+(* covers the MCP server checks and gh is outside it; a config's Cap       *)
+(* covers the children it names. The main thread spawns a child, then adds *)
+(* it to the list that a stop reaches. A child                             *)
 (* writes its status to its own pipe in two steps and then exits. A child  *)
 (* may start a process of its own in its group, its grandchild, which      *)
 (* holds the child's pipe open while it runs, and a process that leaves    *)
@@ -55,11 +60,13 @@
 (* UseQuietHandler: the signal handler only records the signal; otherwise  *)
 (*                  it kills the children listed so far and ends doctor at *)
 (*                  once.                                                  *)
+(* UseCap:          the main thread spawns a child only while fewer than   *)
+(*                  Cap children are busy.                                 *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Probes, Children, Deadline, UseFlag, UseDeadline, UseKill, UseGroupKill, UseSweep,
-          UseCancel, UseJoin, UseStopCheck, UseQuietHandler
+          UseCancel, UseJoin, UseStopCheck, UseQuietHandler, UseCap, Cap
 
 VARIABLES slot, done, cancel, intime, out, child, listed, grand, held, server, waiter, unblocked,
           killed, swept, sig, after_sig, clock, fired, graced, main, report, seen
@@ -244,14 +251,19 @@ Signal ==
 \* The child the main thread spawned last is listed.
 AllListed == \A c \in Children : listed[c] \/ child[c] = "unstarted"
 
+\* The children that hold a slot: started, and not yet reaped by their waiter.
+Busy == {c \in Children : waiter[c] = "reading"}
+
 \* Spawn one more child, unless the timer fired, or, with the stop check,
-\* the signal has arrived. Its waiter starts with it.
+\* the signal has arrived, and, with the cap, only into a free slot. Its
+\* waiter starts with it.
 Spawn(c) ==
     /\ main = "starting"
     /\ child[c] = "unstarted"
     /\ AllListed
     /\ ~fired
     /\ UseStopCheck => ~sig
+    /\ UseCap => Cardinality(Busy) < Cap
     /\ child' = [child EXCEPT ![c] = "running"]
     /\ waiter' = [waiter EXCEPT ![c] = "reading"]
     /\ after_sig' = IF sig THEN after_sig + 1 ELSE after_sig
@@ -267,7 +279,8 @@ List(c) ==
     /\ UNCHANGED <<slot, done, cancel, intime, out, child, grand, held, server, waiter, unblocked, killed, swept, sig, after_sig, clock, fired, graced, main, report, seen>>
 
 \* Stop starting: every child started, the timer fired, or, with the stop
-\* check, the signal has arrived. Children never started stay so.
+\* check, the signal has arrived. Until then the main thread waits for a
+\* free slot. Children never started stay so.
 StartingEnds ==
     /\ main = "starting"
     /\ AllListed
@@ -431,6 +444,9 @@ NoTaskAfterReport ==
 \* Once the signal has arrived, doctor starts no child: it looks before each
 \* spawn, and in the model a spawn is one step.
 NoStartAfterSignalSeen == after_sig = 0
+
+\* No more than Cap children hold a slot at once.
+CapHolds == Cardinality(Busy) <= Cap
 
 \* Doctor ends, by its report or by the signal, even when probes, children,
 \* grandchildren, servers, and processes that left the group hang.

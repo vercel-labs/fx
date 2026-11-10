@@ -107,24 +107,6 @@ pub fn repoFilters(alloc: Allocator, workspace_root: []const u8) RepoFiltersErro
     return .{ .git_dir = git_dir, .names = owned };
 }
 
-pub const Remote = git_config.Remote;
-pub const RepoRemotesError = error{ OutOfMemory, RepoConfigUnavailable };
-
-/// The remotes of the repository containing the absolute `workspace_root`,
-/// in config order, read from system, user and repository config the way git
-/// reads values. Empty outside a repository. An invalid `.git` file is
-/// `error.RepoConfigUnavailable`. Memory belongs to `arena`.
-pub fn repoRemotes(arena: Allocator, workspace_root: []const u8) RepoRemotesError![]const Remote {
-    if (!std.Io.Dir.path.isAbsolute(workspace_root)) return error.RepoConfigUnavailable;
-    const found = layout.discover(arena, workspace_root) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidGitFile => return error.RepoConfigUnavailable,
-    };
-    if (found == null) return &.{};
-    const context = try git_config.Context.fromEnvironment(arena, found);
-    return git_config.remotes(arena, try git_config.loadAll(arena, &context));
-}
-
 test {
     _ = @import("bounded_read.zig");
     _ = @import("wildmatch.zig");

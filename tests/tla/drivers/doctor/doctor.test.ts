@@ -57,8 +57,6 @@ async function run(catalogHangs: boolean, mcpHangs: boolean): Promise<{ observed
     mkdirSync(bin);
     // gh runs only inside a repository.
     if (spawnSync("/usr/bin/git", ["init", "-q", ws]).status !== 0) throw new Error("git init failed");
-    // gh is checked on the host of the repository's remote.
-    spawnSync("/usr/bin/git", ["-C", ws, "remote", "add", "origin", "https://github.com/example/repo.git"]);
     writeFileSync(join(bin, "gh"), mcpHangs ? `#!/bin/sh\n/bin/${GH_GRANDCHILD}\nexit 0\n` : "#!/bin/sh\nexit 1\n");
     chmodSync(join(bin, "gh"), 0o755);
     const mcp1 = mcpHangs
@@ -122,6 +120,8 @@ async function reaches(state: string, label: string): Promise<boolean> {
     "    UseJoin = TRUE",
     "    UseStopCheck = TRUE",
     "    UseQuietHandler = TRUE",
+    "    UseCap = TRUE",
+    "    Cap = 2",
     "INVARIANT NotObserved",
     "CHECK_DEADLOCK FALSE",
     "",
@@ -151,28 +151,33 @@ describe("fx doctor along Doctor.tla", () => {
 
   test("SIGTERM while doctor starts its checks ends it by the signal with nothing left", async () => {
     const root = mkdtempSync(join(tmpdir(), "fx-tla-doctor-signal-"));
-    const server = "sleep 58.4321";
+    // Names and a server line unique to this run, so no other fx on the
+    // machine matches them.
+    const run = `${process.pid}${Date.now() % 100_000}`;
+    const check = `mcp show s${run}_`;
+    const server = `sleep 58.${run}`;
     try {
       const home = join(root, "h");
       mkdirSync(join(home, ".fx"), { recursive: true });
       const mcp: Record<string, unknown> = {};
       // Servers that ignore SIGTERM, so only doctor's kill of each check's
       // tree ends them at once.
-      for (let i = 0; i < 12; i++) mcp[`s${i}`] = { command: ["/bin/sh", "-c", `trap '' TERM; exec /bin/${server}`] };
+      for (let i = 0; i < 12; i++) mcp[`s${run}_${i}`] = { command: ["/bin/sh", "-c", `trap '' TERM; exec /bin/${server}`] };
       writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({ mcp }));
       const env = { HOME: home, PATH: "/usr/bin:/bin", FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1", FX_TEST_DOCTOR_DEADLINE_MS: "30000" };
       const proc = Bun.spawn([fxBin(), "doctor"], { env, cwd: root, stdout: "ignore", stderr: "ignore" });
       const started = performance.now();
-      while (running("mcp show s") === "" && performance.now() - started < 10_000) await Bun.sleep(1);
+      while (running(check) === "" && performance.now() - started < 10_000) await Bun.sleep(1);
       proc.kill("SIGTERM");
       await proc.exited;
       expect(proc.signalCode).toBe("SIGTERM");
-      expect(running("mcp show s")).toBe("");
+      expect(running(check)).toBe("");
       await Bun.sleep(3000);
       expect(running(server)).toBe("");
       expect(await reaches(`main = "exited" /\\ sig /\\ \\A c \\in Children : child[c] # "running" /\\ server[c] # "untold"`, "signal")).toBe(true);
     } finally {
       spawnSync("/usr/bin/pkill", ["-KILL", "-f", server]);
+      spawnSync("/usr/bin/pkill", ["-KILL", "-f", check]);
       rmSync(root, { recursive: true, force: true });
     }
   }, TLC_TIMEOUT_MS);

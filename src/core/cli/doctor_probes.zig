@@ -3,10 +3,11 @@
 //! The provider catalog request runs as a `std.Io` task and writes only its
 //! own slot, then sets `done` with release. Each MCP server is checked by its
 //! own `fx mcp show NAME --json` child, so one process makes one connect, and
-//! `gh auth status` runs as a child for each host the repository's remotes
-//! name. Each child runs in its own process group. One `std.Io` task per
-//! child reads its pipe to the end, reaps it, and then kills whatever the
-//! child left in its group.
+//! at most `serverCap()` of them run at a time; the rest wait in a queue that
+//! `wait` starts from as slots free. In a repository, `gh repo view --json
+//! url` runs as one more child, outside that cap. Each child runs in its own
+//! process group. One `std.Io` task per child reads its pipe to the end,
+//! reaps it, and then kills whatever the child left in its group.
 //!
 //! `wait` stops and joins all of it before it returns. At the deadline, or
 //! when an ending signal arrives, it notes which probes finished in time,
@@ -37,7 +38,6 @@ const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const child_status = @import("doctor_child_status.zig");
-const gh_hosts = @import("doctor_gh_hosts.zig");
 
 const Allocator = std.mem.Allocator;
 const Check = doctor_runtime.Check;
@@ -45,8 +45,6 @@ const CheckStatus = doctor_runtime.CheckStatus;
 const ServerResult = output_contracts.McpServerResult;
 const ChildStatusReader = child_status.ChildStatusReader;
 const appendCheck = doctor_runtime.appendCheckOwnedFix;
-const GhHost = gh_hosts.GhHost;
-const GhTarget = gh_hosts.GhTarget;
 
 const default_deadline_ms: i64 = 5_000;
 const max_test_deadline_ms: i64 = 60_000;
@@ -56,8 +54,14 @@ const reap_grace_ms: i64 = 1_000;
 /// How long the stops of the checks still running get, all together, to
 /// land before doctor looks at what each one started.
 const stop_land_ms: i64 = 100;
-/// How often `wait` looks at the done flags and the stop signal.
+/// How often `wait` looks at the done flags and the stop signal, and starts
+/// queued MCP server checks.
 const poll_ms: u64 = 5;
+/// The fewest and the most MCP server checks that run at once.
+const min_server_checks: usize = 4;
+const max_server_checks: usize = 16;
+/// gh's exit code for a command that needs a sign-in (`gh help exit-codes`).
+const gh_auth_required: u8 = 4;
 
 /// The one deadline for every probe. `FX_TEST_DOCTOR_DEADLINE_MS` shortens it
 /// for tests.
@@ -149,12 +153,15 @@ fn contains(ids: []const []u8, model: []const u8) bool {
 /// after reaping it.
 pub const ProcessProbe = struct {
     name: []const u8,
+    /// What `spawn` runs. A queued check keeps it until a slot frees.
+    argv: []const []const u8 = &.{},
     child: std.process.Child = undefined,
     /// Taken at spawn, before the waiter can reap the child. It is also the
     /// id of the child's process group.
     pid: std.posix.pid_t = 0,
     spawn_error: ?anyerror = null,
-    /// Never started, because the deadline passed or a signal came first.
+    /// Never started, because the deadline passed or a signal came first
+    /// while it waited for a slot.
     not_started: bool = false,
     /// Killed at the deadline or at an ending signal, so it did not finish
     /// in time.
@@ -167,40 +174,53 @@ pub const ProcessProbe = struct {
     /// The SIGSTOP `stopTrees` sent has landed. Doctor's own thread only.
     stop_landed: bool = false,
 
-    /// Spawns `argv` in a new process group, then reads its stdout to the
-    /// end and reaps it in a task of `waiters`. A spawn that fails, or a
-    /// child no task can wait for, is done at once with `spawn_error` set.
-    /// The caller adds the probe to the list `wait` stops before it looks at
-    /// the stop signal again.
-    fn start(alloc: Allocator, waiters: *std.Io.Group, name: []const u8, argv: []const []const u8, status: ?*ChildStatusReader) !*ProcessProbe {
+    /// A check of `argv` that has not started. The caller adds it to the
+    /// list `wait` stops before it spawns it.
+    fn create(alloc: Allocator, name: []const u8, argv: []const []const u8, status: ?*ChildStatusReader) !*ProcessProbe {
         const probe = try alloc.create(ProcessProbe);
-        probe.* = .{ .name = name, .status = status };
+        probe.* = .{ .name = name, .argv = argv, .status = status };
+        return probe;
+    }
+
+    /// `create` and `spawn`, with doctor's own environment.
+    fn start(alloc: Allocator, waiters: *std.Io.Group, name: []const u8, argv: []const []const u8, status: ?*ChildStatusReader) !*ProcessProbe {
+        const probe = try create(alloc, name, argv, status);
+        probe.spawn(waiters, null);
+        return probe;
+    }
+
+    /// Spawns `argv` in a new process group, with `environ_map` or doctor's
+    /// own environment, then reads its stdout to the end and reaps it in a
+    /// task of `waiters`. Its stderr, and its stdout when it has no status
+    /// reader, go nowhere and are never read. A spawn that fails, or a child
+    /// no task can wait for, is done at once with `spawn_error` set.
+    fn spawn(self: *ProcessProbe, waiters: *std.Io.Group, environ_map: ?*const std.process.Environ.Map) void {
         // Before the first child exists, so a signal never ends doctor while
         // a child it started is left running.
         installStopHandler();
-        debug_trace.logf("doctor", "starting check {s}", .{name});
+        debug_trace.logf("doctor", "starting check {s}", .{self.name});
         const io = io_mod.getIo();
-        probe.child = std.process.spawn(io, .{
-            .argv = argv,
+        self.child = std.process.spawn(io, .{
+            .argv = self.argv,
+            .environ_map = environ_map,
             .stdin = .ignore,
-            .stdout = if (status != null) .pipe else .ignore,
+            .stdout = if (self.status != null) .pipe else .ignore,
             .stderr = .ignore,
             .pgid = 0,
         }) catch |err| {
-            probe.spawn_error = err;
-            probe.done.store(true, .release);
-            return probe;
+            self.spawn_error = err;
+            self.done.store(true, .release);
+            return;
         };
-        probe.pid = probe.child.id.?;
-        waiters.concurrent(io, waitForExit, .{probe}) catch |err| {
+        self.pid = self.child.id.?;
+        waiters.concurrent(io, waitForExit, .{self}) catch |err| {
             // Nothing would read or reap it, so it stops now.
-            debug_trace.logf("doctor", "check {s} has no task to wait for it err={s}; killing it with what it started", .{ name, @errorName(err) });
-            stopTrees(&.{probe});
-            probe.child.kill(io);
-            probe.spawn_error = err;
-            probe.done.store(true, .release);
+            debug_trace.logf("doctor", "check {s} has no task to wait for it err={s}; killing it with what it started", .{ self.name, @errorName(err) });
+            stopTrees(&.{self});
+            self.child.kill(io);
+            self.spawn_error = err;
+            self.done.store(true, .release);
         };
-        return probe;
     }
 
     fn waitForExit(self: *ProcessProbe) void {
@@ -348,12 +368,58 @@ fn readsAsOption(name: []const u8) bool {
     return name.len > 0 and name[0] == '-';
 }
 
-/// Starts one `fx mcp show NAME --json` child for each idle server and
-/// appends it to `processes`. An unapproved, rejected, or disabled server is
-/// never idle, so it never gets a child. Starting stops at `deadline`, and
-/// when an ending signal arrives: each server left gets a probe marked not
-/// started, so the limit holds however many servers there are. Every probe
-/// started is in `processes` even when this fails, so `wait` still stops it.
+/// How many MCP server checks run at once: one for each CPU, between
+/// `min_server_checks` and `max_server_checks`, so many servers do not
+/// starve each other of the one deadline.
+pub fn serverCap() usize {
+    const cpus = std.Thread.getCpuCount() catch min_server_checks;
+    return std.math.clamp(cpus, min_server_checks, max_server_checks);
+}
+
+/// The MCP server checks, one for each idle server in config order. At most
+/// `cap` of them run at a time; the ones from `next` on wait for a slot.
+pub const ServerChecks = struct {
+    probes: []const *ProcessProbe = &.{},
+    next: usize = 0,
+    cap: usize = 1,
+
+    /// Starts the queued checks in order while fewer than `cap` run, unless
+    /// the deadline has passed or an ending signal has arrived, which it
+    /// looks at before each start. Doctor's own thread only.
+    fn startMore(self: *ServerChecks, waiters: *std.Io.Group, deadline: i64) void {
+        while (self.next < self.probes.len and self.running() < self.cap) {
+            if (stopRequested() or io_mod.milliTimestamp() >= deadline) return;
+            self.probes[self.next].spawn(waiters, null);
+            self.next += 1;
+        }
+    }
+
+    /// The checks started that have not ended. A check holds its slot until
+    /// its waiter has reaped it.
+    fn running(self: *const ServerChecks) usize {
+        var count: usize = 0;
+        for (self.probes[0..self.next]) |p| {
+            if (!p.done.load(.acquire)) count += 1;
+        }
+        return count;
+    }
+
+    /// The checks still queued when the wait ends are never started.
+    fn dropQueued(self: *ServerChecks) void {
+        for (self.probes[self.next..]) |p| {
+            p.not_started = true;
+            p.done.store(true, .release);
+        }
+        self.next = self.probes.len;
+    }
+};
+
+/// Queues one `fx mcp show NAME --json` check for each idle server, appends
+/// each to `processes`, and starts the first ones up to `cap`, before
+/// `deadline` and unless an ending signal came first; `wait` starts the
+/// rest. An unapproved, rejected, or disabled server is never idle, so it
+/// never gets a check. A queued check is in `processes` before it can
+/// start, so `wait` always reaches it.
 pub fn startServerChildren(
     alloc: Allocator,
     waiters: *std.Io.Group,
@@ -361,50 +427,48 @@ pub fn startServerChildren(
     statuses: []const mcp_runtime.Status,
     self_exe: []const u8,
     deadline: i64,
-) !void {
+    cap: usize,
+) !ServerChecks {
+    const first = processes.items.len;
     for (statuses) |status| {
         if (status.state != .idle or readsAsOption(status.name)) continue;
         try processes.ensureUnusedCapacity(alloc, 1);
         const name = try alloc.dupe(u8, status.name);
-        if (stopRequested() or io_mod.milliTimestamp() >= deadline) {
-            const probe = try alloc.create(ProcessProbe);
-            probe.* = .{ .name = name, .not_started = true };
-            probe.done.store(true, .release);
-            processes.appendAssumeCapacity(probe);
-            continue;
-        }
         const argv = try alloc.dupe([]const u8, &.{ self_exe, "mcp", "show", name, "--json" });
         const reader = try alloc.create(ChildStatusReader);
         reader.init();
-        processes.appendAssumeCapacity(try ProcessProbe.start(alloc, waiters, name, argv, reader));
+        processes.appendAssumeCapacity(try ProcessProbe.create(alloc, name, argv, reader));
     }
+    // A copy, since gh's append may move the list.
+    var servers: ServerChecks = .{ .probes = try alloc.dupe(*ProcessProbe, processes.items[first..]), .cap = @max(1, cap) };
+    servers.startMore(waiters, deadline);
+    return servers;
 }
 
-/// The gh checks of one repository: what doctor read, and one `gh auth
-/// status --hostname` child for each host, in the same order.
-pub const Gh = struct {
-    target: GhTarget,
-    probes: []const *ProcessProbe = &.{},
-};
-
-/// Starts one `gh auth status --hostname HOST` child for each host in
-/// `target`, unless an ending signal came first, and appends each to
-/// `processes`.
-pub fn startGh(alloc: Allocator, waiters: *std.Io.Group, processes: *std.ArrayList(*ProcessProbe), target: GhTarget) !Gh {
-    const hosts = switch (target) {
-        .hosts => |hosts| hosts,
-        else => return .{ .target = target },
+/// Starts `gh repo view --json url` in the workspace, which doctor runs in,
+/// unless an ending signal came first, and appends it to `processes`. gh
+/// then reads the repository's remotes, the host, the active account,
+/// `GH_HOST`, and `GH_REPO` itself, as it does for `fx pr` and `fx issue`.
+/// It gets the environment those get, with prompts and the update check
+/// turned off, so it never waits on a person or writes its update state.
+pub fn startGh(alloc: Allocator, waiters: *std.Io.Group, processes: *std.ArrayList(*ProcessProbe)) !?*ProcessProbe {
+    if (stopRequested()) return null;
+    try processes.ensureUnusedCapacity(alloc, 1);
+    const probe = try ProcessProbe.create(alloc, "gh", &.{ "gh", "repo", "view", "--json", "url" }, null);
+    processes.appendAssumeCapacity(probe);
+    var environ = io_mod.cloneEnvironMap(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            probe.spawn_error = err;
+            probe.done.store(true, .release);
+            return probe;
+        },
     };
-    var probes: std.ArrayList(*ProcessProbe) = .empty;
-    for (hosts) |entry| {
-        if (stopRequested()) break;
-        try processes.ensureUnusedCapacity(alloc, 1);
-        try probes.ensureUnusedCapacity(alloc, 1);
-        const probe = try ProcessProbe.start(alloc, waiters, "gh", &.{ "gh", "auth", "status", "--hostname", entry.host }, null);
-        processes.appendAssumeCapacity(probe);
-        probes.appendAssumeCapacity(probe);
-    }
-    return .{ .target = target, .probes = try probes.toOwnedSlice(alloc) };
+    defer environ.deinit();
+    try environ.put("GH_PROMPT_DISABLED", "1");
+    try environ.put("GH_NO_UPDATE_NOTIFIER", "1");
+    probe.spawn(waiters, &environ);
+    return probe;
 }
 
 fn allDone(catalog: ?*CatalogProbe, processes: []const *ProcessProbe) bool {
@@ -414,17 +478,22 @@ fn allDone(catalog: ?*CatalogProbe, processes: []const *ProcessProbe) bool {
 }
 
 /// Waits until every probe is done, the deadline passes, or an ending signal
-/// arrives, then stops and joins everything doctor started, so nothing runs
-/// after it returns. It notes which probes finished in time, cancels and
-/// awaits a catalog request still out, kills every child still running with
-/// what it started, gives the waiters a short grace to reap them, and then
-/// cancels and joins the waiters. It then removes the signal handler and
-/// returns the signal that arrived, if one did, for `endBySignal`.
-pub fn wait(deadline: i64, catalog: ?*CatalogProbe, processes: []const *ProcessProbe, waiters: *std.Io.Group) ?std.posix.SIG {
+/// arrives, starting queued server checks as slots free, then stops and
+/// joins everything doctor started, so nothing runs after it returns. It
+/// notes which probes finished in time, marks the checks still queued as
+/// never started, cancels and awaits a catalog request still out, kills
+/// every child still running with what it started, gives the waiters a
+/// short grace to reap them, and then cancels and joins the waiters. It then
+/// removes the signal handler and returns the signal that arrived, if one
+/// did, for `endBySignal`.
+pub fn wait(deadline: i64, catalog: ?*CatalogProbe, processes: []const *ProcessProbe, waiters: *std.Io.Group, servers: ?*ServerChecks) ?std.posix.SIG {
     const io = io_mod.getIo();
-    while (io_mod.milliTimestamp() < deadline and !allDone(catalog, processes) and !stopRequested()) {
+    while (true) {
+        if (servers) |queue| queue.startMore(waiters, deadline);
+        if (io_mod.milliTimestamp() >= deadline or allDone(catalog, processes) or stopRequested()) break;
         io_mod.sleep(poll_ms * std.time.ns_per_ms);
     }
+    if (servers) |queue| queue.dropQueued();
     const why = if (stopRequested()) "before doctor got a signal" else "by the deadline";
     if (catalog) |c| c.finish(io);
     for (processes) |p| if (!p.done.load(.acquire) and p.pid != 0) {
@@ -447,20 +516,29 @@ pub fn wait(deadline: i64, catalog: ?*CatalogProbe, processes: []const *ProcessP
     return @fromBackingInt(raw);
 }
 
+/// The network checks doctor waits on, for its wait notice.
+pub const Waiting = struct {
+    /// The provider whose model list doctor asked for, if it asked.
+    provider: ?model_provider.ProviderId = null,
+    /// The MCP server checks started or queued.
+    mcp_servers: usize = 0,
+    gh: enum { not_checked, checking } = .not_checked,
+};
+
 /// The line doctor writes to a terminal's stderr while it waits on the
 /// network checks it started, such as `checking AI Gateway, 3 MCP servers,
 /// and gh (up to 5 s)...`, or null when it started none. The caller owns it.
-pub fn waitNotice(alloc: Allocator, provider: ?model_provider.ProviderId, servers: usize, gh: bool, deadline_ms: i64) Allocator.Error!?[]u8 {
+pub fn waitNotice(alloc: Allocator, waiting: Waiting, deadline_ms: i64) Allocator.Error!?[]u8 {
     var parts: std.ArrayList([]const u8) = .empty;
     defer parts.deinit(alloc);
     var server_text: ?[]u8 = null;
     defer if (server_text) |text| alloc.free(text);
-    if (provider) |id| try parts.append(alloc, providerLabel(id));
-    if (servers > 0) {
-        server_text = try alloc.print("{d} MCP server{s}", .{ servers, if (servers == 1) "" else "s" });
+    if (waiting.provider) |id| try parts.append(alloc, providerLabel(id));
+    if (waiting.mcp_servers > 0) {
+        server_text = try alloc.print("{d} MCP server{s}", .{ waiting.mcp_servers, if (waiting.mcp_servers == 1) "" else "s" });
         try parts.append(alloc, server_text.?);
     }
-    if (gh) try parts.append(alloc, "gh");
+    if (waiting.gh == .checking) try parts.append(alloc, "gh");
     const limit = seconds(deadline_ms);
     const p = parts.items;
     return switch (p.len) {
@@ -608,37 +686,51 @@ fn serverChildCheck(checks: *std.ArrayList(Check), alloc: Allocator, c: *const P
     return failed;
 }
 
-/// The fix for a server that gets no child: `fx mcp VERB NAME`, or, for a
-/// name that every `fx mcp` command reads as an option, renaming it in the
-/// file it comes from.
-fn statusCommand(alloc: Allocator, verb: []const u8, s: mcp_runtime.Status) Allocator.Error![]u8 {
-    if (readsAsOption(s.name)) return alloc.print("rename the server in {s} so its name does not start with \"-\"", .{configFile(s.source)});
-    return mcpCommand(alloc, verb, s.name);
-}
-
 /// Lines for servers that get no child, as the doctor process's own runtime
 /// reads them without starting any.
 pub fn serverStatusChecks(checks: *std.ArrayList(Check), alloc: Allocator, statuses: []const mcp_runtime.Status) !void {
-    for (statuses) |s| switch (s.state) {
-        .idle => if (readsAsOption(s.name)) {
-            try appendCheck(checks, alloc, "mcp", .warn, try alloc.print("{s} was not checked: fx mcp show reads a name that starts with \"-\" as an option", .{s.name}), try statusCommand(alloc, "show", s));
-        },
-        .waiting_for_approval => try appendCheck(checks, alloc, "mcp", .warn, try alloc.print("{s} is waiting for approval", .{s.name}), try statusCommand(alloc, "approve", s)),
+    for (statuses) |s| {
+        const status, const detail = (try statusLine(alloc, s)) orelse continue;
+        const fix = statusFix(alloc, s) catch |err| {
+            alloc.free(detail);
+            return err;
+        };
+        try appendCheck(checks, alloc, "mcp", status, detail, fix);
+    }
+}
+
+/// The status and detail of a server that gets no child, or null when it
+/// gets one or needs no line. The caller owns the detail.
+fn statusLine(alloc: Allocator, s: mcp_runtime.Status) Allocator.Error!?struct { CheckStatus, []u8 } {
+    return switch (s.state) {
+        .idle => if (readsAsOption(s.name)) .{ .warn, try alloc.print("{s} was not checked: fx mcp show reads a name that starts with \"-\" as an option", .{s.name}) } else null,
+        .waiting_for_approval => .{ .warn, try alloc.print("{s} is waiting for approval", .{s.name}) },
+        .missing_env, .invalid_env => .{ .fail, try alloc.print("{s} needs {s}", .{ s.name, s.missing orelse "an environment variable" }) },
+        .unsupported => .{ .warn, try alloc.print("{s} uses a transport fx does not support", .{s.name}) },
+        .failed => .{ .fail, try alloc.print("{s} failed: {s}", .{ s.name, s.last_error orelse "no detail" }) },
+        .connecting, .ready, .retrying, .rejected, .disabled => null,
+    };
+}
+
+/// The fix on a server's status line. Every `fx mcp` command reads a name
+/// that starts with "-" as an option and takes no "--" before it, so such a
+/// server, whatever its state, can only be renamed in the file it comes
+/// from; that is decided before the state is. The caller owns it.
+fn statusFix(alloc: Allocator, s: mcp_runtime.Status) Allocator.Error![]u8 {
+    if (readsAsOption(s.name)) return alloc.print("rename the server in {s} so its name does not start with \"-\"", .{configFile(s.source)});
+    return switch (s.state) {
+        .waiting_for_approval => mcpCommand(alloc, "approve", s.name),
         .missing_env, .invalid_env => {
             const variable = if (s.missing) |name| try command_lex.quoteWord(alloc, name) else try alloc.dupe(u8, "the variable");
             defer alloc.free(variable);
-            try appendCheck(checks, alloc, "mcp", .fail, try alloc.print("{s} needs {s}", .{ s.name, s.missing orelse "an environment variable" }), try alloc.print("set {s}, then run fx doctor again", .{variable}));
+            return alloc.print("set {s}, then run fx doctor again", .{variable});
         },
         .unsupported => {
-            const fix = if (readsAsOption(s.name)) try statusCommand(alloc, "remove", s) else blk: {
-                const quoted = try command_lex.quoteWord(alloc, s.name);
-                defer alloc.free(quoted);
-                break :blk try alloc.print("give {s} a stdio command or an HTTP URL, or run fx mcp remove {s}", .{ quoted, quoted });
-            };
-            try appendCheck(checks, alloc, "mcp", .warn, try alloc.print("{s} uses a transport fx does not support", .{s.name}), fix);
+            const quoted = try command_lex.quoteWord(alloc, s.name);
+            defer alloc.free(quoted);
+            return alloc.print("give {s} a stdio command or an HTTP URL, or run fx mcp remove {s}", .{ quoted, quoted });
         },
-        .failed => try appendCheck(checks, alloc, "mcp", .fail, try alloc.print("{s} failed: {s}", .{ s.name, s.last_error orelse "no detail" }), try statusCommand(alloc, "show", s)),
-        .connecting, .ready, .retrying, .rejected, .disabled => {},
+        .idle, .failed, .connecting, .ready, .retrying, .rejected, .disabled => mcpCommand(alloc, "show", s.name),
     };
 }
 
@@ -651,68 +743,34 @@ fn configFile(source: mcp_contract.ConfigSource) []const u8 {
     };
 }
 
-/// The gh line, read after `wait`: GitHub CLI is ready when it is signed in
-/// to any host of the repository's remotes. Each `gh auth status --hostname`
-/// child exits 1 when that host's account is missing or fails.
-pub fn ghCheck(checks: *std.ArrayList(Check), alloc: Allocator, gh: Gh, deadline_ms: i64) !void {
-    const why = "fx pr --create and fx issue --create need it";
-    const hosts = switch (gh.target) {
-        .hosts => |hosts| hosts,
-        .no_remote => return appendCheck(checks, alloc, "gh", .warn, try alloc.print("this repository has no git remote, so gh has nowhere to publish; {s}", .{why}), try alloc.dupe(u8, "add the repository's remote with git remote add, then run fx doctor again")),
-        .unreadable => |found| return appendCheck(checks, alloc, "gh", .warn, try alloc.print("gh was not checked: fx could not read a host from {s} ({s})", .{ found.source, found.value }), try alloc.dupe(u8, "git remote -v")),
-        .config_unavailable => return appendCheck(checks, alloc, "gh", .warn, try alloc.dupe(u8, "gh was not checked: fx could not read this repository's git config"), try alloc.dupe(u8, "git config --list --show-origin")),
-    };
-    // A signal ended the checks before gh started; doctor does not report.
-    if (gh.probes.len == 0) return;
-    const first = try command_lex.quoteWord(alloc, hosts[0].host);
-    defer alloc.free(first);
-    if (gh.probes[0].spawn_error) |err| {
+/// The gh line, read after `wait`, from how `gh repo view --json url` ended:
+/// 0 when gh can use this repository, `gh_auth_required` when it needs a
+/// sign-in. gh's output is never read, since it can hold remote URLs and
+/// tokens; only its exit status is traced. Null `probe`: a signal ended the
+/// checks before gh started, and doctor does not report.
+pub fn ghCheck(checks: *std.ArrayList(Check), alloc: Allocator, probe: ?*const ProcessProbe, deadline_ms: i64) !void {
+    const p = probe orelse return;
+    const see_why = "run gh repo view to see why";
+    if (p.spawn_error) |err| {
+        const why = "fx pr --create and fx issue --create need it";
         if (err == error.FileNotFound) {
             return appendCheck(checks, alloc, "gh", .warn, try alloc.print("GitHub CLI not found on PATH; {s}", .{why}), try alloc.dupe(u8, "install gh from https://cli.github.com"));
         }
         return appendCheck(checks, alloc, "gh", .warn, try alloc.print("GitHub CLI could not start ({s}); {s}", .{ @errorName(err), why }), try alloc.dupe(u8, "gh --version"));
     }
-    for (gh.probes, hosts[0..gh.probes.len]) |probe, entry| {
-        const term = probe.term orelse continue;
-        if (probe.stopped.load(.acquire) or term != .exited or term.exited != 0) continue;
-        return appendCheck(checks, alloc, "gh", .ok, try ghHostText(alloc, "GitHub CLI is signed in to", entry, ""), null);
+    if (p.stopped.load(.acquire)) {
+        return appendCheck(checks, alloc, "gh", .warn, try alloc.print("gh repo view did not answer in {d} s", .{seconds(deadline_ms)}), try alloc.dupe(u8, see_why));
     }
-    const status_command = try alloc.print("gh auth status --hostname {s}", .{first});
-    for (gh.probes) |probe| {
-        if (probe.stopped.load(.acquire)) {
-            return appendCheck(checks, alloc, "gh", .warn, try alloc.print("gh auth status did not answer in {d} s", .{seconds(deadline_ms)}), status_command);
-        }
+    const term = p.term orelse return appendCheck(checks, alloc, "gh", .warn, try alloc.dupe(u8, "gh repo view gave no result"), try alloc.dupe(u8, see_why));
+    debug_trace.logf("doctor", "gh repo view ended {f}", .{term});
+    switch (term) {
+        .exited => |code| switch (code) {
+            0 => try appendCheck(checks, alloc, "gh", .ok, try alloc.dupe(u8, "gh can use this repository"), null),
+            gh_auth_required => try appendCheck(checks, alloc, "gh", .warn, try alloc.dupe(u8, "gh is not signed in for this repository"), try alloc.dupe(u8, "gh auth login")),
+            else => try appendCheck(checks, alloc, "gh", .warn, try alloc.dupe(u8, "gh could not use this repository"), try alloc.dupe(u8, see_why)),
+        },
+        else => try appendCheck(checks, alloc, "gh", .warn, try alloc.print("gh repo view ended early ({f})", .{term}), try alloc.dupe(u8, see_why)),
     }
-    for (gh.probes) |probe| {
-        const term = probe.term orelse return appendCheck(checks, alloc, "gh", .warn, try alloc.dupe(u8, "gh auth status gave no result"), status_command);
-        if (term != .exited) return appendCheck(checks, alloc, "gh", .warn, try alloc.print("gh auth status ended early ({f})", .{term}), status_command);
-    }
-    alloc.free(status_command);
-    const suffix = try alloc.print("; {s}", .{why});
-    defer alloc.free(suffix);
-    const detail = if (gh.probes.len == 1) try ghHostText(alloc, "GitHub CLI is not signed in to", hosts[0], suffix) else blk: {
-        const list = try hostList(alloc, hosts[0..gh.probes.len]);
-        defer alloc.free(list);
-        break :blk try alloc.print("GitHub CLI is not signed in to any host of this repository's remotes ({s}){s}", .{ list, suffix });
-    };
-    try appendCheck(checks, alloc, "gh", .warn, detail, try alloc.print("gh auth login --hostname {s}", .{first}));
-}
-
-/// `lead HOST, the host of remote NAME` (or `that GH_HOST names`), then
-/// `suffix`. The caller owns it.
-fn ghHostText(alloc: Allocator, lead: []const u8, entry: GhHost, suffix: []const u8) Allocator.Error![]u8 {
-    if (entry.remote) |remote| return alloc.print("{s} {s}, the host of remote {s}{s}", .{ lead, entry.host, remote, suffix });
-    return alloc.print("{s} {s}, the host GH_HOST names{s}", .{ lead, entry.host, suffix });
-}
-
-/// The hosts, comma-separated. The caller owns it.
-fn hostList(alloc: Allocator, hosts: []const GhHost) Allocator.Error![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    for (hosts, 0..) |entry, i| {
-        if (i > 0) try out.appendSlice(alloc, ", ");
-        try out.appendSlice(alloc, entry.host);
-    }
-    return out.toOwnedSlice(alloc);
 }
 
 fn freeChecks(alloc: Allocator, checks: *std.ArrayList(Check)) void {
@@ -831,7 +889,7 @@ test "a catalog request still out at the deadline is cancelled and joined before
     try std.testing.expect(probe.start_error == null);
     var waiters: std.Io.Group = .init;
     const started = io_mod.milliTimestamp();
-    try std.testing.expect(wait(started + 50, &probe, &.{}, &waiters) == null);
+    try std.testing.expect(wait(started + 50, &probe, &.{}, &waiters, null) == null);
     try std.testing.expect(hung.returned.load(.acquire));
     try std.testing.expect(probe.task == null);
     try std.testing.expect(!probe.in_time);
@@ -853,7 +911,7 @@ test "a child still running at the deadline is killed with its group and its wai
     // The grandchild holds the pipe open, as a server a check started would.
     const probe = try ProcessProbe.start(alloc, &waiters, "hung", &.{ "/bin/sh", "-c", "sleep 30 & sleep 30" }, &reader);
     const started = io_mod.milliTimestamp();
-    try std.testing.expect(wait(started + 50, null, &.{probe}, &waiters) == null);
+    try std.testing.expect(wait(started + 50, null, &.{probe}, &waiters, null) == null);
     try std.testing.expect(io_mod.milliTimestamp() - started < 50 + reap_grace_ms);
     try std.testing.expect(probe.done.load(.acquire));
     try std.testing.expect(probe.stopped.load(.acquire));
@@ -897,7 +955,7 @@ test "a waiter blocked by a process that left the group is cancelled after the g
     } else return error.EscapedProcessDidNotStart;
     defer std.posix.kill(escaped, .KILL) catch {};
     const started = io_mod.milliTimestamp();
-    try std.testing.expect(wait(started + 50, null, &.{probe}, &waiters) == null);
+    try std.testing.expect(wait(started + 50, null, &.{probe}, &waiters, null) == null);
     const took = io_mod.milliTimestamp() - started;
     try std.testing.expect(probe.done.load(.acquire));
     // The child exited on its own; only the waiter was stuck on the pipe.
@@ -916,9 +974,11 @@ test "a server whose name fx mcp would read as an option gets no child and a ren
         .{ .name = "-w", .source = .workspace, .transport = .stdio, .state = .waiting_for_approval },
         .{ .name = "-u", .source = .profile, .transport = .sse, .state = .unsupported },
         .{ .name = "-f", .source = .profile, .transport = .stdio, .state = .failed, .last_error = "boom" },
+        .{ .name = "-m", .source = .profile, .transport = .http, .state = .missing_env, .missing = "TOKEN" },
+        .{ .name = "-i", .source = .workspace, .transport = .stdio, .state = .invalid_env },
     };
     try serverStatusChecks(&checks, alloc, &statuses);
-    try std.testing.expectEqual(@as(usize, 5), checks.items.len);
+    try std.testing.expectEqual(@as(usize, 7), checks.items.len);
     try std.testing.expectEqual(CheckStatus.warn, checks.items[0].status);
     try std.testing.expectEqualStrings("-x was not checked: fx mcp show reads a name that starts with \"-\" as an option", checks.items[0].detail);
     const profile_fix = "rename the server in ~/.fx/mcp.json so its name does not start with \"-\"";
@@ -931,16 +991,20 @@ test "a server whose name fx mcp would read as an option gets no child and a ren
     try std.testing.expectEqualStrings(profile_fix, checks.items[3].fix.?);
     try std.testing.expectEqualStrings("-f failed: boom", checks.items[4].detail);
     try std.testing.expectEqualStrings(profile_fix, checks.items[4].fix.?);
+    try std.testing.expectEqualStrings("-m needs TOKEN", checks.items[5].detail);
+    try std.testing.expectEqualStrings(profile_fix, checks.items[5].fix.?);
+    try std.testing.expectEqualStrings("-i needs an environment variable", checks.items[6].detail);
+    try std.testing.expectEqualStrings(project_fix, checks.items[6].fix.?);
 
     var waiters: std.Io.Group = .init;
     var processes: std.ArrayList(*ProcessProbe) = .empty;
     defer processes.deinit(std.heap.c_allocator);
     // Past the deadline already, so no child starts for `normal` either.
-    try startServerChildren(std.heap.c_allocator, &waiters, &processes, &statuses, "/nonexistent/fx", 0);
+    var servers = try startServerChildren(std.heap.c_allocator, &waiters, &processes, &statuses, "/nonexistent/fx", 0, 4);
     try std.testing.expectEqual(@as(usize, 1), processes.items.len);
     try std.testing.expectEqualStrings("normal", processes.items[0].name);
+    try std.testing.expect(wait(0, null, processes.items, &waiters, &servers) == null);
     try std.testing.expect(processes.items[0].not_started);
-    waiters.cancel(io_mod.getIo());
 }
 
 test "every fix line passes a name from a config file to a shell as one word" {
@@ -1032,7 +1096,7 @@ test "a check killed at the deadline takes with it what it started in a group of
     } else return error.ServerDidNotStart;
     defer std.posix.kill(server, .KILL) catch {};
     const started = io_mod.milliTimestamp();
-    try std.testing.expect(wait(started + 50, null, &.{probe}, &waiters) == null);
+    try std.testing.expect(wait(started + 50, null, &.{probe}, &waiters, null) == null);
     // The pipe closed with the server, so no waiter needed the grace.
     try std.testing.expect(io_mod.milliTimestamp() - started < 50 + reap_grace_ms);
     try std.testing.expect(probe.stopped.load(.acquire));
@@ -1058,61 +1122,124 @@ test "an ending signal during the fan-out stops what started, starts nothing mor
     // The handler's whole work, as if the signal reached it now.
     recordStopSignal(.TERM);
     const later = [_]mcp_runtime.Status{.{ .name = "later", .source = .profile, .transport = .stdio, .state = .idle }};
-    try startServerChildren(alloc, &waiters, &processes, &later, "/nonexistent/fx", io_mod.milliTimestamp() + 60_000);
-    try std.testing.expect(processes.items[1].not_started);
-    const gh = try startGh(alloc, &waiters, &processes, .{ .hosts = &.{.{ .host = "github.com", .remote = "origin" }} });
-    try std.testing.expectEqual(@as(usize, 0), gh.probes.len);
+    var servers = try startServerChildren(alloc, &waiters, &processes, &later, "/nonexistent/fx", io_mod.milliTimestamp() + 60_000, 4);
+    try std.testing.expectEqual(@as(usize, 0), servers.next);
+    try std.testing.expect(try startGh(alloc, &waiters, &processes) == null);
     const started = io_mod.milliTimestamp();
-    try std.testing.expectEqual(std.posix.SIG.TERM, wait(started + 60_000, null, processes.items, &waiters).?);
-    // It stopped at the signal, not at the deadline.
+    try std.testing.expectEqual(std.posix.SIG.TERM, wait(started + 60_000, null, processes.items, &waiters, &servers).?);
+    // It stopped at the signal, not at the deadline, and never started the
+    // check that waited in the queue.
     try std.testing.expect(io_mod.milliTimestamp() - started < reap_grace_ms);
     try std.testing.expect(first.stopped.load(.acquire));
     try std.testing.expect(first.term.? == .signal);
+    try std.testing.expect(processes.items[1].not_started);
+    try std.testing.expectEqual(@as(std.posix.pid_t, 0), processes.items[1].pid);
 }
 
-test "gh is ready when it is signed in to any host of the remotes" {
+test "no more server checks run at once than the cap, and the next starts when one ends" {
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.heap.c_allocator;
+    var waiters: std.Io.Group = .init;
+    var processes: std.ArrayList(*ProcessProbe) = .empty;
+    for (0..5) |_| try processes.append(alloc, try ProcessProbe.create(alloc, "slow", &.{ "/bin/sh", "-c", "sleep 0.2" }, null));
+    var servers: ServerChecks = .{ .probes = processes.items, .cap = 2 };
+    const far = io_mod.milliTimestamp() + 30_000;
+    servers.startMore(&waiters, far);
+    try std.testing.expectEqual(@as(usize, 2), servers.next);
+    // Both still run, so no slot is free.
+    servers.startMore(&waiters, far);
+    try std.testing.expectEqual(@as(usize, 2), servers.next);
+    const started = io_mod.milliTimestamp();
+    try std.testing.expect(wait(far, null, processes.items, &waiters, &servers) == null);
+    for (processes.items) |p| {
+        try std.testing.expect(!p.not_started and !p.stopped.load(.acquire));
+        try std.testing.expect(p.term.? == .exited);
+    }
+    // Two at a time, the last three needed two more rounds of 0.2 s.
+    try std.testing.expect(io_mod.milliTimestamp() - started >= 350);
+}
+
+test "server checks still queued at the deadline are never started and say so" {
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.heap.c_allocator;
+    var waiters: std.Io.Group = .init;
+    var processes: std.ArrayList(*ProcessProbe) = .empty;
+    for ([_][]const u8{ "first", "second", "third" }) |name| try processes.append(alloc, try ProcessProbe.create(alloc, name, &.{ "/bin/sh", "-c", "sleep 30" }, null));
+    var servers: ServerChecks = .{ .probes = processes.items, .cap = 1 };
+    const started = io_mod.milliTimestamp();
+    servers.startMore(&waiters, started + 100);
+    try std.testing.expect(wait(started + 100, null, processes.items, &waiters, &servers) == null);
+    try std.testing.expect(processes.items[0].stopped.load(.acquire));
+    for (processes.items[1..]) |p| {
+        try std.testing.expect(p.not_started);
+        try std.testing.expectEqual(@as(std.posix.pid_t, 0), p.pid);
+    }
+    var checks: std.ArrayList(Check) = .empty;
+    defer freeChecks(std.testing.allocator, &checks);
+    var results: std.ArrayList(ServerResult) = .empty;
+    defer results.deinit(std.testing.allocator);
+    try serverChildChecks(&checks, &results, std.testing.allocator, processes.items, 1_000);
+    try std.testing.expectEqualStrings("first did not start in 1 s", checks.items[0].detail);
+    try std.testing.expectEqualStrings("third was not checked: doctor reached its 1 s limit before it could start the check", checks.items[2].detail);
+}
+
+test "the gh line reads only how gh repo view ended" {
     const alloc = std.testing.allocator;
-    const hosts = [_]GhHost{ .{ .host = "github.com", .remote = "upstream" }, .{ .host = "ghe.example.com", .remote = "origin" } };
-    var out: ProcessProbe = .{ .name = "gh", .term = .{ .exited = 1 } };
-    var in: ProcessProbe = .{ .name = "gh", .term = .{ .exited = 0 } };
+    var ok: ProcessProbe = .{ .name = "gh", .term = .{ .exited = 0 } };
+    var signed_out: ProcessProbe = .{ .name = "gh", .term = .{ .exited = gh_auth_required } };
+    var failed: ProcessProbe = .{ .name = "gh", .term = .{ .exited = 1 } };
+    var crashed: ProcessProbe = .{ .name = "gh", .term = .{ .signal = .SEGV } };
     var late: ProcessProbe = .{ .name = "gh" };
     late.stopped.store(true, .release);
     var missing: ProcessProbe = .{ .name = "gh", .spawn_error = error.FileNotFound, .done = .init(true) };
-    const why = "; fx pr --create and fx issue --create need it";
-    const Case = struct { gh: Gh, status: CheckStatus, detail: []const u8, fix: ?[]const u8 };
+    var lost: ProcessProbe = .{ .name = "gh" };
+    const see_why = "run gh repo view to see why";
+    const Case = struct { probe: *const ProcessProbe, status: CheckStatus, detail: []const u8, fix: ?[]const u8 };
     for ([_]Case{
-        .{ .gh = .{ .target = .{ .hosts = &hosts }, .probes = &.{ &out, &in } }, .status = .ok, .detail = "GitHub CLI is signed in to ghe.example.com, the host of remote origin", .fix = null },
-        .{ .gh = .{ .target = .{ .hosts = hosts[0..1] }, .probes = &.{&out} }, .status = .warn, .detail = "GitHub CLI is not signed in to github.com, the host of remote upstream" ++ why, .fix = "gh auth login --hostname github.com" },
-        .{ .gh = .{ .target = .{ .hosts = &hosts }, .probes = &.{ &out, &out } }, .status = .warn, .detail = "GitHub CLI is not signed in to any host of this repository's remotes (github.com, ghe.example.com)" ++ why, .fix = "gh auth login --hostname github.com" },
-        .{ .gh = .{ .target = .{ .hosts = &hosts }, .probes = &.{ &out, &late } }, .status = .warn, .detail = "gh auth status did not answer in 5 s", .fix = "gh auth status --hostname github.com" },
-        .{ .gh = .{ .target = .{ .hosts = hosts[0..1] }, .probes = &.{&missing} }, .status = .warn, .detail = "GitHub CLI not found on PATH" ++ why, .fix = "install gh from https://cli.github.com" },
-        .{ .gh = .{ .target = .{ .hosts = &.{.{ .host = "ghe.example.com", .remote = null }} }, .probes = &.{&in} }, .status = .ok, .detail = "GitHub CLI is signed in to ghe.example.com, the host GH_HOST names", .fix = null },
-        .{ .gh = .{ .target = .no_remote }, .status = .warn, .detail = "this repository has no git remote, so gh has nowhere to publish" ++ why, .fix = "add the repository's remote with git remote add, then run fx doctor again" },
-        .{ .gh = .{ .target = .{ .unreadable = .{ .source = "remote origin", .value = "/srv/repo" } } }, .status = .warn, .detail = "gh was not checked: fx could not read a host from remote origin (/srv/repo)", .fix = "git remote -v" },
+        .{ .probe = &ok, .status = .ok, .detail = "gh can use this repository", .fix = null },
+        .{ .probe = &signed_out, .status = .warn, .detail = "gh is not signed in for this repository", .fix = "gh auth login" },
+        .{ .probe = &failed, .status = .warn, .detail = "gh could not use this repository", .fix = see_why },
+        .{ .probe = &crashed, .status = .warn, .detail = "gh repo view ended early (terminated with signal SEGV)", .fix = see_why },
+        .{ .probe = &late, .status = .warn, .detail = "gh repo view did not answer in 5 s", .fix = see_why },
+        .{ .probe = &missing, .status = .warn, .detail = "GitHub CLI not found on PATH; fx pr --create and fx issue --create need it", .fix = "install gh from https://cli.github.com" },
+        .{ .probe = &lost, .status = .warn, .detail = "gh repo view gave no result", .fix = see_why },
     }) |case| {
         var checks: std.ArrayList(Check) = .empty;
         defer freeChecks(alloc, &checks);
-        try ghCheck(&checks, alloc, case.gh, 5_000);
+        try ghCheck(&checks, alloc, case.probe, 5_000);
         try std.testing.expectEqual(@as(usize, 1), checks.items.len);
         try std.testing.expectEqual(case.status, checks.items[0].status);
         try std.testing.expectEqualStrings(case.detail, checks.items[0].detail);
         if (case.fix) |fix| try std.testing.expectEqualStrings(fix, checks.items[0].fix.?) else try std.testing.expect(checks.items[0].fix == null);
     }
+    // gh never started, because a signal came first: no line.
+    var checks: std.ArrayList(Check) = .empty;
+    defer freeChecks(alloc, &checks);
+    try ghCheck(&checks, alloc, null, 5_000);
+    try std.testing.expectEqual(@as(usize, 0), checks.items.len);
 }
 
 test "the wait notice names each network check doctor started and the limit" {
     const alloc = std.testing.allocator;
-    const Case = struct { provider: ?model_provider.ProviderId, servers: usize, gh: bool, want: ?[]const u8 };
+    const Case = struct { waiting: Waiting, want: ?[]const u8 };
     for ([_]Case{
-        .{ .provider = .gateway, .servers = 3, .gh = true, .want = "checking AI Gateway, 3 MCP servers, and gh (up to 5 s)...\n" },
-        .{ .provider = null, .servers = 1, .gh = false, .want = "checking 1 MCP server (up to 5 s)...\n" },
-        .{ .provider = .grok, .servers = 0, .gh = true, .want = "checking Grok and gh (up to 5 s)...\n" },
-        .{ .provider = null, .servers = 0, .gh = false, .want = null },
+        .{ .waiting = .{ .provider = .gateway, .mcp_servers = 3, .gh = .checking }, .want = "checking AI Gateway, 3 MCP servers, and gh (up to 5 s)...\n" },
+        .{ .waiting = .{ .mcp_servers = 1 }, .want = "checking 1 MCP server (up to 5 s)...\n" },
+        .{ .waiting = .{ .provider = .grok, .gh = .checking }, .want = "checking Grok and gh (up to 5 s)...\n" },
+        .{ .waiting = .{}, .want = null },
     }) |case| {
-        const notice = try waitNotice(alloc, case.provider, case.servers, case.gh, 5_000);
+        const notice = try waitNotice(alloc, case.waiting, 5_000);
         defer if (notice) |text| alloc.free(text);
         if (case.want) |want| try std.testing.expectEqualStrings(want, notice.?) else try std.testing.expect(notice == null);
     }
+}
+
+/// The entries in `dir`, for tests.
+fn entryCount(dir: std.Io.Dir) !usize {
+    var count: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io_mod.getIo())) |_| count += 1;
+    return count;
 }
 
 test "stopping a check that keeps starting processes in groups of their own leaves none of them" {
@@ -1127,13 +1254,22 @@ test "stopping a check that keeps starting processes in groups of their own leav
     const script = "while :; do /usr/bin/perl -e 'setpgrp(0, 0); open(F, \">\", \"$ARGV[0]/\" . $$) or exit 1; close F; sleep 30' \"$0\" & done";
     for (0..5) |round| {
         var waiters: std.Io.Group = .init;
+        const before = try entryCount(tmp.dir);
         const probe = try ProcessProbe.start(alloc, &waiters, "forker", &.{ "/bin/sh", "-c", script, dir }, null);
-        io_mod.sleep((40 + 15 * round) * std.time.ns_per_ms);
+        // Once it has started one, so the stop meets it while it starts more.
+        // On a loaded machine that takes longer than any fixed wait.
+        const started_one = for (0..1_000) |_| {
+            if (try entryCount(tmp.dir) > before) break true;
+            io_mod.sleep(5 * std.time.ns_per_ms);
+        } else false;
+        try std.testing.expect(started_one);
+        io_mod.sleep((5 * round) * std.time.ns_per_ms);
         probe.stopped.store(true, .release);
+        // Under load the stop can take longer than `stop_land_ms` to land,
+        // which `stopTrees` allows; what it started must be gone either way.
         stopTrees(&.{probe});
         waiters.cancel(io_mod.getIo());
         try std.testing.expect(probe.done.load(.acquire));
-        try std.testing.expect(probe.stop_landed);
     }
     // Every process any round started is gone, once the system reaps it.
     var started: usize = 0;

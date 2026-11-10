@@ -3,7 +3,7 @@
 const std = @import("std");
 const text_utils = @import("../shared/text_utils.zig");
 
-pub const ChildStatus = struct {
+const ChildStatus = struct {
     status: []const u8,
     err: ?[]const u8 = null,
     tools: usize = 0,
