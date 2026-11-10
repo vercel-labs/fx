@@ -54,6 +54,7 @@
     {"name": "frozen_prefix", "module": "fx", "test": "a runtime resuming after its frozen prefix matches a full render on arbitrary edits", "iterations": 1500},
     {"name": "session_title", "module": "fx", "test": "session titles keep their rules on fuzzed input", "iterations": 5000000},
     {"name": "routine_names", "module": "fx", "test": "routine name checks keep their laws on fuzzed captures, refreshes, and commands", "iterations": 1500},
-    {"name": "session_records_listing", "module": "fx", "test": "fuzzed puts and writes list each compactor record once (D50)", "iterations": 2000}
+    {"name": "session_records_listing", "module": "fx", "test": "fuzzed puts and writes list each compactor record once (D50)", "iterations": 2000},
+    {"name": "subagent_parallel_groups", "module": "fx", "test": "fuzzed subagent calls never run two calls to one subagent at once", "iterations": 2000}
   ]
 }

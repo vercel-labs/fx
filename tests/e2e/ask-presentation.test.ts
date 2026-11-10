@@ -1061,33 +1061,31 @@ describe("fx ask shell startup files", () => {
     expect(result.stderr).not.toContain("shell snapshot unavailable");
   }, TIMEOUT);
 
-  test("user-profile commands call startup-file helpers whose names start with an underscore", async () => {
+  // Wrappers such as Socket Firewall's `pnpm` call a helper whose name starts
+  // with `_`, which completion functions share.
+  test("a startup-file wrapper that calls an underscore helper runs through the snapshot", async () => {
     const root = createRoot();
-    // Tools such as zoxide define a public wrapper that calls `__` helpers.
     writeStartupFiles(
       root.home,
       "printf 'loaded\\n' >> \"$HOME/rc.log\"\n" +
-        "_fxgreet_helper() { printf 'FX_HELPER_%s\\n' ok; }\n" +
-        "__fxgreet_dunder() { printf 'FX_DUNDER_%s\\n' ok; }\n" +
-        "fxgreet() { _fxgreet_helper && __fxgreet_dunder; }\n",
+        "_fx_wrap_helper() { printf 'FX_WRAPPED_HELPER_OK %s\\n' \"$*\"; }\n" +
+        "fxwrapped() { _fx_wrap_helper fxwrapped \"$@\"; }\n",
     );
     const gateway = startFakeGateway([
-      userShellRun("greet", "fxgreet; echo \"FX_STATUS_$?\""),
-      fakeGatewayFinalText("Helpers checked.\n"),
+      userShellRun("wrapped", "fxwrapped install"),
+      fakeGatewayFinalText("Wrapper checked.\n"),
     ]);
     gateways.push(gateway);
 
     const result = await runFx(
-      ["ask", "--json", "--yolo", "--no-save", "Check the helpers."],
+      ["ask", "--json", "--yolo", "--no-save", "Run the wrapped command."],
       { cwd: root.workspace, env: { ...gatewayEnv(root.home, gateway), FX_SOUND: "0" }, timeoutMs: TIMEOUT },
     );
 
     expect(result.code).toBe(0);
-    const body = gateway.requests[1]!.body;
-    expect(body).toContain("FX_HELPER_ok");
-    expect(body).toContain("FX_DUNDER_ok");
-    expect(body).toContain("FX_STATUS_0");
-    // The command ran from the snapshot: startup ran only for the capture.
+    expect(gateway.requests[1]!.body).toContain("FX_WRAPPED_HELPER_OK fxwrapped install");
+    expect(gateway.requests[1]!.body).not.toContain("command not found");
+    // The capture is the only full startup, so the command ran from the snapshot.
     expect(startupLoads(root.home)).toBe(1);
     expect(result.stderr).not.toContain("shell snapshot unavailable");
   }, TIMEOUT);

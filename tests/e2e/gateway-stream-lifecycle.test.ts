@@ -12255,3 +12255,285 @@ describe("request recovery across statuses and garbled streams", () => {
     }
   });
 });
+
+// Main stops its subagent `worker` and messages it. The subagent's first turn
+// is held until main stops it, and the end of the stopped turn is held through
+// FX_TEST_SUBAGENT_END_HELD until main's next request, so a message can land
+// while the stopped turn is still ending.
+type StopMessageState = {
+  childRequests: number;
+  secondTurns: number;
+  unreadTurns: number;
+  afterStop: string[];
+  heldMarker: string;
+  release: string;
+};
+
+// The text of tool call `id`'s result in a request body.
+function toolResultText(raw: string, id: string): string {
+  const body = JSON.parse(raw);
+  for (const message of body.prompt ?? []) {
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type !== "tool-result" || part.toolCallId !== id) continue;
+      const value = part.output?.value ?? part.output;
+      return typeof value === "string" ? value : JSON.stringify(value);
+    }
+  }
+  return "<no result>";
+}
+
+async function waitUntil(done: () => boolean, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (!done() && Date.now() < deadline) await Bun.sleep(5);
+  return done();
+}
+
+function stopCall(id: string) {
+  return { type: "tool-call", toolCallId: id, toolName: "subagent", input: { request: { action: "stop", agent: "worker" } } };
+}
+
+function messageCall(id: string, message: string) {
+  return { type: "tool-call", toolCallId: id, toolName: "subagent", input: { request: { action: "message", agent: "worker", message } } };
+}
+
+const toolCallsFinish = { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } };
+
+async function runStopMessage(
+  label: string,
+  main: (raw: string, state: StopMessageState) => Promise<Response | undefined>,
+) {
+  const root = createFixtureRoot(label);
+  const held = heldFakeGatewayFinalText();
+  const state: StopMessageState = {
+    childRequests: 0,
+    secondTurns: 0,
+    unreadTurns: 0,
+    afterStop: [],
+    heldMarker: join(root.root, "end-held"),
+    release: join(root.root, "end-release"),
+  };
+  const gateway = startDynamicFakeGateway(async raw => {
+    const body = JSON.parse(raw);
+    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+    if (latest.includes(REPORT_HEADER)) return fakeGatewayFinalText("STOPMSG_REPORT_SEEN");
+    if (latest.includes("STOPMSG_UNREAD")) {
+      state.unreadTurns++;
+      return fakeGatewayFinalText("STOPMSG_UNREAD_DONE");
+    }
+    if (latest.includes("STOPMSG_NEXT")) {
+      state.secondTurns++;
+      return fakeGatewayFinalText("STOPMSG_SECOND_DONE");
+    }
+    if (latest.includes("STOPMSG_FIRST")) {
+      state.childRequests++;
+      return held.response;
+    }
+    const reply = await main(raw, state);
+    if (reply) return reply;
+    return fakeGatewayToolCall("stopmsg-start", "subagent", { request: { action: "message", agent: "worker", message: "STOPMSG_FIRST" } });
+  }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+  try {
+    const result = await runFx(["ask", "--json", "--full-access", "Stop the worker and give it new work."], {
+      cwd: root.workspace,
+      env: {
+        ...fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        FX_SOUND: "0",
+        FX_TRACE_SCOPES: "mailbox,subagent,tool",
+        FX_TEST_SUBAGENT_END_HELD: state.heldMarker,
+        FX_TEST_SUBAGENT_END_RELEASE: state.release,
+      },
+      timeoutMs: 60_000,
+    });
+    return { result, state };
+  } finally {
+    writeFileSync(state.release, "");
+    held.release("STOPMSG_FIRST_LATE");
+    gateway.stop();
+  }
+}
+
+test("a message right after a stop starts the subagent's next turn", async () => {
+  const { result, state } = await runStopMessage("stop-then-message", async (raw, state) => {
+    if (raw.includes("stopmsg-redirect")) {
+      state.afterStop.push(raw);
+      writeFileSync(state.release, "");
+      return fakeGatewayFinalText("STOPMSG_MAIN_DONE");
+    }
+    if (raw.includes("stopmsg-stop")) {
+      // The stop has answered, and the stopped turn is still ending.
+      await waitUntil(() => existsSync(`${state.heldMarker}.1`), 20_000);
+      return fakeGatewayToolCall("stopmsg-redirect", "subagent", { request: { action: "message", agent: "worker", message: "STOPMSG_NEXT" } });
+    }
+    if (raw.includes("stopmsg-start")) {
+      await waitUntil(() => state.childRequests > 0, 20_000);
+      return fakeGatewaySse([stopCall("stopmsg-stop"), toolCallsFinish]);
+    }
+    return undefined;
+  });
+  expect(state.afterStop.length).toBe(1);
+  expect(readFileSync(`${state.heldMarker}.1`, "utf8")).toContain("by=parent");
+  expect(toolResultText(state.afterStop[0]!, "stopmsg-stop")).toContain("Stopped worker: its turn ended");
+  const message = toolResultText(state.afterStop[0]!, "stopmsg-redirect");
+  expect(message).not.toContain("child_cancelled");
+  expect(message).toContain("\"ok\":true");
+  expect(result.code).toBe(0);
+  expect(state.secondTurns).toBe(1);
+}, 90_000);
+
+test("a stop and a message to one subagent in one step run in order", async () => {
+  const { result, state } = await runStopMessage("stop-message-one-step", async (raw, state) => {
+    if (raw.includes("stopmsg-redirect")) {
+      state.afterStop.push(raw);
+      writeFileSync(state.release, "");
+      return fakeGatewayFinalText("STOPMSG_MAIN_DONE");
+    }
+    if (raw.includes("stopmsg-start")) {
+      await waitUntil(() => state.childRequests > 0, 20_000);
+      return fakeGatewaySse([stopCall("stopmsg-stop"), messageCall("stopmsg-redirect", "STOPMSG_NEXT"), toolCallsFinish]);
+    }
+    return undefined;
+  });
+  expect(state.afterStop.length).toBe(1);
+  expect(toolResultText(state.afterStop[0]!, "stopmsg-stop")).toContain("Stopped worker: its turn ended");
+  const message = toolResultText(state.afterStop[0]!, "stopmsg-redirect");
+  expect(message).not.toContain("child_cancelled");
+  expect(message).toContain("\"ok\":true");
+  expect(result.code).toBe(0);
+  // The message reached the subagent's next turn, and was not dropped with
+  // the stopped one.
+  expect(state.secondTurns).toBe(1);
+}, 90_000);
+
+test("a stop that drops an unread message says so", async () => {
+  const { result, state } = await runStopMessage("stop-drops-unread", async (raw, state) => {
+    if (raw.includes("stopmsg-stop")) {
+      state.afterStop.push(raw);
+      writeFileSync(state.release, "");
+      return fakeGatewayFinalText("STOPMSG_MAIN_DONE");
+    }
+    if (raw.includes("stopmsg-unread")) return fakeGatewaySse([stopCall("stopmsg-stop"), toolCallsFinish]);
+    if (raw.includes("stopmsg-start")) {
+      // The subagent's turn waits on its model, so the message stays unread.
+      await waitUntil(() => state.childRequests > 0, 20_000);
+      return fakeGatewaySse([messageCall("stopmsg-unread", "STOPMSG_UNREAD"), toolCallsFinish]);
+    }
+    return undefined;
+  });
+  expect(state.afterStop.length).toBe(1);
+  expect(toolResultText(state.afterStop[0]!, "stopmsg-unread")).toContain("\"delivery\":\"queued\"");
+  expect(toolResultText(state.afterStop[0]!, "stopmsg-stop")).toContain("the message waiting for it was dropped");
+  expect(state.unreadTurns).toBe(0);
+  expect(result.code).toBe(0);
+}, 90_000);
+
+// Main starts subagent `worker` with STARTGAP_TASK, and the start hold
+// (src/core/subagent/start_test_controls.zig) stops its first turn before the
+// worker attaches. Main then messages it STARTGAP_NOTE. `releaseWhenWaiting`
+// lets the start go once fx says the message waits for it; otherwise the
+// start is let go only when main's next request comes. The subagent's first
+// task takes one shell step, so a joined note reaches that task, and a note
+// fx held for the next turn arrives after the task's final answer,
+// STARTGAP_CHILD_DONE.
+async function runStartGap(label: string, options: { releaseWhenWaiting: boolean; waitLimitMs?: number; quitWhenWaiting?: boolean }) {
+  const root = createFixtureRoot(label);
+  const startHeld = join(root.root, "start-held"), startRelease = join(root.root, "start-release");
+  const tracePath = join(root.root, "trace.log");
+  const state = { noteJoined: 0, noteTurns: 0, noteAnswer: "", trace: "" };
+  const release = () => { if (!existsSync(startRelease)) writeFileSync(startRelease, ""); };
+  const gateway = startDynamicFakeGateway(async raw => {
+    const body = JSON.parse(raw);
+    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+    if (latest.includes(REPORT_HEADER)) return fakeGatewayFinalText("STARTGAP_REPORT_SEEN");
+    if (latest.includes("STARTGAP_NOTE")) {
+      // A note after the task's final answer came in a turn of its own.
+      if (raw.includes("STARTGAP_CHILD_DONE")) state.noteTurns++;
+      else state.noteJoined++;
+      return fakeGatewayFinalText("STARTGAP_CHILD_DONE");
+    }
+    if (latest.includes("STARTGAP_TASK")) {
+      if (raw.includes("startgap-shell")) return fakeGatewayFinalText("STARTGAP_CHILD_DONE");
+      return fakeGatewayToolCall("startgap-shell", "shell", { request: { action: "run", command: "true" } });
+    }
+    if (raw.includes("startgap-note")) {
+      state.noteAnswer = toolResultText(raw, "startgap-note");
+      release();
+      return fakeGatewayFinalText("STARTGAP_MAIN_DONE");
+    }
+    if (raw.includes("startgap-start")) {
+      // The first turn is held before its worker attaches.
+      await waitUntil(() => existsSync(`${startHeld}.1`), 20_000);
+      if (options.releaseWhenWaiting) void (async () => {
+        await waitUntil(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=message_waits_start"), 20_000);
+        release();
+      })();
+      return fakeGatewayToolCall("startgap-note", "subagent", { request: { action: "message", agent: "worker", message: "STARTGAP_NOTE" } });
+    }
+    return fakeGatewayToolCall("startgap-start", "subagent", { request: { action: "message", agent: "worker", message: "STARTGAP_TASK" } });
+  }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+  const env = {
+    ...fixtureEnv(root, gateway, tracePath),
+    FX_SOUND: "0",
+    FX_TRACE_SCOPES: "mailbox,subagent,tool",
+    FX_TEST_SUBAGENT_START_HELD: startHeld,
+    FX_TEST_SUBAGENT_START_RELEASE: startRelease,
+    ...(options.waitLimitMs === undefined ? {} : { FX_TEST_SUBAGENT_START_WAIT_MS: String(options.waitLimitMs) }),
+  };
+  try {
+    if (options.quitWhenWaiting) {
+      // fx is told to quit while main's message waits for the start, which
+      // nothing lets go.
+      const proc = Bun.spawn([FX_BIN, "ask", "--json", "--full-access", "Start the worker and tell it one more thing."], {
+        cwd: root.workspace, env: { ...process.env, ...env }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+      });
+      const stderr = new Response(proc.stderr).text();
+      const waited = await waitUntil(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=message_waits_start"), 20_000);
+      const signalled = Date.now();
+      proc.kill("SIGTERM");
+      const exit = await Promise.race([proc.exited, Bun.sleep(20_000).then(() => "hung" as const)]);
+      if (exit === "hung") proc.kill("SIGKILL");
+      return { waited, exit, quitMs: Date.now() - signalled, stderr: await stderr, state };
+    }
+    const result = await runFx(["ask", "--json", "--full-access", "Start the worker and tell it one more thing."], {
+      cwd: root.workspace, env, timeoutMs: 60_000,
+    });
+    state.trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+    return { result, state, heldMarker: readFileSync(`${startHeld}.1`, "utf8") };
+  } finally {
+    release();
+    gateway.stop();
+  }
+}
+
+test("a message right after starting a subagent joins its first task", async () => {
+  const { result, state, heldMarker } = await runStartGap("start-then-message", { releaseWhenWaiting: true });
+  expect(heldMarker).toContain("start child=");
+  expect(state.noteAnswer).toContain("Sent into the subagent's running turn");
+  expect(state.noteAnswer).not.toContain("waits and starts its next turn");
+  expect(result.code).toBe(0);
+  expect(state.noteJoined).toBe(1);
+  expect(state.noteTurns).toBe(0);
+}, 90_000);
+
+test("a message waits only so long for a stuck start, then starts the next turn", async () => {
+  // Nothing lets the start go until main's next request, so the wait limit
+  // passes first.
+  const { result, state } = await runStartGap("start-wait-limit", { releaseWhenWaiting: false, waitLimitMs: 200 });
+  expect(state.trace).toContain("event=message_waits_start");
+  expect(state.trace).toContain("event=message_start_wait_expired");
+  expect(state.noteAnswer).toContain("waits and starts its next turn");
+  expect(result.code).toBe(0);
+  // The note is not lost: the turn after the first task takes it.
+  expect(state.noteJoined).toBe(0);
+  expect(state.noteTurns).toBe(1);
+}, 90_000);
+
+test("fx told to quit while a message waits for a subagent's start exits at once", async () => {
+  const run = await runStartGap("start-wait-quit", { releaseWhenWaiting: false, quitWhenWaiting: true });
+  expect(run.waited).toBe(true);
+  expect(run.exit).not.toBe("hung");
+  // The wait ends with main's cancelled turn, not at the 10 s limit.
+  expect(run.quitMs).toBeLessThan(5_000);
+  expect(run.stderr).not.toContain("panic");
+  expect(run.exit).toBe(143);
+}, 90_000);

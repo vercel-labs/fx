@@ -7,10 +7,13 @@
 (* owner around it: leases, refreshes, and approval epochs.                *)
 (*                                                                          *)
 (* The startup files define functions: a public wrapper, `_` and `__`      *)
-(* helpers it calls, a completion function that compinit only marks for    *)
-(* autoloading (a stub) or that the files load, and fx's own               *)
-(* `__fx_snapshot_` names. zsh startup files may also move ZDOTDIR, with   *)
-(* or without exporting it, from an inherited ZDOTDIR or from HOME.        *)
+(* helpers it calls, a completion function, and fx's own `__fx_snapshot_`  *)
+(* names. A completion function is a `_` function that comes from a        *)
+(* completion file: in zsh one autoloaded from a file of its own name, as  *)
+(* compinit does, whether the files only mark it (a stub) or load it; in   *)
+(* bash one defined in a file whose path holds `completion`. zsh startup   *)
+(* files may also move ZDOTDIR, with or without exporting it, from an      *)
+(* inherited ZDOTDIR or from HOME.                                         *)
 (*                                                                          *)
 (* fx captures once, then before every command compares the stamps of the  *)
 (* startup files it watches: those in fx's own ZDOTDIR, HOME, and the      *)
@@ -28,9 +31,10 @@
 (* whose time is at or after the capture's start as changed.               *)
 (*                                                                          *)
 (* FilterRule and ZdotdirRule pick fx's rules. "fixed" is fx with this     *)
-(* change. "old" and "env_only" are fx before the ZDOTDIR watch: every     *)
-(* `_*` function was dropped, and ZDOTDIR came only from the exported      *)
-(* environment, so it was neither watched nor restored when unexported.    *)
+(* change. "env_only" is fx before the ZDOTDIR watch: ZDOTDIR came only    *)
+(* from the exported environment, so it was neither watched nor restored   *)
+(* when unexported. "old" is fx before it kept `_` helpers: every `_*`     *)
+(* function was dropped.                                                   *)
 (* "stamp_late" is fx with the watch but before the capture-start rule: it *)
 (* stamped the moved folder when the capture finished, so an edit made     *)
 (* while the capture ran became the baseline. The other values plant one   *)
@@ -47,7 +51,7 @@ EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS FilterRule, ZdotdirRule, MaxEdits, MaxRuns
 
-ASSUME FilterRule \in {"fixed", "old", "keep_stubs", "keep_private"}
+ASSUME FilterRule \in {"fixed", "old", "keep_completion", "keep_private"}
 ASSUME ZdotdirRule \in {"fixed", "env_only", "no_restore", "restore_exported", "stamp_late",
                          "failed_layout"}
 ASSUME MaxEdits \in Nat /\ MaxRuns \in Nat \ {0}
@@ -56,6 +60,8 @@ Funcs == {"wrap", "_helper", "__dunder", "_comp", "__fx_snapshot_x"}
 \* Names that start with `_`.
 Underscore == {"_helper", "__dunder", "_comp", "__fx_snapshot_x"}
 FxPrivate == {"__fx_snapshot_x"}
+\* Functions that come from a completion file, loaded or not.
+Completion == {"_comp"}
 Dirs == {"home", "inherited", "moved"}
 \* What the startup files do with ZDOTDIR:
 \*   keep          nothing
@@ -103,13 +109,16 @@ LoginZExported ==
          [] zmode = "assign_moved" -> inherited
 
 \* --- fx's capture rules ----------------------------------------------------
+\* A `_` function that comes from a completion file, or that zsh only marked
+\* for autoloading: commands never run completion, so the replay leaves it out.
+IsCompletion(f) == f \in Completion \/ fstate[f] = "stub"
 Replayed(f) ==
     /\ fstate[f] # "absent"
     /\ CASE FilterRule = "old" -> f \notin Underscore
-         [] FilterRule = "keep_stubs" -> f \notin FxPrivate
-         [] FilterRule = "keep_private" -> ~(f \in Underscore /\ fstate[f] = "stub")
+         [] FilterRule = "keep_completion" -> f \notin FxPrivate
+         [] FilterRule = "keep_private" -> ~(f \in Underscore /\ IsCompletion(f))
          [] OTHER -> /\ f \notin FxPrivate
-                     /\ ~(f \in Underscore /\ fstate[f] = "stub")
+                     /\ ~(f \in Underscore /\ IsCompletion(f))
 \* ZDOTDIR as `env -0` shows it, and as its own payload section shows it.
 EnvZ == IF LoginZExported THEN LoginZ ELSE None
 RecordedZ == IF ZdotdirRule = "env_only" THEN EnvZ ELSE LoginZ
@@ -234,15 +243,16 @@ TypeOK ==
     /\ readVer \in 0..MaxEdits
     /\ failed \in BOOLEAN
 
-\* Every function the startup files define and load can be called in a
-\* command, so a wrapper that calls `_` or `__` helpers works (#1329).
+\* Every function the startup files define and load, except a completion
+\* function, can be called in a command, so a wrapper that calls `_` or `__`
+\* helpers works (#1329).
 HelpersCallable ==
     \A i \in 1..Len(seen) :
-        {f \in Funcs \ FxPrivate : fstate[f] = "loaded"} \subseteq seen[i].callable
+        {f \in Funcs \ (FxPrivate \cup Completion) : fstate[f] = "loaded"} \subseteq seen[i].callable
 
-\* Completion stubs stay out of the replay, which runs before every command.
-StubsStayOut ==
-    \A f \in snap.replay : ~(f \in Underscore /\ fstate[f] = "stub")
+\* Completion functions stay out of the replay, which runs before every command.
+CompletionStaysOut ==
+    \A f \in snap.replay : ~(f \in Underscore /\ IsCompletion(f))
 
 \* fx's own capture variables never reach a command.
 FxPrivateOut == snap.replay \cap FxPrivate = {}
