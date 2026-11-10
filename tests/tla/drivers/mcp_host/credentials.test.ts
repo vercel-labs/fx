@@ -116,7 +116,7 @@ test("a logout stays when the store becomes unreadable (trace ACCEPTED)", async 
   writeStore(s.f);
   s.observe();
   const out = await s.run("logout", ["mcp", "logout", "web"], "web");
-  expect(out.ran.stdout).toBe("Signed out of web.\n");
+  expect(out.ran.stdout).toBe("Signed out of web here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
   expect(out.o.entries).toEqual([]);
   rewriteAsVersion(s.f, 3);
   s.fault("unreadable");

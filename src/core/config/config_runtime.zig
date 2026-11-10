@@ -15,6 +15,7 @@ const model_preferences = @import("model_preferences.zig");
 const configured_provider = @import("configured_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
+pub const tool_placement = @import("tool_placement.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -52,6 +53,8 @@ pub const Settings = struct {
     /// compaction starts. Profile-only.
     auto_compact_percent: ?u8 = null,
     context_limits: context_limits.Overrides = .{},
+    /// Where built-in tools are offered, by tool. Profile-only.
+    tool_placement: tool_placement.Overrides = .{},
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
     fast_mode: ?bool = null,
@@ -218,6 +221,7 @@ pub const ConfigDiagnosticCause = enum {
     manual_backup_available,
     retired_skill_match_fuzzy,
     invalid_context_limits,
+    invalid_tool_placement,
     invalid_additional_directories,
     invalid_skill_symlink_authorities,
     invalid_ultrafast_mode_override,
@@ -253,10 +257,13 @@ pub fn writeDiagnosticMetadata(writer: *std.Io.Writer, diagnostic: ConfigDiagnos
     if (diagnostic.setting_key) |key| try writer.print("; key={s}", .{key});
     if (diagnostic.recovery_path) |path| try writer.print("; recovery={s}", .{path});
     if (diagnostic.cause == .retired_skill_match_fuzzy) {
-        try writer.writeAll("; remove skill_match_fuzzy; skills now load only through explicit invocation or the skill tool");
+        try writer.writeAll("; remove skill_match_fuzzy; skills now load only through explicit invocation or toolbox open");
     }
     if (diagnostic.cause == .invalid_context_limits) {
         try writer.writeAll("; context_limits keys must be documented limit names with a non-negative integer or \"off\" value");
+    }
+    if (diagnostic.cause == .invalid_tool_placement) {
+        try writer.writeAll("; tool_placement keys must be built-in tools that can move (" ++ tool_placement.movable_list ++ ") with the value \"toolbox\" or \"direct\"");
     }
     if (diagnostic.cause == .invalid_additional_directories) {
         try writer.print(
@@ -991,6 +998,10 @@ fn diagnosticCauseForParseError(err: anyerror) ConfigDiagnosticCause {
         error.UnknownContextLimit,
         error.InvalidContextLimitValue,
         => .invalid_context_limits,
+        error.InvalidToolPlacementType,
+        error.UnknownToolPlacementTool,
+        error.InvalidToolPlacementValue,
+        => .invalid_tool_placement,
         error.InvalidSkillSymlinkAuthorities => .invalid_skill_symlink_authorities,
         else => .malformed_settings,
     };
@@ -1751,6 +1762,10 @@ fn parseProfileOnlyFields(
         settings.context_limits = try context_limits.parseJsonObject(context_limits_value);
     }
 
+    if (root.object.get("tool_placement")) |tool_placement_value| {
+        settings.tool_placement = try tool_placement.parseJsonObject(tool_placement_value);
+    }
+
     if (root.object.get("first_call_tool_choice")) |first_call_tool_choice_value| {
         const value = first_call_tool_choice_value;
         if (value != .string) return error.InvalidFirstCallToolChoiceType;
@@ -2032,6 +2047,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
     if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
     target.context_limits.merge(incoming.context_limits);
+    target.tool_placement.merge(incoming.tool_placement);
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
     if (incoming.context) |value| target.context = value;
     if (incoming.fast_mode) |value| target.fast_mode = value;
@@ -4927,11 +4943,13 @@ test "the settings list gives the types, values, and bounds the settings parser 
         // A project file that sets a profile key is ignored, not refused.
         if (key.where == .profile) try expectSettingForTest(.project, key.name, wrong, true);
 
-        for (key.values) |value| {
+        // A map's values are checked by its own tests; a plain string key
+        // takes each listed value as its whole value.
+        if (key.kind == .string) for (key.values) |value| {
             const json = try alloc.print("\"{s}\"", .{value});
             defer alloc.free(json);
             try expectSettingForTest(layer, key.name, json, true);
-        }
+        };
         if (key.minimum) |minimum| {
             const at = try alloc.print("{d}", .{minimum});
             defer alloc.free(at);
@@ -4981,4 +4999,6 @@ test "the settings list names every value the settings enums accept" {
     for (std.meta.tags(types.CredentialSource)) |source| {
         if (types.parseCredentialSource(@tagName(source)) != null) try std.testing.expect(listed.has("credential_source", @tagName(source)));
     }
+    for (std.meta.tags(tool_placement.Placement)) |placement| try std.testing.expect(listed.has("tool_placement", @tagName(placement)));
+    try std.testing.expectEqual(std.meta.tags(tool_placement.Placement).len, settings_keys.find("tool_placement").?.values.len);
 }

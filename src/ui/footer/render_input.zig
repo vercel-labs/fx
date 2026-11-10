@@ -166,22 +166,33 @@ pub fn effortMenuProjection(menu: *const effort_menu.State) EffortMenuProjection
     };
 }
 
+/// How much an agent's state asks of the user, which decides how bright the
+/// agent list draws it.
+pub const AgentStateTone = enum {
+    /// Nothing is going on.
+    idle,
+    /// It is working, or finished since the user last looked.
+    active,
+    /// It waits for the user: an approval, a question, or a request only
+    /// the user can continue.
+    needs_user,
+};
+
 /// One row of the agent list: an open instance or one of its subagents, and
 /// how it is doing.
 pub const AgentsMenuRow = struct {
-    /// An instance's place among the open instances, from 1, as in "fx 3".
-    /// Unused for a subagent.
-    number: usize,
-    /// A subagent's name, such as "reviewer"; empty for an instance.
-    subagent_name: []const u8 = "",
+    /// How fx names it: "main", "fx 3" while several instances are open, or
+    /// a subagent's own name, such as "reviewer".
+    name: []const u8,
+    /// A subagent, drawn on its instance's branch.
+    subagent: bool = false,
     /// Its session's title, or empty before it has one.
     title: []const u8,
     /// The agent profile it runs in.
     profile: []const u8,
     /// What it is doing, such as "needs approval".
     state: []const u8,
-    /// The agent the list opened on, where Esc goes back to.
-    on_screen: bool,
+    state_tone: AgentStateTone = .idle,
     /// The model its turns use, as the agent's settings name it, such as
     /// "anthropic/claude-opus-4-7"; empty when unknown.
     model: []const u8 = "",
@@ -190,14 +201,18 @@ pub const AgentsMenuRow = struct {
     effort: []const u8 = "",
 };
 
-/// The agent list ↓ and Ctrl+X open: every open agent in switch order.
+/// The agent list ↓ and Ctrl+X open: every open agent in switch order, each
+/// instance followed by its own subagents.
 pub const AgentsMenuProjection = struct {
     rows: []const AgentsMenuRow = &.{},
     selected: usize = 0,
     window_start: usize = 0,
-    /// The selected row is a subagent's, which Delete closes.
+    /// Delete closes the selected row: a subagent's, or an instance's while
+    /// another stays open.
     selected_closable: bool = false,
-    /// The first Delete armed the selected subagent's close.
+    /// The selected row is an instance's, not a subagent's.
+    selected_instance: bool = false,
+    /// The first Delete armed the selected row's close.
     close_armed: bool = false,
 
     pub fn active(self: AgentsMenuProjection) bool {

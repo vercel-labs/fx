@@ -610,7 +610,19 @@ describe("/mcp in the shell", () => {
       env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
     });
     await tui.waitForComposer(15_000);
-    const servers = (body: string) => body.slice(body.lastIndexOf("<mcp_servers>"), body.lastIndexOf("</mcp_servers>"));
+    // Every string in a request, decoded, so the menu and notes read as the model reads them.
+    const strings = (value: unknown): string[] =>
+      typeof value === "string" ? [value]
+        : Array.isArray(value) ? value.flatMap(strings)
+        : value !== null && typeof value === "object" ? Object.values(value).flatMap(strings)
+        : [];
+    const text = (body: string) => strings(JSON.parse(body)).join("\n");
+    const menu = (body: string) => {
+      const all = text(body);
+      return all.slice(all.indexOf("<toolbox>"), all.indexOf("</toolbox>"));
+    };
+    // The toolbox's change note, as its MCP servers line.
+    const notedServers = (body: string) => /The toolbox now holds[\s\S]*?MCP servers: (.*)\n/.exec(text(body))?.[1] ?? "";
 
     // Another fx process writes the profile, as an agent's shell tool would.
     expect((await mcp(root, "add", "outside", "--", process.execPath, MODERN_FIXTURE)).code).toBe(0);
@@ -618,19 +630,22 @@ describe("/mcp in the shell", () => {
     await tui.sendText("first prompt");
     await tui.waitForText("first done", 15_000);
     expect(gateway.requests).toHaveLength(1);
-    expect(servers(gateway.requests[0]!.body)).toContain("fixture");
-    expect(servers(gateway.requests[0]!.body)).toContain("outside");
+    const firstMenu = menu(gateway.requests[0]!.body);
+    expect(firstMenu).toContain("- fixture");
+    expect(firstMenu).toContain("- outside");
     // The session runs it, so `/mcp list` reports it.
     await tui.sendText("/mcp list");
     await tui.waitForText(/outside +~\/\.fx\/mcp\.json +stdio/, 10_000);
 
-    // Removed the same way, it's gone by the next prompt.
+    // Removed the same way, it's gone by the next prompt. The menu stays as
+    // first sent, so nothing earlier requests sent changes, and a note names
+    // the servers toolbox holds now.
     expect((await mcp(root, "remove", "outside")).code).toBe(0);
     await tui.sendText("second prompt");
     await tui.waitForText("second done", 15_000);
     expect(gateway.requests).toHaveLength(2);
-    expect(servers(gateway.requests[1]!.body)).toContain("fixture");
-    expect(servers(gateway.requests[1]!.body)).not.toContain("outside");
+    expect(menu(gateway.requests[1]!.body)).toBe(firstMenu);
+    expect(notedServers(gateway.requests[1]!.body)).toBe("fixture");
   }, 90_000);
 
   test.skipIf(!tmuxAvailable())("a prompt sent while a turn runs keeps the current servers, and the next prompt after the turn loads the change", async () => {
