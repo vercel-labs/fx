@@ -346,6 +346,17 @@ pub const Store = struct {
         }
     }
 
+    /// A child's stored title, read without opening it; null when it has
+    /// none yet. Caller owns it.
+    pub fn childTitle(store: *Store, alloc: Allocator, child_id: []const u8) !?[]u8 {
+        var peeked = try store.manager.peek(alloc, child_id);
+        defer peeked.deinit(alloc);
+        const raw = peeked.state.title orelse return null;
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        return try alloc.dupe(u8, try json_decode.parseFromSliceLeaky([]const u8, scratch.allocator(), raw, .{}));
+    }
+
     /// A child's whole history, read without its lock: every turn, oldest
     /// first. Free with `types.freeHistoryTurnSlice`.
     pub fn childHistory(store: *Store, alloc: Allocator, child_id: []const u8) ![]types.HistoryTurn {
@@ -5815,6 +5826,12 @@ test "a child opens under the id its parent names, and its parent folds its line
         try testing.expectEqualStrings(child_id, child.id());
         try testing.expectEqualStrings("Be brief.", child.childInstructions());
         try child.commitTurn(assistantTurn("task one", "done one"), types.ConversationLanguage.default());
+        // Its title reads from the store without opening it.
+        try testing.expect((try t.store.childTitle(alloc, child_id)) == null);
+        try child.rename("Review the parser");
+        const title = (try t.store.childTitle(alloc, child_id)).?;
+        defer alloc.free(title);
+        try testing.expectEqualStrings("Review the parser", title);
     }
     try parent.appendChildLines(&.{.{ .finished = .{ .child = child_id, .work_id = "w1", .outcome = .ok, .data = "{}" } }});
 
@@ -5875,6 +5892,7 @@ test "the manager guards child lines, and a child without a log reopens under it
     // Closed before its first turn, as a crash would leave it: nothing on disk.
     (try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", childSeed(&model, "Stay short."))).close();
     try testing.expectError(error.NotFound, t.store.childHistory(alloc, child_id));
+    try testing.expectError(error.NotFound, t.store.childTitle(alloc, child_id));
     const child = try Session.openChild(alloc, &t.store, parent.id(), child_id, "/w", testSeed(&model));
     defer child.close();
     try testing.expectEqualStrings(child_id, child.id());
