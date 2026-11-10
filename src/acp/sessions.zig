@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const agent_frame = @import("../core/shared/agent_frame.zig");
+const recovery_prompt = @import("../core/shared/recovery_prompt.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 const jsonrpc = @import("jsonrpc.zig");
@@ -1700,6 +1701,11 @@ fn sendExecutionHistory(
                 // message, so it isn't replayed as one.
                 if (agent_frame.isFrame(text)) {
                     debug_trace.logf("acp", "event=history_steering_skipped reason=subagent_frame bytes={d}", .{text.len});
+                    continue;
+                }
+                // Nor is fx's own prompt to a stalled turn.
+                if (recovery_prompt.fromSaved(text) != null) {
+                    debug_trace.logf("acp", "event=history_steering_skipped reason=recovery_prompt bytes={d}", .{text.len});
                     continue;
                 }
                 try sendSteeringHistoryChunk(state, alloc, session_id, text);
