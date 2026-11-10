@@ -44,7 +44,8 @@ pub const Operation = struct {
     turn_id: ?u64,
     origin: Origin,
     phase: Phase = .preparing,
-    /// Manual admission resets this when queued; automatic consumers use the turn clock.
+    /// The start of the activity row's own clock, whatever the origin.
+    /// Manual admission resets it when queued.
     started_at_ms: i64,
     expires_at_ms: ?i64 = null,
     dismissed: bool = false,
