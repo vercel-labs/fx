@@ -135,6 +135,10 @@ pub const activity_blink_half_period_ms: i64 = 500;
 /// One displayed second of an activity clock spans exactly one on/off blink
 /// period, so the marker relights when the seconds digit advances.
 pub const activity_clock_ms_per_second: i64 = 2 * activity_blink_half_period_ms;
+comptime {
+    // The turn and compaction clocks count seconds in `turn_clock.zig`.
+    std.debug.assert(activity_clock_ms_per_second == std.time.ms_per_s);
+}
 
 fn turnMarks(stream: StreamState) turn_clock.Marks {
     return .{ .started_ms = stream.turn_started_ms, .waiting_since_ms = stream.waiting_since_ms };

@@ -7871,7 +7871,7 @@ tmuxTest(
     // Success is silent; wait for durable publication and the activity row to clear.
     await session.waitForPane((pane) =>
       pane.includes("PRESERVE_COMPACTION_DRAFT") &&
-      !/Preparing compaction|Compacting|Stopping compaction/.test(pane) &&
+      !/Compacting|Stopping compaction/.test(pane) &&
       readFileSync(historyPath, "utf8").includes('"kind":"compacted"'),
     TIMEOUT);
     const scrollback = await session.captureFullScrollback();

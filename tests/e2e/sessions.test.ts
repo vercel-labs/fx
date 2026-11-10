@@ -879,7 +879,7 @@ test.skipIf(!tmuxAvailable())("a flipped byte in a turn the newest compaction ke
     const id = onlySessionId(fixture.home);
     await app.session.sendText("/compact");
     await waitForLog(fixture, id, '"kind":"compacted"', TIMEOUT);
-    await app.session.waitForPane((pane) => !/Preparing compaction|Compacting|Stopping compaction/.test(pane), TIMEOUT);
+    await app.session.waitForPane((pane) => !/Compacting|Stopping compaction/.test(pane), TIMEOUT);
     await app.session.waitForComposer(TIMEOUT);
     await quitApp(app);
 
