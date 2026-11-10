@@ -158,7 +158,7 @@ fn printReply(arena: Allocator, io: std.Io, out: *Writer, err: *Writer, operatio
         },
         .tool_error => {
             try err.print("fx mcp call: {f} returned an error:\n", .{text_utils.terminalSafe(tool)});
-            try writeLine(err, reply.bytes);
+            try writeTerminalSafeLine(arena, err, reply.bytes);
             return exit.tool_error;
         },
         .failed => {
@@ -303,6 +303,18 @@ fn writeLine(w: *Writer, text: []const u8) !void {
     if (!std.mem.endsWith(u8, text, "\n")) try w.writeByte('\n');
 }
 
+/// `writeLine` for text an MCP server wrote. A person may read it on a
+/// terminal, and fx's shell tool hands it to the model as it is, so a control
+/// byte in it must show as text instead of acting. Line breaks and tabs stay,
+/// so the server's own lines read as it wrote them (a CRLF becomes a line
+/// feed); every other control byte, C1 control, and invalid UTF-8 byte
+/// becomes a visible escape.
+fn writeTerminalSafeLine(arena: Allocator, w: *Writer, text: []const u8) !void {
+    var safe: std.ArrayList(u8) = .empty;
+    try text_utils.appendTerminalSafeText(arena, &safe, text);
+    try writeLine(w, safe.items);
+}
+
 fn isJsonObject(arena: Allocator, text: []const u8) bool {
     const value = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch return false;
     return value == .object;
@@ -345,6 +357,124 @@ test "a tool error and a denial name the tool as visible escapes, not raw bytes"
         err.written(),
     );
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
+}
+
+/// What `printReply` writes to stderr after its first line for a tool error
+/// whose text is `text`. Allocates in `arena`.
+fn toolErrorLines(arena: Allocator, text: []const u8) ![]const u8 {
+    const asked: wire.Operation = .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } };
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var err: std.Io.Writer.Allocating = .init(arena);
+    try std.testing.expectEqual(exit.tool_error, try printReply(arena, std.testing.io, &out.writer, &err.writer, asked, .{
+        .header = .{ .status = .tool_error, .bytes = text.len },
+        .bytes = text,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    const first_line = "fx mcp call: mcp_s_t returned an error:\n";
+    try std.testing.expect(std.mem.startsWith(u8, err.written(), first_line));
+    return err.written()[first_line.len..];
+}
+
+test "a tool error's text keeps its lines and shows every other control byte as a visible escape" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The text is the MCP server's own, so it can hold any byte.
+    const cases = [_]struct { name: []const u8, text: []const u8, shown: []const u8 }{
+        .{ .name = "a plain line", .text = "Boom", .shown = "Boom\n" },
+        .{
+            .name = "plain lines and a tab stay as they are",
+            .text = "Invalid input: labels require at least one item\n\tretry rejected\n",
+            .shown = "Invalid input: labels require at least one item\n\tretry rejected\n",
+        },
+        .{ .name = "a blank line stays", .text = "one\n\ntwo", .shown = "one\n\ntwo\n" },
+        .{ .name = "JSON stays", .text = "{\"issues\":[1,2]}\n", .shown = "{\"issues\":[1,2]}\n" },
+        .{
+            .name = "valid UTF-8 stays",
+            .text = "caf\xc3\xa9 \xe6\x97\xa5\xe6\x9c\xac \xf0\x9f\x91\x8d",
+            .shown = "caf\xc3\xa9 \xe6\x97\xa5\xe6\x9c\xac \xf0\x9f\x91\x8d\n",
+        },
+        .{ .name = "empty text", .text = "", .shown = "\n" },
+        .{ .name = "a window title", .text = "x\x1b]0;owned\x07y", .shown = "x\\x1b]0;owned\\x07y\n" },
+        .{ .name = "clear screen", .text = "\x1b[2J\x1b[H", .shown = "\\x1b[2J\\x1b[H\n" },
+        .{ .name = "bell", .text = "a\x07b", .shown = "a\\x07b\n" },
+        .{ .name = "NUL", .text = "a\x00b\x00", .shown = "a\\x00b\\x00\n" },
+        .{ .name = "delete", .text = "a\x7fb", .shown = "a\\x7fb\n" },
+        .{ .name = "a C1 control sequence introducer", .text = "a\xc2\x9b2Jb", .shown = "a\\u{009b}2Jb\n" },
+        .{ .name = "a C1 next line", .text = "a\xc2\x85b", .shown = "a\\u{0085}b\n" },
+        .{ .name = "CRLF line ends become line feeds", .text = "one\r\ntwo\r\n", .shown = "one\ntwo\n" },
+        .{ .name = "a lone carriage return would overwrite the line", .text = "good\rbad", .shown = "good\\x0dbad\n" },
+        .{ .name = "a trailing carriage return", .text = "a\r", .shown = "a\\x0d\n" },
+        .{ .name = "a carriage return before a CRLF", .text = "a\r\r\nb", .shown = "a\\x0d\nb\n" },
+        .{ .name = "a stray byte", .text = "a\xffb", .shown = "a\\xffb\n" },
+        .{ .name = "a cut sequence at the end", .text = "ok\xe2\x82", .shown = "ok\\xe2\\x82\n" },
+        .{ .name = "an overlong sequence", .text = "\xc0\xaf", .shown = "\\xc0\\xaf\n" },
+        .{ .name = "an encoded surrogate", .text = "\xed\xa0\x80", .shown = "\\xed\\xa0\\x80\n" },
+    };
+    for (cases) |case| {
+        const shown = try toolErrorLines(arena, case.text);
+        std.testing.expectEqualStrings(case.shown, shown) catch |failure| {
+            std.debug.print("case: {s}\n", .{case.name});
+            return failure;
+        };
+        try std.testing.expect(text_utils.isTerminalSafeText(shown));
+    }
+}
+
+test "a very long tool error text prints whole, and a long run of escapes expands whole" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const plain = try arena.alloc(u8, 1024 * 1024);
+    @memset(plain, 'a');
+    const plain_shown = try toolErrorLines(arena, plain);
+    try std.testing.expectEqual(plain.len + 1, plain_shown.len);
+    try std.testing.expectEqualStrings(plain, plain_shown[0..plain.len]);
+    try std.testing.expectEqual(@as(u8, '\n'), plain_shown[plain.len]);
+
+    const run_len = 100_000;
+    const escapes = try arena.alloc(u8, run_len);
+    @memset(escapes, 0x1b);
+    const escapes_shown = try toolErrorLines(arena, escapes);
+    try std.testing.expectEqual(run_len * 4 + 1, escapes_shown.len);
+    for (0..run_len) |index| {
+        try std.testing.expectEqualStrings("\\x1b", escapes_shown[index * 4 ..][0..4]);
+    }
+    try std.testing.expectEqual(@as(u8, '\n'), escapes_shown[run_len * 4]);
+}
+
+test "a tool error's text reaches stderr terminal-safe whatever bytes the server sends" {
+    try std.testing.fuzz({}, fuzzToolErrorText, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "Invalid input: labels require at least one item\n\tretry rejected\n",
+            "x\x1b]0;owned\x07y \xc2\x9b2J \xff \xe2\x82",
+            "a\r\r\nb\rc\x00d\x7fe",
+        }) ++ @import("fuzz_corpus").mcp_call_error_text.*),
+    });
+}
+
+/// Whatever the bytes, the error text on stderr holds no control but line
+/// breaks and tabs, is valid UTF-8 with no C1 control, ends with one line
+/// break, and costs at most four bytes for each byte of the text. Text that
+/// is already safe prints as it is.
+fn fuzzToolErrorText(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [4096]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    const text = buffer[0..len];
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const shown = try toolErrorLines(arena_state.allocator(), text);
+    try std.testing.expect(std.mem.endsWith(u8, shown, "\n"));
+    try std.testing.expect(text_utils.isTerminalSafeText(shown));
+    try std.testing.expect(shown.len <= text.len * 4 + 1);
+    if (text_utils.isTerminalSafeText(text)) {
+        const ends_with_line = std.mem.endsWith(u8, text, "\n");
+        try std.testing.expectEqual(text.len + @intFromBool(!ends_with_line), shown.len);
+        try std.testing.expectEqualStrings(text, shown[0..text.len]);
+    }
 }
 
 test "a shape summary of one item names sizes, keys, and types, not values" {

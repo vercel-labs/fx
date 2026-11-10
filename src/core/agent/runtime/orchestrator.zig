@@ -23,6 +23,7 @@ const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const diagnostics = @import("../../workspace/diagnostics.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
+const model_context_encoding = @import("../../shared/model_context_encoding.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const io_mod = @import("../../shared/io.zig");
 const host_target = @import("../../hosts/target.zig");
@@ -2671,11 +2672,39 @@ fn preparedTerminalModelOutput(
     if (terminal.model_output) |model_output| return model_output;
     return switch (terminal.kind) {
         .unsupported => try alloc.print(
-            "Unsupported tool: {s}",
-            .{call.name},
+            "Unsupported tool: {f}",
+            .{model_context_encoding.scalar(call.name)},
         ),
         else => unreachable,
     };
+}
+
+test "a prepared call of a tool fx does not know names it as visible text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cases = [_]struct { name: []const u8, shown: []const u8 }{
+        .{ .name = "missing_tool", .shown = "Unsupported tool: missing_tool" },
+        .{ .name = "", .shown = "Unsupported tool: " },
+        .{ .name = "x\x1b]0;owned\x07y", .shown = "Unsupported tool: x&#x1b;]0;owned&#x07;y" },
+        .{ .name = "a\x00b\r\nc", .shown = "Unsupported tool: a&#x00;b&#x0d;&#x0a;c" },
+    };
+    for (cases) |case| {
+        const shown = try preparedTerminalModelOutput(
+            arena,
+            .{ .id = "odd-tool", .name = case.name, .arguments_json = "{}" },
+            .{ .kind = .unsupported },
+        );
+        try std.testing.expectEqualStrings(case.shown, shown);
+    }
+    // A terminal that already carries the model's text is passed on as it is.
+    const kept = try arena.dupe(u8, "Tool arguments are invalid.");
+    try std.testing.expectEqualStrings("Tool arguments are invalid.", try preparedTerminalModelOutput(
+        arena,
+        .{ .id = "x", .name = "read_file", .arguments_json = "{}" },
+        .{ .kind = .validation_failure, .model_output = kept },
+    ));
 }
 
 noinline fn preparedCandidateClassificationComplete(

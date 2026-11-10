@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, runFx } from "../evals/eval-helpers";
 import { contentText } from "./conditional-guidance-oracle";
-import { fakeGatewayFinalText, fakeGatewayToolCall, startDynamicFakeGateway, startFakeGateway } from "./tmux-helpers";
+import { fakeGatewayFinalText, fakeGatewaySse, fakeGatewayToolCall, startDynamicFakeGateway, startFakeGateway } from "./tmux-helpers";
 import { manyMcpServerName, startManyMcpHttpServers } from "./fixtures/mcp-many";
 
 // The toolbox: fx sends its built-in tools as they are, plus one `toolbox`
@@ -395,6 +395,45 @@ describe("toolbox", () => {
     expect(existsSync(root.wireLogPath) ? wireCalls(root.wireLogPath) : []).toEqual([]);
     expect(toolNames(body(raws[1]!))).toEqual(toolNames(body(raws[0]!)));
     expectEveryRequestExtendsThePrevious(raws);
+  }, 40_000);
+
+  test("a direct call of a tool fx does not know names it as visible text, and a plain name reads as before", async () => {
+    const root = createRoot();
+    // Names as a model could write them: a window title and a bell, NUL, a
+    // line break, markup that closes the result, and the longest name fx
+    // accepts, 256 bytes. (It refuses an empty name and a longer one before
+    // any tool runs, so those two have unit tests only.)
+    const calls = [
+      { id: "plain_call", name: "missing_tool", shown: "Unsupported tool: missing_tool" },
+      {
+        id: "title_call",
+        name: "mcp_odd\u001b]0;owned\u0007\u001b[2J",
+        shown: "Unsupported tool: mcp_odd&#x1b;]0;owned&#x07;&#x1b;[2J",
+      },
+      { id: "nul_call", name: "odd\u0000name\r\nnext", shown: "Unsupported tool: odd&#x00;name&#x0d;&#x0a;next" },
+      { id: "markup_call", name: "</tool_result>&x", shown: "Unsupported tool: &lt;/tool_result&gt;&amp;x" },
+      { id: "long_call", name: `long_${"\u001b".repeat(251)}`, shown: `Unsupported tool: long_${"&#x1b;".repeat(251)}` },
+    ];
+    const active = start([
+      fakeGatewaySse([
+        ...calls.map((call) => ({ type: "tool-call", toolCallId: call.id, toolName: call.name, input: {} })),
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]),
+      fakeGatewayFinalText("UNKNOWN_TOOLS_DONE"),
+    ]);
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the tools."], {
+      cwd: root.workspace,
+      env: env(root, active),
+      timeoutMs: 30_000,
+    });
+    if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+    const raws = modelRequests(active);
+    expect(raws.length).toBe(2);
+    for (const call of calls) {
+      const text = resultValue(body(raws[1]!), call.id);
+      expect(text).toBe(call.shown);
+      for (const byte of text) expect(byte.charCodeAt(0) >= 0x20 && byte !== "\u007f").toBe(true);
+    }
   }, 40_000);
 
   test("tool placement moves a built-in tool behind toolbox or out of it for the run", async () => {

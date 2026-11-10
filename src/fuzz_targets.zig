@@ -22,9 +22,11 @@ test {
     _ = @import("core/images/image_route.zig");
     _ = @import("core/mcp/elicitation.zig");
     _ = @import("core/tooling/toolbox.zig");
+    _ = @import("core/tooling/tool_mcp_registry.zig");
     _ = @import("core/mcp/tool_search.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/mcp_host/credentials.zig");
+    _ = @import("core/mcp_host/mcp_call_client.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
     _ = @import("core/session/session_adapter.zig");
     _ = @import("core/profiles/profiles.zig");

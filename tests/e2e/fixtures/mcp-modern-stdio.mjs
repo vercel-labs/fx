@@ -8,6 +8,10 @@ const pidPath = process.env.FX_MCP_PID_PATH;
 const resultText = "p".repeat(Number(process.env.FX_MCP_RESULT_PAD_BYTES ?? "0")) +
   (process.env.FX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT");
 const mode = process.env.FX_MCP_MODE ?? "normal";
+// FX_MCP_FAILURE_TEXT is a JSON string: the text a `tool_failure` error carries.
+const failureText = process.env.FX_MCP_FAILURE_TEXT === undefined
+  ? "Invalid input: labels require at least one item\nretry rejected"
+  : JSON.parse(process.env.FX_MCP_FAILURE_TEXT);
 const imagePath = process.env.FX_MCP_IMAGE_PATH;
 const crashMarkerPath = process.env.FX_MCP_CRASH_MARKER;
 const recoveryFailureMarkerPath = crashMarkerPath
@@ -616,7 +620,7 @@ function handle(message) {
           isError: true,
           content: [{
             type: "text",
-            text: "Invalid input: labels require at least one item\nretry rejected",
+            text: failureText,
           }],
         },
       });
