@@ -1434,14 +1434,48 @@ pub const Runtime = struct {
             debug_trace.eventf("mailbox", "wait_skipped", .{}, "agent={s} reason=quiet", .{self.ownerName()});
             return self.encodeManaged(alloc, .{ .ok = true, .result = "No subagent is working and no message is waiting, so nothing more will arrive. Continue, or end your turn." });
         }
+        // The ones it waits for, named in its result for its row.
+        var roster_arena = std.heap.ArenaAllocator.init(alloc);
+        defer roster_arena.deinit();
+        const waited_for = try self.roster(roster_arena.allocator(), true);
         debug_trace.eventf("mailbox", "wait_begin", .{}, "agent={s}", .{self.ownerName()});
         const wake = worker.waitForPostOrNudge();
         debug_trace.eventf("mailbox", "wait_end", .{}, "agent={s} reason={s}", .{ self.ownerName(), @tagName(wake) });
         return switch (wake) {
-            .posted => self.encodeManaged(alloc, .{ .ok = true, .result = "A report or message arrived. It follows this result." }),
-            .nudged => self.encodeManaged(alloc, .{ .ok = true, .result = "A subagent's turn ended without a report. Call status to see where things stand, or wait again." }),
+            .posted => self.encodeManaged(alloc, .{ .ok = true, .result = "A report or message arrived. It follows this result.", .subagents = waited_for }),
+            .nudged => self.encodeManaged(alloc, .{ .ok = true, .result = "A subagent's turn ended without a report. Call status to see where things stand, or wait again.", .subagents = waited_for }),
             .stopped => error.Cancelled,
         };
+    }
+
+    /// The names of this host's open subagents, or of those working when
+    /// `working_only`, joined with ", " in the order `status` lists them, for
+    /// the row of a call that concerns them all. Null when there are none.
+    /// Reads what `status` reads, under the same locks, so any thread may
+    /// call it. The caller owns the result.
+    pub fn rosterNames(self: *Runtime, alloc: Allocator, working_only: bool) !?[]u8 {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const names = try self.roster(arena.allocator(), working_only);
+        if (names.len == 0) return null;
+        return try std.mem.join(alloc, ", ", names);
+    }
+
+    /// The names `rosterNames` joins, allocated in `alloc`.
+    fn roster(self: *Runtime, alloc: Allocator, working_only: bool) ![]const []const u8 {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        const registry = try self.managed.state_store.load(alloc);
+        var names: std.ArrayList([]const u8) = .empty;
+        for (registry.children) |child| {
+            const name = child.agentName() orelse continue;
+            if (self.closingIndexLocked(child.id) != null) continue;
+            if (working_only and !self.isBusyLocked(child.id)) continue;
+            try names.append(alloc, name);
+        }
+        return names.items;
     }
 
     /// `status`: each subagent, or the one named, with what it is doing.
@@ -1451,6 +1485,9 @@ pub const Runtime = struct {
         const a = arena.allocator();
         var out: std.Io.Writer.Allocating = .init(a);
         var listed: usize = 0;
+        // The open subagents a status that names none reports on, named in
+        // its result for its row.
+        var open: std.ArrayList([]const u8) = .empty;
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         var lock = self.managed.state_store.acquireLock();
@@ -1460,6 +1497,7 @@ pub const Runtime = struct {
             const name = child.agentName() orelse continue;
             if (self.closingIndexLocked(child.id) != null) continue;
             if (agent) |wanted| if (!std.mem.eql(u8, wanted, name)) continue;
+            if (agent == null) try open.append(a, name);
             var waiting: usize = 0;
             for (self.pending.items) |item| {
                 if (std.mem.eql(u8, item.child_id, child.id)) waiting += 1;
@@ -1486,7 +1524,7 @@ pub const Runtime = struct {
         }
         if (agent != null and listed == 0) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_unavailable" });
         if (listed == 0) try out.writer.writeAll("No subagents yet.");
-        return self.encodeManaged(alloc, .{ .ok = true, .result = out.written() });
+        return self.encodeManaged(alloc, .{ .ok = true, .result = out.written(), .subagents = if (agent == null) open.items else null });
     }
 
     /// `stop`: ends the named child's running turn, which then owes no
@@ -2402,6 +2440,43 @@ test "a message to a busy subagent waits and runs as its next work, in order" {
     try std.testing.expectEqual(@as(usize, 0), runtime.work_calls.items.len);
 }
 
+test "the roster names the open subagents, and the working ones while they work" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    try std.testing.expect(try runtime.rosterNames(alloc, false) == null);
+    try std.testing.expect(try runtime.rosterNames(alloc, true) == null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "builder", .message = "first" } }, "call-2", null);
+    try waitForRuns(&fixture, 2);
+    {
+        const working = (try runtime.rosterNames(alloc, true)).?;
+        defer alloc.free(working);
+        try std.testing.expectEqualStrings("reviewer, builder", working);
+    }
+    // A status that names no agent lists the ones it reports on; one about
+    // a single subagent lists none.
+    const status_all = try callTool(runtime, arena, .{ .status = .{} }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, status_all, "\"subagents\":[\"reviewer\",\"builder\"]") != null);
+    const status_one = try callTool(runtime, arena, .{ .status = .{ .agent = "reviewer" } }, "call-4", null);
+    try std.testing.expect(std.mem.find(u8, status_one, "\"subagents\"") == null);
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+    try std.testing.expect(try runtime.rosterNames(alloc, true) == null);
+    const open = (try runtime.rosterNames(alloc, false)).?;
+    defer alloc.free(open);
+    try std.testing.expectEqualStrings("reviewer, builder", open);
+}
+
 test "a message past a busy subagent's full queue is refused to its sender" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -3117,6 +3192,7 @@ test "wait returns at once when nothing works, and when a report arrives" {
 
     const quiet = try callTool(runtime, arena, .wait, "call-1", &worker);
     try std.testing.expect(std.mem.find(u8, quiet, "nothing more will arrive") != null);
+    try std.testing.expect(std.mem.find(u8, quiet, "\"subagents\"") == null);
 
     _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-2", &worker);
     try waitForRuns(&fixture, 1);
@@ -3130,6 +3206,8 @@ test "wait returns at once when nothing works, and when a report arrives" {
     defer releaser.join();
     const woken = try callTool(runtime, arena, .wait, "call-3", &worker);
     try std.testing.expect(std.mem.find(u8, woken, "A report or message arrived") != null);
+    // It names the subagent that was working when it began.
+    try std.testing.expect(std.mem.find(u8, woken, "\"subagents\":[\"reviewer\"]") != null);
     try std.testing.expectEqual(@as(usize, 1), worker.queuedPromptCount());
     const queued = worker.takeQueuedPrompt(alloc).?;
     defer worker_runtime.freeQueuedPrompt(alloc, queued);

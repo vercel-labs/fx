@@ -205,7 +205,7 @@ fn onEvent(raw: *anyopaque, event: agent_stream_provider.Event) void {
             capture.failed = true;
         },
         .tool_started => capture.saw_tool_call = true,
-        .reasoning_delta, .tool_input_delta => {},
+        .reasoning_delta, .tool_input_delta, .tool_input_progress => {},
     }
 }
 
