@@ -1200,7 +1200,7 @@ pub fn Runtime(comptime App: type) type {
             out.print("• waiting on {d} subagent{s}", .{ count, if (count == 1) "" else "s" }) catch return .{};
             if (since_ms > 0) {
                 out.writeAll(" (") catch return .{};
-                activity_status.writeElapsed(&out, @divTrunc(now_ms - since_ms, 1000)) catch return .{};
+                activity_status.writeElapsed(&out, @divTrunc(now_ms - since_ms, activity_status.activity_clock_ms_per_second)) catch return .{};
                 out.writeByte(')') catch return .{};
             }
             out.print(" · {s} to view", .{switchKey(app)}) catch return .{};

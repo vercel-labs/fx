@@ -122,6 +122,9 @@ pub fn buildTurnLabel(buf: []u8, stream: StreamState, now_ms: i64) ?[]const u8 {
 }
 
 pub const activity_blink_half_period_ms: i64 = 500;
+/// One displayed second of an activity clock spans exactly one on/off blink
+/// period, so the marker relights when the seconds digit advances.
+pub const activity_clock_ms_per_second: i64 = 2 * activity_blink_half_period_ms;
 
 /// The instant the turn clock reads. While fx waits on user input the
 /// clock is frozen at the moment the wait began, so time spent on an approval
@@ -147,9 +150,7 @@ pub fn activityBlinkVisible(stream: StreamState, now_ms: i64) ?bool {
 
 fn appendTurnElapsedSuffix(writer: *std.Io.Writer, stream: StreamState, now_ms: i64) !void {
     if (stream.turn_started_ms <= 0 or now_ms < stream.turn_started_ms) return;
-    // One displayed second spans exactly one on/off blink period.
-    const ms_per_second = 2 * activity_blink_half_period_ms;
-    const seconds = @divTrunc(turnClockNow(stream, now_ms) - stream.turn_started_ms, ms_per_second);
+    const seconds = @divTrunc(turnClockNow(stream, now_ms) - stream.turn_started_ms, activity_clock_ms_per_second);
     try writer.writeAll(" (");
     try writeElapsed(writer, seconds);
     try writer.writeByte(')');
