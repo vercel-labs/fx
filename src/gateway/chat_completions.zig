@@ -84,6 +84,7 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
             .provider = &identity,
             .request_fields = request_fields,
             .effort_fields = level,
+            .include_reasoning = declares_efforts(metadata),
         }),
         .@"anthropic-messages" => anthropic_messages.build_request(alloc, request, .{
             .tool_choice_mode = definition.tool_choice_mode,
@@ -110,6 +111,14 @@ fn replay_projection(protocol: definitions.Protocol) *const fn (Allocator, ?type
         .@"openai-responses" => responses_protocol.selectReplayParts,
         .@"anthropic-messages" => anthropic_messages.project_replay,
     };
+}
+
+/// Whether the model's settings, its own or `model_defaults`, declare at
+/// least one effort level: the settings' word that the model reasons.
+fn declares_efforts(metadata: ?definitions.ModelMetadata) bool {
+    const known = metadata orelse return false;
+    const levels = known.reasoning_efforts orelse return false;
+    return levels.len != 0;
 }
 
 /// The request fields of the level `effort` names, when the model declares it.
@@ -335,7 +344,7 @@ fn build_review(raw: *anyopaque, alloc: Allocator, model: []const u8, _: []const
     const state: *Review = @ptrCast(@alignCast(raw));
     const expanded = try review_messages.expandPendingToolReviewMessages(alloc, messages, target_id, deadline, cancel);
     defer alloc.free(expanded);
-    const output_limit = if (state.definition.model(model)) |metadata| @min(metadata.max_output_tokens orelse 2048, 2048) else 2048;
+    const output_limit = if (state.definition.metadata_for(model)) |metadata| @min(metadata.max_output_tokens orelse 2048, 2048) else 2048;
     return build(@ptrCast(@constCast(state.definition)), alloc, .{ .model = model, .instructions = instructions, .messages = expanded, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{}, .max_output_tokens = output_limit });
 }
 fn ignore_event(_: *anyopaque, _: streams.Event) void {}

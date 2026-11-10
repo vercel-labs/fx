@@ -28,6 +28,10 @@ pub const Options = struct {
     /// is refused (`tests/tla/configured_provider/ConfiguredRequest.tla`
     /// EffortOnlyWhenDeclared).
     effort_fields: ?request_fragment.Fragment = null,
+    /// Ask for the reply's reasoning back encrypted. Only for a model whose
+    /// settings declare effort levels: OpenAI refuses the request for a model
+    /// that does not reason, and settings cannot take the field out.
+    include_reasoning: bool = false,
 };
 
 const max_event_bytes: usize = 1024 * 1024;
@@ -114,7 +118,7 @@ pub fn build_request(alloc: Allocator, request: stream_provider.RequestData, opt
     }
     // With nothing stored, a reasoning model's reasoning travels back
     // encrypted, so a later turn can send it again.
-    try writer.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
+    if (options.include_reasoning) try writer.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
     if (request.response_format) |format| {
         try writer.writeAll(",\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":");
         try std.json.Stringify.value(format.name, .{}, writer);
@@ -256,6 +260,20 @@ test "configured responses body has fx's fields, then the model's, with a declar
     defer plain_parsed.deinit();
     try std.testing.expect(plain_parsed.value.object.get("reasoning") == null);
     try std.testing.expectEqual(@as(f64, 0.2), plain_parsed.value.object.get("temperature").?.float);
+}
+
+test "configured responses asks for encrypted reasoning only for a model that reasons" {
+    const alloc = std.testing.allocator;
+    const provider = test_provider();
+    for ([_]bool{ false, true }) |reasons| {
+        const body = try build_request(alloc, test_request(), .{ .provider = &provider, .include_reasoning = reasons });
+        defer alloc.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        const include = parsed.value.object.get("include");
+        try std.testing.expectEqual(reasons, include != null);
+        if (include) |list| try std.testing.expectEqualStrings("reasoning.encrypted_content", list.array.items[0].string);
+    }
 }
 
 test "configured responses refuses what the connection cannot send" {

@@ -1323,3 +1323,59 @@ describe("custom connection limits", () => {
     } finally { f.close(); }
   }, 45000);
 });
+
+// OpenAI's Responses API answers 400 when a request asks for encrypted
+// reasoning from a model that does not reason, and `include` is a field fx
+// owns, so settings cannot take it out.
+describe("custom connection on openai-responses: encrypted reasoning", () => {
+  const high = { high: { reasoning: { effort: "high" } } };
+  test.each([
+    { name: "a model without effort levels", levels: undefined, defaults: undefined, include: false },
+    { name: "a model whose effort levels are an empty list", levels: {}, defaults: undefined, include: false },
+    { name: "a model with effort levels", levels: high, defaults: undefined, include: true },
+    { name: "a model that takes its effort levels from model_defaults", levels: undefined, defaults: { reasoning_efforts: high }, include: true },
+  ])("a Responses request asks for encrypted reasoning only when the model declares effort levels: $name", async ({ levels, defaults, include }) => {
+    const f = fixture(undefined, {
+      [responsesFake.path]: body => body.include !== undefined && !include
+        ? new Response(JSON.stringify({ error: { message: "Encrypted content is not supported with this model.", type: "invalid_request_error", param: "include", code: null } }), { status: 400, headers: { "content-type": "application/json" } })
+        : responsesFake.completion(body.model),
+    });
+    try {
+      connection(f).protocol = "openai-responses";
+      if (levels !== undefined) metadata(f).reasoning_efforts = levels;
+      if (defaults !== undefined) connection(f).model_defaults = defaults;
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const sent = f.requests.filter(request => request.path === responsesFake.path);
+      expect(sent.length).toBe(1);
+      expect(sent[0].body.include).toEqual(include ? ["reasoning.encrypted_content"] : undefined);
+    } finally { f.close(); }
+  }, 25000);
+});
+
+describe("automatic permission review on a custom connection", () => {
+  test.each([
+    { name: "a review model the settings do not declare", declared: undefined, defaults: { max_output_tokens: 300 }, limit: 300 },
+    { name: "a declared review model without its own limit", declared: { context_window: 262144 }, defaults: { max_output_tokens: 300 }, limit: 300 },
+    { name: "a default above the review's own cap", declared: undefined, defaults: { max_output_tokens: 4096 }, limit: 2048 },
+  ])("the review takes its output limit from the model defaults: $name", async ({ declared, defaults, limit }) => {
+    const f = fixture(body => {
+      if (body.tools?.some((tool: any) => tool.function?.name === "permission_decision")) return toolCompletion(body.model, "permission_decision", { decision: "clear", rationale: "fixture review" });
+      if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "done");
+      return toolCompletion(body.model, "shell", { request: { action: "run", command: "python3 -c 'print(42)'" } });
+    });
+    try {
+      f.settings.permission_mode = "auto";
+      connection(f).reviewer_model = "review-model";
+      connection(f).model_defaults = defaults;
+      if (declared !== undefined) (connection(f).model_metadata as any)["review-model"] = declared;
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "Run the Python snippet"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const review = f.requests.find(request => request.body?.tools?.some((tool: any) => tool.function?.name === "permission_decision"));
+      expect(review?.body.model).toBe("review-model");
+      expect(review?.body.max_tokens).toBe(limit);
+    } finally { f.close(); }
+  }, 35000);
+});
