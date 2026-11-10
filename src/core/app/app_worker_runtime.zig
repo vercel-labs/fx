@@ -1009,6 +1009,8 @@ pub fn Runtime(comptime App: type) type {
                 .turn_thinking => |thinking| if (thinking.tone != .thinking) return false,
                 .none, .tool_slot => {},
             }
+            // Counting walks every subagent, so wait until a frame is due.
+            if (!app.shell.render_requests.animationDue(now_ms)) return false;
             if (app.subagentWaitCount() == 0) return false;
             return app.shell.render_requests.requestAnimationDue(now_ms);
         }
