@@ -31,6 +31,7 @@ const subagent_child_state = @import("../subagent/child_state.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const io_mod = @import("../shared/io.zig");
+const activity_status = @import("../output/activity_status.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const types = @import("../shared/types.zig");
@@ -449,6 +450,13 @@ pub fn appOf(comptime App: type, agent: *@FieldType(App, "main_agent")) *App {
     }
     return @alignCast(@fieldParentPtr("main_agent", agent));
 }
+
+/// The "waiting on N subagents" activity row and when its clock started, 0
+/// without one. The label borrows `App.instances` until the next call.
+pub const SubagentWait = struct {
+    label: []const u8 = "",
+    since_ms: i64 = 0,
+};
 
 /// One hosted agent as the switch order sees it: an instance, or a subagent
 /// in the tree of instance `root`, where 0 is the first instance and k the
@@ -1161,6 +1169,42 @@ pub fn Runtime(comptime App: type) type {
             }
             if (count == 0) return "";
             return std.mem.print(buf, "{d} subagent{s} working", .{ count, if (count == 1) "" else "s" }) catch "";
+        }
+
+        /// How many of the agent on screen's own subagents have a turn going
+        /// while its own turn has ended; 0 while it has a turn of its own.
+        pub fn subagentWaitCount(app: *App) usize {
+            const screen = agents.screenAgentOf(app);
+            if (turnInFlight(screen)) return 0;
+            var count: usize = 0;
+            for (app.child_agents.items) |child| {
+                if (child.agent.role != .subagent) continue;
+                if (ownerOf(app, hostOf(app, child)) != screen) continue;
+                if (turnInFlight(&child.agent)) count += 1;
+            }
+            return count;
+        }
+
+        /// The activity row for an agent on screen whose turn ended while its
+        /// own subagents still work, such as "• waiting on 3 subagents (12s)
+        /// · ↓ to view", so an idle parent does not look stopped. The clock
+        /// counts from the agent's last reply. Empty label otherwise.
+        pub fn subagentWaitStatus(app: *App) SubagentWait {
+            const count = subagentWaitCount(app);
+            if (count == 0) return .{};
+            const screen = agents.screenAgentOf(app);
+            const now_ms = io_mod.milliTimestamp();
+            const replied_at = latestReplyAt(screen.session.agent.history.items);
+            const since_ms: i64 = if (replied_at > 0 and replied_at <= now_ms) replied_at else 0;
+            var out: std.Io.Writer = .fixed(&app.instances.subagent_wait_buf);
+            out.print("• waiting on {d} subagent{s}", .{ count, if (count == 1) "" else "s" }) catch return .{};
+            if (since_ms > 0) {
+                out.writeAll(" (") catch return .{};
+                activity_status.writeElapsed(&out, @divTrunc(now_ms - since_ms, 1000)) catch return .{};
+                out.writeByte(')') catch return .{};
+            }
+            out.print(" · {s} to view", .{switchKey(app)}) catch return .{};
+            return .{ .label = out.buffered(), .since_ms = since_ms };
         }
 
         /// The footer note for hidden instances whose turns ended since they

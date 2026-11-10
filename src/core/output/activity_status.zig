@@ -158,7 +158,7 @@ fn appendTurnElapsedSuffix(writer: *std.Io.Writer, stream: StreamState, now_ms: 
 /// Formats an elapsed duration as `1h2m3s`, dropping leading units that are
 /// zero so short turns stay `5s` while long ones read `18m0s` instead of a
 /// wall of seconds.
-fn writeElapsed(writer: *std.Io.Writer, seconds: i64) !void {
+pub fn writeElapsed(writer: *std.Io.Writer, seconds: i64) !void {
     const secs = @mod(seconds, 60);
     const total_minutes = @divTrunc(seconds, 60);
     const mins = @mod(total_minutes, 60);

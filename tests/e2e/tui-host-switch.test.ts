@@ -1654,8 +1654,18 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER plan it");
         await session.waitForText("LIST_MAIN_WAITING", 30_000);
         await until("the reviewer's turn", () => childCalls >= 1);
-        // Main shows that work goes on elsewhere, beside the list's key.
-        await session.waitForText("1 subagent working \u00b7 main \u2193", 15_000);
+        // Idle main says it waits on its subagent above the composer, with
+        // a running clock and the list's key, and the footer still counts
+        // the subagents working beside the list's key.
+        const waitRow = /\u2022 waiting on 1 subagent \((\d+)s\) \u00b7 \u2193 to view/;
+        const waiting = await session.waitForPane((pane) => waitRow.test(pane) && pane.includes("1 subagent working \u00b7 main \u2193"), 15_000);
+        expect(waiting).toContain("1 subagent working \u00b7 main \u2193");
+        // The clock advances, and the bullet blinks: it turns into a space
+        // and back.
+        const firstSeconds = Number(waitRow.exec(waiting)![1]);
+        await session.waitForPane((pane) => Number(waitRow.exec(pane)?.[1] ?? firstSeconds) > firstSeconds, 5_000);
+        await session.waitForPane((pane) => /^\s*waiting on 1 subagent \(\d+s\) \u00b7 \u2193 to view/m.test(pane), 5_000);
+        await session.waitForPane((pane) => waitRow.test(pane), 5_000);
         await session.sendKeys("Down");
         // The reviewer's title is the title model's, from its task, as main's is.
         const list = await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}working {2,}main {2,}\S/m.test(pane), 15_000);
@@ -1667,7 +1677,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(list).not.toContain("delete close");
         await session.sendKeys("Escape");
         reviewer.release();
-        await session.waitForPane((pane) => !pane.includes("subagent working"), 30_000);
+        await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), 30_000);
       }, () => {}, false, {}, subagentTitles);
     },
     TIMEOUT,
@@ -1702,7 +1712,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.sendText("SWITCH_USER start both workers");
           await session.waitForText("ORDER_MAIN_IDLE", 30_000);
           await until("both workers' requests", () => started.reviewer && started.tester);
-          await session.waitForText("2 subagents working", 15_000);
+          await session.waitForPane((pane) => /\u2022 waiting on 2 subagents \(\d+s\) \u00b7 \u2193 to view/.test(pane), 15_000);
           await session.sendKeys("Down");
           const initial = await session.waitForPane((pane) =>
             subagentRow("reviewer", "working").test(pane)

@@ -733,6 +733,10 @@ pub fn Runtime(comptime App: type) type {
                 app.hiddenAgentWaitingNote(waiting_note_buf)
             else
                 "";
+            const subagent_wait = if (comptime @hasDecl(App, "subagentWaitStatus"))
+                app.subagentWaitStatus()
+            else
+                @import("app_agents_runtime.zig").SubagentWait{};
             // Shares the buffer: the footer shows it only without a waiting note.
             const working_note: []const u8 = if (comptime @hasDecl(App, "hiddenAgentWorkingNote"))
                 (if (waiting_note.len == 0) app.hiddenAgentWorkingNote(waiting_note_buf) else "")
@@ -868,6 +872,8 @@ pub fn Runtime(comptime App: type) type {
                 .agent_label = if (comptime @hasDecl(App, "footerAgentLabel")) app.footerAgentLabel() else "",
                 .waiting_note = waiting_note,
                 .working_note = working_note,
+                .subagent_wait = subagent_wait.label,
+                .subagent_wait_since_ms = subagent_wait.since_ms,
                 .mcp_status = if (comptime @hasField(App, "mcp")) app.mcp.hostStatusText() else "",
                 .danger_status = if (yolo_warning_active)
                     app_permission_runtime.yolo_warning_text

@@ -3530,6 +3530,16 @@ const App = struct {
         return AgentsAppRuntime.workingNote(self, buf);
     }
 
+    /// The activity row while the agent on screen waits on its subagents.
+    pub fn subagentWaitStatus(self: *App) app_agents_runtime.SubagentWait {
+        return AgentsAppRuntime.subagentWaitStatus(self);
+    }
+
+    /// How many subagents the agent on screen waits on while idle.
+    pub fn subagentWaitCount(self: *App) usize {
+        return AgentsAppRuntime.subagentWaitCount(self);
+    }
+
     /// Handles the events and paced text of the agent in context.
     fn tickAgentInContext(_: void, self: *App, agent: *agents.Agent) anyerror!void {
         // An agent's session can start while another's transcript is on
