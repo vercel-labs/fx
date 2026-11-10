@@ -858,17 +858,21 @@ pub fn finishEndFacts(data: ?[]const u8) EndFacts {
     return endFactsOf(wire.by, wire.cause);
 }
 
-/// Pure: whether a fork can take a copy of folded child `entry`: every
-/// child not closed for good (D97).
+/// Pure: whether a fork can take a copy of folded child `entry` (D97):
+/// every child but one closed for good, or one whose newest work was lost,
+/// which had no log there to copy (D33).
 pub fn copyableAtFork(entry: session_adapter.Child) bool {
+    if (!entry.open and entry.outcome == .lost) return false;
     return !foldedClosed(entry);
 }
 
 /// Pure: how a fork registers its copy of folded child `entry` (D97): one
 /// finished work item under its newest work id and spawn data. Work still
-/// open at the fork point reads as cancelled, as the copy's log ends it,
-/// and the copy owes no report, so the fork never wakes for work its
-/// source ran. Borrows `entry`; the finish data is in `arena`.
+/// open at the fork point reads as cancelled, as the copy's log ends it.
+/// The data says the copy owes no report, so the fork never wakes for work
+/// its source ran, even for an interrupted work, which a finish without fx
+/// data would owe (`reports.PendingFold`). Borrows `entry`; the finish data
+/// is in `arena`.
 pub fn forkCopy(arena: Allocator, entry: session_adapter.Child) !session_adapter.Session.ChildCopy {
     const outcome: session_adapter.ChildOutcome = if (entry.open) .cancelled else entry.outcome orelse .cancelled;
     var failure: ?[]const u8 = null;
@@ -877,12 +881,14 @@ pub fn forkCopy(arena: Allocator, entry: session_adapter.Child) !session_adapter
         const finish = json_decode.parseFromSliceLeaky(FinishData, arena, raw, options) catch FinishData{};
         failure = finish.failure;
     };
+    var data: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(FinishData{ .failure = failure, .report = false }, .{ .emit_null_optional_fields = false }, &data.writer);
     return .{
         .id = entry.id,
         .work_id = entry.work_id,
         .outcome = outcome,
         .spawn_data = entry.spawn_data,
-        .finish_data = try finishData(arena, failure, false, .{}),
+        .finish_data = data.written(),
     };
 }
 
@@ -941,20 +947,28 @@ test "a fork's copy of a child owes no report, keeps a failure, and ends open wo
     try std.testing.expectEqual(session_adapter.ChildOutcome.ok, copy.outcome);
     try std.testing.expectEqualStrings(spawn, copy.spawn_data.?);
     // A report the source owes stays the source's.
-    try std.testing.expectEqual(@as(?[]const u8, null), copy.finish_data);
+    try std.testing.expectEqualStrings("{\"report\":false}", copy.finish_data.?);
+    try std.testing.expectEqual(@as(?bool, false), finishOwesFlag(copy.finish_data));
 
     entry.outcome = .failed;
     entry.finish_data = @constCast("{\"failure\":\"model refused\",\"report\":true}");
     copy = try forkCopy(arena, entry);
-    try std.testing.expectEqualStrings("{\"failure\":\"model refused\"}", copy.finish_data.?);
+    try std.testing.expectEqualStrings("{\"failure\":\"model refused\",\"report\":false}", copy.finish_data.?);
+
+    // An interrupted work owes nothing in the fork either, though a finish
+    // with no fx data would read as crash repair, which owes a report.
+    entry.outcome = .interrupted;
+    entry.finish_data = null;
+    copy = try forkCopy(arena, entry);
+    try std.testing.expectEqual(session_adapter.ChildOutcome.interrupted, copy.outcome);
+    try std.testing.expectEqual(@as(?bool, false), finishOwesFlag(copy.finish_data));
 
     // Work still open at the fork point ends in the copy's log, as cancelled.
     entry.open = true;
     entry.outcome = null;
-    entry.finish_data = null;
     copy = try forkCopy(arena, entry);
     try std.testing.expectEqual(session_adapter.ChildOutcome.cancelled, copy.outcome);
-    try std.testing.expectEqual(@as(?[]const u8, null), copy.finish_data);
+    try std.testing.expectEqualStrings("{\"report\":false}", copy.finish_data.?);
 }
 
 test "a fork offers every child but one closed for good (D97)" {
@@ -973,6 +987,11 @@ test "a fork offers every child but one closed for good (D97)" {
     // A child whose work runs is open, never closed.
     entry.open = true;
     try std.testing.expect(copyableAtFork(entry));
+    // One whose newest work was lost had no log to copy.
+    entry.open = false;
+    entry.outcome = .lost;
+    entry.finish_data = null;
+    try std.testing.expect(!copyableAtFork(entry));
 }
 
 test "a spawn saves who started a work its parent didn't" {

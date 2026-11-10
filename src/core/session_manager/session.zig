@@ -1748,8 +1748,9 @@ pub fn openFork(env: *const Env, options: ForkOptions) ForkError!*Session {
 /// (D97, `tests/tla/session_manager/ForkChildren.tla`). Every copy is on
 /// disk before the fork, and the fork's first batch registers them all, so
 /// the fork never names a copy that is not there (RegisteredExist) and has
-/// all or none of them (AllOrNone). A failure deletes the copies it made;
-/// only a crash can leave a copy no session names, which nothing lists.
+/// all or none of them (AllOrNone). A failure before the fork is published
+/// deletes the copies it made; only a crash can leave a copy no session
+/// names, which nothing lists.
 pub fn openForkWithChildren(env: *const Env, options: ForkOptions, children: []const ChildCopy) ForkError!Forked {
     const s = env.s;
     const gpa = env.gpa;
@@ -1777,7 +1778,14 @@ pub fn openForkWithChildren(env: *const Env, options: ForkOptions, children: []c
     const copies = try gpa.alloc(*Session, children.len);
     var made: usize = 0;
     errdefer {
-        for (copies[0..made]) |copy| discardCopy(env, copy);
+        // A fork whose folder was published names its copies, so they stay.
+        const published = if (s.stat(env.root, session.identity.id)) |_| true else |_| false;
+        for (copies[0..made]) |copy| {
+            if (published) {
+                copy.close() catch {};
+                copy.destroy();
+            } else discardCopy(env, copy);
+        }
         gpa.free(copies);
     }
     for (children) |child| {

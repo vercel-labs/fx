@@ -1798,7 +1798,8 @@ cached prompt prefix):
   - **Fork:** when the session had subagents at the chosen prompt, the
     menu asks once, `Bring N subagents into the fork?`: Enter or `y`
     forks with a copy of each, `n` or Esc without. A subagent made after
-    that prompt is not offered, nor one closed for good. Each copy is a
+    that prompt is not offered, nor one closed for good, nor one whose
+    newest work there was lost, which had no log to copy (D33). Each copy is a
     new child session of the fork whose lines are the child's own up to
     the fork point, byte for byte, and the fork's first batch registers
     each copy as one finished work item with the child's spawn data
@@ -1806,9 +1807,11 @@ cached prompt prefix):
     the fork point). A child's turn can hold many work items, so its cut
     is the time of the fork point's line, not a turn: a turn open there
     ends in the copy as cancelled, as Esc ends one, and so does the copy's
-    registration. A copy owes no report. Every copy is on disk before the
+    registration. A copy's finish says it owes no report, so not even an
+    interrupted work wakes the fork. Every copy is on disk before the
     fork, so the fork never names a copy that is missing and has all of
-    them or none. A failure deletes the copies it made; a crash between
+    them or none. A failure before the fork is published deletes the
+    copies it made; a crash between
     the copies and the fork can leave a copy no session names, which
     nothing lists. That copy is not a spawned child of any session, so it
     is outside `Subagents.tla`'s `NoOrphanChild`; writing the fork first
