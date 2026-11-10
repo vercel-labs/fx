@@ -28,6 +28,13 @@ const catalogDelayMs = Math.max(
   Number(process.env.FX_MCP_CATALOG_DELAY_MS ?? "0") || 0,
 );
 const compactField = process.env.FX_MCP_COMPACT_FIELD ? JSON.parse(process.env.FX_MCP_COMPACT_FIELD) : null;
+// FX_MCP_CALL_DELAY_MS holds each tools/call that long before answering it,
+// so a test with a short operation_timeout_ms can land just before or just
+// after the deadline. FX_MCP_CATALOG_DELAY_MS does the same for discovery.
+const callDelayMs = Math.max(
+  0,
+  Number(process.env.FX_MCP_CALL_DELAY_MS ?? "0") || 0,
+);
 const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/connect";
 const collidingChoices = [
   { const: "Skip", title: "Skip" },
@@ -876,6 +883,12 @@ process.stdin.on("data", (chunk) => {
     if (lineEnd < 0) return;
     const line = buffer.subarray(0, lineEnd).toString("utf8").replace(/\r+$/, "");
     buffer = buffer.subarray(lineEnd + 1);
-    if (line.length > 0) handle(JSON.parse(line));
+    if (line.length === 0) continue;
+    const message = JSON.parse(line);
+    if (callDelayMs > 0 && message.method === "tools/call") {
+      setTimeout(() => handle(message), callDelayMs);
+    } else {
+      handle(message);
+    }
   }
 });

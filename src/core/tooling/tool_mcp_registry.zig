@@ -2,6 +2,7 @@ const std = @import("std");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const result_store = @import("../session/result_store.zig");
+const model_context_encoding = @import("../shared/model_context_encoding.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -45,7 +46,7 @@ fn dynamicTool(name: []const u8) tool_dispatch.Tool {
             .name = name,
             .description = "Selected dynamic MCP tool.",
         },
-        .executor_kind = .mcp_select_tool,
+        .executor_kind = .mcp_tool,
         .activity_kind = .command,
         .decode = decode,
         .call = call,
@@ -112,13 +113,19 @@ fn resultBytes(ctx: tool_dispatch.DispatchContext) usize {
     return ctx.max_tool_result_bytes;
 }
 
+/// What a call of an MCP tool fx can't run says. A toolbox run (`carried_by`
+/// is set) was admitted, so its tool went away since, and its result says so
+/// in toolbox's words, with the model's name as visible text. A direct call
+/// gets the generic text.
+pub fn unsupportedOutput(alloc: Allocator, name: []const u8, carried_by: ?[]const u8) Allocator.Error![]u8 {
+    if (carried_by != null) return alloc.print("{f} is no longer available. Use toolbox search to find current tools.", .{model_context_encoding.scalar(name)});
+    return alloc.print("Unsupported tool: {s}", .{name});
+}
+
 fn unsupported(
     ctx: tool_dispatch.DispatchContext,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    return .{ .failure = try ctx.allocator.print(
-        "Unsupported tool: {s}",
-        .{ctx.tool_call_name},
-    ) };
+    return .{ .failure = try unsupportedOutput(ctx.allocator, ctx.tool_call_name, ctx.tool_call_carried_by) };
 }
 
 fn readsOnly(_: tool_dispatch.ToolInput) bool {

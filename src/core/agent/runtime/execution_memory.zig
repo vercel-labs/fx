@@ -411,9 +411,9 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
         }
         if (isContextNote(message)) {
             // fx places a note only at a step boundary, so the steps before
-            // it are complete (D93). A note may save a shorter text than it
-            // sends (D95).
-            const copy = try alloc.dupe(u8, message.context_note_saved_text orelse message.content orelse "");
+            // it are complete (D93). A note saves the text it sent, so later
+            // turns send it unchanged (D95).
+            const copy = try alloc.dupe(u8, message.content orelse "");
             errdefer alloc.free(copy);
             const sources = try types.dupeNoteSources(alloc, message.context_note_sources);
             context_notes.append(alloc, .{ .text = copy, .after_tool_step_count = tool_step_count, .sources = sources }) catch |err| {
@@ -2222,7 +2222,6 @@ test "saved inline read retains full file evidence with its external copy" {
 }
 
 test "common execution memory does not mark stored read previews as full" {
-    const session_runtime = @import("../../session/session.zig");
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -2283,10 +2282,6 @@ test "common execution memory does not mark stored read previews as full" {
     try std.testing.expect(execution.tool_steps[0].tool_results[0].truncated);
     try std.testing.expectEqual(@as(usize, 1), execution.files.len);
     try std.testing.expect(!execution.files[0].model_view_covers_full_file);
-
-    const replay = try session_runtime.formatExecutionFileContext(alloc, execution.files);
-    defer alloc.free(replay);
-    try std.testing.expect(std.mem.find(u8, replay, "model_view=full") == null);
 }
 
 test "execution memory persists secret argument values verbatim" {

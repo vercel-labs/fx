@@ -24,6 +24,21 @@ pub fn setIo(zio: std.Io) void {
     real_io = process_io_for(builtin.target.os.tag, zio);
 }
 
+/// Tests only: `getIo` returns `zio`, as given, until `restoreIoForTest`
+/// puts the returned value back. Unlike `setIo`, it skips the Darwin
+/// process selection, so `zio` must come from `getIo` to keep it.
+pub fn replaceIoForTest(zio: std.Io) ?std.Io {
+    comptime std.debug.assert(builtin.is_test);
+    const previous = real_io;
+    real_io = zio;
+    return previous;
+}
+
+pub fn restoreIoForTest(previous: ?std.Io) void {
+    comptime std.debug.assert(builtin.is_test);
+    real_io = previous;
+}
+
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
     return if (os_tag == .macos) darwin_process_spawn.wrap(zio) else zio;
 }

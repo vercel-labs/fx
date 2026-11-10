@@ -14,6 +14,7 @@ const agent_frame = @import("../shared/agent_frame.zig");
 const live_metrics = @import("live_metrics.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const model_contract = @import("model_contract.zig");
+const start_test_controls = @import("start_test_controls.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -28,6 +29,7 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const session_store = @import("../session/session_store.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const toolbox_core = @import("../tooling/toolbox.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -207,6 +209,10 @@ pub const Runtime = struct {
     closed_unseen: std.ArrayList([]u8) = .empty,
     /// Whether `closed_unseen` holds a child, read without the lock.
     closed_waiting: std.atomic.Value(bool) = .init(false),
+    /// Messages waiting for a starting work's turn to begin. A close of
+    /// their child marks them, so the message is refused instead of
+    /// outliving the close. Guarded by `admission_mutex`.
+    start_waits: std.ArrayList(*StartWait) = .empty,
     waiter_mutex: std.Io.Mutex = .init,
     /// The owner's worker while it waits in `wait`.
     waiter: ?*worker_runtime.WorkerRuntime = null,
@@ -281,6 +287,7 @@ pub const Runtime = struct {
         self.closing.deinit(self.alloc);
         for (self.closed_unseen.items) |id| self.alloc.free(id);
         self.closed_unseen.deinit(self.alloc);
+        self.start_waits.deinit(self.alloc);
         self.approvals.deinit();
         if (self.profile_cache) |*cache| cache.deinit();
         self.alloc.free(self.root_id);
@@ -530,76 +537,131 @@ pub const Runtime = struct {
         var admission_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer admission_arena.deinit();
         const admission_alloc = admission_arena.allocator();
-        var admitted = try self.admitAndStartManagedWork(admission_alloc, request.*, operation_id, profiled, resolved_model);
-        defer admitted.deinit(admission_alloc);
         const agent = request.message.agent;
-        switch (admitted) {
-            .feedback => |target| {
-                const delivery = steer: {
-                    self.admission_mutex.lockUncancelable(io_mod.getIo());
-                    defer self.admission_mutex.unlock(io_mod.getIo());
-                    // Older messages for this child wait their turn; a new one
-                    // never joins the running turn past them. A turn the user
-                    // started has no slot to join, so they wait for it too.
-                    if (!self.hasPendingLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) {
-                        const result = try self.managed.steer(target.child_id, target.work_id, operation_id, fingerprint, request.message.message);
-                        switch (result) {
-                            .receipt => |delivery| break :steer delivery,
-                            .waiting => {},
-                            .capacity => {
-                                var buf: [sent_result_bytes]u8 = undefined;
-                                return self.encodeManaged(alloc, .{ .ok = false, .error_code = "feedback_capacity", .result = capacityResult(&buf, agent) });
-                            },
-                            .unavailable, .cancelled, .conflict => return self.encodeManaged(alloc, .{
-                                .ok = false,
-                                .error_code = switch (result) {
-                                    .unavailable => "state_unavailable",
-                                    .cancelled => "child_cancelled",
-                                    .conflict => "operation_conflict",
-                                    else => unreachable,
+        // A second pass runs only when the child went idle while this
+        // message waited for the admission lock (the `.feedback` arm).
+        admit: for (0..2) |pass| {
+            var admitted = try self.admitAndStartManagedWork(admission_alloc, request.*, operation_id, profiled, resolved_model);
+            defer admitted.deinit(admission_alloc);
+            switch (admitted) {
+                .feedback => |target| {
+                    const delivery = steer: {
+                        self.admission_mutex.lockUncancelable(io_mod.getIo());
+                        defer self.admission_mutex.unlock(io_mod.getIo());
+                        // Older messages for this child wait their turn; a new one
+                        // never joins the running turn past them. A turn the user
+                        // started has no slot to join, so they wait for it too.
+                        // A child being closed takes no next turn, and what
+                        // waits for it goes with the close, so it refuses the
+                        // message as admission does
+                        // (`tests/tla/subagent/StopMessage.tla`
+                        // RefusedOnlyWhenClosing).
+                        if (self.closingIndexLocked(target.child_id) != null) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_closing" });
+                        var turned_away = false;
+                        if (!self.hasPendingLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) {
+                            var result = try self.managed.steer(target.child_id, target.work_id, operation_id, fingerprint, request.message.message);
+                            // The work main started has not begun its turn: wait
+                            // for it with the lock released, so other calls and
+                            // ends go on, then send the message into that turn
+                            // (`tests/tla/subagent/StopMessage.tla`
+                            // JoinsStartingWork). Only a stuck start reaches the
+                            // limit, which leaves the message for the next turn.
+                            if (result == .starting) {
+                                var start_wait: StartWait = .{ .child_id = target.child_id };
+                                try self.start_waits.append(self.alloc, &start_wait);
+                                defer self.removeStartWaitLocked(&start_wait);
+                                debug_trace.eventf("mailbox", "message_waits_start", .{}, "child={s} work_id={s}", .{ target.child_id, target.work_id });
+                                const limit_ms = start_test_controls.waitLimitMs();
+                                const deadline = io_mod.milliTimestamp() +| @as(i64, @intCast(@min(limit_ms, std.math.maxInt(i64))));
+                                while (result == .starting) {
+                                    if (io_mod.milliTimestamp() >= deadline) {
+                                        debug_trace.eventf("mailbox", "message_start_wait_expired", .{}, "child={s} work_id={s} limit_ms={d}", .{ target.child_id, target.work_id, limit_ms });
+                                        result = .waiting;
+                                        break;
+                                    }
+                                    self.admission_mutex.unlock(io_mod.getIo());
+                                    io_mod.sleep(start_wait_poll_ns);
+                                    self.admission_mutex.lockUncancelable(io_mod.getIo());
+                                    // Main's turn was cancelled, or fx is quitting.
+                                    if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
+                                    // The child may have been closed, or a message may
+                                    // have queued for it, while the lock was free.
+                                    if (start_wait.closed or self.closingIndexLocked(target.child_id) != null) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_closing" });
+                                    if (self.hasPendingLocked(target.child_id) or self.inTurnWorkLocked(target.child_id)) {
+                                        result = .waiting;
+                                        break;
+                                    }
+                                    result = try self.managed.steer(target.child_id, target.work_id, operation_id, fingerprint, request.message.message);
+                                }
+                            }
+                            switch (result) {
+                                .receipt => |delivery| break :steer delivery,
+                                // An ended work, or one a stop is ending, takes the
+                                // message as its next turn: the stop told the
+                                // parent the turn ended. A start past the limit
+                                // does the same.
+                                .waiting, .stopping, .starting => turned_away = true,
+                                .capacity => {
+                                    var buf: [sent_result_bytes]u8 = undefined;
+                                    return self.encodeManaged(alloc, .{ .ok = false, .error_code = "feedback_capacity", .result = capacityResult(&buf, agent) });
                                 },
-                            }),
+                                .unavailable, .cancelled, .conflict => return self.encodeManaged(alloc, .{
+                                    .ok = false,
+                                    .error_code = switch (result) {
+                                        .unavailable => "state_unavailable",
+                                        .cancelled => "child_cancelled",
+                                        .conflict => "operation_conflict",
+                                        else => unreachable,
+                                    },
+                                }),
+                            }
                         }
-                    }
-                    // It waits, and starts the child's next turn.
-                    self.queuePendingLocked(target.child_id, agent, operation_id, fingerprint, request.*, profiled, resolved_model) catch |err| {
-                        if (err == error.QueueFull) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "queue_full" });
-                        return err;
+                        // The work ended while this message waited for the lock,
+                        // and nothing keeps the child busy any more: admit the
+                        // message again, so it starts a work rather than waiting
+                        // for a turn no end will start.
+                        if (turned_away and pass == 0 and !self.isBusyLocked(target.child_id) and !self.inTurnWorkLocked(target.child_id)) continue :admit;
+                        // It waits, and starts the child's next turn.
+                        self.queuePendingLocked(target.child_id, agent, operation_id, fingerprint, request.*, profiled, resolved_model) catch |err| {
+                            if (err == error.QueueFull) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "queue_full" });
+                            return err;
+                        };
+                        keep_call = true;
+                        if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = target.child_id, .work_id = operation_id, .phase = .dispatched } });
+                        var buf: [sent_result_bytes]u8 = undefined;
+                        return self.encodeManaged(alloc, .{ .ok = true, .result = queuedResult(&buf, agent) });
                     };
+                    debug_trace.eventf("mailbox", "message", .{}, "child={s} work_id={s} delivery=joined receipt={s} operation={s}", .{ target.child_id, target.work_id, @tagName(delivery), operation_id });
+                    if (options.observer) |observer| observer.emit(.{ .delegation = .{
+                        .call_id = options.invocation_id,
+                        .child_id = target.child_id,
+                        .work_id = target.work_id,
+                        .operation_id = operation_id,
+                        .phase = switch (delivery) {
+                            .queued => .feedback_queued,
+                            .applied => .feedback_applied,
+                            .not_applied => .feedback_not_applied,
+                        },
+                    } });
+                    return self.encodeManaged(alloc, model_contract.feedbackResult(delivery));
+                },
+                .rejected => |failure| return self.encodeManaged(alloc, .{
+                    .ok = false,
+                    .error_code = failure.code,
+                }),
+                .ready => |ready| {
                     keep_call = true;
-                    if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = target.child_id, .work_id = operation_id, .phase = .dispatched } });
+                    if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
                     var buf: [sent_result_bytes]u8 = undefined;
-                    return self.encodeManaged(alloc, .{ .ok = true, .result = queuedResult(&buf, agent) });
-                };
-                debug_trace.eventf("mailbox", "message", .{}, "child={s} work_id={s} delivery=joined receipt={s}", .{ target.child_id, target.work_id, @tagName(delivery) });
-                if (options.observer) |observer| observer.emit(.{ .delegation = .{
-                    .call_id = options.invocation_id,
-                    .child_id = target.child_id,
-                    .work_id = target.work_id,
-                    .operation_id = operation_id,
-                    .phase = switch (delivery) {
-                        .queued => .feedback_queued,
-                        .applied => .feedback_applied,
-                        .not_applied => .feedback_not_applied,
-                    },
-                } });
-                return self.encodeManaged(alloc, model_contract.feedbackResult(delivery));
-            },
-            .rejected => |failure| return self.encodeManaged(alloc, .{
-                .ok = false,
-                .error_code = failure.code,
-            }),
-            .ready => |ready| {
-                keep_call = true;
-                if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
-                var buf: [sent_result_bytes]u8 = undefined;
-                return self.encodeManaged(alloc, .{ .ok = true, .result = sentResult(&buf, agent) });
-            },
-            .completed => |completed| {
-                if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = completed.child_id, .work_id = operation_id, .phase = .replayed } });
-                return self.encodeManaged(alloc, .{ .ok = true, .result = "This message was sent earlier, and the subagent's work on it has ended. Its report went to you then." });
-            },
+                    return self.encodeManaged(alloc, .{ .ok = true, .result = sentResult(&buf, agent) });
+                },
+                .completed => |completed| {
+                    if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = completed.child_id, .work_id = operation_id, .phase = .replayed } });
+                    return self.encodeManaged(alloc, .{ .ok = true, .result = "This message was sent earlier, and the subagent's work on it has ended. Its report went to you then." });
+                },
+            }
         }
+        unreachable;
     }
 
     const WorkCall = struct {
@@ -1378,8 +1440,11 @@ pub const Runtime = struct {
         const dropped, const stopped = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
-            const dropped = self.dropPendingLocked(child_id, "stopped");
-            break :blk .{ dropped, self.managed.stop(child_id) or self.stopTurnWorkLocked(child_id) };
+            const waiting = self.dropPendingLocked(child_id, "stopped");
+            // The stopped turn's unread messages go with it, so they count
+            // too (`tests/tla/subagent/StopMessage.tla` NoSilentLoss).
+            if (self.managed.stop(child_id)) |unread| break :blk .{ waiting + unread, true };
+            break :blk .{ waiting, self.stopTurnWorkLocked(child_id) };
         };
         debug_trace.eventf("mailbox", "stop", .{}, "target={s} by=parent running={} dropped={d}", .{ child_id, stopped, dropped });
         const dropped_text = switch (dropped) {
@@ -1438,17 +1503,28 @@ pub const Runtime = struct {
             try self.closing.ensureUnusedCapacity(self.alloc, 1);
             try self.closed_unseen.ensureUnusedCapacity(self.alloc, 1);
             const dropped = self.dropPendingLocked(child_id, "closed");
+            // A message waiting for the closed child's start is refused by
+            // its own call, so the close does not count it.
+            for (self.start_waits.items) |wait| {
+                if (std.mem.eql(u8, wait.child_id, child_id)) wait.closed = true;
+            }
             // A user's close tells the parent what it dropped, as a stop does.
             if (by == .user) self.noteUserDropLocked(child_id, dropped, true);
+            // The parent's close drops the closed turn's unread messages
+            // and counts them, as its stop does.
+            var unread: usize = 0;
             const stopped = switch (by) {
-                .parent => self.managed.stop(child_id),
+                .parent => if (self.managed.stop(child_id)) |count| ended: {
+                    unread = count;
+                    break :ended true;
+                } else false,
                 .user => self.managed.closeByUser(child_id),
             } or self.stopTurnWorkLocked(child_id);
             self.closing.appendAssumeCapacity(owned);
             self.closed_unseen.appendAssumeCapacity(unseen);
             self.closed_waiting.store(true, .release);
-            debug_trace.eventf("mailbox", "close", .{}, "target={s} by={s} running={} dropped={d}", .{ child_id, @tagName(by), stopped, dropped });
-            break :blk .{ .{ .stopped = stopped, .dropped = dropped }, !self.isBusyLocked(child_id) and !self.inTurnWorkLocked(child_id) };
+            debug_trace.eventf("mailbox", "close", .{}, "target={s} by={s} running={} dropped={d}", .{ child_id, @tagName(by), stopped, dropped + unread });
+            break :blk .{ .{ .stopped = stopped, .dropped = dropped + unread }, !self.isBusyLocked(child_id) and !self.inTurnWorkLocked(child_id) };
         };
         if (settle_now and !self.settleClose(child_id)) return error.CloseNotSaved;
         return result;
@@ -1508,6 +1584,14 @@ pub const Runtime = struct {
         self.closed_unseen.clearRetainingCapacity();
         self.closed_waiting.store(false, .release);
         return ids;
+    }
+
+    fn removeStartWaitLocked(self: *Runtime, wait: *StartWait) void {
+        for (self.start_waits.items, 0..) |item, index| {
+            if (item != wait) continue;
+            _ = self.start_waits.swapRemove(index);
+            return;
+        }
     }
 
     fn closingIndexLocked(self: *const Runtime, child_id: []const u8) ?usize {
@@ -2063,10 +2147,18 @@ const MailboxFixture = struct {
     fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, _: domain.AdmissionSnapshot, cancel: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         const worker = turn.workerRuntime();
-        // Counted once it can take steering, so a test that waits for the
-        // run can join it.
-        const steering = self.steerable and worker.beginDirectProcessing(self.runs.load(.seq_cst) + 1);
-        defer if (steering) worker.finishProcessing();
+        // Counted once its turn has begun, so a test that waits for the run
+        // can message it. A run that takes no steering is a turn past its
+        // last step, as a model turn's final answer is: it processes with
+        // steering closed, so a message waits for the next turn.
+        const turn_id = self.runs.load(.seq_cst) + 1;
+        const processing = worker.beginDirectProcessing(turn_id);
+        defer if (processing) worker.finishProcessing();
+        if (processing and !self.steerable) {
+            var boundary = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer boundary.deinit();
+            _ = worker.takeSteeringBoundaryInto(std.testing.allocator, boundary.allocator(), turn_id, .finalizing) catch return error.ProviderFailed;
+        }
         const run_number = self.runs.fetchAdd(1, .seq_cst) + 1;
         while (self.hold and !self.release.isSet() and !cancel.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
         if (cancel.load(.seq_cst)) return error.Cancelled;
@@ -3187,6 +3279,14 @@ fn terminalResult(
     };
 }
 
+/// How often a message that waits for a starting work's turn asks again.
+const start_wait_poll_ns = 5 * std.time.ns_per_ms;
+
+/// One message waiting for its child's starting turn (`Runtime.start_waits`).
+const StartWait = struct {
+    child_id: []const u8,
+    closed: bool = false,
+};
 const sent_result_bytes = 256 + domain.max_agent_name_bytes;
 
 /// `message`'s answer when the child takes it now.
@@ -3517,6 +3617,15 @@ pub fn captureHostAuthorityWithMcpView(
         if (permissions.rulesDenyAllTargetsForTool(rules, registered_tool.name)) continue;
         try tool_names.append(alloc, registered_tool.name);
     }
+    // toolbox's open and search are decided under the names of the tools
+    // they replaced, so a child's profile can keep or drop each one.
+    const has_toolbox = for (tool_names.items) |name| {
+        if (std.mem.eql(u8, name, toolbox_core.tool_name)) break true;
+    } else false;
+    if (has_toolbox) for (toolbox_core.replaced) |name| {
+        if (permissions.rulesDenyAllTargetsForTool(rules, name)) continue;
+        try tool_names.append(alloc, name);
+    };
     return authority.HostAuthority.captureWithPermissionStateAndMcpView(
         alloc,
         tool_names.items,
@@ -3526,4 +3635,30 @@ pub fn captureHostAuthorityWithMcpView(
         permission_state,
         mcp_view,
     );
+}
+
+test "the root's authority names toolbox's open and search, less the ones a rule denies" {
+    const alloc = std.testing.allocator;
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const tools = [_]@import("../tooling/tool_dispatch.zig").Tool{ builtin_tools.read_file, builtin_tools.toolbox };
+    const with_toolbox = tool_set_contract.ToolSet{ .registry = .{ .tools = &tools }, .order = &.{ "read_file", "toolbox" }, .read_only_tool_names = &.{} };
+    var rules = [_]types.PermissionRule{.{ .permission = @constCast("skill"), .pattern = @constCast("*"), .action = .deny }};
+    var root = try captureHostAuthorityWithMcpView(alloc, .{ .tool_set = with_toolbox, .mode = .full }, &.{}, .{ .rules = &rules }, &.{}, .{}, null);
+    defer root.deinit(alloc);
+    const contains = struct {
+        fn in(names: []const []const u8, name: []const u8) bool {
+            for (names) |entry| if (std.mem.eql(u8, entry, name)) return true;
+            return false;
+        }
+    }.in;
+    for ([_][]const u8{ "read_file", "toolbox", "capability_search", "mcp_select_tool" }) |name| {
+        try std.testing.expect(contains(root.tools, name));
+    }
+    try std.testing.expect(!contains(root.tools, "skill"));
+
+    // Without toolbox there is nothing to open or search through.
+    const without = tool_set_contract.ToolSet{ .registry = .{ .tools = tools[0..1] }, .order = &.{"read_file"}, .read_only_tool_names = &.{} };
+    var plain = try captureHostAuthorityWithMcpView(alloc, .{ .tool_set = without, .mode = .full }, &.{}, .{}, &.{}, .{}, null);
+    defer plain.deinit(alloc);
+    for (toolbox_core.replaced) |name| try std.testing.expect(!contains(plain.tools, name));
 }

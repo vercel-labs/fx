@@ -252,27 +252,12 @@ function acpTaggedBlock(body: string, tag: string): string {
   return text.slice(start, end + tag.length + 3);
 }
 
-function acpSkillLocations(body: string, name: string): string[] {
-  return acpTaggedBlock(body, "available_skills").split("\n")
-    .filter((line) => line.startsWith(`- ${name}: `))
-    .map((line) => {
-      const start = line.lastIndexOf(" (location: ");
-      if (start < 0 || !line.endsWith(")")) throw new Error("Malformed skill location");
-      return line.slice(start + " (location: ".length, -1);
-    });
-}
-
-function acpSkillPath(body: string, location: string): string {
-  const match = /^skill:[0-9a-f]{16}:(\d+)\/(.+)$/.exec(location);
-  if (!match) throw new Error(`Invalid scoped skill location: ${location}`);
-  const prefix = `Root ${match[1]}: `;
-  const root = acpTaggedBlock(body, "available_skills").split("\n")
-    .find((line) => line.startsWith(prefix));
-  if (!root) throw new Error(`Missing root for ${location}`);
-  // A root inside the workspace is shown relative to the turn context's workspace_root.
-  const shown = root.slice(prefix.length);
-  const base = isAbsolute(shown) ? shown : join(acpTurnContextWorkspaceRoot(body), shown);
-  return join(base, decodeURIComponent(match[2]!));
+// What the toolbox menu says to open a skill as: its name, or the location
+// it gives a skill whose name another skill shares.
+function acpSkillOpenKeys(body: string, name: string): string[] {
+  return acpTaggedBlock(body, "toolbox").split("\n")
+    .filter((line) => line.startsWith(`- ${name}: `) || line.startsWith(`- ${name} (open as `) || line === `- ${name}`)
+    .map((line) => /^- [^ ]+ \(open as ([^)]+)\)/.exec(line)?.[1] ?? name);
 }
 
 function acpTurnContextWorkspaceRoot(body: string): string {
@@ -1038,7 +1023,7 @@ test("configured provider ACP runs a direct call to a supplied MCP tool that is 
   const fixture = createConfiguredProviderFixture(body => {
     if (isReview(body)) return configuredToolCompletion(body.model, "permission_decision", { decision: "clear", rationale: "fixture review" });
     if (body.messages.some((message: any) => message.role === "tool")) return configuredCompletion(body.model, "direct call complete");
-    return configuredToolCompletion(body.model, MCP_TOOL_NAME, { text: "direct" }, "direct_unloaded");
+    return configuredToolCompletion(body.model, "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "direct" } }, "direct_unloaded");
   });
   const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
   try {
@@ -1872,7 +1857,7 @@ describe("acp: model-independent", () => {
           .map((message) => acpContentText(message.content))
           .join("\n");
         expect(prompt).toContain(submitted);
-        expect(request.tools).toHaveLength(16);
+        expect(request.tools).toHaveLength(13);
         const toolNames = serializedToolNames(oracleRequest);
         expect(toolNames).toEqual(
           AUTO_EXA_SERIALIZED_TOOL_NAMES,
@@ -1882,7 +1867,7 @@ describe("acp: model-independent", () => {
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
         expect(customProviderGuidanceState(oracleRequest)).toEqual({
-          providerToolIndices: [13],
+          providerToolIndices: [10],
           guidanceMessageIndices: [1],
         });
         expect(gateway.requests[0]!.body).not.toContain(
@@ -3097,16 +3082,9 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-mcp-v2-");
       const httpFixture = startModernMcpHttpFixture("json");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("search_http", "capability_search", {
-          kind: "mcp",
-          server: "fixture",
-          query: "echo",
-          limit: 5,
-        }),
-        fakeGatewayToolCall("select_http", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_http", MCP_TOOL_NAME, { text: "acp" }),
+        fakeGatewayToolCall("search_http", "toolbox", { search: "echo", server: "fixture" }),
+        fakeGatewayToolCall("select_http", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_http", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "acp" } }),
         finalText("ACP MCP complete"),
       ]);
       try {
@@ -3170,7 +3148,8 @@ describe("acp: model-independent", () => {
         const initialPrompt = acpGatewayRequest(gateway.requests[0]!.body).prompt
           .map((message) => acpContentText(message.content))
           .join("\n");
-        expect(initialPrompt).toContain('<server name="fixture"');
+        // The toolbox menu lists the supplied server by name.
+        expect(initialPrompt).toContain("MCP servers\n- fixture\n");
         expect(httpFixture.requests.map((entry) => entry.message.method)).toContain("tools/call");
         for (const entry of httpFixture.requests) {
           expect(entry.headers["mcp-protocol-version"]).toBe(MODERN_MCP_VERSION);
@@ -3194,7 +3173,7 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-notices-");
       const httpFixture = startModernMcpHttpFixture("json");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("search_notice", "capability_search", { kind: "mcp", server: "fixture", query: "echo", limit: 5 }),
+        fakeGatewayToolCall("search_notice", "toolbox", { search: "echo", server: "fixture" }),
         finalText("ACP notices complete"),
       ]);
       try {
@@ -3244,7 +3223,7 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-notices-false-");
       const httpFixture = startModernMcpHttpFixture("json");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("search_notice", "capability_search", { kind: "mcp", server: "fixture", query: "echo", limit: 5 }),
+        fakeGatewayToolCall("search_notice", "toolbox", { search: "echo", server: "fixture" }),
         finalText("ACP notices complete"),
       ]);
       try {
@@ -3289,9 +3268,9 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-mcp-v2-loaded-");
       const httpFixture = startModernMcpHttpFixture("json");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("call_loaded", MCP_TOOL_NAME, { text: "acp" }),
+        fakeGatewayToolCall("call_loaded", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "acp" } }),
         finalText("ACP MCP loaded"),
-        fakeGatewayToolCall("call_loaded_again", MCP_TOOL_NAME, { text: "again" }),
+        fakeGatewayToolCall("call_loaded_again", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "again" } }),
         finalText("ACP MCP loaded again"),
         finalText("ACP MCP lazy"),
       ]);
@@ -3354,7 +3333,7 @@ describe("acp: model-independent", () => {
       const pidPath = join(root.root, "fixture.pid");
       const eofPath = join(root.root, "fixture.eof");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("call_stdio", MCP_TOOL_NAME, { text: "acp" }),
+        fakeGatewayToolCall("call_stdio", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "acp" } }),
         finalText("ACP MCP stdio"),
       ]);
       // It keeps running after its input closes, so fx sends SIGTERM after 1.5 s.
@@ -3415,9 +3394,9 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-mcp-v2-load-once-");
       const pidPath = join(root.root, "fixture.pid");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("call_old", MCP_TOOL_NAME, { text: "old" }),
+        fakeGatewayToolCall("call_old", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "old" } }),
         finalText("ACP MCP old"),
-        fakeGatewayToolCall("call_new", MCP_TOOL_NAME, { text: "new" }),
+        fakeGatewayToolCall("call_new", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "new" } }),
         finalText("ACP MCP new"),
       ]);
       // It keeps running after its input closes, so the old copy takes 1.5 s to stop.
@@ -3491,7 +3470,7 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-mcp-direct-");
       const httpFixture = startModernMcpHttpFixture("json");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("direct_unloaded", MCP_TOOL_NAME, { text: "direct" }),
+        fakeGatewayToolCall("direct_unloaded", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "direct" } }),
         finalText("direct call complete"),
       ]);
       try {
@@ -3856,7 +3835,7 @@ describe("acp: model-independent", () => {
       const gateway = startFakeGateway([
         fakeGatewayToolCall("plain_call", "mcp_profile_echo", { text: "from plain" }),
         finalText("plain session done"),
-        fakeGatewayToolCall("profile_call", "mcp_profile_echo", { text: "from profile" }),
+        fakeGatewayToolCall("profile_call", "toolbox", { run: "mcp_profile_echo", arguments: { text: "from profile" } }),
         finalText("profile tool used"),
       ]);
       const promptOf = (index: number) => acpGatewayRequest(gateway.requests[index]!.body).prompt
@@ -3877,7 +3856,7 @@ describe("acp: model-independent", () => {
         await client.readLine();
         const plainPrompt = await runPrompt(client, "Use the profile echo tool.", TIMEOUT);
         expect(plainPrompt.promptResult.result.stopReason).toBe("end_turn");
-        expect(promptOf(0)).not.toContain('<server name="profile"');
+        expect(promptOf(0)).not.toContain("\n- profile\n");
         expect(acpToolResultText(gateway.requests[1]!.body, "plain_call")).not.toContain("PROFILE_SERVER_RESULT");
         expect(existsSync(profilePid)).toBe(false);
 
@@ -3891,7 +3870,7 @@ describe("acp: model-independent", () => {
         await client.readLine();
         const prompt = await runPrompt(client, "Use the profile echo tool.", TIMEOUT);
         expect(prompt.promptResult.result.stopReason).toBe("end_turn");
-        expect(promptOf(2)).toContain('<server name="profile"');
+        expect(promptOf(2)).toContain("- profile");
         expect(acpToolResultText(gateway.requests[3]!.body, "profile_call")).toContain("PROFILE_SERVER_RESULT");
         expect(existsSync(profilePid)).toBe(true);
         expect(client.stderr).toBe("");
@@ -3927,8 +3906,8 @@ describe("acp: model-independent", () => {
         }),
       );
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_project", "mcp_select_tool", { name: "mcp_project_echo" }),
-        fakeGatewayToolCall("call_project", "mcp_project_echo", { text: "acp" }),
+        fakeGatewayToolCall("select_project", "toolbox", { open: "mcp_project_echo" }),
+        fakeGatewayToolCall("call_project", "toolbox", { run: "mcp_project_echo", arguments: { text: "acp" } }),
         finalText("project MCP complete"),
       ]);
       try {
@@ -4099,10 +4078,8 @@ describe("acp: model-independent", () => {
         }),
       );
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_project", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_project", MCP_TOOL_NAME, { text: "acp" }),
+        fakeGatewayToolCall("select_project", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_project", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "acp" } }),
         finalText("ACP project MCP complete"),
       ]);
       const env = {
@@ -4189,8 +4166,8 @@ describe("acp: model-independent", () => {
         }),
       );
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_project", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_project", MCP_TOOL_NAME, { text: "acp" }),
+        fakeGatewayToolCall("select_project", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_project", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "acp" } }),
         finalText("ACP project MCP complete"),
       ]);
       const env = { ...fakeGatewayEnv(root, gateway) };
@@ -4361,10 +4338,8 @@ describe("acp: model-independent", () => {
       const loadFixture = startLegacyHttpSseFixture();
       const resumeFixture = startLegacyHttpSseFixture();
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_legacy_http", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_legacy_http", MCP_TOOL_NAME, { text: "new" }),
+        fakeGatewayToolCall("select_legacy_http", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_legacy_http", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "new" } }),
         finalText("legacy HTTP new complete"),
         finalText("legacy SSE load held"),
         finalText("legacy SSE resume held"),
@@ -4374,8 +4349,8 @@ describe("acp: model-independent", () => {
         const text = acpGatewayRequest(gateway.requests[index]!.body).prompt
           .map((message) => acpContentText(message.content))
           .join("\n");
-        const at = text.indexOf("<mcp_servers");
-        return at < 0 ? "" : text.slice(at, text.indexOf("</mcp_servers>", at));
+        const at = text.indexOf("<toolbox>");
+        return at < 0 ? "" : text.slice(at, text.indexOf("</toolbox>", at));
       };
       try {
         client = await AcpClient.create({
@@ -4435,7 +4410,9 @@ describe("acp: model-independent", () => {
         let start = gateway.requests.length;
         const loaded = await runPrompt(client, "Say hello.", TIMEOUT);
         expect(loaded.promptResult.result.stopReason).toBe("end_turn");
-        expect(serversAt(start)).toContain('<server name="fixture" state="unavailable" />');
+        // The menu lists the server without a live state; the model learns it is
+        // unavailable when it searches or opens it.
+        expect(serversAt(start)).toContain("- fixture");
         client.endStdin();
         expect(await client.waitForExit()).toBe(0);
 
@@ -4460,7 +4437,9 @@ describe("acp: model-independent", () => {
         start = gateway.requests.length;
         const resumed = await runPrompt(client, "Say hello.", TIMEOUT);
         expect(resumed.promptResult.result.stopReason).toBe("end_turn");
-        expect(serversAt(start)).toContain('<server name="fixture" state="unavailable" />');
+        // The menu lists the server without a live state; the model learns it is
+        // unavailable when it searches or opens it.
+        expect(serversAt(start)).toContain("- fixture");
         const closed = await client.request(
           "session/close",
           { sessionId },
@@ -4508,9 +4487,7 @@ describe("acp: model-independent", () => {
         },
       });
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_protected", "mcp_select_tool", {
-          name: "mcp_protected_echo",
-        }),
+        fakeGatewayToolCall("select_protected", "toolbox", { open: "mcp_protected_echo" }),
         finalText("protected server checked"),
       ]);
       try {
@@ -4539,7 +4516,8 @@ describe("acp: model-independent", () => {
         const first = acpGatewayRequest(gateway.requests[0]!.body).prompt
           .map((message) => acpContentText(message.content))
           .join("\n");
-        expect(first).toContain('<server name="protected" state="authentication_required" />');
+        // The menu lists the server; opening its tool says it needs a login.
+        expect(first).toContain("- protected");
         // The server came from the editor, so its credentials go there:
         // fx mcp login can't find it.
         const selected = acpToolResultText(gateway.requests[1]!.body, "select_protected");
@@ -4587,12 +4565,10 @@ describe("acp: model-independent", () => {
         },
       });
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_http_auth", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_http_auth", MCP_TOOL_NAME, {
+        fakeGatewayToolCall("select_http_auth", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_http_auth", "toolbox", { run: MCP_TOOL_NAME, arguments: {
           text: "authenticated",
-        }),
+        } }),
         finalText("ACP authenticated HTTP complete"),
       ]);
       try {
@@ -4656,14 +4632,14 @@ describe("acp: model-independent", () => {
       const loadFixture = startModernMcpHttpFixture("json");
       const resumeFixture = startModernMcpHttpFixture("json");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_http_new", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_http_new", MCP_TOOL_NAME, { text: "new" }),
+        fakeGatewayToolCall("select_http_new", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_http_new", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "new" } }),
         finalText("HTTP new complete"),
-        fakeGatewayToolCall("select_http_load", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_http_load", MCP_TOOL_NAME, { text: "load" }),
+        fakeGatewayToolCall("select_http_load", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_http_load", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "load" } }),
         finalText("HTTP load complete"),
-        fakeGatewayToolCall("select_http_resume", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_http_resume", MCP_TOOL_NAME, { text: "resume" }),
+        fakeGatewayToolCall("select_http_resume", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_http_resume", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "resume" } }),
         finalText("HTTP resume complete"),
       ]);
       try {
@@ -4791,25 +4767,19 @@ describe("acp: model-independent", () => {
       const fastFixture = startModernMcpHttpFixture("json");
       const closeFixture = startModernMcpHttpFixture("stall_call");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_http_replacement_slow", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_http_replacement_slow", MCP_TOOL_NAME, {
+        fakeGatewayToolCall("select_http_replacement_slow", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_http_replacement_slow", "toolbox", { run: MCP_TOOL_NAME, arguments: {
           text: "slow",
-        }),
-        fakeGatewayToolCall("select_http_replacement_fast", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_http_replacement_fast", MCP_TOOL_NAME, {
+        } }),
+        fakeGatewayToolCall("select_http_replacement_fast", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_http_replacement_fast", "toolbox", { run: MCP_TOOL_NAME, arguments: {
           text: "fast",
-        }),
+        } }),
         finalText("HTTP replacement complete"),
-        fakeGatewayToolCall("select_http_close_slow", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_http_close_slow", MCP_TOOL_NAME, {
+        fakeGatewayToolCall("select_http_close_slow", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_http_close_slow", "toolbox", { run: MCP_TOOL_NAME, arguments: {
           text: "slow",
-        }),
+        } }),
       ]);
       try {
         client = await AcpClient.create({
@@ -4895,12 +4865,10 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-mcp-http-eof-");
       const httpFixture = startModernMcpHttpFixture("stall_call");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_http_eof_slow", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_http_eof_slow", MCP_TOOL_NAME, {
+        fakeGatewayToolCall("select_http_eof_slow", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_http_eof_slow", "toolbox", { run: MCP_TOOL_NAME, arguments: {
           text: "slow",
-        }),
+        } }),
       ]);
       try {
         client = await AcpClient.create({
@@ -4951,7 +4919,7 @@ describe("acp: model-independent", () => {
         "version_retry_error_status",
       ] as const;
       const gateway = startFakeGateway(modes.flatMap((mode) => [
-        fakeGatewayToolCall(`select_${mode}`, "mcp_select_tool", { name: MCP_TOOL_NAME }),
+        fakeGatewayToolCall(`select_${mode}`, "toolbox", { open: MCP_TOOL_NAME }),
         finalText(`${mode} checked`),
       ]));
       try {
@@ -5034,14 +5002,14 @@ describe("acp: model-independent", () => {
       const loadPid = join(root.root, "mcp-load.pid");
       const resumePid = join(root.root, "mcp-resume.pid");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_new", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_new", MCP_TOOL_NAME, { text: "new" }),
+        fakeGatewayToolCall("select_new", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_new", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "new" } }),
         finalText("new complete"),
-        fakeGatewayToolCall("select_load", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_load", MCP_TOOL_NAME, { text: "load" }),
+        fakeGatewayToolCall("select_load", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_load", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "load" } }),
         finalText("load complete"),
-        fakeGatewayToolCall("select_resume", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_resume", MCP_TOOL_NAME, { text: "resume" }),
+        fakeGatewayToolCall("select_resume", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_resume", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "resume" } }),
         finalText("resume complete"),
       ]);
       try {
@@ -5135,8 +5103,8 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-mcp-mrtr-");
       const pidPath = join(root.root, "mcp-mrtr.pid");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_mrtr", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_mrtr", MCP_TOOL_NAME, { text: "acp" }),
+        fakeGatewayToolCall("select_mrtr", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_mrtr", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "acp" } }),
         finalText("ACP MRTR boundary complete"),
       ]);
       try {
@@ -5193,12 +5161,10 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-mcp-unadvertised-url-");
       const pidPath = join(root.root, "mcp-unadvertised-url.pid");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_unadvertised", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_unadvertised", MCP_TOOL_NAME, {
+        fakeGatewayToolCall("select_unadvertised", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_unadvertised", "toolbox", { run: MCP_TOOL_NAME, arguments: {
           text: "unadvertised",
-        }),
+        } }),
         finalText("unadvertised URL mode checked"),
       ]);
       const directRequests: Array<Record<string, unknown>> = [];
@@ -5294,8 +5260,8 @@ describe("acp: model-independent", () => {
         const pidPath = join(root.root, "mcp-cap.pid");
         const wirePath = join(root.root, "mcp-cap.wire.jsonl");
         const activeGateway = startFakeGateway([
-          fakeGatewayToolCall("select_cap", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-          fakeGatewayToolCall("call_cap", MCP_TOOL_NAME, { text: testCase.label }),
+          fakeGatewayToolCall("select_cap", "toolbox", { open: MCP_TOOL_NAME }),
+          fakeGatewayToolCall("call_cap", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: testCase.label } }),
           finalText("ACP capability form complete"),
         ]);
         let activeClient: AcpClient | null = null;
@@ -5371,8 +5337,8 @@ describe("acp: model-independent", () => {
       const pidPath = join(root.root, "mcp-elicitation-form.pid");
       const wirePath = join(root.root, "mcp-elicitation-form.wire.jsonl");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_form", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_form", MCP_TOOL_NAME, { text: "acp-form" }),
+        fakeGatewayToolCall("select_form", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_form", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "acp-form" } }),
         finalText("ACP form elicitation complete"),
       ]);
       const directRequests: Array<Record<string, any>> = [];
@@ -5491,8 +5457,8 @@ describe("acp: model-independent", () => {
       const pidPath = join(root.root, "mcp-v2-form.pid");
       const wirePath = join(root.root, "mcp-v2-form.wire.jsonl");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_form", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_form", MCP_TOOL_NAME, { text: "acp-form" }),
+        fakeGatewayToolCall("select_form", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_form", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "acp-form" } }),
         finalText("ACP MCP form complete"),
       ]);
       const directRequests: Array<Record<string, any>> = [];
@@ -5566,8 +5532,8 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-mcp-elicitation-eof-");
       const pidPath = join(root.root, "mcp-elicitation-eof.pid");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_eof", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_eof", MCP_TOOL_NAME, { text: "eof" }),
+        fakeGatewayToolCall("select_eof", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_eof", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "eof" } }),
       ]);
       const directRequests: Array<Record<string, unknown>> = [];
       try {
@@ -5636,8 +5602,8 @@ describe("acp: model-independent", () => {
       const wirePath = join(root.root, "mcp-elicitation-secret.wire.jsonl");
       const tracePath = join(root.root, "fx-trace.log");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_secret", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_secret", MCP_TOOL_NAME, { text: "secret" }),
+        fakeGatewayToolCall("select_secret", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_secret", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "secret" } }),
         finalText("Secret form rejected"),
       ]);
       const directRequests: Array<Record<string, unknown>> = [];
@@ -5723,8 +5689,8 @@ describe("acp: model-independent", () => {
       });
       const targetUrl = `http://127.0.0.1:${target.port}/authorize?flow=test`;
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_url", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_url", MCP_TOOL_NAME, { text: "acp-url" }),
+        fakeGatewayToolCall("select_url", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_url", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "acp-url" } }),
         finalText("ACP URL elicitation complete"),
       ]);
       const directRequests: Array<Record<string, any>> = [];
@@ -5834,12 +5800,10 @@ describe("acp: model-independent", () => {
         mode: "elicitation_form",
       });
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_legacy_form", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_legacy_form", MCP_TOOL_NAME, {
+        fakeGatewayToolCall("select_legacy_form", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_legacy_form", "toolbox", { run: MCP_TOOL_NAME, arguments: {
           text: "legacy-form",
-        }),
+        } }),
         finalText("Legacy form elicitation complete"),
       ]);
       const directRequests: Array<Record<string, any>> = [];
@@ -5936,12 +5900,10 @@ describe("acp: model-independent", () => {
         manualUrlCompletion: true,
       });
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_legacy_url", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_legacy_url", MCP_TOOL_NAME, {
+        fakeGatewayToolCall("select_legacy_url", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_legacy_url", "toolbox", { run: MCP_TOOL_NAME, arguments: {
           text: "legacy-url",
-        }),
+        } }),
         finalText("Legacy URL elicitation complete"),
       ]);
       const directRequests: Array<Record<string, any>> = [];
@@ -6050,12 +6012,10 @@ describe("acp: model-independent", () => {
         completeBeforeElicitationResponse: true,
       });
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_legacy_url_early", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_legacy_url_early", MCP_TOOL_NAME, {
+        fakeGatewayToolCall("select_legacy_url_early", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_legacy_url_early", "toolbox", { run: MCP_TOOL_NAME, arguments: {
           text: "legacy-url-early",
-        }),
+        } }),
         finalText("Early legacy URL completion accepted"),
       ]);
       let directRequestId: number | string | null = null;
@@ -6139,12 +6099,10 @@ describe("acp: model-independent", () => {
         completeBeforeElicitationResponse: true,
       });
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_legacy_url_decline", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_legacy_url_decline", MCP_TOOL_NAME, {
+        fakeGatewayToolCall("select_legacy_url_decline", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_legacy_url_decline", "toolbox", { run: MCP_TOOL_NAME, arguments: {
           text: "legacy-url-decline",
-        }),
+        } }),
         finalText("Early legacy URL completion declined"),
       ]);
       let directRequestId: number | string | null = null;
@@ -6220,12 +6178,10 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-mcp-elicitation-cancel-");
       const pidPath = join(root.root, "mcp-elicitation-cancel.pid");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_cancelled_form", "mcp_select_tool", {
-          name: MCP_TOOL_NAME,
-        }),
-        fakeGatewayToolCall("call_cancelled_form", MCP_TOOL_NAME, {
+        fakeGatewayToolCall("select_cancelled_form", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_cancelled_form", "toolbox", { run: MCP_TOOL_NAME, arguments: {
           text: "cancelled-form",
-        }),
+        } }),
       ]);
       let directRequestSeen = false;
       let elicitationRequestId: number | string | null = null;
@@ -6316,13 +6272,13 @@ describe("acp: model-independent", () => {
       const firstPid = join(root.root, "mcp-first.pid");
       const secondPid = join(root.root, "mcp-second.pid");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_first", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_first", MCP_TOOL_NAME, { text: "one" }),
+        fakeGatewayToolCall("select_first", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_first", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "one" } }),
         finalText("first complete"),
-        fakeGatewayToolCall("select_after_failure", "mcp_select_tool", { name: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("select_after_failure", "toolbox", { open: MCP_TOOL_NAME }),
         finalText("broken replacement checked"),
-        fakeGatewayToolCall("select_second", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_second", MCP_TOOL_NAME, { text: "two" }),
+        fakeGatewayToolCall("select_second", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_second", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "two" } }),
         finalText("second complete"),
       ]);
       try {
@@ -6543,13 +6499,13 @@ describe("acp: model-independent", () => {
       const closePid = join(root.root, "close-slow.pid");
       const closeWire = join(root.root, "close-slow.jsonl");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_replacement_slow", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_replacement_slow", MCP_TOOL_NAME, { text: "slow" }),
-        fakeGatewayToolCall("select_replacement_fast", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_replacement_fast", MCP_TOOL_NAME, { text: "fast" }),
+        fakeGatewayToolCall("select_replacement_slow", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_replacement_slow", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "slow" } }),
+        fakeGatewayToolCall("select_replacement_fast", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_replacement_fast", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "fast" } }),
         finalText("replacement complete"),
-        fakeGatewayToolCall("select_close_slow", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_close_slow", MCP_TOOL_NAME, { text: "slow" }),
+        fakeGatewayToolCall("select_close_slow", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_close_slow", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "slow" } }),
       ]);
       try {
         client = await AcpClient.create({
@@ -6650,8 +6606,8 @@ describe("acp: model-independent", () => {
       const wirePath = join(root.root, "stalled.jsonl");
       const tracePath = join(root.root, "trace.log");
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("select_eof_slow", "mcp_select_tool", { name: MCP_TOOL_NAME }),
-        fakeGatewayToolCall("call_eof_slow", MCP_TOOL_NAME, { text: "slow" }),
+        fakeGatewayToolCall("select_eof_slow", "toolbox", { open: MCP_TOOL_NAME }),
+        fakeGatewayToolCall("call_eof_slow", "toolbox", { run: MCP_TOOL_NAME, arguments: { text: "slow" } }),
       ]);
       try {
         client = await AcpClient.create({
@@ -6694,7 +6650,8 @@ describe("acp: model-independent", () => {
         const trace = readFileSync(tracePath, "utf8");
         expect(trace).toContain("cancel_requested source=acp");
         expect(trace).toContain("event=cancel_observed");
-        expect(trace).toContain("event=aborted_tool_persisted turn_id=1 step_id=2 call_id=call_eof_slow name=mcp_fixture_echo");
+        // The aborted call is the model's toolbox call that ran the MCP tool.
+        expect(trace).toContain("event=aborted_tool_persisted turn_id=1 step_id=2 call_id=call_eof_slow name=toolbox");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -9007,11 +8964,10 @@ describe("acp: model-independent", () => {
       writeFileSync(join(skillDirectory, "references", "required.md"), referenceBody);
       const gateway = startFakeGateway([
         (body) => {
-          const locations = acpSkillLocations(body, "acp-explicit");
-          expect(locations).toHaveLength(1);
-          expect(acpSkillPath(body, locations[0]!)).toBe(skillDirectory);
-          return fakeGatewayToolCall(referenceCallId, "skill", {
-            location: locations[0],
+          const locations = acpSkillOpenKeys(body, "acp-explicit");
+          expect(locations).toEqual(["acp-explicit"]);
+          return fakeGatewayToolCall(referenceCallId, "toolbox", {
+            open: locations[0],
             resource: "references/required.md",
           });
         },
@@ -9098,18 +9054,16 @@ describe("acp: model-independent", () => {
           expect(result.promptResult.error).toBeUndefined();
           expect(result.promptResult.result.stopReason).toBe("end_turn");
           const body = gateway.requests[index]!.body;
-          const available = acpTaggedBlock(body, "available_skills");
+          const available = acpTaggedBlock(body, "toolbox");
           expect(Buffer.byteLength(available)).toBeLessThanOrEqual(1024);
           for (const name of ["aaa-one", "aaa-two", "aaa-three", "system-design-method"]) {
-            const locations = acpSkillLocations(body, name);
-            expect(locations).toHaveLength(1);
-            expect(acpSkillPath(body, locations[0]!)).toBe(join(root.workspace, "skills", name));
+            expect(acpSkillOpenKeys(body, name)).toEqual([name]);
           }
           expect(available).not.toContain(distractorDescription);
           expect(available).not.toContain("Omitted skills:");
-          if (index === 0) {
-            expect(JSON.stringify(result.messages)).toContain("skill catalog shortened");
-          }
+          // The menu says once that it shortened to fit; the kept menu
+          // doesn't say it again.
+          expect(JSON.stringify(result.messages).includes("toolbox menu shortened to fit skill_catalog_bytes")).toBe(index === 0);
           catalogs.push(available.replace(/skill:[0-9a-f]{16}:/g, "skill:turn:"));
         }
         expect(gateway.requests).toHaveLength(2);
@@ -9219,7 +9173,7 @@ describe("acp: model-independent", () => {
         const request = acpGatewayRequest(gateway.requests[0]!.body);
         const available = acpTaggedBlock(
           gateway.requests[0]!.body,
-          "available_skills",
+          "toolbox",
         );
         const promptText = request.prompt
           .map((message) => acpContentText(message.content))
@@ -9227,19 +9181,15 @@ describe("acp: model-independent", () => {
         expect(promptText).toContain(
           '<skill_discovery_warning skipped_candidate_count="1" incomplete_root_count="0" missing_from_incomplete_roots="0" />',
         );
-        const locations = acpSkillLocations(gateway.requests[0]!.body, "acp-valid-skill");
-        expect(locations).toHaveLength(1);
-        expect(acpSkillPath(gateway.requests[0]!.body, locations[0]!)).toBe(validDirectory);
+        expect(acpSkillOpenKeys(gateway.requests[0]!.body, "acp-valid-skill")).toEqual(["acp-valid-skill"]);
         expect(available).not.toContain("acp-malformed-neighbor");
         expect(available).not.toContain(malformedBody);
 
-        const skillSchema = request.tools.find((tool) => tool.name === "skill");
-        expect(skillSchema).toBeDefined();
-        expect(skillSchema?.inputSchema.type).toBe("object");
-        expect(skillSchema?.inputSchema.properties.name).toBeUndefined();
-        expect(skillSchema?.inputSchema.properties.location.type).toBe("string");
-        expect(skillSchema?.inputSchema.properties.resource.type).toBe("string");
-        expect(skillSchema?.inputSchema.required).toEqual(["location"]);
+        expect(request.tools.find((tool) => tool.name === "skill")).toBeUndefined();
+        const toolboxSchema = request.tools.find((tool) => tool.name === "toolbox");
+        expect(toolboxSchema?.inputSchema.type).toBe("object");
+        expect(toolboxSchema?.inputSchema.properties.open.type).toBe("string");
+        expect(toolboxSchema?.inputSchema.properties.resource.type).toBe("string");
 
         const diagnosticNotices = result.messages.filter((message: any) =>
           message.method === "session/update" &&
@@ -9278,7 +9228,7 @@ describe("acp: model-independent", () => {
       const firstMarker = "ACP_CONTEXT_FIRST_SENTINEL";
       const secondMarker = "ACP_CONTEXT_SECOND_SENTINEL";
       const transientMarker =
-        "Runtime context: this is a noninteractive run without live question UI;";
+        "Runtime context: this is a noninteractive run with no question UI.";
       const rulesPath = join(root.workspace, "AGENTS.md");
       writeFileSync(rulesPath, `${firstMarker}\n`);
       const gateway = startFakeGateway([

@@ -198,8 +198,9 @@ pub fn prepare(
     call: types.ToolCall,
     input: file_mutation_contract.FileMutationInput,
     policy_targets: file_mutation_contract.PolicyEvaluatedFileTargets,
+    failure_detail: file_mutation_contract.EditFailureDetail,
 ) FileMutationPrepareError!file_mutation_contract.PrepareResult {
-    return prepareInternal(call_alloc, call, input, policy_targets, true);
+    return prepareInternal(call_alloc, call, input, policy_targets, true, failure_detail);
 }
 
 /// Prepares a mutation whose decoded input and canonical target proof were
@@ -210,8 +211,9 @@ pub fn prepareResolvedTarget(
     call: types.ToolCall,
     input: file_mutation_contract.FileMutationInput,
     policy_targets: file_mutation_contract.PolicyEvaluatedFileTargets,
+    failure_detail: file_mutation_contract.EditFailureDetail,
 ) FileMutationPrepareError!file_mutation_contract.PrepareResult {
-    return prepareInternal(call_alloc, call, input, policy_targets, false);
+    return prepareInternal(call_alloc, call, input, policy_targets, false, failure_detail);
 }
 
 fn prepareInternal(
@@ -220,6 +222,7 @@ fn prepareInternal(
     input: file_mutation_contract.FileMutationInput,
     policy_targets: file_mutation_contract.PolicyEvaluatedFileTargets,
     verify_target_resolution: bool,
+    failure_detail: file_mutation_contract.EditFailureDetail,
 ) FileMutationPrepareError!file_mutation_contract.PrepareResult {
     if (policyIdentityBindingMismatch(policy_targets)) {
         return .{ .semantic_failure = identity_changed_message };
@@ -237,7 +240,7 @@ fn prepareInternal(
         .semantic_failure => |message| return .{ .semantic_failure = message },
     };
 
-    const postimage_result = try derivePostimage(call_alloc, input, preimage);
+    const postimage_result = try derivePostimage(call_alloc, input, preimage, failure_detail);
     const after_content = switch (postimage_result) {
         .content => |content| content,
         .semantic_failure => |message| return .{ .semantic_failure = message },
@@ -1441,6 +1444,7 @@ fn derivePostimage(
     alloc: Allocator,
     input: file_mutation_contract.FileMutationInput,
     preimage: file_mutation_contract.Preimage,
+    failure_detail: file_mutation_contract.EditFailureDetail,
 ) error{OutOfMemory}!PostimageResult {
     return switch (input) {
         .write => |write| .{
@@ -1476,14 +1480,8 @@ fn derivePostimage(
                     }
                 }
             }
-            if (occurrence_count == 0) {
-                break :blk .{ .semantic_failure = "edit_file failed: old_string not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit." };
-            }
-            if (occurrence_count > 1) {
-                break :blk .{ .semantic_failure = try alloc.print(
-                    "edit_file failed: old_string is not unique (found {d} occurrences), provide more context",
-                    .{occurrence_count},
-                ) };
+            if (occurrence_count != 1) {
+                break :blk .{ .semantic_failure = try matchFailureMessage(alloc, failure_detail, before, old_string, occurrence_count) };
             }
 
             const match_start = std.mem.find(
@@ -1526,6 +1524,303 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
         index += relative + needle.len;
     }
     return count;
+}
+
+const not_found_message = "edit_file failed: old_string not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit.";
+/// The closest match is shown only while it stays short enough to copy.
+const max_hint_lines = 40;
+const max_hint_bytes = 4096;
+/// The snippets of a not-unique old_string get half the hint budget; each
+/// needs only enough lines for the next call to add context.
+const max_snippet_bytes = max_hint_bytes / 2;
+/// Lines shorter than this, such as `}` or `end`, recur through most files
+/// and cannot place a match.
+const min_anchor_bytes = 4;
+/// A lone line places a match only when it shares this much of its start or
+/// end with a file line, and at least 1/min_shared_divisor of its length.
+const min_shared_bytes = 8;
+const min_shared_divisor = 2;
+const max_listed_lines = 5;
+const max_shown_occurrences = 3;
+/// Lines shown before each occurrence of a not-unique old_string.
+const context_lines_before = 2;
+/// Bounds the line comparison on large files; a longer old_string still
+/// places its window by its first lines.
+const max_compared_lines = 256;
+/// Finding the closest window compares every file line with old_string's
+/// lines, so past this many lines the hint would cost more time and memory
+/// than re-reading the file, and the message stays the plain advice.
+const max_hint_file_lines = 100_000;
+
+/// The failure for an old_string found zero or several times. `.file_lines`
+/// quotes the lines the edit most likely meant; `.plain` keeps the recovery
+/// advice alone, for a file the model may not read without approval.
+fn matchFailureMessage(
+    alloc: Allocator,
+    detail: file_mutation_contract.EditFailureDetail,
+    content: []const u8,
+    old_string: []const u8,
+    occurrence_count: usize,
+) error{OutOfMemory}![]const u8 {
+    if (occurrence_count == 0) return switch (detail) {
+        .plain => not_found_message,
+        .file_lines => try notFoundMessage(alloc, content, old_string),
+    };
+    return switch (detail) {
+        .plain => try alloc.print(
+            "edit_file failed: old_string is not unique (found {d} occurrences), provide more context",
+            .{occurrence_count},
+        ),
+        .file_lines => try notUniqueMessage(alloc, content, old_string, occurrence_count),
+    };
+}
+
+/// A failed edit usually copies text the model remembers rather than text the
+/// file holds now. Showing the lines it most likely meant lets the next call
+/// copy them instead of reading the whole file again. Without a close match
+/// the message stays the plain recovery advice.
+fn notFoundMessage(alloc: Allocator, content: []const u8, old_string: []const u8) error{OutOfMemory}![]const u8 {
+    const span = (try closestLines(alloc, content, old_string)) orelse return not_found_message;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    if (span.first == span.last) {
+        try out.print(alloc, "edit_file failed: old_string not found in file; the closest match is line {d}.\nIt currently reads:\n", .{span.first + 1});
+    } else {
+        try out.print(alloc, "edit_file failed: old_string not found in file; the closest match is lines {d}-{d}.\nThey currently read:\n", .{ span.first + 1, span.last + 1 });
+    }
+    try out.appendSlice(alloc, content[span.start..span.end]);
+    try out.appendSlice(alloc, "\nIf the change is already applied, do not retry this edit.");
+    return out.toOwnedSlice(alloc);
+}
+
+/// Names the lines of the first occurrences and shows each with the lines
+/// before it, so the next call can add the context that picks one without
+/// reading the file again.
+fn notUniqueMessage(alloc: Allocator, content: []const u8, old_string: []const u8, occurrence_count: usize) error{OutOfMemory}![]const u8 {
+    const found = occurrenceLines(content, old_string);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.print(alloc, "edit_file failed: old_string is not unique (found {d} occurrences, on line{s} ", .{ occurrence_count, if (found.count == 1) "" else "s" });
+    for (found.numbers[0..found.count], 0..) |number, i| {
+        try out.print(alloc, "{s}{d}", .{ if (i == 0) "" else ", ", number });
+    }
+    if (found.more) try out.appendSlice(alloc, ", ...");
+    try out.appendSlice(alloc, "), provide more context");
+    try appendOccurrenceSnippets(alloc, &out, content, old_string);
+    return out.toOwnedSlice(alloc);
+}
+
+const OccurrenceLines = struct {
+    /// One-based; a line that holds several occurrences is listed once.
+    numbers: [max_listed_lines]usize = undefined,
+    count: usize = 0,
+    /// More lines hold an occurrence than `numbers` lists.
+    more: bool = false,
+};
+
+fn occurrenceLines(content: []const u8, old_string: []const u8) OccurrenceLines {
+    var found: OccurrenceLines = .{};
+    var line: usize = 1;
+    var scanned: usize = 0;
+    var index: usize = 0;
+    while (std.mem.find(u8, content[index..], old_string)) |relative| {
+        const position = index + relative;
+        line += std.mem.count(u8, content[scanned..position], "\n");
+        scanned = position;
+        index = position + old_string.len;
+        if (found.count > 0 and found.numbers[found.count - 1] == line) continue;
+        if (found.count == found.numbers.len) {
+            found.more = true;
+            break;
+        }
+        found.numbers[found.count] = line;
+        found.count += 1;
+    }
+    return found;
+}
+
+/// Shows up to `max_shown_occurrences` occurrences, each from
+/// `context_lines_before` lines above it to the end of its last line, within
+/// `max_snippet_bytes` in total.
+fn appendOccurrenceSnippets(alloc: Allocator, out: *std.ArrayList(u8), content: []const u8, old_string: []const u8) error{OutOfMemory}!void {
+    var shown: usize = 0;
+    var shown_bytes: usize = 0;
+    var previous_end: usize = 0;
+    var search: usize = 0;
+    while (shown < max_shown_occurrences) {
+        const relative = std.mem.find(u8, content[search..], old_string) orelse return;
+        const position = search + relative;
+        search = position + old_string.len;
+        // An occurrence inside the last snippet is already shown, and a
+        // snippet starts after the one before it.
+        if (shown > 0 and position < previous_end) continue;
+        var begin = contextStart(content, position);
+        if (shown > 0) begin = @min(@max(begin, previous_end + 1), position);
+        const line_end = if (old_string[old_string.len - 1] == '\n')
+            search - 1
+        else
+            std.mem.findScalarPos(u8, content, search, '\n') orelse content.len;
+        const end = withoutCarriageReturn(content, begin, line_end);
+        if (shown_bytes + (end - begin) > max_snippet_bytes) return;
+        const first_line = 1 + std.mem.count(u8, content[0..begin], "\n");
+        const last_line = first_line + std.mem.count(u8, content[begin..end], "\n");
+        if (first_line == last_line) {
+            try out.print(alloc, "\nLine {d} reads:\n", .{first_line});
+        } else {
+            try out.print(alloc, "\nLines {d}-{d} read:\n", .{ first_line, last_line });
+        }
+        try out.appendSlice(alloc, content[begin..end]);
+        shown += 1;
+        shown_bytes += end - begin;
+        previous_end = line_end;
+    }
+}
+
+/// The start of the line `context_lines_before` lines above the one that
+/// holds `position`, or of the file.
+fn contextStart(content: []const u8, position: usize) usize {
+    var begin = position;
+    var lines_back: usize = 0;
+    while (begin > 0) : (begin -= 1) {
+        if (content[begin - 1] != '\n') continue;
+        if (lines_back == context_lines_before) break;
+        lines_back += 1;
+    }
+    return begin;
+}
+
+/// A CRLF line ends in `\r\n`, so a quoted range that leaves out its last
+/// `\n` leaves out the `\r` before it too.
+fn withoutCarriageReturn(content: []const u8, begin: usize, end: usize) usize {
+    return if (end > begin and content[end - 1] == '\r') end - 1 else end;
+}
+
+const LineSpan = struct {
+    /// Zero-based, inclusive.
+    first: usize,
+    last: usize,
+    /// Byte range of those lines, without the final line ending.
+    start: usize,
+    end: usize,
+};
+
+fn trimmedLine(line: []const u8) []const u8 {
+    return std.mem.trim(u8, line, " \t\r");
+}
+
+/// Line `index` of `content`, without its `\n` or `\r\n`.
+fn lineAt(content: []const u8, starts: []const usize, index: usize) []const u8 {
+    const begin = starts[index];
+    const finish = if (index + 1 < starts.len) starts[index + 1] - 1 else content.len;
+    const line = std.mem.trimEnd(u8, content[begin..finish], "\n");
+    return line[0..withoutCarriageReturn(line, 0, line.len)];
+}
+
+/// Finds the window of old_string's line count whose lines, ignoring
+/// indentation, agree with the most of old_string's distinctive lines. When
+/// none agree, its longest line places the window if it shares a long start
+/// or end with one file line. Null when nothing in the file is close.
+fn closestLines(alloc: Allocator, content: []const u8, old_string: []const u8) error{OutOfMemory}!?LineSpan {
+    var old_lines: std.ArrayList([]const u8) = .empty;
+    defer old_lines.deinit(alloc);
+    var old_iter = std.mem.splitScalar(u8, std.mem.trimEnd(u8, old_string, "\n"), '\n');
+    while (old_iter.next()) |line| {
+        if (old_lines.items.len == max_compared_lines) break;
+        try old_lines.append(alloc, trimmedLine(line));
+    }
+    if (old_lines.items.len == 0) return null;
+
+    // A final line ending does not start another line.
+    const ends_with_newline = content.len > 0 and content[content.len - 1] == '\n';
+    const line_count = 1 + std.mem.count(u8, content, "\n") - @intFromBool(ends_with_newline);
+    if (line_count > max_hint_file_lines) return null;
+    var starts: std.ArrayList(usize) = .empty;
+    defer starts.deinit(alloc);
+    try starts.ensureTotalCapacityPrecise(alloc, line_count);
+    starts.appendAssumeCapacity(0);
+    for (content, 0..) |byte, i| {
+        if (byte == '\n' and i + 1 < content.len) starts.appendAssumeCapacity(i + 1);
+    }
+    const first = (try votedWindowStart(alloc, content, starts.items, old_lines.items)) orelse
+        loneLineWindowStart(content, starts.items, old_lines.items) orelse
+        return null;
+    return boundedSpan(content, starts.items, first, old_lines.items.len);
+}
+
+/// The first line of the window whose lines agree with the most old lines,
+/// counting only file lines long enough to place a match.
+fn votedWindowStart(
+    alloc: Allocator,
+    content: []const u8,
+    starts: []const usize,
+    old_lines: []const []const u8,
+) error{OutOfMemory}!?usize {
+    const old_count = old_lines.len;
+    // votes[s + old_count - 1] counts the lines agreeing with a window that
+    // starts at file line s, which may begin before the file does.
+    const votes = try alloc.alloc(u32, starts.len + old_count);
+    defer alloc.free(votes);
+    @memset(votes, 0);
+    var best: ?usize = null;
+    for (0..starts.len) |file_index| {
+        const file_line = trimmedLine(lineAt(content, starts, file_index));
+        if (file_line.len < min_anchor_bytes) continue;
+        for (old_lines, 0..) |old_line, old_index| {
+            if (!std.mem.eql(u8, file_line, old_line)) continue;
+            const slot = file_index + old_count - 1 - old_index;
+            votes[slot] += 1;
+            if (best == null or votes[slot] > votes[best.?]) best = slot;
+        }
+    }
+    const slot = best orelse return null;
+    return (slot + 1) -| old_count;
+}
+
+/// When no line agrees, the longest old line places the window if one file
+/// line shares enough of its start or end.
+fn loneLineWindowStart(content: []const u8, starts: []const usize, old_lines: []const []const u8) ?usize {
+    var anchor_index: usize = 0;
+    for (old_lines, 0..) |line, i| {
+        if (line.len > old_lines[anchor_index].len) anchor_index = i;
+    }
+    const anchor = old_lines[anchor_index];
+    if (anchor.len < min_shared_bytes) return null;
+    var best_shared: usize = 0;
+    var best_line: usize = 0;
+    for (0..starts.len) |file_index| {
+        const shared = sharedEdgeBytes(trimmedLine(lineAt(content, starts, file_index)), anchor);
+        if (shared > best_shared) {
+            best_shared = shared;
+            best_line = file_index;
+        }
+    }
+    if (best_shared < min_shared_bytes or best_shared * min_shared_divisor < anchor.len) return null;
+    return best_line -| anchor_index;
+}
+
+/// The longer of the start and the end that `file_line` and `anchor` share.
+fn sharedEdgeBytes(file_line: []const u8, anchor: []const u8) usize {
+    const limit = @min(file_line.len, anchor.len);
+    var prefix: usize = 0;
+    while (prefix < limit and file_line[prefix] == anchor[prefix]) prefix += 1;
+    var suffix: usize = 0;
+    while (suffix < limit and file_line[file_line.len - 1 - suffix] == anchor[anchor.len - 1 - suffix]) suffix += 1;
+    return @max(prefix, suffix);
+}
+
+/// The `old_count` lines from `first`, cut at the file's end and at
+/// `max_hint_lines`, then shortened from the end until they fit
+/// `max_hint_bytes`. Null when even the first line does not fit.
+fn boundedSpan(content: []const u8, starts: []const usize, first: usize, old_count: usize) ?LineSpan {
+    var last = @min(first + old_count - 1, starts.len - 1);
+    last = @min(last, first + max_hint_lines - 1);
+    const start = starts[first];
+    while (true) {
+        const end = starts[last] + lineAt(content, starts, last).len;
+        if (end - start <= max_hint_bytes) return .{ .first = first, .last = last, .start = start, .end = end };
+        if (last == first) return null;
+        last -= 1;
+    }
 }
 
 fn buildPreview(
@@ -1721,7 +2016,7 @@ fn expectPrepared(
     policy: PolicyEvaluatedFileTargets,
 ) !PreparedFileMutation {
     const input = try decodeTestMutationInput(alloc, call);
-    return switch (try prepare(alloc, call, input, policy)) {
+    return switch (try prepare(alloc, call, input, policy, .plain)) {
         .prepared => |prepared| prepared,
         .semantic_failure => error.UnexpectedSemanticFailure,
     };
@@ -1732,8 +2027,17 @@ fn expectSemanticFailure(
     call: types.ToolCall,
     policy: PolicyEvaluatedFileTargets,
 ) ![]const u8 {
+    return expectSemanticFailureWithDetail(alloc, call, policy, .plain);
+}
+
+fn expectSemanticFailureWithDetail(
+    alloc: Allocator,
+    call: types.ToolCall,
+    policy: PolicyEvaluatedFileTargets,
+    failure_detail: file_mutation_contract.EditFailureDetail,
+) ![]const u8 {
     const input = try decodeTestMutationInput(alloc, call);
-    return switch (try prepare(alloc, call, input, policy)) {
+    return switch (try prepare(alloc, call, input, policy, failure_detail)) {
         .prepared => error.UnexpectedPreparedMutation,
         .semantic_failure => |message| message,
     };
@@ -1813,7 +2117,7 @@ test "prepare derives a missing write without creating the target" {
         .content = try arena.dupe(u8, "hello\n"),
     } };
     defer input.deinit(arena);
-    const prepared = switch (try prepare(arena, call, input, policy)) {
+    const prepared = switch (try prepare(arena, call, input, policy, .plain)) {
         .prepared => |value| value,
         .semantic_failure => return error.UnexpectedSemanticFailure,
     };
@@ -2003,6 +2307,11 @@ test "prepare preserves exact edit semantic failures" {
         "edit_file failed: old_string is not unique (found 2 occurrences), provide more context",
         try expectSemanticFailure(arena, duplicate_call, duplicate_policy),
     );
+    // Lines of the file appear only when the caller allows them.
+    try std.testing.expectEqualStrings(
+        "edit_file failed: old_string is not unique (found 2 occurrences, on line 1), provide more context\nLine 1 reads:\nsame twice same",
+        try expectSemanticFailureWithDetail(arena, duplicate_call, duplicate_policy, .file_lines),
+    );
 }
 
 test "zero-occurrence edit failure explains recovery and leaves the file untouched" {
@@ -2032,6 +2341,151 @@ test "zero-occurrence edit failure explains recovery and leaves the file untouch
     defer file.close(std.testing.io);
     const unchanged = try io_mod.readFileToEnd(arena, &file, 4096);
     try std.testing.expectEqualStrings("export interface RacePlan {\n  laps: number;\n}\n", unchanged);
+}
+
+test "a failed edit shows the lines it most likely meant" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const content = "import os\n\ndef load(path):\n    with open(path) as f:\n        data = f.read()\n    return data.strip()\n\nTIMEOUT = 30 # secs\n";
+
+    // One remembered line differs and the indentation is off; the other
+    // lines place the window.
+    try std.testing.expectEqualStrings(
+        "edit_file failed: old_string not found in file; the closest match is lines 3-6.\nThey currently read:\n" ++
+            "def load(path):\n    with open(path) as f:\n        data = f.read()\n    return data.strip()\n" ++
+            "If the change is already applied, do not retry this edit.",
+        try notFoundMessage(arena, content, "def load(path):\n  with open(path) as f:\n    text = f.read()\n  return data.strip()\n"),
+    );
+    // A lone line is placed by what it shares with one file line.
+    try std.testing.expectEqualStrings(
+        "edit_file failed: old_string not found in file; the closest match is line 8.\nIt currently reads:\nTIMEOUT = 30 # secs\n" ++
+            "If the change is already applied, do not retry this edit.",
+        try notFoundMessage(arena, content, "TIMEOUT = 30  # seconds"),
+    );
+    // Short lines alone, or text that shares too little, keep the plain advice.
+    try std.testing.expectEqualStrings(not_found_message, try notFoundMessage(arena, content, "}\n)\n"));
+    try std.testing.expectEqualStrings(not_found_message, try notFoundMessage(arena, content, "class Loader:"));
+    try std.testing.expectEqualStrings(not_found_message, try notFoundMessage(arena, "", "def load(path):"));
+}
+
+test "a failed edit shows at most the lines a hint allows" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var content: std.ArrayList(u8) = .empty;
+    var old: std.ArrayList(u8) = .empty;
+    for (0..60) |i| {
+        try content.print(arena, "value_{d} = {d}\n", .{ i, i });
+        try old.print(arena, "value_{d} = {d}\n", .{ i, if (i == 30) 0 else i });
+    }
+    const message = try notFoundMessage(arena, content.items, old.items);
+    try std.testing.expect(std.mem.startsWith(u8, message, "edit_file failed: old_string not found in file; the closest match is lines 1-40.\n"));
+    try std.testing.expect(std.mem.find(u8, message, "value_39 = 39\nIf the change") != null);
+    try std.testing.expect(std.mem.find(u8, message, "value_40") == null);
+}
+
+test "a failed edit of a file past the hint's line limit keeps the plain advice" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const remembered = "timeout = 25 # seconds\nretries = 2\n";
+    var content: std.ArrayList(u8) = .empty;
+    try content.appendSlice(arena, "timeout = 30 # seconds\nretries = 2\n");
+    // The two lines above and these empty lines fill the file to the limit
+    // exactly; the final line ending starts no line.
+    try content.appendNTimes(arena, '\n', max_hint_file_lines - 2);
+    const at_limit = try notFoundMessage(arena, content.items, remembered);
+    try std.testing.expect(std.mem.startsWith(u8, at_limit, "edit_file failed: old_string not found in file; the closest match is lines 1-2."));
+
+    try content.append(arena, '\n');
+    try std.testing.expectEqualStrings(not_found_message, try notFoundMessage(arena, content.items, remembered));
+}
+
+test "a not-unique edit names the lines of its occurrences" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings(
+        "edit_file failed: old_string is not unique (found 3 occurrences, on lines 1, 3), provide more context\n" ++
+            "Line 1 reads:\na = 1; a = 1\nLines 2-3 read:\nb = 2\na = 1",
+        try notUniqueMessage(arena, "a = 1; a = 1\nb = 2\na = 1\n", "a = 1", 3),
+    );
+    try std.testing.expectEqualStrings(
+        "edit_file failed: old_string is not unique (found 7 occurrences, on lines 1, 2, 3, 4, 5, ...), provide more context\n" ++
+            "Line 1 reads:\nx\nLine 2 reads:\nx\nLine 3 reads:\nx",
+        try notUniqueMessage(arena, "x\nx\nx\nx\nx\nx\nx\n", "x", 7),
+    );
+    // A bare newline shows the line each occurrence ends.
+    try std.testing.expectEqualStrings(
+        "edit_file failed: old_string is not unique (found 2 occurrences, on lines 1, 2), provide more context\nLine 1 reads:\na\nLine 2 reads:\nb",
+        try notUniqueMessage(arena, "a\nb\n", "\n", 2),
+    );
+    // Each occurrence shows the two lines before it, which name its function.
+    try std.testing.expectEqualStrings(
+        "edit_file failed: old_string is not unique (found 2 occurrences, on lines 6, 11), provide more context\n" ++
+            "Lines 4-6 read:\ndef invoice_total(items):\n    total = sum(items)\n    return round(total, 2)\n" ++
+            "Lines 9-11 read:\ndef refund_total(items):\n    total = sum(items)\n    return round(total, 2)",
+        try notUniqueMessage(arena, "\"\"\"Totals.\"\"\"\n\n\ndef invoice_total(items):\n    total = sum(items)\n    return round(total, 2)\n\n\ndef refund_total(items):\n    total = sum(items)\n    return round(total, 2)\n", "    return round(total, 2)", 2),
+    );
+}
+
+test "hints for a CRLF file keep its line endings except after the last quoted line" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // An old_string with LF endings still places its window; the quote keeps
+    // the CRLF between lines, which the next call must copy.
+    try std.testing.expectEqualStrings(
+        "edit_file failed: old_string not found in file; the closest match is lines 2-3.\nThey currently read:\n" ++
+            "port = 8080\r\nhost = \"localhost\"\n" ++
+            "If the change is already applied, do not retry this edit.",
+        try notFoundMessage(arena, "[server]\r\nport = 8080\r\nhost = \"localhost\"\r\n[client]\r\nretries = 3\r\n", "port = 8080\nhost = \"localhost\"\n"),
+    );
+    try std.testing.expectEqualStrings(
+        "edit_file failed: old_string is not unique (found 2 occurrences, on lines 1, 3), provide more context\n" ++
+            "Line 1 reads:\na = 1\nLines 2-3 read:\nb = 2\r\na = 1",
+        try notUniqueMessage(arena, "a = 1\r\nb = 2\r\na = 1\r\n", "a = 1", 2),
+    );
+}
+
+test "edit failure hints stay within their bounds for any file and old_string" {
+    try std.testing.fuzz({}, fuzzEditFailureHints, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "a = 1\nb = 2\na = 1\n",
+            "port = 8080\r\nhost = 1\r\nport = 8080\r\n",
+            "\n\n\n\n",
+            "\xff\x00\xe2\x82\n\xe2\x82\n",
+        }) ++ @import("fuzz_corpus").edit_failure_hints.*),
+    });
+}
+
+/// Edits a copy of a random part of the file, as a model's remembered
+/// old_string does, and checks the failure text stays bounded and quotes
+/// only lines the file holds.
+fn fuzzEditFailureHints(_: void, smith: *std.testing.Smith) anyerror!void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var content_buffer: [8192]u8 = undefined;
+    const content = content_buffer[0..smith.slice(&content_buffer)];
+    if (content.len == 0) return;
+    const start = smith.index(content.len);
+    var old_buffer: [512]u8 = undefined;
+    const old_string = old_buffer[0 .. 1 + smith.index(@min(old_buffer.len, content.len - start))];
+    @memcpy(old_string, content[start..][0..old_string.len]);
+    old_string[smith.index(old_string.len)] = smith.value(u8);
+
+    const occurrence_count = countOccurrences(content, old_string);
+    if (occurrence_count == 1) return;
+    const message = try matchFailureMessage(arena, .file_lines, content, old_string, occurrence_count);
+    try std.testing.expect(message.len <= max_hint_bytes + 512);
+    if (occurrence_count > 1) return;
+    // The plain advice has no quote; a hint's header ends at its first ":\n".
+    const quote_start = (std.mem.find(u8, message, ":\n") orelse return) + ":\n".len;
+    const quote_end = std.mem.findLast(u8, message, "\nIf the change is already applied") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.find(u8, content, message[quote_start..quote_end]) != null);
 }
 
 test "an edit copied from tool output that escaped a carried tag edits the file's tag (D93)" {
@@ -2353,7 +2807,7 @@ fn prepareForApply(
     return .{
         .input = input,
         .policy = policy,
-        .prepared = switch (try prepare(alloc, call, input, policy)) {
+        .prepared = switch (try prepare(alloc, call, input, policy, .plain)) {
             .prepared => |prepared| prepared,
             .semantic_failure => return error.UnexpectedSemanticFailure,
         },
