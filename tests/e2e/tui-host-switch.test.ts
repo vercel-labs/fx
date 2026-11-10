@@ -1301,6 +1301,61 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "an idle agent waits only on its own subagents: main shows no wait row for lead's helper, and lead's screen does",
+    async () => {
+      const helper = held();
+      let helperAsked = false;
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            if (userTexts(body).some((text) => text.includes("WAIT_HELPER_TASK"))) {
+              helperAsked = true;
+              await helper.promise;
+              return text("helper", "WAIT_HELPER_DONE");
+            }
+            if (body.includes("WAIT_HELPER_DONE")) return text("lead_after", "WAIT_LEAD_SAW_HELPER");
+            if (!body.includes('"lead_sub"')) {
+              return toolCall("lead_sub", "subagent", {
+                request: { action: "message", agent: "helper", message: "WAIT_HELPER_TASK" },
+              });
+            }
+            return text("lead_started", "WAIT_LEAD_STARTED");
+          }
+          if (body.includes("WAIT_LEAD_SAW_HELPER")) return text("main_after", "WAIT_MAIN_SAW_LEAD_AFTER");
+          if (body.includes("WAIT_LEAD_STARTED")) return text("main_idle", "WAIT_MAIN_IDLE");
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", {
+              request: { action: "message", agent: "lead", message: "WAIT_LEAD_TASK" },
+            });
+          }
+          return text("main_done", "WAIT_MAIN_DONE");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          // Lead's turn has ended and main has read its report, so neither
+          // works; only lead's helper does, held until the checks are done.
+          await session.waitForText("WAIT_MAIN_IDLE", 30_000);
+          await until("the helper's request", () => helperAsked);
+          // Main waits on nothing of its own. The footer note and the wait
+          // row come from the same frame, so a frame that counts the helper
+          // working without the row shows main's count is 0.
+          const mainScreen = await session.waitForPane((pane) => pane.includes("1 subagent working") && !pane.includes("waiting on"), 15_000);
+          expect(mainScreen).not.toContain("waiting on");
+          // Lead, the helper's parent, waits on it.
+          await showAgent(session, "lead");
+          await session.waitForPane((pane) => /\u2022 waiting on 1 subagent \(\d+s\) \u00b7 \u2193 to view/.test(pane), 15_000);
+          helper.release();
+          // The helper's report wakes lead, and lead's row goes once
+          // nothing it started still works.
+          await session.waitForPane((pane) => pane.includes("WAIT_LEAD_SAW_HELPER") && !pane.includes("waiting on"), 30_000);
+        });
+      } finally {
+        helper.release();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "main's stop ends a turn typed on a subagent's screen, which then owes no report",
     async () => {
       const typed = held();
@@ -1869,8 +1924,18 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER plan it");
         await session.waitForText("LIST_MAIN_WAITING", 30_000);
         await until("the reviewer's turn", () => childCalls >= 1);
-        // Main shows that work goes on elsewhere, beside the list's key.
-        await session.waitForText("1 subagent working \u00b7 main \u2193", 15_000);
+        // Idle main says it waits on its subagent above the composer, with
+        // a running clock and the list's key, and the footer still counts
+        // the subagents working beside the list's key.
+        const waitRow = /\u2022 waiting on 1 subagent \((\d+)s\) \u00b7 \u2193 to view/;
+        const waiting = await session.waitForPane((pane) => waitRow.test(pane) && pane.includes("1 subagent working \u00b7 main \u2193"), 15_000);
+        expect(waiting).toContain("1 subagent working \u00b7 main \u2193");
+        // The clock advances, and the bullet blinks: it turns into a space
+        // and back.
+        const firstSeconds = Number(waitRow.exec(waiting)![1]);
+        await session.waitForPane((pane) => Number(waitRow.exec(pane)?.[1] ?? firstSeconds) > firstSeconds, 5_000);
+        await session.waitForPane((pane) => /^\s*waiting on 1 subagent \(\d+s\) \u00b7 \u2193 to view/m.test(pane), 5_000);
+        await session.waitForPane((pane) => waitRow.test(pane), 5_000);
         await session.sendKeys("Down");
         // The reviewer's title is the title model's, from its task, as main's is.
         const list = await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}working {2,}main {2,}\S/m.test(pane), 15_000);
@@ -1882,7 +1947,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(list).not.toContain("delete close");
         await session.sendKeys("Escape");
         reviewer.release();
-        await session.waitForPane((pane) => !pane.includes("subagent working"), 30_000);
+        await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), 30_000);
       }, () => {}, false, {}, subagentTitles);
     },
     TIMEOUT,
@@ -1983,7 +2048,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.sendText("SWITCH_USER start both workers");
           await session.waitForText("ORDER_MAIN_IDLE", 30_000);
           await until("both workers' requests", () => started.reviewer && started.tester);
-          await session.waitForText("2 subagents working", 15_000);
+          await session.waitForPane((pane) => /\u2022 waiting on 2 subagents \(\d+s\) \u00b7 \u2193 to view/.test(pane), 15_000);
           await session.sendKeys("Down");
           const initial = await session.waitForPane((pane) =>
             subagentRow("reviewer", "working").test(pane)
