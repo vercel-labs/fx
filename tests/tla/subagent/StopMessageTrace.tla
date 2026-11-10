@@ -11,6 +11,8 @@
 (*   "send", "stop", "close"                                               *)
 (*             one call of that step ran, and main heard `answer`, with    *)
 (*             the `count` of messages a stop or close dropped;            *)
+(*   "begin"   subagent `sub`'s starting turn began: the driver let go of  *)
+(*             its start hold (FX_TEST_SUBAGENT_START_HELD);               *)
 (*   "read"    subagent `sub`'s running turn read the messages `msgs`;     *)
 (*   "finish"  its turn ended with nothing more to read;                  *)
 (*   "end"     its stopped or closed work ended, and its next turn read    *)
@@ -40,7 +42,7 @@ Observable(o) ==
      /\ steps < MaxSteps
      /\ Write(AsCalls(o.calls))
      /\ UNCHANGED <<phase, unread, waitq, read, dropped, toldDropped, told,
-                    refusedOpen, coverBroken>>
+                    refusedOpen, coverBroken, lateStart>>
   \/ /\ o.op \in {"send", "stop", "close"}
      /\ Exec
      /\ last'.op = o.op
@@ -48,6 +50,8 @@ Observable(o) ==
      /\ last'.msg = o.msg
      /\ last'.answer = o.answer
      /\ last'.count = o.count
+  \/ /\ o.op = "begin"
+     /\ Begin(o.sub)
   \/ /\ o.op = "read"
      /\ Read(o.sub)
      /\ read' \ read = o.msgs
