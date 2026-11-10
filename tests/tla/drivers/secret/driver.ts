@@ -21,6 +21,12 @@
 //                   (in the ReleaseSafe addon only the failed construction can show the key:
 //                   destruction frees through a runtime allocator, whose @memset(undefined)
 //                   the optimizer keeps, while it drops the one before c_allocator's free)
+//   keychain-read   the Keychain read of src/core/hosts/native_keychain.zig, which fx makes on macOS
+//                   for the Vercel login and for the read-back after every save: a zig test of
+//                   native_keychain_reply_tests.zig runs both of its reads over libc against a fake
+//                   child that prints the marker
+//                   and a long reply, in place of /usr/bin/security, so the reply buffer grows, moves,
+//                   and shrinks as it does for a saved session
 //
 // and the same paths when an edge fails:
 //
@@ -40,7 +46,9 @@
 // FX_NO_OPEN_BROWSER=1, a private FX_HOME, and only local fakes. A stub `open`
 // first on PATH keeps any browser launch local. The napi run needs
 // zig-out/lib/libfx.node (zig build libfx-napi -Dnapi-surface=core) and node;
-// LIBFX_NODE picks another addon.
+// LIBFX_NODE picks another addon. The keychain-read run needs zig on PATH, and
+// never touches the real Keychain: fx runs with FX_DISABLE_KEYCHAIN=1, and the
+// zig test it starts reads from a fake child, not /usr/bin/security.
 //
 // Usage (from the repository root, after zig build):
 //   bun tests/tla/drivers/secret/driver.ts
@@ -49,11 +57,12 @@
 //
 // --repeat runs every scenario that many times, and --token-bytes pads each
 // token the fakes hand out or seed by that many bytes, so request bodies and
-// saved sessions outgrow their buffers several times over.
+// saved sessions outgrow their buffers several times over. The Keychain
+// reply is 4096 bytes plus that padding.
 //
 // Exit codes: 0 every run is a behavior of the design, 1 a run gave a secret
 // back to libc or missed a precondition, 2 a toolchain or build failure.
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { REPO_ROOT, TLA_ROOT, fxBin, outDir, runTlc, writeJson } from "../lib/tlc";
@@ -466,6 +475,33 @@ type Scenario = {
   run: (run: Run) => Promise<{ code: number; skipped?: string }>;
 };
 
+// The Keychain read is run as a zig test, in src/core/hosts/native_keychain_reply_tests.zig,
+// compiled here once: a real read would need /usr/bin/security and the user's
+// Keychain, and fx under FX_DISABLE_KEYCHAIN=1 never makes one. The test feeds
+// the read a fake child in place of `security`. A link to src/ in the probe's
+// folder makes that file and the files it imports one zig module.
+let keychainProbe: string | null = null;
+
+function buildKeychainProbe(): string {
+  if (keychainProbe) return keychainProbe;
+  const dir = join(out, "keychain-probe");
+  mkdirSync(dir, { recursive: true });
+  const link = join(dir, "src");
+  if (!existsSync(link)) symlinkSync(join(REPO_ROOT, "src"), link);
+  writeFileSync(join(dir, "probe.zig"), 'test {\n    _ = @import("src/core/hosts/native_keychain_reply_tests.zig");\n}\n');
+  const exe = join(dir, "keychain-probe");
+  const built = Bun.spawnSync(
+    [
+      "zig", "test", "probe.zig", "-lc", "-O", "ReleaseSafe", "--cache-dir", join(dir, "zig-cache"),
+      "--test-filter", "Keychain reads over libc", "--test-no-exec", `-femit-bin=${exe}`,
+    ],
+    { cwd: dir, stdout: "pipe", stderr: "pipe" },
+  );
+  if (built.exitCode !== 0) fail(2, `building the Keychain read probe failed:\n${built.stderr.toString()}`);
+  keychainProbe = exe;
+  return exe;
+}
+
 function expired(): number {
   return Date.now() - 60_000;
 }
@@ -746,6 +782,24 @@ const scenarios: Scenario[] = [
         PATH: `${run.binDir}:/usr/bin:/bin:${join(node, "..")}`,
       });
       run.expect("the runtime took the API key", result.code === 0);
+      return result;
+    },
+  },
+  {
+    name: "keychain-read",
+    async run(run) {
+      const probe = buildKeychainProbe();
+      const reply = run.marker("KEYCHAIN");
+      // The marker reaches the probe in two halves: scan.c reads the whole one
+      // from its markers file, and a copy of the environment, which the spawn
+      // of the fake child makes and frees, must not hold it.
+      const half = Math.floor(reply.length / 2);
+      const result = await run.exec([probe], run.baseEnv({
+        FX_SECRET_SCAN_KEYCHAIN_FIRST: reply.slice(0, half),
+        FX_SECRET_SCAN_KEYCHAIN_SECOND: reply.slice(half),
+        FX_SECRET_SCAN_KEYCHAIN_BYTES: String(4096 + tokenBytes),
+      }));
+      run.expect("both reads returned the reply the child printed", result.code === 0);
       return result;
     },
   },

@@ -5413,6 +5413,7 @@ test {
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/auth/secret.zig");
     _ = @import("core/auth/subscription_session.zig");
+    _ = @import("core/auth/browser_callback.zig");
     _ = @import("core/shared/testing_allocator.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("core/workspace/path_completion.zig");
@@ -5432,6 +5433,7 @@ test {
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");
     _ = @import("core/hosts/host.zig");
+    _ = @import("core/hosts/native_keychain_reply_tests.zig");
     _ = @import("core/hooks/common.zig");
     _ = @import("core/hooks/definitions.zig");
     _ = @import("core/hooks/prompt.zig");
