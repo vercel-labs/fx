@@ -42,6 +42,18 @@ function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean
   return rows;
 }
 
+// Waits until the agent list draws `name`'s row selected, then returns the
+// pane as text.
+async function waitForSelected(session: TmuxSession, name: string, ms = 10_000): Promise<string> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const escapes = await session.capturePaneEscapes();
+    if (agentRows(escapes).find((row) => row.selected)?.name === name) return await session.capturePane();
+    if (Date.now() > deadline) throw new Error(`the agent list never selected ${name}:\n${escapes}`);
+    await Bun.sleep(25);
+  }
+}
+
 // Directions follow the list's order: the instances as they started, each
 // followed by its own subagents. A number selects that fx instance.
 async function switchAgent(session: TmuxSession, target: "next" | "previous" | number) {
@@ -440,11 +452,11 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendText("HOST_A first");
         await session.waitForText("HOST_ANSWER_A", 30_000);
 
-        // The list previews the highlighted row, so fx 2 is on screen.
+        // The highlight moves to fx 2, and fx 1 stays on screen.
         await session.sendKeys("C-x");
         await session.waitForText(LIST_HINT, 10_000);
         await session.sendKeys("Down");
-        await session.waitForText("delete close", 10_000);
+        expect(shownAnswers(await session.waitForText("delete close", 10_000))).toEqual(["HOST_ANSWER_A"]);
         await session.sendKeys("BSpace");
         await session.waitForText("press delete again to close this instance", 10_000);
         await session.sendKeys("BSpace");
@@ -1706,7 +1718,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // Esc closes it.
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !instanceRow(3).test(pane), 15_000);
-        // ↓↓ previews fx 3, and Enter keeps it.
+        // ↓↓ moves the highlight to fx 3, and Enter shows it.
         await session.sendText("/agents");
         await session.waitForPane((pane) => instanceRow(3).test(pane), 15_000);
         await session.sendKeys("Down");
@@ -1714,6 +1726,43 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("Enter");
         await session.waitForPane((pane) => pane.includes("fx 3/3") && !instanceRow(3).test(pane), 15_000);
         await session.waitForComposer(15_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "moving through the agent list moves only the highlight, and the screen changes on Enter",
+    async () => {
+      await withHost(answerByLetter, { instances: 3 }, async ({ session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/3"), 15_000);
+        await session.sendText("HOST_A first");
+        await session.waitForText("HOST_ANSWER_A", 30_000);
+        await session.waitForComposer(15_000);
+        await session.sendKeys("Down");
+        await session.waitForText(LIST_HINT, 10_000);
+        // Down, Down, Up, and Down past the last row: each move lands the
+        // highlight, and fx 1's conversation stays on screen. The list's hint
+        // row takes the footer's place while it is open.
+        for (const [key, name] of [["Down", "fx 2"], ["Down", "fx 3"], ["Up", "fx 2"], ["Down", "fx 3"], ["Down", "fx 3"]] as const) {
+          await session.sendKeys(key);
+          const pane = await waitForSelected(session, name);
+          expect(shownAnswers(pane)).toEqual(["HOST_ANSWER_A"]);
+        }
+        // Esc closes the list on fx 1, as it was.
+        await session.sendKeys("Escape");
+        const kept = await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+        expect(kept).toContain("fx 1/3");
+        expect(shownAnswers(kept)).toEqual(["HOST_ANSWER_A"]);
+        // Enter on a row switches to it.
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendKeys("Down");
+        await session.sendKeys("Down");
+        await waitForSelected(session, "fx 3");
+        await session.sendKeys("Enter");
+        const shown = await session.waitForPane((pane) => pane.includes("fx 3/3") && !pane.includes(LIST_HINT), 15_000);
+        expect(shownAnswers(shown)).toEqual([]);
       });
     },
     TIMEOUT,

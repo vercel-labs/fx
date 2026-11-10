@@ -123,22 +123,22 @@ pub const ChildAgent = struct {
 
 /// The agent list ↓, Ctrl+X, and `/agents` open. Its rows are every open
 /// agent in switch order, built each time it is drawn so each shows what it
-/// is doing now. The highlighted row's agent is the one on screen: moving
-/// through the list previews each agent, Enter keeps the one shown, and Esc
-/// or Ctrl+X go back to `origin`.
+/// is doing now. It opens on the agent on screen, and moving through it moves
+/// only the highlight: Enter shows the highlighted agent, and Esc or Ctrl+X
+/// close the list with the agent on screen unchanged.
 /// A row Delete closes in the agent list: a subagent, or an instance with
 /// null for the first.
 const CloseTarget = struct { agent: ?*ChildAgent };
 
 pub const AgentsMenu = struct {
     open: bool = false,
-    /// The selected agent's place in the switch list, from 0.
+    /// The highlighted agent's place in the switch list, from 0, as
+    /// `switchList` last found `highlight` there.
     selected: usize = 0,
     window_start: usize = 0,
-    /// The agent on screen when the list opened, null for the first
-    /// instance. Compared by address only, so it is never read after its
-    /// agent closes. Meaningful while `open`.
-    origin: ?*ChildAgent = null,
+    /// The highlighted agent while `open`. It stays on its agent while rows
+    /// start, reorder, and close around it.
+    highlight: Highlight = .on_screen,
     /// The agent whose close the first Delete armed, until the second
     /// closes it or another key disarms it. Compared by address only.
     close_armed: ?CloseTarget = null,
@@ -152,6 +152,16 @@ pub const AgentsMenu = struct {
         self.names.deinit(alloc);
         self.* = .{};
     }
+
+    /// The agent the list highlights: one agent, null for the first
+    /// instance, compared by address only; or the agent on screen, once the
+    /// highlighted agent closed. `dropHosted` puts it back on the agent on
+    /// screen before it frees the agent, so it never names a freed agent or
+    /// one that took its address.
+    pub const Highlight = union(enum) {
+        on_screen,
+        agent: ?*ChildAgent,
+    };
 };
 
 /// Room for an instance's name in the agent list, such as "fx 12".
@@ -957,9 +967,16 @@ pub fn Runtime(comptime App: type) type {
                 out.appendAssumeCapacity(if (position == 0) null else hosted[position - 1]);
             }
             // Activity can change while the menu is open. Keep the highlighted
-            // agent, not its previous row, for navigation, Enter, and Delete.
+            // agent, not its previous row, for navigation, Enter, and Delete;
+            // once it closed, the highlight moves to the agent on screen.
             if (menuActive(app)) {
-                app.instances.agents_menu.selected = positionIn(out.items, app.agent_on_screen) orelse 0;
+                const menu = &app.instances.agents_menu;
+                const at = switch (menu.highlight) {
+                    .on_screen => null,
+                    .agent => |agent| positionIn(out.items, agent),
+                };
+                if (at == null) menu.highlight = .on_screen;
+                menu.selected = at orelse positionIn(out.items, app.agent_on_screen) orelse 0;
             }
         }
 
@@ -1195,8 +1212,7 @@ pub fn Runtime(comptime App: type) type {
             return app.instances.agents_menu.open;
         }
 
-        /// Opens the agent list on the agent on screen, which Esc and Ctrl+X
-        /// go back to.
+        /// Opens the agent list with the agent on screen highlighted.
         pub fn openMenu(app: *App) !void {
             if (comptime !@hasField(App, "instances")) return;
             syncChildList(app) catch |err| {
@@ -1208,7 +1224,7 @@ pub fn Runtime(comptime App: type) type {
             const menu = &app.instances.agents_menu;
             menu.selected = positionIn(order.items, app.agent_on_screen) orelse 0;
             menu.window_start = 0;
-            menu.origin = app.agent_on_screen;
+            menu.highlight = .{ .agent = app.agent_on_screen };
             menu.close_armed = null;
             menu.open = true;
             debug_trace.eventf("host", "agents_menu_opened", .{}, "agents={d} position={d} agent={s}", .{
@@ -1231,32 +1247,22 @@ pub fn Runtime(comptime App: type) type {
         fn endMenu(app: *App) void {
             const menu = &app.instances.agents_menu;
             menu.open = false;
-            menu.origin = null;
+            menu.highlight = .on_screen;
             menu.close_armed = null;
             app.shell.render_requests.request(.footer);
         }
 
-        /// Esc and Ctrl+X: closes the list and puts back the agent it opened
-        /// on. If that agent closed meanwhile, the one shown stays.
+        /// Esc, Ctrl+X, Ctrl+C, and a paste: closes the list. The agent on
+        /// screen stays, since moving the highlight never changed it.
         pub fn backMenu(app: *App) !bool {
             if (!menuActive(app)) return false;
-            const origin = app.instances.agents_menu.origin;
             endMenu(app);
-            var order: std.ArrayList(?*ChildAgent) = .empty;
-            defer order.deinit(app.alloc);
-            try switchList(app, &order);
-            if (positionIn(order.items, origin) != null) {
-                try show(app, origin);
-            } else {
-                debug_trace.logf("host", "agents menu origin closed; keeping agent={s}", .{nameOf(app.agent_on_screen)});
-            }
             debug_trace.eventf("host", "agents_menu_back", .{}, "agent={s}", .{nameOf(app.agent_on_screen)});
             return true;
         }
 
-        /// Moves the list's selection by `delta`, keeping it in view in
-        /// `row_budget` rows, and shows the agent it lands on: the list
-        /// previews by switching.
+        /// Moves the list's highlight by `delta`, keeping it in view in
+        /// `row_budget` rows. The agent on screen stays until Enter.
         pub fn moveMenu(app: *App, delta: i32, row_budget: u16) !bool {
             if (!menuActive(app)) return false;
             disarmClose(app);
@@ -1269,14 +1275,14 @@ pub fn Runtime(comptime App: type) type {
             const current: i64 = @intCast(@min(menu.selected, order.items.len - 1));
             menu.selected = @intCast(std.math.clamp(current + delta, 0, last));
             const target = order.items[menu.selected];
-            if (target != app.agent_on_screen) try show(app, target);
+            menu.highlight = .{ .agent = target };
             menu.window_start = agents_menu_presentation.windowStart(menuProjection(app), row_budget);
             app.shell.render_requests.request(.footer);
-            debug_trace.eventf("host", "agents_menu_previewed", .{}, "position={d} agent={s}", .{ menu.selected + 1, nameOf(target) });
+            debug_trace.eventf("host", "agents_menu_moved", .{}, "position={d} agent={s}", .{ menu.selected + 1, nameOf(target) });
             return true;
         }
 
-        /// Enter: closes the list, keeping the agent it shows.
+        /// Enter: closes the list and shows the highlighted agent.
         pub fn submitMenu(app: *App) !bool {
             if (!menuActive(app)) return false;
             var order: std.ArrayList(?*ChildAgent) = .empty;
@@ -1284,8 +1290,6 @@ pub fn Runtime(comptime App: type) type {
             try switchList(app, &order);
             const selected = app.instances.agents_menu.selected;
             endMenu(app);
-            // The preview already shows the selected agent; a list that
-            // changed under it shows it now.
             if (order.items.len > 0) {
                 const chosen = order.items[@min(selected, order.items.len - 1)];
                 if (chosen != app.agent_on_screen) try show(app, chosen);
@@ -1385,24 +1389,19 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Closes instance `target`, null for the first, and every subagent in
-        /// its tree, as `/close` does on its screen. The next instance takes
-        /// its place on screen and as the agent Esc goes back to, and the list
-        /// stays open on it. Call only while another instance runs.
+        /// its tree, as `/close` does on its screen. When one of them is on
+        /// screen, the next instance takes its place, and the list stays open
+        /// with the agent on screen highlighted. Call only while another
+        /// instance runs.
         fn closeInstanceFromMenu(app: *App, target: ?*ChildAgent) !void {
             const menu = &app.instances.agents_menu;
-            const next = if (target) |child| nextInstanceAfter(app, child) else instanceAfterFirst(app);
-            const root: *AppAgent = if (target) |child| &child.agent else &app.main_agent;
-            const origin_closes = if (menu.origin) |origin|
-                origin == target or (origin.agent.role == .subagent and rootInstance(app, origin) == root)
-            else
-                target == null;
-            if (origin_closes) menu.origin = next;
             if (target) |child| try closeInstance(app, child) else try closeFirstInstance(app);
             if (menuActive(app)) {
+                // The highlight was on `target`, so it moves to the agent on
+                // screen.
                 var order: std.ArrayList(?*ChildAgent) = .empty;
                 defer order.deinit(app.alloc);
                 try switchList(app, &order);
-                menu.selected = positionIn(order.items, app.agent_on_screen) orelse 0;
                 menu.window_start = @min(menu.window_start, menu.selected);
                 app.shell.render_requests.request(.footer);
             }
@@ -1499,9 +1498,8 @@ pub fn Runtime(comptime App: type) type {
 
         /// Drops subagent `child`, which its host closed, and every subagent
         /// it started, each before the agent that started it, as `/close`
-        /// drops an instance's tree. When one of them is on screen, or the
-        /// agent list opened on one, the agent that started `child` takes
-        /// its place.
+        /// drops an instance's tree. When one of them is on screen, the agent
+        /// that started `child` takes its place.
         fn closeBranch(app: *App, child: *ChildAgent) !void {
             var branch: std.ArrayList(*ChildAgent) = .empty;
             defer branch.deinit(app.alloc);
@@ -1512,17 +1510,16 @@ pub fn Runtime(comptime App: type) type {
             const parent: ?*ChildAgent = if (ownerOf(app, hostOf(app, child))) |owner| hostedOf(app, owner) else null;
             if (inBranch(branch.items, app.agent_on_screen)) try show(app, parent);
             const menu = &app.instances.agents_menu;
-            if (inBranch(branch.items, menu.origin)) menu.origin = parent;
             stopSet(app, branch.items, null);
             debug_trace.eventf("host", "subagent_closed", .{}, "agent={s} subagents={d}", .{ child.id, branch.items.len - 1 });
             dropSet(app, branch.items);
-            // The list's highlight stays on the agent shown, as it always is,
-            // not on whichever row took the closed one's place.
+            // The list's highlight stays on its agent, not on whichever row
+            // took the closed one's place, or moves to the agent on screen
+            // when its agent closed.
             if (menuActive(app)) {
                 var order: std.ArrayList(?*ChildAgent) = .empty;
                 defer order.deinit(app.alloc);
                 try switchList(app, &order);
-                menu.selected = positionIn(order.items, app.agent_on_screen) orelse 0;
                 menu.window_start = @min(menu.window_start, menu.selected);
                 app.shell.render_requests.request(.footer);
             }
@@ -2292,6 +2289,10 @@ pub fn Runtime(comptime App: type) type {
                     _ = app.child_agents.orderedRemove(index);
                     break;
                 };
+            }
+            if (comptime @hasField(App, "instances")) {
+                const menu = &app.instances.agents_menu;
+                if (menu.highlight == .agent and menu.highlight.agent == child) menu.highlight = .on_screen;
             }
             if (!released) return;
             child.screen.deinit(app.alloc);

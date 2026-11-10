@@ -5715,7 +5715,7 @@ test "the tick visits only the child agents with work waiting" {
     try std.testing.expect(app.screenAgent() == &app.main_agent);
 }
 
-test "the agent list previews each agent by switching, keeps every draft where it was typed, and Esc goes back" {
+test "the agent list moves only its highlight, Enter shows the highlighted agent, and every draft stays where it was typed" {
     const alloc = std.testing.allocator;
     // A switch writes the tab title, so keep it off the test runner's stdout.
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
@@ -5727,6 +5727,7 @@ test "the agent list previews each agent by switching, keeps every draft where i
     defer App.AgentsAppRuntime.deinitChildren(&app);
     defer app.instances.agents_menu.deinit(alloc);
     const runtime = App.AgentsAppRuntime;
+    const menu = &app.instances.agents_menu;
     const first = try addTestChildAgent(&app, "first");
     const second = try addTestChildAgent(&app, "second");
     first.name = try alloc.dupe(u8, "reviewer");
@@ -5734,11 +5735,39 @@ test "the agent list previews each agent by switching, keeps every draft where i
     try first.screen.transcript.notebook.transcript.appendSlice(alloc, "first text\n");
     try app.input_runtime.edit_state.setText(alloc, "main draft");
 
-    // The list opens on main; ↓ previews the first subagent on its own
-    // screen with its own empty composer, and main's draft waits with main.
+    // The list opens on main; ↓ moves the highlight to the first subagent,
+    // and main stays on screen with its draft.
     try runtime.openMenu(&app);
     try std.testing.expect(runtime.menuActive(&app));
+    try std.testing.expectEqual(@as(usize, 0), menu.selected);
     try std.testing.expect(try runtime.moveMenu(&app, 1, 10));
+    try std.testing.expectEqual(@as(usize, 1), menu.selected);
+    try std.testing.expect(app.agent_on_screen == null);
+    try std.testing.expectEqualStrings("main text\n", app.shell.notebook.transcript.items);
+    try std.testing.expectEqualStrings("main draft", app.input_runtime.edit_state.input.items);
+
+    // On to the last row, which stays put past the end. Main stays on screen.
+    _ = try runtime.moveMenu(&app, 1, 10);
+    try std.testing.expectEqual(@as(usize, 2), menu.selected);
+    _ = try runtime.moveMenu(&app, 1, 10);
+    try std.testing.expectEqual(@as(usize, 2), menu.selected);
+    try std.testing.expect(app.agent_on_screen == null);
+
+    // Esc closes the list. Main never left the screen, and keeps its draft.
+    try std.testing.expect(try runtime.backMenu(&app));
+    try std.testing.expect(!runtime.menuActive(&app));
+    try std.testing.expect(app.agent_on_screen == null);
+    try std.testing.expectEqualStrings("main text\n", app.shell.notebook.transcript.items);
+    try std.testing.expectEqualStrings("main draft", app.input_runtime.edit_state.input.items);
+
+    // Enter shows the highlighted subagent on its own screen, with its own
+    // empty composer; main's draft waits with main.
+    try runtime.openMenu(&app);
+    try std.testing.expectEqual(@as(usize, 0), menu.selected);
+    _ = try runtime.moveMenu(&app, 1, 10);
+    try std.testing.expect(app.agent_on_screen == null);
+    try std.testing.expect(try runtime.submitMenu(&app));
+    try std.testing.expect(!runtime.menuActive(&app));
     try std.testing.expect(app.agent_on_screen == first);
     try std.testing.expect(app.screenAgent() == &first.agent);
     try std.testing.expectEqualStrings("first text\n", app.shell.notebook.transcript.items);
@@ -5746,38 +5775,190 @@ test "the agent list previews each agent by switching, keeps every draft where i
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings("main draft", app.main_screen.draft.edit.input.items);
 
-    // On to the last row, which stays put past the end.
-    _ = try runtime.moveMenu(&app, 1, 10);
-    try std.testing.expect(app.agent_on_screen == second);
-    _ = try runtime.moveMenu(&app, 1, 10);
-    try std.testing.expect(app.agent_on_screen == second);
-
-    // Esc goes back to main, with its draft.
-    try std.testing.expect(try runtime.backMenu(&app));
-    try std.testing.expect(!runtime.menuActive(&app));
-    try std.testing.expect(app.agent_on_screen == null);
-    try std.testing.expectEqualStrings("main text\n", app.shell.notebook.transcript.items);
-    try std.testing.expectEqualStrings("main draft", app.input_runtime.edit_state.input.items);
-
-    // Enter keeps the agent shown; main's draft stays with main.
-    try runtime.openMenu(&app);
-    _ = try runtime.moveMenu(&app, 1, 10);
-    try std.testing.expect(try runtime.submitMenu(&app));
-    try std.testing.expect(!runtime.menuActive(&app));
-    try std.testing.expect(app.agent_on_screen == first);
-    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqualStrings("main draft", app.main_screen.draft.edit.input.items);
-
-    // A draft typed on the subagent stays with it when main comes back.
+    // The list opens on the subagent on screen. A draft typed on it stays
+    // with it while ↑ moves to main, and when Enter brings main back.
     try app.input_runtime.edit_state.setText(alloc, "first draft");
     try runtime.openMenu(&app);
+    try std.testing.expectEqual(@as(usize, 1), menu.selected);
     _ = try runtime.moveMenu(&app, -1, 10);
+    try std.testing.expect(app.agent_on_screen == first);
+    try std.testing.expectEqualStrings("first draft", app.input_runtime.edit_state.input.items);
+    _ = try runtime.submitMenu(&app);
     try std.testing.expect(app.agent_on_screen == null);
     try std.testing.expectEqualStrings("main draft", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings("first draft", first.screen.draft.edit.input.items);
-    _ = try runtime.submitMenu(&app);
     try std.testing.expectEqualStrings("reviewer", first.displayName());
     try std.testing.expectEqualStrings("second", second.displayName());
+}
+
+test "the agent list's highlight stays on its agent as rows change, and moves to the agent on screen when its agent is dropped" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const menu = &app.instances.agents_menu;
+    _ = try addTestChildAgent(&app, "first");
+    const second = try addTestChildAgent(&app, "second");
+    const third = try addTestChildAgent(&app, "third");
+
+    try runtime.openMenu(&app);
+    _ = try runtime.moveMenu(&app, 1, 10);
+    _ = try runtime.moveMenu(&app, 1, 10);
+    try std.testing.expectEqual(@as(usize, 2), menu.selected);
+    try std.testing.expect(menu.highlight == .agent and menu.highlight.agent == second);
+
+    // A row ahead of it goes: the highlight stays on its agent, a row up.
+    const first = app.child_agents.orderedRemove(0);
+    defer {
+        first.screen.deinit(alloc);
+        alloc.free(first.id);
+        alloc.destroy(first);
+    }
+    _ = runtime.menuProjection(&app);
+    try std.testing.expectEqual(@as(usize, 1), menu.selected);
+    try std.testing.expect(menu.highlight.agent == second);
+
+    // Its own agent goes: dropHosted puts the highlight back on the agent
+    // on screen before it frees the agent, so no later agent at that
+    // address inherits it.
+    runtime.dropHosted(&app, second);
+    try std.testing.expect(menu.highlight == .on_screen);
+    _ = runtime.menuProjection(&app);
+    try std.testing.expectEqual(@as(usize, 0), menu.selected);
+    try std.testing.expect(try runtime.submitMenu(&app));
+    try std.testing.expect(app.agent_on_screen == null);
+    try std.testing.expectEqual(@as(usize, 1), app.child_agents.items.len);
+    try std.testing.expect(app.child_agents.items[0] == third);
+}
+
+test "the agent list's highlight and the agent on screen hold for fuzzed steps" {
+    try std.testing.fuzz({}, fuzzAgentsMenu, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            // Open, down twice, Enter.
+            "\x00\x01\x01\x03",
+            // Two subagents, open, down twice, drop the highlighted one, up.
+            "\x05\x05\x00\x01\x01\x06\x02\x02",
+            // Three subagents, open, down, reorder, drop the one on screen,
+            // a new one at a freed address, Enter.
+            "\x05\x05\x05\x00\x01\x07\x00\x02\x06\x00\x05\x03",
+            // Switch with the list closed, open, down, Esc, open, Enter.
+            "\x05\x05\x88\x01\x00\x01\x04\x00\x03",
+        }) ++ @import("fuzz_corpus").agents_menu_selection.*),
+    });
+}
+
+/// One fuzzed run of the agent list over the real runtime, as
+/// tests/tla/agents_menu/spec/AgentsMenu.tla models it. Each input byte is a
+/// step, its low three bits naming it: open the list, move its highlight
+/// down or up, press Enter or Esc, start a subagent, drop one (showing main
+/// first when it is on screen, as a close does), or reorder two. A step with
+/// the top bit set first switches screens with the list closed. The bytes
+/// after a drop, a reorder, or a switch pick the agents. After every step the
+/// agent on screen changed only on Enter, a switch, or a drop of the agent
+/// on screen, and the highlight is on the agent it was on, or on the agent on
+/// screen once that one was dropped, even when a new agent takes the dropped
+/// one's address.
+fn fuzzAgentsMenu(_: void, smith: *std.testing.Smith) !void {
+    var input: [96]u8 = undefined;
+    const bytes = input[0..smith.slice(&input)];
+    var at: usize = 0;
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const ChildAgent = app_agents_runtime.ChildAgent;
+    var order: std.ArrayList(?*ChildAgent) = .empty;
+    defer order.deinit(alloc);
+    // The agent the highlight must be on while the list is open.
+    var expected: ?*ChildAgent = null;
+    var ids: usize = 0;
+    while (at < bytes.len) {
+        const step = bytes[at];
+        at += 1;
+        const screen_before = app.agent_on_screen;
+        var screen_may_change = false;
+        // With the list closed, the person can still switch another way.
+        if (step & 0x80 != 0 and !runtime.menuActive(&app) and app.child_agents.items.len > 0) {
+            try runtime.show(&app, app.child_agents.items[pickIndex(bytes, &at, app.child_agents.items.len)]);
+            screen_may_change = true;
+        }
+        const open = runtime.menuActive(&app);
+        switch (step & 0x07) {
+            0 => if (!open) {
+                try runtime.openMenu(&app);
+                expected = app.agent_on_screen;
+            },
+            1, 2 => |key| if (open) {
+                order.clearRetainingCapacity();
+                try runtime.switchList(&app, &order);
+                const from = indexOfAgent(order.items, expected).?;
+                const to = if (key == 1) @min(from + 1, order.items.len - 1) else from -| 1;
+                _ = try runtime.moveMenu(&app, if (key == 1) 1 else -1, 10);
+                expected = order.items[to];
+            },
+            3 => if (open) {
+                _ = try runtime.submitMenu(&app);
+                try std.testing.expect(app.agent_on_screen == expected);
+                screen_may_change = true;
+            },
+            4 => if (open) {
+                _ = try runtime.backMenu(&app);
+            },
+            5 => if (app.child_agents.items.len < 6) {
+                var buf: [16]u8 = undefined;
+                ids += 1;
+                _ = try addTestChildAgent(&app, try std.fmt.bufPrint(&buf, "agent-{d}", .{ids}));
+            },
+            6 => if (app.child_agents.items.len > 0) {
+                const child = app.child_agents.items[pickIndex(bytes, &at, app.child_agents.items.len)];
+                if (app.agent_on_screen == child) {
+                    try runtime.show(&app, null);
+                    screen_may_change = true;
+                }
+                runtime.dropHosted(&app, child);
+                if (expected == child) expected = app.agent_on_screen;
+            },
+            7 => if (app.child_agents.items.len > 1) {
+                const from = pickIndex(bytes, &at, app.child_agents.items.len);
+                const to = pickIndex(bytes, &at, app.child_agents.items.len);
+                const child = app.child_agents.orderedRemove(from);
+                app.child_agents.insertAssumeCapacity(to, child);
+            },
+            else => unreachable,
+        }
+        if (!screen_may_change) try std.testing.expect(app.agent_on_screen == screen_before);
+        if (runtime.menuActive(&app)) {
+            order.clearRetainingCapacity();
+            try runtime.switchList(&app, &order);
+            try std.testing.expect(app.instances.agents_menu.selected < order.items.len);
+            try std.testing.expect(order.items[app.instances.agents_menu.selected] == expected);
+        }
+    }
+}
+
+/// The next input byte as an index below `len`, or 0 past the input's end.
+fn pickIndex(bytes: []const u8, at: *usize, len: usize) usize {
+    if (at.* >= bytes.len) return 0;
+    defer at.* += 1;
+    return bytes[at.*] % len;
+}
+
+fn indexOfAgent(order: []const ?*app_agents_runtime.ChildAgent, agent: ?*app_agents_runtime.ChildAgent) ?usize {
+    for (order, 0..) |entry, index| if (entry == agent) return index;
+    return null;
 }
 
 test "the footer indicator names the agent on screen and the key that opens the list" {

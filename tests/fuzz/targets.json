@@ -6,6 +6,7 @@
     {"name": "mcp_store_lock_wait", "module": "fx", "test": "the store and refresh locks' wait rules hold for fuzzed stamps and times", "iterations": 1000000},
     {"name": "host_restore", "module": "fx", "test": "restoring holds for fuzzed sets of records", "iterations": 2000000},
     {"name": "switch_order", "module": "fx", "test": "the switch order holds for fuzzed hosts", "iterations": 4000000},
+    {"name": "agents_menu_selection", "module": "fx", "test": "the agent list's highlight and the agent on screen hold for fuzzed steps", "iterations": 20000},
     {"name": "queue_placement", "module": "fx", "test": "queue placement delivers each message once and in order on fuzzed sequences", "iterations": 200000},
     {"name": "pending_reports", "module": "fx", "test": "pending reports keep their laws on fuzzed report lines", "iterations": 500000},
     {"name": "profile_parse", "module": "fx", "test": "profile parsing stays bounded on fuzzed settings and prompts", "iterations": 1000000},
