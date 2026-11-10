@@ -70,15 +70,15 @@ pub fn subagentAction(
     } else outer;
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
     // Every other action says what it does to whom, with nothing to preview.
-    if (actionWords(action)) |words| {
-        const raw_target = tool_args.optionalStringArg(args, "agent") orelse words.no_agent orelse return null;
+    if (action_words.get(action)) |words| {
+        const raw_target = words.target orelse tool_args.optionalStringArg(args, "agent") orelse words.no_agent orelse return null;
         const target = try text_utils.encodeTerminalSafe(scratch, raw_target, 64);
         const label = switch (state) {
             .active, .pending => try alloc.print("{s} {s}", .{ words.doing, target.bytes }),
             .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
                 try alloc.print("couldn't {s} {s}", .{ words.verb, target.bytes })
             else
-                try alloc.print("{s} {s} interrupted", .{ words.verb, target.bytes }),
+                try alloc.print("{s} {s}", .{ reason, target.bytes }),
             .identity, .completed, .feedback => try alloc.print("{s} {s}", .{ words.done, target.bytes }),
         };
         errdefer alloc.free(label);
@@ -119,20 +119,23 @@ pub fn subagentAction(
     return .{ .label = label, .detail = detail };
 }
 
-/// How a subagent row words an action other than a message, and what it
-/// names when the call names no agent.
-const ActionWords = struct { verb: []const u8, doing: []const u8, done: []const u8, no_agent: ?[]const u8 = null };
+/// How a subagent row words an action other than a message: what it names
+/// always (`target`), or when the call names no agent (`no_agent`).
+const ActionWords = struct {
+    verb: []const u8,
+    doing: []const u8,
+    done: []const u8,
+    target: ?[]const u8 = null,
+    no_agent: ?[]const u8 = null,
+};
 
-fn actionWords(action: []const u8) ?ActionWords {
-    const table = [_]struct { []const u8, ActionWords }{
-        .{ "close", .{ .verb = "close", .doing = "closing", .done = "closed" } },
-        .{ "stop", .{ .verb = "stop", .doing = "stopping", .done = "stopped" } },
-        .{ "status", .{ .verb = "check", .doing = "checking", .done = "checked", .no_agent = "subagents" } },
-        .{ "wait", .{ .verb = "wait for", .doing = "waiting for", .done = "waited for", .no_agent = "subagents" } },
-    };
-    for (table) |entry| if (std.mem.eql(u8, entry[0], action)) return entry[1];
-    return null;
-}
+const action_words = std.StaticStringMap(ActionWords).initComptime(.{
+    .{ "close", ActionWords{ .verb = "close", .doing = "closing", .done = "closed" } },
+    .{ "stop", ActionWords{ .verb = "stop", .doing = "stopping", .done = "stopped" } },
+    .{ "status", ActionWords{ .verb = "check", .doing = "checking", .done = "checked", .no_agent = "subagents" } },
+    // A wait takes every report, whatever agent it names.
+    .{ "wait", ActionWords{ .verb = "wait for", .doing = "waiting for", .done = "waited for", .target = "subagents" } },
+});
 
 /// The preview a subagent row shows for `raw`: runs of whitespace, line
 /// breaks included, become one space, made terminal-safe and cut to 120
@@ -226,7 +229,9 @@ test "subagent rows project request identity state and bounded safe previews" {
         .{ .args = "{\"action\":\"stop\",\"agent\":\"tester\"}", .state = .completed, .label = "stopped tester", .detail = "" },
         .{ .args = "{\"action\":\"wait\"}", .state = .active, .label = "waiting for subagents", .detail = "" },
         .{ .args = "{\"action\":\"wait\"}", .state = .completed, .label = "waited for subagents", .detail = "" },
-        .{ .args = "{\"action\":\"wait\"}", .state = .{ .stopped = "Cancelled" }, .label = "wait for subagents interrupted", .detail = "" },
+        .{ .args = "{\"action\":\"wait\"}", .state = .{ .stopped = "Cancelled" }, .label = "Cancelled subagents", .detail = "" },
+        .{ .args = "{\"action\":\"wait\",\"agent\":\"tester\"}", .state = .active, .label = "waiting for subagents", .detail = "" },
+        .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .{ .stopped = "Denied" }, .label = "Denied tester", .detail = "" },
         .{ .args = "{\"action\":\"status\"}", .state = .completed, .label = "checked subagents", .detail = "" },
         .{ .args = "{\"action\":\"status\",\"agent\":\"tester\"}", .state = .{ .stopped = "Failed" }, .label = "couldn't check tester", .detail = "" },
     };
