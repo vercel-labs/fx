@@ -7,11 +7,15 @@ const xai_grok = @import("../gateway/xai_grok.zig");
 const xai_grok_models = @import("../gateway/xai_grok_models.zig");
 const xai_grok_permission_reviewer = @import("../gateway/xai_grok_permission_reviewer.zig");
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
-const chat_completions = @import("../gateway/chat_completions.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
+const chat_completions = @import("../gateway/chat_completions.zig");
+const google_vertex = @import("../gateway/google_vertex.zig");
 
 fn configuredBundle(_: ?*anyopaque, definition: *const configured_provider.Definition) provider_set.Bundle {
-    return chat_completions.bundle(definition);
+    return switch (definition.protocol) {
+        .@"openai-chat-completions" => chat_completions.bundle(definition),
+        .@"google-vertex" => google_vertex.bundle(definition),
+    };
 }
 
 pub const native = provider_set.Set{
