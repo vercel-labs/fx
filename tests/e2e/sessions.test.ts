@@ -1802,6 +1802,10 @@ test.skipIf(!tmuxAvailable())("a switch stops only a working subagent's task: ba
   const childBodies: string[] = [];
   let held = false;
   let reports = 0;
+  // The third work answers only once its turn has its final reply, so its
+  // report never joins that turn (see startChatWithSubagents).
+  let thirdDone = false;
+  const afterThird: (() => void)[] = [];
   const gateway = startDynamicFakeGateway((body) => {
     if (isAppChildRequest(body, typed)) {
       childBodies.push(body);
@@ -1810,7 +1814,10 @@ test.skipIf(!tmuxAvailable())("a switch stops only a working subagent's task: ba
         held = true;
         return new Promise<Response>((resolve) => releases.push(() => resolve(fakeGatewayFinalText("KEEPER_SECOND_DONE"))));
       }
-      if (latest.includes("KEEPER_THIRD")) return fakeGatewayFinalText("KEEPER_THIRD_DONE");
+      if (latest.includes("KEEPER_THIRD")) {
+        if (thirdDone) return fakeGatewayFinalText("KEEPER_THIRD_DONE");
+        return new Promise<Response>((resolve) => afterThird.push(() => resolve(fakeGatewayFinalText("KEEPER_THIRD_DONE"))));
+      }
       return fakeGatewayFinalText("KEEPER_FIRST_DONE");
     }
     if (isReportTurn(body)) {
@@ -1820,7 +1827,11 @@ test.skipIf(!tmuxAvailable())("a switch stops only a working subagent's task: ba
     const answered = answeredCall(body);
     if (answered === "keep-one") return fakeGatewayFinalText("KEEP_PARENT_ONE");
     if (answered === "keep-two") return fakeGatewayFinalText("KEEP_PARENT_TWO");
-    if (answered === "keep-three") return fakeGatewayFinalText("KEEP_PARENT_THREE");
+    if (answered === "keep-three") {
+      thirdDone = true;
+      queueMicrotask(() => afterThird.splice(0).forEach((release) => release()));
+      return fakeGatewayFinalText("KEEP_PARENT_THREE");
+    }
     const latest = latestUserText(body);
     if (latest.includes("Keep prompt one.")) return delegate("keep-one", "keeper", "Work on KEEPER_FIRST.");
     if (latest.includes("Keep prompt two.")) return delegate("keep-two", "keeper", "Work on KEEPER_SECOND.");
@@ -1886,13 +1897,20 @@ async function startChatWithSubagents(prefix: string) {
   const typed = ["Copy prompt one.", "Copy prompt two.", "Copy prompt three.", "Copy prompt four.", "Use the helper in the fork."];
   const childBodies: string[] = [];
   let reports = 0;
+  // A report that reaches the third turn while it still runs joins that
+  // turn's next request, which then reads as a report turn. So the third
+  // turn's subagents answer only once that turn has its final reply.
+  let thirdDone = false;
+  const afterThird: (() => void)[] = [];
+  const afterThirdTurn = (text: string) =>
+    thirdDone ? fakeGatewayFinalText(text) : new Promise<Response>((resolve) => afterThird.push(() => resolve(fakeGatewayFinalText(text))));
   const gateway = startDynamicFakeGateway((body) => {
     if (isAppChildRequest(body, typed)) {
       childBodies.push(body);
       const latest = latestUserText(body);
       if (latest.includes("HELPER_FORK")) return fakeGatewayFinalText("HELPER_FORK_DONE");
-      if (latest.includes("HELPER_THREE")) return fakeGatewayFinalText("HELPER_THREE_DONE");
-      if (latest.includes("LATE_TASK")) return fakeGatewayFinalText("LATE_DONE");
+      if (latest.includes("HELPER_THREE")) return afterThirdTurn("HELPER_THREE_DONE");
+      if (latest.includes("LATE_TASK")) return afterThirdTurn("LATE_DONE");
       return fakeGatewayFinalText("HELPER_ONE_DONE");
     }
     if (isReportTurn(body)) {
@@ -1902,7 +1920,11 @@ async function startChatWithSubagents(prefix: string) {
     const answered = answeredCall(body);
     if (answered === "copy-one") return fakeGatewayFinalText("COPY_PARENT_ONE");
     if (answered === "copy-three") return delegate("copy-late", "late", "Work on LATE_TASK.");
-    if (answered === "copy-late") return fakeGatewayFinalText("COPY_PARENT_THREE");
+    if (answered === "copy-late") {
+      thirdDone = true;
+      queueMicrotask(() => afterThird.splice(0).forEach((release) => release()));
+      return fakeGatewayFinalText("COPY_PARENT_THREE");
+    }
     if (answered === "copy-fork") return fakeGatewayFinalText("COPY_PARENT_FORK");
     const latest = latestUserText(body);
     if (latest.includes("Copy prompt one.")) return delegate("copy-one", "helper", "Work on HELPER_ONE.");
