@@ -133,6 +133,19 @@ pub const CatalogAccess = union(enum) {
         };
     }
 
+    /// The same access with another token for the same sign-in, such as one
+    /// renewed after the first was rejected. Public access is unchanged.
+    pub fn withCredential(self: CatalogAccess, credential: []const u8) CatalogAccess {
+        return switch (self) {
+            .authenticated => |access| blk: {
+                var renewed = access;
+                renewed.credential = credential;
+                break :blk .{ .authenticated = renewed };
+            },
+            .public_only, .host_managed => self,
+        };
+    }
+
     pub fn withExplicitAuthority(self: CatalogAccess) CatalogAccess {
         return switch (self) {
             .public_only => |access| .{ .public_only = access },

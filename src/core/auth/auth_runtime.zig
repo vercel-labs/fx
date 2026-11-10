@@ -230,6 +230,20 @@ pub fn refreshCredentialForAccount(
     mode: CredentialRefreshMode,
     expected_account_id: ?[]const u8,
 ) !?credentials.Credential {
+    const credential = (try loadCredentialForAccount(transport, alloc, source, mode, expected_account_id)) orelse return null;
+    noteRequestPathCredentialVerified(source);
+    return credential;
+}
+
+/// `refreshCredentialForAccount` without proving the request path's copy:
+/// the caller owns the result and must call `Credential.deinit`.
+fn loadCredentialForAccount(
+    transport: oauth_transport.Provider,
+    alloc: Allocator,
+    source: credentials.Source,
+    mode: CredentialRefreshMode,
+    expected_account_id: ?[]const u8,
+) !?credentials.Credential {
     if (!credentials.sourceRefreshable(source)) return null;
 
     var credential = (loadCredentialForRefresh(alloc, transport, source, mode) catch |err| {
@@ -251,8 +265,89 @@ pub fn refreshCredentialForAccount(
             return error.ChatGptAccountChanged;
         }
     }
-    noteRequestPathCredentialVerified(source);
     return credential;
+}
+
+/// What a background request, such as a session title or the model list,
+/// needs to renew a sign-in on its own thread. The transport's context must
+/// outlive the request.
+pub const Renewal = struct {
+    transport: oauth_transport.Provider,
+    source: credentials.Source,
+    account_id: ?[]const u8 = null,
+
+    /// The renewal for `source`, or null when fx cannot renew it.
+    pub fn forSource(
+        transport: oauth_transport.Provider,
+        source: ?credentials.Source,
+        account_id: ?[]const u8,
+    ) ?Renewal {
+        const active = source orelse return null;
+        if (!credentials.sourceRefreshable(active)) return null;
+        return .{ .transport = transport, .source = active, .account_id = account_id };
+    }
+};
+
+/// Reads the stored credential for a background request before it sends.
+/// Another fx process may have refreshed the shared sign-in after this one
+/// read it, so the copy in memory can be rejected while the store already
+/// holds a newer token (tests/tla/session_title/SessionTitle.tla
+/// TitleFirstSendUsesStore). Refreshes only an expired session. Null when the
+/// store has no usable credential, and the caller keeps the token it has. The
+/// caller owns the result.
+pub fn readStoredCredential(
+    alloc: Allocator,
+    renewal: Renewal,
+    cancel_flag: *std.atomic.Value(bool),
+) Allocator.Error!?credentials.Credential {
+    return loadForBackground(alloc, renewal, .if_needed, cancel_flag);
+}
+
+/// Renews a credential the gateway rejected with 401: the stored credential
+/// when another fx process has already replaced `rejected`, and a forced
+/// refresh only when the store still holds it, because every forced refresh
+/// rotates the sign-in all fx processes share (tests/tla/session_title/
+/// SessionTitle.tla NoNeedlessRefresh). Null when neither gives a token. The
+/// caller owns the result.
+pub fn renewRejectedCredential(
+    alloc: Allocator,
+    renewal: Renewal,
+    rejected: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+) Allocator.Error!?credentials.Credential {
+    if (try loadForBackground(alloc, renewal, .if_needed, cancel_flag)) |stored| {
+        var current = stored;
+        if (!std.mem.eql(u8, current.token, rejected)) {
+            debug_trace.logf("auth", "background credential renewed step=reread source={t}", .{renewal.source});
+            return current;
+        }
+        current.deinit(alloc);
+    }
+    if (cancel_flag.load(.seq_cst)) return null;
+    const forced = (try loadForBackground(alloc, renewal, .force, cancel_flag)) orelse return null;
+    debug_trace.logf("auth", "background credential renewed step=force source={t}", .{renewal.source});
+    return forced;
+}
+
+/// Loads for a background request. It does not stamp the request path's
+/// verification: the main turn's own copy may still be stale, and only its
+/// own load may let it skip the next one (`requestPathCredentialVerifiedRecently`).
+fn loadForBackground(
+    alloc: Allocator,
+    renewal: Renewal,
+    mode: CredentialRefreshMode,
+    cancel_flag: *std.atomic.Value(bool),
+) Allocator.Error!?credentials.Credential {
+    var transport: oauth_transport.Cancellable = .{ .inner = renewal.transport, .cancel_flag = cancel_flag };
+    return loadCredentialForAccount(transport.provider(), alloc, renewal.source, mode, renewal.account_id) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf(
+            "auth",
+            "background credential renewal failed source={t} mode={t} err={s}",
+            .{ renewal.source, mode, @errorName(err) },
+        );
+        return null;
+    };
 }
 
 fn loadCredentialForRefresh(
@@ -2061,6 +2156,12 @@ pub const Runtime = struct {
 
     pub fn oauthTransport(self: *const Self) oauth_transport.Provider {
         return self.oauth_transport;
+    }
+
+    /// How a background request renews the selected sign-in, or null when fx
+    /// cannot renew it.
+    pub fn backgroundRenewal(self: *const Self) ?Renewal {
+        return Renewal.forSource(self.oauth_transport, self.credentialSource(), self.accountId());
     }
 
     pub fn secretStore(self: *const Self) host.SecretStore {

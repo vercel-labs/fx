@@ -20,11 +20,7 @@ const renewal_sign_in_message = "Your sign-in has expired. Run /login, then chec
 
 /// Renews a refreshable credential that is past its refresh deadline before
 /// the lookup asks for credits.
-pub const Renewal = struct {
-    transport: oauth_transport.Provider,
-    source: credentials.Source,
-    account_id: ?[]const u8,
-};
+pub const Renewal = auth_runtime.Renewal;
 
 pub const Result = struct {
     snapshot: output_contracts.CreditsSnapshot,

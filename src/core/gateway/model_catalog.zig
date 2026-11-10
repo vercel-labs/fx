@@ -24,6 +24,21 @@ pub const FetchInput = struct {
     /// A provider with `reports_connection` sets this once its request has a
     /// connection: the DNS lookup, connect, and any TLS handshake are done.
     connected: ?*std.atomic.Value(bool) = null,
+    /// Asked once when the provider rejects the authenticated request with
+    /// 401, before the public fallback (`fetchWithPublicFallback`).
+    renew_after_rejection: ?RenewAfterRejection = null,
+};
+
+/// Gives another token for a sign-in whose token the catalog rejected, such
+/// as one another fx process has already stored, or null to fall back. The
+/// token stays owned by the context until the fetch returns.
+pub const RenewAfterRejection = struct {
+    context: *anyopaque,
+    renew_fn: *const fn (context: *anyopaque, rejected: []const u8) ?[]const u8,
+
+    pub fn renew(self: RenewAfterRejection, rejected: []const u8) ?[]const u8 {
+        return self.renew_fn(self.context, rejected);
+    }
 };
 
 pub const FailureCategory = enum {
@@ -240,7 +255,24 @@ fn fetchWithPublicFallbackUntraced(
             .catalog = catalog,
             .provenance = .{ .access = .init(attempt.access) },
         } },
-        .failure => |failure| {
+        .failure => |first_failure| {
+            var failure = first_failure;
+            // A 401 can mean only that this token is stale: another fx process
+            // may have refreshed the shared sign-in. Try the renewed token once
+            // before the public list (tests/tla/session_title/SessionTitle.tla
+            // CatalogFallsBackOnlyWhenUnrecoverable).
+            if (renewedAccess(attempt, failure)) |renewed| {
+                attempt.access = renewed;
+                const retried = provider.fetch(alloc, attempt) catch
+                    return failedOutcome(attempt.access, false, .{ .category = .resource_exhausted });
+                switch (retried) {
+                    .catalog => |catalog| return .{ .loaded = .{
+                        .catalog = catalog,
+                        .provenance = .{ .access = .init(attempt.access) },
+                    } },
+                    .failure => |retry_failure| failure = retry_failure,
+                }
+            }
             if (!failure.allowsPublicFallback()) {
                 return failedOutcome(attempt.access, false, failure);
             }
@@ -262,6 +294,17 @@ fn fetchWithPublicFallbackUntraced(
             };
         },
     }
+}
+
+/// The access to retry with after `failure`, when the provider rejected the
+/// authenticated token with 401 and the caller renewed it.
+fn renewedAccess(attempt: FetchInput, failure: Failure) ?credentials.CatalogAccess {
+    if (failure.http_status != .unauthorized) return null;
+    const renew = attempt.renew_after_rejection orelse return null;
+    const rejected = attempt.access.authorizationCredential() orelse return null;
+    const token = renew.renew(rejected) orelse return null;
+    if (std.mem.eql(u8, token, rejected)) return null;
+    return attempt.access.withCredential(token);
 }
 
 fn traceCatalogLoad(requested: AccessMetadata, result: *const FetchResult) void {
@@ -705,6 +748,91 @@ const FallbackProbe = struct {
         return .{ .context = self, .fetch_fn = fetch };
     }
 };
+
+/// Rejects every token but `accepted` with `status`, and records each token.
+const TokenProbe = struct {
+    accepted: []const u8,
+    status: std.http.Status = .unauthorized,
+    tokens: [3][]const u8 = .{ "", "", "" },
+    calls: usize = 0,
+
+    fn fetch(raw: ?*anyopaque, _: Allocator, input: FetchInput) Allocator.Error!ProviderResult {
+        const self: *TokenProbe = @ptrCast(@alignCast(raw.?));
+        const token = input.access.authorizationCredential() orelse "";
+        self.tokens[self.calls] = token;
+        self.calls += 1;
+        if (token.len == 0 or std.mem.eql(u8, token, self.accepted)) return .{ .catalog = .empty };
+        return .{ .failure = failureForHttpStatus(self.status) };
+    }
+
+    fn provider(self: *TokenProbe) Provider {
+        return .{ .context = self, .fetch_fn = fetch };
+    }
+};
+
+const RenewProbe = struct {
+    token: ?[]const u8,
+    calls: usize = 0,
+
+    fn renew(raw: *anyopaque, _: []const u8) ?[]const u8 {
+        const self: *RenewProbe = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        return self.token;
+    }
+
+    fn hook(self: *RenewProbe) RenewAfterRejection {
+        return .{ .context = self, .renew_fn = renew };
+    }
+};
+
+test "catalog renews a rejected token once before the public list" {
+    const access = credentials.catalogAccessForCredential(.fx_login, "stale-key", "team_123");
+
+    // The renewed token works: no public fallback.
+    var probe = TokenProbe{ .accepted = "fresh-key" };
+    var renewed = RenewProbe{ .token = "fresh-key" };
+    var loaded = fetchWithPublicFallback(probe.provider(), std.testing.allocator, .{
+        .access = access,
+        .endpoint = "/v1/models",
+        .renew_after_rejection = renewed.hook(),
+    });
+    defer freeModelCatalog(std.testing.allocator, &loaded.loaded.catalog);
+    try std.testing.expectEqual(AccessLevel.authenticated, loaded.loaded.provenance.access.level);
+    try std.testing.expect(!loaded.loaded.provenance.anonymous_fallback_used);
+    try std.testing.expectEqual(@as(usize, 1), renewed.calls);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expectEqualStrings("stale-key", probe.tokens[0]);
+    try std.testing.expectEqualStrings("fresh-key", probe.tokens[1]);
+
+    // No other token, or one rejected too: the public list, after at most one retry.
+    for ([_]?[]const u8{ null, "stale-key", "also-stale" }) |token| {
+        var rejected = TokenProbe{ .accepted = "fresh-key" };
+        var renew = RenewProbe{ .token = token };
+        var fallback = fetchWithPublicFallback(rejected.provider(), std.testing.allocator, .{
+            .access = access,
+            .endpoint = "/v1/models",
+            .renew_after_rejection = renew.hook(),
+        });
+        defer freeModelCatalog(std.testing.allocator, &fallback.loaded.catalog);
+        try std.testing.expect(fallback.loaded.provenance.anonymous_fallback_used);
+        try std.testing.expectEqual(@as(usize, 1), renew.calls);
+        const retried = token != null and !std.mem.eql(u8, token.?, "stale-key");
+        try std.testing.expectEqual(@as(usize, if (retried) 3 else 2), rejected.calls);
+        try std.testing.expectEqualStrings("", rejected.tokens[rejected.calls - 1]);
+    }
+
+    // A 403 is not a stale token: no renewal.
+    var forbidden = TokenProbe{ .accepted = "fresh-key", .status = .forbidden };
+    var unused = RenewProbe{ .token = "fresh-key" };
+    var public = fetchWithPublicFallback(forbidden.provider(), std.testing.allocator, .{
+        .access = access,
+        .endpoint = "/v1/models",
+        .renew_after_rejection = unused.hook(),
+    });
+    defer freeModelCatalog(std.testing.allocator, &public.loaded.catalog);
+    try std.testing.expectEqual(@as(usize, 0), unused.calls);
+    try std.testing.expectEqual(@as(usize, 2), forbidden.calls);
+}
 
 test "catalog HTTP failure classification preserves policy evidence" {
     for ([_]struct { status: std.http.Status, category: FailureCategory, retryable: bool }{

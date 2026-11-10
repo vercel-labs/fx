@@ -368,6 +368,12 @@ export type FakeGatewayResponse =
   | Response
   | ((body: string) => Response | Promise<Response>);
 
+// A title response can also read the request's headers, such as the bearer
+// token fx sent, to answer like a gateway that rejects a stale one.
+export type FakeGatewayTitleResponse =
+  | Response
+  | ((body: string, headers: Headers) => Response | Promise<Response>);
+
 export type FakeGatewayModel = {
   id: string;
   type?: string;
@@ -402,7 +408,7 @@ export type FakeGatewayOptions = {
       | Promise<FakeGatewayModel[] | Response>);
   classifierDecision?: "clear" | "caution";
   classifierResponses?: FakeGatewayResponse[];
-  titleResponses?: FakeGatewayResponse[];
+  titleResponses?: FakeGatewayTitleResponse[];
   // Answers usage GETs (`/v1/report`, `/ai-gateway/usage-report`, ChatGPT's
   // `/backend-api/wham/...`, Grok's `/billing` and `/settings`); see
   // usage-fakes.ts. Null falls through to the routes below.
@@ -526,7 +532,7 @@ function serveFakeGateway(
       if (body.includes(TITLE_GENERATION_MARKER)) {
         titleRequests.push({ body, headers });
         const next = titleResponses.shift();
-        if (next) return typeof next === "function" ? await next(body) : next;
+        if (next) return typeof next === "function" ? await next(body, headers) : next;
         return fakeGatewayTitleDefault();
       }
       requests.push({ body, headers });

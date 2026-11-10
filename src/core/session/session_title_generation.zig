@@ -1,5 +1,9 @@
 const std = @import("std");
 const observation = @import("../agent/runtime/observation.zig");
+const auth_runtime = @import("../auth/auth_runtime.zig");
+const auth_transition = @import("../auth/auth_transition.zig");
+const credentials = @import("../auth/credentials.zig");
+const oauth_transport = @import("../auth/oauth_transport.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
@@ -41,6 +45,11 @@ pub const Gate = struct {
     recovery_replay: bool,
     /// A generation attempt is already running.
     task_running: bool,
+    /// This session already started a title request. A turn the next prompt
+    /// interrupts reaches the history only after that prompt starts, so the
+    /// history alone cannot tell the first prompt from a later one
+    /// (tests/tla/session_title/SessionTitle.tla AtMostOneTitleRequest).
+    title_started: bool = false,
 };
 
 pub fn shouldGenerate(gate: Gate) bool {
@@ -48,7 +57,8 @@ pub fn shouldGenerate(gate: Gate) bool {
         gate.provider_supports_titles and
         gate.session_untitled and
         !gate.recovery_replay and
-        !gate.task_running;
+        !gate.task_running and
+        !gate.title_started;
 }
 
 /// Returns the bounded excerpt of the first user prompt used as title source
@@ -110,6 +120,10 @@ pub const Request = struct {
     prompt_excerpt: []const u8,
     cancel_flag: *std.atomic.Value(bool),
     timeout_ms: u32 = default_timeout_ms,
+    /// How the request renews a sign-in fx can refresh. With it, the request
+    /// reads the stored credential before it sends and, after a 401, renews
+    /// it and sends once more, as the main turn does.
+    renewal: ?auth_runtime.Renewal = null,
 };
 
 /// Why a title generation attempt did not install a generated title. Static
@@ -147,17 +161,96 @@ pub const Outcome = union(enum) {
 /// Runs one bounded title generation call. Effects live here; prompt
 /// selection and output sanitization stay pure above.
 pub fn run(alloc: Allocator, request: Request) !Outcome {
-    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = instructions_text }};
-    const messages = [_]types.ChatMessage{.{ .role = .user, .content = request.prompt_excerpt }};
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(request.timeout_ms),
     });
+    const renewal = if (request.credential_source == .host_managed) null else request.renewal;
+    var token: Token = .{ .bytes = request.api_key };
+    defer token.deinit(alloc);
+    // Another fx process may have refreshed the shared sign-in since this one
+    // read it (tests/tla/session_title/SessionTitle.tla TitleFirstSendUsesStore).
+    if (renewal) |active| {
+        if (try auth_runtime.readStoredCredential(alloc, active, request.cancel_flag)) |stored| token.adopt(alloc, stored);
+    }
+    if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };
+
+    var sent = try send(alloc, request, token.bytes, deadline);
+    defer sent.deinit(alloc);
+    if (renewal) |active| {
+        if (rejectedAndRenewable(sent, active)) {
+            if (try auth_runtime.renewRejectedCredential(alloc, active, token.bytes, request.cancel_flag)) |renewed| {
+                token.adopt(alloc, renewed);
+                debug_trace.logf("session", "event=title_generation replay=renewed_credential", .{});
+                sent.deinit(alloc);
+                // Keeps the deferred deinit safe if the next send fails.
+                sent = .{ .unavailable = .{ .reason = .cancelled } };
+                sent = try send(alloc, request, token.bytes, deadline);
+            }
+        }
+    }
+    return finish(alloc, request, sent);
+}
+
+/// The token a title request sends: the caller's copy until the request reads
+/// or renews one from the store, which it then owns and wipes.
+const Token = struct {
+    bytes: []const u8,
+    owned: ?credentials.Credential = null,
+
+    fn adopt(self: *Token, alloc: Allocator, credential: credentials.Credential) void {
+        if (self.owned) |*old| old.deinit(alloc);
+        self.owned = credential;
+        self.bytes = credential.token;
+    }
+
+    fn deinit(self: *Token, alloc: Allocator) void {
+        if (self.owned) |*credential| credential.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+/// One request to the title model, or why it could not complete.
+const Sent = union(enum) {
+    result: stream_provider.Result,
+    unavailable: Failure,
+
+    fn deinit(self: *Sent, alloc: Allocator) void {
+        switch (self.*) {
+            .result => |*result| result.deinit(alloc),
+            .unavailable => {},
+        }
+    }
+};
+
+/// Whether a request the gateway rejected with 401 is sent once more with a
+/// renewed sign-in (tests/tla/session_title/SessionTitle.tla
+/// TitleGivesUpOnlyWhenUnrecoverable). The title has no tools and shows
+/// nothing while it streams, so sending it again is always safe.
+fn rejectedAndRenewable(sent: Sent, renewal: auth_runtime.Renewal) bool {
+    const failure = switch (sent) {
+        .result => |result| switch (result) {
+            .failed => |failed| failed,
+            .completed => return false,
+        },
+        .unavailable => return false,
+    };
+    return auth_transition.decideAuthReplay(.{
+        .authentication_rejected = failure.kind == .unauthorized,
+        .refreshable = credentials.sourceRefreshable(renewal.source),
+        .delivery_safe = true,
+        .already_replayed = false,
+    }) == .refresh_and_replay;
+}
+
+fn send(alloc: Allocator, request: Request, token: []const u8, deadline: std.Io.Clock.Timestamp) Allocator.Error!Sent {
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = instructions_text }};
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = request.prompt_excerpt }};
     const credential: stream_provider.CredentialLease = if (request.credential_source == .host_managed)
         .host_managed
     else
         .{ .direct = .{
-            .secret_bytes = request.api_key,
+            .secret_bytes = token,
             .source = request.credential_source,
             .account_id = request.account_id,
             .tenant_context = request.gateway_team,
@@ -165,7 +258,7 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
     var delivery = stream_provider.DeliveryCertainty.init();
     var attempt_evidence: stream_provider.AttemptEvidence = .{};
     var callback_context: u8 = 0;
-    var result = gateway_step.streamModelCompletion(
+    const result = gateway_step.streamModelCompletion(
         request.stream_provider,
         alloc,
         .{
@@ -197,8 +290,15 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
         debug_trace.logf("session", "event=title_generation result=unavailable err={s}", .{@errorName(err)});
         return .{ .unavailable = .{ .reason = .transport_error, .detail = @errorName(err) } };
     };
-    defer result.deinit(alloc);
+    return .{ .result = result };
+}
+
+fn finish(alloc: Allocator, request: Request, sent: Sent) !Outcome {
     if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };
+    const result = switch (sent) {
+        .unavailable => |failure| return .{ .unavailable = failure },
+        .result => |result| result,
+    };
     const completion = switch (result) {
         .failed => |failure| {
             debug_trace.logf(
@@ -240,6 +340,9 @@ pub const Task = struct {
     gateway_team: ?[]u8 = null,
     account_id: ?[]u8 = null,
     credential_source: ?types.CredentialSource = null,
+    /// Borrowed; renews the sign-in when its source is refreshable. Its
+    /// context must outlive the task.
+    renewal_transport: ?oauth_transport.Provider = null,
     stream_provider: stream_provider.Provider,
     title: ?[]u8 = null,
     failure: ?anyerror = null,
@@ -259,6 +362,7 @@ pub const Task = struct {
         gateway_team: ?[]const u8 = null,
         account_id: ?[]const u8 = null,
         credential_source: ?types.CredentialSource = null,
+        renewal_transport: ?oauth_transport.Provider = null,
         stream_provider: stream_provider.Provider,
     };
 
@@ -289,6 +393,7 @@ pub const Task = struct {
             .gateway_team = gateway_team,
             .account_id = account_id,
             .credential_source = init.credential_source,
+            .renewal_transport = init.renewal_transport,
             .stream_provider = init.stream_provider,
         };
         return task;
@@ -378,6 +483,10 @@ pub const Task = struct {
             .session_id = self.session_id,
             .prompt_excerpt = self.prompt_excerpt,
             .cancel_flag = &self.cancel_requested,
+            .renewal = if (self.renewal_transport) |transport|
+                auth_runtime.Renewal.forSource(transport, self.credential_source, self.account_id)
+            else
+                null,
         }) catch |err| {
             self.failure = err;
             self.status = .unavailable;

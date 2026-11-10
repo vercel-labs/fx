@@ -2029,6 +2029,7 @@ fn maybeStartAskTitleTask(
         .gateway_team = ctx.gateway_team,
         .account_id = ctx.account_id,
         .credential_source = ctx.credential_source,
+        .renewal_transport = ctx.cfg.gateway_provider.oauth_transport,
         .stream_provider = agent_stream,
     }) catch return null;
     task.spawn() catch |err| {

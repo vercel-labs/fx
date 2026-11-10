@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const collections = @import("../shared/collections.zig");
@@ -141,6 +142,64 @@ const OwnedCatalogAccess = struct {
                 if (access.account_id) |account| alloc.free(@constCast(account));
             },
         }
+        self.* = undefined;
+    }
+};
+
+/// A warmup's copy of how to renew its sign-in; it owns the account id.
+const OwnedRenewal = struct {
+    renewal: auth_runtime.Renewal,
+
+    fn init(alloc: Allocator, renewal: auth_runtime.Renewal) !OwnedRenewal {
+        var owned = renewal;
+        owned.account_id = if (renewal.account_id) |account| try alloc.dupe(u8, account) else null;
+        return .{ .renewal = owned };
+    }
+
+    fn deinit(self: *OwnedRenewal, alloc: Allocator) void {
+        if (self.renewal.account_id) |account| alloc.free(account);
+        self.* = undefined;
+    }
+};
+
+/// Renews the model list's sign-in on the warmup thread. It owns every token
+/// it hands to the fetch until the fetch returns.
+const CatalogRenewer = struct {
+    alloc: Allocator,
+    renewal: auth_runtime.Renewal,
+    cancel_flag: *std.atomic.Value(bool),
+    stored_credential: ?credentials.Credential = null,
+    renewed_credential: ?credentials.Credential = null,
+
+    /// The stored token when it differs from `current`: another fx process
+    /// may have refreshed the shared sign-in since the app read it
+    /// (tests/tla/session_title/SessionTitle.tla CatalogFirstSendUsesStore).
+    fn storedToken(self: *CatalogRenewer, current: []const u8) ?[]const u8 {
+        var credential = (auth_runtime.readStoredCredential(self.alloc, self.renewal, self.cancel_flag) catch null) orelse return null;
+        if (std.mem.eql(u8, credential.token, current)) {
+            credential.deinit(self.alloc);
+            return null;
+        }
+        if (self.stored_credential) |*old| old.deinit(self.alloc);
+        self.stored_credential = credential;
+        return credential.token;
+    }
+
+    fn hook(self: *CatalogRenewer) model_catalog.RenewAfterRejection {
+        return .{ .context = self, .renew_fn = renew };
+    }
+
+    fn renew(context: *anyopaque, rejected: []const u8) ?[]const u8 {
+        const self: *CatalogRenewer = @ptrCast(@alignCast(context));
+        const credential = (auth_runtime.renewRejectedCredential(self.alloc, self.renewal, rejected, self.cancel_flag) catch null) orelse return null;
+        if (self.renewed_credential) |*old| old.deinit(self.alloc);
+        self.renewed_credential = credential;
+        return credential.token;
+    }
+
+    fn deinit(self: *CatalogRenewer) void {
+        if (self.stored_credential) |*credential| credential.deinit(self.alloc);
+        if (self.renewed_credential) |*credential| credential.deinit(self.alloc);
         self.* = undefined;
     }
 };
@@ -436,19 +495,38 @@ pub const Runtime = struct {
         access: credentials.CatalogAccess,
         trigger: LoadTrigger,
     ) void {
+        self.startWarmupRenewing(provider, access, trigger, null);
+    }
+
+    /// `startWarmup` for a sign-in fx can renew: the warmup reads the stored
+    /// credential before it fetches, and renews a token the provider rejects
+    /// with 401 before it falls back to the public list.
+    pub fn startWarmupRenewing(
+        self: *Self,
+        provider: model_catalog.Provider,
+        access: credentials.CatalogAccess,
+        trigger: LoadTrigger,
+        renewal: ?auth_runtime.Renewal,
+    ) void {
         self.from_profile_settings = provider.provider_id == .configured;
         if (!self.beginLoad(access, provider.refresh_interval_ms, trigger)) return;
 
-        const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
-            self.completeFetch(.{ .failed = .{
-                .access = .init(access),
-                .anonymous_fallback_used = false,
-                .failure = .{ .category = .resource_exhausted },
-            } });
+        const failed_to_copy: model_catalog.FetchResult = .{ .failed = .{
+            .access = .init(access),
+            .anonymous_fallback_used = false,
+            .failure = .{ .category = .resource_exhausted },
+        } };
+        var owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
+            self.completeFetch(failed_to_copy);
             return;
         };
+        const owned_renewal: ?OwnedRenewal = if (renewal) |value| OwnedRenewal.init(self.alloc, value) catch {
+            owned_access.deinit(self.alloc);
+            self.completeFetch(failed_to_copy);
+            return;
+        } else null;
 
-        const thread = std.Thread.spawn(.{}, preloadThreadMain, .{ self, provider, owned_access }) catch {
+        const thread = std.Thread.spawn(.{}, preloadThreadMain, .{ self, provider, owned_access, owned_renewal }) catch {
             var failed_access = owned_access;
             const failure = model_catalog.FailedOutcome{
                 .access = .init(failed_access.access),
@@ -456,6 +534,10 @@ pub const Runtime = struct {
                 .failure = .{ .category = .runtime, .retryable = true },
             };
             failed_access.deinit(self.alloc);
+            if (owned_renewal) |value| {
+                var failed_renewal = value;
+                failed_renewal.deinit(self.alloc);
+            }
             self.completeFetch(.{ .failed = failure });
             return;
         };
@@ -842,15 +924,36 @@ pub const Runtime = struct {
         self: *Self,
         provider: model_catalog.Provider,
         owned_access: OwnedCatalogAccess,
+        owned_renewal: ?OwnedRenewal,
     ) void {
         var access = owned_access;
         defer access.deinit(self.alloc);
+        var renewal = owned_renewal;
+        defer if (renewal) |*value| value.deinit(self.alloc);
+
+        var fetch_access = access.access;
+        var renewer: ?CatalogRenewer = null;
+        defer if (renewer) |*active| active.deinit();
+        if (renewal) |value| {
+            if (fetch_access.authorizationCredential()) |current| {
+                if (fetch_access.credentialSource() == value.renewal.source) {
+                    renewer = .{ .alloc = self.alloc, .renewal = value.renewal, .cancel_flag = &self.cancel_requested };
+                    if (renewer) |*active| {
+                        if (active.storedToken(current)) |token| {
+                            debug_trace.logf("catalog", "model catalog uses the stored credential reason=newer", .{});
+                            fetch_access = fetch_access.withCredential(token);
+                        }
+                    }
+                }
+            }
+        }
 
         self.completeFetch(model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
-            .access = access.access,
+            .access = fetch_access,
             .endpoint = self.models_path,
             .cancel_flag = &self.cancel_requested,
             .view = .picker,
+            .renew_after_rejection = if (renewer) |*active| active.hook() else null,
         }));
     }
 

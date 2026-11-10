@@ -1,0 +1,58 @@
+[
+  {
+    "id": "no-reload",
+    "breaks": "the title sends the in-memory token without reading the store",
+    "file": "src/core/session/session_title_generation.zig",
+    "find": "        if (try auth_runtime.readStoredCredential(alloc, active, request.cancel_flag)) |stored| token.adopt(alloc, stored);",
+    "replace": "        if (request.prompt_excerpt.len == 0) if (try auth_runtime.readStoredCredential(alloc, active, request.cancel_flag)) |stored| token.adopt(alloc, stored);",
+    "only": "tui"
+  },
+  {
+    "id": "no-replay",
+    "breaks": "the title gives up after one 401",
+    "file": "src/core/session/session_title_generation.zig",
+    "find": "        .already_replayed = false,\n    }) == .refresh_and_replay;",
+    "replace": "        .already_replayed = renewal.source != .host_managed,\n    }) == .refresh_and_replay;",
+    "only": "ask"
+  },
+  {
+    "id": "double-replay",
+    "breaks": "the title is sent a third time",
+    "file": "src/core/session/session_title_generation.zig",
+    "find": "                sent = try send(alloc, request, token.bytes, deadline);\n            }\n        }\n    }\n    return finish(alloc, request, sent);",
+    "replace": "                sent = try send(alloc, request, token.bytes, deadline);\n                if (rejectedAndRenewable(sent, active)) {\n                    sent.deinit(alloc);\n                    sent = .{ .unavailable = .{ .reason = .cancelled } };\n                    sent = try send(alloc, request, token.bytes, deadline);\n                }\n            }\n        }\n    }\n    return finish(alloc, request, sent);",
+    "only": "ask"
+  },
+  {
+    "id": "force-no-recheck",
+    "breaks": "a 401 forces a refresh while the store already holds a newer token",
+    "file": "src/core/auth/auth_runtime.zig",
+    "find": "        if (!std.mem.eql(u8, current.token, rejected)) {",
+    "replace": "        if (rejected.len == 0 and !std.mem.eql(u8, current.token, rejected)) {",
+    "only": "ask"
+  },
+  {
+    "id": "history-gate",
+    "breaks": "the gate reads only the history, so an interrupting prompt titles the session again",
+    "file": "src/core/app/app_session_runtime.zig",
+    "find": "                .title_started = agent.session_persistence.title_generation.startedFor(session_id),",
+    "replace": "                .title_started = false,",
+    "only": "tui"
+  },
+  {
+    "id": "catalog-no-reload",
+    "breaks": "the model list sends the in-memory token without reading the store",
+    "file": "src/core/app/model_cache_runtime.zig",
+    "find": "    fn storedToken(self: *CatalogRenewer, current: []const u8) ?[]const u8 {\n",
+    "replace": "    fn storedToken(self: *CatalogRenewer, current: []const u8) ?[]const u8 {\n        if (current.len > 0) return null;\n",
+    "only": "catalog"
+  },
+  {
+    "id": "catalog-no-replay",
+    "breaks": "the model list falls back to public models after one 401",
+    "file": "src/core/gateway/model_catalog.zig",
+    "find": "    if (failure.http_status != .unauthorized) return null;",
+    "replace": "    if (failure.http_status != .unauthorized or attempt.endpoint.len > 0) return null;",
+    "only": "catalog"
+  }
+]

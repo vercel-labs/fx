@@ -594,6 +594,12 @@ pub const SessionPickerLoad = struct {
 pub const TitleGenerationLoad = struct {
     task: ?*session_title_generation.Task = null,
     last: LastResult = .{},
+    /// The session whose title request started. The gate checks it, because
+    /// a first turn the next prompt interrupts reaches the history only after
+    /// that prompt starts (tests/tla/session_title/SessionTitle.tla
+    /// AtMostOneTitleRequest).
+    started_session_buf: [LastResult.max_session_bytes]u8 = undefined,
+    started_session_len: u8 = 0,
 
     /// Final state of the most recent attempt, retained for diagnostics after
     /// the task itself is destroyed. `detail` is a static string borrowed from
@@ -649,9 +655,27 @@ pub const TitleGenerationLoad = struct {
             old.destroy();
         }
         self.task = task;
+        self.recordStarted(task.session_id);
+    }
+
+    /// Whether `session_id` already started a title request.
+    pub fn startedFor(self: *const TitleGenerationLoad, session_id: []const u8) bool {
+        return self.started_session_len > 0 and
+            std.mem.eql(u8, self.started_session_buf[0..self.started_session_len], session_id);
+    }
+
+    fn recordStarted(self: *TitleGenerationLoad, session_id: []const u8) void {
+        if (session_id.len == 0 or session_id.len > self.started_session_buf.len) {
+            debug_trace.logf("session", "event=title_generation_start_unrecorded reason=session_id_len len={d}", .{session_id.len});
+            self.started_session_len = 0;
+            return;
+        }
+        @memcpy(self.started_session_buf[0..session_id.len], session_id);
+        self.started_session_len = @intCast(session_id.len);
     }
 
     pub fn recordSpawnFailure(self: *TitleGenerationLoad, session_id: []const u8, model: []const u8, err: anyerror) void {
+        self.recordStarted(session_id);
         var last = LastResult{
             .status = .failed,
             .reason = .spawn_failed,
