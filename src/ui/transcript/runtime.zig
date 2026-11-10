@@ -8631,7 +8631,27 @@ pub const TranscriptRuntime = struct {
                     retained_semantic_progress_rows + growth_rows;
                 // Retained debt repairs the attempted frame. Only source
                 // growth is a new content release that needs finality.
-                const semantic_rows, const semantic_progress_rows = if (self.finalityFloorBytes(prepared) != null) bounded: {
+                // A rebase receipt that does not track semantic progress owes
+                // no rows: its frame has no append base
+                // (`resolveTransitionAppendBase`), so planning them would
+                // scroll the terminal without writing them, which leaves
+                // blank rows in native scrollback and scrolls the same rows
+                // again once history catches up. A source rewrite already
+                // drops that debt (`reconcileTranscriptCommitSourceWithRewriteMode`); the history debt
+                // the stable anchor derives settles through replay on a later
+                // frame.
+                const rebase_owes_nothing = receipt.projection_rebase_pending and
+                    !receipt.tracks_semantic_progress;
+                if (rebase_owes_nothing and candidate_semantic_rows > 0) {
+                    debug_trace.logf(
+                        "scroll",
+                        "transcript_recovery_debt_deferred semantic_rows={d} reason=projection_rebase_untracked",
+                        .{candidate_semantic_rows},
+                    );
+                }
+                const semantic_rows, const semantic_progress_rows = if (rebase_owes_nothing)
+                    .{ @as(u32, 0), @as(u32, 0) }
+                else if (self.finalityFloorBytes(prepared) != null) bounded: {
                     const releasable_offset = self.finalityReleasableOffset(
                         prepared,
                         target_offset,
