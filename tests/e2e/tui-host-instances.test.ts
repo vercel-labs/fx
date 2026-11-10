@@ -1241,8 +1241,10 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
             await session.waitForText("TREE_MCP_DONE", 45_000);
           });
           // The fixture's answer reaches the model only when the profile
-          // names its server, whether or not the model selected the tool.
+          // names its server, whether or not the model selected the tool,
+          // and its toolbox menu lists the server only then.
           expect((bodies.at(-1) ?? "").includes("MODERN_MCP_TOOL_RESULT")).toBe(reaches);
+          expect((bodies[0] ?? "").includes("MCP servers\\n- fixture")).toBe(reaches);
         } finally {
           cleanupIsolatedTestHome(home);
           rmSync(workspace, { recursive: true, force: true });
