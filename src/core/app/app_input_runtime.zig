@@ -1886,6 +1886,7 @@ pub fn Runtime(comptime App: type) type {
         /// bytes do nothing, so a stray key never forks; control bytes
         /// pass, so Ctrl+C still works.
         fn routeForkQuestionByte(app: *App, agent: *AppAgent, byte: u8) !bool {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
             if (!agent.session_persistence.fork_menu.asking()) return false;
             const bring: ?bool = switch (byte) {
@@ -1903,6 +1904,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn answerForkQuestionOnEscape(app: *App, agent: *AppAgent) !bool {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
             if (!agent.session_persistence.fork_menu.asking()) return false;
             return submitForkMenuSelection(app, agent, false, forkPromptLimit());
