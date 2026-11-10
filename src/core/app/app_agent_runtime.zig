@@ -1616,6 +1616,7 @@ pub fn Runtime(comptime App: type) type {
                 .auto_compact_percent = job.agent_settings.auto_compact_percent,
                 .cancel_flag = &agent.worker.worker_cancel_requested,
                 .recovery_continue_flag = &agent.worker.recovery_continue_requested,
+                .recovery_sign_in_closed_flag = &agent.worker.recovery_sign_in_closed,
                 .review_enabled = false,
                 .fast_mode = job.agent_settings.fast_mode,
                 .ultrafast_mode = job.agent_settings.ultrafast_mode,

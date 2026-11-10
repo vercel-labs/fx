@@ -4,6 +4,7 @@ const model_capabilities = @import("../../config/model_capabilities.zig");
 const image_route = @import("../../images/image_route.zig");
 const types = @import("../../shared/types.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const io_mod = @import("../../shared/io.zig");
 const runtime_telemetry = @import("telemetry.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
@@ -138,6 +139,13 @@ fn recordProviderResultMetric(
     const input_tokens = clampTokenCount(completion.usage.input_tokens);
     const output_tokens = clampTokenCount(completion.usage.output_tokens);
     const terminal_stop_reason = if (completion.finish_reason) |reason| reason.label() else "";
+    // The gateway's words, masked and clipped the way fx shows them; the
+    // provider already masked the credential it sent.
+    const error_message: ?[]u8 = if (failure) |value| if (value.http_status) |status| if (value.detail) |detail|
+        gateway_error_format.formatHttpRecoveryDiagnostic(std.heap.c_allocator, status, detail) catch null
+    else
+        null else null else null;
+    defer if (error_message) |message| std.heap.c_allocator.free(message);
 
     runtime_telemetry.recordGatewayCallMetricWithDiagnostics(
         model,
@@ -155,6 +163,7 @@ fn recordProviderResultMetric(
             .schema = if (failure) |value| value.diagnostics.schema orelse "" else "",
             .request_shape = if (failure) |value| value.diagnostics.request_shape orelse "" else "",
             .provider_stop_reason = completion.finish_reason_raw.slice(),
+            .error_message = error_message orelse "",
         },
     );
 }

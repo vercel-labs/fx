@@ -617,6 +617,10 @@ pub const WorkerRuntime = struct {
     /// Set when the user answers a request that waits for them; the request's
     /// recovery reads and clears it (`RequestRecovery.continue_flag`).
     recovery_continue_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set when the sign-in fx opened for a waiting request closes without
+    /// a new login; the request's recovery reads and clears it
+    /// (`RequestRecovery.sign_in_closed_flag`).
+    recovery_sign_in_closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// The active turn whose text steering admission owns the cancel flag.
     /// Guarded by `worker_mutex`; explicit cancellation clears this ownership.
     steering_cancel_turn_id: ?u64 = null,
@@ -903,6 +907,14 @@ pub const WorkerRuntime = struct {
     /// Enter. A request that is not waiting ignores it.
     pub fn requestRecoveryContinue(self: *WorkerRuntime) void {
         self.recovery_continue_requested.store(true, .seq_cst);
+    }
+
+    /// The sign-in fx opened for a request that waits for one closed without
+    /// a new login, for example because its code expired. The request tries
+    /// its saved login once more; a request that does not wait for a sign-in
+    /// ignores it.
+    pub fn requestRecoverySignInClosed(self: *WorkerRuntime) void {
+        self.recovery_sign_in_closed.store(true, .seq_cst);
     }
 
     pub fn cancellationStopsTurn(self: *WorkerRuntime) bool {

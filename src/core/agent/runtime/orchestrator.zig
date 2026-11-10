@@ -4595,8 +4595,10 @@ fn needsUserFailureKind(
     if (isContextOverflowFailure(failure)) return .too_long;
     return switch (failure.kind) {
         .invalid_request, .forbidden, .request_too_large, .provider_error => .rejected,
-        // fx already refreshed the credential once. A source that /login
-        // repairs waits for the user to sign in; any other keeps its notice.
+        // fx tried to refresh the credential once, and the refresh failed:
+        // a refresh that worked waits and resends as `refused` before this.
+        // A source that /login repairs waits for the user to sign in; any
+        // other keeps its notice.
         .unauthorized => if (signInRepairs(credential_source)) .sign_in else null,
         // 429 and 5xx retry.
         .rate_limited, .quota_exhausted, .server_error, .bad_gateway, .unavailable, .gateway_timeout => null,
@@ -7737,6 +7739,9 @@ fn processQueuedPromptLoop(
         // The next send reads the stored credential again, after a sign-in.
         var credential_reload_pending = false;
         var auth_retry_used = false;
+        // The gateway's reason for refusing this request's login is on
+        // screen; its resends do not repeat it.
+        var auth_reason_shown = false;
         var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
         var context_overflow_recovery: ContextOverflowRecoveryState = .ready;
@@ -7756,6 +7761,7 @@ fn processQueuedPromptLoop(
         // stay fx's own and resend inside the same module send.
         var request_recovery = runtime_request_recovery.RequestRecovery.init(deps, config.cancel_flag, step_ctx);
         request_recovery.continue_flag = config.recovery_continue_flag;
+        request_recovery.sign_in_closed_flag = config.recovery_sign_in_closed_flag;
         // `deinit` clears a status still shown on every exit; an error exit
         // reports `failed` first.
         defer request_recovery.deinit();
@@ -8927,6 +8933,33 @@ fn processQueuedPromptLoop(
                 }
             };
 
+            // fx refreshed the login after a 401 and the gateway refused the
+            // new one too, so the login itself is good and signing in again
+            // cannot help. On a host that can ask, the request waits and
+            // resends with the same login as for a 5xx, showing the gateway's
+            // reason once; Esc during the wait falls through to the cancel
+            // path below. A host that cannot ask ends the turn as before.
+            if (response_failure) |failure| if (failure.kind == .unauthorized and auth_retry_used and
+                request_recovery.canAskUser() and !config.cancel_flag.load(.seq_cst))
+            {
+                if (!auth_reason_shown) {
+                    try pushWaitingHttpFailureReason(deps, arena, failure, job, request_capabilities);
+                    auth_reason_shown = true;
+                }
+                _ = try request_recovery.failed(.{ .kind = .refused });
+                if (try request_recovery.waitForSend() != null) {
+                    stream_result.deinit(arena);
+                    stream_result_set = false;
+                    // Another fx process may have saved a newer login.
+                    credential_reload_pending = true;
+                    // A refused request reached no model.
+                    recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
+                    recovery_cause = .authentication;
+                    reset_stream_for_next_attempt = true;
+                    continue;
+                }
+            };
+
             // On a host that can ask, an error that resending alone cannot fix
             // waits for the user: Enter or a picker choice resends the
             // request unchanged, and Esc ends the turn through the cancel
@@ -8937,11 +8970,13 @@ fn processQueuedPromptLoop(
             {
                 if (needsUserFailureKind(arena, failure, job.credential_source)) |kind| {
                     // The provider's reason stays visible while fx waits, and
-                    // after Esc, so the user knows what to change. A sign-in
-                    // needs no reason: fx opens it.
-                    if (kind != .sign_in) {
+                    // after Esc, so the user knows what to change. A wait for
+                    // a sign-in resends now and then, and shows its reason
+                    // once.
+                    if (kind != .sign_in or !auth_reason_shown) {
                         try pushWaitingHttpFailureReason(deps, arena, failure, job, request_capabilities);
                         http_failure_notice_shown = true;
+                        if (kind == .sign_in) auth_reason_shown = true;
                     }
                     switch (try waitForUser(&request_recovery, deps, kind)) {
                         .resend => {
