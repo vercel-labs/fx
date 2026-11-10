@@ -254,7 +254,7 @@ The `TLA+ transcript window model` job takes about 4 minutes and runs its checks
 The `TLA+ subagent and session-write models` job takes a few minutes and runs its checks when the change touches:
 
 - `src/core/subagent/`, `src/core/session/`, `src/core/agent/worker_runtime.zig`, or `src/core/agent/runtime/parallel_execution.zig`
-- The models in `tests/tla/subagent/`, the session-write model in `tests/tla/session/`, or their drivers in `tests/tla/drivers/subagent/` and `tests/tla/drivers/session/write.test.ts`
+- The models in `tests/tla/subagent/`, the session-write and live sessions models in `tests/tla/session/`, or their drivers in `tests/tla/drivers/subagent/`, `tests/tla/drivers/session/write.test.ts`, and `tests/tla/drivers/session/live.test.ts`
 - The shared code in `tests/tla/lib/` and `tests/tla/drivers/lib/`, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`
 
 All four run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
