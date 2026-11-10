@@ -4267,6 +4267,24 @@ describe("fx mcp call", () => {
     expect(toolCalls(root)).toHaveLength(0);
   }, 90_000);
 
+  test("a tool name with control bytes shows as visible escapes in a command's messages", async () => {
+    const root = bridgeRoot("bridge-odd-name");
+    // The name is a word the model wrote, so it can hold an escape sequence.
+    const seen = shellOutput(await runBridgeCommand(root, [
+      `name=$(printf 'mcp_fixture_\\033]0;x\\007nope')`,
+      `"${FX_BIN}" mcp call "$name" '{}' 2>&1; echo "call=$?"`,
+      `"${FX_BIN}" mcp call help "$name" 2>&1; echo "help=$?"`,
+    ].join("\n")));
+    const shown = "mcp_fixture_\\x1b]0;x\\x07nope";
+    expect(seen).toContain(`fx mcp call: ${shown} did not run. No MCP tool named ${shown} is available to this agent.`);
+    expect(seen).toContain("call=5");
+    expect(seen).toContain(`No MCP tool named ${shown} is available to this agent. Find tool names with fx mcp call search.`);
+    expect(seen).toContain("help=1");
+    expect(seen).not.toContain("\x1b");
+    expect(seen).not.toContain("\x07");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
+
   test("list, search, and help hide a tool the permission rules deny", async () => {
     const root = bridgeRoot("bridge-lookups-denied", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
     const seen = shellOutput(await runBridgeCommand(root, [
