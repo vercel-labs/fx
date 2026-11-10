@@ -465,6 +465,10 @@ pub fn executeToolCallAuthorized(
     execution_ctx.command_replay_unavailable = request.command_replay_unavailable;
 
     const started_at_ms = io_mod.milliTimestamp();
+    const call_dir = workspace_access.AccessScope.primaryDirectoryOf(
+        execution_ctx.access_scope,
+        execution_ctx.workspace_root,
+    );
     const uses_file_mutation_contract = if (registeredToolSpec(
         execution_ctx,
         request.call.name,
@@ -508,6 +512,8 @@ pub fn executeToolCallAuthorized(
             .outcome = classifyToolExecutionError(err),
             .started_at_ms = started_at_ms,
             .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
+            .call_id = request.call.id,
+            .dir = call_dir,
         });
         return if (err == error.CancelledBeforeExecution) error.Cancelled else err;
     };
@@ -518,6 +524,8 @@ pub fn executeToolCallAuthorized(
         .outcome = classifyReturnedToolCallOutcome(result),
         .started_at_ms = started_at_ms,
         .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
+        .call_id = request.call.id,
+        .dir = call_dir,
     });
     if (request.command_replay_capture) |continued| {
         replay_continuation_transferred = result.command_replay_capture == continued;

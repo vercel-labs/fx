@@ -16,7 +16,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { commandReplays, onlySessionId, savedSessionIds, savedText, storeRoot } from "./saved-sessions";
@@ -1768,12 +1768,23 @@ describe("effect-aware command permissions", () => {
       expect(report).toContain(
         "last=4 succeeded=2 rejected=0 command_failed=1 tool_failed=1 runtime_failed=0",
       );
-      const localCalls = report.split("## Tool Calls\n### Local\n")[1]?.split("### Web Search")[0];
+      const localCalls = report.split("### Local\n")[1]?.split("### Web Search")[0];
       expect(localCalls).toBeDefined();
-      expect(localCalls).toMatch(/name=shell outcome=succeeded duration=\d+ms source=subagent#1\n/);
-      expect(localCalls).toMatch(/name=subagent outcome=succeeded duration=\d+ms source=parent\n/);
-      expect(localCalls).toMatch(/name=shell outcome=command_failed duration=\d+ms source=parent\n/);
-      expect(localCalls).toMatch(/name=edit_file outcome=tool_failed duration=\d+ms source=parent\n/);
+      expect(localCalls).toMatch(
+        /name=shell outcome=succeeded duration=\d+ms source=subagent#1 call_id=trace_child_command\n/,
+      );
+      expect(localCalls).toMatch(/name=subagent outcome=succeeded duration=\d+ms source=parent call_id=trace_child\n/);
+      expect(localCalls).toMatch(
+        /name=shell outcome=command_failed duration=\d+ms source=parent call_id=trace_command_failed\n/,
+      );
+      expect(localCalls).toMatch(
+        /name=edit_file outcome=tool_failed duration=\d+ms source=parent call_id=trace_edit_failed\n/,
+      );
+      // Both failures are kept whole under Failures, ahead of the window.
+      const failures = report.split("### Failures\n")[1]?.split("### Local\n")[0];
+      expect(failures).toContain("kept=2 of 2 session failures");
+      expect(failures).toContain("call_id=trace_command_failed");
+      expect(failures).toContain("call_id=trace_edit_failed");
       expect(report).toContain("name=edit_file outcome=tool_failed");
       expect(report).toContain("name=shell outcome=command_failed");
       expect(report).not.toContain("name=edit_file outcome=runtime_failed");
@@ -1786,6 +1797,167 @@ describe("effect-aware command permissions", () => {
       activeSession = null;
     },
     TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace keeps a failed call whole after later calls fill the window",
+    async () => {
+      const configuredShell = userInfo().shell ?? "";
+      if (!configuredShell.endsWith("/bash") && !configuredShell.endsWith("/zsh")) return;
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      // The user's startup files replace `ls`, as eza users' do.
+      const startup = "alias ls='fx-eza-fixture --icons'\n";
+      writeFileSync(join(root.home, ".zshrc"), startup);
+      writeFileSync(join(root.home, ".bash_profile"), startup);
+      // Longer than the window's 1200-byte argument cut, with its marker at
+      // the end; its output is longer than the 2000-byte result cut.
+      const failing = `ls -d missing-dir; : ${"p".repeat(1500)}; i=0; ` +
+        `while [ $i -lt 120 ]; do echo "output line $i ${"y".repeat(40)}"; i=$((i+1)); done; ` +
+        "echo OUTPUT_TAIL_MARKER; exit 2 # COMMAND_TAIL_MARKER";
+      const successes = 70;
+      const rootPrompt = "Run the window fill fixture.";
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes(rootPrompt)) return finalText("unexpected request");
+        if (!body.includes('"toolCallId":"trace_failed_first"')) {
+          return toolCall(failing, {}, "trace_failed_first");
+        }
+        const done = [...body.matchAll(/"toolCallId":"trace_ok_(\d+)"/g)].map((match) => Number(match[1]));
+        const next = done.length === 0 ? 0 : Math.max(...done) + 1;
+        if (next < successes) return toolCall("true", {}, `trace_ok_${next}`);
+        return finalText("window filled");
+      });
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      await activeSession.waitForText("window filled", 120_000);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const report = readFileSync(latestTraceReportPath(root), "utf8");
+      const section = (start: string, end: string) => report.split(start)[1]?.split(end)[0];
+
+      // The window has moved past the failed call.
+      expect(report).toContain(`coverage: window holds only the last 64 of ${successes + 1} tool calls`);
+      const local = section("### Local\n", "### Web Search");
+      expect(local).toBeDefined();
+      expect(local).not.toContain("trace_failed_first");
+      expect(local).toMatch(/name=shell outcome=succeeded duration=\d+ms source=parent call_id=trace_ok_69\n/);
+
+      // The failed call is kept whole: its call ID, folder, whole command,
+      // and the end of its output.
+      const failures = section("### Failures\n", "### Local\n");
+      expect(failures).toBeDefined();
+      expect(failures).toMatch(
+        /name=shell outcome=command_failed duration=\d+ms source=parent call_id=trace_failed_first\n/,
+      );
+      expect(failures).toContain(`  dir: ${root.workspace}\n`);
+      expect(failures).toContain("COMMAND_TAIL_MARKER");
+      expect(failures).toContain("OUTPUT_TAIL_MARKER");
+      expect(failures).toContain("  redefined: ls (alias of fx-eza-fixture)\n");
+
+      const problems = section("## Problems\n", "\n## ");
+      expect(problems).toContain("call_id=trace_failed_first");
+
+      // The call ID finds the call in the session log.
+      const log = readFileSync(join(storeRoot(root.home), onlySessionId(root.home), "log.jsonl"), "utf8");
+      const records = log.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+      expect(records.some((record) => record.type === "tool_call" && record.data?.call_id === "trace_failed_first"))
+        .toBe(true);
+
+      const shell = section("## Shell\n", "\n## ");
+      expect(shell).toBeDefined();
+      expect(shell).toContain(`login_shell: ${configuredShell}\n`);
+      expect(shell).toMatch(/snapshot: state=ready /);
+      expect(shell).toContain("ls (alias of fx-eza-fixture)");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    180_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace says why the shell snapshot capture failed",
+    async () => {
+      const configuredShell = userInfo().shell ?? "";
+      if (!configuredShell.endsWith("/bash") && !configuredShell.endsWith("/zsh")) return;
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      // The startup files end the shell before the capture can report.
+      writeFileSync(join(root.home, ".zshrc"), "exit 0\n");
+      writeFileSync(join(root.home, ".bash_profile"), "exit 0\n");
+      const rootPrompt = "Run the snapshot probe.";
+      const gateway = startDynamicFakeGateway(async (body) => {
+        if (!body.includes(rootPrompt)) return finalText("unexpected request");
+        if (!body.includes('"toolCallId":"snapshot_probe"')) return toolCall("echo probe", {}, "snapshot_probe");
+        return finalText("probe done");
+      });
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText(rootPrompt);
+      await activeSession.waitForText("probe done", TIMEOUT);
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const report = readFileSync(latestTraceReportPath(root), "utf8");
+      const shell = report.split("## Shell\n")[1]?.split("\n## ")[0];
+      expect(shell).toBeDefined();
+      expect(shell).toContain(
+        "snapshot: state=failed reason=the login shell exited before reporting its state",
+      );
+      expect(shell).toContain("user commands start: full startup");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT * 2,
   );
 
   test.skipIf(!tmuxAvailable())(

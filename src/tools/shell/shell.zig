@@ -2047,15 +2047,14 @@ fn resolveCwd(
     ctx: tool_dispatch.DispatchContext,
     requested: ?[]const u8,
 ) ![]const u8 {
-    const scope = ctx.access_scope orelse
-        workspace_access.AccessScope.primaryOnly(ctx.workspace_root);
-    const value = requested orelse return arena.dupe(u8, scope.primary_directory);
+    const primary = workspace_access.AccessScope.primaryDirectoryOf(ctx.access_scope, ctx.workspace_root);
+    const value = requested orelse return arena.dupe(u8, primary);
     if (std.mem.eql(u8, value, ".")) {
-        return arena.dupe(u8, scope.primary_directory);
+        return arena.dupe(u8, primary);
     }
     return pathing.resolveWorkspaceOrExternalPath(
         arena,
-        scope.primary_directory,
+        primary,
         value,
     );
 }

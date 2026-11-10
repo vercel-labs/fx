@@ -9,7 +9,10 @@
 //! epoch advances so remembered shell approvals stop matching.
 //!
 //! Snapshot contents stay in memory. They reach a command only through its
-//! environment and the supervisor's stdin script, and are never logged.
+//! environment and the supervisor's stdin script, and are never logged. The
+//! `/trace` report shows only `traceView`: the state, the number of names, and
+//! which of `traced_command_names` the startup files redefine, with the first
+//! word an alias runs.
 //!
 //! TLA+ model: `tests/tla/terminal/ShellSnapshot.tla`.
 
@@ -183,6 +186,125 @@ pub const Generation = struct {
     }
 };
 
+/// Command names an agent's shell commands often use. `/trace` names the ones
+/// a user's startup files redefine, since an alias or function there changes
+/// what those commands run and print, as `ls` running eza does.
+pub const traced_command_names = [_][]const u8{
+    "awk",    "bash", "cat",    "cd",     "cp",      "curl", "diff", "echo",
+    "env",    "find", "git",    "grep",   "head",    "kill", "less", "ln",
+    "ls",     "make", "mkdir",  "mv",     "node",    "npm",  "npx",  "open",
+    "printf", "ps",   "pwd",    "python", "python3", "rg",   "rm",   "sed",
+    "sh",     "sort", "source", "sudo",   "tail",    "tar",  "test", "time",
+    "touch",  "uniq", "wc",     "which",  "xargs",   "zsh",
+};
+
+pub const max_alias_target_len: usize = 64;
+
+/// A common command the startup files redefine.
+pub const RedefinedCommand = struct {
+    /// One of `traced_command_names`.
+    name: []const u8,
+    kind: enum { alias, function },
+    target_buf: [max_alias_target_len]u8 = @splat(0),
+    target_len: u8 = 0,
+
+    /// The first word the alias runs, such as `eza`; null for a function or
+    /// an alias whose first word is not plain text.
+    pub fn aliasTarget(self: *const RedefinedCommand) ?[]const u8 {
+        if (self.kind != .alias or self.target_len == 0) return null;
+        return self.target_buf[0..self.target_len];
+    }
+};
+
+pub const TraceView = struct {
+    /// `empty`, `capturing`, `ready`, or `failed`.
+    state: []const u8,
+    dirty: bool,
+    failure: ?[]const u8 = null,
+    shell_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined,
+    shell_path_len: usize = 0,
+    /// Every alias and function name the snapshot holds.
+    names_total: usize = 0,
+    redefined_buf: [traced_command_names.len]RedefinedCommand = undefined,
+    redefined_len: usize = 0,
+
+    pub fn shellPath(self: *const TraceView) []const u8 {
+        return self.shell_path_buf[0..self.shell_path_len];
+    }
+
+    pub fn redefined(self: *const TraceView) []const RedefinedCommand {
+        return self.redefined_buf[0..self.redefined_len];
+    }
+
+    fn setShellPath(self: *TraceView, path: []const u8) void {
+        const len = @min(path.len, self.shell_path_buf.len);
+        @memcpy(self.shell_path_buf[0..len], path[0..len]);
+        self.shell_path_len = len;
+    }
+
+    /// Lists each traced name the snapshot defines, reading every alias
+    /// line of the replay once.
+    fn collectRedefined(self: *TraceView, generation: *const Generation) void {
+        var targets: [traced_command_names.len]?[]const u8 = @splat(null);
+        var lines = std.mem.splitScalar(u8, generation.replay, '\n');
+        while (lines.next()) |line| {
+            const alias = parseAliasLine(line) orelse continue;
+            for (traced_command_names, 0..) |name, index| {
+                if (targets[index] == null and std.mem.eql(u8, name, alias.name)) targets[index] = alias.target;
+            }
+        }
+        for (traced_command_names, 0..) |name, index| {
+            if (!generation.defines(name)) continue;
+            var entry: RedefinedCommand = .{ .name = name, .kind = .function };
+            if (targets[index]) |target| {
+                entry.kind = .alias;
+                const len = @min(target.len, max_alias_target_len);
+                @memcpy(entry.target_buf[0..len], target[0..len]);
+                entry.target_len = @intCast(len);
+            }
+            self.redefined_buf[self.redefined_len] = entry;
+            self.redefined_len += 1;
+        }
+    }
+};
+
+const AliasLine = struct {
+    name: []const u8,
+    /// The first word of the value; empty when it starts with anything but
+    /// plain text.
+    target: []const u8,
+};
+
+/// Reads an `alias -L` or `alias -p` line, such as `alias ls='eza --icons'`
+/// or `alias -- -x=y`. Indented lines are part of a function body and are not
+/// alias lines.
+fn parseAliasLine(line: []const u8) ?AliasLine {
+    if (!std.mem.startsWith(u8, line, "alias ")) return null;
+    var rest = line["alias ".len..];
+    // Flags such as `-g`, `-s`, and the `--` before a name starting with `-`.
+    while (std.mem.startsWith(u8, rest, "-")) {
+        const space = std.mem.findScalar(u8, rest, ' ') orelse return null;
+        const flag = rest[0..space];
+        rest = rest[space + 1 ..];
+        if (std.mem.eql(u8, flag, "--")) break;
+    }
+    const equals = std.mem.findScalar(u8, rest, '=') orelse return null;
+    const name = rest[0..equals];
+    if (name.len == 0) return null;
+    var value = rest[equals + 1 ..];
+    if (value.len > 0 and (value[0] == '\'' or value[0] == '"')) value = value[1..];
+    var end: usize = 0;
+    while (end < value.len and end < max_alias_target_len and isAliasTargetByte(value[end])) end += 1;
+    return .{ .name = name, .target = value[0..end] };
+}
+
+fn isAliasTargetByte(byte: u8) bool {
+    return switch (byte) {
+        '\'', '"', ';', '&', '|', '`', '$', '(', ')', '<', '>', '\\' => false,
+        else => byte > ' ' and byte < 0x7f,
+    };
+}
+
 const CaptureFailure = enum {
     unsupported_shell,
     spawn_failed,
@@ -289,6 +411,8 @@ pub const Owner = struct {
     failed_shell: [std.Io.Dir.max_path_bytes]u8 = undefined,
     failed_shell_len: usize = 0,
     failed_fingerprint: Fingerprint = .{},
+    /// Why the last capture failed, while `state` is `.failed`.
+    last_failure: ?CaptureFailure = null,
     notice: Notice = .{},
     /// Epoch each remembered shell command grant was made under, keyed by
     /// the grant target. Keys are owned by `std.heap.c_allocator`.
@@ -415,6 +539,31 @@ pub const Owner = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return self.state == .failed;
+    }
+
+    /// What `/trace` shows of the snapshot: its state, why its capture failed,
+    /// and which common commands the startup files redefine. It copies no
+    /// alias or function body.
+    pub fn traceView(self: *Owner) TraceView {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var view: TraceView = .{
+            .state = @tagName(self.state),
+            .dirty = self.dirty,
+            .failure = if (self.state == .failed)
+                if (self.last_failure) |reason| reason.description() else null
+            else
+                null,
+        };
+        if (self.active) |generation| {
+            view.setShellPath(generation.shell_path);
+            view.names_total = generation.names.count();
+            view.collectRedefined(generation);
+        } else if (self.state == .failed) {
+            view.setShellPath(self.failed_shell[0..self.failed_shell_len]);
+        }
+        return view;
     }
 
     /// Reports whether any word of `command` names an alias or function in
@@ -572,6 +721,7 @@ pub const Owner = struct {
                 self.retireLocked(self.active);
                 self.active = generation;
                 self.state = .ready;
+                self.last_failure = null;
                 self.notice.ui_pending = false;
                 self.notice.result_pending = false;
                 debug_trace.logf(
@@ -593,6 +743,7 @@ pub const Owner = struct {
         self.retireLocked(self.active);
         self.active = null;
         self.state = .failed;
+        self.last_failure = reason;
         const len = @min(shell_path.len, self.failed_shell.len);
         @memcpy(self.failed_shell[0..len], shell_path[0..len]);
         self.failed_shell_len = len;
@@ -1080,6 +1231,110 @@ test "snapshot owner reports aliases and functions named in a command" {
     try testing.expect(owner.definesAnyWord("echo $(ll)"));
     try testing.expect(!owner.definesAnyWord("ls -l"));
     try testing.expect(!owner.definesAnyWord("llama --help"));
+}
+
+const TraceCapture = struct {
+    fn capture(request: CaptureRequest) CaptureOutcome {
+        const generation = Generation.create() catch return .{ .failed = .out_of_memory };
+        const alloc = generation.arena.allocator();
+        generation.shell_path = alloc.dupe(u8, request.shell_path) catch {
+            generation.destroy();
+            return .{ .failed = .out_of_memory };
+        };
+        // A function body's own alias line is indented and is not the alias.
+        generation.replay = "cd () {\n\talias ls=not-this\n\tbuiltin cd \"$@\"\n}\n" ++
+            "alias gs=git\nalias ll='ls -l'\nalias ls='eza --icons'\nalias -g grep='$(rg)'\n";
+        for ([_][]const u8{ "cd", "gs", "grep", "ll", "ls" }) |name| {
+            generation.names.put(alloc, name, {}) catch {};
+        }
+        return .{ .ready = generation };
+    }
+};
+
+test "snapshot trace view names redefined common commands and what their aliases run" {
+    var owner: Owner = .{ .capture_fn = TraceCapture.capture };
+    defer owner.deinit();
+
+    const before = owner.traceView();
+    try testing.expectEqualStrings("empty", before.state);
+    try testing.expectEqual(@as(usize, 0), before.redefined().len);
+
+    const lease = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
+    lease.release();
+    const view = owner.traceView();
+    try testing.expectEqualStrings("ready", view.state);
+    try testing.expect(view.failure == null);
+    try testing.expectEqualStrings("/bin/zsh", view.shellPath());
+    try testing.expectEqual(@as(usize, 5), view.names_total);
+    const redefined = view.redefined();
+    try testing.expectEqual(@as(usize, 3), redefined.len);
+    try testing.expectEqualStrings("cd", redefined[0].name);
+    try testing.expect(redefined[0].kind == .function);
+    try testing.expect(redefined[0].aliasTarget() == null);
+    try testing.expectEqualStrings("grep", redefined[1].name);
+    try testing.expect(redefined[1].kind == .alias);
+    try testing.expect(redefined[1].aliasTarget() == null);
+    try testing.expectEqualStrings("ls", redefined[2].name);
+    try testing.expectEqualStrings("eza", redefined[2].aliasTarget().?);
+}
+
+test "snapshot trace view says why the capture failed" {
+    FakeCapture.reset(0, true);
+    var owner: Owner = .{ .capture_fn = FakeCapture.capture };
+    defer owner.deinit();
+
+    try testing.expect((try owner.acquire("/bin/zsh", "/tmp", .{})) == .full_startup);
+    const view = owner.traceView();
+    try testing.expectEqualStrings("failed", view.state);
+    try testing.expectEqualStrings("the login shell did not finish within 10 s", view.failure.?);
+    try testing.expectEqualStrings("/bin/zsh", view.shellPath());
+    try testing.expectEqual(@as(usize, 0), view.redefined().len);
+}
+
+test "alias lines give the first word their alias runs" {
+    const cases = [_]struct { line: []const u8, name: []const u8, target: []const u8 }{
+        .{ .line = "alias ls=eza", .name = "ls", .target = "eza" },
+        .{ .line = "alias ls='eza --icons'", .name = "ls", .target = "eza" },
+        .{ .line = "alias ll=\"ls -la\"", .name = "ll", .target = "ls" },
+        .{ .line = "alias -- -x=y", .name = "-x", .target = "y" },
+        .{ .line = "alias -g G='| grep'", .name = "G", .target = "" },
+        .{ .line = "alias cat='bat\x1b[0m'", .name = "cat", .target = "bat" },
+    };
+    for (cases) |case| {
+        const alias = parseAliasLine(case.line).?;
+        try testing.expectEqualStrings(case.name, alias.name);
+        try testing.expectEqualStrings(case.target, alias.target);
+    }
+    try testing.expect(parseAliasLine("\talias ls=eza") == null);
+    try testing.expect(parseAliasLine("ls () {") == null);
+    try testing.expect(parseAliasLine("alias =x") == null);
+    try testing.expect(parseAliasLine("alias -g") == null);
+}
+
+test "alias line reading stays bounded on fuzzed bytes" {
+    try testing.fuzz({}, fuzzAliasLines, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "alias ls='eza --icons'\nalias -- -x=y\n",
+            "alias -g -s -- =\nalias a=\x00\xff'\n",
+            "cd () {\n\talias ls=no\n}\n",
+        }) ++ @import("fuzz_corpus").snapshot_alias_lines.*),
+    });
+}
+
+fn fuzzAliasLines(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [512]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    var lines = std.mem.splitScalar(u8, buffer[0..len], '\n');
+    while (lines.next()) |line| {
+        const alias = parseAliasLine(line) orelse continue;
+        try testing.expect(alias.name.len > 0);
+        try testing.expect(alias.target.len <= max_alias_target_len);
+        for (alias.target) |byte| try testing.expect(isAliasTargetByte(byte));
+        // Both slices point into the line.
+        try testing.expect(@intFromPtr(alias.name.ptr) >= @intFromPtr(line.ptr));
+        try testing.expect(@intFromPtr(alias.target.ptr) + alias.target.len <= @intFromPtr(line.ptr) + line.len);
+    }
 }
 
 test "snapshot owner falls back with one notice and recovers after reload" {

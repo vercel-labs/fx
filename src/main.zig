@@ -5344,6 +5344,7 @@ test {
     _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/workspace_access.zig");
+    _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("core/workspace/workspace_commands.zig");
     _ = @import("core/app/app_workspace_runtime.zig");
     _ = @import("core/app/app_bootstrap_runtime.zig");

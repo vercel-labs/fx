@@ -9,6 +9,7 @@ const app_lifecycle = @import("app_lifecycle.zig");
 const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
+const shell_resolver = @import("../terminal/shell_resolver.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const credits_lookup = @import("credits_lookup.zig");
@@ -1583,6 +1584,9 @@ fn buildTraceReport(app: anytype) ![]u8 {
     try out.writer.print("permission_mode: {s}\n", .{perm_label});
     try out.writer.print("workspace: {s}\n", .{app.workspace_root});
 
+    // Taken once, so the failures and the Shell section agree.
+    const shell_view = shell_snapshot.processOwner().traceView();
+
     try writeCurrentStateSummary(&out.writer, app, app.alloc);
     try writeProblemsSummary(&out.writer, app, app.alloc);
     try writeLastShutdownSection(&out.writer, app.alloc);
@@ -1591,9 +1595,16 @@ fn buildTraceReport(app: anytype) ![]u8 {
     try writeSessionTitleSummary(&out.writer, app, app.alloc);
     try writeNetworkCallsSummary(&out.writer);
     try writeModelCatalogSummary(&out.writer, app);
-    try writeToolCallsSummary(&out.writer, app.alloc, agents.screenAgentOf(app).session.agent.history.items);
+    try writeToolCallsSummary(&out.writer, app.alloc, agents.screenAgentOf(app).session.agent.history.items, &shell_view);
     try writePermissionsSummary(&out.writer, permission_view.grants.items);
     try writeRuntimeContextSummary(&out.writer, app, app.alloc);
+    var login_shell_buffer: [4096]u8 = undefined;
+    try writeShellSummary(
+        &out.writer,
+        app.alloc,
+        &shell_view,
+        shell_resolver.configuredLoginShellInto(&login_shell_buffer),
+    );
     try writeRendererState(&out.writer, app, app.alloc);
     try writeRendererEvents(&out.writer, app.alloc);
 
@@ -1939,19 +1950,7 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         try writeNetworkCallCompact(writer, call);
     }
 
-    var tool_buf: [diagnostics.tool_call_ring_capacity]diagnostics.ToolCallMetric = undefined;
-    const tool_n = diagnostics.snapshotToolCalls(&tool_buf);
-    var tool_reported: usize = 0;
-    var ti = tool_n;
-    while (ti > 0 and tool_reported < 5) {
-        ti -= 1;
-        const call = tool_buf[ti];
-        if (call.outcome == .succeeded) continue;
-        count += 1;
-        tool_reported += 1;
-        try writer.writeAll("- tool ");
-        try writeToolCallCompact(writer, call);
-    }
+    count += try writeToolCallProblems(writer, alloc);
 
     var compaction_buf: [diagnostics.compaction_ring_capacity]diagnostics.CompactionEvent = undefined;
     const compaction_n = diagnostics.snapshotCompactionEvents(&compaction_buf);
@@ -2173,6 +2172,98 @@ fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.m
 
     if (try writeMcpHostServers(writer, app, alloc)) return;
     try writer.writeAll("mcp_servers: none\n");
+}
+
+/// How fx starts the agent's shell commands and what the user's startup
+/// files change in them, so a report can tell a shell setup from a bug.
+fn writeShellSummary(
+    writer: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    view: *const shell_snapshot.TraceView,
+    configured: ?[]const u8,
+) !void {
+    try writer.writeAll("\n## Shell\n");
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const commands = shellCommandLines(arena, configured) catch |err| {
+        try writer.print("login_shell: {s}\nuser commands start: unavailable ({s})\n", .{ configured orelse "(unknown)", @errorName(err) });
+        try writeSnapshotState(writer, view);
+        return;
+    };
+    if (configured != null and std.mem.eql(u8, configured.?, commands.path)) {
+        try writer.print("login_shell: {s}\n", .{commands.path});
+    } else {
+        try writer.print("login_shell: {s} (fx runs {s})\n", .{ configured orelse "(unknown)", commands.path });
+    }
+    const state = view.state;
+    if (std.mem.eql(u8, state, "ready") and !view.dirty) {
+        try writer.print("user commands start: snapshot replay `{s}` with the startup files' aliases and functions\n", .{commands.replay});
+    } else if (std.mem.eql(u8, state, "ready")) {
+        try writer.print("user commands start: the next command captures the startup files again with `{s}`, since they changed or a reload was asked\n", .{commands.full});
+    } else if (std.mem.eql(u8, state, "failed")) {
+        try writer.print("user commands start: full startup `{s}` for every command\n", .{commands.full});
+    } else if (std.mem.eql(u8, state, "capturing")) {
+        try writer.print("user commands start: the first command is capturing the startup files with `{s}`\n", .{commands.full});
+    } else {
+        try writer.print("user commands start: no command yet; the first one captures the startup files with `{s}`\n", .{commands.full});
+    }
+    try writeSnapshotState(writer, view);
+    try writer.writeAll("folders: a shell call runs in its cwd argument, else in the dir its failure shows\n");
+}
+
+const ShellCommandLines = struct {
+    path: []const u8,
+    /// A `user` profile command without a snapshot, up to its `-c`.
+    full: []const u8,
+    /// A `user` profile command restored from the snapshot, up to its `-c`.
+    replay: []const u8,
+};
+
+fn shellCommandLines(arena: std.mem.Allocator, configured: ?[]const u8) !ShellCommandLines {
+    const environment = try shell_resolver.environment(arena, configured, null);
+    const path = switch (environment) {
+        .user => |value| value,
+        else => return error.UnsupportedShell,
+    };
+    return .{
+        .path = path,
+        .full = try invocationBeforeCommand(arena, try shell_resolver.capturedInvocation(arena, environment, "")),
+        .replay = try invocationBeforeCommand(arena, try shell_resolver.snapshotInvocation(arena, path, "")),
+    };
+}
+
+fn invocationBeforeCommand(arena: std.mem.Allocator, invocation: shell_resolver.Invocation) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    for (invocation.argv()) |arg| {
+        if (std.mem.eql(u8, arg, "-c")) break;
+        if (out.written().len > 0) try out.writer.writeByte(' ');
+        try out.writer.writeAll(arg);
+    }
+    return out.toOwnedSlice();
+}
+
+fn writeSnapshotState(writer: *std.Io.Writer, view: *const shell_snapshot.TraceView) !void {
+    if (std.mem.eql(u8, view.state, "failed")) {
+        try writer.print("snapshot: state=failed reason={s}\n", .{view.failure orelse "unknown"});
+    } else {
+        try writer.print("snapshot: state={s} dirty={s} names={d}\n", .{ view.state, boolLabel(view.dirty), view.names_total });
+    }
+    if (!std.mem.eql(u8, view.state, "ready")) {
+        try writer.writeAll("redefined common commands: unknown without a snapshot\n");
+        return;
+    }
+    const redefined = view.redefined();
+    if (redefined.len == 0) {
+        try writer.writeAll("redefined common commands: none\n");
+        return;
+    }
+    try writer.writeAll("redefined common commands: ");
+    for (redefined, 0..) |*entry, index| {
+        if (index > 0) try writer.writeAll(", ");
+        try writeRedefinedCommand(writer, entry);
+    }
+    try writer.writeByte('\n');
 }
 
 fn writeRendererState(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
@@ -2450,9 +2541,48 @@ fn writePermissionsSummary(writer: *std.Io.Writer, grants: []const types.Permiss
 }
 
 fn writeToolCallCompact(writer: *std.Io.Writer, call: diagnostics.ToolCallMetric) !void {
-    try writeTraceTimestampUtc(writer, call.started_at_ms);
-    try writer.print(" name={s} outcome={s} duration={d}ms", .{ traceToolDisplayName(call.name()), @tagName(call.outcome), call.duration_ms });
-    if (call.subagent_id != 0) try writer.print(" source=subagent#{d}", .{call.subagent_id}) else try writer.writeAll(" source=parent");
+    try writeToolCallLine(writer, call.started_at_ms, call.name(), call.outcome, call.duration_ms, call.subagent_id, call.callId());
+}
+
+/// Lists the newest five kept failed calls. They come from the kept
+/// failures, not the window, so later successful calls never remove them.
+fn writeToolCallProblems(writer: *std.Io.Writer, alloc: std.mem.Allocator) !usize {
+    const failed_buf = try alloc.alloc(diagnostics.FailedToolCall, diagnostics.failed_tool_call_capacity);
+    defer alloc.free(failed_buf);
+    const failed_n = diagnostics.snapshotFailedToolCalls(failed_buf);
+    var reported: usize = 0;
+    var index = failed_n;
+    while (index > 0 and reported < 5) {
+        index -= 1;
+        reported += 1;
+        try writer.writeAll("- tool ");
+        try writeFailedToolCallCompact(writer, &failed_buf[index]);
+    }
+    return reported;
+}
+
+fn writeFailedToolCallCompact(writer: *std.Io.Writer, call: *const diagnostics.FailedToolCall) !void {
+    try writeToolCallLine(writer, call.started_at_ms, call.name(), call.outcome, call.duration_ms, call.subagent_id, call.callId());
+}
+
+/// One tool call's line. `call_id` is the provider's ID, which the session's
+/// `log.jsonl` records carry as `call_id`.
+fn writeToolCallLine(
+    writer: *std.Io.Writer,
+    started_at_ms: i64,
+    name: []const u8,
+    outcome: diagnostics.ToolCallOutcome,
+    duration_ms: u32,
+    subagent_id: u64,
+    call_id: []const u8,
+) !void {
+    try writeTraceTimestampUtc(writer, started_at_ms);
+    try writer.print(" name={s} outcome={s} duration={d}ms", .{ traceToolDisplayName(name), @tagName(outcome), duration_ms });
+    if (subagent_id != 0) try writer.print(" source=subagent#{d}", .{subagent_id}) else try writer.writeAll(" source=parent");
+    if (call_id.len > 0) {
+        try writer.writeAll(" call_id=");
+        for (call_id) |byte| try writer.writeByte(if (byte > ' ' and byte < 0x7f) byte else '?');
+    }
     try writer.writeByte('\n');
 }
 
@@ -2524,17 +2654,24 @@ noinline fn writeToolCallsSummary(
     writer: *std.Io.Writer,
     alloc: std.mem.Allocator,
     history: []const types.HistoryTurn,
+    shell_view: ?*const shell_snapshot.TraceView,
 ) !void {
     var buf: [diagnostics.tool_call_ring_capacity]diagnostics.ToolCallMetric = undefined;
     const n = diagnostics.snapshotToolCalls(&buf);
     var provider_buf: [diagnostics.tool_call_ring_capacity]ProviderToolCallSummary = undefined;
     const provider_n = projectProviderToolCalls(history, &provider_buf);
-    if (n == 0 and provider_n == 0) {
+    // About 17 KiB each, so on the heap rather than the stack.
+    const failed_buf = try alloc.alloc(diagnostics.FailedToolCall, diagnostics.failed_tool_call_capacity);
+    defer alloc.free(failed_buf);
+    const failed = failed_buf[0..diagnostics.snapshotFailedToolCalls(failed_buf)];
+    if (n == 0 and provider_n == 0 and failed.len == 0) {
         try writer.writeAll("\n## Tool Calls\n(none recorded)\n");
         return;
     }
 
-    try writer.writeAll("\n## Tool Calls\n### Local\n");
+    try writer.writeAll("\n## Tool Calls\n");
+    try writeFailedToolCalls(writer, alloc, failed, shell_view);
+    try writer.writeAll("### Local\n");
     if (n == 0) {
         try writer.writeAll("(none locally executed)\n");
     } else {
@@ -2585,6 +2722,10 @@ noinline fn writeToolCallsSummary(
             for (buf[0..n]) |call| {
                 if (call.outcome == .succeeded) continue;
                 try writeToolCallCompact(writer, call);
+                if (failureIsKept(failed, &call)) {
+                    try writer.writeAll("  details: under Failures\n");
+                    continue;
+                }
                 try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
                 try writeToolFieldBlock(writer, alloc, "result", call.result(), call.result_len, call.result_total_bytes);
             }
@@ -2611,6 +2752,141 @@ noinline fn writeToolCallsSummary(
             "name=web_search status={s}\n",
             .{providerToolStatusLabel(call.status)},
         );
+    }
+}
+
+fn failureIsKept(failed: []const diagnostics.FailedToolCall, call: *const diagnostics.ToolCallMetric) bool {
+    if (call.callId().len == 0) return false;
+    for (failed) |*kept| {
+        if (kept.started_at_ms == call.started_at_ms and std.mem.eql(u8, kept.callId(), call.callId())) return true;
+    }
+    return false;
+}
+
+/// The kept failed calls, whole up to their head and tail cuts. Unlike the
+/// window below, later successful calls never push these out.
+fn writeFailedToolCalls(
+    writer: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    failed: []const diagnostics.FailedToolCall,
+    shell_view: ?*const shell_snapshot.TraceView,
+) !void {
+    try writer.writeAll("### Failures\n");
+    if (failed.len == 0) {
+        try writer.writeAll("(none)\n");
+        return;
+    }
+    const lifetime = diagnostics.toolCallLifetimeStats();
+    try writer.print(
+        "kept={d} of {d} session failures, newest last; later successful calls do not push these out\n",
+        .{ failed.len, lifetime.failureCount() },
+    );
+    for (failed) |*call| {
+        try writeFailedToolCallCompact(writer, call);
+        if (call.dir().len > 0) {
+            try writer.writeAll("  dir: ");
+            try writeTraceSafeText(writer, call.dir());
+            try writer.writeByte('\n');
+        }
+        if (shell_view) |view| {
+            if (std.mem.eql(u8, call.name(), "shell")) try writeRedefinedWordsInCall(writer, view, call);
+        }
+        try writeKeptTextBlock(writer, alloc, "args", &call.args);
+        try writeKeptTextBlock(writer, alloc, "result", &call.result);
+    }
+}
+
+/// Names the common commands a failed shell call used that the user's
+/// startup files redefine, such as `ls` running eza.
+fn writeRedefinedWordsInCall(
+    writer: *std.Io.Writer,
+    view: *const shell_snapshot.TraceView,
+    call: *const diagnostics.FailedToolCall,
+) !void {
+    var wrote = false;
+    for (view.redefined()) |*entry| {
+        if (!traceTextHasWord(call.args.head(), entry.name) and !traceTextHasWord(call.args.tail(), entry.name)) continue;
+        try writer.writeAll(if (wrote) ", " else "  redefined: ");
+        try writeRedefinedCommand(writer, entry);
+        wrote = true;
+    }
+    if (wrote) try writer.writeByte('\n');
+}
+
+fn writeRedefinedCommand(writer: *std.Io.Writer, entry: *const shell_snapshot.RedefinedCommand) !void {
+    switch (entry.kind) {
+        .function => try writer.print("{s} (function)", .{entry.name}),
+        .alias => if (entry.aliasTarget()) |target|
+            try writer.print("{s} (alias of {s})", .{ entry.name, target })
+        else
+            try writer.print("{s} (alias)", .{entry.name}),
+    }
+}
+
+/// Whether `word` is a whole word of a tool call's JSON arguments. A JSON
+/// escape such as `\n` separates words, as the newline it stands for does.
+fn traceTextHasWord(text: []const u8, word: []const u8) bool {
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '\\') {
+            index += 2;
+            continue;
+        }
+        if (isTraceWordSeparator(text[index])) {
+            index += 1;
+            continue;
+        }
+        const start = index;
+        while (index < text.len and text[index] != '\\' and !isTraceWordSeparator(text[index])) index += 1;
+        if (std.mem.eql(u8, text[start..index], word)) return true;
+    }
+    return false;
+}
+
+fn isTraceWordSeparator(byte: u8) bool {
+    return switch (byte) {
+        ' ', '\t', '\r', '\n', ';', '|', '&', '(', ')', '<', '>', '\'', '"', '`', '$', '{', '}', '!', ':', ',', '=', '[', ']' => true,
+        else => false,
+    };
+}
+
+fn writeKeptTextBlock(writer: *std.Io.Writer, alloc: std.mem.Allocator, label: []const u8, kept: *const diagnostics.KeptText) !void {
+    if (kept.total_bytes == 0) return;
+    try writer.print("  {s}:\n", .{label});
+    try writeIndentedTraceText(writer, alloc, kept.head());
+    if (kept.omittedBytes() > 0) {
+        try writer.print("    ... ({d} bytes omitted) ...\n", .{kept.omittedBytes()});
+        try writeIndentedTraceText(writer, alloc, kept.tail());
+    }
+}
+
+fn writeIndentedTraceText(writer: *std.Io.Writer, alloc: std.mem.Allocator, text: []const u8) !void {
+    const masked = try text_utils.maskSecrets(alloc, text);
+    defer if (masked.ptr != text.ptr) alloc.free(masked);
+    var lines = std.mem.splitScalar(u8, masked, '\n');
+    while (lines.next()) |line| {
+        try writer.writeAll("    ");
+        try writeTraceSafeText(writer, std.mem.trimEnd(u8, line, " \t\r"));
+        try writer.writeByte('\n');
+    }
+}
+
+/// Writes tool text so the report stays readable and safe to print in a
+/// terminal: control characters and bytes that are not UTF-8 become `\xNN`.
+fn writeTraceSafeText(writer: *std.Io.Writer, text: []const u8) !void {
+    var index: usize = 0;
+    while (index < text.len) {
+        const rune = display_width.decodeNextRune(text, index);
+        const len = @max(rune.len, 1);
+        const invalid = rune.codepoint == 0xfffd and len == 1;
+        const control = (rune.codepoint < 0x20 and rune.codepoint != '\t') or
+            (rune.codepoint >= 0x7f and rune.codepoint < 0xa0);
+        if (invalid or control) {
+            for (text[index..][0..len]) |byte| try writer.print("\\x{x:0>2}", .{byte});
+        } else {
+            try writer.writeAll(text[index..][0..len]);
+        }
+        index += len;
     }
 }
 
@@ -4104,7 +4380,7 @@ test "trace tool calls preserve outcomes and mask obvious secrets" {
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeToolCallsSummary(&out.writer, alloc, &.{});
+    try writeToolCallsSummary(&out.writer, alloc, &.{}, null);
     const text = out.written();
 
     try std.testing.expect(std.mem.find(u8, text, "last=5 succeeded=1 rejected=1 command_failed=1 tool_failed=1 runtime_failed=1") != null);
@@ -4134,7 +4410,7 @@ test "trace successful tool calls use compact result previews" {
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeToolCallsSummary(&out.writer, alloc, &.{});
+    try writeToolCallsSummary(&out.writer, alloc, &.{}, null);
     const text = out.written();
 
     try std.testing.expect(std.mem.find(u8, text, "recent successes (compact):") != null);
@@ -4156,7 +4432,7 @@ test "trace omits web_fetch URL and result bodies from tool-call diagnostics" {
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeToolCallsSummary(&out.writer, alloc, &.{});
+    try writeToolCallsSummary(&out.writer, alloc, &.{}, null);
     const text = out.written();
 
     try std.testing.expect(std.mem.find(u8, text, "name=web_fetch") != null);
@@ -4231,7 +4507,7 @@ test "trace web search calls hide provider names and payloads" {
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeToolCallsSummary(&out.writer, alloc, &history);
+    try writeToolCallsSummary(&out.writer, alloc, &history, null);
     const text = out.written();
 
     try std.testing.expect(std.mem.find(u8, text, "name=web_search status=ok") != null);
@@ -4425,6 +4701,146 @@ test "trace network section states complete coverage when nothing was evicted" {
     try std.testing.expect(std.mem.find(u8, text, "coverage: complete") != null);
 }
 
+fn recordTraceTestCall(
+    name: []const u8,
+    outcome: diagnostics.ToolCallOutcome,
+    call_id: []const u8,
+    arguments_json: []const u8,
+    model_output: []const u8,
+) void {
+    diagnostics.recordToolCallResult(.{
+        .name = name,
+        .arguments_json = arguments_json,
+        .model_output = model_output,
+        .outcome = outcome,
+        .started_at_ms = io_mod.milliTimestamp(),
+        .call_id = call_id,
+        .dir = "/Users/example/project",
+    });
+}
+
+fn traceTestShellView(state: []const u8) shell_snapshot.TraceView {
+    var view: shell_snapshot.TraceView = .{ .state = state, .dirty = false, .names_total = 7 };
+    view.redefined_buf[0] = .{ .name = "cat", .kind = .function };
+    view.redefined_buf[1] = .{ .name = "ls", .kind = .alias };
+    @memcpy(view.redefined_buf[1].target_buf[0..3], "eza");
+    view.redefined_buf[1].target_len = 3;
+    view.redefined_len = 2;
+    return view;
+}
+
+fn traceSection(text: []const u8, start: []const u8, end: []const u8) ![]const u8 {
+    const from = (std.mem.find(u8, text, start) orelse return error.TestExpectedEqual) + start.len;
+    const to = std.mem.findPos(u8, text, from, end) orelse text.len;
+    return text[from..to];
+}
+
+test "trace failures section keeps a failure whole after the window moves on" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    // Longer than the kept 8 KiB, so the report keeps its head and its tail.
+    const output = try std.mem.concat(alloc, u8, &.{ "no such dir \x1b[31mred\x1b[0m \xff\n", text_utils.repeat("z", 9000), "\nOUTPUT_TAIL_MARKER" });
+    defer alloc.free(output);
+    recordTraceTestCall(
+        "shell",
+        .command_failed,
+        "call_failed",
+        "{\"action\":\"run\",\"command\":\"ls -d missing\\ncat notes\\nAI_GATEWAY_API_KEY=abcdefghijklmnop exit 2\"}",
+        output,
+    );
+    var i: usize = 0;
+    while (i < diagnostics.tool_call_ring_capacity) : (i += 1) recordTraceTestCall("shell", .succeeded, "call_ok", "{}", "ok");
+
+    const view = traceTestShellView("ready");
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCallsSummary(&out.writer, alloc, &.{}, &view);
+    const text = out.written();
+
+    const failures = try traceSection(text, "## Tool Calls\n### Failures\n", "### Local\n");
+    try std.testing.expect(std.mem.startsWith(u8, failures, "kept=1 of 1 session failures"));
+    try std.testing.expect(std.mem.find(u8, failures, " name=shell outcome=command_failed duration=") != null);
+    try std.testing.expect(std.mem.find(u8, failures, " source=parent call_id=call_failed\n") != null);
+    try std.testing.expect(std.mem.find(u8, failures, "  dir: /Users/example/project\n") != null);
+    // `cat` follows a JSON `\n` escape, which separates words.
+    try std.testing.expect(std.mem.find(u8, failures, "  redefined: cat (function), ls (alias of eza)\n") != null);
+    try std.testing.expect(std.mem.find(u8, failures, " bytes omitted) ...\n") != null);
+    try std.testing.expect(std.mem.find(u8, failures, "    OUTPUT_TAIL_MARKER\n") != null);
+    try std.testing.expect(std.mem.find(u8, failures, "ls -d missing") != null);
+    try std.testing.expect(std.mem.find(u8, failures, "AI_GATEWAY_API_KEY=[redacted]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "abcdefghijklmnop") == null);
+    try std.testing.expect(std.mem.find(u8, failures, "no such dir \\x1b[31mred\\x1b[0m \\xff\n") != null);
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+
+    const local = try traceSection(text, "### Local\n", "### Web Search");
+    try std.testing.expect(std.mem.find(u8, local, "call_failed") == null);
+    try std.testing.expect(std.mem.find(u8, local, " source=parent call_id=call_ok\n") != null);
+}
+
+test "trace window points a failure it still holds at Failures" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    recordTraceTestCall("read_file", .tool_failed, "call_missing", "{\"path\":\"missing.txt\"}", "not found");
+    recordTraceTestCall("read_file", .succeeded, "call_ok", "{}", "ok");
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCallsSummary(&out.writer, alloc, &.{}, null);
+    const local = try traceSection(out.written(), "### Local\n", "### Web Search");
+    try std.testing.expect(std.mem.find(u8, local, " call_id=call_missing\n  details: under Failures\n") != null);
+    try std.testing.expect(std.mem.find(u8, local, "missing.txt") == null);
+    // Without a shell view, a failure names no redefined commands.
+    try std.testing.expect(std.mem.find(u8, out.written(), "redefined:") == null);
+}
+
+test "trace problems list a failure the window no longer holds" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    recordTraceTestCall("shell", .command_failed, "call_failed", "{}", "exit 2");
+    var i: usize = 0;
+    while (i < diagnostics.tool_call_ring_capacity) : (i += 1) recordTraceTestCall("shell", .succeeded, "call_ok", "{}", "ok");
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try writeToolCallProblems(&out.writer, alloc));
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "- tool ["));
+    try std.testing.expect(std.mem.find(u8, out.written(), " name=shell outcome=command_failed ") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), " call_id=call_failed\n") != null);
+}
+
+test "trace shell section says how commands start and what startup files redefine" {
+    const alloc = std.testing.allocator;
+
+    const ready = traceTestShellView("ready");
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeShellSummary(&out.writer, alloc, &ready, "/bin/zsh");
+    const text = out.written();
+    try std.testing.expect(std.mem.find(u8, text, "\n## Shell\nlogin_shell: /bin/zsh\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "user commands start: snapshot replay `/bin/zsh -f` with the startup files' aliases and functions\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "snapshot: state=ready dirty=false names=7\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "redefined common commands: cat (function), ls (alias of eza)\n") != null);
+
+    var failed = traceTestShellView("failed");
+    failed.failure = "the login shell exited before reporting its state";
+    var failed_out: std.Io.Writer.Allocating = .init(alloc);
+    defer failed_out.deinit();
+    try writeShellSummary(&failed_out.writer, alloc, &failed, "/bin/bash");
+    const failed_text = failed_out.written();
+    try std.testing.expect(std.mem.find(u8, failed_text, "user commands start: full startup `/bin/bash --login -O expand_aliases` for every command\n") != null);
+    try std.testing.expect(std.mem.find(u8, failed_text, "snapshot: state=failed reason=the login shell exited before reporting its state\n") != null);
+    try std.testing.expect(std.mem.find(u8, failed_text, "redefined common commands: unknown without a snapshot\n") != null);
+
+    var other: std.Io.Writer.Allocating = .init(alloc);
+    defer other.deinit();
+    try writeShellSummary(&other.writer, alloc, &ready, "/usr/bin/fish");
+    try std.testing.expect(std.mem.find(u8, other.written(), "login_shell: /usr/bin/fish (fx runs /bin/") != null);
+}
+
 test "trace tool section reports session totals and window coverage" {
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
@@ -4445,7 +4861,7 @@ test "trace tool section reports session totals and window coverage" {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     const history: []const types.HistoryTurn = &.{};
-    try writeToolCallsSummary(&out.writer, alloc, history);
+    try writeToolCallsSummary(&out.writer, alloc, history, null);
     const text = out.written();
 
     const total = diagnostics.tool_call_ring_capacity + 2;
@@ -4465,7 +4881,7 @@ test "trace tool section reports session totals and window coverage" {
     diagnostics.recordToolCall(ok_call);
     var fresh: std.Io.Writer.Allocating = .init(alloc);
     defer fresh.deinit();
-    try writeToolCallsSummary(&fresh.writer, alloc, history);
+    try writeToolCallsSummary(&fresh.writer, alloc, history, null);
     try std.testing.expect(std.mem.find(u8, fresh.written(), "coverage: complete") != null);
 }
 
