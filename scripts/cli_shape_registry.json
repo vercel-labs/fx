@@ -153,6 +153,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_CHATGPT_REVOKE_URL": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_CHATGPT_TOKEN_URL": {
       "job": "test",
       "stability": "internal"
