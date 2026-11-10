@@ -2508,6 +2508,94 @@ test "zsh user profile snapshot restores a function that replaces a default alia
     try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
+test "bash user profile snapshot restores a helper from a startup file that turned extglob off again" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The file has extglob on only while it defines the helper, so the replay
+    // shell, which starts with it off, must turn it on for the definition and
+    // give the file's setting back before the command.
+    const paths = try writeSnapshotTestShellFor(
+        arena,
+        &tmp,
+        "bash",
+        ".bash_profile",
+        "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
+            "shopt -s extglob\n" ++
+            "_fxsnap_glob_helper() { case $1 in @(a|b)) printf 'glob-ok\\n';; *) printf 'no-match\\n';; esac; }\n" ++
+            "shopt -u extglob\n",
+    );
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    for (0..2) |_| {
+        const result = try executeCommandInEnvironment(
+            config,
+            arena,
+            "shopt -p extglob; _fxsnap_glob_helper a; shopt -s extglob; _fxsnap_glob_helper a",
+            paths.workspace,
+            .{ .user = paths.shell },
+        );
+        try std.testing.expectEqualStrings(
+            "exit_code=0\n<stdout>\nshopt -u extglob\nno-match\nglob-ok\n</stdout>\n",
+            result.output,
+        );
+    }
+    // Both commands ran from the snapshot, so startup ran only for its capture.
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+}
+
+test "zsh user profile snapshot watches and restores a ZDOTDIR the startup files set without exporting it" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The wrapper exports ZDOTDIR as HOME; ~/.zshenv moves it without export.
+    const paths = try writeSnapshotTestShellFor(arena, &tmp, "zsh", ".zshenv", "unset ZDOTDIR\nZDOTDIR=\"$HOME/zd\"\n");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/zd");
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "home/zd/.zshrc",
+        .data = "print -r -- loaded >> \"$HOME/rc-loads.log\"\nexport FXSNAP_ZDOT=v1\n",
+    });
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    // The wrapper runs the snapshot shell too and exports ZDOTDIR as HOME
+    // there, so only the replay can set it to the moved folder. Whether it
+    // stays unexported is checked through the built binary in
+    // tests/e2e/ask-presentation.test.ts, where no wrapper exports it.
+    const probe = "print -r -- \"mark=$FXSNAP_ZDOT zdotdir=$ZDOTDIR\"";
+    const expected_zdotdir = try std.Io.Dir.path.join(arena, &.{ paths.home, "zd" });
+
+    const before = try executeCommandInEnvironment(config, arena, probe, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expect(std.mem.find(u8, before.output, try arena.print("mark=v1 zdotdir={s}\n", .{expected_zdotdir})) != null);
+    _ = try executeCommandInEnvironment(
+        config,
+        arena,
+        "print -r -- 'export FXSNAP_ZDOT=v2' >> \"$HOME/zd/.zshrc\"",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    const after = try executeCommandInEnvironment(config, arena, probe, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expect(std.mem.find(u8, after.output, try arena.print("mark=v2 zdotdir={s}\n", .{expected_zdotdir})) != null);
+
+    // One capture, and one more after the edit.
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\nloaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+}
+
 test "user profile command with an approval from an earlier shell epoch does not run" {
     if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
