@@ -16,6 +16,7 @@ const http_headers = @import("../protocol/http_headers.zig");
 const wire = @import("../protocol/wire.zig");
 const Budget = @import("budget.zig").Budget;
 const Read = @import("budget.zig").Read;
+const Trust = @import("../host.zig").Trust;
 
 pub const Options = struct {
     url: []const u8,
@@ -31,6 +32,9 @@ pub const Options = struct {
     /// sat idle without either end hearing of it, and a request sent on it
     /// would wait out its timeout.
     max_idle_ms: u32 = 60_000,
+    /// Loads the client's trusted roots before a request; null leaves them
+    /// to std's own scan.
+    trust: ?Trust = null,
 };
 
 pub const Method = enum { post, get, delete };
@@ -491,6 +495,10 @@ pub const Client = struct {
     /// connection it failed on is closed, where `std.http` would keep it for
     /// the next request to fail on too. Null when it couldn't go out.
     fn openSent(c: *Client, method: Method, uri: std.Uri, options: std.http.Client.RequestOptions, body: ?[]u8) Io.Cancelable!?std.http.Client.Request {
+        if (c.options.trust) |trust| trust(&c.http, uri) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.CertificateBundleLoadFailure => return null,
+        };
         var fresh = false;
         while (true) {
             var with = options;

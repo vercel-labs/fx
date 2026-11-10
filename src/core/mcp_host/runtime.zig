@@ -24,6 +24,7 @@ const loopback = @import("login.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const tls_roots = @import("../shared/tls_roots.zig");
 
 const Allocator = std.mem.Allocator;
 const engine = mcp.engine;
@@ -525,7 +526,7 @@ pub const Runtime = struct {
         errdefer gpa.free(r.tools_epochs);
         for (r.tools_epochs) |*e| e.* = .init(0);
         // The engine copies what it keeps, so the rest of the config goes.
-        try r.engine.init(io, gpa, .{ .context = r, .allow = allow, .log = log }, .{
+        try r.engine.init(io, gpa, .{ .context = r, .allow = allow, .log = log, .trust = tls_roots.prepare }, .{
             .client = .{ .info = .{ .name = "fx", .version = options.client_version }, .capabilities = declaredCapabilities(options.questions) },
         }, resolved.engine);
         errdefer r.engine.deinit();

@@ -7,6 +7,7 @@ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const local_address = @import("../core/shared/local_address.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
+const tls_roots = @import("../core/shared/tls_roots.zig");
 const input_loop_guard = @import("../core/shared/input_loop_guard.zig");
 const io_mod = @import("../core/shared/io.zig");
 const select_watch = @import("../core/shared/select_watch.zig");
@@ -474,7 +475,7 @@ fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const
         .response_writer = &out.writer,
         .redirect_behavior = .unhandled,
     };
-    const result = if (client) |own| try own.fetch(options) else try fetchOnOpenJob(options);
+    const result = if (client) |own| try tls_roots.fetch(own, options) else try fetchOnOpenJob(options);
 
     return .{
         .status = result.status,
@@ -744,7 +745,7 @@ pub fn postGatewayCompletion(
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        const result = client.fetch(.{
+        const result = tls_roots.fetch(&client, .{
             .location = .{ .url = request_url },
             .method = .POST,
             .payload = payload,
@@ -1232,7 +1233,7 @@ const RequestOpenOperation = struct {
             self.reused = opened.reused;
             return opened.request;
         }
-        return self.client.request(self.method, self.uri, self.options);
+        return tls_roots.request(self.client, self.method, self.uri, self.options);
     }
 };
 
@@ -12206,4 +12207,32 @@ test "a model catalog fetch ends at its deadline during a lookup that hangs" {
         null,
     ));
     try std.testing.expect(elapsedMsSince(started) < 1_000);
+}
+
+const keychain_denied_testing = @import("../core/shared/keychain_denied_testing.zig");
+
+test "an open job loads trusted roots when a sandbox denies the keychain files" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var denied = keychain_denied_testing.install(false);
+    defer waitForOwnClientOpenJobs() catch {};
+    defer denied.deinit();
+    // Nothing listens on port 1, so the open ends at the connect, after the
+    // client's roots load.
+    var opened = openRequestOnJob(.GET, try std.Uri.parse("https://127.0.0.1:1/v1/models"), .{}) catch |err| {
+        try std.testing.expect(err != error.CertificateBundleLoadFailure);
+        return;
+    };
+    opened.deinit();
+    return error.TestUnexpectedResult;
+}
+
+test "an open job fails before it connects when a sandbox denies the keychain files and the public bundle" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var denied = keychain_denied_testing.install(true);
+    defer waitForOwnClientOpenJobs() catch {};
+    defer denied.deinit();
+    try std.testing.expectError(
+        error.CertificateBundleLoadFailure,
+        openRequestOnJob(.GET, try std.Uri.parse("https://127.0.0.1:1/v1/models"), .{}),
+    );
 }
