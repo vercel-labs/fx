@@ -1883,8 +1883,8 @@ pub fn Runtime(comptime App: type) type {
         /// While `/fork` asks whether the fork takes copies of the session's
         /// subagents (D97), Enter or y answers yes and n answers no; Esc
         /// also answers no (`answerForkQuestionOnEscape`). Other printable
-        /// bytes do nothing, so a stray key never forks; control bytes
-        /// pass, so Ctrl+C still works.
+        /// bytes are dropped with a trace line, so a stray key never forks;
+        /// control bytes pass, so Ctrl+C still works.
         fn routeForkQuestionByte(app: *App, agent: *AppAgent, byte: u8) !bool {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
@@ -1900,6 +1900,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (byte < 0x20) return false;
             if (byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(&app.input_runtime.text_scalar, "fork_question");
+            debug_trace.logf("input", "fork question ignored byte=0x{x} reason=not_an_answer", .{byte});
             return true;
         }
 

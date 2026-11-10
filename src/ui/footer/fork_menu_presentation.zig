@@ -56,7 +56,7 @@ pub const question_hint_variants = [_][]const u8{
 };
 
 /// The question after a prompt is chosen where the session had subagents.
-pub fn questionText(buf: []u8, count: usize) []const u8 {
+fn questionText(buf: []u8, count: usize) []const u8 {
     if (count == 1) return "Bring 1 subagent into the fork?";
     return std.mem.print(buf, "Bring {d} subagents into the fork?", .{count}) catch "Bring the subagents into the fork?";
 }

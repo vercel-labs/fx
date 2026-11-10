@@ -1744,6 +1744,34 @@ pub fn openFork(env: *const Env, options: ForkOptions) ForkError!*Session {
     return forked.session;
 }
 
+/// A source session's folder and log, open for reading without its lock,
+/// and the end of the log's last whole line.
+const SourceLog = struct {
+    dir: storage.Dir,
+    file: storage.File,
+    end: u64,
+
+    fn open(env: *const Env, id_: []const u8) ForkError!SourceLog {
+        const s = env.s;
+        if (!schema.validId(id_)) return error.NotFound;
+        const dir = s.openDir(env.root, id_) catch |err| return notFoundOr(err);
+        errdefer s.closeDir(dir);
+        const file = s.openFile(dir, "log.jsonl", .read_only) catch |err| return switch (err) {
+            error.NotFound => error.Corrupt,
+            else => |io_err| storage.ioFault(io_err),
+        };
+        errdefer s.closeFile(file);
+        const len = s.length(file) catch |io_err| return storage.ioFault(io_err);
+        const end = log_mod.lastLineEnd(s, file, len) catch return error.Corrupt;
+        return .{ .dir = dir, .file = file, .end = end };
+    }
+
+    fn close(self: SourceLog, s: storage.Storage) void {
+        s.closeFile(self.file);
+        s.closeDir(self.dir);
+    }
+};
+
 /// `openFork`, where the fork also takes a copy of each of `children`
 /// (D97, `tests/tla/session_manager/ForkChildren.tla`). Every copy is on
 /// disk before the fork, and the fork's first batch registers them all, so
@@ -1754,16 +1782,11 @@ pub fn openFork(env: *const Env, options: ForkOptions) ForkError!*Session {
 pub fn openForkWithChildren(env: *const Env, options: ForkOptions, children: []const ChildCopy) ForkError!Forked {
     const s = env.s;
     const gpa = env.gpa;
-    if (!schema.validId(options.source)) return error.NotFound;
-    const src_dir = s.openDir(env.root, options.source) catch |err| return notFoundOr(err);
-    defer s.closeDir(src_dir);
-    const src = s.openFile(src_dir, "log.jsonl", .read_only) catch |err| return switch (err) {
-        error.NotFound => error.Corrupt,
-        else => |io_err| storage.ioFault(io_err),
-    };
-    defer s.closeFile(src);
-    const len = s.length(src) catch |io_err| return storage.ioFault(io_err);
-    const end = log_mod.lastLineEnd(s, src, len) catch return error.Corrupt;
+    const source_log = try SourceLog.open(env, options.source);
+    defer source_log.close(s);
+    const src_dir = source_log.dir;
+    const src = source_log.file;
+    const end = source_log.end;
     const point = try findForkPoint(env, options.source, src, end, options.at);
 
     const session = try openNew(env, .{
@@ -1867,16 +1890,11 @@ const ChildCopyOptions = struct {
 fn openChildCopy(env: *const Env, options: ChildCopyOptions) ForkError!*Session {
     const s = env.s;
     const gpa = env.gpa;
-    if (!schema.validId(options.source)) return error.NotFound;
-    const src_dir = s.openDir(env.root, options.source) catch |err| return notFoundOr(err);
-    defer s.closeDir(src_dir);
-    const src = s.openFile(src_dir, "log.jsonl", .read_only) catch |err| return switch (err) {
-        error.NotFound => error.Corrupt,
-        else => |io_err| storage.ioFault(io_err),
-    };
-    defer s.closeFile(src);
-    const len = s.length(src) catch |io_err| return storage.ioFault(io_err);
-    const end = log_mod.lastLineEnd(s, src, len) catch return error.Corrupt;
+    const source_log = try SourceLog.open(env, options.source);
+    defer source_log.close(s);
+    const src_dir = source_log.dir;
+    const src = source_log.file;
+    const end = source_log.end;
     const cut = try findChildCut(env, options.source, src, end, options.cut_ms);
 
     const session = try openNew(env, .{
@@ -1960,16 +1978,10 @@ fn findChildCut(env: *const Env, source: []const u8, src: storage.File, end: u64
 pub fn stateAt(env: *const Env, source: []const u8, at: ForkPoint) ForkError!fold.State {
     const s = env.s;
     const gpa = env.gpa;
-    if (!schema.validId(source)) return error.NotFound;
-    const src_dir = s.openDir(env.root, source) catch |err| return notFoundOr(err);
-    defer s.closeDir(src_dir);
-    const src = s.openFile(src_dir, "log.jsonl", .read_only) catch |err| return switch (err) {
-        error.NotFound => error.Corrupt,
-        else => |io_err| storage.ioFault(io_err),
-    };
-    defer s.closeFile(src);
-    const len = s.length(src) catch |io_err| return storage.ioFault(io_err);
-    const end = log_mod.lastLineEnd(s, src, len) catch return error.Corrupt;
+    const source_log = try SourceLog.open(env, source);
+    defer source_log.close(s);
+    const src = source_log.file;
+    const end = source_log.end;
     const point = try findForkPoint(env, source, src, end, at);
 
     var state: fold.State = .{};
@@ -3246,71 +3258,77 @@ const session_tests = struct {
         return out.toOwnedSlice(gpa);
     }
 
-    test "a power loss at any step of a fork with a child copy leaves the source whole and the fork with all its copies or none (D97)" {
-        if (!hooks) return error.SkipZigTest;
-        var step: u64 = 1;
-        while (true) : (step += 1) {
-            var t: TestEnv = undefined;
-            t.init(.{});
-            defer t.deinit();
-            // A power loss drops unsynced bytes by design.
-            t.crashed = true;
-            const made = try parentWithChild(&t, true);
-            defer gpa.free(made.parent);
-            defer gpa.free(made.kid);
-            const parent_before = try t.kinds(made.parent);
-            defer gpa.free(parent_before);
-            const kid_before = try t.kinds(made.kid);
-            defer gpa.free(kid_before);
+    /// Needs the storage's fault hooks, so only the hook build compiles it.
+    const power_loss_tests = struct {
+        test "a power loss at any step of a fork with a child copy leaves the source whole and the fork with all its copies or none (D97)" {
+            var step: u64 = 1;
+            while (true) : (step += 1) {
+                var t: TestEnv = undefined;
+                t.init(.{});
+                defer t.deinit();
+                // A power loss drops unsynced bytes by design.
+                t.crashed = true;
+                const made = try parentWithChild(&t, true);
+                defer gpa.free(made.parent);
+                defer gpa.free(made.kid);
+                const parent_before = try t.kinds(made.parent);
+                defer gpa.free(parent_before);
+                const kid_before = try t.kinds(made.kid);
+                defer gpa.free(kid_before);
 
-            const base = t.fault.steps.load(.monotonic);
-            t.fault.power_at_step = base + step;
-            if (session_mod.openForkWithChildren(&t.env, .{ .source = made.parent, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app }, &.{
-                .{ .id = made.kid, .work_id = "w1", .outcome = .cancelled },
-            })) |forked| {
-                for (forked.copies) |copy| {
-                    copy.close() catch {};
-                    copy.destroy();
+                const base = t.fault.steps.load(.monotonic);
+                t.fault.power_at_step = base + step;
+                if (session_mod.openForkWithChildren(&t.env, .{ .source = made.parent, .at = .{ .turn = 1 }, .workspace = "/w", .host = .app }, &.{
+                    .{ .id = made.kid, .work_id = "w1", .outcome = .cancelled },
+                })) |forked| {
+                    for (forked.copies) |copy| {
+                        copy.close() catch {};
+                        copy.destroy();
+                    }
+                    gpa.free(forked.copies);
+                    forked.session.close() catch {};
+                    forked.session.destroy();
+                } else |_| {}
+                const reached = t.fault.steps.load(.monotonic) >= base + step;
+                t.fault.power_at_step = null;
+                t.fault.reboot();
+
+                // The source and its child are never written.
+                const parent_after = try t.kinds(made.parent);
+                defer gpa.free(parent_after);
+                try testing.expectEqualSlices(schema.Kind, parent_before, parent_after);
+                const kid_after = try t.kinds(made.kid);
+                defer gpa.free(kid_after);
+                try testing.expectEqualSlices(schema.Kind, kid_before, kid_after);
+                // A fork that exists names one copy, and the copy is there.
+                const forks = try otherRoots(&t, made.parent);
+                defer {
+                    for (forks) |id| gpa.free(id);
+                    gpa.free(forks);
                 }
-                gpa.free(forked.copies);
-                forked.session.close() catch {};
-                forked.session.destroy();
-            } else |_| {}
-            const reached = t.fault.steps.load(.monotonic) >= base + step;
-            t.fault.power_at_step = null;
-            t.fault.reboot();
-
-            // The source and its child are never written.
-            const parent_after = try t.kinds(made.parent);
-            defer gpa.free(parent_after);
-            try testing.expectEqualSlices(schema.Kind, parent_before, parent_after);
-            const kid_after = try t.kinds(made.kid);
-            defer gpa.free(kid_after);
-            try testing.expectEqualSlices(schema.Kind, kid_before, kid_after);
-            // A fork that exists names one copy, and the copy is there.
-            const forks = try otherRoots(&t, made.parent);
-            defer {
-                for (forks) |id| gpa.free(id);
-                gpa.free(forks);
+                try testing.expect(forks.len <= 1);
+                for (forks) |fork_id| {
+                    var page = try session_mod.readPage(&t.env, gpa, fork_id, .start, .forward, 1 << 20);
+                    defer page.deinit();
+                    // Lines to the fork point are the source's, naming its own child.
+                    const point = page.entries[0].body.?.session_created.forked_from.?.seq;
+                    var named: usize = 0;
+                    for (page.entries) |entry| if (entry.seq > point and entry.kind == .child_spawned) {
+                        named += 1;
+                        var copy = try session_mod.readPage(&t.env, gpa, entry.body.?.child_spawned.child, .start, .forward, 1);
+                        copy.deinit();
+                    };
+                    try testing.expectEqual(@as(usize, 1), named);
+                }
+                if (!reached) break;
             }
-            try testing.expect(forks.len <= 1);
-            for (forks) |fork_id| {
-                var page = try session_mod.readPage(&t.env, gpa, fork_id, .start, .forward, 1 << 20);
-                defer page.deinit();
-                // Lines to the fork point are the source's, naming its own child.
-                const point = page.entries[0].body.?.session_created.forked_from.?.seq;
-                var named: usize = 0;
-                for (page.entries) |entry| if (entry.seq > point and entry.kind == .child_spawned) {
-                    named += 1;
-                    var copy = try session_mod.readPage(&t.env, gpa, entry.body.?.child_spawned.child, .start, .forward, 1);
-                    copy.deinit();
-                };
-                try testing.expectEqual(@as(usize, 1), named);
-            }
-            if (!reached) break;
+            // The fork took more than a few steps, so the matrix cut inside it.
+            try testing.expect(step > 5);
         }
-        // The fork took more than a few steps, so the matrix cut inside it.
-        try testing.expect(step > 5);
+    };
+
+    test {
+        if (hooks) _ = power_loss_tests;
     }
 
     const CopyLine = struct { kind: schema.Kind, ts: u64, reason: ?schema.Reason };
