@@ -661,11 +661,7 @@ pub const Runtime = struct {
                     if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
                     var buf: [sent_result_bytes]u8 = undefined;
                     const sent = sentResult(&buf, agent);
-                    const result = if (ready.created and self.forgetUserClosed(agent))
-                        try alloc.print("{s} The user closed the earlier {s}, so this one starts with no history.", .{ sent, agent })
-                    else
-                        sent;
-                    return self.encodeManaged(alloc, .{ .ok = true, .result = result });
+                    return self.encodeManaged(alloc, .{ .ok = true, .result = if (ready.user_closed) try userClosedResult(alloc, sent, agent) else sent });
                 },
                 .completed => |completed| {
                     if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = completed.child_id, .work_id = operation_id, .phase = .replayed } });
@@ -1001,16 +997,17 @@ pub const Runtime = struct {
     /// message that starts a new one under it. Hold the admission mutex.
     fn noteUserClosedLocked(self: *Runtime, name: []const u8) void {
         for (self.user_closed.items) |known| if (std.mem.eql(u8, known, name)) return;
-        self.user_closed.ensureUnusedCapacity(self.alloc, 1) catch return lostUserClose(name);
-        const owned = self.alloc.dupe(u8, name) catch return lostUserClose(name);
-        self.user_closed.appendAssumeCapacity(owned);
+        noted: {
+            self.user_closed.ensureUnusedCapacity(self.alloc, 1) catch break :noted;
+            self.user_closed.appendAssumeCapacity(self.alloc.dupe(u8, name) catch break :noted);
+            return;
+        }
+        debug_trace.logf("mailbox", "user close not noted agent={s} reason=out_of_memory", .{name});
     }
 
     /// Forgets `name`, which a new subagent now has. True when the user had
-    /// closed one under it.
-    fn forgetUserClosed(self: *Runtime, name: []const u8) bool {
-        self.admission_mutex.lockUncancelable(io_mod.getIo());
-        defer self.admission_mutex.unlock(io_mod.getIo());
+    /// closed one under it. Hold the admission mutex.
+    fn forgetUserClosedLocked(self: *Runtime, name: []const u8) bool {
         for (self.user_closed.items, 0..) |known, index| {
             if (!std.mem.eql(u8, known, name)) continue;
             self.alloc.free(self.user_closed.swapRemove(index));
@@ -1432,7 +1429,7 @@ pub const Runtime = struct {
         defer self.admission_mutex.unlock(io_mod.getIo());
         var lock = self.managed.state_store.acquireLock();
         defer lock.release();
-        const registry = try self.managed.state_store.load(a);
+        var registry = try self.managed.state_store.load(a);
         for (registry.children) |child| {
             const name = child.agentName() orelse continue;
             if (self.closingIndexLocked(child.id) != null) continue;
@@ -1455,6 +1452,8 @@ pub const Runtime = struct {
         }
         for (self.user_closed.items) |name| {
             if (agent) |wanted| if (!std.mem.eql(u8, wanted, name)) continue;
+            // A close that couldn't be saved left the child in place.
+            if (registry.findPersistent(name) != null) continue;
             if (listed > 0) try out.writer.writeByte('\n');
             try out.writer.print("{s}: closed by the user; a message to it starts a new one with no history", .{name});
             listed += 1;
@@ -1552,9 +1551,12 @@ pub const Runtime = struct {
             for (self.start_waits.items) |wait| {
                 if (std.mem.eql(u8, wait.child_id, child_id)) wait.closed = true;
             }
-            // A user's close tells the parent what it dropped, as a stop does.
-            if (by == .user) self.noteUserDropLocked(child_id, dropped, true);
-            if (by == .user) if (name) |value| self.noteUserClosedLocked(value);
+            // A user's close tells the parent what it dropped, as a stop does,
+            // and keeps the name for main's status and its next message to it.
+            if (by == .user) {
+                self.noteUserDropLocked(child_id, dropped, true);
+                if (name) |value| self.noteUserClosedLocked(value);
+            }
             // The parent's close drops the closed turn's unread messages
             // and counts them, as its stop does.
             var unread: usize = 0;
@@ -1843,8 +1845,9 @@ pub const Runtime = struct {
     }
 
     const ManagedAdmission = union(enum) {
-        /// `created` when this admission made the child.
-        ready: struct { child_id: []u8, created: bool = false },
+        /// `created` when this admission made the child, and `user_closed`
+        /// when it took the name of one the user closed.
+        ready: struct { child_id: []u8, created: bool = false, user_closed: bool = false },
         feedback: struct { child_id: []u8, work_id: []u8 },
         completed: struct {
             child_id: []u8,
@@ -1887,6 +1890,9 @@ pub const Runtime = struct {
         var admitted = try self.admitManagedWork(alloc, request, operation_id, options, resolved_model);
         errdefer admitted.deinit(alloc);
         if (admitted == .ready) {
+            if (admitted.ready.created) if (request.agentName()) |name| {
+                admitted.ready.user_closed = self.forgetUserClosedLocked(name);
+            };
             const child_id = admitted.ready.child_id;
             try self.markBusyLocked(child_id);
             _ = self.managed.start(child_id) catch |err| {
@@ -2103,10 +2109,6 @@ pub const Runtime = struct {
         };
     }
 };
-
-fn lostUserClose(name: []const u8) void {
-    debug_trace.logf("mailbox", "user close not noted agent={s} reason=out_of_memory", .{name});
-}
 
 fn operationIdAlloc(
     alloc: Allocator,
@@ -3378,6 +3380,12 @@ const sent_result_bytes = 256 + domain.max_agent_name_bytes;
 /// `message`'s answer when the child takes it now.
 fn sentResult(buf: []u8, agent: []const u8) []const u8 {
     return std.mem.print(buf, "Sent to {s}, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.", .{agent}) catch "Sent.";
+}
+
+/// `message`'s answer when it starts a new child under the name of one the
+/// user closed.
+fn userClosedResult(alloc: Allocator, sent: []const u8, agent: []const u8) ![]const u8 {
+    return alloc.print("{s} The user closed the earlier {s}, so this one starts with no history.", .{ sent, agent });
 }
 
 /// `message`'s refusal when the child's running turn already holds as many
