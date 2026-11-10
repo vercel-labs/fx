@@ -151,6 +151,8 @@ pub const State = struct {
     startup_count: usize = 1,
     /// Backs the footer's agent indicator, which can hold a subagent's label.
     label_buf: [192]u8 = undefined,
+    /// Backs the "waiting on N subagents" activity row.
+    subagent_wait_buf: [96]u8 = undefined,
     /// Whether the first instance, kept in `App.main_agent`, still runs. It
     /// closes like any other and stays closed.
     first_open: bool = true,

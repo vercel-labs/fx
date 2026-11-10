@@ -703,6 +703,7 @@ fn streamAgentCompletion(
         .admission = request.admission,
         .on_reasoning_chunk = agent_stream_provider_contract.EventSink.onReasoningChunk,
         .on_tool_input_chunk = agent_stream_provider_contract.EventSink.onToolInputChunk,
+        .on_tool_input_progress = agent_stream_provider_contract.EventSink.onToolInputProgress,
         .provider_attempt_owner = switch (request.provider_attempt_owner) {
             .transport => .transport,
             .agent => .agent,

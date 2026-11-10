@@ -129,7 +129,11 @@ pub const ForkOptions = struct {
     at: ForkPoint,
     workspace: []const u8,
     host: Host,
+    /// The source's children the fork takes a copy of (D97).
+    children: []const ChildCopy = &.{},
 };
+
+pub const ChildCopy = session_mod.ChildCopy;
 
 pub const ImportOptions = struct {
     /// The v1 id, kept (D8).
@@ -332,19 +336,39 @@ pub const Manager = struct {
     pub fn openFork(m: *Manager, options: ForkOptions) OpenError!Session {
         try checkId(options.source);
         try checkText(options.workspace);
+        for (options.children) |child| {
+            try checkId(child.id);
+            try checkText(child.work_id);
+        }
         try ready(m);
-        const inner = session_mod.openFork(&m.env, .{
+        const forked = session_mod.openForkWithChildren(&m.env, .{
             .source = options.source,
             .at = options.at,
             .workspace = options.workspace,
             .host = options.host,
-        }) catch |err| return switch (err) {
+        }, options.children) catch |err| return switch (err) {
             error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.InvalidForkPoint, error.OutOfMemory => |e| e,
             else => |io_err| storage.ioFault(io_err),
         };
-        const session: Session = .{ .manager = m, .inner = inner };
+        defer m.gpa.free(forked.copies);
+        // Each copy is whole on disk; closing it appends `closed`, and the
+        // index lists it as its parent's child.
+        for (forked.copies) |copy| (Session{ .manager = m, .inner = copy }).release();
+        const session: Session = .{ .manager = m, .inner = forked.session };
         session.updateIndexAs(.published);
         return session;
+    }
+
+    /// `source`'s state just past fork point `at`: which children it had
+    /// then, and how each one's newest work stood (D97). The caller frees
+    /// it with `deinit`.
+    pub fn stateAt(m: *Manager, source: []const u8, at: ForkPoint) OpenError!State {
+        try checkId(source);
+        if (!try readyToRead(m)) return error.NotFound;
+        return session_mod.stateAt(&m.env, source, at) catch |err| switch (err) {
+            error.NotFound, error.Busy, error.ChildSession, error.Corrupt, error.UnsupportedVersion, error.InvalidForkPoint, error.OutOfMemory => |e| e,
+            else => |io_err| storage.ioFault(io_err),
+        };
     }
 
     /// The v1 conversion only (D8): a new session under an existing id,

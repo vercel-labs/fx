@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { compactionRecordPath, logLines, sessionDir } from "./saved-sessions";
 
 process.env.FX_E2E_DISABLE_DOTENV = "1";
-const { fakeGatewayFinalText, startDynamicFakeGateway } = await import("./tmux-helpers");
+const { fakeGatewayFinalText, fakeGatewayToolCall, startDynamicFakeGateway } = await import("./tmux-helpers");
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const checkpointMarker = "fx-compactor-v1\n";
 
@@ -120,3 +120,113 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     else { writeFileSync(join(root, "requests.json"), JSON.stringify(bodies, null, 2)); console.error(`compaction evidence retained: ${root}`); }
   }
 }, 90_000);
+
+// The toolbox menu a conversation sent first stays its menu, byte for byte,
+// across every compaction: providers that bind reasoning to the instructions
+// drop the kept turns' reasoning when it changes, and the request a turn built
+// before the compaction holds it (tests/tla/toolbox/Toolbox.tla MenuFixed).
+const TOOLBOX_MENU = "Skills, MCP servers, and tools you can use through the toolbox tool";
+const BIG_REPLY = Array.from({ length: 14_000 }, (_, n) => `Reference line ${n}: earlier detail kept only by the summary.\n`).join("");
+
+type Script = (request: any, raw: string, phase: string) => Response;
+
+async function toolboxRun(model: string, label: string, phases: { phase: string; prompt: string; resume: boolean; env?: Record<string, string> }[], script: Script) {
+  const root = mkdtempSync(join(tmpdir(), "fx-toolbox-menu-")), home = join(root, "home"), cwd = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  mkdirSync(cwd, { mode: 0o700 });
+  writeFileSync(join(cwd, "notes.txt"), "TOOLBOX_MENU_NOTES\n");
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model, auto_upgrade: false }), { mode: 0o600 });
+  const agentBodies: string[] = [];
+  let phase = "";
+  const gateway = startDynamicFakeGateway((raw: string) => {
+    const request = JSON.parse(raw);
+    const summary = request.tools?.length === 0 && request.toolChoice?.type === "none";
+    if (!summary) agentBodies.push(raw);
+    return script(request, raw, summary ? "summary" : phase);
+  }, { models: [{ id: model, type: "language", tags: ["tool-use", "reasoning"], context_window: 128000, max_tokens: 8192 }] });
+  const env: Record<string, string> = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+    AI_GATEWAY_API_KEY: "synthetic-toolbox-menu", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+    FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model,
+    FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  };
+  let sessionId = "";
+  let passed = false;
+  try {
+    for (const step of phases) {
+      phase = step.phase;
+      const out = join(root, `${step.phase}.stdout`), err = join(root, `${step.phase}.stderr`);
+      const args = ["ask", "--json", "--full-access", ...(step.resume ? ["--resume", sessionId] : []), step.prompt];
+      const child = Bun.spawn([binary, ...args], { cwd, env: { ...env, ...step.env }, stdin: "ignore", stdout: Bun.file(out), stderr: Bun.file(err) });
+      const timer = setTimeout(() => child.kill("SIGKILL"), 60_000);
+      try { expect(await child.exited).toBe(0); } finally { clearTimeout(timer); }
+      if (!step.resume) sessionId = JSON.parse(readFileSync(out, "utf8")).session_id;
+    }
+    const menus = agentBodies.map((raw) => {
+      const request = JSON.parse(raw);
+      const found = request.prompt.find((message: any) => message.role === "system" && typeof message.content === "string" && message.content.startsWith(TOOLBOX_MENU));
+      return found?.content ?? null;
+    });
+    const result = { home, sessionId, bodies: agentBodies, menus, compactions: logLines(home, sessionId).filter((line: any) => line.kind === "compacted").length };
+    passed = true;
+    return result;
+  } finally {
+    gateway.stop();
+    if (passed) rmSync(root, { recursive: true, force: true });
+    else { writeFileSync(join(root, "requests.json"), JSON.stringify(agentBodies.map((raw) => JSON.parse(raw)), null, 1)); console.error(`toolbox menu evidence retained (${label}): ${root}`); }
+  }
+}
+
+function expectMenuKept(run: { bodies: string[]; menus: (string | null)[] }) {
+  // A NUL in a request is fx sending memory it no longer holds.
+  for (const [index, raw] of run.bodies.entries()) expect({ index, nul: raw.includes("\\u0000") }).toEqual({ index, nul: false });
+  expect(run.menus[0]).toBeString();
+  for (const [index, menu] of run.menus.entries()) expect({ index, same: menu === run.menus[0] }).toEqual({ index, same: true });
+}
+
+for (const model of ["anthropic/claude-sonnet-5.5", "openai/gpt-6.1-sol", "fixture/compaction"]) test(`automatic compaction keeps the toolbox menu the conversation sent first (${model})`, async () => {
+  const run = await toolboxRun(model, `automatic ${model}`, [
+    { phase: "seed", prompt: "Start the work.", resume: false },
+    { phase: "continue", prompt: "Continue the work.", resume: true },
+    { phase: "after", prompt: "One more turn.", resume: true },
+  ], (_request, _raw, phase) => {
+    if (phase === "summary") return fakeGatewayFinalText("Turn 1\nIn between: none");
+    return fakeGatewayFinalText(phase === "seed" ? `SEED_DONE\n${BIG_REPLY}` : `${phase.toUpperCase()}_DONE`);
+  });
+  expect(run.compactions).toBe(1);
+  expect(run.bodies.length).toBe(3);
+  expectMenuKept(run);
+}, 120_000);
+
+test("two automatic compactions in one session keep the toolbox menu the conversation sent first", async () => {
+  const run = await toolboxRun("fixture/compaction", "two compactions", [
+    { phase: "seed", prompt: "Start the work.", resume: false },
+    { phase: "grow", prompt: "Add more detail.", resume: true },
+    { phase: "after", prompt: "One more turn.", resume: true },
+  ], (_request, _raw, phase) => {
+    if (phase === "summary") return fakeGatewayFinalText("Turn 1\nIn between: none");
+    return fakeGatewayFinalText(phase === "after" ? "AFTER_DONE" : `${phase.toUpperCase()}_DONE\n${BIG_REPLY}`);
+  });
+  expect(run.compactions).toBe(2);
+  expectMenuKept(run);
+}, 120_000);
+
+test("overflow recovery in the middle of a turn keeps the toolbox menu the conversation sent first", async () => {
+  let attempt = 0;
+  const run = await toolboxRun("fixture/compaction", "overflow", [
+    { phase: "seed", prompt: "Read notes.txt and reply.", resume: false },
+    { phase: "overflow", prompt: "Continue.", resume: true },
+  ], (_request, raw, phase) => {
+    if (phase === "summary") return fakeGatewayFinalText("Facts:\nF1: the earlier turn read notes.txt.");
+    if (phase === "seed") return raw.includes('"seed-read"') ? fakeGatewayFinalText("SEED_DONE") : fakeGatewayToolCall("seed-read", "read_file", { path: "notes.txt" });
+    attempt += 1;
+    // The provider refuses the turn's first request for its size, so fx
+    // compacts in the middle of the turn and sends it again.
+    if (attempt === 1) return Response.json({ error: { type: "invalid_request_error", code: "context_length_exceeded", message: "This model's maximum context length is 128000 tokens. The request exceeds the context window." } }, { status: 400 });
+    return fakeGatewayFinalText("OVERFLOW_RECOVERED");
+  });
+  expect(run.compactions).toBe(1);
+  expect(attempt).toBe(2);
+  expectMenuKept(run);
+}, 120_000);
