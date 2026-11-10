@@ -1974,8 +1974,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           expectRowOrder(idle, mainRow(), subagentRow("tester"), subagentRow("reviewer"));
           await waitForSelectedRow(session, "tester");
           expect(idle).toContain("ORDER_MAIN_IDLE");
+          // Enter switches, so the screen clears and reprints tester's
+          // conversation; wait for tester's footer, not only for the list to go.
           await session.sendKeys("Enter");
-          const kept = await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+          const kept = await session.waitForPane((pane) => !pane.includes("esc back") && pane.includes("tester \u00b7 done \u2193"), 10_000);
           expect(kept).toContain("ORDER_TESTER_DONE");
           expect(kept).toContain("tester \u00b7 done \u2193");
           expect(kept).not.toContain("ORDER_MAIN_IDLE");
