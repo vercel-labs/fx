@@ -296,6 +296,18 @@ function occurrenceCount(text: string, needle: string): number {
 }
 
 
+// A provider's prompt cache covers a request only up to the first message that
+// differs from the request before it, so the next request must open with every
+// message the last one carried, byte for byte.
+function expectAcpPromptExtends(previousBody: string, nextBody: string) {
+  const before = acpGatewayRequest(previousBody).prompt;
+  const after = acpGatewayRequest(nextBody).prompt;
+  expect(after.length).toBeGreaterThanOrEqual(before.length);
+  before.forEach((message, index) => {
+    expect(JSON.stringify(after[index])).toBe(JSON.stringify(message));
+  });
+}
+
 function acpPromptText(body: string): string {
   return acpGatewayRequest(body).prompt
     .map((message) => acpContentText(message.content))
@@ -6837,6 +6849,139 @@ describe("acp: model-independent", () => {
     },
     TIMEOUT,
   );
+
+  test("ACP's next prompt starts with the request that carried a Vision outage notice", async () => {
+    const root = createIsolatedRoot("fx-acp-vision-outage-");
+    writeFileSync(
+      join(root.workspace, "logo.png"),
+      readFileSync(join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png")),
+    );
+    const outageNotice = "None of the requested images were read by Vision.";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("vision_outage", "vision", { paths: ["logo.png"], focus: "describe the image" }),
+      new Response("vision unavailable", { status: 502 }),
+      new Response("vision unavailable", { status: 502 }),
+      new Response("vision unavailable", { status: 502 }),
+      finalText("ACP_VISION_OUTAGE_ANSWER"),
+      finalText("ACP_SECOND_PROMPT_ANSWER"),
+      finalText("ACP_LOADED_PROMPT_ANSWER"),
+    ], {
+      models: [
+        { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+        { id: "google/gemini-2.5-flash", type: "language", tags: ["vision", "file-input", "tool-use"] },
+      ],
+    });
+    try {
+      client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+      const sessionId = await startAutoSession(client);
+      const first = await runPrompt(client, "Describe logo.png.", TIMEOUT);
+      expect(first.promptResult.result.stopReason).toBe("end_turn");
+      const turnEnd = gateway.requests.length - 1;
+      expect(gateway.requests[turnEnd]!.body).toContain(outageNotice);
+
+      const second = await runPrompt(client, "And once more.", TIMEOUT);
+      expect(second.promptResult.result.stopReason).toBe("end_turn");
+      expect(gateway.requests).toHaveLength(turnEnd + 2);
+      expectAcpPromptExtends(gateway.requests[turnEnd]!.body, gateway.requests[turnEnd + 1]!.body);
+
+      // A reloaded session replays what the user saw and nothing fx sent on
+      // its own: neither the notice nor the marker that saves it.
+      await client.close();
+      client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+      await client.request("initialize", { protocolVersion: 1 }, 10);
+      client.send({ jsonrpc: "2.0", id: 11, method: "session/load", params: { sessionId, cwd: root.workspace, mcpServers: [] } });
+      const replayed: unknown[] = [];
+      for (;;) {
+        const message = await client.readLine(TIMEOUT) as any;
+        if (message.id === 11) {
+          expect(message.error).toBeUndefined();
+          break;
+        }
+        replayed.push(message);
+      }
+      expect(JSON.stringify(replayed)).toContain("ACP_SECOND_PROMPT_ANSWER");
+      expect(JSON.stringify(replayed)).not.toContain(outageNotice);
+      expect(JSON.stringify(replayed)).not.toContain("fx_recovery_prompt");
+
+      const loaded = await runPrompt(client, "One more after the reload.", TIMEOUT);
+      expect(loaded.promptResult.result.stopReason).toBe("end_turn");
+      expect(gateway.requests).toHaveLength(turnEnd + 3);
+      expectAcpPromptExtends(gateway.requests[turnEnd + 1]!.body, gateway.requests[turnEnd + 2]!.body);
+      expect(client.stderr).toBe("");
+    } finally {
+      await client?.close();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 3);
+
+  test("ACP after a crash with the Vision outage notice in flight, the next prompt starts with the cut-off request", async () => {
+    const root = createIsolatedRoot("fx-acp-vision-crash-");
+    writeFileSync(
+      join(root.workspace, "logo.png"),
+      readFileSync(join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png")),
+    );
+    const outageNotice = "None of the requested images were read by Vision.";
+    const held = heldFakeGatewayFinalText();
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("vision_outage", "vision", { paths: ["logo.png"], focus: "describe the image" }),
+      new Response("vision unavailable", { status: 502 }),
+      new Response("vision unavailable", { status: 502 }),
+      new Response("vision unavailable", { status: 502 }),
+      // The request after the notice parks here; the process dies while it is
+      // in flight.
+      held.response,
+      finalText("ACP_RECOVERED_ANSWER"),
+    ], {
+      models: [
+        { id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] },
+        { id: "google/gemini-2.5-flash", type: "language", tags: ["vision", "file-input", "tool-use"] },
+      ],
+    });
+    const proc = nodeSpawn(FX_BIN, ["acp"], {
+      cwd: root.workspace,
+      env: { ...process.env, ...fakeGatewayEnv(root, gateway), NO_COLOR: "1" },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    try {
+      client = new AcpClient(proc);
+      const sessionId = await startAutoSession(client);
+      sendPrompt(client, 40, "Describe logo.png.");
+      await waitForCondition("held request after the notice", () => gateway.requests.length === 5, TIMEOUT);
+      expect(gateway.requests[4]!.body).toContain(outageNotice);
+      const exited = client.waitForExit();
+      proc.kill("SIGKILL");
+      await exited;
+      expect(proc.signalCode).toBe("SIGKILL");
+
+      client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+      await client.request("initialize", { protocolVersion: 1 }, 10);
+      client.send({ jsonrpc: "2.0", id: 11, method: "session/load", params: { sessionId, mcpServers: [] } });
+      const loaded: unknown[] = [];
+      for (;;) {
+        const message = await client.readLine() as any;
+        if (message.id === 11) {
+          expect(message.error).toBeUndefined();
+          break;
+        }
+        loaded.push(message);
+      }
+      // The reopened turn shows the user's prompt, never fx's own notice.
+      expect(JSON.stringify(loaded)).toContain("Describe logo.png.");
+      expect(JSON.stringify(loaded)).not.toContain(outageNotice);
+      expect(JSON.stringify(loaded)).not.toContain("fx_recovery_prompt");
+
+      const resumed = await runPrompt(client, "Carry on from the saved turn.", TIMEOUT);
+      expect(resumed.promptResult.result.stopReason).toBe("end_turn");
+      expect(gateway.requests).toHaveLength(6);
+      expectAcpPromptExtends(gateway.requests[4]!.body, gateway.requests[5]!.body);
+    } finally {
+      held.dispose();
+      await client?.close();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 3);
 
   test("ACP keeps a failed turn's image through reload and a new image prompt goes on", async () => {
     const root = createIsolatedRoot("fx-acp-checkpoint-image-");

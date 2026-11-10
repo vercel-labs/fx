@@ -9197,11 +9197,27 @@ const empty_reply_prompt = "Your last reply had no text and no tool call.";
 const reasoning_only_state =
     "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"opaque\"}}}]";
 
+/// What a two-turn check scripts for the first turn's tool calls: what each
+/// call hands back, and the feedback the user types as each one is approved.
+const TurnScript = struct {
+    exec_plans: []const test_support.FakeExecPlan = &.{},
+    permission_feedback: []const []const u8 = &.{},
+};
+
+fn expectNextTurnExtendsLastRequest(
+    completions: []const FakeCompletion,
+    last_request: usize,
+    prompt: []const u8,
+) !void {
+    try expectNextTurnExtendsLastRequestWith(.{}, completions, last_request, prompt);
+}
+
 /// Runs a turn on `completions`, whose request number `last_request` ends it
 /// and carries `prompt`. Then runs a second turn over the history the first
 /// saved, and fails unless the second turn's first request opens with all of
 /// that request: the provider's prompt cache still covers it.
-fn expectNextTurnExtendsLastRequest(
+fn expectNextTurnExtendsLastRequestWith(
+    script: TurnScript,
     completions: []const FakeCompletion,
     last_request: usize,
     prompt: []const u8,
@@ -9211,6 +9227,8 @@ fn expectNextTurnExtendsLastRequest(
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
+    hooks.exec_plans = script.exec_plans;
+    hooks.permission_feedback = script.permission_feedback;
     var fixture = PromptFixture{};
     var job = fixture.job();
     job.model = @constCast(unmarked_model);
@@ -9307,6 +9325,167 @@ test "the next turn extends the request that carried the empty-reply nudge after
         .{ .content = "Answer" },
     };
     try expectNextTurnExtendsLastRequest(&completions, 2, empty_reply_prompt);
+}
+
+test "the next turn extends the request that carried a tool's notice" {
+    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Done reading" },
+    };
+    const plans = [_]test_support.FakeExecPlan{.{ .result = .{
+        .model_output = "tool output",
+        .system_notice = "continue with degraded visual evidence",
+    } }};
+    try expectNextTurnExtendsLastRequestWith(
+        .{ .exec_plans = &plans },
+        &completions,
+        1,
+        "continue with degraded visual evidence",
+    );
+}
+
+test "a tool's notice follows every result of its step, in the request and in the next turn" {
+    const calls = [_]ToolCall{
+        toolCall("call_1", "read_file", "{\"path\":\"a\"}"),
+        toolCall("call_2", "read_file", "{\"path\":\"b\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Done reading" },
+    };
+    // The first call raises the notice: it waits for the second call's result.
+    const plans = [_]test_support.FakeExecPlan{
+        .{ .result = .{ .model_output = "first output", .system_notice = "notice from the first call" } },
+        .{ .result = .{ .model_output = "second output" } },
+    };
+    try expectNextTurnExtendsLastRequestWith(.{ .exec_plans = &plans }, &completions, 1, "notice from the first call");
+
+    var gateway = FakeGateway.init(std.testing.allocator, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer hooks.deinit();
+    hooks.exec_plans = &plans;
+    var fixture = PromptFixture{};
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try expectBodyContainsInOrder(&gateway, 1, &.{ "first output", "second output", "notice from the first call" });
+}
+
+test "a tool's notice and permission feedback keep one order in the request and in the next turn" {
+    const calls = [_]ToolCall{
+        toolCall("call_1", "read_file", "{\"path\":\"a\"}"),
+        toolCall("call_2", "read_file", "{\"path\":\"b\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Done reading" },
+    };
+    // The notice comes from the first call and the feedback is typed for the
+    // second, and the other way round.
+    const notice_first = [_]test_support.FakeExecPlan{
+        .{ .result = .{ .model_output = "first output", .system_notice = "notice from the first call" } },
+        .{ .result = .{ .model_output = "second output" } },
+    };
+    try expectNextTurnExtendsLastRequestWith(
+        .{ .exec_plans = &notice_first, .permission_feedback = &.{ "", "feedback for the second call" } },
+        &completions,
+        1,
+        "notice from the first call",
+    );
+    const notice_second = [_]test_support.FakeExecPlan{
+        .{ .result = .{ .model_output = "first output" } },
+        .{ .result = .{ .model_output = "second output", .system_notice = "notice from the second call" } },
+    };
+    try expectNextTurnExtendsLastRequestWith(
+        .{ .exec_plans = &notice_second, .permission_feedback = &.{ "feedback for the first call", "" } },
+        &completions,
+        1,
+        "notice from the second call",
+    );
+}
+
+test "a tool's notice raised on the last step the limit allows is saved with the turn" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{.{ .result = .{
+        .model_output = "tool output",
+        .system_notice = "notice on the last step",
+    } }};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 1;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+
+    var next_gateway = FakeGateway.init(alloc, &.{.{ .content = "Second answer" }});
+    defer next_gateway.deinit();
+    var next_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer next_hooks.deinit();
+    var next_fixture = PromptFixture{};
+    var next_job = next_fixture.job();
+    next_job.prompt = @constCast("second prompt");
+    next_job.history = hooks.history_turns.items;
+    try runFakePrompt(&next_gateway, &next_hooks, next_fixture.config(), next_job);
+    try test_support.expectPromptExtends(gateway.request_bodies.items[0], next_gateway.request_bodies.items[0]);
+    try expectBodyContainsInOrder(&next_gateway, 0, &.{ "tool output", "notice on the last step", "second prompt" });
+}
+
+test "the next turn extends the request after any placement of notices and feedback in a step" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var count: usize = 1;
+    while (count <= 3) : (count += 1) {
+        const calls = try arena.alloc(ToolCall, count);
+        for (calls, 0..) |*call, index| {
+            call.* = toolCall(
+                try arena.print("call_{d}", .{index}),
+                "read_file",
+                try arena.print("{{\"path\":\"file_{d}\"}}", .{index}),
+            );
+        }
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = calls },
+            .{ .content = "Done reading" },
+        };
+        const masks: usize = @as(usize, 1) << @intCast(count);
+        var notices: usize = 0;
+        while (notices < masks) : (notices += 1) {
+            var feedback: usize = 0;
+            while (feedback < masks) : (feedback += 1) {
+                const plans = try arena.alloc(test_support.FakeExecPlan, count);
+                const typed = try arena.alloc([]const u8, count);
+                var first_notice: []const u8 = "";
+                for (plans, typed, 0..) |*plan, *text, index| {
+                    const notice: ?[]const u8 = if (notices & (@as(usize, 1) << @intCast(index)) != 0)
+                        try arena.print("notice from call {d}", .{index})
+                    else
+                        null;
+                    if (notice != null and first_notice.len == 0) first_notice = notice.?;
+                    plan.* = .{ .result = .{
+                        .model_output = try arena.print("output of call {d}", .{index}),
+                        .system_notice = notice,
+                    } };
+                    text.* = if (feedback & (@as(usize, 1) << @intCast(index)) != 0)
+                        try arena.print("feedback for call {d}", .{index})
+                    else
+                        "";
+                }
+                try expectNextTurnExtendsLastRequestWith(
+                    .{ .exec_plans = plans, .permission_feedback = typed },
+                    &completions,
+                    1,
+                    first_notice,
+                );
+            }
+        }
+    }
 }
 
 test "completed assistant provider replay survives turn materialization" {

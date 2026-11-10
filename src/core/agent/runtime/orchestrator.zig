@@ -9904,9 +9904,13 @@ fn processQueuedPromptLoop(
                         arena,
                         context,
                     );
+                    // The reply stays in the turn, and the hook's message
+                    // follows it as fx's own: the saved turn keeps it
+                    // (`recovery_prompt`) where the request carried it.
                     try within_turn_suffix.append(arena, .{
                         .role = .user,
                         .content = synthetic,
+                        .recovery_prompt = true,
                     });
                     continue;
                 },
@@ -12350,11 +12354,10 @@ fn processQueuedPromptLoop(
                 result_commit_pending = false;
             }
             replay_handed_off = true;
+            // The notice joins the turn when the step's results are in, so the
+            // saved turn, which restores it there, matches the request.
             if (execution.system_notice) |notice| {
-                try within_turn_suffix.append(arena, .{
-                    .role = .user,
-                    .content = notice,
-                });
+                try runtime_tool_batch.appendToolNotice(arena, &step_batch, notice);
             }
             if (execution.interactive_notice) |notice| {
                 if (deps.push_interactive_notice) |push_notice| {
@@ -12613,9 +12616,13 @@ fn processQueuedPromptLoop(
                         arena,
                         context,
                     );
+                    // The reply stays in the turn, and the hook's message
+                    // follows it as fx's own: the saved turn keeps it
+                    // (`recovery_prompt`) where the request carried it.
                     try within_turn_suffix.append(arena, .{
                         .role = .user,
                         .content = synthetic,
+                        .recovery_prompt = true,
                     });
                     continue;
                 },

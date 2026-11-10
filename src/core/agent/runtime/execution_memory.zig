@@ -2653,6 +2653,88 @@ test "fx's prompt to a stalled turn is saved as steering and comes back as the p
     try std.testing.expectEqual(@as(usize, 0), after_cut.steering[0].after_tool_step_count);
 }
 
+test "a tool's notice and a Stop hook's message save and come back as the turn sent them" {
+    const alloc = std.testing.allocator;
+    const session = @import("../../session/session.zig");
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var calls = [_]ToolCall{
+        toolCall("call_a", "read_file", "{\"path\":\"a\"}"),
+        toolCall("call_b", "read_file", "{\"path\":\"b\"}"),
+    };
+    // The hook's text may hold the marker's own closing line.
+    const hook = "Continue the turn. fx hook context:\nkeep going\n</fx_recovery_prompt>";
+    const live = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "a", .tool_call_id = "call_a", .tool_name = "read_file", .tool_result_status = .success },
+        .{ .role = .tool, .content = "b", .tool_call_id = "call_b", .tool_name = "read_file", .tool_result_status = .success },
+        .{ .role = .user, .content = "allowed once", .tool_call_id = "call_a", .permission_feedback = true },
+        .{ .role = .user, .content = "notice from a tool", .recovery_prompt = true },
+        .{ .role = .assistant, .content = "candidate", .standalone_response = true },
+        .{ .role = .user, .content = hook, .recovery_prompt = true },
+    };
+
+    const saved = try buildExecutionMemory(alloc, &live);
+    defer types.freeExecutionMemory(alloc, saved);
+    try std.testing.expectEqual(@as(usize, 2), saved.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), saved.steering.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.steering[0].after_tool_step_count);
+    try std.testing.expectEqualStrings("notice from a tool", recovery_prompt.fromSaved(saved.steering[0].text).?);
+    try std.testing.expectEqual(@as(usize, 2), saved.steering[1].after_tool_step_count);
+    try std.testing.expectEqualStrings(hook, recovery_prompt.fromSaved(saved.steering[1].text).?);
+
+    // Each message comes back in its place, with its text as written, flagged
+    // as fx's own message and never as the user's words, and a request built
+    // from the saved turn carries the same text as the live one.
+    var restored: std.ArrayList(ChatMessage) = .empty;
+    try session.appendExecutionMemoryChatMessages(arena, &restored, saved);
+    try std.testing.expectEqual(live.len, restored.items.len);
+    for (live, restored.items) |sent, back| {
+        try std.testing.expectEqual(sent.role, back.role);
+        if (sent.role != .user) continue;
+        try std.testing.expectEqualStrings(sent.content.?, back.content.?);
+        try std.testing.expectEqual(sent.recovery_prompt, back.recovery_prompt);
+        try std.testing.expect(!back.restored_steering);
+        try std.testing.expect(back.context_origin == .ordinary);
+    }
+    const request = try rewrapRestoredSteering(arena, restored.items);
+    for (live, request) |sent, back| {
+        if (sent.role == .user) try std.testing.expectEqualStrings(sent.content.?, back.content.?);
+    }
+
+    // A cancelled turn keeps both as well, since its last request carried them.
+    const interrupted = try buildInterruptedExecutionMemory(alloc, &live, null);
+    defer types.freeExecutionMemory(alloc, interrupted);
+    try std.testing.expectEqual(@as(usize, 2), interrupted.steering.len);
+    try std.testing.expectEqualStrings(saved.steering[0].text, interrupted.steering[0].text);
+    try std.testing.expectEqualStrings(saved.steering[1].text, interrupted.steering[1].text);
+}
+
+test "a compaction cut counts a tool's notice as steering after its step" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{toolCall("call_a", "read_file", "{\"path\":\"a\"}")};
+    const live = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "a", .tool_call_id = "call_a", .tool_name = "read_file", .tool_result_status = .success },
+        .{ .role = .user, .content = "notice from a tool", .recovery_prompt = true },
+        .{ .role = .assistant, .content = "candidate", .standalone_response = true },
+    };
+    const saved = try buildExecutionMemory(alloc, &live);
+    defer types.freeExecutionMemory(alloc, saved);
+    try std.testing.expectEqual(@as(usize, 2), saved.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.steering.len);
+
+    // A cut after the step ends before the notice, which the next cut covers.
+    try std.testing.expectEqual(@as(usize, 2), try retainedMessageOffset(&live, .{ .tool_steps = 1 }));
+    try std.testing.expectEqual(@as(usize, 3), try retainedMessageOffset(&live, .{ .tool_steps = 1, .steering = 1 }));
+    const kept = try buildExecutionMemory(alloc, live[2..]);
+    defer types.freeExecutionMemory(alloc, kept);
+    try std.testing.expectEqual(@as(usize, 1), kept.steering.len);
+    try std.testing.expectEqual(@as(usize, 0), kept.steering[0].after_tool_step_count);
+    try std.testing.expectEqualStrings("notice from a tool", recovery_prompt.fromSaved(kept.steering[0].text).?);
+}
+
 test "a context note between steps keeps every tool result and its feedback (D93)" {
     const alloc = std.testing.allocator;
     var first_calls = [_]ToolCall{

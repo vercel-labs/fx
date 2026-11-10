@@ -612,6 +612,23 @@ function promptParts(body: string): Array<Record<string, unknown>> {
   );
 }
 
+/** What Vision hands the model after a failed read (`outage_system_notice` in
+ * `src/core/agent/runtime/vision_executor.zig`). */
+const VISION_OUTAGE_NOTICE =
+  "None of the requested images were read by Vision. You may retry Vision, change strategy, or answer without making visual claims.";
+
+/** A provider's prompt cache covers a request only up to the first message
+ * that differs from the request before it, so the next request must open with
+ * every message the last one carried, byte for byte. */
+function expectPromptExtends(previousBody: string, nextBody: string) {
+  const previous = promptMessages(previousBody);
+  const next = promptMessages(nextBody);
+  expect(next.length).toBeGreaterThanOrEqual(previous.length);
+  previous.forEach((message, index) => {
+    expect(JSON.stringify(next[index])).toBe(JSON.stringify(message));
+  });
+}
+
 function toolResultText(body: string, toolCallId: string): string {
   const result = promptParts(body).find(
     (part) => part.type === "tool-result" && part.toolCallId === toolCallId,
@@ -2141,6 +2158,85 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
+    "a resumed session's next request starts with the request that carried the Vision outage notice",
+    async () => {
+      const root = createIsolatedRoot();
+      copyFileSync(IMAGE_PATH, join(root.workspace, "logo.png"));
+      const gateway = startImageGateway([
+        sseToolCall("vision", { paths: ["logo.png"], focus: "describe the image" }, "vision_outage"),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        sseText("Vision unavailable final answer"),
+        sseText("second turn answered"),
+      ]);
+      try {
+        const first = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "Describe logo.png."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT },
+        );
+        const firstJson = parseFxJson(first);
+        expect(firstJson.output).toContain("Vision unavailable final answer");
+        const turnEnd = gateway.chatRequests.length - 1;
+        expect(gateway.chatRequests[turnEnd].body).toContain(VISION_OUTAGE_NOTICE);
+
+        const resumed = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", firstJson.session_id, "And once more."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(resumed).output).toContain("second turn answered");
+        expect(gateway.chatRequests).toHaveLength(turnEnd + 2);
+        expectPromptExtends(gateway.chatRequests[turnEnd].body, gateway.chatRequests[turnEnd + 1].body);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a request that fails once after the Vision outage notice is sent again with it, and the next request extends the one that went through",
+    async () => {
+      const root = createIsolatedRoot();
+      copyFileSync(IMAGE_PATH, join(root.workspace, "logo.png"));
+      const gateway = startImageGateway([
+        sseToolCall("vision", { paths: ["logo.png"], focus: "describe the image" }, "vision_outage"),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        // The request that carries the notice fails once, then goes through.
+        new Response("bad gateway", { status: 502 }),
+        sseText("Vision unavailable final answer"),
+        sseText("second turn answered"),
+      ]);
+      try {
+        const first = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "Describe logo.png."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: 60_000 },
+        );
+        const firstJson = parseFxJson(first);
+        expect(firstJson.output).toContain("Vision unavailable final answer");
+        const sent = gateway.chatRequests.length - 2;
+        expect(gateway.chatRequests[sent].body).toContain(VISION_OUTAGE_NOTICE);
+        expectPromptExtends(gateway.chatRequests[sent].body, gateway.chatRequests[sent + 1].body);
+
+        const resumed = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", firstJson.session_id, "And once more."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(resumed).output).toContain("second turn answered");
+        expect(gateway.chatRequests).toHaveLength(sent + 3);
+        expectPromptExtends(gateway.chatRequests[sent + 1].body, gateway.chatRequests[sent + 2].body);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    90_000,
+  );
+
+  test(
     "cold resume rebases image ids and preserves authority across both model-switch directions",
     async () => {
       const root = createIsolatedRoot();
@@ -3466,6 +3562,87 @@ describe("Vision route fake Gateway", () => {
       }
     },
     30_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "tmux resumed terminal session shows neither the Vision outage notice nor its marker, and its next request extends the last one",
+    async () => {
+      const root = createIsolatedRoot();
+      copyFileSync(IMAGE_PATH, join(root.workspace, "logo.png"));
+      const gateway = startImageGateway([
+        sseToolCall("vision", { paths: ["logo.png"], focus: "describe the image" }, "vision_outage"),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        sseText("Vision unavailable final answer"),
+        sseText("answered in the resumed terminal"),
+      ]);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      const launch = (cmd: string) =>
+        TmuxSession.create({
+          cmd,
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway, GLM_MODEL),
+            FX_PERMISSION_MODE: "auto",
+            FX_AUTO_UPGRADE: "0",
+            NO_COLOR: "1",
+          },
+          stderrPath,
+          width: 140,
+          height: 50,
+        });
+      let session: TmuxSession | null = null;
+      try {
+        session = await launch(FX_BIN);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        await session.sendText("Describe the logo file in this folder.");
+        const live = await session.waitForText("Vision unavailable final answer", TIMEOUT);
+        // fx sent the notice to the model on its own; the user never saw it.
+        expect(live).not.toContain("None of the requested images were read");
+        const turnEnd = gateway.chatRequests.length - 1;
+        expect(gateway.chatRequests[turnEnd].body).toContain(VISION_OUTAGE_NOTICE);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+
+        session = await launch(`${FX_BIN} --resume last`);
+        await session.waitForComposer(TIMEOUT);
+        const screen = await session.waitForText("Vision unavailable final answer", TIMEOUT);
+        expect(screen).not.toContain("None of the requested images were read");
+        expect(screen).not.toContain("fx_recovery_prompt");
+
+        await session.sendKeys("C-o");
+        const full = await session.waitForPane(
+          (pane) => pane.includes("esc close · pgup/pgdn scroll"),
+          TIMEOUT,
+        );
+        expect(full).toContain("Describe the logo file in this folder.");
+        expect(full).toContain("Vision unavailable final answer");
+        expect(full).not.toContain("None of the requested images were read");
+        expect(full).not.toContain("fx_recovery_prompt");
+        await session.sendKeys("Escape");
+        await session.waitForComposer(TIMEOUT);
+
+        await session.sendText("And once more.");
+        await session.waitForText("answered in the resumed terminal", TIMEOUT);
+        expect(gateway.chatRequests).toHaveLength(turnEnd + 2);
+        expectPromptExtends(gateway.chatRequests[turnEnd].body, gateway.chatRequests[turnEnd + 1].body);
+        const scrollback = await session.captureFullScrollback();
+        expect(scrollback).not.toContain("None of the requested images were read");
+        expect(scrollback).not.toContain("fx_recovery_prompt");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      } finally {
+        if (session) await session.kill();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 4,
   );
 });
 

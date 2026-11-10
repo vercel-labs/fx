@@ -2524,6 +2524,19 @@ fn restoredSteeringChatMessage(text: []const u8) core_types.ChatMessage {
     };
 }
 
+test "saved steering with a half marker comes back as the user's words, never as fx's message" {
+    for ([_][]const u8{
+        "<fx_recovery_prompt>\nnotice with no closing line",
+        "no opening line\n</fx_recovery_prompt>",
+        "<fx_recovery_prompt>\n</fx_recovery_prompt>x",
+    }) |text| {
+        const back = restoredSteeringChatMessage(text);
+        try std.testing.expect(back.restored_steering and !back.recovery_prompt);
+        try std.testing.expectEqualStrings(text, back.content.?);
+        try std.testing.expect(back.context_origin == .user_turn);
+    }
+}
+
 test "a recovery prompt a turn sent after its last step ends the saved turn as the turn sent it" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
