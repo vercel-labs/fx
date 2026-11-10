@@ -917,14 +917,14 @@ pub fn Runtime(comptime App: type) type {
                 };
                 for (listing) |entry| {
                     const child = findChild(app, entry.id) orelse restored: {
+                        const restored_child = try addChild(app, entry.id);
+                        try showSavedTitle(app, host, restored_child);
                         const history = host.childHistory(app.alloc, entry.id) catch |err| {
                             debug_trace.logf("host", "saved reply time unavailable agent={s} err={s}", .{ entry.id, @errorName(err) });
-                            break :restored try addChild(app, entry.id);
+                            break :restored restored_child;
                         };
                         defer types.freeHistoryTurnSlice(app.alloc, history);
-                        const restored_child = try addChild(app, entry.id);
                         restored_child.saved_reply_at_ms = latestReplyAt(history);
-                        try showSavedTitle(app, host, restored_child);
                         break :restored restored_child;
                     };
                     if (child.name.len == 0 and entry.name.len > 0) child.name = try app.alloc.dupe(u8, entry.name);
