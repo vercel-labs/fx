@@ -4408,6 +4408,12 @@ pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
 
 const default_command_output_block_cap: usize = 1024 * 1024;
 const full_transcript_snapshot_clone_max_bytes: usize = 8 * 1024 * 1024;
+/// Saved-history bytes one frame of a resumed transcript writes. A frame is
+/// one synchronized update, and the terminal engine fails on one over 1 MiB
+/// (`max_sync_bytes` in `src/core/terminal/engine.zig`), so `fx replay` could
+/// not read a tape that holds a larger frame. Half of that leaves room for
+/// the row breaks, the viewport, and the footer the frame also writes.
+const resume_publication_bytes_per_frame: usize = 512 * 1024;
 
 pub const PaintTraceState = struct {
     transcript_top: u16 = 0,
@@ -8425,7 +8431,15 @@ pub const TranscriptRuntime = struct {
         semantic_rows: u32,
         semantic_progress_rows: u32,
     ) u16 {
-        const planned = frameInlineScrollBudget(resize_reflow_rows, semantic_rows);
+        const semantic_cap = if (self.notebook.pending_resume_source != null)
+            resumePublicationRowsPerFrame(prepared, source_visual_offset)
+        else
+            std.math.maxInt(u32);
+        const planned = frameInlineScrollBudgetCapped(
+            resize_reflow_rows,
+            semantic_rows,
+            semantic_cap,
+        );
         if (semantic_rows == 0) return planned;
 
         const materialized = self.materializedTranscriptProjection(
@@ -8437,7 +8451,7 @@ pub const TranscriptRuntime = struct {
                 return frameInlineScrollBudgetCapped(
                     resize_reflow_rows,
                     semantic_rows,
-                    projection.visual_rows,
+                    @min(projection.visual_rows, semantic_cap),
                 );
             }
         }
@@ -8467,8 +8481,43 @@ pub const TranscriptRuntime = struct {
         return frameInlineScrollBudgetCapped(
             resize_reflow_rows,
             semantic_rows,
-            projection.visual_rows,
+            @min(projection.visual_rows, semantic_cap),
         );
+    }
+
+    /// How many rows of a resumed transcript one frame writes, starting
+    /// `source_visual_offset` rows into the prepared source: the rows whose
+    /// text fits `resume_publication_bytes_per_frame`, and at least one. A
+    /// line that does not fit is cut at a row, taking its rows to share its
+    /// bytes evenly. There is no limit when everything left fits.
+    fn resumePublicationRowsPerFrame(
+        prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
+        source_visual_offset: u32,
+    ) u32 {
+        const lines = prepared.sourceVisibleLines();
+        const visual_rows = prepared.sourceVisualRows();
+        const line_count = @min(lines.len, visual_rows.len);
+        var line_top: u32 = 0;
+        var rows: u32 = 0;
+        var bytes_left: u64 = resume_publication_bytes_per_frame;
+        for (lines[0..line_count], visual_rows[0..line_count]) |line, line_rows| {
+            const line_end = line_top + line_rows;
+            defer line_top = line_end;
+            if (line_end <= source_visual_offset or line_rows == 0) continue;
+            const pending_rows: u64 = line_end - @max(line_top, source_visual_offset);
+            const line_bytes: u64 = switch (line) {
+                .transcript => |t| t.ref.ref.len,
+                .folded_line => |f| f.text.len,
+            };
+            const pending_bytes = line_bytes * pending_rows / line_rows;
+            if (pending_bytes > bytes_left) {
+                rows += @intCast(bytes_left * pending_rows / pending_bytes);
+                return @max(rows, 1);
+            }
+            bytes_left -= pending_bytes;
+            rows += @intCast(pending_rows);
+        }
+        return std.math.maxInt(u32);
     }
 
     pub fn planTranscriptScroll(
@@ -14075,31 +14124,63 @@ fn frameInlineScrollBudget(resize_reflow_rows: u16, semantic_rows: u32) u16 {
     );
 }
 
-test "pending resume publication plans its whole history in one frame" {
-    const alloc = std.testing.allocator;
-    var runtime: TranscriptRuntime = .{};
+/// The scroll plan for the first frame of a resumed transcript whose saved
+/// flow is `flow`.
+fn pendingResumeFirstFramePlan(alloc: Allocator, flow: []const u8) !TranscriptScrollFacts {
+    const layout = invalidationTestLayout();
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+    };
     defer runtime.deinit(alloc);
-    const prepared = transcript_painter.PreparedTranscriptSurfacePaint{ .selection = .{
-        .top_row = 1,
-        .bottom_row = 1,
-        .start_line = 0,
-        .partial_skip_rows = 0,
-        .line_count = 1,
-    } };
-
-    try std.testing.expectEqual(
-        @as(u16, 1_000),
-        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0),
-    );
     runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
         &runtime,
         alloc,
-        try alloc.dupe(u8, "pending"),
+        try alloc.dupe(u8, flow),
     );
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        &source,
+        .{ .top = 1, .bottom = layout.content_bottom },
+    );
+    defer prepared.deinit(alloc);
+    return runtime.planTranscriptScroll(&prepared);
+}
+
+test "pending resume publication bounds one frame by its history bytes" {
+    const alloc = std.testing.allocator;
+    const line = text_utils.repeat("x", 64) ++ "\n";
+    var flow: std.ArrayList(u8) = .empty;
+    defer flow.deinit(alloc);
+
+    // A history under the budget goes out in one frame.
+    for (0..1_000) |_| try flow.appendSlice(alloc, line);
+    const short = try pendingResumeFirstFramePlan(alloc, flow.items);
+    try std.testing.expect(short.semantic_rows > 0);
+    try std.testing.expectEqual(short.semantic_rows, @as(u32, short.planned_rows));
+
+    // A longer one stops at the row where the budget ends.
+    for (0..19_000) |_| try flow.appendSlice(alloc, line);
+    const long = try pendingResumeFirstFramePlan(alloc, flow.items);
     try std.testing.expectEqual(
-        @as(u16, 1_000),
-        runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0),
+        resume_publication_bytes_per_frame / 64,
+        @as(usize, long.planned_rows),
     );
+    try std.testing.expect(long.semantic_rows > long.planned_rows);
+
+    // One line over the budget is cut at a row inside it.
+    const cols: usize = invalidationTestLayout().cols;
+    const rows_in_budget = resume_publication_bytes_per_frame / cols;
+    flow.clearRetainingCapacity();
+    try flow.appendNTimes(alloc, 'x', 2 * rows_in_budget * cols);
+    try flow.appendSlice(alloc, "\ntail");
+    const wrapped = try pendingResumeFirstFramePlan(alloc, flow.items);
+    try std.testing.expectEqual(rows_in_budget, @as(usize, wrapped.planned_rows));
+    try std.testing.expect(wrapped.semantic_rows > wrapped.planned_rows);
 }
 
 fn frameInlineScrollBudgetCapped(
