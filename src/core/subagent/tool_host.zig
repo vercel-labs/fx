@@ -17,6 +17,7 @@ const model_contract = @import("model_contract.zig");
 const start_test_controls = @import("start_test_controls.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const execution_memory = @import("../agent/execution_memory.zig");
 const io_mod = @import("../shared/io.zig");
 const profiles = @import("../profiles/profiles.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
@@ -1134,13 +1135,32 @@ pub const Runtime = struct {
             self.managedResultText(a, end.child_id, end.work_id) catch null;
         // An empty reply says nothing, so the report reads as if it had none.
         const text = if (saved) |value| (if (value.len > 0) value else null) else null;
-        return switch (end.outcome) {
-            .completed => text orelse "The subagent ended its turn without a reply.",
-            .failed => formatFailedResult(a, if (end.failure) |*failure| failure.view() else null, text),
-            .cancelled => withPartial(a, cancelledSentence(end.end.cause), text),
-            .interrupted => withPartial(a, "fx stopped before it finished.", text),
-            .lost => lost_result,
+        const output = switch (end.outcome) {
+            .completed => return text orelse "The subagent ended its turn without a reply.",
+            .lost => return lost_result,
+            .failed => try formatFailedResult(a, if (end.failure) |*failure| failure.view() else null, text),
+            .cancelled => try withPartial(a, cancelledSentence(end.end.cause), text),
+            .interrupted => try withPartial(a, "fx stopped before it finished.", text),
         };
+        // Work that ended early says what it already changed, so its parent
+        // neither redoes it nor misses it. The list is extra: without it the
+        // report still goes.
+        const changed = (self.changedFiles(a, end.child_id, end.work_id) catch |err| unread: {
+            debug_trace.eventf("mailbox", "report_files_unavailable", .{}, "child={s} work_id={s} err={s}", .{ end.child_id, end.work_id, @errorName(err) });
+            break :unread null;
+        }) orelse return output;
+        return a.print("{s}\n\nFiles it changed before it ended: {s}", .{ output, changed });
+    }
+
+    /// The files work `work_id` changed, from its saved turn
+    /// (`listChangedFiles`).
+    fn changedFiles(self: *Runtime, a: Allocator, child_id: []const u8, work_id: []const u8) !?[]const u8 {
+        const history = try self.children.parent.store.childHistory(a, child_id);
+        return listChangedFiles(a, switch (turnForWork(history, work_id) orelse return null) {
+            .assistant => |value| value.execution.files,
+            .interrupted => |value| value.execution.files,
+            .compacted_summary => return null,
+        });
     }
 
     fn childName(self: *Runtime, a: Allocator, child_id: []const u8) ![]const u8 {
@@ -2957,6 +2977,26 @@ test "the user's close tells main how many of its messages waiting for the subag
     try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
 }
 
+test "an early-ended work names each file it changed once, without reads or failed changes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const file = struct {
+        fn make(path: []const u8, action: types.FileEvidenceAction, status: types.PersistedToolStatus) types.FileEvidence {
+            return .{ .path = @constCast(path), .tool_call_id = @constCast("call"), .tool_name = @constCast("edit_file"), .action = action, .status = status };
+        }
+    }.make;
+    try std.testing.expect((try listChangedFiles(a, &.{file("a.zig", .read, .success)})) == null);
+    const listed = (try listChangedFiles(a, &.{
+        file("a.zig", .read, .success),
+        file("b.zig", .edit, .success),
+        file("c.zig", .write, .failure),
+        file("b.zig", .write, .success),
+        file("d.zig", .write, .success),
+    })).?;
+    try std.testing.expectEqualStrings("b.zig, d.zig", listed);
+}
+
 test "after the user closes a subagent, main's status and the message that starts a new one under its name say so, once" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -3631,19 +3671,36 @@ fn assistantTextForWork(
     history: []const types.HistoryTurn,
     work_id: []const u8,
 ) ?[]const u8 {
+    return switch (turnForWork(history, work_id) orelse return null) {
+        .assistant => |value| value.assistant,
+        .interrupted => |value| value.assistant orelse "",
+        .compacted_summary => null,
+    };
+}
+
+/// The newest saved turn of work `work_id`.
+fn turnForWork(history: []const types.HistoryTurn, work_id: []const u8) ?types.HistoryTurn {
     var index = history.len;
     while (index > 0) {
         index -= 1;
-        const candidate = history[index];
-        const candidate_work_id = session.historyTurnWorkId(candidate) orelse continue;
-        if (!std.mem.eql(u8, candidate_work_id, work_id)) continue;
-        return switch (candidate) {
-            .assistant => |value| value.assistant,
-            .interrupted => |value| value.assistant orelse "",
-            .compacted_summary => null,
-        };
+        const candidate_work_id = session.historyTurnWorkId(history[index]) orelse continue;
+        if (std.mem.eql(u8, candidate_work_id, work_id)) return history[index];
     }
     return null;
+}
+
+/// The files `files` changed, each path once, as one list; null when none.
+/// Only the file tools record changes, so a shell command's are not in it.
+fn listChangedFiles(a: Allocator, files: []const types.FileEvidence) !?[]const u8 {
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (files) |file| {
+        if (file.status != .success or !execution_memory.isMutationFileAction(file.action)) continue;
+        for (paths.items) |known| {
+            if (std.mem.eql(u8, known, file.path)) break;
+        } else try paths.append(a, file.path);
+    }
+    if (paths.items.len == 0) return null;
+    return try std.mem.join(a, ", ", paths.items);
 }
 
 /// Builds the parent-facing guidance for a rejected model override.

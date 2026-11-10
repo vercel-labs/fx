@@ -627,8 +627,8 @@ pub fn Runtime(comptime App: type) type {
                 );
             }
 
-            // The open agent list takes every key first: the agent it shows
-            // is a preview.
+            // The open agent list takes every key first, ahead of the agent
+            // on screen.
             if (ingress.event) |event| {
                 if (try routeAgentsMenuInput(app, event)) return ingress.replay_byte_after_routing;
             }
@@ -1224,6 +1224,7 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             }
             if (try routeMcpHostMenuByte(app, byte)) return true;
+            if (try routeForkQuestionByte(app, agent, byte)) return true;
             if (activeCompactCommandMenu(app)) |menu| {
                 if (byte >= 0x80) {
                     input_reset.resetPendingTextScalarWithTrace(
@@ -1441,7 +1442,7 @@ pub fn Runtime(comptime App: type) type {
                     if (try submitSlashPickerSelection(app, agent)) return;
                     if (comptime runtime_profile.allows(App, .durable_sessions)) {
                         if (try submitSessionPickerSelection(app, agent)) return;
-                        if (try submitForkMenuSelection(app, agent, max_input_len)) return;
+                        if (try submitForkMenuSelection(app, agent, null, max_input_len)) return;
                     }
                     if (try completion_rt.submitFilePickerOnEnter(app, agent, max_input_len)) |result| {
                         if (result == .limit_exceeded) {
@@ -1753,13 +1754,12 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// While the agent list is open it takes every key, ahead of the
-        /// prompts and composer of the agent it shows, which is a preview:
-        /// ↑ and ↓ move and preview, Enter keeps the agent shown, and Esc,
-        /// Ctrl+X, and Ctrl+C go back to the one it opened on. A paste keeps
-        /// the agent shown and lands in its composer, and mouse input passes
-        /// through. Any other key does nothing, so none edits the previewed
-        /// agent's draft or answers its prompt. Returns whether the list
-        /// took `event`.
+        /// prompts and composer of the agent on screen: ↑ and ↓ move the
+        /// highlight, Enter shows the highlighted agent, and Esc, Ctrl+X, and
+        /// Ctrl+C close the list. A paste closes it too, keeping the agent on
+        /// screen, and lands in its composer; mouse input passes through. Any
+        /// other key does nothing, so none edits the agent's draft or answers
+        /// its prompt behind the list. Returns whether the list took `event`.
         fn routeAgentsMenuInput(app: *App, event: input_action.TerminalInputEvent) !bool {
             if (!agentsMenuActive(app)) return false;
             const agent = agents.screenAgentOf(app);
@@ -1794,7 +1794,7 @@ pub fn Runtime(comptime App: type) type {
                         _ = disarmEscapeClear(app);
                     },
                     .paste_start => {
-                        _ = try submitAgentsMenuSelection(app);
+                        _ = try backAgentsMenu(app);
                         return false;
                     },
                     // Replayed as the byte it stands for, which comes back here.
@@ -1806,16 +1806,23 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Forks before the selected prompt and puts its text in the composer.
-        fn submitForkMenuSelection(app: *App, agent: *AppAgent, max_input_len: usize) !bool {
-            if (comptime !@hasDecl(App, "forkBeforeSelectedPrompt")) return false;
+        /// Enter on `/fork`'s prompts (`bring` null), or the answer to its
+        /// question whether the fork takes copies of the subagents (D97).
+        fn submitForkMenuSelection(app: *App, agent: *AppAgent, bring: ?bool, max_input_len: usize) !bool {
+            if (comptime !@hasDecl(App, "submitForkMenu")) return false;
             if (!forkMenuActive(agent)) return false;
-            const prompt = app.forkBeforeSelectedPrompt(agent) catch |err| {
+            const forked = app.submitForkMenu(agent, bring) catch |err| {
                 debug_trace.logf("session", "fork failed err={s}", .{@errorName(err)});
                 try app.writeDomainNotice(.{
                     .topic = "session",
                     .tone = .@"error",
                     .body = "Unable to fork the session.",
                 }, true);
+                app.shell.render_requests.request(.footer);
+                return true;
+            };
+            // The menu asks its question first.
+            const prompt = forked orelse {
                 app.shell.render_requests.request(.footer);
                 return true;
             };
@@ -1870,6 +1877,45 @@ pub fn Runtime(comptime App: type) type {
         fn sessionMenuActive(agent: *AppAgent) bool {
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
             return agent.session_persistence.session_picker.active;
+        }
+
+        /// While `/fork` asks whether the fork takes copies of the session's
+        /// subagents (D97), Enter or y answers yes and n answers no; Esc
+        /// also answers no (`answerForkQuestionOnEscape`). Other printable
+        /// bytes are dropped with a trace line, so a stray key never forks;
+        /// control bytes pass, so Ctrl+C still works.
+        fn routeForkQuestionByte(app: *App, agent: *AppAgent, byte: u8) !bool {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (!agent.session_persistence.fork_menu.asking()) return false;
+            const bring: ?bool = switch (byte) {
+                '\r', 'y', 'Y' => true,
+                'n', 'N' => false,
+                else => null,
+            };
+            if (bring) |yes| {
+                _ = try submitForkMenuSelection(app, agent, yes, forkPromptLimit());
+                return true;
+            }
+            if (byte < 0x20) return false;
+            if (byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(&app.input_runtime.text_scalar, "fork_question");
+            debug_trace.logf("input", "fork question ignored byte=0x{x} reason=not_an_answer", .{byte});
+            return true;
+        }
+
+        fn answerForkQuestionOnEscape(app: *App, agent: *AppAgent) !bool {
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+            if (!agent.session_persistence.fork_menu.asking()) return false;
+            return submitForkMenuSelection(app, agent, false, forkPromptLimit());
+        }
+
+        /// The composer's limit, which the fork's restored prompt keeps.
+        fn forkPromptLimit() usize {
+            return if (comptime @hasDecl(App, "input_limits"))
+                App.input_limits.composer_bytes
+            else
+                std.math.maxInt(usize);
         }
 
         fn forkMenuActive(agent: *AppAgent) bool {
@@ -2868,11 +2914,16 @@ pub fn Runtime(comptime App: type) type {
 
         fn resolveEscape(app: *App, agent: *AppAgent, was_cancel_pending: bool, now: i64) !void {
             if (try full_transcript_rt.routeAction(app, agent, .escape)) return;
-            // Ahead of the prompts: the open agent list shows `agent` only as
-            // a preview, and Esc goes back from it.
+            // Ahead of the prompts: Esc closes the open agent list first.
             if (try backAgentsMenu(app)) {
                 _ = disarmEscapeClear(app);
                 _ = disarmEscapeInterrupt(app, "menu");
+                return;
+            }
+            // Esc answers `/fork`'s question: fork without the subagents (D97).
+            if (try answerForkQuestionOnEscape(app, agent)) {
+                _ = disarmEscapeClear(app);
+                _ = disarmEscapeInterrupt(app, "fork_question");
                 return;
             }
             if (was_cancel_pending) {

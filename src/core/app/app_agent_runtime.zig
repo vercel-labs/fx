@@ -499,13 +499,26 @@ pub fn Runtime(comptime App: type) type {
             ctx.model_override_resolver = app_callbacks.Bindings(App).modelOverrideResolver(agent);
             // An instance whose profile names its MCP servers uses only those.
             // A subagent's run replaces this with its own view below.
-            if (comptime agents.hasAgentField(App, "profile") and agents.hasAgentField(App, "role")) {
-                if (agent.role == .instance and profiles.setsMcpServers(&agent.profile.profile)) {
-                    ctx.mcp_access = .{ .servers = .{ .context = @ptrCast(&agent.profile.profile), .allows_fn = profileAllowsMcpServer } };
-                }
+            if (instanceMcpProfile(agent)) |profile| {
+                ctx.mcp_access = .{ .servers = .{ .context = @ptrCast(profile), .allows_fn = profileAllowsMcpServer } };
             }
             if (childRun(agent)) |run| applyChildToolContext(app, &ctx, run);
             return ctx;
+        }
+
+        /// The profile of an instance that names its MCP servers; null otherwise.
+        fn instanceMcpProfile(agent: *const AppAgent) ?*const profiles.Profile {
+            if (comptime !(agents.hasAgentField(App, "profile") and agents.hasAgentField(App, "role"))) return null;
+            if (agent.role != .instance or !profiles.setsMcpServers(&agent.profile.profile)) return null;
+            return &agent.profile.profile;
+        }
+
+        /// The servers in `names` that `profile` allows; all of them without one.
+        fn allowedMcpServers(arena: Allocator, names: []const []const u8, profile: ?*const profiles.Profile) ![]const []const u8 {
+            const value = profile orelse return names;
+            var kept: std.ArrayList([]const u8) = .empty;
+            for (names) |name| if (profiles.allowsMcpServer(value, name)) try kept.append(arena, name);
+            return kept.items;
         }
 
         /// Whether the instance profile at `raw` allows MCP server `server`.
@@ -1180,11 +1193,12 @@ pub fn Runtime(comptime App: type) type {
                 &tool_projection,
                 session_child_capability,
             );
-            // The toolbox menu lists the configured MCP servers, by name.
+            // The toolbox menu lists the MCP servers the agent may call, by name.
             var toolbox_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer toolbox_arena_state.deinit();
             if (comptime @hasDecl(App, "mcpServerNames")) {
-                config.toolbox_mcp_servers = try app.mcpServerNames(toolbox_arena_state.allocator());
+                const toolbox_arena = toolbox_arena_state.allocator();
+                config.toolbox_mcp_servers = try allowedMcpServers(toolbox_arena, try app.mcpServerNames(toolbox_arena), instanceMcpProfile(agent));
             }
             if (comptime @hasField(App, "toolbox_behind")) config.toolbox_behind = app.toolbox_behind.slice();
             // A subagent is shown only the built-in tools its run was admitted

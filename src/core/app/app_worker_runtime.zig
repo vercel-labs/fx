@@ -977,7 +977,7 @@ pub fn Runtime(comptime App: type) type {
             }
             const compaction_active = if (compaction.operation) |op| op.active() and op.visible(now_ms) else false;
             if (!compaction_active and !agent.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) {
-                return false;
+                return advanceSubagentWaitBlink(app, agent, now_ms);
             }
             if (agent.approval_prompt.isActive() or
                 agent.question_prompt.isActive() or
@@ -996,6 +996,23 @@ pub fn Runtime(comptime App: type) type {
                 .{ previous_deadline, now_ms, render_request.animation_interval_ms },
             );
             return true;
+        }
+
+        /// Keeps frames coming while the idle agent on screen shows "waiting
+        /// on N subagents", so its bullet blinks like a turn's.
+        fn advanceSubagentWaitBlink(app: *App, agent: *AppAgent, now_ms: i64) bool {
+            if (comptime !@hasDecl(App, "subagentWaitCount")) return false;
+            if (offScreen(app, agent)) return false;
+            if (agent.approval_prompt.isActive() or agent.question_prompt.isActive() or !app.shell.shimmer_active) return false;
+            // A worker status, such as a failed request, shows in its place.
+            switch (app.shell.activityProjection()) {
+                .turn_thinking => |thinking| if (thinking.tone != .thinking) return false,
+                .none, .tool_slot => {},
+            }
+            // Counting walks every subagent, so wait until a frame is due.
+            if (!app.shell.render_requests.animationDue(now_ms)) return false;
+            if (app.subagentWaitCount() == 0) return false;
+            return app.shell.render_requests.requestAnimationDue(now_ms);
         }
 
         fn activityShimmerLabel(

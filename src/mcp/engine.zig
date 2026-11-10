@@ -351,8 +351,8 @@ pub const Engine = struct {
         return s.revoking();
     }
 
-    /// The status server `name`'s last sign-out revocation was answered
-    /// with, 0 when it couldn't be sent or read; null before an answer.
+    /// Server `name`'s `Server.revocationAnswer`; null when no server `name`
+    /// is running.
     pub fn revocationAnswer(e: *Engine, name: []const u8) ?u16 {
         const s = (e.find(name) catch return null).server orelse return null;
         return s.revocationAnswer();
