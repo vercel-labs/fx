@@ -10,6 +10,7 @@ const runtime_deps = @import("deps.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 
 const Allocator = std.mem.Allocator;
+const json_decode = @import("../../shared/json_decode.zig");
 const ChatMessage = types.ChatMessage;
 const PermissionGrant = types.PermissionGrant;
 const ToolCall = types.ToolCall;
@@ -25,7 +26,6 @@ pub fn isReadOnlyCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
         .read_file,
         .read_tool_result,
         .grep_files,
-        .skill,
         .web_fetch,
         .web_search,
         => tool.activity_kind == .read,
@@ -45,9 +45,39 @@ fn isSubagentCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
     return tool.executor_kind == .subagent and tool.activity_kind == .subagent;
 }
 
-fn parallelSubagentPrefixLen(registry: tool_dispatch.Registry, calls: []const ToolCall) usize {
+/// The subagent a subagent call goes to: `none` for a call that names none,
+/// such as a wait, and `unknown` when its arguments can't be read.
+const SubagentTarget = union(enum) { none, named: []const u8, unknown };
+
+fn subagentTarget(arena: Allocator, call: ToolCall) SubagentTarget {
+    if (call.argument_integrity != .valid) return .unknown;
+    const Arguments = struct { request: ?struct { agent: ?[]const u8 = null } = null };
+    const parsed = json_decode.parseFromSliceLeaky(Arguments, arena, call.arguments_json, .{ .ignore_unknown_fields = true }) catch return .unknown;
+    const request = parsed.request orelse return .unknown;
+    return if (request.agent) |agent| .{ .named = agent } else .none;
+}
+
+/// Leading subagent calls that may run together. Calls to one subagent run
+/// in the order written, so the group ends before a call to a subagent
+/// already in it, and a call whose subagent can't be read runs alone
+/// (`tests/tla/subagent/StopMessage.tla` StopRunsFirst). `alloc` holds the
+/// names only while the group is formed.
+fn parallelSubagentPrefixLen(alloc: Allocator, registry: tool_dispatch.Registry, calls: []const ToolCall) usize {
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var named: std.ArrayList([]const u8) = .empty;
     var len: usize = 0;
-    while (len < calls.len and isSubagentCall(registry, calls[len])) : (len += 1) {}
+    while (len < calls.len and isSubagentCall(registry, calls[len])) : (len += 1) {
+        switch (subagentTarget(arena, calls[len])) {
+            .none => {},
+            .unknown => return if (len == 0) 1 else len,
+            .named => |name| {
+                for (named.items) |seen| if (std.mem.eql(u8, seen, name)) return len;
+                named.append(arena, name) catch return if (len == 0) 1 else len;
+            },
+        }
+    }
     return len;
 }
 
@@ -79,12 +109,13 @@ pub const LeadingGroup = struct {
 };
 
 pub fn leadingParallelGroup(
+    alloc: Allocator,
     registry: tool_dispatch.Registry,
     calls: []const ToolCall,
 ) LeadingGroup {
     const read_only_len = parallelReadOnlyPrefixLen(registry, calls);
     if (read_only_len > 0) return .{ .kind = .read_only, .len = read_only_len };
-    const subagent_len = parallelSubagentPrefixLen(registry, calls);
+    const subagent_len = parallelSubagentPrefixLen(alloc, registry, calls);
     if (subagent_len > 0) return .{ .kind = .subagent, .len = subagent_len };
     const host_len = parallelHostPrefixLen(registry, calls);
     if (host_len > 0) return .{ .kind = .host, .len = host_len };
@@ -123,6 +154,8 @@ pub const ParallelHookExecContext = struct {
     permission_mode: types.PermissionMode,
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
+    toolbox_behind: []const []const u8 = &.{},
+    toolbox_mcp_servers: []const []const u8 = &.{},
     classification_complete: []const bool = &.{},
     presentation_group_id: ?types.ToolPresentationGroupId = null,
 };
@@ -368,6 +401,8 @@ pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, in
         .session_grants = exec_ctx.session_grants,
         .advertised_dynamic_tool_names = exec_ctx.advertised_dynamic_tool_names,
         .max_tool_result_bytes = exec_ctx.max_tool_result_bytes,
+        .toolbox_behind = exec_ctx.toolbox_behind,
+        .toolbox_mcp_servers = exec_ctx.toolbox_mcp_servers,
         .classification_complete = index < exec_ctx.classification_complete.len and
             exec_ctx.classification_complete[index],
         .lifecycle_id = .{ .turn_id = exec_ctx.turn_id, .call_id = call.id },
@@ -679,12 +714,12 @@ test "host calls run together until a writer, which runs alone" {
     };
 
     const expected_first: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 2 };
-    try std.testing.expectEqual(expected_first, leadingParallelGroup(registry, &calls));
+    try std.testing.expectEqual(expected_first, leadingParallelGroup(std.testing.allocator, registry, &calls));
     // The writer is a fence: no group includes it, and the call after it
     // starts a new group.
-    try std.testing.expectEqual(LeadingGroup{}, leadingParallelGroup(registry, calls[2..]));
+    try std.testing.expectEqual(LeadingGroup{}, leadingParallelGroup(std.testing.allocator, registry, calls[2..]));
     const expected_last: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 1 };
-    try std.testing.expectEqual(expected_last, leadingParallelGroup(registry, calls[3..]));
+    try std.testing.expectEqual(expected_last, leadingParallelGroup(std.testing.allocator, registry, calls[3..]));
 }
 
 test "a host group holds at most max_parallel_host_calls calls" {
@@ -700,9 +735,9 @@ test "a host group holds at most max_parallel_host_calls calls" {
     for (&calls) |*call| call.* = toolCall("call", "read", "{}");
 
     const expected: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = max_parallel_host_calls };
-    try std.testing.expectEqual(expected, leadingParallelGroup(registry, &calls));
+    try std.testing.expectEqual(expected, leadingParallelGroup(std.testing.allocator, registry, &calls));
     const rest: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 4 };
-    try std.testing.expectEqual(rest, leadingParallelGroup(registry, calls[max_parallel_host_calls..]));
+    try std.testing.expectEqual(rest, leadingParallelGroup(std.testing.allocator, registry, calls[max_parallel_host_calls..]));
 }
 
 test "parallel classifier keeps one leading registered subagent group" {
@@ -718,7 +753,7 @@ test "parallel classifier keeps one leading registered subagent group" {
         toolCall("read_1", "read_file", "{\"path\":\"README.md\"}"),
     };
 
-    const group = leadingParallelGroup(registry, &calls);
+    const group = leadingParallelGroup(std.testing.allocator, registry, &calls);
     try std.testing.expectEqual(GroupKind.subagent, group.kind);
     try std.testing.expectEqual(@as(usize, 2), group.len);
 }
@@ -738,25 +773,10 @@ test "parallel classifier admits approval-bearing web fetch read groups" {
     try std.testing.expectEqual(@as(usize, 2), parallelReadOnlyPrefixLen(registry, &calls));
 }
 
-test "parallel classifier admits installed skill reads" {
-    const builtin_tools = @import("../../../builtins/tools.zig");
-    const tools = [_]tool_dispatch.Tool{builtin_tools.skill};
-    const registry = tool_dispatch.Registry{ .tools = &tools };
-    const calls = [_]ToolCall{toolCall(
-        "skill_1",
-        "skill",
-        "{\"name\":\"demo\",\"location\":\"/tmp/demo\",\"resource\":\"SKILL.md\"}",
-    )};
-
-    try std.testing.expectEqual(@as(usize, 1), parallelReadOnlyPrefixLen(registry, &calls));
-    try std.testing.expect(isReadOnlyCall(registry, calls[0]));
-}
-
 test "parallel classifier rejects prompts approvals dynamic tools and mutations" {
     const builtin_tools = @import("../../../builtins/tools.zig");
     const tools = [_]tool_dispatch.Tool{
         builtin_tools.ask_user_question,
-        builtin_tools.mcp_select_tool,
         builtin_tools.subagent,
         builtin_tools.install_skill,
         builtin_tools.shell,
@@ -765,7 +785,6 @@ test "parallel classifier rejects prompts approvals dynamic tools and mutations"
     const registry = tool_dispatch.Registry{ .tools = &tools };
     const cases = [_]ToolCall{
         toolCall("ask_1", "ask_user_question", "{\"questions\":[]}"),
-        toolCall("mcp_1", "mcp_select_tool", "{\"name\":\"tool\"}"),
         toolCall("subagent_1", "subagent", "{\"command\":{\"inspect\":{\"id\":\"01J00000000000000000000000\",\"sections\":[\"status\"]}}}"),
         toolCall("skill_1", "install_skill", "{\"source\":\"repo\"}"),
         toolCall("browser_1", "browser_snapshot", "{}"),
@@ -1049,4 +1068,77 @@ test "parallel result duplication cleans up every allocation failure" {
         checkParallelResultDuplicationAllocationFailures,
         .{},
     );
+}
+
+test "fuzzed subagent calls never run two calls to one subagent at once" {
+    try std.testing.fuzz({}, fuzzSubagentGroups, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "\x00",
+            "\x01\x00",
+            "\x00\x04\x00",
+            "\x02\x02\x00\x04\x08\x0c\x00",
+            "\x03\x00\x07\x04\x0b\x0f",
+        }) ++ @import("fuzz_corpus").subagent_parallel_groups.*),
+    });
+}
+
+/// Each byte is one call of a step. Its low two bits pick a message (0), a
+/// stop (1), or a wait (2) to agent `a0`..`a3` named by the next two bits,
+/// or (3) one of: arguments that aren't JSON, a message to `a1` spelled with
+/// a JSON escape, a message to the parent, or a read_file call. The leading
+/// subagent group must stop before a call to an agent already in it, and a
+/// call whose agent can't be read runs alone, so calls to one subagent run
+/// in the order written (`tests/tla/subagent/StopMessage.tla` StopRunsFirst).
+fn fuzzSubagentGroups(_: void, smith: *std.testing.Smith) anyerror!void {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{ builtin_tools.subagent, builtin_tools.read_file };
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var calls: std.ArrayList(ToolCall) = .empty;
+    const Target = union(enum) { none, named: []const u8, unknown, other };
+    var targets: std.ArrayList(Target) = .empty;
+    var bytes: [64]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&bytes));
+    const input = bytes[0..len];
+    for (input, 0..) |byte, index| {
+        const agent = try arena.print("a{d}", .{(byte >> 2) & 3});
+        const id = try arena.print("call_{d}", .{index});
+        const call: ToolCall, const target: Target = switch (byte & 3) {
+            0 => .{ toolCall(id, "subagent", try arena.print("{{\"request\":{{\"action\":\"message\",\"agent\":\"{s}\",\"message\":\"m\"}}}}", .{agent})), .{ .named = agent } },
+            1 => .{ toolCall(id, "subagent", try arena.print("{{\"request\":{{\"action\":\"stop\",\"agent\":\"{s}\"}}}}", .{agent})), .{ .named = agent } },
+            2 => .{ toolCall(id, "subagent", "{\"request\":{\"action\":\"wait\"}}"), .none },
+            else => switch ((byte >> 2) & 3) {
+                0 => .{ toolCall(id, "subagent", "{\"request\":"), .unknown },
+                1 => .{ toolCall(id, "subagent", "{\"request\":{\"action\":\"message\",\"agent\":\"a\\u0031\",\"message\":\"m\"}}"), .{ .named = "a1" } },
+                2 => .{ toolCall(id, "subagent", "{\"request\":{\"action\":\"message\",\"agent\":\"parent\",\"message\":\"m\"}}"), .{ .named = "parent" } },
+                else => .{ toolCall(id, "read_file", "{\"path\":\"README.md\"}"), .other },
+            },
+        };
+        try calls.append(arena, call);
+        try targets.append(arena, target);
+    }
+    if (calls.items.len == 0 or targets.items[0] == .other) return;
+    var expected: usize = 0;
+    var named: std.ArrayList([]const u8) = .empty;
+    group: for (targets.items, 0..) |target, index| {
+        switch (target) {
+            .other => break,
+            .none => {},
+            .unknown => {
+                if (index == 0) expected = 1;
+                break;
+            },
+            .named => |name| {
+                for (named.items) |seen| if (std.mem.eql(u8, seen, name)) break :group;
+                try named.append(arena, name);
+            },
+        }
+        expected = index + 1;
+    }
+    const group = leadingParallelGroup(std.testing.allocator, registry, calls.items);
+    try std.testing.expectEqual(GroupKind.subagent, group.kind);
+    try std.testing.expectEqual(expected, group.len);
 }

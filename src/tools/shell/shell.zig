@@ -94,27 +94,49 @@ pub fn actionFieldContract(action: Action) ActionFieldContract {
 
 /// Names the action of a call that omits `action` when exactly one action
 /// takes every field it sends and gets every field it requires. Fields that
-/// decode treats as absent, null or the text "null", are ignored. A bare
-/// session_id fits both interact and stop, so it names neither. The
-/// orchestrator adds the result before the call is stored or admitted, so
-/// permission admission and decode read the same arguments
+/// decode treats as absent, null or the text "null", are ignored. When no
+/// action fits, a second pass also ignores known fields set to an empty
+/// value that the action does not take, which decode drops for that action;
+/// a call that fits today keeps its action. A bare session_id fits both
+/// interact and stop, so it names neither. The orchestrator adds the result
+/// before the call is stored or admitted, so permission admission and decode
+/// read the same arguments
 /// (`tests/tla/shell_command/ShellContract.tla` AdmissionConsistency).
 pub fn inferAction(object: std.json.ObjectMap) ?[]const u8 {
     if (object.get("action") != null) return null;
-    var found: ?Action = null;
-    for (std.enums.values(Action)) |action| {
-        if (!fieldsFitAction(object, actionFieldContract(action))) continue;
-        if (found != null) return null;
-        found = action;
-    }
-    return if (found) |action| @tagName(action) else null;
+    return switch (fittingAction(object, .counted)) {
+        .one => |action| @tagName(action),
+        .several => null,
+        .none => switch (fittingAction(object, .ignored_outside_action)) {
+            .one => |action| @tagName(action),
+            .several, .none => null,
+        },
+    };
 }
 
-fn fieldsFitAction(object: std.json.ObjectMap, contract: ActionFieldContract) bool {
+const Fit = union(enum) { none, one: Action, several };
+
+/// Whether an empty field the action does not take stops the action from
+/// fitting (`counted`) or is skipped as decode would drop it.
+const EmptyFields = enum { counted, ignored_outside_action };
+
+fn fittingAction(object: std.json.ObjectMap, empty_fields: EmptyFields) Fit {
+    var found: ?Action = null;
+    for (std.enums.values(Action)) |action| {
+        if (!fieldsFitAction(object, actionFieldContract(action), empty_fields)) continue;
+        if (found != null) return .several;
+        found = action;
+    }
+    return if (found) |action| .{ .one = action } else .none;
+}
+
+fn fieldsFitAction(object: std.json.ObjectMap, contract: ActionFieldContract, empty_fields: EmptyFields) bool {
     var fields = object.iterator();
     while (fields.next()) |entry| {
         if (isAbsentValue(entry.value_ptr.*)) continue;
-        if (!containsFieldName(contract.allowed, entry.key_ptr.*)) return false;
+        if (containsFieldName(contract.allowed, entry.key_ptr.*)) continue;
+        if (empty_fields == .ignored_outside_action and isDroppableOutsideAction(entry.key_ptr.*, entry.value_ptr.*)) continue;
+        return false;
     }
     for (contract.required) |name| {
         if (std.mem.eql(u8, name, "action")) continue;
@@ -127,6 +149,60 @@ fn fieldsFitAction(object: std.json.ObjectMap, contract: ActionFieldContract) bo
 fn isAbsentValue(value: std.json.Value) bool {
     return value == .null or
         (value == .string and tool_args.isNullPlaceholderText(value.string));
+}
+
+/// A known shell field with an empty value (`tool_args.isEmptyArgumentValue`)
+/// means the same as leaving it out for an action that does not take it.
+/// Unknown names still reach the field check, since they can carry intent
+/// that dropping would lose.
+fn isDroppableOutsideAction(name: []const u8, value: std.json.Value) bool {
+    return containsFieldName(public_field_names[1..], name) and tool_args.isEmptyArgumentValue(value);
+}
+
+/// A run without a terminal uses the login shell and `profile`, which is
+/// also what permission admission checks, and `shell` applies only with
+/// tty=true. Some models send a `shell` that names the login shell anyway,
+/// often beside `profile`; that `shell` changes nothing, so it is dropped
+/// rather than rejected or reported as a conflict. It stays when it names
+/// another shell, or when its clean_start asks for a clean start that
+/// `profile` does not, since running then would not do what was asked.
+fn elideLoginShellOnPlainRun(object: *std.json.ObjectMap, action: Action, login_shell: ?[]const u8) void {
+    if (action != .run) return;
+    const login = login_shell orelse return;
+    if (object.get("tty")) |tty| if (tty != .bool or tty.bool) return;
+    const profile: ?[]const u8 = if (object.get("profile")) |value| switch (value) {
+        .string => |text| text,
+        else => return,
+    } else null;
+    const shell = object.get("shell") orelse return;
+    if (shell != .object) return;
+    const kind = shell.object.get("kind") orelse return;
+    const path = shell.object.get("path") orelse return;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "executable")) return;
+    if (path != .string or !std.mem.eql(u8, path.string, login)) return;
+    for (shell.object.keys()) |member| {
+        if (!std.mem.eql(u8, member, "kind") and !std.mem.eql(u8, member, "path") and !std.mem.eql(u8, member, "clean_start")) return;
+    }
+    if (shell.object.get("clean_start")) |clean_start| {
+        if (clean_start != .bool) return;
+        if (clean_start.bool and !std.mem.eql(u8, profile orelse "user", "clean")) return;
+    }
+    debug_trace.logf(
+        "shell",
+        "run without tty ignored shell field: it names the login shell path=\"{f}\"",
+        .{std.zig.fmtString(login)},
+    );
+    _ = object.orderedRemove("shell");
+}
+
+/// Drops the empty fields `isDroppableOutsideAction` describes for `action`.
+fn elideEmptyFieldsOutsideAction(object: *std.json.ObjectMap, action: Action) void {
+    const allowed = actionFieldContract(action).allowed;
+    for (public_field_names[1..]) |field_name| {
+        if (containsFieldName(allowed, field_name)) continue;
+        const value = object.get(field_name) orelse continue;
+        if (isDroppableOutsideAction(field_name, value)) _ = object.orderedRemove(field_name);
+    }
 }
 
 fn containsFieldName(names: []const []const u8, name: []const u8) bool {
@@ -144,6 +220,16 @@ test "inferAction names the one action a call's fields fit" {
         .{ .args = "{\"session_id\":\"shell-1\",\"chars\":\"y\\n\"}", .action = "interact" },
         .{ .args = "{\"session_id\":\"shell-1\",\"yield_time_ms\":5000}", .action = "interact" },
         .{ .args = "{\"session_id\":\"shell-1\",\"force\":true}", .action = "stop" },
+        // Empty fields that only another action takes ask for nothing.
+        .{ .args = "{\"command\":\"ls\",\"chars\":\"\",\"session_id\":\"\",\"force\":false,\"reload\":false}", .action = "run" },
+        // A call that fits under the strict pass keeps that action.
+        .{ .args = "{\"session_id\":\"shell-1\",\"chars\":\"\"}", .action = "interact" },
+        .{ .args = "{\"session_id\":\"shell-1\",\"force\":false}", .action = "stop" },
+        // Ignoring an empty command still leaves session_id fitting two actions.
+        .{ .args = "{\"session_id\":\"shell-1\",\"command\":\"\"}", .action = null },
+        // Unknown names and set values are never dropped.
+        .{ .args = "{\"command\":\"ls\",\"note\":\"\"}", .action = null },
+        .{ .args = "{\"command\":\"ls\",\"chars\":\"y\"}", .action = null },
         // A bare session_id could observe or stop the session.
         .{ .args = "{\"session_id\":\"shell-1\"}", .action = null },
         // A command beside a session could start one or write to one.
@@ -211,6 +297,9 @@ fn decode_input(
     const action = std.meta.stringToEnum(Action, raw_action.string) orelse
         return null;
     elideKnownNullFields(&raw.object);
+    elideEmptyFieldsOutsideAction(&raw.object, action);
+    var login_shell_buffer: [4096]u8 = undefined;
+    elideLoginShellOnPlainRun(&raw.object, action, shell_resolver.configuredLoginShellInto(&login_shell_buffer));
 
     var correction_scratch: ActionFieldCorrectionScratch = .{};
     defer correction_scratch.deinit(ctx.allocator);
@@ -337,6 +426,9 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
         try object.put(arena, "action", .{ .string = "run" });
         break :blk .run;
     };
+    elideEmptyFieldsOutsideAction(&object, action);
+    var login_shell_buffer: [4096]u8 = undefined;
+    elideLoginShellOnPlainRun(&object, action, shell_resolver.configuredLoginShellInto(&login_shell_buffer));
 
     var scratch: ActionFieldCorrectionScratch = .{};
     if (try actionFieldCorrection(arena, action, object, &scratch)) |correction| {
@@ -1788,6 +1880,9 @@ fn shellParseRetryGuidance(output: []const u8, whole_output: bool) ?[]const u8 {
 // snapshot, bash names the script it sources from `/dev/fd/0`
 // (`snapshotScript` in shell_resolver.zig), followed by `eval:`. Anchoring
 // bash to that path keeps the `eval` errors of a script the command runs out.
+// bash 3.2 evaluates the snapshot script instead of sourcing it
+// (`snapshotInvocation`), so it names the shell, which the basename match
+// covers.
 fn shellErrorFamily(line: []const u8) ?ShellFamily {
     const colon = std.mem.findScalar(u8, line, ':') orelse return null;
     const token = line[0..colon];
@@ -2103,7 +2198,10 @@ test "shell request correction suggests only unambiguous repairs without executi
         .{ .input = "{\"session_id\":\"shell-3\"}", .retry = null },
         .{ .input = "{\"command\":\"true\",\"session_id\":\"shell-3\"}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":true}", .retry = null },
-        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"}}", .retry = null },
+        // A shell that is no host's login shell: the decoder drops a `shell`
+        // naming the login shell on a run without a terminal, so a common path
+        // such as /bin/bash would make this case depend on the host.
+        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/opt/example/bin/bash\"}}", .retry = null },
         .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":\"1000\",\"timeout_ms\":0}}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":4294967296}", .retry = null },
         .{ .input = "{\"action\":\"stop\",\"session_id\":\"shell-3\",\"force\":\"true\"}", .retry = null },
@@ -2339,6 +2437,104 @@ test "shell decoder preserves null omission and rejects cross action fields" {
             try std.testing.expect(std.mem.find(u8, failure, "invalid_shell_request") != null);
         },
     }
+}
+
+/// Decodes arguments a test expects to decode, printing the failure text
+/// when they do not.
+fn decodeOrFail(ctx: tool_dispatch.DispatchContext, args_json: []const u8) !tool_dispatch.ToolInput {
+    return switch (try decode(ctx, args_json)) {
+        .input => |input| input,
+        .failure => |failure| {
+            defer ctx.allocator.free(failure);
+            std.debug.print("{s}\n", .{failure});
+            return error.TestUnexpectedResult;
+        },
+    };
+}
+
+test "shell decoder drops empty fields the action does not take" {
+    const alloc = std.testing.allocator;
+    const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
+    // Every advertised field filled in, the unused ones empty.
+    {
+        const input = try decodeOrFail(
+            ctx,
+            "{\"action\":\"run\",\"command\":\"true\",\"chars\":\"\",\"session_id\":\"\",\"force\":false,\"reload\":false,\"tty\":false}",
+        );
+        defer input.deinit(alloc);
+        const value = input.as(OwnedInput).value;
+        try std.testing.expect(isCapturedCommand(input));
+        try std.testing.expect(value.chars == null and value.session_id == null and !value.force);
+    }
+    {
+        const stop = try decodeOrFail(ctx, "{\"action\":\"stop\",\"session_id\":\"shell-1\",\"command\":\"\",\"tty\":false}");
+        defer stop.deinit(alloc);
+        try std.testing.expectEqual(Action.stop, stop.as(OwnedInput).value.action);
+    }
+    // Text to type, a true flag, or an unknown name still does not belong to run.
+    for ([_][]const u8{
+        "{\"action\":\"run\",\"command\":\"true\",\"chars\":\"y\"}",
+        "{\"action\":\"run\",\"command\":\"true\",\"force\":true}",
+        "{\"action\":\"run\",\"command\":\"true\",\"note\":\"\"}",
+    }) |args| {
+        switch (try decode(ctx, args)) {
+            .input => |input| {
+                defer input.deinit(alloc);
+                return error.TestUnexpectedResult;
+            },
+            .failure => |failure| {
+                defer alloc.free(failure);
+                try std.testing.expect(std.mem.find(u8, failure, "invalid_shell_request") != null);
+            },
+        }
+    }
+}
+
+test "a login shell on a run without a terminal is dropped" {
+    const alloc = std.testing.allocator;
+    const Case = struct { args: []const u8, dropped: bool };
+    const cases = [_]Case{
+        .{ .args = "{\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\"},\"tty\":false}", .dropped = true },
+        .{ .args = "{\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\",\"clean_start\":true}}", .dropped = true },
+        .{ .args = "{\"profile\":\"user\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\"}}", .dropped = true },
+        // A clean start that profile does not ask for would be lost.
+        .{ .args = "{\"profile\":\"user\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\",\"clean_start\":true}}", .dropped = false },
+        // Without profile, the login shell with a default start changes nothing.
+        .{ .args = "{\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\"}}", .dropped = true },
+        .{ .args = "{\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\",\"clean_start\":false},\"tty\":false}", .dropped = true },
+        .{ .args = "{\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\",\"clean_start\":true}}", .dropped = false },
+        // Another shell or a terminal keeps shell and its checks.
+        .{ .args = "{\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"}}", .dropped = false },
+        .{ .args = "{\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"}}", .dropped = false },
+        .{ .args = "{\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\"},\"tty\":true}", .dropped = false },
+        .{ .args = "{\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\",\"extra\":1}}", .dropped = false },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.args, .{});
+        defer parsed.deinit();
+        elideLoginShellOnPlainRun(&parsed.value.object, .run, "/bin/zsh");
+        try std.testing.expectEqual(!case.dropped, parsed.value.object.contains("shell"));
+    }
+    // Only run takes the change, and no login shell means nothing to compare.
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cases[0].args, .{});
+    defer parsed.deinit();
+    elideLoginShellOnPlainRun(&parsed.value.object, .interact, "/bin/zsh");
+    elideLoginShellOnPlainRun(&parsed.value.object, .run, null);
+    try std.testing.expect(parsed.value.object.contains("shell"));
+}
+
+test "shell decoder runs a call that names the login shell" {
+    const alloc = std.testing.allocator;
+    var login_shell_buffer: [4096]u8 = undefined;
+    const login = shell_resolver.configuredLoginShellInto(&login_shell_buffer) orelse return error.SkipZigTest;
+    const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
+    const args = try std.mem.concat(alloc, u8, &.{ "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"", login, "\"},\"tty\":false}" });
+    defer alloc.free(args);
+    const input = try decodeOrFail(ctx, args);
+    defer input.deinit(alloc);
+    const value = input.as(OwnedInput).value;
+    try std.testing.expect(value.shell == null);
+    try std.testing.expectEqual(command_environment.Profile.clean, value.profile.?);
 }
 
 test "shell decoder applies action specific observation defaults" {
@@ -2777,6 +2973,11 @@ test "failure guidance detectors match only their signatures" {
     try std.testing.expectEqual(
         line_shell_parse_retry_guidance,
         failureRetryGuidance(1, "/dev/fd/0: eval: line 40: unexpected EOF while looking for matching `\"'\n", true),
+    );
+    // bash 3.2 evaluates the snapshot script, so it names the shell instead.
+    try std.testing.expectEqual(
+        line_shell_parse_retry_guidance,
+        failureRetryGuidance(1, "/bin/bash: eval: line 11: unexpected EOF while looking for matching `\"'\n/bin/bash: eval: line 12: syntax error: unexpected end of file\n", true),
     );
     try std.testing.expectEqual(
         line_shell_parse_retry_guidance,

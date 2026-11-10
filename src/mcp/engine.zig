@@ -351,6 +351,13 @@ pub const Engine = struct {
         return s.revoking();
     }
 
+    /// The status server `name`'s last sign-out revocation was answered
+    /// with, 0 when it couldn't be sent or read; null before an answer.
+    pub fn revocationAnswer(e: *Engine, name: []const u8) ?u16 {
+        const s = (e.find(name) catch return null).server orelse return null;
+        return s.revocationAnswer();
+    }
+
     /// Writes server `name`'s sign-in credential for the host to keep
     /// securely, and pass back in `Config.auth.saved`; false when there is
     /// none to keep. A `credential` event says when it changed.

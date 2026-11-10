@@ -1,6 +1,6 @@
 //! What `fx mcp call list`, `search`, and `help` print: plain text for a
 //! shell command, made from the same search pages and tool schemas the agent's
-//! own `capability_search` uses (`tool_search.zig`, `selected_schema.zig`).
+//! own toolbox search uses (`tool_search.zig`, `selected_schema.zig`).
 //!
 //! The pages and schemas carry server text encoded for the model
 //! (`model_context_encoding.writeScalar`), so it is decoded first. It comes

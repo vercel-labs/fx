@@ -97,7 +97,7 @@ pub fn appendToolResultContent(
         .role = .tool,
         .content = content,
         .tool_call_id = tool_call.id,
-        .tool_name = tool_call.name,
+        .tool_name = tool_call.calledName(),
         .tool_result_status = accounting.status orelse
             if (accounting.increment_error) .failure else .success,
         .tool_result_memory = memory,
@@ -381,7 +381,7 @@ pub fn processCommittedFileResult(
         .role = .tool,
         .content = model_output,
         .tool_call_id = tool_call.id,
-        .tool_name = tool_call.name,
+        .tool_name = tool_call.calledName(),
         .tool_result_status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(
             execution.status,
             model_output,

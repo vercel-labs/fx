@@ -160,6 +160,8 @@ fn isRunCommandCall(input: Input, arena: Allocator, call: ToolCall) !bool {
 }
 
 fn permissionNameForCall(input: Input, arena: Allocator, call: ToolCall) ![]const u8 {
+    // A toolbox open or search meets the rules of the tool it replaced.
+    if (call.toolbox_lookup) |lookup| return lookup.permission;
     const command_call = try isRunCommandCall(input, arena, call);
     if (command_call) return "run_command";
     return if (std.mem.eql(u8, call.name, "shell")) "terminal" else call.name;
@@ -170,6 +172,7 @@ fn permissionTargetKindForCall(
     arena: Allocator,
     call: ToolCall,
 ) !permissions.PermissionTargetKind {
+    if (call.toolbox_lookup != null) return .none;
     return if (try isRunCommandCall(input, arena, call))
         .command_cwd
     else
@@ -493,19 +496,23 @@ pub fn preflightPreparedFileMutation(
     defer if (policy_targets_owned) policy_targets.deinitOwned(arena);
 
     const edit_prompt_required = policy_targets.prompt_required;
-    const equality_prompt_required =
+    const read_requires_prompt =
         request.permission_mode != .yolo and
-        policy_targets.items[0].expected_identity != null and
         try fileMutationEqualityDisclosureRequiresPrompt(
             arena,
             request,
             policy_targets.canonical_target_path,
         );
+    const equality_prompt_required =
+        read_requires_prompt and policy_targets.items[0].expected_identity != null;
 
     var authorization: file_mutation_contract.FileExecutionAuthorization = .{
         .input = input,
         .policy_targets = policy_targets,
         .read_disclosure_required = equality_prompt_required,
+        // A failed edit here returns before any prompt or review, so it may
+        // quote the file only when reading it needs neither.
+        .edit_failure_detail = if (read_requires_prompt) .plain else .file_lines,
     };
     const state_may_decide = if (request.session_permission_state) |state|
         state.rules.items.len > 0
@@ -531,6 +538,7 @@ pub fn preflightPreparedFileMutation(
         call,
         input,
         policy_targets,
+        authorization.edit_failure_detail,
     )) {
         .semantic_failure => |reason| return .{ .tool_failure = reason },
         .prepared => |value| value,
@@ -2552,6 +2560,11 @@ fn targetPathForFailureMessage(arena: Allocator, call: ToolCall) !?[]const u8 {
 }
 
 fn permissionTargetsForCall(input: Input, arena: Allocator, call: ToolCall) !permissions.PermissionCallTargets {
+    if (call.toolbox_lookup) |lookup| {
+        const items = try arena.alloc(permissions.PermissionCallTarget, 1);
+        items[0] = .{ .role = "target", .path = try arena.dupe(u8, lookup.target) };
+        return .{ .items = items };
+    }
     if (isAvailableDynamicTool(input, call.name)) {
         const items = try arena.alloc(permissions.PermissionCallTarget, 1);
         items[0] = .{ .role = "target", .path = try arena.dupe(u8, call.name) };
@@ -3619,6 +3632,87 @@ test "file mutation preflight compatibility wrapper preserves deny and target fa
     );
 }
 
+test "a failed edit quotes its file only when reading the file needs no approval" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    var file = try tmp.dir.createFile(io_mod.getIo(), "workspace/credentials", .{ .truncate = true });
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), "[default]\naws_secret_access_key = stored-value\n");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const call: ToolCall = .{
+        .id = "guessed-edit",
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\"credentials\",\"old_string\":\"aws_secret_access_key = guess\",\"new_string\":\"aws_secret_access_key = rotated\"}",
+    };
+    const request: FileMutationPreflightRequest = .{
+        .tool_registry = test_admission_registry,
+        .workspace_root = workspace,
+        .permission_rules = .{},
+        .permission_mode = .auto,
+        .can_prompt = false,
+    };
+    const edit_allowed: types.PermissionRule = .{
+        .permission = @constCast("edit"),
+        .pattern = @constCast("**"),
+        .action = .allow,
+    };
+
+    // An edit that needs no prompt is prepared at execution, with the detail
+    // admission chose.
+    var allow_rules = [_]types.PermissionRule{edit_allowed};
+    var allowed_request = request;
+    allowed_request.permission_rules = .{ .rules = &allow_rules };
+    switch (try preflightFileMutation(arena, call, allowed_request)) {
+        .allowed => |authorization| try std.testing.expectEqual(
+            file_mutation_contract.EditFailureDetail.file_lines,
+            authorization.edit_failure_detail,
+        ),
+        else => |outcome| {
+            std.debug.print("unexpected {s}\n", .{@tagName(outcome)});
+            return error.TestExpectedAllowed;
+        },
+    }
+
+    // One that needs a prompt is prepared here, and fails before it.
+    const open = switch (try preflightFileMutation(arena, call, request)) {
+        .tool_failure => |value| value,
+        else => |outcome| {
+            std.debug.print("unexpected {s}\n", .{@tagName(outcome)});
+            return error.TestExpectedToolFailure;
+        },
+    };
+    try std.testing.expect(std.mem.find(u8, open, "aws_secret_access_key = stored-value") != null);
+
+    // A read rule that denies the file, or asks first, keeps its text out.
+    for ([_]types.PermissionAction{ .deny, .ask }) |action| {
+        var rules = [_]types.PermissionRule{ edit_allowed, .{
+            .permission = @constCast("read_file"),
+            .pattern = @constCast("*"),
+            .action = action,
+        } };
+        var guarded_request = request;
+        guarded_request.permission_rules = .{ .rules = &rules };
+        const guarded = switch (try preflightFileMutation(arena, call, guarded_request)) {
+            .tool_failure => |value| value,
+            else => |outcome| {
+                std.debug.print("unexpected {s} for read {s}\n", .{ @tagName(outcome), @tagName(action) });
+                return error.TestExpectedToolFailure;
+            },
+        };
+        try std.testing.expectEqualStrings(
+            "edit_file failed: old_string not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit.",
+            guarded,
+        );
+    }
+}
+
 test "file mutation preflight fails closed without registered input ownership" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -3869,7 +3963,7 @@ fn testInputWithClassifier(
     };
 }
 
-test "resolved skill calls retain name policy and ordinary execution authority" {
+test "a toolbox open is decided by its skill's name and keeps ordinary execution authority" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -3877,23 +3971,20 @@ test "resolved skill calls retain name policy and ordinary execution authority" 
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
     var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
-    input.tool_registry = .{ .tools = &.{test_builtin_tools.skill} };
+    input.tool_registry = .{ .tools = &.{test_builtin_tools.toolbox} };
     var rules = [_]types.PermissionRule{.{
         .permission = @constCast("skill"),
         .pattern = @constCast("restricted-name"),
         .action = .deny,
     }};
     input.permission_rules = .{ .rules = &rules };
-    const skill: @import("../skills/skill_contract.zig").PreparedSkill = .{ .skill = .{
-        .name = "restricted-name",
-        .description = "",
-        .path = "/installed/different-directory-name",
-        .source = .global_fx,
-    } };
+    // However the open names it, by location, path, or a folder with another
+    // name, the rule for the skill's own name decides it.
+    const lookup: types.ToolboxLookup = .{ .permission = "skill", .target = "restricted-name" };
     const calls = [_]ToolCall{
-        .{ .id = "alias", .name = "skill", .arguments_json = "{\"location\":\"skill:0000000000000001:0/different-directory-name\"}", .resolved_skill = &skill },
-        .{ .id = "canonical", .name = "skill", .arguments_json = "{\"location\":\"/installed/different-directory-name\",\"resource\":\"reference.md\"}", .resolved_skill = &skill },
-        .{ .id = "legacy", .name = "skill", .arguments_json = "{\"name\":\"restricted-name\",\"location\":\"/installed/different-directory-name\",\"offset\":1}", .resolved_skill = &skill },
+        .{ .id = "alias", .name = "toolbox", .arguments_json = "{\"open\":\"skill:0000000000000001:0/different-directory-name\"}", .toolbox_lookup = lookup },
+        .{ .id = "canonical", .name = "toolbox", .arguments_json = "{\"open\":\"/installed/different-directory-name\",\"resource\":\"reference.md\"}", .toolbox_lookup = lookup },
+        .{ .id = "named", .name = "toolbox", .arguments_json = "{\"open\":\"restricted-name\",\"offset\":1}", .toolbox_lookup = lookup },
     };
     for (calls) |call| {
         try std.testing.expectEqualStrings("restricted-name", try permissionTargetForCall(input, arena, call));
@@ -3907,11 +3998,6 @@ test "resolved skill calls retain name policy and ordinary execution authority" 
     const allowed = try requestPermissionOutcome(input, arena, calls[0], .ask, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.once, allowed.decision);
     try std.testing.expect(allowed.execution_authority.? == .ordinary);
-    var legacy_unbound = calls[2];
-    legacy_unbound.resolved_skill = null;
-    const old_key = try permissionStateKeyForCall(input, arena, legacy_unbound);
-    const bound_key = try permissionStateKeyForCall(input, arena, calls[2]);
-    try std.testing.expect(old_key.eql(bound_key));
 }
 
 test "exact command approval remains valid across live authority revalidation" {

@@ -25,7 +25,6 @@ const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const io_mod = @import("../shared/io.zig");
 const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
-const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const permission_gate = @import("../permissions/permission_gate.zig");
 const permissions = @import("../permissions/permissions.zig");
 const prompt_policy_contract = @import("../config/prompt_policy.zig");
@@ -1018,35 +1017,9 @@ pub fn Runtime(comptime App: type) type {
             try app.contextRegistry().appendDefaultStatic(.{
                 .project_context = modelVisibleProjectContext(app, agent),
             }, arena, messages);
-            var report = if (comptime @hasDecl(App, "snapshotMcpModelCatalog"))
-                try app.snapshotMcpModelCatalog(arena)
-            else
-                mcp_model_catalog.Report{ .snapshot = try mcp_model_catalog.Snapshot.empty(arena) };
-            // The request arena retains the change notice, which outlives this
-            // function inside `messages`; only the snapshot names are released.
-            defer report.snapshot.deinit(arena);
-            const section = try mcp_model_catalog.render(arena, report.snapshot);
-            if (section.text.len > 0) {
-                try messages.append(arena, .{ .role = .system, .content = section.text });
-            }
-            if (report.change_notice) |notice| {
-                try messages.append(arena, .{ .role = .system, .content = notice });
-            }
-            if (section.notice) |notice| try pushMcpModelCatalogNotice(app, agent, notice);
-        }
-
-        fn pushMcpModelCatalogNotice(app: *App, agent: *AppAgent, notice: []const u8) !void {
-            if (comptime @hasDecl(@TypeOf(agent.session), "claimContextNotice")) {
-                if (!try agent.session.claimContextNotice(std.heap.c_allocator, notice)) return;
-            }
-            const body = try types.renderContextNoticeBody(std.heap.c_allocator, notice);
-            defer std.heap.c_allocator.free(body);
-            try app_worker_runtime.Runtime(App).pushSemanticNotice(app, agent, .{
-                .topic = "context",
-                .tone = .warning,
-                .body = body,
-                .visibility = .full_only,
-            });
+            // The toolbox menu lists the MCP servers (config.toolbox_mcp_servers),
+            // so there is no MCP block here, and no per-request status that
+            // would change what earlier requests sent.
         }
 
         pub fn appendTransientRuntimeContextMessage(
@@ -1204,6 +1177,13 @@ pub fn Runtime(comptime App: type) type {
                 &tool_projection,
                 session_child_capability,
             );
+            // The toolbox menu lists the configured MCP servers, by name.
+            var toolbox_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer toolbox_arena_state.deinit();
+            if (comptime @hasDecl(App, "mcpServerNames")) {
+                config.toolbox_mcp_servers = try app.mcpServerNames(toolbox_arena_state.allocator());
+            }
+            if (comptime @hasField(App, "toolbox_behind")) config.toolbox_behind = app.toolbox_behind.slice();
             // A subagent is shown only the built-in tools its run was admitted
             // with, the ones its live authority lets it call.
             var child_tools = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -1714,7 +1694,6 @@ fn formatToolAction(
     const presentation = tool_dispatch.presentationForArgs(spec.*, args);
     const value = display_target orelse
         call.resolved_display_target orelse
-        tool_presentation.resolvedSkillName(call, presentation) orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
     return formatToolActionValue(arena, presentationLabel(presentation, state, denied_label), value);
@@ -1812,7 +1791,6 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.web_search,
     test_builtin_tools.shell,
     test_builtin_tools.grep_files,
-    test_builtin_tools.skill,
     test_builtin_tools.install_skill,
     test_builtin_tools.subagent,
 };
@@ -2008,7 +1986,6 @@ const FakeApp = struct {
     mcp_name: []const u8 = "mcp_lookup",
     mcp_has_tool_calls: usize = 0,
     mcp_result: []const u8 = "{\"ok\":true}",
-    mcp_change_notice: ?[]const u8 = null,
     diff_blocks: usize = 0,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
@@ -2049,14 +2026,8 @@ const FakeApp = struct {
         return self.context_registry;
     }
 
-    pub fn snapshotMcpModelCatalog(
-        self: *FakeApp,
-        alloc: Allocator,
-    ) !mcp_model_catalog.Report {
-        return .{
-            .snapshot = try mcp_model_catalog.Snapshot.empty(alloc),
-            .change_notice = if (self.mcp_change_notice) |notice| try alloc.dupe(u8, notice) else null,
-        };
+    pub fn mcpServerNames(_: *FakeApp, _: Allocator) ![]const []const u8 {
+        return &.{};
     }
 
     fn promptPolicy(_: *const FakeApp, _: anytype) prompt_policy_contract.Policy {
@@ -2772,80 +2743,6 @@ test "provider search labels use search wording and generic fallback" {
     try std.testing.expect(std.mem.find(u8, completed, "web") != null);
 }
 
-test "tool labels preserve skill name value" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    const selected: @import("../skills/skill_contract.zig").PreparedSkill = .{ .skill = .{
-        .name = "selected-workflow",
-        .description = "",
-        .path = "/skills/different-directory",
-        .source = .workspace_fx,
-    } };
-    const selected_call: ToolCall = .{
-        .id = "selected",
-        .name = "skill",
-        .arguments_json = "{\"location\":\"skill:0000000000000001:0/different-directory\"}",
-        .resolved_skill = &selected,
-    };
-    const selected_active = try app.describeToolAction(app.agent(), arena, selected_call);
-    try std.testing.expect(std.mem.find(u8, selected_active, "selected-workflow") != null);
-    const selected_completed = try app.describeToolActionCompleted(app.agent(), arena, selected_call);
-    try std.testing.expect(std.mem.find(u8, selected_completed, "selected-workflow") != null);
-
-    var selected_resource = selected_call;
-    selected_resource.arguments_json = "{\"location\":\"/skills/different-directory\",\"resource\":\"references/rules.md\"}";
-    const selected_resource_completed = try app.describeToolActionCompleted(app.agent(), arena, selected_resource);
-    try std.testing.expect(std.mem.find(u8, selected_resource_completed, "Read skill resource") != null);
-    try std.testing.expect(std.mem.find(u8, selected_resource_completed, "references/rules.md") != null);
-
-    const skill_call: ToolCall = .{
-        .id = "skill",
-        .name = "skill",
-        .arguments_json = "{\"name\":\"workflow\"}",
-    };
-    const active = try app.describeToolAction(app.agent(), arena, skill_call);
-    try std.testing.expect(std.mem.find(u8, active, "Loading skill") != null);
-    try std.testing.expect(std.mem.find(u8, active, "workflow") != null);
-
-    const completed = try app.describeToolActionCompleted(app.agent(), arena, skill_call);
-    try std.testing.expect(std.mem.find(u8, completed, "Loaded skill") != null);
-    try std.testing.expect(std.mem.find(u8, completed, "workflow") != null);
-
-    const resource_call: ToolCall = .{
-        .id = "skill_resource",
-        .name = "skill",
-        .arguments_json = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}",
-    };
-    const resource_active = try app.describeToolAction(app.agent(), arena, resource_call);
-    try std.testing.expect(std.mem.find(u8, resource_active, "Reading skill resource") != null);
-    try std.testing.expect(std.mem.find(u8, resource_active, "references/contract-design.md") != null);
-    try std.testing.expect(std.mem.find(u8, resource_active, "Loading skill workflow") == null);
-
-    const resource_completed = try app.describeToolActionCompleted(app.agent(), arena, resource_call);
-    try std.testing.expect(std.mem.find(u8, resource_completed, "Read skill resource") != null);
-    try std.testing.expect(std.mem.find(u8, resource_completed, "references/contract-design.md") != null);
-    try std.testing.expect(std.mem.find(u8, resource_completed, "Loaded skill workflow") == null);
-
-    const install_call: ToolCall = .{
-        .id = "install_skill",
-        .name = "install_skill",
-        .arguments_json = "{\"source\":\"vercel-labs/agent-skills\",\"skill\":\"workflow\"}",
-    };
-    const install_active = try app.describeToolAction(app.agent(), arena, install_call);
-    try std.testing.expect(std.mem.find(u8, install_active, "Installing skill") != null);
-    try std.testing.expect(std.mem.find(u8, install_active, "vercel-labs/agent-skills") != null);
-
-    const install_completed = try app.describeToolActionCompleted(app.agent(), arena, install_call);
-    try std.testing.expect(std.mem.find(u8, install_completed, "Installed skill") != null);
-    try std.testing.expect(std.mem.find(u8, install_completed, "vercel-labs/agent-skills") != null);
-}
-
 test "subagent labels show named request and reply" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -3012,11 +2909,10 @@ test "app agent runtime appends static and transient context through configured 
     try Runtime(FakeApp).appendStaticContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
     try std.testing.expectEqual(types.ChatRole.system, messages.items[0].role);
     try std.testing.expectEqualStrings("provider static:project context", messages.items[0].content.?);
-    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
-    try std.testing.expectEqualStrings("provider transient:/tmp/workspace:auto", messages.items[2].content.?);
+    try std.testing.expectEqualStrings("provider transient:/tmp/workspace:auto", messages.items[1].content.?);
 }
 
 test "app agent runtime prefers active queued project context snapshot" {
@@ -3036,31 +2932,10 @@ test "app agent runtime prefers active queued project context snapshot" {
 
     try Runtime(FakeApp).appendStaticContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
-    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
     try std.testing.expectEqualStrings("provider static:queued project context", messages.items[0].content.?);
-    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
     const tool_context = testToolContext(&app);
     try std.testing.expectEqualStrings("test.default_context", tool_context.context_registry.defaultProvider().id);
-}
-
-test "app agent runtime shows MCP availability changes to the model" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    app.mcp_change_notice = "MCP server availability changed since earlier in this session:\n  linear: authentication_required -> ready (74 tools)\n";
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var messages: std.ArrayList(ChatMessage) = .empty;
-    defer messages.deinit(arena);
-
-    try Runtime(FakeApp).appendStaticContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
-    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
-    try std.testing.expectEqual(types.ChatRole.system, messages.items[2].role);
-    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "linear: authentication_required -> ready (74 tools)") != null);
 }
 
 fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {

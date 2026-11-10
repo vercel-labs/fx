@@ -83,6 +83,21 @@ pub const Locations = struct {
     skills: []const Skill = &.{},
     diagnostics: []const SkillDiagnostic = &.{},
 
+    /// The location the skill catalog gives the skill at `skill_path`, which
+    /// `resolve` maps back to it. Null when its directory is not one of the
+    /// roots.
+    pub fn locationOf(self: Locations, alloc: std.mem.Allocator, skill_path: []const u8) !?[]u8 {
+        const parent = std.Io.Dir.path.dirname(skill_path) orelse return null;
+        const index = for (self.roots, 0..) |root, index| {
+            if (std.mem.eql(u8, root, parent)) break index;
+        } else return null;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        out.writer.print("skill:{x:0>16}:{d}/", .{ self.namespace, index }) catch return error.OutOfMemory;
+        (std.Uri.Component{ .raw = std.Io.Dir.path.basename(skill_path) }).formatEscaped(&out.writer) catch return error.OutOfMemory;
+        return try out.toOwnedSlice();
+    }
+
     pub fn resolve(self: Locations, alloc: std.mem.Allocator, location: []const u8) ![]u8 {
         if (!std.mem.startsWith(u8, location, "skill:")) return alloc.dupe(u8, location);
         const suffix = location["skill:".len..];
@@ -123,6 +138,18 @@ pub const SkillSource = enum {
     global_agents,
     global_claw,
 };
+
+test "a skill's location resolves back to its path" {
+    const alloc = std.testing.allocator;
+    const locations: Locations = .{ .namespace = 19, .roots = &.{ "/first", "/second" } };
+    const location = (try locations.locationOf(alloc, "/second/review notes")).?;
+    defer alloc.free(location);
+    try std.testing.expectEqualStrings("skill:0000000000000013:1/review%20notes", location);
+    const path = try locations.resolve(alloc, location);
+    defer alloc.free(path);
+    try std.testing.expectEqualStrings("/second/review notes", path);
+    try std.testing.expectEqual(@as(?[]u8, null), try locations.locationOf(alloc, "/elsewhere/review"));
+}
 
 test "skill locations preserve exact roots and reject stale namespaces" {
     const alloc = std.testing.allocator;

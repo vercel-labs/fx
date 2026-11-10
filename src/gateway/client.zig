@@ -411,15 +411,10 @@ const UsageGetOperation = struct {
 
     fn run(self: *@This()) !GetResult {
         const uri = try std.Uri.parse(self.url);
-        var client: std.http.Client = .{
-            .allocator = self.alloc,
-            .io = io_mod.getIo(),
-        };
-        defer client.deinit();
         const auth_header = try self.alloc.print("Bearer {s}", .{self.bearer});
         defer secret.zeroAndFree(self.alloc, auth_header);
         var extra_headers_buf: [4]std.http.Header = undefined;
-        var req = try tls_roots.request(&client, .GET, uri, .{
+        var opened = try openRequestOnJob(.GET, uri, .{
             .headers = .{
                 .accept_encoding = .omit,
                 .user_agent = .{ .override = user_agent },
@@ -428,7 +423,8 @@ const UsageGetOperation = struct {
             .extra_headers = usageExtraHeaders(&extra_headers_buf, self.gateway_team, self.account),
             .redirect_behavior = .unhandled,
         });
-        defer req.deinit();
+        defer opened.deinit();
+        const req = &opened.request;
         try req.sendBodiless();
         if (req.connection) |conn| try conn.flush();
 
@@ -447,12 +443,17 @@ const UsageGetOperation = struct {
 };
 
 pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8) !GetResult {
+    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    defer client.deinit();
+    return fetchGatewayGet(alloc, api_key, path, &client);
+}
+
+/// The GET of `fetchGatewayGetResult`, on `client`, or with no client on an
+/// open job (`fetchOnOpenJob`).
+fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8, client: ?*std.http.Client) !GetResult {
     const default_url = try alloc.print("{s}{s}", .{ gatewayBaseUrl(), path });
     defer alloc.free(default_url);
     const url = try resolveE2eGatewayUrl(e2e_gateway_credits_url_env, default_url);
-
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
 
     var auth_header: ?[]u8 = null;
     defer if (auth_header) |value| secret.zeroAndFree(alloc, value);
@@ -467,13 +468,14 @@ pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, pat
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    const result = try tls_roots.fetch(&client, .{
+    const options: std.http.Client.FetchOptions = .{
         .location = .{ .url = url },
         .method = .GET,
         .headers = headers,
         .response_writer = &out.writer,
         .redirect_behavior = .unhandled,
-    });
+    };
+    const result = if (client) |own| try tls_roots.fetch(own, options) else try fetchOnOpenJob(options);
 
     return .{
         .status = result.status,
@@ -504,7 +506,7 @@ const GatewayGetOperation = struct {
     path: []const u8,
 
     fn run(self: *@This()) !GetResult {
-        return fetchGatewayGetResult(self.alloc, self.api_key, self.path);
+        return fetchGatewayGet(self.alloc, self.api_key, self.path, null);
     }
 };
 
@@ -582,9 +584,6 @@ fn fetchGatewayJsonAtUrlCore(
 ) !GatewayJsonResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
-
     const uri = try std.Uri.parse(url);
 
     var auth_header: ?[]u8 = null;
@@ -600,7 +599,7 @@ fn fetchGatewayJsonAtUrlCore(
     var extra_headers_buf: [1]std.http.Header = undefined;
     const extra_headers = gatewayModelCatalogExtraHeaders(&extra_headers_buf, gateway_team);
 
-    var req = tls_roots.request(&client, .GET, uri, .{
+    var opened = openRequestOnJob(.GET, uri, .{
         .headers = headers,
         .extra_headers = extra_headers,
         .redirect_behavior = .unhandled,
@@ -608,8 +607,9 @@ fn fetchGatewayJsonAtUrlCore(
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
         return err;
     };
-    defer req.deinit();
-    // `client.request` returns once the connection is open, TLS included.
+    defer opened.deinit();
+    const req = &opened.request;
+    // The open returns once the connection is open, TLS included.
     if (connected) |flag| flag.store(true, .release);
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
@@ -1211,6 +1211,7 @@ const RequestOpenOperation = struct {
     client: *std.http.Client,
     /// Set when `client` is the pool's shared client.
     pool: ?*http_pool.HttpPool,
+    method: std.http.Method,
     uri: std.Uri,
     options: std.http.Client.RequestOptions,
     request_open_override: ?RequestOpenOverride,
@@ -1222,17 +1223,17 @@ const RequestOpenOperation = struct {
             return request_open.run(
                 request_open.ctx,
                 self.client,
-                .POST,
+                self.method,
                 self.uri,
                 self.options,
             );
         }
         if (self.pool) |pool| {
-            const opened = try pool.openRequest(.POST, self.uri, self.options);
+            const opened = try pool.openRequest(self.method, self.uri, self.options);
             self.reused = opened.reused;
             return opened.request;
         }
-        return tls_roots.request(self.client, .POST, self.uri, self.options);
+        return tls_roots.request(self.client, self.method, self.uri, self.options);
     }
 };
 
@@ -1261,6 +1262,7 @@ const OpenJob = struct {
 
     fn start(
         pool: ?*http_pool.HttpPool,
+        method: std.http.Method,
         uri: std.Uri,
         options: std.http.Client.RequestOptions,
         request_open_override: ?RequestOpenOverride,
@@ -1278,6 +1280,7 @@ const OpenJob = struct {
         job.operation = .{
             .client = client,
             .pool = pool,
+            .method = method,
             .uri = try dupeUri(job.arena.allocator(), uri),
             .options = job_options,
             .request_open_override = request_open_override,
@@ -1546,7 +1549,7 @@ fn openGatewayRequestBounded(
     }
 
     if (comptime !builtin.single_threaded) {
-        const job = try OpenJob.start(pool, uri, options, request_open_override);
+        const job = try OpenJob.start(pool, .POST, uri, options, request_open_override);
         var opened = try job.waitForOpen(uri, options, epoch.deadline, cancel_flag, reused);
         if (cancel_flag.load(.seq_cst)) {
             opened.deinit();
@@ -2678,7 +2681,7 @@ fn openBoundedPostWith(
         .redirect_behavior = .unhandled,
     };
     if (comptime builtin.single_threaded) return error.ConcurrencyUnavailable;
-    const job = try OpenJob.start(null, target.uri, options, request_open_override);
+    const job = try OpenJob.start(null, .POST, target.uri, options, request_open_override);
     var reused = false;
     var opened = job.waitForOpen(target.uri, options, deadline, cancel_flag, &reused) catch |err| return switch (err) {
         // The bound error callers of a bounded operation already handle.
@@ -2690,6 +2693,85 @@ fn openBoundedPostWith(
         return error.Cancelled;
     }
     return opened;
+}
+
+/// Opens a request on a client of its own, on an open job (`OpenJob`), for
+/// an operation that `runBoundedHttpOperation` runs. When the operation's
+/// cancel flag or deadline cancels its task, the request walks away at once,
+/// even while its lookup hangs; a client of the operation's own would wait
+/// the lookup out first. Without a cancelled task it waits for the open as
+/// `client.request` does. The caller owns the result and frees it with
+/// `deinit`.
+pub fn openRequestOnJob(
+    method: std.http.Method,
+    uri: std.Uri,
+    options: std.http.Client.RequestOptions,
+) !OpenedRequest {
+    if (comptime builtin.single_threaded) return error.ConcurrencyUnavailable;
+    const job = try OpenJob.start(null, method, uri, options, null);
+    // The bounded operation's watch owns the cancel flag and deadline; it
+    // ends this wait by cancelling the task.
+    var never_cancelled = std.atomic.Value(bool).init(false);
+    const no_deadline: std.Io.Clock.Timestamp = .{ .clock = .awake, .raw = .fromNanoseconds(std.math.maxInt(i96)) };
+    var reused = false;
+    return job.waitForOpen(uri, options, no_deadline, &never_cancelled, &reused);
+}
+
+/// `std.http.Client.fetch` with the connection opened by `openRequestOnJob`,
+/// for an operation that `runBoundedHttpOperation` runs. Redirects are not
+/// followed: `options.redirect_behavior` must be `.unhandled`, and the
+/// caller gets the 3xx status.
+pub fn fetchOnOpenJob(options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
+    std.debug.assert(options.redirect_behavior == .unhandled);
+    const uri = switch (options.location) {
+        .url => |url| try std.Uri.parse(url),
+        .uri => |uri| uri,
+    };
+    var opened = try openRequestOnJob(options.method orelse if (options.payload != null) .POST else .GET, uri, .{
+        .redirect_behavior = .unhandled,
+        .headers = options.headers,
+        .extra_headers = options.extra_headers,
+        .privileged_headers = options.privileged_headers,
+        .keep_alive = options.keep_alive,
+    });
+    defer opened.deinit();
+    const req = &opened.request;
+
+    if (options.payload) |payload| {
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var body = try req.sendBodyUnflushed(&.{});
+        try body.writer.writeAll(payload);
+        try body.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+
+    var response = try req.receiveHead(&.{});
+    const response_writer = options.response_writer orelse {
+        _ = response.reader(&.{}).discardRemaining() catch |err| switch (err) {
+            error.ReadFailed => return response.bodyErr().?,
+        };
+        return .{ .status = response.head.status };
+    };
+
+    const client_alloc = req.client.allocator;
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => options.decompress_buffer orelse try client_alloc.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => options.decompress_buffer orelse try client_alloc.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer if (options.decompress_buffer == null) client_alloc.free(decompress_buffer);
+
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr().?,
+        else => |e| return e,
+    };
+    return .{ .status = response.head.status };
 }
 
 /// Watches one provider request on its connection with the lifecycle the
@@ -10241,6 +10323,7 @@ fn expectCancellableGatewayJsonCancellation(
     const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
 
     try std.testing.expectError(error.Cancelled, result);
+    try waitForOwnClientOpenJobs();
     if (fixture.failure) |err| return err;
     try std.testing.expect(fixture.reached_stage.load(.seq_cst));
     try std.testing.expect(elapsed_ms < max_elapsed_ms);
@@ -10300,6 +10383,7 @@ test "a gateway JSON request reports no connection while its TLS handshake stall
         error.Cancelled,
         fetchGatewayJsonAtUrlCancellable(std.testing.allocator, "test-key", null, models_url, &cancel_flag, gateway_json_fetch_timeout_ms, &connected),
     );
+    try waitForOwnClientOpenJobs();
     try std.testing.expect(fixture.reached_stage.load(.seq_cst));
     try std.testing.expect(!connected.load(.acquire));
     if (fixture.failure) |err| return err;
@@ -10920,6 +11004,7 @@ test "usage GET cancellation interrupts TLS setup" {
     fixture.deinit();
 
     try std.testing.expectError(error.Cancelled, result);
+    try waitForOwnClientOpenJobs();
     try std.testing.expect(elapsed_ms < 1000);
 }
 
@@ -11654,9 +11739,11 @@ test "two hundred Esc presses during stuck lookups leave no job or connection be
     try std.testing.expect(pool.freeConnectionCount() <= pool.client.connection_pool.free_size);
 }
 
-/// Waits until no open job on a client of its own is left, so the testing
-/// allocator's leak check sees what each job freed.
-fn waitForOwnClientOpenJobs() !void {
+/// Tests only: waits until no open job on a client of its own is running.
+/// A test that walks away from an open calls this before it returns, so the
+/// testing allocator's leak check sees the job's frees and none of them lands
+/// in the next test's allocator.
+pub fn waitForOwnClientOpenJobs() !void {
     var waited_ms: usize = 0;
     while (own_client_open_jobs.load(.acquire) != 0) : (waited_ms += 1) {
         if (waited_ms > 5_000) return error.TestOpenJobStillRunning;
@@ -12052,4 +12139,72 @@ test "two hundred Esc presses during stuck unpooled lookups leave no job, client
         try waitForOwnClientOpenJobs();
         _ = try fixture.lateConnection(0);
     }
+}
+
+const stuck_lookup_testing = @import("stuck_lookup_testing.zig");
+
+/// Runs `fetch` while every lookup hangs, cancelling it once one does, and
+/// returns how long it took to give up.
+fn cancelDuringStuckLookup(comptime expected: anyerror, fetch: anytype) !i64 {
+    var stuck = stuck_lookup_testing.StuckLookups.install();
+    defer waitForOwnClientOpenJobs() catch {};
+    defer stuck.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    const canceller = try stuck.cancelOnceStuck(&cancel);
+    defer canceller.join();
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    try std.testing.expectError(expected, fetch.run(&cancel));
+    return elapsedMsSince(started);
+}
+
+test "a usage GET stops at once when cancelled during a lookup that hangs" {
+    const Fetch = struct {
+        fn run(_: @This(), cancel: *std.atomic.Value(bool)) !GetResult {
+            return fetchUsageGet(std.testing.allocator, "usage-key", null, .none, "https://usage.stuck-lookup.test/v1/usage", cancel);
+        }
+    };
+    const elapsed_ms = try cancelDuringStuckLookup(error.Cancelled, Fetch{});
+    try std.testing.expect(elapsed_ms < 1_000);
+}
+
+test "a credits GET stops at once when cancelled during a lookup that hangs" {
+    const Fetch = struct {
+        fn run(_: @This(), cancel: *std.atomic.Value(bool)) !GetResult {
+            return fetchGatewayGetResultCancellable(std.testing.allocator, "credits-key", "/v1/credits", cancel);
+        }
+    };
+    const elapsed_ms = try cancelDuringStuckLookup(error.Cancelled, Fetch{});
+    try std.testing.expect(elapsed_ms < 1_000);
+}
+
+test "a model catalog fetch stops at once when cancelled during a lookup that hangs" {
+    const Fetch = struct {
+        connected: *std.atomic.Value(bool),
+
+        fn run(self: @This(), cancel: *std.atomic.Value(bool)) !GatewayJsonResult {
+            return fetchGatewayJsonCancellable(std.testing.allocator, "catalog-key", null, "https://catalog.stuck-lookup.test/v1/models", cancel, self.connected);
+        }
+    };
+    var connected = std.atomic.Value(bool).init(false);
+    const elapsed_ms = try cancelDuringStuckLookup(error.Cancelled, Fetch{ .connected = &connected });
+    try std.testing.expect(elapsed_ms < 1_000);
+    try std.testing.expect(!connected.load(.acquire));
+}
+
+test "a model catalog fetch ends at its deadline during a lookup that hangs" {
+    var stuck = stuck_lookup_testing.StuckLookups.install();
+    defer waitForOwnClientOpenJobs() catch {};
+    defer stuck.deinit();
+    var never_cancelled = std.atomic.Value(bool).init(false);
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    try std.testing.expectError(error.Timeout, fetchGatewayJsonAtUrlCancellable(
+        std.testing.allocator,
+        "catalog-key",
+        null,
+        "https://catalog.stuck-lookup.test/v1/models",
+        &never_cancelled,
+        100,
+        null,
+    ));
+    try std.testing.expect(elapsedMsSince(started) < 1_000);
 }

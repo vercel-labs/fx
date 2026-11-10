@@ -241,6 +241,14 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_SESSION_WRITE_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SESSION_WRITE_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_SHELL_PARITY_ALL_SHELLS": {
       "job": "test",
       "stability": "internal"
@@ -254,6 +262,26 @@
       "stability": "internal"
     },
     "FX_TEST_SNAPSHOT_MARKER": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_END_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_END_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_START_HELD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_START_RELEASE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_SUBAGENT_START_WAIT_MS": {
       "job": "test",
       "stability": "internal"
     },

@@ -2,7 +2,6 @@ const std = @import("std");
 const versions = @import("../core/gateway/provider_versions.zig");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
-const tls_roots = @import("../core/shared/tls_roots.zig");
 const gateway_client = @import("client.zig");
 const json_decode = @import("../core/shared/json_decode.zig");
 
@@ -77,12 +76,10 @@ const LookupOperation = struct {
     url: []const u8,
 
     pub fn run(self: *LookupOperation) !Response {
-        var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
-        defer client.deinit();
         const buffer = try self.alloc.alloc(u8, max_response_bytes + 1);
         defer self.alloc.free(buffer);
         var writer = std.Io.Writer.fixed(buffer);
-        const result = try tls_roots.fetch(&client, .{
+        const result = try gateway_client.fetchOnOpenJob(.{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = .{
@@ -130,4 +127,19 @@ test "provider version metadata parses the two upstream release formats" {
     try std.testing.expectEqualStrings("1.0.13", grok.slice());
     try std.testing.expectError(error.InvalidProviderVersion, parseResponse(std.testing.allocator, .codex, "{\"version\":\"bad\"}"));
     try std.testing.expectError(error.InvalidProviderVersion, parseResponse(std.testing.allocator, .grok, "1.0.13\nHeader: injected"));
+}
+
+test "a version lookup ends at its deadline during a lookup that hangs" {
+    const stuck_lookup_testing = @import("stuck_lookup_testing.zig");
+    var stuck = stuck_lookup_testing.StuckLookups.install();
+    defer gateway_client.waitForOwnClientOpenJobs() catch {};
+    defer stuck.deinit();
+    var never_cancelled = std.atomic.Value(bool).init(false);
+    var context = LookupContext{
+        .cancel_flag = &never_cancelled,
+        .outer_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(100) }),
+    };
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    try std.testing.expectError(error.ProviderVersionUnavailable, fetch(&context, std.testing.allocator, .grok));
+    try std.testing.expect(stuck_lookup_testing.elapsedMsSince(started) < 1_000);
 }

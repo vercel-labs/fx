@@ -19,21 +19,40 @@ import {
 const TIMEOUT = 90_000;
 const LIST_HINT = "enter switch";
 
-// Directions follow the current menu order; a number selects that stable fx
-// instance regardless of where working state or completed replies put its row.
+// The agent list's row for instance `number`, and for subagent `name`, which
+// sits under its instance behind a branch.
+function instanceRow(number: number): RegExp {
+  return new RegExp(`^ {2}fx ${number} {2,}`, "m");
+}
+
+function subagentRow(name: string): RegExp {
+  return new RegExp(`^ {2}[\u251c\u2514] ${name} {2,}`, "m");
+}
+
+// The agent list's rows, top to bottom, from a capture with its escapes: each
+// one's name, such as "fx 2" or a subagent's own, and whether it is the
+// selected row, which the list draws bold and the others dim.
+function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean }> {
+  const rows: Array<{ name: string; selected: boolean }> = [];
+  for (const line of paneEscapes.split("\n")) {
+    const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
+    const row = /^ {2}(?:(fx \d+|main)|[\u251c\u2514] (\S+)) {2,}\S/.exec(plain);
+    if (row) rows.push({ name: (row[1] ?? row[2])!, selected: line.includes("\x1b[1m") });
+  }
+  return rows;
+}
+
+// Directions follow the list's order: the instances as they started, each
+// followed by its own subagents. A number selects that fx instance.
 async function switchAgent(session: TmuxSession, target: "next" | "previous" | number) {
   await session.sendKeys("C-x");
-  const pane = await session.waitForText(LIST_HINT, 10_000);
-  const lines = pane.split("\n");
-  const hint = lines.findIndex((line) => line.includes(LIST_HINT));
-  // The rows sit between the two rules above the hint.
-  let top = hint - 2;
-  while (top > 0 && !lines[top - 1].trimStart().startsWith("\u2500")) top -= 1;
-  const rows = lines.slice(top, hint - 1);
-  const from = rows.findIndex((row) => row.includes("(on screen)"));
+  await session.waitForText(LIST_HINT, 10_000);
+  const pane = await session.capturePaneEscapes();
+  const rows = agentRows(pane);
+  const from = rows.findIndex((row) => row.selected);
   if (from < 0 || rows.length < 2) throw new Error(`no agent list in:\n${pane}`);
   const to = typeof target === "number"
-    ? rows.findIndex((row) => new RegExp(`\\bfx ${target}(?: \\(on screen\\))? ·`).test(row))
+    ? rows.findIndex((row) => row.name === `fx ${target}`)
     : target === "next" ? (from + 1) % rows.length : (from + rows.length - 1) % rows.length;
   if (to < 0) throw new Error(`no fx ${target} row in:\n${pane}`);
   for (let step = 0; step < Math.abs(to - from); step += 1) await session.sendKeys(to > from ? "Down" : "Up");
@@ -378,6 +397,99 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         expect(refused).toContain("Couldn't start another fx instance: no profile named 'nosuch'. Profiles:");
         expect(refused).not.toContain("ProfileNotFound");
         expect(refused).toContain("fx 2/2");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/launch lists the profiles it can start, and Enter on one launches it",
+    async () => {
+      await withHost(answerByLetter, {}, async ({ home, session }) => {
+        // Saved after fx started: the list reads the profiles when it opens.
+        writeProfile(home, "reviewer", { description: "Reviews code for bugs", model: "anthropic/claude-opus-4-7", effort: "high", tools: ["*"] });
+        writeProfile(home, "installer", { description: "Installs skills", tools: ["install_skill"] });
+        await session.sendLiteral("/launch ");
+        // Each row shows the model and effort the instance would start with, as the agent list does, not its
+        // description. FX_MODEL wins over the profile's model, as it does at launch; the effort stays the profile's.
+        const listed = await session.waitForPane((pane) => /reviewer\s+gpt-5\s+high/.test(pane), 15_000);
+        expect(listed).not.toContain("Reviews code for bugs");
+        expect(listed).toMatch(/^\s*main\b/m);
+        expect(listed).toMatch(/installer\s+gpt-5\s+default\s+custom/);
+        expect(listed).not.toContain("read-only");
+        await session.sendLiteral("rev");
+        await session.waitForPane((pane) => /reviewer\s+gpt-5\s+high/.test(pane) && !/^\s*main\b/m.test(pane), 10_000);
+        await session.sendKeys("Enter");
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        // The agent list names each instance's profile, and opens on the
+        // launched one, which is on screen.
+        await session.sendKeys("C-x");
+        const list = await session.waitForText(LIST_HINT, 10_000);
+        expect(list).toMatch(/^ {2}fx 2 {2,}.* {2,}reviewer(?: {2,}|$)/m);
+        expect(agentRows(await session.capturePaneEscapes()).find((row) => row.selected)?.name).toBe("fx 2");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "Delete, then Delete again, in the agent list closes an instance, but never the last one",
+    async () => {
+      await withHost(answerByLetter, { instances: 2 }, async ({ session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        await session.sendText("HOST_A first");
+        await session.waitForText("HOST_ANSWER_A", 30_000);
+
+        // The list previews the highlighted row, so fx 2 is on screen.
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendKeys("Down");
+        await session.waitForText("delete close", 10_000);
+        await session.sendKeys("BSpace");
+        await session.waitForText("press delete again to close this instance", 10_000);
+        await session.sendKeys("BSpace");
+        // The list stays open on the instance left, the first, which Delete
+        // no longer offers to close: that would end fx.
+        const closed = await session.waitForPane((pane) => !/\bfx 2\b/.test(pane) && pane.includes("esc back"), 15_000);
+        expect(shownAnswers(closed)).toEqual(["HOST_ANSWER_A"]);
+        expect(closed).not.toContain("delete close");
+        await session.sendKeys("BSpace");
+        await session.sendKeys("BSpace");
+        // Keys are handled in order, so the list closing shows both Deletes ran.
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+        await session.sendText("HOST_B still here");
+        await session.waitForText("HOST_ANSWER_B", 30_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "Delete, then Delete again, on the first instance's row closes it, and the next one takes over",
+    async () => {
+      await withHost(answerByLetter, { instances: 2 }, async ({ session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        await session.sendText("HOST_A first");
+        await session.waitForText("HOST_ANSWER_A", 30_000);
+
+        // The list opens on the first instance, the one on screen.
+        await session.sendKeys("C-x");
+        await session.waitForText("delete close", 10_000);
+        await session.sendKeys("BSpace");
+        await session.waitForText("press delete again to close this instance", 10_000);
+        await session.sendKeys("BSpace");
+        const closed = await session.waitForPane((pane) => shownAnswers(pane).length === 0 && pane.includes("esc back"), 15_000);
+        expect(closed).not.toContain("delete close");
+        // The instance left is the one the list goes back to: its row is
+        // selected and, as the only instance open, named main.
+        expect(agentRows(await session.capturePaneEscapes())).toEqual([{ name: "main", selected: true }]);
+        // Esc keeps the instance that took over, not the closed one the list opened on.
+        await session.sendKeys("Escape");
+        const after = await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+        expect(shownAnswers(after)).toEqual([]);
+        await session.sendText("HOST_B second");
+        await session.waitForText("HOST_ANSWER_B", 30_000);
       });
     },
     TIMEOUT,
@@ -1014,6 +1126,42 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
 
 
   test(
+    "a subagent whose profile lists a tool placed behind toolbox keeps toolbox to reach it",
+    async () => {
+      let childAsked = false;
+      const bodies = await withHost((body) => {
+        const texts = userTexts(body).join("\n");
+        if (texts.includes("TREE_FINDER_TASK")) {
+          // The child's title request carries its task too, before or after
+          // its model request; only a request with tools is the child's turn.
+          if (toolNames(body).length > 0) childAsked = true;
+          return text("finder_done", "TREE_FINDER_DONE");
+        }
+        const last = userTexts(body).at(-1) ?? "";
+        if (last.includes("TREE_USER_FINDER")) {
+          if (answered(body)) return text("finder_final", "TREE_FINDER_FINAL");
+          return call("finder_sub", "subagent", { request: { action: "message", agent: "finder", profile: "finder", message: "TREE_FINDER_TASK" } });
+        }
+        return answerByLetter(body);
+      }, { args: "--tool-placement glob_files=toolbox", env: { FX_PERMISSION_MODE: "full-access" } }, async ({ home, session }) => {
+        writeProfile(home, "finder", { description: "Finds files", tools: ["glob_files"] });
+        await session.sendText("TREE_USER_FINDER start a finder");
+        await session.waitForText("TREE_FINDER_FINAL", 45_000);
+        const deadline = Date.now() + 15_000;
+        while (!childAsked && Date.now() < deadline) await Bun.sleep(25);
+      });
+      // The child is shown what its run was admitted with: glob_files sits
+      // behind toolbox for this run, so it keeps toolbox to run it. Its
+      // title request carries the task too, but no tools.
+      const child = bodies.filter((body) => userTexts(body).join("\n").includes("TREE_FINDER_TASK") && toolNames(body).length > 0);
+      expect(child.length).toBeGreaterThan(0);
+      expect(toolNames(child[0]!)).toContain("toolbox");
+      expect(toolNames(child[0]!)).not.toContain("glob_files");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a launched instance's subagent asks on that instance's screen, not the first's",
     async () => {
       await withHost((body) => {
@@ -1060,13 +1208,13 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     "an instance's profile decides which MCP servers it can use",
     async () => {
       const fixture = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
-      // Select the fixture's tool and call it, or call it without selecting
-      // it first, then finish.
+      // Open the fixture's tool and run it, or run it without opening it
+      // first, then finish.
       const respond = (direct: boolean) => (body: string): Response => {
         const request = JSON.parse(body) as { prompt?: Array<{ role?: string }> };
         const results = (request.prompt ?? []).filter((message) => message.role === "tool").length;
-        if (!direct && results === 0) return call("select_mcp", "mcp_select_tool", { name: "mcp_fixture_echo" });
-        if (results === (direct ? 0 : 1)) return call("call_mcp", "mcp_fixture_echo", { text: "hello" });
+        if (!direct && results === 0) return call("select_mcp", "toolbox", { open: "mcp_fixture_echo" });
+        if (results === (direct ? 0 : 1)) return call("call_mcp", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "hello" } });
         return text("mcp_done", "TREE_MCP_DONE");
       };
       for (const [profile, servers, reaches, direct] of [
@@ -1104,6 +1252,35 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     TIMEOUT * 4,
   );
 
+
+  test(
+    "fx --profile whose tools list one placed behind toolbox starts with toolbox to reach it",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-placed-")));
+      try {
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        writeProfile(home, "finder", { description: "Finds files", tools: ["glob_files"] });
+        // The profile is read before the flag places glob_files behind
+        // toolbox, so main's tools must be decided again once it is.
+        const bodies = await withHost(() => text("answer_placed", "HOST_PLACED_DONE"), {
+          args: "--profile finder --tool-placement glob_files=toolbox",
+          reuse: { home, workspace },
+        }, async ({ session }) => {
+          await session.sendText("HOST_PLACED_USER list the files");
+          await session.waitForText("HOST_PLACED_DONE", 45_000);
+        });
+        const first = bodies.find((body) => toolNames(body).length > 0);
+        expect(first).toBeDefined();
+        expect(toolNames(first!)).toContain("toolbox");
+        expect(toolNames(first!)).not.toContain("glob_files");
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 
   test(
     "a launched instance's model and speed changes reach its own turns and no other's",
@@ -1428,8 +1605,8 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           const request = JSON.parse(body) as { prompt?: Array<{ role?: string }> };
           const results = (request.prompt ?? []).filter((message) => message.role === "tool").length;
           if (userTexts(body).join("\n").includes("CHILD_MCP_TASK")) {
-            if (results === 0) return call("select_mcp", "mcp_select_tool", { name: "mcp_fixture_echo" });
-            if (results === 1) return call("call_mcp", "mcp_fixture_echo", { text: "hello" });
+            if (results === 0) return call("select_mcp", "toolbox", { open: "mcp_fixture_echo" });
+            if (results === 1) return call("call_mcp", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "hello" } });
             return text("child_mcp_done", "CHILD_MCP_DONE");
           }
           // The child's report wakes the parent once its MCP call is done.
@@ -1444,7 +1621,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // The fixture's answer reached the child after its call.
         expect(child.at(-1) ?? "").toContain("MODERN_MCP_TOOL_RESULT");
         // The child is offered its profile's tools, and no vision fallback.
-        expect(toolNames(child[0])).toEqual(["read_file", "mcp_select_tool"]);
+        expect(toolNames(child[0])).toEqual(["read_file", "toolbox"]);
       } finally {
         cleanupIsolatedTestHome(home);
         rmSync(workspace, { recursive: true, force: true });
@@ -1578,22 +1755,29 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendText("/status");
         await session.waitForPane((pane) => pane.includes("Step limit"), 15_000);
         await session.sendKeys("C-x");
-        const list = await session.waitForPane((pane) => pane.includes("fx 3 ·"), 15_000);
+        const list = await session.waitForPane((pane) => instanceRow(3).test(pane), 15_000);
         expect(list).not.toContain("Step limit");
-        expect(list).toContain("fx 1 (on screen) ·");
-        expect(list).toContain("fx 2 · new session · main · idle");
-        expect(list).toContain("fx 3 · new session · main · idle");
+        expect(list).toContain("Agents 3");
+        expect(list).toMatch(instanceRow(1));
+        expect(list).toMatch(/^ {2}fx 2 {2,}new session {2,}idle {2,}main {2,}\S/m);
+        expect(list).toMatch(/^ {2}fx 3 {2,}new session {2,}idle {2,}main {2,}\S/m);
         expect(list).toContain(LIST_HINT);
+        // The list opens on the agent on screen.
+        expect(agentRows(await session.capturePaneEscapes())).toEqual([
+          { name: "fx 1", selected: true },
+          { name: "fx 2", selected: false },
+          { name: "fx 3", selected: false },
+        ]);
         // Esc closes it.
         await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("fx 3 ·"), 15_000);
+        await session.waitForPane((pane) => !instanceRow(3).test(pane), 15_000);
         // ↓↓ previews fx 3, and Enter keeps it.
         await session.sendText("/agents");
-        await session.waitForPane((pane) => pane.includes("fx 3 ·"), 15_000);
+        await session.waitForPane((pane) => instanceRow(3).test(pane), 15_000);
         await session.sendKeys("Down");
         await session.sendKeys("Down");
         await session.sendKeys("Enter");
-        await session.waitForPane((pane) => pane.includes("fx 3/3") && !pane.includes("fx 3 ·"), 15_000);
+        await session.waitForPane((pane) => pane.includes("fx 3/3") && !instanceRow(3).test(pane), 15_000);
         await session.waitForComposer(15_000);
       });
     },
@@ -1606,15 +1790,15 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       await withHost(answerByLetter, {}, async ({ session }) => {
         await session.sendKeys("Down");
         await Bun.sleep(500);
-        expect(await session.capturePane()).not.toContain("fx 1 (on screen)");
+        expect(await session.capturePane()).not.toContain(LIST_HINT);
         await session.sendText("/launch");
         await session.waitForPane((pane) => pane.includes("fx 2/2 \u2193"), 15_000);
         await session.waitForComposer(15_000);
         await session.sendKeys("Down");
-        const list = await session.waitForPane((pane) => pane.includes("fx 2 (on screen) ·"), 15_000);
-        expect(list).toContain("fx 1 ·");
+        const list = await session.waitForPane((pane) => instanceRow(2).test(pane), 15_000);
+        expect(list).toMatch(instanceRow(1));
         await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("fx 2 (on screen) ·"), 15_000);
+        await session.waitForPane((pane) => !instanceRow(2).test(pane), 15_000);
 
         // In a draft of several lines, down stays in the draft and Option+Up
         // moves up a paragraph.
@@ -1626,7 +1810,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.sendKeys("M-Up");
         await session.sendLiteral("Z");
         const moved = await session.waitForPane((pane) => pane.includes("Z"), 10_000);
-        expect(moved).not.toContain("(on screen) ·");
+        expect(moved).not.toContain(LIST_HINT);
         expect(moved).not.toContain("secondZ");
       });
     },
@@ -1634,7 +1818,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
-    "the agent list puts each instance's subagents under it and marks the agent on screen",
+    "the agent list puts each instance's subagents under it and opens on the agent on screen",
     async () => {
       await withHost((body) => {
         const texts = userTexts(body).join("\n");
@@ -1654,14 +1838,15 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await switchAgent(session, "next");
         await session.waitForPane((pane) => pane.includes("helper \u00b7 "), 15_000);
         await session.sendKeys("C-x");
-        const list = await session.waitForPane((pane) => pane.includes("helper (on screen) ·"), 15_000);
-        const rows = list.split("\n");
-        const first = rows.findIndex((row) => row.includes("fx 1 ·"));
-        const helper = rows.findIndex((row) => row.includes("    helper (on screen) ·"));
-        const second = rows.findIndex((row) => row.includes("fx 2 ·"));
-        expect(first).toBeGreaterThanOrEqual(0);
-        expect(helper).toBe(first + 1);
-        expect(second).toBe(helper + 1);
+        const list = await session.waitForPane((pane) => subagentRow("helper").test(pane) && pane.includes(LIST_HINT), 15_000);
+        expect(list).toContain("Agents 3");
+        // The helper's branch ends at it: fx 1 has no other subagent.
+        expect(list).toMatch(/^ {2}\u2514 helper {2,}/m);
+        expect(agentRows(await session.capturePaneEscapes())).toEqual([
+          { name: "fx 1", selected: false },
+          { name: "helper", selected: true },
+          { name: "fx 2", selected: false },
+        ]);
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("helper \u00b7 "), 15_000);
       });
@@ -1685,8 +1870,8 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
         await session.waitForPane((pane) => pane.includes("fx 2 finished · fx 1/2 \u2193"), 15_000);
         await session.sendText("/agents");
-        const list = await session.waitForPane((pane) => pane.includes("fx 2 ·"), 15_000);
-        expect(list).toMatch(/fx 2 · .* · main · finished/);
+        const list = await session.waitForPane((pane) => instanceRow(2).test(pane), 15_000);
+        expect(list).toMatch(/^ {2}fx 2 {2,}.* {2,}finished {2,}main {2,}\S/m);
         await session.sendKeys("Escape");
         // Showing it clears the note.
         await switchAgent(session, "next");
@@ -1717,8 +1902,8 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await switchAgent(session, "previous");
         await session.waitForPane((pane) => pane.includes("fx 1/2") && pane.includes("fx 2 needs you · fx 1/2 \u2193"), 15_000);
         await session.sendText("/agents");
-        const list = await session.waitForPane((pane) => pane.includes("fx 2 ·"), 15_000);
-        expect(list).toMatch(/fx 2 · .* · main · needs you/);
+        const list = await session.waitForPane((pane) => instanceRow(2).test(pane), 15_000);
+        expect(list).toMatch(/^ {2}fx 2 {2,}.* {2,}needs you {2,}main {2,}\S/m);
         await session.sendKeys("Escape");
         // Esc on its own screen ends the request, and the note goes.
         await switchAgent(session, "next");

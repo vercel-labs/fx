@@ -176,6 +176,9 @@ pub const Auth = struct {
     refusal: ?oauth.Refusal = null,
     /// The revocation a sign-out sent, until its answer: closing waits for it.
     revoke_key: u64 = 0,
+    /// The status that revocation was answered with, 0 when it couldn't be
+    /// sent or read; null until it's answered.
+    revoke_answer: ?u16 = null,
     next_key: u64 = fetch_base,
     actions: std.ArrayList(Action) = .empty,
 
@@ -408,6 +411,7 @@ pub const Auth = struct {
             try oauth.writeTokenRequest(&body.writer, .{ .revoke = .{ .token = token, .hint = hint } }, "", cred.client);
             const key = a.newKey();
             a.revoke_key = key;
+            a.revoke_answer = null;
             a.post(key, endpoint, body.written(), "application/x-www-form-urlencoded", try oauth.basicAuthorization(a.flow_arena.allocator(), cred.client)) catch {
                 a.revoke_key = 0;
             };
@@ -638,6 +642,12 @@ pub const Auth = struct {
         return if (a.revoke_key == 0) null else a.revoke_key;
     }
 
+    /// The status the last sign-out's revocation was answered with, as
+    /// `revoke_answer` holds it.
+    pub fn revocationAnswer(a: *const Auth) ?u16 {
+        return a.revoke_answer;
+    }
+
     /// The answer to one of this module's requests. False when `key` isn't one.
     /// `answer` lasts only until the client's next `next`; what is read from it
     /// is read from a copy kept as long as it's needed. `media` is its
@@ -647,6 +657,7 @@ pub const Auth = struct {
         if (key == 0) return false;
         if (key == a.revoke_key) {
             a.revoke_key = 0;
+            a.revoke_answer = status;
             return true;
         }
         if (key == a.refresh_key) {

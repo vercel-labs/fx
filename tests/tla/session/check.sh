@@ -19,6 +19,14 @@
 # stream-witness-*.cfg must be violated. stream-simulate*.cfg run random
 # behaviors with more calls and rebuilds.
 #
+# SessionWrite models how a session's writes list the compactor's records
+# (D50) when they run on more than one thread. session-write.cfg must pass
+# with one write at a time and failed appends on. session-write-today*.cfg
+# show fx before the write lock: the second clear panics, a clear can drop a
+# record no batch listed, and two batches list the same record. Each
+# session-write-mutant-*.cfg plants one bug that its property must catch,
+# and each session-write-witness-*.cfg must be violated.
+#
 # Run the real binary along the models and have TLC check every run:
 #   bun test ../drivers/session/
 #
@@ -62,4 +70,14 @@ TurnStream stream-witness-recovery NeverCommittedAfterRecovery
 TurnStream stream-witness-missed-path MissedPathsNeverParse
 TurnStream stream-simulate simulate $sim
 TurnStream stream-simulate-before simulate $sim
+SessionWrite session-write -
+SessionWrite session-write-today NoStaleRemoval
+SessionWrite session-write-today-loss ClearedWereListed
+SessionWrite session-write-today-twice ListedOnce
+SessionWrite session-write-mutant-unlock-after-take NoStaleRemoval
+SessionWrite session-write-mutant-clear-all ClearedWereListed
+SessionWrite session-write-mutant-clear-on-failure ClearedWereListed
+SessionWrite session-write-witness-added-during-write NeverAddedDuringWrite
+SessionWrite session-write-witness-waits NeverWaitsBehindDue
+SessionWrite session-write-witness-relisted NeverRelistedAfterFailure
 EOF
