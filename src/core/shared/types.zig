@@ -297,9 +297,10 @@ pub const StreamState = struct {
     /// When the turn started; 0 hides the elapsed counter and activity blink.
     /// Monotonic for the whole turn: phase and tool boundaries never reset it.
     turn_started_ms: i64 = 0,
-    /// When fx started waiting on user input (approval or question); 0 means
-    /// not waiting. While set, the turn clock freezes at this instant;
-    /// on resume the wait is excluded by shifting turn_started_ms forward.
+    /// When the turn started waiting, on user input (approval or question)
+    /// or on a compaction; 0 means not waiting. While set, the turn clock
+    /// freezes at this instant; on resume the wait is excluded by shifting
+    /// turn_started_ms forward.
     waiting_since_ms: i64 = 0,
 };
 

@@ -23,6 +23,13 @@ const HANDOFF = `Facts:\nF1: INTERNAL_HANDOFF_4e12: preserve ${HEAD} and ${TAIL}
 const FOLLOWUP = "FOLLOWUP_OK_732c";
 const REOPEN = "REOPEN_OK_492a";
 const ACTIVITY = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
+// The compaction row's own clock and the step it shows after it.
+const COMPACTION_CLOCK = /Compacting \(((?:\d+h)?(?:\d+m)?\d+s)\)(?: · (\d\/3 \w+))?/;
+const TURN_CLOCK = /Thinking \(((?:\d+h)?(?:\d+m)?\d+s)\)/;
+function clockSeconds(clock: string): number {
+  const [, hours, minutes, seconds] = /^(?:(\d+)h)?(?:(\d+)m)?(\d+)s$/.exec(clock)!;
+  return Number(hours ?? 0) * 3600 + Number(minutes ?? 0) * 60 + Number(seconds);
+}
 const COMPACTION_OUTPUT = /Compacting|compaction|Context compacted|No context to compact|Synthetic summary rejection|INTERNAL_HANDOFF_4e12/i;
 // Ctrl+O gives each compaction's model call its own line, as for every call;
 // nothing else there may speak of compaction.
@@ -58,7 +65,7 @@ async function until(predicate: () => boolean, label: string, timeout = 20_000) 
   }
 }
 
-async function fixture(trigger: Trigger, outcome: Outcome = "success", longResume = false) {
+async function fixture(trigger: Trigger, outcome: Outcome = "success", longResume = false, overflowDelayMs = 0) {
   // Ctrl+O includes the recording path; keep it free of forbidden notice words.
   const root = mkdtempSync(join(tmpdir(), "fx-activity-"));
   const home = join(root, "home");
@@ -108,10 +115,11 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
     if (phase === "attempt") {
       if (trigger === "overflow" && !overflowSent) {
         overflowSent = true;
-        return Response.json({ error: {
+        const overflow = Response.json({ error: {
           type: "invalid_request_error", code: "context_length_exceeded",
           message: "This model's maximum context length is 128000 tokens. The request exceeds the context window.",
         } }, { status: 400 });
+        return overflowDelayMs > 0 ? Bun.sleep(overflowDelayMs).then(() => overflow) : overflow;
       }
       return ordinaryHold.response;
     }
@@ -340,6 +348,44 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       } finally { await f.cleanup(passed); }
     }, 120_000);
   }
+
+  test("overflow: compaction counts its own time from zero with its step, and the turn clock goes on from where it stopped", async () => {
+    // The turn's first request answers with the overflow only after 3 s, so
+    // the turn clock is past zero when compaction starts.
+    const f = await fixture("overflow", "success", false, 3000);
+    let passed = false;
+    try {
+      const terminal = await f.launch();
+      await terminal.sendText("Continue the current turn.");
+      let before = -1;
+      const started = await terminal.waitForPane((pane) => {
+        const turn = TURN_CLOCK.exec(pane);
+        if (turn) before = Math.max(before, clockSeconds(turn[1]!));
+        return COMPACTION_CLOCK.test(pane);
+      }, 15_000);
+      expect(before).toBeGreaterThanOrEqual(2);
+      expect(clockSeconds(COMPACTION_CLOCK.exec(started)![1]!)).toBeLessThanOrEqual(1);
+      // The summary is held, so the row stays on the summary step while its
+      // own clock runs well past what the turn showed.
+      await terminal.waitForPane((pane) => {
+        const row = COMPACTION_CLOCK.exec(pane);
+        return row !== null && row[2] === "2/3 summarizing" && clockSeconds(row[1]!) >= 4;
+      }, 15_000);
+      f.summaryHold.release(HANDOFF);
+      await until(() => f.durable() > 0, "acknowledged checkpoint");
+      const resumed = await terminal.waitForText(TURN_CLOCK, 10_000);
+      expect(resumed).not.toMatch(COMPACTION_CLOCK);
+      // The turn goes on from the second compaction started in, plus at most
+      // the second the release took; the 4 s or more of compaction are not in it.
+      const after = clockSeconds(TURN_CLOCK.exec(resumed)![1]!);
+      expect(after).toBeGreaterThanOrEqual(before);
+      expect(after).toBeLessThanOrEqual(before + 2);
+      f.ordinaryHold.release("CURRENT_TURN_OK_f713");
+      await terminal.waitForPane((pane) => pane.includes("CURRENT_TURN_OK_f713") && hasEmptyComposer(pane), 10_000);
+      await f.close();
+      passed = true;
+    } finally { await f.cleanup(passed); }
+  }, 90_000);
 
   for (const trigger of ["manual", "auto"] as const) {
     test(`${trigger}: a message submitted during a held compaction waits and runs after with compacted context`, async () => {
