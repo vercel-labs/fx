@@ -213,8 +213,20 @@ fn loadFromService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
 
     var account_buf: AccountBuffer = undefined;
     const account = try accountName(&account_buf);
-    const result = std.process.run(alloc, io_mod.getIo(), .{
-        .argv = &.{ "/usr/bin/security", "find-generic-password", "-a", account, "-s", service, "-w" },
+    return loadFromChild(alloc, &.{ "/usr/bin/security", "find-generic-password", "-a", account, "-s", service, "-w" });
+}
+
+/// Runs `argv`, a Keychain read that prints the secret, and returns its
+/// output without the trailing newline. The caller owns the result and frees
+/// it with `secret.zeroAndFree` and `alloc`. Public for
+/// `native_keychain_reply_tests.zig`, which runs a fake child in its place.
+pub fn loadFromChild(alloc: std.mem.Allocator, argv: []const []const u8) !?[]u8 {
+    // The reply buffer grows by realloc as the child prints, and every block it
+    // outgrows holds the secret, so it grows through an allocator that wipes
+    // the blocks it gives back. Its blocks come straight from `alloc`.
+    var wiping: secret.Wiping = .init(alloc);
+    const result = std.process.run(wiping.allocator(), io_mod.getIo(), .{
+        .argv = argv,
     }) catch |err| {
         debug_trace.logf("keychain", "load failed step=spawn err={s}", .{@errorName(err)});
         return error.KeychainReadFailed;
@@ -515,7 +527,11 @@ const McpKeychainRunEvent = union(enum) {
 fn runMcpKeychainChild(
     context: *const McpKeychainRunContext,
 ) anyerror!std.process.RunResult {
-    return std.process.run(context.alloc, io_mod.getIo(), .{
+    // The reply can hold a saved session or MCP credentials, so its buffer grows
+    // through an allocator that wipes the blocks it gives back (see
+    // `loadFromChild`). The result's blocks come straight from `context.alloc`.
+    var wiping: secret.Wiping = .init(context.alloc);
+    return std.process.run(wiping.allocator(), io_mod.getIo(), .{
         .argv = context.argv,
         .stdout_limit = context.stdout_limit,
         .stderr_limit = .limited(4096),
@@ -561,7 +577,8 @@ fn abandonMcpKeychainRun(
     };
 }
 
-fn runMcpKeychainProcess(
+/// Public for `native_keychain_reply_tests.zig`, which runs a fake child.
+pub fn runMcpKeychainProcess(
     alloc: std.mem.Allocator,
     argv: []const []const u8,
     cancel_flag: ?*const std.atomic.Value(bool),

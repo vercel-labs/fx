@@ -233,7 +233,8 @@ pub fn pollDeviceTokenBounded(
     deadline: std.Io.Clock.Timestamp,
 ) !PollResult {
     var form: FormBody = .{};
-    var writer: std.Io.Writer.Allocating = .init(alloc);
+    var wiping: secret.Wiping = .init(alloc);
+    var writer: std.Io.Writer.Allocating = .init(wiping.allocator());
     defer writer.deinit();
     try form.append(&writer.writer, "client_id", client_id);
     try form.append(&writer.writer, "grant_type", "urn:ietf:params:oauth:grant-type:device_code");
@@ -266,7 +267,8 @@ pub fn refreshToken(
     refresh_token: []const u8,
 ) !TokenSet {
     var form: FormBody = .{};
-    var writer: std.Io.Writer.Allocating = .init(alloc);
+    var wiping: secret.Wiping = .init(alloc);
+    var writer: std.Io.Writer.Allocating = .init(wiping.allocator());
     defer writer.deinit();
     try form.append(&writer.writer, "client_id", client_id);
     try form.append(&writer.writer, "grant_type", "refresh_token");
@@ -292,7 +294,8 @@ pub fn revokeToken(
     token_type_hint: TokenTypeHint,
 ) !void {
     var form: FormBody = .{};
-    var writer: std.Io.Writer.Allocating = .init(alloc);
+    var wiping: secret.Wiping = .init(alloc);
+    var writer: std.Io.Writer.Allocating = .init(wiping.allocator());
     defer writer.deinit();
     try form.append(&writer.writer, "client_id", client_id);
     try form.append(&writer.writer, "token", token);
@@ -330,7 +333,8 @@ pub fn parseMetadata(alloc: Allocator, bytes: []const u8) !Metadata {
 }
 
 pub fn parseDeviceAuthorization(alloc: Allocator, bytes: []const u8) !DeviceAuthorization {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    var wiping: secret.Wiping = .init(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, wiping.allocator(), bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return OAuthError.InvalidOAuthResponse;
     const object = parsed.value.object;
@@ -355,7 +359,8 @@ pub fn parseDeviceAuthorization(alloc: Allocator, bytes: []const u8) !DeviceAuth
 }
 
 pub fn parseTokenSet(alloc: Allocator, bytes: []const u8) !TokenSet {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    var wiping: secret.Wiping = .init(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, wiping.allocator(), bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return OAuthError.InvalidOAuthResponse;
     const object = parsed.value.object;
@@ -383,7 +388,8 @@ pub fn parseBrowserTokenSet(
     alloc: Allocator,
     bytes: []const u8,
 ) !BrowserTokenSet {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    var wiping: secret.Wiping = .init(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, wiping.allocator(), bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return OAuthError.InvalidOAuthResponse;
     const object = parsed.value.object;
@@ -949,4 +955,165 @@ test "oauth parsers reject non-object JSON" {
     try std.testing.expectError(OAuthError.InvalidOAuthResponse, parseDeviceAuthorization(std.testing.allocator, "null"));
     try std.testing.expectError(OAuthError.InvalidOAuthResponse, parseTokenSet(std.testing.allocator, "\"token\""));
     try std.testing.expectError(OAuthError.OAuthRequestFailed, mapOAuthHttpError(std.testing.allocator, "42"));
+}
+
+/// An issuer that answers every request with `reply`.
+const ReplyTransport = struct {
+    reply: []const u8,
+
+    fn provider(self: *ReplyTransport) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+        const self: *ReplyTransport = @ptrCast(@alignCast(raw.?));
+        return .{ .disposition = .accepted, .body = try alloc.dupe(u8, self.reply) };
+    }
+};
+
+test "parsing an OAuth reply gives back no block that still holds its secrets" {
+    {
+        var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+        const alloc = scan.allocator();
+        var set = try parseTokenSet(alloc,
+            \\{"access_token":"SECRET_MARK_access","refresh_token":"SECRET_MARK_refresh","token_type":"Bearer","expires_in":3600,"scope":"openid"}
+        );
+        set.deinit(alloc);
+        try scan.expectWiped();
+    }
+    {
+        var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+        const alloc = scan.allocator();
+        var device = try parseDeviceAuthorization(alloc,
+            \\{"device_code":"SECRET_MARK_device","user_code":"ABCD-EFGH","verification_uri":"https://vercel.com/device","expires_in":600,"interval":5}
+        );
+        device.deinit(alloc);
+        try scan.expectWiped();
+    }
+    {
+        var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+        const alloc = scan.allocator();
+        var set = try parseBrowserTokenSet(alloc,
+            \\{"access_token":"SECRET_MARK_access","refresh_token":"SECRET_MARK_refresh","expires_in":3600}
+        );
+        set.deinit(alloc);
+        try scan.expectWiped();
+    }
+}
+
+test "an OAuth device poll, refresh, or revocation gives back no block that still holds the secret it sends" {
+    var issuer: ReplyTransport = .{ .reply =
+        \\{"access_token":"new-access","refresh_token":"new-refresh","token_type":"Bearer","expires_in":3600,"scope":"openid"}
+    };
+    const metadata: Metadata = .{
+        .issuer = @constCast("https://vercel.com"),
+        .device_authorization_endpoint = @constCast("https://vercel.com/device"),
+        .token_endpoint = @constCast("https://vercel.com/token"),
+    };
+    // A short secret, and one long enough to outgrow a buffer that grows.
+    var long: [2048]u8 = @splat('x');
+    @memcpy(long[0.."SECRET_MARK".len], "SECRET_MARK");
+    for ([_][]const u8{ "SECRET_MARK", &long }) |value| {
+        {
+            var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+            const alloc = scan.allocator();
+            var cancel = std.atomic.Value(bool).init(false);
+            const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(30_000),
+            });
+            var result = try pollDeviceTokenBounded(alloc, issuer.provider(), metadata, "cl_test", value, &cancel, deadline);
+            result.success.deinit(alloc);
+            try scan.expectWiped();
+        }
+        {
+            var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+            const alloc = scan.allocator();
+            var set = try refreshToken(alloc, issuer.provider(), metadata, "cl_test", value);
+            set.deinit(alloc);
+            try scan.expectWiped();
+        }
+        {
+            var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+            try revokeToken(scan.allocator(), issuer.provider(), "https://vercel.com/revoke", "cl_test", value, .refresh_token);
+            try scan.expectWiped();
+        }
+    }
+}
+
+test "an OAuth reply refused after its token was copied gives back no block that still holds it" {
+    var scan: testing_allocator.ReleaseScan = .{ .needle = "SECRET_MARK" };
+    const alloc = scan.allocator();
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, parseTokenSet(alloc,
+        \\{"access_token":"SECRET_MARK_access","token_type":"mac","expires_in":3600}
+    ));
+    try scan.expectWiped();
+}
+
+test "an OAuth reply gives back no block that still holds its secrets on fuzzed replies" {
+    try std.testing.fuzz({}, fuzzReplySecrets, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            // A token reply with two long tokens, a Bearer type, and a lifetime.
+            "\x00\x00\x80\x01\x00\x80\x03\x00\x00\x05\x02\x3c",
+            // A device authorization reply.
+            "\x02\x00\x10\x07\x00\x00\x08\x00\x00\x05\x02\x3c",
+            // Escaped tokens, so only their decoded copies hold the marker.
+            "\x00\x01\x00\x01\x01\x00\x03\x00\x00\x05\x02\x3c",
+            // A reply cut off inside its refresh token.
+            "\x00\x00\x40\x01\x00\xff\x05\x02\x3c\xc0",
+            // A reply refused after its token was copied: the type is a number.
+            "\x00\x00\x08\x03\x02\x00",
+        }) ++ @import("fuzz_corpus").oauth_reply_secrets.*),
+    });
+}
+
+/// Builds a reply from a fuzzed recipe, three bytes a field, in which only
+/// the secret fields carry the marker; one byte left over cuts the reply
+/// short. Then parses it every way fx parses a reply. Whether a parse
+/// succeeds, refuses the reply, or finds no JSON, no block it gives back may
+/// still hold the marker.
+fn fuzzReplySecrets(_: void, smith: *std.testing.Smith) anyerror!void {
+    const marker = "SECRET_MARK";
+    // The fields below index 3 are the secrets.
+    const names = [_][]const u8{
+        "access_token", "refresh_token", "device_code", "token_type",       "scope",
+        "expires_in",   "interval",      "user_code",   "verification_uri",
+    };
+    var recipe_buf: [96]u8 = undefined;
+    const recipe = recipe_buf[0..@intCast(smith.slice(&recipe_buf))];
+    var reply: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer reply.deinit();
+    const w = &reply.writer;
+    try w.writeByte('{');
+    var at: usize = 0;
+    while (at + 3 <= recipe.len) : (at += 3) {
+        const index = recipe[at] % names.len;
+        if (at > 0) try w.writeByte(',');
+        try w.print("\"{s}\":", .{names[index]});
+        const carries = index < 3;
+        switch (recipe[at + 1] % 5) {
+            0 => if (carries) {
+                try w.writeAll("\"" ++ marker);
+                try w.splatByteAll('x', @as(usize, recipe[at + 2]) * 8);
+                try w.writeByte('"');
+            } else try w.writeAll("\"Bearer\""),
+            1 => try w.writeAll(if (carries) "\"\\u0053ECRET_MARK\"" else "\"openid\""),
+            2 => try w.print("{d}", .{@as(i32, recipe[at + 2]) * 60}),
+            3 => try w.writeAll("null"),
+            else => try w.writeAll("[\"a\",{\"b\":1}]"),
+        }
+    }
+    try w.writeByte('}');
+    const text = reply.written();
+    const bytes = if (recipe.len % 3 == 1) text[0 .. text.len * recipe[recipe.len - 1] / 256] else text;
+
+    inline for (.{ parseTokenSet, parseDeviceAuthorization, parseBrowserTokenSet }) |parse| {
+        var scan: testing_allocator.ReleaseScan = .{ .needle = marker };
+        const alloc = scan.allocator();
+        if (parse(alloc, bytes)) |value| {
+            var owned = value;
+            owned.deinit(alloc);
+        } else |_| {}
+        try std.testing.expectEqual(@as(usize, 0), scan.holding);
+    }
 }
