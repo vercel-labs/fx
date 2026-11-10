@@ -344,23 +344,7 @@ test "warmAsync is a no-op in test builds" {
     try std.testing.expect(!pool.warm_started.load(.acquire));
 }
 
-/// A test Io that refuses to open either keychain file std's macOS scan
-/// reads, as a sandbox that denies them does, so no test reads them.
-const KeychainDeniedIo = struct {
-    var vtable: std.Io.VTable = undefined;
-
-    fn io() std.Io {
-        vtable = std.testing.io.vtable.*;
-        vtable.dirOpenFile = open;
-        return .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
-    }
-
-    fn open(userdata: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
-        if (std.mem.eql(u8, path, "/System/Library/Keychains/SystemRootCertificates.keychain") or
-            std.mem.eql(u8, path, "/Library/Keychains/System.keychain")) return error.PermissionDenied;
-        return std.testing.io.vtable.dirOpenFile(userdata, dir, path, options);
-    }
-};
+const keychain_denied_testing = @import("keychain_denied_testing.zig");
 
 test "the pool loads trusted roots when a sandbox denies the keychain files" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
@@ -368,14 +352,14 @@ test "the pool loads trusted roots when a sandbox denies the keychain files" {
     // the roots load.
     var warmed = HttpPool.init(std.testing.allocator);
     defer _ = warmed.deinit();
-    warmed.client.io = KeychainDeniedIo.io();
+    warmed.client.io = keychain_denied_testing.io(false);
     warmed.warm("https://127.0.0.1:1/");
     try std.testing.expect(warmed.client.now != null);
     try std.testing.expect(warmed.client.ca_bundle.map.count() > 0);
 
     var opened = HttpPool.init(std.testing.allocator);
     defer _ = opened.deinit();
-    opened.client.io = KeychainDeniedIo.io();
+    opened.client.io = keychain_denied_testing.io(false);
     const uri = try std.Uri.parse("https://127.0.0.1:1/v1/chat/completions");
     if (opened.openRequest(.POST, uri, .{})) |pooled| {
         var request = pooled.request;

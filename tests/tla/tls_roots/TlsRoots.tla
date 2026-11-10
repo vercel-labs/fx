@@ -32,7 +32,8 @@ EXTENDS Naturals, FiniteSets
 
 CONSTANTS
     OSes,       \* systems to explore: "macos", "linux"
-    Sites,      \* HTTPS clients, such as "pool" and "mcp"
+    Sites,      \* HTTPS clients: "pool", "mcp", and "job", the one-shot lookups
+                \* that open on a client of their own (`openRequestOnJob`)
     Skips,      \* clients that do not call the loader (planted defect)
     Requests,   \* concurrent requests per client
     Rule        \* "fixed", "today", or a planted defect

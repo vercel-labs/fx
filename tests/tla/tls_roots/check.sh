@@ -14,7 +14,8 @@
 #   any-os         the fallback runs on systems other than macOS   FallbackOnlyOnDenial
 #   accept-empty   a public bundle with no roots is installed      InstalledNotEmpty
 #   clock-first    the clock is set before the bundle is swapped   HandshakeHasRoots
-#   skip-site      one client keeps std's own scan                 NoFailureWhileRootsReadable
+#   skip-site      the MCP client keeps std's own scan             NoFailureWhileRootsReadable
+#   skip-job       the open job's own client keeps std's own scan  NoFailureWhileRootsReadable
 #
 # TlsRootsTrace.tla checks runs of the built fx binary against the model;
 # tests/tla/drivers/tls_roots/driver.ts runs it.
@@ -40,4 +41,5 @@ TlsRoots tls-roots-mutation-any-os FallbackOnlyOnDenial
 TlsRoots tls-roots-mutation-accept-empty InstalledNotEmpty
 TlsRoots tls-roots-mutation-clock-first HandshakeHasRoots
 TlsRoots tls-roots-mutation-skip-site NoFailureWhileRootsReadable
+TlsRoots tls-roots-mutation-skip-job NoFailureWhileRootsReadable
 VERDICTS

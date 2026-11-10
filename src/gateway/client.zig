@@ -12208,3 +12208,31 @@ test "a model catalog fetch ends at its deadline during a lookup that hangs" {
     ));
     try std.testing.expect(elapsedMsSince(started) < 1_000);
 }
+
+const keychain_denied_testing = @import("../core/shared/keychain_denied_testing.zig");
+
+test "an open job loads trusted roots when a sandbox denies the keychain files" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var denied = keychain_denied_testing.install(false);
+    defer waitForOwnClientOpenJobs() catch {};
+    defer denied.deinit();
+    // Nothing listens on port 1, so the open ends at the connect, after the
+    // client's roots load.
+    var opened = openRequestOnJob(.GET, try std.Uri.parse("https://127.0.0.1:1/v1/models"), .{}) catch |err| {
+        try std.testing.expect(err != error.CertificateBundleLoadFailure);
+        return;
+    };
+    opened.deinit();
+    return error.TestUnexpectedResult;
+}
+
+test "an open job fails before it connects when a sandbox denies the keychain files and the public bundle" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var denied = keychain_denied_testing.install(true);
+    defer waitForOwnClientOpenJobs() catch {};
+    defer denied.deinit();
+    try std.testing.expectError(
+        error.CertificateBundleLoadFailure,
+        openRequestOnJob(.GET, try std.Uri.parse("https://127.0.0.1:1/v1/models"), .{}),
+    );
+}
