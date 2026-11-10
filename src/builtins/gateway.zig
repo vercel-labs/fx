@@ -867,8 +867,12 @@ fn creditsSnapshotFromJsonValue(
     if (obj.get("balance")) |field| {
         if (field == .string) snapshot.balance = try alloc.dupe(u8, field.string);
     }
-    if (obj.get("used")) |field| {
-        if (field == .string) snapshot.used = try alloc.dupe(u8, field.string);
+    // The Gateway reports spend as `total_used`; older responses named it `used`.
+    for ([_][]const u8{ "total_used", "used" }) |key| {
+        const field = obj.get(key) orelse continue;
+        if (field != .string) continue;
+        snapshot.used = try alloc.dupe(u8, field.string);
+        break;
     }
     if (obj.get("plan")) |field| {
         if (field == .string) snapshot.plan = try alloc.dupe(u8, field.string);
@@ -2227,6 +2231,22 @@ test "built-in credits provider returns owned string fields" {
         "[credits] balance=10\n[credits] used=2\n[credits] plan=pro\n",
         text,
     );
+}
+
+test "built-in credits provider reads the Gateway's total_used as used" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"balance\":\"12.50\",\"total_used\":\"1.25\",\"used\":\"9\"}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    var snapshot = try creditsSnapshotFromJsonValue(std.testing.allocator, parsed.value);
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("12.50", snapshot.balance.?);
+    try std.testing.expectEqualStrings("1.25", snapshot.used.?);
 }
 
 test "built-in credits provider ignores non-string fields" {
