@@ -4408,7 +4408,6 @@ pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
 
 const default_command_output_block_cap: usize = 1024 * 1024;
 const full_transcript_snapshot_clone_max_bytes: usize = 8 * 1024 * 1024;
-const resume_publication_rows_per_frame: u32 = 64;
 
 pub const PaintTraceState = struct {
     transcript_top: u16 = 0,
@@ -8426,15 +8425,7 @@ pub const TranscriptRuntime = struct {
         semantic_rows: u32,
         semantic_progress_rows: u32,
     ) u16 {
-        const semantic_cap = if (self.notebook.pending_resume_source != null)
-            resume_publication_rows_per_frame
-        else
-            std.math.maxInt(u32);
-        const planned = frameInlineScrollBudgetCapped(
-            resize_reflow_rows,
-            semantic_rows,
-            semantic_cap,
-        );
+        const planned = frameInlineScrollBudget(resize_reflow_rows, semantic_rows);
         if (semantic_rows == 0) return planned;
 
         const materialized = self.materializedTranscriptProjection(
@@ -8446,7 +8437,7 @@ pub const TranscriptRuntime = struct {
                 return frameInlineScrollBudgetCapped(
                     resize_reflow_rows,
                     semantic_rows,
-                    @min(projection.visual_rows, semantic_cap),
+                    projection.visual_rows,
                 );
             }
         }
@@ -8476,7 +8467,7 @@ pub const TranscriptRuntime = struct {
         return frameInlineScrollBudgetCapped(
             resize_reflow_rows,
             semantic_rows,
-            @min(projection.visual_rows, semantic_cap),
+            projection.visual_rows,
         );
     }
 
@@ -13721,7 +13712,7 @@ test "oversized resume publication starts without a prior committed frame" {
     try std.testing.expect(facts.target_visual_offset > std.math.maxInt(u16));
     try std.testing.expectEqual(@as(u32, std.math.maxInt(u16)), facts.semantic_rows);
     try std.testing.expectEqual(
-        @as(u16, resume_publication_rows_per_frame),
+        @as(u16, std.math.maxInt(u16)),
         facts.planned_rows,
     );
     try std.testing.expect(facts.recovery_progress_compatible);
@@ -13739,11 +13730,8 @@ test "oversized resume publication starts without a prior committed frame" {
         facts.semantic_rows,
         facts.semantic_progress_rows,
     );
-    try std.testing.expectEqual(
-        @as(u32, resume_publication_rows_per_frame),
-        accepted.semantic_rows,
-    );
-    try std.testing.expect(accepted.semantic_rows < facts.semantic_rows);
+    try std.testing.expectEqual(facts.semantic_rows, accepted.semantic_rows);
+    try std.testing.expect(accepted.semantic_rows < facts.target_visual_offset);
 
     const append_base = (try runtime.resolveTransitionAppendBase(
         &prepared,
@@ -14087,7 +14075,7 @@ fn frameInlineScrollBudget(resize_reflow_rows: u16, semantic_rows: u32) u16 {
     );
 }
 
-test "pending resume publication yields after a bounded row batch" {
+test "pending resume publication plans its whole history in one frame" {
     const alloc = std.testing.allocator;
     var runtime: TranscriptRuntime = .{};
     defer runtime.deinit(alloc);
@@ -14109,7 +14097,7 @@ test "pending resume publication yields after a bounded row batch" {
         try alloc.dupe(u8, "pending"),
     );
     try std.testing.expectEqual(
-        @as(u16, resume_publication_rows_per_frame),
+        @as(u16, 1_000),
         runtime.plannedTranscriptRows(&prepared, 0, 0, 1_000, 0),
     );
 }
