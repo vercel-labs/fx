@@ -978,6 +978,14 @@ pub const McpToolBinding = struct {
     }
 };
 
+/// A `toolbox` open or search as the tool it replaced: `skill` with the
+/// skill's name, `mcp_select_tool` with the MCP tool or server, or
+/// `capability_search` with `*`.
+pub const ToolboxLookup = struct {
+    permission: []const u8,
+    target: []const u8,
+};
+
 pub const ToolCall = struct {
     id: []const u8,
     name: []const u8,
@@ -990,13 +998,35 @@ pub const ToolCall = struct {
     provider_result: ?[]const u8 = null,
     final_identity: FinalToolIdentity = .valid,
     provenance: ToolExecutionProvenance = .fx_local,
-    /// Borrowed only for this action. Copies and durable/provider encodings omit it.
-    resolved_skill: ?*const skill_contract.PreparedSkill = null,
     /// What this action works on, resolved from earlier results, such as the
     /// command whose saved output a `read_tool_result` call reads. Borrowed
     /// only for this action. Copies and durable/provider encodings omit it.
     resolved_display_target: ?[]const u8 = null,
+    /// The tool the model called when this is the call a `toolbox {run}`
+    /// carries: fx prepares, admits, and runs this call, and its result goes
+    /// back under that name. Borrowed only for this action. Copies and
+    /// durable/provider encodings omit it.
+    carried_by: ?[]const u8 = null,
+    /// What this call stands for when it is a `toolbox` open or search, set
+    /// before admission so the permission rules and a subagent's profile
+    /// decide it as the tool it replaced. Borrowed only for this action.
+    /// Copies and durable/provider encodings omit it.
+    toolbox_lookup: ?ToolboxLookup = null,
+
+    /// The name the model called, which this call's result goes back under.
+    pub fn calledName(self: ToolCall) []const u8 {
+        return self.carried_by orelse self.name;
+    }
 };
+
+/// The prefix of every MCP tool name fx gives the model, which
+/// `src/core/mcp/tool_names.zig` builds.
+pub const mcp_tool_prefix = "mcp_";
+
+/// Whether `name` has the shape of an MCP tool name fx gives the model.
+pub fn isMcpToolName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, mcp_tool_prefix);
+}
 
 pub const WebSearchProgress = union(enum) {
     query_started: []const u8,
@@ -1795,16 +1825,17 @@ pub const ChatMessage = struct {
     permission_feedback: bool = false,
     /// Checkpoint steering text has already had its envelope removed.
     restored_steering: bool = false,
+    /// A prompt fx sent on its own to a turn that stopped without a final
+    /// answer, as plain user text. A save of the turn keeps it in the
+    /// steering list inside a marker (`recovery_prompt.saved`), and a
+    /// restored one comes back with this flag and the bare prompt.
+    recovery_prompt: bool = false,
     /// A `.system` message fx added after the conversation started, which
     /// only the messages lane carries (D93). Plain text content only.
     context_note: bool = false,
     /// The instruction files a context note delivers. Borrowed; never sent
     /// to a provider.
     context_note_sources: []const ContextNoteSource = &.{},
-    /// What a save of the turn records for this context note instead of
-    /// `content`, which only this turn's requests send: a named skill's text
-    /// is saved as a short note (D95). Borrowed.
-    context_note_saved_text: ?[]const u8 = null,
     // Source provenance for compaction, never permission authority.
     context_origin: enum { ordinary, user_turn, handoff } = .ordinary,
     standalone_response: bool = false,
@@ -3579,17 +3610,16 @@ test "dupeToolCall preserves argument integrity" {
 }
 
 test "dupeToolCall drops action scoped bindings" {
-    const skill: skill_contract.PreparedSkill = .{ .skill = .{ .name = "workflow", .description = "", .path = "/skills/workflow", .source = .global_fx } };
     const source: ToolCall = .{
-        .id = "skill",
-        .name = "skill",
-        .arguments_json = "{\"location\":\"/skills/workflow\"}",
-        .resolved_skill = &skill,
+        .id = "open",
+        .name = "toolbox",
+        .arguments_json = "{\"open\":\"/skills/workflow\"}",
+        .toolbox_lookup = .{ .permission = "skill", .target = "workflow" },
         .resolved_display_target = "more output from zig build test",
     };
     const copy = try dupeToolCall(std.testing.allocator, source);
     defer freeToolCall(std.testing.allocator, copy);
-    try std.testing.expect(copy.resolved_skill == null);
+    try std.testing.expect(copy.toolbox_lookup == null);
     try std.testing.expect(copy.resolved_display_target == null);
     try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
 }

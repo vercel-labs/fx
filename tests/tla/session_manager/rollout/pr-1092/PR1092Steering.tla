@@ -1,7 +1,8 @@
 -------------------------- MODULE PR1092Steering ---------------------------
 EXTENDS Naturals, Sequences, FiniteSets
 CONSTANT MaxMessages, MaxSteps
-Kinds == {"steering", "restored", "feedback", "plain"}
+\* "recovery" is fx's own prompt to a stalled turn (src/core/shared/recovery_prompt.zig).
+Kinds == {"steering", "restored", "feedback", "recovery", "plain"}
 Entry == [kind : Kinds, after : 0..MaxSteps, valid : BOOLEAN]
 VARIABLES steps, messages, saved, cancelled
 vars == <<steps, messages, saved, cancelled>>
@@ -19,7 +20,7 @@ Cancel == /\ ~cancelled /\ cancelled' = TRUE
           /\ UNCHANGED <<steps, messages>>
 Next == ToolResult \/ (\E k \in Kinds, v \in BOOLEAN : TypeMessage(k,v)) \/ Cancel \/ UNCHANGED vars
 Spec == Init /\ [][Next]_vars
-Expected == SelectSeq(messages, LAMBDA e : e.valid /\ e.kind \in {"steering", "restored", "feedback"})
+Expected == SelectSeq(messages, LAMBDA e : e.valid /\ e.kind \in {"steering", "restored", "feedback", "recovery"})
 SavedExactlyMarkedTail == cancelled => saved = Expected
 PlainTailExcluded == \A i \in 1..Len(saved) : saved[i].kind # "plain"
 AnchorsPreserved == cancelled => \A i \in 1..Len(saved) : saved[i].after = Expected[i].after

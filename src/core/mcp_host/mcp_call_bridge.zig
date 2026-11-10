@@ -19,6 +19,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const capability_mod = @import("../tooling/mcp_call_capability.zig");
 const mcp_call = @import("mcp_call.zig");
@@ -430,14 +431,14 @@ fn serve(stream: std.Io.net.Stream) void {
     };
 
     const request_id = arena.print("fx-mcp-call-{d}", .{@backingInt(work.id)}) catch "fx-mcp-call";
-    // A lookup reads tool metadata only, like the agent's own
-    // `capability_search`, so it has no permission check to wait for.
+    // A lookup reads tool metadata only, like the agent's own toolbox
+    // search, so it has no permission check to wait for.
     const authorization: capability_mod.Authorization = switch (request.operation) {
         .call => |value| blk: {
             bridge.prompt.lockUncancelable(io);
             defer bridge.prompt.unlock(io);
             break :blk registration.capability.authorize(arena, request_id, value.tool, value.arguments_json) catch |err|
-                .{ .deny = arena.print("The permission check for {s} failed: {s}", .{ value.tool, @errorName(err) }) catch "The permission check failed." };
+                .{ .deny = arena.print("The permission check for {f} failed: {s}", .{ text_utils.terminalSafe(value.tool), @errorName(err) }) catch "The permission check failed." };
         },
         .list, .search, .help => .{ .allow = .{} },
     };
@@ -493,6 +494,8 @@ fn runOperation(
 /// A capability whose permission check and call the test controls.
 const FakeTool = struct {
     allow: bool = true,
+    /// The permission check ends in an error instead of a decision.
+    fail: bool = false,
     /// While set, the permission check waits, as for a prompt.
     gate: std.atomic.Value(bool) = .init(false),
     authorizing: std.atomic.Value(bool) = .init(false),
@@ -514,6 +517,7 @@ const FakeTool = struct {
         const self: *FakeTool = @ptrCast(@alignCast(raw));
         self.authorizing.store(true, .release);
         while (self.gate.load(.acquire)) io_mod.sleep(5 * std.time.ns_per_ms);
+        if (self.fail) return error.PermissionCheckFailed;
         return if (self.allow) .{ .allow = .{} } else .{ .deny = "Denied by the test." };
     }
 
@@ -570,6 +574,22 @@ test "a denied call does not run" {
     const reply = try client.call(arena, std.testing.io, variables[0].value, wire.parseToken(variables[1].value).?, .{ .call = .{ .tool = "mcp_s_t", .arguments_json = "{}" } });
     try std.testing.expectEqual(wire.Status.denied, reply.header.status);
     try std.testing.expectEqualStrings("Denied by the test.", reply.bytes);
+    try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
+}
+
+test "a failed permission check names the tool as visible escapes, not raw bytes" {
+    if (!supported) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tool: FakeTool = .{ .fail = true };
+    const registration = try register(tool.capability());
+    defer unregister(registration);
+    const variables = registration.environment();
+    // The name is a word from a command line, so it can hold any byte.
+    const reply = try client.call(arena, std.testing.io, variables[0].value, wire.parseToken(variables[1].value).?, .{ .call = .{ .tool = "mcp_s_\x1b]0;x\x07\x00t", .arguments_json = "{}" } });
+    try std.testing.expectEqual(wire.Status.denied, reply.header.status);
+    try std.testing.expectEqualStrings("The permission check for mcp_s_\\x1b]0;x\\x07\\x00t failed: PermissionCheckFailed", reply.bytes);
     try std.testing.expectEqual(@as(u32, 0), tool.calls.load(.acquire));
 }
 

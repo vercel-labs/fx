@@ -54,6 +54,7 @@ const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
 const subagent_reports = @import("../subagent/reports.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
+const recovery_prompt = @import("../shared/recovery_prompt.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const builtin_tools = @import("../../builtins/tools.zig");
@@ -1545,6 +1546,7 @@ pub fn Runtime(comptime App: type) type {
                 v2.close();
             }
             try restoreChildState(app, agent, resumed.state);
+            if (resumed.title) |title| if (cachedSessionTitle(agent) == null) try setCachedSessionTitle(app, agent, title);
             if (comptime @hasDecl(@TypeOf(agent.session), "configureWebFetchArtifactBlobs")) {
                 if (v2.childCapability()) |capability| {
                     agent.session.configureWebFetchArtifactBlobs(app.alloc, capability, v2.id());
@@ -2663,6 +2665,14 @@ pub fn Runtime(comptime App: type) type {
             }
             const host = agent.session_persistence.subagent_host orelse return;
             host.rebindHost(app, subagentAuthorityResolver(app));
+            bindToolboxBehind(app, host);
+        }
+
+        /// Points `host`'s children at the app's tools behind toolbox, so a
+        /// child whose profile lists one keeps toolbox to reach it. Bound
+        /// again after the app moves, as the host's callbacks are.
+        fn bindToolboxBehind(app: *App, host: *subagent_tool_host.Runtime) void {
+            if (comptime @hasField(App, "toolbox_behind")) host.authority_resolver.toolbox_behind = &app.toolbox_behind;
         }
 
         /// Stops the subagent host, joining its child threads, before the
@@ -3808,7 +3818,7 @@ pub fn Runtime(comptime App: type) type {
                 if (steering.assistant_prefix) |prefix| {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
-                if (steering.text.len == 0) continue;
+                if (steering.text.len == 0 or isRecoveryPrompt(steering.text)) continue;
                 try sink.appendUserTurn(savedSteeringTurn(steering.text), true);
             }
         }
@@ -3838,6 +3848,14 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Whether a saved steering entry is fx's own prompt to a stalled turn,
+        /// which was never on screen, so a replay leaves it out.
+        fn isRecoveryPrompt(text: []const u8) bool {
+            if (recovery_prompt.fromSaved(text) == null) return false;
+            debug_trace.logf("session", "replay skipped a recovery prompt bytes={d}", .{text.len});
+            return true;
+        }
+
         /// A saved steering entry as the message it was: the user's update,
         /// or a subagent's report a boundary took, which draws as its card.
         fn savedSteeringTurn(text: []u8) types.UserTurn {
@@ -3858,7 +3876,7 @@ pub fn Runtime(comptime App: type) type {
                 if (item.assistant_prefix) |prefix| {
                     if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
                 }
-                if (item.text.len > 0) {
+                if (item.text.len > 0 and !isRecoveryPrompt(item.text)) {
                     try sink.appendUserTurn(savedSteeringTurn(item.text), true);
                 }
                 index.* += 1;
@@ -3977,36 +3995,23 @@ pub fn Runtime(comptime App: type) type {
                 )
             else if (try tooling_presentation.subagentStatusLine(action_arena.allocator(), call, result.output)) |line|
                 line
-            else if (result.status == .success) success: {
-                var skill_name_buffer: [skill_contract.max_name_bytes]u8 = undefined;
-                const registry = app.toolAdvertisementSet(agent).registry;
-                const display_target = target: {
-                    const spec = registry.lookup(call.name) orelse break :target null;
-                    if (spec.prepare_skill_call_fn == null) break :target null;
-                    const args = tool_args.parseToolArgsObject(action_arena.allocator(), call.arguments_json) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => break :target null,
-                    };
-                    const presentation = tool_dispatch.presentationForArgs(spec.*, args);
-                    if (presentation.label_arg_kind != .name or
-                        tool_dispatch.presentationLabelValue(presentation, args) != null) break :target null;
-                    break :target skill_invocation.displayNameFromOutput(result.preview orelse result.output, &skill_name_buffer);
-                };
-                break :success try app.describeToolActionCompletedWithAdvertised(
+            else if (result.status == .success)
+                try app.describeToolActionCompletedWithAdvertised(
                     agent,
                     action_arena.allocator(),
                     call,
-                    display_target orelse action_target,
+                    action_target,
+                    &.{},
+                )
+            else
+                try app.describeToolActionDeniedWithAdvertised(
+                    agent,
+                    action_arena.allocator(),
+                    call,
+                    action_target,
+                    try tooling_presentation.subagentFailureLabel(action_arena.allocator(), call, result.output),
                     &.{},
                 );
-            } else try app.describeToolActionDeniedWithAdvertised(
-                agent,
-                action_arena.allocator(),
-                call,
-                action_target,
-                try tooling_presentation.subagentFailureLabel(action_arena.allocator(), call, result.output),
-                &.{},
-            );
             const formatted_action = if (outcome_decision) |decision|
                 if (decision.detail) |detail|
                     try action_arena.allocator().print(
@@ -4578,6 +4583,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             agent.session_persistence.v2_children = children;
+            bindToolboxBehind(app, agent.session_persistence.subagent_host.?);
             // Its children report to this agent, through the main loop.
             if (comptime @hasDecl(App, "postSubagentReport")) {
                 const host = agent.session_persistence.subagent_host.?;
@@ -6792,6 +6798,30 @@ test "execution replay keeps an inline command preview when its stored output is
     try std.testing.expectEqualStrings("/workspace", app.command_stdout.items);
     try std.testing.expectEqualStrings("warning", app.command_stderr.items);
     try std.testing.expectEqual(@as(usize, 1), app.command_output_flush_count);
+}
+
+test "execution replay shows the user's steering and not fx's own recovery prompt" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    const inside = try recovery_prompt.saved(alloc, "Summarize what you just did.");
+    defer alloc.free(inside);
+    const trailing = try recovery_prompt.saved(alloc, "Your last reply had no text and no tool call.");
+    defer alloc.free(trailing);
+    var steps = [_]types.ToolExecutionStep{.{}};
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast("focus on rendering"), .after_tool_step_count = 0 },
+        .{ .text = inside, .after_tool_step_count = 0 },
+        .{ .text = trailing, .after_tool_step_count = 1 },
+        .{ .text = @constCast("later update"), .after_tool_step_count = 1 },
+    };
+
+    try Runtime(TestApp).writeExecutionHistory(&app, (&app).agent(), .{ .tool_steps = steps[0..], .steering = steering[0..] });
+
+    try std.testing.expectEqual(@as(usize, 2), app.cards.items.len);
+    try std.testing.expectEqualStrings("focus on rendering", app.cards.items[0].text);
+    try std.testing.expectEqualStrings("later update", app.cards.items[1].text);
 }
 
 test "execution replay labels shell session interactions with their launch command" {

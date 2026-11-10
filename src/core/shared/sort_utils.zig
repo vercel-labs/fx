@@ -8,6 +8,11 @@ const std = @import("std");
 // both larger than the buffer falls back to in-place SymMerge (Kim and
 // Kutzner, 2004), whose smaller merges and rotations use the buffer again.
 
+/// Byte order of two strings, as a `sort` comparator.
+pub fn lessThanBytes(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.lessThan(u8, lhs, rhs);
+}
+
 /// Drop-in replacement for std.mem.sort: stable, in place, same signature.
 pub fn sort(
     comptime T: type,

@@ -4,6 +4,7 @@
 const std = @import("std");
 const profiles = @import("../profiles/profiles.zig");
 const tool_set = @import("../tooling/tool_set.zig");
+const toolbox = @import("../tooling/toolbox.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
@@ -18,9 +19,11 @@ const row_text = @import("../../ui/footer/row_text.zig");
 pub const ProfileTools = struct {
     profile: *const profiles.Profile,
     role: profiles.Role,
+    /// The built-in tools the run offers through toolbox.
+    behind: []const []const u8,
 
     pub fn allows(self: ProfileTools, name: []const u8) bool {
-        return profiles.allowsTool(self.profile, name);
+        return profiles.allowsTool(self.profile, name, self.behind);
     }
 };
 
@@ -318,6 +321,18 @@ test "the launch profile's model gives way to the model the process chose" {
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = agents.Agent;
+        /// Narrows `agent`'s tools to its profile, by the tools its run keeps
+        /// behind toolbox now. The launch profile is applied before settings
+        /// and flags place them, so startup narrows main's again after.
+        pub fn narrowProfileTools(app: *App, agent: *AppAgent, base_tools: tool_set.ToolSet) !void {
+            const held = &agent.profile;
+            agent.profile_tools = try tool_set.narrow(held.arena.?.allocator(), base_tools, ProfileTools{
+                .profile = &held.profile,
+                .role = .main,
+                .behind = if (comptime @hasField(App, "toolbox_behind")) app.toolbox_behind.slice() else &toolbox.default_behind,
+            });
+        }
+
         /// Loads main's profile before startup, so its model and effort reach
         /// startup. `--model`, `--provider`, `FX_MODEL`, and `--effort` still
         /// win, as `launchModel` decides. Narrows main's tools to the profile.
@@ -350,11 +365,7 @@ pub fn Runtime(comptime App: type) type {
                 });
                 return err;
             };
-            const held = &agent.profile;
-            agent.profile_tools = try tool_set.narrow(held.arena.?.allocator(), base_tools, ProfileTools{
-                .profile = &held.profile,
-                .role = .main,
-            });
+            try narrowProfileTools(app, agent, base_tools);
         }
 
         /// After startup has read the user's permission mode, applies the

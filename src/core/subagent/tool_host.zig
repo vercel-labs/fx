@@ -29,6 +29,7 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const session_store = @import("../session/session_store.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const toolbox_core = @import("../tooling/toolbox.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -195,6 +196,11 @@ pub const Runtime = struct {
     /// parent's messages waiting for them the stop dropped, until the
     /// stopped work's report or notice says so (`userStopped`).
     user_dropped: std.ArrayList(UserDrop) = .empty,
+    /// The names of subagents the user closed, until main's message starts
+    /// a new one under the name: main's status lists them, and that message
+    /// says so, since the new one has none of the old one's history. Under
+    /// `admission_mutex`.
+    user_closed: std.ArrayList([]u8) = .empty,
     /// Children working on a turn their parent didn't start, as a work in
     /// the parent's log (`beginTurnWork`): the user's, typed on the child's
     /// screen, or one its own child's report woke.
@@ -277,6 +283,8 @@ pub const Runtime = struct {
         self.work_calls.deinit(self.alloc);
         for (self.user_dropped.items) |drop| self.alloc.free(drop.child_id);
         self.user_dropped.deinit(self.alloc);
+        for (self.user_closed.items) |name| self.alloc.free(name);
+        self.user_closed.deinit(self.alloc);
         for (self.turn_works.items) |*work| work.deinit(self.alloc);
         self.turn_works.deinit(self.alloc);
         for (self.closing.items) |id| {
@@ -388,6 +396,12 @@ pub const Runtime = struct {
     /// owns the turns (`types.freeHistoryTurnSlice`).
     pub fn childHistory(self: *Runtime, alloc: Allocator, child_id: []const u8) ![]types.HistoryTurn {
         return self.children.parent.store.childHistory(alloc, child_id);
+    }
+
+    /// A child's saved title, read without opening it; null when it has
+    /// none. Caller owns it.
+    pub fn childTitle(self: *Runtime, alloc: Allocator, child_id: []const u8) !?[]u8 {
+        return self.children.parent.store.childTitle(alloc, child_id);
     }
 
     /// What a turn the user starts on a subagent's own screen runs under.
@@ -652,7 +666,8 @@ pub const Runtime = struct {
                     keep_call = true;
                     if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
                     var buf: [sent_result_bytes]u8 = undefined;
-                    return self.encodeManaged(alloc, .{ .ok = true, .result = sentResult(&buf, agent) });
+                    const sent = sentResult(&buf, agent);
+                    return self.encodeManaged(alloc, .{ .ok = true, .result = if (ready.user_closed) try userClosedResult(alloc, sent, agent) else sent });
                 },
                 .completed => |completed| {
                     if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = completed.child_id, .work_id = operation_id, .phase = .replayed } });
@@ -982,6 +997,29 @@ pub const Runtime = struct {
             self.alloc.free(owned);
             return self.logLostDrop(child_id, dropped);
         };
+    }
+
+    /// Keeps `name`, a subagent the user closed, for main's status and the
+    /// message that starts a new one under it. Hold the admission mutex.
+    fn noteUserClosedLocked(self: *Runtime, name: []const u8) void {
+        for (self.user_closed.items) |known| if (std.mem.eql(u8, known, name)) return;
+        noted: {
+            self.user_closed.ensureUnusedCapacity(self.alloc, 1) catch break :noted;
+            self.user_closed.appendAssumeCapacity(self.alloc.dupe(u8, name) catch break :noted);
+            return;
+        }
+        debug_trace.logf("mailbox", "user close not noted agent={s} reason=out_of_memory", .{name});
+    }
+
+    /// Forgets `name`, which a new subagent now has. True when the user had
+    /// closed one under it. Hold the admission mutex.
+    fn forgetUserClosedLocked(self: *Runtime, name: []const u8) bool {
+        for (self.user_closed.items, 0..) |known, index| {
+            if (!std.mem.eql(u8, known, name)) continue;
+            self.alloc.free(self.user_closed.swapRemove(index));
+            return true;
+        }
+        return false;
     }
 
     fn logLostDrop(_: *Runtime, child_id: []const u8, dropped: usize) void {
@@ -1397,7 +1435,7 @@ pub const Runtime = struct {
         defer self.admission_mutex.unlock(io_mod.getIo());
         var lock = self.managed.state_store.acquireLock();
         defer lock.release();
-        const registry = try self.managed.state_store.load(a);
+        var registry = try self.managed.state_store.load(a);
         for (registry.children) |child| {
             const name = child.agentName() orelse continue;
             if (self.closingIndexLocked(child.id) != null) continue;
@@ -1416,6 +1454,14 @@ pub const Runtime = struct {
             if (waiting > 0) try out.writer.print(", {d} waiting message{s}", .{ waiting, if (waiting == 1) "" else "s" });
             if (child.last_outcome) |outcome| try out.writer.print(", last work {s}", .{@tagName(outcome)});
             try out.writer.print(", reports {s}", .{@tagName(child.report_rule)});
+            listed += 1;
+        }
+        for (self.user_closed.items) |name| {
+            if (agent) |wanted| if (!std.mem.eql(u8, wanted, name)) continue;
+            // A close that couldn't be saved left the child in place.
+            if (registry.findPersistent(name) != null) continue;
+            if (listed > 0) try out.writer.writeByte('\n');
+            try out.writer.print("{s}: closed by the user; a message to it starts a new one with no history", .{name});
             listed += 1;
         }
         if (agent != null and listed == 0) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_unavailable" });
@@ -1484,13 +1530,17 @@ pub const Runtime = struct {
     /// that the user closed it. The app drops the child's agent once it
     /// takes the child from `takeClosed`. False when there is no such child.
     pub fn closeChild(self: *Runtime, child_id: []const u8, by: CloseBy) !?Closed {
-        {
+        var name_buf: [domain.max_agent_name_bytes]u8 = undefined;
+        const name: ?[]const u8 = blk: {
             var lock = self.managed.state_store.acquireLock();
             defer lock.release();
             var registry = try self.managed.state_store.load(self.alloc);
             defer registry.deinit(self.alloc);
-            if (registry.findById(child_id) == null) return null;
-        }
+            const child = registry.findById(child_id) orelse return null;
+            const value = child.agentName() orelse break :blk null;
+            @memcpy(name_buf[0..value.len], value);
+            break :blk name_buf[0..value.len];
+        };
         const result: Closed, const settle_now = blk: {
             self.admission_mutex.lockUncancelable(io_mod.getIo());
             defer self.admission_mutex.unlock(io_mod.getIo());
@@ -1507,8 +1557,12 @@ pub const Runtime = struct {
             for (self.start_waits.items) |wait| {
                 if (std.mem.eql(u8, wait.child_id, child_id)) wait.closed = true;
             }
-            // A user's close tells the parent what it dropped, as a stop does.
-            if (by == .user) self.noteUserDropLocked(child_id, dropped, true);
+            // A user's close tells the parent what it dropped, as a stop does,
+            // and keeps the name for main's status and its next message to it.
+            if (by == .user) {
+                self.noteUserDropLocked(child_id, dropped, true);
+                if (name) |value| self.noteUserClosedLocked(value);
+            }
             // The parent's close drops the closed turn's unread messages
             // and counts them, as its stop does.
             var unread: usize = 0;
@@ -1669,16 +1723,26 @@ pub const Runtime = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const agent = if (from_root) "" else self.childName(arena.allocator(), options.caller_id) catch options.caller_id;
+        // What the user typed in the turn that sends it, from that turn's
+        // own worker, so the parent sees the user's own words.
+        const typed: []const []const u8 = if (options.caller_worker) |worker|
+            worker.typedThisTurn(arena.allocator()) catch |err| blk: {
+                debug_trace.logf("mailbox", "typed lines unavailable from={s} err={s}", .{ options.caller_id, @errorName(err) });
+                break :blk &.{};
+            }
+        else
+            &.{};
         sink.post(self, .{ .message = .{
             .to = if (from_root) .owners_parent else .owner,
             .agent = agent,
             .child_id = options.caller_id,
             .text = text,
+            .user_typed = typed,
         } }) catch |err| return self.encodeManaged(alloc, .{
             .ok = false,
             .error_code = if (err == error.QueueFull) "queue_full" else "no_parent",
         });
-        debug_trace.eventf("mailbox", "post", .{}, "from={s} to={s}", .{ options.caller_id, if (from_root) "owners_parent" else self.ownerName() });
+        debug_trace.eventf("mailbox", "post", .{}, "from={s} to={s} typed={d}", .{ options.caller_id, if (from_root) "owners_parent" else self.ownerName(), typed.len });
         return self.encodeManaged(alloc, .{ .ok = true, .result = "Sent to your parent. It arrives as your message, never as the user's." });
     }
 
@@ -1797,8 +1861,9 @@ pub const Runtime = struct {
     }
 
     const ManagedAdmission = union(enum) {
-        /// `created` when this admission made the child.
-        ready: struct { child_id: []u8, created: bool = false },
+        /// `created` when this admission made the child, and `user_closed`
+        /// when it took the name of one the user closed.
+        ready: struct { child_id: []u8, created: bool = false, user_closed: bool = false },
         feedback: struct { child_id: []u8, work_id: []u8 },
         completed: struct {
             child_id: []u8,
@@ -1848,10 +1913,10 @@ pub const Runtime = struct {
                 self.clearBusyLocked(child_id);
                 return err;
             };
-            if (admitted.ready.created)
-                debug_trace.eventf("mailbox", "launch", .{}, "child={s} work_id={s}", .{ child_id, operation_id })
-            else
-                debug_trace.eventf("mailbox", "message", .{}, "child={s} work_id={s} delivery=next_turn", .{ child_id, operation_id });
+            if (admitted.ready.created) {
+                debug_trace.eventf("mailbox", "launch", .{}, "child={s} work_id={s}", .{ child_id, operation_id });
+                if (request.agentName()) |name| admitted.ready.user_closed = self.forgetUserClosedLocked(name);
+            } else debug_trace.eventf("mailbox", "message", .{}, "child={s} work_id={s} delivery=next_turn", .{ child_id, operation_id });
         }
         return admitted;
     }
@@ -2892,6 +2957,43 @@ test "the user's close tells main how many of its messages waiting for the subag
     try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
 }
 
+test "after the user closes a subagent, main's status and the message that starts a new one under its name say so, once" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "tester", .message = "first" } }, "call-2", null);
+    try waitUntilQuiet(runtime);
+    _ = (try runtime.closeChild(try reviewerId(runtime, arena), .user)).?;
+    // Main's own close is no news to main.
+    {
+        var registry = try runtime.managed.state_store.load(arena);
+        _ = (try runtime.closeChild(registry.findPersistent("tester").?.id, .parent)).?;
+    }
+    const status = try callTool(runtime, arena, .{ .status = .{} }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, status, "reviewer: closed by the user") != null);
+    try std.testing.expect(std.mem.find(u8, status, "tester") == null);
+    const sent = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "again" } }, "call-4", null);
+    try std.testing.expect(std.mem.find(u8, sent, "The user closed the earlier reviewer, so this one starts with no history.") != null);
+    try waitUntilQuiet(runtime);
+    const later = try callTool(runtime, arena, .{ .status = .{} }, "call-5", null);
+    try std.testing.expect(std.mem.find(u8, later, "closed by the user") == null);
+    const taken = try runtime.takeClosed(alloc);
+    defer {
+        for (taken) |id| alloc.free(id);
+        alloc.free(taken);
+    }
+}
+
 test "an idle subagent closes at once, and its name then starts a new one" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -3044,6 +3146,112 @@ test "the root has no parent to message" {
     defer runtime.deinit();
     const body = try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-1", null);
     try std.testing.expect(std.mem.find(u8, body, "no_parent") != null);
+}
+
+test "a subagent's message to its parent carries what the user typed in the turn that sends it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    const Capture = struct {
+        posts: usize = 0,
+        lines: std.ArrayList([]u8) = .empty,
+        fn post(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.posts += 1;
+            for (self.lines.items) |line| std.testing.allocator.free(line);
+            self.lines.clearRetainingCapacity();
+            for (delivery.message.user_typed) |line| {
+                const owned = try std.testing.allocator.dupe(u8, line);
+                self.lines.append(std.testing.allocator, owned) catch |err| {
+                    std.testing.allocator.free(owned);
+                    return err;
+                };
+            }
+        }
+    };
+    var capture: Capture = .{};
+    defer {
+        for (capture.lines.items) |line| alloc.free(line);
+        capture.lines.deinit(alloc);
+    }
+    runtime.report_sink = .{ .context = &capture, .post_fn = Capture.post };
+
+    // The sending turn's own worker, as helper's is when helper messages
+    // lead: its lines, never another agent's.
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    worker.worker_processing = true;
+    worker.active_turn_id = 3;
+    worker.typed_turn_id = 3;
+    try worker.typed_this_turn.append(alloc, try alloc.dupe(u8, "tell lead the schema changed"));
+    for ([_]?*worker_runtime.WorkerRuntime{ &worker, null }) |caller_worker| {
+        var request = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "parent", .message = "the user says the schema changed" } });
+        defer request.deinit(alloc);
+        const result = try runtime.executeManaged(arena, &request, .{
+            .caller_id = "helper-1",
+            .invocation_id = "call-1",
+            .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+            .max_result_bytes = 4096,
+            .timestamp_ms = 1,
+            .caller_worker = caller_worker,
+        });
+        try std.testing.expect(std.mem.find(u8, result.body, "Sent to your parent") != null);
+        if (caller_worker != null) {
+            try std.testing.expectEqual(@as(usize, 1), capture.lines.items.len);
+            try std.testing.expectEqualStrings("tell lead the schema changed", capture.lines.items[0]);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), capture.lines.items.len);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), capture.posts);
+}
+
+test "a subagent's message its parent can't take says so, and keeps nothing of what the user typed" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    const Full = struct {
+        fn post(_: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
+            if (delivery.message.user_typed.len == 0) return error.AgentGone;
+            return error.QueueFull;
+        }
+    };
+    runtime.report_sink = .{ .context = null, .post_fn = Full.post };
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    worker.worker_processing = true;
+    worker.active_turn_id = 1;
+    worker.typed_turn_id = 1;
+    try worker.typed_this_turn.append(alloc, try alloc.dupe(u8, "tell main hi"));
+    var request = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "parent", .message = "hi from the user" } });
+    defer request.deinit(alloc);
+    const result = try runtime.executeManaged(arena, &request, .{
+        .caller_id = "helper-1",
+        .invocation_id = "call-1",
+        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .caller_worker = &worker,
+    });
+    try std.testing.expect(std.mem.find(u8, result.body, "queue_full") != null);
+    // The worker still has the turn's lines for a later message.
+    try std.testing.expectEqual(@as(usize, 1), worker.typed_this_turn.items.len);
 }
 
 /// Waits, in a test, until no child of `runtime` works.
@@ -3291,6 +3499,12 @@ const sent_result_bytes = 256 + domain.max_agent_name_bytes;
 /// `message`'s answer when the child takes it now.
 fn sentResult(buf: []u8, agent: []const u8) []const u8 {
     return std.mem.print(buf, "Sent to {s}, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.", .{agent}) catch "Sent.";
+}
+
+/// `message`'s answer when it starts a new child under the name of one the
+/// user closed.
+fn userClosedResult(alloc: Allocator, sent: []const u8, agent: []const u8) ![]const u8 {
+    return alloc.print("{s} The user closed the earlier {s}, so this one starts with no history.", .{ sent, agent });
 }
 
 /// `message`'s refusal when the child's running turn already holds as many
@@ -3616,6 +3830,15 @@ pub fn captureHostAuthorityWithMcpView(
         if (permissions.rulesDenyAllTargetsForTool(rules, registered_tool.name)) continue;
         try tool_names.append(alloc, registered_tool.name);
     }
+    // toolbox's open and search are decided under the names of the tools
+    // they replaced, so a child's profile can keep or drop each one.
+    const has_toolbox = for (tool_names.items) |name| {
+        if (std.mem.eql(u8, name, toolbox_core.tool_name)) break true;
+    } else false;
+    if (has_toolbox) for (toolbox_core.replaced) |name| {
+        if (permissions.rulesDenyAllTargetsForTool(rules, name)) continue;
+        try tool_names.append(alloc, name);
+    };
     return authority.HostAuthority.captureWithPermissionStateAndMcpView(
         alloc,
         tool_names.items,
@@ -3625,4 +3848,30 @@ pub fn captureHostAuthorityWithMcpView(
         permission_state,
         mcp_view,
     );
+}
+
+test "the root's authority names toolbox's open and search, less the ones a rule denies" {
+    const alloc = std.testing.allocator;
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const tools = [_]@import("../tooling/tool_dispatch.zig").Tool{ builtin_tools.read_file, builtin_tools.toolbox };
+    const with_toolbox = tool_set_contract.ToolSet{ .registry = .{ .tools = &tools }, .order = &.{ "read_file", "toolbox" }, .read_only_tool_names = &.{} };
+    var rules = [_]types.PermissionRule{.{ .permission = @constCast("skill"), .pattern = @constCast("*"), .action = .deny }};
+    var root = try captureHostAuthorityWithMcpView(alloc, .{ .tool_set = with_toolbox, .mode = .full }, &.{}, .{ .rules = &rules }, &.{}, .{}, null);
+    defer root.deinit(alloc);
+    const contains = struct {
+        fn in(names: []const []const u8, name: []const u8) bool {
+            for (names) |entry| if (std.mem.eql(u8, entry, name)) return true;
+            return false;
+        }
+    }.in;
+    for ([_][]const u8{ "read_file", "toolbox", "capability_search", "mcp_select_tool" }) |name| {
+        try std.testing.expect(contains(root.tools, name));
+    }
+    try std.testing.expect(!contains(root.tools, "skill"));
+
+    // Without toolbox there is nothing to open or search through.
+    const without = tool_set_contract.ToolSet{ .registry = .{ .tools = tools[0..1] }, .order = &.{"read_file"}, .read_only_tool_names = &.{} };
+    var plain = try captureHostAuthorityWithMcpView(alloc, .{ .tool_set = without, .mode = .full }, &.{}, .{}, &.{}, .{}, null);
+    defer plain.deinit(alloc);
+    for (toolbox_core.replaced) |name| try std.testing.expect(!contains(plain.tools, name));
 }

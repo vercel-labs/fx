@@ -69,17 +69,17 @@ pub fn subagentAction(
         else => return null,
     } else outer;
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
-    // A close names the subagent it removes, with nothing to preview.
-    if (std.mem.eql(u8, action, "close")) {
-        const raw_closed = tool_args.optionalStringArg(args, "agent") orelse return null;
-        const closed = try text_utils.encodeTerminalSafe(scratch, raw_closed, 64);
+    // Every other action says what it does to whom, with nothing to preview.
+    if (action_words.get(action)) |words| {
+        const raw_target = words.target orelse tool_args.optionalStringArg(args, "agent") orelse words.no_agent orelse return null;
+        const target = try text_utils.encodeTerminalSafe(scratch, raw_target, 64);
         const label = switch (state) {
-            .active, .pending => try alloc.print("closing {s}", .{closed.bytes}),
+            .active, .pending => try alloc.print("{s} {s}", .{ words.doing, target.bytes }),
             .stopped => |reason| if (std.mem.eql(u8, reason, "Failed"))
-                try alloc.print("couldn't close {s}", .{closed.bytes})
+                try alloc.print("couldn't {s} {s}", .{ words.verb, target.bytes })
             else
-                try alloc.print("{s} {s}", .{ reason, closed.bytes }),
-            .identity, .completed, .feedback => try alloc.print("closed {s}", .{closed.bytes}),
+                try alloc.print("{s} {s}", .{ reason, target.bytes }),
+            .identity, .completed, .feedback => try alloc.print("{s} {s}", .{ words.done, target.bytes }),
         };
         errdefer alloc.free(label);
         return .{ .label = label, .detail = try alloc.dupe(u8, "") };
@@ -118,6 +118,24 @@ pub fn subagentAction(
         try alloc.print("· {s}", .{preview});
     return .{ .label = label, .detail = detail };
 }
+
+/// How a subagent row words an action other than a message: what it names
+/// always (`target`), or when the call names no agent (`no_agent`).
+const ActionWords = struct {
+    verb: []const u8,
+    doing: []const u8,
+    done: []const u8,
+    target: ?[]const u8 = null,
+    no_agent: ?[]const u8 = null,
+};
+
+const action_words = std.StaticStringMap(ActionWords).initComptime(.{
+    .{ "close", ActionWords{ .verb = "close", .doing = "closing", .done = "closed" } },
+    .{ "stop", ActionWords{ .verb = "stop", .doing = "stopping", .done = "stopped" } },
+    .{ "status", ActionWords{ .verb = "check", .doing = "checking", .done = "checked", .no_agent = "subagents" } },
+    // A wait takes every report, whatever agent it names.
+    .{ "wait", ActionWords{ .verb = "wait for", .doing = "waiting for", .done = "waited for", .target = "subagents" } },
+});
 
 /// The preview a subagent row shows for `raw`: runs of whitespace, line
 /// breaks included, become one space, made terminal-safe and cut to 120
@@ -207,6 +225,15 @@ test "subagent rows project request identity state and bounded safe previews" {
         .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .completed, .label = "closed tester", .detail = "" },
         .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .active, .label = "closing tester", .detail = "" },
         .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .{ .stopped = "Failed" }, .label = "couldn't close tester", .detail = "" },
+        .{ .args = "{\"action\":\"stop\",\"agent\":\"tester\"}", .state = .active, .label = "stopping tester", .detail = "" },
+        .{ .args = "{\"action\":\"stop\",\"agent\":\"tester\"}", .state = .completed, .label = "stopped tester", .detail = "" },
+        .{ .args = "{\"action\":\"wait\"}", .state = .active, .label = "waiting for subagents", .detail = "" },
+        .{ .args = "{\"action\":\"wait\"}", .state = .completed, .label = "waited for subagents", .detail = "" },
+        .{ .args = "{\"action\":\"wait\"}", .state = .{ .stopped = "Cancelled" }, .label = "Cancelled subagents", .detail = "" },
+        .{ .args = "{\"action\":\"wait\",\"agent\":\"tester\"}", .state = .active, .label = "waiting for subagents", .detail = "" },
+        .{ .args = "{\"action\":\"close\",\"agent\":\"tester\"}", .state = .{ .stopped = "Denied" }, .label = "Denied tester", .detail = "" },
+        .{ .args = "{\"action\":\"status\"}", .state = .completed, .label = "checked subagents", .detail = "" },
+        .{ .args = "{\"action\":\"status\",\"agent\":\"tester\"}", .state = .{ .stopped = "Failed" }, .label = "couldn't check tester", .detail = "" },
     };
     for (cases) |case| {
         const action = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = case.args }, case.state)).?;
@@ -214,7 +241,7 @@ test "subagent rows project request identity state and bounded safe previews" {
         try std.testing.expectEqualStrings(case.label, action.label);
         try std.testing.expectEqualStrings(case.detail, action.detail);
     }
-    for ([_][]const u8{ "{", "[]", "{\"request\":null}", "{\"action\":\"inspect\"}", "{\"action\":\"message\",\"message\":\"hello\"}", "{\"action\":\"run\",\"task\":\"gone\"}", "{\"action\":\"wait\"}" }) |args| {
+    for ([_][]const u8{ "{", "[]", "{\"request\":null}", "{\"action\":\"inspect\"}", "{\"action\":\"message\",\"message\":\"hello\"}", "{\"action\":\"run\",\"task\":\"gone\"}", "{\"action\":\"stop\"}" }) |args| {
         try std.testing.expectEqual(@as(?SubagentAction, null), try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = args }, .active));
     }
     const unsafe = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"a\\u001b[2J\",\"message\":\"Check 日本語\\u001b[31m\"}" }, .active)).?;
@@ -652,13 +679,6 @@ pub fn formatToolActionValue(alloc: Allocator, label: []const u8, value: []const
     return alloc.print("● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
 }
 
-/// Borrows the name from the prepared action without replacing resource labels.
-pub fn resolvedSkillName(call: ToolCall, presentation: tool_dispatch.CallPresentation) ?[]const u8 {
-    if (presentation.label_arg_kind != .name) return null;
-    const selected = call.resolved_skill orelse return null;
-    return selected.skill.name;
-}
-
 /// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     const call = input.call;
@@ -667,17 +687,17 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     }
     if (file_mutation_contract.isToolName(call.name)) {
         const spec = input.tool_registry.lookup(call.name) orelse
-            return alloc.print("Working: {s}", .{call.name});
+            return alloc.print("Working: {f}", .{text_utils.terminalSafe(call.name)});
         return alloc.print(
-            "{s} {s}",
-            .{ spec.action_label, input.display_target orelse spec.label_arg_default },
+            "{s} {f}",
+            .{ spec.action_label, text_utils.terminalSafe(input.display_target orelse spec.label_arg_default) },
         );
     }
 
     if (try formatRunCommandActivity(alloc, input.tool_registry, input.workspace_root, call)) |activity| {
         defer alloc.free(activity.detail);
         const action_label = if (activity.compatibility_tool) |tool| tool.action_label else "Running";
-        return alloc.print("{s} {s}", .{ action_label, activity.detail });
+        return alloc.print("{s} {f}", .{ action_label, text_utils.terminalSafe(activity.detail) });
     }
 
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
@@ -689,25 +709,26 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
             const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
                 return alloc.print("Searching web", .{});
             };
-            return alloc.print("Searching {s}", .{try formatWebSearchActionDetail(scratch, args)});
+            return alloc.print("Searching {f}", .{text_utils.terminalSafe(try formatWebSearchActionDetail(scratch, args))});
         }
-        if (input.is_available_dynamic_mcp_tool) return alloc.print("MCP: {s}", .{call.name});
-        return alloc.print("Working: {s}", .{call.name});
+        if (input.is_available_dynamic_mcp_tool) return alloc.print("MCP: {f}", .{text_utils.terminalSafe(call.name)});
+        return alloc.print("Working: {f}", .{text_utils.terminalSafe(call.name)});
     };
     const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
-        return alloc.print("Working: {s}", .{call.name});
+        return alloc.print("Working: {f}", .{text_utils.terminalSafe(call.name)});
     };
 
     const presentation = tool_dispatch.presentationForArgs(spec.*, args);
     if (spec.executor_kind == .web_search) {
-        return alloc.print("{s} {s}", .{ presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
+        return alloc.print("{s} {f}", .{ presentation.action_label, text_utils.terminalSafe(try formatWebSearchActionDetail(scratch, args)) });
     }
     const value = input.display_target orelse
         call.resolved_display_target orelse
-        resolvedSkillName(call, presentation) orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
-    return alloc.print("{s} {s}", .{ presentation.action_label, value });
+    // The value is what the model asked for, such as a toolbox open's target,
+    // so a control sequence in it is written as visible text.
+    return alloc.print("{s} {f}", .{ presentation.action_label, text_utils.terminalSafe(value) });
 }
 
 /// Names an earlier call in the row of a later call that reads its saved
@@ -911,7 +932,7 @@ fn executeTestSkillInstall(
 }
 
 const test_install_skill = blk: {
-    var tool = test_builtin_tools.skill;
+    var tool = test_builtin_tools.install_skill;
     tool.name = "install_skill";
     tool.model_schema.name = "install_skill";
     tool.executor_kind = .install_skill;
@@ -946,7 +967,6 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.edit_file,
     test_web_search,
     test_builtin_tools.shell,
-    test_builtin_tools.skill,
     test_install_skill,
     test_builtin_tools.ask_user_question,
 };
@@ -1303,37 +1323,12 @@ test "tool presentation preserves plain action fallbacks" {
         .{ .call = .{ .id = "read", .name = "read_file", .arguments_json = "{\"path\":\"src/main.zig\"}" }, .expected = "Reading src/main.zig" },
         .{ .call = .{ .id = "command", .name = "run_command", .arguments_json = "{\"command\":\"zig build\"}" }, .expected = "Running zig build" },
         .{ .call = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{}" }, .expected = "Asking " },
-        .{ .call = .{ .id = "skill", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" }, .expected = "Loading skill workflow" },
-        .{ .call = .{ .id = "skill-resource", .name = "skill", .arguments_json = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}" }, .expected = "Reading skill resource references/contract-design.md" },
         .{ .call = .{ .id = "install", .name = "install_skill", .arguments_json = "{\"source\":\"vercel-labs/agent-skills\",\"skill\":\"workflow\"}" }, .expected = "Installing skill vercel-labs/agent-skills" },
         .{ .call = .{ .id = "unknown", .name = "unknown_tool", .arguments_json = "{}" }, .expected = "Working: unknown_tool" },
     };
 
     for (cases) |case| {
         const label = try formatPlainAction(alloc, .{ .tool_registry = test_tool_registry, .call = case.call });
-        defer alloc.free(label);
-        try std.testing.expectEqualStrings(case.expected, label);
-    }
-}
-
-test "tool presentation uses the resolved skill name for location calls" {
-    const alloc = std.testing.allocator;
-    const selected: @import("../skills/skill_contract.zig").PreparedSkill = .{ .skill = .{
-        .name = "workflow",
-        .description = "",
-        .path = "/skills/different-directory",
-        .source = .workspace_fx,
-    } };
-    const cases = [_]struct { args: []const u8, expected: []const u8 }{
-        .{ .args = "{\"location\":\"skill:0000000000000001:0/different-directory\"}", .expected = "Loading skill workflow" },
-        .{ .args = "{\"location\":\"/skills/different-directory\",\"resource\":\"SKILL.md\"}", .expected = "Loading skill workflow" },
-        .{ .args = "{\"location\":\"/skills/different-directory\",\"resource\":\"references/rules.md\"}", .expected = "Reading skill resource references/rules.md" },
-    };
-    for (cases) |case| {
-        const label = try formatPlainAction(alloc, .{
-            .tool_registry = test_tool_registry,
-            .call = .{ .id = "load", .name = "skill", .arguments_json = case.args, .resolved_skill = &selected },
-        });
         defer alloc.free(label);
         try std.testing.expectEqualStrings(case.expected, label);
     }

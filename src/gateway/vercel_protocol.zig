@@ -31,6 +31,11 @@ const anthropic_cache_breakpoint = ",\"providerOptions\":{\"anthropic\":{\"cache
 /// breakpoint takes one, and fx adds at most two.
 const openai_cache_breakpoint = ",\"providerOptions\":{\"openai\":{\"promptCacheBreakpoint\":{\"mode\":\"explicit\"}}}";
 
+/// The same mark for Amazon Nova, as a Bedrock cache point. Nova caches only
+/// behind an explicit point: its implicit caching is not billed or reported as
+/// cache reads. A request takes at most four, and fx adds at most two.
+const bedrock_cache_breakpoint = ",\"providerOptions\":{\"bedrock\":{\"cachePoint\":{\"type\":\"default\"}}}";
+
 pub fn roleName(role: ChatRole) []const u8 {
     return switch (role) {
         .system => "system",
@@ -844,6 +849,7 @@ fn writeChatMessageJsonInner(
                 .none => "",
                 .anthropic => anthropic_cache_breakpoint,
                 .openai => openai_cache_breakpoint,
+                .bedrock => bedrock_cache_breakpoint,
             });
         },
         .user => {
@@ -1983,7 +1989,7 @@ test "Gateway request marks flagged system messages in the requested syntax only
         .{ .role = .user, .content = "hello", .cache_breakpoint = true },
     };
 
-    for ([_]model_capabilities.CacheMarkers{ .anthropic, .openai }) |markers| {
+    for ([_]model_capabilities.CacheMarkers{ .anthropic, .openai, .bedrock }) |markers| {
         const cached = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{ .prompt_caching = true, .cache_markers = markers }, .auto);
         defer alloc.free(cached);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cached, .{});
@@ -1996,14 +2002,15 @@ test "Gateway request marks flagged system messages in the requested syntax only
             if (options) |value| {
                 try std.testing.expectEqual(@as(usize, 1), value.object.count());
                 // A marker in the wrong syntax fails here, not on a null unwrap.
-                const marker, const field, const expected = switch (markers) {
-                    .anthropic => .{ "anthropic", "cacheControl", "ephemeral" },
-                    .openai => .{ "openai", "promptCacheBreakpoint", "explicit" },
+                const marker, const field, const key, const expected = switch (markers) {
+                    .anthropic => .{ "anthropic", "cacheControl", "type", "ephemeral" },
+                    .openai => .{ "openai", "promptCacheBreakpoint", "mode", "explicit" },
+                    .bedrock => .{ "bedrock", "cachePoint", "type", "default" },
                     .none => unreachable,
                 };
                 const provider = value.object.get(marker) orelse return error.TestExpectedCacheMarkerSyntax;
                 const setting = provider.object.get(field) orelse return error.TestExpectedCacheMarkerSyntax;
-                const kind = setting.object.get(if (markers == .anthropic) "type" else "mode") orelse return error.TestExpectedCacheMarkerSyntax;
+                const kind = setting.object.get(key) orelse return error.TestExpectedCacheMarkerSyntax;
                 try std.testing.expectEqualStrings(expected, kind.string);
             }
         }
@@ -2015,11 +2022,13 @@ test "Gateway request marks flagged system messages in the requested syntax only
         .{ .prompt_caching = true },
         .{ .cache_markers = .anthropic },
         .{ .cache_markers = .openai },
+        .{ .cache_markers = .bedrock },
     }) |options| {
         const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, options, .auto);
         defer alloc.free(body);
         try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
         try std.testing.expect(std.mem.find(u8, body, "promptCacheBreakpoint") == null);
+        try std.testing.expect(std.mem.find(u8, body, "cachePoint") == null);
     }
 }
 

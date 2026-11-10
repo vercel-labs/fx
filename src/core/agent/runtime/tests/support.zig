@@ -161,11 +161,9 @@ const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.web_fetch,
     builtin_tools.web_search,
     builtin_tools.shell,
-    builtin_tools.capability_search,
-    builtin_tools.skill,
     builtin_tools.install_skill,
     builtin_tools.subagent,
-    builtin_tools.mcp_select_tool,
+    builtin_tools.toolbox,
     builtin_tools.ask_user_question,
     builtin_tools.read_tool_result,
 };
@@ -457,6 +455,7 @@ pub const FakeAgentRuntimeDeps = struct {
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
+    image_folder_rules: bool = false,
     root_permission_mode: ?PermissionMode = null,
     cache_warmer: ?*cache_warmer.Warmer = null,
     /// Records each usage the agent loop saves, as a saved session would.
@@ -755,6 +754,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .tool_activity_recorder = self.tool_activity_recorder,
             .context_registry = self.context_registry,
             .context_enabled = self.context_enabled,
+            .image_folder_rules = self.image_folder_rules,
             .snapshot_root_permission_mode = if (self.root_permission_mode != null)
                 snapshotRootPermissionMode
             else
@@ -1122,7 +1122,10 @@ pub const FakeAgentRuntimeDeps = struct {
                 advertised_dynamic_tool_names,
             );
         }
-        try self.permission_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
+        // The name the rules decide: a toolbox open or search is decided as
+        // the tool it replaced.
+        const permission_name = if (call.toolbox_lookup) |lookup| lookup.permission else call.name;
+        try self.permission_names.append(self.alloc, try self.alloc.dupe(u8, permission_name));
         try self.permission_call_ids.append(self.alloc, try self.alloc.dupe(u8, call.id));
         try self.permission_user_intent_contexts.append(
             self.alloc,
@@ -2174,6 +2177,29 @@ pub fn expectGatewayPromptFinalUserText(gateway: *const FakeGateway, index: usiz
         return;
     }
     return error.TestExpectedPromptMessageMissing;
+}
+
+/// Fails unless every message of `previous_body`'s prompt opens `next_body`'s
+/// prompt, byte for byte and in order: the next request extends the previous
+/// one, so the provider's prompt cache still covers all of it.
+pub fn expectPromptExtends(previous_body: []const u8, next_body: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var previous = try std.json.parseFromSlice(std.json.Value, alloc, previous_body, .{});
+    defer previous.deinit();
+    var next = try std.json.parseFromSlice(std.json.Value, alloc, next_body, .{});
+    defer next.deinit();
+    const previous_prompt = previous.value.object.get("prompt").?.array.items;
+    const next_prompt = next.value.object.get("prompt").?.array.items;
+    try std.testing.expect(next_prompt.len >= previous_prompt.len);
+    for (previous_prompt, next_prompt[0..previous_prompt.len]) |earlier, later| {
+        var earlier_bytes: std.Io.Writer.Allocating = .init(alloc);
+        defer earlier_bytes.deinit();
+        try std.json.Stringify.value(earlier, .{}, &earlier_bytes.writer);
+        var later_bytes: std.Io.Writer.Allocating = .init(alloc);
+        defer later_bytes.deinit();
+        try std.json.Stringify.value(later, .{}, &later_bytes.writer);
+        try std.testing.expectEqualStrings(earlier_bytes.written(), later_bytes.written());
+    }
 }
 
 pub fn countText(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) usize {

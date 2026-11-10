@@ -283,6 +283,8 @@ pub const ReportPost = struct {
     dropped: usize = 0,
     /// Who started a report's work and why it was cancelled.
     end: subagent_child_state.EndFacts = .{},
+    /// A message's lines the user typed in the turn that sent it.
+    typed_lines: [][]u8 = &.{},
 
     fn create(host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) !*ReportPost {
         const post = try handoff_alloc.create(ReportPost);
@@ -309,6 +311,22 @@ pub const ReportPost = struct {
             .dropped = if (delivery == .report) delivery.report.dropped else 0,
             .end = if (delivery == .report) delivery.report.end else .{},
         };
+        if (delivery == .message) {
+            // The others are freed by their own errdefers above.
+            errdefer handoff_alloc.free(post.text);
+            const typed = delivery.message.user_typed;
+            const lines = try handoff_alloc.alloc([]u8, typed.len);
+            var copied: usize = 0;
+            errdefer {
+                for (lines[0..copied]) |line| handoff_alloc.free(line);
+                handoff_alloc.free(lines);
+            }
+            for (typed) |line| {
+                lines[copied] = try handoff_alloc.dupe(u8, line);
+                copied += 1;
+            }
+            post.typed_lines = lines;
+        }
         return post;
     }
 
@@ -317,9 +335,26 @@ pub const ReportPost = struct {
         handoff_alloc.free(self.child_id);
         handoff_alloc.free(self.work_id);
         handoff_alloc.free(self.text);
+        for (self.typed_lines) |line| handoff_alloc.free(line);
+        handoff_alloc.free(self.typed_lines);
         handoff_alloc.destroy(self);
     }
 };
+
+test "a message's hand-off keeps its own copy of what the user typed" {
+    var host: subagent_tool_host.Runtime = undefined;
+    var first = "tell main hi".*;
+    var second = "and bye".*;
+    const lines = [_][]const u8{ &first, &second };
+    const post = try ReportPost.create(&host, .{ .message = .{ .to = .owner, .agent = "reviewer", .child_id = "c1", .text = "hi", .user_typed = &lines } });
+    defer post.destroy();
+    // The sender's buffers change once the post is made.
+    @memset(&first, 'x');
+    @memset(&second, 'x');
+    try std.testing.expectEqual(@as(usize, 2), post.typed_lines.len);
+    try std.testing.expectEqualStrings("tell main hi", post.typed_lines[0]);
+    try std.testing.expectEqualStrings("and bye", post.typed_lines[1]);
+}
 
 test "a report's hand-off keeps the count a user's stop dropped, and who started and stopped its work" {
     // Only the host's address is kept, so any will do.
@@ -927,12 +962,13 @@ pub fn Runtime(comptime App: type) type {
                 };
                 for (listing) |entry| {
                     const child = findChild(app, entry.id) orelse restored: {
+                        const restored_child = try addChild(app, entry.id);
+                        try showSavedTitle(app, host, restored_child);
                         const history = host.childHistory(app.alloc, entry.id) catch |err| {
                             debug_trace.logf("host", "saved reply time unavailable agent={s} err={s}", .{ entry.id, @errorName(err) });
-                            break :restored try addChild(app, entry.id);
+                            break :restored restored_child;
                         };
                         defer types.freeHistoryTurnSlice(app.alloc, history);
-                        const restored_child = try addChild(app, entry.id);
                         restored_child.saved_reply_at_ms = latestReplyAt(history);
                         break :restored restored_child;
                     };
@@ -943,6 +979,17 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             orderByListing(app.child_agents.items, order.items);
+        }
+
+        /// Gives a subagent restored from before a restart its saved title,
+        /// so its row in the list names it before its conversation opens.
+        fn showSavedTitle(app: *App, host: *subagent_tool_host.Runtime, child: *ChildAgent) !void {
+            const title = host.childTitle(app.alloc, child.id) catch |err| {
+                debug_trace.logf("host", "saved title unavailable agent={s} err={s}", .{ child.id, @errorName(err) });
+                return;
+            } orelse return;
+            defer app.alloc.free(title);
+            try app_session_runtime.Runtime(App).setCachedSessionTitle(app, &child.agent, title);
         }
 
         /// The switch order, with each instance's subagents sorted
@@ -1953,7 +2000,7 @@ pub fn Runtime(comptime App: type) type {
                     .dropped = post.dropped,
                     .end = post.end,
                 }, limit),
-                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, started_by) catch |err| {
+                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, started_by, post.typed_lines) catch |err| {
                     target.worker.releaseAgentMessage();
                     return err;
                 },

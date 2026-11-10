@@ -595,6 +595,12 @@ function lastUserText(body: string): string {
   return textFromContent(users[users.length - 1].content);
 }
 
+/** The request's messages as the model sees them: role and content only. */
+function promptMessages(body: string): Array<{ role: string; content: unknown }> {
+  const parsed = JSON.parse(body) as { prompt: Array<{ role: string; content: unknown }> };
+  return parsed.prompt.map(({ role, content }) => ({ role, content }));
+}
+
 function promptParts(body: string): Array<Record<string, unknown>> {
   const parsed = JSON.parse(body) as { prompt: Array<{ content?: unknown }> };
   return parsed.prompt.flatMap((message) =>
@@ -1896,6 +1902,72 @@ describe("Vision route fake Gateway", () => {
       }
     },
     TIMEOUT,
+  );
+
+  test(
+    "an image from a folder with its own rules leaves the earlier request unchanged and brings the rules at the end",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      const gateway = startImageGateway([sseText("First answer."), sseText("It shows a logo.")]);
+      try {
+        const env = fakeGatewayEnv(root, gateway, KIMI_MODEL);
+        const first = parseFxJson(
+          await runFx(["ask", "--json", "--auto", "--no-color", "Hello there."], {
+            cwd: root.workspace,
+            env,
+            timeoutMs: TIMEOUT,
+          }),
+        );
+        // The next turn runs in a new process and attaches an image from a
+        // folder whose rules the session has not seen.
+        const second = parseFxJson(
+          await runFx(
+            [
+              "ask",
+              "--json",
+              "--auto",
+              "--no-color",
+              "--resume",
+              first.session_id,
+              "--image",
+              fixture.imagePath,
+              "Describe the attached image.",
+            ],
+            { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+          ),
+        );
+        expect(second.output).toContain("It shows a logo.");
+        expect(gateway.chatRequests).toHaveLength(2);
+
+        const before = promptMessages(gateway.chatRequests[0].body);
+        const after = promptMessages(gateway.chatRequests[1].body);
+        // The instructions and everything else the first request sent come
+        // back byte for byte, so the provider's cached prefix still matches.
+        expect(after.slice(0, before.length)).toEqual(before);
+        for (const message of after.filter((entry) => entry.role === "system")) {
+          expect(JSON.stringify(message.content)).not.toContain(fixture.nestedRule);
+        }
+        expect(JSON.stringify(before)).toContain(fixture.rootRule);
+
+        // The folder's rules still arrive, once, on the turn's own message,
+        // after the text the user sent.
+        const secondBody = gateway.chatRequests[1].body;
+        expect(secondBody.split(fixture.nestedRule)).toHaveLength(2);
+        expect(secondBody).not.toContain(fixture.siblingRule);
+        const finalUser = after[after.length - 1]!;
+        expect(finalUser.role).toBe("user");
+        const finalText = textFromContent(finalUser.content);
+        expect(finalText).toContain(fixture.nestedRule);
+        expect(finalText.indexOf("Describe the attached image.")).toBeLessThan(finalText.indexOf(fixture.nestedRule));
+        expect(finalText).toContain('from="assets/nested/AGENTS.md" scope="assets/nested"');
+        expect(finalText).not.toContain(root.workspace);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
   );
 
   test(
