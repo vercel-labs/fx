@@ -14,6 +14,7 @@ const session_adapter = @import("../session/session_adapter.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 const safe_git = @import("../shell_command/safe_git.zig");
+const command_lex = @import("../shell_command/command_lex.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 
@@ -199,10 +200,11 @@ fn configWarningFix(alloc: Allocator, diagnostic: config_runtime.ConfigDiagnosti
         .invalid_additional_directories => alloc.print("fix additional_directories in {s}", .{file}),
         .ignored_project_user_only_setting => alloc.print("move {s} from .fx.json to {s}", .{ diagnostic.setting_key orelse "that setting", profile_paths.displayText("~/.fx/settings.json") }),
         .legacy_workspace_preferences => alloc.print("move these preferences out of workspaces in {s}", .{file}),
-        .manual_backup_available => if (diagnostic.recovery_path) |path|
-            alloc.print("to go back to the last good settings, copy {s} to {s}", .{ path, file })
-        else
-            alloc.print("fix or remove {s}, then run fx doctor again", .{file}),
+        .manual_backup_available => if (diagnostic.recovery_path) |path| blk: {
+            const quoted = try command_lex.quoteWord(alloc, path);
+            defer alloc.free(quoted);
+            break :blk alloc.print("to go back to the last good settings, copy {s} to {s}", .{ quoted, file });
+        } else alloc.print("fix or remove {s}, then run fx doctor again", .{file}),
         .private_state_permissions_tightened => alloc.print("check {s} if you did not write it yourself", .{file}),
         else => alloc.print("fix or remove {s}, then run fx doctor again", .{file}),
     };
@@ -640,9 +642,11 @@ fn appendCheck(checks: *std.ArrayList(Check), alloc: Allocator, name: []const u8
     });
 }
 
-fn appendCheckOwnedFix(checks: *std.ArrayList(Check), alloc: Allocator, name: []const u8, status: CheckStatus, detail: []u8, fix: []u8) !void {
+/// Appends a check that owns its detail and its fix, if it has one. Both are
+/// freed when the append fails.
+pub fn appendCheckOwnedFix(checks: *std.ArrayList(Check), alloc: Allocator, name: []const u8, status: CheckStatus, detail: []u8, fix: ?[]u8) !void {
     errdefer alloc.free(detail);
-    errdefer alloc.free(fix);
+    errdefer if (fix) |owned| alloc.free(owned);
     try checks.append(alloc, .{
         .name = name,
         .status = status,

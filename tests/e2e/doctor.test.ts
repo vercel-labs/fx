@@ -2,11 +2,12 @@
 // that works, fails, or hangs on purpose.
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { writeChatGptLogin, writeGrokLogin } from "./usage-fakes";
 import { createConfiguredProviderFixture } from "./fixtures/chat-completions";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
+import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const MODEL = "fake/doctor-model";
 const MODERN_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
@@ -113,6 +114,24 @@ function writeTeamlessFxLogin(home: string) {
 function writeScript(path: string, body: string) {
   writeFileSync(path, `#!/bin/sh\n${body}\n`);
   chmodSync(path, 0o755);
+}
+
+/** A git repository at the workspace, with `origin` at `url` when given. */
+function gitRepo(r: Root, url: string | null = "https://github.com/example/repo.git") {
+  expect(spawnSync("/usr/bin/git", ["init", "-q", r.workspace]).status).toBe(0);
+  if (url) expect(spawnSync("/usr/bin/git", ["-C", r.workspace, "remote", "add", "origin", url]).status).toBe(0);
+}
+
+/** A gh that logs each call and is signed in only to `host`. */
+function signedInOnlyTo(r: Root, host: string): string {
+  const log = join(r.root, "gh.log");
+  writeScript(join(r.bin, "gh"), [
+    `echo "$*" >> '${log}'`,
+    `case " $* " in *" --hostname ${host} "*) exit 0 ;; esac`,
+    'echo "You are not logged into any accounts" >&2',
+    "exit 1",
+  ].join("\n"));
+  return log;
 }
 
 describe("fx doctor provider", () => {
@@ -315,7 +334,7 @@ describe("fx doctor local checks", () => {
   }, TIMEOUT);
 
   test("gh missing, signed out, and hanging are each a warning with a fix inside a repository", async () => {
-    const repo = (r: Root) => expect(spawnSync("/usr/bin/git", ["init", "-q", r.workspace]).status).toBe(0);
+    const repo = (r: Root) => gitRepo(r);
     const outside = makeRoot();
     const away = await doctor(outside, env(outside, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
     expect(away.stdout).not.toMatch(/^\[(ok|warn|fail)\] gh: /m);
@@ -329,7 +348,7 @@ describe("fx doctor local checks", () => {
     repo(signedOut);
     writeScript(join(signedOut.bin, "gh"), 'echo "You are not logged into any GitHub hosts." >&2; exit 1');
     const out = await doctor(signedOut, env(signedOut, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(out.stdout).toMatch(/^\[warn\] gh: GitHub CLI is not signed in to github\.com; /m);
+    expect(out.stdout).toMatch(/^\[warn\] gh: GitHub CLI is not signed in to github\.com, the host of remote origin; /m);
     expect(out.stdout).toContain("  fix: gh auth login --hostname github.com");
 
     // gh exits 1 when any host's account fails, unless asked about one host:
@@ -343,7 +362,7 @@ describe("fx doctor local checks", () => {
       "esac",
     ].join("\n"));
     const signedIn = await doctor(otherHost, env(otherHost, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
-    expect(signedIn.stdout).toMatch(/^\[ok\] gh: GitHub CLI is signed in to github\.com$/m);
+    expect(signedIn.stdout).toMatch(/^\[ok\] gh: GitHub CLI is signed in to github\.com, the host of remote origin$/m);
 
     // gh's own child holds nothing doctor waits for, and dies with it.
     const hanging = makeRoot();
@@ -356,11 +375,35 @@ describe("fx doctor local checks", () => {
     expect(running(marker)).toBe("");
   }, TIMEOUT);
 
+  test("gh is checked on the host of the repository's remote, and a repository with no remote says so", async () => {
+    const enterprise = makeRoot();
+    gitRepo(enterprise, "git@ghe.example.com:team/repo.git");
+    const enterpriseLog = signedInOnlyTo(enterprise, "ghe.example.com");
+    const onEnterprise = await doctor(enterprise, env(enterprise, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
+    expect(onEnterprise.stdout).toMatch(/^\[ok\] gh: GitHub CLI is signed in to ghe\.example\.com, the host of remote origin$/m);
+    expect(readFileSync(enterpriseLog, "utf8")).toBe("auth status --hostname ghe.example.com\n");
+
+    // gh drops remotes on hosts it is not signed in to, so one is enough.
+    const both = makeRoot();
+    gitRepo(both, "https://ghe.example.com/team/repo.git");
+    expect(spawnSync("/usr/bin/git", ["-C", both.workspace, "remote", "add", "upstream", "https://github.com/org/repo.git"]).status).toBe(0);
+    signedInOnlyTo(both, "ghe.example.com");
+    const either = await doctor(both, env(both, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
+    expect(either.stdout).toMatch(/^\[ok\] gh: GitHub CLI is signed in to ghe\.example\.com, the host of remote origin$/m);
+
+    const bare = makeRoot();
+    gitRepo(bare, null);
+    const bareLog = signedInOnlyTo(bare, "github.com");
+    const noRemote = await doctor(bare, env(bare, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" }));
+    expect(noRemote.stdout).toContain("[warn] gh: this repository has no git remote, so gh has nowhere to publish; fx pr --create and fx issue --create need it\n  fix: add the repository's remote with git remote add, then run fx doctor again\n");
+    expect(existsSync(bareLog)).toBe(false);
+  }, TIMEOUT);
+
   test("a signal that ends doctor also ends the checks it started", async () => {
     const markers = { SIGINT: "sleep 56.1234", SIGTERM: "sleep 56.4321", SIGHUP: "sleep 56.5555" } as const;
     for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
       const r = makeRoot();
-      expect(spawnSync("/usr/bin/git", ["init", "-q", r.workspace]).status).toBe(0);
+      gitRepo(r);
       const marker = markers[signal];
       writeScript(join(r.bin, "gh"), `/bin/${marker}\nexit 0`);
       const proc = Bun.spawn([FX_BIN, "doctor"], { env: env(r, { FX_TEST_DOCTOR_DEADLINE_MS: "20000" }), cwd: r.workspace, stdout: "ignore", stderr: "ignore" });
@@ -451,17 +494,104 @@ describe("fx doctor MCP", () => {
       mcp: {
         "--help": { command: [process.execPath, MODERN_FIXTURE] },
         "-x": { command: [process.execPath, MODERN_FIXTURE] },
+        "-s": { type: "sse", url: "https://mcp.invalid.example/rpc" },
         normal: { command: [process.execPath, MODERN_FIXTURE] },
       },
     }));
+    // A project server waits for approval, which `fx mcp approve -w` cannot give.
+    writeFileSync(join(r.workspace, ".mcp.json"), JSON.stringify({ mcpServers: { "-w": { command: "/bin/sh", args: ["-c", "exit 0"] } } }));
     const trace = join(r.root, "trace.log");
     const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key", FX_TEST_DOCTOR_DEADLINE_MS: "3000", FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "doctor" }));
     for (const name of ["--help", "-x"]) {
       expect(result.stdout).toContain(`[warn] mcp: ${name} was not checked: fx mcp show reads a name that starts with "-" as an option\n  fix: rename the server in ~/.fx/mcp.json so its name does not start with "-"\n`);
       expect(readFileSync(trace, "utf8")).not.toContain(`starting check ${name}`);
     }
+    expect(result.stdout).toContain('[warn] mcp: -s uses a transport fx does not support\n  fix: rename the server in ~/.fx/mcp.json so its name does not start with "-"\n');
+    expect(result.stdout).toContain('[warn] mcp: -w is waiting for approval\n  fix: rename the server in .mcp.json so its name does not start with "-"\n');
+    expect(result.stdout).not.toMatch(/fix: fx mcp \w+ -/);
     expect(result.stdout).toMatch(/^\[ok\] mcp: normal ready, 1 tool$/m);
     expect(result.code).toBe(0);
+  }, TIMEOUT);
+
+  test("a fix line passes a server name from .mcp.json to a shell as one word, and runs as written", async () => {
+    const r = makeRoot();
+    const marker = join(r.root, "pwned");
+    const names = [`x; touch '${marker}' #`, `$(touch '${marker}2')`, "it's `id`", "two words"];
+    writeFileSync(join(r.workspace, ".mcp.json"), JSON.stringify({
+      mcpServers: Object.fromEntries(names.map((name) => [name, { command: "/bin/sh", args: ["-c", "exit 0"] }])),
+    }));
+    const result = await doctor(r, env(r));
+    const fixes = result.stdout.split("\n").filter((line) => line.startsWith("  fix: fx mcp approve ")).map((line) => line.slice("  fix: ".length));
+    expect(fixes).toHaveLength(names.length);
+    // A stand-in fx records the words a shell hands it.
+    const fake = join(r.root, "fake-bin");
+    mkdirSync(fake);
+    const argsLog = join(r.root, "args.log");
+    writeScript(join(fake, "fx"), `for a in "$@"; do printf '[%s]' "$a"; done >> '${argsLog}'; echo >> '${argsLog}'`);
+    for (const fix of fixes) expect(spawnSync("/bin/sh", ["-c", fix], { env: { PATH: `${fake}:/usr/bin:/bin` } }).status).toBe(0);
+    expect(existsSync(marker) || existsSync(`${marker}2`)).toBe(false);
+    const got = readFileSync(argsLog, "utf8").trim().split("\n").sort();
+    expect(got).toEqual(names.map((name) => `[mcp][approve][${name}]`).sort());
+
+    // The real fx approves each one from the same line.
+    const real = join(r.root, "real-bin");
+    mkdirSync(real);
+    symlinkSync(FX_BIN, join(real, "fx"));
+    for (const fix of fixes) {
+      expect(spawnSync("/bin/sh", ["-c", fix], { cwd: r.workspace, env: env(r, { PATH: `${real}:/usr/bin:/bin` }) }).status).toBe(0);
+    }
+    expect(existsSync(marker) || existsSync(`${marker}2`)).toBe(false);
+    const after = await doctor(r, env(r));
+    expect(after.stdout).not.toContain("is waiting for approval");
+  }, TIMEOUT);
+
+  test("SIGINT or SIGTERM while doctor starts its checks leaves no check and no server running", async () => {
+    const r = makeRoot();
+    const server = "sleep 55.4321";
+    const mcp: Record<string, unknown> = {};
+    // Servers that ignore SIGTERM, so only doctor's kill of each check with
+    // everything it started ends them at once.
+    for (let i = 0; i < 50; i++) mcp[`f${i}`] = { command: ["/bin/sh", "-c", `trap '' TERM; exec /bin/${server}`] };
+    writeFileSync(join(r.home, ".fx", "mcp.json"), JSON.stringify({ mcp }));
+    cleanups.push(() => {
+      spawnSync("/usr/bin/pkill", ["-KILL", "-f", server]);
+      spawnSync("/usr/bin/pkill", ["-KILL", "-f", "mcp show f[0-9]"]);
+    });
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+      for (const delay of [0, 10, 40]) {
+        const proc = Bun.spawn([FX_BIN, "doctor"], { env: env(r, { FX_TEST_DOCTOR_DEADLINE_MS: "30000" }), cwd: r.workspace, stdout: "ignore", stderr: "ignore" });
+        const started = performance.now();
+        while (running("mcp show f") === "" && performance.now() - started < 10_000) await Bun.sleep(1);
+        if (delay > 0) await Bun.sleep(delay);
+        proc.kill(signal);
+        await proc.exited;
+        expect(proc.signalCode).toBe(signal);
+        expect(running("mcp show f")).toBe("");
+        await Bun.sleep(3_000);
+        expect(running(server)).toBe("");
+      }
+    }
+  }, 120_000);
+
+  test.skipIf(!tmuxAvailable())("on a terminal, doctor says on stderr which checks it waits for, and not with --json", async () => {
+    const r = makeRoot();
+    const hang = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 0, fetch: () => new Promise<Response>(() => {}) });
+    cleanups.push(() => hang.stop(true));
+    writeFileSync(join(r.home, ".fx", "mcp.json"), JSON.stringify({ mcp: { slow: { type: "http", url: `http://127.0.0.1:${hang.port}/mcp` } } }));
+    for (const args of ["", " --json"]) {
+      // The word after doctor ends marks the end of its output, which a
+      // narrow pane can wrap.
+      const cmd = `/bin/sh -c ${JSON.stringify(`${JSON.stringify(FX_BIN)} doctor${args}; echo DOCTOR-ENDED`)}`;
+      const session = await TmuxSession.create({ cmd, cwd: r.workspace, env: env(r, { FX_TEST_DOCTOR_DEADLINE_MS: "2000" }), remainOnExit: true });
+      try {
+        await session.waitForText("DOCTOR-ENDED", 15_000);
+        const screen = await session.captureFullScrollback();
+        if (args) expect(screen).not.toContain("checking ");
+        else expect(screen).toContain("checking 1 MCP server (up to 2 s)...");
+      } finally {
+        await session.kill();
+      }
+    }
   }, TIMEOUT);
 
   test("a project .mcp.json that skips servers fails with a fix, as ~/.fx/mcp.json does", async () => {

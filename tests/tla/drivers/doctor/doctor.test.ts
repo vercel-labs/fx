@@ -5,7 +5,10 @@
 // doctor must end by the deadline plus its reap grace, which it can only do
 // once it has cancelled and joined every check (NoTaskAfterReport), and
 // neither a child nor a process a child started in its group may outlive
-// doctor (NoChildAfterExit): the hanging gh runs a sleep of its own.
+// doctor (NoChildAfterExit): the hanging gh runs a sleep of its own. One more
+// run sends SIGTERM while doctor starts its checks: doctor must end by the
+// signal, as the spec's `exited` state, with no check child and no server it
+// started left behind.
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -19,6 +22,8 @@ const GRACE_MS = 2500;
 type Outcome = "result" | "timed_out" | "none";
 type Observation = { catalog: Outcome; mcp1: Outcome; gh: Outcome };
 const GH_GRANDCHILD = "sleep 59.8765";
+// TLC searches the whole model to reject a report, which takes about a minute.
+const TLC_TIMEOUT_MS = 180_000;
 
 const servers: Array<{ stop: (force?: boolean) => void }> = [];
 afterAll(() => {
@@ -52,6 +57,8 @@ async function run(catalogHangs: boolean, mcpHangs: boolean): Promise<{ observed
     mkdirSync(bin);
     // gh runs only inside a repository.
     if (spawnSync("/usr/bin/git", ["init", "-q", ws]).status !== 0) throw new Error("git init failed");
+    // gh is checked on the host of the repository's remote.
+    spawnSync("/usr/bin/git", ["-C", ws, "remote", "add", "origin", "https://github.com/example/repo.git"]);
     writeFileSync(join(bin, "gh"), mcpHangs ? `#!/bin/sh\n/bin/${GH_GRANDCHILD}\nexit 0\n` : "#!/bin/sh\nexit 1\n");
     chmodSync(join(bin, "gh"), 0o755);
     const mcp1 = mcpHangs
@@ -85,13 +92,17 @@ async function run(catalogHangs: boolean, mcpHangs: boolean): Promise<{ observed
 
 /** Whether the spec can reach `main = "reported"` with this report. */
 async function reachable(observed: Observation, label: string): Promise<boolean> {
-  const dir = outDir(`doctor-driver-${label}`);
   const value = (o: Outcome) => `"${o}"`;
+  return reaches(`main = "reported" /\\ report = [x \\in Checks |-> IF x = "catalog" THEN ${value(observed.catalog)} ELSE IF x = "mcp1" THEN ${value(observed.mcp1)} ELSE ${value(observed.gh)}]`, label);
+}
+
+/** Whether the spec can reach a state where `state`, a TLA+ predicate, holds. */
+async function reaches(state: string, label: string): Promise<boolean> {
+  const dir = outDir(`doctor-driver-${label}`);
   writeFileSync(join(dir, "DoctorObserved.tla"), [
     "---- MODULE DoctorObserved ----",
     "EXTENDS Doctor",
-    `Observed == [x \\in Checks |-> IF x = "catalog" THEN ${value(observed.catalog)} ELSE IF x = "mcp1" THEN ${value(observed.mcp1)} ELSE ${value(observed.gh)}]`,
-    "NotObserved == ~(main = \"reported\" /\\ report = Observed)",
+    `NotObserved == ~(${state})`,
     "====",
     "",
   ].join("\n"));
@@ -106,8 +117,11 @@ async function reachable(observed: Observation, label: string): Promise<boolean>
     "    UseDeadline = TRUE",
     "    UseKill = TRUE",
     "    UseGroupKill = TRUE",
+    "    UseSweep = TRUE",
     "    UseCancel = TRUE",
     "    UseJoin = TRUE",
+    "    UseStopCheck = TRUE",
+    "    UseQuietHandler = TRUE",
     "INVARIANT NotObserved",
     "CHECK_DEADLOCK FALSE",
     "",
@@ -132,10 +146,38 @@ describe("fx doctor along Doctor.tla", () => {
       expect(ms).toBeLessThan(DEADLINE_MS + GRACE_MS);
       expect(left).toBe("");
       expect(await reachable(observed, label)).toBe(true);
-    }, 60_000);
+    }, TLC_TIMEOUT_MS);
   }
+
+  test("SIGTERM while doctor starts its checks ends it by the signal with nothing left", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-tla-doctor-signal-"));
+    const server = "sleep 58.4321";
+    try {
+      const home = join(root, "h");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      const mcp: Record<string, unknown> = {};
+      // Servers that ignore SIGTERM, so only doctor's kill of each check's
+      // tree ends them at once.
+      for (let i = 0; i < 12; i++) mcp[`s${i}`] = { command: ["/bin/sh", "-c", `trap '' TERM; exec /bin/${server}`] };
+      writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({ mcp }));
+      const env = { HOME: home, PATH: "/usr/bin:/bin", FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1", FX_TEST_DOCTOR_DEADLINE_MS: "30000" };
+      const proc = Bun.spawn([fxBin(), "doctor"], { env, cwd: root, stdout: "ignore", stderr: "ignore" });
+      const started = performance.now();
+      while (running("mcp show s") === "" && performance.now() - started < 10_000) await Bun.sleep(1);
+      proc.kill("SIGTERM");
+      await proc.exited;
+      expect(proc.signalCode).toBe("SIGTERM");
+      expect(running("mcp show s")).toBe("");
+      await Bun.sleep(3000);
+      expect(running(server)).toBe("");
+      expect(await reaches(`main = "exited" /\\ sig /\\ \\A c \\in Children : child[c] # "running" /\\ server[c] # "untold"`, "signal")).toBe(true);
+    } finally {
+      spawnSync("/usr/bin/pkill", ["-KILL", "-f", server]);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, TLC_TIMEOUT_MS);
 
   test("a report the spec cannot produce is rejected", async () => {
     expect(await reachable({ catalog: "none", mcp1: "result", gh: "result" }, "impossible")).toBe(false);
-  }, 60_000);
+  }, TLC_TIMEOUT_MS);
 });

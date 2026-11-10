@@ -65,7 +65,7 @@ python3 -m scripts.pgso all \
 
 `build` verifies the control, bitcode, instrumented link, profile-section alignment, signature, and one profile-producing smoke. `train` additionally runs the versioned corpus and creates a checked candidate. Both are useful diagnostics but finish with `eligible: false` because they do not run the complete release-safety gate.
 
-`all` runs the complete fresh-build path: training, profile use, candidate verification, the candidate behavior corpus, six startup comparisons, and six heavy-workload comparisons. It is the canonical CI entry point. `report --output-dir <path>` is the only command that may reuse an existing directory, and it only reads a complete eligible manifest.
+`all` runs the complete fresh-build path: training, profile use, candidate verification, the candidate behavior corpus, four startup comparisons, and six heavy-workload comparisons. It is the canonical CI entry point. `report --output-dir <path>` is the only command that may reuse an existing directory, and it only reads a complete eligible manifest.
 
 The production workflow runs the same gate as a distributed DAG. One seed job
 builds the control, bitcode, and instrumented binary. Up to twenty training
@@ -73,8 +73,8 @@ jobs execute non-overlapping corpus assignments, one coordinator validates and
 merges every shard profile, builds three dedicated heavy-workload benchmark
 pairs, adds their hash-compatible speed evidence to the production profile,
 and builds the candidate. Up to twenty behavior jobs then verify
-non-overlapping candidate assignments. The six startup and six heavy-workload
-comparisons run on twelve fresh machines. Every performance job measures its
+non-overlapping candidate assignments. The four startup and six heavy-workload
+comparisons run on ten fresh machines. Every performance job measures its
 immutable control and candidate on the same machine.
 
 The fx candidate applies the accepted whole-program profile-use pipeline, then

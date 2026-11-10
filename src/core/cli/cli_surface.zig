@@ -28,6 +28,7 @@ const app_profile_runtime = @import("../app/app_profile_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const doctor_probes = @import("doctor_probes.zig");
+const doctor_gh_hosts = @import("doctor_gh_hosts.zig");
 const mcp_runtime = @import("../mcp_host/runtime.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -4127,7 +4128,7 @@ const DoctorProbes = struct {
     /// The MCP server children first, then gh.
     processes: std.ArrayList(*doctor_probes.ProcessProbe) = .empty,
     server_children: usize = 0,
-    gh: ?*doctor_probes.ProcessProbe = null,
+    gh: ?doctor_probes.Gh = null,
     waiters: std.Io.Group = .init,
     mcp_statuses: []const mcp_runtime.Status = &.{},
     mcp_checked: bool = false,
@@ -4160,10 +4161,8 @@ const DoctorProbes = struct {
         // one, doctor does not run it, so gh writes nothing on its behalf. Unit
         // tests run inside this repository and must not reach GitHub.
         if (snapshot.in_git_repository and !builtin.is_test) {
-            try self.processes.ensureUnusedCapacity(probe_alloc, 1);
-            const gh = try doctor_probes.startGh(probe_alloc, &self.waiters);
-            self.processes.appendAssumeCapacity(gh);
-            self.gh = gh;
+            const target = try doctor_gh_hosts.read(probe_alloc, workspace_root);
+            self.gh = try doctor_probes.startGh(probe_alloc, &self.waiters, &self.processes, target);
         }
     }
 
@@ -4194,8 +4193,23 @@ const DoctorProbes = struct {
     }
 
     /// Waits for the checks until the deadline, then stops and joins them.
-    fn wait(self: *DoctorProbes) void {
-        doctor_probes.wait(self.deadline, self.catalog, self.processes.items, &self.waiters);
+    /// The ending signal that stopped the checks, if one did.
+    fn wait(self: *DoctorProbes) ?std.posix.SIG {
+        return doctor_probes.wait(self.deadline, self.catalog, self.processes.items, &self.waiters);
+    }
+
+    /// One line on a terminal's stderr while doctor waits on its network
+    /// checks, so a slow one does not look like a hang.
+    fn writeWaitNotice(self: *const DoctorProbes, alloc: Allocator, deps: RunDeps, provider: model_provider.ProviderId, deadline_ms: i64) !void {
+        if (builtin.is_test or !(std.Io.File.stderr().isTty(io_mod.getIo()) catch false)) return;
+        var servers: usize = 0;
+        for (self.processes.items[0..self.server_children]) |probe| {
+            if (!probe.not_started and probe.spawn_error == null) servers += 1;
+        }
+        const gh_started = if (self.gh) |gh| gh.probes.len > 0 else false;
+        const notice = try doctor_probes.waitNotice(alloc, if (self.catalog != null) provider else null, servers, gh_started, deadline_ms) orelse return;
+        defer alloc.free(notice);
+        try writeStderr(deps, notice);
     }
 
     /// The probe check lines, and what doctor found for each MCP server.
@@ -4210,7 +4224,7 @@ const DoctorProbes = struct {
         if (self.catalog) |probe| try doctor_probes.catalogChecks(out, alloc, probe, provider, deadline_ms);
         try doctor_probes.serverStatusChecks(out, alloc, self.mcp_statuses);
         try doctor_probes.serverChildChecks(out, results, alloc, self.processes.items[0..self.server_children], deadline_ms);
-        if (self.gh) |probe| try doctor_probes.ghCheck(out, alloc, probe, deadline_ms);
+        if (self.gh) |gh| try doctor_probes.ghCheck(out, alloc, gh, deadline_ms);
     }
 };
 
@@ -4268,8 +4282,11 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
     const deadline_ms = doctor_probes.deadlineMs();
     var probes: DoctorProbes = .{ .deadline = io_mod.milliTimestamp() + deadline_ms };
     const started = probes.start(cfg, deps, &snapshot, workspace_root);
+    if (opts.format == .text) probes.writeWaitNotice(alloc, deps, snapshot.provider, deadline_ms) catch |err| {
+        debug_trace.logf("doctor", "wait notice not written err={s}", .{@errorName(err)});
+    };
     // Runs on every path, so nothing doctor started outlives it.
-    probes.wait();
+    if (probes.wait()) |sig| doctor_probes.endBySignal(sig);
     try started;
 
     var probe_checks: std.ArrayList(doctor_runtime.Check) = .empty;

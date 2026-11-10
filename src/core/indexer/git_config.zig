@@ -535,6 +535,59 @@ pub fn filterDriverNames(arena: Allocator, loaded: Loaded) Allocator.Error![]con
     return names.toOwnedSlice(arena);
 }
 
+pub const Remote = struct {
+    name: []const u8,
+    /// The first `url`, which git fetches from, with the longest matching
+    /// `url.<base>.insteadOf` applied as `git remote -v` shows it.
+    url: []const u8,
+    /// Marked by `gh repo set-default` (`remote.<name>.gh-resolved`).
+    gh_resolved: bool,
+};
+
+/// Each remote with a URL, in config order, from config loaded in `values`
+/// mode. Memory belongs to `arena`.
+pub fn remotes(arena: Allocator, loaded: Loaded) Allocator.Error![]const Remote {
+    var found: std.ArrayList(Remote) = .empty;
+    for (loaded.entries) |loaded_entry| {
+        const entry = loaded_entry.entry;
+        if (!std.mem.eql(u8, entry.section, "remote")) continue;
+        const name = entry.subsection orelse continue;
+        const remote = for (found.items) |*known| {
+            if (std.mem.eql(u8, known.name, name)) break known;
+        } else blk: {
+            try found.append(arena, .{ .name = name, .url = "", .gh_resolved = false });
+            break :blk &found.items[found.items.len - 1];
+        };
+        if (std.mem.eql(u8, entry.name, "url")) {
+            if (remote.url.len == 0) remote.url = entry.value orelse "";
+        } else if (std.mem.eql(u8, entry.name, "gh-resolved")) {
+            remote.gh_resolved = true;
+        }
+    }
+    var kept: std.ArrayList(Remote) = .empty;
+    for (found.items) |remote| {
+        if (remote.url.len == 0) continue;
+        try kept.append(arena, .{ .name = remote.name, .url = try rewriteUrl(arena, loaded, remote.url), .gh_resolved = remote.gh_resolved });
+    }
+    return kept.toOwnedSlice(arena);
+}
+
+/// `url` with the longest `url.<base>.insteadOf` prefix replaced by its base.
+fn rewriteUrl(arena: Allocator, loaded: Loaded, url: []const u8) Allocator.Error![]const u8 {
+    var base: ?[]const u8 = null;
+    var prefix_len: usize = 0;
+    for (loaded.entries) |loaded_entry| {
+        const entry = loaded_entry.entry;
+        if (!std.mem.eql(u8, entry.section, "url") or !std.mem.eql(u8, entry.name, "insteadof")) continue;
+        const prefix = entry.value orelse continue;
+        if (prefix.len <= prefix_len or !std.mem.startsWith(u8, url, prefix)) continue;
+        base = entry.subsection orelse continue;
+        prefix_len = prefix.len;
+    }
+    const replacement = base orelse return url;
+    return std.mem.concat(arena, u8, &.{ replacement, url[prefix_len..] });
+}
+
 pub const ObjectFormat = enum { sha1, sha256 };
 
 pub const IgnoreSettings = struct {
@@ -838,6 +891,25 @@ test "repository filter names come only from repository config and count every i
     try std.testing.expectEqual(@as(usize, 2), values.len);
     try std.testing.expectEqualStrings("lfs", values[0]);
     try std.testing.expectEqualStrings("evil", values[1]);
+}
+
+test "remotes keep config order, the first url, the gh mark, and the longest insteadOf" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try testRepo(arena, &tmp, "repo", "main");
+    try writeTestFile(tmp.dir, "home/.gitconfig", "[url \"https://ghe.example.com/\"]\ninsteadOf = work:\n[url \"https://ghe.example.com/mirror/\"]\ninsteadOf = work:team/\n");
+    try writeTestFile(tmp.dir, "repo/.git/config", "[remote \"origin\"]\nurl = work:team/repo\nurl = https://second.example.com/x\n[remote \"upstream\"]\nurl = git@github.com:org/repo.git\ngh-resolved = base\n[remote \"empty\"]\nfetch = +refs/heads/*:refs/remotes/empty/*\n");
+    const found = try remotes(arena, try loadAll(arena, &repo.context));
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    try std.testing.expectEqualStrings("origin", found[0].name);
+    try std.testing.expectEqualStrings("https://ghe.example.com/mirror/repo", found[0].url);
+    try std.testing.expect(!found[0].gh_resolved);
+    try std.testing.expectEqualStrings("upstream", found[1].name);
+    try std.testing.expectEqualStrings("git@github.com:org/repo.git", found[1].url);
+    try std.testing.expect(found[1].gh_resolved);
 }
 
 test "config sources that are not bounded regular files are unavailable" {
