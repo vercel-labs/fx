@@ -980,9 +980,8 @@ pub fn Runtime(comptime App: type) type {
         fn runsProcessModel(app: *App, agent: *AppAgent) bool {
             if (comptime !agents.hasAgentField(App, "role")) return false;
             if (agent == &app.main_agent or agent.role != .instance) return false;
-            const model = agent.session_persistence.process_model_override orelse return false;
-            const preferences = agent.session_persistence.session_preferences orelse return false;
-            return std.mem.eql(u8, preferences.model, model);
+            if (agent.session_persistence.session_preferences == null) return false;
+            return provider_runtime.runsProcessModel(app, agent);
         }
 
         fn releaseLiveSessionTransitionHold(app: *App, agent: *AppAgent) void {
@@ -2347,13 +2346,43 @@ pub fn Runtime(comptime App: type) type {
             if (agent.session_persistence.v2) |v2| {
                 if (result.session_error != null) return result;
                 const preferences = agent.session_persistence.session_preferences orelse return result;
-                v2.setPreferences(preferences) catch |err| {
+                // An instance launched after the first runs the --model or
+                // FX_MODEL model in its preferences; the session keeps its own
+                // unless this change picked one.
+                var without_run_model: ?session_codec.DurableSessionPreferences = null;
+                defer if (without_run_model) |*value| value.deinit(app.alloc);
+                if (patch.model == null and runsProcessModel(app, agent)) {
+                    without_run_model = withSavedModel(app.alloc, v2, preferences) catch |err| {
+                        result.session_error = err;
+                        warnDegraded(app, agent, err) catch {};
+                        return result;
+                    };
+                }
+                v2.setPreferences(without_run_model orelse preferences) catch |err| {
                     result.session_error = err;
                     warnDegraded(app, agent, err) catch {};
                 };
                 return result;
             }
             return result;
+        }
+
+        /// `preferences` with the model and provider `v2` has saved in place of
+        /// theirs. Caller owns.
+        fn withSavedModel(
+            alloc: Allocator,
+            v2: *session_adapter.Session,
+            preferences: session_codec.DurableSessionPreferences,
+        ) !session_codec.DurableSessionPreferences {
+            var saved = try v2.currentPreferences(alloc);
+            defer saved.deinit(alloc);
+            var copy = try preferences.dupe(alloc);
+            errdefer copy.deinit(alloc);
+            const model = try alloc.dupe(u8, saved.model);
+            alloc.free(copy.model);
+            copy.model = model;
+            copy.provider = saved.provider;
+            return copy;
         }
 
         pub fn activeSessionId(agent: *AppAgent) ?[]const u8 {

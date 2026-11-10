@@ -1366,6 +1366,68 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
+    "/effort in a launched instance under FX_MODEL saves the effort but not the run's model",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-effort-env-model-")));
+      try {
+        const before: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { env: { FX_MODEL: "other/model" }, models: PREFERENCE_MODELS, requests: before, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await session.sendText("/launch");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("/effort low");
+          await session.waitForText("Reasoning effort set to", 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "SAVED_TURN");
+          await quitWith(session, "/exit");
+        });
+        expect(preferencesOf(before, "SAVED_TURN")).toMatchObject({ model: "other/model", reasoning: "low" });
+        const id = sessionHolding(home, "DONE_SAVED_TURN")!;
+        const after: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: `--resume ${id}`, env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: after, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("DONE_SAVED_TURN"), 30_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "RESUMED_TURN");
+        });
+        // FX_MODEL shaped only the run that set it.
+        expect(preferencesOf(after, "RESUMED_TURN")?.model).not.toBe("other/model");
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "/fast under FX_MODEL changes the run without saving the run's model to settings",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-fast-env-model-")));
+      try {
+        const requests: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { env: { FX_MODEL: "other/model" }, models: PREFERENCE_MODELS, requests, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await session.sendText("/fast on");
+          await session.waitForText("fast: on", 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "FAST_TURN");
+          await quitWith(session, "/exit");
+        });
+        expect(preferencesOf(requests, "FAST_TURN")).toMatchObject({ model: "other/model", speed: "fast" });
+        // fast mode is saved with its model, so neither outlives this run.
+        const settings = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+        expect(settings).not.toHaveProperty("models");
+        expect(settings).not.toHaveProperty("fast_mode");
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "/new in a launched instance keeps FX_MODEL for the run without saving it",
     async () => {
       const home = createIsolatedTestHome();
