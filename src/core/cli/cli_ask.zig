@@ -46,6 +46,7 @@ const agent_run_flags = @import("agent_run_flags.zig");
 const flag_placement = @import("flag_placement.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
+const token_pass = @import("../gateway/token_pass.zig");
 const builtin_commands = @import("../../builtins/commands.zig");
 const cli_flags = @import("cli_flags.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -2017,7 +2018,12 @@ fn maybeStartAskTitleTask(
     if (ctx.session.agent.history.items.len != 0) return null;
     const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    const title_model = bundle.title_model orelse return null;
+    const provider_title_model = bundle.title_model orelse return null;
+    // A Token Pass session titles itself with a Token Pass model.
+    const title_model = if (ctx.provider == .gateway)
+        token_pass.modelForSideCall(.title, ctx.model, provider_title_model)
+    else
+        provider_title_model;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
     if (ctx.credential_source != .host_managed and ctx.api_key.len == 0) return null;

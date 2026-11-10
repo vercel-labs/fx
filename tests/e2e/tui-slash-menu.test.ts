@@ -3425,6 +3425,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       // does not name Token Pass again, and /credits points at its balance.
       await session.sendText("Use Token Pass.");
       await session.waitForText("TOKEN_PASS_REPLY", 10_000);
+      // The session's title comes from a Token Pass model too.
+      const titleDeadline = Date.now() + 5_000;
+      while (gateway.titleRequests.length === 0 && Date.now() < titleDeadline) await Bun.sleep(50);
+      expect(gateway.titleRequests.map((request) => request.headers.get("ai-language-model-id")))
+        .toEqual(["zai/glm-5.3-flash"]);
       await pickModel("glm", tokenPassModel, "effort");
       await waitForScrollbackCount(`Switched to ${tokenPassModel} (effort: default, speed: normal)`, 2);
       expect(await scrollbackCount(covers)).toBe(1);

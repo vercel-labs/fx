@@ -40,6 +40,41 @@ pub fn isTokenPassProvider(provider: []const u8) bool {
     return std.ascii.eqlIgnoreCase(provider, provider_slug);
 }
 
+/// A call fx makes on its own during a session, beside the session's turns.
+pub const SideCall = enum {
+    /// The automatic permission review. It needs reliable structured tool
+    /// calls within the reviewer's output budget.
+    review,
+    /// The session title, within a 128-token reply.
+    title,
+    /// The vision tool, which reads images for a model that cannot.
+    vision,
+};
+
+/// The Token Pass model for each side call. Chosen with the auto-permission
+/// reliability eval and title and image checks against each featured model.
+fn sideCallModel(call: SideCall) []const u8 {
+    return switch (call) {
+        .review => "deepseek/deepseek-v4.1-flash",
+        .title, .vision => "zai/glm-5.3-flash",
+    };
+}
+
+/// The model for an AI Gateway side call: a Token Pass model when the
+/// session runs a Token Pass model, so the whole session stays on Token Pass
+/// credit, and `default_model` otherwise.
+pub fn modelForSideCall(call: SideCall, session_model: []const u8, default_model: []const u8) []const u8 {
+    return if (isFeaturedModel(session_model)) sideCallModel(call) else default_model;
+}
+
+/// The Token Pass model of another family that retries a summary a Token
+/// Pass model could not write. Null when `primary` is not a Token Pass
+/// model, which leaves the choice to the compactor.
+pub fn compactionFallback(primary: []const u8) ?[]const u8 {
+    if (!isFeaturedModel(primary)) return null;
+    return if (std.ascii.startsWithIgnoreCase(primary, "zai/")) "deepseek/deepseek-v4.1-flash" else "zai/glm-5.3";
+}
+
 /// What fx has seen of the current team's Token Pass. `unknown` covers a
 /// team without one and a team that has not yet sent a featured request.
 pub const Status = enum { unknown, active };
@@ -114,6 +149,28 @@ test "token pass: featured models match exactly and ignore case" {
     try std.testing.expect(!isFeaturedModel("glm-5.3"));
     try std.testing.expect(!isFeaturedModel("openai/gpt-5.6-luna"));
     try std.testing.expect(!isFeaturedModel(""));
+}
+
+test "token pass: side calls stay on Token Pass models in a Token Pass session" {
+    const default_model = "openai/gpt-5.6-luna";
+    for (featured_models) |session_model| {
+        inline for (.{ SideCall.review, SideCall.title, SideCall.vision }) |call| {
+            const chosen = modelForSideCall(call, session_model, default_model);
+            try std.testing.expect(isFeaturedModel(chosen));
+        }
+    }
+    try std.testing.expectEqualStrings(default_model, modelForSideCall(.review, "anthropic/claude-opus-4.8", default_model));
+    try std.testing.expectEqualStrings(default_model, modelForSideCall(.title, "zai/glm-5.3-fast", default_model));
+}
+
+test "token pass: a compaction retry uses another Token Pass family" {
+    for (featured_models) |primary| {
+        const fallback = compactionFallback(primary).?;
+        try std.testing.expect(isFeaturedModel(fallback));
+        const family = primary[0 .. std.mem.findScalar(u8, primary, '/').? + 1];
+        try std.testing.expect(!std.mem.startsWith(u8, fallback, family));
+    }
+    try std.testing.expect(compactionFallback("anthropic/claude-opus-4.8") == null);
 }
 
 test "token pass: the tracker turns active once on a token-pass response" {
