@@ -2026,7 +2026,8 @@ fn maybeStartAskTitleTask(
         provider_title_model;
     const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
-    if (ctx.credential_source != .host_managed and ctx.api_key.len == 0) return null;
+    // A custom connection may need no key; its adapter checks the one it gets.
+    if (ctx.credential_source != .host_managed and ctx.credential_source != .configured and ctx.api_key.len == 0) return null;
     const task = session_title_generation.Task.create(.{
         .session_id = session_id,
         .model = title_model,
@@ -2178,6 +2179,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .push_diff_block = pushDiffBlock,
         .push_system_notice = pushSystemNotice,
         .push_context_notice = pushContextNotice,
+        .push_session_notice = pushSessionNotice,
         .push_route_recovery_status = pushRouteRecoveryStatus,
         .begin_route_recovery_request = beginRouteRecoveryRequest,
         .push_command_output_complete = pushCommandOutputComplete,
@@ -3404,6 +3406,12 @@ fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     try ctx.writeStderr("[notice] ");
     try ctx.writeStderr(text);
     try ctx.writeStderr("\n");
+}
+
+fn pushSessionNotice(raw_ctx: *anyopaque, text: []const u8) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!try ctx.session.claimContextNotice(ctx.alloc, text)) return;
+    try pushSystemNotice(raw_ctx, text);
 }
 
 fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {

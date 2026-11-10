@@ -149,6 +149,9 @@ fn appendContinuationPrompt(
     try within_turn_suffix.append(arena, .{ .role = .user, .content = prompt, .recovery_prompt = true });
 }
 
+const ignored_effort_notice =
+    "Effort {s} is not available for {s}, so it is not sent. To offer it, add it to the model's reasoning_efforts in settings.json.";
+
 fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {
     const prefix = empty_length_limited_reply ++ " Retrying with";
     if (raised_limit and lowered_effort) return prefix ++ " a higher limit and low effort.";
@@ -7683,6 +7686,7 @@ fn processQueuedPromptLoop(
         selected_fast_mode;
     var fast_unavailable_notified = false;
     var ultrafast_unconfirmed_notified = false;
+    var ignored_effort_notified = false;
     // Attachment pixel sizes probed during this turn, so each step does not
     // reread every attachment snapshot. Entries live in the turn arena.
     var attachment_dimensions: image_attachments.AttachmentDimensionCache = .empty;
@@ -8189,6 +8193,17 @@ fn processQueuedPromptLoop(
             provider_opts.provider_order = config.provider_order;
             provider_opts.provider_strict = config.provider_strict;
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, attempt_fast_mode, step_effort, provider_opts);
+            // A custom connection sends an effort level only when the model's
+            // settings declare it. One the person set and the model does not
+            // declare is left out, and the session says so once
+            // (`tests/tla/configured_provider/ConfiguredRequest.tla`
+            // IgnoredEffortNoticed, NoticeOncePerSession).
+            if (job.provider == .configured and !step_effort.isDefault() and provider_opts.reasoning == null and !ignored_effort_notified) {
+                ignored_effort_notified = true;
+                if (deps.push_session_notice) |push| {
+                    try push(deps.ctx, try overlay_arena.print(ignored_effort_notice, .{ step_effort.label(), gateway_model }));
+                }
+            }
             // Fast drops silently when the catalog cannot confirm support.
             // Tell the user once per turn, but only when the catalog itself is
             // known to be down; a reachable catalog that simply lacks fast

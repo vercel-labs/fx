@@ -1977,6 +1977,12 @@ fn runNonInteractiveWithDeps(
             defer collections.freeStringList(alloc, &ids);
             var entries = loaded.entries;
             defer model_catalog.freeModelCatalog(alloc, &entries);
+            defer if (loaded.notice) |notice| alloc.free(notice);
+            if (loaded.notice) |notice| {
+                try writeStderr(deps, "fx models: ");
+                try writeStderr(deps, notice);
+                try writeStderr(deps, "\n");
+            }
             const details = try modelDetails(
                 alloc,
                 ids.items,

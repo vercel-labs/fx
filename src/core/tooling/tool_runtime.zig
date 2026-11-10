@@ -1887,10 +1887,11 @@ fn executeVisionRequest(
         .trace_ctx = .{},
         .output_limit = state.runtime.context_limits.image_adapter_output_bytes,
         // A Token Pass session reads images with a Token Pass model.
+        // A custom connection reads images with its own vision_model.
         .model = if (state.runtime.provider == .gateway)
             token_pass.modelForSideCall(.vision, state.runtime.model, image_provider.default_model)
         else
-            image_provider.default_model,
+            state.runtime.provider_capabilities.vision_model orelse image_provider.default_model,
     };
     if (request.image_ids() != null) {
         if (authority != .ordinary) return error.InvalidVisionExecutionAuthority;

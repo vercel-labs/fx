@@ -589,7 +589,7 @@ fn composeStateRow(alloc: Allocator, projection: ModelMenuProjection, width: u16
 
 fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]const u8 {
     if (retryableFailureText(state.failure)) |text| return text;
-    if (state.from_profile_settings) return "Models from profile settings; explicit model IDs do not require catalog discovery.";
+    if (state.from_profile_settings) return "Models from settings and, with fetch_models, the server; explicit model IDs need no catalog.";
     if (state.private_models_hidden) {
         const reason = state.public_only_reason orelse return "Using the public model catalog.";
         return switch (reason) {
@@ -911,7 +911,7 @@ test "configured model menu identifies profile settings without Gateway sign-in"
 
     var status = try composeModelMenuRow(alloc, projection, rows - 1, 120, rows);
     defer status.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, status.items, "Models from profile settings; explicit model IDs do not require catalog discovery.") != null);
+    try std.testing.expect(std.mem.find(u8, status.items, "Models from settings and, with fetch_models, the server; explicit model IDs need no catalog.") != null);
     try std.testing.expect(std.mem.find(u8, status.items, "public model catalog") == null);
     try std.testing.expect(std.mem.find(u8, status.items, "sign in") == null);
 }

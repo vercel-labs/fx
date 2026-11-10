@@ -1,0 +1,711 @@
+// Runs fx along the custom model connection models in
+// tests/tla/configured_provider/ and has TLC check what it observes.
+//
+//   request    One `fx ask` per session against a local fake server, for every
+//              shape of model metadata the model knows (declared levels and
+//              their order, request fields, effort fields, an output limit,
+//              the field that carries it), every configured effort, and a
+//              script of replies: tool calls, a reply cut off by the output
+//              limit, a final answer. The driver records what each request
+//              carried and how many ignored-effort notices fx printed, and TLC
+//              replays the sessions through ConfiguredRequest's own actions
+//              (ConfiguredRequestTrace.tla).
+//   catalog    One `fx models` per run, on one of two connections, with
+//              fetch_models on or off and a server that lists its models,
+//              refuses, or never answers. TLC replays the runs through
+//              ConfiguredCatalog's actions (ConfiguredCatalogTrace.tla).
+//   deadlines  Walks src/gateway/request_deadlines.zig along every edge of
+//              ConfiguredDeadlines.tla's state graph, then seeded random
+//              paths, through lab.zig, which owns the clock. After every step
+//              the module's wait and its verdict on the deadline must match
+//              the model's next state.
+//
+// --self-check also replays the observations through the model of fx before
+// the change (Bug = "today"), which must reject them, expects a tampered
+// expectation to be rejected, and plants bugs in a copy of
+// request_deadlines.zig, each of which the walks must catch. --stress N adds
+// one session of N tool steps.
+//
+// Usage (from the repository root, after zig build):
+//   bun tests/tla/drivers/configured_provider/driver.ts
+//   bun tests/tla/drivers/configured_provider/driver.ts --self-check
+//   bun tests/tla/drivers/configured_provider/driver.ts request --random 200 --seed 7 --jobs 8
+//   bun tests/tla/drivers/configured_provider/driver.ts request --random 0 --stress 1000
+//
+// Exit codes: 0 everything accepted (and every self-check rejected), 1 a run
+// the model cannot produce, 2 a toolchain, build, or harness failure.
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { parseValue } from "../graph.mjs";
+import { binary, targetModule, testEnvironment } from "../lib/context";
+import { REPO_ROOT, TLA_ROOT, outDir, runTlc, tlcToolchain, writeJson } from "../lib/tlc";
+
+type Verdict = "ACCEPTED" | "REJECTED" | "TOOL_ERROR";
+const tlaDir = join(TLA_ROOT, "configured_provider");
+
+function option(name: string, fallback: number): number {
+  const at = process.argv.indexOf(name);
+  if (at < 0) return fallback;
+  const value = Number(process.argv[at + 1]);
+  if (!Number.isInteger(value) || value < 0) throw new Error(`${name} takes a whole number`);
+  return value;
+}
+
+const parts = ["request", "catalog", "deadlines"].filter((part) => process.argv.includes(part));
+const options = {
+  parts: parts.length > 0 ? parts : ["request", "catalog", "deadlines"],
+  selfCheck: process.argv.includes("--self-check"),
+  random: option("--random", 60),
+  seed: option("--seed", 1),
+  jobs: option("--jobs", 8),
+  stress: option("--stress", 0),
+  walks: option("--walks", 300),
+  steps: option("--steps", 14),
+};
+
+// mulberry32: a small seeded generator, so a failing random run replays.
+function generator(seed: number) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const str = (value: string) => JSON.stringify(value);
+const set = (values: string[]) => `{${values.map(str).join(", ")}}`;
+const seq = (values: string[]) => `<<${values.join(", ")}>>`;
+
+async function pool<T>(count: number, jobs: number, run: (index: number) => Promise<T>): Promise<T[]> {
+  const results: T[] = new Array(count);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.max(1, jobs) }, async () => {
+    while (next < count) {
+      const index = next++;
+      results[index] = await run(index);
+    }
+  }));
+  return results;
+}
+
+// Replays `observed` through `trace` with TLC. ACCEPTED is the sentinel
+// NotAllMatched being violated, which needs every observation to match.
+async function runTrace(spec: string, observed: string, constants: string[], parent: string, label: string): Promise<{ verdict: Verdict; dir: string }> {
+  const dir = mkdtempSync(join(parent, `trace-${label}-`));
+  for (const file of [`${spec}.tla`, `${spec}Trace.tla`]) copyFileSync(join(tlaDir, file), join(dir, file));
+  writeFileSync(join(dir, `${spec}Observed.tla`), [
+    `---- MODULE ${spec}Observed ----`,
+    "(* Generated by tests/tla/drivers/configured_provider/driver.ts. Do not edit. *)",
+    "EXTENDS Sequences",
+    `Observed == << ${observed} >>`,
+    "====",
+    "",
+  ].join("\n"));
+  writeFileSync(join(dir, "trace.cfg"), ["SPECIFICATION TraceSpec", "CONSTANTS", ...constants.map((line) => `  ${line}`),
+    "INVARIANT NotAllMatched", "CHECK_DEADLOCK FALSE", ""].join("\n"));
+  const { java, jar } = tlcToolchain();
+  mkdirSync(join(dir, ".tlc-tmp"), { recursive: true });
+  const child = Bun.spawn([java, "-XX:+UseParallelGC", "-Xss16m", `-Djava.io.tmpdir=${join(dir, ".tlc-tmp")}`, "-cp", jar,
+    "tlc2.TLC", "-workers", "1", "-metadir", join(dir, ".tlc-states"), "-config", "trace.cfg", `${spec}Trace.tla`], {
+    cwd: dir, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+  });
+  const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+  const log = `${stdout}\n${stderr}`;
+  writeFileSync(join(dir, "tlc.log"), log);
+  if (code === 12 && log.includes("Invariant NotAllMatched is violated")) return { verdict: "ACCEPTED", dir };
+  if (code === 0 && log.includes("Model checking completed. No error has been found.")) return { verdict: "REJECTED", dir };
+  return { verdict: "TOOL_ERROR", dir };
+}
+
+// The first observation the model cannot produce: the shortest rejected prefix.
+async function firstMismatch<T>(items: T[], check: (prefix: T[]) => Promise<Verdict>): Promise<T | null> {
+  let low = 1;
+  let high = items.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    const verdict = await check(items.slice(0, middle));
+    if (verdict === "TOOL_ERROR") return null;
+    if (verdict === "ACCEPTED") low = middle + 1;
+    else high = middle;
+  }
+  return items[low - 1] ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// request: sessions of `fx ask`, checked against ConfiguredRequest.tla.
+
+const LEVELS = ["low", "high"];
+const MODEL = "local-model";
+type Kind = "answer" | "tool" | "cut";
+type Fragment = string[];
+type Definition = { declared: string[]; request: Fragment; levels: Record<string, Fragment>; limit: boolean; field: string };
+type Sent = { effort: string; body: Record<string, string>; limit: string; field: string; resend: boolean };
+type Session = {
+  id: string;
+  def: Definition;
+  configured: string;
+  loaded: "ok" | "rejected" | "unknown";
+  replies: Kind[];
+  sent: Sent[];
+  notices: number;
+  evidence: { exit: number; error: string | null; tail: string };
+};
+
+const ORDERS = [[], ["low"], ["high"], ["low", "high"], ["high", "low"]];
+const REQUEST_FRAGMENTS: Fragment[] = [[], ["temperature"], ["temperature", "reasoning_effort"], ["model"]];
+const LEVEL_FRAGMENTS: Fragment[] = [["reasoning_effort"], ["reasoning_effort", "temperature"], ["model"]];
+const SCRIPTS: Kind[][] = [[], ["tool"], ["cut"], ["tool", "tool"], ["tool", "cut"], ["cut", "tool"], ["cut", "cut"]];
+
+// The JSON a fragment stands for. Each value names where it came from, so a
+// request body shows which fragment set each field.
+function requestFields(fragment: Fragment): Record<string, unknown> {
+  const fields: Record<string, unknown> = {};
+  for (const key of fragment) fields[key] = key === "temperature" ? 0.2 : key === "model" ? "other-request" : "request";
+  return fields;
+}
+
+function levelFields(fragment: Fragment, level: string): Record<string, unknown> {
+  const fields: Record<string, unknown> = {};
+  for (const key of fragment) fields[key] = key === "temperature" ? 0.7 : key === "model" ? "other-level" : level;
+  return fields;
+}
+
+function metadataOf(def: Definition): Record<string, unknown> {
+  const metadata: Record<string, unknown> = { context_window: 262144, supports_tool_use: true, output_limit_field: def.field };
+  if (def.limit) metadata.max_output_tokens = 8192;
+  if (def.request.length > 0) metadata.request = requestFields(def.request);
+  if (def.declared.length > 0) {
+    metadata.reasoning_efforts = Object.fromEntries(def.declared.map((level) => [level, levelFields(def.levels[level]!, level)]));
+  }
+  return metadata;
+}
+
+function sentOf(body: any, afterCut: boolean): Sent {
+  const source = (key: string): string => {
+    const value = body[key];
+    if (key === "model") return value === MODEL ? "fx" : value === "other-request" ? "request" : value === "other-level" ? "level" : "unknown";
+    if (value === undefined) return "absent";
+    if (key === "temperature") return value === 0.2 ? "request" : value === 0.7 ? "level" : "unknown";
+    return value === "request" ? "request" : LEVELS.includes(value) ? "level" : "unknown";
+  };
+  const field = body.max_tokens !== undefined ? "max_tokens" : body.max_completion_tokens !== undefined ? "max_completion_tokens" : "none";
+  const amount = body.max_tokens ?? body.max_completion_tokens;
+  return {
+    effort: LEVELS.includes(body.reasoning_effort) ? body.reasoning_effort : "none",
+    body: { model: source("model"), temperature: source("temperature"), reasoning_effort: source("reasoning_effort") },
+    limit: amount === undefined ? "none" : amount === 8192 ? "model" : amount === 32768 ? "raised" : "unknown",
+    field,
+    resend: afterCut,
+  };
+}
+
+function sse(chunks: unknown[]): Response {
+  return new Response(chunks.map((value) => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n",
+    { headers: { "content-type": "text/event-stream" } });
+}
+
+// A tool call whose reply ran out of output tokens mid-arguments.
+function cutReply(model: string): Response {
+  const args = JSON.stringify({ path: "note.txt" });
+  return sse([
+    { id: "chat-cut", model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call-cut", type: "function", function: { name: "read_file", arguments: args.slice(0, args.length - 4) } }] }, finish_reason: null }] },
+    { id: "chat-cut", model, choices: [{ index: 0, delta: {}, finish_reason: "length" }] },
+  ]);
+}
+
+async function runSession(fixtures: any, id: string, def: Definition, configured: string, script: Kind[], steps: number): Promise<Session> {
+  const served: Kind[] = [];
+  const f = fixtures.createConfiguredProviderFixture((body: any) => {
+    const kind: Kind = script[served.length] ?? "answer";
+    served.push(kind);
+    if (kind === "tool") return fixtures.toolCompletion(body.model, "read_file", { path: "note.txt" }, `call-${served.length}`);
+    if (kind === "cut") return cutReply(body.model);
+    return fixtures.completion(body.model, `ANSWER_${id}`);
+  });
+  try {
+    writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+    f.settings.providers.local.model_metadata = { [MODEL]: metadataOf(def) };
+    if (configured !== "auto") f.settings.effort = configured;
+    f.save();
+    const child = Bun.spawn([binary, "ask", "--json", "--no-save", "Read note.txt"], {
+      cwd: f.workspace,
+      env: testEnvironment({ HOME: f.home, FX_MAX_AGENT_STEPS: String(steps), NO_COLOR: "1" }),
+      stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    });
+    const timer = setTimeout(() => child.kill(9), script.length > 50 ? 600_000 : 60_000);
+    const [stdout, stderr, exit] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    clearTimeout(timer);
+    let error: string | null = null;
+    try {
+      error = JSON.parse(stdout.trim()).error ?? null;
+    } catch {
+      error = "unreadable_output";
+    }
+    const requests: Array<{ body: any }> = f.requests;
+    const loaded = requests.length > 0 ? "ok" : error === "ReservedRequestField" ? "rejected" : "unknown";
+    return {
+      id, def, configured, loaded,
+      replies: served,
+      sent: requests.map((request, index) => sentOf(request.body, index > 0 && served[index - 1] === "cut")),
+      notices: stderr.split("is not available for").length - 1,
+      evidence: { exit, error, tail: `${stdout}\n${stderr}`.slice(-300) },
+    };
+  } finally {
+    f.close();
+  }
+}
+
+function sessionValue(s: Session): string {
+  const fragment = (f: Fragment) => set(f);
+  const levels = `[${LEVELS.map((level) => `${level} |-> ${fragment(s.def.levels[level]!)}`).join(", ")}]`;
+  const def = `[declared |-> ${seq(s.def.declared.map(str))}, request |-> ${fragment(s.def.request)}, levels |-> ${levels}, ` +
+    `limit |-> ${s.def.limit ? "TRUE" : "FALSE"}, field |-> ${str(s.def.field)}]`;
+  const sent = s.sent.map((r) =>
+    `[effort |-> ${str(r.effort)}, body |-> [model |-> ${str(r.body.model!)}, temperature |-> ${str(r.body.temperature!)}, ` +
+    `reasoning_effort |-> ${str(r.body.reasoning_effort!)}], limit |-> ${str(r.limit)}, field |-> ${str(r.field)}, ` +
+    `resend |-> ${r.resend ? "TRUE" : "FALSE"}]`);
+  return `[def |-> ${def}, configured |-> ${str(s.configured)}, loaded |-> ${str(s.loaded)}, replies |-> ${seq(s.replies.map(str))}, ` +
+    `sent |-> ${seq(sent)}, notices |-> ${s.notices}]`;
+}
+
+function sessionCases(): Array<{ def: Definition; configured: string; script: Kind[] }> {
+  const cases: Array<{ def: Definition; configured: string; script: Kind[] }> = [];
+  let turn = 0;
+  for (const declared of ORDERS) for (const request of REQUEST_FRAGMENTS) for (const fragment of LEVEL_FRAGMENTS) {
+    for (const limit of [false, true]) for (const field of ["max_tokens", "max_completion_tokens"]) for (const configured of ["auto", ...LEVELS]) {
+      const levels = Object.fromEntries(LEVELS.map((level) => [level, fragment]));
+      cases.push({ def: { declared, request, levels, limit, field }, configured, script: SCRIPTS[turn++ % SCRIPTS.length]! });
+    }
+  }
+  const next = generator(options.seed);
+  const pick = <T>(items: T[]): T => items[Math.floor(next() * items.length)]!;
+  for (let i = 0; i < options.random; i++) {
+    const levels = Object.fromEntries(LEVELS.map((level) => [level, pick(LEVEL_FRAGMENTS.slice(0, 2))]));
+    const script = Array.from({ length: Math.floor(next() * 5) }, () => pick<Kind>(["tool", "tool", "cut"]));
+    cases.push({
+      def: { declared: pick(ORDERS), request: pick(REQUEST_FRAGMENTS.slice(0, 3)), levels, limit: next() < 0.5, field: pick(["max_tokens", "max_completion_tokens"]) },
+      configured: pick(["auto", ...LEVELS]),
+      script,
+    });
+  }
+  return cases;
+}
+
+const requestConstants = (bug: string) => [`Levels = ${set(LEVELS)}`, "MaxRequests = 100000", `Bug = ${str(bug)}`];
+
+async function requestPart(out: string): Promise<number> {
+  const fixtures = await targetModule("fixtures/chat-completions.ts");
+  const cases = sessionCases();
+  if (options.stress > 0) {
+    const levels = Object.fromEntries(LEVELS.map((level) => [level, LEVEL_FRAGMENTS[1]!]));
+    cases.push({
+      def: { declared: ["low", "high"], request: ["temperature"], levels, limit: true, field: "max_tokens" },
+      configured: "high",
+      script: Array.from({ length: options.stress }, (): Kind => "tool"),
+    });
+  }
+  const started = performance.now();
+  const sessions = await pool(cases.length, options.jobs, (index) => {
+    const { def, configured, script } = cases[index]!;
+    return runSession(fixtures, `s${index}`, def, configured, script, 0);
+  });
+  const seconds = ((performance.now() - started) / 1000).toFixed(1);
+  writeJson(join(out, "sessions.json"), sessions);
+  const requests = sessions.reduce((sum, s) => sum + s.sent.length, 0);
+  const rejected = sessions.filter((s) => s.loaded === "rejected").length;
+  const noticed = sessions.filter((s) => s.notices > 0).length;
+  const efforts = sessions.filter((s) => s.sent.some((r) => r.effort !== "none")).length;
+  const resends = sessions.filter((s) => s.sent.some((r) => r.resend)).length;
+  console.log(`request: ${sessions.length} sessions of ${binary} in ${seconds}s, ${requests} requests; ` +
+    `${rejected} settings refused, ${efforts} sent a level, ${noticed} printed a notice, ${resends} resent`);
+  if (options.stress > 0) {
+    const stress = sessions.at(-1)!;
+    console.log(`stress: ${options.stress} tool steps, ${stress.sent.length} requests, ` +
+      `${stress.sent.filter((r) => r.effort === "high").length} carried the level, ${stress.notices} notices`);
+  }
+
+  const unknown = sessions.find((s) => s.loaded === "unknown" ||
+    s.sent.some((r) => r.limit === "unknown" || Object.values(r.body).includes("unknown")));
+  if (unknown) {
+    console.log(`REJECTED: session ${unknown.id} did something the driver cannot read: ${JSON.stringify(unknown)}`);
+    return 1;
+  }
+  const check = async (items: Session[], bug: string) =>
+    runTrace("ConfiguredRequest", items.map(sessionValue).join(",\n  "), requestConstants(bug), out, `request-${bug}`);
+  const design = await check(sessions, "none");
+  console.log(`request, the design: ${design.verdict} (TLC work ${design.dir})`);
+  if (design.verdict === "TOOL_ERROR") return 2;
+  if (design.verdict === "REJECTED") {
+    const mismatch = await firstMismatch(sessions, async (prefix) => (await check(prefix, "none")).verdict);
+    console.log(`first session the model cannot produce: ${JSON.stringify(mismatch)}`);
+    return 1;
+  }
+  if (options.selfCheck) {
+    const today = await check(sessions, "today");
+    console.log(`self-check, request, the model of fx before the change: ${today.verdict} (must be REJECTED)`);
+    if (today.verdict !== "REJECTED") return today.verdict === "TOOL_ERROR" ? 2 : 1;
+    const tampered = sessions.map((s) => (s.notices > 0 ? { ...s, notices: s.notices + 1 } : s));
+    const twice = await check(tampered, "none");
+    console.log(`self-check, request, a notice counted twice: ${twice.verdict} (must be REJECTED)`);
+    if (twice.verdict !== "REJECTED") return twice.verdict === "TOOL_ERROR" ? 2 : 1;
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// catalog: runs of `fx models`, checked against ConfiguredCatalog.tla.
+
+type Server = "lists" | "refuses" | "silent";
+type CatalogRun = {
+  id: string;
+  fetch: Record<string, boolean>;
+  selected: string;
+  server: Server;
+  asked: Array<{ to: string; token: string }>;
+  shown: string[][];
+  lines: number;
+  evidence: { exit: number; seconds: number; tail: string };
+};
+
+const CONNS = ["a", "b"];
+const REFUSALS = [
+  () => Response.json({ error: { message: "no" } }, { status: 401 }),
+  () => new Response("down", { status: 500 }),
+  () => new Response("{\"object\":\"list\",\"data\":", { headers: { "content-type": "application/json" } }),
+  () => Response.json({ error: { message: "slow down" } }, { status: 429 }),
+];
+
+async function runCatalog(id: string, fetch: Record<string, boolean>, selected: string, server: Server, scratch: string, refusal: number): Promise<CatalogRun> {
+  const asked: Array<{ to: string; token: string }> = [];
+  const held: Array<() => void> = [];
+  const host = Bun.serve({
+    hostname: "127.0.0.1", port: 0, idleTimeout: 0,
+    async fetch(request) {
+      const [, conn, , leaf] = new URL(request.url).pathname.split("/");
+      if (leaf !== "models" || !CONNS.includes(conn!)) return new Response("unexpected endpoint", { status: 500 });
+      const token = /^Bearer token-([ab])$/.exec(request.headers.get("authorization") ?? "")?.[1] ?? "none";
+      asked.push({ to: conn!, token });
+      if (server === "silent") return new Promise<Response>((resolve) => held.push(() => resolve(new Response("late", { status: 500 }))));
+      if (server === "refuses") return REFUSALS[refusal % REFUSALS.length]!();
+      return Response.json({ object: "list", data: [{ id: `${conn}-listed`, object: "model" }] });
+    },
+  });
+  const root = mkdtempSync(join(scratch, `${id}-`));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace, { recursive: true });
+  const providers = Object.fromEntries(CONNS.map((conn) => [conn, {
+    protocol: "openai-chat-completions",
+    base_url: `http://127.0.0.1:${host.port}/${conn}/v1`,
+    auth: { type: "bearer", env: `FX_TEST_TOKEN_${conn.toUpperCase()}` },
+    fetch_models: fetch[conn],
+    timeouts: { connect_ms: 2000, first_response_ms: 300 },
+    model_metadata: { [`${conn}-declared`]: { context_window: 32768 } },
+  }]));
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+    provider: selected, auto_upgrade: false, providers,
+    models: Object.fromEntries(CONNS.map((conn) => [conn, `${conn}-declared`])),
+  }));
+  try {
+    const started = performance.now();
+    const child = Bun.spawn([binary, "models", "--json"], {
+      cwd: workspace,
+      env: testEnvironment({ HOME: home, FX_TEST_TOKEN_A: "token-a", FX_TEST_TOKEN_B: "token-b", NO_COLOR: "1" }),
+      stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    });
+    const timer = setTimeout(() => child.kill(9), 30_000);
+    const [stdout, stderr, exit] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    clearTimeout(timer);
+    let ids: string[] = [];
+    try {
+      ids = JSON.parse(stdout.trim()).ids ?? [];
+    } catch {
+      ids = ["unreadable-output"];
+    }
+    return {
+      id, fetch, selected, server, asked,
+      shown: ids.map((model) => model.split("-")).sort(),
+      lines: stderr.split("showing the models in settings").length - 1,
+      evidence: { exit, seconds: Number(((performance.now() - started) / 1000).toFixed(2)), tail: `${stdout}\n${stderr}`.slice(-300) },
+    };
+  } finally {
+    for (const release of held) release();
+    host.stop(true);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function catalogValue(run: CatalogRun): string {
+  const fetch = `[${CONNS.map((conn) => `${conn} |-> ${run.fetch[conn] ? "TRUE" : "FALSE"}`).join(", ")}]`;
+  const asked = run.asked.map((ask) => `[to |-> ${str(ask.to)}, token |-> ${str(ask.token)}]`);
+  const shown = `{${run.shown.map((model) => seq(model.map(str))).join(", ")}}`;
+  return `[fetch |-> ${fetch}, selected |-> ${str(run.selected)}, server |-> ${str(run.server)}, asked |-> ${seq(asked)}, ` +
+    `shown |-> ${shown}, lines |-> ${run.lines}]`;
+}
+
+const catalogConstants = (bug: string) => ["Timeout = 2", "MaxSwitches = 0", "MaxAsks = 100000", `Bug = ${str(bug)}`];
+
+async function catalogPart(out: string): Promise<number> {
+  const scratch = join(out, "catalog");
+  mkdirSync(scratch, { recursive: true });
+  const cases: Array<{ fetch: Record<string, boolean>; selected: string; server: Server; refusal: number }> = [];
+  for (const a of [false, true]) for (const b of [false, true]) for (const selected of CONNS) {
+    for (const server of ["lists", "silent"] as Server[]) cases.push({ fetch: { a, b }, selected, server, refusal: 0 });
+    for (let refusal = 0; refusal < REFUSALS.length; refusal++) cases.push({ fetch: { a, b }, selected, server: "refuses", refusal });
+  }
+  const started = performance.now();
+  const runs = await pool(cases.length, options.jobs, (index) => {
+    const { fetch, selected, server, refusal } = cases[index]!;
+    return runCatalog(`c${index}`, fetch, selected, server, scratch, refusal);
+  });
+  writeJson(join(out, "catalog-runs.json"), runs);
+  const slowest = Math.max(...runs.map((run) => run.evidence.seconds));
+  console.log(`catalog: ${runs.length} runs of ${binary} models in ${((performance.now() - started) / 1000).toFixed(1)}s; ` +
+    `${runs.filter((run) => run.asked.length > 0).length} asked the server, ${runs.filter((run) => run.lines > 0).length} printed a failure line, ` +
+    `slowest ${slowest}s`);
+  const unread = runs.find((run) => run.evidence.exit !== 0 || run.shown.some((model) => model.length !== 2));
+  if (unread) {
+    console.log(`REJECTED: run ${unread.id} ended in a way the driver cannot read: ${JSON.stringify(unread)}`);
+    return 1;
+  }
+  const check = async (items: CatalogRun[], bug: string) =>
+    runTrace("ConfiguredCatalog", items.map(catalogValue).join(",\n  "), catalogConstants(bug), out, `catalog-${bug}`);
+  const design = await check(runs, "none");
+  console.log(`catalog, the design: ${design.verdict} (TLC work ${design.dir})`);
+  if (design.verdict === "TOOL_ERROR") return 2;
+  if (design.verdict === "REJECTED") {
+    const mismatch = await firstMismatch(runs, async (prefix) => (await check(prefix, "none")).verdict);
+    console.log(`first run the model cannot produce: ${JSON.stringify(mismatch)}`);
+    return 1;
+  }
+  if (options.selfCheck) {
+    const today = await check(runs, "today");
+    console.log(`self-check, catalog, the model of fx before the change: ${today.verdict} (must be REJECTED)`);
+    if (today.verdict !== "REJECTED") return today.verdict === "TOOL_ERROR" ? 2 : 1;
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// deadlines: request_deadlines.zig walked along ConfiguredDeadlines.tla.
+
+type Model = Record<string, any>;
+type Edge = { to: string; label: string };
+type Graph = { states: Map<string, Model>; next: Map<string, Edge[]>; init: string };
+type Hop = { from: string; to: string; label: string };
+type LabState = { phase: string; clock: number; quiet: number; cause: string; waited: number; due: boolean };
+
+const BOUNDS = { Connect: 1, Head: 2, Stall: 2, MaxClock: 4 };
+const deadlinesModule = join(REPO_ROOT, "src", "gateway", "request_deadlines.zig");
+
+function buildLab(moduleSource: string, out: string, name: string): string | null {
+  const bin = join(out, name);
+  const build = Bun.spawnSync(
+    ["zig", "build-exe", "-O", "ReleaseSafe", "--dep", "request_deadlines",
+      `-Mroot=${join(TLA_ROOT, "drivers", "configured_provider", "lab.zig")}`, `-Mrequest_deadlines=${moduleSource}`,
+      "--name", name, `-femit-bin=${bin}`],
+    { cwd: REPO_ROOT, stdout: "pipe", stderr: "pipe" },
+  );
+  if (build.exitCode !== 0) {
+    console.log(`building ${name} failed:\n${new TextDecoder().decode(build.stderr).slice(0, 2000)}`);
+    return null;
+  }
+  return bin;
+}
+
+async function loadGraph(out: string): Promise<Graph | null> {
+  const dir = join(out, "deadlines-graph");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "Driver.cfg"), ["INIT Init", "NEXT Next", "CONSTANTS", `    Connect = ${BOUNDS.Connect}`, `    Head = ${BOUNDS.Head}`,
+    `    Stall = ${BOUNDS.Stall}`, "    BuiltIn = 3", `    MaxClock = ${BOUNDS.MaxClock}`, "    Bug = \"none\"", "CHECK_DEADLOCK FALSE", ""].join("\n"));
+  const run = await runTlc(dir, "ConfiguredDeadlines", "Driver.cfg", ["ConfiguredDeadlines.tla"], tlaDir, ["-dump", "dot,actionlabels", "graph"]);
+  if (run.exitCode !== 0) {
+    console.log(`TLC failed on ConfiguredDeadlines.tla (exit ${run.exitCode}); see ${join(dir, "tlc.log")}`);
+    return null;
+  }
+  const states = new Map<string, Model>();
+  const next = new Map<string, Edge[]>();
+  let init = "";
+  const unescape = (label: string) => label.replace(/\\(.)/g, (_, char) => (char === "n" ? "\n" : char));
+  for (const line of readFileSync(join(dir, "graph.dot"), "utf8").split("\n")) {
+    const edge = /^(-?\d+) -> (-?\d+) \[label="(\w+)"/.exec(line);
+    if (edge) {
+      if (!next.has(edge[1]!)) next.set(edge[1]!, []);
+      next.get(edge[1]!)!.push({ to: edge[2]!, label: edge[3]! });
+      continue;
+    }
+    const node = /^(-?\d+) \[label="((?:[^"\\]|\\.)*)"(.*)$/.exec(line);
+    if (!node) continue;
+    const state: Model = {};
+    for (const entry of unescape(node[2]!).split(/\n(?=\/\\ )/)) {
+      const match = /^\/\\ (\w+) = ([\s\S]*)$/.exec(entry.trim());
+      if (match) state[match[1]!] = parseValue(match[2]!.trim());
+    }
+    states.set(node[1]!, state);
+    if (/style\s*=\s*filled/.test(node[3]!)) init = node[1]!;
+  }
+  if (!init) return null;
+  console.log(`deadlines: graph of ${states.size} states, ${run.durationMs} ms`);
+  return { states, next, init };
+}
+
+function walksOf(graph: Graph): Hop[][] {
+  const parent = new Map<string, { from: string; label: string } | null>([[graph.init, null]]);
+  const queue = [graph.init];
+  for (let at = 0; at < queue.length; at += 1) {
+    for (const edge of graph.next.get(queue[at]!) ?? []) {
+      if (edge.to === queue[at] || parent.has(edge.to)) continue;
+      parent.set(edge.to, { from: queue[at]!, label: edge.label });
+      queue.push(edge.to);
+    }
+  }
+  const walks: Hop[][] = [];
+  for (const id of queue) {
+    for (const edge of graph.next.get(id) ?? []) {
+      if (edge.to === id) continue;
+      const hops: Hop[] = [{ from: id, to: edge.to, label: edge.label }];
+      for (let at = id; parent.get(at); at = parent.get(at)!.from) hops.unshift({ from: parent.get(at)!.from, to: at, label: parent.get(at)!.label });
+      walks.push(hops);
+    }
+  }
+  const random = generator(options.seed);
+  for (let w = 0; w < options.walks; w += 1) {
+    const hops: Hop[] = [];
+    let at = graph.init;
+    for (let i = 0; i < options.steps; i += 1) {
+      const edges = (graph.next.get(at) ?? []).filter((edge) => edge.to !== at);
+      if (edges.length === 0) break;
+      const edge = edges[Math.floor(random() * edges.length)]!;
+      hops.push({ from: at, to: edge.to, label: edge.label });
+      at = edge.to;
+    }
+    walks.push(hops);
+  }
+  return walks;
+}
+
+const OPS: Record<string, string> = { Tick: "tick", Connects: "connects", HeadArrives: "head", Bytes: "bytes", Completes: "completes", Expires: "expires" };
+
+// Whether the model lets the current wait run out in state `t`.
+function due(t: Model): boolean {
+  const bound = t.phase === "connecting" ? BOUNDS.Connect : t.phase === "awaiting_head" ? BOUNDS.Head : t.phase === "streaming" ? BOUNDS.Stall : null;
+  return bound !== null && (t.phase === "streaming" ? t.quiet : t.clock) >= bound;
+}
+
+function runLab(bin: string, walks: Hop[][], out: string, name: string): LabState[] | null {
+  const lines: string[] = [];
+  for (const walk of walks) {
+    lines.push(JSON.stringify({ op: "walk" }));
+    for (const hop of walk) lines.push(JSON.stringify({ op: OPS[hop.label] }));
+  }
+  const opsPath = join(out, `${name}.ops.jsonl`);
+  const resultsPath = join(out, `${name}.results.jsonl`);
+  writeFileSync(opsPath, `${lines.join("\n")}\n`);
+  const run = Bun.spawnSync([bin, opsPath, resultsPath], { stdout: "pipe", stderr: "pipe" });
+  if (run.exitCode !== 0) {
+    console.log(`${name} exited ${run.exitCode}:\n${new TextDecoder().decode(run.stderr).slice(0, 2000)}`);
+    return null;
+  }
+  const results = readFileSync(resultsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as LabState);
+  return results.length === lines.length ? results : null;
+}
+
+function mismatchesOf(walks: Hop[][], graph: Graph, results: LabState[], tamper: boolean): string[] {
+  const found: string[] = [];
+  let r = 0;
+  walks.forEach((walk, w) => {
+    r += 1; // the walk's reset
+    let failed = false;
+    walk.forEach((hop, i) => {
+      const real = results[r++]!;
+      if (failed) return;
+      const t = graph.states.get(hop.to)!;
+      const expected: Record<string, unknown> = { phase: t.phase, clock: t.clock, quiet: t.quiet, cause: t.cause, waited: t.waited, due: tamper ? !due(t) : due(t) };
+      for (const [field, model] of Object.entries(expected)) {
+        if (JSON.stringify(model) === JSON.stringify((real as any)[field])) continue;
+        failed = true;
+        found.push(`walk ${w} step ${i} (${walk.slice(0, i + 1).map((x) => x.label).join(" > ")}): ${field}: model ${JSON.stringify(model)}, module ${JSON.stringify((real as any)[field])}`);
+        break;
+      }
+    });
+  });
+  return found;
+}
+
+async function deadlinesPart(out: string): Promise<number> {
+  if (!existsSync(deadlinesModule)) {
+    console.log(`REJECTED: deadlines: ${deadlinesModule} does not exist, so fx has no per-connection bounds to walk`);
+    return 1;
+  }
+  const lab = buildLab(deadlinesModule, out, "configured_deadlines_lab");
+  const graph = await loadGraph(out);
+  if (!lab || !graph) return 2;
+  const walks = walksOf(graph);
+  const results = runLab(lab, walks, out, "configured_deadlines_lab");
+  if (!results) return 2;
+  const mismatches = mismatchesOf(walks, graph, results, false);
+  const steps = walks.reduce((sum, walk) => sum + walk.length, 0);
+  console.log(`deadlines: ${walks.length} walks, ${steps} steps, ${mismatches.length} mismatching walks`);
+  for (const line of mismatches.slice(0, 3)) console.log(`  ${line}`);
+  const walked = new Set(walks.flat().map((hop) => hop.label));
+  for (const label of Object.keys(OPS)) {
+    if (!walked.has(label)) {
+      console.log(`deadlines: action ${label} was never walked`);
+      return 1;
+    }
+  }
+  if (mismatches.length > 0) return 1;
+  if (options.selfCheck) {
+    const source = readFileSync(deadlinesModule, "utf8");
+    const mutants = [
+      { name: "ends a wait one millisecond late", target: "silence_ms >= bound_ms", planted: "silence_ms > bound_ms" },
+      { name: "times the whole response against the stall bound", target: "now_ms -| self.last_bytes_ms", planted: "now_ms -| self.wait_started_ms" },
+      { name: "never gives up on a silent response", target: ".streaming => self.bounds.stall_ms", planted: ".streaming => std.math.maxInt(u32)" },
+    ];
+    let caught = true;
+    mutants.forEach((mutant, index) => {
+      if (!source.includes(mutant.target)) {
+        console.log(`self-check: the target for "${mutant.name}" is gone from request_deadlines.zig`);
+        caught = false;
+        return;
+      }
+      const dir = join(out, `deadlines-mutant-${index}`);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "request_deadlines.zig"), source.replace(mutant.target, mutant.planted));
+      const name = `configured_deadlines_lab_mutant_${index}`;
+      const bin = buildLab(join(dir, "request_deadlines.zig"), out, name);
+      const mutated = bin ? runLab(bin, walks, out, name) : null;
+      const rejected = mutated !== null && mismatchesOf(walks, graph, mutated, false).length > 0;
+      console.log(`self-check: deadlines that ${mutant.name} ${rejected ? "rejected" : "NOT rejected"}`);
+      caught &&= rejected;
+    });
+    const tampered = mismatchesOf(walks, graph, results, true).length > 0;
+    console.log(`self-check: deadlines, tampered expectation ${tampered ? "rejected" : "NOT rejected"}`);
+    if (!caught || !tampered) return 1;
+  }
+  return 0;
+}
+
+async function main(): Promise<number> {
+  if (!existsSync(binary)) {
+    console.log(`TOOL_ERROR: missing ${binary}; run zig build first`);
+    return 2;
+  }
+  const out = outDir("configured_provider");
+  const run: Record<string, (out: string) => Promise<number>> = { request: requestPart, catalog: catalogPart, deadlines: deadlinesPart };
+  let worst = 0;
+  for (const part of options.parts) worst = Math.max(worst, await run[part]!(out));
+  console.log(`${worst === 0 ? "ACCEPTED" : worst === 1 ? "REJECTED" : "TOOL_ERROR"}; output in ${out}`);
+  return worst;
+}
+
+try {
+  process.exit(await main());
+} catch (error) {
+  console.error(error);
+  process.exit(2);
+}

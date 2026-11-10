@@ -1,4 +1,5 @@
 const std = @import("std");
+const request_fragment = @import("request_fragment.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
@@ -10,6 +11,14 @@ pub const max_model_bytes = 1024;
 const max_url_bytes = 2048;
 const max_env_bytes = 128;
 const max_json_bytes = 1024 * 1024;
+/// As many levels as fx offers for any model (`types.ReasoningEffort.max_options`).
+pub const max_effort_levels = 16;
+const max_effort_name_bytes = 64;
+const max_headers = 16;
+const max_header_name_bytes = 64;
+/// One day: longer than any wait a person sits through, and it keeps every
+/// bound far from overflow.
+pub const max_timeout_ms = 24 * 60 * 60 * 1000;
 
 pub const ParseError = Allocator.Error || error{
     InvalidJson,
@@ -28,10 +37,48 @@ pub const ParseError = Allocator.Error || error{
     InvalidToolChoiceMode,
     InvalidModelId,
     InvalidModelMetadata,
+    InvalidRequestFields,
+    ReservedRequestField,
+    InvalidEffortLevel,
+    InvalidHeader,
+    ReservedHeader,
+    InvalidTimeout,
+    InvalidConnectionOption,
 };
 
-pub const Protocol = enum { @"openai-chat-completions" };
+pub const Protocol = enum {
+    @"openai-chat-completions",
+    @"openai-responses",
+    @"anthropic-messages",
+
+    /// Where a model request goes, after the connection's base URL.
+    pub fn request_path(self: Protocol) []const u8 {
+        return switch (self) {
+            .@"openai-chat-completions" => "/chat/completions",
+            .@"openai-responses" => "/responses",
+            .@"anthropic-messages" => "/messages",
+        };
+    }
+
+    /// The top-level request fields fx writes itself. A model's `request`
+    /// fields and its effort levels cannot name one
+    /// (`tests/tla/configured_provider/ConfiguredRequest.tla`
+    /// OwnedKeysKeepFxValue). The reasoning controls are left out on purpose:
+    /// an effort level is how a connection sets them.
+    pub fn owned_request_fields(self: Protocol) []const []const u8 {
+        return switch (self) {
+            .@"openai-chat-completions" => &.{ "model", "messages", "stream", "stream_options", "tools", "tool_choice", "parallel_tool_calls", "max_tokens", "max_completion_tokens", "response_format" },
+            .@"openai-responses" => &.{ "model", "input", "instructions", "stream", "store", "tools", "tool_choice", "parallel_tool_calls", "max_output_tokens", "include", "text" },
+            .@"anthropic-messages" => &.{ "model", "messages", "system", "stream", "tools", "tool_choice", "max_tokens" },
+        };
+    }
+};
+
 pub const ToolChoiceMode = enum { omit, send };
+
+/// The Chat Completions field that carries the output limit. Servers differ:
+/// some read only one of the two and ignore the other without an error.
+pub const OutputLimitField = enum { max_tokens, max_completion_tokens };
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
 /// the effectful edge; `none` must omit Authorization rather than supply a token.
@@ -40,12 +87,48 @@ pub const Auth = union(enum) {
     bearer: []const u8,
 };
 
+/// A request header whose value is read from the environment variable `env`
+/// when a request is sent. Like `Auth`, it never holds the value.
+pub const Header = struct {
+    name: []const u8,
+    env: []const u8,
+};
+
+/// How long one request may wait. Null keeps fx's own bound for that wait
+/// (`tests/tla/configured_provider/ConfiguredDeadlines.tla`).
+pub const Timeouts = struct {
+    connect_ms: ?u32 = null,
+    first_response_ms: ?u32 = null,
+    stall_ms: ?u32 = null,
+};
+
+/// One effort level a model offers, and the request fields that choose it.
+pub const EffortLevel = struct {
+    name: []const u8,
+    fields: request_fragment.Fragment,
+};
+
 pub const ModelMetadata = struct {
     id: []const u8,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
     supports_tool_use: ?bool = null,
     supports_vision: ?bool = null,
+    /// Chat Completions only. Null sends `max_tokens`.
+    output_limit_field: ?OutputLimitField = null,
+    /// Fields sent with every request for the model.
+    request: ?request_fragment.Fragment = null,
+    /// The levels fx offers for the model, in the settings' order. Null means
+    /// the settings do not say; an empty list says the model has none.
+    reasoning_efforts: ?[]const EffortLevel = null,
+
+    pub fn effort(self: *const ModelMetadata, name: []const u8) ?*const EffortLevel {
+        const levels = self.reasoning_efforts orelse return null;
+        for (levels) |*level| {
+            if (std.mem.eql(u8, level.name, name)) return level;
+        }
+        return null;
+    }
 };
 
 /// Registry owns all slices. Treat definitions as immutable while borrowed by
@@ -57,11 +140,36 @@ pub const Definition = struct {
     auth: Auth,
     tool_choice_mode: ToolChoiceMode = .omit,
     reviewer_model: ?[]const u8 = null,
+    /// The model that names a session from its first prompt. Null: sessions
+    /// on this connection keep the title derived from the prompt.
+    title_model: ?[]const u8 = null,
+    /// The model that reads images for a selected model that cannot. Null:
+    /// the connection has no image fallback.
+    vision_model: ?[]const u8 = null,
+    headers: []const Header = &.{},
+    timeouts: Timeouts = .{},
+    /// Ask the server for its model list (`GET {base_url}/models`). Off unless
+    /// the settings turn it on, so fx never probes a server on its own
+    /// (`tests/tla/configured_provider/ConfiguredCatalog.tla` NoRequestWhenOff).
+    fetch_models: bool = false,
+    /// Metadata for every model on the connection that does not set a field
+    /// itself, including one the settings do not declare. Its `id` is empty.
+    model_defaults: ?ModelMetadata = null,
     model_metadata: []const ModelMetadata = &.{},
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
     pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
         return std.mem.concat(alloc, u8, &.{ self.base_url, "/chat/completions" });
+    }
+
+    /// The URL model requests go to for the connection's protocol. Caller owns it.
+    pub fn request_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
+        return std.mem.concat(alloc, u8, &.{ self.base_url, self.protocol.request_path() });
+    }
+
+    /// The URL of the server's model list. Caller owns it.
+    pub fn models_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
+        return std.mem.concat(alloc, u8, &.{ self.base_url, "/models" });
     }
 
     /// Borrowed metadata; absence and unspecified fields remain unknown.
@@ -71,6 +179,22 @@ pub const Definition = struct {
             if (std.mem.eql(u8, metadata.id, id)) return metadata;
         }
         return null;
+    }
+
+    /// What the connection knows about `id`: the model's own metadata, with
+    /// `model_defaults` for each field it leaves out. Null when the settings
+    /// say nothing about the model. The result borrows `id` and the registry.
+    pub fn metadata_for(self: Definition, id: []const u8) ?ModelMetadata {
+        if (id.len > max_model_bytes) return null;
+        const declared = self.model(id);
+        const defaults = self.model_defaults orelse return if (declared) |metadata| metadata.* else null;
+        var merged: ModelMetadata = if (declared) |metadata| metadata.* else .{ .id = id };
+        inline for (@typeInfo(ModelMetadata).@"struct".field_names) |name| {
+            if (comptime !std.mem.eql(u8, name, "id")) {
+                if (@field(merged, name) == null) @field(merged, name) = @field(defaults, name);
+            }
+        }
+        return merged;
     }
 
     /// Non-secret route provenance, stable across credential rotation in the
@@ -89,22 +213,13 @@ pub const Definition = struct {
         }
         return hash.finalResult();
     }
-
-    fn deinit(self: Definition, alloc: Allocator) void {
-        alloc.free(self.id);
-        alloc.free(self.base_url);
-        switch (self.auth) {
-            .none => {},
-            .bearer => |env| alloc.free(env),
-        }
-        if (self.reviewer_model) |id| alloc.free(id);
-        for (self.model_metadata) |metadata| alloc.free(metadata.id);
-        alloc.free(self.model_metadata);
-    }
 };
 
 pub const Registry = struct {
     definitions: []const Definition = &.{},
+    /// Holds every slice the definitions point at. Null for an empty registry
+    /// and for a view built from another registry's `definitions`.
+    arena: ?*std.heap.ArenaAllocator = null,
 
     /// Parse the providers object itself, not the surrounding settings object.
     /// All returned storage is owned, independent of `providers`, and must be
@@ -115,23 +230,27 @@ pub const Registry = struct {
     pub fn parse(alloc: Allocator, providers: std.json.Value) ParseError!Registry {
         if (providers != .object) return error.InvalidObject;
         if (providers.object.count() > max_providers) return error.LimitExceeded;
-        const definitions = try alloc.alloc(Definition, providers.object.count());
-        var initialized: usize = 0;
+        const arena = try alloc.create(std.heap.ArenaAllocator);
+        arena.* = .init(alloc);
         errdefer {
-            for (definitions[0..initialized]) |definition| definition.deinit(alloc);
-            alloc.free(definitions);
+            arena.deinit();
+            alloc.destroy(arena);
         }
+        const owned = arena.allocator();
+        const definitions = try owned.alloc(Definition, providers.object.count());
         var iterator = providers.object.iterator();
-        while (iterator.next()) |entry| {
-            definitions[initialized] = try parse_definition(alloc, entry.key_ptr.*, entry.value_ptr.*);
-            initialized += 1;
+        var index: usize = 0;
+        while (iterator.next()) |entry| : (index += 1) {
+            definitions[index] = try parse_definition(owned, entry.key_ptr.*, entry.value_ptr.*);
         }
-        return .{ .definitions = definitions };
+        return .{ .definitions = definitions, .arena = arena };
     }
 
     /// Bounded, duplicate-rejecting convenience parser for a raw providers object.
     /// std.json.Value parses iteratively; input size also bounds nesting/work.
     /// The temporary JSON tree is released before returning the owned registry.
+    /// A string longer than a URL may be, a request field's value included, is
+    /// refused here.
     pub fn parse_json(alloc: Allocator, json: []const u8) ParseError!Registry {
         if (json.len > max_json_bytes) return error.LimitExceeded;
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{
@@ -148,8 +267,10 @@ pub const Registry = struct {
     }
 
     pub fn deinit(self: *Registry, alloc: Allocator) void {
-        for (self.definitions) |definition| definition.deinit(alloc);
-        alloc.free(self.definitions);
+        if (self.arena) |arena| {
+            arena.deinit();
+            alloc.destroy(arena);
+        }
         self.* = .{};
     }
 
@@ -163,11 +284,13 @@ pub const Registry = struct {
     }
 };
 
-fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
+/// `owned` is the registry's arena: a failure frees nothing here.
+fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
-    const protocol = try required(value, "protocol");
-    if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "vision_model", "headers", "timeouts", "fetch_models", "model_defaults", "model_metadata" });
+    const protocol_name = try required(value, "protocol");
+    if (protocol_name != .string) return error.InvalidProtocol;
+    const protocol = std.meta.stringToEnum(Protocol, protocol_name.string) orelse return error.InvalidProtocol;
     const url = try required(value, "base_url");
     if (url != .string) return error.InvalidBaseUrl;
     const normalized = try validate_url(url.string);
@@ -177,36 +300,36 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         if (choice != .string) return error.InvalidToolChoiceMode;
         mode = if (std.mem.eql(u8, choice.string, "omit")) .omit else if (std.mem.eql(u8, choice.string, "send")) .send else return error.InvalidToolChoiceMode;
     }
-    var reviewer: ?[]const u8 = null;
-    if (value.object.get("reviewer_model")) |model_value| {
-        if (model_value != .string) return error.InvalidModelId;
-        try validate_model_id(model_value.string);
-        reviewer = model_value.string;
+    var fetch_models = false;
+    if (value.object.get("fetch_models")) |fetch| {
+        if (fetch != .bool) return error.InvalidConnectionOption;
+        fetch_models = fetch.bool;
     }
-
-    const owned_id = try alloc.dupe(u8, id);
-    errdefer alloc.free(owned_id);
-    const owned_url = try alloc.dupe(u8, normalized);
-    errdefer alloc.free(owned_url);
-    const owned_auth: Auth = switch (auth) {
-        .none => .none,
-        .bearer => |env| .{ .bearer = try alloc.dupe(u8, env) },
-    };
-    errdefer switch (owned_auth) {
-        .none => {},
-        .bearer => |env| alloc.free(env),
-    };
-    const owned_reviewer = if (reviewer) |model_id| try alloc.dupe(u8, model_id) else null;
-    errdefer if (owned_reviewer) |model_id| alloc.free(model_id);
     return .{
-        .id = owned_id,
-        .protocol = .@"openai-chat-completions",
-        .base_url = owned_url,
-        .auth = owned_auth,
+        .id = try owned.dupe(u8, id),
+        .protocol = protocol,
+        .base_url = try owned.dupe(u8, normalized),
+        .auth = switch (auth) {
+            .none => .none,
+            .bearer => |env| .{ .bearer = try owned.dupe(u8, env) },
+        },
         .tool_choice_mode = mode,
-        .reviewer_model = owned_reviewer,
-        .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
+        .reviewer_model = try optional_model(owned, value.object.get("reviewer_model")),
+        .title_model = try optional_model(owned, value.object.get("title_model")),
+        .vision_model = try optional_model(owned, value.object.get("vision_model")),
+        .headers = if (value.object.get("headers")) |headers| try parse_headers(owned, headers) else &.{},
+        .timeouts = if (value.object.get("timeouts")) |timeouts| try parse_timeouts(timeouts) else .{},
+        .fetch_models = fetch_models,
+        .model_defaults = if (value.object.get("model_defaults")) |defaults| try parse_model(owned, protocol, "", defaults) else null,
+        .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(owned, protocol, metadata) else &.{},
     };
+}
+
+fn optional_model(owned: Allocator, value: ?std.json.Value) ParseError!?[]const u8 {
+    const present = value orelse return null;
+    if (present != .string) return error.InvalidModelId;
+    try validate_model_id(present.string);
+    return try owned.dupe(u8, present.string);
 }
 
 fn parse_auth(value: std.json.Value) ParseError!Auth {
@@ -218,45 +341,136 @@ fn parse_auth(value: std.json.Value) ParseError!Auth {
         return .none;
     }
     if (!std.mem.eql(u8, kind.string, "bearer")) return error.InvalidAuth;
-    const env = try required(value, "env");
-    if (env != .string) return error.InvalidEnvironmentName;
-    if (env.string.len > max_env_bytes) return error.LimitExceeded;
-    if (env.string.len == 0 or (!std.ascii.isAlphabetic(env.string[0]) and env.string[0] != '_')) return error.InvalidEnvironmentName;
-    for (env.string) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and byte != '_') return error.InvalidEnvironmentName;
-    }
-    return .{ .bearer = env.string };
+    return .{ .bearer = try environment_name(try required(value, "env")) };
 }
 
-fn parse_metadata(alloc: Allocator, value: std.json.Value) ParseError![]const ModelMetadata {
+/// The name of an environment variable, borrowed from `value`.
+fn environment_name(value: std.json.Value) ParseError![]const u8 {
+    if (value != .string) return error.InvalidEnvironmentName;
+    const env = value.string;
+    if (env.len > max_env_bytes) return error.LimitExceeded;
+    if (env.len == 0 or (!std.ascii.isAlphabetic(env[0]) and env[0] != '_')) return error.InvalidEnvironmentName;
+    for (env) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_') return error.InvalidEnvironmentName;
+    }
+    return env;
+}
+
+/// Headers fx sets on every request, or that the transport owns. `auth` is
+/// how a connection sets Authorization.
+const reserved_headers = [_][]const u8{ "authorization", "content-type", "content-length", "host", "accept", "accept-encoding", "user-agent", "connection", "transfer-encoding" };
+
+fn parse_headers(owned: Allocator, value: std.json.Value) ParseError![]const Header {
+    if (value != .object) return error.InvalidHeader;
+    if (value.object.count() > max_headers) return error.LimitExceeded;
+    const headers = try owned.alloc(Header, value.object.count());
+    var iterator = value.object.iterator();
+    var index: usize = 0;
+    while (iterator.next()) |entry| : (index += 1) {
+        const name = entry.key_ptr.*;
+        if (name.len > max_header_name_bytes) return error.LimitExceeded;
+        if (name.len == 0) return error.InvalidHeader;
+        for (name) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and std.mem.findScalar(u8, "!#$%&'*+-.^_`|~", byte) == null) return error.InvalidHeader;
+        }
+        for (reserved_headers) |reserved| {
+            if (std.ascii.eqlIgnoreCase(name, reserved)) return error.ReservedHeader;
+        }
+        // Header names are case-insensitive, so two spellings are one header.
+        for (headers[0..index]) |earlier| {
+            if (std.ascii.eqlIgnoreCase(earlier.name, name)) return error.DuplicateField;
+        }
+        const slot = entry.value_ptr.*;
+        if (slot != .object) return error.InvalidHeader;
+        try check_fields(slot, &.{"env"});
+        headers[index] = .{
+            .name = try owned.dupe(u8, name),
+            .env = try owned.dupe(u8, try environment_name(try required(slot, "env"))),
+        };
+    }
+    return headers;
+}
+
+fn parse_timeouts(value: std.json.Value) ParseError!Timeouts {
+    if (value != .object) return error.InvalidTimeout;
+    try check_fields(value, &.{ "connect_ms", "first_response_ms", "stall_ms" });
+    return .{
+        .connect_ms = try timeout(value.object.get("connect_ms")),
+        .first_response_ms = try timeout(value.object.get("first_response_ms")),
+        .stall_ms = try timeout(value.object.get("stall_ms")),
+    };
+}
+
+fn timeout(value: ?std.json.Value) ParseError!?u32 {
+    const present = value orelse return null;
+    if (present != .integer or present.integer <= 0 or present.integer > max_timeout_ms) return error.InvalidTimeout;
+    return @intCast(present.integer);
+}
+
+fn parse_metadata(owned: Allocator, protocol: Protocol, value: std.json.Value) ParseError![]const ModelMetadata {
     if (value != .object) return error.InvalidObject;
     if (value.object.count() > max_models) return error.LimitExceeded;
-    const models = try alloc.alloc(ModelMetadata, value.object.count());
-    var initialized: usize = 0;
-    errdefer {
-        for (models[0..initialized]) |metadata| alloc.free(metadata.id);
-        alloc.free(models);
-    }
+    const models = try owned.alloc(ModelMetadata, value.object.count());
     var iterator = value.object.iterator();
-    while (iterator.next()) |entry| {
+    var index: usize = 0;
+    while (iterator.next()) |entry| : (index += 1) {
         try validate_model_id(entry.key_ptr.*);
-        const metadata = entry.value_ptr.*;
-        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision" });
-        const context = try positive_limit(metadata.object.get("context_window"));
-        const output = try positive_limit(metadata.object.get("max_output_tokens"));
-        if (context != null and output != null and output.? >= context.?) return error.InvalidModelMetadata;
-        const tools = try optional_bool(metadata.object.get("supports_tool_use"));
-        const vision = try optional_bool(metadata.object.get("supports_vision"));
-        models[initialized] = .{
-            .id = try alloc.dupe(u8, entry.key_ptr.*),
-            .context_window = context,
-            .max_output_tokens = output,
-            .supports_tool_use = tools,
-            .supports_vision = vision,
-        };
-        initialized += 1;
+        models[index] = try parse_model(owned, protocol, entry.key_ptr.*, entry.value_ptr.*);
     }
     return models;
+}
+
+fn parse_model(owned: Allocator, protocol: Protocol, id: []const u8, metadata: std.json.Value) ParseError!ModelMetadata {
+    try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "output_limit_field", "request", "reasoning_efforts" });
+    const context = try positive_limit(metadata.object.get("context_window"));
+    const output = try positive_limit(metadata.object.get("max_output_tokens"));
+    if (context != null and output != null and output.? >= context.?) return error.InvalidModelMetadata;
+    var limit_field: ?OutputLimitField = null;
+    if (metadata.object.get("output_limit_field")) |field| {
+        // The other protocols each have one field for the limit.
+        if (protocol != .@"openai-chat-completions" or field != .string) return error.InvalidModelMetadata;
+        limit_field = std.meta.stringToEnum(OutputLimitField, field.string) orelse return error.InvalidModelMetadata;
+    }
+    const fx_fields = protocol.owned_request_fields();
+    return .{
+        .id = try owned.dupe(u8, id),
+        .context_window = context,
+        .max_output_tokens = output,
+        .supports_tool_use = try optional_bool(metadata.object.get("supports_tool_use")),
+        .supports_vision = try optional_bool(metadata.object.get("supports_vision")),
+        .output_limit_field = limit_field,
+        .request = if (metadata.object.get("request")) |fields| try request_fragment.parse(owned, fields, fx_fields) else null,
+        .reasoning_efforts = if (metadata.object.get("reasoning_efforts")) |levels| try parse_efforts(owned, levels, fx_fields) else null,
+    };
+}
+
+fn parse_efforts(owned: Allocator, value: std.json.Value, fx_fields: []const []const u8) ParseError![]const EffortLevel {
+    if (value != .object) return error.InvalidEffortLevel;
+    if (value.object.count() > max_effort_levels) return error.LimitExceeded;
+    const levels = try owned.alloc(EffortLevel, value.object.count());
+    var iterator = value.object.iterator();
+    var index: usize = 0;
+    while (iterator.next()) |entry| : (index += 1) {
+        try validate_effort_name(entry.key_ptr.*);
+        levels[index] = .{
+            .name = try owned.dupe(u8, entry.key_ptr.*),
+            .fields = try request_fragment.parse(owned, entry.value_ptr.*, fx_fields),
+        };
+    }
+    return levels;
+}
+
+/// A level's name follows the rule for an effort anywhere in fx
+/// (`types.ReasoningEffort`), and is never one of the words for "no level".
+fn validate_effort_name(name: []const u8) error{ LimitExceeded, InvalidEffortLevel }!void {
+    if (name.len > max_effort_name_bytes) return error.LimitExceeded;
+    if (name.len == 0) return error.InvalidEffortLevel;
+    for (name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.') return error.InvalidEffortLevel;
+    }
+    for ([_][]const u8{ "auto", "adaptive", "default" }) |unset| {
+        if (std.ascii.eqlIgnoreCase(name, unset)) return error.InvalidEffortLevel;
+    }
 }
 
 fn positive_limit(value: ?std.json.Value) ParseError!?u32 {
@@ -637,4 +851,329 @@ fn test_invalid_allocations(alloc: Allocator) !void {
 
 test "configured provider validation failures release earlier definitions and models" {
     try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, test_invalid_allocations, .{});
+}
+
+const test_options_json =
+    \\{"router":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"bearer","env":"ROUTER_KEY"},
+    \\"title_model":"small/title","vision_model":"small/vision","fetch_models":true,
+    \\"headers":{"X-Org":{"env":"ROUTER_ORG"},"x-trace":{"env":"_TRACE"}},
+    \\"timeouts":{"connect_ms":1,"first_response_ms":600000,"stall_ms":86400000},
+    \\"model_defaults":{"context_window":65536,"supports_tool_use":true,"request":{"top_p":0.9},"reasoning_efforts":{"low":{"reasoning_effort":"low"}}},
+    \\"model_metadata":{
+    \\"thinker":{"max_output_tokens":4096,"output_limit_field":"max_completion_tokens","request":{"temperature":0.2},
+    \\"reasoning_efforts":{"high":{"reasoning":{"effort":"high"}},"low":{"reasoning":{"effort":"low"}},"x-high.2":{}}},
+    \\"plain":{"reasoning_efforts":{}}}}}
+;
+
+test "configured provider reads connection options, request fields, and effort levels in order" {
+    var registry = try Registry.parse_json(std.testing.allocator, test_options_json);
+    defer registry.deinit(std.testing.allocator);
+    const router = registry.get("router").?;
+    try std.testing.expectEqualStrings("small/title", router.title_model.?);
+    try std.testing.expectEqualStrings("small/vision", router.vision_model.?);
+    try std.testing.expect(router.fetch_models);
+    try std.testing.expectEqual(@as(usize, 2), router.headers.len);
+    try std.testing.expectEqualStrings("X-Org", router.headers[0].name);
+    try std.testing.expectEqualStrings("ROUTER_ORG", router.headers[0].env);
+    try std.testing.expectEqualStrings("_TRACE", router.headers[1].env);
+    try std.testing.expectEqual(Timeouts{ .connect_ms = 1, .first_response_ms = 600_000, .stall_ms = max_timeout_ms }, router.timeouts);
+
+    const thinker = router.model("thinker").?;
+    try std.testing.expectEqual(@as(?OutputLimitField, .max_completion_tokens), thinker.output_limit_field);
+    try std.testing.expectEqualStrings("temperature", thinker.request.?.fields[0].key);
+    const levels = thinker.reasoning_efforts.?;
+    try std.testing.expectEqual(@as(usize, 3), levels.len);
+    for ([_][]const u8{ "high", "low", "x-high.2" }, levels) |name, level| try std.testing.expectEqualStrings(name, level.name);
+    try std.testing.expectEqualStrings("{\"effort\":\"high\"}", thinker.effort("high").?.fields.fields[0].value_json);
+    try std.testing.expectEqual(@as(usize, 0), thinker.effort("x-high.2").?.fields.fields.len);
+    try std.testing.expect(thinker.effort("medium") == null);
+    try std.testing.expect(thinker.effort("HIGH") == null);
+
+    // A declared model keeps its own fields and takes the rest from the defaults.
+    const merged = router.metadata_for("thinker").?;
+    try std.testing.expectEqual(@as(?u32, 65536), merged.context_window);
+    try std.testing.expectEqual(@as(?u32, 4096), merged.max_output_tokens);
+    try std.testing.expectEqual(@as(?bool, true), merged.supports_tool_use);
+    try std.testing.expect(merged.supports_vision == null);
+    try std.testing.expectEqualStrings("temperature", merged.request.?.fields[0].key);
+    try std.testing.expectEqual(@as(usize, 3), merged.reasoning_efforts.?.len);
+    // "This model has no levels" is not the same as leaving the levels out.
+    try std.testing.expectEqual(@as(usize, 0), router.metadata_for("plain").?.reasoning_efforts.?.len);
+    // A model the settings do not declare gets the defaults.
+    const served = router.metadata_for("served-by-the-server").?;
+    try std.testing.expectEqualStrings("served-by-the-server", served.id);
+    try std.testing.expectEqual(@as(?u32, 65536), served.context_window);
+    try std.testing.expectEqualStrings("top_p", served.request.?.fields[0].key);
+    try std.testing.expectEqualStrings("low", served.reasoning_efforts.?[0].name);
+    try std.testing.expect(served.output_limit_field == null);
+
+    for ([_]struct { protocol: []const u8, path: []const u8 }{
+        .{ .protocol = "openai-chat-completions", .path = "/chat/completions" },
+        .{ .protocol = "openai-responses", .path = "/responses" },
+        .{ .protocol = "anthropic-messages", .path = "/messages" },
+    }) |case| {
+        const json = try std.testing.allocator.print("{{\"c\":{{\"protocol\":\"{s}\",\"base_url\":\"https://example.com/v1/\",\"auth\":{{\"type\":\"none\"}}}}}}", .{case.protocol});
+        defer std.testing.allocator.free(json);
+        var one = try Registry.parse_json(std.testing.allocator, json);
+        defer one.deinit(std.testing.allocator);
+        const definition = one.get("c").?;
+        try std.testing.expectEqualStrings(case.protocol, @tagName(definition.protocol));
+        const url = try definition.request_url(std.testing.allocator);
+        defer std.testing.allocator.free(url);
+        try std.testing.expectEqualStrings(case.path, url["https://example.com/v1".len..]);
+        const models = try definition.models_url(std.testing.allocator);
+        defer std.testing.allocator.free(models);
+        try std.testing.expectEqualStrings("https://example.com/v1/models", models);
+        try std.testing.expect(!definition.fetch_models);
+        try std.testing.expect(definition.metadata_for("anything") == null);
+        try std.testing.expect(definition.title_model == null and definition.vision_model == null);
+        try std.testing.expectEqual(Timeouts{}, definition.timeouts);
+    }
+}
+
+test "configured provider connection options do not change a connection's identity, and its protocol does" {
+    const alloc = std.testing.allocator;
+    var plain = try Registry.parse_json(alloc, "{\"router\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"bearer\",\"env\":\"ROUTER_KEY\"}}}");
+    defer plain.deinit(alloc);
+    var options = try Registry.parse_json(alloc, test_options_json);
+    defer options.deinit(alloc);
+    const identity = plain.get("router").?.binding_identity();
+    // A session saved before the options existed still resumes.
+    try std.testing.expectEqual(identity, options.get("router").?.binding_identity());
+    var other = plain.get("router").?.*;
+    other.protocol = .@"openai-responses";
+    try std.testing.expect(!std.mem.eql(u8, &identity, &other.binding_identity()));
+}
+
+test "configured provider refuses fx's own fields and headers, and malformed options" {
+    const cases = [_]struct { json: []const u8, err: ParseError }{
+        .{ .json = "\"model_metadata\":{\"m\":{\"request\":{\"messages\":[]}}}", .err = error.ReservedRequestField },
+        .{ .json = "\"model_metadata\":{\"m\":{\"request\":{\"max_tokens\":1}}}", .err = error.ReservedRequestField },
+        .{ .json = "\"model_metadata\":{\"m\":{\"request\":{\"max_completion_tokens\":1}}}", .err = error.ReservedRequestField },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"high\":{\"model\":\"other\"}}}}", .err = error.ReservedRequestField },
+        .{ .json = "\"model_defaults\":{\"request\":{\"stream\":false}}", .err = error.ReservedRequestField },
+        .{ .json = "\"model_metadata\":{\"m\":{\"request\":[]}}", .err = error.InvalidRequestFields },
+        .{ .json = "\"model_metadata\":{\"m\":{\"request\":null}}", .err = error.InvalidRequestFields },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"high\":\"high\"}}}", .err = error.InvalidRequestFields },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"low\",\"high\"]}}", .err = error.InvalidEffortLevel },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"\":{}}}}", .err = error.InvalidEffortLevel },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"very high\":{}}}}", .err = error.InvalidEffortLevel },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"auto\":{}}}}", .err = error.InvalidEffortLevel },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"Default\":{}}}}", .err = error.InvalidEffortLevel },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"" ++ text_utils.repeat("e", max_effort_name_bytes + 1) ++ "\":{}}}}", .err = error.LimitExceeded },
+        .{ .json = "\"model_metadata\":{\"m\":{\"output_limit_field\":\"max_output_tokens\"}}", .err = error.InvalidModelMetadata },
+        .{ .json = "\"model_metadata\":{\"m\":{\"output_limit_field\":true}}", .err = error.InvalidModelMetadata },
+        .{ .json = "\"model_defaults\":[]", .err = error.InvalidObject },
+        .{ .json = "\"model_defaults\":{\"context_window\":2,\"max_output_tokens\":2}", .err = error.InvalidModelMetadata },
+        .{ .json = "\"model_defaults\":{\"id\":\"m\"}", .err = error.UnknownField },
+        .{ .json = "\"headers\":{\"Authorization\":{\"env\":\"KEY\"}}", .err = error.ReservedHeader },
+        .{ .json = "\"headers\":{\"content-TYPE\":{\"env\":\"KEY\"}}", .err = error.ReservedHeader },
+        .{ .json = "\"headers\":{\"Host\":{\"env\":\"KEY\"}}", .err = error.ReservedHeader },
+        .{ .json = "\"headers\":{\"X-Org\":{\"env\":\"A\"},\"x-org\":{\"env\":\"B\"}}", .err = error.DuplicateField },
+        .{ .json = "\"headers\":{\"X Org\":{\"env\":\"KEY\"}}", .err = error.InvalidHeader },
+        .{ .json = "\"headers\":{\"X-Org:\":{\"env\":\"KEY\"}}", .err = error.InvalidHeader },
+        .{ .json = "\"headers\":{\"\":{\"env\":\"KEY\"}}", .err = error.InvalidHeader },
+        .{ .json = "\"headers\":{\"X-Org\":\"literal-value\"}", .err = error.InvalidHeader },
+        .{ .json = "\"headers\":[]", .err = error.InvalidHeader },
+        .{ .json = "\"headers\":{\"X-Org\":{}}", .err = error.MissingField },
+        .{ .json = "\"headers\":{\"X-Org\":{\"env\":\"KEY\",\"value\":\"literal\"}}", .err = error.UnknownField },
+        .{ .json = "\"headers\":{\"X-Org\":{\"env\":\"1KEY\"}}", .err = error.InvalidEnvironmentName },
+        .{ .json = "\"headers\":{\"" ++ text_utils.repeat("h", max_header_name_bytes + 1) ++ "\":{\"env\":\"KEY\"}}", .err = error.LimitExceeded },
+        .{ .json = "\"timeouts\":{\"connect_ms\":0}", .err = error.InvalidTimeout },
+        .{ .json = "\"timeouts\":{\"first_response_ms\":-1}", .err = error.InvalidTimeout },
+        .{ .json = "\"timeouts\":{\"stall_ms\":86400001}", .err = error.InvalidTimeout },
+        .{ .json = "\"timeouts\":{\"stall_ms\":1.5}", .err = error.InvalidTimeout },
+        .{ .json = "\"timeouts\":{\"stall_ms\":\"30s\"}", .err = error.InvalidTimeout },
+        .{ .json = "\"timeouts\":{\"stall_ms\":null}", .err = error.InvalidTimeout },
+        .{ .json = "\"timeouts\":300", .err = error.InvalidTimeout },
+        .{ .json = "\"timeouts\":{\"total_ms\":1}", .err = error.UnknownField },
+        .{ .json = "\"fetch_models\":\"yes\"", .err = error.InvalidConnectionOption },
+        .{ .json = "\"fetch_models\":null", .err = error.InvalidConnectionOption },
+        .{ .json = "\"title_model\":\"\"", .err = error.InvalidModelId },
+        .{ .json = "\"vision_model\":7", .err = error.InvalidModelId },
+    };
+    for (cases) |case| {
+        const json = "{\"local\":{" ++ test_required_fields ++ ",";
+        const whole = try std.mem.concat(std.testing.allocator, u8, &.{ json, case.json, "}}" });
+        defer std.testing.allocator.free(whole);
+        std.testing.expectError(case.err, Registry.parse_json(std.testing.allocator, whole)) catch |err| {
+            std.debug.print("case: {s}\n", .{case.json});
+            return err;
+        };
+    }
+
+    // Each protocol keeps its own fields, and only Chat Completions has two
+    // names for the output limit.
+    const per_protocol = [_]struct { protocol: []const u8, fragment: []const u8, err: ?ParseError }{
+        .{ .protocol = "openai-chat-completions", .fragment = "\"request\":{\"input\":1,\"system\":2,\"max_output_tokens\":3,\"reasoning\":{},\"thinking\":{}}", .err = null },
+        .{ .protocol = "openai-responses", .fragment = "\"request\":{\"input\":1}", .err = error.ReservedRequestField },
+        .{ .protocol = "openai-responses", .fragment = "\"request\":{\"max_output_tokens\":1}", .err = error.ReservedRequestField },
+        .{ .protocol = "openai-responses", .fragment = "\"request\":{\"messages\":1,\"max_tokens\":2,\"reasoning\":{\"effort\":\"low\"}}", .err = null },
+        .{ .protocol = "openai-responses", .fragment = "\"output_limit_field\":\"max_tokens\"", .err = error.InvalidModelMetadata },
+        .{ .protocol = "anthropic-messages", .fragment = "\"request\":{\"system\":\"x\"}", .err = error.ReservedRequestField },
+        .{ .protocol = "anthropic-messages", .fragment = "\"request\":{\"max_tokens\":1}", .err = error.ReservedRequestField },
+        .{ .protocol = "anthropic-messages", .fragment = "\"request\":{\"input\":1,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024}}", .err = null },
+        .{ .protocol = "anthropic-messages", .fragment = "\"output_limit_field\":\"max_tokens\"", .err = error.InvalidModelMetadata },
+    };
+    for (per_protocol) |case| {
+        const json = try std.testing.allocator.print("{{\"c\":{{\"protocol\":\"{s}\",\"base_url\":\"https://example.com\",\"auth\":{{\"type\":\"none\"}},\"model_metadata\":{{\"m\":{{{s}}}}}}}}}", .{ case.protocol, case.fragment });
+        defer std.testing.allocator.free(json);
+        if (case.err) |err| {
+            try std.testing.expectError(err, Registry.parse_json(std.testing.allocator, json));
+        } else {
+            var registry = try Registry.parse_json(std.testing.allocator, json);
+            registry.deinit(std.testing.allocator);
+        }
+    }
+}
+
+test "configured provider takes sixteen effort levels and sixteen headers, and one more of neither" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ max_effort_levels, max_effort_levels + 1 }) |count| {
+        var levels: std.ArrayList(u8) = .empty;
+        defer levels.deinit(alloc);
+        var headers: std.ArrayList(u8) = .empty;
+        defer headers.deinit(alloc);
+        for (0..count) |index| {
+            try levels.print(alloc, "{s}\"level{d}\":{{\"reasoning_effort\":\"level{d}\"}}", .{ if (index == 0) "" else ",", index, index });
+            try headers.print(alloc, "{s}\"X-H{d}\":{{\"env\":\"H{d}\"}}", .{ if (index == 0) "" else ",", index, index });
+        }
+        for ([_][]const u8{
+            try alloc.print("\"model_metadata\":{{\"m\":{{\"reasoning_efforts\":{{{s}}}}}}}", .{levels.items}),
+            try alloc.print("\"headers\":{{{s}}}", .{headers.items}),
+        }) |option| {
+            defer alloc.free(option);
+            const json = try std.mem.concat(alloc, u8, &.{ "{\"local\":{" ++ test_required_fields ++ ",", option, "}}" });
+            defer alloc.free(json);
+            if (count == max_effort_levels) {
+                var registry = try Registry.parse_json(alloc, json);
+                defer registry.deinit(alloc);
+                const local = registry.get("local").?;
+                const listed = if (local.model("m")) |m| m.reasoning_efforts.?.len else local.headers.len;
+                try std.testing.expectEqual(count, listed);
+            } else try std.testing.expectError(error.LimitExceeded, Registry.parse_json(alloc, json));
+        }
+    }
+}
+
+fn test_option_allocations(alloc: Allocator) !void {
+    var registry = try Registry.parse_json(alloc, test_options_json);
+    defer registry.deinit(alloc);
+    const url = try registry.get("router").?.request_url(alloc);
+    defer alloc.free(url);
+    const invalid = "{\"first\":{" ++ test_required_fields ++ ",\"headers\":{\"X-A\":{\"env\":\"A\"}},\"model_metadata\":{\"m\":{\"request\":{\"a\":[1,{\"b\":2}]},\"reasoning_efforts\":{\"low\":{\"c\":1},\"high\":{\"model\":2}}}}}}";
+    if (Registry.parse_json(alloc, invalid)) |parsed| {
+        var unexpected = parsed;
+        unexpected.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.ReservedRequestField => {},
+        else => return err,
+    }
+}
+
+test "configured provider options release everything on any allocation failure" {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, test_option_allocations, .{});
+}
+
+test "configured provider settings parse or are refused on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzDefinition, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:11434/v1\",\"auth\":{\"type\":\"none\"}}}",
+            test_options_json,
+            "{\"a\":{\"protocol\":\"anthropic-messages\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"none\"},\"headers\":{\"x-api-key\":{\"env\":\"KEY\"}},\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"high\":{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2048}}}}}}}",
+            "{\"r\":{\"protocol\":\"openai-responses\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"none\"},\"model_metadata\":{\"m\":{\"request\":{\"input\":1}}}}}",
+            "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:1/v1\",\"auth\":{\"type\":\"none\"},\"timeouts\":{\"stall_ms\":0}}}",
+            "\xff\x00{",
+        }) ++ @import("fuzz_corpus").configured_provider_definition.*),
+    });
+}
+
+/// Whatever bytes the settings hold, the parser refuses them or returns a
+/// registry that keeps its own limits: no fragment names a field fx writes
+/// for the connection's protocol, and no model offers more levels than fx can.
+fn fuzzDefinition(_: void, smith: *std.testing.Smith) anyerror!void {
+    const alloc = std.testing.allocator;
+    var buffer: [4096]u8 = undefined;
+    const json = buffer[0..@intCast(smith.slice(&buffer))];
+    var registry = Registry.parse_json(alloc, json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer registry.deinit(alloc);
+    for (registry.definitions) |definition| {
+        const owned = definition.protocol.owned_request_fields();
+        if (definition.model_defaults) |defaults| try expectWithinLimits(defaults, owned);
+        for (definition.model_metadata) |metadata| {
+            try expectWithinLimits(metadata, owned);
+            try std.testing.expect(definition.metadata_for(metadata.id) != null);
+        }
+        try std.testing.expect(definition.headers.len <= max_headers);
+        _ = definition.binding_identity();
+    }
+}
+
+fn expectWithinLimits(metadata: ModelMetadata, owned: []const []const u8) !void {
+    for (owned) |name| {
+        if (metadata.request) |fields| try std.testing.expect(!fields.has(name));
+        for (metadata.reasoning_efforts orelse &.{}) |level| try std.testing.expect(!level.fields.has(name));
+    }
+    if (metadata.reasoning_efforts) |levels| try std.testing.expect(levels.len <= max_effort_levels);
+}
+
+test "a model's request fields and effort levels reach the body as valid JSON on fuzzed settings" {
+    try std.testing.fuzz({}, fuzzFragments, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"temperature\":0.2,\"top_p\":0.9}\x00{\"reasoning_effort\":\"high\",\"temperature\":0.7}",
+            "{\"temperature\":0.2}\x00{\"reasoning\":{\"effort\":\"high\"},\"temperature\":0.7}",
+            "{\"metadata\":{\"user_id\":\"u\"}}\x00{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2048}}",
+            "{\"options\":{\"num_ctx\":[1,2,{\"a\":null}]},\"stop\":[\"\\n\"]}",
+            "{\"model\":\"x\"}\x00{}",
+            "[]\x00{\"a\":1}",
+        }) ++ @import("fuzz_corpus").configured_request_fragments.*),
+    });
+}
+
+/// Two fragments from arbitrary bytes, the model's and a level's, split at
+/// the first NUL, written after fx's own fields: the body stays one valid
+/// JSON object, every field fx writes keeps fx's value, and a field both set
+/// carries the level's value
+/// (`tests/tla/configured_provider/ConfiguredRequest.tla` OwnedKeysKeepFxValue,
+/// LevelBeatsRequest). The input's length picks the protocol whose fields fx owns.
+fn fuzzFragments(_: void, smith: *std.testing.Smith) anyerror!void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buffer: [2048]u8 = undefined;
+    const bytes = buffer[0..@intCast(smith.slice(&buffer))];
+    const protocols = std.enums.values(Protocol);
+    const owned = protocols[bytes.len % protocols.len].owned_request_fields();
+    const split = std.mem.findScalar(u8, bytes, 0);
+    const request = fuzzFragment(arena, if (split) |at| bytes[0..at] else bytes, owned) orelse return;
+    const level = fuzzFragment(arena, if (split) |at| bytes[at + 1 ..] else "{}", owned) orelse return;
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.writeAll("{\"model\":\"fx-model\",\"stream\":true");
+    try request_fragment.write(&out.writer, request, level);
+    try out.writer.writeByte('}');
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, out.written(), .{ .duplicate_field_behavior = .@"error" });
+    defer parsed.deinit();
+    const body = parsed.value.object;
+    try std.testing.expectEqualStrings("fx-model", body.get("model").?.string);
+    try std.testing.expect(body.get("stream").?.bool);
+    for (level.fields) |field| {
+        var expected = try std.json.parseFromSlice(std.json.Value, arena, field.value_json, .{});
+        defer expected.deinit();
+        var sent: std.Io.Writer.Allocating = .init(arena);
+        try std.json.Stringify.value(body.get(field.key).?, .{}, &sent.writer);
+        var wanted: std.Io.Writer.Allocating = .init(arena);
+        try std.json.Stringify.value(expected.value, .{}, &wanted.writer);
+        try std.testing.expectEqualStrings(wanted.written(), sent.written());
+    }
+}
+
+/// A fragment parsed from `bytes`, or null when the settings would refuse it.
+fn fuzzFragment(arena: Allocator, bytes: []const u8, owned: []const []const u8) ?request_fragment.Fragment {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_url_bytes }) catch return null;
+    return request_fragment.parse(arena, value, owned) catch null;
 }
