@@ -4396,6 +4396,214 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  for (const provider of REPLAY_PROVIDERS) {
+    test(`saved ask sends a tool turn unchanged before its signed final reply (${provider.name})`, async () => {
+      const root = createFixtureRoot(`signed-history-${provider.name}`);
+      writeFileSync(join(root.workspace, "notes.txt"), "SIGNED_HISTORY_NOTES\n");
+      const steps = [
+        signedToolStep(provider, "read", "read_file", { path: "notes.txt" }),
+        signedFinalStep(provider, "first_reply", "The notes are read."),
+        signedFinalStep(provider, "second_reply", "Nothing else."),
+      ];
+      const { gateway, edits } = startPreservedThinkingGateway(provider, (request) =>
+        steps.shift() ?? signedFinalStep(provider, `extra_${request}`, "Extra reply.")
+      );
+      try {
+        const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: provider.model };
+        const first = await runFx(["ask", "--json", "--full-access", "Read notes.txt and say what it holds."], {
+          cwd: root.workspace,
+          env,
+          timeoutMs: 15_000,
+        });
+        expect(first.code).toBe(0);
+        const sessionId = parseAskJson(first.stdout).session_id;
+        const second = await runFx(["ask", "--json", "--full-access", "--resume", sessionId, "Anything else?"], {
+          cwd: root.workspace,
+          env,
+          timeoutMs: 15_000,
+        });
+        expect(edits).toEqual([]);
+        expect(second.code).toBe(0);
+        expect(gateway.requestCount()).toBe(3);
+        // The resumed request is the first turn's last request, that
+        // request's signed reply, and the new message, with nothing between.
+        const sent = gatewayRequest(gateway.requests[1]!.body).prompt;
+        const resumed = gatewayRequest(gateway.requests[2]!.body).prompt;
+        expect(resumed.slice(0, sent.length)).toEqual(sent);
+        expect(resumed[sent.length]!.role).toBe("assistant");
+        expect(signaturesIn(JSON.stringify(resumed[sent.length]!.content))).toEqual(["SIG_first_reply"]);
+        expect(resumed).toHaveLength(sent.length + 2);
+        expect(contentText(resumed[sent.length + 1]!.content)).toBe("Anything else?");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 45_000);
+  }
+
+  const SIGNED_TURN_SHAPES: Array<{
+    name: string;
+    steps: (provider: ReplayProvider) => object[][];
+    after?: (workspace: string) => void;
+  }> = [
+    {
+      name: "a read then an edit of the same file",
+      steps: (provider) => [
+        signedToolStep(provider, "read_config", "read_file", { path: "config.txt" }),
+        signedToolStep(provider, "edit_config", "edit_file", {
+          path: "config.txt",
+          old_string: "port=8080",
+          new_string: "port=9090",
+        }),
+        signedFinalStep(provider, "edited_reply", "The port is now 9090."),
+      ],
+      after: (workspace) => expect(readFileSync(join(workspace, "config.txt"), "utf8")).toBe("port=9090\n"),
+    },
+    {
+      name: "a file read whose final reply is only reasoning",
+      steps: (provider) => [
+        signedToolStep(provider, "read_config", "read_file", { path: "config.txt" }),
+        signedFinalStep(provider, "silent_reply", null),
+      ],
+    },
+    {
+      name: "a reply without tool calls",
+      steps: (provider) => [signedFinalStep(provider, "plain_reply", "No tools needed.")],
+    },
+  ];
+
+  for (const [shapeIndex, shape] of SIGNED_TURN_SHAPES.entries()) {
+    test(`saved ask keeps signed reasoning valid on the next turn after ${shape.name}`, async () => {
+      const provider = REPLAY_PROVIDERS[0]!;
+      const root = createFixtureRoot(`signed-turn-shape-${shapeIndex}`);
+      writeFileSync(join(root.workspace, "config.txt"), "port=8080\n");
+      const steps = shape.steps(provider);
+      const { gateway, edits } = startPreservedThinkingGateway(provider, (request) =>
+        steps.shift() ?? signedFinalStep(provider, `reply_${request}`, "Done.")
+      );
+      try {
+        const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: provider.model };
+        const first = await runFx(["ask", "--json", "--full-access", "Work on config.txt."], {
+          cwd: root.workspace,
+          env,
+          timeoutMs: 15_000,
+        });
+        const sessionId = parseAskJson(first.stdout).session_id;
+        expect(steps).toEqual([]);
+        shape.after?.(root.workspace);
+        const second = await runFx(["ask", "--json", "--full-access", "--resume", sessionId, "Anything else?"], {
+          cwd: root.workspace,
+          env,
+          timeoutMs: 15_000,
+        });
+        expect(edits).toEqual([]);
+        expect(second.code).toBe(0);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 45_000);
+  }
+
+  test("a turn killed after a file read resumes, and the turn after keeps it as the resume sent it", async () => {
+    const provider = REPLAY_PROVIDERS[0]!;
+    const root = createFixtureRoot("signed-crash-resume");
+    writeFileSync(join(root.workspace, "notes.txt"), "CRASH_NOTES\n");
+    let releaseHeld: (() => void) | undefined;
+    let heldArrived: () => void = () => {};
+    const arrived = new Promise<void>((resolve) => {
+      heldArrived = resolve;
+    });
+    const { gateway, edits } = startPreservedThinkingGateway(provider, async (request) => {
+      if (request === 0) return signedToolStep(provider, "crash_read", "read_file", { path: "notes.txt" });
+      if (request === 1) {
+        heldArrived();
+        await new Promise<void>((resolve) => {
+          releaseHeld = resolve;
+        });
+        return signedFinalStep(provider, "never_seen", "Too late.");
+      }
+      return signedFinalStep(provider, `after_crash_${request}`, "Recovered.");
+    });
+    try {
+      const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: provider.model, FX_SOUND: "0" };
+      const proc = Bun.spawn([FX_BIN, "ask", "--full-access", "--json", "Read notes.txt and say what it holds."], {
+        cwd: root.workspace,
+        env: { ...process.env, ...env },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      await arrived;
+      // fx dies while the step after its read waits on the gateway.
+      proc.kill("SIGKILL");
+      await proc.exited;
+      const sessionId = onlySessionId(root.home);
+      const resumed = await runFx(["ask", "--json", "--full-access", "--resume", sessionId, "Continue after the crash."], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 15_000,
+      });
+      expect(edits).toEqual([]);
+      expect(resumed.code).toBe(0);
+      expect(signaturesIn(gateway.requests[gateway.requests.length - 1]!.body)).toContain("SIG_crash_read");
+      // Once the resume is saved, the stopped turn is projected for a later
+      // resume; the next turn must still send it as the resume did.
+      const next = await runFx(["ask", "--json", "--full-access", "--resume", sessionId, "And now?"], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 15_000,
+      });
+      expect(edits).toEqual([]);
+      expect(next.code).toBe(0);
+    } finally {
+      releaseHeld?.();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("forty saved turns with file tools each resume without editing an earlier turn", async () => {
+    const provider = REPLAY_PROVIDERS[0]!;
+    const root = createFixtureRoot("signed-history-stress");
+    writeFileSync(join(root.workspace, "counter.txt"), "count=0\n");
+    const turns = 40;
+    let queue: object[][] = [];
+    const { gateway, edits } = startPreservedThinkingGateway(provider, (request) =>
+      queue.shift() ?? signedFinalStep(provider, `unexpected_${request}`, "Unexpected.")
+    );
+    try {
+      const env = { ...fixtureEnv(root, gateway, join(root.root, "trace.log")), FX_MODEL: provider.model };
+      let sessionId: string | undefined;
+      for (let turn = 1; turn <= turns; turn += 1) {
+        queue = [
+          signedToolStep(provider, `read_${turn}`, "read_file", { path: "counter.txt" }),
+          signedToolStep(provider, `edit_${turn}`, "edit_file", {
+            path: "counter.txt",
+            old_string: `count=${turn - 1}`,
+            new_string: `count=${turn}`,
+          }),
+          signedFinalStep(provider, `reply_${turn}`, `Count is ${turn}.`),
+        ];
+        const args = sessionId === undefined
+          ? ["ask", "--json", "--full-access", `Turn ${turn}.`]
+          : ["ask", "--json", "--full-access", "--resume", sessionId, `Turn ${turn}.`];
+        const result = await runFx(args, { cwd: root.workspace, env, timeoutMs: 30_000 });
+        expect(edits).toEqual([]);
+        expect(result.code).toBe(0);
+        expect(queue).toEqual([]);
+        sessionId ??= parseAskJson(result.stdout).session_id;
+      }
+      expect(readFileSync(join(root.workspace, "counter.txt"), "utf8")).toBe(`count=${turns}\n`);
+      // The last request carries every earlier turn's three signed steps and
+      // this turn's read and edit.
+      expect(signaturesIn(gateway.requests[gateway.requests.length - 1]!.body)).toHaveLength(turns * 3 - 1);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 240_000);
+
   // A turn that names a skill sends the skill's text with its message; every
   // later request sends that turn exactly as it was sent (D95). The steps run
   // a shell command, which leaves no saved file list on the turn.
@@ -12720,4 +12928,115 @@ test("a stop that drops an unread message says so", async () => {
   expect(toolResultText(state.afterStop[0]!, "stopmsg-stop")).toContain("the message waiting for it was dropped");
   expect(state.unreadTurns).toBe(0);
   expect(result.code).toBe(0);
+}, 90_000);
+
+// Main starts subagent `worker` with STARTGAP_TASK, and the start hold
+// (src/core/subagent/start_test_controls.zig) stops its first turn before the
+// worker attaches. Main then messages it STARTGAP_NOTE. `releaseWhenWaiting`
+// lets the start go once fx says the message waits for it; otherwise the
+// start is let go only when main's next request comes. The subagent's first
+// task takes one shell step, so a joined note reaches that task, and a note
+// fx held for the next turn arrives after the task's final answer,
+// STARTGAP_CHILD_DONE.
+async function runStartGap(label: string, options: { releaseWhenWaiting: boolean; waitLimitMs?: number; quitWhenWaiting?: boolean }) {
+  const root = createFixtureRoot(label);
+  const startHeld = join(root.root, "start-held"), startRelease = join(root.root, "start-release");
+  const tracePath = join(root.root, "trace.log");
+  const state = { noteJoined: 0, noteTurns: 0, noteAnswer: "", trace: "" };
+  const release = () => { if (!existsSync(startRelease)) writeFileSync(startRelease, ""); };
+  const gateway = startDynamicFakeGateway(async raw => {
+    const body = JSON.parse(raw);
+    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+    if (latest.includes(REPORT_HEADER)) return fakeGatewayFinalText("STARTGAP_REPORT_SEEN");
+    if (latest.includes("STARTGAP_NOTE")) {
+      // A note after the task's final answer came in a turn of its own.
+      if (raw.includes("STARTGAP_CHILD_DONE")) state.noteTurns++;
+      else state.noteJoined++;
+      return fakeGatewayFinalText("STARTGAP_CHILD_DONE");
+    }
+    if (latest.includes("STARTGAP_TASK")) {
+      if (raw.includes("startgap-shell")) return fakeGatewayFinalText("STARTGAP_CHILD_DONE");
+      return fakeGatewayToolCall("startgap-shell", "shell", { request: { action: "run", command: "true" } });
+    }
+    if (raw.includes("startgap-note")) {
+      state.noteAnswer = toolResultText(raw, "startgap-note");
+      release();
+      return fakeGatewayFinalText("STARTGAP_MAIN_DONE");
+    }
+    if (raw.includes("startgap-start")) {
+      // The first turn is held before its worker attaches.
+      await waitUntil(() => existsSync(`${startHeld}.1`), 20_000);
+      if (options.releaseWhenWaiting) void (async () => {
+        await waitUntil(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=message_waits_start"), 20_000);
+        release();
+      })();
+      return fakeGatewayToolCall("startgap-note", "subagent", { request: { action: "message", agent: "worker", message: "STARTGAP_NOTE" } });
+    }
+    return fakeGatewayToolCall("startgap-start", "subagent", { request: { action: "message", agent: "worker", message: "STARTGAP_TASK" } });
+  }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+  const env = {
+    ...fixtureEnv(root, gateway, tracePath),
+    FX_SOUND: "0",
+    FX_TRACE_SCOPES: "mailbox,subagent,tool",
+    FX_TEST_SUBAGENT_START_HELD: startHeld,
+    FX_TEST_SUBAGENT_START_RELEASE: startRelease,
+    ...(options.waitLimitMs === undefined ? {} : { FX_TEST_SUBAGENT_START_WAIT_MS: String(options.waitLimitMs) }),
+  };
+  try {
+    if (options.quitWhenWaiting) {
+      // fx is told to quit while main's message waits for the start, which
+      // nothing lets go.
+      const proc = Bun.spawn([FX_BIN, "ask", "--json", "--full-access", "Start the worker and tell it one more thing."], {
+        cwd: root.workspace, env: { ...process.env, ...env }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+      });
+      const stderr = new Response(proc.stderr).text();
+      const waited = await waitUntil(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=message_waits_start"), 20_000);
+      const signalled = Date.now();
+      proc.kill("SIGTERM");
+      const exit = await Promise.race([proc.exited, Bun.sleep(20_000).then(() => "hung" as const)]);
+      if (exit === "hung") proc.kill("SIGKILL");
+      return { waited, exit, quitMs: Date.now() - signalled, stderr: await stderr, state };
+    }
+    const result = await runFx(["ask", "--json", "--full-access", "Start the worker and tell it one more thing."], {
+      cwd: root.workspace, env, timeoutMs: 60_000,
+    });
+    state.trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+    return { result, state, heldMarker: readFileSync(`${startHeld}.1`, "utf8") };
+  } finally {
+    release();
+    gateway.stop();
+  }
+}
+
+test("a message right after starting a subagent joins its first task", async () => {
+  const { result, state, heldMarker } = await runStartGap("start-then-message", { releaseWhenWaiting: true });
+  expect(heldMarker).toContain("start child=");
+  expect(state.noteAnswer).toContain("Sent into the subagent's running turn");
+  expect(state.noteAnswer).not.toContain("waits and starts its next turn");
+  expect(result.code).toBe(0);
+  expect(state.noteJoined).toBe(1);
+  expect(state.noteTurns).toBe(0);
+}, 90_000);
+
+test("a message waits only so long for a stuck start, then starts the next turn", async () => {
+  // Nothing lets the start go until main's next request, so the wait limit
+  // passes first.
+  const { result, state } = await runStartGap("start-wait-limit", { releaseWhenWaiting: false, waitLimitMs: 200 });
+  expect(state.trace).toContain("event=message_waits_start");
+  expect(state.trace).toContain("event=message_start_wait_expired");
+  expect(state.noteAnswer).toContain("waits and starts its next turn");
+  expect(result.code).toBe(0);
+  // The note is not lost: the turn after the first task takes it.
+  expect(state.noteJoined).toBe(0);
+  expect(state.noteTurns).toBe(1);
+}, 90_000);
+
+test("fx told to quit while a message waits for a subagent's start exits at once", async () => {
+  const run = await runStartGap("start-wait-quit", { releaseWhenWaiting: false, quitWhenWaiting: true });
+  expect(run.waited).toBe(true);
+  expect(run.exit).not.toBe("hung");
+  // The wait ends with main's cancelled turn, not at the 10 s limit.
+  expect(run.quitMs).toBeLessThan(5_000);
+  expect(run.stderr).not.toContain("panic");
+  expect(run.exit).toBe(143);
 }, 90_000);

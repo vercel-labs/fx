@@ -126,6 +126,10 @@ pub const ChildAgent = struct {
 /// is doing now. The highlighted row's agent is the one on screen: moving
 /// through the list previews each agent, Enter keeps the one shown, and Esc
 /// or Ctrl+X go back to `origin`.
+/// A row Delete closes in the agent list: a subagent, or an instance with
+/// null for the first.
+const CloseTarget = struct { agent: ?*ChildAgent };
+
 pub const AgentsMenu = struct {
     open: bool = false,
     /// The selected agent's place in the switch list, from 0.
@@ -135,9 +139,9 @@ pub const AgentsMenu = struct {
     /// instance. Compared by address only, so it is never read after its
     /// agent closes. Meaningful while `open`.
     origin: ?*ChildAgent = null,
-    /// The subagent whose close the first x armed, until the second x
+    /// The agent whose close the first Delete armed, until the second
     /// closes it or another key disarms it. Compared by address only.
-    close_armed: ?*ChildAgent = null,
+    close_armed: ?CloseTarget = null,
     /// Backs the rows the last projection showed. Owned.
     rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
     /// Backs the instance names in `rows`, such as "fx 12". Owned.
@@ -1205,6 +1209,7 @@ pub fn Runtime(comptime App: type) type {
             menu.selected = positionIn(order.items, app.agent_on_screen) orelse 0;
             menu.window_start = 0;
             menu.origin = app.agent_on_screen;
+            menu.close_armed = null;
             menu.open = true;
             debug_trace.eventf("host", "agents_menu_opened", .{}, "agents={d} position={d} agent={s}", .{
                 order.items.len,
@@ -1227,6 +1232,7 @@ pub fn Runtime(comptime App: type) type {
             const menu = &app.instances.agents_menu;
             menu.open = false;
             menu.origin = null;
+            menu.close_armed = null;
             app.shell.render_requests.request(.footer);
         }
 
@@ -1319,20 +1325,23 @@ pub fn Runtime(comptime App: type) type {
                 });
             }
             if (menu.selected >= menu.rows.items.len) menu.selected = menu.rows.items.len -| 1;
-            const chosen: ?*ChildAgent = if (order.items.len > 0) order.items[@min(menu.selected, order.items.len - 1)] else null;
-            const closable = if (chosen) |child| child.agent.role == .subagent else false;
+            if (order.items.len == 0) return .{ .rows = menu.rows.items };
+            const chosen = order.items[@min(menu.selected, order.items.len - 1)];
+            const closable = deleteCloses(app, chosen);
             return .{
                 .rows = menu.rows.items,
                 .selected = menu.selected,
                 .window_start = menu.window_start,
                 .selected_closable = closable,
-                .close_armed = closable and menu.close_armed == chosen,
+                .selected_instance = isInstance(chosen),
+                .close_armed = closable and armedFor(menu, chosen),
             };
         }
 
-        /// Delete in the agent list: the first press on a subagent's row arms its
-        /// close, and the second closes it for good (`closeSubagent`).
-        /// Instances close with /close, so Delete on one does nothing.
+        /// Delete in the agent list: the first press on a row arms its close,
+        /// and the second closes it: a subagent for good (`closeSubagent`), an
+        /// instance as `/close` does (`closeInstanceFromMenu`). The last open
+        /// instance stays, since closing it would end fx.
         pub fn pressCloseKey(app: *App) !bool {
             if (!menuActive(app)) return false;
             var order: std.ArrayList(?*ChildAgent) = .empty;
@@ -1340,18 +1349,63 @@ pub fn Runtime(comptime App: type) type {
             try switchList(app, &order);
             if (order.items.len == 0) return true;
             const menu = &app.instances.agents_menu;
-            const target = order.items[@min(menu.selected, order.items.len - 1)] orelse return true;
-            if (target.agent.role != .subagent) return true;
-            if (menu.close_armed != target) {
-                menu.close_armed = target;
-                debug_trace.eventf("host", "agents_menu_close_armed", .{}, "agent={s}", .{target.id});
+            const target = order.items[@min(menu.selected, order.items.len - 1)];
+            if (!deleteCloses(app, target)) return true;
+            if (!armedFor(menu, target)) {
+                menu.close_armed = .{ .agent = target };
+                debug_trace.eventf("host", "agents_menu_close_armed", .{}, "agent={s}", .{if (target) |child| child.id else "first"});
                 // Its warning shows now, not at the next frame something else asks for.
                 app.shell.render_requests.request(.footer);
                 return true;
             }
             menu.close_armed = null;
-            try closeSubagent(app, target);
+            if (isInstance(target)) {
+                try closeInstanceFromMenu(app, target);
+            } else {
+                try closeSubagent(app, target.?);
+            }
             return true;
+        }
+
+        /// Whether `target`'s row is an instance's, null being the first.
+        fn isInstance(target: ?*ChildAgent) bool {
+            const child = target orelse return true;
+            return child.agent.role != .subagent;
+        }
+
+        /// Whether Delete closes `target`'s row: any subagent, and an instance
+        /// while another stays open.
+        fn deleteCloses(app: *App, target: ?*ChildAgent) bool {
+            return !isInstance(target) or openInstanceCount(app) > 1;
+        }
+
+        fn armedFor(menu: *const AgentsMenu, target: ?*ChildAgent) bool {
+            const armed = menu.close_armed orelse return false;
+            return armed.agent == target;
+        }
+
+        /// Closes instance `target`, null for the first, and every subagent in
+        /// its tree, as `/close` does on its screen. The next instance takes
+        /// its place on screen and as the agent Esc goes back to, and the list
+        /// stays open on it. Call only while another instance runs.
+        fn closeInstanceFromMenu(app: *App, target: ?*ChildAgent) !void {
+            const menu = &app.instances.agents_menu;
+            const next = if (target) |child| nextInstanceAfter(app, child) else instanceAfterFirst(app);
+            const root: *AppAgent = if (target) |child| &child.agent else &app.main_agent;
+            const origin_closes = if (menu.origin) |origin|
+                origin == target or (origin.agent.role == .subagent and rootInstance(app, origin) == root)
+            else
+                target == null;
+            if (origin_closes) menu.origin = next;
+            if (target) |child| try closeInstance(app, child) else try closeFirstInstance(app);
+            if (menuActive(app)) {
+                var order: std.ArrayList(?*ChildAgent) = .empty;
+                defer order.deinit(app.alloc);
+                try switchList(app, &order);
+                menu.selected = positionIn(order.items, app.agent_on_screen) orelse 0;
+                menu.window_start = @min(menu.window_start, menu.selected);
+                app.shell.render_requests.request(.footer);
+            }
         }
 
         /// Any key but Delete disarms a close the first Delete armed, and its warning
@@ -1481,10 +1535,10 @@ pub fn Runtime(comptime App: type) type {
         /// cancelled. `dropSet` drops them after.
         fn stopSet(app: *App, set: []const *ChildAgent, first_host: ?*subagent_tool_host.Runtime) void {
             const menu = &app.instances.agents_menu;
-            if (inBranch(set, menu.close_armed)) {
+            if (menu.close_armed) |armed| if (inBranch(set, armed.agent)) {
                 menu.close_armed = null;
                 debug_trace.eventf("host", "agents_menu_close_disarmed", .{}, "reason=closed", .{});
-            }
+            };
             if (inBranch(set, app.approval_lender)) _ = returnApproval(app);
             if (inBranch(set, app.question_lender)) _ = returnQuestion(app);
             if (comptime agents.hasAgentField(App, "session_persistence")) {

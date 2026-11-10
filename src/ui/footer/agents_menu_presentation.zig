@@ -257,9 +257,14 @@ const armed_hint_variants = [_][]const u8{
     "press delete again to close this subagent",
 };
 
-/// Delete closes a subagent's row after a second press confirms it.
+const armed_instance_hint_variants = [_][]const u8{
+    "press delete again to close this instance",
+};
+
+/// Delete closes a subagent's or an instance's row after a second press
+/// confirms it.
 pub fn hintVariants(projection: AgentsMenuProjection) []const []const u8 {
-    if (projection.close_armed) return &armed_hint_variants;
+    if (projection.close_armed) return if (projection.selected_instance) &armed_instance_hint_variants else &armed_hint_variants;
     if (projection.selected_closable) return &closable_hint_variants;
     return &hint_variants;
 }

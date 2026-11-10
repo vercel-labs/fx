@@ -3191,12 +3191,11 @@ test "a named skill's text rides on its turn's message and the turn saves it as 
     const body = second_gateway.request_bodies.items[0];
     try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], body);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "REQUESTED_SKILL_CONTENT"));
-    // The first turn's message, its saved file evidence, then this turn's.
+    // The first turn's message as it was sent, then this turn's.
     const users = try userMessageTexts(arena, body);
-    try std.testing.expectEqual(@as(usize, 3), users.items.len);
-    try std.testing.expect(std.mem.startsWith(u8, users.items[1], "Session file evidence from previous tool execution."));
+    try std.testing.expectEqual(@as(usize, 2), users.items.len);
     try std.testing.expectEqualStrings(sent_users.items[0], users.items[0]);
-    try std.testing.expectEqualStrings("Thanks.", users.items[2]);
+    try std.testing.expectEqualStrings("Thanks.", users.items[1]);
     try std.testing.expectEqual(@as(usize, 0), second_hooks.history_turns.items[0].assistant.execution.context_notes.len);
 
     // A turn recovered from the checkpoint set right after its tool step
