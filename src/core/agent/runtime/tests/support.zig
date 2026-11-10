@@ -161,11 +161,9 @@ const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.web_fetch,
     builtin_tools.web_search,
     builtin_tools.shell,
-    builtin_tools.capability_search,
-    builtin_tools.skill,
     builtin_tools.install_skill,
     builtin_tools.subagent,
-    builtin_tools.mcp_select_tool,
+    builtin_tools.toolbox,
     builtin_tools.ask_user_question,
     builtin_tools.read_tool_result,
 };
@@ -1122,7 +1120,10 @@ pub const FakeAgentRuntimeDeps = struct {
                 advertised_dynamic_tool_names,
             );
         }
-        try self.permission_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
+        // The name the rules decide: a toolbox open or search is decided as
+        // the tool it replaced.
+        const permission_name = if (call.toolbox_lookup) |lookup| lookup.permission else call.name;
+        try self.permission_names.append(self.alloc, try self.alloc.dupe(u8, permission_name));
         try self.permission_call_ids.append(self.alloc, try self.alloc.dupe(u8, call.id));
         try self.permission_user_intent_contexts.append(
             self.alloc,

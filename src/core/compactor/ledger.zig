@@ -18,6 +18,7 @@ const std = @import("std");
 const checkpoint = @import("checkpoint.zig");
 const trace = @import("trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -830,9 +831,22 @@ pub fn addUsed(arena: Allocator, earlier: []const checkpoint.Used, calls: []cons
 const Found = struct { kind: checkpoint.Used.Kind, name: []const u8 };
 
 /// The skill or MCP tool a call used: a `skill` call's location (and
-/// resource), an MCP tool by its name, or an `mcp_features` call by its
-/// server and action.
+/// resource), an MCP tool by its name, an `mcp_features` call by its server
+/// and action, or what a `toolbox` call opened or ran.
 fn usedBy(arena: Allocator, call: Call) Allocator.Error!?Found {
+    if (std.mem.eql(u8, call.name, "toolbox")) {
+        if (try stringArgument(arena, call.arguments, "run")) |tool| {
+            return if (types.isMcpToolName(tool)) .{ .kind = .mcp, .name = tool } else null;
+        }
+        const opened = try stringArgument(arena, call.arguments, "open") orelse return null;
+        // An MCP tool's definition isn't a use of it. Any other open is
+        // counted as the skill it most often is; a server's name can't be
+        // told apart from a skill's here.
+        if (types.isMcpToolName(opened)) return null;
+        const resource = try stringArgument(arena, call.arguments, "resource") orelse "";
+        const name = if (resource.len == 0) opened else try arena.print("{s} {s}", .{ opened, resource });
+        return .{ .kind = .skill, .name = name };
+    }
     if (std.mem.eql(u8, call.name, "skill")) {
         const location = try stringArgument(arena, call.arguments, "location") orelse return null;
         const resource = try stringArgument(arena, call.arguments, "resource") orelse "";
@@ -844,7 +858,7 @@ fn usedBy(arena: Allocator, call: Call) Allocator.Error!?Found {
         const action = try stringArgument(arena, call.arguments, "action") orelse "";
         return .{ .kind = .mcp, .name = try arena.print("mcp_features {s} {s}", .{ server, action }) };
     }
-    if (std.mem.startsWith(u8, call.name, "mcp_") and !std.mem.eql(u8, call.name, "mcp_select_tool")) {
+    if (types.isMcpToolName(call.name) and !std.mem.eql(u8, call.name, "mcp_select_tool")) {
         return .{ .kind = .mcp, .name = try arena.dupe(u8, call.name) };
     }
     return null;
@@ -862,6 +876,20 @@ fn stringArgument(arena: Allocator, arguments: []const u8, field: []const u8) Al
 }
 
 const testing = std.testing;
+
+test "a toolbox call is used as the skill it opened or the MCP tool it ran" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const opened = (try usedBy(arena, .{ .number = 1, .name = "toolbox", .arguments = "{\"open\":\"fx-commit\",\"resource\":\"ship.md\"}" })).?;
+    try std.testing.expectEqual(checkpoint.Used.Kind.skill, opened.kind);
+    try std.testing.expectEqualStrings("fx-commit ship.md", opened.name);
+    const ran = (try usedBy(arena, .{ .number = 2, .name = "toolbox", .arguments = "{\"run\":\"mcp_linear_get_issue\",\"arguments\":{}}" })).?;
+    try std.testing.expectEqual(checkpoint.Used.Kind.mcp, ran.kind);
+    try std.testing.expectEqualStrings("mcp_linear_get_issue", ran.name);
+    try std.testing.expectEqual(@as(?Found, null), try usedBy(arena, .{ .number = 3, .name = "toolbox", .arguments = "{\"open\":\"mcp_linear_get_issue\"}" }));
+    try std.testing.expectEqual(@as(?Found, null), try usedBy(arena, .{ .number = 4, .name = "toolbox", .arguments = "{\"run\":\"install_skill\",\"arguments\":{}}" }));
+}
 
 test "a saved entry with an empty ID is skipped when new IDs are numbered" {
     var text: std.ArrayList(u8) = .empty;

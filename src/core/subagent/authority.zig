@@ -7,6 +7,8 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
 const profiles = @import("../profiles/profiles.zig");
+const tool_placement = @import("../config/tool_placement.zig");
+const toolbox = @import("../tooling/toolbox.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
@@ -300,6 +302,11 @@ pub const Resolver = struct {
     /// host clears it and its children are never given `subagent`.
     children_nest: bool = true,
 
+    /// The host's tools behind toolbox, read when a child's tools are
+    /// decided, so a profile that lists one keeps toolbox to reach it.
+    /// Unset, they are toolbox's defaults.
+    toolbox_behind: ?*const tool_placement.Behind = null,
+
     /// The authority of the work main started on child `child_id`, which
     /// must still be active.
     pub fn resolve(
@@ -445,7 +452,8 @@ pub const Resolver = struct {
         errdefer alloc.free(owned_child_id);
         const owned_root_id = try alloc.dupe(u8, self.root_id);
         errdefer alloc.free(owned_root_id);
-        const tools = try cloneKeptTools(alloc, tool_source, current.profile, self.children_nest);
+        const behind = if (self.toolbox_behind) |value| value.slice() else &toolbox.default_behind;
+        const tools = try cloneKeptTools(alloc, tool_source, current.profile, self.children_nest, behind);
         errdefer freeStrings(alloc, tools);
         const integrations = try cloneIntegrations(alloc, integration_source, current.profile, view_source);
         errdefer freeStrings(alloc, integrations);
@@ -615,19 +623,23 @@ fn cloneStrings(alloc: Allocator, values: []const []const u8) ![][]u8 {
 }
 
 /// The host's tools a child may use: all of them, or with a profile only
-/// those it allows. `subagent` is among them only when the child `nests`.
+/// those it allows, `behind` naming the ones the run keeps behind toolbox.
+/// `subagent` is among them only when the child `nests`.
 fn cloneKeptTools(
     alloc: Allocator,
     values: []const []const u8,
     profile: ?*const profiles.Profile,
     nests: bool,
+    behind: []const []const u8,
 ) ![][]u8 {
-    if (nests) return cloneKept(alloc, values, profile, keepTool);
-    return cloneKept(alloc, values, profile, keepToolButSubagent);
-}
-
-fn keepToolButSubagent(profile: ?*const profiles.Profile, name: []const u8) bool {
-    return !std.mem.eql(u8, name, "subagent") and keepTool(profile, name);
+    var kept: std.ArrayList([]const u8) = .empty;
+    defer kept.deinit(alloc);
+    for (values) |name| {
+        if (!nests and std.mem.eql(u8, name, "subagent")) continue;
+        if (profile) |value| if (!profiles.allowsTool(value, name, behind)) continue;
+        try kept.append(alloc, name);
+    }
+    return cloneStrings(alloc, kept.items);
 }
 
 /// The host's MCP integrations a child may use: with a profile, only the
@@ -699,38 +711,6 @@ fn cloneIntegrations(
         if (profiles.allowsMcpServer(value, server)) try kept.append(alloc, name);
     }
     return cloneStrings(alloc, kept.items);
-}
-
-/// A tool the child keeps from the set it starts from, unless its profile
-/// leaves it out. `subagent` is kept like any other, so a child starts its
-/// own.
-fn keepTool(profile: ?*const profiles.Profile, name: []const u8) bool {
-    const value = profile orelse return true;
-    return profiles.allowsTool(value, name);
-}
-
-fn cloneKept(
-    alloc: Allocator,
-    values: []const []const u8,
-    profile: ?*const profiles.Profile,
-    comptime keep: fn (?*const profiles.Profile, []const u8) bool,
-) ![][]u8 {
-    var count: usize = 0;
-    for (values) |value| {
-        if (keep(profile, value)) count += 1;
-    }
-    const out = try alloc.alloc([]u8, count);
-    var copied: usize = 0;
-    errdefer {
-        for (out[0..copied]) |value| alloc.free(value);
-        alloc.free(out);
-    }
-    for (values) |value| {
-        if (!keep(profile, value)) continue;
-        out[copied] = try alloc.dupe(u8, value);
-        copied += 1;
-    }
-    return out;
 }
 
 fn freeStrings(alloc: Allocator, values: [][]u8) void {
@@ -1318,4 +1298,27 @@ test "a child with no mode of its own follows its parent's current mode, under i
     parent_mode = .auto;
     try std.testing.expectEqual(types.PermissionMode.auto, try resolver.currentMode(alloc, "plain-child"));
     try std.testing.expectError(error.ChildNotAttached, resolver.currentMode(alloc, "missing-child"));
+}
+
+test "a child whose profile lists a tool kept behind toolbox keeps toolbox to reach it" {
+    const alloc = std.testing.allocator;
+    const host_tools = [_][]const u8{ "read_file", "glob_files", "toolbox", "skill", "subagent" };
+    const profile = profiles.Profile{ .name = "finder", .description = "Finder", .source = .home, .tools = &.{"glob_files"} };
+    const moved = [_][]const u8{ "install_skill", "glob_files" };
+    // glob_files placed behind toolbox: the child keeps toolbox to run it.
+    const kept = try cloneKeptTools(alloc, &host_tools, &profile, true, &moved);
+    defer freeStrings(alloc, kept);
+    try std.testing.expectEqual(@as(usize, 2), kept.len);
+    try std.testing.expectEqualStrings("glob_files", kept[0]);
+    try std.testing.expectEqualStrings("toolbox", kept[1]);
+    // Sent directly, it needs no toolbox.
+    const direct = try cloneKeptTools(alloc, &host_tools, &profile, true, &toolbox.default_behind);
+    defer freeStrings(alloc, direct);
+    try std.testing.expectEqual(@as(usize, 1), direct.len);
+    // Without a profile, every tool is kept, and subagent only for a child
+    // that nests.
+    const all = try cloneKeptTools(alloc, &host_tools, null, false, &moved);
+    defer freeStrings(alloc, all);
+    try std.testing.expectEqual(@as(usize, 4), all.len);
+    for (all) |name| try std.testing.expect(!std.mem.eql(u8, name, "subagent"));
 }

@@ -161,6 +161,7 @@ fn postCommitResolutionError(
             .invalid_model_id => return error.InvalidModelValue,
             .retired_skill_match_fuzzy => return error.InvalidSettingsFormat,
             .invalid_context_limits => return error.InvalidSettingsFormat,
+            .invalid_tool_placement => return error.InvalidSettingsFormat,
             .invalid_additional_directories => return error.InvalidSettingsFormat,
             .invalid_skill_symlink_authorities,
             .invalid_ultrafast_mode_override,

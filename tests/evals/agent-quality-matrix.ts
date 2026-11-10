@@ -100,9 +100,9 @@ const LOCAL_INSPECTION_TOOLS = [
 const WEB_FETCH_TOOL = "web_fetch" as const;
 const WEB_SEARCH_TOOL = "web_search" as const;
 
+// MCP tools are found, opened, and run through toolbox.
 const MCP_DISCOVERY_TOOLS = [
-  "capability_search",
-  "mcp_select_tool",
+  "toolbox",
 ] as const;
 
 const DESTRUCTIVE_OR_MUTATING_TOOLS = [
@@ -951,21 +951,21 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
       category: "deferred MCP metadata search",
       tools: [MCP_DISCOVERY_TOOLS[0]],
       notes:
-        "Dynamic MCP schemas should stay out of the base prompt; the model searches metadata before exact-selecting a tool.",
+        "Dynamic MCP schemas stay out of the base prompt; the model finds the tool through toolbox search or the menu's server list, opens it for its arguments, and runs it.",
     },
     forbiddenTools: [WEB_SEARCH_TOOL, "ask_user_question"],
     expectedUserVisibleBehavior:
-      "Searches configured MCP tool metadata, exact-selects the matching tool, then calls the selected dynamic tool only after its schema is advertised.",
+      "Finds the matching MCP tool through toolbox, opens it for its arguments, then runs it through toolbox; the tools fx sends never change.",
     deterministicCoverage: {
       type: "tool-call recorder test",
       status: "implemented",
       notes:
-        "Recorder assertions cover first-tool routing; Zig unit tests assert deferred base advertisement, metadata search, exact schema selection, and selected-schema overlay without requiring AI_GATEWAY_API_KEY.",
+        "Recorder assertions cover first-tool routing; tests/e2e/toolbox.test.ts covers the menu, open, run, and unchanged tools without requiring AI_GATEWAY_API_KEY.",
     },
     modelBackedEval: {
       required: true,
       reason:
-        "Choosing scoped capability_search before mcp_select_tool and the final dynamic call is model-visible routing behavior.",
+        "Choosing toolbox search, open, and run for the right server is model-visible routing behavior.",
     },
     currentBaselineResult: {
       status: "known-gap",
@@ -973,9 +973,9 @@ export const AGENT_QUALITY_BASELINE_MATRIX: readonly AgentQualityMatrixRow[] = [
         "A 13-server run with 28 ready Datadog tools made 18 unscoped searches without returning a Datadog tool.",
     },
     targetResult:
-      "First action is capability_search with kind=mcp and the exact server alias; the model pages if needed, exact-selects a result, and calls it without web_search or clarification.",
+      "First action is toolbox, searching or opening the matching server; the model opens a result for its arguments and runs it through toolbox without web_search or clarification.",
     coveredEntrypoints: [
-      askEntrypoint("Depends on available_tools advertising only the MCP discovery tools until an exact select occurs."),
+      askEntrypoint("Depends on the toolbox menu listing the MCP servers while the tools fx sends stay fixed."),
       interactiveEntrypoint("Interactive mode should use the same deferred discovery path with live MCP runtimes."),
     ],
   },

@@ -114,8 +114,8 @@ function fixtureEnv(
 
 function startToolGateway(finalText: string) {
   return startFakeGateway([
-    fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-    fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+    fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+    fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
     fakeGatewayFinalText(finalText),
   ], {
     models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -198,19 +198,13 @@ describe("version-scoped legacy MCP remote transports", () => {
       const root = createRoot(`list-changed-${version}`, "http", streamable.url);
       const freshTool = "mcp_fixture_fresh";
       gateway = startFakeGateway([
-        fakeGatewayToolCall("activate_listener", "capability_search", {
-          query: "echo",
-        }),
+        fakeGatewayToolCall("activate_listener", "toolbox", { search: "echo" }),
         async () => {
           await Bun.sleep(100);
-          return fakeGatewayToolCall("search_fresh", "capability_search", {
-            query: "fresh",
-          });
+          return fakeGatewayToolCall("search_fresh", "toolbox", { search: "fresh" });
         },
-        fakeGatewayToolCall("select_fresh", "mcp_select_tool", {
-          name: freshTool,
-        }),
-        fakeGatewayToolCall("call_fresh", freshTool, { text: "changed" }),
+        fakeGatewayToolCall("select_fresh", "toolbox", { open: freshTool }),
+        fakeGatewayToolCall("call_fresh", "toolbox", { run: freshTool, arguments: { text: "changed" } }),
         fakeGatewayFinalText(`${version} live refresh complete.`),
       ], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -477,8 +471,8 @@ describe("version-scoped legacy MCP remote transports", () => {
           chmodSync(openPath, 0o755);
         }
         gateway = startFakeGateway([
-          fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-          fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+          fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+          fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "hello" } }),
           fakeGatewayFinalText("Legacy HTTP tools URL-required complete."),
         ], {
           models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
@@ -625,9 +619,9 @@ describe("version-scoped legacy MCP remote transports", () => {
       },
     );
     gateway = startFakeGateway([
-      fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall("expired_call", TOOL_NAME, { text: "expired" }),
-      fakeGatewayToolCall("recovered_call", TOOL_NAME, { text: "recovered" }),
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("expired_call", "toolbox", { run: TOOL_NAME, arguments: { text: "expired" } }),
+      fakeGatewayToolCall("recovered_call", "toolbox", { run: TOOL_NAME, arguments: { text: "recovered" } }),
       fakeGatewayFinalText("Session recovery complete."),
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
