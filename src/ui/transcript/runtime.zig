@@ -579,60 +579,6 @@ pub const TranscriptBodyDisposition = union(enum) {
     retain_committed: RetainedTranscriptBody,
 };
 
-fn nextResizeBottomAnchorPending(
-    pending: bool,
-    terminal_reset_commit: bool,
-    resize_reset_commit: bool,
-    tail_kind: ?TranscriptBlockKind,
-    occupied_last_row: u16,
-    content_bottom_row: u16,
-) bool {
-    const next = if (terminal_reset_commit)
-        resize_reset_commit
-    else
-        pending;
-    if (tail_kind == .cancel_notice and
-        occupied_last_row == content_bottom_row)
-    {
-        return false;
-    }
-    return next;
-}
-
-test "resize bottom anchor remains pending until a cancel projection reaches it" {
-    const Case = struct {
-        pending: bool,
-        terminal_reset_commit: bool,
-        resize_reset_commit: bool,
-        tail_kind: ?TranscriptBlockKind,
-        occupied_last_row: u16,
-        content_bottom_row: u16,
-        expected: bool,
-    };
-    const cases = [_]Case{
-        .{ .pending = false, .terminal_reset_commit = false, .resize_reset_commit = false, .tail_kind = null, .occupied_last_row = 4, .content_bottom_row = 8, .expected = false },
-        .{ .pending = false, .terminal_reset_commit = true, .resize_reset_commit = true, .tail_kind = null, .occupied_last_row = 4, .content_bottom_row = 8, .expected = true },
-        .{ .pending = true, .terminal_reset_commit = false, .resize_reset_commit = false, .tail_kind = .assistant_turn, .occupied_last_row = 4, .content_bottom_row = 8, .expected = true },
-        .{ .pending = true, .terminal_reset_commit = false, .resize_reset_commit = false, .tail_kind = .cancel_notice, .occupied_last_row = 4, .content_bottom_row = 8, .expected = true },
-        .{ .pending = true, .terminal_reset_commit = false, .resize_reset_commit = false, .tail_kind = .cancel_notice, .occupied_last_row = 8, .content_bottom_row = 8, .expected = false },
-        .{ .pending = true, .terminal_reset_commit = true, .resize_reset_commit = false, .tail_kind = null, .occupied_last_row = 4, .content_bottom_row = 8, .expected = false },
-    };
-
-    for (cases) |case| {
-        try std.testing.expectEqual(
-            case.expected,
-            nextResizeBottomAnchorPending(
-                case.pending,
-                case.terminal_reset_commit,
-                case.resize_reset_commit,
-                case.tail_kind,
-                case.occupied_last_row,
-                case.content_bottom_row,
-            ),
-        );
-    }
-}
-
 const MaterializedEndpoint = struct {
     visual_offset: u32 = 0,
     visual_rows: u16 = 0,
@@ -4774,7 +4720,6 @@ const transcript_screen_fields = [_][:0]const u8{
     "pending_resize_observation",
     "viewport_clear_pending",
     "terminal_reset_pending",
-    "resize_bottom_anchor_pending",
     "render_requests",
     "has_committed_frame",
     "committed_frame_layout",
@@ -4898,9 +4843,6 @@ pub const TranscriptRuntime = struct {
     /// A settled terminal resize needs a canonical repaint from row one.
     /// It remains pending until the reset frame commits successfully.
     terminal_reset_pending: bool = false,
-    /// A committed resize reset established terminal-bottom ownership that
-    /// the next cancellation projection must preserve.
-    resize_bottom_anchor_pending: bool = false,
     render_requests: render_request.RenderRequestState = .{},
     /// Set after the frame commit path has successfully written and fed
     /// a frame. Resize-time invalid terminal dimensions before this point
@@ -10611,28 +10553,12 @@ pub const TranscriptRuntime = struct {
         const before_history_catchup_pending = self.historyCatchupPending();
         const terminal_reset_commit =
             result.is_committed() and self.terminal_reset_pending;
-        const resize_reset_commit =
-            terminal_reset_commit and
-            (self.pending_resize_observation != null or
-                self.resize_history_row_delta != null);
         const scroll_commit = result.scrollCommit(scroll_plan);
         self.ackPreservedRowReleaseCommit(scroll_plan, scroll_commit);
         if (transition) |value| {
             std.debug.assert(std.meta.eql(scroll_plan, value.scroll_plan));
             self.consumeTranscriptTransitionWithCommit(alloc, value, result, scroll_commit);
         }
-        const committed_selection = if (result.is_committed())
-            if (transition) |value| value.selection else null
-        else
-            null;
-        self.resize_bottom_anchor_pending = nextResizeBottomAnchorPending(
-            self.resize_bottom_anchor_pending,
-            terminal_reset_commit,
-            resize_reset_commit,
-            if (committed_selection) |selection| selection.tail_kind else null,
-            if (committed_selection) |selection| selection.last_visible_row else 0,
-            self.layout.content_bottom,
-        );
         self.recordRenderCommit(
             before,
             before_recovery_pending,
