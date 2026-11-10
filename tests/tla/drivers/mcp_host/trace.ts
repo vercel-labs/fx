@@ -55,6 +55,7 @@ const substitutions: Record<string, string[]> = {
   MixedBuilds: ["RevokeOnReplay"],
   StoreLockBudget: ["Budget", "Slack", "Tolerance"],
   RefreshLease: ["RefreshMax", "Budget", "Slack", "Tolerance"],
+  ConfigEdit: ["Names", "Classes", "Checked", "KeyScan", "GuardRemove", "Atomic"],
 };
 
 function wrapperCfg(module: string, invariant: string): string {

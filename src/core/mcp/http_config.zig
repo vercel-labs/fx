@@ -4,9 +4,21 @@
 const std = @import("std");
 const mcp_contract = @import("mcp_contract.zig");
 
+/// Why `validateEndpoint` refuses a URL. Every caller refuses on any of them;
+/// the config reader names the reason in its skip note (`project_config.zig`).
 pub const EndpointError = error{
+    /// It can't be parsed, or its host can't be read.
     InvalidEndpoint,
+    /// Plain http to a host other than localhost, 127.0.0.1 and [::1].
     InsecureEndpoint,
+    /// A user name or password in the URL.
+    EndpointHasCredentials,
+    EndpointHasFragment,
+    EndpointNoHost,
+    /// Neither https nor http.
+    EndpointScheme,
+    /// Plain http to localhost, 127.0.0.1 or [::1] with no port.
+    EndpointNeedsPort,
 };
 
 pub const HeaderError = error{
@@ -18,25 +30,22 @@ pub const HeaderError = error{
 
 pub fn validateEndpoint(url: []const u8) EndpointError!void {
     const uri = std.Uri.parse(url) catch return error.InvalidEndpoint;
-    if (uri.user != null or uri.password != null or uri.fragment != null) {
-        return error.InvalidEndpoint;
-    }
-    const host_component = uri.host orelse return error.InvalidEndpoint;
+    if (uri.user != null or uri.password != null) return error.EndpointHasCredentials;
+    if (uri.fragment != null) return error.EndpointHasFragment;
+    const host_component = uri.host orelse return error.EndpointNoHost;
 
     if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return;
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") or uri.port == null) {
-        return error.InsecureEndpoint;
-    }
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.EndpointScheme;
 
     var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
     const host = host_component.toRaw(&host_buf) catch return error.InvalidEndpoint;
-    if (std.mem.eql(u8, host, "127.0.0.1") or
+    if (!(std.mem.eql(u8, host, "127.0.0.1") or
         std.ascii.eqlIgnoreCase(host, "localhost") or
-        std.mem.eql(u8, host, "[::1]"))
+        std.mem.eql(u8, host, "[::1]")))
     {
-        return;
+        return error.InsecureEndpoint;
     }
-    return error.InsecureEndpoint;
+    if (uri.port == null) return error.EndpointNeedsPort;
 }
 
 /// An `oauth.resource`: an endpoint `validateEndpoint` takes, whose host and
@@ -130,9 +139,30 @@ test "MCP endpoint policy accepts HTTPS and explicit loopback HTTP" {
     try validateEndpoint("http://[::1]:4321/mcp");
 
     try std.testing.expectError(error.InsecureEndpoint, validateEndpoint("http://example.com/mcp"));
-    try std.testing.expectError(error.InsecureEndpoint, validateEndpoint("http://localhost/mcp"));
-    try std.testing.expectError(error.InvalidEndpoint, validateEndpoint("https://user@example.com/mcp"));
-    try std.testing.expectError(error.InvalidEndpoint, validateEndpoint("https://example.com/mcp#fragment"));
+    try std.testing.expectError(error.EndpointNeedsPort, validateEndpoint("http://localhost/mcp"));
+    try std.testing.expectError(error.EndpointHasCredentials, validateEndpoint("https://user@example.com/mcp"));
+    try std.testing.expectError(error.EndpointHasFragment, validateEndpoint("https://example.com/mcp#fragment"));
+}
+
+test "MCP endpoint policy names why it refuses a URL, and accepts what it did" {
+    const refused = [_]struct { url: []const u8, why: EndpointError }{
+        .{ .url = "http://example.com/mcp", .why = error.InsecureEndpoint },
+        .{ .url = "http://example.com:8080/mcp", .why = error.InsecureEndpoint },
+        .{ .url = "http://localhost.:8080/mcp", .why = error.InsecureEndpoint },
+        .{ .url = "http://127.0.0.2:8080/mcp", .why = error.InsecureEndpoint },
+        .{ .url = "http://localhost/mcp", .why = error.EndpointNeedsPort },
+        .{ .url = "http://127.0.0.1/mcp", .why = error.EndpointNeedsPort },
+        .{ .url = "http://[::1]/mcp", .why = error.EndpointNeedsPort },
+        .{ .url = "https://u:p@x.example/mcp", .why = error.EndpointHasCredentials },
+        .{ .url = "https://x.example/mcp#part", .why = error.EndpointHasFragment },
+        .{ .url = "https:///mcp", .why = error.EndpointNoHost },
+        .{ .url = "ftp://x.example/mcp", .why = error.EndpointScheme },
+        .{ .url = "https://", .why = error.InvalidEndpoint },
+        .{ .url = "https://x.example:99999/mcp", .why = error.InvalidEndpoint },
+    };
+    for (refused) |c| try std.testing.expectError(c.why, validateEndpoint(c.url));
+    // The scheme is not case-sensitive here (add's own prefix check is).
+    for ([_][]const u8{ "HTTPS://x.example/mcp", "HTTP://LOCALHOST:8080/mcp", "http://127.0.0.1:80/", "https://x y/mcp" }) |url| try validateEndpoint(url);
 }
 
 test "an OAuth resource and client metadata URL follow fx's URL rules" {

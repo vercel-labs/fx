@@ -1,0 +1,38 @@
+[
+  {
+    "description": "The reader's check is skipped: an add saves a URL, header or variable the reader then skips",
+    "old": "ReaderRefused(f, c) == (Checked /\\ ~Loads(f, c)) \\/ (f = \"profile\" /\\ KeyBlocks)",
+    "new": "ReaderRefused(f, c) == (f = \"profile\" /\\ KeyBlocks)",
+    "invariant": "AddedIsLoaded"
+  },
+  {
+    "description": "The check forgets that the profile skips an Authorization header",
+    "old": "ReaderRefused(f, c) == (Checked /\\ ~Loads(f, c)) \\/ (f = \"profile\" /\\ KeyBlocks)",
+    "new": "ReaderRefused(f, c) == (Checked /\\ c = \"bad\") \\/ (f = \"profile\" /\\ KeyBlocks)",
+    "invariant": "AddedIsLoaded"
+  },
+  {
+    "description": "Only add reads the profile's keys: remove rewrites a profile whose servers key is misspelled",
+    "old": "       ELSE IF f = \"profile\" /\\ GuardRemove /\\ KeyBlocks",
+    "new": "       ELSE IF FALSE",
+    "invariant": "NoRewriteOfMisspelled"
+  },
+  {
+    "description": "The write comes before the check: a refused add has already changed the file",
+    "old": "       THEN /\\ UNCHANGED <<st, ent, added, wroteTypo>>\n            /\\ last' = \"refused\"\n            /\\ same' = TRUE",
+    "new": "       THEN /\\ st' = [st EXCEPT ![f] = \"ok\"]\n            /\\ ent' = [ent EXCEPT ![f][n] = c]\n            /\\ UNCHANGED <<added, wroteTypo>>\n            /\\ last' = \"refused\"\n            /\\ same' = FALSE",
+    "invariant": "RefusedLeavesFile"
+  },
+  {
+    "description": "An edit uses the scan fx runs at load, which gives up on a big file",
+    "old": "KeyBlocks == typo /\\ (KeyScan = \"complete\" \\/ (KeyScan = \"bounded\" /\\ ~big))",
+    "new": "KeyBlocks == typo /\\ ~big",
+    "invariant": "NoRewriteOfMisspelled"
+  },
+  {
+    "description": "A remove takes out every entry of the removed entry's class",
+    "old": "            ELSE /\\ ent' = [ent EXCEPT ![f][n] = NoEntry]",
+    "new": "            ELSE /\\ ent' = [ent EXCEPT ![f] = [m \\in Names |-> IF ent[f][m] = ent[f][n] THEN NoEntry ELSE ent[f][m]]]",
+    "invariant": "OthersKept"
+  }
+]

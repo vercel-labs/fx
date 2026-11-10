@@ -1,10 +1,13 @@
 //! `~/.fx/mcp.json` and `.mcp.json` edited in place. `add` and
 //! `remove` change one entry of the file's JSON tree, so keys fx doesn't
 //! know, the other top-level keys, the order, the spelling, and the text of
-//! numbers all stay as written.
+//! numbers all stay as written. `update` writes only what fx's own reader
+//! then loads, and never a profile whose servers key looks misspelled
+//! (`tests/tla/mcp_host/ConfigEdit.tla` `AddedIsLoaded`, `NoRewriteOfMisspelled`).
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const project_config = @import("../mcp/project_config.zig");
 
 const Allocator = std.mem.Allocator;
 const json = std.json;
@@ -91,11 +94,42 @@ pub const Updated = union(enum) {
     /// The removed entry's `url`, owned by the caller's allocator.
     removed: ?[]u8,
     missing,
+    /// Nothing was written.
+    refused: Refusal,
 };
+
+/// Why an edit isn't made. Both carry bounded text only, never an entry's URL or headers.
+pub const Refusal = union(enum) {
+    /// The reader would skip the new entry.
+    entry: project_config.EntryProblem,
+    /// The profile has a key that looks like a misspelling of its servers key.
+    misspelled: project_config.MisspelledKey,
+};
+
+/// Whether adding `name` to `file`, which held `before` and would hold `after`,
+/// is refused: the profile's servers key looks misspelled, or the reader would
+/// skip the new entry. Null for a file the reader loads the entry from. It runs
+/// the reader on the text as it will be written, so the rules stay the reader's.
+pub fn refusalOf(alloc: Allocator, file: File, before: ?[]const u8, after: []const u8, name: []const u8) Allocator.Error!?Refusal {
+    if (file == .profile) {
+        if (try misspelledIn(alloc, file, before)) |key| return .{ .misspelled = key };
+    }
+    if (try project_config.entryProblemIn(alloc, file == .profile, after, name)) |problem| return .{ .entry = problem };
+    return null;
+}
+
+/// The profile's misspelled servers key, found by reading every key; null for
+/// `.mcp.json`, whose keys fx doesn't check, and for a file that isn't there.
+fn misspelledIn(alloc: Allocator, file: File, text: ?[]const u8) Allocator.Error!?project_config.MisspelledKey {
+    if (file != .profile) return null;
+    return project_config.misspelledKey(alloc, text orelse return null);
+}
 
 /// Applies `change` to the file at `path`. Every MCP config write holds the
 /// profile's lock, next to `profile_path`, so two fx processes can't lose
-/// each other's change.
+/// each other's change. The reader's check reads the file under that lock, as
+/// it is then, so a key that appears between two commands is found by the
+/// next one. A refused change writes nothing.
 pub fn update(alloc: Allocator, profile_path: []const u8, file: File, path: []const u8, change: Change) !Updated {
     var lock = try lockProfile(profile_path);
     defer lock.release();
@@ -105,6 +139,7 @@ pub fn update(alloc: Allocator, profile_path: []const u8, file: File, path: []co
         .add => |a| {
             const next = try add(alloc, file, text, a.name, a.entry);
             defer alloc.free(next);
+            if (try refusalOf(alloc, file, text, next, a.name)) |refusal| return .{ .refused = refusal };
             try write(alloc, file, path, next);
             return .added;
         },
@@ -112,6 +147,10 @@ pub fn update(alloc: Allocator, profile_path: []const u8, file: File, path: []co
             const removed = (try remove(alloc, file, text orelse return .missing, name)) orelse return .missing;
             defer alloc.free(removed.text);
             errdefer if (removed.url) |u| alloc.free(u);
+            if (try misspelledIn(alloc, file, text)) |key| {
+                if (removed.url) |u| alloc.free(u);
+                return .{ .refused = .{ .misspelled = key } };
+            }
             try write(alloc, file, path, removed.text);
             return .{ .removed = removed.url };
         },
@@ -426,4 +465,233 @@ test "the profile's first write creates ~/.fx readable only by its owner" {
     try testing.expectEqual(@as(std.posix.mode_t, 0o700), dir.permissions.toMode() & 0o777);
     const file = try tmp.dir.statFile(io, ".fx/mcp.json", .{});
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), file.permissions.toMode() & 0o777);
+}
+
+const bad_entry: Entry = .{ .http = .{ .url = "http://example.com/mcp" } };
+const good_entry: Entry = .{ .http = .{ .url = "https://mcp.example/mcp" } };
+const authorized: Entry = .{ .http = .{ .url = "https://mcp.example/mcp", .headers = &.{.{ .key = "authorization", .value = "Bearer x" }} } };
+
+test "update writes what the reader loads, and a refused change writes nothing" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const profile = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "mcp.json" });
+    defer alloc.free(profile);
+    const project = try std.Io.Dir.path.join(alloc, &.{ home, ".mcp.json" });
+    defer alloc.free(project);
+
+    // A missing profile stays missing when the first add is refused.
+    const refused = try update(alloc, profile, .profile, profile, .{ .add = .{ .name = "web", .entry = bad_entry } });
+    try testing.expectEqual(project_config.EntryProblem.url_insecure, refused.refused.entry);
+    try testing.expect(try read(alloc, profile) == null);
+
+    const added = try update(alloc, profile, .profile, profile, .{ .add = .{ .name = "web", .entry = good_entry } });
+    try testing.expect(added == .added);
+    const before = (try read(alloc, profile)).?;
+    defer alloc.free(before);
+
+    // An Authorization header is the profile's to refuse and .mcp.json's to take.
+    const auth = try update(alloc, profile, .profile, profile, .{ .add = .{ .name = "authd", .entry = authorized } });
+    try testing.expectEqual(project_config.EntryProblem.authorization, auth.refused.entry);
+    try testing.expect(try update(alloc, profile, .project, project, .{ .add = .{ .name = "authd", .entry = authorized } }) == .added);
+    const after = (try read(alloc, profile)).?;
+    defer alloc.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "update never rewrites a profile whose servers key looks misspelled, and reads every key to find it" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const profile = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "mcp.json" });
+    defer alloc.free(profile);
+
+    // 70 other keys first, and the misspelled one last: the scan fx runs at load gives up on this file.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    try text.append(alloc, '{');
+    for (0..70) |i| try text.print(alloc, "\"note{d}\":{d},", .{ i, i });
+    try text.appendSlice(alloc, "\"mcpServers\":{\"a\":{\"command\":\"x\"}},\"mcp_servers\":{\"b\":{\"command\":\"y\"}}}");
+    try write(alloc, .profile, profile, text.items);
+
+    const add_refused = try update(alloc, profile, .profile, profile, .{ .add = .{ .name = "web", .entry = good_entry } });
+    try testing.expectEqualStrings("mcp_servers", add_refused.refused.misspelled.key());
+    try testing.expectEqualStrings("mcpServers", add_refused.refused.misspelled.real());
+    const remove_refused = try update(alloc, profile, .profile, profile, .{ .remove = "a" });
+    try testing.expectEqualStrings("mcp_servers", remove_refused.refused.misspelled.key());
+    const same = (try read(alloc, profile)).?;
+    defer alloc.free(same);
+    try testing.expectEqualStrings(text.items, same);
+
+    // A name that is not under the real key is not found, so there is nothing to refuse.
+    try testing.expect(try update(alloc, profile, .profile, profile, .{ .remove = "b" }) == .missing);
+
+    // The key the file already uses is the one the fix names.
+    const old = "{\"mcp\":{\"a\":{\"command\":\"x\"}},\"MCP-Servers\":{\"b\":{\"command\":\"y\"}}}";
+    try write(alloc, .profile, profile, old);
+    const named = try update(alloc, profile, .profile, profile, .{ .add = .{ .name = "web", .entry = good_entry } });
+    try testing.expectEqualStrings("MCP-Servers", named.refused.misspelled.key());
+    try testing.expectEqualStrings("mcp", named.refused.misspelled.real());
+
+    // .mcp.json has no such check.
+    const project = try std.Io.Dir.path.join(alloc, &.{ home, ".mcp.json" });
+    defer alloc.free(project);
+    try write(alloc, .project, project, "{\"servers\":{\"b\":{\"command\":\"y\"}}}");
+    try testing.expect(try update(alloc, profile, .project, project, .{ .add = .{ .name = "web", .entry = good_entry } }) == .added);
+}
+
+// The entries and files a fuzzed add draws from: addresses that load, that the
+// reader skips for each reason it has, and headers and variables of every class.
+const fuzz_schemes = [_][]const u8{ "https", "https", "http", "HTTP", "ftp", "" };
+const fuzz_hosts = [_][]const u8{ "x.example", "localhost", "localhost.", "127.0.0.1", "127.0.0.2", "[::1]", "", "x y", "u:p@x.example", "u@localhost" };
+const fuzz_ports = [_][]const u8{ "", "", ":80", ":8080", ":0", ":99999", ":" };
+const fuzz_tails = [_][]const u8{ "/mcp", "/mcp", "", "/mcp#part", "?a=1" };
+const fuzz_header_names = [_][]const u8{ "X-A", "x-a", "Authorization", "authorization", "Host", "Mcp-Param-X", "Bad Header", "" };
+const fuzz_values = [_][]const u8{ "1", "", "${X}", "${", "${1X}", "${X:-d}", "a\x01b" };
+const fuzz_commands = [_][]const u8{ "node", "", "x y", "${C}", "${" };
+const fuzz_env_names = [_][]const u8{ "K", "1X", "BAD NAME", "" };
+const fuzz_names = [_][]const u8{ "a", "web", "x-1", "s_2" };
+const fuzz_typo_keys = [_][]const u8{ "servers", "mcp_servers", "MCP-Servers", "mcpserver", "ModelContextProtocol", "notes", "mcp" };
+
+/// A profile or `.mcp.json` text: some unrelated top-level keys, the real
+/// servers key (or none), and a key that may or may not be a misspelling.
+fn fuzzBefore(a: Allocator, smith: *std.testing.Smith) Allocator.Error!?[]const u8 {
+    if (smith.valueRangeAtMost(u8, 0, 5) == 0) return null;
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '{');
+    var first = true;
+    const fillers = smith.valueRangeAtMost(u8, 0, 80);
+    for (0..fillers) |i| {
+        if (!first) try out.append(a, ',');
+        first = false;
+        try out.print(a, "\"note{d}\":{d}", .{ i, i });
+    }
+    const real = smith.valueRangeAtMost(u8, 0, 3);
+    if (real != 0) {
+        if (!first) try out.append(a, ',');
+        first = false;
+        const key: []const u8 = if (real == 3) "mcp" else "mcpServers";
+        try out.print(a, "\"{s}\":{{\"old\":{{\"command\":\"x\"}}}}", .{key});
+    }
+    if (smith.value(bool)) {
+        if (!first) try out.append(a, ',');
+        const key = fuzz_typo_keys[smith.index(fuzz_typo_keys.len)];
+        // Servers, or entries that aren't servers first: the load scan gives up on a wide one.
+        const junk = smith.valueRangeAtMost(u8, 0, 70);
+        try out.print(a, "\"{s}\":{{", .{key});
+        for (0..junk) |i| try out.print(a, "\"n{d}\":{d},", .{ i, i });
+        try out.appendSlice(a, "\"real\":{\"command\":\"y\"}}");
+    }
+    try out.append(a, '}');
+    return out.items;
+}
+
+fn fuzzEntry(a: Allocator, smith: *std.testing.Smith) Allocator.Error!Entry {
+    if (smith.value(bool)) {
+        const url = try a.print("{s}://{s}{s}{s}", .{
+            fuzz_schemes[smith.index(fuzz_schemes.len)],
+            fuzz_hosts[smith.index(fuzz_hosts.len)],
+            fuzz_ports[smith.index(fuzz_ports.len)],
+            fuzz_tails[smith.index(fuzz_tails.len)],
+        });
+        const count = smith.valueRangeAtMost(u8, 0, 3);
+        const headers = try a.alloc(Pair, count);
+        for (headers) |*h| h.* = .{
+            .key = fuzz_header_names[smith.index(fuzz_header_names.len)],
+            .value = fuzz_values[smith.index(fuzz_values.len)],
+        };
+        return .{ .http = .{ .url = url, .headers = headers } };
+    }
+    const args = try a.alloc([]const u8, smith.valueRangeAtMost(u8, 0, 2));
+    for (args) |*arg| arg.* = fuzz_values[smith.index(fuzz_values.len)];
+    const env = try a.alloc(Pair, smith.valueRangeAtMost(u8, 0, 2));
+    for (env) |*pair| pair.* = .{
+        .key = fuzz_env_names[smith.index(fuzz_env_names.len)],
+        .value = fuzz_values[smith.index(fuzz_values.len)],
+    };
+    return .{ .stdio = .{ .command = fuzz_commands[smith.index(fuzz_commands.len)], .args = args, .env = env } };
+}
+
+/// Whether the reader's own entry points load `name` from `text`, as they do
+/// when fx starts. A server held back only for a variable that isn't set counts
+/// as loaded: the reader says why in a note, and `add` saves such a server.
+fn readerLoads(a: Allocator, file: File, text: []const u8, name: []const u8) !bool {
+    var environment = std.process.Environ.Map.init(a);
+    switch (file) {
+        .profile => {
+            var diagnostics: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty;
+            var configs = project_config.parseProfileServers(a, text, &diagnostics) catch return false;
+            try project_config.expandProfileConfigs(a, &configs, &diagnostics, &environment);
+            return loadedOrHeld(configs.items, diagnostics.items, name);
+        },
+        .project => {
+            var approved = [_][]u8{@constCast(name)};
+            const result = try project_config.parseWorkspaceJsonWithEnvironment(a, text, .workspace, .{ .approved = &approved }, &environment);
+            return loadedOrHeld(result.configs.items, result.diagnostics.items, name);
+        },
+    }
+}
+
+/// `configs` are the reader's servers and `diagnostics` its notes.
+fn loadedOrHeld(configs: anytype, diagnostics: []const project_config.WorkspaceDiagnostic, name: []const u8) bool {
+    for (configs) |c| if (std.mem.eql(u8, c.name, name)) return true;
+    for (diagnostics) |d| {
+        const named = if (d.server_name) |n| std.mem.eql(u8, n, name) else false;
+        if (named and d.cause == .missing_environment_variable) return true;
+    }
+    return false;
+}
+
+fn fuzzAddReaderAgree(_: void, smith: *std.testing.Smith) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file: File = if (smith.value(bool)) .profile else .project;
+    const name = fuzz_names[smith.index(fuzz_names.len)];
+    const before = try fuzzBefore(a, smith);
+    const entry = try fuzzEntry(a, smith);
+    // A file add refuses on its own (not JSON, both keys, a name that is there) has nothing to check.
+    const after = add(a, file, before, name, entry) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    // Whatever add writes is JSON, and it keeps what was there.
+    const written = try std.json.parseFromSliceLeaky(std.json.Value, a, after, .{});
+    try testing.expect(written == .object);
+    if (before) |text| {
+        const old = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+        var keys = old.object.iterator();
+        while (keys.next()) |key| try testing.expect(written.object.contains(key.key_ptr.*));
+    }
+
+    // The reader's check: a text it accepts is loaded by the reader's own entry points.
+    const refusal = try refusalOf(a, file, before, after, name);
+    if (refusal == null) {
+        try testing.expect(try readerLoads(a, file, after, name));
+        // No misspelled key is left for the next edit to find.
+        if (file == .profile) try testing.expect(try project_config.misspelledKey(a, after) == null);
+    }
+    // The load path's bounded scan never finds a misspelling the edit's complete scan misses.
+    if (before) |text| {
+        var bounded = project_config.parseProfileDocument(a, text) catch return;
+        defer bounded.deinit(a);
+        if (bounded.diagnostic) |d| {
+            if (d.cause == .suspicious_server_key) try testing.expect(try project_config.misspelledKey(a, text) != null);
+        }
+    }
+}
+
+test "an add the reader's check accepts is loaded by the reader's own entry points, for fuzzed entries and files" {
+    try std.testing.fuzz({}, fuzzAddReaderAgree, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+            "garbage!garbage!garbage!",
+        }) ++ @import("fuzz_corpus").mcp_add_reader_agree.*),
+    });
 }

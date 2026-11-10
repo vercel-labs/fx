@@ -24,6 +24,7 @@ test {
     _ = @import("core/tooling/toolbox.zig");
     _ = @import("core/mcp/tool_search.zig");
     _ = @import("core/output/diff.zig");
+    _ = @import("core/mcp_host/config_file.zig");
     _ = @import("core/mcp_host/credentials.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
     _ = @import("core/session/session_adapter.zig");

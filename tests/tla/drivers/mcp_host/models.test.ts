@@ -16,10 +16,10 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   save(join(artifacts, "gate-summary.json"), results.map(({ module, label, kind, verdict, expected, distinct, exit }) => ({ module, label, kind, verdict, expected, distinct, exit })));
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
-  // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget and
-  // RefreshLease joined the four.
-  expect(count("smoke", "PASS")).toBe(10);
-  expect(count("stress", "PASS")).toBe(10);
+  // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget,
+  // RefreshLease and ConfigEdit joined the four.
+  expect(count("smoke", "PASS")).toBe(11);
+  expect(count("stress", "PASS")).toBe(11);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
@@ -31,7 +31,11 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // it ended the call at the -32042 error. HostLifecycle's AtMostOneOwner
   // became the code once a reload kept its host: its smoke and stress
   // configs check it.
-  expect(count("finding", "FINDING")).toBe(2);
+  // ConfigEdit's four are the code before the reader check (a save the reader
+  // skips, a profile rewritten under a misspelled key) and the two designs
+  // ruled out for the check: fx's bounded load scan, and a dry run outside
+  // the lock.
+  expect(count("finding", "FINDING")).toBe(6);
   expect(count("repair", "PASS")).toBe(1);
 }, 1_800_000);
 
@@ -129,6 +133,22 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "run", data: { cmd: "signin" } }, { event: "observe", data: { v2kind: "v2", v2: true, v3: false } },
     ],
     badAt: 2,
+  },
+  {
+    name: "config edit", module: "ConfigEdit",
+    constants: { ObsNames: ["a"], ObsClasses: ["ok", "bad", "auth"], ObsChecked: true, ObsKeyScan: "complete", ObsGuardRemove: true, ObsAtomic: true },
+    good: [
+      { event: "init", data: { profile: { st: "ok", typo: false, both: false, big: false, ent: { a: "none" } }, project: { st: "absent", typo: false, both: false, big: false, ent: { a: "none" } } } },
+      { event: "add", data: { file: "profile", name: "a", class: "bad", outcome: "refused", same: true } },
+      { event: "add", data: { file: "profile", name: "a", class: "ok", outcome: "added", same: false } },
+      { event: "list", data: { file: "profile", loaded: ["a"] } },
+    ],
+    // An add of an entry the reader skips that says "Added": the model refuses it.
+    bad: [
+      { event: "init", data: { profile: { st: "ok", typo: false, both: false, big: false, ent: { a: "none" } }, project: { st: "absent", typo: false, both: false, big: false, ent: { a: "none" } } } },
+      { event: "add", data: { file: "profile", name: "a", class: "bad", outcome: "added", same: false } },
+    ],
+    badAt: 1,
   },
 ];
 
