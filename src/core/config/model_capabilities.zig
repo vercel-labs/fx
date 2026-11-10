@@ -5,7 +5,7 @@ const image_route = @import("../images/image_route.zig");
 
 /// The provider syntax for the cache markers on messages flagged with
 /// `ChatMessage.cache_breakpoint`.
-pub const CacheMarkers = enum { none, anthropic, openai };
+pub const CacheMarkers = enum { none, anthropic, openai, bedrock };
 
 pub const ResolvedProviderOptions = struct {
     reasoning: ?types.ReasoningEffort = null,

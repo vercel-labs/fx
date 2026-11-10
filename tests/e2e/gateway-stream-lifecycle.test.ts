@@ -2081,6 +2081,47 @@ describe("gateway stream lifecycle", () => {
     }
   }, 60_000);
 
+  test("fx ask marks the stable instructions with Bedrock cache points for Amazon Nova only", async () => {
+    const root = createFixtureRoot("nova-cache-points");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => fakeGatewayFinalText("NOVA_CACHE_POINT_COMPLETE"));
+
+    try {
+      const bodies: Record<string, string> = {};
+      for (const model of ["amazon/nova-pro", "google/gemini-3-flash"]) {
+        const result = await runFx(["ask", "--json", "--no-save", "Say done."], {
+          cwd: root.workspace,
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_MODEL: model },
+          timeoutMs: 30_000,
+        });
+        expect(result.code).toBe(0);
+        bodies[model] = gateway.requests.at(-1)!.body;
+      }
+      expect(gateway.requests).toHaveLength(2);
+
+      const nova = JSON.parse(bodies["amazon/nova-pro"]!);
+      expect(nova.providerOptions.gateway.caching).toBe("auto");
+      const marked = nova.prompt.filter(
+        (message: { providerOptions?: { bedrock?: { cachePoint?: { type?: string } } } }) =>
+          message.providerOptions?.bedrock?.cachePoint?.type === "default",
+      );
+      // The stable instructions end in one or two marked system messages,
+      // within Nova's limit of four cache points.
+      expect(marked.length).toBeGreaterThanOrEqual(1);
+      expect(marked.length).toBeLessThanOrEqual(4);
+      expect(marked.every((message: { role: string }) => message.role === "system")).toBe(true);
+      expect(bodies["amazon/nova-pro"]).not.toContain("cacheControl");
+      expect(bodies["amazon/nova-pro"]).not.toContain("promptCacheBreakpoint");
+
+      // A model outside the Nova list gets the Gateway's automatic caching and no cache point.
+      expect(JSON.parse(bodies["google/gemini-3-flash"]!).providerOptions.gateway.caching).toBe("auto");
+      expect(bodies["google/gemini-3-flash"]).not.toContain("cachePoint");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("source context limits reach ask with workspace precedence, complete skill blocking, and CLI off", async () => {
     const root = createFixtureRoot("source-context-limits-ask");
     writeContextLimitFixture(root);
