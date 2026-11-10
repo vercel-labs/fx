@@ -240,16 +240,16 @@ pub fn composeAgentsMenuRow(
 }
 
 const hint_variants = [_][]const u8{
-    "↑↓ preview     enter switch     esc back",
-    "↑↓ preview  enter switch  esc back",
-    "↑↓ preview  enter  esc",
+    "↑↓ move     enter switch     esc back",
+    "↑↓ move  enter switch  esc back",
+    "↑↓ move  enter  esc",
     "enter switch  esc back",
 };
 
 const closable_hint_variants = [_][]const u8{
-    "↑↓ preview     enter switch     delete close     esc back",
-    "↑↓ preview  enter switch  delete close  esc back",
-    "↑↓ preview  enter  delete close  esc",
+    "↑↓ move     enter switch     delete close     esc back",
+    "↑↓ move  enter switch  delete close  esc back",
+    "↑↓ move  enter  delete close  esc",
     "enter switch  esc back",
 };
 

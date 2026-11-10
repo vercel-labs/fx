@@ -55,14 +55,27 @@ function agentRows(paneEscapes: string): Array<{ name: string; selected: boolean
 }
 
 // Shows `agent`, "main" or a subagent's name, through the agent list: Ctrl+X
-// opens it whatever the composer holds, each arrow shows the next row, and
-// Enter keeps it. Main's row comes first, then its working subagents, then
+// opens it whatever the composer holds, each arrow moves the highlight a row,
+// and Enter shows the highlighted agent. Main's row comes first, then its working subagents, then
 // the rest by their latest reply. Those rows can move while the list is
 // open, so each step reads the rows again instead of counting them.
 async function showAgent(session: TmuxSession, agent: string) {
   await selectAgent(session, agent);
   await session.sendKeys("Enter");
   await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+}
+
+// Waits until the open agent list highlights `agent`'s row, and returns the
+// pane then.
+async function waitForSelectedRow(session: TmuxSession, agent: string, timeoutMs = 10_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const escapes = await session.capturePaneEscapes();
+    const rows = agentRows(escapes);
+    if (rows.find((row) => row.selected)?.name === agent) return escapes.replace(/\x1b\[[0-9;]*m/g, "");
+    if (Date.now() > deadline) throw new Error(`the agent list never highlighted ${agent}: ${JSON.stringify(rows)}`);
+    await Bun.sleep(25);
+  }
 }
 
 // Opens the agent list and moves its highlight to `agent`'s row.
@@ -1288,6 +1301,61 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "an idle agent waits only on its own subagents: main shows no wait row for lead's helper, and lead's screen does",
+    async () => {
+      const helper = held();
+      let helperAsked = false;
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            if (userTexts(body).some((text) => text.includes("WAIT_HELPER_TASK"))) {
+              helperAsked = true;
+              await helper.promise;
+              return text("helper", "WAIT_HELPER_DONE");
+            }
+            if (body.includes("WAIT_HELPER_DONE")) return text("lead_after", "WAIT_LEAD_SAW_HELPER");
+            if (!body.includes('"lead_sub"')) {
+              return toolCall("lead_sub", "subagent", {
+                request: { action: "message", agent: "helper", message: "WAIT_HELPER_TASK" },
+              });
+            }
+            return text("lead_started", "WAIT_LEAD_STARTED");
+          }
+          if (body.includes("WAIT_LEAD_SAW_HELPER")) return text("main_after", "WAIT_MAIN_SAW_LEAD_AFTER");
+          if (body.includes("WAIT_LEAD_STARTED")) return text("main_idle", "WAIT_MAIN_IDLE");
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", {
+              request: { action: "message", agent: "lead", message: "WAIT_LEAD_TASK" },
+            });
+          }
+          return text("main_done", "WAIT_MAIN_DONE");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER");
+          // Lead's turn has ended and main has read its report, so neither
+          // works; only lead's helper does, held until the checks are done.
+          await session.waitForText("WAIT_MAIN_IDLE", 30_000);
+          await until("the helper's request", () => helperAsked);
+          // Main waits on nothing of its own. The footer note and the wait
+          // row come from the same frame, so a frame that counts the helper
+          // working without the row shows main's count is 0.
+          const mainScreen = await session.waitForPane((pane) => pane.includes("1 subagent working") && !pane.includes("waiting on"), 15_000);
+          expect(mainScreen).not.toContain("waiting on");
+          // Lead, the helper's parent, waits on it.
+          await showAgent(session, "lead");
+          await session.waitForPane((pane) => /\u2022 waiting on 1 subagent \(\d+s\) \u00b7 \u2193 to view/.test(pane), 15_000);
+          helper.release();
+          // The helper's report wakes lead, and lead's row goes once
+          // nothing it started still works.
+          await session.waitForPane((pane) => pane.includes("WAIT_LEAD_SAW_HELPER") && !pane.includes("waiting on"), 30_000);
+        });
+      } finally {
+        helper.release();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "main's stop ends a turn typed on a subagent's screen, which then owes no report",
     async () => {
       const typed = held();
@@ -1747,7 +1815,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "down on an empty composer opens the agent list, which previews, and Esc goes back",
+    "down on an empty composer opens the agent list, whose arrows move only the highlight, and Enter shows the highlighted agent",
     async () => {
       await withReviewer(async (session) => {
         // The indicator on the right names main and the key that opens the list.
@@ -1768,24 +1836,37 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(list).toContain("Agents 2");
         expectRowOrder(list, mainRow(), subagentRow("reviewer"));
 
-        // Down again shows the subagent above the list, and the list stays.
+        // Down again moves the highlight to the subagent's row. Main stays on
+        // screen above the list until Enter.
         await session.sendKeys("Down");
-        const preview = await session.waitForPane((pane) => pane.includes("EDGE_CHILD_ANSWER") && pane.includes(LIST_HINT), 10_000);
-        expect(preview).not.toContain("EDGE_MAIN_FINAL");
+        // Only the subagent's own screen shows its task as a prompt; main's
+        // shows it in the tool call that sent it.
+        const moved = await waitForSelectedRow(session, "reviewer");
+        expect(moved).toContain(LIST_HINT);
+        expect(moved).toContain("EDGE_MAIN_FINAL");
+        expect(moved).not.toContain("\u2503 EDGE_TASK");
+        await session.sendKeys("Up");
+        await waitForSelectedRow(session, "main");
+        await session.sendKeys("Down");
+        await waitForSelectedRow(session, "reviewer");
 
-        // Esc goes back to main.
+        // Esc closes the list, and main is still the agent on screen.
         await session.sendKeys("Escape");
         const back = await session.waitForPane((pane) => pane.includes("EDGE_MAIN_FINAL") && !pane.includes(LIST_HINT), 10_000);
         expect(back).toContain("main \u2193");
+        expect(back).not.toContain("\u2503 EDGE_TASK");
 
-        // Enter keeps the agent shown.
+        // Enter shows the highlighted agent.
         await session.sendKeys("Down");
         await session.waitForText(LIST_HINT, 10_000);
         await session.sendKeys("Down");
-        await session.waitForText("EDGE_CHILD_ANSWER", 10_000);
+        await waitForSelectedRow(session, "reviewer");
+        expect(await session.capturePane()).not.toContain("\u2503 EDGE_TASK");
         await session.sendKeys("Enter");
         const kept = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("reviewer \u00b7 done \u2193"), 10_000);
         expect(kept).toContain("EDGE_CHILD_ANSWER");
+        expect(kept).toContain("\u2503 EDGE_TASK");
+        expect(kept).not.toContain("EDGE_MAIN_FINAL");
       });
     },
     TIMEOUT,
@@ -1806,8 +1887,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendLiteral("q");
         await session.sendKeys("BSpace");
         await session.sendKeys("Down");
-        const preview = await session.waitForPane((pane) => pane.includes("EDGE_CHILD_ANSWER"), 10_000);
-        expect(preview).not.toContain("EDGE_KEEP_ME");
+        const moved = await waitForSelectedRow(session, "reviewer");
+        expect(moved).toContain("EDGE_MAIN_FINAL");
+        expect(moved).not.toContain("\u2503 EDGE_TASK");
         await session.sendKeys("Enter");
 
         // The subagent's composer is its own and empty.
@@ -1842,8 +1924,18 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendText("SWITCH_USER plan it");
         await session.waitForText("LIST_MAIN_WAITING", 30_000);
         await until("the reviewer's turn", () => childCalls >= 1);
-        // Main shows that work goes on elsewhere, beside the list's key.
-        await session.waitForText("1 subagent working \u00b7 main \u2193", 15_000);
+        // Idle main says it waits on its subagent above the composer, with
+        // a running clock and the list's key, and the footer still counts
+        // the subagents working beside the list's key.
+        const waitRow = /\u2022 waiting on 1 subagent \((\d+)s\) \u00b7 \u2193 to view/;
+        const waiting = await session.waitForPane((pane) => waitRow.test(pane) && pane.includes("1 subagent working \u00b7 main \u2193"), 15_000);
+        expect(waiting).toContain("1 subagent working \u00b7 main \u2193");
+        // The clock advances, and the bullet blinks: it turns into a space
+        // and back.
+        const firstSeconds = Number(waitRow.exec(waiting)![1]);
+        await session.waitForPane((pane) => Number(waitRow.exec(pane)?.[1] ?? firstSeconds) > firstSeconds, 5_000);
+        await session.waitForPane((pane) => /^\s*waiting on 1 subagent \(\d+s\) \u00b7 \u2193 to view/m.test(pane), 5_000);
+        await session.waitForPane((pane) => waitRow.test(pane), 5_000);
         await session.sendKeys("Down");
         // The reviewer's title is the title model's, from its task, as main's is.
         const list = await session.waitForPane((pane) => /^ {2}\u2514 reviewer {2,}Review the parser {2,}working {2,}main {2,}\S/m.test(pane), 15_000);
@@ -1851,11 +1943,11 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(list).toContain("Agents 2");
         // Main's row stays first and selected, above a working child.
         expectRowOrder(list, mainRow(), subagentRow("reviewer"));
-        expect(list).toContain("\u2191\u2193 preview     enter switch     esc back");
+        expect(list).toContain("\u2191\u2193 move     enter switch     esc back");
         expect(list).not.toContain("delete close");
         await session.sendKeys("Escape");
         reviewer.release();
-        await session.waitForPane((pane) => !pane.includes("subagent working"), 30_000);
+        await session.waitForPane((pane) => !pane.includes("subagent working") && !pane.includes("waiting on 1 subagent"), 30_000);
       }, () => {}, false, {}, subagentTitles);
     },
     TIMEOUT,
@@ -1956,7 +2048,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           await session.sendText("SWITCH_USER start both workers");
           await session.waitForText("ORDER_MAIN_IDLE", 30_000);
           await until("both workers' requests", () => started.reviewer && started.tester);
-          await session.waitForText("2 subagents working", 15_000);
+          await session.waitForPane((pane) => /\u2022 waiting on 2 subagents \(\d+s\) \u00b7 \u2193 to view/.test(pane), 15_000);
           await session.sendKeys("Down");
           const initial = await session.waitForPane((pane) =>
             subagentRow("reviewer", "working").test(pane)
@@ -1966,30 +2058,37 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           // started in under it.
           expectRowOrder(initial, mainRow(), subagentRow("reviewer"), subagentRow("tester"));
           await session.sendKeys("Down");
-          await session.waitForText("ORDER_REVIEW_TASK check the parser", 10_000);
+          await waitForSelectedRow(session, "reviewer");
           await session.sendKeys("Down");
-          const preview = await session.waitForText("ORDER_TEST_TASK check the tests", 10_000);
-          expect(preview).toContain("ORDER_TEST_TASK check the tests");
-          expect(preview).toContain("enter switch     delete close     esc back");
+          const moved = await waitForSelectedRow(session, "tester");
+          expect(moved).toContain("enter switch     delete close     esc back");
+          // Main stays on screen while the highlight moves.
+          expect(moved).toContain("ORDER_MAIN_IDLE");
 
           gates.reviewer.release();
           const reordered = await session.waitForPane((pane) =>
-            pane.includes("ORDER_TEST_TASK check the tests")
-            && subagentRow("tester", "working").test(pane)
+            subagentRow("tester", "working").test(pane)
             && subagentRow("reviewer").test(pane)
             && !subagentRow("reviewer", "working").test(pane)
             && mainRow("(?:idle|finished)").test(pane), 30_000);
-          // The worker moves above the subagent that finished.
+          // The worker moves above the subagent that finished, and the
+          // highlight moves with it.
           expectRowOrder(reordered, mainRow(), subagentRow("tester"), subagentRow("reviewer"));
+          await waitForSelectedRow(session, "tester");
+          expect(await session.capturePane()).toContain("ORDER_MAIN_IDLE");
           gates.tester.release();
-          const idle = await session.waitForPane((pane) => pane.includes("ORDER_TESTER_DONE")
-            && subagentRow("tester").test(pane) && subagentRow("reviewer").test(pane)
+          const idle = await session.waitForPane((pane) =>
+            subagentRow("tester").test(pane) && subagentRow("reviewer").test(pane)
             && mainRow("idle").test(pane)
             && pane.includes(LIST_HINT) && !subagentRow("\\S+", "working").test(pane), 30_000);
           // Reports are disabled, so tester has the newest reply of the two.
           expectRowOrder(idle, mainRow(), subagentRow("tester"), subagentRow("reviewer"));
+          await waitForSelectedRow(session, "tester");
+          expect(idle).toContain("ORDER_MAIN_IDLE");
+          // Enter switches, so the screen clears and reprints tester's
+          // conversation; wait for tester's footer, not only for the list to go.
           await session.sendKeys("Enter");
-          const kept = await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+          const kept = await session.waitForPane((pane) => !pane.includes("esc back") && pane.includes("tester \u00b7 done \u2193"), 10_000);
           expect(kept).toContain("ORDER_TESTER_DONE");
           expect(kept).toContain("tester \u00b7 done \u2193");
           expect(kept).not.toContain("ORDER_MAIN_IDLE");
@@ -2018,6 +2117,14 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
             && subagentRow("tester").test(pane) && subagentRow("reviewer").test(pane), 15_000);
           expectRowOrder(restored, mainRow(), subagentRow("tester"), subagentRow("reviewer"));
           expect(restored).not.toContain("delete close");
+          // Moving onto a saved subagent's row loads nothing onto the screen:
+          // main's conversation stays until Enter.
+          await resumed.sendKeys("Down");
+          const onTester = await waitForSelectedRow(resumed, "tester");
+          expect(onTester).toContain("ORDER_MAIN_NEWEST");
+          expect(onTester).not.toContain("\u2503 ORDER_TEST_TASK");
+          await resumed.sendKeys("Up");
+          await waitForSelectedRow(resumed, "main");
           await resumed.sendKeys("Enter");
           await resumed.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
           expect(await resumed.capturePane()).toContain("ORDER_MAIN_NEWEST");
@@ -2149,7 +2256,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "closing the middle row of the agent list keeps the highlight on the agent shown, and the first Delete warns at once",
+    "closing the highlighted middle row of the agent list moves the highlight to the agent on screen, and the first Delete warns at once",
     async () => {
       let reviewerReported = false;
       await withFx(async (body) => {
@@ -2193,16 +2300,70 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendLiteral("\x1b[127u");
         await session.waitForText("press delete again to close this subagent", 10_000);
         await session.sendLiteral("\x1b[127;1u");
-        // Main is shown, and the highlight is on its row, not on reviewer's.
+        // Main is on screen, so the highlight moves to its row, not to
+        // reviewer's, which took the closed row's place.
         const closed = await session.waitForPane((pane) => !subagentRow("tester").test(pane) && pane.includes("esc back"), 15_000);
         expect(closed).toMatch(subagentRow("reviewer"));
-        expect(closed).toContain("\u2191\u2193 preview     enter switch     esc back");
+        expect(closed).toContain("\u2191\u2193 move     enter switch     esc back");
+        await waitForSelectedRow(session, "main");
         expect(closed).not.toContain("delete close");
         expect(await session.captureFullScrollback()).not.toContain("for good");
         await session.sendKeys("Enter");
         const kept = await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
         expect(kept).toContain("MIDDLE_MAIN_DONE");
         expect(kept).toContain("main \u2193");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main closing the highlighted subagent moves the highlight to main, and a paste closes the list into main's composer",
+    async () => {
+      const closeNow = held();
+      let mainCalls = 0;
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) return text("child_done", "EDGE_CHILD_DONE");
+        mainCalls += 1;
+        if (mainCalls === 1) {
+          return toolCall("main_r", "subagent", { request: { action: "message", agent: "reviewer", message: "EDGE_REVIEW_TASK", report: "never" } });
+        }
+        if (mainCalls === 2) {
+          return toolCall("main_t", "subagent", { request: { action: "message", agent: "tester", message: "EDGE_TEST_TASK", report: "never" } });
+        }
+        if (mainCalls === 3) {
+          // Main's turn waits here, with the list open on tester's row.
+          await closeNow.promise;
+          return toolCall("main_close", "subagent", { request: { action: "close", agent: "tester" } });
+        }
+        return text("main_done", "EDGE_CLOSE_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER start them, then close tester");
+        await until("main's turn that closes tester", () => mainCalls >= 3);
+        await session.waitForPane((pane) => pane.includes("sent to tester"), 15_000);
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        const rows = agentRows(await session.capturePaneEscapes()).map((row) => row.name);
+        expect(rows).toEqual(expect.arrayContaining(["main", "reviewer", "tester"]));
+        for (let step = 0; step < rows.indexOf("tester"); step += 1) await session.sendKeys("Down");
+        await waitForSelectedRow(session, "tester");
+        closeNow.release();
+        // Tester's row goes. Main is on screen, so the highlight moves to its
+        // row, not to the row that takes tester's place, and the list stays.
+        await session.waitForPane((pane) => !subagentRow("tester").test(pane) && pane.includes(LIST_HINT), 30_000);
+        const after = await waitForSelectedRow(session, "main");
+        expect(after).toMatch(subagentRow("reviewer"));
+        await session.waitForText("EDGE_CLOSE_DONE", 30_000);
+
+        // A paste with the highlight on reviewer's row closes the list, keeps
+        // main on screen, and lands in main's composer.
+        await session.sendKeys("Down");
+        await waitForSelectedRow(session, "reviewer");
+        await session.pasteText("EDGE_PASTED");
+        const pasted = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("\u2503 EDGE_PASTED"), 10_000);
+        expect(pasted).toContain("main \u00b7 ctrl+x");
+        expect(pasted).toContain("EDGE_CLOSE_DONE");
+        expect(pasted).not.toContain("\u2503 EDGE_REVIEW_TASK");
       });
     },
     TIMEOUT,
