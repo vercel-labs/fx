@@ -1239,14 +1239,15 @@ pub fn Runtime(comptime App: type) type {
             return changed;
         }
 
-        /// The footer note for hidden subagents with a turn going or queued,
-        /// such as "1 subagent working", so the agent on screen shows that
-        /// work goes on elsewhere; empty when none is.
+        /// The footer note for hidden subagents that work, such as "1
+        /// subagent working", so the agent on screen shows that work goes on
+        /// elsewhere; empty when none does. One that waits for the user is
+        /// in the waiting note, or on screen, instead.
         pub fn workingNote(app: *App, buf: []u8) []const u8 {
             var count: usize = 0;
             for (app.child_agents.items) |child| {
                 if (child.agent.role != .subagent or child == app.agent_on_screen) continue;
-                if (turnInFlight(&child.agent)) count += 1;
+                if (stateOf(app, child) == .working) count += 1;
             }
             if (count == 0) return "";
             return std.mem.print(buf, "{d} subagent{s} working", .{ count, if (count == 1) "" else "s" }) catch "";
