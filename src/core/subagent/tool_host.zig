@@ -17,6 +17,7 @@ const model_contract = @import("model_contract.zig");
 const start_test_controls = @import("start_test_controls.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const execution_memory = @import("../agent/execution_memory.zig");
 const io_mod = @import("../shared/io.zig");
 const profiles = @import("../profiles/profiles.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
@@ -1107,14 +1108,17 @@ pub const Runtime = struct {
         // Work that ended early says what it already changed, so its parent
         // neither redoes it nor misses it. The list is extra: without it the
         // report still goes.
-        const changed = (self.changedFiles(a, end.child_id, end.work_id) catch null) orelse return output;
+        const changed = (self.changedFiles(a, end.child_id, end.work_id) catch |err| unread: {
+            debug_trace.eventf("mailbox", "report_files_unavailable", .{}, "child={s} work_id={s} err={s}", .{ end.child_id, end.work_id, @errorName(err) });
+            break :unread null;
+        }) orelse return output;
         return a.print("{s}\n\nFiles it changed before it ended: {s}", .{ output, changed });
     }
 
     /// The files work `work_id` changed, from its saved turn
     /// (`listChangedFiles`).
     fn changedFiles(self: *Runtime, a: Allocator, child_id: []const u8, work_id: []const u8) !?[]const u8 {
-        const history = self.children.parent.store.childHistory(a, child_id) catch return null;
+        const history = try self.children.parent.store.childHistory(a, child_id);
         return listChangedFiles(a, switch (turnForWork(history, work_id) orelse return null) {
             .assistant => |value| value.execution.files,
             .interrupted => |value| value.execution.files,
@@ -2919,27 +2923,24 @@ test "the user's close tells main how many of its messages waiting for the subag
     try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
 }
 
-test "an early-ended work names each file it changed once, without reads or failed changes, up to the cap" {
+test "an early-ended work names each file it changed once, without reads or failed changes" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const file = struct {
-        fn make(path: []const u8, new_path: ?[]const u8, action: types.FileEvidenceAction, status: types.PersistedToolStatus) types.FileEvidence {
-            return .{ .path = @constCast(path), .new_path = if (new_path) |value| @constCast(value) else null, .tool_call_id = @constCast("call"), .tool_name = @constCast("edit_file"), .action = action, .status = status };
+        fn make(path: []const u8, action: types.FileEvidenceAction, status: types.PersistedToolStatus) types.FileEvidence {
+            return .{ .path = @constCast(path), .tool_call_id = @constCast("call"), .tool_name = @constCast("edit_file"), .action = action, .status = status };
         }
     }.make;
-    try std.testing.expect((try listChangedFiles(a, &.{file("a.zig", null, .read, .success)})) == null);
+    try std.testing.expect((try listChangedFiles(a, &.{file("a.zig", .read, .success)})) == null);
     const listed = (try listChangedFiles(a, &.{
-        file("a.zig", null, .read, .success),
-        file("b.zig", null, .edit, .success),
-        file("c.zig", null, .write, .failure),
-        file("b.zig", null, .write, .success),
-        file("old.zig", "new.zig", .rename, .success),
+        file("a.zig", .read, .success),
+        file("b.zig", .edit, .success),
+        file("c.zig", .write, .failure),
+        file("b.zig", .write, .success),
+        file("d.zig", .write, .success),
     })).?;
-    try std.testing.expectEqualStrings("b.zig, new.zig", listed);
-    var many: [max_listed_files + 2]types.FileEvidence = undefined;
-    for (&many, 0..) |*entry, index| entry.* = file(try a.print("f{d}", .{index}), null, .write, .success);
-    try std.testing.expect(std.mem.endsWith(u8, (try listChangedFiles(a, &many)).?, "f19, and 2 more"));
+    try std.testing.expectEqualStrings("b.zig, d.zig", listed);
 }
 
 test "an idle subagent closes at once, and its name then starts a new one" {
@@ -3591,30 +3592,19 @@ fn turnForWork(history: []const types.HistoryTurn, work_id: []const u8) ?types.H
     return null;
 }
 
-/// The files `files` changed, each path once, as one list of the first
-/// `max_listed_files`; null when none. Reads and failed changes don't count.
+/// The files `files` changed, each path once, as one list; null when none.
+/// Only the file tools record changes, so a shell command's are not in it.
 fn listChangedFiles(a: Allocator, files: []const types.FileEvidence) !?[]const u8 {
     var paths: std.ArrayList([]const u8) = .empty;
     for (files) |file| {
-        if (file.status != .success) continue;
-        switch (file.action) {
-            .write, .edit, .delete, .rename, .copy => {},
-            .read, .search, .list, .unknown => continue,
-        }
-        const path = file.new_path orelse file.path;
+        if (file.status != .success or !execution_memory.isMutationFileAction(file.action)) continue;
         for (paths.items) |known| {
-            if (std.mem.eql(u8, known, path)) break;
-        } else try paths.append(a, path);
+            if (std.mem.eql(u8, known, file.path)) break;
+        } else try paths.append(a, file.path);
     }
     if (paths.items.len == 0) return null;
-    const shown = paths.items[0..@min(paths.items.len, max_listed_files)];
-    const list = try std.mem.join(a, ", ", shown);
-    if (shown.len == paths.items.len) return list;
-    return try a.print("{s}, and {d} more", .{ list, paths.items.len - shown.len });
+    return try std.mem.join(a, ", ", paths.items);
 }
-
-/// How many changed files a report of early-ended work names.
-const max_listed_files = 20;
 
 /// Builds the parent-facing guidance for a rejected model override.
 fn modelOverrideFailureMessage(
