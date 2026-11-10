@@ -10,6 +10,7 @@
 //! outside the repository, so it cannot read the user's other files.
 
 const std = @import("std");
+const toolbox = @import("../tooling/toolbox.zig");
 const types = @import("../shared/types.zig");
 const io_mod = @import("../shared/io.zig");
 const pathing = @import("../workspace/pathing.zig");
@@ -242,10 +243,34 @@ pub fn parse(
 
 /// Whether `profile` lets an agent use `tool`. `*` covers every tool,
 /// `subagent` included, for main and subagents alike. A profile that sets
-/// no tools allows every one, leaving its parent's in place.
-pub fn allowsTool(profile: *const Profile, tool: []const u8) bool {
+/// no tools allows every one, leaving its parent's in place. `behind` names
+/// the built-in tools the agent's run offers through toolbox.
+pub fn allowsTool(profile: *const Profile, tool: []const u8, behind: []const []const u8) bool {
     const tools = profile.tools orelse return true;
-    return listAllows(tools, tool, false);
+    if (listAllows(tools, tool, false)) return true;
+    // A profile written for the tools toolbox replaces keeps what they gave:
+    // toolbox reaches its skills and MCP tools now. One that lists a tool
+    // the run keeps behind toolbox reaches it there. What toolbox runs is
+    // still decided against the profile, call by call.
+    if (std.mem.eql(u8, tool, toolbox.tool_name)) {
+        // Leaving toolbox out by name leaves it out, whatever else is kept.
+        if (listDenies(tools, toolbox.tool_name)) return false;
+        for (toolbox.replaced) |name| if (listAllows(tools, name, false)) return true;
+        for (behind) |name| if (listAllows(tools, name, false)) return true;
+    }
+    // Opening a skill, opening an MCP tool, and searching are each named for
+    // the tool they replaced; a profile that lists toolbox itself allows all
+    // three, apart from one it leaves out by name.
+    if (toolbox.isReplaced(tool)) return !listDenies(tools, tool) and listAllows(tools, toolbox.tool_name, false);
+    return false;
+}
+
+/// Whether `entries` leaves `name` out with a `!name` entry.
+fn listDenies(entries: []const []const u8, name: []const u8) bool {
+    for (entries) |entry| {
+        if (entry.len > 1 and entry[0] == '!' and std.mem.eql(u8, entry[1..], name)) return true;
+    }
+    return false;
 }
 
 pub fn allowsMcpServer(profile: *const Profile, server: []const u8) bool {
@@ -589,8 +614,8 @@ test "a profile's settings, tools, and prompt parse from profile.json and prompt
     try testing.expect(profile.effort.?.eql(types.ReasoningEffort.literal("high")));
     try testing.expectEqual(types.PermissionMode.ask, profile.permission_mode.?);
     try testing.expectEqual(PromptMode.replace, profile.prompt_mode);
-    try testing.expect(allowsTool(&profile, "read_file"));
-    try testing.expect(!allowsTool(&profile, "write_file"));
+    try testing.expect(allowsTool(&profile, "read_file", &toolbox.default_behind));
+    try testing.expect(!allowsTool(&profile, "write_file", &toolbox.default_behind));
     try testing.expect(allowsMcpServer(&profile, "github"));
     try testing.expect(!allowsMcpServer(&profile, "slack"));
     try testing.expectEqual(@as(usize, 0), profile.ignored.len);
@@ -647,10 +672,10 @@ test "a profile without a description, with bad JSON, or with a bad value is ref
 test "fx's main and agent profiles decide nothing, so an agent in either copies its parent" {
     const main = builtin(main_name).?;
     const agent = builtin(agent_name).?;
-    try testing.expect(allowsTool(&main, "subagent"));
-    try testing.expect(allowsTool(&main, "write_file"));
-    try testing.expect(allowsTool(&agent, "subagent"));
-    try testing.expect(allowsTool(&agent, "write_file"));
+    try testing.expect(allowsTool(&main, "subagent", &toolbox.default_behind));
+    try testing.expect(allowsTool(&main, "write_file", &toolbox.default_behind));
+    try testing.expect(allowsTool(&agent, "subagent", &toolbox.default_behind));
+    try testing.expect(allowsTool(&agent, "write_file", &toolbox.default_behind));
     try testing.expect(!setsTools(&main) and !setsTools(&agent));
     try testing.expect(!setsMcpServers(&main) and !setsMcpServers(&agent));
     try testing.expect(main.permission_mode == null and agent.permission_mode == null);
@@ -663,24 +688,78 @@ test "a profile's * covers every tool, subagent included, and only !subagent lea
     const all = try testParse(arena_state.allocator(), .home,
         \\{"description": "All", "tools": ["*", "!shell"]}
     , "");
-    try testing.expect(allowsTool(&all, "read_file"));
-    try testing.expect(!allowsTool(&all, "shell"));
-    try testing.expect(allowsTool(&all, "subagent"));
+    try testing.expect(allowsTool(&all, "read_file", &toolbox.default_behind));
+    try testing.expect(!allowsTool(&all, "shell", &toolbox.default_behind));
+    try testing.expect(allowsTool(&all, "subagent", &toolbox.default_behind));
     const leaf = try testParse(arena_state.allocator(), .home,
         \\{"description": "Leaf", "tools": ["*", "!subagent"]}
     , "");
-    try testing.expect(!allowsTool(&leaf, "subagent"));
-    try testing.expect(allowsTool(&leaf, "read_file"));
+    try testing.expect(!allowsTool(&leaf, "subagent", &toolbox.default_behind));
+    try testing.expect(allowsTool(&leaf, "read_file", &toolbox.default_behind));
     const none = try testParse(arena_state.allocator(), .home,
         \\{"description": "None", "tools": []}
     , "");
-    try testing.expect(!allowsTool(&none, "read_file"));
+    try testing.expect(!allowsTool(&none, "read_file", &toolbox.default_behind));
     try testing.expect(setsTools(&none));
     const unset = try testParse(arena_state.allocator(), .home,
         \\{"description": "Unset"}
     , "");
     try testing.expect(!setsTools(&unset) and !setsMcpServers(&unset));
-    try testing.expect(allowsTool(&unset, "shell"));
+    try testing.expect(allowsTool(&unset, "shell", &toolbox.default_behind));
+}
+
+test "a profile that lists a tool the run keeps behind toolbox keeps toolbox to reach it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const profile = try testParse(arena, .home,
+        \\{"description": "Finder", "tools": ["glob_files"]}
+    , "");
+    const moved = [_][]const u8{ "install_skill", "glob_files" };
+    // With glob_files placed behind toolbox, toolbox is its only way in.
+    try testing.expect(allowsTool(&profile, "toolbox", &moved));
+    try testing.expect(!allowsTool(&profile, "toolbox", &toolbox.default_behind));
+    try testing.expect(allowsTool(&profile, "glob_files", &moved));
+    // What toolbox opens and searches is still the profile's to give.
+    for (toolbox.replaced) |name| try testing.expect(!allowsTool(&profile, name, &moved));
+    // Leaving toolbox out by name leaves it out, with every tool kept.
+    const no_toolbox = try testParse(arena, .home,
+        \\{"description": "No toolbox", "tools": ["*", "!toolbox"]}
+    , "");
+    try testing.expect(!allowsTool(&no_toolbox, "toolbox", &moved));
+    try testing.expect(allowsTool(&no_toolbox, "glob_files", &moved));
+}
+
+test "a profile decides toolbox's open and search as the tools they replaced" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Written for the old tools: toolbox comes with what they gave, no more.
+    const old = try testParse(arena, .home,
+        \\{"description": "Old", "tools": ["read_file", "mcp_select_tool"]}
+    , "");
+    try testing.expect(allowsTool(&old, "toolbox", &toolbox.default_behind));
+    try testing.expect(allowsTool(&old, "mcp_select_tool", &toolbox.default_behind));
+    try testing.expect(!allowsTool(&old, "skill", &toolbox.default_behind));
+    try testing.expect(!allowsTool(&old, "capability_search", &toolbox.default_behind));
+    // Listing toolbox, or every tool, allows all three.
+    for ([_][]const u8{
+        \\{"description": "Box", "tools": ["toolbox"]}
+        ,
+        \\{"description": "All", "tools": ["*"]}
+        ,
+        \\{"description": "Unset"}
+    }) |json| {
+        const profile = try testParse(arena, .home, json, "");
+        for (toolbox.replaced) |name| try testing.expect(allowsTool(&profile, name, &toolbox.default_behind));
+    }
+    // A name left out stays out, even with toolbox allowed.
+    const no_skills = try testParse(arena, .home,
+        \\{"description": "No skills", "tools": ["*", "!skill"]}
+    , "");
+    try testing.expect(allowsTool(&no_skills, "toolbox", &toolbox.default_behind));
+    try testing.expect(!allowsTool(&no_skills, "skill", &toolbox.default_behind));
+    try testing.expect(allowsTool(&no_skills, "capability_search", &toolbox.default_behind));
 }
 
 test "a profile's prompt adds to fx's prompt, or replaces it when the profile says so" {
@@ -731,7 +810,7 @@ test "a name resolves from the user's profiles, then the repository's, then fx's
     try testing.expectEqual(Source.builtin, agent.source);
     const main = try load(arena, roots, "main", &failure);
     try testing.expectEqual(Source.builtin, main.source);
-    try testing.expect(allowsTool(&main, "read_file"));
+    try testing.expect(allowsTool(&main, "read_file", &toolbox.default_behind));
     try testing.expectError(error.InvalidProfile, load(arena, roots, "broken", &failure));
     try testing.expect(std.mem.find(u8, failure.?, "not valid JSON") != null);
     try testing.expectError(error.ProfileNotFound, load(arena, roots, "missing", &failure));

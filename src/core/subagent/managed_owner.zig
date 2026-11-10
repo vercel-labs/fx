@@ -11,6 +11,7 @@ const execution = @import("execution.zig");
 const live_metrics = @import("live_metrics.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const end_test_controls = @import("end_test_controls.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -73,6 +74,9 @@ pub const max_unread_feedback = 64;
 pub const FeedbackResult = union(enum) {
     receipt: types.SteeringDelivery,
     waiting,
+    /// A stop has ended the child's turn, which is still ending: the message
+    /// waits for the child's next turn.
+    stopping,
     unavailable,
     cancelled,
     conflict,
@@ -246,8 +250,16 @@ pub const Owner = struct {
             };
             return if (observation.phase == .running or observation.phase == .awaiting_approval) .unavailable else .waiting;
         };
-        if (slot.cancel.load(.seq_cst) or slot.shutdown.load(.seq_cst)) return .cancelled;
+        if (slot.shutdown.load(.seq_cst) or slot.closed_by_user) return .cancelled;
+        // A work that has ended takes the message as its next turn, whatever
+        // ended it.
         if (slot.completion != .running) return if (slot.completion == .published) .waiting else .unavailable;
+        // The parent's or the user's stop has answered, and the stopped turn
+        // reads no more messages: one sent now waits for the next turn
+        // (`tests/tla/subagent/StopMessage.tla` RefusedOnlyWhenClosing). A
+        // quit, the user's close, and any other cancel still refuse it.
+        if (slot.stopped_by_parent or slot.stopped_by_user) return .stopping;
+        if (slot.cancel.load(.seq_cst)) return .cancelled;
         const worker = slot.worker orelse return .waiting;
         if (!std.mem.eql(u8, slot.work_id orelse return .waiting, work_id)) return .waiting;
         // The limit is this child's unread messages at one moment. A read
@@ -458,19 +470,28 @@ pub const Owner = struct {
     }
 
     /// The parent's `stop`: ends the child's running turn, which owes no
-    /// report, since the stop call answers it. False when nothing runs.
-    pub fn stop(self: *Owner, child_id: []const u8) bool {
+    /// report, since the stop call answers it. Returns how many of the
+    /// parent's messages the turn leaves unread, which the stop drops, or
+    /// null when nothing runs (`tests/tla/subagent/StopMessage.tla`
+    /// NoSilentLoss).
+    pub fn stop(self: *Owner, child_id: []const u8) ?usize {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         for (self.slots.items) |slot| {
             if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
-            if (slot.completion != .running) return false;
+            if (slot.completion != .running) return null;
+            // A second stop of a turn still ending: the first counted its
+            // unread messages, which stay queued until the end drops them.
+            const counted = slot.stopped_by_parent;
             slot.stopped_by_parent = true;
             slot.cancel.store(true, .seq_cst);
             stopTurn(slot, .cancel);
-            return true;
+            if (counted) return 0;
+            // Counted after the cancel, so no step of the turn reads one of
+            // them any more (`StopMessage.tla` CountedNeverRead).
+            return if (slot.worker) |worker| worker.queuedParentSteering() else 0;
         }
-        return false;
+        return null;
     }
 
     pub fn cancel(self: *Owner, child_id: []const u8) CancelError!void {
@@ -733,6 +754,45 @@ test "child feedback counts each child's unread messages alone, and a close forg
     try std.testing.expect(owner.feedbackReplay("second-0", fingerprint) != null);
 }
 
+test "a stopped turn that is still ending takes no message, and its stop counts the unread ones once" {
+    const alloc = std.testing.allocator;
+    var parent_worker = worker_runtime.WorkerRuntime{};
+    var user_worker = worker_runtime.WorkerRuntime{};
+    var owner = Owner{ .alloc = alloc, .children = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
+    for ([_][]const u8{ "parent-stopped", "user-stopped" }, [_]*worker_runtime.WorkerRuntime{ &parent_worker, &user_worker }) |child_id, worker| {
+        const slot = try alloc.create(Slot);
+        slot.* = .{ .owner = &owner, .child_id = try alloc.dupe(u8, child_id), .worker = worker, .work_id = "work" };
+        try owner.slots.append(alloc, slot);
+    }
+    defer {
+        for (owner.slots.items) |slot| slot.worker = null;
+        parent_worker.deinit(alloc);
+        user_worker.deinit(alloc);
+        owner.deinit();
+    }
+    try std.testing.expect(parent_worker.beginDirectProcessing(1));
+    try std.testing.expect(user_worker.beginDirectProcessing(2));
+    const fingerprint: [32]u8 = @splat(1);
+
+    // The parent's stop counts the message its turn never read, once.
+    try std.testing.expectEqual(types.SteeringDelivery.queued, (try owner.steer("parent-stopped", "work", "unread", fingerprint, "text")).receipt);
+    try std.testing.expectEqual(@as(?usize, 1), owner.stop("parent-stopped"));
+    try std.testing.expectEqual(@as(?usize, 0), owner.stop("parent-stopped"));
+    // A message sent while the stopped turn ends waits for the next turn.
+    try std.testing.expect((try owner.steer("parent-stopped", "work", "after-stop", fingerprint, "text")) == .stopping);
+    try std.testing.expectEqual(@as(usize, 1), parent_worker.queuedPromptCount());
+
+    // So does one sent while the user's stop ends the turn.
+    owner.noteUserStop("user-stopped");
+    try std.testing.expect((try owner.steer("user-stopped", "work", "after-user-stop", fingerprint, "text")) == .stopping);
+    try std.testing.expectEqual(@as(usize, 0), user_worker.queuedPromptCount());
+
+    // Once the work has ended, the child takes it as before.
+    owner.slots.items[0].completion = .{ .published = .{ .phase = .finished, .outcome = .cancelled } };
+    try std.testing.expect((try owner.steer("parent-stopped", "work", "after-end", fingerprint, "text")) == .waiting);
+    try std.testing.expectEqual(@as(?usize, null), owner.stop("parent-stopped"));
+}
+
 fn checkFeedbackAllocation(alloc: Allocator) !void {
     var owner = Owner{ .alloc = alloc, .children = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
     defer owner.deinit();
@@ -766,6 +826,14 @@ fn slotMain(slot: *Slot) void {
     while (true) {
         const outcome = runOne(slot);
         defer outcome.deinit(owner.alloc);
+        if (end_test_controls.armed()) {
+            const stopped_by: ?[]const u8 = blk: {
+                owner.mutex.lockUncancelable(io_mod.getIo());
+                defer owner.mutex.unlock(io_mod.getIo());
+                break :blk if (slot.stopped_by_parent) "parent" else if (slot.stopped_by_user) "user" else null;
+            };
+            if (stopped_by) |by| end_test_controls.holdStoppedEnd(slot.child_id, by);
+        }
         // Startup must not inspect the old slot between saved and in-memory completion.
         // Take owner before registry, matching cancellation and approval lock ordering.
         owner.mutex.lockUncancelable(io_mod.getIo());

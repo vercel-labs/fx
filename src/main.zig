@@ -86,7 +86,6 @@ const debug_trace = @import("core/shared/debug_trace.zig");
 const display_width = @import("core/shared/display_width.zig");
 const file_index_mod = @import("core/workspace/file_index.zig");
 const mcp_host = @import("core/mcp_host/host.zig");
-const mcp_model_catalog = @import("core/mcp/model_catalog.zig");
 const mcp_access_policy = @import("core/mcp/access_policy.zig");
 const app_mcp_runtime = @import("core/app/app_mcp_runtime.zig");
 const skill_commands = @import("core/skills/skill_commands.zig");
@@ -625,6 +624,11 @@ const App = struct {
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
     context_limits: config_runtime.context_limits.Values = .{},
+    /// Where built-in tools are offered, from the settings files.
+    tool_placement: config_runtime.tool_placement.Overrides = .{},
+    /// The built-in tools offered through toolbox, fixed for the process, so
+    /// a conversation's tools never change while it runs.
+    toolbox_behind: config_runtime.tool_placement.Behind = config_runtime.tool_placement.behindToolbox(.{}, &.{}),
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
     /// Resolved review-model override for automatic permission review
@@ -767,6 +771,15 @@ const App = struct {
             }
         }
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
+        app.toolbox_behind = config_runtime.tool_placement.behindToolbox(app.tool_placement, launch.modifiers.tool_placement_overrides);
+        // The launch profile narrowed main's tools before the tools behind
+        // toolbox were placed; a tool it lists that now sits there needs
+        // toolbox.
+        if (launch.modifiers.profile_name != null) {
+            if (comptime host_profile.tools) {
+                try ProfileAppRuntime.narrowProfileTools(&app, &app.main_agent, builtin_tools.advertisement_set);
+            }
+        }
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
             if (app.requested_resume != null) {
                 const picks = app.requested_resume.? == .pick;
@@ -1103,7 +1116,7 @@ const App = struct {
         main_agent.change_tracker.deinit(std.heap.c_allocator);
         for (main_agent.diff_entries.items) |*entry| entry.deinit(std.heap.c_allocator);
         main_agent.diff_entries.deinit(std.heap.c_allocator);
-        self.mcp.deinit(self.alloc);
+        self.mcp.deinit();
         shutdown_trace.mark("mcp_deinit");
         self.skills.deinit(std.heap.c_allocator);
         main_agent.context_snapshot.deinit(self.alloc);
@@ -1919,8 +1932,8 @@ const App = struct {
         return self.refreshMcpHostFromFiles(agent);
     }
 
-    pub fn snapshotMcpModelCatalog(self: *App, alloc: Allocator) !mcp_model_catalog.Report {
-        return self.mcp.snapshotModelCatalog(alloc, self.alloc);
+    pub fn mcpServerNames(self: *App, alloc: Allocator) ![]const []const u8 {
+        return self.mcp.serverNames(alloc);
     }
 
     fn effectiveToolSet(self: *const App, agent: *const agents.Agent) tool_set_contract.ToolSet {
@@ -2055,6 +2068,7 @@ const App = struct {
             .permission_rules = permission_rules,
             .subagent_available = subagent_available,
             .subagent_profiles = subagent_profiles,
+            .behind_toolbox = self.toolbox_behind.slice(),
         });
     }
 
@@ -5406,6 +5420,7 @@ test {
     _ = @import("core/auth/grok_session.zig");
     _ = @import("core/auth/grok_oauth.zig");
     _ = @import("gateway/xai_grok_models.zig");
+    _ = @import("gateway/provider_versions.zig");
     _ = @import("gateway/xai_grok.zig");
     _ = @import("gateway/xai_grok_permission_reviewer.zig");
     _ = credentials;
@@ -5511,6 +5526,7 @@ test {
     _ = @import("core/tooling/tool_result_errors.zig");
     _ = @import("core/tooling/tool_runtime.zig");
     _ = @import("core/tooling/tool_specs.zig");
+    _ = @import("core/tooling/toolbox.zig");
     _ = @import("builtins/commands.zig");
     _ = @import("builtins/mcp.zig");
     _ = @import("builtins/modes.zig");
@@ -5529,6 +5545,9 @@ test {
     _ = @import("tools/session/read_tool_result.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");
+    _ = @import("tools/skills/skill_search.zig");
+    _ = @import("tools/capabilities/capability_search.zig");
+    _ = @import("tools/capabilities/toolbox.zig");
     _ = @import("core/upgrade/upgrade_helpers.zig");
     _ = @import("core/upgrade/upgrade_runtime.zig");
     _ = @import("core/shared/types.zig");

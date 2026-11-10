@@ -1626,6 +1626,22 @@ pub const WorkerRuntime = struct {
         return drop;
     }
 
+    /// How many of the parent's messages still wait to join the running
+    /// turn. Counted after a stop's cancel, it is what the stop drops: the
+    /// cancelled turn reads no more of them.
+    pub fn queuedParentSteering(self: *WorkerRuntime) usize {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        var count: usize = 0;
+        for (self.held_back_feedback.items) |prompt| {
+            if (prompt.author == .parent) count += 1;
+        }
+        for (self.queued_prompts.items) |prompt| {
+            if (prompt.author == .parent and prompt.steering_receipt != null) count += 1;
+        }
+        return count;
+    }
+
     /// A message main steered into a turn that the turn never took.
     pub const LeftoverMessage = struct {
         operation_id: []u8,

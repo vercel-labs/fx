@@ -1,4 +1,5 @@
 const std = @import("std");
+const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const observation = @import("../agent/runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -114,13 +115,6 @@ pub const VisionProvider = struct {
         return self.execute_fn(self.ctx, ctx, input);
     }
 };
-
-pub const SelectedDynamicToolSinkFn = *const fn (
-    ?*anyopaque,
-    []const u8,
-    []const u8,
-    ?tool_mcp_runtime.Binding,
-) error{OutOfMemory}!void;
 
 pub const ContextNoticeSinkFn = *const fn (?*anyopaque, []const u8) error{OutOfMemory}!void;
 
@@ -268,7 +262,6 @@ pub const DispatchContext = struct {
     max_command_output_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     skills_dir: []const u8 = "",
     skill_locations: ?*const skill_contract.Locations = null,
-    resolved_skill: ?*const skill_contract.PreparedSkill = null,
     context_limits: context_limits.Values = .{},
     read_tracker: ?*read_tracker_mod.ReadTracker = null,
     change_tracker: ?*change_tracker.ChangeTracker = null,
@@ -305,6 +298,9 @@ pub const DispatchContext = struct {
     web_search_backend: ?WebSearchBackend = null,
     tool_call_id: []const u8 = "",
     tool_call_name: []const u8 = "",
+    /// `ToolCall.carried_by`: the tool the model called when this is the call
+    /// a `toolbox {run}` carries. Null for a direct call.
+    tool_call_carried_by: ?[]const u8 = null,
     web_search_progress_ctx: ?*anyopaque = null,
     on_web_search_progress: ?WebSearchProgressFn = null,
     web_fetch_progress_ctx: ?*anyopaque = null,
@@ -321,9 +317,14 @@ pub const DispatchContext = struct {
     /// Lent to `fx mcp call` while this tool call runs; see
     /// `mcp_call_capability.zig`. Only the shell tool uses it.
     mcp_call_capability: ?mcp_call_capability.Capability = null,
+    /// What `toolbox {run}` runs through: the permission check and execution
+    /// a direct call of the named tool gets. Valid while this call runs.
+    toolbox_run: ?ToolboxRun = null,
+    /// The MCP servers the toolbox menu lists, by name.
+    toolbox_mcp_servers: []const []const u8 = &.{},
+    /// The built-in tools the toolbox menu lists, by name.
+    toolbox_behind: []const []const u8 = &.{},
     mcp_permission_rules: core_types.PermissionRuleSet = .{},
-    selected_dynamic_tool_ctx: ?*anyopaque = null,
-    on_selected_dynamic_tool: ?SelectedDynamicToolSinkFn = null,
     context_notice_ctx: ?*anyopaque = null,
     on_context_notice: ?ContextNoticeSinkFn = null,
     inner_usage_sink: ?*?core_types.ToolUsage = null,
@@ -400,6 +401,9 @@ pub const LabelArgKind = enum {
     server,
     selector,
     session_id,
+    open,
+    run,
+    search,
 };
 
 pub const PermissionTargetKind = core_permissions.PermissionTargetKind;
@@ -415,14 +419,14 @@ pub const ExecutorKind = enum {
     web_search,
     run_command,
     terminal,
-    skill,
     install_skill,
     subagent,
-    capability_search,
-    mcp_select_tool,
     ask_user_question,
     vision,
     host,
+    toolbox,
+    /// An MCP tool from a server, registered while it is sent or run.
+    mcp_tool,
 };
 
 pub const ApprovalPolicy = enum {
@@ -443,6 +447,56 @@ pub const CapturedCommandFn = *const fn (ToolInput) bool;
 /// exactly one. See `Tool.infer_action_fn`.
 pub const InferActionFn = *const fn (std.json.ObjectMap) ?[]const u8;
 pub const ProcessLocalFn = *const fn (ToolInput) bool;
+
+pub const ToolboxDescription = union(enum) {
+    definition: Definition,
+    /// Why the tool can't be used now, such as its server being unavailable.
+    unavailable: []const u8,
+
+    pub const Definition = struct {
+        /// The tool's name, description, and arguments as JSON.
+        json: []const u8,
+        /// What a context limit cut from it, for the user, as selecting the
+        /// tool reported.
+        notice: ?[]const u8 = null,
+    };
+};
+
+/// Lent by the tool runtime to each call it dispatches, for `toolbox`. The
+/// agent loop runs what a `toolbox {run}` carries as its own direct call of
+/// it, so a run that reaches the toolbox tool is one that can't run.
+pub const ToolboxRun = struct {
+    context: *anyopaque,
+    /// Why `tool` can't run through toolbox: toolbox itself, a host's own
+    /// tool, or nothing toolbox can find, and for an MCP tool its server's
+    /// state. Allocated in `arena`.
+    explain_fn: *const fn (context: *anyopaque, arena: Allocator, tool: []const u8) anyerror![]const u8,
+    /// What `toolbox {open}` gives a tool `run` can run. Null when there is
+    /// no such built-in or MCP tool.
+    describe_fn: *const fn (context: *anyopaque, arena: Allocator, tool: []const u8) anyerror!?ToolboxDescription,
+    /// The built-in tools behind toolbox that match `query`, best first, for
+    /// `toolbox {search}`. Allocated in `arena`.
+    search_fn: *const fn (context: *anyopaque, arena: Allocator, query: *const lexical_relevance.PreparedQuery) anyerror![]const ToolboxMatch,
+
+    pub fn describe(self: ToolboxRun, arena: Allocator, tool: []const u8) anyerror!?ToolboxDescription {
+        return self.describe_fn(self.context, arena, tool);
+    }
+
+    pub fn explain(self: ToolboxRun, arena: Allocator, tool: []const u8) anyerror![]const u8 {
+        return self.explain_fn(self.context, arena, tool);
+    }
+
+    pub fn searchBuiltins(self: ToolboxRun, arena: Allocator, query: *const lexical_relevance.PreparedQuery) anyerror![]const ToolboxMatch {
+        return self.search_fn(self.context, arena, query);
+    }
+};
+
+/// A built-in tool behind toolbox that a search found.
+pub const ToolboxMatch = struct {
+    name: []const u8,
+    /// Its short line, as the menu lists it.
+    description: []const u8,
+};
 
 pub const CallPresentation = struct {
     activity_kind: core_types.ToolActivityKind,
@@ -505,7 +559,6 @@ pub const Tool = struct {
     cancel_if_requested_after_call: bool = false,
     run_command_compatibility: ?RunCommandCompatibility = null,
     take_file_mutation_input_fn: ?TakeFileMutationInputFn = null,
-    prepare_skill_call_fn: ?*const fn (DispatchContext, []const u8) DispatchError!skill_contract.CallPreparation = null,
     reads_only_fn: ReadsOnlyFn,
     irreversible_fn: IrreversibleFn,
 };
@@ -578,7 +631,7 @@ pub fn toolActivityKind(registry: Registry, tool_name: []const u8) core_types.To
 /// A name the registry does not hold is an MCP server's tool when it has the
 /// `mcp_` prefix every MCP tool name gets, and is otherwise treated as a command.
 fn unregisteredActivityKind(tool_name: []const u8) core_types.ToolActivityKind {
-    return if (std.mem.startsWith(u8, tool_name, "mcp_")) .mcp else .command;
+    return if (core_types.isMcpToolName(tool_name)) .mcp else .command;
 }
 
 pub fn staticPresentation(tool: Tool) CallPresentation {
@@ -647,7 +700,36 @@ fn labelValueForKind(kind: LabelArgKind, args: std.json.ObjectMap) ?[]const u8 {
         .server => optionalStringArg(args, "server"),
         .selector => optionalStringArg(args, "selector"),
         .session_id => optionalStringArg(args, "session_id"),
+        .open => if (optionalStringArg(args, "open")) |value| openLabel(value) else null,
+        .run => optionalStringArg(args, "run"),
+        .search => optionalStringArg(args, "search"),
     };
+}
+
+/// What a `toolbox {open}` row names: the skill's name when the model opened
+/// a skill by its folder, its SKILL.md, or a `skill:` location, as the skill
+/// tool's rows did, and the value itself otherwise.
+fn openLabel(value: []const u8) []const u8 {
+    const is_location = std.mem.startsWith(u8, value, "skill:");
+    if (!is_location and !std.Io.Dir.path.isAbsolute(value)) return value;
+    var trimmed = std.mem.trimEnd(u8, value, "/");
+    if (std.mem.endsWith(u8, trimmed, "/SKILL.md")) trimmed = trimmed[0 .. trimmed.len - "/SKILL.md".len];
+    const slash = std.mem.findScalarLast(u8, trimmed, '/') orelse return value;
+    const name = trimmed[slash + 1 ..];
+    return if (name.len == 0) value else name;
+}
+
+test "an open row names the skill, not the path it was opened by" {
+    const cases = [_]struct { value: []const u8, label: []const u8 }{
+        .{ .value = "review", .label = "review" },
+        .{ .value = "mcp_linear_create_issue", .label = "mcp_linear_create_issue" },
+        .{ .value = "/Users/example/.fx/skills/review", .label = "review" },
+        .{ .value = "/Users/example/.fx/skills/review/", .label = "review" },
+        .{ .value = "/Users/example/.fx/skills/review/SKILL.md", .label = "review" },
+        .{ .value = "skill:0000000000000013:1/review", .label = "review" },
+        .{ .value = "/", .label = "/" },
+    };
+    for (cases) |case| try std.testing.expectEqualStrings(case.label, openLabel(case.value));
 }
 
 fn optionalStringArg(args: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -963,16 +1045,6 @@ pub fn reportCommandResultJson(ctx: DispatchContext, json: []const u8) void {
 pub fn reportResultCommit(ctx: DispatchContext, token: result_commit.Token) void {
     const sink = ctx.result_commit_sink orelse return;
     sink.* = token;
-}
-
-pub fn reportSelectedDynamicTool(
-    ctx: DispatchContext,
-    name: []const u8,
-    schema_json: []const u8,
-    binding: ?tool_mcp_runtime.Binding,
-) error{OutOfMemory}!void {
-    const sink = ctx.on_selected_dynamic_tool orelse return;
-    try sink(ctx.selected_dynamic_tool_ctx, name, schema_json, binding);
 }
 
 pub fn reportContextNotice(ctx: DispatchContext, notice: []const u8) error{OutOfMemory}!void {
