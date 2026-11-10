@@ -63,15 +63,12 @@ pub fn writeStamp(file: std.Io.File, now_ms: i64, scope: []const u8) void {
         debug_trace.logf(scope, "lock stamp not written err={s}", .{@errorName(err)});
 }
 
-/// The stamp the holder of lock file `name` wrote, or null when there is none to read.
+/// The stamp the holder of lock file `name` wrote, or null when there is none
+/// to read: also when the name is a link, a folder, or a fifo, whose open
+/// would wait for a writer that never comes.
 pub fn readStamp(dir: *io_mod.VerifiedDir, name: []const u8) ?i64 {
     const io = io_mod.getIo();
-    var file = dir.dir.openFile(io, name, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch return null;
+    var file = io_mod.openExistingReadOnlyRegularFile(dir.dir, name, .no_follow) catch return null;
     defer file.close(io);
     var bytes: [8]u8 = undefined;
     const n = file.readPositionalAll(io, &bytes, 0) catch return null;
@@ -94,6 +91,7 @@ pub fn expired(stamp_ms: ?i64, started_ms: i64, now_ms: i64, wait_ms: i64) bool 
 }
 
 const testing = std.testing;
+const lock_fixtures = @import("lock_fixtures.zig");
 
 test "a waiter gives up only once the holder's stamp, or its own start if later, is wait_ms old" {
     const started: i64 = 1_000_000;
@@ -125,4 +123,16 @@ test "a held lock's stamp reads back, and a waiter that can't wait gives up at o
     const again = restamp(held.lock.file, "test", "test");
     try testing.expectEqual(@as(?i64, again), readStamp(&dir, "test.lock"));
     try testing.expectError(error.LockBusy, acquire(&dir, "test.lock", io_mod.awakeMilliTimestamp(), 0, .{}, "test", "test"));
+}
+
+test "no stamp is read from a link, a folder, a mode 644 file with none, or a fifo, and nothing waits for a writer" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir: io_mod.VerifiedDir = .{ .dir = try tmp.dir.openDir(testing.io, ".", .{ .iterate = true }) };
+    defer dir.close();
+    for (lock_fixtures.all) |state| {
+        try lock_fixtures.plant(tmp.dir, @tagName(state), state);
+        try testing.expectEqual(@as(?i64, null), readStamp(&dir, @tagName(state)));
+    }
+    try testing.expectEqual(@as(?i64, null), readStamp(&dir, "not-there.lock"));
 }
