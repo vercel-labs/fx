@@ -73,6 +73,11 @@ pub const Entry = struct {
     name: []const u8,
     description: []const u8,
     source: Source,
+    /// The profile's own model, effort, and tools; null keeps the ones fx
+    /// runs with.
+    model: ?[]const u8 = null,
+    effort: ?types.ReasoningEffort = null,
+    tools: ?[]const []const u8 = null,
 };
 
 pub const ParseError = error{ OutOfMemory, InvalidProfile };
@@ -325,13 +330,13 @@ pub fn list(arena: Allocator, roots: Roots) ![]Entry {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => continue,
             }) orelse continue;
-            try entries.append(arena, .{ .name = profile.name, .description = profile.description, .source = profile.source });
+            try entries.append(arena, .{ .name = profile.name, .description = profile.description, .source = profile.source, .model = profile.model, .effort = profile.effort, .tools = profile.tools });
         }
     }
     for ([_][]const u8{ main_name, agent_name }) |name| {
         if (hasEntry(entries.items, name)) continue;
         const profile = builtin(name).?;
-        try entries.append(arena, .{ .name = profile.name, .description = profile.description, .source = .builtin });
+        try entries.append(arena, .{ .name = profile.name, .description = profile.description, .source = .builtin, .model = profile.model, .effort = profile.effort, .tools = profile.tools });
     }
     sort_utils.sort(Entry, entries.items, {}, entryLessThan);
     return entries.items;
@@ -354,6 +359,178 @@ fn hasEntry(entries: []const Entry, name: []const u8) bool {
 
 fn entryLessThan(_: void, a: Entry, b: Entry) bool {
     return std.mem.lessThan(u8, a.name, b.name);
+}
+
+/// Folder entries `listForCompletion` reads across both roots, counting every
+/// one, profile or not.
+const max_completion_dir_entries = 128;
+/// `profile.json` bytes `listForCompletion` reads across every profile.
+const max_completion_settings_bytes = 1024 * 1024;
+
+/// Profiles to offer as completions. `limited` says the scan stopped at a
+/// bound or skipped a file too large to read, so profiles may be missing.
+pub const CompletionList = struct {
+    entries: []Entry,
+    limited: bool,
+
+    /// Frees what `listForCompletion` returned, for an `alloc` that is not an
+    /// arena.
+    pub fn deinit(self: CompletionList, alloc: Allocator) void {
+        freeEntries(alloc, self.entries);
+        alloc.free(self.entries);
+    }
+};
+
+/// Like `list`, but bounded for completion: it reads at most
+/// `max_completion_dir_entries` folder entries and
+/// `max_completion_settings_bytes` of settings, and never reads `prompt.md`.
+/// The user's own still win over the repository's, fx's `main` and `agent`
+/// are always there, and the entries are sorted by name. Every slice of the
+/// result belongs to `alloc`.
+pub fn listForCompletion(alloc: Allocator, roots: Roots) Allocator.Error!CompletionList {
+    const io = io_mod.getIo();
+    var entries: std.ArrayList(Entry) = .empty;
+    errdefer {
+        freeEntries(alloc, entries.items);
+        entries.deinit(alloc);
+    }
+    // Holds one profile's paths, settings, parsed JSON, and failure message,
+    // reset before the next so a scan of failing profiles stays bounded.
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    var visited: usize = 0;
+    var budget: usize = max_completion_settings_bytes;
+    var limited = false;
+    const sources = [_]struct { dir: ?[]const u8, source: Source }{
+        .{ .dir = roots.home, .source = .home },
+        .{ .dir = roots.project, .source = .project },
+    };
+    scan: for (sources) |root| {
+        const dir_path = root.dir orelse continue;
+        var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch {
+            limited = true;
+            break :scan;
+        }) |item| {
+            visited += 1;
+            if (visited > max_completion_dir_entries) {
+                limited = true;
+                break :scan;
+            }
+            if (item.kind != .directory or !validName(item.name)) continue;
+            if (std.mem.eql(u8, item.name, main_name)) continue;
+            if (hasEntry(entries.items, item.name)) continue;
+            _ = scratch_state.reset(.retain_capacity);
+            const read = try readCompletionProfile(scratch_state.allocator(), dir_path, item.name, root.source, roots.fileRoot(root.source, dir_path), budget);
+            budget -= read.bytes;
+            switch (read.outcome) {
+                .missing, .invalid => {},
+                .too_large => limited = true,
+                // A profile left unread may outrank a later one of the same
+                // name, so the scan stops rather than offer the wrong one.
+                .over_budget => {
+                    limited = true;
+                    break :scan;
+                },
+                .loaded => |profile| {
+                    try entries.ensureUnusedCapacity(alloc, 1);
+                    entries.appendAssumeCapacity(try cloneEntry(alloc, profile));
+                },
+            }
+        }
+    }
+    for ([_][]const u8{ main_name, agent_name }) |name| {
+        if (hasEntry(entries.items, name)) continue;
+        try entries.ensureUnusedCapacity(alloc, 1);
+        entries.appendAssumeCapacity(try cloneEntry(alloc, builtin(name).?));
+    }
+    sort_utils.sort(Entry, entries.items, {}, entryLessThan);
+    return .{ .entries = try entries.toOwnedSlice(alloc), .limited = limited };
+}
+
+const CompletionRead = struct {
+    /// Settings bytes read, counted against the budget whether or not they
+    /// parsed.
+    bytes: usize = 0,
+    outcome: union(enum) {
+        missing,
+        invalid,
+        /// Larger than `max_settings_bytes`, which `load` refuses too.
+        too_large,
+        /// Larger than what was left of the budget.
+        over_budget,
+        loaded: Profile,
+    },
+};
+
+/// Reads and parses `<dir>/<name>/profile.json` alone into `scratch`, reading
+/// no more than `budget` bytes.
+fn readCompletionProfile(
+    scratch: Allocator,
+    dir: []const u8,
+    name: []const u8,
+    source: Source,
+    within: ?[]const u8,
+    budget: usize,
+) Allocator.Error!CompletionRead {
+    const limit = @min(max_settings_bytes, budget);
+    if (limit == 0) return .{ .outcome = .over_budget };
+    const settings_path = try std.Io.Dir.path.join(scratch, &.{ dir, name, settings_file_name });
+    const settings = readFile(scratch, settings_path, limit, within) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.FileNotFound => .{ .outcome = .missing },
+        error.StreamTooLong => .{
+            .bytes = limit,
+            .outcome = if (limit < max_settings_bytes) .over_budget else .too_large,
+        },
+        else => .{ .outcome = .invalid },
+    };
+    var failure: ?[]const u8 = null;
+    const profile = parse(scratch, name, source, settings, "", &failure) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidProfile => .{ .bytes = settings.len, .outcome = .invalid },
+    };
+    return .{ .bytes = settings.len, .outcome = .{ .loaded = profile } };
+}
+
+/// Copies the parts of `profile` an `Entry` keeps into `alloc`.
+fn cloneEntry(alloc: Allocator, profile: Profile) Allocator.Error!Entry {
+    const name = try alloc.dupe(u8, profile.name);
+    errdefer alloc.free(name);
+    const description = try alloc.dupe(u8, profile.description);
+    errdefer alloc.free(description);
+    const model = if (profile.model) |text| try alloc.dupe(u8, text) else null;
+    errdefer if (model) |text| alloc.free(text);
+    const tools = if (profile.tools) |names| try cloneNames(alloc, names) else null;
+    return .{ .name = name, .description = description, .source = profile.source, .model = model, .effort = profile.effort, .tools = tools };
+}
+
+fn cloneNames(alloc: Allocator, names: []const []const u8) Allocator.Error![]const []const u8 {
+    const out = try alloc.alloc([]const u8, names.len);
+    var done: usize = 0;
+    errdefer {
+        for (out[0..done]) |text| alloc.free(text);
+        alloc.free(out);
+    }
+    for (names, out) |text, *slot| {
+        slot.* = try alloc.dupe(u8, text);
+        done += 1;
+    }
+    return out;
+}
+
+fn freeEntries(alloc: Allocator, entries: []const Entry) void {
+    for (entries) |entry| {
+        alloc.free(entry.name);
+        alloc.free(entry.description);
+        if (entry.model) |text| alloc.free(text);
+        if (entry.tools) |names| {
+            for (names) |text| alloc.free(text);
+            alloc.free(names);
+        }
+    }
 }
 
 /// Reads `<dir>/<name>/profile.json` and its optional `prompt.md`. Returns null
@@ -773,4 +950,139 @@ test "a held profile replaces the last only when the next one loads, and keeps i
     try testing.expectEqualStrings("reviewer", held.profile.name);
     try testing.expectEqual(types.PermissionMode.ask, held.profile.permission_mode.?);
     try testing.expectEqualStrings("BASE\n\nReview only.", held.system_prompt.?);
+}
+
+fn findEntry(entries: []const Entry, name: []const u8) ?Entry {
+    for (entries) |entry| if (std.mem.eql(u8, entry.name, name)) return entry;
+    return null;
+}
+
+test "completion keeps the user's profiles over the repository's and fx's, sorted, in memory the caller owns" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestProfile(tmp.dir, "home/reviewer", "{\"description\": \"Home reviewer\", \"model\": \"test/model\", \"effort\": \"high\", \"tools\": [\"read_file\", \"!shell\"]}");
+    try writeTestProfile(tmp.dir, "project/reviewer", "{\"description\": \"Repo reviewer\"}");
+    try writeTestProfile(tmp.dir, "project/tester", "{\"description\": \"Repo tester\"}");
+    try writeTestProfile(tmp.dir, "project/agent", "{\"description\": \"Repo agent\"}");
+    try writeTestProfile(tmp.dir, "project/broken", "{not json");
+    try writeTestProfile(tmp.dir, "home/main", "{\"description\": \"Not fx\"}");
+    const roots: Roots = .{
+        .home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home"),
+        .project = try io_mod.dirRealpathAlloc(arena, tmp.dir, "project"),
+    };
+
+    // The testing allocator fails the test on a leak, so every scratch byte
+    // is freed and every kept slice was copied into the caller's allocator.
+    const result = try listForCompletion(testing.allocator, roots);
+    defer result.deinit(testing.allocator);
+    try testing.expect(!result.limited);
+    try testing.expectEqual(@as(usize, 4), result.entries.len);
+    const names = [_][]const u8{ "agent", "main", "reviewer", "tester" };
+    for (names, result.entries) |name, entry| try testing.expectEqualStrings(name, entry.name);
+    try testing.expectEqual(Source.project, result.entries[0].source);
+    try testing.expectEqual(Source.builtin, result.entries[1].source);
+    const reviewer = result.entries[2];
+    try testing.expectEqual(Source.home, reviewer.source);
+    try testing.expectEqualStrings("Home reviewer", reviewer.description);
+    try testing.expectEqualStrings("test/model", reviewer.model.?);
+    try testing.expect(reviewer.effort.?.eql(types.ReasoningEffort.literal("high")));
+    try testing.expectEqual(@as(usize, 2), reviewer.tools.?.len);
+    try testing.expectEqualStrings("!shell", reviewer.tools.?[1]);
+}
+
+test "completion never reads a prompt, so a large or linked one does not hide its profile" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestProfile(tmp.dir, "home/huge", "{\"description\": \"Huge prompt\"}");
+    const huge = try arena.alloc(u8, max_prompt_bytes + 1);
+    @memset(huge, 'x');
+    try writeTestFile(tmp.dir, "home/huge/prompt.md", huge);
+    try writeTestProfile(tmp.dir, "home/device", "{\"description\": \"Device prompt\"}");
+    try linkTestFile(tmp.dir, "/dev/null", "home/device/prompt.md");
+    try writeTestFile(tmp.dir, "outside/secret.txt", "SECRET");
+    try writeTestProfile(tmp.dir, "repo/.fx/agents/evil", "{\"description\": \"Linked prompt\"}");
+    try linkTestFile(tmp.dir, try io_mod.dirRealpathAlloc(arena, tmp.dir, "outside/secret.txt"), "repo/.fx/agents/evil/prompt.md");
+    var roots = try Roots.init(arena, null, try io_mod.dirRealpathAlloc(arena, tmp.dir, "repo"));
+    roots.home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
+
+    // `load` reads each prompt and refuses all three.
+    var failure: ?[]const u8 = null;
+    for ([_][]const u8{ "huge", "device", "evil" }) |name|
+        try testing.expectError(error.InvalidProfile, load(arena, roots, name, &failure));
+
+    const result = try listForCompletion(arena, roots);
+    try testing.expect(!result.limited);
+    for ([_][]const u8{ "huge", "device", "evil" }) |name| try testing.expect(findEntry(result.entries, name) != null);
+}
+
+test "completion stops after its folder entry cap, counting entries that are not profiles" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Junk fills the cap in the user's folder: files and folders whose names
+    // are not profile names.
+    for (0..max_completion_dir_entries) |index| {
+        if (index % 2 == 0) {
+            try writeTestFile(tmp.dir, try arena.print("home/junk{d}.txt", .{index}), "");
+        } else {
+            try tmp.dir.createDirPath(io_mod.getIo(), try arena.print("home/Junk {d}", .{index}));
+        }
+    }
+    try writeTestProfile(tmp.dir, "project/tester", "{\"description\": \"Repo tester\"}");
+    const roots: Roots = .{
+        .home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home"),
+        .project = try io_mod.dirRealpathAlloc(arena, tmp.dir, "project"),
+    };
+
+    const capped = try listForCompletion(arena, roots);
+    try testing.expect(capped.limited);
+    try testing.expect(findEntry(capped.entries, "tester") == null);
+    try testing.expectEqual(@as(usize, 2), capped.entries.len);
+    try testing.expectEqualStrings("agent", capped.entries[0].name);
+    try testing.expectEqualStrings("main", capped.entries[1].name);
+
+    // Under the cap, the repository's profile is offered.
+    const full = try listForCompletion(arena, .{ .project = roots.project });
+    try testing.expect(!full.limited);
+    try testing.expect(findEntry(full.entries, "tester") != null);
+}
+
+test "completion skips a settings file over its own limit and stops at the shared byte budget" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const padding = try arena.alloc(u8, max_settings_bytes - 1024);
+    @memset(padding, 'x');
+    const big_json = try arena.print("{{\"description\": \"Big\", \"pad\": \"{s}\"}}", .{padding});
+    try testing.expect(big_json.len < max_settings_bytes);
+
+    const oversized = try arena.alloc(u8, max_settings_bytes + 16);
+    @memset(oversized, ' ');
+    try writeTestProfile(tmp.dir, "alone/oversized", oversized);
+    try writeTestProfile(tmp.dir, "alone/fine", "{\"description\": \"Fine\"}");
+    const alone = try listForCompletion(arena, .{ .home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "alone") });
+    try testing.expect(alone.limited);
+    try testing.expect(findEntry(alone.entries, "oversized") == null);
+    try testing.expect(findEntry(alone.entries, "fine") != null);
+
+    // Twenty files of almost 64 KiB pass 1 MiB together.
+    const count = 20;
+    for (0..count) |index| try writeTestProfile(tmp.dir, try arena.print("home/big{d}", .{index}), big_json);
+    const result = try listForCompletion(testing.allocator, .{ .home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home") });
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.limited);
+    const listed = result.entries.len - 2;
+    try testing.expect(listed > 0 and listed < count);
+    try testing.expect(listed * big_json.len < max_completion_settings_bytes);
+    try testing.expect(findEntry(result.entries, "main") != null and findEntry(result.entries, "agent") != null);
 }

@@ -1801,7 +1801,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await until("the reviewer's turn", () => childCalls >= 1);
         await session.sendKeys("Down");
         await session.waitForText("esc back", 10_000);
-        // On main's row, Delete does nothing: an instance closes with /close. The
+        // On main's row, Delete does nothing: closing the only instance would end fx. The
         // next key is handled once the hint changes, so by then the trace
         // shows whether Delete armed anything.
         await session.sendKeys("BSpace");
