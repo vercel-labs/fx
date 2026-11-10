@@ -53,6 +53,9 @@ const max_test_deadline_ms: i64 = 60_000;
 /// After the deadline kills the children still running, how long their
 /// waiters get to reap them before `wait` cancels the ones still blocked.
 const reap_grace_ms: i64 = 1_000;
+/// How long the stops of the checks still running get, all together, to
+/// land before doctor looks at what each one started.
+const stop_land_ms: i64 = 100;
 /// How often `wait` looks at the done flags and the stop signal.
 const poll_ms: u64 = 5;
 
@@ -161,6 +164,8 @@ pub const ProcessProbe = struct {
     /// Reads the child's stdout as it arrives. Null when doctor needs only
     /// the exit status, and then the child's stdout goes nowhere.
     status: ?*ChildStatusReader = null,
+    /// The SIGSTOP `stopTrees` sent has landed. Doctor's own thread only.
+    stop_landed: bool = false,
 
     /// Spawns `argv` in a new process group, then reads its stdout to the
     /// end and reaps it in a task of `waiters`. A spawn that fails, or a
@@ -190,7 +195,7 @@ pub const ProcessProbe = struct {
         waiters.concurrent(io, waitForExit, .{probe}) catch |err| {
             // Nothing would read or reap it, so it stops now.
             debug_trace.logf("doctor", "check {s} has no task to wait for it err={s}; killing it with what it started", .{ name, @errorName(err) });
-            killTree(probe.pid);
+            stopTrees(&.{probe});
             probe.child.kill(io);
             probe.spawn_error = err;
             probe.done.store(true, .release);
@@ -224,27 +229,48 @@ pub const ProcessProbe = struct {
         std.posix.kill(-self.pid, .KILL) catch {};
         self.done.store(true, .release);
     }
-
-    /// Kills a child that is still running with everything it started; its
-    /// waiter then reaps it.
-    fn stop(self: *ProcessProbe) void {
-        if (self.done.load(.acquire) or self.pid == 0) return;
-        self.stopped.store(true, .release);
-        killTree(self.pid);
-    }
 };
 
-/// Kills the process group of `pid` and every process `pid` started outside
-/// it, such as the stdio MCP servers an `fx mcp show` child starts in groups
-/// of their own, and their helper. A group kill alone would leave a server
-/// the child had started but not yet told its helper about. The group is
-/// stopped first, so the child starts nothing more while doctor looks at
-/// what it started; a child that started nothing is then only killed. Any
+/// Kills each check in `probes` that is still running, with everything it
+/// started, in three steps over all of them: every check's group is
+/// stopped, so none starts anything more; doctor waits, `stop_land_ms` in
+/// all, until each stop has landed or the check has exited, since kill(2)
+/// only queues a SIGSTOP and a check still running could start a server
+/// after doctor looked; then each tree is walked and killed. Their waiters
+/// then reap them.
+fn stopTrees(probes: []const *ProcessProbe) void {
+    for (probes) |p| if (!p.done.load(.acquire) and p.pid != 0) std.posix.kill(-p.pid, .STOP) catch {};
+    const limit = io_mod.milliTimestamp() + stop_land_ms;
+    while (true) {
+        var waiting = false;
+        for (probes) |p| {
+            if (p.stop_landed or p.pid == 0) continue;
+            // A check that has exited can start nothing, so it counts as stopped.
+            if (p.done.load(.acquire) or (process_tree.processIsStopped(std.heap.c_allocator, p.pid) catch false)) {
+                p.stop_landed = true;
+            } else {
+                waiting = true;
+            }
+        }
+        if (!waiting or io_mod.milliTimestamp() >= limit) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    for (probes) |p| {
+        if (p.done.load(.acquire) or p.pid == 0) continue;
+        if (!p.stop_landed) debug_trace.logf("doctor", "check {s} did not stop within {d} ms; killing it with what it started anyway", .{ p.name, stop_land_ms });
+        killTree(p.pid);
+    }
+}
+
+/// Kills the process group of `pid`, which `stopTrees` has stopped, and
+/// every process `pid` started outside it, such as the stdio MCP servers an
+/// `fx mcp show` child starts in groups of their own, and their helper. A
+/// group kill alone would leave a server the child had started but not yet
+/// told its helper about. A child that started nothing is only killed. Any
 /// other tree is stopped and killed whole, and a process the kill skipped is
 /// resumed (`process_tree.Tracker`). Only for a child not yet reaped, so its
 /// id cannot have been reused.
 fn killTree(pid: std.posix.pid_t) void {
-    std.posix.kill(-pid, .STOP) catch {};
     var tree = process_tree.Tracker.init(std.heap.c_allocator) catch return killGroup(pid);
     defer tree.deinit();
     tree.refresh(pid) catch |err| debug_trace.logf("doctor", "check {d}: could not list the processes it started err={s}", .{ pid, @errorName(err) });
@@ -401,10 +427,11 @@ pub fn wait(deadline: i64, catalog: ?*CatalogProbe, processes: []const *ProcessP
     }
     const why = if (stopRequested()) "before doctor got a signal" else "by the deadline";
     if (catalog) |c| c.finish(io);
-    for (processes) |p| if (!p.done.load(.acquire)) {
+    for (processes) |p| if (!p.done.load(.acquire) and p.pid != 0) {
         debug_trace.logf("doctor", "check {s} did not finish {s}; killing it with what it started and dropping its late result", .{ p.name, why });
-        p.stop();
+        p.stopped.store(true, .release);
     };
+    stopTrees(processes);
     const reap_deadline = io_mod.milliTimestamp() + reap_grace_ms;
     while (io_mod.milliTimestamp() < reap_deadline and !allDone(null, processes)) {
         io_mod.sleep(poll_ms * std.time.ns_per_ms);
@@ -1086,4 +1113,59 @@ test "the wait notice names each network check doctor started and the limit" {
         defer if (notice) |text| alloc.free(text);
         if (case.want) |want| try std.testing.expectEqualStrings(want, notice.?) else try std.testing.expect(notice == null);
     }
+}
+
+test "stopping a check that keeps starting processes in groups of their own leaves none of them" {
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.heap.c_allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    // Each process it starts moves to a group of its own and writes its pid,
+    // like a stdio server an `fx mcp show` child starts.
+    const script = "while :; do /usr/bin/perl -e 'setpgrp(0, 0); open(F, \">\", \"$ARGV[0]/\" . $$) or exit 1; close F; sleep 30' \"$0\" & done";
+    for (0..5) |round| {
+        var waiters: std.Io.Group = .init;
+        const probe = try ProcessProbe.start(alloc, &waiters, "forker", &.{ "/bin/sh", "-c", script, dir }, null);
+        io_mod.sleep((40 + 15 * round) * std.time.ns_per_ms);
+        probe.stopped.store(true, .release);
+        stopTrees(&.{probe});
+        waiters.cancel(io_mod.getIo());
+        try std.testing.expect(probe.done.load(.acquire));
+        try std.testing.expect(probe.stop_landed);
+    }
+    // Every process any round started is gone, once the system reaps it.
+    var started: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(io_mod.getIo())) |entry| {
+        const pid = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
+        started += 1;
+        const gone = for (0..200) |_| {
+            if (!try process_tree.processIsAlive(alloc, pid)) break true;
+            io_mod.sleep(5 * std.time.ns_per_ms);
+        } else false;
+        if (!gone) std.posix.kill(pid, .KILL) catch {};
+        try std.testing.expect(gone);
+    }
+    try std.testing.expect(started > 0);
+}
+
+test "a check that has already exited does not hold up the stop of the others" {
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.heap.c_allocator;
+    const io = io_mod.getIo();
+    // No waiter reaps it, so it stays a zombie that can start nothing.
+    var exited: ProcessProbe = .{ .name = "exited" };
+    exited.child = try std.process.spawn(io, .{ .argv = &.{ "/bin/sh", "-c", "exit 0" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .pgid = 0 });
+    exited.pid = exited.child.id.?;
+    defer _ = exited.child.wait(io) catch {};
+    for (0..1_000) |_| {
+        if (!try process_tree.processIsAlive(alloc, exited.pid)) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    const started = io_mod.milliTimestamp();
+    stopTrees(&.{&exited});
+    try std.testing.expect(exited.stop_landed);
+    try std.testing.expect(io_mod.milliTimestamp() - started < stop_land_ms);
 }

@@ -547,26 +547,30 @@ describe("fx doctor MCP", () => {
 
   test("SIGINT or SIGTERM while doctor starts its checks leaves no check and no server running", async () => {
     const r = makeRoot();
-    const server = "sleep 55.4321";
+    // Names and a server line unique to this run, so no other fx on the
+    // machine matches them.
+    const run = `${process.pid}${Date.now() % 100_000}`;
+    const check = `mcp show sig${run}_`;
+    const server = `sleep 55.${run}`;
     const mcp: Record<string, unknown> = {};
     // Servers that ignore SIGTERM, so only doctor's kill of each check with
     // everything it started ends them at once.
-    for (let i = 0; i < 50; i++) mcp[`f${i}`] = { command: ["/bin/sh", "-c", `trap '' TERM; exec /bin/${server}`] };
+    for (let i = 0; i < 50; i++) mcp[`sig${run}_${i}`] = { command: ["/bin/sh", "-c", `trap '' TERM; exec /bin/${server}`] };
     writeFileSync(join(r.home, ".fx", "mcp.json"), JSON.stringify({ mcp }));
     cleanups.push(() => {
       spawnSync("/usr/bin/pkill", ["-KILL", "-f", server]);
-      spawnSync("/usr/bin/pkill", ["-KILL", "-f", "mcp show f[0-9]"]);
+      spawnSync("/usr/bin/pkill", ["-KILL", "-f", check]);
     });
     for (const signal of ["SIGINT", "SIGTERM"] as const) {
       for (const delay of [0, 10, 40]) {
         const proc = Bun.spawn([FX_BIN, "doctor"], { env: env(r, { FX_TEST_DOCTOR_DEADLINE_MS: "30000" }), cwd: r.workspace, stdout: "ignore", stderr: "ignore" });
         const started = performance.now();
-        while (running("mcp show f") === "" && performance.now() - started < 10_000) await Bun.sleep(1);
+        while (running(check) === "" && performance.now() - started < 10_000) await Bun.sleep(1);
         if (delay > 0) await Bun.sleep(delay);
         proc.kill(signal);
         await proc.exited;
         expect(proc.signalCode).toBe(signal);
-        expect(running("mcp show f")).toBe("");
+        expect(running(check)).toBe("");
         await Bun.sleep(3_000);
         expect(running(server)).toBe("");
       }

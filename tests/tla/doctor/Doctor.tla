@@ -284,7 +284,12 @@ AllDone ==
 \* Stop waiting: everything is done, the timer fired, or the signal arrived.
 \* Note which probes finished in time and cancel the others. Kill each child
 \* whose waiter is not done, with group kills its grandchild too, and with
-\* the sweep each running child's server.
+\* the sweep each running child's server. The kill and the sweep are one
+\* step here, so no child starts a server between them. The implementation
+\* earns that in three steps: it stops the group of every child still
+\* running, waits (100 ms in all) until each stop has landed or the child
+\* has exited, since kill(2) only queues a SIGSTOP, and only then looks at
+\* what each child started and kills it.
 StopWaiting ==
     /\ main = "waiting"
     /\ IF UseDeadline THEN fired \/ AllDone \/ sig ELSE AllDone \/ sig
