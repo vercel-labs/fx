@@ -1095,14 +1095,9 @@ fn raceRounds(rounds: usize, commands: usize, callers_per_command: usize, seed: 
             caller.join();
             if (caller.status == .ok) answered_ok += 1;
         }
-        std.testing.expectEqual(answered_ok, tool.calls.load(.acquire)) catch |err| {
-            std.debug.print("race round {d} (seed {d}) answered {d} ok for {d} calls\n", .{ round, seed, answered_ok, tool.calls.load(.acquire) });
-            return err;
-        };
-        if (!bridgeIsIdle()) {
-            std.debug.print("race round {d} (seed {d}) left the bridge busy\n", .{ round, seed });
-            return error.TestUnexpectedResult;
-        }
+        // The seed is fixed, so a failing round replays.
+        try std.testing.expectEqual(answered_ok, tool.calls.load(.acquire));
+        try std.testing.expect(bridgeIsIdle());
     }
 }
 
