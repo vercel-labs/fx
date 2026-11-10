@@ -411,9 +411,9 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
         }
         if (isContextNote(message)) {
             // fx places a note only at a step boundary, so the steps before
-            // it are complete (D93). A note may save a shorter text than it
-            // sends (D95).
-            const copy = try alloc.dupe(u8, message.context_note_saved_text orelse message.content orelse "");
+            // it are complete (D93). A note saves the text it sent, so later
+            // turns send it unchanged (D95).
+            const copy = try alloc.dupe(u8, message.content orelse "");
             errdefer alloc.free(copy);
             const sources = try types.dupeNoteSources(alloc, message.context_note_sources);
             context_notes.append(alloc, .{ .text = copy, .after_tool_step_count = tool_step_count, .sources = sources }) catch |err| {

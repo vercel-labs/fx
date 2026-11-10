@@ -77,7 +77,9 @@
 (*              instructions when a note sits right before a user message, *)
 (*              and on OpenAI a note is not an eligible message, so it is  *)
 (*              cached only after the next one.                            *)
-(* At the end of a skill turn the skill text is swapped for a short note.  *)
+(* A named skill's text stays on its turn's message in later turns, as     *)
+(* the turn sent it (D95). Mutation "skill_swapped" is fx before that: the *)
+(* next turn swaps the text for a short note.                              *)
 (* Event "remind" is a tool step in a later turn that reaches a folder      *)
 (* whose rules an earlier turn delivered: fx appends a one-line reminder   *)
 (* to that step's tool result (src/builtins/context.zig                    *)
@@ -131,7 +133,8 @@ ASSUME Design \in {"current", "proposed"}
 ASSUME Family \in {"anthropic", "openai"}
 ASSUME Mutation \in {"none", "mark_every_system", "fence_after_context", "no_auto",
                      "note_not_saved", "contract_late", "remind_old_result",
-                     "stale_in_instructions", "overlay_rebuilt", "overlay_not_saved"}
+                     "stale_in_instructions", "overlay_rebuilt", "overlay_not_saved",
+                     "skill_swapped"}
 ASSUME Carrier \in {"message", "note"}
 ASSUME MaxSessions \in Nat /\ MaxSteps \in Nat /\ Limit \in Nat
 ASSUME PathScoped \in BOOLEAN
@@ -240,7 +243,7 @@ vars == <<cache, sessions, active, log, branchOf>>
 NoSession == [on |-> FALSE, w |-> "none", s |-> 0, n |-> 0, br |-> "b1", br0 |-> "b1",
               hist |-> <<>>, last |-> <<>>, switched |-> FALSE, delivered |-> FALSE,
               skilled |-> FALSE, scopedTurn |-> FALSE, scopedStable |-> FALSE,
-              skill |-> FALSE, skillUser |-> 0, skillText |-> 0,
+              skill |-> FALSE, skillText |-> 0,
               carrierAt |-> 0, remindable |-> FALSE, reminded |-> FALSE,
               resumed |-> FALSE, stale |-> FALSE, out |-> FALSE, out0 |-> FALSE]
 
@@ -341,7 +344,7 @@ Continue(kind) ==
       recapture == kind = "resume" /\ Mutation = "overlay_not_saved"
       misplaced == kind = "remind" /\ carried /\ Mutation = "remind_old_result"
       br == IF kind = "switch" THEN "b2" ELSE a.br
-      swapped == IF isTurn /\ Notes /\ a.skillText > 0
+      swapped == IF isTurn /\ Notes /\ a.skillText > 0 /\ Mutation = "skill_swapped"
                  THEN [a.hist EXCEPT ![a.skillText] =
                          IF carried THEN Block("userc", @.v \o "short")
                          ELSE Block("skillnote", "k")]
@@ -374,8 +377,6 @@ Continue(kind) ==
                         !.scopedTurn = (IF isTurn THEN FALSE
                                         ELSE a.scopedTurn \/ (~Notes /\ kind = "deliver")),
                         !.skill = (IF isTurn THEN ~Notes /\ kind = "skill" ELSE a.skill),
-                        !.skillUser = (IF kind = "skill" THEN Len(withMsg)
-                                       ELSE IF isTurn THEN 0 ELSE a.skillUser),
                         !.skillText = (IF Notes /\ kind = "skill" THEN Len(hist)
                                        ELSE IF isTurn THEN 0 ELSE a.skillText),
                         !.carrierAt = (IF kind = "deliver" /\ carried THEN Len(withMsg)
@@ -388,11 +389,7 @@ Continue(kind) ==
                         !.br0 = IF recapture THEN a.br ELSE a.br0,
                         !.out0 = IF recapture THEN a.out ELSE a.out0]
       req == Lead(next) \o hist
-      \* On the turn after a named skill, only the history before that turn's
-      \* user message must be read.
-      keep == IF isTurn /\ a.skillUser > 0
-              THEN Len(a.last) - Len(a.hist) + a.skillUser - 1
-              ELSE LastKept(a.last)
+      keep == LastKept(a.last)
   IN /\ a.on
      /\ a.n < MaxSteps
      /\ kind \in {"switch", "deliver", "skill", "remind", "resume", "outside"} => kind \in Events
@@ -464,26 +461,23 @@ ContextChangeKeepsStable ==
   \A i \in 1..Len(log) : log[i].changed => log[i].read >= PosStable
 
 (* When the turn context changes mid-session, the history is still read,   *)
-(* except on the turn after a named skill, whose text is swapped for a     *)
-(* short note (the exception MidSessionKeepsHistory and PreviousFully-     *)
-(* Reused make too; "resume" is the change that can land on that turn).    *)
-(* Only the notes design has it; elsewhere the turn context sits ahead of  *)
-(* the history, and gap-history.cfg keeps that gap visible.                *)
+(* the turn after a named skill included. Only the notes design has it;    *)
+(* elsewhere the turn context sits ahead of the history, and               *)
+(* gap-history.cfg keeps that gap visible.                                 *)
 ContextChangeKeepsHistory ==
   \A i \in 1..Len(log) :
-    log[i].changed /\ log[i].keep = LastKept(log[i].prev) => log[i].read >= Len(log[i].prev)
+    log[i].changed => log[i].read >= Len(log[i].prev)
 
 (* Within a session, each request reads all of the previous one except the *)
-(* notes at its end, and on the turn after a named skill, all history      *)
-(* before that turn's user message. fx today misses it: mid-session        *)
-(* changes sit ahead of the history.                                       *)
+(* notes at its end, the turn after a named skill included. fx before P6   *)
+(* missed it: mid-session changes sat ahead of the history.                *)
 MidSessionKeepsHistory ==
   \A i \in 1..Len(log) : ~log[i].first => log[i].read >= log[i].keep
 
 (* Within a session, each request reads all of the previous one, changes   *)
-(* included, except on the turn after a named skill. The message carrier   *)
-(* has it on both families; a note is not an eligible OpenAI message.      *)
+(* included. The message carrier has it on both families; a note is not an *)
+(* eligible OpenAI message.                                                *)
 PreviousFullyReused ==
   \A i \in 1..Len(log) :
-    ~log[i].first /\ log[i].keep = LastKept(log[i].prev) => log[i].read >= Len(log[i].prev)
+    ~log[i].first => log[i].read >= Len(log[i].prev)
 =============================================================================

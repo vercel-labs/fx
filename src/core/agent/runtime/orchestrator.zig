@@ -5634,22 +5634,24 @@ const PreparedSkills = struct {
 };
 
 /// Puts a named skill's text on the turn's own message: a context note at the
-/// turn's first boundary, after any note already there, which a save records
-/// as `used_note` (D95). A recovered turn already holds that short note; its
-/// full text goes back in the same place. Returns the note's index.
+/// turn's first boundary, after any note already there. The turn saves the
+/// note as sent, so every later request sends the same message (D95). A turn
+/// recovered from its checkpoint already holds the note and keeps it as it
+/// is; the short note an older fx saved there gets the full text back.
+/// Returns the note's index.
 fn carryExplicitSkill(
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
     text: []const u8,
-    used_note: []const u8,
 ) Allocator.Error!usize {
     var boundary: usize = 0;
     while (boundary < within_turn_suffix.items.len and within_turn_suffix.items[boundary].role == .system and
         within_turn_suffix.items[boundary].context_note) : (boundary += 1)
     {
         const note = &within_turn_suffix.items[boundary];
-        if (std.mem.startsWith(u8, note.content orelse "", skill_invocation.skill_used_open_tag)) {
-            note.context_note_saved_text = note.content;
+        const content = note.content orelse "";
+        if (std.mem.startsWith(u8, content, skill_invocation.explicit_heading)) return boundary;
+        if (std.mem.startsWith(u8, content, skill_invocation.skill_used_open_tag)) {
             note.content = text;
             return boundary;
         }
@@ -5658,7 +5660,6 @@ fn carryExplicitSkill(
         .role = .system,
         .content = text,
         .context_note = true,
-        .context_note_saved_text = used_note,
     });
     return boundary;
 }
@@ -5677,12 +5678,10 @@ fn keepExplicitSkillNote(
 ) Allocator.Error!?usize {
     const index = note_index orelse return null;
     if (index >= cut) return index;
-    const section = explicit.?;
     try within_turn_suffix.insert(arena, cut, .{
         .role = .system,
-        .content = section.text,
+        .content = explicit.?.text,
         .context_note = true,
-        .context_note_saved_text = section.used_note.?,
     });
     debug_trace.logf("skills", "explicit skill note added again after compaction index={d}", .{cut});
     return cut;
@@ -5909,13 +5908,13 @@ fn processQueuedPromptInner(
         }
     }
     // A named skill's text rides on the turn's own message, so the
-    // instructions stay as they were cached; the turn saves a short note in
-    // its place (D95).
+    // instructions stay as they were cached, and the turn saves it as sent,
+    // so later turns send that message unchanged (D95).
     var explicit_note_index: ?usize = null;
     if (explicit_section) |section| {
         if (section.text.len > 0) {
-            explicit_note_index = try carryExplicitSkill(arena, &within_turn_suffix, section.text, section.used_note.?);
-            debug_trace.logf("skills", "explicit skill note queued index={d} bytes={d} saved_bytes={d}", .{ explicit_note_index.?, section.text.len, section.used_note.?.len });
+            explicit_note_index = try carryExplicitSkill(arena, &within_turn_suffix, section.text);
+            debug_trace.logf("skills", "explicit skill note queued index={d} bytes={d}", .{ explicit_note_index.?, section.text.len });
         }
     }
     try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, &stable_prefix);
