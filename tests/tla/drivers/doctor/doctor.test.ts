@@ -2,8 +2,9 @@
 // makes the provider catalog, one MCP server, and gh answer or hang, maps the
 // report to the spec's `report` variable, and has TLC confirm the spec can
 // reach that report. A report the spec cannot produce must be rejected,
-// doctor must end by the deadline plus its reap grace, which it can only do
-// once it has cancelled and joined every check (NoTaskAfterReport), and
+// doctor's own time, from its first trace line to its exit, must end by the
+// deadline plus a grace, which it can only do once it has cancelled and
+// joined every check (NoTaskAfterReport), and
 // neither a child nor a process a child started in its group may outlive
 // doctor (NoChildAfterExit): the hanging gh runs a sleep of its own. One more
 // run sends SIGTERM while doctor starts its checks: doctor must end by the
@@ -11,14 +12,19 @@
 // started left behind.
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fxBin, outDir, REPO_ROOT, runTlc, TLA_ROOT } from "../lib/tlc";
 
 const FIXTURE = join(REPO_ROOT, "tests", "e2e", "fixtures", "mcp-modern-stdio.mjs");
 const DEADLINE_MS = 1500;
+// Doctor's own time, from its first trace line to its exit, may pass its
+// deadline by this much: the stop, the reap grace, the join, and the report.
 const GRACE_MS = 2500;
+// The whole process, fx's start and local checks included, which a loaded
+// machine slows; only a hang should cross it.
+const PROCESS_LIMIT_MS = 10_000;
 type Outcome = "result" | "timed_out" | "none";
 type Observation = { catalog: Outcome; mcp1: Outcome; gh: Outcome };
 const GH_GRANDCHILD = "sleep 59.8765";
@@ -46,7 +52,7 @@ const running = (marker: string) => spawnSync("/usr/bin/pgrep", ["-f", marker]).
  * gh hangs with the server, running a sleep of its own, and otherwise says
  * it is signed out.
  */
-async function run(catalogHangs: boolean, mcpHangs: boolean): Promise<{ observed: Observation; ms: number; left: string }> {
+async function run(catalogHangs: boolean, mcpHangs: boolean): Promise<{ observed: Observation; ms: number; span: number; left: string }> {
   const root = mkdtempSync(join(tmpdir(), "fx-tla-doctor-"));
   try {
     const home = join(root, "h");
@@ -68,11 +74,18 @@ async function run(catalogHangs: boolean, mcpHangs: boolean): Promise<{ observed
       HOME: home, PATH: bin, FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1", FX_MODEL: "fake/m",
       AI_GATEWAY_API_KEY: "driver-key", FX_GATEWAY_BASE_URL: base,
       FX_TEST_GATEWAY_MODELS_URL: `${base}/coding-agent/v1/models`, FX_TEST_DOCTOR_DEADLINE_MS: String(DEADLINE_MS),
+      FX_TRACE_LOG: join(root, "trace.log"), FX_TRACE_SCOPES: "doctor",
     };
     const started = performance.now();
     const proc = Bun.spawn([fxBin(), "doctor", "--json"], { env, cwd: ws, stdout: "pipe", stderr: "ignore" });
     const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
     const ms = performance.now() - started;
+    const exited = Date.now();
+    // Each trace line starts with its wall-clock time in milliseconds; the
+    // first one comes once doctor starts its checks, after its deadline is set.
+    const first = Number(readFileSync(join(root, "trace.log"), "utf8").split(" ", 1)[0]);
+    if (!Number.isFinite(first) || first <= 0) throw new Error("doctor wrote no trace line");
+    const span = exited - first;
     const left = [running("mcp show mcp1 --json"), running(GH_GRANDCHILD)].filter(Boolean).join("\n");
     const checks: Array<{ name: string; status: string; detail: string }> = JSON.parse(out).checks;
     const catalog: Outcome = checks.some((c) => c.name === "provider" && c.detail.includes("could not reach"))
@@ -82,7 +95,7 @@ async function run(catalogHangs: boolean, mcpHangs: boolean): Promise<{ observed
     const mcp: Outcome = !server ? "none" : server.detail.includes("did not start in") ? "timed_out" : "result";
     const ghLine = checks.find((c) => c.name === "gh");
     const gh: Outcome = !ghLine ? "none" : ghLine.detail.includes("did not answer") ? "timed_out" : "result";
-    return { observed: { catalog, mcp1: mcp, gh }, ms, left };
+    return { observed: { catalog, mcp1: mcp, gh }, ms, span, left };
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -141,9 +154,10 @@ describe("fx doctor along Doctor.tla", () => {
   ];
   for (const [label, catalogHangs, mcpHangs, want] of cases) {
     test(`${label}: the report is one the spec reaches, by the deadline, with no child left`, async () => {
-      const { observed, ms, left } = await run(catalogHangs, mcpHangs);
+      const { observed, ms, span, left } = await run(catalogHangs, mcpHangs);
       expect(observed).toEqual(want);
-      expect(ms).toBeLessThan(DEADLINE_MS + GRACE_MS);
+      expect(span).toBeLessThan(DEADLINE_MS + GRACE_MS);
+      expect(ms).toBeLessThan(PROCESS_LIMIT_MS);
       expect(left).toBe("");
       expect(await reachable(observed, label)).toBe(true);
     }, TLC_TIMEOUT_MS);
