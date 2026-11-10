@@ -31,6 +31,18 @@ function clockSeconds(clock: string): number {
   const [, hours, minutes, seconds] = /^(?:(\d+)h)?(?:(\d+)m)?(\d+)s$/.exec(clock)!;
   return Number(hours ?? 0) * 3600 + Number(minutes ?? 0) * 60 + Number(seconds);
 }
+// The summary line a finished turn leaves after it, such as `  12s (↑34 ↓433)`.
+const TURN_SUMMARY_LINE = /^  (\d+s|\d+m \d+s|\d+h \d{2}m)(?: \(↑[^\n]*\))?$/m;
+/// The seconds on the summary line of the turn whose prompt holds `prompt`,
+/// or null before that turn has finished.
+function turnSummarySeconds(pane: string, prompt: string): number | null {
+  const at = pane.lastIndexOf(prompt);
+  if (at < 0) return null;
+  const line = TURN_SUMMARY_LINE.exec(pane.slice(at));
+  if (!line) return null;
+  const [, hours, minutes, seconds] = /^(?:(\d+)h)?(?: ?(\d+)m)?(?: ?(\d+)s)?$/.exec(line[1]!)!;
+  return Number(hours ?? 0) * 3600 + Number(minutes ?? 0) * 60 + Number(seconds ?? 0);
+}
 const COMPACTION_OUTPUT = /Compacting|compaction|Context compacted|No context to compact|Synthetic summary rejection|INTERNAL_HANDOFF_4e12/i;
 // Ctrl+O gives each compaction's model call its own line, as for every call;
 // nothing else there may speak of compaction.
@@ -370,19 +382,25 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       // own clock runs well past what the turn showed.
       await terminal.waitForPane((pane) => {
         const row = COMPACTION_CLOCK.exec(pane);
-        return row !== null && row[2] === "2/3 summarizing" && clockSeconds(row[1]!) >= 4;
+        return row !== null && row[2] === "2/3 summarizing" && clockSeconds(row[1]!) >= 6;
       }, 15_000);
       f.summaryHold.release(HANDOFF);
       await until(() => f.durable() > 0, "acknowledged checkpoint");
       const resumed = await terminal.waitForText(TURN_CLOCK, 10_000);
       expect(resumed).not.toMatch(COMPACTION_CLOCK);
       // The turn goes on from the second compaction started in, plus at most
-      // the second the release took; the 4 s or more of compaction are not in it.
+      // the second the release took; the 6 s or more of compaction are not in it.
       const after = clockSeconds(TURN_CLOCK.exec(resumed)![1]!);
       expect(after).toBeGreaterThanOrEqual(before);
       expect(after).toBeLessThanOrEqual(before + 2);
       f.ordinaryHold.release("CURRENT_TURN_OK_f713");
-      await terminal.waitForPane((pane) => pane.includes("CURRENT_TURN_OK_f713") && hasEmptyComposer(pane), 10_000);
+      const finished = await terminal.waitForPane((pane) =>
+        pane.includes("CURRENT_TURN_OK_f713") && hasEmptyComposer(pane) && turnSummarySeconds(pane, "Continue the current turn.") !== null, 10_000);
+      // The finished turn's duration leaves out the compaction too: about
+      // what its clock showed, not that plus the 6 s of compaction.
+      const total = turnSummarySeconds(finished, "Continue the current turn.")!;
+      expect(total).toBeGreaterThanOrEqual(after - 1);
+      expect(total).toBeLessThanOrEqual(after + 2);
       await f.close();
       passed = true;
     } finally { await f.cleanup(passed); }
@@ -772,8 +790,6 @@ const LIVE_MODEL = process.env.FX_COMPACTION_LIVE_MODEL ?? "anthropic/claude-hai
 const LIVE = process.env.FX_E2E_REAL_API === "1" && HAS_API_KEY;
 // The turn row names its phase: thinking, running a tool, or generating.
 const LIVE_TURN_CLOCK = /(?:Thinking|Running|Generating) \(((?:\d+h)?(?:\d+m)?\d+s)\)/;
-// The summary line a finished turn leaves after it, such as `  12s (↑34 ↓433)`.
-const TURN_SUMMARY_LINE = /^  (?:\d+s|\d+m \d+s|\d+h \d{2}m)(?: \(↑[^\n]*\))?$/m;
 const LIVE_PROMPT = "Use read_file to read part1.txt, then part2.txt, then part3.txt, one file per step. Then reply with the single word DONE.";
 
 describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live model", () => {
@@ -839,10 +855,7 @@ describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live
       let pane = "";
       // The model may take more or fewer steps; the test waits for the turn
       // to end, which leaves its summary line after the prompt.
-      const finished = (text: string) => {
-        const prompt = text.lastIndexOf("one file per step");
-        return prompt >= 0 && TURN_SUMMARY_LINE.test(text.slice(prompt)) && hasEmptyComposer(text);
-      };
+      const finished = (text: string) => turnSummarySeconds(text, "one file per step") !== null && hasEmptyComposer(text);
       while (Date.now() - sent < 240_000) {
         pane = await terminal.capturePane();
         const turn = LIVE_TURN_CLOCK.exec(pane);
@@ -899,6 +912,12 @@ describe.skipIf(!tmuxAvailable() || !LIVE)("tui: compaction activity with a live
         expect(episode.after).toBeGreaterThanOrEqual(episode.before);
         expect(episode.after).toBeLessThanOrEqual(episode.before + Math.ceil(episode.gap / 1000) + 2);
       }
+      // The finished turn's duration leaves out the compaction too: about
+      // what the turn clock last showed.
+      const total = turnSummarySeconds(pane, "one file per step")!;
+      console.log(`live turn: clock last ${lastTurn?.seconds}s, summary ${total}s`);
+      expect(total).toBeGreaterThanOrEqual(lastTurn!.seconds - 1);
+      expect(total).toBeLessThanOrEqual(lastTurn!.seconds + 2);
       expect(checkpoints(readFileSync(join(sessionDir(home, sessionId), "log.jsonl")))).toBeGreaterThan(0);
       await terminal.sendText("/quit");
       expect(await terminal.waitForSessionEnd(10_000)).toBe(true);
