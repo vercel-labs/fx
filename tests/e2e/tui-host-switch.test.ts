@@ -538,6 +538,52 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "a subagent the user stops tells main which files it changed before it ended",
+    async () => {
+      let childCalls = 0;
+      let reported = "";
+      const held_turn = held();
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          if (childCalls === 1) return toolCall("child_write", "write_file", { path: "stop-notes.txt", content: "STOP_NOTES\n" });
+          // The turn waits here, after its write, until the user's stop.
+          await held_turn.promise;
+          return text("child_answer", "STOP_CHILD_RAN");
+        }
+        if (body.includes('\\"cause\\":\\"user_stop\\"')) {
+          reported = body;
+          return text("main_saw", "STOP_MAIN_SAW");
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "worker", message: "STOP_TASK write notes", profile: "notes" } });
+        }
+        return text("main_done", "STOP_MAIN_DONE");
+      }, async (session, { workspace }) => {
+        await session.sendText("SWITCH_USER");
+        await until("the subagent's turn after its write", () => childCalls >= 2);
+        expect(readFileSync(join(workspace, "stop-notes.txt"), "utf8")).toBe("STOP_NOTES\n");
+        await showAgent(session, "worker");
+        await session.waitForPane((pane) => pane.includes("STOP_TASK") && pane.includes("worker \u2193"), 15_000);
+        await session.sendKeys("Escape");
+        await session.waitForText("esc again to interrupt", 10_000);
+        await session.sendKeys("Escape");
+        await session.waitForText("What can fx do differently?", 15_000);
+        await showAgent(session, "main");
+        await session.waitForText("STOP_MAIN_SAW", 30_000);
+        held_turn.release();
+      }, (home) => {
+        // Its writes need no approval, so the turn runs on to the stop.
+        const folder = join(home, ".fx", "agents", "notes");
+        mkdirSync(folder, { recursive: true });
+        writeFileSync(join(folder, "profile.json"), JSON.stringify({ description: "Writes notes", tools: ["write_file"], permission_mode: "full-access" }));
+      });
+      expect(reported).toContain("Files it changed before it ended: stop-notes.txt");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a message main sends while a user's stop is ending the subagent's turn starts its next turn",
     async () => {
       const dir = realpathSync(mkdtempSync(join(tmpdir(), "fx-user-stop-end-")));

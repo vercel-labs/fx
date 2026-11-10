@@ -1097,13 +1097,29 @@ pub const Runtime = struct {
             self.managedResultText(a, end.child_id, end.work_id) catch null;
         // An empty reply says nothing, so the report reads as if it had none.
         const text = if (saved) |value| (if (value.len > 0) value else null) else null;
-        return switch (end.outcome) {
-            .completed => text orelse "The subagent ended its turn without a reply.",
-            .failed => formatFailedResult(a, if (end.failure) |*failure| failure.view() else null, text),
-            .cancelled => withPartial(a, cancelledSentence(end.end.cause), text),
-            .interrupted => withPartial(a, "fx stopped before it finished.", text),
-            .lost => lost_result,
+        const output = switch (end.outcome) {
+            .completed => return text orelse "The subagent ended its turn without a reply.",
+            .lost => return lost_result,
+            .failed => try formatFailedResult(a, if (end.failure) |*failure| failure.view() else null, text),
+            .cancelled => try withPartial(a, cancelledSentence(end.end.cause), text),
+            .interrupted => try withPartial(a, "fx stopped before it finished.", text),
         };
+        // Work that ended early says what it already changed, so its parent
+        // neither redoes it nor misses it. The list is extra: without it the
+        // report still goes.
+        const changed = (self.changedFiles(a, end.child_id, end.work_id) catch null) orelse return output;
+        return a.print("{s}\n\nFiles it changed before it ended: {s}", .{ output, changed });
+    }
+
+    /// The files work `work_id` changed, from its saved turn
+    /// (`listChangedFiles`).
+    fn changedFiles(self: *Runtime, a: Allocator, child_id: []const u8, work_id: []const u8) !?[]const u8 {
+        const history = self.children.parent.store.childHistory(a, child_id) catch return null;
+        return listChangedFiles(a, switch (turnForWork(history, work_id) orelse return null) {
+            .assistant => |value| value.execution.files,
+            .interrupted => |value| value.execution.files,
+            .compacted_summary => return null,
+        });
     }
 
     fn childName(self: *Runtime, a: Allocator, child_id: []const u8) ![]const u8 {
@@ -2903,6 +2919,29 @@ test "the user's close tells main how many of its messages waiting for the subag
     try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
 }
 
+test "an early-ended work names each file it changed once, without reads or failed changes, up to the cap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const file = struct {
+        fn make(path: []const u8, new_path: ?[]const u8, action: types.FileEvidenceAction, status: types.PersistedToolStatus) types.FileEvidence {
+            return .{ .path = @constCast(path), .new_path = if (new_path) |value| @constCast(value) else null, .tool_call_id = @constCast("call"), .tool_name = @constCast("edit_file"), .action = action, .status = status };
+        }
+    }.make;
+    try std.testing.expect((try listChangedFiles(a, &.{file("a.zig", null, .read, .success)})) == null);
+    const listed = (try listChangedFiles(a, &.{
+        file("a.zig", null, .read, .success),
+        file("b.zig", null, .edit, .success),
+        file("c.zig", null, .write, .failure),
+        file("b.zig", null, .write, .success),
+        file("old.zig", "new.zig", .rename, .success),
+    })).?;
+    try std.testing.expectEqualStrings("b.zig, new.zig", listed);
+    var many: [max_listed_files + 2]types.FileEvidence = undefined;
+    for (&many, 0..) |*entry, index| entry.* = file(try a.print("f{d}", .{index}), null, .write, .success);
+    try std.testing.expect(std.mem.endsWith(u8, (try listChangedFiles(a, &many)).?, "f19, and 2 more"));
+}
+
 test "an idle subagent closes at once, and its name then starts a new one" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -3534,20 +3573,48 @@ fn assistantTextForWork(
     history: []const types.HistoryTurn,
     work_id: []const u8,
 ) ?[]const u8 {
+    return switch (turnForWork(history, work_id) orelse return null) {
+        .assistant => |value| value.assistant,
+        .interrupted => |value| value.assistant orelse "",
+        .compacted_summary => null,
+    };
+}
+
+/// The newest saved turn of work `work_id`.
+fn turnForWork(history: []const types.HistoryTurn, work_id: []const u8) ?types.HistoryTurn {
     var index = history.len;
     while (index > 0) {
         index -= 1;
-        const candidate = history[index];
-        const candidate_work_id = session.historyTurnWorkId(candidate) orelse continue;
-        if (!std.mem.eql(u8, candidate_work_id, work_id)) continue;
-        return switch (candidate) {
-            .assistant => |value| value.assistant,
-            .interrupted => |value| value.assistant orelse "",
-            .compacted_summary => null,
-        };
+        const candidate_work_id = session.historyTurnWorkId(history[index]) orelse continue;
+        if (std.mem.eql(u8, candidate_work_id, work_id)) return history[index];
     }
     return null;
 }
+
+/// The files `files` changed, each path once, as one list of the first
+/// `max_listed_files`; null when none. Reads and failed changes don't count.
+fn listChangedFiles(a: Allocator, files: []const types.FileEvidence) !?[]const u8 {
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (files) |file| {
+        if (file.status != .success) continue;
+        switch (file.action) {
+            .write, .edit, .delete, .rename, .copy => {},
+            .read, .search, .list, .unknown => continue,
+        }
+        const path = file.new_path orelse file.path;
+        for (paths.items) |known| {
+            if (std.mem.eql(u8, known, path)) break;
+        } else try paths.append(a, path);
+    }
+    if (paths.items.len == 0) return null;
+    const shown = paths.items[0..@min(paths.items.len, max_listed_files)];
+    const list = try std.mem.join(a, ", ", shown);
+    if (shown.len == paths.items.len) return list;
+    return try a.print("{s}, and {d} more", .{ list, paths.items.len - shown.len });
+}
+
+/// How many changed files a report of early-ended work names.
+const max_listed_files = 20;
 
 /// Builds the parent-facing guidance for a rejected model override.
 fn modelOverrideFailureMessage(
