@@ -2411,11 +2411,6 @@ fn appendExecutionMemoryMessages(
             }
         }
     }
-    if (execution.files.len > 0) {
-        const text = try formatExecutionFileContext(alloc, execution.files);
-        errdefer alloc.free(text);
-        try messages.append(alloc, message.Message.userOwned(text));
-    }
     while (steering_index < execution.steering.len) : (steering_index += 1) {
         const steering = execution.steering[steering_index];
         if (steering.assistant_prefix) |prefix| {
@@ -2479,14 +2474,10 @@ pub fn appendExecutionMemoryChatMessages(
             }
         }
     }
-    // Notes after the last step follow its results, as the turn sent them,
-    // and come before the file context a saved turn adds.
+    // Notes after the last step follow its results, as the turn sent them.
+    // Nothing the turn never sent joins it here: a model that checks earlier
+    // reasoning rejects a reply whose preceding messages changed.
     try appendContextNoteChatMessages(alloc, messages, execution.context_notes, &note_index, null);
-    if (execution.files.len > 0) {
-        const text = try formatExecutionFileContext(alloc, execution.files);
-        errdefer alloc.free(text);
-        try messages.append(alloc, .{ .role = .user, .content = text });
-    }
     while (steering_index < execution.steering.len) : (steering_index += 1) {
         const steering = execution.steering[steering_index];
         if (steering.assistant_prefix) |prefix| {
@@ -2660,28 +2651,6 @@ pub fn formatCompactedContinuationMessage(alloc: Allocator, summary: []const u8)
         "{s}{s}\n\n{s}\n{s}",
         .{ compact_continuation_preamble, summary, compact_recent_messages_note, compact_direct_resume_instruction },
     );
-}
-
-pub fn formatExecutionFileContext(alloc: Allocator, files: []const core_types.FileEvidence) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-
-    out.writer.writeAll("Session file evidence from previous tool execution. Re-read stale paths before relying on exact contents:") catch return error.OutOfMemory;
-    for (files) |file| {
-        out.writer.print("\n- action={s} status={s} path={s}", .{ @tagName(file.action), @tagName(file.status), file.path }) catch return error.OutOfMemory;
-        if (file.new_path) |new_path| {
-            out.writer.print(" new_path={s}", .{new_path}) catch return error.OutOfMemory;
-        }
-        if (file.model_view_covers_full_file) {
-            out.writer.writeAll(" model_view=full") catch return error.OutOfMemory;
-        }
-        if (file.stale) {
-            out.writer.writeAll(" stale=true") catch return error.OutOfMemory;
-        }
-        out.writer.print(" tool={s}", .{file.tool_name}) catch return error.OutOfMemory;
-    }
-
-    return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 pub fn formatInterruptedHistoryContext(alloc: Allocator, entry: InterruptedHistoryTurn) ![]u8 {
@@ -2928,7 +2897,7 @@ test "resume history preserves steering between tool episodes" {
     try std.testing.expectEqualStrings("after second", messages.items[6].content.?.asText());
 }
 
-test "resume history keeps context notes between tool episodes, before steering and the file context (D93)" {
+test "resume history keeps context notes between tool episodes and before steering (D93)" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -2991,19 +2960,17 @@ test "resume history keeps context notes between tool episodes, before steering 
         .{ .assistant, null },
         .{ .tool, "second result" },
         .{ .system, "note after second" },
-        .{ .user, null },
         .{ .user, "after second" },
         .{ .assistant, "finished" },
     };
+    // The saved file list adds no message: the turn never sent one, and a
+    // message it never sent would change what came before its reply.
     try std.testing.expectEqual(expected.len, messages.items.len);
     for (expected, messages.items) |want, got| {
         try std.testing.expectEqual(want[0], got.role);
         try std.testing.expectEqual(want[0] == .system, got.context_note);
         if (want[1]) |text| try std.testing.expectEqualStrings(text, got.content.?);
     }
-    // The file context a saved turn adds follows the last step's note, which
-    // rides on that step's result, and comes before the last steering.
-    try std.testing.expect(std.mem.find(u8, messages.items[8].content.?, "first") != null);
 }
 
 test "resume projection replays assistant tool execution memory before final answer" {
@@ -3044,16 +3011,16 @@ test "resume projection replays assistant tool execution memory before final ans
     defer deinitMessages(alloc, &messages);
     try appendHistoryMessages(alloc, &messages, &history);
 
-    try std.testing.expectEqual(@as(usize, 5), messages.items.len);
+    // The final answer directly follows the last tool result, as the turn
+    // sent them; the saved file list adds nothing between.
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
     try std.testing.expectEqual(.user, messages.items[0].role);
     try std.testing.expectEqual(.assistant, messages.items[1].role);
     try std.testing.expectEqualStrings("call_read", messages.items[1].tool_calls[0].id);
     try std.testing.expectEqual(.tool, messages.items[2].role);
     try std.testing.expectEqualStrings("file contents", messages.items[2].content.?.asText());
-    try std.testing.expectEqual(.user, messages.items[3].role);
-    try std.testing.expect(std.mem.find(u8, messages.items[3].content.?.asText(), "model_view=full") != null);
-    try std.testing.expectEqual(.assistant, messages.items[4].role);
-    try std.testing.expectEqualStrings("main wires the app", messages.items[4].content.?.asText());
+    try std.testing.expectEqual(.assistant, messages.items[3].role);
+    try std.testing.expectEqualStrings("main wires the app", messages.items[3].content.?.asText());
 }
 
 test "resume projections omit empty terminal assistant after completed execution" {
@@ -4274,20 +4241,19 @@ fn checkPromptHistoryMessageProjectionAllocationFailures(
         return err;
     };
 
-    try std.testing.expect(messages.items.len >= 6);
+    try std.testing.expectEqual(@as(usize, 6), messages.items.len);
     try std.testing.expectEqualStrings(
         "latest user",
-        messages.items[messages.items.len - 5].content.?.asText(),
+        messages.items[messages.items.len - 4].content.?.asText(),
     );
     try std.testing.expectEqual(
         PersistedToolStatus.failure,
-        messages.items[messages.items.len - 3].tool_result_status.?,
+        messages.items[messages.items.len - 2].tool_result_status.?,
     );
-    try std.testing.expect(std.mem.find(
-        u8,
-        messages.items[messages.items.len - 2].content.?.asText(),
-        "src/latest.zig",
-    ) != null);
+    try std.testing.expectEqualStrings(
+        "latest assistant",
+        messages.items[messages.items.len - 1].content.?.asText(),
+    );
 }
 
 test "prompt history cleanup is independent after snapshot creation" {

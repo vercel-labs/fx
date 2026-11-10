@@ -106,7 +106,7 @@ tests/tla/sdk/check.sh                                  # the SDK specs; writes 
 bun tests/tla/drivers/drive.mjs send --walks 40         # one durable-session graph; see .github/workflows/ci.yml for the rest
 bun tests/tla/drivers/drive-agents.mjs --walks 60       # agent routing
 bun tests/tla/drivers/drive-tenants.mjs --walks 60      # tenants in one process
-bun tests/tla/drivers/drive-steer.mjs ideal --walks 20  # steering
+bun tests/tla/drivers/drive-steer.mjs ideal --walks 20  # steering; --stream-lag MS shows each stream line MS ms late
 bun test ./tests/tla/drivers/shell_command/             # a driver written as bun tests; see each check.sh for its own
 tests/tla/session/check.sh                              # the shell's session, /status and the exit line, and a turn's stream
 tests/tla/subagent/check.sh                             # main's messages into its subagents' turns, and planted bugs

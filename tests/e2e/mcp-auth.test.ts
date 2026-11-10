@@ -149,6 +149,8 @@ function startAuthFixture(
     resourceAtOrigin?: boolean;
     /** Answer revocations this late. */
     revokeDelayMs?: number;
+    /** Answer revocations with this status, in place of 200. */
+    revokeStatus?: number;
     /** Answer the authorization server's metadata this late, like a slow sign-in. */
     discoveryDelayMs?: number;
     /**
@@ -397,7 +399,7 @@ function startAuthFixture(
       if (url.pathname === "/revoke") {
         revocations += 1;
         if (options.revokeDelayMs) await Bun.sleep(options.revokeDelayMs);
-        return new Response("", { status: 200 });
+        return new Response("", { status: options.revokeStatus ?? 200 });
       }
       if (url.pathname === "/register" && options.registration && request.method === "POST") {
         registrations += 1;
@@ -936,6 +938,45 @@ describe("MCP login", () => {
     expect(logoutMs).toBeGreaterThanOrEqual(500);
     expect(await statusOf(root)).toBe("not_started");
   }, 60_000);
+
+  // Before, a logout that sent no revocation, as for a server whose
+  // authorization server takes none, still said only "Signed out", though
+  // the tokens kept working there.
+  test("a logout that can't revoke the login at its server says the tokens stay valid", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    seedV2Credential(root, auth, { revocation_endpoint: null });
+    expect(await statusOf(root)).toBe("signed_in");
+
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(logout.stdout).toBe("Signed out of fixture here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
+    expect(logout.stderr).toBe("");
+    expect(logout.code).toBe(0);
+    expect(auth.revocations).toBe(0);
+    expect(await statusOf(root)).toBe("not_started");
+  }, 60_000);
+
+  // A revocation the server refused, or didn't answer before fx stopped
+  // waiting, may have left the tokens working there.
+  for (const [what, options] of [
+    ["refuses", { revokeStatus: 503 }],
+    ["doesn't answer in time", { revokeDelayMs: 4_000 }],
+  ] as const) {
+    test(`a logout whose revocation the server ${what} says the tokens may stay valid`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, options);
+      const root = createRoot(auth);
+      seedV2Credential(root, auth);
+      const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+      expect(logout.stdout).toBe("Signed out of fixture here, but its server didn't confirm the revocation, so its tokens may stay valid until they expire.\n");
+      expect(logout.stderr).toBe("");
+      expect(logout.code).toBe(0);
+      expect(auth.revocations).toBe(1);
+      expect(await statusOf(root)).toBe("not_started");
+    }, 60_000);
+  }
 
   test("fx mcp login says why the server refused the sign-in, in its words", async () => {
     upstream = startModernMcpHttpFixture("json");

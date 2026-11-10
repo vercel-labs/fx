@@ -488,6 +488,13 @@ pub const Server = struct {
         return !r.stdio and r.auth.revoking() != null;
     }
 
+    /// The status the last sign-out's revocation was answered with, 0 when
+    /// it couldn't be sent or read; null before an answer.
+    pub fn revocationAnswer(r: *const Server) ?u16 {
+        if (r.stdio) return null;
+        return r.auth.revocationAnswer();
+    }
+
     /// Writes the sign-in credential for the host to keep securely,
     /// and pass back as `auth.saved`; false when there is none to keep.
     pub fn saveCredential(r: *const Server, w: *std.Io.Writer) std.Io.Writer.Error!bool {

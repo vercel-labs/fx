@@ -2000,40 +2000,51 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       const env: Record<string, string> = { FX_PERMISSION_MODE: "full-access" };
       let lastResult = "";
       let laneRequests = 0;
-      const laneStep = held(), laneRead = held(), laneDone = held();
+      const laneStarted = held(), laneStep = held(), laneRead = held(), laneDone = held();
       const steers = Array.from({ length: 64 }, (_, i) => ({ id: `steer_${i + 1}`, agent: "lane", message: `STEER_${String(i + 1).padStart(3, "0")} note` }));
-      await withFx(async (body) => {
-        if (!isMainRequest(body)) {
-          laneRequests += 1;
-          if (laneRequests === 1) {
-            await laneStep.promise;
-            return toolCall("lane_t1", "shell", { action: "run", command: "true" });
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            laneRequests += 1;
+            if (laneRequests === 1) {
+              // The lane's turn is running now, so steers go into it instead
+              // of waiting for its next turn.
+              laneStarted.release();
+              await laneStep.promise;
+              return toolCall("lane_t1", "shell", { action: "run", command: "true" });
+            }
+            // The lane reads every waiting message at this step.
+            if (body.includes("STEER_064")) laneRead.release();
+            await laneDone.promise;
+            return text("lane_done", "LANE_DONE");
           }
-          // The lane reads every waiting message at this step.
-          if (body.includes("STEER_064")) laneRead.release();
-          await laneDone.promise;
-          return text("lane_done", "LANE_DONE");
-        }
-        if (latestUserText(body).includes('"child_id"')) return text("main_report", "MAIN_SAW_REPORT");
-        if (body.includes('"steer_last"')) {
-          lastResult = toolResultText(body, "steer_last");
-          laneDone.release();
-          return text("main_done", "MAIN_DONE");
-        }
-        if (body.includes('"steer_64"')) {
-          laneStep.release();
-          await laneRead.promise;
-          return toolCall("steer_last", "subagent", { request: { action: "message", agent: "lane", message: "STEER_LAST one more" } });
-        }
-        if (body.includes('"main_start"')) return messageSteps(steers);
-        return toolCall("main_start", "subagent", { request: { action: "message", agent: "lane", message: "LANE_TASK keep working" } });
-      }, async (session) => {
-        await session.sendText("SWITCH_USER steer the lane");
-        await session.waitForText("MAIN_DONE", 120_000);
-        console.log(`STEER_LAST_RESULT: ${lastResult}`);
-        // None of the 64 was waiting any more, so the limit doesn't apply.
-        expect(lastResult).toContain("Sent into the subagent's running turn");
-      }, () => {}, false, env);
+          if (latestUserText(body).includes('"child_id"')) return text("main_report", "MAIN_SAW_REPORT");
+          if (body.includes('"steer_last"')) {
+            lastResult = toolResultText(body, "steer_last");
+            laneDone.release();
+            return text("main_done", "MAIN_DONE");
+          }
+          if (body.includes('"steer_64"')) {
+            laneStep.release();
+            await laneRead.promise;
+            return toolCall("steer_last", "subagent", { request: { action: "message", agent: "lane", message: "STEER_LAST one more" } });
+          }
+          if (body.includes('"main_start"')) {
+            await laneStarted.promise;
+            return messageSteps(steers);
+          }
+          return toolCall("main_start", "subagent", { request: { action: "message", agent: "lane", message: "LANE_TASK keep working" } });
+        }, async (session) => {
+          await session.sendText("SWITCH_USER steer the lane");
+          await session.waitForText("MAIN_DONE", 120_000);
+          console.log(`STEER_LAST_RESULT: ${lastResult}`);
+          // None of the 64 was waiting any more, so the limit doesn't apply.
+          expect(lastResult).toContain("Sent into the subagent's running turn");
+        }, () => {}, false, env);
+      } finally {
+        // A failed run must not leave gateway handlers waiting.
+        for (const hold of [laneStarted, laneStep, laneRead, laneDone]) hold.release();
+      }
     },
     180_000,
   );
@@ -2044,43 +2055,56 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       const env: Record<string, string> = { FX_PERMISSION_MODE: "full-access" };
       let fullResult = "";
       let otherResult = "";
-      const lanesDone = held();
+      const laneAStarted = held(), laneBStarted = held(), lanesDone = held();
       const steers = Array.from({ length: 64 }, (_, i) => ({ id: `steer_a_${i + 1}`, agent: "lane-a", message: `A_STEER_${String(i + 1).padStart(3, "0")} note` }));
-      await withFx(async (body) => {
-        if (!isMainRequest(body)) {
-          // Neither lane reaches a step boundary until the checks are done,
-          // so every message to lane-a stays unread.
-          await lanesDone.promise;
-          return text("lane_done", "LANE_DONE");
-        }
-        if (latestUserText(body).includes('"child_id"')) return text("main_report", "MAIN_SAW_REPORT");
-        if (body.includes('"steer_b"')) {
-          fullResult = toolResultText(body, "steer_a_65");
-          otherResult = toolResultText(body, "steer_b");
-          lanesDone.release();
-          return text("main_done", "MAIN_DONE");
-        }
-        if (body.includes('"steer_a_64"')) {
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            // Each lane's turn is running once it asks the model, so messages
+            // go into that turn instead of waiting for its next one.
+            const asked = userTexts(body).join("\n");
+            if (asked.includes("LANE_A_TASK")) laneAStarted.release();
+            if (asked.includes("LANE_B_TASK")) laneBStarted.release();
+            // Neither lane reaches a step boundary until the checks are done,
+            // so every message to lane-a stays unread.
+            await lanesDone.promise;
+            return text("lane_done", "LANE_DONE");
+          }
+          if (latestUserText(body).includes('"child_id"')) return text("main_report", "MAIN_SAW_REPORT");
+          if (body.includes('"steer_b"')) {
+            fullResult = toolResultText(body, "steer_a_65");
+            otherResult = toolResultText(body, "steer_b");
+            lanesDone.release();
+            return text("main_done", "MAIN_DONE");
+          }
+          if (body.includes('"steer_a_64"')) {
+            return messageSteps([
+              { id: "steer_a_65", agent: "lane-a", message: "A_STEER_065 one too many" },
+              { id: "steer_b", agent: "lane-b", message: "B_STEER_001 note" },
+            ]);
+          }
+          if (body.includes('"start_b"')) {
+            await Promise.all([laneAStarted.promise, laneBStarted.promise]);
+            return messageSteps(steers);
+          }
           return messageSteps([
-            { id: "steer_a_65", agent: "lane-a", message: "A_STEER_065 one too many" },
-            { id: "steer_b", agent: "lane-b", message: "B_STEER_001 note" },
+            { id: "start_a", agent: "lane-a", message: "LANE_A_TASK keep working" },
+            { id: "start_b", agent: "lane-b", message: "LANE_B_TASK keep working" },
           ]);
-        }
-        if (body.includes('"start_b"')) return messageSteps(steers);
-        return messageSteps([
-          { id: "start_a", agent: "lane-a", message: "LANE_A_TASK keep working" },
-          { id: "start_b", agent: "lane-b", message: "LANE_B_TASK keep working" },
-        ]);
-      }, async (session) => {
-        await session.sendText("SWITCH_USER fill lane-a");
-        await session.waitForText("MAIN_DONE", 120_000);
-        console.log(`FULL_RESULT: ${fullResult}`);
-        console.log(`OTHER_RESULT: ${otherResult}`);
-        const full = JSON.parse(fullResult.slice(fullResult.indexOf("{")));
-        expect(full.ok).toBe(false);
-        expect(full.result).toContain("lane-a already has 64 unread messages");
-        expect(otherResult).toContain("Sent into the subagent's running turn");
-      }, () => {}, false, env);
+        }, async (session) => {
+          await session.sendText("SWITCH_USER fill lane-a");
+          await session.waitForText("MAIN_DONE", 120_000);
+          console.log(`FULL_RESULT: ${fullResult}`);
+          console.log(`OTHER_RESULT: ${otherResult}`);
+          const full = JSON.parse(fullResult.slice(fullResult.indexOf("{")));
+          expect(full.ok).toBe(false);
+          expect(full.result).toContain("lane-a already has 64 unread messages");
+          expect(otherResult).toContain("Sent into the subagent's running turn");
+        }, () => {}, false, env);
+      } finally {
+        // A failed run must not leave gateway handlers waiting.
+        for (const hold of [laneAStarted, laneBStarted, lanesDone]) hold.release();
+      }
     },
     180_000,
   );
