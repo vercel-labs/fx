@@ -133,7 +133,7 @@ jobs:
   zig:
     name: Build & Test
     if: ${{ always() }}
-    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-package-guards, sdk-browser-wasm, tla-mcp, tla-transcript-window]
+    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-package-guards, sdk-browser-wasm, tla-mcp, tla-transcript-window, tla-subagent]
     runs-on: ubuntu-latest
     steps:
       - name: Require unit tests and every SDK job
@@ -141,7 +141,7 @@ jobs:
           RESULTS: ${{ toJSON(needs.*.result) }}
         run: |
           printf '%s\n' "$RESULTS"
-          jq -e 'length == 8 and all(.[]; . == "success")' <<<"$RESULTS"
+          jq -e 'length == 9 and all(.[]; . == "success")' <<<"$RESULTS"
 
   build:
     name: Build fx (ReleaseSafe)
@@ -185,10 +185,10 @@ jobs:
 
   # The durable-session model check in SDK (Bun + N-API/WASM) takes about 40
   # minutes, the TLA+ MCP models and drivers about 20, and the TLA+ transcript
-  # window model a few. A pull request runs each only when it changes the code
-  # that check covers; see scripts/detect-ci-need.sh. Pushes to main and manual
-  # dispatches always run all three, so the main run that Publish libfx waits
-  # for includes them.
+  # window and subagent models a few each. A pull request runs each only when
+  # it changes the code that check covers; see scripts/detect-ci-need.sh.
+  # Pushes to main and manual dispatches always run all four, so the main run
+  # that Publish libfx waits for includes them.
   ci-need:
     name: Detect CI need
     runs-on: ubuntu-24.04
@@ -197,6 +197,7 @@ jobs:
       libfx: ${{ steps.detect.outputs.libfx }}
       mcp: ${{ steps.detect.outputs.mcp }}
       transcript_window: ${{ steps.detect.outputs.transcript_window }}
+      subagent: ${{ steps.detect.outputs.subagent }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -491,6 +492,7 @@ jobs:
           bun tests/tla/drivers/drive-steer.mjs faults --walks 20 --seed 4
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 4 --hooks
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 6 --backend wasm
+          bun tests/tla/drivers/drive-steer.mjs faults --walks 8 --seed 8 --stream-lag 400
 
       - name: Test libfx on a World
         run: |
@@ -751,6 +753,50 @@ jobs:
           curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
           TLA2TOOLS_JAR="$jar" tests/tla/transcript_window/check.sh --ci
+
+  # The subagent steering and stop-then-message models and the session-write
+  # model, and the drivers that run a built fx along them. Only the design
+  # configs and the session-write witnesses run here; the planted bugs and fx's
+  # old defects stay local (both check.sh scripts with no arguments): they
+  # measure the checks, not the code.
+  tla-subagent:
+    name: TLA+ subagent and session-write models
+    needs: [build, ci-need]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+        if: needs.ci-need.outputs.subagent == 'true'
+      - name: Download fx
+        if: needs.ci-need.outputs.subagent == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: fx-linux-x86_64
+          path: zig-out/bin
+      - name: Restore executable mode
+        if: needs.ci-need.outputs.subagent == 'true'
+        run: chmod +x zig-out/bin/fx
+      - name: Setup Bun
+        if: needs.ci-need.outputs.subagent == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Model-check subagent messages and session writes, and drive fx along the models
+        if: needs.ci-need.outputs.subagent == 'true'
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
+          export TLA2TOOLS_JAR="$jar"
+          tests/tla/subagent/check.sh steer-queue steer-queue-deep stop-message stop-message-deep
+          tests/tla/session/check.sh session-write session-write-witness-added-during-write session-write-witness-waits session-write-witness-relisted
+          bun tests/tla/drivers/subagent/driver.ts
+          bun test ./tests/tla/drivers/subagent/stop-message.test.ts
+          bun test ./tests/tla/drivers/session/write.test.ts
 
   e2e_mode:
     name: E2E (deterministic, shard ${{ matrix.shard.label }})

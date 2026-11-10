@@ -1,10 +1,13 @@
 const std = @import("std");
+const sort_utils = @import("../../shared/sort_utils.zig");
+const toolbox = @import("../../tooling/toolbox.zig");
 const testing_allocator = @import("../../shared/testing_allocator.zig");
 const skill_runtime = @import("../../skills/skill_runtime.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const skill_invocation = @import("../../skills/skill_invocation.zig");
 const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
+const context_limits = @import("../../config/context_limits.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const model_catalog = @import("../../gateway/model_catalog.zig");
@@ -2500,34 +2503,6 @@ const PreparationClassifierContext = struct {
     deps: *const AgentRuntimeDeps,
 };
 
-fn prepareSkillCall(deps: *const AgentRuntimeDeps, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !?skill_contract.CallPreparation {
-    const tool = deps.tool_registry.lookup(call.name) orelse return null;
-    if (tool.prepare_skill_call_fn == null) return null;
-    const prepare = deps.prepare_skill_call orelse return null;
-    return prepare(deps.ctx, arena, call, locations) catch |err| switch (err) {
-        error.OutOfMemory, error.Cancelled => return err,
-        else => .{ .failure = .{ .model_output = try arena.print("skill failed: {s}", .{@errorName(err)}) } },
-    };
-}
-
-fn skillPreparationFailure(arena: Allocator, output: skill_contract.ExecuteOutput) !ToolExecutionResult {
-    var notices: [2][]const u8 = undefined;
-    var count: usize = 0;
-    if (output.notice) |notice| {
-        notices[count] = notice;
-        count += 1;
-    }
-    if (output.diagnostic_notice) |notice| {
-        notices[count] = notice;
-        count += 1;
-    }
-    return .{
-        .status = .failure,
-        .model_output = output.model_output,
-        .context_notices = try arena.dupe([]const u8, notices[0..count]),
-    };
-}
-
 fn preparationExecutionStatus(status: runtime_tool_contracts.ToolExecutionStatus) tool_preparation.ToolStatus {
     return switch (status) {
         .success => .success,
@@ -2573,46 +2548,88 @@ fn prepareAvailabilityTerminal(
     };
 }
 
-/// Advertises live MCP tools the model called without loading them first, so
-/// those calls reach normal validation and MCP permission instead of failing
-/// as unselected. Names that do not resolve, including lookups that fail or
-/// are cancelled, keep the unsupported-tool path, where the turn's normal
-/// cancellation handling still applies.
-fn advertiseUnselectedMcpCalls(
+/// The call a `toolbox {run}` carries, which fx prepares, admits, and runs as
+/// the agent's own direct call of it, so a run meets every check a direct
+/// call does (`tests/tla/toolbox/Toolbox.tla` RunNeedsAdmission): the call of
+/// `run` with the toolbox call's id and its `arguments`, whose result goes
+/// back under toolbox (`ToolCall.carried_by`). An MCP tool the request didn't
+/// send is admitted for this step only, in `advertised_tools` and
+/// `advertised_names`, and never joins the tools fx sends (ToolsFixed). Null
+/// when the call isn't a valid toolbox run, or names toolbox itself, a host's
+/// own tool, or nothing fx can find now; that call stays a toolbox run, whose
+/// result says why.
+fn toolboxRunSubject(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
-    calls: []const ToolCall,
-    selected: *std.ArrayList(agent_stream_provider.DynamicFunctionTool),
+    call: ToolCall,
     advertised_tools: *[]const agent_stream_provider.DynamicFunctionTool,
     advertised_names: *[][]const u8,
-) !void {
-    const resolve = deps.resolve_unselected_mcp_tool orelse return;
-    for (calls) |call| {
-        if (deps.tool_registry.lookup(call.name) != null) continue;
-        if (containsString(advertised_names.*, call.name)) continue;
-        const resolved = resolve(deps.ctx, arena, call.name) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                debug_trace.logf("mcp", "unselected MCP tool lookup failed tool={s} err={s}", .{ call.name, @errorName(err) });
-                continue;
-            },
-        };
-        const definition = resolved orelse continue;
-        if (!std.mem.eql(u8, definition.name, call.name) or definition.mcp_binding == null) continue;
-        try runtime_gateway_step.recordSelectedDynamicTool(arena, selected, definition);
-        const tool = for (selected.items) |item| {
-            if (std.mem.eql(u8, item.name, call.name)) break item;
-        } else unreachable;
-        const tools = try arena.alloc(agent_stream_provider.DynamicFunctionTool, advertised_tools.len + 1);
-        @memcpy(tools[0..advertised_tools.len], advertised_tools.*);
-        tools[advertised_tools.len] = tool;
-        const names = try arena.alloc([]const u8, advertised_names.len + 1);
-        @memcpy(names[0..advertised_names.len], advertised_names.*);
-        names[advertised_names.len] = tool.name;
-        advertised_tools.* = tools;
-        advertised_names.* = names;
-        debug_trace.logf("mcp", "loaded unselected MCP tool for direct call tool={s}", .{call.name});
+) !?ToolCall {
+    if (!std.mem.eql(u8, call.name, toolbox.tool_name) or call.argument_integrity != .valid) return null;
+    const run = (try toolbox.carriedCall(arena, call.name, call.arguments_json)) orelse return null;
+    if (std.mem.eql(u8, run.name, toolbox.tool_name)) return null;
+    var subject = call;
+    subject.name = run.name;
+    subject.arguments_json = run.arguments_json;
+    subject.carried_by = call.name;
+    if (deps.tool_registry.lookup(run.name)) |spec| return if (toolbox.runs(spec.*)) subject else null;
+    for (advertised_tools.*) |tool| {
+        if (std.mem.eql(u8, tool.name, run.name)) return if (tool.mcp_binding != null) subject else null;
     }
+    const resolve = deps.resolve_unselected_mcp_tool orelse return null;
+    const resolved = resolve(deps.ctx, arena, run.name) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("toolbox", "run lookup failed call={s} tool={s} err={s}", .{ call.id, run.name, @errorName(err) });
+            return null;
+        },
+    };
+    const definition = resolved orelse return null;
+    if (!std.mem.eql(u8, definition.name, run.name) or definition.mcp_binding == null) return null;
+    var converted: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try runtime_gateway_step.recordSelectedDynamicTool(arena, &converted, definition);
+    const tools = try arena.alloc(agent_stream_provider.DynamicFunctionTool, advertised_tools.len + 1);
+    @memcpy(tools[0..advertised_tools.len], advertised_tools.*);
+    tools[advertised_tools.len] = converted.items[0];
+    const names = try arena.alloc([]const u8, advertised_names.len + 1);
+    @memcpy(names[0..advertised_names.len], advertised_names.*);
+    names[advertised_names.len] = converted.items[0].name;
+    advertised_tools.* = tools;
+    advertised_names.* = names;
+    debug_trace.logf("toolbox", "run admitted for this step call={s} tool={s}", .{ call.id, run.name });
+    return subject;
+}
+
+/// The call fx admits for a toolbox call: the one a run carries
+/// (`toolboxRunSubject`), or an open or search marked with what it stands
+/// for (`ToolCall.toolbox_lookup`), so the permission rules and a subagent's
+/// profile decide it as the tool it replaced. Null for any other call.
+fn toolboxSubject(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    call: ToolCall,
+    locations: ?*const skill_contract.Locations,
+    servers: []const []const u8,
+    advertised_tools: *[]const agent_stream_provider.DynamicFunctionTool,
+    advertised_names: *[][]const u8,
+) !?ToolCall {
+    if (try toolboxRunSubject(deps, arena, call, advertised_tools, advertised_names)) |subject| return subject;
+    if (call.argument_integrity != .valid) return null;
+    const lookup = (try toolbox.lookupOf(arena, call, locations, servers, deps.tool_registry)) orelse return null;
+    var marked = call;
+    marked.toolbox_lookup = lookup;
+    debug_trace.logf("toolbox", "lookup admitted as call={s} permission={s}", .{ call.id, lookup.permission });
+    return marked;
+}
+
+/// The call a subagent's live authority decides: a toolbox open or search as
+/// the tool it replaced, so a profile without `skill` reads no skill through
+/// toolbox; any other call as it is.
+fn authorityCall(call: ToolCall) ToolCall {
+    const lookup = call.toolbox_lookup orelse return call;
+    var decided = call;
+    decided.name = lookup.permission;
+    return decided;
 }
 
 fn containsString(items: []const []const u8, item: []const u8) bool {
@@ -5636,22 +5653,24 @@ const PreparedSkills = struct {
 };
 
 /// Puts a named skill's text on the turn's own message: a context note at the
-/// turn's first boundary, after any note already there, which a save records
-/// as `used_note` (D95). A recovered turn already holds that short note; its
-/// full text goes back in the same place. Returns the note's index.
+/// turn's first boundary, after any note already there. The turn saves the
+/// note as sent, so every later request sends the same message (D95). A turn
+/// recovered from its checkpoint already holds the note and keeps it as it
+/// is; the short note an older fx saved there gets the full text back.
+/// Returns the note's index.
 fn carryExplicitSkill(
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
     text: []const u8,
-    used_note: []const u8,
 ) Allocator.Error!usize {
     var boundary: usize = 0;
     while (boundary < within_turn_suffix.items.len and within_turn_suffix.items[boundary].role == .system and
         within_turn_suffix.items[boundary].context_note) : (boundary += 1)
     {
         const note = &within_turn_suffix.items[boundary];
-        if (std.mem.startsWith(u8, note.content orelse "", skill_invocation.skill_used_open_tag)) {
-            note.context_note_saved_text = note.content;
+        const content = note.content orelse "";
+        if (std.mem.startsWith(u8, content, skill_invocation.explicit_heading)) return boundary;
+        if (std.mem.startsWith(u8, content, skill_invocation.skill_used_open_tag)) {
             note.content = text;
             return boundary;
         }
@@ -5660,7 +5679,6 @@ fn carryExplicitSkill(
         .role = .system,
         .content = text,
         .context_note = true,
-        .context_note_saved_text = used_note,
     });
     return boundary;
 }
@@ -5679,12 +5697,10 @@ fn keepExplicitSkillNote(
 ) Allocator.Error!?usize {
     const index = note_index orelse return null;
     if (index >= cut) return index;
-    const section = explicit.?;
     try within_turn_suffix.insert(arena, cut, .{
         .role = .system,
-        .content = section.text,
+        .content = explicit.?.text,
         .context_note = true,
-        .context_note_saved_text = section.used_note.?,
     });
     debug_trace.logf("skills", "explicit skill note added again after compaction index={d}", .{cut});
     return cut;
@@ -5706,9 +5722,224 @@ fn prepareSkillCatalog(
         config.workspace_root,
     );
     errdefer section.deinit(alloc);
-    if (section.notice) |notice| try deps.pushContextNotice(notice);
+    // With toolbox the catalog's text isn't sent, so its shortening isn't
+    // news; the menu counts what it leaves out.
+    if (!toolbox.isAdvertised(config.advertised_tool_names)) {
+        if (section.notice) |notice| try deps.pushContextNotice(notice);
+    }
     if (section.diagnostic_notice) |notice| try deps.pushContextNotice(notice);
     return section;
+}
+
+/// The toolbox menu for this request: the one this conversation sent first,
+/// or, on its first request, one rendered from the visible skills, the
+/// configured MCP servers, and the built-in tools behind toolbox. Null when
+/// toolbox isn't advertised. The result lives in `agent`.
+fn toolboxMenu(
+    arena: Allocator,
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    agent: *runtime_agent.Agent,
+    skill_section: ?*const skill_runtime.BoundedPromptSection,
+    context_window: ?u32,
+    turn_notes: *std.ArrayList(ChatMessage),
+) !?[]const u8 {
+    if (!toolbox.isAdvertised(config.advertised_tool_names)) return null;
+    // Once the conversation keeps its menu, each entry's kind and name are
+    // all a request needs: the change hash and the change note read only
+    // those, so the descriptions and the shared-name scan are skipped.
+    const kept = agent.toolbox_menu.get() != null;
+    var entries: std.ArrayList(toolbox.Entry) = .empty;
+    const descriptions_limited = try appendSkillEntries(arena, &entries, skill_section, config.context_limits, kept);
+    if (descriptions_limited > 0) {
+        var notice: std.Io.Writer.Allocating = .init(arena);
+        skill_runtime.writeDescriptionsShortened(&notice.writer, descriptions_limited, config.context_limits) catch return error.OutOfMemory;
+        try deps.pushContextNotice(notice.written());
+    }
+    // Sorted here, so the menu never depends on the order a host lists them.
+    const servers = try arena.dupe([]const u8, config.toolbox_mcp_servers);
+    sort_utils.sort([]const u8, servers, {}, sort_utils.lessThanBytes);
+    for (servers) |name| try entries.append(arena, .{ .kind = .mcp_server, .name = name });
+    for (config.toolbox_behind) |name| {
+        const tool = deps.tool_registry.lookup(name) orelse continue;
+        try entries.append(arena, .{ .kind = .tool, .name = name, .description = if (kept) "" else tool.description });
+    }
+    // A skipped skill is told where the skills are listed, as the catalog did.
+    const lead = if (kept) "" else (try skill_runtime.discoveryWarningMarker(arena, config.skill_catalog.diagnostics)) orelse "";
+    const decided = try keptToolboxMenu(arena, &agent.toolbox_menu, entries.items, lead, .{
+        .max_bytes = skill_runtime.skillListBudget(config.context_limits, context_window),
+    });
+    if (decided.shortened) {
+        var notice: std.Io.Writer.Allocating = .init(arena);
+        skill_runtime.writeListShortened(&notice.writer, config.context_limits, context_window) catch return error.OutOfMemory;
+        try deps.pushContextNotice(notice.written());
+    }
+    if (decided.note) |note| {
+        // A note in the turn, saved with it, so the model learns of the
+        // change while the menu and everything earlier requests sent stay as
+        // they were (D93).
+        try turn_notes.append(arena, .{ .role = .system, .content = note, .context_note = true });
+        debug_trace.logf("toolbox", "change noted entries={d} bytes={d}", .{ entries.items.len, note.len });
+    }
+    return decided.menu;
+}
+
+/// Adds the skills of `skill_section` to `entries` in discovery order, and
+/// returns how many descriptions `limits` cut. A kept menu needs only each
+/// entry's kind and name, so its descriptions and open-as locations are left
+/// out, but it lists the same skills as a new one, or the change hash would
+/// differ between the first request and the rest.
+fn appendSkillEntries(
+    arena: Allocator,
+    entries: *std.ArrayList(toolbox.Entry),
+    skill_section: ?*const skill_runtime.BoundedPromptSection,
+    limits: context_limits.Values,
+    kept: bool,
+) !usize {
+    const skills = if (skill_section) |section| section.locations.skills else &.{};
+    var listed: std.ArrayList(skill_runtime.Skill) = .empty;
+    var descriptions_limited: usize = 0;
+    for (skills) |skill| {
+        // Listed once, as in the skill catalog the menu replaces, though the
+        // copies still share their name, so that name opens by location.
+        if (skill_runtime.listsSameSkill(listed.items, skill)) continue;
+        try listed.append(arena, skill);
+        if (kept) {
+            try entries.append(arena, .{ .kind = .skill, .name = skill.name });
+            continue;
+        }
+        // A name two skills share opens by location, as the catalog has it.
+        const shared = for (skills) |other| {
+            if (other.path.ptr != skill.path.ptr and std.mem.eql(u8, other.name, skill.name)) break true;
+        } else false;
+        const open_as = if (shared) try skill_section.?.locations.locationOf(arena, skill.path) else null;
+        // Sanitized and within skill_description_bytes, as the catalog shows it.
+        const description = try skill_runtime.limitedSkillDescription(arena, skill.description, limits);
+        if (description.limited) descriptions_limited += 1;
+        try entries.append(arena, .{ .kind = .skill, .name = skill.name, .description = description.text, .open_as = open_as });
+    }
+    return descriptions_limited;
+}
+
+/// The menu a request sends, and the note to push when the toolbox holds
+/// something other than the last request knew: the conversation's kept menu
+/// when it has one, so its bytes never change (`Toolbox.tla` MenuFixed),
+/// otherwise a new one rendered from `entries` and kept in `kept`.
+fn keptToolboxMenu(
+    arena: Allocator,
+    kept: *runtime_agent.ToolboxMenu,
+    entries: []const toolbox.Entry,
+    lead: []const u8,
+    limits: toolbox.Limits,
+) !struct { menu: []const u8, note: ?[]const u8, shortened: bool = false } {
+    const hash = toolbox.entriesHash(entries);
+    if (kept.get()) |menu| {
+        if (hash == kept.noted_hash) return .{ .menu = menu, .note = null };
+        kept.noted_hash = hash;
+        return .{ .menu = menu, .note = try toolbox.renderChangeNote(arena, entries) };
+    }
+    const bounded = try toolbox.renderBounded(arena, entries, limits);
+    kept.keep(lead, bounded.menu, hash);
+    debug_trace.logf("toolbox", "menu kept bytes={d} entries={d} shortened={}", .{ bounded.menu.len, entries.len, bounded.shortened });
+    // Only a new menu is news: a kept one shortens nothing again.
+    return .{ .menu = kept.get().?, .note = null, .shortened = bounded.shortened };
+}
+
+test "the toolbox menu stays as first sent, and each change is noted once" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var kept: runtime_agent.ToolboxMenu = .{};
+    const first = [_]toolbox.Entry{.{ .kind = .skill, .name = "review", .description = "Review a change." }};
+    const added = first ++ [_]toolbox.Entry{.{ .kind = .mcp_server, .name = "linear" }};
+
+    const sent = try keptToolboxMenu(arena, &kept, &first, "", .{});
+    try std.testing.expectEqual(@as(?[]const u8, null), sent.note);
+    try std.testing.expect(std.mem.find(u8, sent.menu, "- review") != null);
+    const menu = try arena.dupe(u8, sent.menu);
+
+    // A server added later leaves the menu's bytes alone and is noted.
+    const changed = try keptToolboxMenu(arena, &kept, &added, "", .{});
+    try std.testing.expectEqualStrings(menu, changed.menu);
+    try std.testing.expect(std.mem.find(u8, changed.note.?, "MCP servers: linear") != null);
+
+    // The same change isn't noted twice.
+    const again = try keptToolboxMenu(arena, &kept, &added, "", .{});
+    try std.testing.expectEqualStrings(menu, again.menu);
+    try std.testing.expectEqual(@as(?[]const u8, null), again.note);
+
+    // Going back is a change too, and the menu still doesn't move.
+    const back = try keptToolboxMenu(arena, &kept, &first, "", .{});
+    try std.testing.expectEqualStrings(menu, back.menu);
+    try std.testing.expect(back.note != null);
+}
+
+test "the toolbox menu lists a skill copied into two folders once" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "review", .description = "Review a change.", .path = "/workspace/.agents/skills/review", .source = .workspace_agents },
+        .{ .name = "review", .description = "Review a change.", .path = "/home/.fx/skills/review", .source = .global_fx },
+        .{ .name = "review", .description = "Review a pull request as an exam.", .path = "/home/.agents/skills/review", .source = .global_agents },
+        .{ .name = "deploy", .description = "Deploy a release.", .path = "/workspace/.agents/skills/deploy", .source = .workspace_agents },
+    };
+    var section = try skill_runtime.buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
+    defer section.deinit(alloc);
+
+    var entries: std.ArrayList(toolbox.Entry) = .empty;
+    _ = try appendSkillEntries(arena, &entries, &section, .{}, false);
+
+    // The identical copy from the lower-precedence folder is left out; the
+    // copy with its own description stays.
+    try std.testing.expectEqual(@as(usize, 3), entries.items.len);
+    try std.testing.expectEqualStrings("Review a change.", entries.items[0].description);
+    try std.testing.expectEqualStrings("Review a pull request as an exam.", entries.items[1].description);
+    try std.testing.expectEqualStrings("deploy", entries.items[2].name);
+    const menu = try toolbox.render(arena, entries.items, .{});
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, menu, "- review (open as "));
+    try std.testing.expect(std.mem.find(u8, menu, "Review a change.") != null);
+    // The listed copy still opens by the location the catalog gives it.
+    const resolved = try section.locations.resolve(arena, entries.items[0].open_as.?);
+    try std.testing.expectEqualStrings("/workspace/.agents/skills/review", resolved);
+
+    // A conversation that keeps its menu lists the same skills, so the change
+    // hash doesn't differ between its first request and the rest.
+    var kept_entries: std.ArrayList(toolbox.Entry) = .empty;
+    _ = try appendSkillEntries(arena, &kept_entries, &section, .{}, true);
+    try std.testing.expectEqual(toolbox.entriesHash(entries.items), toolbox.entriesHash(kept_entries.items));
+}
+
+test "an unconfigured skill description is cut to the catalog's 200 characters in the menu" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "long", .description = text_utils.repeat("x", 300), .path = "/workspace/.agents/skills/long", .source = .workspace_agents },
+        .{ .name = "short", .description = "Fits as it is.", .path = "/workspace/.agents/skills/short", .source = .workspace_agents },
+    };
+    var section = try skill_runtime.buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
+    defer section.deinit(alloc);
+
+    var entries: std.ArrayList(toolbox.Entry) = .empty;
+    const limited = try appendSkillEntries(arena, &entries, &section, .{}, false);
+    try std.testing.expectEqual(@as(usize, 1), limited);
+    try std.testing.expectEqual(@as(usize, context_limits.catalog_skill_description_characters), entries.items[0].description.len);
+    try std.testing.expectEqualStrings("Fits as it is.", entries.items[1].description);
+    // The menu still cuts each line to its own 100 bytes.
+    const menu = try toolbox.render(arena, entries.items, .{});
+    const line_start = std.mem.find(u8, menu, "- long: ").?;
+    const line_end = std.mem.findScalarPos(u8, menu, line_start, '\n').?;
+    try std.testing.expectEqual(@as(usize, 100), std.mem.count(u8, menu[line_start..line_end], "x"));
+
+    // A configured limit replaces the default.
+    var configured: context_limits.Values = .{};
+    configured.skill_description_bytes = .{ .value = .{ .bytes = 50 }, .source = .user_workspace };
+    var configured_entries: std.ArrayList(toolbox.Entry) = .empty;
+    try std.testing.expectEqual(@as(usize, 1), try appendSkillEntries(arena, &configured_entries, &section, configured, false));
+    try std.testing.expectEqual(@as(usize, 50), configured_entries.items[0].description.len);
 }
 
 fn processQueuedPromptInner(
@@ -5911,16 +6142,17 @@ fn processQueuedPromptInner(
         }
     }
     // A named skill's text rides on the turn's own message, so the
-    // instructions stay as they were cached; the turn saves a short note in
-    // its place (D95).
+    // instructions stay as they were cached, and the turn saves it as sent,
+    // so later turns send that message unchanged (D95).
     var explicit_note_index: ?usize = null;
     if (explicit_section) |section| {
         if (section.text.len > 0) {
-            explicit_note_index = try carryExplicitSkill(arena, &within_turn_suffix, section.text, section.used_note.?);
-            debug_trace.logf("skills", "explicit skill note queued index={d} bytes={d} saved_bytes={d}", .{ explicit_note_index.?, section.text.len, section.used_note.?.len });
+            explicit_note_index = try carryExplicitSkill(arena, &within_turn_suffix, section.text);
+            debug_trace.logf("skills", "explicit skill note queued index={d} bytes={d}", .{ explicit_note_index.?, section.text.len });
         }
     }
-    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, &stable_prefix);
+    const toolbox_menu = try toolboxMenu(arena, deps, config, agent, if (skill_section) |*section| section else null, request_capabilities.context_window, &within_turn_suffix);
+    try appendStablePromptContext(arena, deps, config, toolbox_menu orelse if (skill_section) |section| section.text else null, &stable_prefix);
     const active_history = job.history;
     const history_messages_before = stable_prefix.items.len;
     const interrupted_turns = runtime_interruption.countInterruptedHistory(active_history);
@@ -9633,14 +9865,9 @@ fn processQueuedPromptLoop(
             }
         }
 
-        try advertiseUnselectedMcpCalls(
-            deps,
-            arena,
-            completion.tool_calls,
-            &selected_dynamic_tools,
-            &advertised_dynamic_tools,
-            &advertised_dynamic_tool_names,
-        );
+        // A direct call of an MCP tool fx didn't send fails and points the
+        // model at toolbox run: listing the tool now would change the tools
+        // every earlier request sent (`Toolbox.tla` ToolsFixed).
         const prepared_tool_calls = try arena.alloc(
             PreparedToolCall,
             completion.tool_calls.len,
@@ -9738,6 +9965,13 @@ fn processQueuedPromptLoop(
                 return err;
             };
         }
+        // A toolbox run is prepared, admitted, and run as the call it
+        // carries; the assistant's call and its result stay toolbox.
+        const toolbox_subjects = try arena.alloc(?ToolCall, prepared_tool_calls.len);
+        for (prepared_tool_calls, toolbox_subjects) |prepared_call, *subject| subject.* = switch (prepared_call) {
+            .ready => try toolboxSubject(deps, arena, prepared_call.call(), if (skills.catalog) |catalog| &catalog.locations else null, config.toolbox_mcp_servers, &advertised_dynamic_tools, &advertised_dynamic_tool_names),
+            .blocked, .provider_executed => null,
+        };
         const effective_tool_calls = try arena.alloc(
             ToolCall,
             prepared_tool_calls.len,
@@ -9790,7 +10024,7 @@ fn processQueuedPromptLoop(
                     .ready => {},
                     .blocked, .provider_executed => continue,
                 }
-                const tool_call = prepared_call.call();
+                const tool_call = toolbox_subjects[i] orelse prepared_call.call();
                 preparation_batch.prepare(arena, i, tool_call, .{
                     .tool_registry = deps.tool_registry,
                     .workspace_root = config.workspace_root,
@@ -9823,7 +10057,7 @@ fn processQueuedPromptLoop(
                             finalization,
                             job,
                             partial_assistant,
-                            tool_call,
+                            prepared_call.call(),
                             completed_tool_names.items,
                             &interrupted_persisted,
                             step_ctx,
@@ -10023,7 +10257,10 @@ fn processQueuedPromptLoop(
         var parallel_skip_until: usize = 0;
         for (prepared_tool_calls, 0..) |prepared_tool_call, tool_call_index| {
             if (tool_call_index < parallel_skip_until) continue;
-            var tool_call = prepared_tool_call.call();
+            // What the model called, which an interrupted turn saves; the
+            // call that runs is what a toolbox run carries, when it is one.
+            const identity_call = prepared_tool_call.call();
+            var tool_call = toolbox_subjects[tool_call_index] orelse identity_call;
             tool_call.resolved_display_target = effective_tool_calls[tool_call_index].resolved_display_target;
             const root_live_permission_mode = snapshotRootPermissionMode(deps);
             const root_action_permission_mode = permissionModeForAction(
@@ -10036,6 +10273,7 @@ fn processQueuedPromptLoop(
                 !context_delta and
                 deps.live_tool_authority == null)
                 runtime_parallel_execution.leadingParallelGroup(
+                    arena,
                     deps.tool_registry,
                     effective_tool_calls[tool_call_index..],
                 )
@@ -10075,15 +10313,6 @@ fn processQueuedPromptLoop(
             if (parallel_len > 1) {
                 const parallel_calls = effective_tool_calls[tool_call_index .. tool_call_index + parallel_len];
                 const parallel_prepared = prepared_tool_calls[tool_call_index .. tool_call_index + parallel_len];
-                const parallel_skill_preparations = try arena.alloc(?skill_contract.CallPreparation, parallel_calls.len);
-                @memset(parallel_skill_preparations, null);
-                defer {
-                    for (parallel_calls) |*call| call.resolved_skill = null;
-                    for (parallel_skill_preparations) |maybe_prepared| {
-                        if (maybe_prepared) |prepared| skill_invocation.freeCallPreparation(arena, prepared);
-                    }
-                    arena.free(parallel_skill_preparations);
-                }
                 const precomputed_results = try arena.alloc(?ToolExecutionResult, parallel_calls.len);
                 @memset(precomputed_results, null);
                 const parallel_status_started = try arena.alloc(bool, parallel_calls.len);
@@ -10164,9 +10393,8 @@ fn processQueuedPromptLoop(
                 defer mem_utils.deinitList(arena, &executable_calls);
                 var executable_classification_complete: std.ArrayList(bool) = .empty;
                 defer mem_utils.deinitList(arena, &executable_classification_complete);
-                for (parallel_calls, precomputed_results, 0..) |unbound_call, precomputed, group_index| {
+                for (parallel_calls, precomputed_results, 0..) |parallel_call, precomputed, group_index| {
                     if (precomputed != null) continue;
-                    var parallel_call = unbound_call;
                     if (config.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
@@ -10187,37 +10415,6 @@ fn processQueuedPromptLoop(
                         finish_trace.finish("interrupted");
                         return;
                     }
-                    parallel_skill_preparations[group_index] = prepareSkillCall(deps, arena, parallel_call, if (skills.catalog) |catalog| &catalog.locations else null) catch |err| {
-                        if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
-                        runtime_telemetry.traceCancelObserved(step_ctx, true);
-                        try finishPendingParallelCancelled(
-                            deps,
-                            &stream_ctx.provisional_statuses,
-                            stream_ctx.alloc,
-                            arena,
-                            config,
-                            turn_id,
-                            parallel_calls,
-                            precomputed_results,
-                            parallel_status_started,
-                            parallel_status_terminalized,
-                            advertised_dynamic_tool_names,
-                        );
-                        try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                        try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, parallel_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
-                        finish_trace.finish("interrupted");
-                        return;
-                    };
-                    if (parallel_skill_preparations[group_index]) |*prepared| switch (prepared.*) {
-                        .selected => |*skill| {
-                            parallel_call.resolved_skill = skill;
-                            parallel_calls[group_index].resolved_skill = skill;
-                        },
-                        .failure => |output| {
-                            precomputed_results[group_index] = try skillPreparationFailure(arena, output);
-                            continue;
-                        },
-                    };
                     if (!runtime_tool_admission.deferVisibleLifecycleUntilAfterPermission(parallel_call.name)) {
                         parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
                     }
@@ -10428,6 +10625,8 @@ fn processQueuedPromptLoop(
                         .permission_mode = root_action_permission_mode,
                         .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                         .max_tool_result_bytes = config.max_tool_result_bytes,
+                        .toolbox_behind = config.toolbox_behind,
+                        .toolbox_mcp_servers = config.toolbox_mcp_servers,
                         .classification_complete = executable_classification_complete.items,
                         .presentation_group_id = stream_ctx.provisional_statuses.presentation_group_id,
                     };
@@ -10646,7 +10845,7 @@ fn processQueuedPromptLoop(
                     advertised_dynamic_tool_names,
                 );
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, identity_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
             }
@@ -10989,61 +11188,6 @@ fn processQueuedPromptLoop(
                     continue;
                 }
             }
-            var skill_preparation = prepareSkillCall(deps, arena, tool_call, if (skills.catalog) |catalog| &catalog.locations else null) catch |err| {
-                if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
-                runtime_telemetry.traceCancelObserved(step_ctx, true);
-                try finishPendingCancelledCalls(
-                    deps,
-                    &stream_ctx.provisional_statuses,
-                    stream_ctx.alloc,
-                    arena,
-                    config,
-                    turn_id,
-                    effective_tool_calls[tool_call_index..],
-                    advertised_dynamic_tool_names,
-                );
-                try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
-                finish_trace.finish("interrupted");
-                return;
-            };
-            defer if (skill_preparation) |prepared| skill_invocation.freeCallPreparation(arena, prepared);
-            if (skill_preparation) |*skill_prepared| {
-                switch (skill_prepared.*) {
-                    .selected => |*skill| tool_call.resolved_skill = skill,
-                    .failure => |output| {
-                        const execution = try skillPreparationFailure(arena, output);
-                        const prepared = try runtime_execution_memory.prepareToolExecutionOutput(arena, config, tool_call, execution, null);
-                        _ = try stream_ctx.provisional_statuses.finishExecutedCall(
-                            deps,
-                            stream_ctx.alloc,
-                            arena,
-                            turn_id,
-                            tool_call,
-                            false,
-                            tool_display_target,
-                            execution,
-                            prepared.model_output,
-                            prepared.memory,
-                            null,
-                            advertised_dynamic_tool_names,
-                        );
-                        try runtime_tool_admission.recordRejectedToolCall(deps, arena, tool_call, prepared.model_output, null);
-                        for (execution.context_notices) |notice| try deps.pushContextNotice(notice);
-                        try runtime_tool_batch.appendToolResultContent(
-                            arena,
-                            &within_turn_suffix,
-                            &completed_tool_names,
-                            &step_batch,
-                            tool_call,
-                            prepared.model_output,
-                            prepared.memory,
-                            .{ .increment_error = true },
-                        );
-                        continue;
-                    },
-                }
-            }
             const is_file_mutation = file_mutation_contract.isToolName(tool_call.name) and
                 // A host tool may reuse a reserved file-mutation name; it owns
                 // its own execution and never enters the builtin contract. A
@@ -11141,10 +11285,10 @@ fn processQueuedPromptLoop(
                 const resolved = switch (try resolveLiveToolAuthority(
                     deps,
                     arena,
-                    tool_call,
+                    authorityCall(tool_call),
                     config.workspace_root,
                     advertised_dynamic_tool_names,
-                    live_authority_target,
+                    live_authority_target orelse if (tool_call.toolbox_lookup) |lookup| lookup.target else null,
                 )) {
                     .resolved => |value| value,
                     .tool_failure => |failure| {
@@ -11152,8 +11296,11 @@ fn processQueuedPromptLoop(
                         break :live null;
                     },
                 };
-                if (liveAuthorityRejectsExecution(resolved)) {
-                    const outcome: []const u8 = if (resolved.decision == .deny)
+                // A toolbox run is decided as the child's own call of what it
+                // carries, so a profile's limits hold through toolbox.
+                const decided = resolved;
+                if (liveAuthorityRejectsExecution(decided)) {
+                    const outcome: []const u8 = if (decided.decision == .deny)
                         "denied"
                     else
                         "unavailable";
@@ -11162,7 +11309,7 @@ fn processQueuedPromptLoop(
                         "live_authority_rejected",
                         step_ctx,
                         "call_id={s} tool_name={s} generation={d} outcome={s}",
-                        .{ tool_call.id, tool_call.name, resolved.authority.generation, outcome },
+                        .{ tool_call.id, tool_call.name, decided.authority.generation, outcome },
                     );
                     if (deps.tool_activity_recorder) |recorder| {
                         recorder.record(tool_call.id, tool_call.name, .denied) catch |err| {
@@ -11187,7 +11334,7 @@ fn processQueuedPromptLoop(
                         &within_turn_suffix,
                         &completed_tool_names,
                         &step_batch,
-                        if (resolved.decision == .deny)
+                        if (decided.decision == .deny)
                             "live_authority_denied"
                         else
                             "live_authority_unavailable",
@@ -11345,7 +11492,7 @@ fn processQueuedPromptLoop(
                     advertised_dynamic_tool_names,
                 );
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, identity_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
             }
@@ -11432,7 +11579,7 @@ fn processQueuedPromptLoop(
                         advertised_dynamic_tool_names,
                     );
                     try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                    try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                    try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, identity_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                     finish_trace.finish("interrupted");
                     return;
                 }
@@ -11727,7 +11874,7 @@ fn processQueuedPromptLoop(
                     advertised_dynamic_tool_names,
                 );
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, identity_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
             }
@@ -11779,6 +11926,8 @@ fn processQueuedPromptLoop(
                 .live_authority = if (live_authority) |resolved| resolved.authority else null,
                 .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                 .max_tool_result_bytes = config.max_tool_result_bytes,
+                .toolbox_behind = config.toolbox_behind,
+                .toolbox_mcp_servers = config.toolbox_mcp_servers,
                 .expected_mcp_runtime_generation = expected_mcp_runtime_generation,
                 .expected_mcp_binding = for (advertised_dynamic_tools) |tool| {
                     if (std.mem.eql(u8, tool.name, execution_call.name)) break tool.mcp_binding;
@@ -11875,7 +12024,7 @@ fn processQueuedPromptLoop(
                         finalization,
                         job,
                         partial_assistant,
-                        tool_call,
+                        identity_call,
                         completed_tool_names.items,
                         &interrupted_persisted,
                         step_ctx,
@@ -12128,7 +12277,15 @@ fn processQueuedPromptLoop(
                 debug_trace.eventf("tool", "after_tool_execution", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
                 debug_trace.eventf("tool", "execution_result", step_ctx, "call_id={s} name={s} result_kind={s} model_output_bytes={d}", .{ tool_call.id, tool_call.name, runtime_telemetry.toolExecutionResultKind(execution), safe_tool_output.len });
             }
-            try runtime_gateway_step.recordSelectedDynamicTools(arena, &selected_dynamic_tools, execution);
+            // With toolbox the tools fx sends stay as first sent, so a schema
+            // a call loaded, such as a run's changed definition, never joins
+            // them (`Toolbox.tla` ToolsFixed); the run's result says to open
+            // it again (`refreshChangedMcpTool`).
+            if (!toolbox.isAdvertised(config.advertised_tool_names)) {
+                try runtime_gateway_step.recordSelectedDynamicTools(arena, &selected_dynamic_tools, execution);
+            } else if (execution.selected_dynamic_tools.len > 0) {
+                debug_trace.logf("toolbox", "selected tools not sent call={s} count={d}: the tools stay as first sent", .{ tool_call.id, execution.selected_dynamic_tools.len });
+            }
             try runtime_tool_batch.appendOrdinaryExecutedResult(
                 deps.tool_registry,
                 arena,

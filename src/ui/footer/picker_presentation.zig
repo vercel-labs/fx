@@ -1482,7 +1482,8 @@ pub fn composeSlashCompletionOptionRow(
     }
 
     if (description.len > 0 and before_label_width + visible < width_usize) {
-        try row.appendSlice(alloc, ui_render.dim_style);
+        const select_description = selected and command_specs.nthSlashCompletionSelectsDescription(registry, prefix, match_idx);
+        try row.appendSlice(alloc, if (select_description) ui_render.selected_completion_style else ui_render.dim_style);
         const desc_remaining: u16 = @intCast(width_usize - before_label_width - visible);
         try row_text.appendClipped(alloc, &row, description, desc_remaining);
         try row.appendSlice(alloc, ui_render.reset_style);

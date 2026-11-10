@@ -1715,33 +1715,38 @@ permission mode does not rewrite a cached prompt prefix):
   prompt for every model.
 
 Settled for named skills (2026-10-24, so naming a skill does not rewrite a
-cached prompt prefix):
+cached prompt prefix; revised 2026-11-09, so later turns send the skill turn
+as it was sent):
 - **D95 Decision:** the text of a skill the user names with `$name` rides
-  on that turn's user message, and the turn saves a short note in its
-  place.
+  on that turn's user message, and the turn saves it as sent.
   - **The turn:** fx loads the full text as before and adds it as a
     context note (D93) at the turn's first step boundary, after any note
     already there, so it joins the user's message. Every request of the
     turn sends it there, and the instructions stay as they were.
-  - **Saved:** the turn saves only the short note, opened by
-    `<fx-skill-used>`. It names the skills, says fx sent their full text
-    with that message, and says to load them again with the skill tool if
-    they still apply. Later turns and resumes send that note. A recovered
-    turn sends the full text again in the note's place.
+  - **Saved:** the turn saves the note with the full text, so later turns
+    and resumes send that turn's message exactly as the turn sent it. A
+    recovered turn keeps the note its checkpoint saved. A session an older
+    fx saved holds a short note opened by `<fx-skill-used>` in the text's
+    place; later turns send it as saved, and a turn recovered from such a
+    checkpoint sends the full text there again.
   - **Compaction:** when an in-turn compaction cuts the note, fx adds it
     again where the kept messages start, so the text still rides on the
-    turn's message and the turn still saves the short note.
+    turn's message.
 
   **Why:** the text sat in the instructions for one turn, so it rewrote the
   cached prefix twice: when it appeared and when it went. On the message,
-  the skill turn reads the whole conversation from the cache, and the next
-  turn pays again only from that message. In live runs of eleven model
-  families, every skill turn followed the skill, against ten of eleven with
-  the text in the instructions, and new tokens at those two requests fell
-  by about half. With the text gone and no note, one model took back its
-  earlier reply on the next turn, saying it had never loaded the skill.
-  **Alternative:** keep the full text in the conversation, which every
-  later request pays for, or keep it in the instructions.
+  the skill turn reads the whole conversation from the cache. In live runs
+  of eleven model families, every skill turn followed the skill, against ten
+  of eleven with the text in the instructions. Until the revision the turn
+  saved a short note in the text's place, so the next turn paid again from
+  that message. Anthropic models from 5.1 on bind each thinking block to
+  everything sent before it and reject or drop the block when that changes,
+  so the swap broke the skill turn's thinking on the next request: Fable 5.2
+  dropped it at the turn's first step. Keeping the text costs its tokens on
+  every later request, read from the cache, and keeps the whole conversation
+  cached for every family.
+  **Alternative:** swap the text for a short note on later turns, which
+  breaks that thinking check, or keep it in the instructions.
 - **D96 Decision:** every model call a turn's agent loop makes, its
   retries, replays after a refreshed login, failed attempts and compactions
   included, is saved with the turn as a `model_call`

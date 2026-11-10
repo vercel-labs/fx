@@ -17,7 +17,6 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
 const access_policy = @import("../mcp/access_policy.zig");
 const catalog_state = @import("../mcp/catalog_state.zig");
-const model_catalog = @import("../mcp/model_catalog.zig");
 const selected_schema = @import("../mcp/selected_schema.zig");
 const tool_names = @import("../mcp/tool_names.zig");
 const tool_result = @import("../mcp/tool_result.zig");
@@ -469,36 +468,30 @@ pub const Catalog = struct {
 
     /// The servers the model's prompt lists. Project servers that aren't
     /// approved stay out of it.
-    pub fn modelSnapshot(c: *Catalog, alloc: Allocator) !model_catalog.Snapshot {
+    /// The names of the servers the model may reach, for the toolbox menu:
+    /// every configured server but one waiting for approval or rejected.
+    /// `alloc` owns the slice and each name.
+    pub fn serverNames(c: *Catalog, alloc: Allocator) ![]const []const u8 {
         var scratch: std.heap.ArenaAllocator = .init(c.gpa);
         defer scratch.deinit();
         const statuses = try c.runtime.statuses(scratch.allocator());
-        var out: std.ArrayList(model_catalog.ServerSummary) = .empty;
+        var out: std.ArrayList([]const u8) = .empty;
         errdefer {
-            for (out.items) |s| alloc.free(s.name);
+            for (out.items) |name| alloc.free(name);
             out.deinit(alloc);
         }
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
-        for (c.servers, c.lists) |server, l| {
+        for (c.servers) |server| {
             const s = statusOf(statuses, server.name) orelse continue;
-            const availability: model_catalog.Availability = switch (s.state) {
+            switch (s.state) {
                 .waiting_for_approval, .rejected => continue,
-                .disabled => .disabled,
-                .unsupported, .missing_env, .invalid_env => .unavailable,
-                .idle => if (l.state == .loaded) .ready else .available_on_demand,
-                .connecting, .retrying => .discovering,
-                .ready => .ready,
-                .failed => .failed,
-            };
+                else => {},
+            }
             try out.ensureUnusedCapacity(alloc, 1);
-            out.appendAssumeCapacity(.{
-                .name = try alloc.dupe(u8, s.name),
-                .availability = if (s.needs_login) .authentication_required else availability,
-                .tool_count = if (l.state == .loaded) l.tools.len else null,
-            });
+            out.appendAssumeCapacity(try alloc.dupe(u8, s.name));
         }
-        return .{ .servers = try out.toOwnedSlice(alloc) };
+        return out.toOwnedSlice(alloc);
     }
 
     // ---- lists ----
@@ -1080,10 +1073,13 @@ test "an MCP server's tools reach the model under fx's names" {
     defer view.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), view.tools.len);
     try testing.expect(Access.allowsTool(.{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } }, c.currentGeneration(), "mcp_fake_echo"));
-    var snapshot = try c.modelSnapshot(testing.allocator);
-    defer snapshot.deinit(testing.allocator);
-    try testing.expectEqual(model_catalog.Availability.ready, snapshot.servers[0].availability);
-    try testing.expectEqual(@as(?usize, 1), snapshot.servers[0].tool_count);
+    const names = try c.serverNames(testing.allocator);
+    defer {
+        for (names) |name| testing.allocator.free(name);
+        testing.allocator.free(names);
+    }
+    try testing.expectEqual(@as(usize, 1), names.len);
+    try testing.expectEqualStrings("fake", names[0]);
 }
 
 test "a reload keeps a kept server's list and the bindings made from it, until a server is dropped" {

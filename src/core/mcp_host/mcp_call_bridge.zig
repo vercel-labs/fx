@@ -430,8 +430,8 @@ fn serve(stream: std.Io.net.Stream) void {
     };
 
     const request_id = arena.print("fx-mcp-call-{d}", .{@backingInt(work.id)}) catch "fx-mcp-call";
-    // A lookup reads tool metadata only, like the agent's own
-    // `capability_search`, so it has no permission check to wait for.
+    // A lookup reads tool metadata only, like the agent's own toolbox
+    // search, so it has no permission check to wait for.
     const authorization: capability_mod.Authorization = switch (request.operation) {
         .call => |value| blk: {
             bridge.prompt.lockUncancelable(io);
