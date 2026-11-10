@@ -71,8 +71,9 @@ pub const CommandExecutionAuthority = union(enum) {
     shell_allowed: struct {
         fingerprint: AdmissionFingerprint,
         source: ShellAuthorizationSource,
-        /// Shell snapshot epoch of the remembered grant that admitted the
-        /// command. Execution under a later epoch is asked again.
+        /// Shell snapshot epoch that admitted the command: the remembered
+        /// grant's, or that of the generation whose names the routine
+        /// command check read. Execution under another epoch is asked again.
         grant_epoch: ?u64 = null,
     },
 };
