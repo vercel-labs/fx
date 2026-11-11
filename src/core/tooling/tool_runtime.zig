@@ -25,6 +25,7 @@ const file_mutation_contract = @import("file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
+const permissions = @import("../permissions/permissions.zig");
 const glob_pattern = @import("../workspace/glob_pattern.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
@@ -1336,7 +1337,7 @@ fn lookupBridge(
                 request.validate() catch |err| {
                     return .{ .status = .failed, .bytes = try arena.print("fx can't search for that: {s}.", .{@errorName(err)}) };
                 };
-                const result = try search(runtime, arena, request, ctx.permission_rules, limits, ctx.mcp_access, cancel);
+                const result = try search(runtime, arena, request, mcpRulesOf(ctx), limits, ctx.mcp_access, cancel);
                 const page = mcp_tool_lookup.writeToolLines(arena, &out.writer, result.model_output) catch |err| switch (err) {
                     error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
                     error.InvalidSearchPage => return .{ .status = .failed, .bytes = "The MCP search returned a page fx could not read." },
@@ -1520,10 +1521,17 @@ fn toolExecutionResultFromDispatch(
     };
 }
 
+/// The permission rules an MCP path uses in this context: none in full access
+/// (`permissions.mcpRules`), so one function decides it for search, open, run,
+/// `fx mcp call`, the per-step refresh, and the dispatch context's field.
+fn mcpRulesOf(ctx: Context) types.PermissionRuleSet {
+    return permissions.mcpRules(ctx.permission_mode, ctx.permission_rules);
+}
+
 pub fn snapshotMcpDefinition(ctx: Context, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
     const runtime = ctx.mcp_ctx orelse return .unavailable;
     const snapshot = ctx.mcp_snapshot_tool orelse return .unavailable;
-    return snapshot(runtime, arena, name, known, ctx.permission_rules, ctx.context_limits, ctx.mcp_access);
+    return snapshot(runtime, arena, name, known, mcpRulesOf(ctx), ctx.context_limits, ctx.mcp_access);
 }
 
 /// Resolves the exact exposed name of a live MCP tool the model called
@@ -1536,7 +1544,7 @@ pub fn resolveUnselectedMcpTool(ctx: Context, arena: Allocator, name: []const u8
         runtime_context,
         arena,
         name,
-        ctx.permission_rules,
+        mcpRulesOf(ctx),
         ctx.context_limits,
         ctx.mcp_access,
         runtimeCancelFlag(ctx),
@@ -1574,7 +1582,7 @@ fn lookupToolboxMcpTool(ctx: Context, arena: Allocator, name: []const u8) !Toolb
         runtime_context,
         arena,
         name,
-        ctx.permission_rules,
+        mcpRulesOf(ctx),
         ctx.context_limits,
         ctx.mcp_access,
         runtimeCancelFlag(ctx),
@@ -1603,7 +1611,7 @@ fn refreshChangedMcpTool(ctx: Context, arena: Allocator, call: ToolCall) !ToolEx
         "MCP tool definition changed before execution and is no longer available. Search for current tools.";
     var notice: ?[]const u8 = null;
     if (ctx.mcp_ctx) |runtime_context| if (ctx.mcp_tool_schema) |schema_fn| {
-        const current = schema_fn(runtime_context, arena, name, ctx.permission_rules, ctx.context_limits, ctx.mcp_access, runtimeCancelFlag(ctx)) catch |err| switch (err) {
+        const current = schema_fn(runtime_context, arena, name, mcpRulesOf(ctx), ctx.context_limits, ctx.mcp_access, runtimeCancelFlag(ctx)) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => null,
         };
@@ -1756,10 +1764,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .mcp_tool_schema = ctx.mcp_tool_schema,
         .mcp_access = ctx.mcp_access,
         .mcp_input_responder = ctx.mcp_input_responder,
-        .mcp_permission_rules = if (ctx.permission_mode == .yolo)
-            .{}
-        else
-            ctx.permission_rules,
+        .mcp_permission_rules = mcpRulesOf(ctx),
     };
 }
 
@@ -6881,6 +6886,7 @@ const McpFixture = struct {
 
     const PermissionContext = struct {
         search_rule_count: usize = 0,
+        schema_rule_count: usize = 0,
     };
 
     const AuthorityContext = struct {
@@ -6946,6 +6952,12 @@ const McpFixture = struct {
         return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read <context_limit action='literal' />\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"context_limit_rejection\":{\"type\":\"string\"}}}}") } };
     }
 
+    fn schemaRecordingRules(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access, cancel: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+        const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
+        ctx.schema_rule_count = permission_rules.rules.len;
+        return schema(raw_ctx, arena, name, permission_rules, limits, access, cancel);
+    }
+
     fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, request: capability_retrieval.Request, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access, _: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
         const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
         ctx.search_rule_count = permission_rules.rules.len;
@@ -6986,6 +6998,47 @@ test "toolbox search forwards permission rules to MCP search" {
     });
 
     try std.testing.expectEqual(@as(usize, 0), permission_context.search_rule_count);
+}
+
+// Full access ignores deny rules on every MCP path, so each reader of the
+// rules takes them from `permissions.mcpRules` with the mode of its context
+// (tests/tla/mcp_host/McpRules.tla): the dispatch field, a toolbox run or the
+// bridge (`resolveUnselectedMcpTool`), and an open of a tool. In ask and auto
+// each reads the host's rules.
+test "every MCP reader takes the host's rules outside full access and none in it" {
+    var permission_context = McpFixture.PermissionContext{};
+    var rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("mcp_fs_read"), .pattern = @constCast("*"), .action = .deny },
+    };
+    var rt = TestRuntime{
+        .mcp_ctx = @ptrCast(&permission_context),
+        .mcp_tool_schema = McpFixture.schemaRecordingRules,
+        .permission_rules = .{ .rules = &rules },
+    };
+    defer rt.deinit(std.testing.allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_]struct { mode: types.PermissionMode, rules: usize }{
+        .{ .mode = .ask, .rules = 1 },
+        .{ .mode = .auto, .rules = 1 },
+        .{ .mode = .yolo, .rules = 0 },
+    }) |case| {
+        rt.permission_mode = case.mode;
+        const context = rt.context();
+
+        try std.testing.expectEqual(case.rules, typedDispatchContext(context, arena).mcp_permission_rules.rules.len);
+
+        permission_context.schema_rule_count = 99;
+        _ = try resolveUnselectedMcpTool(context, arena, "mcp_fs_read");
+        try std.testing.expectEqual(case.rules, permission_context.schema_rule_count);
+
+        permission_context.schema_rule_count = 99;
+        _ = try lookupToolboxMcpTool(context, arena, "mcp_fs_read");
+        try std.testing.expectEqual(case.rules, permission_context.schema_rule_count);
+    }
 }
 
 test "MCP dynamic tool cannot execute before it is advertised" {

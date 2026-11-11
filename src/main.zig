@@ -1995,7 +1995,7 @@ const App = struct {
     }
 
     pub fn snapshotMcpToolNames(self: *App, alloc: Allocator) ![][]u8 {
-        return self.mcp.snapshotToolNames(alloc, self.permission_engine.rules);
+        return self.mcp.snapshotToolNames(alloc);
     }
 
     pub fn snapshotMcpAccessView(
@@ -2003,9 +2003,8 @@ const App = struct {
         alloc: Allocator,
         owner_id: []const u8,
         parent_id: []const u8,
-        permission_rules: types.PermissionRuleSet,
     ) !?mcp_access_policy.View {
-        return self.mcp.snapshotAccessView(alloc, owner_id, parent_id, permission_rules);
+        return self.mcp.snapshotAccessView(alloc, owner_id, parent_id);
     }
 
     pub fn snapshotModelToolProjection(

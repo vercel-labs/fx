@@ -3228,6 +3228,44 @@ describe("acp: model-independent", () => {
     LIVE_TIMEOUT,
   );
 
+  // An editor's MCP server is always loaded, so its tools are advertised to the
+  // model on every turn, not found through toolbox. Full access ignores a deny
+  // rule on one of them, as on every MCP path; ask and auto leave it out.
+  test(
+    "an always-loaded MCP tool a deny rule names is advertised in full access and left out in auto",
+    async () => {
+      for (const modeId of ["full-access", "auto"] as const) {
+        const root = createIsolatedRoot(`fx-acp-always-rule-${modeId}-`);
+        writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ permission: { mcp_fixture_echo: "deny" } }));
+        const httpFixture = startModernMcpHttpFixture("json");
+        const gateway = startFakeGateway([finalText("ACP rule complete")]);
+        try {
+          client = await AcpClient.create({ cwd: root.workspace, env: { ...fakeGatewayEnv(root, gateway) }, args: ["acp"] });
+          await client.request("initialize", { protocolVersion: 1, clientCapabilities: {} }, 1);
+          const created = await client.request(
+            "session/new",
+            { cwd: root.workspace, mcpServers: [{ type: "http", name: "fixture", url: httpFixture.url, headers: [] }] },
+            2,
+          ) as any;
+          expect(created.error).toBeUndefined();
+          await client.readLine();
+          await client.request("session/set_mode", { modeId }, 3);
+          const prompt = await runPrompt(client, "Say hello.", TIMEOUT);
+          expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+          const names = serializedToolNames(parseGatewayRequest(gateway.requests[0]!.body));
+          expect([modeId, names.includes("mcp_fixture_echo")]).toEqual([modeId, modeId === "full-access"]);
+        } finally {
+          await client?.close();
+          client = null;
+          gateway.stop();
+          httpFixture.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    },
+    LIVE_TIMEOUT,
+  );
+
   test(
     "an editor that sets session.notices to false gets context notices as agent messages",
     async () => {

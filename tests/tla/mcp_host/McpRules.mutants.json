@@ -1,0 +1,56 @@
+[
+  {
+    "description": "Outside full access every path hides every tool: the rules are replaced by 'everything' in ask and auto",
+    "old": "EffRules(m) == IF m = \"full\" THEN {} ELSE denied",
+    "new": "EffRules(m) == IF m = \"full\" THEN {} ELSE Tools",
+    "invariant": "UndeniedShown"
+  },
+  {
+    "description": "Full access empties the rules in ask and auto too: a denied tool is shown outside full access",
+    "old": "EffRules(m) == IF m = \"full\" THEN {} ELSE denied",
+    "new": "EffRules(m) == {}",
+    "invariant": "DenyHoldsOutside"
+  },
+  {
+    "description": "ask counts as full access: the rules are emptied in ask",
+    "old": "EffRules(m) == IF m = \"full\" THEN {} ELSE denied",
+    "new": "EffRules(m) == IF m # \"auto\" THEN {} ELSE denied",
+    "invariant": "DenyHoldsOutside"
+  },
+  {
+    "description": "One path still reads the host's rules in full access: the bridge's call",
+    "old": "RulesFor(p, m) == IF p \\in OwnRules THEN denied ELSE EffRules(m)",
+    "new": "RulesFor(p, m) == IF p \\in OwnRules \\/ p = \"bridge_call\" THEN denied ELSE EffRules(m)",
+    "invariant": "FullAccessIgnoresRules"
+  },
+  {
+    "description": "The bridge is skipped: a denied tool runs through fx mcp call outside full access",
+    "old": "Shown(p, a, t) == Access(a, t) /\\ t \\notin RulesFor(p, ModeOf(a)) /\\ Gate(p, a, t)",
+    "new": "Shown(p, a, t) == Access(a, t) /\\ (t \\notin RulesFor(p, ModeOf(a)) \\/ p = \"bridge_call\") /\\ Gate(p, a, t)",
+    "invariant": "DenyHoldsOutside"
+  },
+  {
+    "description": "The integrations list is built from the host's rules in full access: a subagent's run of a denied tool is refused",
+    "old": "Integrations(m) == {t \\in Tools : t \\notin RulesFor(\"integrations\", m)}",
+    "new": "Integrations(m) == {t \\in Tools : t \\notin denied}",
+    "invariant": "FullAccessIgnoresRules"
+  },
+  {
+    "description": "Full access widens the access: a child limited to other servers is not limited",
+    "old": "Access(a, t) == Granted(a, t)",
+    "new": "Access(a, t) == Granted(a, t) \\/ mode = \"full\"",
+    "invariant": "AccessHolds"
+  },
+  {
+    "description": "Search hides a tool no rule names in ask: one path gives another answer",
+    "old": "Shown(p, a, t) == Access(a, t) /\\ t \\notin RulesFor(p, ModeOf(a)) /\\ Gate(p, a, t)",
+    "new": "Shown(p, a, t) == Access(a, t) /\\ t \\notin RulesFor(p, ModeOf(a)) /\\ Gate(p, a, t) /\\ ~(p = \"search\" /\\ ModeOf(a) = \"ask\")",
+    "invariant": "PathsAgree"
+  },
+  {
+    "description": "The host builds the integrations list with the host's mode, not the mode the child runs in",
+    "old": "Gate(p, a, t) == IF a = \"child\" /\\ p = \"run\" THEN t \\in Integrations(childMode) ELSE TRUE",
+    "new": "Gate(p, a, t) == IF a = \"child\" /\\ p = \"run\" THEN t \\in Integrations(mode) ELSE TRUE",
+    "invariant": "FullAccessIgnoresRules"
+  }
+]

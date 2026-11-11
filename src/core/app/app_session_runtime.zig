@@ -4762,7 +4762,7 @@ pub fn Runtime(comptime App: type) type {
             }
             const rules: types.PermissionRuleSet = if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{};
             var mcp_view: ?mcp_access.View = if (comptime @hasDecl(App, "snapshotMcpAccessView"))
-                try app.snapshotMcpAccessView(alloc, root_id, root_id, rules)
+                try app.snapshotMcpAccessView(alloc, root_id, root_id)
             else
                 null;
             defer if (mcp_view) |*view| view.deinit(alloc);
@@ -4877,12 +4877,7 @@ pub fn Runtime(comptime App: type) type {
                 alloc.free(integrations);
             }
             var mcp_view: ?mcp_access.View = if (comptime @hasDecl(App, "snapshotMcpAccessView"))
-                try app.snapshotMcpAccessView(
-                    alloc,
-                    root_id,
-                    root_id,
-                    app.permission_engine.rules,
-                )
+                try app.snapshotMcpAccessView(alloc, root_id, root_id)
             else
                 null;
             defer if (mcp_view) |*view| view.deinit(alloc);
