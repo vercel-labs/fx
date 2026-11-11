@@ -4138,6 +4138,8 @@ fn parseDoctorArgs(args: []const [:0]const u8) !DoctorOptions {
 /// to the process exit, which follows the report.
 const DoctorProbes = struct {
     deadline: i64,
+    /// The limit `deadline` ends, in milliseconds.
+    limit_ms: i64,
     catalog: ?*doctor_probes.CatalogProbe = null,
     /// The MCP server checks first, then gh.
     processes: std.ArrayList(*doctor_probes.ProcessProbe) = .empty,
@@ -4169,7 +4171,7 @@ const DoctorProbes = struct {
                 self.mcp_statuses = try loaded_host.runtime.statuses(probe_alloc);
                 const exe_path = try self_exe.pathForReexec(probe_alloc);
                 defer self.server_children = self.processes.items.len;
-                self.servers = try doctor_probes.startServerChildren(probe_alloc, &self.waiters, &self.processes, self.mcp_statuses, exe_path, self.deadline, doctor_probes.serverCap());
+                self.servers = try doctor_probes.startServerChildren(probe_alloc, &self.waiters, &self.processes, self.mcp_statuses, exe_path, self.deadline, self.limit_ms, doctor_probes.serverCap());
                 self.mcp_checked = true;
             }
         }
@@ -4304,7 +4306,7 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
     defer snapshot.deinit(alloc);
 
     const deadline_ms = doctor_probes.deadlineMs();
-    var probes: DoctorProbes = .{ .deadline = io_mod.milliTimestamp() + deadline_ms };
+    var probes: DoctorProbes = .{ .deadline = io_mod.milliTimestamp() + deadline_ms, .limit_ms = deadline_ms };
     const started = probes.start(cfg, deps, &snapshot, workspace_root);
     if (opts.format == .text) probes.writeWaitNotice(alloc, deps, snapshot.provider, deadline_ms) catch |err| {
         debug_trace.logf("doctor", "wait notice not written err={s}", .{@errorName(err)});

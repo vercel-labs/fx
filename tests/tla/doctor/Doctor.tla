@@ -256,7 +256,12 @@ Busy == {c \in Children : waiter[c] = "reading"}
 
 \* Spawn one more child, unless the timer fired, or, with the stop check,
 \* the signal has arrived, and, with the cap, only into a free slot. Its
-\* waiter starts with it.
+\* waiter starts with it. fx also stops starting MCP server checks once less
+\* than a share of the limit is left (min(1 s, a quarter of it)), and drops
+\* the rest as never started. That is only an earlier start deadline, which
+\* this model needs no step for: the timer may fire at any step, so its runs
+\* already include every run that stops starting sooner, and the signal check
+\* still comes before each spawn.
 Spawn(c) ==
     /\ main = "starting"
     /\ child[c] = "unstarted"

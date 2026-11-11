@@ -60,6 +60,9 @@ const poll_ms: u64 = 5;
 /// The fewest and the most MCP server checks that run at once.
 const min_server_checks: usize = 4;
 const max_server_checks: usize = 16;
+/// The most of the limit a queued MCP server check must have left to start
+/// (`checkShareMs`).
+const max_check_share_ms: i64 = 1_000;
 /// gh's exit code for a command that needs a sign-in (`gh help exit-codes`).
 const gh_auth_required: u8 = 4;
 
@@ -173,19 +176,16 @@ pub const ProcessProbe = struct {
     status: ?*ChildStatusReader = null,
     /// The SIGSTOP `stopTrees` sent has landed. Doctor's own thread only.
     stop_landed: bool = false,
+    /// When `spawn` started it, and, once `wait` has stopped it, how long it
+    /// had run by then. Doctor's own thread only.
+    started_at: i64 = 0,
+    stopped_after_ms: i64 = 0,
 
     /// A check of `argv` that has not started. The caller adds it to the
     /// list `wait` stops before it spawns it.
     fn create(alloc: Allocator, name: []const u8, argv: []const []const u8, status: ?*ChildStatusReader) !*ProcessProbe {
         const probe = try alloc.create(ProcessProbe);
         probe.* = .{ .name = name, .argv = argv, .status = status };
-        return probe;
-    }
-
-    /// `create` and `spawn`, with doctor's own environment.
-    fn start(alloc: Allocator, waiters: *std.Io.Group, name: []const u8, argv: []const []const u8, status: ?*ChildStatusReader) !*ProcessProbe {
-        const probe = try create(alloc, name, argv, status);
-        probe.spawn(waiters, null);
         return probe;
     }
 
@@ -200,6 +200,7 @@ pub const ProcessProbe = struct {
         installStopHandler();
         debug_trace.logf("doctor", "starting check {s}", .{self.name});
         const io = io_mod.getIo();
+        self.started_at = io_mod.milliTimestamp();
         self.child = std.process.spawn(io, .{
             .argv = self.argv,
             .environ_map = environ_map,
@@ -368,13 +369,27 @@ fn readsAsOption(name: []const u8) bool {
     return name.len > 0 and name[0] == '-';
 }
 
-/// How many MCP server checks run at once: one for each CPU, between
-/// `min_server_checks` and `max_server_checks`, so many servers do not
-/// starve each other of the one deadline.
+/// How many MCP server checks run at once on this machine (`serverCapFor`).
 pub fn serverCap() usize {
-    const cpus = std.Thread.getCpuCount() catch min_server_checks;
+    return serverCapFor(std.Thread.getCpuCount() catch min_server_checks);
+}
+
+/// One check for each of `cpus` CPUs, between `min_server_checks` and
+/// `max_server_checks`, so many servers do not starve each other of the one
+/// deadline.
+fn serverCapFor(cpus: usize) usize {
     return std.math.clamp(cpus, min_server_checks, max_server_checks);
 }
+
+/// How much of a `limit_ms` limit must be left for a queued check to start:
+/// `max_check_share_ms`, or a quarter of a shorter limit, so a short test
+/// limit still starts checks.
+fn checkShareMs(limit_ms: i64) i64 {
+    return @min(max_check_share_ms, @divTrunc(limit_ms, 4));
+}
+
+/// Why checks still queued were never started.
+const DropReason = enum { limit, signal };
 
 /// The MCP server checks, one for each idle server in config order. At most
 /// `cap` of them run at a time; the ones from `next` on wait for a slot.
@@ -382,12 +397,18 @@ pub const ServerChecks = struct {
     probes: []const *ProcessProbe = &.{},
     next: usize = 0,
     cap: usize = 1,
+    /// The last moment a queued check may start: the deadline less the
+    /// check's share of the limit (`checkShareMs`).
+    last_start: i64 = std.math.maxInt(i64),
 
-    /// Starts the queued checks in order while fewer than `cap` run, unless
-    /// the deadline has passed or an ending signal has arrived, which it
-    /// looks at before each start. Doctor's own thread only.
+    /// Starts the queued checks in order while fewer than `cap` run. Before
+    /// each start it looks, in this order, at `last_start`, past which it
+    /// drops the rest, so a check the limit cuts has had at least its share
+    /// of it; then at an ending signal and the deadline. Doctor's own thread
+    /// only.
     fn startMore(self: *ServerChecks, waiters: *std.Io.Group, deadline: i64) void {
         while (self.next < self.probes.len and self.running() < self.cap) {
+            if (io_mod.milliTimestamp() >= self.last_start) return self.dropQueued(.limit);
             if (stopRequested() or io_mod.milliTimestamp() >= deadline) return;
             self.probes[self.next].spawn(waiters, null);
             self.next += 1;
@@ -404,9 +425,15 @@ pub const ServerChecks = struct {
         return count;
     }
 
-    /// The checks still queued when the wait ends are never started.
-    fn dropQueued(self: *ServerChecks) void {
+    /// The checks still queued are never started. Each gets a trace line
+    /// that names it and says why.
+    fn dropQueued(self: *ServerChecks, reason: DropReason) void {
+        const why = switch (reason) {
+            .limit => "too little of doctor's limit was left to start it",
+            .signal => "doctor got a signal first",
+        };
         for (self.probes[self.next..]) |p| {
+            debug_trace.logf("doctor", "check {s} was never started, since {s}; dropping it", .{ p.name, why });
             p.not_started = true;
             p.done.store(true, .release);
         }
@@ -415,11 +442,11 @@ pub const ServerChecks = struct {
 };
 
 /// Queues one `fx mcp show NAME --json` check for each idle server, appends
-/// each to `processes`, and starts the first ones up to `cap`, before
-/// `deadline` and unless an ending signal came first; `wait` starts the
-/// rest. An unapproved, rejected, or disabled server is never idle, so it
-/// never gets a check. A queued check is in `processes` before it can
-/// start, so `wait` always reaches it.
+/// each to `processes`, and starts the first ones up to `cap`, as
+/// `ServerChecks.startMore` allows under `deadline`, which ends a limit of
+/// `limit_ms`; `wait` starts the rest. An unapproved, rejected, or disabled
+/// server is never idle, so it never gets a check. A queued check is in
+/// `processes` before it can start, so `wait` always reaches it.
 pub fn startServerChildren(
     alloc: Allocator,
     waiters: *std.Io.Group,
@@ -427,6 +454,7 @@ pub fn startServerChildren(
     statuses: []const mcp_runtime.Status,
     self_exe: []const u8,
     deadline: i64,
+    limit_ms: i64,
     cap: usize,
 ) !ServerChecks {
     const first = processes.items.len;
@@ -440,7 +468,11 @@ pub fn startServerChildren(
         processes.appendAssumeCapacity(try ProcessProbe.create(alloc, name, argv, reader));
     }
     // A copy, since gh's append may move the list.
-    var servers: ServerChecks = .{ .probes = try alloc.dupe(*ProcessProbe, processes.items[first..]), .cap = @max(1, cap) };
+    var servers: ServerChecks = .{
+        .probes = try alloc.dupe(*ProcessProbe, processes.items[first..]),
+        .cap = @max(1, cap),
+        .last_start = deadline - checkShareMs(limit_ms),
+    };
     servers.startMore(waiters, deadline);
     return servers;
 }
@@ -452,7 +484,10 @@ pub fn startServerChildren(
 /// It gets the environment those get, with prompts and the update check
 /// turned off, so it never waits on a person or writes its update state.
 pub fn startGh(alloc: Allocator, waiters: *std.Io.Group, processes: *std.ArrayList(*ProcessProbe)) !?*ProcessProbe {
-    if (stopRequested()) return null;
+    if (stopRequested()) {
+        debug_trace.logf("doctor", "check gh was never started, since doctor got a signal first", .{});
+        return null;
+    }
     try processes.ensureUnusedCapacity(alloc, 1);
     const probe = try ProcessProbe.create(alloc, "gh", &.{ "gh", "repo", "view", "--json", "url" }, null);
     processes.appendAssumeCapacity(probe);
@@ -493,11 +528,13 @@ pub fn wait(deadline: i64, catalog: ?*CatalogProbe, processes: []const *ProcessP
         if (io_mod.milliTimestamp() >= deadline or allDone(catalog, processes) or stopRequested()) break;
         io_mod.sleep(poll_ms * std.time.ns_per_ms);
     }
-    if (servers) |queue| queue.dropQueued();
+    if (servers) |queue| queue.dropQueued(if (stopRequested()) .signal else .limit);
     const why = if (stopRequested()) "before doctor got a signal" else "by the deadline";
     if (catalog) |c| c.finish(io);
+    const stopped_at = io_mod.milliTimestamp();
     for (processes) |p| if (!p.done.load(.acquire) and p.pid != 0) {
         debug_trace.logf("doctor", "check {s} did not finish {s}; killing it with what it started and dropping its late result", .{ p.name, why });
+        p.stopped_after_ms = stopped_at - p.started_at;
         p.stopped.store(true, .release);
     };
     stopTrees(processes);
@@ -651,7 +688,9 @@ fn serverChildCheck(checks: *std.ArrayList(Check), alloc: Allocator, c: *const P
         return timed_out;
     }
     if (c.stopped.load(.acquire)) {
-        try appendCheck(checks, alloc, "mcp", .fail, try alloc.print("{s} did not start in {d} s", .{ c.name, seconds(deadline_ms) }), try mcpCommand(alloc, "show", c.name));
+        // Its own time, which a check started late in the limit had less of.
+        const tenths = @divTrunc(c.stopped_after_ms + 50, 100);
+        try appendCheck(checks, alloc, "mcp", .fail, try alloc.print("{s} did not answer in {d}.{d} s, when doctor's {d} s limit ended", .{ c.name, @divTrunc(tenths, 10), @mod(tenths, 10), seconds(deadline_ms) }), try mcpCommand(alloc, "show", c.name));
         return timed_out;
     }
     if (c.spawn_error) |err| {
@@ -909,7 +948,8 @@ test "a child still running at the deadline is killed with its group and its wai
     var reader: ChildStatusReader = undefined;
     reader.init();
     // The grandchild holds the pipe open, as a server a check started would.
-    const probe = try ProcessProbe.start(alloc, &waiters, "hung", &.{ "/bin/sh", "-c", "sleep 30 & sleep 30" }, &reader);
+    const probe = try ProcessProbe.create(alloc, "hung", &.{ "/bin/sh", "-c", "sleep 30 & sleep 30" }, &reader);
+    probe.spawn(&waiters, null);
     const started = io_mod.milliTimestamp();
     try std.testing.expect(wait(started + 50, null, &.{probe}, &waiters, null) == null);
     try std.testing.expect(io_mod.milliTimestamp() - started < 50 + reap_grace_ms);
@@ -944,7 +984,8 @@ test "a waiter blocked by a process that left the group is cancelled after the g
     var waiters: std.Io.Group = .init;
     var reader: ChildStatusReader = undefined;
     reader.init();
-    const probe = try ProcessProbe.start(alloc, &waiters, "escaped", &.{ "/bin/sh", "-c", script, pid_file }, &reader);
+    const probe = try ProcessProbe.create(alloc, "escaped", &.{ "/bin/sh", "-c", script, pid_file }, &reader);
+    probe.spawn(&waiters, null);
     // The pid file is written after setsid, so the group kill then misses it.
     const escaped: std.posix.pid_t = for (0..2_000) |_| {
         if (tmp.dir.readFileAlloc(io_mod.getIo(), "escaped.pid", alloc, .limited(32))) |text| {
@@ -1000,7 +1041,7 @@ test "a server whose name fx mcp would read as an option gets no child and a ren
     var processes: std.ArrayList(*ProcessProbe) = .empty;
     defer processes.deinit(std.heap.c_allocator);
     // Past the deadline already, so no child starts for `normal` either.
-    var servers = try startServerChildren(std.heap.c_allocator, &waiters, &processes, &statuses, "/nonexistent/fx", 0, 4);
+    var servers = try startServerChildren(std.heap.c_allocator, &waiters, &processes, &statuses, "/nonexistent/fx", 0, 5_000, 4);
     try std.testing.expectEqual(@as(usize, 1), processes.items.len);
     try std.testing.expectEqualStrings("normal", processes.items[0].name);
     try std.testing.expect(wait(0, null, processes.items, &waiters, &servers) == null);
@@ -1086,7 +1127,8 @@ test "a check killed at the deadline takes with it what it started in a group of
     var waiters: std.Io.Group = .init;
     var reader: ChildStatusReader = undefined;
     reader.init();
-    const probe = try ProcessProbe.start(alloc, &waiters, "server", &.{ "/bin/sh", "-c", script, pid_file }, &reader);
+    const probe = try ProcessProbe.create(alloc, "server", &.{ "/bin/sh", "-c", script, pid_file }, &reader);
+    probe.spawn(&waiters, null);
     const server: std.posix.pid_t = for (0..2_000) |_| {
         if (tmp.dir.readFileAlloc(io_mod.getIo(), "server.pid", alloc, .limited(32))) |text| {
             defer alloc.free(text);
@@ -1117,12 +1159,13 @@ test "an ending signal during the fan-out stops what started, starts nothing mor
     defer stop_signal.store(0, .seq_cst);
     var waiters: std.Io.Group = .init;
     var processes: std.ArrayList(*ProcessProbe) = .empty;
-    const first = try ProcessProbe.start(alloc, &waiters, "first", &.{ "/bin/sh", "-c", "sleep 30" }, null);
+    const first = try ProcessProbe.create(alloc, "first", &.{ "/bin/sh", "-c", "sleep 30" }, null);
+    first.spawn(&waiters, null);
     try processes.append(alloc, first);
     // The handler's whole work, as if the signal reached it now.
     recordStopSignal(.TERM);
     const later = [_]mcp_runtime.Status{.{ .name = "later", .source = .profile, .transport = .stdio, .state = .idle }};
-    var servers = try startServerChildren(alloc, &waiters, &processes, &later, "/nonexistent/fx", io_mod.milliTimestamp() + 60_000, 4);
+    var servers = try startServerChildren(alloc, &waiters, &processes, &later, "/nonexistent/fx", io_mod.milliTimestamp() + 60_000, 60_000, 4);
     try std.testing.expectEqual(@as(usize, 0), servers.next);
     try std.testing.expect(try startGh(alloc, &waiters, &processes) == null);
     const started = io_mod.milliTimestamp();
@@ -1179,8 +1222,54 @@ test "server checks still queued at the deadline are never started and say so" {
     var results: std.ArrayList(ServerResult) = .empty;
     defer results.deinit(std.testing.allocator);
     try serverChildChecks(&checks, &results, std.testing.allocator, processes.items, 1_000);
-    try std.testing.expectEqualStrings("first did not start in 1 s", checks.items[0].detail);
+    try std.testing.expect(std.mem.startsWith(u8, checks.items[0].detail, "first did not answer in 0."));
+    try std.testing.expect(std.mem.endsWith(u8, checks.items[0].detail, " s, when doctor's 1 s limit ended"));
     try std.testing.expectEqualStrings("third was not checked: doctor reached its 1 s limit before it could start the check", checks.items[2].detail);
+}
+
+test "the cap is one check per CPU, at least 4 and at most 16" {
+    for ([_][2]usize{ .{ 1, 4 }, .{ 4, 4 }, .{ 8, 8 }, .{ 16, 16 }, .{ 64, 16 } }) |case| {
+        try std.testing.expectEqual(case[1], serverCapFor(case[0]));
+    }
+}
+
+test "a queued check needs a share of the limit left to start, and one too late is never started" {
+    try std.testing.expectEqual(@as(i64, 1_000), checkShareMs(5_000));
+    try std.testing.expectEqual(@as(i64, 300), checkShareMs(1_200));
+    try std.testing.expectEqual(@as(i64, 0), checkShareMs(1));
+    const alloc = std.heap.c_allocator;
+    var waiters: std.Io.Group = .init;
+    var processes: std.ArrayList(*ProcessProbe) = .empty;
+    for ([_][]const u8{ "first", "second" }) |name| try processes.append(alloc, try ProcessProbe.create(alloc, name, &.{ "/bin/sh", "-c", "sleep 30" }, null));
+    // The deadline is still ahead, but the last moment to start has passed.
+    const now = io_mod.milliTimestamp();
+    var servers: ServerChecks = .{ .probes = processes.items, .cap = 4, .last_start = now - 1 };
+    servers.startMore(&waiters, now + 60_000);
+    try std.testing.expectEqual(processes.items.len, servers.next);
+    for (processes.items) |p| {
+        try std.testing.expect(p.not_started and p.done.load(.acquire));
+        try std.testing.expectEqual(@as(std.posix.pid_t, 0), p.pid);
+    }
+    // With nothing left to wait for, the wait ends at once.
+    try std.testing.expect(wait(now + 60_000, null, processes.items, &waiters, &servers) == null);
+    try std.testing.expect(io_mod.milliTimestamp() - now < 1_000);
+}
+
+test "a check the limit cuts says how long it ran, not the whole limit" {
+    const alloc = std.testing.allocator;
+    var cut: ProcessProbe = .{ .name = "late", .stopped_after_ms = 1_234 };
+    cut.stopped.store(true, .release);
+    var whole: ProcessProbe = .{ .name = "hung", .stopped_after_ms = 4_960 };
+    whole.stopped.store(true, .release);
+    var checks: std.ArrayList(Check) = .empty;
+    defer freeChecks(alloc, &checks);
+    var results: std.ArrayList(ServerResult) = .empty;
+    defer results.deinit(alloc);
+    try serverChildChecks(&checks, &results, alloc, &.{ &cut, &whole }, 5_000);
+    try std.testing.expectEqualStrings("late did not answer in 1.2 s, when doctor's 5 s limit ended", checks.items[0].detail);
+    try std.testing.expectEqualStrings("fx mcp show late", checks.items[0].fix.?);
+    try std.testing.expectEqualStrings("hung did not answer in 5.0 s, when doctor's 5 s limit ended", checks.items[1].detail);
+    try std.testing.expectEqual(ServerResult.Connection.timed_out, results.items[0].connection);
 }
 
 test "the gh line reads only how gh repo view ended" {
@@ -1255,7 +1344,8 @@ test "stopping a check that keeps starting processes in groups of their own leav
     for (0..5) |round| {
         var waiters: std.Io.Group = .init;
         const before = try entryCount(tmp.dir);
-        const probe = try ProcessProbe.start(alloc, &waiters, "forker", &.{ "/bin/sh", "-c", script, dir }, null);
+        const probe = try ProcessProbe.create(alloc, "forker", &.{ "/bin/sh", "-c", script, dir }, null);
+        probe.spawn(&waiters, null);
         // Once it has started one, so the stop meets it while it starts more.
         // On a loaded machine that takes longer than any fixed wait.
         const started_one = for (0..1_000) |_| {

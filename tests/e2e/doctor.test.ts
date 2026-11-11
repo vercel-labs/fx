@@ -443,7 +443,7 @@ describe("fx doctor MCP", () => {
     expect(started).toContain("starting check ready1");
     expect(started).not.toContain("starting check project");
     expect(result.stdout).toMatch(/^\[ok\] mcp: ready1\b/m);
-    expect(result.stdout).toMatch(/^\[fail\] mcp: hang1 .*did not start/m);
+    expect(result.stdout).toMatch(/^\[fail\] mcp: hang1 did not answer in \d+\.\d s, when doctor's 3 s limit ended$/m);
     expect(result.stdout).toMatch(/^\[warn\] mcp: project .*approv/m);
     await Bun.sleep(300);
     expect(existsSync(marker)).toBe(false);
@@ -608,14 +608,18 @@ describe("fx doctor MCP", () => {
     const mcp: Record<string, unknown> = {};
     for (const name of names) mcp[name] = { command: "/bin/sh", args: ["-c", `: > '${join(r.root, name)}'; /bin/sleep 30`] };
     writeFileSync(join(r.home, ".fx", "mcp.json"), JSON.stringify({ mcp }));
-    const result = await doctor(r, env(r, { FX_TEST_DOCTOR_DEADLINE_MS: "1" }));
+    const trace = join(r.root, "trace.log");
+    const result = await doctor(r, env(r, { FX_TEST_DOCTOR_DEADLINE_MS: "1", FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "doctor" }));
     expect(result.code).toBe(1);
     const notChecked = names.filter((name) => {
-      expect(result.stdout).toMatch(new RegExp(`^\\[fail\\] mcp: ${name} (was not checked: doctor reached its 1 s limit before it could start the check|did not start in 1 s)\\n  fix: fx mcp show ${name}$`, "m"));
+      expect(result.stdout).toMatch(new RegExp(`^\\[fail\\] mcp: ${name} (was not checked: doctor reached its 1 s limit before it could start the check|did not answer in \\d+\\.\\d s, when doctor's 1 s limit ended)\\n  fix: fx mcp show ${name}$`, "m"));
       return result.stdout.includes(`[fail] mcp: ${name} was not checked`);
     });
     expect(notChecked.length).toBeGreaterThanOrEqual(names.length - 16);
     for (const name of notChecked) expect(existsSync(join(r.root, name))).toBe(false);
+    // The trace names every check doctor dropped without starting it, and why.
+    const traced = readFileSync(trace, "utf8");
+    for (const name of notChecked) expect(traced).toContain(`check ${name} was never started, since too little of doctor's limit was left to start it; dropping it`);
     spawnSync("/usr/bin/pkill", ["-KILL", "-f", `${r.root}/late`]);
   }, TIMEOUT);
 

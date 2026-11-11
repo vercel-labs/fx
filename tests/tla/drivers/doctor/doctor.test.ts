@@ -92,7 +92,7 @@ async function run(catalogHangs: boolean, mcpHangs: boolean): Promise<{ observed
       ? "timed_out"
       : checks.some((c) => c.name === "model") ? "result" : "none";
     const server = checks.find((c) => c.name === "mcp" && c.detail.startsWith("mcp1"));
-    const mcp: Outcome = !server ? "none" : server.detail.includes("did not start in") ? "timed_out" : "result";
+    const mcp: Outcome = !server ? "none" : server.detail.includes("did not answer in") ? "timed_out" : "result";
     const ghLine = checks.find((c) => c.name === "gh");
     const gh: Outcome = !ghLine ? "none" : ghLine.detail.includes("did not answer") ? "timed_out" : "result";
     return { observed: { catalog, mcp1: mcp, gh }, ms, span, left };
