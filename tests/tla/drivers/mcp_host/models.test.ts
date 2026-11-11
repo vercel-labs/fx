@@ -16,10 +16,10 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   save(join(artifacts, "gate-summary.json"), results.map(({ module, label, kind, verdict, expected, distinct, exit }) => ({ module, label, kind, verdict, expected, distinct, exit })));
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
-  // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget and
-  // RefreshLease joined the four.
-  expect(count("smoke", "PASS")).toBe(10);
-  expect(count("stress", "PASS")).toBe(10);
+  // SharedLogins, SubagentAccess, UrlRetry, MixedBuilds, StoreLockBudget,
+  // RefreshLease and McpRules joined the four.
+  expect(count("smoke", "PASS")).toBe(11);
+  expect(count("stress", "PASS")).toBe(11);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
@@ -31,7 +31,9 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   // it ended the call at the -32042 error. HostLifecycle's AtMostOneOwner
   // became the code once a reload kept its host: its smoke and stress
   // configs check it.
-  expect(count("finding", "FINDING")).toBe(2);
+  // McpRules' three are today's split of the rule sources (the code before
+  // full access ignored deny rules on every MCP path).
+  expect(count("finding", "FINDING")).toBe(5);
   expect(count("repair", "PASS")).toBe(1);
 }, 1_800_000);
 
@@ -129,6 +131,22 @@ const controls: { name: string; module: string; constants: Record<string, never>
       { event: "run", data: { cmd: "signin" } }, { event: "observe", data: { v2kind: "v2", v2: true, v3: false } },
     ],
     badAt: 2,
+  },
+  {
+    name: "MCP rules", module: "McpRules",
+    constants: { ObsTools: ["a", "b"], ObsOwnRules: [] },
+    good: [
+      { event: "init", data: { mode: "full", childMode: "full", denied: ["a"], view: ["a", "b"] } },
+      { event: "ask", data: { path: "run", agent: "main", tool: "a", answer: "shown" } },
+      { event: "mode", data: { mode: "auto" } },
+      { event: "ask", data: { path: "run", agent: "main", tool: "a", answer: "hidden" } },
+    ],
+    // A tool a rule names, hidden on one path in full access.
+    bad: [
+      { event: "init", data: { mode: "full", childMode: "full", denied: ["a"], view: ["a", "b"] } },
+      { event: "ask", data: { path: "open_tool", agent: "main", tool: "a", answer: "hidden" } },
+    ],
+    badAt: 1,
   },
 ];
 

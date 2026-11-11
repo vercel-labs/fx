@@ -455,7 +455,12 @@ pub const Resolver = struct {
         const behind = if (self.toolbox_behind) |value| value.slice() else &toolbox.default_behind;
         const tools = try cloneKeptTools(alloc, tool_source, current.profile, self.children_nest, behind);
         errdefer freeStrings(alloc, tools);
-        const integrations = try cloneIntegrations(alloc, integration_source, current.profile, view_source);
+        // The profile's server scope first, then the host's deny rules in the
+        // mode the child runs in (its profile may set one apart from its
+        // host's): full access ignores them, as it does on every MCP path.
+        const scoped = try cloneIntegrations(alloc, integration_source, current.profile, view_source);
+        defer freeStrings(alloc, scoped);
+        const integrations = try cloneWithoutDeniedMcp(alloc, scoped, current.permission_mode, host.rules);
         errdefer freeStrings(alloc, integrations);
         var rules = try types.dupePermissionRuleSet(alloc, host.rules);
         errdefer rules.deinit(alloc);
@@ -709,6 +714,25 @@ fn cloneIntegrations(
     for (values) |name| {
         const server = if (view) |known| if (known.tool(name)) |tool| tool.server_name else name else name;
         if (profiles.allowsMcpServer(value, server)) try kept.append(alloc, name);
+    }
+    return cloneStrings(alloc, kept.items);
+}
+
+/// `values`, MCP tool names, without the ones a deny rule names, except for an
+/// agent in full access (`permissions.mcpRules`). The hosts list every loaded
+/// tool, so this is the one place the rules cut a subagent's integrations.
+fn cloneWithoutDeniedMcp(
+    alloc: Allocator,
+    values: []const []const u8,
+    mode: types.PermissionMode,
+    rules: types.PermissionRuleSet,
+) ![][]u8 {
+    const used = permissions.mcpRules(mode, rules);
+    var kept: std.ArrayList([]const u8) = .empty;
+    defer kept.deinit(alloc);
+    for (values) |name| {
+        if (permissions.rulesDenyAllTargetsForPermission(used, name)) continue;
+        try kept.append(alloc, name);
     }
     return cloneStrings(alloc, kept.items);
 }
@@ -1321,4 +1345,90 @@ test "a child whose profile lists a tool kept behind toolbox keeps toolbox to re
     defer freeStrings(alloc, all);
     try std.testing.expectEqual(@as(usize, 4), all.len);
     for (all) |name| try std.testing.expect(!std.mem.eql(u8, name, "subagent"));
+}
+
+test "a subagent's integrations lose the names a deny rule names outside full access, and keep them in it" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("mcp_a_secret"), .pattern = @constCast("*"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = rules_buf[0..] };
+    const names = [_][]const u8{ "mcp_a_secret", "mcp_a_open", "mcp_b_open" };
+
+    for ([_]types.PermissionMode{ .ask, .auto }) |mode| {
+        const kept = try cloneWithoutDeniedMcp(alloc, &names, mode, rules);
+        defer freeStrings(alloc, kept);
+        try std.testing.expectEqual(@as(usize, 2), kept.len);
+        try std.testing.expectEqualStrings("mcp_a_open", kept[0]);
+        try std.testing.expectEqualStrings("mcp_b_open", kept[1]);
+    }
+    const all = try cloneWithoutDeniedMcp(alloc, &names, .yolo, rules);
+    defer freeStrings(alloc, all);
+    try std.testing.expectEqual(@as(usize, 3), all.len);
+    try std.testing.expectEqualStrings("mcp_a_secret", all[0]);
+}
+
+test "a child's integrations follow the mode it runs in, not its host's: a deny rule cuts them in auto and not in full access" {
+    const Host = struct {
+        fn resolve(_: ?*anyopaque, alloc: Allocator, root_id: []const u8) HostResolveError!HostAuthority {
+            var servers = [_]mcp_access.ServerIdentity{
+                .{ .name = @constCast("github"), .source = .profile, .scope = .profile, .connection_generation = 1, .catalog_generation = 1, .auth_generation = 1 },
+            };
+            var tools = [_]mcp_access.ToolIdentity{
+                .{ .name = @constCast("github_issue"), .server_name = @constCast("github") },
+                .{ .name = @constCast("github_pr"), .server_name = @constCast("github") },
+            };
+            const view = mcp_access.View{
+                .runtime_generation = 1,
+                .owner_id = @constCast(root_id),
+                .parent_id = @constCast(root_id),
+                .servers = &servers,
+                .tools = &tools,
+            };
+            var deny = [_]types.PermissionRule{
+                .{ .permission = @constCast("github_issue"), .pattern = @constCast("*"), .action = .deny },
+            };
+            return HostAuthority.captureWithPermissionStateAndMcpView(alloc, &.{ "read_file", "subagent" }, &.{ "github_issue", "github_pr" }, .{ .rules = &deny }, &.{}, .{}, &view) catch
+                return error.OutOfMemory;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    inline for (.{ .{ "autoer", "auto" }, .{ "fuller", "full-access" } }) |p| {
+        try tmp.dir.createDirPath(io_mod.getIo(), "fxhome/.fx/agents/" ++ p[0]);
+        var file = try tmp.dir.createFile(io_mod.getIo(), "fxhome/.fx/agents/" ++ p[0] ++ "/profile.json", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "{\"description\": \"Child\", \"permission_mode\": \"" ++ p[1] ++ "\"}");
+    }
+    const fx_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "fxhome");
+    defer alloc.free(fx_home);
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const store = parent.stateStore();
+    var registry = try child_state.Registry.init(alloc, parent.parent.id());
+    defer registry.deinit(alloc);
+    var work = child_state.ActiveWork{ .id = try alloc.dupe(u8, "work-1"), .message = try alloc.dupe(u8, "review"), .permission_mode = .ask, .created_at_ms = 1 };
+    defer work.deinit(alloc);
+    try registry.appendOneOff(alloc, "auto-child", work);
+    try registry.setProfile(alloc, "auto-child", "autoer");
+    try registry.appendOneOff(alloc, "full-child", work);
+    try registry.setProfile(alloc, "full-child", "fuller");
+    try store.save(alloc, registry);
+
+    var cache: ProfileCache = .{ .alloc = alloc, .roots = .{ .home = fx_home, .workspace_root = null } };
+    defer cache.deinit();
+    var resolver = Resolver{ .children = &parent.children, .root_id = parent.parent.id(), .host = .{ .resolve_fn = Host.resolve }, .profiles = &cache };
+
+    var in_auto = try resolver.resolve(alloc, "auto-child");
+    defer in_auto.deinit(alloc);
+    try std.testing.expectEqual(types.PermissionMode.auto, in_auto.permission_mode);
+    try std.testing.expectEqual(@as(usize, 1), in_auto.integrations.len);
+    try std.testing.expectEqualStrings("github_pr", in_auto.integrations[0]);
+
+    var in_full = try resolver.resolve(alloc, "full-child");
+    defer in_full.deinit(alloc);
+    try std.testing.expectEqual(types.PermissionMode.yolo, in_full.permission_mode);
+    try std.testing.expectEqual(@as(usize, 2), in_full.integrations.len);
 }

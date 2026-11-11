@@ -378,7 +378,9 @@ pub const Catalog = struct {
     }
 
     /// The names of the tools in the lists the catalog has, owned by `alloc`.
-    pub fn snapshotToolNames(c: *Catalog, alloc: Allocator, permission_rules: types.PermissionRuleSet) ![][]u8 {
+    /// Every loaded tool is named: what a deny rule hides is decided by the
+    /// mode of the agent that uses the list (`permissions.mcpRules`), not here.
+    pub fn snapshotToolNames(c: *Catalog, alloc: Allocator) ![][]u8 {
         var names: std.ArrayList([]u8) = .empty;
         errdefer {
             for (names.items) |n| alloc.free(n);
@@ -389,7 +391,6 @@ pub const Catalog = struct {
         for (c.lists) |l| {
             if (l.state != .loaded) continue;
             for (l.tools) |tool| {
-                if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
                 const name = try alloc.dupe(u8, tool.prefixed_name);
                 names.append(alloc, name) catch |err| {
                     alloc.free(name);
@@ -402,12 +403,13 @@ pub const Catalog = struct {
 
     /// What a subagent may use: every server its parent may use, whether or
     /// not its list has loaded, and the tools of the lists already loaded.
+    /// Access is not decided by rules: a deny rule applies to the mode the
+    /// agent runs in, on every path that uses the tool (`permissions.mcpRules`).
     pub fn snapshotAccessView(
         c: *Catalog,
         alloc: Allocator,
         owner_id: []const u8,
         parent_id: []const u8,
-        permission_rules: types.PermissionRuleSet,
     ) !access_policy.View {
         var servers: std.ArrayList(access_policy.ServerIdentity) = .empty;
         var tools: std.ArrayList(access_policy.ToolIdentity) = .empty;
@@ -441,7 +443,6 @@ pub const Catalog = struct {
             });
             if (l.state != .loaded) continue;
             for (l.tools) |tool| {
-                if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
                 try tools.ensureUnusedCapacity(alloc, 1);
                 const name = try alloc.dupe(u8, tool.prefixed_name);
                 errdefer alloc.free(name);
@@ -958,7 +959,7 @@ test "a subagent made before its parent's server starts may use the server's too
     const a = arena.allocator();
 
     // Nothing has started `fake` yet; the disabled server stays out.
-    var view = try c.snapshotAccessView(testing.allocator, "child", "parent", .{});
+    var view = try c.snapshotAccessView(testing.allocator, "child", "parent");
     defer view.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), view.servers.len);
     try testing.expectEqualStrings("fake", view.servers[0].name);
@@ -1068,8 +1069,8 @@ test "an MCP server's tools reach the model under fx's names" {
     try testing.expectError(error.McpAdvertisedToolChanged, c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .expected_binding = stale }));
     try testing.expect((try c.callTool(a, "mcp_fake_nope", "{}", 4096, .{})) == null);
 
-    try testing.expectEqual(@as(usize, 1), (try c.snapshotToolNames(a, .{})).len);
-    var view = try c.snapshotAccessView(testing.allocator, "child", "parent", .{});
+    try testing.expectEqual(@as(usize, 1), (try c.snapshotToolNames(a)).len);
+    var view = try c.snapshotAccessView(testing.allocator, "child", "parent");
     defer view.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), view.tools.len);
     try testing.expect(Access.allowsTool(.{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } }, c.currentGeneration(), "mcp_fake_echo"));
@@ -1105,7 +1106,7 @@ test "a reload keeps a kept server's list and the bindings made from it, until a
     // Adding a server keeps what the model was shown, and the lists loaded.
     try c.reload(try r.reload(&.{ fake, gone, late }, &f.inherited));
     try testing.expectEqual(generation, c.currentGeneration());
-    try testing.expectEqual(@as(usize, 2), (try c.snapshotToolNames(a, .{})).len);
+    try testing.expectEqual(@as(usize, 2), (try c.snapshotToolNames(a)).len);
     try testing.expect((try c.snapshotToolDefinition(a, "mcp_fake_echo", binding, .{}, .{}, .unrestricted)) == .current);
     const result = (try c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .expected_binding = binding })).?;
     try testing.expectEqual(tool_mcp_runtime.CallStatus.success, result.status);
@@ -1116,7 +1117,7 @@ test "a reload keeps a kept server's list and the bindings made from it, until a
     try testing.expectError(error.McpAdvertisedToolChanged, c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .expected_binding = binding }));
     try testing.expect((try c.callTool(a, "mcp_gone_echo", "{}", 4096, .{})) == null);
     // The kept server's list stays without asking it again.
-    try testing.expectEqual(@as(usize, 1), (try c.snapshotToolNames(a, .{})).len);
+    try testing.expectEqual(@as(usize, 1), (try c.snapshotToolNames(a)).len);
     try testing.expect(c.hasTool("mcp_late_echo", .unrestricted));
 }
 

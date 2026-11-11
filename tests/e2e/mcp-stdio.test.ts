@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { contentText } from "./conditional-guidance-oracle";
+import { LARGE_TOOL, OTHER_TOOL, SMALL_TOOL, runPaths, seen, type PathName, type PathsRun } from "./mcp-rules-paths";
 import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import {
   fakeGatewayFinalText,
@@ -4021,7 +4022,7 @@ describe("fx mcp call", () => {
 
   // Runs one shell command through the built binary and returns what the
   // model saw of it.
-  const runBridgeCommand = async (root: FixtureRoot, shellCommand: string) => {
+  const runBridgeCommand = async (root: FixtureRoot, shellCommand: string, modeFlag: "--full-access" | "--auto" = "--full-access") => {
     let seen = "";
     gateway = startFakeGateway([
       fakeGatewayToolCall("run_call", "shell", { action: "run", command: shellCommand }),
@@ -4032,7 +4033,7 @@ describe("fx mcp call", () => {
     ], {
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
-    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Run the command."], {
+    const result = await runFx(["ask", "--json", modeFlag, "--no-save", "Run the command."], {
       cwd: root.workspace,
       env: fixtureEnv(root, gateway),
       timeoutMs: 80_000,
@@ -4285,16 +4286,29 @@ describe("fx mcp call", () => {
     expect(toolCalls(root)).toHaveLength(0);
   }, 90_000);
 
-  test("list, search, and help hide a tool the permission rules deny", async () => {
+  test("in auto, list, search, and help hide a tool the permission rules deny", async () => {
     const root = bridgeRoot("bridge-lookups-denied", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
     const seen = shellOutput(await runBridgeCommand(root, [
       `"${FX_BIN}" mcp call list fixture; echo "list=$?"`,
       `"${FX_BIN}" mcp call help ${TOOL_NAME}; echo "help=$?"`,
-    ].join("\n")));
+    ].join("\n"), "--auto"));
     expect(seen).not.toContain(`${TOOL_NAME}\t`);
     expect(seen).toContain("list=0");
     expect(seen).toContain(`No MCP tool named ${TOOL_NAME} is available to this agent.`);
     expect(seen).toContain("help=1");
+  }, 90_000);
+
+  // Full access ignores MCP deny rules on every path (tests/tla/mcp_host/McpRules.tla, FullAccessIgnoresRules).
+  test("in full access, list and help show a tool the permission rules deny", async () => {
+    const root = bridgeRoot("bridge-lookups-denied-full", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
+    const seen = shellOutput(await runBridgeCommand(root, [
+      `"${FX_BIN}" mcp call list fixture; echo "list=$?"`,
+      `"${FX_BIN}" mcp call help ${TOOL_NAME}; echo "help=$?"`,
+    ].join("\n")));
+    expect(seen).toContain(`${TOOL_NAME}\t`);
+    expect(seen).toContain("list=0");
+    expect(seen).not.toContain(`No MCP tool named ${TOOL_NAME} is available to this agent.`);
+    expect(seen).toContain("help=0");
   }, 90_000);
 
   test.skipIf(!tmuxAvailable())(
@@ -4376,4 +4390,133 @@ describe("fx mcp call", () => {
     },
     60_000,
   );
+});
+
+// A deny rule names an MCP tool. In full access fx skips its permission
+// policy, so no rule hides or blocks an MCP tool on any path: toolbox search,
+// open of a small and of a large server, open and run of a tool, and a shell
+// command's `fx mcp call` list, search, help and call, for the main agent and
+// for a subagent. In ask and auto a denied tool stays hidden and refused on
+// every path. What a subagent's access allows holds in every mode.
+describe("MCP deny rules by permission mode", () => {
+  const rules = { [SMALL_TOOL]: "deny", [LARGE_TOOL]: "deny" };
+  const DENIED: Array<[PathName, string]> = [
+    ["search", SMALL_TOOL], ["search", LARGE_TOOL],
+    ["open_small", SMALL_TOOL], ["open_large", LARGE_TOOL],
+    ["open_tool", SMALL_TOOL], ["open_tool", LARGE_TOOL],
+    ["run", SMALL_TOOL], ["run", LARGE_TOOL],
+    ["bridge_list", SMALL_TOOL], ["bridge_list", LARGE_TOOL],
+    ["bridge_search", SMALL_TOOL], ["bridge_search", LARGE_TOOL],
+    ["bridge_help", SMALL_TOOL], ["bridge_help", LARGE_TOOL],
+    ["bridge_call", SMALL_TOOL], ["bridge_call", LARGE_TOOL],
+  ];
+  const READ_ONLY = DENIED.filter(([path]) => path === "search" || path.startsWith("open_"));
+  const UNDENIED: Array<[PathName, string]> = [["open_large", OTHER_TOOL], ["open_tool", OTHER_TOOL], ["run", OTHER_TOOL], ["bridge_call", OTHER_TOOL]];
+  const name = ([path, tool]: [PathName, string]) => `${path} ${tool}`;
+  const hidden = (run: PathsRun, pairs: Array<[PathName, string]>) => pairs.filter(([p, t]) => !seen(run, p, t).shown).map(name);
+  const shown = (run: PathsRun, pairs: Array<[PathName, string]>) => pairs.filter(([p, t]) => seen(run, p, t).shown).map(name);
+  const ok = (run: PathsRun) => expect([run.code, run.stderr.slice(-200)]).toEqual([0, run.stderr.slice(-200)]);
+
+  test("full access: every path finds, opens and runs a tool a deny rule names", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "full", rules });
+    ok(run);
+    expect(hidden(run, DENIED)).toEqual([]);
+    expect(hidden(run, UNDENIED)).toEqual([]);
+  }, 240_000);
+
+  test("full access: a subagent finds, opens and runs it too", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "full", agent: "child", rules });
+    ok(run);
+    expect(hidden(run, DENIED)).toEqual([]);
+    expect(hidden(run, UNDENIED)).toEqual([]);
+  }, 240_000);
+
+  test("guard: in full access a subagent limited to the big server still gets 'not found' for the other server's tool", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "full", agent: "child", rules: { [SMALL_TOOL]: "deny" }, childServers: ["big"] });
+    ok(run);
+    const fixture = DENIED.filter(([, tool]) => tool === SMALL_TOOL);
+    expect(shown(run, fixture)).toEqual([]);
+    expect(hidden(run, [...UNDENIED, ["open_large", LARGE_TOOL], ["run", LARGE_TOOL]])).toEqual([]);
+  }, 240_000);
+
+  test("edge: a subagent whose profile sets full access under a host in auto ignores the rule, as the mode it runs in says", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "auto", childMode: "full", agent: "child", rules, label: "child-full-under-auto" });
+    ok(run);
+    expect(hidden(run, DENIED)).toEqual([]);
+    expect(hidden(run, UNDENIED)).toEqual([]);
+  }, 240_000);
+
+  test("guard: a subagent whose profile sets auto under a host in full access still gets the rule", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "full", childMode: "auto", agent: "child", rules, label: "child-auto-under-full" });
+    ok(run);
+    expect(shown(run, DENIED)).toEqual([]);
+    expect(hidden(run, UNDENIED)).toEqual([]);
+  }, 240_000);
+
+  test("guard: in auto a denied tool stays hidden and refused on every path, in today's words", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "auto", rules });
+    ok(run);
+    expect(shown(run, DENIED)).toEqual([]);
+    expect(hidden(run, UNDENIED)).toEqual([]);
+    expect(seen(run, "open_tool", SMALL_TOOL).text).toContain(`Nothing named ${SMALL_TOOL} is in the toolbox menu. Use toolbox search to find it.`);
+    expect(seen(run, "run", SMALL_TOOL).text).toContain(`No tool named ${SMALL_TOOL} is in the toolbox. Use toolbox search to find it.`);
+    expect(seen(run, "bridge_help", SMALL_TOOL).text).toContain(`No MCP tool named ${SMALL_TOOL} is available to this agent.`);
+  }, 240_000);
+
+  test("guard: in auto a subagent's denied tool stays hidden and refused too", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "auto", agent: "child", rules });
+    ok(run);
+    expect(shown(run, DENIED)).toEqual([]);
+    expect(hidden(run, UNDENIED)).toEqual([]);
+  }, 240_000);
+
+  test("guard: in ask, search and open hide a denied tool", async () => {
+    const run = await runPaths({ bin: FX_BIN, mode: "ask", rules, readOnly: true });
+    ok(run);
+    expect(shown(run, READ_ONLY)).toEqual([]);
+    expect(hidden(run, [["open_large", OTHER_TOOL], ["open_tool", OTHER_TOOL]])).toEqual([]);
+  }, 240_000);
+
+  test("edge: a rule on a whole server hides all of it in auto and nothing of it in full access", async () => {
+    const wholeServer = { "mcp_big_*": "deny" };
+    const bigTools = DENIED.filter(([, tool]) => tool === LARGE_TOOL);
+    const auto = await runPaths({ bin: FX_BIN, mode: "auto", rules: wholeServer, label: "whole-auto" });
+    ok(auto);
+    expect(shown(auto, [...bigTools, ...UNDENIED.filter(([, tool]) => tool === OTHER_TOOL)])).toEqual([]);
+    const full = await runPaths({ bin: FX_BIN, mode: "full", rules: wholeServer, label: "whole-full" });
+    ok(full);
+    expect(hidden(full, [...bigTools, ...UNDENIED])).toEqual([]);
+  }, 400_000);
+
+  test("edge: with an allow rule and a deny rule for one tool, auto keeps the deny and full access ignores both", async () => {
+    const both = { "mcp_fixture_*": "allow", [SMALL_TOOL]: "deny" };
+    const smallTool = DENIED.filter(([, tool]) => tool === SMALL_TOOL);
+    const auto = await runPaths({ bin: FX_BIN, mode: "auto", rules: both, label: "both-auto" });
+    ok(auto);
+    expect(shown(auto, smallTool)).toEqual([]);
+    const full = await runPaths({ bin: FX_BIN, mode: "full", rules: both, label: "both-full" });
+    ok(full);
+    expect(hidden(full, smallTool)).toEqual([]);
+  }, 400_000);
+
+  test("edge: a rule for the bare tool name matches nothing, in every mode", async () => {
+    const bare = { echo: "deny", tool_01: "deny" };
+    for (const mode of ["auto", "full"] as const) {
+      const run = await runPaths({ bin: FX_BIN, mode, rules: bare, label: `bare-${mode}` });
+      ok(run);
+      expect([mode, hidden(run, DENIED)]).toEqual([mode, []]);
+    }
+  }, 400_000);
+
+  test("fault: a server that is down answers the same in full access and in auto", async () => {
+    const auto = await runPaths({ bin: FX_BIN, mode: "auto", rules: {}, down: true, readOnly: true, label: "down-auto" });
+    const full = await runPaths({ bin: FX_BIN, mode: "full", rules: {}, down: true, readOnly: true, label: "down-full" });
+    ok(auto);
+    ok(full);
+    // A server that exits at start is not in the menu: today's words, in both modes.
+    expect(seen(auto, "open_small", SMALL_TOOL).text).toContain("Nothing named fixture is in the toolbox menu.");
+    for (const path of ["search", "open_small", "open_tool"] as const) {
+      expect([path, seen(full, path, SMALL_TOOL).text]).toEqual([path, seen(auto, path, SMALL_TOOL).text]);
+    }
+  }, 400_000);
 });

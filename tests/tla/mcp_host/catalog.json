@@ -77,5 +77,16 @@
     "stress": "RefreshLease.stress.cfg",
     "findings": [],
     "repair": []
+  },
+  {
+    "module": "McpRules",
+    "smoke": "McpRules.cfg",
+    "stress": "McpRules.stress.cfg",
+    "findings": [
+      { "config": "McpRules.findings.cfg", "invariant": "FullAccessIgnoresRules" },
+      { "config": "McpRules.findings-paths.cfg", "invariant": "PathsAgree" },
+      { "config": "McpRules.findings-integrations.cfg", "invariant": "FullAccessIgnoresRules" }
+    ],
+    "repair": []
   }
 ]
