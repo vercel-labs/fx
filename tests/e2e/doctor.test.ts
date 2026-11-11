@@ -351,8 +351,15 @@ describe("fx doctor local checks", () => {
     gitRepo(hanging);
     const marker = "sleep 57.6543";
     writeScript(join(hanging.bin, "gh"), `/bin/${marker}\nexit 0`);
-    const hung = await doctor(hanging, env(hanging, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key", FX_TEST_DOCTOR_DEADLINE_MS: "1000" }));
-    expect(hung.ms).toBeLessThan(2_500);
+    const hungTrace = join(hanging.root, "trace.log");
+    const hung = await doctor(hanging, env(hanging, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key", FX_TEST_DOCTOR_DEADLINE_MS: "1000", FX_TRACE_LOG: hungTrace, FX_TRACE_SCOPES: "doctor" }));
+    const ended = Date.now();
+    // Doctor's own time, from its first trace line to its exit, stays near
+    // its 1 s limit. The startup before that line varies with the machine's
+    // load, so only the whole run's loose bound includes it.
+    const firstLine = Number(readFileSync(hungTrace, "utf8").split(" ", 1)[0]);
+    expect(ended - firstLine).toBeLessThan(2_000);
+    expect(hung.ms).toBeLessThan(10_000);
     expect(hung.stdout).toContain("[warn] gh: gh repo view did not answer in 1 s\n  fix: run gh repo view to see why\n");
     expect(running(marker)).toBe("");
   }, TIMEOUT);
@@ -603,7 +610,9 @@ describe("fx doctor MCP", () => {
     const r = makeRoot();
     // More servers than doctor checks at once (16 at most). A check of one
     // never ends on its own, so no slot frees before the 1 ms deadline, and
-    // the servers past the cap are never started.
+    // the servers past the cap are never started: dropped by the start
+    // cutoff when a slot is free and too little of the limit is left, or at
+    // the limit when every slot is still taken.
     const names = Array.from({ length: 20 }, (_, i) => `late${i}`);
     const mcp: Record<string, unknown> = {};
     for (const name of names) mcp[name] = { command: "/bin/sh", args: ["-c", `: > '${join(r.root, name)}'; /bin/sleep 30`] };
@@ -611,15 +620,21 @@ describe("fx doctor MCP", () => {
     const trace = join(r.root, "trace.log");
     const result = await doctor(r, env(r, { FX_TEST_DOCTOR_DEADLINE_MS: "1", FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "doctor" }));
     expect(result.code).toBe(1);
+    const cutoff = "was not checked: too little of doctor's 1 s limit was left to start it";
+    const atLimit = "was not checked: doctor reached its 1 s limit before it could start the check";
     const notChecked = names.filter((name) => {
-      expect(result.stdout).toMatch(new RegExp(`^\\[fail\\] mcp: ${name} (was not checked: doctor reached its 1 s limit before it could start the check|did not answer in \\d+\\.\\d s, when doctor's 1 s limit ended)\\n  fix: fx mcp show ${name}$`, "m"));
+      expect(result.stdout).toMatch(new RegExp(`^\\[fail\\] mcp: ${name} (${cutoff}|${atLimit}|did not answer in \\d+\\.\\d s, when doctor's 1 s limit ended)\\n  fix: fx mcp show ${name}$`, "m"));
       return result.stdout.includes(`[fail] mcp: ${name} was not checked`);
     });
     expect(notChecked.length).toBeGreaterThanOrEqual(names.length - 16);
     for (const name of notChecked) expect(existsSync(join(r.root, name))).toBe(false);
-    // The trace names every check doctor dropped without starting it, and why.
+    // The trace names every check doctor dropped without starting it, with
+    // the reason its line gives.
     const traced = readFileSync(trace, "utf8");
-    for (const name of notChecked) expect(traced).toContain(`check ${name} was never started, since too little of doctor's limit was left to start it; dropping it`);
+    for (const name of notChecked) {
+      const why = result.stdout.includes(`[fail] mcp: ${name} ${cutoff}`) ? "too little of doctor's limit was left to start it" : "doctor's limit came while it waited for a slot";
+      expect(traced.split(`check ${name} was never started, since ${why}; dropping it`).length).toBe(2);
+    }
     spawnSync("/usr/bin/pkill", ["-KILL", "-f", `${r.root}/late`]);
   }, TIMEOUT);
 

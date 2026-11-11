@@ -60,9 +60,10 @@ const poll_ms: u64 = 5;
 /// The fewest and the most MCP server checks that run at once.
 const min_server_checks: usize = 4;
 const max_server_checks: usize = 16;
-/// The most of the limit a queued MCP server check must have left to start
-/// (`checkShareMs`).
+/// The most of the limit a queued MCP server check must have left to start,
+/// and the part of a shorter limit it needs instead (`checkShareMs`).
 const max_check_share_ms: i64 = 1_000;
+const check_share_divisor: i64 = 4;
 /// gh's exit code for a command that needs a sign-in (`gh help exit-codes`).
 const gh_auth_required: u8 = 4;
 
@@ -163,9 +164,12 @@ pub const ProcessProbe = struct {
     /// id of the child's process group.
     pid: std.posix.pid_t = 0,
     spawn_error: ?anyerror = null,
-    /// Never started, because the deadline passed or a signal came first
-    /// while it waited for a slot.
+    /// Never started, because too little of the limit was left to start
+    /// it, the limit came while it waited for a slot, or a signal came first.
     not_started: bool = false,
+    /// Never started for the first of those reasons, before the limit itself
+    /// was reached.
+    start_cutoff: bool = false,
     /// Killed at the deadline or at an ending signal, so it did not finish
     /// in time.
     stopped: std.atomic.Value(bool) = .init(false),
@@ -382,14 +386,16 @@ fn serverCapFor(cpus: usize) usize {
 }
 
 /// How much of a `limit_ms` limit must be left for a queued check to start:
-/// `max_check_share_ms`, or a quarter of a shorter limit, so a short test
-/// limit still starts checks.
+/// `max_check_share_ms`, or a quarter (`check_share_divisor`) of a shorter
+/// limit, so a short test limit still starts checks.
 fn checkShareMs(limit_ms: i64) i64 {
-    return @min(max_check_share_ms, @divTrunc(limit_ms, 4));
+    return @min(max_check_share_ms, @divTrunc(limit_ms, check_share_divisor));
 }
 
-/// Why checks still queued were never started.
-const DropReason = enum { limit, signal };
+/// Why checks still queued were never started: too little of the limit was
+/// left to start one, the limit came while every slot was taken, or an
+/// ending signal came.
+const DropReason = enum { cutoff, limit, signal };
 
 /// The MCP server checks, one for each idle server in config order. At most
 /// `cap` of them run at a time; the ones from `next` on wait for a slot.
@@ -408,7 +414,7 @@ pub const ServerChecks = struct {
     /// only.
     fn startMore(self: *ServerChecks, waiters: *std.Io.Group, deadline: i64) void {
         while (self.next < self.probes.len and self.running() < self.cap) {
-            if (io_mod.milliTimestamp() >= self.last_start) return self.dropQueued(.limit);
+            if (io_mod.milliTimestamp() >= self.last_start) return self.dropQueued(.cutoff);
             if (stopRequested() or io_mod.milliTimestamp() >= deadline) return;
             self.probes[self.next].spawn(waiters, null);
             self.next += 1;
@@ -429,11 +435,13 @@ pub const ServerChecks = struct {
     /// that names it and says why.
     fn dropQueued(self: *ServerChecks, reason: DropReason) void {
         const why = switch (reason) {
-            .limit => "too little of doctor's limit was left to start it",
+            .cutoff => "too little of doctor's limit was left to start it",
+            .limit => "doctor's limit came while it waited for a slot",
             .signal => "doctor got a signal first",
         };
         for (self.probes[self.next..]) |p| {
             debug_trace.logf("doctor", "check {s} was never started, since {s}; dropping it", .{ p.name, why });
+            p.start_cutoff = reason == .cutoff;
             p.not_started = true;
             p.done.store(true, .release);
         }
@@ -684,7 +692,11 @@ fn serverChildCheck(checks: *std.ArrayList(Check), alloc: Allocator, c: *const P
     const failed: Found = .{ .connection = .failed };
     const timed_out: Found = .{ .connection = .timed_out };
     if (c.not_started) {
-        try appendCheck(checks, alloc, "mcp", .fail, try alloc.print("{s} was not checked: doctor reached its {d} s limit before it could start the check", .{ c.name, seconds(deadline_ms) }), try mcpCommand(alloc, "show", c.name));
+        const detail = if (c.start_cutoff)
+            try alloc.print("{s} was not checked: too little of doctor's {d} s limit was left to start it", .{ c.name, seconds(deadline_ms) })
+        else
+            try alloc.print("{s} was not checked: doctor reached its {d} s limit before it could start the check", .{ c.name, seconds(deadline_ms) });
+        try appendCheck(checks, alloc, "mcp", .fail, detail, try mcpCommand(alloc, "show", c.name));
         return timed_out;
     }
     if (c.stopped.load(.acquire)) {
@@ -1202,20 +1214,45 @@ test "no more server checks run at once than the cap, and the next starts when o
     try std.testing.expect(io_mod.milliTimestamp() - started >= 350);
 }
 
+/// Sends the doctor trace lines a test writes to `trace.log` in `tmp`.
+fn startTraceForTest(alloc: Allocator, tmp: std.testing.TmpDir) !void {
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
+    defer alloc.free(path);
+    debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, path, "doctor");
+}
+
+/// Ends the tracing `startTraceForTest` began and returns what it wrote.
+/// The caller owns it.
+fn readTraceForTest(alloc: Allocator, tmp: std.testing.TmpDir) ![]u8 {
+    debug_trace.shutdown();
+    return tmp.dir.readFileAlloc(io_mod.getIo(), "trace.log", alloc, .limited(1 << 20));
+}
+
 test "server checks still queued at the deadline are never started and say so" {
     if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.heap.c_allocator;
     var waiters: std.Io.Group = .init;
     var processes: std.ArrayList(*ProcessProbe) = .empty;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try startTraceForTest(alloc, tmp);
+    defer debug_trace.resetForTest();
     for ([_][]const u8{ "first", "second", "third" }) |name| try processes.append(alloc, try ProcessProbe.create(alloc, name, &.{ "/bin/sh", "-c", "sleep 30" }, null));
+    // No start cutoff, so the one slot is still taken when the limit comes.
     var servers: ServerChecks = .{ .probes = processes.items, .cap = 1 };
     const started = io_mod.milliTimestamp();
     servers.startMore(&waiters, started + 100);
     try std.testing.expect(wait(started + 100, null, processes.items, &waiters, &servers) == null);
     try std.testing.expect(processes.items[0].stopped.load(.acquire));
+    const trace = try readTraceForTest(alloc, tmp);
     for (processes.items[1..]) |p| {
-        try std.testing.expect(p.not_started);
+        try std.testing.expect(p.not_started and !p.start_cutoff);
         try std.testing.expectEqual(@as(std.posix.pid_t, 0), p.pid);
+        const line = try alloc.print("check {s} was never started, since doctor's limit came while it waited for a slot; dropping it", .{p.name});
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, line));
     }
     var checks: std.ArrayList(Check) = .empty;
     defer freeChecks(std.testing.allocator, &checks);
@@ -1241,18 +1278,64 @@ test "a queued check needs a share of the limit left to start, and one too late 
     var waiters: std.Io.Group = .init;
     var processes: std.ArrayList(*ProcessProbe) = .empty;
     for ([_][]const u8{ "first", "second" }) |name| try processes.append(alloc, try ProcessProbe.create(alloc, name, &.{ "/bin/sh", "-c", "sleep 30" }, null));
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try startTraceForTest(alloc, tmp);
+    defer debug_trace.resetForTest();
     // The deadline is still ahead, but the last moment to start has passed.
     const now = io_mod.milliTimestamp();
     var servers: ServerChecks = .{ .probes = processes.items, .cap = 4, .last_start = now - 1 };
     servers.startMore(&waiters, now + 60_000);
     try std.testing.expectEqual(processes.items.len, servers.next);
     for (processes.items) |p| {
-        try std.testing.expect(p.not_started and p.done.load(.acquire));
+        try std.testing.expect(p.not_started and p.start_cutoff and p.done.load(.acquire));
         try std.testing.expectEqual(@as(std.posix.pid_t, 0), p.pid);
     }
     // With nothing left to wait for, the wait ends at once.
     try std.testing.expect(wait(now + 60_000, null, processes.items, &waiters, &servers) == null);
     try std.testing.expect(io_mod.milliTimestamp() - now < 1_000);
+    const trace = try readTraceForTest(alloc, tmp);
+    var checks: std.ArrayList(Check) = .empty;
+    defer freeChecks(std.testing.allocator, &checks);
+    var results: std.ArrayList(ServerResult) = .empty;
+    defer results.deinit(std.testing.allocator);
+    try serverChildChecks(&checks, &results, std.testing.allocator, processes.items, 60_000);
+    for (processes.items, checks.items) |p, check| {
+        const line = try alloc.print("check {s} was never started, since too little of doctor's limit was left to start it; dropping it", .{p.name});
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, line));
+        const detail = try alloc.print("{s} was not checked: too little of doctor's 60 s limit was left to start it", .{p.name});
+        try std.testing.expectEqualStrings(detail, check.detail);
+        const fix = try alloc.print("fx mcp show {s}", .{p.name});
+        try std.testing.expectEqualStrings(fix, check.fix.?);
+    }
+}
+
+test "a signal drops each queued check with a trace line, and gh is never started" {
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.heap.c_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try startTraceForTest(alloc, tmp);
+    defer debug_trace.resetForTest();
+    defer stop_signal.store(0, .seq_cst);
+    var waiters: std.Io.Group = .init;
+    var processes: std.ArrayList(*ProcessProbe) = .empty;
+    const names = [_][]const u8{ "first", "second", "third" };
+    for (names) |name| try processes.append(alloc, try ProcessProbe.create(alloc, name, &.{ "/bin/sh", "-c", "sleep 30" }, null));
+    var servers: ServerChecks = .{ .probes = processes.items, .cap = 4 };
+    // The handler's whole work, as if the signal reached it before any start.
+    recordStopSignal(.TERM);
+    try std.testing.expect(try startGh(alloc, &waiters, &processes) == null);
+    try std.testing.expectEqual(std.posix.SIG.TERM, wait(io_mod.milliTimestamp() + 60_000, null, processes.items, &waiters, &servers).?);
+    const trace = try readTraceForTest(alloc, tmp);
+    for (names, processes.items) |name, p| {
+        try std.testing.expect(p.not_started and !p.start_cutoff);
+        try std.testing.expectEqual(@as(std.posix.pid_t, 0), p.pid);
+        const line = try alloc.print("check {s} was never started, since doctor got a signal first; dropping it", .{name});
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, line));
+    }
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "check gh was never started, since doctor got a signal first"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, trace, "starting check"));
 }
 
 test "a check the limit cuts says how long it ran, not the whole limit" {
