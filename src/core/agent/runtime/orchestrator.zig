@@ -3696,7 +3696,14 @@ fn recoveryToolEvidence(
                     else => .uncertain,
                 };
             }
-            return .uncertain;
+            // fx runs local calls only once their completion succeeds, so the
+            // local calls of a failed completion never ran. A call the
+            // provider runs itself may have, beside them or in the stream.
+            for (value.tool_calls) |call| {
+                if (call.provenance == .provider_executed) return .uncertain;
+            }
+            if (stream_ctx.saw_provider_tool_start) return .uncertain;
+            return .proven_unexecuted;
         }
     }
     if (stream_ctx.saw_provider_tool_start) return .uncertain;
