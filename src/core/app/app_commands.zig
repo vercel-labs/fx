@@ -1394,9 +1394,11 @@ pub fn Handlers(comptime App: type) type {
                 if (snapshot.err_message == null) {
                     if (snapshot.token_pass != null) {
                         app.model_cache.observeTokenPassCredit();
+                    } else if (snapshot.no_token_pass) {
+                        app.model_cache.observeNoTokenPass("credits");
                     } else if (app.model_cache.tokenPassStatus() == .active) {
-                        // The team uses Token Pass, but the Gateway reported
-                        // no Token Pass credit: point at the tab that has it.
+                        // The team uses Token Pass, but this reply does not
+                        // mention Token Pass: point at the tab that has it.
                         try app.writeDomainNotice(.{
                             .topic = "credits",
                             .tone = .neutral,

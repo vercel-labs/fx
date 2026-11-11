@@ -3295,6 +3295,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
             },
           },
         ]),
+        Response.json(
+          { error: { message: "This request requires an active Vercel Token Pass.", type: "no_providers_available" } },
+          { status: 403 },
+        ),
       ], {
         models: [
           {
@@ -3325,7 +3329,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         usage: (url) => {
           if (url.pathname !== "/coding-agent/v1/credits") return null;
           creditsRequests.push(url.pathname);
-          return Response.json({ balance: "12.50", total_used: "1.25", token_pass: null });
+          // A reply from before the Gateway reported Token Pass credit.
+          return Response.json({ balance: "12.50", total_used: "1.25" });
         },
       });
       session = await TmuxSession.create({
@@ -3442,13 +3447,26 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await waitForScrollbackCount(`Switched to ${tokenPassModel} (effort: default, speed: normal)`, 2);
       expect(await scrollbackCount(covers)).toBe(1);
 
-      // The Gateway reports no Token Pass credit for this team, so /credits
-      // points at the dashboard tab instead.
+      // This reply does not mention Token Pass, so /credits points at the
+      // dashboard tab instead.
       await session.sendText("/credits");
       await session.waitForText("Token Pass credit is a separate balance.", 10_000);
       expect(creditsRequests).toHaveLength(1);
 
-      expect(gateway.requests).toHaveLength(1);
+      // AI Gateway denies a request because the team has no active Token
+      // Pass: fx forgets that it has one, so the next switch names it again.
+      await session.sendText("Use Token Pass again.");
+      await session.waitForText("requires an active Vercel Token Pass", 10_000);
+      // The turn waits on the rejection until the user presses Esc.
+      await session.waitForText("press Esc", 5_000);
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("press Esc"), 5_000);
+      await session.sendKeys("C-u");
+      await pickModel("glm", tokenPassModel, "effort");
+      await waitForScrollbackCount(`Switched to ${tokenPassModel} (effort: default, speed: normal)`, 3);
+      await waitForScrollbackCount(covers, 2);
+
+      expect(gateway.requests).toHaveLength(2);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -3462,6 +3480,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
     async () => {
       const fixture = createModelsMenuFixture();
       const tokenPassModel = "zai/glm-5.3-flash";
+      let creditsReplies = 0;
       gateway = startFakeGateway([], {
         models: [
           { id: "provider/plain-model", type: "language", released: 200, tags: ["tool-use"] },
@@ -3469,10 +3488,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         ],
         usage: (url) => {
           if (url.pathname !== "/coding-agent/v1/credits") return null;
+          creditsReplies += 1;
+          // The second reply says the team no longer has an active Token Pass.
           return Response.json({
             balance: "12.50",
             total_used: "1.25",
-            token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+            token_pass: creditsReplies === 1 ? { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" } : null,
           });
         },
       });
@@ -3514,6 +3535,18 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Enter");
       await session.waitForText(`Switched to ${tokenPassModel}`, 5_000);
       expect(await session.captureFullScrollback()).not.toContain("Token Pass covers this model");
+
+      // `token_pass: null` means the team has no active Token Pass, so fx
+      // forgets it and the next switch names Token Pass again.
+      await session.sendText("/credits");
+      await session.waitForPane(() => creditsReplies === 2, 10_000);
+      await session.waitForPane((pane) => (pane.match(/balance=12\.50/g) ?? []).length >= 2, 10_000);
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 2);
+      await session.sendLiteralText("glm");
+      await session.waitForPane((pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes(tokenPassModel)), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForText("Token Pass covers this model", 5_000);
       expect(gateway.requests).toHaveLength(0);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");

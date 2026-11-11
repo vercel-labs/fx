@@ -616,6 +616,19 @@ pub const Runtime = struct {
         }
     }
 
+    /// Records that AI Gateway said this team has no active Token Pass;
+    /// `source` names how, for the trace.
+    pub fn observeNoTokenPass(self: *Self, source: []const u8) void {
+        if (self.token_pass.observeNoPass()) {
+            debug_trace.logf("catalog", "token pass status=unknown source={s}", .{source});
+        }
+    }
+
+    /// Reads an error the user sees for AI Gateway's Token Pass denial.
+    pub fn observeErrorText(self: *Self, text: []const u8) void {
+        if (token_pass_mod.deniedCause(text) == .no_active_pass) self.observeNoTokenPass("denied");
+    }
+
     pub fn tokenPassStatus(self: *const Self) token_pass_mod.Status {
         return self.token_pass.status;
     }

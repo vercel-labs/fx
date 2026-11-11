@@ -226,7 +226,7 @@ pub inline fn composeModelMenuRow(
             alloc,
             item.*,
             display_index == layout.selected,
-            FactColumns.build(projection, width, layout.token_pass_rows != null),
+            FactColumns.build(projection, width, if (layout.token_pass_rows != null) .shown else .hidden),
             width,
         );
     }
@@ -386,7 +386,10 @@ const FactColumns = struct {
     const context_label = " context";
     const output_label = " output";
 
-    fn build(projection: ModelMenuProjection, row_width: u16, grouped: bool) ?FactColumns {
+    /// Whether the list shows the Token Pass heading above its models.
+    const Headings = enum { shown, hidden };
+
+    fn build(projection: ModelMenuProjection, row_width: u16, headings: Headings) ?FactColumns {
         const indent: usize = if (row_width <= 2) 0 else 2;
         const filter = projection.providerFilter();
         var columns: FactColumns = .{};
@@ -408,7 +411,7 @@ const FactColumns = struct {
             columns.speed = @max(columns.speed, speedFacts(&buf, item.capabilities).len);
         }
         // Under the Token Pass heading the tag says nothing new.
-        columns.token_pass = tab_has_token_pass and !grouped;
+        columns.token_pass = tab_has_token_pass and headings == .hidden;
 
         const id_floor = @min(longest_id, min_id_width);
         while (columns.width() > 0 and indent + id_floor + fact_gap + columns.width() > row_width) columns.dropLast();

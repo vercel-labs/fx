@@ -21,7 +21,7 @@ pub const featured_models = [_][]const u8{
 };
 
 /// The provider AI Gateway reports for a request Token Pass served.
-pub const provider_slug = "token-pass";
+const provider_slug = "token-pass";
 
 pub const docs_url = "https://vercel.com/docs/ai-gateway/token-pass";
 
@@ -37,7 +37,7 @@ pub fn isFeaturedModel(model: []const u8) bool {
     return false;
 }
 
-pub fn isTokenPassProvider(provider: []const u8) bool {
+fn isTokenPassProvider(provider: []const u8) bool {
     return std.ascii.eqlIgnoreCase(provider, provider_slug);
 }
 
@@ -52,8 +52,11 @@ pub const SideCall = enum {
     vision,
 };
 
-/// The Token Pass model for each side call. Chosen with the auto-permission
-/// reliability eval and title and image checks against each featured model.
+/// The Token Pass model for each side call. The reviewer must return one
+/// structured decision within its output budget and its 30-second deadline:
+/// DeepSeek V4.1 Flash does, while GLM 5.3 Flash can spend the budget on
+/// reasoning and GLM 5.3 can miss the deadline. GLM 5.3 Flash writes a title
+/// well within 128 tokens and reads images, so it takes both of those calls.
 fn sideCallModel(call: SideCall) []const u8 {
     return switch (call) {
         .review => "deepseek/deepseek-v4.1-flash",
@@ -80,9 +83,12 @@ pub fn compactionFallback(primary: []const u8) ?[]const u8 {
 /// team without one and a team that has not yet sent a featured request.
 pub const Status = enum { unknown, active };
 
-/// The current credential's Token Pass status, learned from the provider
-/// that served each request. Its owner resets it when the credential or the
-/// team changes. It is read and written on the main thread only.
+/// The current credential's Token Pass status. It turns active when a
+/// response names `token-pass` as the provider that served it or the credits
+/// endpoint reports Token Pass credit, and back to unknown when AI Gateway
+/// says the team has no active Token Pass. Its owner resets it when the
+/// credential or the team changes. It is read and written on the main thread
+/// only.
 pub const Tracker = struct {
     status: Status = .unknown,
 
@@ -97,6 +103,15 @@ pub const Tracker = struct {
     /// credit. Returns true when the status changed.
     pub fn observeCredit(self: *Tracker) bool {
         return self.markActive();
+    }
+
+    /// Records that AI Gateway said the team has no active Token Pass: a
+    /// credits reply with `token_pass: null`, or a request it denied for that
+    /// reason. Returns true when the status changed.
+    pub fn observeNoPass(self: *Tracker) bool {
+        if (self.status == .unknown) return false;
+        self.status = .unknown;
+        return true;
     }
 
     fn markActive(self: *Tracker) bool {
@@ -200,6 +215,13 @@ test "token pass: the tracker turns active once on a token-pass response" {
     try std.testing.expect(from_credits.observeCredit());
     try std.testing.expect(!from_credits.observeCredit());
     try std.testing.expectEqual(Status.active, from_credits.status);
+
+    // AI Gateway saying the team has no active Token Pass ends the status,
+    // and a later Token Pass response starts it again.
+    try std.testing.expect(from_credits.observeNoPass());
+    try std.testing.expectEqual(Status.unknown, from_credits.status);
+    try std.testing.expect(!from_credits.observeNoPass());
+    try std.testing.expect(from_credits.observeServedBy("token-pass"));
 }
 
 test "token pass: denied causes come from the documented messages" {

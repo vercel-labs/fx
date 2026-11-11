@@ -2049,6 +2049,9 @@ pub const CreditsSnapshot = struct {
     /// The team's Token Pass credit, a separate balance, while it has an
     /// active Token Pass.
     token_pass: ?TokenPassCredit = null,
+    /// The Gateway said the team has no active Token Pass (`token_pass: null`),
+    /// as opposed to a reply that does not mention Token Pass.
+    no_token_pass: bool = false,
     raw_json: ?[]const u8 = null,
     err_message: ?[]const u8 = null,
 
@@ -2088,27 +2091,27 @@ pub const CreditsSnapshot = struct {
         defer out.deinit();
 
         if (self.err_message) |msg| {
-            try out.writer.print("[credits] error: {s}\n", .{msg});
+            try out.writer.print("[credits] error: {f}\n", .{text_utils.terminalSafe(msg)});
             return try out.toOwnedSlice();
         }
 
         if (self.balance) |b| {
-            try out.writer.print("[credits] balance={s}\n", .{b});
+            try out.writer.print("[credits] balance={f}\n", .{text_utils.terminalSafe(b)});
         }
         if (self.used) |u| {
-            try out.writer.print("[credits] used={s}\n", .{u});
+            try out.writer.print("[credits] used={f}\n", .{text_utils.terminalSafe(u)});
         }
         if (self.plan) |p| {
-            try out.writer.print("[credits] plan={s}\n", .{p});
+            try out.writer.print("[credits] plan={f}\n", .{text_utils.terminalSafe(p)});
         }
         if (self.token_pass) |credit| {
-            try out.writer.print("[credits] token_pass_remaining={s}\n", .{credit.remaining});
-            if (credit.resets_at) |resets_at| try out.writer.print("[credits] token_pass_resets_at={s}\n", .{resets_at});
+            try out.writer.print("[credits] token_pass_remaining={f}\n", .{text_utils.terminalSafe(credit.remaining)});
+            if (credit.resets_at) |resets_at| try out.writer.print("[credits] token_pass_resets_at={f}\n", .{text_utils.terminalSafe(resets_at)});
         }
 
         if (!self.hasFields()) {
             if (self.raw_json) |raw| {
-                try out.writer.print("[credits] {s}\n", .{raw});
+                try out.writer.print("[credits] {f}\n", .{text_utils.terminalSafe(raw)});
             } else {
                 try out.writer.writeAll("[credits] no data returned by gateway\n");
             }
@@ -2121,31 +2124,31 @@ pub const CreditsSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        if (self.err_message) |msg| return alloc.dupe(u8, msg);
+        if (self.err_message) |msg| return alloc.print("{f}", .{text_utils.terminalSafe(msg)});
         var wrote_field = false;
         if (self.balance) |balance| {
-            try out.writer.print("balance={s}", .{balance});
+            try out.writer.print("balance={f}", .{text_utils.terminalSafe(balance)});
             wrote_field = true;
         }
         if (self.used) |used| {
             if (wrote_field) try out.writer.writeByte('\n');
-            try out.writer.print("used={s}", .{used});
+            try out.writer.print("used={f}", .{text_utils.terminalSafe(used)});
             wrote_field = true;
         }
         if (self.plan) |plan| {
             if (wrote_field) try out.writer.writeByte('\n');
-            try out.writer.print("plan={s}", .{plan});
+            try out.writer.print("plan={f}", .{text_utils.terminalSafe(plan)});
             wrote_field = true;
         }
         if (self.token_pass) |credit| {
             if (wrote_field) try out.writer.writeByte('\n');
-            try out.writer.print("token_pass_remaining={s}", .{credit.remaining});
-            if (credit.resets_at) |resets_at| try out.writer.print("\ntoken_pass_resets_at={s}", .{resets_at});
+            try out.writer.print("token_pass_remaining={f}", .{text_utils.terminalSafe(credit.remaining)});
+            if (credit.resets_at) |resets_at| try out.writer.print("\ntoken_pass_resets_at={f}", .{text_utils.terminalSafe(resets_at)});
             wrote_field = true;
         }
         if (!self.hasFields()) {
             if (self.raw_json) |raw| {
-                try out.writer.writeAll(raw);
+                try out.writer.print("{f}", .{text_utils.terminalSafe(raw)});
             } else {
                 try out.writer.writeAll("no data returned by gateway");
             }
@@ -3609,6 +3612,28 @@ test "core credits snapshot renders parsed, raw, and empty fallbacks" {
     const empty_text = try (CreditsSnapshot{}).renderText(std.testing.allocator);
     defer std.testing.allocator.free(empty_text);
     try std.testing.expectEqualStrings("[credits] no data returned by gateway\n", empty_text);
+}
+
+test "core credits snapshot never lets Gateway text add lines or reach the terminal raw" {
+    const snapshot = CreditsSnapshot{
+        .balance = "1\n[credits] balance=999999",
+        .plan = "pro\x1b]52;c;aGk=\x07\x1b[2K",
+    };
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "\n"));
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x07) == null);
+
+    const body = try snapshot.renderInteractiveBody(std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\n"));
+    try std.testing.expect(std.mem.findScalar(u8, body, 0x1b) == null);
+
+    const failed = CreditsSnapshot{ .err_message = "denied\x1b[2J" };
+    const failed_text = try failed.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(failed_text);
+    try std.testing.expect(std.mem.findScalar(u8, failed_text, 0x1b) == null);
 }
 
 test "core credits snapshot renders the Token Pass balance on every surface" {
