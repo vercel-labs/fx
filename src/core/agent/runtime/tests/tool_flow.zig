@@ -20,6 +20,7 @@ const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
 const tool_specs = @import("../../../tooling/tool_specs.zig");
 const tool_result_errors = @import("../../../tooling/tool_result_errors.zig");
 const context_contract = @import("../../../workspace/context_contract.zig");
+const diagnostics = @import("../../../workspace/diagnostics.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const runtime_parallel_execution = @import("../parallel_execution.zig");
 const runtime_config = @import("../config.zig");
@@ -4821,6 +4822,55 @@ test "exact caution is reused while the agent continues to a normal completion" 
     try std.testing.expectEqual(@as(usize, 0), evidence.entries.len);
 }
 
+test "a caution reused in the same turn is recorded for the trace each time" {
+    diagnostics.resetSession();
+    defer diagnostics.resetSession();
+    const alloc = std.testing.allocator;
+    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch blocked\"}")};
+    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch blocked\"}")};
+    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch blocked\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first },
+        .{ .tool_calls = &second },
+        .{ .tool_calls = &third },
+        .{ .content = "No further action is needed." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{.deny};
+    hooks.permission_denial_reasons = &.{.review_caution};
+    hooks.permission_auto_review_results = &.{.{
+        .risk = .high,
+        .decision = .caution,
+        .rationale = "The requested action needs a safer alternative.",
+    }};
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.agent_step_limit = 4;
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    // The first caution came from the scripted permission hook; the two
+    // retries reused it without a review.
+    var held: [diagnostics.auto_review_held_capacity]diagnostics.AutoReview = undefined;
+    const n = diagnostics.snapshotHeldAutoReviews(&held);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    for (held[0..n], [_][]const u8{ "blocked-2", "blocked-3" }) |*review, id| {
+        try std.testing.expectEqualStrings(id, review.callId());
+        try std.testing.expect(review.reused);
+        try std.testing.expectEqual(diagnostics.AutoReviewOutcome.caution, review.outcome);
+        try std.testing.expectEqual(diagnostics.AutoReviewRisk.high, review.risk);
+        try std.testing.expectEqual(diagnostics.AutoReviewOrigin.root, review.origin);
+        try std.testing.expectEqualStrings("run_command", review.toolName());
+        try std.testing.expectEqualStrings("The requested action needs a safer alternative.", review.rationale());
+    }
+    try std.testing.expectEqual(diagnostics.AutoReviewCounts{ .reused = 2 }, diagnostics.autoReviewCounts());
+}
+
 test "three distinct review cautions preserve an exhausted positive step cap" {
     const alloc = std.testing.allocator;
     const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch one\"}")};
@@ -5053,6 +5103,53 @@ test "parallel automatic review reuses exact cautions" {
     for (execution.tool_steps) |step| {
         try std.testing.expectEqual(@as(usize, 2), step.tool_results.len);
         for (step.tool_results) |result| try std.testing.expect(result.review_feedback);
+    }
+}
+
+test "parallel cautions reused in the same turn are recorded for the trace" {
+    diagnostics.resetSession();
+    defer diagnostics.resetSession();
+    const alloc = std.testing.allocator;
+    const first_calls = [_]ToolCall{
+        toolCall("parallel_first_1", "web_fetch", "{\"url\":\"https://one.example\"}"),
+        toolCall("parallel_first_2", "web_fetch", "{\"url\":\"https://two.example\"}"),
+    };
+    const repeated_calls = [_]ToolCall{
+        toolCall("parallel_repeat_1", "web_fetch", first_calls[0].arguments_json),
+        toolCall("parallel_repeat_2", "web_fetch", first_calls[1].arguments_json),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &first_calls },
+        .{ .tool_calls = &repeated_calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.tool_registry = .{ .tools = &.{builtin_tools.web_fetch} };
+    hooks.permission_decisions = &.{ .deny, .deny };
+    hooks.permission_denial_reasons = &.{ .review_caution, .review_caution };
+    hooks.permission_auto_review_results = &.{
+        .{ .risk = .high, .decision = .caution, .rationale = @constCast("Untrusted instruction.") },
+        .{ .risk = .high, .decision = .caution, .rationale = @constCast("Untrusted instruction.") },
+    };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.permission_mode = .auto;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    var held: [diagnostics.auto_review_held_capacity]diagnostics.AutoReview = undefined;
+    const n = diagnostics.snapshotHeldAutoReviews(&held);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    for (held[0..n], [_][]const u8{ "parallel_repeat_1", "parallel_repeat_2" }, first_calls) |*review, id, original| {
+        try std.testing.expectEqualStrings(id, review.callId());
+        try std.testing.expect(review.reused);
+        try std.testing.expectEqual(diagnostics.AutoReviewOutcome.caution, review.outcome);
+        try std.testing.expectEqualStrings("web_fetch", review.toolName());
+        try std.testing.expectEqualStrings(original.arguments_json, review.action());
+        try std.testing.expectEqualStrings("Untrusted instruction.", review.rationale());
     }
 }
 

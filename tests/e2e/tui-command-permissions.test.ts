@@ -4050,6 +4050,108 @@ describe("effect-aware command permissions", () => {
     },
     TIMEOUT,
   );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI trace shows the workspace's git state, the settings that are set, and the skills",
+    async () => {
+      const root = createIsolatedRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      // The repository is made with the real git; fx must not run the
+      // hostile git that PATH puts first.
+      const git = (...args: string[]) => {
+        const result = Bun.spawnSync(["git", ...args], {
+          cwd: root.workspace,
+          env: { ...process.env, HOME: root.home, GIT_CONFIG_NOSYSTEM: "1" },
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        expect(result.exitCode, result.stderr.toString()).toBe(0);
+      };
+      git("init", "-q", "-b", "feature/trace-probe");
+      git("config", "user.name", "Example");
+      git("config", "user.email", "example@example.com");
+      writeFileSync(join(root.workspace, "tracked.txt"), "one\n");
+      git("add", "tracked.txt");
+      git("commit", "-q", "-m", "Add tracked file");
+      writeFileSync(join(root.workspace, "tracked.txt"), "two\n");
+      writeFileSync(join(root.workspace, "new-file.txt"), "new\n");
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          sandbox: "none",
+          permission: {},
+          collapse_tool_calls: false,
+          workspaces: { [root.workspace]: { auto_compact_percent: 50 } },
+        }),
+      );
+      writeFileSync(join(root.workspace, ".fx.json"), JSON.stringify({ max_agent_steps: 40 }));
+      const skillDir = join(root.workspace, ".agents", "skills", "trace-probe");
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(join(skillDir, "SKILL.md"), "---\nname: trace-probe\ndescription: A skill the trace lists\n---\n\nbody\n");
+
+      const gateway = startDynamicFakeGateway(async () => finalText("setup traced"));
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_TRACE: "0",
+          FX_TRACE_LOG: undefined,
+          FX_TRACE_STDERR: "0",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Say hello.");
+      await activeSession.waitForText("setup traced", TIMEOUT);
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin" ? "Clipboard copy failed" : "Trace saved at",
+        TIMEOUT,
+      );
+      const report = readFileSync(latestTraceReportPath(root), "utf8");
+      const section = (title: string) => {
+        const body = report.split(`\n## ${title}\n`)[1]?.split("\n## ")[0];
+        expect(body).toBeDefined();
+        return body!;
+      };
+
+      // Git's own lines are indented, so its `## branch` line can't start
+      // a section of the report.
+      const gitSection = section("Git");
+      expect(gitSection).toMatch(/^branch: feature\/trace-probe\n/);
+      expect(gitSection).toContain("\nstatus:\n  ## feature/trace-probe\n");
+      expect(gitSection).toContain("\n   M tracked.txt\n");
+      expect(gitSection).toContain("\n  ?? new-file.txt\n");
+      expect(gitSection).toContain("\nrecent commits:\n  ");
+      expect(gitSection).toContain(" Add tracked file\n");
+      // File names with a line break or an escape byte stay on one line.
+      expect(gitSection).toContain("  ?? \"line\\nname\"\n");
+      expect(gitSection).not.toContain("\x1b");
+      expect(existsSync(root.commandMarkers.git!)).toBe(false);
+
+      const settings = section("Settings");
+      expect(settings).toMatch(/settings\.json\tcollapse_tool_calls=false\n/);
+      expect(settings).toContain(`workspace:${root.workspace}\tauto_compact_percent=50\n`);
+      expect(settings).toContain("file:.fx.json\tmax_agent_steps=40\n");
+      expect(settings).toContain(`env:FX_MODEL\tmodels.gateway=${MODEL}\n`);
+
+      const skills = section("Skills");
+      expect(skills).toMatch(/\n- trace-probe \(.+\)\n/);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT * 2,
+  );
 });
 
 class AcpClient {

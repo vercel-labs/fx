@@ -39,6 +39,7 @@ test {
     _ = @import("core/skills/skill_contract.zig");
     _ = @import("core/skills/skill_invocation.zig");
     _ = @import("core/subagent/reports.zig");
+    _ = @import("core/workspace/auto_review_metrics.zig");
     _ = @import("core/terminal/engine.zig");
     _ = @import("core/tooling/command_output_content.zig");
     _ = @import("core/tooling/file_mutation.zig");

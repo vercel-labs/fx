@@ -7,6 +7,7 @@
 const network_metrics = @import("network_metrics.zig");
 const tool_call_metrics = @import("tool_call_metrics.zig");
 const render_metrics = @import("render_metrics.zig");
+const auto_review_metrics = @import("auto_review_metrics.zig");
 const compactor = @import("../compactor/compactor.zig");
 const model_catalog_metrics = @import("model_catalog_metrics.zig");
 
@@ -27,6 +28,14 @@ pub const CompactionEvent = compactor.TraceEvent;
 pub const compaction_ring_capacity = compactor.trace_ring_capacity;
 pub const ModelCatalogEvent = model_catalog_metrics.Event;
 pub const model_catalog_ring_capacity = model_catalog_metrics.ring_capacity;
+pub const AutoReview = auto_review_metrics.Review;
+pub const AutoReviewRecord = auto_review_metrics.Record;
+pub const AutoReviewCounts = auto_review_metrics.Counts;
+pub const AutoReviewOutcome = auto_review_metrics.Outcome;
+pub const AutoReviewRisk = auto_review_metrics.Risk;
+pub const AutoReviewOrigin = auto_review_metrics.Origin;
+pub const auto_review_recent_capacity = auto_review_metrics.recent_capacity;
+pub const auto_review_held_capacity = auto_review_metrics.held_capacity;
 
 pub fn snapshotCompactionEvents(out: []CompactionEvent) usize {
     return compactor.snapshotTrace(out);
@@ -54,6 +63,27 @@ pub fn networkLifetimeStats() NetworkLifetimeStats {
 
 pub fn snapshotNetworkTurnRollups(out: []NetworkTurnRollup) usize {
     return network_metrics.snapshotTurnRollups(out);
+}
+
+/// Records an auto-mode safety review, or a hold reused from one, so
+/// `/trace` can say what the reviewer decided without FX_TRACE.
+pub fn recordAutoReview(review: AutoReviewRecord) void {
+    auto_review_metrics.record(review);
+}
+
+/// Copies the newest reviews, oldest first.
+pub fn snapshotAutoReviews(out: []AutoReview) usize {
+    return auto_review_metrics.snapshotRecent(out);
+}
+
+/// Copies the newest reviews that did not clear, oldest first. Cleared
+/// reviews never push them out.
+pub fn snapshotHeldAutoReviews(out: []AutoReview) usize {
+    return auto_review_metrics.snapshotHeld(out);
+}
+
+pub fn autoReviewCounts() AutoReviewCounts {
+    return auto_review_metrics.totals();
 }
 
 pub fn recordToolCall(call: ToolCallMetric) void {
@@ -88,6 +118,7 @@ pub fn resetSession() void {
     render_metrics.reset();
     compactor.resetTrace();
     model_catalog_metrics.reset();
+    auto_review_metrics.reset();
 }
 
 pub fn resetForTest() void {

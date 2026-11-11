@@ -36,6 +36,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const current_branch = @import("../workspace/current_branch.zig");
+const diagnostics = @import("../workspace/diagnostics.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -949,6 +950,105 @@ test "direct git push branch proof accepts only explicit literal operands" {
     }
 }
 
+/// What `/trace` keeps of one review's result.
+const ReviewTrace = struct {
+    outcome: diagnostics.AutoReviewOutcome,
+    risk: diagnostics.AutoReviewRisk = .none,
+    /// Why no decision came, or the error's name.
+    reason: []const u8 = "",
+    rationale: []const u8 = "",
+};
+
+fn reviewTraceOf(review: permission_auto_classifier.ParseOutcome) ReviewTrace {
+    return switch (review) {
+        .valid => |result| .{
+            .outcome = switch (result.decision) {
+                .clear => .clear,
+                .caution => .caution,
+            },
+            .risk = traceRisk(result.risk),
+            .rationale = result.rationale,
+        },
+        .evidence_incomplete => .{ .outcome = .held, .reason = "review_evidence_incomplete" },
+        .invalid => |reason| .{ .outcome = .unavailable, .reason = @tagName(reason) },
+    };
+}
+
+fn traceRisk(risk: permission_auto_classifier.Risk) diagnostics.AutoReviewRisk {
+    return switch (risk) {
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .critical => .critical,
+    };
+}
+
+fn traceOrigin(review_turn: ?permission_auto_classifier.ReviewTurnContext) diagnostics.AutoReviewOrigin {
+    const turn = review_turn orelse return .root;
+    return switch (turn.origin) {
+        .root => .root,
+        .subagent => .subagent,
+    };
+}
+
+/// The command, shell input, file path, or tool arguments a review judged.
+fn reviewedActionText(action: permission_auto_classifier.Action) []const u8 {
+    return switch (action) {
+        .command => |command| command.command,
+        .shell_input => |shell_input| shell_input.arguments_json,
+        .file_mutation => |mutation| mutation.display_path,
+        .tool => |tool| tool.arguments_json,
+    };
+}
+
+/// Records a review for `/trace`. With no reviewed action, as when no review
+/// could start, the call's own arguments stand in for it.
+fn recordAutoReview(
+    call: ToolCall,
+    review_turn: ?permission_auto_classifier.ReviewTurnContext,
+    action: ?permission_auto_classifier.Action,
+    trace: ReviewTrace,
+    started_ms: i64,
+    ended_ms: i64,
+) void {
+    diagnostics.recordAutoReview(.{
+        .outcome = trace.outcome,
+        .risk = trace.risk,
+        .origin = traceOrigin(review_turn),
+        .elapsed_ms = @intCast(std.math.clamp(ended_ms - started_ms, 0, std.math.maxInt(u32))),
+        .call_id = call.id,
+        .tool_name = call.name,
+        .action_kind = if (action) |value| @tagName(std.meta.activeTag(value)) else "",
+        .action = if (action) |value| reviewedActionText(value) else call.arguments_json,
+        .reason = trace.reason,
+        .rationale = trace.rationale,
+        .at_ms = started_ms,
+    });
+}
+
+/// Records, for `/trace`, a hold the turn's review cache returned for `call`
+/// with no new review. Its arguments stand in for the reviewed action.
+pub fn recordReusedReviewHold(
+    call: ToolCall,
+    hold: command_admission.PermissionOutcome,
+    from_subagent: bool,
+) void {
+    const evidence_incomplete = hold.denial_reason == .review_evidence_incomplete;
+    const caution = hold.auto_review_result;
+    diagnostics.recordAutoReview(.{
+        .outcome = if (evidence_incomplete) .held else .caution,
+        .risk = if (caution) |result| traceRisk(result.risk) else .none,
+        .origin = if (from_subagent) .subagent else .root,
+        .reused = true,
+        .call_id = call.id,
+        .tool_name = call.name,
+        .action = call.arguments_json,
+        .reason = if (evidence_incomplete) "review_evidence_incomplete" else "",
+        .rationale = if (caution) |result| result.rationale else "",
+        .at_ms = io_mod.milliTimestamp(),
+    });
+}
+
 /// An unavailable or invalid automatic review never executes anything. It is
 /// returned to the primary model as neutral advisory unavailability.
 fn traceReviewerUnavailable(
@@ -963,10 +1063,13 @@ fn traceReviewerUnavailable(
 }
 
 fn reviewerUnavailableOutcome(
+    input: Input,
     call: ToolCall,
     failure: permission_auto_classifier.InvalidReason,
 ) command_admission.PermissionOutcome {
     traceReviewerUnavailable(call, failure);
+    const now_ms = io_mod.milliTimestamp();
+    recordAutoReview(call, input.permission_review_turn, null, .{ .outcome = .unavailable, .reason = @tagName(failure) }, now_ms, now_ms);
     return .{
         .decision = .deny,
         .denial_reason = .review_unavailable,
@@ -1014,17 +1117,17 @@ fn automaticReviewOutcome(
     file_authorization: ?file_mutation_contract.FileExecutionAuthorization,
 ) !command_admission.PermissionOutcome {
     if (!input.auto_classifier.enabled()) {
-        return reviewerUnavailableOutcome(call, .reviewer_unconfigured);
+        return reviewerUnavailableOutcome(input, call, .reviewer_unconfigured);
     }
     const review_turn = input.permission_review_turn orelse
-        return reviewerUnavailableOutcome(call, .invalid_context);
+        return reviewerUnavailableOutcome(input, call, .invalid_context);
     if (!review_turn.review_attempt_available) {
         debug_trace.logf(
             "permission",
             "event=auto_review_budget_exhausted tool_name={s} call_id={s} execution_started=false",
             .{ call.name, call.id },
         );
-        return reviewerUnavailableOutcome(call, .turn_review_budget_exhausted);
+        return reviewerUnavailableOutcome(input, call, .turn_review_budget_exhausted);
     }
 
     const request = try reviewRequestForCall(
@@ -1074,8 +1177,10 @@ fn runAutomaticReview(
             "event=auto_review_result tool_name={s} decision=cancelled_or_error fallback_reason={s} elapsed_ms={d} execution_started=false call_id={s}",
             .{ call.name, @errorName(err), io_mod.milliTimestamp() - started_ms, call.id },
         );
+        recordAutoReview(call, request.review_turn, request.action, .{ .outcome = .@"error", .reason = @errorName(err) }, started_ms, io_mod.milliTimestamp());
         return err;
     };
+    recordAutoReview(call, request.review_turn, request.action, reviewTraceOf(review), started_ms, io_mod.milliTimestamp());
     switch (review) {
         .valid => |result| debug_trace.logf(
             "permission",
@@ -5395,6 +5500,94 @@ test "invalid automatic review returns to the agent before prompting" {
     try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, outcome.denial_reason.?);
     try std.testing.expect(outcome.execution_authority == null);
     try std.testing.expect(outcome.auto_review_result == null);
+}
+
+test "every automatic review and every review that could not start is recorded for the trace" {
+    diagnostics.resetSession();
+    defer diagnostics.resetSession();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+
+    var caution = FakeAutoClassifier{ .decision = .caution, .risk = .high, .rationale = "Held for the trace." };
+    _ = try requestPermissionOutcome(
+        testInputWithClassifier(&worker, permission_auto_classifier.Classifier.withOverride(@ptrCast(&caution), FakeAutoClassifier.classify)),
+        arena,
+        .{ .id = "trace-caution", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"touch public\"}" },
+        .auto,
+        &.{},
+    );
+    var clear = FakeAutoClassifier{};
+    _ = try requestPermissionOutcome(
+        testInputWithClassifier(&worker, permission_auto_classifier.Classifier.withOverride(@ptrCast(&clear), FakeAutoClassifier.classify)),
+        arena,
+        .{ .id = "trace-clear", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"touch cleared.txt\"}" },
+        .auto,
+        &.{},
+    );
+    var invalid = FakeAutoClassifier{ .invalid_reason = .transport_timed_out };
+    _ = try requestPermissionOutcome(
+        testInputWithClassifier(&worker, permission_auto_classifier.Classifier.withOverride(@ptrCast(&invalid), FakeAutoClassifier.classify)),
+        arena,
+        .{ .id = "trace-timeout", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"touch slow.txt\"}" },
+        .auto,
+        &.{},
+    );
+    _ = try requestPermissionOutcome(
+        testInputWithClassifier(&worker, .disabled()),
+        arena,
+        .{ .id = "trace-unconfigured", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"touch none.txt\"}" },
+        .auto,
+        &.{},
+    );
+    var spent = FakeAutoClassifier{};
+    var spent_input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.withOverride(@ptrCast(&spent), FakeAutoClassifier.classify));
+    spent_input.permission_review_turn.?.review_attempt_available = false;
+    spent_input.permission_review_turn.?.origin = .subagent;
+    _ = try requestPermissionOutcome(
+        spent_input,
+        arena,
+        .{ .id = "trace-spent", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"touch spent.txt\"}" },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 0), spent.calls);
+
+    try std.testing.expectEqual(
+        diagnostics.AutoReviewCounts{ .reviews = 5, .clear = 1, .caution = 1, .unavailable = 3 },
+        diagnostics.autoReviewCounts(),
+    );
+    var recent: [diagnostics.auto_review_recent_capacity]diagnostics.AutoReview = undefined;
+    try std.testing.expectEqual(@as(usize, 5), diagnostics.snapshotAutoReviews(&recent));
+    var held: [diagnostics.auto_review_held_capacity]diagnostics.AutoReview = undefined;
+    try std.testing.expectEqual(@as(usize, 4), diagnostics.snapshotHeldAutoReviews(&held));
+
+    try std.testing.expectEqualStrings("trace-caution", held[0].callId());
+    try std.testing.expectEqual(diagnostics.AutoReviewOutcome.caution, held[0].outcome);
+    try std.testing.expectEqual(diagnostics.AutoReviewRisk.high, held[0].risk);
+    try std.testing.expectEqualStrings("command", held[0].actionKind());
+    try std.testing.expectEqualStrings("touch public", held[0].action());
+    try std.testing.expectEqualStrings("Held for the trace.", held[0].rationale());
+
+    try std.testing.expectEqualStrings("trace-timeout", held[1].callId());
+    try std.testing.expectEqualStrings("transport_timed_out", held[1].reason());
+    try std.testing.expectEqualStrings("touch slow.txt", held[1].action());
+
+    // No review started, so the call's arguments stand in for the action.
+    try std.testing.expectEqualStrings("trace-unconfigured", held[2].callId());
+    try std.testing.expectEqualStrings("reviewer_unconfigured", held[2].reason());
+    try std.testing.expectEqualStrings("", held[2].actionKind());
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"touch none.txt\"}", held[2].action());
+
+    try std.testing.expectEqualStrings("trace-spent", held[3].callId());
+    try std.testing.expectEqualStrings("turn_review_budget_exhausted", held[3].reason());
+    try std.testing.expectEqual(diagnostics.AutoReviewOrigin.subagent, held[3].origin);
+
+    try std.testing.expectEqualStrings("trace-clear", recent[1].callId());
+    try std.testing.expectEqual(diagnostics.AutoReviewOutcome.clear, recent[1].outcome);
+    try std.testing.expectEqual(diagnostics.AutoReviewRisk.low, recent[1].risk);
 }
 
 test "invalid automatic review returns a recoverable denial without a prompter" {

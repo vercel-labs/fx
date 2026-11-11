@@ -71,6 +71,34 @@ pub fn utf8PrefixByBytes(text: []const u8, max_bytes: usize) []const u8 {
     return text[0..utf8BackwardBoundary(text, max_bytes)];
 }
 
+/// Writes `text` as one line that a terminal or a Markdown report prints as
+/// it reads: line breaks and tabs become spaces, and other control
+/// characters (C0, DEL, C1) and bytes that are not UTF-8 become `\xNN`.
+pub fn writeOneLine(writer: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
+    var index: usize = 0;
+    while (index < text.len) {
+        const byte = text[index];
+        if (byte == '\n' or byte == '\r' or byte == '\t') {
+            try writer.writeByte(' ');
+            index += 1;
+            continue;
+        }
+        const len: usize = std.unicode.utf8ByteSequenceLength(byte) catch 1;
+        const sequence = if (index + len <= text.len) text[index..][0..len] else text[index..][0..1];
+        const codepoint = display_width.decodeUtf8Sequence(sequence) catch {
+            try writer.print("\\x{x:0>2}", .{byte});
+            index += 1;
+            continue;
+        };
+        if (codepoint < 0x20 or (codepoint >= 0x7f and codepoint < 0xa0)) {
+            for (sequence) |part| try writer.print("\\x{x:0>2}", .{part});
+        } else {
+            try writer.writeAll(sequence);
+        }
+        index += sequence.len;
+    }
+}
+
 pub fn normalizeLineEndingsInPlace(bytes: []u8) []u8 {
     var read: usize = 0;
     var write: usize = 0;
@@ -1721,4 +1749,20 @@ test "dupeValidUtf8 escapes only bytes outside valid sequences" {
     defer alloc.free(fixed);
     try std.testing.expectEqualStrings("a\\xff\\xfe\x00\\xc3(b\\xed\\xa0\\x80", fixed);
     try std.testing.expect(std.unicode.utf8ValidateSlice(fixed));
+}
+
+test "one-line text has no line break, tab, or control byte" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeOneLine(&out.writer, "one\ntwo\r\n\tthree \x1b[31mred\x1b[0m \x7f \xc2\x85 caf\xc3\xa9 \xe2\x9a\xa0 \xff \xc3");
+    try std.testing.expectEqualStrings("one two   three \\x1b[31mred\\x1b[0m \\x7f \\xc2\\x85 café ⚠ \\xff \\xc3", out.written());
+}
+
+test "one-line text keeps plain text and empty text as they are" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeOneLine(&out.writer, "");
+    try std.testing.expectEqualStrings("", out.written());
+    try writeOneLine(&out.writer, "touch \"/Users/example/a b\"");
+    try std.testing.expectEqualStrings("touch \"/Users/example/a b\"", out.written());
 }

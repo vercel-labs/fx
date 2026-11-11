@@ -36,29 +36,61 @@ const queries = [_]Query{ branch_query, status_query, log_query, staged_query, u
 pub fn snapshot(alloc: Allocator) !Snapshot {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const ready = switch (try prepareHere(arena_state.allocator())) {
-        .ready => |ready| ready,
-        .refused => return .{
-            .in_git_repo = true,
-            .text = try formatSnapshot(alloc, null, null, null, null, null),
-        },
-    };
+    var parts = try partsFrom(alloc, try prepareHere(arena_state.allocator()));
+    defer parts.deinit(alloc);
+    return snapshotFromParts(alloc, parts);
+}
 
-    const branch = try runGit(alloc, ready, branch_query);
-    defer if (branch) |text| alloc.free(text);
-    const status = try runGit(alloc, ready, status_query);
-    defer if (status) |text| alloc.free(text);
-    const log = try runGit(alloc, ready, log_query);
-    defer if (log) |text| alloc.free(text);
-    const staged = try runGit(alloc, ready, staged_query);
-    defer if (staged) |text| alloc.free(text);
-    const unstaged = try runGit(alloc, ready, unstaged_query);
-    defer if (unstaged) |text| alloc.free(text);
-
+/// A refusal does not claim the directory is outside a repository.
+fn snapshotFromParts(alloc: Allocator, parts: Parts) !Snapshot {
     return .{
-        .in_git_repo = isGitRepository(alloc, ready),
-        .text = try formatSnapshot(alloc, branch, status, log, staged, unstaged),
+        .in_git_repo = parts.refused != null or parts.in_git_repo,
+        .text = try formatSnapshot(alloc, parts.branch, parts.status, parts.log, parts.staged, parts.unstaged),
     };
+}
+
+/// What each git query printed, trimmed, or null when it failed or printed
+/// nothing. Owned by the allocator given to `queryParts`.
+pub const Parts = struct {
+    /// Why safe git refused to run; every query is then null.
+    refused: ?safe_git.Refusal = null,
+    in_git_repo: bool = false,
+    branch: ?[]u8 = null,
+    status: ?[]u8 = null,
+    log: ?[]u8 = null,
+    staged: ?[]u8 = null,
+    unstaged: ?[]u8 = null,
+
+    pub fn deinit(self: *Parts, alloc: Allocator) void {
+        for ([_]?[]u8{ self.branch, self.status, self.log, self.staged, self.unstaged }) |part| {
+            if (part) |text| alloc.free(text);
+        }
+        self.* = undefined;
+    }
+};
+
+/// Runs the snapshot's git queries in `cwd`, an absolute path, through safe
+/// git, for `/trace`.
+pub fn queryParts(alloc: Allocator, cwd: []const u8) !Parts {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    return partsFrom(alloc, try safe_git.prepare(arena_state.allocator(), cwd));
+}
+
+fn partsFrom(alloc: Allocator, prepared: safe_git.Prepared) !Parts {
+    const ready = switch (prepared) {
+        .ready => |ready| ready,
+        .refused => |refusal| return .{ .refused = refusal },
+    };
+    var result: Parts = .{};
+    errdefer result.deinit(alloc);
+    result.branch = try runGit(alloc, ready, branch_query);
+    result.status = try runGit(alloc, ready, status_query);
+    result.log = try runGit(alloc, ready, log_query);
+    result.staged = try runGit(alloc, ready, staged_query);
+    result.unstaged = try runGit(alloc, ready, unstaged_query);
+    result.in_git_repo = isGitRepository(alloc, ready);
+    return result;
 }
 
 fn prepareHere(arena: Allocator) Allocator.Error!safe_git.Prepared {
@@ -232,4 +264,19 @@ test "snapshot returns owned Git status text" {
 
     try std.testing.expect(std.mem.find(u8, state.text, "Git snapshot") != null);
     try std.testing.expect(std.mem.find(u8, state.text, "Branch:") != null);
+}
+
+test "a refused safe git reads as unavailable and still claims a repository" {
+    var refused = try partsFrom(std.testing.allocator, .{ .refused = .git_too_old });
+    defer refused.deinit(std.testing.allocator);
+    try std.testing.expectEqual(safe_git.Refusal.git_too_old, refused.refused.?);
+    try std.testing.expect(refused.branch == null and refused.status == null and refused.log == null);
+    const shown = try snapshotFromParts(std.testing.allocator, refused);
+    defer shown.deinit(std.testing.allocator);
+    try std.testing.expect(shown.in_git_repo);
+    try std.testing.expect(std.mem.startsWith(u8, shown.text, "Git snapshot\nBranch: unavailable\n"));
+
+    const outside = try snapshotFromParts(std.testing.allocator, .{});
+    defer outside.deinit(std.testing.allocator);
+    try std.testing.expect(!outside.in_git_repo);
 }

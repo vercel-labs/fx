@@ -18,6 +18,8 @@ const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const cli_config = @import("../cli/cli_config.zig");
+const git_context = @import("../github/git_context.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const editor_state = @import("../input/editor_state.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
@@ -1593,6 +1595,10 @@ fn buildTraceReport(app: anytype) ![]u8 {
     try writeModelCatalogSummary(&out.writer, app);
     try writeToolCallsSummary(&out.writer, app.alloc, agents.screenAgentOf(app).session.agent.history.items);
     try writePermissionsSummary(&out.writer, permission_view.grants.items);
+    try writeAutoReviewsSummary(&out.writer, app.alloc);
+    try writeGitSummary(&out.writer, app.alloc, app.workspace_root);
+    try writeSettingsSummary(&out.writer, app.alloc, app.workspace_root);
+    try writeSkillsSummary(&out.writer, app, app.alloc);
     try writeRuntimeContextSummary(&out.writer, app, app.alloc);
     try writeRendererState(&out.writer, app, app.alloc);
     try writeRendererEvents(&out.writer, app.alloc);
@@ -1611,6 +1617,261 @@ fn buildTraceReport(app: anytype) ![]u8 {
     }
 
     return try out.toOwnedSlice();
+}
+
+/// Bytes of one git output line, settings line, or skill path the report keeps.
+const trace_setup_line_max_bytes: usize = 400;
+const trace_git_status_max_lines: usize = 60;
+const trace_git_stat_max_lines: usize = 30;
+const trace_settings_max_lines: usize = 200;
+const trace_skills_max: usize = 400;
+/// Above the stored action and rationale, so only masking can lengthen
+/// them and the line shows their full size once.
+const trace_review_text_max_bytes: usize = 4 * 1024;
+
+/// Writes `text` with secrets masked, as one line, cut to `max_bytes` on a
+/// UTF-8 boundary, with the full size when it was cut.
+fn writeTraceLine(writer: *std.Io.Writer, alloc: std.mem.Allocator, text: []const u8, max_bytes: usize) !void {
+    const masked = try text_utils.maskSecrets(alloc, text);
+    defer if (masked.ptr != text.ptr) alloc.free(masked);
+    const kept = text_utils.utf8PrefixByBytes(masked, max_bytes);
+    try text_utils.writeOneLine(writer, kept);
+    if (kept.len < masked.len) try writer.print(" ... ({d} bytes)", .{masked.len});
+}
+
+fn writeAutoReviewsSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const recent = try arena.alloc(diagnostics.AutoReview, diagnostics.auto_review_recent_capacity);
+    const held = try arena.alloc(diagnostics.AutoReview, diagnostics.auto_review_held_capacity);
+    try writeAutoReviewsSection(
+        writer,
+        arena,
+        diagnostics.autoReviewCounts(),
+        recent[0..diagnostics.snapshotAutoReviews(recent)],
+        held[0..diagnostics.snapshotHeldAutoReviews(held)],
+    );
+}
+
+/// The Auto Reviews section: every review this session counted, the newest
+/// that did not clear in full, and the newest of all on one line each.
+fn writeAutoReviewsSection(
+    writer: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    counts: diagnostics.AutoReviewCounts,
+    recent: []const diagnostics.AutoReview,
+    held: []const diagnostics.AutoReview,
+) !void {
+    try writer.writeAll("\n## Auto Reviews\n");
+    if (counts.reviews == 0 and counts.reused == 0) {
+        try writer.writeAll("(none)\n");
+        return;
+    }
+    try writer.print("reviews={d} reused={d} clear={d} caution={d} unavailable={d} held={d} error={d}\n", .{
+        counts.reviews,
+        counts.reused,
+        counts.clear,
+        counts.caution,
+        counts.unavailable,
+        counts.held,
+        counts.@"error",
+    });
+    const total = counts.reviews + counts.reused;
+    if (total > recent.len) {
+        try writer.print("coverage: Recent holds the last {d} of {d}; Held keeps the last {d} that did not clear\n", .{ recent.len, total, diagnostics.auto_review_held_capacity });
+    }
+    try writer.writeAll("### Held\n");
+    if (held.len == 0) try writer.writeAll("(none)\n");
+    for (held) |*review| try writeAutoReview(writer, alloc, review, true);
+    try writer.writeAll("### Recent\n");
+    for (recent) |*review| try writeAutoReview(writer, alloc, review, false);
+}
+
+fn writeAutoReview(writer: *std.Io.Writer, alloc: std.mem.Allocator, review: *const diagnostics.AutoReview, detail: bool) !void {
+    try writer.writeAll("- ");
+    try writeTraceTimestampUtc(writer, review.at_ms);
+    try writer.print(" outcome={s}", .{@tagName(review.outcome)});
+    if (review.risk != .none) try writer.print(" risk={s}", .{@tagName(review.risk)});
+    if (review.reason().len > 0) {
+        try writer.writeAll(" reason=");
+        try text_utils.writeOneLine(writer, review.reason());
+    }
+    try writer.writeAll(" tool=");
+    try text_utils.writeOneLine(writer, review.toolName());
+    try writer.print(" origin={s}", .{@tagName(review.origin)});
+    if (review.reused) try writer.writeAll(" reused") else try writer.print(" elapsed={d}ms", .{review.elapsed_ms});
+    try writer.writeAll(" call_id=");
+    try text_utils.writeOneLine(writer, review.callId());
+    try writer.writeByte('\n');
+    if (!detail) return;
+    if (review.action().len > 0) {
+        try writer.writeAll("  action: ");
+        try writeTraceLine(writer, alloc, review.action(), trace_review_text_max_bytes);
+        if (review.action_total_bytes > review.action().len) try writer.print(" ... ({d} bytes)", .{review.action_total_bytes});
+        try writer.writeByte('\n');
+    }
+    if (review.rationale().len > 0) {
+        try writer.writeAll("  rationale: ");
+        try writeTraceLine(writer, alloc, review.rationale(), trace_review_text_max_bytes);
+        if (review.rationale_total_bytes > review.rationale().len) try writer.print(" ... ({d} bytes)", .{review.rationale_total_bytes});
+        try writer.writeByte('\n');
+    }
+}
+
+fn writeGitSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator, workspace_root: []const u8) !void {
+    var parts = git_context.queryParts(alloc, workspace_root) catch |err| {
+        try writer.print("\n## Git\nunavailable: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer parts.deinit(alloc);
+    try writeGitSection(writer, alloc, parts);
+}
+
+/// The Git section. Each line git printed is indented, so a status line such
+/// as `## main` can't start a section of the report.
+fn writeGitSection(writer: *std.Io.Writer, alloc: std.mem.Allocator, parts: git_context.Parts) !void {
+    try writer.writeAll("\n## Git\n");
+    if (parts.refused) |refusal| {
+        try writer.print("unavailable: fx won't run git here ({s})\n", .{@tagName(refusal)});
+        return;
+    }
+    if (!parts.in_git_repo) {
+        try writer.writeAll("not a git repository\n");
+        return;
+    }
+    try writer.writeAll("branch: ");
+    if (parts.branch) |branch| try writeTraceLine(writer, alloc, branch, trace_setup_line_max_bytes) else try writer.writeAll("(none: detached or unborn)");
+    try writer.writeByte('\n');
+    try writeGitBlock(writer, alloc, "status", parts.status, trace_git_status_max_lines);
+    try writeGitBlock(writer, alloc, "recent commits", parts.log, trace_git_status_max_lines);
+    try writeGitBlock(writer, alloc, "staged", parts.staged, trace_git_stat_max_lines);
+    try writeGitBlock(writer, alloc, "unstaged", parts.unstaged, trace_git_stat_max_lines);
+}
+
+fn writeGitBlock(writer: *std.Io.Writer, alloc: std.mem.Allocator, label: []const u8, text: ?[]const u8, max_lines: usize) !void {
+    const body = text orelse {
+        try writer.print("{s}: none\n", .{label});
+        return;
+    };
+    try writer.print("{s}:\n", .{label});
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    var shown: usize = 0;
+    var more: usize = 0;
+    while (lines.next()) |line| {
+        if (shown == max_lines) {
+            more += 1;
+            continue;
+        }
+        try writer.writeAll("  ");
+        try writeTraceLine(writer, alloc, std.mem.trimEnd(u8, line, "\r"), trace_setup_line_max_bytes);
+        try writer.writeByte('\n');
+        shown += 1;
+    }
+    if (more > 0) try writer.print("  ... {d} more lines\n", .{more});
+}
+
+fn writeSettingsSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator, workspace_root: []const u8) !void {
+    var paths = config_runtime.discoverPaths(alloc, workspace_root) catch |err| {
+        try writer.print("\n## Settings\nunavailable: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer paths.deinit(alloc);
+    try writeSettingsSection(writer, alloc, paths, workspace_root);
+}
+
+fn writeSettingsSection(writer: *std.Io.Writer, alloc: std.mem.Allocator, paths: config_runtime.Paths, workspace_root: []const u8) !void {
+    try writer.writeAll("\n## Settings\n");
+    var failed_file: ?[]const u8 = null;
+    var loaded = cli_config.load(alloc, paths, workspace_root, .all, &failed_file) catch |err| {
+        try writer.print("unreadable: {s} {s}\n", .{ failed_file orelse "settings", cli_config.loadFailureReason(err) });
+        return;
+    };
+    defer loaded.deinit(alloc);
+    // The same text as `fx config list --show-origin`: what each file and
+    // FX_* variable sets, lowest precedence first.
+    const snapshot: output_contracts.ConfigSnapshot = .{
+        .entries = loaded.entries.items,
+        .workspace_root = workspace_root,
+        .show_origin = true,
+    };
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try writeSettingsLines(writer, alloc, text, loaded.unknown);
+}
+
+fn writeSettingsLines(
+    writer: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    unknown: []const output_contracts.ConfigUnknownSetting,
+) !void {
+    const body = std.mem.trimEnd(u8, text, "\n");
+    if (body.len == 0) try writer.writeAll("(none set)\n");
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    var shown: usize = 0;
+    var more: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (shown == trace_settings_max_lines) {
+            more += 1;
+            continue;
+        }
+        // The origin and the key are fx's own; only the tab between them
+        // stays, so a value can't add a line or a column.
+        if (std.mem.findScalar(u8, line, '\t')) |tab| {
+            try text_utils.writeOneLine(writer, line[0..tab]);
+            try writer.writeByte('\t');
+            try writeTraceLine(writer, alloc, line[tab + 1 ..], trace_setup_line_max_bytes);
+        } else {
+            try writeTraceLine(writer, alloc, line, trace_setup_line_max_bytes);
+        }
+        try writer.writeByte('\n');
+        shown += 1;
+    }
+    if (more > 0) try writer.print("... {d} more settings\n", .{more});
+    for (unknown) |entry| {
+        try writer.writeAll("unknown key: ");
+        if (entry.key.parent) |parent| {
+            try text_utils.writeOneLine(writer, parent);
+            try writer.writeByte('.');
+        }
+        try text_utils.writeOneLine(writer, entry.key.name);
+        try writer.writeAll(" in ");
+        try text_utils.writeOneLine(writer, entry.file);
+        try writer.writeByte('\n');
+    }
+}
+
+fn writeSkillsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
+    if (comptime !@hasField(@TypeOf(app.*), "skills")) return;
+    try writeSkillsSection(writer, alloc, app.skills.items, app.skills.diagnostics);
+}
+
+/// The Skills section: each skill fx found, with where it comes from, and
+/// each candidate it skipped, with why.
+fn writeSkillsSection(
+    writer: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    skills: []const skill_runtime.Skill,
+    skill_diagnostics: []const skill_runtime.SkillDiagnostic,
+) !void {
+    try writer.writeAll("\n## Skills\n");
+    try writer.print("skills={d} load_problems={d}\n", .{ skills.len, skill_diagnostics.len });
+    for (skills[0..@min(skills.len, trace_skills_max)]) |skill| {
+        try writer.writeAll("- ");
+        try writeTraceLine(writer, alloc, skill.name, trace_setup_line_max_bytes);
+        try writer.print(" ({s})\n", .{skill_runtime.skillSourceLabel(skill.source)});
+    }
+    if (skills.len > trace_skills_max) try writer.print("... {d} more skills\n", .{skills.len - trace_skills_max});
+    for (skill_diagnostics) |diagnostic| {
+        try writer.print("problem: {s} ", .{@tagName(diagnostic.scope)});
+        try writeTraceLine(writer, alloc, diagnostic.path, trace_setup_line_max_bytes);
+        switch (diagnostic.cause) {
+            .invalid_metadata => |cause| try writer.print(" cause=invalid_metadata:{s}\n", .{@tagName(cause)}),
+            else => try writer.print(" cause={s}\n", .{@tagName(std.meta.activeTag(diagnostic.cause))}),
+        }
+    }
 }
 
 noinline fn writeMaskedInline(writer: *std.Io.Writer, alloc: std.mem.Allocator, text: []const u8) !void {
@@ -4791,4 +5052,152 @@ test "skills show missing name keeps not found notice" {
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.notebook.entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "Skill 'missing' not found.") != null);
+}
+
+fn testAutoReview(outcome: diagnostics.AutoReviewOutcome, call_id: []const u8, action: []const u8, rationale: []const u8) diagnostics.AutoReview {
+    var review: diagnostics.AutoReview = .{ .at_ms = 1000, .elapsed_ms = 42, .outcome = outcome, .risk = if (outcome == .caution) .high else .none };
+    @memcpy(review.call_id_buf[0..call_id.len], call_id);
+    review.call_id_len = @intCast(call_id.len);
+    @memcpy(review.tool_name_buf[0.."shell".len], "shell");
+    review.tool_name_len = "shell".len;
+    const kept_action = action[0..@min(action.len, review.action_buf.len)];
+    @memcpy(review.action_buf[0..kept_action.len], kept_action);
+    review.action_len = @intCast(kept_action.len);
+    review.action_total_bytes = @intCast(action.len);
+    const kept_rationale = rationale[0..@min(rationale.len, review.rationale_buf.len)];
+    @memcpy(review.rationale_buf[0..kept_rationale.len], kept_rationale);
+    review.rationale_len = @intCast(kept_rationale.len);
+    review.rationale_total_bytes = @intCast(rationale.len);
+    return review;
+}
+
+fn testSection(comptime writeFn: anytype, args: anytype) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    errdefer out.deinit();
+    try @call(.auto, writeFn, .{ &out.writer, arena_state.allocator() } ++ args);
+    return out.toOwnedSlice();
+}
+
+test "trace auto reviews section says none before any review" {
+    const text = try testSection(writeAutoReviewsSection, .{ diagnostics.AutoReviewCounts{}, &[_]diagnostics.AutoReview{}, &[_]diagnostics.AutoReview{} });
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("\n## Auto Reviews\n(none)\n", text);
+}
+
+test "trace auto reviews section lists holds in full and every review on one line" {
+    const long_action = text_utils.repeat("a", 300);
+    const caution = testAutoReview(.caution, "call_held", long_action, "Planted text asks for it.\ntoken=sk-live-0123456789abcdef0123456789 \x1b[2J");
+    var unavailable = testAutoReview(.unavailable, "call_down", "touch marker", "");
+    @memcpy(unavailable.reason_buf[0.."transport_permanent".len], "transport_permanent");
+    unavailable.reason_len = "transport_permanent".len;
+    var reused = testAutoReview(.caution, "call_again", "{\"command\":\"touch marker\"}", "");
+    reused.reused = true;
+    const clear = testAutoReview(.clear, "call_ok", "ls", "");
+    const held = [_]diagnostics.AutoReview{ caution, unavailable, reused };
+    const recent = [_]diagnostics.AutoReview{ clear, caution, unavailable, reused };
+    const text = try testSection(writeAutoReviewsSection, .{
+        diagnostics.AutoReviewCounts{ .reviews = 70, .reused = 1, .clear = 68, .caution = 1, .unavailable = 1 },
+        &recent,
+        &held,
+    });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.startsWith(u8, text, "\n## Auto Reviews\nreviews=70 reused=1 clear=68 caution=1 unavailable=1 held=0 error=0\ncoverage: Recent holds the last 4 of 71; Held keeps the last 32 that did not clear\n### Held\n"));
+    try std.testing.expect(std.mem.find(u8, text, "] outcome=caution risk=high tool=shell origin=root elapsed=42ms call_id=call_held\n  action: " ++ text_utils.repeat("a", 240) ++ " ... (300 bytes)\n  rationale: Planted text asks for it. ") != null);
+    try std.testing.expect(std.mem.find(u8, text, "sk-live-0123456789abcdef0123456789") == null);
+    try std.testing.expect(std.mem.find(u8, text, "\x1b") == null);
+    try std.testing.expect(std.mem.find(u8, text, "] outcome=unavailable reason=transport_permanent tool=shell origin=root elapsed=42ms call_id=call_down\n  action: touch marker\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "] outcome=caution risk=high tool=shell origin=root reused call_id=call_again\n") != null);
+    // Recent has one line for each review and no detail.
+    const recent_part = text[std.mem.find(u8, text, "### Recent\n").?..];
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, recent_part, "\n- ["));
+    try std.testing.expect(std.mem.find(u8, recent_part, "action:") == null);
+    try std.testing.expect(std.mem.find(u8, recent_part, "] outcome=clear tool=shell origin=root elapsed=42ms call_id=call_ok\n") != null);
+}
+
+test "trace git section says when fx won't run git or the folder is not a repository" {
+    const refused = try testSection(writeGitSection, .{git_context.Parts{ .refused = .git_too_old }});
+    defer std.testing.allocator.free(refused);
+    try std.testing.expectEqualStrings("\n## Git\nunavailable: fx won't run git here (git_too_old)\n", refused);
+    const outside = try testSection(writeGitSection, .{git_context.Parts{}});
+    defer std.testing.allocator.free(outside);
+    try std.testing.expectEqualStrings("\n## Git\nnot a git repository\n", outside);
+}
+
+test "trace git section indents git's lines, masks them, and caps long output" {
+    var status: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer status.deinit();
+    try status.writer.writeAll("## main...origin/main [ahead 1]\n M src/a.zig\n?? token=sk-live-0123456789abcdef0123456789\n");
+    var index: usize = 0;
+    while (index < trace_git_status_max_lines) : (index += 1) try status.writer.print("?? file-{d}.txt\n", .{index});
+    const parts: git_context.Parts = .{
+        .in_git_repo = true,
+        .status = @constCast(std.mem.trimEnd(u8, status.written(), "\n")),
+        .log = @constCast("abc1234 Add a file"),
+    };
+    const text = try testSection(writeGitSection, .{parts});
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.startsWith(u8, text, "\n## Git\nbranch: (none: detached or unborn)\nstatus:\n  ## main...origin/main [ahead 1]\n   M src/a.zig\n  ?? "));
+    try std.testing.expect(std.mem.find(u8, text, "sk-live-0123456789abcdef0123456789") == null);
+    try std.testing.expect(std.mem.find(u8, text, "\n## main") == null);
+    try std.testing.expect(std.mem.find(u8, text, "  ... 3 more lines\nrecent commits:\n  abc1234 Add a file\nstaged: none\nunstaged: none\n") != null);
+}
+
+test "trace settings lines keep the origin, mask values, and list unknown keys" {
+    const unknown = [_]output_contracts.ConfigUnknownSetting{.{ .key = .{ .name = "colour", .parent = "statusLine", .known = &.{} }, .file = "~/.fx/settings.json" }};
+    const text = try testSection(writeSettingsLines, .{
+        "file:~/.fx/settings.json\tcollapse_tool_calls=false\nenv:FX_REVIEW\treview_model=token=sk-live-0123456789abcdef0123456789\n",
+        &unknown,
+    });
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "file:~/.fx/settings.json\tcollapse_tool_calls=false\nenv:FX_REVIEW\treview_model="));
+    try std.testing.expect(std.mem.find(u8, text, "sk-live-0123456789abcdef0123456789") == null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "\nunknown key: statusLine.colour in ~/.fx/settings.json\n"));
+
+    const empty = try testSection(writeSettingsLines, .{ "", &[_]output_contracts.ConfigUnknownSetting{} });
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqualStrings("(none set)\n", empty);
+}
+
+test "trace settings section names a settings file it can't parse" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/settings.json", .data = "{ not json" });
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace);
+    var paths = try config_runtime.discoverPathsFromHome(std.testing.allocator, home, workspace);
+    defer paths.deinit(std.testing.allocator);
+
+    const text = try testSection(writeSettingsSection, .{ paths, workspace });
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "\n## Settings\nunreadable: "));
+    try std.testing.expect(std.mem.endsWith(u8, text, "settings.json isn't valid JSON\n"));
+}
+
+test "trace skills section lists each skill with its source and each load problem" {
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "review", .description = "", .path = "/Users/example/.fx/skills/review/SKILL.md", .source = .global_fx },
+        .{ .name = "probe\nskill", .description = "", .path = "/Users/example/w/.agents/skills/probe/SKILL.md", .source = .workspace_agents },
+    };
+    const problems = [_]skill_runtime.SkillDiagnostic{
+        .{ .path = "/Users/example/w/.agents/skills/broken/SKILL.md", .source = .workspace_agents, .scope = .candidate, .cause = .{ .invalid_metadata = .missing_name } },
+        .{ .path = "/Users/example/w/.claude/skills", .source = .workspace_claude, .scope = .root, .cause = .unreadable },
+    };
+    const text = try testSection(writeSkillsSection, .{ &skills, &problems });
+    defer std.testing.allocator.free(text);
+    const expected = try std.testing.allocator.print(
+        "\n## Skills\nskills=2 load_problems=2\n- review ({s})\n- probe skill ({s})\n" ++
+            "problem: candidate /Users/example/w/.agents/skills/broken/SKILL.md cause=invalid_metadata:missing_name\n" ++
+            "problem: root /Users/example/w/.claude/skills cause=unreadable\n",
+        .{ skill_runtime.skillSourceLabel(.global_fx), skill_runtime.skillSourceLabel(.workspace_agents) },
+    );
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, text);
 }
