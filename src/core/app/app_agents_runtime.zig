@@ -242,6 +242,24 @@ fn turnInFlight(agent: *agents.Agent) bool {
     return agent.worker.isProcessing() or agent.worker.queuedPromptCount() > 0;
 }
 
+/// Whether a request that waits for `need` is one a subagent's parent may
+/// send again: a refused or a day-old one. A sign-in, credits, the content
+/// filter, a request too long, or one that crashed fx twice is the user's.
+fn parentMayResend(need: @FieldType(types.RouteRecoveryStatus, "need")) bool {
+    return switch (need orelse return false) {
+        .rejected, .stale => true,
+        .sign_in, .quota, .content_filter, .too_long, .crash_loop => false,
+    };
+}
+
+test "a subagent's parent may send again only a refused or a day-old request" {
+    try std.testing.expect(parentMayResend(.rejected));
+    try std.testing.expect(parentMayResend(.stale));
+    for ([_]@FieldType(types.RouteRecoveryStatus, "need"){ null, .sign_in, .quota, .content_filter, .too_long, .crash_loop }) |need| {
+        try std.testing.expect(!parentMayResend(need));
+    }
+}
+
 /// Slot threads and the main loop both use the hand-off list.
 const handoff_alloc = std.heap.c_allocator;
 
@@ -2628,6 +2646,24 @@ pub fn Runtime(comptime App: type) type {
             defer alloc.free(work_id);
             debug_trace.eventf("host", "user_work_ended", .{}, "agent={s} work_id={s} outcome={s}", .{ run.child_id, work_id, @tagName(outcome) });
             host.endUserWork(run.child_id, work_id, outcome, reply);
+        }
+
+        /// A subagent's request that starts waiting for the user waits for
+        /// its parent too: the parent hears of it, and its message sends the
+        /// request again (`noteChildWaiting`).
+        pub fn noteChildWaiting(app: *App, agent: *AppAgent, status: types.RouteRecoveryStatus) void {
+            if (agent.role != .subagent) return;
+            const child = hostedOf(app, agent) orelse return;
+            const host = hostOf(app, child) orelse return;
+            const first = if (agent.child_run) |*run| first: {
+                run.waits +|= 1;
+                break :first run.waits == 1;
+            } else false;
+            const resend = first and parentMayResend(status.need);
+            agent.worker.parent_may_continue.store(resend, .seq_cst);
+            // The part the parent can use, without the keys for the user.
+            const text = status.text.slice();
+            host.noteChildWaiting(child.id, child.displayName(), if (std.mem.find(u8, text, " \u{b7} ")) |at| text[0..at] else text, resend);
         }
 
         /// Keeps a child's terminal provider error for the parent.

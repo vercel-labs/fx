@@ -251,6 +251,17 @@ function unavailable(): Response {
   });
 }
 
+// A request the gateway refuses, as it did a tool a team's providers don't
+// allow; fx waits for the user, or the parent, to send it again.
+function refused(): Response {
+  return new Response(JSON.stringify({
+    error: {
+      type: "invalid_request_error",
+      message: "Gateway-executed tool(s) are not available for this team: gateway.exa_search.",
+    },
+  }), { status: 400, headers: { "content-type": "application/json" } });
+}
+
 // A reply the test holds back until it calls `release`.
 function held() {
   let release!: () => void;
@@ -545,6 +556,77 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         first.release();
         // The message main sent while it worked never ran.
         expect(childCalls).toBe(1);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent whose request waits for a follow-up tells main, and main's message sends it again",
+    async () => {
+      let childCalls = 0;
+      let mainSawWait = false;
+      let childSawGoOn = false;
+      await withFx((body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          if (latestUserText(body).includes("go on")) childSawGoOn = true;
+          if (childCalls === 1) return refused();
+          return text("child_recovered", "SWITCH_CHILD_RECOVERED");
+        }
+        if (body.includes("SWITCH_CHILD_RECOVERED")) return text("main_done", "SWITCH_MAIN_SAW_RECOVERY");
+        if (body.includes("waits for a follow-up") && !mainSawWait) {
+          mainSawWait = true;
+          return toolCall("main_go_on", "subagent", { request: { action: "message", agent: "worker", message: "go on" } });
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "worker", message: "SWITCH_WAIT_TASK" } });
+        }
+        return text("main_wait", "SWITCH_MAIN_WAITING");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        // Nobody touches the subagent's screen: main hears of the wait, and
+        // its message sends the request again.
+        await session.waitForText("SWITCH_MAIN_SAW_RECOVERY", 30_000);
+        expect(mainSawWait).toBe(true);
+        // The request goes again, then the turn takes main's message, as it
+        // takes a line the user types there.
+        expect(childCalls).toBe(3);
+        expect(childSawGoOn).toBe(true);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent whose request fails again after main's resend asks main to tell the user, and waits",
+    async () => {
+      let childCalls = 0;
+      const notes = { resend: false, user: false };
+      await withFx((body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          return refused();
+        }
+        if (body.includes("Only the user can continue it") && !notes.user) {
+          notes.user = true;
+          return text("main_told", "SWITCH_MAIN_TELLS_USER");
+        }
+        if (body.includes("waits for a follow-up") && !notes.resend) {
+          notes.resend = true;
+          return toolCall("main_go_on", "subagent", { request: { action: "message", agent: "worker", message: "go on" } });
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "worker", message: "SWITCH_WAIT_TASK" } });
+        }
+        return text("main_wait", "SWITCH_MAIN_WAITING");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_TELLS_USER", 30_000);
+        // One resend from main, then the wait is the user's: no third try.
+        await Bun.sleep(1500);
+        expect(notes.resend).toBe(true);
+        expect(childCalls).toBe(2);
       });
     },
     TIMEOUT,
