@@ -1340,6 +1340,12 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           // working without the row shows main's count is 0.
           const mainScreen = await session.waitForPane((pane) => pane.includes("1 subagent working") && !pane.includes("waiting on"), 15_000);
           expect(mainScreen).not.toContain("waiting on");
+          // The list draws lead's helper under lead, on a branch of its own.
+          await session.sendKeys("Down");
+          const list = await session.waitForPane((pane) => /^ {4}\u2514 helper /m.test(pane), 10_000);
+          expect(list).toMatch(/^ {2}\u2514 lead /m);
+          await session.sendKeys("Escape");
+          await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
           // Lead, the helper's parent, waits on it.
           await showAgent(session, "lead");
           await session.waitForPane((pane) => /\u2022 waiting on 1 subagent \(\d+s\) \u00b7 \u2193 to view/.test(pane), 15_000);
@@ -2182,9 +2188,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.waitForPane((pane) => !pane.includes("press delete again to close this subagent")
           && mainRow().test(pane) && !pane.includes("delete close"), 10_000);
         await session.sendKeys("Down");
-        await session.sendKeys("BSpace");
+        // The forward Delete key arms and closes, as Backspace does.
+        await session.sendKeys("DC");
         await session.waitForText("press delete again to close this subagent", 10_000);
-        await session.sendKeys("BSpace");
+        await session.sendKeys("DC");
         const closed = await session.waitForPane((pane) => !subagentRow("reviewer").test(pane) && pane.includes("esc back"), 15_000);
         // Main is on screen again, and the reviewer's turn ended with the close.
         expect(closed).toContain("SWITCH_USER review it");
@@ -2367,6 +2374,70 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(pasted).toContain("EDGE_CLOSE_DONE");
         expect(pasted).not.toContain("\u2503 EDGE_REVIEW_TASK");
       });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a subagent call's row names its subagent while main writes it, and main's status and wait name the subagents they concern",
+    async () => {
+      const nameSent = held();
+      const children = { reviewer: held(), builder: held() };
+      const encoder = new TextEncoder();
+      // Main's first call streams up to the subagent's name, then holds the
+      // rest until the test has seen the row.
+      const streamedCall = (id: string, input: object) => new Response(new ReadableStream<Uint8Array>({
+        async start(controller) {
+          const send = (event: object) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+          const json = JSON.stringify(input);
+          const cut = json.indexOf('"message":"');
+          send({ type: "tool-input-start", id, toolName: "subagent" });
+          send({ type: "tool-input-delta", id, delta: json.slice(0, cut) });
+          await nameSent.promise;
+          send({ type: "tool-input-delta", id, delta: json.slice(cut) });
+          send({ type: "tool-input-end", id });
+          send({ type: "tool-call", toolCallId: id, toolName: "subagent", input });
+          send({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } });
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        },
+      }), { headers: { "content-type": "text/event-stream" } });
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            const who = body.includes("NAMES_REVIEW") ? "reviewer" : "builder";
+            await children[who].promise;
+            return text(`names_${who}`, `NAMES_${who.toUpperCase()}_DONE`);
+          }
+          if (!body.includes('"names_r"')) {
+            return streamedCall("names_r", { request: { action: "message", agent: "reviewer", message: "NAMES_REVIEW the parser", report: "never" } });
+          }
+          if (!body.includes('"names_b"')) {
+            return toolCall("names_b", "subagent", { request: { action: "message", agent: "builder", message: "NAMES_BUILD the binary", report: "never" } });
+          }
+          if (!body.includes('"names_s"')) return toolCall("names_s", "subagent", { request: { action: "status" } });
+          if (!body.includes('"names_w"')) return toolCall("names_w", "subagent", { request: { action: "wait" } });
+          return text("names_main", "NAMES_MAIN_DONE");
+        }, async (session) => {
+          await session.sendText("SWITCH_USER start the reviewer and the builder");
+          // The name has arrived and the rest of the call has not.
+          await session.waitForText("Managing reviewer", 15_000);
+          nameSent.release();
+          await session.waitForText("sent to reviewer", 15_000);
+          // Both are working when main checks on them and then waits.
+          await session.waitForText("checked reviewer, builder", 15_000);
+          await session.waitForText("waiting for reviewer, builder", 15_000);
+          children.reviewer.release();
+          children.builder.release();
+          const done = await session.waitForPane((pane) => pane.includes("waited for reviewer, builder"), 30_000);
+          expect(done).not.toContain("waiting for subagents");
+          expect(await session.captureFullScrollback()).not.toContain("checked subagents");
+        });
+      } finally {
+        nameSent.release();
+        children.reviewer.release();
+        children.builder.release();
+      }
     },
     TIMEOUT,
   );

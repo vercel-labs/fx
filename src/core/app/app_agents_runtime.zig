@@ -509,6 +509,9 @@ pub const SubagentWait = struct {
 const OrderEntry = struct {
     role: agents.Role,
     root: usize = 0,
+    /// The switch position of the subagent that started this one; null when
+    /// an instance did.
+    parent: ?usize = null,
     working: bool = false,
     reply_at_ms: i64 = 0,
 };
@@ -600,6 +603,30 @@ fn sortSubagentGroups(entries: []const OrderEntry, order: []usize) void {
         sort_utils.sort(usize, order[start..end], ctx, Context.lessThan);
         start = end;
     }
+}
+
+/// Puts each subagent's own subagents right under it, in the order `order`
+/// already has them, so the list draws a tree. `scratch` is as long as
+/// `order`.
+fn nestSubagents(entries: []const OrderEntry, order: []usize, scratch: []usize) void {
+    @memcpy(scratch, order);
+    var next: usize = 0;
+    for (scratch) |position| {
+        if (position != 0 and entries[position - 1].parent != null) continue;
+        next = placeWithChildren(entries, scratch, position, order, next);
+    }
+    std.debug.assert(next == order.len);
+}
+
+fn placeWithChildren(entries: []const OrderEntry, flat: []const usize, position: usize, out: []usize, next: usize) usize {
+    out[next] = position;
+    var at = next + 1;
+    for (flat) |child| {
+        if (child == 0) continue;
+        const parent = entries[child - 1].parent orelse continue;
+        if (parent == position) at = placeWithChildren(entries, flat, child, out, at);
+    }
+    return at;
 }
 
 fn appendGroup(entries: []const OrderEntry, root: usize, out: []usize, next: *usize) void {
@@ -1018,7 +1045,8 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// The switch order, with each instance's subagents sorted
-        /// (`sortSubagentGroups`).
+        /// (`sortSubagentGroups`) and each subagent's own right under it
+        /// (`nestSubagents`).
         pub fn switchList(app: *App, out: *std.ArrayList(?*ChildAgent)) !void {
             const hosted = app.child_agents.items;
             const entries = try app.alloc.alloc(OrderEntry, hosted.len);
@@ -1026,15 +1054,18 @@ pub fn Runtime(comptime App: type) type {
             for (hosted, entries) |child, *entry| entry.* = .{
                 .role = child.agent.role,
                 .root = if (child.agent.role == .subagent) instanceOrdinal(app, rootInstance(app, child)) else 0,
+                .parent = if (parentSubagent(app, child)) |parent| (if (std.mem.findScalar(*ChildAgent, hosted, parent)) |index| index + 1 else null) else null,
                 .working = stateOf(app, child) == .working,
                 .reply_at_ms = @max(child.saved_reply_at_ms, latestReplyAt(child.agent.session.agent.history.items)),
             };
-            const order = try app.alloc.alloc(usize, hosted.len + 1);
+            const order = try app.alloc.alloc(usize, 2 * (hosted.len + 1));
             defer app.alloc.free(order);
-            switchOrder(entries, order);
-            sortSubagentGroups(entries, order);
-            try out.ensureUnusedCapacity(app.alloc, order.len);
-            for (order) |position| {
+            const switch_order = order[0 .. hosted.len + 1];
+            switchOrder(entries, switch_order);
+            sortSubagentGroups(entries, switch_order);
+            nestSubagents(entries, switch_order, order[hosted.len + 1 ..]);
+            try out.ensureUnusedCapacity(app.alloc, switch_order.len);
+            for (switch_order) |position| {
                 if (position == 0 and !firstOpen(app)) continue;
                 out.appendAssumeCapacity(if (position == 0) null else hosted[position - 1]);
             }
@@ -1429,6 +1460,7 @@ pub fn Runtime(comptime App: type) type {
                 menu.rows.appendAssumeCapacity(.{
                     .name = name,
                     .subagent = subagent != null,
+                    .nested = if (subagent) |child| parentSubagent(app, child) != null else false,
                     .title = agent.session_title.items,
                     // A subagent's own agent never loads its profile; its
                     // host's list says which one it runs in.
@@ -1776,6 +1808,14 @@ pub fn Runtime(comptime App: type) type {
                 if (hosted.agent.role == .instance) return owner;
                 current = hosted;
             }
+        }
+
+        /// The subagent that started subagent `child`; null when an instance
+        /// did.
+        fn parentSubagent(app: *App, child: *const ChildAgent) ?*ChildAgent {
+            const owner = ownerOf(app, hostOf(app, child)) orelse return null;
+            const hosted = hostedOf(app, owner) orelse return null;
+            return if (hosted.agent.role == .subagent) hosted else null;
         }
 
         /// The agent whose own subagent host is `host`.
@@ -2941,6 +2981,63 @@ test "sorting subagents keeps every instance in place and every subagent under i
             const here = entries[after - 1];
             try std.testing.expect(above.working or !here.working);
             if (!above.working) try std.testing.expect(above.reply_at_ms >= here.reply_at_ms);
+        }
+    }
+}
+
+test "a subagent's own subagents come right under it, in their sorted order" {
+    // Main's lead works and started helper and checker; tester replied last.
+    const entries = [_]OrderEntry{
+        .{ .role = .subagent, .working = true },
+        .{ .role = .subagent, .parent = 1, .reply_at_ms = 5 },
+        .{ .role = .subagent, .reply_at_ms = 9 },
+        .{ .role = .subagent, .parent = 1, .working = true },
+    };
+    var order: [entries.len + 1]usize = undefined;
+    var scratch: [entries.len + 1]usize = undefined;
+    switchOrder(&entries, &order);
+    sortSubagentGroups(&entries, &order);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4, 3, 2 }, &order);
+    nestSubagents(&entries, &order, &scratch);
+    // Main, lead, checker, helper, tester.
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4, 2, 3 }, &order);
+}
+
+test "nesting keeps every agent and instance in place, and puts each subagent's own right under it, for random hosts" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_7e57);
+    const random = prng.random();
+    var buf: [24]OrderEntry = undefined;
+    var sorted: [buf.len + 1]usize = undefined;
+    var order: [buf.len + 1]usize = undefined;
+    var scratch: [buf.len + 1]usize = undefined;
+    for (0..10_000) |_| {
+        const entries = randomEntries(random, &buf);
+        for (entries, 0..) |*entry, index| {
+            entry.working = random.boolean();
+            entry.reply_at_ms = random.uintAtMost(u8, 3);
+            if (entry.role != .subagent or index == 0 or random.boolean()) continue;
+            // Two levels: a parent is one of the same tree's subagents that
+            // an instance started.
+            const candidate = random.uintLessThan(usize, index);
+            const parent = entries[candidate];
+            if (parent.role == .subagent and parent.root == entry.root and parent.parent == null) entry.parent = candidate + 1;
+        }
+        const len = entries.len + 1;
+        switchOrder(entries, sorted[0..len]);
+        sortSubagentGroups(entries, sorted[0..len]);
+        @memcpy(order[0..len], sorted[0..len]);
+        nestSubagents(entries, order[0..len], scratch[0..len]);
+        for (sorted[0..len], order[0..len]) |before, after| {
+            try std.testing.expect(std.mem.findScalar(usize, order[0..len], before) != null);
+            if (before == 0 or entries[before - 1].role == .instance) try std.testing.expectEqual(before, after);
+        }
+        for (order[0..len], 0..) |position, at| {
+            if (position == 0) continue;
+            const parent = entries[position - 1].parent orelse continue;
+            var back = at - 1;
+            while (order[back] != parent) : (back -= 1) {
+                try std.testing.expectEqual(@as(?usize, parent), entries[order[back] - 1].parent);
+            }
         }
     }
 }
