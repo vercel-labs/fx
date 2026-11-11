@@ -11,6 +11,8 @@ pub const max_error_len: usize = 48;
 pub const max_stop_reason_len: usize = 48;
 pub const max_gateway_schema_diagnostic_len: usize = 160;
 pub const max_gateway_request_shape_len: usize = 512;
+/// The gateway's own words for a failed call, so a trace says why it failed.
+pub const max_gateway_error_message_len: usize = 200;
 pub const ring_capacity: usize = 32;
 
 pub const NetworkCallKind = enum {
@@ -46,6 +48,8 @@ pub const NetworkCall = struct {
     gateway_schema_diagnostic_len: u16 = 0,
     gateway_request_shape_buf: [max_gateway_request_shape_len]u8 = @splat(0),
     gateway_request_shape_len: u16 = 0,
+    gateway_error_message_buf: [max_gateway_error_message_len]u8 = @splat(0),
+    gateway_error_message_len: u16 = 0,
 
     pub fn model(self: *const NetworkCall) []const u8 {
         return self.model_buf[0..self.model_len];
@@ -69,6 +73,10 @@ pub const NetworkCall = struct {
 
     pub fn gatewayRequestShape(self: *const NetworkCall) []const u8 {
         return self.gateway_request_shape_buf[0..self.gateway_request_shape_len];
+    }
+
+    pub fn gatewayErrorMessage(self: *const NetworkCall) []const u8 {
+        return self.gateway_error_message_buf[0..self.gateway_error_message_len];
     }
 
     pub fn setModel(self: *NetworkCall, name: []const u8) void {
@@ -105,6 +113,40 @@ pub const NetworkCall = struct {
         const n = @min(shape.len, max_gateway_request_shape_len);
         @memcpy(self.gateway_request_shape_buf[0..n], shape[0..n]);
         self.gateway_request_shape_len = @intCast(n);
+    }
+
+    /// Keeps `message` as one line the trace can quote: control bytes and
+    /// double quotes become spaces and single quotes, and a cut never splits
+    /// a UTF-8 sequence. Bytes that are not UTF-8 become `?`.
+    pub fn setGatewayErrorMessage(self: *NetworkCall, message: []const u8) void {
+        var out: usize = 0;
+        var at: usize = 0;
+        while (at < message.len) {
+            const byte = message[at];
+            const width: usize = std.unicode.utf8ByteSequenceLength(byte) catch 0;
+            const valid = width > 0 and at + width <= message.len and
+                (width == 1 or std.unicode.utf8ValidateSlice(message[at .. at + width]));
+            if (!valid) {
+                if (out + 1 > max_gateway_error_message_len) break;
+                self.gateway_error_message_buf[out] = '?';
+                out += 1;
+                at += 1;
+                continue;
+            }
+            if (out + width > max_gateway_error_message_len) break;
+            if (width == 1) {
+                self.gateway_error_message_buf[out] = switch (byte) {
+                    0...0x1f, 0x7f => ' ',
+                    '"' => '\'',
+                    else => byte,
+                };
+            } else {
+                @memcpy(self.gateway_error_message_buf[out .. out + width], message[at .. at + width]);
+            }
+            out += width;
+            at += width;
+        }
+        self.gateway_error_message_len = @intCast(out);
     }
 
     /// Failure predicate shared by the /trace renderer and the lifetime
@@ -385,4 +427,43 @@ test "gateway diagnostics default empty truncate and survive snapshot" {
     try std.testing.expectEqual(max_gateway_request_shape_len, buf[0].gatewayRequestShape().len);
     try std.testing.expectEqual(@as(u8, 's'), buf[0].gatewaySchemaDiagnostic()[0]);
     try std.testing.expectEqual(@as(u8, 'r'), buf[0].gatewayRequestShape()[0]);
+}
+
+fn fuzzGatewayErrorMessage(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [4096]u8 = undefined;
+    const len = smith.slice(&buffer);
+    var call: NetworkCall = .{};
+    call.setGatewayErrorMessage(buffer[0..len]);
+    const kept = call.gatewayErrorMessage();
+    try std.testing.expect(kept.len <= max_gateway_error_message_len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(kept));
+    for (kept) |byte| {
+        try std.testing.expect(byte >= 0x20 and byte != 0x7f and byte != '"');
+    }
+}
+
+test "fuzzed gateway error messages stay one bounded line of UTF-8" {
+    try std.testing.fuzz({}, fuzzGatewayErrorMessage, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "HTTP 401: token expired",
+            "multi\nline \"quoted\" \x00\x7f",
+            "caf\xc3\xa9 \xe2\x80",
+            "\xff\xfe broken",
+        }) ++ @import("fuzz_corpus").network_error_message.*),
+    });
+}
+
+test "a gateway error message keeps its words on one line and cuts at a character" {
+    var call: NetworkCall = .{};
+    call.setGatewayErrorMessage("HTTP 401: \"token\"\nexpired");
+    try std.testing.expectEqualStrings("HTTP 401: 'token' expired", call.gatewayErrorMessage());
+    var long: [max_gateway_error_message_len + 8]u8 = undefined;
+    @memset(&long, 'a');
+    // An e with an acute accent across the limit is dropped whole.
+    @memcpy(long[max_gateway_error_message_len - 1 ..][0..2], "\xc3\xa9");
+    call.setGatewayErrorMessage(&long);
+    try std.testing.expectEqual(max_gateway_error_message_len - 1, call.gatewayErrorMessage().len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(call.gatewayErrorMessage()));
+    call.setGatewayErrorMessage("");
+    try std.testing.expectEqualStrings("", call.gatewayErrorMessage());
 }

@@ -2311,6 +2311,8 @@ fn writeNetworkCallCompact(writer: *std.Io.Writer, call: diagnostics.NetworkCall
     if (call.providerStopReason().len > 0) try writer.print(" provider_stop_reason={s}", .{call.providerStopReason()});
     if (call.turn_id != 0) try writer.print(" turn={d}", .{call.turn_id});
     if (call.step_id != 0) try writer.print(" step={d}", .{call.step_id});
+    // Before the long request shape, which a reader may cut.
+    if (call.gatewayErrorMessage().len > 0) try writer.print(" error=\"{s}\"", .{call.gatewayErrorMessage()});
     if (call.gatewaySchemaDiagnostic().len > 0) try writer.print(" gateway_schema=\"{s}\"", .{call.gatewaySchemaDiagnostic()});
     if (call.gatewayRequestShape().len > 0) try writer.print(" request_shape=\"{s}\"", .{call.gatewayRequestShape()});
     try writer.writeByte('\n');
