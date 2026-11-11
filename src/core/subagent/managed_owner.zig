@@ -297,6 +297,9 @@ pub const Owner = struct {
         };
         accepted = try worker.admitActiveSteering(self.alloc, prompt);
         if (!accepted) return .waiting;
+        // A request that waits for a follow-up the parent may give takes the
+        // parent's message as one, as it takes the user's Enter.
+        if (worker.parent_may_continue.swap(false, .seq_cst)) worker.requestRecoveryContinue();
         self.feedback.appendAssumeCapacity(item);
         debug_trace.eventf("subagent", "feedback_queued", .{}, "child_id={s} work_id={s} operation={s}", .{ child_id, work_id, operation_id });
         return .{ .receipt = .queued };

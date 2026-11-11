@@ -189,6 +189,8 @@ pub const AgentsMenuRow = struct {
     name: []const u8,
     /// A subagent, drawn on its instance's branch.
     subagent: bool = false,
+    /// A subagent's own subagent, drawn on its parent's branch.
+    nested: bool = false,
     /// Its session's title, or empty before it has one.
     title: []const u8,
     /// The agent profile it runs in.

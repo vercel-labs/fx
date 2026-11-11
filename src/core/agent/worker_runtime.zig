@@ -621,6 +621,9 @@ pub const WorkerRuntime = struct {
     /// a new login; the request's recovery reads and clears it
     /// (`RequestRecovery.sign_in_closed_flag`).
     recovery_sign_in_closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set while the request waits for a follow-up the parent may give
+    /// (`noteChildWaiting`); the parent's next message takes it.
+    parent_may_continue: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// The active turn whose text steering admission owns the cancel flag.
     /// Guarded by `worker_mutex`; explicit cancellation clears this ownership.
     steering_cancel_turn_id: ?u64 = null,
