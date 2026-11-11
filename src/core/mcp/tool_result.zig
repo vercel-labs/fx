@@ -215,7 +215,7 @@ fn write_protocol_diagnostic(
 
 const invalid_params_prefix = "MCP protocol error -32602: ";
 const max_cause_fields = 3;
-pub const max_cause_bytes = 240;
+const max_cause_bytes = 240;
 
 /// Why an MCP server refused a call's parameters, as one short line, read from
 /// the text `write_protocol_diagnostic` wrote for a JSON-RPC -32602 error. It
@@ -234,7 +234,9 @@ pub fn invalidParamsCause(arena: Allocator, text: []const u8) Allocator.Error!?[
     const named = (writeGoRejections(&line.writer, message) catch return error.OutOfMemory) or
         try writeZodRejections(arena, &line.writer, message);
     if (!named) line.writer.writeAll("the server rejected the call's parameters (-32602)") catch return error.OutOfMemory;
-    const encoded = try text_utils.encodeTerminalSafeInline(arena, line.written(), max_cause_bytes);
+    // Mask before the length cut, which could leave a token too short to match.
+    const masked = text_utils.maskSecrets(arena, line.written()) catch return error.OutOfMemory;
+    const encoded = try text_utils.encodeTerminalSafeInline(arena, masked, max_cause_bytes);
     return encoded.bytes;
 }
 
@@ -250,9 +252,7 @@ fn writeGoRejections(writer: *std.Io.Writer, message: []const u8) std.Io.Writer.
         const field_end = std.mem.find(u8, entry, ": ") orelse continue;
         const actual = quotedAfter(entry[field_end..], "has type \"") orelse continue;
         const want_at = std.mem.find(u8, entry[field_end..], ", want ") orelse continue;
-        const want_raw = std.mem.trim(u8, entry[field_end + want_at + ", want ".len ..], " \t\r");
-        const want = if (want_raw.len > 1 and want_raw[0] == '"' and want_raw[want_raw.len - 1] == '"') want_raw[1 .. want_raw.len - 1] else want_raw;
-        if (want.len == 0) continue;
+        const want = wantedType(entry[field_end + want_at + ", want ".len ..]) orelse continue;
         if (count == max_cause_fields) {
             try writer.writeAll("; and more");
             break;
@@ -263,6 +263,19 @@ fn writeGoRejections(writer: *std.Io.Writer, message: []const u8) std.Io.Writer.
         count += 1;
     }
     return count > 0;
+}
+
+/// The type after `want `: a quoted name, a bracketed list, or one bare word.
+/// Whatever the server wrote after it stays out of the cause.
+fn wantedType(after_want: []const u8) ?[]const u8 {
+    const text = std.mem.trimStart(u8, after_want, " \t");
+    if (text.len == 0) return null;
+    const want = switch (text[0]) {
+        '"' => text[1 .. 1 + (std.mem.findScalar(u8, text[1..], '"') orelse return null)],
+        '[' => text[0 .. 1 + (std.mem.findScalar(u8, text, ']') orelse return null)],
+        else => text[0 .. std.mem.findAny(u8, text, " \t\r,;") orelse text.len],
+    };
+    return if (want.len == 0) null else want;
 }
 
 /// The TypeScript SDK sends zod's issues as a JSON array:
@@ -829,6 +842,31 @@ test "only a -32602 gets a cause, so other failures keep their text" {
     try expectCause("tool said: MCP protocol error -32602: Unknown tool", null);
     try expectCause("Invalid input: labels require at least one item", null);
     try expectCause("", null);
+}
+
+test "an invalid-params cause leaves out what the server wrote after the type and masks secrets" {
+    const token = "ghp_" ++ text_utils.repeat("a", 36);
+    try expectCause(
+        "MCP protocol error -32602: validating /properties/limit: type: \"40\" has type \"string\", want \"number\" token=" ++ token,
+        "arguments rejected: limit is a string, the schema wants a number",
+    );
+    try expectCause(
+        "MCP protocol error -32602: validating /properties/id: type: \"x\" has type \"string\", want [\"integer\",\"null\"] (see " ++ token ++ ")",
+        "arguments rejected: id is a string, the schema wants [\"integer\",\"null\"]",
+    );
+    try expectCause(
+        "MCP protocol error -32602: validating /properties/limit: type: \"40\" has type \"string\", want number, see " ++ token,
+        "arguments rejected: limit is a string, the schema wants a number",
+    );
+    try expectCause("MCP protocol error -32602: validating /properties/limit: type: \"40\" has type \"string\", want \"number", "the server rejected the call's parameters (-32602)");
+    try expectCause(
+        "MCP protocol error -32602: validating /properties/" ++ token ++ ": type: 1 has type \"integer\", want \"string\"",
+        "arguments rejected: [redacted] is an integer, the schema wants a string",
+    );
+    try expectCause(
+        "MCP protocol error -32602: [{\"code\":\"invalid_type\",\"expected\":\"number\",\"received\":\"string\",\"path\":[\"" ++ token ++ "\"]}]",
+        "arguments rejected: [redacted] is a string, the schema wants a number",
+    );
 }
 
 test "an invalid-params cause stays one terminal-safe line within its bound" {
