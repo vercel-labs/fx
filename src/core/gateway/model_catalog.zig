@@ -8,6 +8,7 @@ const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const types = @import("../shared/types.zig");
+const token_pass = @import("token_pass.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -488,8 +489,19 @@ pub fn projectPickerModelCatalog(alloc: std.mem.Allocator, candidates: []const M
     errdefer freeModelCatalog(alloc, &selected);
     try selected.ensureTotalCapacity(alloc, candidates.len);
 
+    // Token Pass models lead the list, so nobody has to scroll the catalog to
+    // find the models a Token Pass pays for.
+    for (token_pass.featured_models) |id| {
+        for (candidates) |candidate| {
+            if (!std.mem.eql(u8, candidate.id, id)) continue;
+            if (!pickerCatalogContains(selected.items, candidate.id)) try appendClonedModelCatalogEntry(alloc, &selected, candidate);
+            break;
+        }
+    }
+
     for (featured_picker_families) |featured| {
-        var remaining = featured.count;
+        // A Token Pass model already on top fills its family's slot.
+        var remaining = featured.count -| pickerFamilySelectionCount(selected.items, featured.family);
         while (remaining > 0) : (remaining -= 1) {
             const candidate = newestUnselectedPickerCandidate(candidates, featured.family, selected.items) orelse break;
             try appendClonedModelCatalogEntry(alloc, &selected, candidate.*);
@@ -611,6 +623,14 @@ fn pickerProviderLimit(provider: []const u8) usize {
         return extended_picker_provider_limit;
     }
     return picker_provider_limit;
+}
+
+fn pickerFamilySelectionCount(entries: []const ModelCatalogEntry, family: []const u8) usize {
+    var count: usize = 0;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, modelPickerFamily(entry.id), family)) count += 1;
+    }
+    return count;
 }
 
 fn pickerProviderSelectionCount(entries: []const ModelCatalogEntry, provider: []const u8) usize {
@@ -975,4 +995,33 @@ test "featured deepseek slot prefers the pro variant at equal recency" {
     try std.testing.expectEqualStrings("deepseek/deepseek-v4-pro", curated.items[0].id);
     try std.testing.expectEqualStrings("deepseek/deepseek-v4", curated.items[1].id);
     try std.testing.expectEqualStrings("deepseek/deepseek-v4-flash", curated.items[2].id);
+}
+
+test "picker lists Token Pass models first without a second slot for their families" {
+    const candidates = [_]ModelCatalogEntry{
+        .{ .id = @constCast("anthropic/claude-fable-5"), .model_type = @constCast("language"), .released = 300, .has_tool_use = true },
+        .{ .id = @constCast("openai/gpt-6"), .model_type = @constCast("language"), .released = 290, .has_tool_use = true },
+        .{ .id = @constCast("deepseek/deepseek-v4.1-pro"), .model_type = @constCast("language"), .released = 260, .has_tool_use = true },
+        .{ .id = @constCast("deepseek/deepseek-v4.1-flash"), .model_type = @constCast("language"), .released = 255, .has_tool_use = true },
+        .{ .id = @constCast("zai/glm-5.3"), .model_type = @constCast("language"), .released = 250, .has_tool_use = true },
+        .{ .id = @constCast("zai/glm-5.3-flash"), .model_type = @constCast("language"), .released = 240, .has_tool_use = true },
+        .{ .id = @constCast("moonshotai/kimi-k3"), .model_type = @constCast("language"), .released = 230, .has_tool_use = true },
+        .{ .id = @constCast("zai/glm-5.2"), .model_type = @constCast("language"), .released = 100, .has_tool_use = true },
+    };
+
+    var curated = try projectPickerModelCatalog(std.testing.allocator, &candidates);
+    defer freeModelCatalog(std.testing.allocator, &curated);
+
+    const expected = [_][]const u8{
+        "moonshotai/kimi-k3",
+        "zai/glm-5.3",
+        "zai/glm-5.3-flash",
+        "deepseek/deepseek-v4.1-flash",
+        "anthropic/claude-fable-5",
+        "openai/gpt-6",
+        "deepseek/deepseek-v4.1-pro",
+        "zai/glm-5.2",
+    };
+    try std.testing.expectEqual(expected.len, curated.items.len);
+    for (expected, curated.items) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
 }

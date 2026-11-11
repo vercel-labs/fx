@@ -3491,10 +3491,16 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForText("token_pass_remaining=79.92906", 10_000);
       await session.waitForText("token_pass_resets_at=2026-12-05T08:00:00.000Z", 5_000);
 
+      // Token Pass models lead the default list, ahead of the newer model.
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 2);
+      const rows = menu.filter((line) => !isComposerLine(line) && (line.includes(tokenPassModel) || line.includes("provider/plain-model")));
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toContain(tokenPassModel);
+      expect(rows[1]).toContain("provider/plain-model");
+
       // fx now knows the team has Token Pass, so a switch to a Token Pass
       // model does not point at the Token Pass docs.
-      await session.sendKeys("C-p");
-      await waitForModelsMenu(session, 2);
       await session.sendLiteralText("glm");
       await session.waitForPane((pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes(tokenPassModel)), 5_000);
       await session.sendKeys("Enter");
