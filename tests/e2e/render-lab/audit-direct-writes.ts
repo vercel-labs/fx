@@ -65,6 +65,7 @@ const allowlist: AllowRule[] = [
   rule("src/core/cli/cli_replay.zig", "(?:writeStdout|writeStderr)", /stdio_acquisition_write/, "noninteractive_output", "replay process output"),
   rule("src/core/cli/cli_surface.zig", "(?:writeRealStdout|writeRealStderr|writeFdAll)", /(?:stdio_acquisition_write|fixed_fd_write|raw_fd_write|delegated_fd_write)/, "noninteractive_output", "top-level CLI output"),
   rule("src/core/cli/cli_surface.zig", "(?:setupTerminalAvailableDefault|enable)", /fixed_descriptor/, "terminal_probe", "masked setup prompt TTY and raw-mode setup"),
+  rule("src/core/cli/cli_surface.zig", "stderrIsTerminal", /stdio_acquisition/, "terminal_probe", "fx doctor wait notice TTY probe"),
   rule("src/core/auth/login_flow.zig", "(?:canUseInteractiveTeamPicker|enable)", /fixed_descriptor/, "terminal_probe", "auth login team-picker TTY probe"),
   rule("src/core/auth/login_flow.zig", "writeStdout", /stdio_acquisition_write/, "noninteractive_output", "CLI auth login output"),
   rule("src/core/auth/chatgpt_oauth.zig", "writeStdout", /stdio_acquisition_write/, "noninteractive_output", "Codex CLI login output"),

@@ -2,6 +2,8 @@ const std = @import("std");
 const testing_allocator = @import("../../../shared/testing_allocator.zig");
 const agent_stream_provider = @import("../../stream_provider.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
+const builtin_context = @import("../../../../builtins/context.zig");
+const context_contract = @import("../../../workspace/context_contract.zig");
 const types = @import("../../../shared/types.zig");
 const token_estimate = @import("../../../shared/token_estimate.zig");
 const result_store = @import("../../../session/result_store.zig");
@@ -756,6 +758,161 @@ test "processQueuedPrompt gates text-only images through the real Vision runtime
     try expectBodyContains(&gateway, 2, "FX LOGO");
     try expectBodyNotContains(&gateway, 2, image_path);
     try std.testing.expectEqualStrings("Final selected-model answer", hooks.finish_assistant_text.?);
+}
+
+/// Every message of the `earlier` request comes back unchanged at the start
+/// of the `later` one, so a provider's cached prefix still matches.
+fn expectPromptStartsWith(alloc: Allocator, earlier: []const u8, later: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const before = (try std.json.parseFromSliceLeaky(std.json.Value, arena, earlier, .{})).object.get("prompt").?.array.items;
+    const after = (try std.json.parseFromSliceLeaky(std.json.Value, arena, later, .{})).object.get("prompt").?.array.items;
+    try std.testing.expect(after.len > before.len);
+    for (before, after[0..before.len]) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.object.get("role").?.string, actual.object.get("role").?.string);
+        try std.testing.expectEqualStrings(
+            try std.json.Stringify.valueAlloc(arena, expected.object.get("content").?, .{}),
+            try std.json.Stringify.valueAlloc(arena, actual.object.get("content").?, .{}),
+        );
+    }
+}
+
+test "an image from a folder with its own rules brings them as a note on the turn's message and leaves the instructions alone (D93)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/assets/nested");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/assets/nested/AGENTS.md", .data = "IMAGE_FOLDER_RULE" });
+    {
+        const size = try std.base64.standard.Decoder.calcSizeForSlice(test_image_base64);
+        const bytes = try alloc.alloc(u8, size);
+        defer alloc.free(bytes);
+        try std.base64.standard.Decoder.decode(bytes, test_image_base64);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/assets/nested/fixture.png", .data = bytes });
+    }
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/assets/nested/fixture.png");
+    defer alloc.free(image_path);
+    const rules_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "assets", "nested", "AGENTS.md" });
+    defer alloc.free(rules_path);
+    const block = "<scoped-rules from=\"assets/nested/AGENTS.md\" scope=\"assets/nested\">\nIMAGE_FOLDER_RULE\n</scoped-rules>";
+    const reminder = "<scoped-rules-reminder from=\"assets/nested/AGENTS.md\" scope=\"assets/nested\">" ++
+        "The rules fx added earlier for this folder still apply.</scoped-rules-reminder>";
+    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
+    const completions = [_]FakeCompletion{.{ .content = "Answer" }};
+    const capability_overrides = [_]ModelCapabilityOverride{.{
+        .model = "native/test-vision",
+        .capabilities = .{
+            .image_input_support = .native,
+            .supports_vision = true,
+            .supports_file_input = true,
+        },
+    }};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+
+    // Turn 1 has no image.
+    var first_gateway = FakeGateway.init(alloc, &completions);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.capability_overrides = &capability_overrides;
+    first_hooks.context_enabled = true;
+    first_hooks.context_registry = registry;
+    first_hooks.image_folder_rules = true;
+    var first = fixture.job();
+    first.model = @constCast("native/test-vision");
+    first.prompt = @constCast("Hello there.");
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), first);
+    try expectBodyNotContains(&first_gateway, 0, "IMAGE_FOLDER_RULE");
+    try std.testing.expectEqual(@as(usize, 0), first_hooks.history_turns.items[0].assistant.execution.context_notes.len);
+
+    // Turn 2 attaches an image from a folder the session has not seen. The
+    // request starts with every message turn 1 sent, instructions included,
+    // and the folder's rules end the turn's own message once.
+    var history: std.ArrayList(HistoryTurn) = .empty;
+    defer history.deinit(alloc);
+    try history.append(alloc, first_hooks.history_turns.items[0]);
+    const second_image = try testCapturedImage(alloc, &tmp, image_path, 1);
+    defer types.freeImageAttachment(alloc, second_image);
+    var second_images = [_]types.ImageAttachment{second_image};
+    var second_gateway = FakeGateway.init(alloc, &completions);
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    second_hooks.capability_overrides = &capability_overrides;
+    second_hooks.context_enabled = true;
+    second_hooks.context_registry = registry;
+    second_hooks.image_folder_rules = true;
+    var second = fixture.job();
+    second.model = @constCast("native/test-vision");
+    second.prompt = @constCast("Describe the image.");
+    second.history = history.items;
+    second.images = &second_images;
+    second.authorized_image_catalog = &second_images;
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), second);
+    try std.testing.expectEqual(@as(usize, 1), second_gateway.request_bodies.items.len);
+    try expectPromptStartsWith(alloc, first_gateway.request_bodies.items[0], second_gateway.request_bodies.items[0]);
+    try expectGatewayPromptFinalUserText(&second_gateway, 0, "Describe the image.\n\n" ++ block);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(second_gateway.request_bodies.items[0], "IMAGE_FOLDER_RULE"));
+    try expectBodyNotContains(&second_gateway, 0, image_path);
+    // The saved turn keeps the note at its start, with the file it delivered.
+    const saved = second_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 0), saved.context_notes[0].after_tool_step_count);
+    try std.testing.expectEqualStrings(block, saved.context_notes[0].text);
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes[0].sources.len);
+    try std.testing.expectEqualStrings(rules_path, saved.context_notes[0].sources[0].path);
+    try std.testing.expect(saved.context_notes[0].sources[0].stamp != 0);
+
+    // Turn 3 attaches another image from the same folder. The rules stay in
+    // turn 2's message, which comes back as it was, and this turn's message
+    // ends with a reminder line instead of a second copy.
+    try history.append(alloc, second_hooks.history_turns.items[0]);
+    const third_image = try testCapturedImage(alloc, &tmp, image_path, 2);
+    defer types.freeImageAttachment(alloc, third_image);
+    var third_images = [_]types.ImageAttachment{third_image};
+    var third_gateway = FakeGateway.init(alloc, &completions);
+    defer third_gateway.deinit();
+    var third_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer third_hooks.deinit();
+    third_hooks.capability_overrides = &capability_overrides;
+    third_hooks.context_enabled = true;
+    third_hooks.context_registry = registry;
+    third_hooks.image_folder_rules = true;
+    var third = fixture.job();
+    third.model = @constCast("native/test-vision");
+    third.prompt = @constCast("And this one?");
+    third.history = history.items;
+    third.images = &third_images;
+    third.authorized_image_catalog = &third_images;
+    try runFakePrompt(&third_gateway, &third_hooks, fixture.config(), third);
+    try expectPromptStartsWith(alloc, second_gateway.request_bodies.items[0], third_gateway.request_bodies.items[0]);
+    try expectGatewayPromptFinalUserText(&third_gateway, 0, "And this one?\n\n" ++ reminder);
+    try std.testing.expectEqual(@as(usize, 1), countNeedle(third_gateway.request_bodies.items[0], "IMAGE_FOLDER_RULE"));
+    try std.testing.expectEqual(@as(usize, 1), third_hooks.history_turns.items[0].assistant.execution.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 0), third_hooks.history_turns.items[0].assistant.execution.context_notes[0].sources.len);
+
+    // A host whose images carry no workspace path sends no such note.
+    var plain_gateway = FakeGateway.init(alloc, &completions);
+    defer plain_gateway.deinit();
+    var plain_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer plain_hooks.deinit();
+    plain_hooks.capability_overrides = &capability_overrides;
+    plain_hooks.context_enabled = true;
+    plain_hooks.context_registry = registry;
+    const plain_image = try testCapturedImage(alloc, &tmp, image_path, 1);
+    defer types.freeImageAttachment(alloc, plain_image);
+    var plain_images = [_]types.ImageAttachment{plain_image};
+    var plain = fixture.job();
+    plain.model = @constCast("native/test-vision");
+    plain.prompt = @constCast("Describe the image.");
+    plain.images = &plain_images;
+    plain.authorized_image_catalog = &plain_images;
+    try runFakePrompt(&plain_gateway, &plain_hooks, fixture.config(), plain);
+    try expectBodyNotContains(&plain_gateway, 0, "IMAGE_FOLDER_RULE");
+    try std.testing.expectEqual(@as(usize, 0), plain_hooks.history_turns.items[0].assistant.execution.context_notes.len);
 }
 
 test "processQueuedPrompt recovers when a model rejects post-Vision assistant prefill" {
@@ -4164,10 +4321,11 @@ test "a named skill's text stays in the turn once after an in-turn compaction cu
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[2], "REQUESTED_SKILL_CONTENT"));
     try expectBodyContains(&gateway, 2, "Use $requested-workflow.\\n\\nExplicitly invoked skill content for this query:");
     try std.testing.expectEqualStrings("Completed from the observed result.", hooks.finish_assistant_text.?);
-    // The turn saves the short note in its place.
+    // The turn saves the text as it sent it.
     const saved = hooks.history_turns.items[hooks.history_turns.items.len - 1].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
-    try std.testing.expect(std.mem.startsWith(u8, saved.context_notes[0].text, "<fx-skill-used>"));
+    try std.testing.expect(std.mem.startsWith(u8, saved.context_notes[0].text, "Explicitly invoked skill content for this query:\n"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, saved.context_notes[0].text, "REQUESTED_SKILL_CONTENT"));
 }
 
 test "automatic compaction summarizes a newest exchange larger than the input window" {
@@ -5054,9 +5212,9 @@ test "processQueuedPrompt places transient overlay before history and current pr
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
 
-test "processQueuedPrompt keeps search advertised after an empty search" {
+test "processQueuedPrompt keeps toolbox advertised after an empty search" {
     const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("search_empty", "capability_search", "{\"query\":\"missing capability\"}")};
+    const calls = [_]ToolCall{toolCall("search_empty", "toolbox", "{\"search\":\"missing capability\"}")};
     const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Final" } };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
@@ -5066,8 +5224,8 @@ test "processQueuedPrompt keeps search advertised after an empty search" {
     hooks.exec_plans = &.{.{ .result = .{ .model_output = "{\"state\":\"no_match\",\"skills\":[],\"tools\":[]}" } }};
     var fixture = PromptFixture{};
     var config = fixture.config();
-    config.advertised_tool_names = &.{ "capability_search", "skill" };
-    config.advertised_functions = &.{ builtin_tools.capability_search.model_schema, builtin_tools.skill.model_schema };
+    config.advertised_tool_names = &.{"toolbox"};
+    config.advertised_functions = &.{builtin_tools.toolbox.model_schema};
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
@@ -5077,7 +5235,7 @@ test "processQueuedPrompt keeps search advertised after an empty search" {
         var found = false;
         for (parsed.value.object.get("tools").?.array.items) |tool| {
             const name = tool.object.get("name") orelse continue;
-            if (name == .string and std.mem.eql(u8, name.string, "capability_search")) found = true;
+            if (name == .string and std.mem.eql(u8, name.string, "toolbox")) found = true;
         }
         if (!found) return if (index == 0) error.MissingInitialSearchSchema else error.SearchSchemaLostAfterNoMatch;
     }
@@ -5097,8 +5255,8 @@ test "processQueuedPrompt retains complete skill content without granting ordina
         const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
         defer alloc.free(result_dir);
         const calls = [_]ToolCall{
-            toolCall("skill_one", "skill", "{\"location\":\"/skills/one\"}"),
-            toolCall("skill_two", "skill", "{\"location\":\"/skills/two\"}"),
+            toolCall("skill_one", "toolbox", "{\"open\":\"/skills/one\"}"),
+            toolCall("skill_two", "toolbox", "{\"open\":\"/skills/two\"}"),
         };
         const count: usize = if (case.parallel) 2 else 1;
         const completions = [_]FakeCompletion{
@@ -5118,8 +5276,8 @@ test "processQueuedPrompt retains complete skill content without granting ordina
         var fixture = PromptFixture{};
         var config = fixture.config();
         config.tool_result_dir = result_dir;
-        config.advertised_tool_names = &.{"skill"};
-        config.advertised_functions = &.{builtin_tools.skill.model_schema};
+        config.advertised_tool_names = &.{"toolbox"};
+        config.advertised_functions = &.{builtin_tools.toolbox.model_schema};
         try runFakePrompt(&gateway, &hooks, config, fixture.job());
         try std.testing.expectEqual(count, hooks.executed_names.items.len);
         try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
@@ -8644,13 +8802,220 @@ test "processQueuedPrompt waits for a sign-in after an expired login and resends
     try runFakePrompt(&gateway, &hooks, config, job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try std.testing.expectEqualStrings("Sign-in expired · opening /login", needUserText(&hooks).?);
+    try std.testing.expectEqualStrings("Sign-in expired · waiting 0s · next try in 3m 00s", needUserText(&hooks).?);
     const modes = hooks.credential_refresh_modes.items;
     try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .force, .reload }, modes);
     try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[0]);
     try std.testing.expectEqualStrings("token-after", gateway.request_api_keys.items[1]);
-    // The status line says fx is opening the sign-in; no reason notice.
-    try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
+    // The gateway's reason shows once while fx waits for the sign-in.
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "token expired") != null);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+fn waitingTextStarting(hooks: *const FakeAgentRuntimeDeps, prefix: []const u8) bool {
+    for (hooks.route_recovery_statuses.items) |*status| {
+        if (status.kind == .waiting and std.mem.startsWith(u8, status.text.slice(), prefix)) return true;
+    }
+    return false;
+}
+
+test "processQueuedPrompt resends a login the gateway refuses after a refresh that worked, without a sign-in" {
+    const alloc = std.testing.allocator;
+    const refused = "{\"error\":{\"message\":\"refused for now\"}}";
+    // Two refused waits: the first send and its replay, then the resend
+    // and its replay.
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .content = "accepted answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-after", "token-after", "token-after", "token-after" };
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 5), gateway.request_models.items.len);
+    try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[0]);
+    for (gateway.request_api_keys.items[1..]) |key| try std.testing.expectEqualStrings("token-after", key);
+    // No sign-in: the login just refreshed is good.
+    try std.testing.expect(needUserText(&hooks) == null);
+    try std.testing.expect(waitingTextStarting(&hooks, "Gateway refused the login · next try in "));
+    // Each resend reads the stored login again, and its 401 gets a forced
+    // refresh of its own, so the login is checked again on every resend.
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .force, .reload, .force, .reload }, hooks.credential_refresh_modes.items);
+    // The reason shows once, not once per resend.
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
+    try std.testing.expect(std.mem.find(u8, hooks.system_notices.items[0], "refused for now") != null);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt waits for a sign-in when a refused login's refresh stops working" {
+    const alloc = std.testing.allocator;
+    const refused = "{\"error\":{\"message\":\"refused for now\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .content = "signed in answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-after" };
+    // The first forced refresh works; the refresh token is revoked before
+    // the resend, so the second finds nothing.
+    hooks.credential_refresh_force_successes = 1;
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    hooks.continue_on_need_user = &continue_flag;
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
+    try std.testing.expect(waitingTextStarting(&hooks, "Gateway refused the login · next try in "));
+    const asked = needUserText(&hooks) orelse return error.TestExpectedSignInWait;
+    try std.testing.expect(std.mem.startsWith(u8, asked, "Sign-in expired · waiting "));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(runtime_deps.CredentialRefreshMode, hooks.credential_refresh_modes.items, &.{.force}));
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt waits for a sign-in on a subscription 401 after a refresh that worked" {
+    const alloc = std.testing.allocator;
+    for ([_]types.CredentialSource{ .chatgpt_subscription, .grok_subscription }) |source| {
+        const refused = "{\"error\":{\"message\":\"subscription refused\"}}";
+        const completions = [_]FakeCompletion{
+            .{ .status = .unauthorized, .err_body = refused },
+            .{ .status = .unauthorized, .err_body = refused },
+            .{ .content = "signed in answer" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.credential_refresh_tokens = &.{ "token-before", "token-after" };
+        var fixture = PromptFixture{};
+        var continue_flag: std.atomic.Value(bool) = .init(false);
+        hooks.continue_on_need_user = &continue_flag;
+        var config = fixture.config();
+        config.recovery_continue_flag = &continue_flag;
+        var job = fixture.job();
+        job.credential_source = source;
+
+        try runFakePrompt(&gateway, &hooks, config, job);
+
+        // Only an fx login on AI Gateway retries a refused login; a
+        // subscription signs in again, as before, and shows no provider
+        // error while it waits.
+        try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+        try std.testing.expect(!waitingTextStarting(&hooks, "Gateway refused the login"));
+        try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
+        const asked = needUserText(&hooks) orelse return error.TestExpectedSignInWait;
+        try std.testing.expect(std.mem.startsWith(u8, asked, "Sign-in expired · waiting "));
+        try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    }
+}
+
+test "processQueuedPrompt resends after a sign-in during a sign-in resend that then gets a gateway error" {
+    const alloc = std.testing.allocator;
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = "{\"error\":{\"message\":\"token expired\"}}" },
+        // The wait's own resend: the user signs in while it is on the wire,
+        // and the gateway answers 503.
+        .{ .status = .service_unavailable, .err_body = "{\"error\":{\"message\":\"try later\"}}", .set_before_answer = &continue_flag },
+        .{ .content = "answer after the sign-in" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{"token-before"};
+    hooks.credential_refresh_fail_force = true;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt ends the turn on a refused login after a refresh when the host cannot ask" {
+    const alloc = std.testing.allocator;
+    const refused = "{\"error\":{\"message\":\"refused for now\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .status = .unauthorized, .err_body = refused },
+        .{ .content = "MUST_NOT_RUN" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-after" };
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try std.testing.expect(!waitingTextStarting(&hooks, "Gateway refused the login"));
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt waiting for a sign-in resends on its own and finishes when the login works again" {
+    const alloc = std.testing.allocator;
+    const expired = "{\"error\":{\"message\":\"token expired\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = expired },
+        .{ .status = .unauthorized, .err_body = expired },
+        .{ .content = "answer once the login works" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{"token-before"};
+    // No refresh works and nobody signs in: only the timed resends happen.
+    hooks.credential_refresh_fail_force = true;
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, needUserText(&hooks).?, "Sign-in expired · waiting "));
+    // The timed resends kept the sign-in status: no retry status between them.
+    for (hooks.route_recovery_statuses.items) |*status| {
+        try std.testing.expect(status.kind != .retrying);
+    }
+    // The reason shows once across both waits.
+    try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
@@ -9030,6 +9395,125 @@ test "processQueuedPrompt preserves provider state during silent-tool continuati
     const steps = hooks.history_turns.items[0].assistant.execution.tool_steps;
     try std.testing.expectEqual(@as(usize, 3), steps.len);
     try std.testing.expectEqualStrings(StateObserver.state, steps[2].provider_replay.?.parts_json);
+}
+
+// A model that takes no cache markers, so request bodies compare as sent.
+const unmarked_model = "openai/gpt-oss-120b";
+const continuation_prompt = "Summarize what you just did.";
+const empty_reply_prompt = "Your last reply had no text and no tool call.";
+const reasoning_only_state =
+    "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"opaque\"}}}]";
+
+/// Runs a turn on `completions`, whose request number `last_request` ends it
+/// and carries `prompt`. Then runs a second turn over the history the first
+/// saved, and fails unless the second turn's first request opens with all of
+/// that request: the provider's prompt cache still covers it.
+fn expectNextTurnExtendsLastRequest(
+    completions: []const FakeCompletion,
+    last_request: usize,
+    prompt: []const u8,
+) !void {
+    const alloc = std.testing.allocator;
+    var gateway = FakeGateway.init(alloc, completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(unmarked_model);
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(last_request + 1, gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, last_request, prompt);
+
+    const next_completions = [_]FakeCompletion{.{ .content = "Second answer" }};
+    var next_gateway = FakeGateway.init(alloc, &next_completions);
+    defer next_gateway.deinit();
+    var next_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer next_hooks.deinit();
+    var next_fixture = PromptFixture{};
+    var next_job = next_fixture.job();
+    next_job.model = @constCast(unmarked_model);
+    next_job.prompt = @constCast("second prompt");
+    next_job.history = hooks.history_turns.items;
+
+    try runFakePrompt(&next_gateway, &next_hooks, next_fixture.config(), next_job);
+
+    try std.testing.expectEqual(@as(usize, 1), next_gateway.request_bodies.items.len);
+    try test_support.expectPromptExtends(
+        gateway.request_bodies.items[last_request],
+        next_gateway.request_bodies.items[0],
+    );
+}
+
+test "the next turn extends the request that carried the continuation after a blank reply" {
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .tool_calls = &call_two },
+        .{ .content = " \n" },
+        .{ .content = "Summary" },
+    };
+    try expectNextTurnExtendsLastRequest(&completions, 3, continuation_prompt);
+}
+
+test "the next turn extends the request that carried the continuation after a reasoning-only reply" {
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .tool_calls = &call_two },
+        .{ .content = " \n", .provider_state_json = reasoning_only_state },
+        .{ .content = "Summary" },
+    };
+    try expectNextTurnExtendsLastRequest(&completions, 3, continuation_prompt);
+}
+
+test "the next turn extends a request after the continuation, when tool calls followed it" {
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const call_two = [_]ToolCall{toolCall("call_2", "read_file", "{\"path\":\"b\"}")};
+    const call_three = [_]ToolCall{toolCall("call_3", "read_file", "{\"path\":\"c\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .tool_calls = &call_two },
+        .{ .content = " \n" },
+        .{ .tool_calls = &call_three },
+        .{ .content = "Summary" },
+    };
+    try expectNextTurnExtendsLastRequest(&completions, 4, continuation_prompt);
+}
+
+test "the next turn extends the request that carried the assistant-prefill recovery" {
+    const calls = [_]ToolCall{toolCall("call_bad_prefill", "read_file", "{\"path\":\"a\",}")};
+    const prefill_rejection =
+        "{\"error\":{\"message\":\"AI_APICallError: This model does not support " ++
+        "assistant message prefill. The conversation must end with a user message.\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .status = .bad_request, .err_body = prefill_rejection },
+        .{ .content = "Recovered after malformed call" },
+    };
+    try expectNextTurnExtendsLastRequest(&completions, 2, "Continue from the preceding tool result.");
+}
+
+test "the next turn extends the request that carried the empty-reply nudge on the first request" {
+    const completions = [_]FakeCompletion{
+        .{ .finish_reason = .other },
+        .{ .content = "Answer" },
+    };
+    try expectNextTurnExtendsLastRequest(&completions, 1, empty_reply_prompt);
+}
+
+test "the next turn extends the request that carried the empty-reply nudge after a tool step" {
+    const call_one = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &call_one },
+        .{ .finish_reason = .other },
+        .{ .content = "Answer" },
+    };
+    try expectNextTurnExtendsLastRequest(&completions, 2, empty_reply_prompt);
 }
 
 test "completed assistant provider replay survives turn materialization" {

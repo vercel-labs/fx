@@ -34,6 +34,7 @@ pub const login_options = [_]command_specs.OptionDoc{
 };
 
 pub const sessions_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--live", .description = "List only the sessions an fx process has open now, with their subagents" },
     .{ .flag = "--all", .description = "List saved sessions across every workspace in this profile" },
     .{ .flag = "--limit <1-100>", .description = "Set the maximum sessions returned per page" },
     .{ .flag = "--cursor <cursor>", .description = "Continue from a prior sessions result" },
@@ -45,6 +46,13 @@ pub const sessions_convert_options = [_]command_specs.OptionDoc{json_option};
 pub const usage_options = [_]command_specs.OptionDoc{
     .{ .flag = "--period <today|7d|month>", .description = "Select the period, in UTC days (default: month)" },
     json_option,
+};
+
+/// Options for `fx doctor`. Its parser in `src/core/cli/cli_surface.zig`
+/// reads this list, so help and parsing can't disagree.
+pub const doctor_options = [_]command_specs.OptionDoc{
+    json_option,
+    .{ .flag = "--fix", .description = "Remove old terminal and side folders whose session is gone" },
 };
 
 pub const upgrade_options = [_]command_specs.OptionDoc{
@@ -91,6 +99,7 @@ const session_subcommands = [_]command_specs.SubcommandDoc{
 
 pub const session_options = [_]command_specs.OptionDoc{
     .{ .flag = "--id <id>", .description = "Inspect a saved session by exact id" },
+    .{ .flag = "--tail <1-1000>", .description = "Show only the last turns, each under its own number" },
     json_option,
 };
 
@@ -339,9 +348,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .doctor,
         .token = "doctor",
-        .usage = "doctor [--json]",
-        .summary = "Run local health and preflight checks",
-        .options = &.{json_option},
+        .usage = "doctor [--json] [--fix]",
+        .summary = "Check that fx can work here, with a fix for each problem",
+        .options = &doctor_options,
     },
     .{
         .kind = .teams,
@@ -352,18 +361,25 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .session,
         .token = "session",
-        .usage = "session <last|id>|--id <id> [--json] | session resume [last|<id>] | session recover <id>|--id <id> [--json]",
+        .usage = "session <last|id|id/agent>|--id <id> [--tail <1-1000>] [--json] | session resume [last|<id>] | session recover <id>|--id <id> [--json]",
         .summary = "Inspect, resume, or recover saved sessions",
         .subcommands = &session_subcommands,
         .options = &session_options,
+        .details = &.{
+            "<id>/<agent> reads a subagent by the name its parent gave it, and <id>/<agent>/<agent> that subagent's own; fx sessions --live lists them.",
+            "Reading takes no lock, so it works while another fx has the session open. --tail shows finished turns; the one in progress is not saved yet.",
+        },
     },
     .{
         .kind = .sessions,
         .token = "sessions",
-        .usage = "sessions [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions convert [--json]",
+        .usage = "sessions [--all] [--limit <1-100>] [--cursor <cursor>] [--json] | sessions --live [--all] [--json] | sessions convert [--json]",
         .summary = "List saved sessions for the current workspace",
         .subcommands = &.{.{ .usage = "convert", .description = "Convert every session saved in the previous format", .options = &sessions_convert_options }},
         .options = &sessions_options,
+        .details = &.{
+            "--live shows each session's state (working or idle), the model saved with it, and its subagents with the <id>/<agent> address fx session reads them by.",
+        },
     },
     .{
         .kind = .@"resume",
@@ -512,6 +528,7 @@ pub const launch_wide_options = [_]command_specs.OptionDoc{
     .{ .flag = "--context-limit <spec>", .description = "" },
     .{ .flag = "--add-dir <path>", .description = "" },
     .{ .flag = "--no-additional-dirs", .description = "" },
+    .{ .flag = "--tool-placement <spec>", .description = "" },
 };
 
 /// The flags `fx` reads before a command or an interactive launch, in the
@@ -570,6 +587,10 @@ pub const top_level_flags = [_]TopLevelFlag{
     .{
         .usage = "--no-additional-dirs",
         .description = "Ignore saved additional directories",
+    },
+    .{
+        .usage = "--tool-placement <spec>",
+        .description = "Move a built-in tool: tool=toolbox or tool=direct; repeatable",
     },
     .{
         .usage = "--provider <name>",

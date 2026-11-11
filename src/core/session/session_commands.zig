@@ -161,6 +161,7 @@ fn postCommitResolutionError(
             .invalid_model_id => return error.InvalidModelValue,
             .retired_skill_match_fuzzy => return error.InvalidSettingsFormat,
             .invalid_context_limits => return error.InvalidSettingsFormat,
+            .invalid_tool_placement => return error.InvalidSettingsFormat,
             .invalid_additional_directories => return error.InvalidSettingsFormat,
             .invalid_skill_symlink_authorities,
             .invalid_ultrafast_mode_override,
@@ -899,7 +900,7 @@ pub fn Commands(comptime App: type) type {
                 },
             );
 
-            if (persist) {
+            if (persist and savesModeChange(app, agent, "fast")) {
                 try persistPreferenceTargets(
                     app,
                     agent,
@@ -958,7 +959,7 @@ pub fn Commands(comptime App: type) type {
                 },
             );
 
-            if (persist) {
+            if (persist and savesModeChange(app, agent, "ultrafast")) {
                 try persistPreferenceTargets(
                     app,
                     agent,
@@ -1367,6 +1368,19 @@ pub fn Commands(comptime App: type) type {
                 "model",
                 !announce,
             );
+        }
+
+        /// Whether a `/fast` or `/ultrafast` change is saved. Each saves the
+        /// model it is bound to, so while `agent` runs the model a run flag
+        /// chose, the change lasts for this run only.
+        fn savesModeChange(app: *App, agent: *AppAgent, label: []const u8) bool {
+            if (!provider_runtime.runsProcessModel(app, agent)) return true;
+            debug_trace.logf(
+                "session",
+                "{s} mode not saved: model={s} is this run's --model, --provider, or FX_MODEL choice",
+                .{ label, provider_runtime.modelOf(app, agent) },
+            );
+            return false;
         }
 
         fn persistPreferenceTargets(

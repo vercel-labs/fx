@@ -23,7 +23,9 @@
 # runtime block stay as the session started and a change rides on the message where fx
 # noticed it. p6-mutant-overlay-rebuilt.cfg follows the current values on every request,
 # as fx did, and p6-mutant-overlay-not-saved.cfg recaptures them when fx restarts;
-# MidSessionKeepsHistory catches both. p6-implicit-context.cfg checks that
+# MidSessionKeepsHistory catches both. p6-mutant-skill-swapped.cfg swaps a named
+# skill's text for a short note on the next turn, as fx did, which
+# MidSessionKeepsHistory catches. p6-implicit-context.cfg checks that
 # with a change carried on a message, even a family fx sends no markers to
 # reads the stable instructions after it, which openai-current-context.cfg
 # shows fx did not before.
@@ -86,4 +88,5 @@ MCPromptCache p6-overlay - -deadlock
 MCPromptCache p6-openai-overlay - -deadlock
 MCPromptCache p6-mutant-overlay-rebuilt MidSessionKeepsHistory -deadlock
 MCPromptCache p6-mutant-overlay-not-saved MidSessionKeepsHistory -deadlock
+MCPromptCache p6-mutant-skill-swapped MidSessionKeepsHistory -deadlock
 EOT

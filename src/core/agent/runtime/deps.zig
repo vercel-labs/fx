@@ -190,6 +190,12 @@ pub const AgentRuntimeDeps = struct {
     tool_registry: tool_dispatch.Registry = .{},
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
+    /// True where a turn's images are files the user named by path, as in the
+    /// TUI and `fx ask`. The rules of each image's folder then reach the model
+    /// the way a tool call's do: a note on the turn's own message, so the
+    /// instructions stay as they were cached. Hosts whose images carry no
+    /// workspace path leave it false.
+    image_folder_rules: bool = false,
     live_tool_authority: ?LiveToolAuthorityProvider = null,
     /// Samples host-owned root permission mode at an action boundary.
     snapshot_root_permission_mode: ?*const fn (ctx: *anyopaque) PermissionMode = null,
@@ -212,7 +218,6 @@ pub const AgentRuntimeDeps = struct {
     /// advertise. A returned definition is advertised before admission, so
     /// the call runs under the normal MCP validation and permission path.
     resolve_unselected_mcp_tool: ?*const fn (ctx: *anyopaque, arena: Allocator, name: []const u8) anyerror!?@import("../../tooling/tool_mcp_runtime.zig").SelectedTool = null,
-    prepare_skill_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) anyerror!skill_contract.CallPreparation = null,
     check_tool_availability: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 = null,
     request_tool_permission: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, revalidation: ?tool_contracts.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) anyerror!command_admission.PermissionOutcome,
     /// Admission consumes `prepared`; callers must not retry the same value through the raw callback.

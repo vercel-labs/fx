@@ -28,6 +28,13 @@ const catalogDelayMs = Math.max(
   Number(process.env.FX_MCP_CATALOG_DELAY_MS ?? "0") || 0,
 );
 const compactField = process.env.FX_MCP_COMPACT_FIELD ? JSON.parse(process.env.FX_MCP_COMPACT_FIELD) : null;
+// FX_MCP_CALL_DELAY_MS holds each tools/call that long before answering it,
+// so a test with a short operation_timeout_ms can land just before or just
+// after the deadline. FX_MCP_CATALOG_DELAY_MS does the same for discovery.
+const callDelayMs = Math.max(
+  0,
+  Number(process.env.FX_MCP_CALL_DELAY_MS ?? "0") || 0,
+);
 const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/connect";
 const collidingChoices = [
   { const: "Skip", title: "Skip" },
@@ -37,6 +44,21 @@ const collidingChoices = [
   { const: "escape-raw", title: "Collision\u001b[2J" },
   { const: "escape-literal", title: "Collision\\x1b[2J" },
 ];
+// typed_arguments: a tool whose fields have other types than string, checked
+// on each call the way strict servers such as Datadog's do, with a -32602
+// error that names the first field of the wrong type.
+const typedArgumentsSchema = {
+  type: "object",
+  properties: {
+    text: { type: "string" },
+    limit: { type: "number" },
+    count: { type: "integer" },
+    verbose: { type: "boolean" },
+    queries: { type: "array", items: { oneOf: [{ type: "string" }, { type: "object" }] } },
+    filter: { type: "object" },
+    either: { type: ["string", "number"] },
+  },
+};
 const recoveryGeneration = crashMarkerPath ? existsSync(crashMarkerPath) : false;
 const stallRecovery = mode === "block_then_stall_recovery" && recoveryGeneration;
 let currentToolName = recoveryGeneration ? recoveredToolName : initialToolName;
@@ -85,6 +107,28 @@ function log(message) {
       `${JSON.stringify({ pid: process.pid, message })}\n`,
     );
   }
+}
+
+function jsonType(value) {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  if (typeof value === "number") return Number.isInteger(value) ? "integer" : "number";
+  return typeof value;
+}
+
+// The first field whose value isn't of its schema's type, worded as the Go MCP
+// SDK's validator words it, or null when every field fits.
+function typedArgumentMismatch(args) {
+  for (const [field, value] of Object.entries(args)) {
+    const want = typedArgumentsSchema.properties[field]?.type;
+    if (want === undefined) continue;
+    const wanted = Array.isArray(want) ? want : [want];
+    const actual = jsonType(value);
+    if (wanted.includes(actual) || (actual === "integer" && wanted.includes("number"))) continue;
+    return `validating "arguments": validating root: validating /properties/${field}: ` +
+      `type: ${JSON.stringify(value)} has type "${actual}", want ${JSON.stringify(want)}`;
+  }
+  return null;
 }
 
 // Requests that can elicit carry exactly the declared capabilities; any other
@@ -291,11 +335,13 @@ function handle(message) {
           : [{
               name: currentToolName,
               description: "Echo text through the modern MCP fixture",
-              inputSchema: {
-                type: "object",
-                properties: { text: { type: "string" } },
-                required: ["text"],
-              },
+              inputSchema: mode === "typed_arguments"
+                ? typedArgumentsSchema
+                : {
+                    type: "object",
+                    properties: { text: { type: "string" } },
+                    required: ["text"],
+                  },
               ...(mode === "tool_failure"
                 ? {
                     outputSchema: {
@@ -583,6 +629,21 @@ function handle(message) {
   }
   if (message.method === "tools/call") {
     if (mode === "stall_operation") return;
+    if (mode === "typed_arguments") {
+      const args = message.params?.arguments ?? {};
+      const mismatch = typedArgumentMismatch(args);
+      send(mismatch
+        ? { jsonrpc: "2.0", id: message.id, error: { code: -32602, message: mismatch } }
+        : {
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              resultType: "complete",
+              content: [{ type: "text", text: `TYPED_ARGUMENTS_OK:${JSON.stringify(args)}` }],
+            },
+          });
+      return;
+    }
     if (mode === "image_result") {
       send({
         jsonrpc: "2.0",
@@ -876,6 +937,12 @@ process.stdin.on("data", (chunk) => {
     if (lineEnd < 0) return;
     const line = buffer.subarray(0, lineEnd).toString("utf8").replace(/\r+$/, "");
     buffer = buffer.subarray(lineEnd + 1);
-    if (line.length > 0) handle(JSON.parse(line));
+    if (line.length === 0) continue;
+    const message = JSON.parse(line);
+    if (callDelayMs > 0 && message.method === "tools/call") {
+      setTimeout(() => handle(message), callDelayMs);
+    } else {
+      handle(message);
+    }
   }
 });

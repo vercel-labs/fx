@@ -181,6 +181,32 @@ test "a login file another fx deletes after this one opened it is none" {
     try std.testing.expectEqual(@as(?anyerror, null), Logout.failed);
 }
 
+test "a login file another fx replaces after every open is given up after the last open" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "auth.json", .data = "old", .flags = .{ .permissions = .fromMode(0o600) } });
+    // Another fx saves a new login over it after each open.
+    const Saves = struct {
+        var count: usize = 0;
+        var failed: ?anyerror = null;
+        fn run(dir: std.Io.Dir, name: []const u8) void {
+            count += 1;
+            dir.writeFile(std.testing.io, .{ .sub_path = "auth.json.new", .data = "new", .flags = .{ .permissions = .fromMode(0o600) } }) catch |err| {
+                failed = err;
+                return;
+            };
+            dir.rename("auth.json.new", dir, name, std.testing.io) catch |err| {
+                failed = err;
+            };
+        }
+    };
+
+    try std.testing.expectError(error.LoginFileKeptChanging, openCurrentWith(tmp.dir, "auth.json", Saves.run));
+    try std.testing.expectEqual(@as(?anyerror, null), Saves.failed);
+    try std.testing.expectEqual(@as(usize, max_opens), Saves.count);
+}
+
 test "missing native profile root is unavailable" {
     try std.testing.expectEqual(
         host.SecretStorePresence.unavailable,

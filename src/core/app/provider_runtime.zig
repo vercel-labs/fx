@@ -102,6 +102,16 @@ pub fn modelOf(app: anytype, agent: anytype) []const u8 {
     @compileError("app must own provider_selection");
 }
 
+/// Whether `agent` runs the model `--model`, `--provider`, or `FX_MODEL`
+/// chose for this run, not one picked since with `/model`.
+pub fn runsProcessModel(app: anytype, agent: anytype) bool {
+    const App = @TypeOf(app.*);
+    if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
+    if (comptime !@hasField(@FieldType(@FieldType(App, "main_agent"), "session_persistence"), "process_model_override")) return false;
+    const override = agent.session_persistence.process_model_override orelse return false;
+    return std.mem.eql(u8, modelOf(app, agent), override);
+}
+
 /// Whether `App` runs subagents whose model choice is their own.
 fn tracksSubagentPreferences(comptime App: type) bool {
     if (!@hasField(App, "main_agent") or !@hasField(App, "screen_owner")) return false;
@@ -196,6 +206,30 @@ pub fn replaceSelection(
         return replaceModel(app, value);
     }
     @compileError("app must own provider_selection");
+}
+
+test "runsProcessModel holds only while the agent runs the run's model" {
+    const alloc = std.testing.allocator;
+    const TestAgent = struct {
+        session_persistence: struct { process_model_override: ?[]u8 = null } = .{},
+    };
+    const TestApp = struct {
+        main_agent: TestAgent = .{},
+        selected_model: std.ArrayList(u8) = .empty,
+    };
+    var app = TestApp{};
+    defer app.selected_model.deinit(alloc);
+    try app.selected_model.appendSlice(alloc, "run/model");
+    try std.testing.expect(!runsProcessModel(&app, &app.main_agent));
+
+    var override = "run/model".*;
+    app.main_agent.session_persistence.process_model_override = &override;
+    try std.testing.expect(runsProcessModel(&app, &app.main_agent));
+
+    // A model picked since with /model is the user's own.
+    app.selected_model.clearRetainingCapacity();
+    try app.selected_model.appendSlice(alloc, "chosen/model");
+    try std.testing.expect(!runsProcessModel(&app, &app.main_agent));
 }
 
 test "provider runtime adopts an owned selection without a fallible publication" {

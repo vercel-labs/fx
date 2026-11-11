@@ -25,7 +25,6 @@ const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const io_mod = @import("../shared/io.zig");
 const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
-const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const permission_gate = @import("../permissions/permission_gate.zig");
 const permissions = @import("../permissions/permissions.zig");
 const prompt_policy_contract = @import("../config/prompt_policy.zig");
@@ -500,13 +499,26 @@ pub fn Runtime(comptime App: type) type {
             ctx.model_override_resolver = app_callbacks.Bindings(App).modelOverrideResolver(agent);
             // An instance whose profile names its MCP servers uses only those.
             // A subagent's run replaces this with its own view below.
-            if (comptime agents.hasAgentField(App, "profile") and agents.hasAgentField(App, "role")) {
-                if (agent.role == .instance and profiles.setsMcpServers(&agent.profile.profile)) {
-                    ctx.mcp_access = .{ .servers = .{ .context = @ptrCast(&agent.profile.profile), .allows_fn = profileAllowsMcpServer } };
-                }
+            if (instanceMcpProfile(agent)) |profile| {
+                ctx.mcp_access = .{ .servers = .{ .context = @ptrCast(profile), .allows_fn = profileAllowsMcpServer } };
             }
             if (childRun(agent)) |run| applyChildToolContext(app, &ctx, run);
             return ctx;
+        }
+
+        /// The profile of an instance that names its MCP servers; null otherwise.
+        fn instanceMcpProfile(agent: *const AppAgent) ?*const profiles.Profile {
+            if (comptime !(agents.hasAgentField(App, "profile") and agents.hasAgentField(App, "role"))) return null;
+            if (agent.role != .instance or !profiles.setsMcpServers(&agent.profile.profile)) return null;
+            return &agent.profile.profile;
+        }
+
+        /// The servers in `names` that `profile` allows; all of them without one.
+        fn allowedMcpServers(arena: Allocator, names: []const []const u8, profile: ?*const profiles.Profile) ![]const []const u8 {
+            const value = profile orelse return names;
+            var kept: std.ArrayList([]const u8) = .empty;
+            for (names) |name| if (profiles.allowsMcpServer(value, name)) try kept.append(arena, name);
+            return kept.items;
         }
 
         /// Whether the instance profile at `raw` allows MCP server `server`.
@@ -674,6 +686,19 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) !?[]const u8 {
             const ctx = toolContext(app, agent, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
+            // A wait, or a status that names no agent, concerns every
+            // subagent this agent runs, so its row names them as its host
+            // lists them now: `waiting for reviewer, builder`.
+            if (try tool_presentation.subagentRoster(arena, call)) |roster| {
+                const subagent_host = ctx.subagent_host orelse return null;
+                return subagent_host.rosterNames(arena, roster == .working) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => blk: {
+                        debug_trace.logf("subagent", "roster unavailable for row call_id={s} err={s}", .{ call.id, @errorName(err) });
+                        break :blk null;
+                    },
+                };
+            }
             return tool_presentation.resolveTerminalDisplayTarget(
                 arena,
                 ctx.tool_registry,
@@ -1018,35 +1043,9 @@ pub fn Runtime(comptime App: type) type {
             try app.contextRegistry().appendDefaultStatic(.{
                 .project_context = modelVisibleProjectContext(app, agent),
             }, arena, messages);
-            var report = if (comptime @hasDecl(App, "snapshotMcpModelCatalog"))
-                try app.snapshotMcpModelCatalog(arena)
-            else
-                mcp_model_catalog.Report{ .snapshot = try mcp_model_catalog.Snapshot.empty(arena) };
-            // The request arena retains the change notice, which outlives this
-            // function inside `messages`; only the snapshot names are released.
-            defer report.snapshot.deinit(arena);
-            const section = try mcp_model_catalog.render(arena, report.snapshot);
-            if (section.text.len > 0) {
-                try messages.append(arena, .{ .role = .system, .content = section.text });
-            }
-            if (report.change_notice) |notice| {
-                try messages.append(arena, .{ .role = .system, .content = notice });
-            }
-            if (section.notice) |notice| try pushMcpModelCatalogNotice(app, agent, notice);
-        }
-
-        fn pushMcpModelCatalogNotice(app: *App, agent: *AppAgent, notice: []const u8) !void {
-            if (comptime @hasDecl(@TypeOf(agent.session), "claimContextNotice")) {
-                if (!try agent.session.claimContextNotice(std.heap.c_allocator, notice)) return;
-            }
-            const body = try types.renderContextNoticeBody(std.heap.c_allocator, notice);
-            defer std.heap.c_allocator.free(body);
-            try app_worker_runtime.Runtime(App).pushSemanticNotice(app, agent, .{
-                .topic = "context",
-                .tone = .warning,
-                .body = body,
-                .visibility = .full_only,
-            });
+            // The toolbox menu lists the MCP servers (config.toolbox_mcp_servers),
+            // so there is no MCP block here, and no per-request status that
+            // would change what earlier requests sent.
         }
 
         pub fn appendTransientRuntimeContextMessage(
@@ -1087,7 +1086,11 @@ pub fn Runtime(comptime App: type) type {
             }, arena, messages);
         }
 
-        pub fn refreshProjectContext(app: *App, agent: *AppAgent, targets: []const context_contract.ApplicableTarget) context_contract.ProviderError!void {
+        /// Gathers the instructions' project context for the next turn. It
+        /// names no target: rules for a folder a turn reaches arrive as notes
+        /// in the conversation, never here, so the instructions do not change
+        /// from turn to turn.
+        pub fn refreshProjectContext(app: *App, agent: *AppAgent) context_contract.ProviderError!void {
             agent.context_snapshot.deinit(app.alloc);
             if (!app.context_enabled) return;
 
@@ -1095,7 +1098,6 @@ pub fn Runtime(comptime App: type) type {
             agent.context_snapshot = app.contextRegistry().gatherDefaultSnapshot(app.alloc, .{
                 .workspace_root = workspace.root,
                 .access_scope = workspace.access_scope,
-                .targets = targets,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             }) catch |err| {
                 debug_trace.logf("context", "gather failed err={s}", .{@errorName(err)});
@@ -1204,6 +1206,14 @@ pub fn Runtime(comptime App: type) type {
                 &tool_projection,
                 session_child_capability,
             );
+            // The toolbox menu lists the MCP servers the agent may call, by name.
+            var toolbox_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer toolbox_arena_state.deinit();
+            if (comptime @hasDecl(App, "mcpServerNames")) {
+                const toolbox_arena = toolbox_arena_state.allocator();
+                config.toolbox_mcp_servers = try allowedMcpServers(toolbox_arena, try app.mcpServerNames(toolbox_arena), instanceMcpProfile(agent));
+            }
+            if (comptime @hasField(App, "toolbox_behind")) config.toolbox_behind = app.toolbox_behind.slice();
             // A subagent is shown only the built-in tools its run was admitted
             // with, the ones its live authority lets it call.
             var child_tools = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -1633,6 +1643,7 @@ pub fn Runtime(comptime App: type) type {
                 .auto_compact_percent = job.agent_settings.auto_compact_percent,
                 .cancel_flag = &agent.worker.worker_cancel_requested,
                 .recovery_continue_flag = &agent.worker.recovery_continue_requested,
+                .recovery_sign_in_closed_flag = &agent.worker.recovery_sign_in_closed,
                 .review_enabled = false,
                 .fast_mode = job.agent_settings.fast_mode,
                 .ultrafast_mode = job.agent_settings.ultrafast_mode,
@@ -1699,7 +1710,11 @@ fn formatToolAction(
             display_target orelse spec.label_arg_default,
         );
     }
-    if (try tool_presentation.subagentAction(arena, call, switch (state) {
+    // The subagents a call that concerns them all names reach its row as
+    // the call's resolved target.
+    var subagent_call = call;
+    if (display_target) |target| subagent_call.resolved_display_target = target;
+    if (try tool_presentation.subagentAction(arena, subagent_call, switch (state) {
         .active => .active,
         .completed => .completed,
         .denied => .{ .stopped = denied_label.? },
@@ -1714,7 +1729,6 @@ fn formatToolAction(
     const presentation = tool_dispatch.presentationForArgs(spec.*, args);
     const value = display_target orelse
         call.resolved_display_target orelse
-        tool_presentation.resolvedSkillName(call, presentation) orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
     return formatToolActionValue(arena, presentationLabel(presentation, state, denied_label), value);
@@ -1812,7 +1826,6 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.web_search,
     test_builtin_tools.shell,
     test_builtin_tools.grep_files,
-    test_builtin_tools.skill,
     test_builtin_tools.install_skill,
     test_builtin_tools.subagent,
 };
@@ -1871,14 +1884,12 @@ const test_prompt_policy = prompt_policy_contract.Policy{
 };
 
 var refresh_gather_calls: usize = 0;
-var refresh_targets_match: bool = false;
+var refresh_named_target: bool = false;
 var refresh_gather_error: context_contract.ProviderError = error.WriteFailed;
 
 fn gatherFreshProjectContext(alloc: Allocator, input: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
     refresh_gather_calls += 1;
-    refresh_targets_match = input.targets.len == 1 and
-        input.targets[0].kind == .file and
-        std.mem.eql(u8, input.targets[0].path, "/tmp/workspace/images/example.png");
+    refresh_named_target = input.targets.len != 0;
     const content = try alloc.print("fresh:{s}", .{input.workspace_root});
     errdefer alloc.free(content);
     const notices = try alloc.alloc([]u8, 1);
@@ -2008,7 +2019,6 @@ const FakeApp = struct {
     mcp_name: []const u8 = "mcp_lookup",
     mcp_has_tool_calls: usize = 0,
     mcp_result: []const u8 = "{\"ok\":true}",
-    mcp_change_notice: ?[]const u8 = null,
     diff_blocks: usize = 0,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
@@ -2049,14 +2059,8 @@ const FakeApp = struct {
         return self.context_registry;
     }
 
-    pub fn snapshotMcpModelCatalog(
-        self: *FakeApp,
-        alloc: Allocator,
-    ) !mcp_model_catalog.Report {
-        return .{
-            .snapshot = try mcp_model_catalog.Snapshot.empty(alloc),
-            .change_notice = if (self.mcp_change_notice) |notice| try alloc.dupe(u8, notice) else null,
-        };
+    pub fn mcpServerNames(_: *FakeApp, _: Allocator) ![]const []const u8 {
+        return &.{};
     }
 
     fn promptPolicy(_: *const FakeApp, _: anytype) prompt_policy_contract.Policy {
@@ -2772,80 +2776,6 @@ test "provider search labels use search wording and generic fallback" {
     try std.testing.expect(std.mem.find(u8, completed, "web") != null);
 }
 
-test "tool labels preserve skill name value" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-
-    const selected: @import("../skills/skill_contract.zig").PreparedSkill = .{ .skill = .{
-        .name = "selected-workflow",
-        .description = "",
-        .path = "/skills/different-directory",
-        .source = .workspace_fx,
-    } };
-    const selected_call: ToolCall = .{
-        .id = "selected",
-        .name = "skill",
-        .arguments_json = "{\"location\":\"skill:0000000000000001:0/different-directory\"}",
-        .resolved_skill = &selected,
-    };
-    const selected_active = try app.describeToolAction(app.agent(), arena, selected_call);
-    try std.testing.expect(std.mem.find(u8, selected_active, "selected-workflow") != null);
-    const selected_completed = try app.describeToolActionCompleted(app.agent(), arena, selected_call);
-    try std.testing.expect(std.mem.find(u8, selected_completed, "selected-workflow") != null);
-
-    var selected_resource = selected_call;
-    selected_resource.arguments_json = "{\"location\":\"/skills/different-directory\",\"resource\":\"references/rules.md\"}";
-    const selected_resource_completed = try app.describeToolActionCompleted(app.agent(), arena, selected_resource);
-    try std.testing.expect(std.mem.find(u8, selected_resource_completed, "Read skill resource") != null);
-    try std.testing.expect(std.mem.find(u8, selected_resource_completed, "references/rules.md") != null);
-
-    const skill_call: ToolCall = .{
-        .id = "skill",
-        .name = "skill",
-        .arguments_json = "{\"name\":\"workflow\"}",
-    };
-    const active = try app.describeToolAction(app.agent(), arena, skill_call);
-    try std.testing.expect(std.mem.find(u8, active, "Loading skill") != null);
-    try std.testing.expect(std.mem.find(u8, active, "workflow") != null);
-
-    const completed = try app.describeToolActionCompleted(app.agent(), arena, skill_call);
-    try std.testing.expect(std.mem.find(u8, completed, "Loaded skill") != null);
-    try std.testing.expect(std.mem.find(u8, completed, "workflow") != null);
-
-    const resource_call: ToolCall = .{
-        .id = "skill_resource",
-        .name = "skill",
-        .arguments_json = "{\"name\":\"workflow\",\"resource\":\"references/contract-design.md\"}",
-    };
-    const resource_active = try app.describeToolAction(app.agent(), arena, resource_call);
-    try std.testing.expect(std.mem.find(u8, resource_active, "Reading skill resource") != null);
-    try std.testing.expect(std.mem.find(u8, resource_active, "references/contract-design.md") != null);
-    try std.testing.expect(std.mem.find(u8, resource_active, "Loading skill workflow") == null);
-
-    const resource_completed = try app.describeToolActionCompleted(app.agent(), arena, resource_call);
-    try std.testing.expect(std.mem.find(u8, resource_completed, "Read skill resource") != null);
-    try std.testing.expect(std.mem.find(u8, resource_completed, "references/contract-design.md") != null);
-    try std.testing.expect(std.mem.find(u8, resource_completed, "Loaded skill workflow") == null);
-
-    const install_call: ToolCall = .{
-        .id = "install_skill",
-        .name = "install_skill",
-        .arguments_json = "{\"source\":\"vercel-labs/agent-skills\",\"skill\":\"workflow\"}",
-    };
-    const install_active = try app.describeToolAction(app.agent(), arena, install_call);
-    try std.testing.expect(std.mem.find(u8, install_active, "Installing skill") != null);
-    try std.testing.expect(std.mem.find(u8, install_active, "vercel-labs/agent-skills") != null);
-
-    const install_completed = try app.describeToolActionCompleted(app.agent(), arena, install_call);
-    try std.testing.expect(std.mem.find(u8, install_completed, "Installed skill") != null);
-    try std.testing.expect(std.mem.find(u8, install_completed, "vercel-labs/agent-skills") != null);
-}
-
 test "subagent labels show named request and reply" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2871,7 +2801,7 @@ test "subagent labels show named request and reply" {
 test "app agent runtime refreshes enabled project context through registry" {
     const alloc = std.testing.allocator;
     refresh_gather_calls = 0;
-    refresh_targets_match = false;
+    refresh_named_target = true;
     var app = RefreshContextApp{
         .alloc = alloc,
         .context_enabled = true,
@@ -2880,14 +2810,12 @@ test "app agent runtime refreshes enabled project context through registry" {
     };
     defer app.deinit();
 
-    const targets = [_]context_contract.ApplicableTarget{.{
-        .path = "/tmp/workspace/images/example.png",
-        .kind = .file,
-    }};
-    try Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent(), &targets);
+    try Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
-    try std.testing.expect(refresh_targets_match);
+    // The instructions' context never names a target; a turn's folders reach
+    // the model as notes.
+    try std.testing.expect(!refresh_named_target);
     const contribution = app.agent().context_snapshot.contribution orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("test.fresh_context", contribution.provider_id);
     try std.testing.expectEqualStrings("fresh:/tmp/workspace", contribution.content);
@@ -2945,7 +2873,7 @@ test "app agent runtime gathers project context from the host workspace root" {
     };
     defer app.deinit();
 
-    try Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent(), &.{});
+    try Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
     const contribution = app.agent().context_snapshot.contribution orelse return error.TestExpectedEqual;
@@ -2963,7 +2891,7 @@ test "app agent runtime clears disabled project context without gathering" {
     };
     defer app.deinit();
 
-    try Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent(), &.{});
+    try Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent());
 
     try std.testing.expectEqual(@as(usize, 0), refresh_gather_calls);
     try std.testing.expect(app.agent().context_snapshot.contribution == null);
@@ -2989,7 +2917,7 @@ test "app agent runtime propagates project context gathering failures" {
 
         try std.testing.expectError(
             expected_error,
-            Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent(), &.{}),
+            Runtime(RefreshContextApp).refreshProjectContext(&app, (&app).agent()),
         );
 
         try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
@@ -3012,11 +2940,10 @@ test "app agent runtime appends static and transient context through configured 
     try Runtime(FakeApp).appendStaticContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
     try std.testing.expectEqual(types.ChatRole.system, messages.items[0].role);
     try std.testing.expectEqualStrings("provider static:project context", messages.items[0].content.?);
-    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
-    try std.testing.expectEqualStrings("provider transient:/tmp/workspace:auto", messages.items[2].content.?);
+    try std.testing.expectEqualStrings("provider transient:/tmp/workspace:auto", messages.items[1].content.?);
 }
 
 test "app agent runtime prefers active queued project context snapshot" {
@@ -3036,31 +2963,10 @@ test "app agent runtime prefers active queued project context snapshot" {
 
     try Runtime(FakeApp).appendStaticContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
 
-    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
     try std.testing.expectEqualStrings("provider static:queued project context", messages.items[0].content.?);
-    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
     const tool_context = testToolContext(&app);
     try std.testing.expectEqualStrings("test.default_context", tool_context.context_registry.defaultProvider().id);
-}
-
-test "app agent runtime shows MCP availability changes to the model" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc);
-    defer app.deinit();
-    app.mcp_change_notice = "MCP server availability changed since earlier in this session:\n  linear: authentication_required -> ready (74 tools)\n";
-
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var messages: std.ArrayList(ChatMessage) = .empty;
-    defer messages.deinit(arena);
-
-    try Runtime(FakeApp).appendStaticContextMessage(&app, (&app).agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
-
-    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
-    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
-    try std.testing.expectEqual(types.ChatRole.system, messages.items[2].role);
-    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "linear: authentication_required -> ready (74 tools)") != null);
 }
 
 fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {

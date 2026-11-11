@@ -812,7 +812,7 @@ const FinishData = struct {
 
 /// Pure: whether folded child `entry`'s newest line closed it for good.
 /// Data this fx can't read closes nothing.
-fn foldedClosed(entry: session_adapter.Child) bool {
+pub fn foldedClosed(entry: session_adapter.Child) bool {
     if (entry.open) return false;
     const bytes = entry.finish_data orelse return false;
     var buf: [256]u8 = undefined;
@@ -820,6 +820,32 @@ fn foldedClosed(entry: session_adapter.Child) bool {
     const Wire = struct { closed: ?bool = null };
     const wire = json_decode.parseFromSliceLeaky(Wire, fba.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return false;
     return wire.closed orelse false;
+}
+
+/// Pure: the name folded child `entry` goes by, from its newest spawn's
+/// data, or null for a one-off, a name that is not an agent name, or data
+/// this fx can't read. The name is copied into `arena`.
+pub fn foldedName(arena: Allocator, entry: session_adapter.Child) ?[]const u8 {
+    const bytes = entry.spawn_data orelse return null;
+    const Wire = struct { agent: ?[]const u8 = null };
+    const wire = json_decode.parseFromSliceLeaky(Wire, arena, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return null;
+    const name = wire.agent orelse return null;
+    return if (domain.validAgentName(name)) name else null;
+}
+
+test "a folded child's name is its spawn's agent, when it is an agent name" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var entry: session_adapter.Child = .{ .id = @constCast("c"), .work_id = @constCast("w"), .open = false, .outcome = .ok, .spawn_data = null, .finish_data = null, .seq = 1 };
+    try std.testing.expectEqual(@as(?[]const u8, null), foldedName(arena, entry));
+    entry.spawn_data = @constCast("{\"agent\":\"reviewer\",\"fingerprint\":\"ab\"}");
+    try std.testing.expectEqualStrings("reviewer", foldedName(arena, entry).?);
+    // A one-off, a name fx never gives, and data it can't read have none.
+    for ([_][]const u8{ "{\"fingerprint\":\"ab\"}", "{\"agent\":\"Bad Name\"}", "{\"agent\":\"a\\u001b[31m\"}", "not json", "{\"agent\":7}" }) |data| {
+        entry.spawn_data = @constCast(data);
+        try std.testing.expectEqual(@as(?[]const u8, null), foldedName(arena, entry));
+    }
 }
 
 /// Pure: the batch that closes idle child `child` for good in its parent's
@@ -858,6 +884,40 @@ pub fn finishEndFacts(data: ?[]const u8) EndFacts {
     return endFactsOf(wire.by, wire.cause);
 }
 
+/// Pure: whether a fork can take a copy of folded child `entry` (D97):
+/// every child but one closed for good, or one whose newest work was lost,
+/// which had no log there to copy (D33).
+pub fn copyableAtFork(entry: session_adapter.Child) bool {
+    if (!entry.open and entry.outcome == .lost) return false;
+    return !foldedClosed(entry);
+}
+
+/// Pure: how a fork registers its copy of folded child `entry` (D97): one
+/// finished work item under its newest work id and spawn data. Work still
+/// open at the fork point reads as cancelled, as the copy's log ends it.
+/// The data says the copy owes no report, so the fork never wakes for work
+/// its source ran, even for an interrupted work, which a finish without fx
+/// data would owe (`reports.PendingFold`). Borrows `entry`; the finish data
+/// is in `arena`.
+pub fn forkCopy(arena: Allocator, entry: session_adapter.Child) !session_adapter.Session.ChildCopy {
+    const outcome: session_adapter.ChildOutcome = if (entry.open) .cancelled else entry.outcome orelse .cancelled;
+    var failure: ?[]const u8 = null;
+    if (outcome == .failed) if (entry.finish_data) |raw| {
+        const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+        const finish = json_decode.parseFromSliceLeaky(FinishData, arena, raw, options) catch FinishData{};
+        failure = finish.failure;
+    };
+    var data: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(FinishData{ .failure = failure, .report = false }, .{ .emit_null_optional_fields = false }, &data.writer);
+    return .{
+        .id = entry.id,
+        .work_id = entry.work_id,
+        .outcome = outcome,
+        .spawn_data = entry.spawn_data,
+        .finish_data = data.written(),
+    };
+}
+
 /// The data for a finish with `failure` and `report_owed`, or null when it
 /// has neither, so a finish that owes nothing is written as before.
 fn finishData(arena: Allocator, failure: ?[]const u8, report_owed: bool, end: EndFacts) !?[]const u8 {
@@ -891,6 +951,73 @@ test "a finish that owes a report saves who started its work and why it was canc
     try std.testing.expectEqual(EndFacts{}, finishEndFacts("{\"report\":true}"));
     try std.testing.expectEqual(EndFacts{}, finishEndFacts("{\"report\":true,\"by\":\"robot\",\"cause\":\"meteor\"}"));
     try std.testing.expectEqual(EndFacts{}, finishEndFacts(null));
+}
+
+test "a fork's copy of a child owes no report, keeps a failure, and ends open work as cancelled (D97)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const spawn = @constCast("{\"agent\":\"helper\",\"fingerprint\":\"ab\",\"report\":\"final\"}");
+    var entry: session_adapter.Child = .{
+        .id = @constCast("kid"),
+        .work_id = @constCast("w1"),
+        .open = false,
+        .outcome = .ok,
+        .spawn_data = spawn,
+        .finish_data = @constCast("{\"report\":true,\"by\":\"user\"}"),
+        .seq = 9,
+    };
+    var copy = try forkCopy(arena, entry);
+    try std.testing.expectEqualStrings("kid", copy.id);
+    try std.testing.expectEqualStrings("w1", copy.work_id);
+    try std.testing.expectEqual(session_adapter.ChildOutcome.ok, copy.outcome);
+    try std.testing.expectEqualStrings(spawn, copy.spawn_data.?);
+    // A report the source owes stays the source's.
+    try std.testing.expectEqualStrings("{\"report\":false}", copy.finish_data.?);
+    try std.testing.expectEqual(@as(?bool, false), finishOwesFlag(copy.finish_data));
+
+    entry.outcome = .failed;
+    entry.finish_data = @constCast("{\"failure\":\"model refused\",\"report\":true}");
+    copy = try forkCopy(arena, entry);
+    try std.testing.expectEqualStrings("{\"failure\":\"model refused\",\"report\":false}", copy.finish_data.?);
+
+    // An interrupted work owes nothing in the fork either, though a finish
+    // with no fx data would read as crash repair, which owes a report.
+    entry.outcome = .interrupted;
+    entry.finish_data = null;
+    copy = try forkCopy(arena, entry);
+    try std.testing.expectEqual(session_adapter.ChildOutcome.interrupted, copy.outcome);
+    try std.testing.expectEqual(@as(?bool, false), finishOwesFlag(copy.finish_data));
+
+    // Work still open at the fork point ends in the copy's log, as cancelled.
+    entry.open = true;
+    entry.outcome = null;
+    copy = try forkCopy(arena, entry);
+    try std.testing.expectEqual(session_adapter.ChildOutcome.cancelled, copy.outcome);
+    try std.testing.expectEqualStrings("{\"report\":false}", copy.finish_data.?);
+}
+
+test "a fork offers every child but one closed for good (D97)" {
+    var entry: session_adapter.Child = .{
+        .id = @constCast("kid"),
+        .work_id = @constCast("w1"),
+        .open = false,
+        .outcome = .cancelled,
+        .spawn_data = null,
+        .finish_data = null,
+        .seq = 3,
+    };
+    try std.testing.expect(copyableAtFork(entry));
+    entry.finish_data = @constCast("{\"closed\":true}");
+    try std.testing.expect(!copyableAtFork(entry));
+    // A child whose work runs is open, never closed.
+    entry.open = true;
+    try std.testing.expect(copyableAtFork(entry));
+    // One whose newest work was lost had no log to copy.
+    entry.open = false;
+    entry.outcome = .lost;
+    entry.finish_data = null;
+    try std.testing.expect(!copyableAtFork(entry));
 }
 
 test "a spawn saves who started a work its parent didn't" {

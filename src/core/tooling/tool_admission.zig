@@ -160,6 +160,8 @@ fn isRunCommandCall(input: Input, arena: Allocator, call: ToolCall) !bool {
 }
 
 fn permissionNameForCall(input: Input, arena: Allocator, call: ToolCall) ![]const u8 {
+    // A toolbox open or search meets the rules of the tool it replaced.
+    if (call.toolbox_lookup) |lookup| return lookup.permission;
     const command_call = try isRunCommandCall(input, arena, call);
     if (command_call) return "run_command";
     return if (std.mem.eql(u8, call.name, "shell")) "terminal" else call.name;
@@ -170,6 +172,7 @@ fn permissionTargetKindForCall(
     arena: Allocator,
     call: ToolCall,
 ) !permissions.PermissionTargetKind {
+    if (call.toolbox_lookup != null) return .none;
     return if (try isRunCommandCall(input, arena, call))
         .command_cwd
     else
@@ -2557,6 +2560,11 @@ fn targetPathForFailureMessage(arena: Allocator, call: ToolCall) !?[]const u8 {
 }
 
 fn permissionTargetsForCall(input: Input, arena: Allocator, call: ToolCall) !permissions.PermissionCallTargets {
+    if (call.toolbox_lookup) |lookup| {
+        const items = try arena.alloc(permissions.PermissionCallTarget, 1);
+        items[0] = .{ .role = "target", .path = try arena.dupe(u8, lookup.target) };
+        return .{ .items = items };
+    }
     if (isAvailableDynamicTool(input, call.name)) {
         const items = try arena.alloc(permissions.PermissionCallTarget, 1);
         items[0] = .{ .role = "target", .path = try arena.dupe(u8, call.name) };
@@ -3955,7 +3963,7 @@ fn testInputWithClassifier(
     };
 }
 
-test "resolved skill calls retain name policy and ordinary execution authority" {
+test "a toolbox open is decided by its skill's name and keeps ordinary execution authority" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -3963,23 +3971,20 @@ test "resolved skill calls retain name policy and ordinary execution authority" 
     var worker: WorkerRuntime = .{};
     defer worker.deinit(alloc);
     var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
-    input.tool_registry = .{ .tools = &.{test_builtin_tools.skill} };
+    input.tool_registry = .{ .tools = &.{test_builtin_tools.toolbox} };
     var rules = [_]types.PermissionRule{.{
         .permission = @constCast("skill"),
         .pattern = @constCast("restricted-name"),
         .action = .deny,
     }};
     input.permission_rules = .{ .rules = &rules };
-    const skill: @import("../skills/skill_contract.zig").PreparedSkill = .{ .skill = .{
-        .name = "restricted-name",
-        .description = "",
-        .path = "/installed/different-directory-name",
-        .source = .global_fx,
-    } };
+    // However the open names it, by location, path, or a folder with another
+    // name, the rule for the skill's own name decides it.
+    const lookup: types.ToolboxLookup = .{ .permission = "skill", .target = "restricted-name" };
     const calls = [_]ToolCall{
-        .{ .id = "alias", .name = "skill", .arguments_json = "{\"location\":\"skill:0000000000000001:0/different-directory-name\"}", .resolved_skill = &skill },
-        .{ .id = "canonical", .name = "skill", .arguments_json = "{\"location\":\"/installed/different-directory-name\",\"resource\":\"reference.md\"}", .resolved_skill = &skill },
-        .{ .id = "legacy", .name = "skill", .arguments_json = "{\"name\":\"restricted-name\",\"location\":\"/installed/different-directory-name\",\"offset\":1}", .resolved_skill = &skill },
+        .{ .id = "alias", .name = "toolbox", .arguments_json = "{\"open\":\"skill:0000000000000001:0/different-directory-name\"}", .toolbox_lookup = lookup },
+        .{ .id = "canonical", .name = "toolbox", .arguments_json = "{\"open\":\"/installed/different-directory-name\",\"resource\":\"reference.md\"}", .toolbox_lookup = lookup },
+        .{ .id = "named", .name = "toolbox", .arguments_json = "{\"open\":\"restricted-name\",\"offset\":1}", .toolbox_lookup = lookup },
     };
     for (calls) |call| {
         try std.testing.expectEqualStrings("restricted-name", try permissionTargetForCall(input, arena, call));
@@ -3993,11 +3998,6 @@ test "resolved skill calls retain name policy and ordinary execution authority" 
     const allowed = try requestPermissionOutcome(input, arena, calls[0], .ask, &.{});
     try std.testing.expectEqual(ToolPermissionDecision.once, allowed.decision);
     try std.testing.expect(allowed.execution_authority.? == .ordinary);
-    var legacy_unbound = calls[2];
-    legacy_unbound.resolved_skill = null;
-    const old_key = try permissionStateKeyForCall(input, arena, legacy_unbound);
-    const bound_key = try permissionStateKeyForCall(input, arena, calls[2]);
-    try std.testing.expect(old_key.eql(bound_key));
 }
 
 test "exact command approval remains valid across live authority revalidation" {

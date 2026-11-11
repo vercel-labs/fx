@@ -130,13 +130,24 @@ pub fn rank(
     }
 
     // Schemas are chosen before the page is rendered, so the page can say
-    // which tools this search loads in full.
-    var loads = try SchemaLoads.init(alloc, matches, limits);
+    // which tools this search loads in full. A search that puts the schemas
+    // in its result loads none.
+    var loads = if (request.load_schemas and !request.schemas_in_result)
+        try SchemaLoads.init(alloc, matches, limits)
+    else
+        try SchemaLoads.none(alloc, matches.len);
     defer loads.deinit(alloc);
+    var argument_rows: ?ArgumentRows = if (request.schemas_in_result)
+        try ArgumentRows.init(alloc, matches, limits)
+    else
+        null;
+    defer if (argument_rows) |*rows| rows.deinit(alloc);
+    const arguments: ?*ArgumentRows = if (argument_rows) |*rows| rows else null;
 
+    const effective_bytes = limits.mcp_search_result_bytes.effectiveBytes();
     const full_cursor = try page.cursorAfter(alloc, matches.len);
     defer if (full_cursor) |cursor| alloc.free(cursor);
-    const full = try renderSearchResult(
+    var full = try renderSearchResult(
         alloc,
         matches,
         matches.len,
@@ -145,11 +156,17 @@ pub fn rank(
         limits.mcp_description_bytes,
         limits.mcp_search_result_bytes,
         &loads,
+        arguments,
         0,
         false,
     );
+    // Arguments go from the last row first, so every row found stays on the
+    // page before any of them is left out.
+    if (arguments) |rows| while (full.len > effective_bytes and rows.dropLast(matches.len)) {
+        alloc.free(full);
+        full = try renderSearchResult(alloc, matches, matches.len, page.total_matches, full_cursor, limits.mcp_description_bytes, limits.mcp_search_result_bytes, &loads, arguments, 0, false);
+    };
     const observed_bytes = full.len;
-    const effective_bytes = limits.mcp_search_result_bytes.effectiveBytes();
     const limit_triggered = full.len > effective_bytes;
     var shown = matches.len;
     var output = full;
@@ -167,6 +184,7 @@ pub fn rank(
                 limits.mcp_description_bytes,
                 limits.mcp_search_result_bytes,
                 &loads,
+                arguments,
                 observed_bytes,
                 true,
             );
@@ -177,6 +195,13 @@ pub fn rank(
             alloc.free(candidate);
             shown -= 1;
         }
+        // With fewer rows, the first ones may have room for their arguments
+        // again.
+        if (arguments) |rows| {
+            const cursor = try page.cursorAfter(alloc, shown);
+            defer if (cursor) |value| alloc.free(value);
+            output = try restoreArguments(alloc, rows, output, matches, shown, page.total_matches, cursor, limits, &loads, observed_bytes, effective_bytes);
+        }
     }
     errdefer alloc.free(output);
     var notice = try renderSearchNotice(alloc, matches, shown, limits, observed_bytes, limit_triggered, &loads);
@@ -186,11 +211,109 @@ pub fn rank(
     return tool_mcp_runtime.SearchResult{ .model_output = output, .notice = notice, .selected_tools = selected };
 }
 
+/// Gives the first `shown` rows of a page their arguments back, in order,
+/// while the page stays within `effective_bytes`, up to the first row that
+/// doesn't fit. Takes `output`, the page without them, and returns the page
+/// with the most rows' arguments; the caller owns it.
+fn restoreArguments(
+    alloc: Allocator,
+    rows: *ArgumentRows,
+    output: []u8,
+    matches: []const Candidate,
+    shown: usize,
+    total_matches: usize,
+    cursor: ?[]const u8,
+    limits: context_limits.Values,
+    loads: *const SchemaLoads,
+    observed_bytes: usize,
+    effective_bytes: usize,
+) ![]u8 {
+    var best = output;
+    errdefer alloc.free(best);
+    for (0..shown) |index| {
+        if (!rows.restore(index)) continue;
+        const candidate = try renderSearchResult(alloc, matches, shown, total_matches, cursor, limits.mcp_description_bytes, limits.mcp_search_result_bytes, loads, rows, observed_bytes, true);
+        if (candidate.len > effective_bytes) {
+            alloc.free(candidate);
+            rows.shown[index] = false;
+            break;
+        }
+        alloc.free(best);
+        best = candidate;
+    }
+    return best;
+}
+
 fn appendSearchNotice(alloc: Allocator, notice: *?[]u8, message: []const u8) !void {
     const combined = if (notice.*) |current| try alloc.print("{s}\n{s}", .{ current, message }) else try alloc.dupe(u8, message);
     if (notice.*) |current| alloc.free(current);
     notice.* = combined;
 }
+
+/// Which rows of a search page carry their tool's input schema as
+/// `arguments`. A row can when its schema is valid JSON within the one-tool
+/// `mcp_selected_schema_bytes` budget; a page over its byte budget gives the
+/// arguments up from the last row first.
+const ArgumentRows = struct {
+    /// Whether the row's schema can be shown at all.
+    eligible: []bool,
+    /// Whether the row shows it now.
+    shown: []bool,
+
+    fn init(alloc: Allocator, matches: []const Candidate, limits: context_limits.Values) !ArgumentRows {
+        const eligible = try alloc.alloc(bool, matches.len);
+        errdefer alloc.free(eligible);
+        const per_tool = limits.mcp_selected_schema_bytes.effectiveBytes();
+        for (matches, eligible) |match, *row| {
+            const schema = match.tool.input_schema_json;
+            row.* = schema.len <= per_tool and try std.json.validate(alloc, schema);
+        }
+        return .{ .eligible = eligible, .shown = try alloc.dupe(bool, eligible) };
+    }
+
+    fn deinit(rows: *ArgumentRows, alloc: Allocator) void {
+        alloc.free(rows.eligible);
+        alloc.free(rows.shown);
+        rows.* = undefined;
+    }
+
+    /// Takes the arguments off the last of the first `count` rows that shows
+    /// them. False when none does.
+    fn dropLast(rows: *ArgumentRows, count: usize) bool {
+        var index = count;
+        while (index > 0) {
+            index -= 1;
+            if (rows.shown[index]) {
+                rows.shown[index] = false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Shows row `index`'s arguments again. False when it can't have them or
+    /// already shows them.
+    fn restore(rows: *ArgumentRows, index: usize) bool {
+        if (!rows.eligible[index] or rows.shown[index]) return false;
+        rows.shown[index] = true;
+        return true;
+    }
+
+    fn field(rows: ?*const ArgumentRows, index: usize) ArgumentsField {
+        const value = rows orelse return .none;
+        return if (value.shown[index]) .shown else .omitted;
+    }
+};
+
+/// What a search row says about its tool's arguments.
+const ArgumentsField = enum {
+    /// Nothing: the search doesn't put arguments in its result.
+    none,
+    /// `arguments`, the tool's input schema.
+    shown,
+    /// `open_for_arguments`: the row has no room for them.
+    omitted,
+};
 
 /// The schemas a search loads, one entry per match. The budget is spent in
 /// match order and stops at the first schema that doesn't fit, so the loads
@@ -235,6 +358,13 @@ const SchemaLoads = struct {
             remaining -= payload.model_output.len;
         }
         return loads;
+    }
+
+    /// Loads nothing: every match keeps its whole description on the page.
+    fn none(alloc: Allocator, count: usize) !SchemaLoads {
+        const entries = try alloc.alloc(Entry, count);
+        @memset(entries, .{});
+        return .{ .entries = entries };
     }
 
     fn deinit(loads: *SchemaLoads, alloc: Allocator) void {
@@ -287,6 +417,7 @@ fn renderSearchResult(
     description_limit: context_limits.Resolved,
     result_limit: context_limits.Resolved,
     loads: *const SchemaLoads,
+    arguments: ?*const ArgumentRows,
     observed_bytes: usize,
     limit_triggered: bool,
 ) ![]u8 {
@@ -295,7 +426,7 @@ fn renderSearchResult(
     try out.writer.writeAll("{\"tools\":[");
     for (matches[0..selected_count], 0..) |match, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try writeToolMetadataJson(alloc, &out.writer, match, description_limit, loads.loaded(index));
+        try writeToolMetadataJson(alloc, &out.writer, match, description_limit, loads.loaded(index), ArgumentRows.field(arguments, index));
     }
     try out.writer.print(
         "],\"count\":{d},\"total_matches\":{d},\"more_available\":{s},\"next_cursor\":",
@@ -361,6 +492,7 @@ fn writeToolMetadataJson(
     /// The search loads this tool's schema, which carries its whole
     /// description, so a shortened one here is only a preview.
     schema_loaded: bool,
+    arguments: ArgumentsField,
 ) !void {
     const tool = match.tool;
     const bounded = try boundedEncodedScalar(
@@ -390,6 +522,15 @@ fn writeToolMetadataJson(
         );
         try std.json.Stringify.value(description_limit.source.label(), .{}, writer);
         try writer.writeAll(",\"override\":\"--context-limit mcp_description_bytes=BYTES|off\"}");
+    }
+    switch (arguments) {
+        .none => {},
+        // Valid JSON, checked when the rows were chosen.
+        .shown => {
+            try writer.writeAll(",\"arguments\":");
+            try writer.writeAll(tool.input_schema_json);
+        },
+        .omitted => try writer.writeAll(",\"open_for_arguments\":true"),
     }
     try writer.writeByte('}');
 }
@@ -767,4 +908,103 @@ test "MCP search pages agree with the schemas they load under fuzzed tools and l
             "\x06\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
         }) ++ @import("fuzz_corpus").mcp_search_page.*),
     });
+}
+
+fn searchWithArguments(f: *const SearchFixture, alloc: Allocator, limits: context_limits.Values) !tool_mcp_runtime.SearchResult {
+    const query = try lexical_relevance.prepare("");
+    return rank(alloc, &f.candidates, .{ .query = &query, .kind = .mcp, .server = "srv", .load_schemas = false, .schemas_in_result = true }, limits, null);
+}
+
+test "a search with arguments in its result gives each row its tool's input schema and loads none" {
+    const alloc = std.testing.allocator;
+    var f: SearchFixture = .{};
+    f.init(.{ 100, 100, 100 });
+    var result = try searchWithArguments(&f, alloc, .{});
+    defer result.deinit(alloc);
+    // Nothing is loaded for the next step: the tools fx sends never change.
+    try std.testing.expectEqual(@as(usize, 0), result.selected_tools.len);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
+    defer parsed.deinit();
+    const tools = parsed.value.object.get("tools").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), tools.len);
+    for (tools) |tool| {
+        try std.testing.expectEqualStrings("object", tool.object.get("arguments").?.object.get("type").?.string);
+        try std.testing.expect(tool.object.get("open_for_arguments") == null);
+        try std.testing.expect(tool.object.get("schema_loaded") == null);
+    }
+}
+
+test "a page with room for one row's arguments keeps every row and gives them to the first" {
+    const alloc = std.testing.allocator;
+    var f: SearchFixture = .{};
+    f.init(.{ 100, 100, 100 });
+    // The page with no arguments at all: no schema fits the one-tool budget.
+    var none_limits: context_limits.Values = .{};
+    none_limits.mcp_selected_schema_bytes = .{ .value = .{ .bytes = 1 }, .source = .command_line };
+    var none = try searchWithArguments(&f, alloc, none_limits);
+    defer none.deinit(alloc);
+    // A row's arguments take this much more room than its open_for_arguments.
+    const extra = ",\"arguments\":{\"type\":\"object\"}".len - ",\"open_for_arguments\":true".len;
+    var limits: context_limits.Values = .{};
+    limits.mcp_search_result_bytes = .{ .value = .{ .bytes = none.model_output.len + extra }, .source = .command_line };
+    var result = try searchWithArguments(&f, alloc, limits);
+    defer result.deinit(alloc);
+    try std.testing.expect(result.model_output.len <= none.model_output.len + extra);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("context_limit") == null);
+    const tools = parsed.value.object.get("tools").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), tools.len);
+    try std.testing.expect(tools[0].object.get("arguments") != null);
+    for (tools[1..]) |tool| {
+        try std.testing.expect(tool.object.get("arguments") == null);
+        try std.testing.expect(tool.object.get("open_for_arguments").?.bool);
+    }
+}
+
+test "a tool whose schema isn't valid JSON is opened for its arguments, never pasted into the page" {
+    const alloc = std.testing.allocator;
+    var f: SearchFixture = .{};
+    f.init(.{ 100, 100, 100 });
+    var broken_schema = "{\"type\":".*;
+    f.tools[1].input_schema_json = &broken_schema;
+    var result = try searchWithArguments(&f, alloc, .{});
+    defer result.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
+    defer parsed.deinit();
+    for (parsed.value.object.get("tools").?.array.items) |tool| {
+        const broken = std.mem.eql(u8, tool.object.get("name").?.string, "mcp_srv_b");
+        try std.testing.expectEqual(broken, tool.object.get("arguments") == null);
+        try std.testing.expectEqual(broken, tool.object.get("open_for_arguments") != null);
+    }
+}
+
+test "at every page budget, the rows that show arguments come first, have no room to spare, and fit" {
+    const alloc = std.testing.allocator;
+    var f: SearchFixture = .{};
+    f.init(.{ 300, 60, 900 });
+    const extra = ",\"arguments\":{\"type\":\"object\"}".len - ",\"open_for_arguments\":true".len;
+    var budget: usize = 64;
+    while (budget <= 4096) : (budget += 13) {
+        var limits: context_limits.Values = .{};
+        limits.mcp_description_bytes = .{ .value = .{ .bytes = 256 }, .source = .command_line };
+        limits.mcp_search_result_bytes = .{ .value = .{ .bytes = budget }, .source = .command_line };
+        var result = try searchWithArguments(&f, alloc, limits);
+        defer result.deinit(alloc);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
+        defer parsed.deinit();
+        const tools = parsed.value.object.get("tools").?.array.items;
+        if (tools.len > 0) try std.testing.expect(result.model_output.len <= budget);
+        var without = false;
+        for (tools) |tool| {
+            const has = tool.object.get("arguments") != null;
+            // Exactly one of the two, and no row with arguments after one without.
+            try std.testing.expect(has != (tool.object.get("open_for_arguments") != null));
+            if (has) try std.testing.expect(!without) else without = true;
+        }
+        // The first row without arguments had no room for them: every schema
+        // here is valid, so its arguments would have put the page over.
+        if (without) try std.testing.expect(result.model_output.len + extra > budget);
+        try std.testing.expectEqual(@as(usize, 0), result.selected_tools.len);
+    }
 }

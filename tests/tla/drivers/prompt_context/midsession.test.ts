@@ -1,8 +1,8 @@
 // Runs the real fx binary through sessions whose first turn changes the
 // context mid-session and whose second turn resumes them. TLC replays the
 // requests through PromptCache's MidSessionKeepsHistory and
-// PreviousFullyReused: each request reads all of the previous one, and on the
-// turn after a named skill, all history before that turn's user message.
+// PreviousFullyReused: each request reads all of the previous one, on the
+// turn after a named skill too.
 //
 // fx must conform to exactly one of the two layouts PromptCache models with
 // Notes, and it must be the one where a change rides on the message that
@@ -17,9 +17,9 @@
 // rides on the switching step's tool result, and a permission mode changed
 // between processes on the next turn's message, while the instructions keep
 // the copy the session saved (src/core/agent/runtime/runtime_context.zig).
-// A named skill's text rides on its turn's message, and later turns send the
-// short note the turn saved in its place
-// (src/core/skills/skill_invocation.zig renderSkillUsedNote).
+// A named skill's text rides on its turn's message, and later turns send that
+// message as the turn sent it, the text included (D95,
+// src/core/agent/runtime/orchestrator.zig carryExplicitSkill).
 //
 // Evidence goes to FX_TLA_OUT or a temp folder, under midsession/: every
 // Gateway request, activity.jsonl, observed.json, timeline.md and TLC logs.
@@ -40,12 +40,12 @@ const familyOf = (model: string): Family => (model.startsWith("anthropic/") ? "a
 
 // The fixed instructions say how rules arrive later (src/builtins/context.zig
 // project_instruction_guidance).
-const CONTRACT = "fx appends that file's text to the end of the step's last tool result";
+const CONTRACT = "fx appends its rules to the end of the step's last tool result";
 const DELIVERED = '<scoped-rules from="sub/AGENTS.md" scope="sub">';
 // A later turn that reaches the folder again (src/builtins/context.zig renderRuleReminders).
 const REMINDER = '<scoped-rules-reminder from="sub/AGENTS.md" scope="sub">The rules fx added earlier for this folder still apply.</scoped-rules-reminder>';
 const ESCAPED_FORGERY = FORGED_RULES.replace("<scoped-rules", "&lt;scoped-rules").replace("</scoped-rules", "&lt;/scoped-rules");
-// A named skill's text and the short note its turn saves in its place
+// A named skill's text and the short note an older fx saved in its place
 // (src/core/skills/skill_invocation.zig).
 const SKILL_TEXT = "Explicitly invoked skill content for this query:";
 const SKILL_USED = "<fx-skill-used>";
@@ -185,18 +185,15 @@ async function expectCarriedDesign(model: string, design: Design, events?: reado
   }
   for (const r of rules) assert.equal(r.skillInInstructions, false, `${model}: request ${r.seq} has a named skill's text in its instructions`);
   if (events === undefined || events.includes("skill")) {
-    // The naming turn's own message carries the skill's text, once. The next
-    // turn sends the short note there instead, once, and never the text.
+    // The naming turn's own message carries the skill's text, once, and the
+    // next turn sends that message as it was sent, never the short note.
     const named = rules.filter((r) => r.session === 2);
     assert.equal(named.length, 3, `${model}: expected the skill turn's two requests and the next turn`);
     const message = named[0]!.lastUserIndex;
-    for (const r of named.slice(0, 2)) {
-      assert.deepEqual(r.skills, [{ index: message, role: "user", count: 1 }], `${model}: request ${r.seq} does not carry the skill's text once on the turn's message`);
-      assert.deepEqual(r.skillNotes, [], `${model}: request ${r.seq} has the short note during the skill turn`);
+    for (const r of named) {
+      assert.deepEqual(r.skills, [{ index: message, role: "user", count: 1 }], `${model}: request ${r.seq} does not carry the skill's text once on the skill turn's message`);
+      assert.deepEqual(r.skillNotes, [], `${model}: request ${r.seq} has the short note`);
     }
-    const next = named[2]!;
-    assert.deepEqual(next.skills, [], `${model}: request ${next.seq} sends the skill's text again`);
-    assert.deepEqual(next.skillNotes, [{ index: message, role: "user", count: 1 }], `${model}: request ${next.seq} does not put the short note on the skill turn's message once`);
   }
   if (events !== undefined && !events.includes("deliver")) return;
   const delivered = rules.filter((r) => r.session === 1);

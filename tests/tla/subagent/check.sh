@@ -7,10 +7,11 @@
 # (Runtime.stopChild and the message path in tool_host.zig, and the subagent
 # group in src/core/agent/runtime/parallel_execution.zig). stop-message.cfg and
 # stop-message-deep.cfg are the design and must pass, with every rule.
-# stop-message-today.cfg, -today-order.cfg and -today-loss.cfg are fx before
-# it, one defect each. Each stop-message-mutation-*.cfg plants one defect. A
-# defect can break more than one rule at about the same depth, so each of
-# these configs checks only the rule named for it:
+# stop-message-today.cfg, -today-order.cfg, -today-loss.cfg and
+# -today-start.cfg are fx before it, one defect each. Each
+# stop-message-mutation-*.cfg plants one defect. A defect can break more than
+# one rule at about the same depth, so each of these configs checks only the
+# rule named for it:
 #
 #   refuse-ending        a message to a stopped, ending turn is refused        RefusedOnlyWhenClosing
 #   no-order             a step's calls to one subagent run in any order        StopRunsFirst
@@ -19,6 +20,7 @@
 #   read-after-stop      a stopped turn still reads messages                    CountedNeverRead
 #   drop-waiting-at-end  the stopped turn's end drops the waiting messages      NoSilentLoss
 #   queue-closing        a message to a closing subagent waits, and goes with it  NoSilentLoss
+#   start-next-turn      a message to a starting turn waits for the next one    JoinsStartingWork
 #
 # StopMessageTrace.tla checks runs of the built fx binary against it;
 # tests/tla/drivers/subagent/stop-message.test.ts runs it.
@@ -71,6 +73,7 @@ StopMessage stop-message-deep -
 StopMessage stop-message-today RefusedOnlyWhenClosing
 StopMessage stop-message-today-order StopRunsFirst
 StopMessage stop-message-today-loss NoSilentLoss
+StopMessage stop-message-today-start JoinsStartingWork
 StopMessage stop-message-mutation-refuse-ending RefusedOnlyWhenClosing
 StopMessage stop-message-mutation-no-order StopRunsFirst
 StopMessage stop-message-mutation-uncounted NoSilentLoss
@@ -78,4 +81,5 @@ StopMessage stop-message-mutation-join-user-ending NoSilentLoss
 StopMessage stop-message-mutation-read-after-stop CountedNeverRead
 StopMessage stop-message-mutation-drop-waiting-at-end NoSilentLoss
 StopMessage stop-message-mutation-queue-closing NoSilentLoss
+StopMessage stop-message-mutation-start-next-turn JoinsStartingWork
 VERDICTS

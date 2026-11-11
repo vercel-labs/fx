@@ -14,6 +14,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
 const gateway_client = @import("../gateway/client.zig");
+const chat_completions_protocol = @import("../gateway/chat_completions_protocol.zig");
 const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
 const vercel_protocol = @import("../gateway/vercel_protocol.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -431,10 +432,12 @@ test "agent request builder sends stable cache markers in each family's syntax" 
         .{ .role = .system, .content = "turn context" },
     };
     const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
-    for ([_]struct { model: []const u8, anthropic: usize, openai: usize }{
+    for ([_]struct { model: []const u8, anthropic: usize, openai: usize, bedrock: usize = 0 }{
         .{ .model = "anthropic/claude-sonnet-5.5", .anthropic = 1, .openai = 0 },
         .{ .model = "openai/gpt-6.1-sol", .anthropic = 0, .openai = 1 },
         .{ .model = "openai/gpt-5.6-luna", .anthropic = 0, .openai = 1 },
+        .{ .model = "amazon/nova-pro", .anthropic = 0, .openai = 0, .bedrock = 1 },
+        .{ .model = "amazon/nova-2-lite", .anthropic = 0, .openai = 0, .bedrock = 1 },
         .{ .model = "openai/gpt-5", .anthropic = 0, .openai = 0 },
         .{ .model = "google/gemini-3-flash", .anthropic = 0, .openai = 0 },
     }) |case| {
@@ -450,6 +453,7 @@ test "agent request builder sends stable cache markers in each family's syntax" 
         defer alloc.free(body);
         try std.testing.expectEqual(case.anthropic, std.mem.count(u8, body, "\"cacheControl\""));
         try std.testing.expectEqual(case.openai, std.mem.count(u8, body, "\"promptCacheBreakpoint\""));
+        try std.testing.expectEqual(case.bedrock, std.mem.count(u8, body, "\"cachePoint\""));
         // The caller's instructions are not modified.
         try std.testing.expect(instructions[0].cache_breakpoint);
     }
@@ -478,6 +482,7 @@ test "agent requests carry delivered rules in the tool result for every family, 
         "moonshotai/kimi-k3",
         "alibaba/qwen3.8-max",
         "meta/llama-4-maverick",
+        "amazon/nova-pro",
     }) |model| {
         var options = resolveGatewayProviderOptions(model, .auto, false);
         options.prompt_caching = true;
@@ -494,7 +499,7 @@ test "agent requests carry delivered rules in the tool result for every family, 
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"role\":\"system\""));
         // Only the stable instructions carry a marker, for the families fx marks.
         const markers: usize = @intFromBool(vercel_model_policy.cacheMarkers(model) != .none);
-        try std.testing.expectEqual(markers, std.mem.count(u8, body, "\"cacheControl\"") + std.mem.count(u8, body, "\"promptCacheBreakpoint\""));
+        try std.testing.expectEqual(markers, std.mem.count(u8, body, "\"cacheControl\"") + std.mem.count(u8, body, "\"promptCacheBreakpoint\"") + std.mem.count(u8, body, "\"cachePoint\""));
     }
 }
 
@@ -698,6 +703,7 @@ fn streamAgentCompletion(
         .admission = request.admission,
         .on_reasoning_chunk = agent_stream_provider_contract.EventSink.onReasoningChunk,
         .on_tool_input_chunk = agent_stream_provider_contract.EventSink.onToolInputChunk,
+        .on_tool_input_progress = agent_stream_provider_contract.EventSink.onToolInputProgress,
         .provider_attempt_owner = switch (request.provider_attempt_owner) {
             .transport => .transport,
             .agent => .agent,
@@ -733,17 +739,21 @@ fn streamAgentCompletion(
         vercel_failure_diagnostics.FailureDiagnostics{}
     else
         vercel_failure_diagnostics.collect(alloc, payload, result.err_body);
-    if (result.status != .ok) return .{ .failed = .{
-        .kind = gatewayFailureKind(alloc, result.status, result.err_body),
-        .http_status = result.status,
-        .detail = result.err_body,
-        .diagnostics = .{
-            .schema = diagnostics.schema,
-            .request_shape = diagnostics.request_shape,
+    if (result.status != .ok) return .{
+        .failed = .{
+            .kind = gatewayFailureKind(alloc, result.status, result.err_body),
+            .http_status = result.status,
+            // The body can echo the credential it refused, and it reaches the
+            // screen and the trace.
+            .detail = if (result.err_body) |body| try chat_completions_protocol.redactOwnedErrorBody(alloc, body, request.credential.secret() orelse "") else null,
+            .diagnostics = .{
+                .schema = diagnostics.schema,
+                .request_shape = diagnostics.request_shape,
+            },
+            .retry_after_seconds = result.retry_after_seconds,
+            .ownership = .owned,
         },
-        .retry_after_seconds = result.retry_after_seconds,
-        .ownership = .owned,
-    } };
+    };
     return .{ .completed = .{
         .completion = result.completion,
         .ownership = .owned,

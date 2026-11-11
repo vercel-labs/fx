@@ -39,8 +39,8 @@ pub const CallOutcome = struct {
 };
 
 /// A question about the MCP tools themselves: `fx mcp call list`, `search`,
-/// and `help`. It reads tool metadata only, as the agent's own
-/// `capability_search` does, so it needs no permission check; it sees only
+/// and `help`. It reads tool metadata only, as the agent's own toolbox
+/// search does, so it needs no permission check; it sees only
 /// the tools the agent may use.
 pub const Lookup = union(enum) {
     /// Every tool of the named server.

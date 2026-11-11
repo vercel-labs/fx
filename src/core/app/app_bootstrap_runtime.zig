@@ -584,6 +584,10 @@ pub fn Runtime(comptime App: type) type {
             agent.worker.agent_turn_settings.max_tool_result_bytes = startup.max_tool_result_bytes;
             agent.worker.agent_turn_settings.auto_compact_percent = startup.auto_compact_percent;
             if (comptime @hasField(App, "context_limits")) app.context_limits = startup.context_limits;
+            if (comptime @hasField(App, "tool_placement")) {
+                app.tool_placement = startup.tool_placement;
+                app.toolbox_behind = config_runtime.tool_placement.behindToolbox(startup.tool_placement, &.{});
+            }
             agent.worker.agent_turn_settings.first_call_tool_choice = startup.first_call_tool_choice;
             agent.worker.agent_turn_settings.fast_mode = startup.fast_mode;
             agent.worker.agent_turn_settings.ultrafast_mode = startup.ultrafast_mode;

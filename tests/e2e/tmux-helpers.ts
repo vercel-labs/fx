@@ -10,7 +10,7 @@ import { execFileSync, execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { FX_BIN, REPO_ROOT, providerVersionTestEnv } from "../evals/eval-helpers";
 
 let sessionCounter = 0;
@@ -30,6 +30,7 @@ const DEFAULT_UNSET_ENV_KEYS = [
   "FX_TEST_GATEWAY_CREDITS_URL",
   "FX_TEST_UPGRADE_BASE_URL",
   "FX_PERMISSION_MODE",
+  "FX_HOME",
 ] as const;
 const MIRRORED_ENV_KEYS = [
   "FX_GATEWAY_BASE_URL",
@@ -112,13 +113,14 @@ export function buildObservedCommand(
   command: string,
   stderrPath: string | undefined,
   exitStatusPath: string,
+  cwd: string,
 ): string {
   const childCommand = stderrPath
     ? `/bin/sh -c ${shellQuote(`exec ${command} 2>${shellQuote(stderrPath)}`)}`
     : command;
+  const changeDirectory = `cd -- ${shellQuote(resolve(cwd))}${stderrPath ? ` 2>${shellQuote(stderrPath)}` : ""}`;
   const observer = `/bin/sh -c ${shellQuote([
-    childCommand,
-    "status=$?",
+    `if ${changeDirectory}; then ${childCommand}; status=$?; else status=125; fi`,
     `printf '%s\\n' \"$status\" > ${shellQuote(exitStatusPath)}`,
     'exit "$status"',
   ].join("; "))}`;
@@ -738,6 +740,7 @@ export class TmuxSession {
       command,
       stderrPath,
       exitStatusPath,
+      cwd,
     );
     const processEnv = {
       ...process.env,

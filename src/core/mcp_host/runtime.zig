@@ -107,6 +107,27 @@ pub const Status = struct {
 
 pub const Tool = struct { name: []const u8, raw: []const u8 };
 
+/// How a logout ended.
+pub const Logout = struct {
+    /// Why the saved login couldn't be removed, if it couldn't: this fx is
+    /// signed out, but every other fx, and the next one, still has it.
+    kept: ?anyerror = null,
+    revocation: Revocation = .none,
+
+    /// What the server did with the login's tokens.
+    pub const Revocation = enum {
+        /// No revocation went out, as when its authorization server takes
+        /// none: the tokens stay valid there until they expire.
+        none,
+        /// The server answered the revocation with a 2xx, so the tokens no
+        /// longer work there (RFC 7009 section 2.2).
+        confirmed,
+        /// It answered otherwise, or not within `revoke_wait_ms`: the tokens
+        /// may still work there.
+        unconfirmed,
+    };
+};
+
 pub const ToolsResult = union(enum) {
     tools: []Tool,
     needs_login,
@@ -224,6 +245,9 @@ const Request = struct {
     question: ?Pending = null,
     /// Set by the owner before a logout ends: why the saved login stayed.
     logout_kept: ?anyerror = null,
+    /// Set by the owner before a logout ends: what the server did with the
+    /// revocation.
+    logout_revocation: Logout.Revocation = .none,
     /// Owner thread only: fx declined the server's question, so the call's
     /// cancellation is fx's answer, not the user's.
     declined: bool = false,
@@ -410,6 +434,11 @@ pub const Runtime = struct {
     /// Set once the owner gave the servers their saved credentials and
     /// published that, so `statuses` never reports a premature signed_in.
     credentials_restored: std.Io.Event = .unset,
+    /// Owner thread only: why the store of saved logins couldn't be read,
+    /// from a read that gave servers no login (at the start, or for one a
+    /// reload added) until one works. Those servers start without a login,
+    /// and one asked for a login reads the store again first.
+    store_unread: ?anyerror = null,
 
     /// Owner thread only.
     calls: std.AutoHashMapUnmanaged(engine.Handle, *Request) = .empty,
@@ -437,6 +466,9 @@ pub const Runtime = struct {
         tried: ?[32]u8 = null,
         /// A save failed, and the user heard so.
         not_saved: bool = false,
+        /// Its tools were asked for again with a login read after a 401, so
+        /// the listing that 401 ended answers no waits; the next one does.
+        relisting: bool = false,
     };
 
     /// A refresh the engine said was due: waiting for its login's refresh lock,
@@ -686,12 +718,10 @@ pub const Runtime = struct {
     }
 
     /// Signs out: the token is revoked where the server can, and forgotten.
-    /// Returns why the saved login couldn't be removed, if it couldn't: this
-    /// fx is signed out, but every other fx, and the next one, still has it.
-    pub fn logout(r: *Runtime, server: []const u8) Error!?anyerror {
+    pub fn logout(r: *Runtime, server: []const u8) Error!Logout {
         var req: Request = .{ .kind = .{ .logout = server }, .alloc = r.gpa };
         try r.submitOk(&req);
-        return req.logout_kept;
+        return .{ .kept = req.logout_kept, .revocation = req.logout_revocation };
     }
 
     /// Every server that needs a login takes one saved since by another fx,
@@ -894,7 +924,10 @@ pub const Runtime = struct {
             .tools => |name| {
                 const i = r.serverIndex(name) orelse return r.finish(req, .{ .tools = .unknown_server });
                 if (r.heldReason(req.alloc, i)) |why| return r.finish(req, .{ .tools = .{ .failed = try why } });
-                if (r.flags[i].needs_login and r.loginFor(i) == null and !try r.pickUpLogin(i)) return r.finish(req, .{ .tools = .needs_login });
+                if (r.flags[i].needs_login and r.loginFor(i) == null and !try r.pickUpLogin(i)) {
+                    if (try r.unreadText(req.alloc, i)) |why| return r.finish(req, .{ .tools = .{ .failed = why } });
+                    return r.finish(req, .{ .tools = .needs_login });
+                }
                 // Between tries too, it waits for the next start, and a
                 // failed start ends it with the reason, as a call waits.
                 try r.tool_waiters.ensureUnusedCapacity(r.gpa, 1);
@@ -1055,8 +1088,10 @@ pub const Runtime = struct {
                 };
                 r.flags[i] = .{};
                 // A program that exits next would lose a revocation still on
-                // its way, so the logout ends when it's answered.
+                // its way, so the logout ends when it's answered. Until then,
+                // whether it worked isn't known.
                 if (!r.engine.revoking(s.name)) return r.finish(req, .ok);
+                req.logout_revocation = .unconfirmed;
                 try r.logouts.append(r.gpa, .{ .server = i, .request = req, .deadline_ms = r.nowMs() + revoke_wait_ms });
             },
         }
@@ -1196,6 +1231,9 @@ pub const Runtime = struct {
                 continue;
             }
             _ = r.logouts.swapRemove(k);
+            if (r.engine.revocationAnswer(r.resolved.servers[l.server].name)) |status| {
+                if (status >= 200 and status < 300) l.request.logout_revocation = .confirmed;
+            }
             r.finish(l.request, .ok);
         }
     }
@@ -1277,6 +1315,13 @@ pub const Runtime = struct {
     fn onServer(r: *Runtime, i: usize, name: []const u8, event: mcp.server.Event) !void {
         switch (event) {
             .tools => |t| {
+                // The sign-in is announced before the listing gives up for it
+                // (`src/mcp/auth/client.zig`), so this is the listing that
+                // 401 ended.
+                if (r.flags[i].relisting) {
+                    r.flags[i].relisting = false;
+                    if (!t.ok and t.needs_auth) return;
+                }
                 var k: usize = 0;
                 while (k < r.tool_waiters.items.len) {
                     const w = r.tool_waiters.items[k];
@@ -1294,6 +1339,23 @@ pub const Runtime = struct {
                 }
             },
             .auth_required => |required| {
+                // The store this fx couldn't read at the start may hold the
+                // login: it's read again first. While it still can't be read,
+                // a sign-in couldn't be saved either, so the server is down
+                // for that reason, not waiting for a sign-in.
+                if (!required.step_up and r.store_unread != null) {
+                    if (try r.pickUpLogin(i)) {
+                        debug_trace.logf("mcp", "MCP saved login read again server={s} reason=the store wasn't read at the start", .{name});
+                        r.flags[i].relisting = true;
+                        return r.engine.needTools(name);
+                    }
+                    if (r.store_unread) |err| {
+                        r.flags[i].needs_login = true;
+                        r.flags[i].signed_in = false;
+                        debug_trace.logf("mcp", "MCP login not asked for server={s} reason=saved logins not read err={s}", .{ name, @errorName(err) });
+                        return r.endToolWaiters(i, .failed);
+                    }
+                }
                 r.flags[i].needs_login = true;
                 // Only a step-up keeps the login working for what it had;
                 // otherwise the saved one, if any, doesn't sign anything in.
@@ -1790,13 +1852,17 @@ pub const Runtime = struct {
     }
 
     /// A server a reload added signs in with the login saved for it, as
-    /// `restoreCredentials` does at the start.
+    /// `restoreCredentials` does at the start, and a store that can't be
+    /// read is noted in `store_unread` the same way.
     fn adoptSaved(r: *Runtime, i: usize) void {
         const s = r.resolved.servers[i];
         if (s.url == null) return;
-        const saved = r.options.credentials.store.get(r.gpa, s.credentialKey()) catch |err| {
+        const found = r.options.credentials.store.lookup(r.gpa, s.credentialKey()) catch |err| {
+            if (err != error.OutOfMemory) r.store_unread = err;
             return debug_trace.logf("mcp", "MCP saved login not read server={s} err={s}", .{ s.name, @errorName(err) });
-        } orelse return;
+        };
+        r.store_unread = null;
+        const saved = found orelse return;
         defer secret.zeroAndFree(r.gpa, saved);
         r.engine.restoreCredential(s.name, saved) catch |err| {
             return debug_trace.logf("mcp", "MCP credential not loaded server={s} err={s}", .{ s.name, @errorName(err) });
@@ -1892,6 +1958,11 @@ pub const Runtime = struct {
             o.needs_login = r.flags[i].needs_login;
             o.signed_in = r.flags[i].signed_in;
             o.signing_in = r.loginFor(i) != null;
+            if (try r.unreadText(a, i)) |why| {
+                o.state = .failed;
+                o.needs_login = false;
+                o.last_error = why;
+            }
             if (r.engine.instructions(s.name)) |t| o.instructions = try a.dupe(u8, t);
         }
         r.mutex.lockUncancelable(r.io);
@@ -2030,7 +2101,22 @@ pub const Runtime = struct {
     }
 
     fn lastError(r: *const Runtime, alloc: Allocator, i: usize) Allocator.Error![]u8 {
+        if (try r.unreadText(alloc, i)) |why| return why;
         return (try r.failureText(alloc, i)) orelse try alloc.dupe(u8, "the server is unavailable");
+    }
+
+    /// Why server `i` has no login, in `alloc`, when that's because the
+    /// store of saved logins couldn't be read; null otherwise. Such a server
+    /// isn't asked to sign in: it's down until the store reads.
+    fn unreadText(r: *const Runtime, alloc: Allocator, i: usize) Allocator.Error!?[]u8 {
+        const err = r.store_unread orelse return null;
+        if (!r.flags[i].needs_login) return null;
+        const store = switch (r.options.credentials) {
+            .store => |s| s,
+            .detect => return null,
+        };
+        var buffer: [256]u8 = undefined;
+        return try alloc.dupe(u8, store.readFailure(&buffer, err));
     }
 
     /// Why server `i` is down, in `alloc`, with what its process said when
@@ -2172,15 +2258,18 @@ pub const Runtime = struct {
     /// can't use it.
     fn takeSaved(r: *Runtime, i: usize) !bool {
         const s = r.resolved.servers[i];
-        const saved = r.options.credentials.store.get(r.gpa, s.credentialKey()) catch |err| switch (err) {
+        const saved = r.options.credentials.store.lookup(r.gpa, s.credentialKey()) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 debug_trace.logf("mcp", "MCP saved login not read server={s} err={s}", .{ s.name, @errorName(err) });
+                if (r.store_unread != null) r.store_unread = err;
                 return false;
             },
-        } orelse return false;
-        defer secret.zeroAndFree(r.gpa, saved);
-        return r.take(i, saved);
+        };
+        r.store_unread = null;
+        const c = saved orelse return false;
+        defer secret.zeroAndFree(r.gpa, c);
+        return r.take(i, c);
     }
 
     /// `saved` given to server `i`, as `takeSaved` does.
@@ -2199,7 +2288,7 @@ pub const Runtime = struct {
     /// Before any request: picks the store when `start` left that to the
     /// owner, reads it once, and gives each HTTP server the login saved
     /// under its key, so no server starts without it. A store that can't be
-    /// read leaves every server signed out, as one without credentials.
+    /// read leaves every server signed out, and `store_unread` says why.
     fn restoreCredentials(r: *Runtime) void {
         defer r.credentials_restored.set(r.io);
         const store: credentials.Store = switch (r.options.credentials) {
@@ -2209,6 +2298,7 @@ pub const Runtime = struct {
         r.options.credentials = .{ .store = store };
         var saved = store.snapshot(r.gpa) catch |err| {
             debug_trace.logf("mcp", "MCP credentials not loaded err={s}", .{@errorName(err)});
+            r.store_unread = err;
             return;
         };
         defer saved.deinit(r.gpa);

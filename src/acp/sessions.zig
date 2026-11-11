@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const agent_frame = @import("../core/shared/agent_frame.zig");
+const recovery_prompt = @import("../core/shared/recovery_prompt.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 const jsonrpc = @import("jsonrpc.zig");
@@ -1702,6 +1703,11 @@ fn sendExecutionHistory(
                     debug_trace.logf("acp", "event=history_steering_skipped reason=subagent_frame bytes={d}", .{text.len});
                     continue;
                 }
+                // Nor is fx's own prompt to a stalled turn.
+                if (recovery_prompt.fromSaved(text) != null) {
+                    debug_trace.logf("acp", "event=history_steering_skipped reason=recovery_prompt bytes={d}", .{text.len});
+                    continue;
+                }
                 try sendSteeringHistoryChunk(state, alloc, session_id, text);
             },
             .tool_call => |call| try sendHistoryToolCall(state, alloc, session_id, call),
@@ -1773,17 +1779,19 @@ fn planToolCallFrame(
         call,
         saved,
     );
-    const name = tool_call_presentation.acpToolName(call.name);
+    // A toolbox run replays as the tool it ran, as it was shown live.
+    const shown = try tool_call_presentation.shownCall(arena, call);
+    const name = tool_call_presentation.acpToolName(shown.name);
     // MCP identity comes from the live catalog, or from the identity recorded
     // when the session made the call; it is never guessed from the exposed
     // name.
-    const mcp_identity = if (registry.lookup(call.name) == null)
-        (if (session_host) |h| h.catalog.toolIdentity(arena, call.name) catch null else null) orelse
-            if (identities) |record| try record.lookup(arena, call.name) else null
+    const mcp_identity = if (registry.lookup(shown.name) == null)
+        (if (session_host) |h| h.catalog.toolIdentity(arena, shown.name) catch null else null) orelse
+            if (identities) |record| try record.lookup(arena, shown.name) else null
     else
         null;
-    const presentation = tool_call_presentation.describeToolCall(registry, arena, call, mcp_identity);
-    const masked_arguments = try agent_execution_memory.redactToolArgumentsJson(arena, call.name, call.arguments_json);
+    const presentation = tool_call_presentation.describeToolCall(registry, arena, shown, mcp_identity);
+    const masked_arguments = try agent_execution_memory.redactToolArgumentsJson(arena, shown.name, shown.arguments_json);
     // Parsed with the arena and returned in the frame; no deinit, the caller's
     // arena frees it in bulk.
     const parsed: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(

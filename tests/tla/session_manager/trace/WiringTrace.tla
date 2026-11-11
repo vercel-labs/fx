@@ -13,8 +13,9 @@
 (* (a process whose tracing starts after its store opened starts at its  *)
 (* first line);                                                          *)
 (* Crash is added by check_wiring_traces.py when a process's lines stop    *)
-(* without Exit. Accepted when every line is an allowed step in turn:     *)
-(* `NotDone` then fails.                                                   *)
+(* without Exit. A Close line is two steps of the model: StartClose, the  *)
+(* main loop starting the close, then Close (D97). Accepted when every    *)
+(* line is an allowed step in turn: `NotDone` then fails.                 *)
 (***************************************************************************)
 EXTENDS Wiring, WiringData, Naturals, Sequences, TLC
 
@@ -39,8 +40,9 @@ TraceInit == Init /\ l = 1
 
 TraceNext ==
     /\ l <= Len(Trace)
-    /\ Act(Trace[l])
-    /\ l' = l + 1
+    /\ IF Trace[l].a = "Close" /\ loop = "free"
+       THEN StartClose(Trace[l].s) /\ l' = l
+       ELSE Act(Trace[l]) /\ l' = l + 1
 
 TraceSpec == TraceInit /\ [][TraceNext]_tvars
 

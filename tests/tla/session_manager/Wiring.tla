@@ -12,6 +12,12 @@
 (* `/fork` (D58) makes a new session from the current one's log before a  *)
 (* prompt and switches to it. The process can crash anywhere.             *)
 (*                                                                         *)
+(* The host's main loop is one thread. A close first stops the session's   *)
+(* subagent host, which joins each child's slot thread, and only then      *)
+(* writes the close (`loop` is "closing" in between). A hosted child's run *)
+(* ends only on that main loop (finishRun), so a child can finish only     *)
+(* while the loop is free.                                                 *)
+(*                                                                         *)
 (* The manager's own rules are modeled elsewhere (TurnLifecycle.tla,       *)
 (* Subagents.tla, WriterLock.tla); here a reopen simply ends a turn a      *)
 (* crash left open as interrupted (D1).                                    *)
@@ -32,9 +38,11 @@ VARIABLES
     childOf,     \* the session whose turn spawned the child, or "none"
     next,        \* the session opened to switch to, or "none" (D41)
     made,        \* [Sessions -> BOOLEAN]: the session exists on disk
-    forkOf       \* [Sessions -> Sessions \cup {"none"}]: the session a fork came from
+    forkOf,      \* [Sessions -> Sessions \cup {"none"}]: the session a fork came from
+    loop,        \* the main loop: "free", or "closing" while it joins the children
+    closing      \* the session the loop is closing, or "none"
 
-vars == <<up, cur, turnOpen, lastEnd, linked, child, childOf, next, made, forkOf>>
+vars == <<up, cur, turnOpen, lastEnd, linked, child, childOf, next, made, forkOf, loop, closing>>
 
 TypeOK ==
     /\ up \in BOOLEAN
@@ -47,6 +55,8 @@ TypeOK ==
     /\ next \in Sessions \cup {"none"}
     /\ made \in [Sessions -> BOOLEAN]
     /\ forkOf \in [Sessions -> Sessions \cup {"none"}]
+    /\ loop \in {"free", "closing"}
+    /\ closing \in Sessions \cup {"none"}
 
 Init ==
     /\ up = FALSE
@@ -59,6 +69,8 @@ Init ==
     /\ next = "none"
     /\ made = [s \in Sessions |-> FALSE]
     /\ forkOf = [s \in Sessions |-> "none"]
+    /\ loop = "free"
+    /\ closing = "none"
 
 Active == up /\ cur # "none"
 
@@ -66,29 +78,30 @@ Active == up /\ cur # "none"
 Start ==
     /\ ~up
     /\ up' = TRUE
-    /\ UNCHANGED <<cur, turnOpen, lastEnd, linked, child, childOf, next, made, forkOf>>
+    /\ UNCHANGED <<cur, turnOpen, lastEnd, linked, child, childOf, next, made, forkOf, loop, closing>>
 
 \* The adapter opens a session: into the slot, or, while one is open, as the
 \* session to switch to (D41). A turn a crash left open ends as interrupted.
 Open(s) ==
     /\ up
+    /\ loop = "free"
     /\ next = "none"
     /\ s # cur
     /\ IF cur = "none" THEN cur' = s /\ next' = "none" ELSE cur' = cur /\ next' = s
     /\ turnOpen' = [turnOpen EXCEPT ![s] = FALSE]
     /\ lastEnd' = IF turnOpen[s] THEN [lastEnd EXCEPT ![s] = "interrupt"] ELSE lastEnd
     /\ made' = [made EXCEPT ![s] = TRUE]
-    /\ UNCHANGED <<up, linked, child, childOf, forkOf>>
+    /\ UNCHANGED <<up, linked, child, childOf, forkOf, loop, closing>>
 
 \* New work needs a session and no switch pending.
-Idle == Active /\ next = "none"
+Idle == Active /\ next = "none" /\ loop = "free"
 
 BeginTurn ==
     /\ Idle
     /\ ~turnOpen[cur]
     /\ turnOpen' = [turnOpen EXCEPT ![cur] = TRUE]
     /\ linked' = [linked EXCEPT ![cur] = "none"]
-    /\ UNCHANGED <<up, cur, lastEnd, child, childOf, next, made, forkOf>>
+    /\ UNCHANGED <<up, cur, lastEnd, child, childOf, next, made, forkOf, loop, closing>>
 
 \* "Continue" (D23): a new turn whose first item links to the newest ended
 \* turn, which must have been interrupted.
@@ -98,7 +111,7 @@ Continue ==
     /\ lastEnd[cur] = "interrupt"
     /\ turnOpen' = [turnOpen EXCEPT ![cur] = TRUE]
     /\ linked' = [linked EXCEPT ![cur] = lastEnd[cur]]
-    /\ UNCHANGED <<up, cur, lastEnd, child, childOf, next, made, forkOf>>
+    /\ UNCHANGED <<up, cur, lastEnd, child, childOf, next, made, forkOf, loop, closing>>
 
 \* The turn ends, also while a switch is pending (a cancelled turn).
 EndTurn(e) ==
@@ -106,7 +119,7 @@ EndTurn(e) ==
     /\ turnOpen[cur]
     /\ turnOpen' = [turnOpen EXCEPT ![cur] = FALSE]
     /\ lastEnd' = [lastEnd EXCEPT ![cur] = e]
-    /\ UNCHANGED <<up, cur, linked, child, childOf, next, made, forkOf>>
+    /\ UNCHANGED <<up, cur, linked, child, childOf, next, made, forkOf, loop, closing>>
 
 \* A turn spawns a child thread (child_spawned through the parent).
 Spawn ==
@@ -115,26 +128,50 @@ Spawn ==
     /\ child = "none"
     /\ child' = "running"
     /\ childOf' = cur
-    /\ UNCHANGED <<up, cur, turnOpen, lastEnd, linked, next, made, forkOf>>
+    /\ UNCHANGED <<up, cur, turnOpen, lastEnd, linked, next, made, forkOf, loop, closing>>
 
 \* The child's thread appends child_finished through the parent's Session,
-\* or the parent cancels it; either way through an open parent.
+\* or the parent cancels it; either way through an open parent. The run
+\* ends on the main loop (finishRun), so the loop must be free.
 ChildDone ==
     /\ up
+    /\ loop = "free"
     /\ child = "running"
     /\ cur = childOf
     /\ child' = "none"
     /\ childOf' = "none"
-    /\ UNCHANGED <<up, cur, turnOpen, lastEnd, linked, next, made, forkOf>>
+    /\ UNCHANGED <<up, cur, turnOpen, lastEnd, linked, next, made, forkOf, loop, closing>>
 
-\* The host closes a session, to switch or to exit: children are finished
-\* and joined first, then close interrupts an open turn. Closing the
+\* Every child thread has finished and been joined.
+ChildrenJoined == child = "none"
+
+\* A close starts only once the loop has stopped the session's children, as
+\* /close and quit do and a switch does (D97): the join then never waits for
+\* a child that only the loop can end.
+StoppedFirst == ChildrenJoined
+
+\* The host starts to close a session, to switch or to exit: the main loop
+\* stops the session's subagent host, which joins each child's slot thread.
+StartClose(s) ==
+    /\ up
+    /\ loop = "free"
+    /\ s \in {cur, next} \ {"none"}
+    /\ StoppedFirst
+    /\ loop' = "closing"
+    /\ closing' = s
+    /\ UNCHANGED <<up, cur, turnOpen, lastEnd, linked, child, childOf, next, made, forkOf>>
+
+\* Once the children are joined, close interrupts an open turn. Closing the
 \* current session hands the slot to the one switched to; closing that one
 \* instead abandons the switch (D41).
 Close(s) ==
     /\ up
+    /\ loop = "closing"
+    /\ closing = s
     /\ s \in {cur, next} \ {"none"}
-    /\ child = "none"
+    /\ ChildrenJoined
+    /\ loop' = "free"
+    /\ closing' = "none"
     /\ cur' = IF s = cur THEN next ELSE cur
     /\ next' = "none"
     /\ turnOpen' = [turnOpen EXCEPT ![s] = FALSE]
@@ -143,12 +180,12 @@ Close(s) ==
 
 \* /fork (D58): a new session holding the current one's log before a chosen
 \* prompt becomes the session to switch to, and Close then hands it the
-\* slot. Only between turns and with no child running; the source is never
+\* slot. Only between turns; a child of the source may still run, since
+\* the fork counts children only after its fork point. The source is never
 \* written. The fork's newest ended turn is whichever the source had before
 \* that prompt.
 Fork(f) ==
     /\ Idle
-    /\ child = "none"
     /\ f \notin {cur, next}
     /\ ~made[f]
     /\ ~turnOpen[cur]
@@ -156,15 +193,16 @@ Fork(f) ==
     /\ made' = [made EXCEPT ![f] = TRUE]
     /\ forkOf' = [forkOf EXCEPT ![f] = cur]
     /\ \E e \in Ends : lastEnd' = [lastEnd EXCEPT ![f] = e]
-    /\ UNCHANGED <<up, cur, turnOpen, linked, child, childOf>>
+    /\ UNCHANGED <<up, cur, turnOpen, linked, child, childOf, loop, closing>>
 
 Exit ==
     /\ up
     /\ cur = "none"
     /\ next = "none"
     /\ child = "none"
+    /\ loop = "free"
     /\ up' = FALSE
-    /\ UNCHANGED <<cur, turnOpen, lastEnd, linked, child, childOf, next, made, forkOf>>
+    /\ UNCHANGED <<cur, turnOpen, lastEnd, linked, child, childOf, next, made, forkOf, loop, closing>>
 
 \* The process dies anywhere: memory and threads are gone; the logs stay.
 Crash ==
@@ -174,11 +212,13 @@ Crash ==
     /\ next' = "none"
     /\ child' = "none"
     /\ childOf' = "none"
+    /\ loop' = "free"
+    /\ closing' = "none"
     /\ UNCHANGED <<turnOpen, lastEnd, linked, made, forkOf>>
 
 Next ==
     \/ Start
-    \/ \E s \in Sessions : Open(s) \/ Close(s)
+    \/ \E s \in Sessions : Open(s) \/ StartClose(s) \/ Close(s)
     \/ BeginTurn \/ Continue
     \/ \E e \in {"commit", "interrupt"} : EndTurn(e)
     \/ Spawn \/ ChildDone
@@ -186,6 +226,9 @@ Next ==
     \/ Exit \/ Crash
 
 Spec == Init /\ [][Next]_vars
+
+\* The loop gets to run what is enabled; a crash is never forced.
+LiveSpec == Spec /\ WF_vars(ChildDone) /\ \A s \in Sessions : WF_vars(Close(s))
 
 -----------------------------------------------------------------------------
 (* Invariants *)
@@ -212,7 +255,13 @@ ForkLeavesSource ==
          /\ turnOpen'[cur] = turnOpen[cur] /\ lastEnd'[cur] = lastEnd[cur]
          /\ linked'[cur] = linked[cur]]_vars
 
-\* A fork happens between turns, with no child running.
+\* A fork happens between turns.
 ForkBetweenTurns ==
-    [][\A f \in Sessions : ForkStep(f) => (~turnOpen[cur] /\ child = "none")]_vars
+    [][\A f \in Sessions : ForkStep(f) => ~turnOpen[cur]]_vars
+
+(* Liveness *)
+
+\* A close the main loop starts always ends: the loop never waits forever
+\* for a child that only the loop can end.
+SwitchEnds == [](loop = "closing" => <>(loop = "free"))
 =============================================================================

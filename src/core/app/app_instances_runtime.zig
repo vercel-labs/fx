@@ -116,6 +116,20 @@ pub const Seed = struct {
         self.captured = true;
     }
 
+    /// What `/launch` shows an instance would start with besides its
+    /// profile, as `launchWith` applies the seed: `--model`, `--provider`,
+    /// or `FX_MODEL` pins the model as `initializePersistence` does, and
+    /// `--effort` wins over the profile's. Borrows the seed's slices.
+    pub fn launchDefaults(self: *const Seed) app_profile_runtime.LaunchCompletion.Defaults {
+        return .{
+            .model = self.selected_model,
+            .effort = self.agent_effort,
+            .model_override = if (self.model_source == .process_override or self.provider_process_override != null) self.selected_model else null,
+            .effort_override = self.effort_process_override,
+            .profile_name = self.profile_name orelse profiles.main_name,
+        };
+    }
+
     pub fn captureProfile(self: *Seed, alloc: Allocator, name: ?[]const u8) !void {
         const owned = if (name) |value| try alloc.dupe(u8, value) else null;
         if (self.profile_name) |old| alloc.free(old);
@@ -137,6 +151,8 @@ pub const State = struct {
     startup_count: usize = 1,
     /// Backs the footer's agent indicator, which can hold a subagent's label.
     label_buf: [192]u8 = undefined,
+    /// Backs the "waiting on N subagents" activity row.
+    subagent_wait_buf: [96]u8 = undefined,
     /// Whether the first instance, kept in `App.main_agent`, still runs. It
     /// closes like any other and stays closed.
     first_open: bool = true,

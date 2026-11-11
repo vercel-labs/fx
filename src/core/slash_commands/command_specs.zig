@@ -667,7 +667,7 @@ pub fn slashCompletionPrefix(registry: SlashRegistry, input: []const u8) ?[]cons
 
 pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
     if (runtimeArgQuery(registry, prefix)) |query| {
-        return runtimeArgFilter(registry, query).count();
+        return runtimeArgFilter(query).count();
     }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return allowlistArgCompletionCount(query);
@@ -690,7 +690,7 @@ pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
 
 pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
     if (runtimeArgQuery(registry, prefix)) |query| {
-        return (nthRuntimeArg(registry, query, n) orelse return null).full;
+        return (nthRuntimeArg(query, n) orelse return null).full;
     }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return nthAllowlistArgCompletion(query, n);
@@ -716,6 +716,7 @@ pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize)
 /// the prefix is not an arg-completion command.
 pub fn argCompletionAnchor(prefix: []const u8) usize {
     if (mcpVerbsOn() and argCompletionPrefix(prefix, "/mcp") != null) return "/mcp ".len;
+    if (argCompletionPrefix(prefix, "/launch") != null) return "/launch ".len;
     if (statuslineArgCompletionPrefix(prefix) != null) return "/statusline ".len;
     if (notificationsArgCompletionPrefix(prefix) != null) return "/sound ".len;
     if (permissionsArgCompletionPrefix(prefix) != null) return "/permissions ".len;
@@ -730,8 +731,8 @@ pub fn argCompletionAnchor(prefix: []const u8) usize {
 /// full command string is returned unchanged.
 pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
     if (runtimeArgQuery(registry, prefix)) |query| {
-        const entry = nthRuntimeArg(registry, query, n) orelse return null;
-        return entry.full[runtimeArgCommand(registry).len + 1 ..];
+        const entry = nthRuntimeArg(query, n) orelse return null;
+        return entry.full[runtimeArgCommand(query.group).len + 1 ..];
     }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return nthAllowlistArgLabel(query, n);
@@ -751,9 +752,15 @@ pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: u
     return nthSlashCompletion(registry, prefix, n);
 }
 
+/// Whether completion `n`, selected, draws its description selected too.
+pub fn nthSlashCompletionSelectsDescription(registry: SlashRegistry, prefix: []const u8, n: usize) bool {
+    const query = runtimeArgQuery(registry, prefix) orelse return false;
+    return (nthRuntimeArg(query, n) orelse return false).select_description;
+}
+
 pub fn nthSlashCompletionDescription(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
     if (runtimeArgQuery(registry, prefix)) |query| {
-        return (nthRuntimeArg(registry, query, n) orelse return null).description;
+        return (nthRuntimeArg(query, n) orelse return null).description;
     }
     if (allowlistArgCompletionPrefix(prefix) != null) return null;
     if (statuslineArgCompletionPrefix(prefix) != null) return null;
@@ -954,30 +961,40 @@ fn mcpVerbsOn() bool {
     return true;
 }
 
-fn runtimeArgCommand(registry: SlashRegistry) []const u8 {
-    const first = registry.arguments[0].full;
+/// The command a non-empty group of the app's completions is for.
+fn runtimeArgCommand(group: []const mod_registry.ArgumentCompletion) []const u8 {
+    const first = group[0].full;
     return first[0 .. std.mem.findScalar(u8, first, ' ') orelse first.len];
 }
 
-/// What follows the command the app's completions are for, untrimmed at
-/// the end so a finished word moves on to the next one.
-fn runtimeArgQuery(registry: SlashRegistry, prefix: []const u8) ?[]const u8 {
-    if (registry.arguments.len == 0) return null;
-    const command = runtimeArgCommand(registry);
-    if (!std.mem.startsWith(u8, prefix, command) or prefix.len == command.len) return null;
-    if (prefix[command.len] != ' ') return null;
-    return std.mem.trimStart(u8, prefix[command.len..], " ");
+/// The app's completions for the command `prefix` starts with, and what
+/// follows that command, untrimmed at the end so a finished word moves on
+/// to the next one.
+const RuntimeArgQuery = struct {
+    group: []const mod_registry.ArgumentCompletion,
+    text: []const u8,
+};
+
+fn runtimeArgQuery(registry: SlashRegistry, prefix: []const u8) ?RuntimeArgQuery {
+    for (registry.argument_groups) |group| {
+        if (group.len == 0) continue;
+        const command = runtimeArgCommand(group);
+        if (!std.mem.startsWith(u8, prefix, command) or prefix.len == command.len) continue;
+        if (prefix[command.len] != ' ') continue;
+        return .{ .group = group, .text = std.mem.trimStart(u8, prefix[command.len..], " ") };
+    }
+    return null;
 }
 
 /// Before the first space a verb matches by prefix. After it the verb must
 /// be complete, and the name matches as every menu matches. The list keeps
 /// its order (`fuzzy_match.Filter`).
 const RuntimeArgMatches = struct {
-    registry: SlashRegistry,
+    group: []const mod_registry.ArgumentCompletion,
     query: []const u8,
 
     pub fn matchAt(self: RuntimeArgMatches, position: usize) ?fuzzy_match.Match {
-        const rest = self.registry.arguments[position].full[runtimeArgCommand(self.registry).len + 1 ..];
+        const rest = self.group[position].full[runtimeArgCommand(self.group).len + 1 ..];
         const query_space = std.mem.findScalar(u8, self.query, ' ');
         const rest_space = std.mem.findScalar(u8, rest, ' ');
         if ((query_space == null) != (rest_space == null)) return null;
@@ -988,12 +1005,12 @@ const RuntimeArgMatches = struct {
     }
 };
 
-fn runtimeArgFilter(registry: SlashRegistry, query: []const u8) fuzzy_match.Filter(RuntimeArgMatches) {
-    return .init(.{ .registry = registry, .query = query }, registry.arguments.len);
+fn runtimeArgFilter(query: RuntimeArgQuery) fuzzy_match.Filter(RuntimeArgMatches) {
+    return .init(.{ .group = query.group, .query = query.text }, query.group.len);
 }
 
-fn nthRuntimeArg(registry: SlashRegistry, query: []const u8, n: usize) ?mod_registry.ArgumentCompletion {
-    return registry.arguments[runtimeArgFilter(registry, query).at(n) orelse return null];
+fn nthRuntimeArg(query: RuntimeArgQuery, n: usize) ?mod_registry.ArgumentCompletion {
+    return query.group[runtimeArgFilter(query).at(n) orelse return null];
 }
 
 fn argCompletionPrefix(prefix: []const u8, command: []const u8) ?[]const u8 {
@@ -2357,3 +2374,25 @@ pub const slack_install_spec: TopLevelSpec = .{
         "Refresh runs only when requested; no background service is installed.",
     },
 };
+
+test "app argument completions route each command to its own group" {
+    const mcp = [_]mod_registry.ArgumentCompletion{ .{ .full = "/mcp list" }, .{ .full = "/mcp show" } };
+    const launch = [_]mod_registry.ArgumentCompletion{
+        .{ .full = "/launch main", .description = "gpt-5", .select_description = true },
+        .{ .full = "/launch scout", .description = "haiku 4-5", .select_description = true },
+    };
+    var registry: SlashRegistry = .{};
+    registry.argument_groups = .{ &mcp, &launch };
+
+    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(registry, "/launch "));
+    try std.testing.expectEqualStrings("main", nthSlashCompletionLabel(registry, "/launch ", 0).?);
+    try std.testing.expectEqualStrings("gpt-5", nthSlashCompletionDescription(registry, "/launch ", 0).?);
+    try std.testing.expect(nthSlashCompletionSelectsDescription(registry, "/launch ", 0));
+    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(registry, "/launch sc"));
+    try std.testing.expectEqualStrings("/launch scout", nthSlashCompletion(registry, "/launch sc", 0).?);
+
+    try std.testing.expectEqualStrings("/mcp show", nthSlashCompletion(registry, "/mcp sh", 0).?);
+    try std.testing.expect(!nthSlashCompletionSelectsDescription(registry, "/mcp ", 0));
+    // A command without a group, or without its space, completes nothing from the app.
+    try std.testing.expectEqual(@as(usize, 0), slashCompletionCount(registry, "/launchx "));
+}

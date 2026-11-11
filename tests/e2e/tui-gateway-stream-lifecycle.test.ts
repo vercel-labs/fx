@@ -6161,8 +6161,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             {
               type: "tool-call",
               toolCallId: `select_approval_mcp_${decision}`,
-              toolName: "mcp_select_tool",
-              input: { name: dynamicToolName },
+              toolName: "toolbox",
+              input: { open: dynamicToolName },
             },
             {
               type: "finish",
@@ -6173,8 +6173,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             {
               type: "tool-call",
               toolCallId: `call_approval_mcp_${decision}`,
-              toolName: dynamicToolName,
-              input: { text: argumentSentinel },
+              toolName: "toolbox",
+              input: { run: dynamicToolName, arguments: { text: argumentSentinel } },
             },
             {
               type: "finish",
@@ -6186,8 +6186,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
               {
                 type: "tool-call",
                 toolCallId: "call_approval_mcp_session_second",
-                toolName: dynamicToolName,
-                input: { text: secondArgumentSentinel },
+                toolName: "toolbox",
+              input: { run: dynamicToolName, arguments: { text: secondArgumentSentinel } },
               },
               {
                 type: "finish",
@@ -6282,8 +6282,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "select_narrow_approval_mcp",
-            toolName: "mcp_select_tool",
-            input: { name: dynamicToolName },
+            toolName: "toolbox",
+              input: { open: dynamicToolName },
           },
           {
             type: "finish",
@@ -6294,8 +6294,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "call_narrow_approval_mcp",
-            toolName: dynamicToolName,
-            input: { text: overlongText },
+            toolName: "toolbox",
+              input: { run: dynamicToolName, arguments: { text: overlongText } },
           },
           {
             type: "finish",
@@ -6629,7 +6629,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "a shell subagent keeps an MCP tool it selected on its next request",
+    "a shell subagent runs an MCP tool it opened through toolbox, and its tools stay the same",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-subagent-mcp-selected-")));
       const home = join(root, "home");
@@ -6668,9 +6668,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         if (has("child_select")) {
           // Selecting a tool puts its definition on the child's next request.
           offeredAfterSelect = (request.tools ?? []).some((tool) => tool.name === toolName);
-          return fakeGatewayToolCall("child_call", toolName, { text: "selected" });
+          return fakeGatewayToolCall("child_call", "toolbox", { run: toolName, arguments: { text: "selected" } });
         }
-        return fakeGatewayToolCall("child_select", "mcp_select_tool", { name: toolName });
+        return fakeGatewayToolCall("child_select", "toolbox", { open: toolName });
       }, { classifierDecision: "clear" });
       gateway = childGateway;
       session = await TmuxSession.create({
@@ -6694,7 +6694,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText(rootPrompt);
       await session.waitForText("SUBAGENT_SELECTED_PARENT_DONE", TIMEOUT);
-      expect(offeredAfterSelect).toBe(true);
+      // Opening a tool never adds it to the tools the child sends.
+      expect(offeredAfterSelect).toBe(false);
       expect(readFileSync(fixture.callStartedPath, "utf8")).toContain("selected");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
@@ -7010,7 +7011,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           await session.waitForText(`ROW_REPORT_READ_${index + 1}`, TIMEOUT);
         }
         const compact = await session.captureFullScrollback();
-        expect(compact).toContain("● 5 tool calls · 4 subagents · 1 read");
+        expect(compact).toContain("● 5 tool calls · 4 subagent calls · 1 read");
         expect(compact).toContain("Invalid Agent failed · Check failure visibility");
         expect(compact).not.toContain("sent to Invalid Agent");
         for (let index = 0; index < tasks.length; index += 1) {
@@ -7044,7 +7045,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
         await session.waitForText("ROW_REPORT_READ_3", TIMEOUT);
         const resumed = await session.captureFullScrollback();
-        expect(resumed).toContain("● 5 tool calls · 4 subagents · 1 read");
+        expect(resumed).toContain("● 5 tool calls · 4 subagent calls · 1 read");
         expect(resumed).toContain("Invalid Agent failed · Check failure visibility");
         expect(resumed).toContain("sent to helper · Check one-off cleanup");
         expect(resumed).toContain("sent to checker · Check replay again");
@@ -7126,6 +7127,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         // The frame is the subagent's, never drawn as the user's prompt.
         expect(live).not.toContain(header);
         expect(live).not.toContain("REPORT_NEVER_JOINED");
+        // Main's waits say what they did, not the tool's name, and name the
+        // subagent that was working when the wait began.
+        expect(live).toContain("waited for helper");
+        expect(live).not.toContain("waited for subagents");
+        expect(live).not.toContain("Managed subagent");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -7137,6 +7143,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         const resumed = await session.captureFullScrollback();
         expect(countOccurrences(resumed, row)).toBe(1);
         expect(resumed).not.toContain(header);
+        // The saved result names the subagent, so the resumed row does too.
+        expect(resumed).toContain("waited for helper");
+        expect(resumed).not.toContain("waited for subagents");
         // The saved turn kept the report, in its own frame.
         await session.sendText("AFTER_RESUME_PROMPT");
         await session.waitForText("AFTER_RESUME_DONE", TIMEOUT);

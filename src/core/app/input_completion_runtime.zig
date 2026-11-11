@@ -521,8 +521,8 @@ pub fn CompletionRuntime(comptime App: type) type {
             return true;
         }
 
-        /// Moves the agent list's selection, keeping it in view, and shows
-        /// the agent it lands on.
+        /// Moves the agent list's highlight, keeping it in view. The agent
+        /// on screen stays until Enter.
         pub fn routeAgentsMenuMove(app: *App, agent: *AppAgent, delta: i32) !bool {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
             const runtime = app_agents_runtime.Runtime(App);
@@ -780,6 +780,9 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         fn catalogMenuOwnsSurface(app: *App, agent: *AppAgent) bool {
             if (app.input_runtime.help_menu.active or app.input_runtime.settings_menu.active) return true;
+            if (comptime @hasField(App, "instances")) {
+                if (app.instances.agents_menu.open) return true;
+            }
             if (comptime @hasField(App, "skills")) {
                 if (comptime @hasField(@TypeOf(app.skills), "menu")) {
                     if (app.skills.menuVisible()) return true;

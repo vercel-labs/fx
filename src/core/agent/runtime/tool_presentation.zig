@@ -1,4 +1,5 @@
 const std = @import("std");
+const toolbox = @import("../../tooling/toolbox.zig");
 const testing_allocator = @import("../../shared/testing_allocator.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const managed_execution = @import("../../execution/managed_execution.zig");
@@ -139,15 +140,17 @@ pub const ProvisionalToolStatuses = struct {
         var buf: [512]u8 = undefined;
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
-        const is_skill = std.mem.eql(u8, tool_name, "skill");
-        var observed_label = if (is_skill) null else label_value;
+        // A toolbox call's row, once its arguments arrive, reads as what it
+        // opens, runs, or searches, since the first string in them may be
+        // any of those.
+        const is_toolbox = std.mem.eql(u8, tool_name, toolbox.tool_name);
+        var observed_label = if (is_toolbox) null else label_value;
         var observed_kind = activity_kind;
-        const resource_label: ?[]const u8 = if (is_skill) resource: {
+        const argument_label: ?[]const u8 = if (is_toolbox) resource: {
             const json = arguments_json orelse break :resource null;
             const args = tool_args.parseToolArgsObject(scratch.allocator(), json) catch break :resource null;
             const spec = hooks.tool_registry.lookup(tool_name) orelse break :resource null;
             const presentation = tool_dispatch.presentationForArgs(spec.*, args);
-            if (presentation.label_arg_kind != .resource) break :resource null;
             const value = tool_dispatch.presentationLabelValue(presentation, args) orelse break :resource null;
             const encoded = text_utils.encodeTerminalSafe(scratch.allocator(), value, buf.len) catch break :resource null;
             if (encoded.truncated) break :resource null;
@@ -156,7 +159,18 @@ pub const ProvisionalToolStatuses = struct {
             observed_kind = presentation.activity_kind;
             break :resource formatted;
         } else null;
-        const label = resource_label orelse try formatProvisionalProgressLabel(&buf, action_label, observed_label);
+        // A subagent call's row names its subagent once its arguments hold
+        // the name, while they stream in or once complete, and keeps a name
+        // it already shows; the first string in them is its action.
+        const is_subagent = std.mem.eql(u8, tool_name, "subagent");
+        if (is_subagent) {
+            observed_label = tooling_presentation.subagentStreamedAgent(arguments_json orelse "") orelse self.trackedLabel(tool_id);
+        }
+        const shown_label = if (is_subagent and observed_label != null)
+            (try text_utils.encodeTerminalSafe(scratch.allocator(), observed_label.?, 64)).bytes
+        else
+            observed_label;
+        const label = argument_label orelse try formatProvisionalProgressLabel(&buf, action_label, shown_label);
         const recorded = try self.recordTracked(
             alloc,
             tool_id,
@@ -180,6 +194,33 @@ pub const ProvisionalToolStatuses = struct {
                 .text = label,
             },
         }) catch {};
+    }
+
+    /// Names the subagent a streaming `subagent` call's row is for as soon
+    /// as its arguments so far hold the whole name, so the row reads
+    /// `Managing reviewer` while the rest of the call streams in.
+    pub fn observeArguments(
+        self: *ProvisionalToolStatuses,
+        hooks: *const AgentRuntimeDeps,
+        alloc: Allocator,
+        turn_id: u64,
+        tool_id: []const u8,
+        arguments: []const u8,
+    ) !void {
+        const index = self.findTracked(tool_id) orelse return;
+        const status = self.tracked.items[index];
+        if (!std.mem.eql(u8, status.tool_name, "subagent") or status.label_value != null) return;
+        if (tooling_presentation.subagentStreamedAgent(arguments) == null) return;
+        const metadata = switch (preflight(hooks.tool_registry, status.tool_name) orelse return) {
+            .ineligible => return,
+            .eligible => |metadata| metadata,
+        };
+        try self.publish(hooks, alloc, turn_id, status.id, status.tool_name, metadata.activity_kind, metadata.action_label, null, arguments);
+    }
+
+    fn trackedLabel(self: *const ProvisionalToolStatuses, id: []const u8) ?[]const u8 {
+        const index = self.findTracked(id) orelse return null;
+        return self.tracked.items[index].label_value;
     }
 
     pub fn finishMalformedToolArguments(
@@ -1483,11 +1524,10 @@ fn failureStatusDetail(
         return if (encoded.bytes.len == 0) detail else encoded.bytes;
     }
 
-    if (safe_result.len == 0 or
-        !containsName(advertised_dynamic_tool_names, call.name))
-    {
-        return null;
-    }
+    // An MCP call shows why it failed, made directly or through toolbox.
+    const mcp_call = containsName(advertised_dynamic_tool_names, call.name) or
+        if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| types.isMcpToolName(run.name) else false;
+    if (safe_result.len == 0 or !mcp_call) return null;
     const detail = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
     const masked_detail = try text_utils.maskSecrets(arena, detail);
     const encoded = try text_utils.encodeTerminalSafeInline(arena, masked_detail, 256);
@@ -1672,7 +1712,8 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.edit_file,
     test_builtin_tools.shell,
     test_builtin_tools.ask_user_question,
-    test_builtin_tools.skill,
+    test_builtin_tools.toolbox,
+    test_builtin_tools.subagent,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_activity_tool = blk: {
@@ -1995,32 +2036,19 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
     }
 }
 
-test "provisional skill labels select complete resource arguments and ignore opaque hints" {
-    const cases = [_]struct {
-        arguments_json: ?[]const u8,
-        hint: ?[]const u8 = "skill:opaque/location",
-        resource: ?[]const u8 = null,
-    }{
-        .{ .arguments_json = "{\"location\":\"skill:opaque/location\",\"resource\":\"references/types.md\"}", .resource = "references/types.md" },
-        .{ .arguments_json = "{\"resource\":\"references/types.md\",\"location\":\"skill:opaque/location\"}", .resource = "references/types.md" },
-        .{ .arguments_json = "{\"resource\":\"references/types.md\"}", .hint = null, .resource = "references/types.md" },
-        .{ .arguments_json = null },
-        .{ .arguments_json = "" },
-        .{ .arguments_json = "{\"resource\":\"partial" },
-        .{ .arguments_json = "[]" },
-        .{ .arguments_json = "null" },
-        .{ .arguments_json = "\"references/types.md\"" },
-        .{ .arguments_json = "{\"resource\":null}" },
-        .{ .arguments_json = "{\"resource\":42}" },
-        .{ .arguments_json = "{\"resource\":false}" },
-        .{ .arguments_json = "{\"resource\":[]}" },
-        .{ .arguments_json = "{\"resource\":{}}" },
-        .{ .arguments_json = "{\"resource\":\"\"}" },
-        .{ .arguments_json = "{\"resource\":\"SKILL.md\"}" },
-        .{ .arguments_json = "{\"resource\":\"SKILL.md\",\"offset\":1}" },
-        .{ .arguments_json = "{\"location\":\"skill:opaque/location\"}" },
-        .{ .arguments_json = "{\"name\":\"root-skill\"}" },
-        .{ .arguments_json = "{}" },
+test "provisional toolbox labels read as what the call opens, runs, or searches" {
+    // The stream's hint is the first string in the arguments, which may name
+    // what a run runs or what a search looks for, so it never labels the row.
+    const cases = [_]struct { arguments_json: ?[]const u8, label: []const u8, value: ?[]const u8 = null }{
+        .{ .arguments_json = null, .label = "Using" },
+        .{ .arguments_json = "{\"run\":\"glob", .label = "Using" },
+        .{ .arguments_json = "{}", .label = "Using" },
+        .{ .arguments_json = "{\"run\":\"glob_files\",\"arguments\":{\"pattern\":\"*.md\"}}", .label = "Running", .value = "glob_files" },
+        .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .label = tooling_presentation.mcp_running_label, .value = "mcp_fixture_echo" },
+        .{ .arguments_json = "{\"search\":\"list files\"}", .label = "Searching toolbox", .value = "list files" },
+        .{ .arguments_json = "{\"open\":\"fixture\"}", .label = "Opening", .value = "fixture" },
+        // A skill's file reads as that file.
+        .{ .arguments_json = "{\"open\":\"skill:opaque/location\",\"resource\":\"references/types.md\"}", .label = "Reading skill resource", .value = "references/types.md" },
     };
     const alloc = std.testing.allocator;
     for (cases) |case| {
@@ -2029,22 +2057,63 @@ test "provisional skill labels select complete resource arguments and ignore opa
         const hooks = capture.hooks();
         var statuses = ProvisionalToolStatuses{};
         defer statuses.deinit(alloc);
-        try statuses.publish(&hooks, alloc, 7, "skill_1", "skill", .read, eligibleActionLabel("skill"), case.hint, case.arguments_json);
+        try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, .read, eligibleActionLabel(toolbox.tool_name), "glob_files", case.arguments_json);
         try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
-        try std.testing.expectEqual(types.ToolActivityKind.read, capture.events.items[0].provisional.activity_kind);
-        try std.testing.expectEqualStrings("skill_1", capture.events.items[1].progress.id.call_id);
         var expected_buf: [512]u8 = undefined;
-        const expected = try formatProvisionalProgressLabel(&expected_buf, if (case.resource != null) "Reading skill resource" else "Loading skill", case.resource);
+        const expected = try formatProvisionalProgressLabel(&expected_buf, case.label, case.value);
         try std.testing.expectEqualStrings(expected, capture.events.items[1].progress.text);
-        if (case.resource) |resource| {
-            try std.testing.expectEqualStrings(resource, statuses.tracked.items[0].label_value.?);
+        if (case.value) |value| {
+            try std.testing.expectEqualStrings(value, statuses.tracked.items[0].label_value.?);
         } else {
             try std.testing.expect(statuses.tracked.items[0].label_value == null);
         }
     }
 }
 
-test "provisional skill labels decode escaped UTF-8 and encode terminal controls before copying" {
+test "a streaming subagent call's row names its subagent once the name arrives, and keeps it" {
+    const alloc = std.testing.allocator;
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    var statuses = ProvisionalToolStatuses{};
+    defer statuses.deinit(alloc);
+    const kind = activityKind(hooks.tool_registry, "subagent");
+    const action = eligibleActionLabel("subagent");
+    var named_buf: [512]u8 = undefined;
+    const named = try formatProvisionalProgressLabel(&named_buf, action, "reviewer");
+
+    try statuses.publish(&hooks, alloc, 7, "sub_1", "subagent", kind, action, null, null);
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    try std.testing.expectEqualStrings("● Managing\x1b[0m", capture.events.items[1].progress.text);
+    // Part of the name is not yet a name.
+    try statuses.observeArguments(&hooks, alloc, 7, "sub_1", "{\"request\":{\"action\":\"message\",\"agent\":\"revi");
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    try statuses.observeArguments(&hooks, alloc, 7, "sub_1", "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\"");
+    try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
+    try std.testing.expectEqualStrings("sub_1", capture.events.items[2].provisional.id.call_id);
+    try std.testing.expectEqualStrings(named, capture.events.items[3].progress.text);
+    // The rest of the call streams in without another publication.
+    try statuses.observeArguments(&hooks, alloc, 7, "sub_1", "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Review");
+    try std.testing.expectEqual(@as(usize, 4), capture.events.items.len);
+    // The stream's final start keeps the name.
+    try statuses.publish(&hooks, alloc, 7, "sub_1", "subagent", kind, action, null, "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Review it\"}}");
+    try std.testing.expectEqualStrings(named, capture.events.items[5].progress.text);
+
+    // A call without `request` starts with its action, which the stream's
+    // hint would name; the row names its subagent instead.
+    try statuses.publish(&hooks, alloc, 7, "sub_2", "subagent", kind, action, "message", "{\"action\":\"message\",\"agent\":\"tester\",\"message\":\"Run it\"}");
+    var tester_buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(try formatProvisionalProgressLabel(&tester_buf, action, "tester"), capture.events.items[7].progress.text);
+
+    // Other tools and unknown calls are left alone.
+    try statuses.publish(&hooks, alloc, 7, "read_1", "read_file", activityKind(hooks.tool_registry, "read_file"), eligibleActionLabel("read_file"), null, null);
+    const before = capture.events.items.len;
+    try statuses.observeArguments(&hooks, alloc, 7, "read_1", "{\"agent\":\"reviewer\"");
+    try statuses.observeArguments(&hooks, alloc, 7, "missing", "{\"agent\":\"reviewer\"");
+    try std.testing.expectEqual(before, capture.events.items.len);
+}
+
+test "provisional toolbox labels decode escaped UTF-8 and encode terminal controls before copying" {
     const alloc = std.testing.allocator;
     var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
     defer capture.deinit();
@@ -2052,9 +2121,9 @@ test "provisional skill labels decode escaped UTF-8 and encode terminal controls
     var statuses = ProvisionalToolStatuses{};
     defer statuses.deinit(alloc);
     {
-        const json = try alloc.dupe(u8, "{\"location\":\"skill:opaque/location\",\"resource\":\"r/\\u00e9\\u4e2d\\\"\\u001b[31m\\n\\r\\t\\u0000\\u0080.md\"}");
+        const json = try alloc.dupe(u8, "{\"open\":\"skill:opaque/location\",\"resource\":\"r/\\u00e9\\u4e2d\\\"\\u001b[31m\\n\\r\\t\\u0000\\u0080.md\"}");
         defer alloc.free(json);
-        try statuses.publish(&hooks, alloc, 7, "skill_1", "skill", .read, eligibleActionLabel("skill"), "skill:opaque/location", json);
+        try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, .read, eligibleActionLabel(toolbox.tool_name), "skill:opaque/location", json);
     }
     try std.testing.expectEqualStrings(
         "● Reading skill resource\x1b[0m \x1b[38;5;245mr/é中\"\\x1b[31m\\x0a\\x0d\\x09\\x00\\u{0080}.md\x1b[0m",
@@ -2063,7 +2132,7 @@ test "provisional skill labels decode escaped UTF-8 and encode terminal controls
     try std.testing.expectEqualStrings("r/é中\"\x1b[31m\n\r\t\x00\u{0080}.md", statuses.tracked.items[0].label_value.?);
 }
 
-test "provisional skill labels fall back when encoded resource exceeds the progress buffer" {
+test "provisional toolbox labels fall back when an encoded resource exceeds the progress buffer" {
     const alloc = std.testing.allocator;
     const max_detail = 512 - "● Reading skill resource\x1b[0m \x1b[38;5;245m\x1b[0m".len;
     for ([_]usize{ max_detail, max_detail + 1, 512, 513, 4096 }) |len| {
@@ -2075,15 +2144,15 @@ test "provisional skill labels fall back when encoded resource exceeds the progr
         const resource = try alloc.alloc(u8, len);
         defer alloc.free(resource);
         @memset(resource, 'a');
-        const json = try alloc.print("{{\"resource\":\"{s}\"}}", .{resource});
+        const json = try alloc.print("{{\"open\":\"skill:opaque/location\",\"resource\":\"{s}\"}}", .{resource});
         defer alloc.free(json);
-        try statuses.publish(&hooks, alloc, 7, "skill_1", "skill", .read, eligibleActionLabel("skill"), "skill:opaque/location", json);
+        try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, .read, eligibleActionLabel(toolbox.tool_name), "skill:opaque/location", json);
         const text = capture.events.items[1].progress.text;
         if (len == max_detail) {
             try std.testing.expectEqual(@as(usize, 512), text.len);
             try std.testing.expectEqualStrings(resource, statuses.tracked.items[0].label_value.?);
         } else {
-            try std.testing.expectEqualStrings("● Loading skill\x1b[0m", text);
+            try std.testing.expectEqualStrings("● Using\x1b[0m", text);
             try std.testing.expect(statuses.tracked.items[0].label_value == null);
         }
     }

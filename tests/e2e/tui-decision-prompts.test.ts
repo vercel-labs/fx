@@ -279,6 +279,60 @@ function outerQuestionCall() {
   ]);
 }
 
+const TALL_QUESTION_PROMPT = "Who should relay events to the chat panes?";
+const TALL_QUESTION_DESCRIPTION =
+  "The relay follows each session and passes its events on, so every pane keeps updating " +
+  "while the app is closed, at the cost of one more hop for each message.";
+
+function outerTallQuestionCall() {
+  return outerToolCalls([
+    {
+      id: "tall_question_outer_1",
+      name: "ask_user_question",
+      input: {
+        questions: [
+          {
+            question: TALL_QUESTION_PROMPT,
+            options: [
+              { label: "A relay process", description: TALL_QUESTION_DESCRIPTION },
+              { label: "Each pane directly", description: TALL_QUESTION_DESCRIPTION },
+              { label: "Both, per pane", description: TALL_QUESTION_DESCRIPTION },
+            ],
+          },
+        ],
+      },
+    },
+  ]);
+}
+
+const FILL_LINE_COUNT = 40;
+
+function fillLine(index: number) {
+  return `FILL_LINE_${String(index).padStart(3, "0")} transcript row`;
+}
+
+function outerFillText() {
+  return outerText(
+    Array.from({ length: FILL_LINE_COUNT }, (_, index) => fillLine(index + 1)).join("\n\n"),
+  );
+}
+
+/// The longest run of blank rows between the first row containing `from`
+/// and the first later row containing `to`.
+function longestBlankRunBetween(rows: string[], from: string, to: string) {
+  const start = rows.findIndex((row) => row.includes(from));
+  const end = rows.findIndex((row, index) => index > start && row.includes(to));
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  let longest = 0;
+  let run = 0;
+  for (const row of rows.slice(start, end)) {
+    run = row.trim() === "" ? run + 1 : 0;
+    longest = Math.max(longest, run);
+  }
+  return longest;
+}
+
 function outerQuestionBatchCall() {
   return outerToolCalls([
     {
@@ -2815,7 +2869,64 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
-    "resized question cancellation keeps the footer bottom anchored through the first edit",
+    "question cancellation after a resize keeps the transcript in place",
+    async () => {
+      const ctx = await launchScenario([
+        outerFillText(),
+        outerTallQuestionCall(),
+        outerText("tall question cancellation handled"),
+      ]);
+      await ctx.session.sendText("Fill the screen with numbered rows.");
+      await ctx.session.waitForText(fillLine(FILL_LINE_COUNT), TIMEOUT);
+      await ctx.session.resizeWindow(90, 40);
+      await ctx.session.resizeWindow(120, 40);
+      await waitForGridState(
+        ctx.session,
+        "settled resize before the question",
+        (grid) =>
+          grid.some((row) => row.includes(fillLine(FILL_LINE_COUNT))) &&
+          findFooterBlocks(grid).length > 0,
+      );
+
+      await ctx.session.sendText("Ask me who should relay the events.");
+      const questionGrid = await waitForGridState(
+        ctx.session,
+        "tall question prompt",
+        (grid) => grid.some((row) => row.includes(TALL_QUESTION_PROMPT)),
+      );
+      // The question displaced earlier rows into scrollback; the first row
+      // still on screen is the anchor that must not move.
+      const anchorRow = questionGrid.findIndex((row) => row.includes("FILL_LINE_"));
+      expect(anchorRow).toBeGreaterThanOrEqual(0);
+      expect(anchorRow).toBeLessThanOrEqual(1);
+      const anchorText = questionGrid[anchorRow]!.trim();
+
+      await ctx.session.sendKeys("Escape");
+      const cancelledGrid = await waitForGridState(
+        ctx.session,
+        "tall question cancellation",
+        (grid) =>
+          grid.some((row) => row.includes("▪ Cancelled")) &&
+          findFooterBlocks(grid).length > 0,
+      );
+      expect(cancelledGrid.findIndex((row) => row.trim() === anchorText)).toBe(anchorRow);
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
+      const footer = findFooterBlocks(cancelledGrid).at(-1)!;
+      expect(footer.topDivider).toBe(cancelledRow + 2);
+      expect(cancelledGrid[cancelledRow + 1]!.trim()).toBe("");
+      expect(cancelledGrid.at(-1)!.trim()).toBe("");
+
+      const history = (await ctx.session.captureFullScrollback()).split("\n");
+      expect(longestBlankRunBetween(history, fillLine(1), "▪ Cancelled")).toBe(1);
+      expect(countOccurrences(history.join("\n"), anchorText)).toBe(1);
+      expect(ctx.gateway.requests).toHaveLength(2);
+      await assertProcessAliveAndClean(ctx);
+    },
+    90_000,
+  );
+
+  test(
+    "resized question cancellation keeps the transcript in place through the first edit",
     async () => {
       const ctx = await launchScenario(
         [
@@ -2844,40 +2955,30 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.sendKeys("Escape");
       const cancelledGrid = await waitForGridState(
         ctx.session,
-        "bottom-anchored question cancellation",
-        (grid) => {
-          const footer = findFooterBlocks(grid).at(-1);
-          return (
-            grid.some((row) => row.includes("▪ Cancelled")) &&
-            footer?.bottomDivider === grid.length - 2
-          );
-        },
+        "in-place question cancellation",
+        (grid) =>
+          grid.some((row) => row.includes("▪ Cancelled")) &&
+          findFooterBlocks(grid).length > 0,
       );
       const cancelledFooter = findFooterBlocks(cancelledGrid).at(-1);
       const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(cancelledFooter).toBeDefined();
-      expect(cancelledRow).toBeGreaterThanOrEqual(0);
-      expect(cancelledRow).toBeLessThan(cancelledFooter!.topDivider);
-      expect(
-        cancelledGrid
-          .slice(cancelledRow + 1, cancelledFooter!.topDivider)
-          .every((row) => row.trim() === ""),
-      ).toBe(true);
+      // The transcript stays at the top and the rows the question freed go
+      // below the footer, not above the transcript.
+      expect(cancelledGrid[0]!.trim()).not.toBe("");
+      expect(cancelledFooter!.topDivider).toBe(cancelledRow + 2);
+      expect(cancelledGrid[cancelledRow + 1]!.trim()).toBe("");
+      expect(cancelledGrid.at(-1)!.trim()).toBe("");
 
       await ctx.session.sendLiteralText("x");
       const editedGrid = await waitForGridState(
         ctx.session,
-        "bottom-anchored question cancellation after edit",
-        (grid) => {
-          const footer = findFooterBlocks(grid).at(-1);
-          return (
-            currentFooterText(grid).includes("x") &&
-            footer?.bottomDivider === grid.length - 2
-          );
-        },
+        "in-place question cancellation after edit",
+        (grid) => currentFooterText(grid).includes("x"),
       );
       const editedFooter = findFooterBlocks(editedGrid).at(-1);
       expect(editedFooter).toEqual(cancelledFooter);
+      expect(editedGrid.slice(0, cancelledRow + 1)).toEqual(cancelledGrid.slice(0, cancelledRow + 1));
       expect(countOccurrences(editedGrid.join("\n"), "▪ Cancelled")).toBe(1);
       expect(editedGrid.join("\n")).not.toContain(QUESTION_PROMPT);
       expect(ctx.gateway.requests).toHaveLength(2);

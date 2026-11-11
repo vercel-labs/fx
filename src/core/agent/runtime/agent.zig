@@ -6,8 +6,39 @@ const session_codec = @import("../../session/session_codec.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const text_utils = @import("../../shared/text_utils.zig");
+const toolbox = @import("../../tooling/toolbox.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// A rendered toolbox menu kept inline, so the conversation's state stays a
+/// plain value: no allocation, no deinit work.
+pub const ToolboxMenu = struct {
+    bytes: [toolbox.max_lead_bytes + toolbox.max_menu_bytes]u8 = undefined,
+    len: usize = 0,
+    set: bool = false,
+    /// `toolbox.entriesHash` of what the menu lists, and of what the
+    /// conversation was last told the toolbox holds.
+    entries_hash: u64 = 0,
+    noted_hash: u64 = 0,
+
+    pub fn get(self: *const ToolboxMenu) ?[]const u8 {
+        return if (self.set) self.bytes[0..self.len] else null;
+    }
+
+    /// Keeps `lead` and then `menu`, which `toolbox.renderBounded` keeps
+    /// within the buffer, rendered from entries whose hash is `entries_hash`.
+    /// A lead past `toolbox.max_lead_bytes` is left out.
+    pub fn keep(self: *ToolboxMenu, lead: []const u8, menu: []const u8, entries_hash: u64) void {
+        std.debug.assert(menu.len <= toolbox.max_menu_bytes);
+        const kept_lead = if (lead.len <= toolbox.max_lead_bytes) lead else "";
+        @memcpy(self.bytes[0..kept_lead.len], kept_lead);
+        @memcpy(self.bytes[kept_lead.len..][0..menu.len], menu);
+        self.len = kept_lead.len + menu.len;
+        self.set = true;
+        self.entries_hash = entries_hash;
+        self.noted_hash = entries_hash;
+    }
+};
 
 /// The provider-neutral state for one conversation. Product session metadata,
 /// persistence, permissions, credentials, and host effects live outside it.
@@ -27,6 +58,11 @@ pub const Agent = struct {
     /// A request size limit learned from a provider rejection, kept for later
     /// requests to the same model in this conversation. Plain value state.
     request_byte_limit: ?RequestByteLimitState = null,
+    /// The toolbox menu this conversation sent first. Later requests send the
+    /// same bytes until the conversation is cleared, compactions included,
+    /// whatever the skills and MCP servers do meanwhile
+    /// (`tests/tla/toolbox/Toolbox.tla` MenuFixed). Plain value state.
+    toolbox_menu: ToolboxMenu = .{},
 
     pub fn deinit(self: *Agent, alloc: Allocator) void {
         self.clearHistory(alloc);
@@ -97,11 +133,26 @@ pub const Agent = struct {
     }
 
     pub fn clearHistory(self: *Agent, alloc: Allocator) void {
+        self.dropHistory(alloc);
+        // A new conversation lists what the toolbox holds now.
+        self.toolbox_menu = .{};
+    }
+
+    /// Frees every saved turn so a compaction can put its checkpoint in their
+    /// place. The conversation goes on, so it keeps its toolbox menu: later
+    /// requests send the bytes the first one did, and the request a turn
+    /// built before compacting still points at them
+    /// (`tests/tla/toolbox/Toolbox.tla` MenuFixed).
+    pub fn dropHistory(self: *Agent, alloc: Allocator) void {
         for (self.history.items) |turn| types.freeHistoryTurn(alloc, turn);
         self.history.clearRetainingCapacity();
         // Cleared history no longer resembles the calibrated request.
         self.request_token_calibration = null;
         self.request_byte_limit = null;
+        // The notes that told the conversation of toolbox changes may have
+        // gone with the turns, so the next request notes any difference
+        // from the menu again (`Toolbox.tla` Informed).
+        self.toolbox_menu.noted_hash = self.toolbox_menu.entries_hash;
     }
 
     /// Returns the learned request size limit for `model`, if any.
@@ -241,6 +292,25 @@ test "Agent request token calibration survives startTurn and dies with cleared h
     agent.storeRequestTokenCalibration("fixture/model", cost);
     try agent.restoreHistory(alloc, &.{});
     try std.testing.expectEqual(@as(?RequestTokenCalibrationState, null), agent.request_token_calibration);
+}
+
+test "Agent keeps its toolbox menu when compaction drops the history and loses it when the history is cleared" {
+    const alloc = std.testing.allocator;
+    var agent: Agent = .{};
+    defer agent.deinit(alloc);
+    agent.toolbox_menu.keep("", "- review", 7);
+    const menu = agent.toolbox_menu.get().?;
+
+    agent.toolbox_menu.noted_hash = 11;
+    agent.dropHistory(alloc);
+    try std.testing.expectEqualStrings("- review", agent.toolbox_menu.get().?);
+    // The slice a request took before the compaction still reads the menu.
+    try std.testing.expectEqualStrings("- review", menu);
+    // What the dropped turns noted is forgotten: only the menu is known.
+    try std.testing.expectEqual(@as(u64, 7), agent.toolbox_menu.noted_hash);
+
+    agent.clearHistory(alloc);
+    try std.testing.expectEqual(@as(?[]const u8, null), agent.toolbox_menu.get());
 }
 
 test "Agent request size limit only lowers, follows the model, and dies with cleared history" {
