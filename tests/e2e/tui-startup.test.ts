@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -24,6 +25,24 @@ import {
 const SKIP = !tmuxAvailable() || !HAS_API_KEY;
 const SKIP_TMUX = !tmuxAvailable();
 const TIMEOUT = 30_000;
+
+/// Whether this process can write into a folder whose mode forbids it, as root
+/// or a sandbox that holds every capability can.
+function ignoresFileModes(): boolean {
+  const probe = mkdtempSync(join(tmpdir(), "fx-e2e-mode-probe-"));
+  try {
+    chmodSync(probe, 0o500);
+    try {
+      writeFileSync(join(probe, "probe"), "");
+      return true;
+    } catch {
+      return false;
+    }
+  } finally {
+    chmodSync(probe, 0o700);
+    rmSync(probe, { recursive: true, force: true });
+  }
+}
 
 let session: TmuxSession | null = null;
 
@@ -931,6 +950,91 @@ describe.skipIf(SKIP_TMUX)("tui: startup errors", () => {
           await session.kill();
           session = null;
         }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a debug recording that cannot start says why",
+    async () => {
+      // A file-size limit of zero fails the tape's first write as a full disk
+      // does. The limit also covers a stderr file, so the message is read from
+      // the pane.
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-recording-fault-")));
+      const home = join(root, "home");
+      const limited = join(root, "limited.sh");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(
+        limited,
+        `#!/bin/sh\ntrap '' XFSZ\nulimit -f 0\nexec '${FX_BIN.replaceAll("'", "'\\''")}'\n`,
+        { mode: 0o700 },
+      );
+
+      try {
+        session = await TmuxSession.create({
+          cmd: limited,
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_DEBUG_RECORD: "1",
+          },
+          remainOnExit: true,
+        });
+        await session.waitForPane(() => session!.paneStatus().dead === true, TIMEOUT);
+        expect(session.paneStatus().status).toBe(1);
+        const shown = await session.captureFullScrollback();
+        expect(shown).toContain("fx: unable to start terminal recording: a file-size limit was reached.");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(ignoresFileModes())(
+    "a debug recording in a folder fx cannot write says permission denied",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-recording-denied-")));
+      const home = join(root, "home");
+      const locked = join(root, "locked");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(locked);
+      chmodSync(locked, 0o500);
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_DEBUG_RECORD: "1",
+            FX_RECORD: join(locked, "tape.fxtape"),
+          },
+          stderrPath,
+          remainOnExit: true,
+        });
+        await session.waitForPane(() => session!.paneStatus().dead === true, TIMEOUT);
+        expect(session.paneStatus().status).toBe(1);
+        expect(readFileSync(stderrPath, "utf8")).toBe("fx: unable to start terminal recording: permission denied.\n");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        chmodSync(locked, 0o700);
         rmSync(root, { recursive: true, force: true });
       }
     },
