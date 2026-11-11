@@ -358,8 +358,6 @@ pub const LogoutResult = struct {
 };
 
 /// Deletes the saved Codex login, then revokes its refresh token at OpenAI.
-/// A revocation OpenAI doesn't confirm leaves the login deleted and sets
-/// `revocation_failed`.
 pub fn logout(alloc: Allocator, transport: oauth_transport.Provider) !LogoutResult {
     const local = try logoutLocally(alloc);
     defer if (local.refresh_token) |token| secret.zeroAndFree(alloc, token);
@@ -373,18 +371,14 @@ pub fn logout(alloc: Allocator, transport: oauth_transport.Provider) !LogoutResu
     return result;
 }
 
-/// The outcome of deleting the saved Codex login, with its refresh token kept
-/// so it can still be revoked.
+/// A deleted Codex login, with its refresh token kept for `revokeToken`.
 pub const LocalLogout = struct {
     result: LogoutResult,
-    /// Owned by the caller when set; release it with `secret.zeroAndFree`
-    /// using the allocator passed to `logoutLocally`.
+    /// Owned by the caller; release it with `secret.zeroAndFree`.
     refresh_token: ?[]u8 = null,
 };
 
-/// Deletes the saved Codex login without contacting OpenAI. Revoke the
-/// returned refresh token with `revokeToken`, then release it. The login is
-/// deleted first, so a failed deletion never leaves a revoked token on disk.
+/// Deletes the saved Codex login first, so a failed deletion never leaves a revoked token on disk.
 pub fn logoutLocally(alloc: Allocator) !LocalLogout {
     var mutation = (try chatgpt_session.beginExistingMutation()) orelse return .{ .result = .{
         .deletion = .missing,
@@ -413,19 +407,11 @@ pub fn logoutLocally(alloc: Allocator) !LocalLogout {
     };
 }
 
-/// Revokes a Codex refresh token at OpenAI, which ends its login there. Any
-/// answer but a 2xx is an error.
+/// Revokes a Codex refresh token at OpenAI, which ends its login there.
 pub fn revokeToken(alloc: Allocator, transport: oauth_transport.Provider, token: []const u8) !void {
     const endpoint_url = try configuredEndpoint(alloc, e2e_revoke_url_env, revoke_url);
     defer alloc.free(endpoint_url);
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-    var form: FormBody = .{};
-    try form.append(&body.writer, "token", token);
-    try form.append(&body.writer, "token_type_hint", "refresh_token");
-    try form.append(&body.writer, "client_id", client_id);
-    const bytes = try requestAcceptedWithBounds(alloc, transport, .post_form, endpoint_url, body.written(), null, null);
-    secret.zeroAndFree(alloc, bytes);
+    try oauth.revokeToken(alloc, transport, endpoint_url, client_id, token, .refresh_token);
 }
 
 pub fn sourceExists(alloc: Allocator) !bool {
