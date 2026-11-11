@@ -957,6 +957,9 @@ pub fn Runtime(comptime App: type) type {
                     if (app.shell.fullTranscriptActive()) return .done;
                     if (!app_agents_runtime.Runtime(App).hasAnotherAgent(app)) return .done;
                     dismissActiveMenusThenRedraw(app, agents.screenAgentOf(app));
+                    // The list sets the draft aside itself, so the model
+                    // picker's goes back to the composer first.
+                    restoreModelPickerDraft(app);
                     try app.openAgentsMenu();
                 }
                 return .done;
@@ -985,7 +988,9 @@ pub fn Runtime(comptime App: type) type {
                 else => {},
             }
 
-            if (agents.screenAgentOf(app).question_prompt.isActive()) {
+            // The open agent list covers the prompt, and its search box
+            // takes the keys it passes on.
+            if (agents.screenAgentOf(app).question_prompt.isActive() and !agentsMenuActive(app)) {
                 try question_rt.routeQuestionEscapeAction(
                     app,
                     agents.screenAgentOf(app),
@@ -995,7 +1000,7 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
-            if (agents.screenAgentOf(app).approval_prompt.isActive()) {
+            if (agents.screenAgentOf(app).approval_prompt.isActive() and !agentsMenuActive(app)) {
                 try approval_rt.routeApprovalEscapeAction(
                     app,
                     agents.screenAgentOf(app),
@@ -1167,6 +1172,9 @@ pub fn Runtime(comptime App: type) type {
             max_input_len: usize,
         ) !bool {
             const byte = raw.byte;
+            // The open agent list covers the prompt; its search box takes the
+            // bytes it passes on.
+            if (agentsMenuActive(app)) return false;
             if ((agent.question_prompt.isActive() or approvalOwnsCurrentSurface(app, agent)) and byte == ctrl_g_upgrade_byte) {
                 _ = try routeUpgradeShortcut(app, agent, byte);
                 return true;
@@ -1730,12 +1738,6 @@ pub fn Runtime(comptime App: type) type {
             return app_agents_runtime.Runtime(App).menuActive(app);
         }
 
-        /// Closes the agent list, keeping the agent it shows.
-        fn cancelAgentsMenu(app: *App) bool {
-            if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
-            return app_agents_runtime.Runtime(App).closeMenu(app);
-        }
-
         /// Closes the agent list and puts back the agent it opened on.
         fn backAgentsMenu(app: *App) !bool {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
@@ -1748,6 +1750,22 @@ pub fn Runtime(comptime App: type) type {
             return app_agents_runtime.Runtime(App).pressCloseKey(app);
         }
 
+        /// The composer, the open agent list's search box, holds a search.
+        fn agentsMenuSearching(app: *App) bool {
+            return app.input_runtime.edit_state.input.items.len > 0;
+        }
+
+        fn clearAgentsMenuSearch(app: *App) void {
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            syncAgentsMenu(app);
+        }
+
+        fn syncAgentsMenu(app: *App) void {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return;
+            app_agents_runtime.Runtime(App).searchChanged(app);
+        }
+
         fn disarmAgentsMenuClose(app: *App) void {
             if (comptime !@hasDecl(App, "openAgentsMenu")) return;
             app_agents_runtime.Runtime(App).disarmClose(app);
@@ -1757,10 +1775,13 @@ pub fn Runtime(comptime App: type) type {
         /// prompts and composer of the agent on screen: ↑ and ↓ move the
         /// highlight, Enter shows the highlighted agent, Backspace or Delete
         /// arms and then closes it, and Esc, Ctrl+X, and Ctrl+C close the
-        /// list. A paste closes it too, keeping the agent on screen, and
-        /// lands in its composer; mouse input passes through. Any other key
-        /// does nothing, so none edits the agent's draft or answers its
-        /// prompt behind the list. Returns whether the list took `event`.
+        /// list. The composer is its search box, with the agent's draft set
+        /// aside: typing, Left, and Right edit it, and while it holds a
+        /// search, Backspace and Delete edit it too and Esc clears it. A paste
+        /// closes the list, keeping the agent on screen, and lands in its
+        /// draft; mouse input passes through. Any other key does nothing, so
+        /// none answers the prompt behind the list. Returns whether the list
+        /// took `event`.
         fn routeAgentsMenuInput(app: *App, event: input_action.TerminalInputEvent) !bool {
             if (!agentsMenuActive(app)) return false;
             const agent = agents.screenAgentOf(app);
@@ -1779,20 +1800,27 @@ pub fn Runtime(comptime App: type) type {
                 .paste_byte => return false,
                 .raw => |raw| switch (raw.byte) {
                     '\r' => _ = try submitAgentsMenuSelection(app),
-                    127, 8 => _ = try pressAgentsMenuClose(app),
+                    127, 8 => if (agentsMenuSearching(app)) return false else {
+                        _ = try pressAgentsMenuClose(app);
+                    },
                     3, 24 => _ = try backAgentsMenu(app),
+                    ' '...'~' => return false,
                     10 => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
                     11 => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),
-                    else => if (raw.byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(
-                        &app.input_runtime.text_scalar,
-                        "agents_menu_active",
-                    ),
+                    else => if (raw.byte >= 0x80) return false,
                 },
                 .action => |decoded| switch (decoded.action) {
                     .cursor_up, .history_up => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),
                     .cursor_down, .history_down => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
-                    .delete_next => _ = try pressAgentsMenuClose(app),
-                    .escape, .open_agent_list => {
+                    .delete_next => if (agentsMenuSearching(app)) return false else {
+                        _ = try pressAgentsMenuClose(app);
+                    },
+                    .cursor_left, .cursor_right => return false,
+                    .escape => {
+                        if (agentsMenuSearching(app)) clearAgentsMenuSearch(app) else _ = try backAgentsMenu(app);
+                        _ = disarmEscapeClear(app);
+                    },
+                    .open_agent_list => {
                         _ = try backAgentsMenu(app);
                         _ = disarmEscapeClear(app);
                     },
@@ -2174,12 +2202,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn dismissActiveMenusForComposerEdit(app: *App, agent: *AppAgent) bool {
-            // The fork and effort menus and the instance list read no query
-            // from the composer, so an edit closes them.
+            // The fork and effort menus read no query from the composer, so an
+            // edit closes them. The agent list searches with it instead.
             const fork_menu_closed = cancelForkMenu(app, agent);
             const effort_menu_closed = cancelEffortMenu(app);
-            const agents_menu_closed = cancelAgentsMenu(app);
-            return dismissAuthPickerForComposerEdit(app, agent) or fork_menu_closed or effort_menu_closed or agents_menu_closed;
+            return dismissAuthPickerForComposerEdit(app, agent) or fork_menu_closed or effort_menu_closed;
         }
 
         fn dismissActiveMenusThenRedraw(app: *App, agent: *AppAgent) void {
@@ -2707,6 +2734,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn syncCatalogMenus(app: *App, agent: *AppAgent) void {
+            syncAgentsMenu(app);
             syncSettingsMenu(app);
             syncHelpMenu(app);
             syncSkillsMenu(app);

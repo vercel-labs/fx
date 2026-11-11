@@ -1526,7 +1526,12 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // approval main shows for it.
         expect(over).toMatch(/^ {2}\u2514 writer {2,}.* {2,}writer {2,}\S/m);
         expect(over).toMatch(/^ {2}\u2514 writer .*needs approval/m);
+        // A digit goes in the list's search box, so it can't answer the
+        // prompt under it. Esc clears the search, then closes the list.
         await session.sendKeys("1");
+        await session.waitForText("esc clear", 10_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => pane.includes(LIST_HINT) && !pane.includes("esc clear"), 10_000);
         await session.sendKeys("Escape");
         const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("Apply this change?"), 10_000);
         expect(back).toContain("Subagent writer needs permission");
@@ -1971,7 +1976,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("Down");
         expect(await session.capturePane()).not.toContain(LIST_HINT);
 
-        // Ctrl+X opens the list; typing there does nothing.
+        // Ctrl+X opens the list and sets the draft aside: typing there
+        // searches the list.
         await session.sendKeys("C-x");
         await session.waitForText(LIST_HINT, 10_000);
         await session.sendLiteral("q");
@@ -1995,6 +2001,72 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     },
     TIMEOUT,
   );
+  test(
+    "typing in the agent list searches it from the composer, and Enter opens the match",
+    async () => {
+      await withReviewer(async (session) => {
+        await session.sendLiteral("EDGE_KEEP_ME");
+        await session.waitForPane((pane) => pane.includes("main \u00b7 ctrl+x"), 10_000);
+        await session.sendKeys("C-x");
+        // The draft is set aside, so the composer is the search box.
+        const opened = await session.waitForPane((pane) => pane.includes(LIST_HINT) && !composerContains(pane, "EDGE_KEEP_ME"), 10_000);
+        expect(opened).toContain("Agents 2");
+
+        // Case aside, only reviewer's name has it, so main's row goes.
+        await session.sendLiteral("VIEW");
+        const found = await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "VIEW"), 10_000);
+        expect(found).toMatch(subagentRow("reviewer"));
+        expect(found).toContain("esc clear");
+        expect(found).not.toContain("delete close");
+
+        // Nothing matches: the list stays open, with no rows.
+        await session.sendLiteral("q");
+        const none = await session.waitForPane((pane) => pane.includes("Agents 0") && composerContains(pane, "VIEWq"), 10_000);
+        expect(none).not.toMatch(subagentRow("reviewer"));
+
+        // Backspace edits the search; Esc clears it, not the list.
+        await session.sendKeys("BSpace");
+        await session.waitForPane((pane) => pane.includes("Agents 1") && !composerContains(pane, "VIEWq"), 10_000);
+        await session.sendKeys("Escape");
+        const cleared = await session.waitForPane((pane) => pane.includes("Agents 2") && pane.includes("esc back"), 10_000);
+        expect(composerContains(cleared, "VIEW")).toBe(false);
+
+        // Enter opens the match, with its own empty composer.
+        await session.sendLiteral("rev");
+        await session.waitForPane((pane) => pane.includes("Agents 1") && composerContains(pane, "rev"), 10_000);
+        await session.sendKeys("Enter");
+        const child = await session.waitForPane((pane) => pane.includes("reviewer \u00b7 done \u2193"), 10_000);
+        expect(composerContains(child, "rev")).toBe(false);
+
+        // /agents opens the list with an empty search box, and leaves the
+        // composer empty when it closes.
+        await session.sendLiteral("/agents");
+        await session.sendKeys("Enter");
+        const listed = await session.waitForPane((pane) => pane.includes(LIST_HINT), 10_000);
+        expect(composerContains(listed, "/agents")).toBe(false);
+        await session.sendKeys("Escape");
+        const closed = await session.waitForPane((pane) => !pane.includes(LIST_HINT), 10_000);
+        expect(composerContains(closed, "/agents")).toBe(false);
+
+        // Back on main, its draft is as it was typed.
+        await showAgent(session, "main");
+        const main = await session.waitForPane((pane) => composerContains(pane, "EDGE_KEEP_ME"), 10_000);
+        expect(main).not.toContain("EDGE_KEEP_MEVIEW");
+        expect(main).not.toContain("EDGE_KEEP_MErev");
+
+        // Ctrl+P lends the composer to the model picker; Ctrl+X from there
+        // opens the list on the same draft, which comes back when it closes.
+        await session.sendKeys("C-p");
+        await session.waitForPane((pane) => !composerContains(pane, "EDGE_KEEP_ME"), 10_000);
+        await session.sendKeys("C-x");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes(LIST_HINT) && composerContains(pane, "EDGE_KEEP_ME"), 10_000);
+      });
+    },
+    TIMEOUT,
+  );
+
   test(
     "the agent list shows each agent's title, state, profile, and model in columns, and main's footer counts the subagents working",
     async () => {
@@ -2383,12 +2455,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("BSpace");
         await session.waitForText("press delete again to close this subagent", 10_000);
         // Any other key keeps it, and its warning goes at once.
-        await session.sendKeys("a");
+        await session.sendKeys("Tab");
         await session.waitForText("enter switch     delete close     esc back", 10_000);
-        // The old letter shortcuts no longer arm deletion.
-        await session.sendKeys("x");
-        await session.sendKeys("X");
-        expect(await session.capturePane()).not.toContain("press delete again to close this subagent");
         // Kitty-encoded Backspace also preserves the two-press confirmation.
         await session.sendLiteral("\x1b[127u");
         await session.waitForText("press delete again to close this subagent", 10_000);

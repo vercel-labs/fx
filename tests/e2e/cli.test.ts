@@ -469,7 +469,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain("Inspect, resume, or recover saved sessions");
-        expect(r.stdout).toContain("session <last|id>|--id <id>");
+        expect(r.stdout).toContain("session <last|id|id/agent>|--id <id> [--tail <1-1000>]");
         expect(r.stdout).toContain("session resume [last|<id>]");
         expect(r.stdout).toContain("session recover <id>|--id <id>");
         // Sessions convert on open; there is nothing to migrate by hand.
