@@ -12,13 +12,13 @@ import {
 } from "./eval-helpers";
 
 // Main is given two related tasks in sequence, both meant for subagents, in
-// two prompts of one session: a review, then the fix. The second needs what
-// the first one learned, so main should send it to the subagent that already
-// has that context instead of starting a new one. Before fx told main which
-// subagents were idle, main named a new subagent for each task and left the
-// first one idle, so idle subagents piled up. Main may close the reviewer
-// when it is done or keep it for more related work; it must not leave a
-// second idle subagent behind.
+// two prompts of one session: a review, then the fix. Before fx told main
+// which subagents were idle, main named a new subagent for each task and left
+// the first one idle, so idle subagents piled up. Main judges whether to keep
+// the reviewer once its review is done: closing it is a fair call, since a
+// fixer is another role. But when it kept the reviewer, the fix, which needs
+// what the review learned, must go to it rather than to a new subagent. Either
+// way main must not leave a second idle subagent behind.
 
 const TIMEOUT = 600_000;
 let workDir: string | null = null;
@@ -103,6 +103,7 @@ describe("eval: subagent reuse", () => {
       const review = await ask([
         "Delegate this to a subagent instead of doing it yourself: have a subagent review src/stats.js and report every bug it finds, without editing any file. Then summarize its findings in one line.",
       ]);
+      const firstCalls = subagentCalls(home, review.session_id).length;
       await ask([
         "--resume", review.session_id,
         "Now have a subagent fix the bugs that review found. When the fixes are in, reply with one line that lists what changed.",
@@ -114,14 +115,26 @@ describe("eval: subagent reuse", () => {
       writeFileSync(join(workDir, "check.js"), CHECK);
       assertCommandSucceeds(workDir, "node check.js");
 
-      // Both tasks went to one subagent.
+      const openAfter = (upTo: SubagentCall[]) => {
+        const open = new Set<string>();
+        for (const call of upTo) {
+          if (!call.agent || call.agent === "parent") continue;
+          if (call.action === "message") open.add(call.agent);
+          if (call.action === "close") open.delete(call.agent);
+        }
+        return open;
+      };
       const messaged = calls.filter((call) => call.action === "message" && call.agent && call.agent !== "parent");
       expect(messaged.length).toBeGreaterThanOrEqual(2);
-      const names = [...new Set(messaged.map((call) => call.agent))];
-      expect(names).toHaveLength(1);
-      // At most that one is still open at the end.
-      const closed = new Set(calls.filter((call) => call.action === "close").map((call) => call.agent));
-      expect(names.filter((name) => !closed.has(name)).length).toBeLessThanOrEqual(1);
+      const reviewer = messaged[0]!.agent!;
+      // A reviewer main kept gets the fix.
+      if (openAfter(calls.slice(0, firstCalls)).has(reviewer)) {
+        const fixes = calls.slice(firstCalls).filter((call) => call.action === "message" && call.agent && call.agent !== "parent");
+        expect(fixes.length).toBeGreaterThan(0);
+        expect(new Set(fixes.map((call) => call.agent))).toEqual(new Set([reviewer]));
+      }
+      // At most one subagent is still open at the end.
+      expect(openAfter(calls).size).toBeLessThanOrEqual(1);
     },
     TIMEOUT,
   );
