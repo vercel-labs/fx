@@ -173,7 +173,7 @@ test.skipIf(!tmuxAvailable())(
     expect(fixRows[1]).toBe("├ Read desktop/src/window.ts");
     expect(fixRows[2]).toBe("├ Edited desktop/src/main.ts +1 / -1");
     expect(fixRows[3]).toBe("└ Ran sh build.sh");
-    expect(lines.some((line) => /^ {2}1 file changed \+1 -1 · ran 4 commands ✓ · /.test(line))).toBe(true);
+    expect(lines.some((line) => /^ {2}1 file changed \+1 -1 · ran 4 commands · /.test(line))).toBe(true);
     expect(lines.some((line) => / tool calls? · /.test(line))).toBe(false);
 
     // The same session, reopened, renders the same story.

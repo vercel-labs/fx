@@ -1936,8 +1936,8 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText(tailMarker, TIMEOUT);
 
       await active.sendKeys("C-o");
-      // Only the compact view marks the result and recaps the turn.
-      await active.waitForText("Ran 1 command ✓", TIMEOUT);
+      // Only the compact view recaps the turn.
+      await active.waitForText("Ran 1 command · ", TIMEOUT);
       const restored = await active.capturePane();
       const restoredScrollback = await active.captureFullScrollback();
       expect(restored).not.toContain("lines more (ctrl+o to view)");

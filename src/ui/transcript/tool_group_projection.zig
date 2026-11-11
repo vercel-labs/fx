@@ -704,8 +704,8 @@ const StoryTally = struct {
     followed_sessions: std.ArrayList([]const u8) = .empty,
     unnamed_session_calls: usize = 0,
     commands_failed: usize = 0,
-    /// Whether the latest command failed, so the result mark and the recap
-    /// report where the work ended rather than every retry on the way.
+    /// Whether the latest command failed, so the result mark reports where
+    /// the work ended rather than every retry on the way.
     last_command_failed: ?bool = null,
     /// Commands that have not finished, which hold back the ✓.
     commands_running: usize = 0,
@@ -1306,8 +1306,8 @@ fn storyFailureReason(scratch: std.mem.Allocator, detail: ?*const ToolDetailReco
 }
 
 /// The recap a turn summary leads with: "1 file changed +2 -1 · ran 4
-/// commands ✓ · ", where the mark is the outcome of the last command. Empty
-/// when the turn changed and ran nothing.
+/// commands · ". It has no result mark, since the group headers show how
+/// each command ended. Empty when the turn changed and ran nothing.
 fn formatTurnRecap(scratch: std.mem.Allocator, tally: StoryTally) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(scratch);
     const w = &out.writer;
@@ -1318,12 +1318,8 @@ fn formatTurnRecap(scratch: std.mem.Allocator, tally: StoryTally) ![]const u8 {
         if (tally.diff.removed > 0) try w.print(" -{d}", .{tally.diff.removed});
         try w.writeAll(" · ");
     }
-    if (tally.last_command_failed) |last_failed| {
-        try w.print("ran {d} {s} {s} · ", .{
-            tally.commands,
-            pluralWord(tally.commands, "command", "commands"),
-            if (last_failed) "✗" else "✓",
-        });
+    if (tally.last_command_failed != null) {
+        try w.print("ran {d} {s} · ", .{ tally.commands, pluralWord(tally.commands, "command", "commands") });
     }
     // A turn that handed its work to subagents did more than explore.
     if (changed == 0 and tally.commands == 0 and tally.subagent_calls == 0 and tally.read_paths.items.len > 0) {
@@ -4633,7 +4629,7 @@ test "input to a running session and its stop are not new commands" {
     const bytes = projection.entry_actions.items[0].override.bytes;
     try std.testing.expect(std.mem.startsWith(u8, bytes, "● Ran 1 shell command ✓\n"));
     try std.testing.expect(std.mem.find(u8, bytes, " · 2 calls") != null);
-    try std.testing.expectEqualStrings("  Ran 1 command ✓ · 2s", projection.entry_actions.items[3].override.bytes);
+    try std.testing.expectEqualStrings("  Ran 1 command · 2s", projection.entry_actions.items[3].override.bytes);
 
     // A group that only checks on the session names the session.
     var follow_ups = try build(alloc, entries[1..3], details[1..3], 120);
@@ -4969,7 +4965,7 @@ test "the turn summary leads with a recap of what the turn changed and ran" {
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "  1 file changed +2 -1 · ran 2 commands ✓ · 3s (↑1 ↓2)",
+        "  1 file changed +2 -1 · ran 2 commands · 3s (↑1 ↓2)",
         projection.entry_actions.items[3].override.bytes,
     );
 
