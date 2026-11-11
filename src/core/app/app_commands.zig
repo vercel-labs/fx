@@ -1925,19 +1925,7 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         }
     }
 
-    var network_buf: [diagnostics.network_ring_capacity]diagnostics.NetworkCall = undefined;
-    const network_n = diagnostics.snapshotNetworkCalls(&network_buf);
-    var network_reported: usize = 0;
-    var ni = network_n;
-    while (ni > 0 and network_reported < 3) {
-        ni -= 1;
-        const call = network_buf[ni];
-        if (!networkCallIsError(call)) continue;
-        count += 1;
-        network_reported += 1;
-        try writer.writeAll("- network ");
-        try writeNetworkCallCompact(writer, call);
-    }
+    count += try writeNetworkProblems(writer);
 
     var tool_buf: [diagnostics.tool_call_ring_capacity]diagnostics.ToolCallMetric = undefined;
     const tool_n = diagnostics.snapshotToolCalls(&tool_buf);
@@ -1953,28 +1941,7 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         try writeToolCallCompact(writer, call);
     }
 
-    var compaction_buf: [diagnostics.compaction_ring_capacity]diagnostics.CompactionEvent = undefined;
-    const compaction_n = diagnostics.snapshotCompactionEvents(&compaction_buf);
-    var compaction_reported: usize = 0;
-    var ci = compaction_n;
-    while (ci > 0 and compaction_reported < 3) {
-        ci -= 1;
-        const event = &compaction_buf[ci];
-        if (!event.failed) continue;
-        count += 1;
-        compaction_reported += 1;
-        try writer.writeAll("- context compaction ");
-        try writer.writeAll(event.name());
-        if (event.turn_id != 0) try writer.print(" turn_id={d}", .{event.turn_id});
-        if (event.detail_len > 0) {
-            try writer.writeAll(" detail=");
-            const detail = event.detail();
-            const visible = if (detail.len > 160) detail[0..160] else detail;
-            try writeTraceTextNeutralized(writer, visible);
-            if (detail.len > 160) try writer.writeAll(" ...");
-        }
-        try writer.writeByte('\n');
-    }
+    count += try writeCompactionProblems(writer);
 
     count += try writeMcpHostProblems(writer, app, alloc);
 
@@ -1985,21 +1952,63 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
 
 /// Surfaces failed model-catalog loads, capability lookup misses, and image
 /// gate rejections under Problems so an unverifiable-capability failure is
-/// never reported as "no obvious errors".
+/// never reported as "no obvious errors". They come from the kept failures,
+/// so later catalog events never remove them.
 fn writeModelCatalogProblems(writer: *std.Io.Writer) !usize {
-    var buf: [diagnostics.model_catalog_ring_capacity]diagnostics.ModelCatalogEvent = undefined;
-    const total = diagnostics.snapshotModelCatalogEvents(&buf);
+    var buf: [diagnostics.failed_model_catalog_event_capacity]diagnostics.ModelCatalogEvent = undefined;
+    const total = diagnostics.snapshotFailedModelCatalogEvents(&buf);
     var count: usize = 0;
     var index = total;
     while (index > 0 and count < 3) {
         index -= 1;
         const event = &buf[index];
-        if (!event.failed) continue;
         count += 1;
         try writer.print("- model catalog {s}", .{event.name()});
         if (event.detail().len > 0) {
             try writer.writeByte(' ');
             try writer.writeAll(event.detail());
+        }
+        try writer.writeByte('\n');
+    }
+    return count;
+}
+
+/// Lists the newest three kept failed network calls. They come from the kept
+/// failures, not the window, so later successful calls never remove them.
+fn writeNetworkProblems(writer: *std.Io.Writer) !usize {
+    var buf: [diagnostics.failed_network_call_capacity]diagnostics.NetworkCall = undefined;
+    const total = diagnostics.snapshotFailedNetworkCalls(&buf);
+    var count: usize = 0;
+    var index = total;
+    while (index > 0 and count < 3) {
+        index -= 1;
+        count += 1;
+        try writer.writeAll("- network ");
+        try writeNetworkCallCompact(writer, buf[index]);
+    }
+    return count;
+}
+
+/// Lists the newest three kept failed compaction events, from the kept
+/// failures rather than the window, with each detail cut on a UTF-8 boundary.
+fn writeCompactionProblems(writer: *std.Io.Writer) !usize {
+    var buf: [diagnostics.failed_compaction_event_capacity]diagnostics.CompactionEvent = undefined;
+    const total = diagnostics.snapshotFailedCompactionEvents(&buf);
+    var count: usize = 0;
+    var index = total;
+    while (index > 0 and count < 3) {
+        index -= 1;
+        count += 1;
+        const event = &buf[index];
+        try writer.writeAll("- context compaction ");
+        try writer.writeAll(event.name());
+        if (event.turn_id != 0) try writer.print(" turn_id={d}", .{event.turn_id});
+        if (event.detail_len > 0) {
+            try writer.writeAll(" detail=");
+            const detail = event.detail();
+            const visible = text_utils.utf8PrefixByBytes(detail, 160);
+            try writeTraceTextNeutralized(writer, visible);
+            if (visible.len < detail.len) try writer.writeAll(" ...");
         }
         try writer.writeByte('\n');
     }
@@ -2028,37 +2037,54 @@ fn writeCompactionSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !voi
     const overwritten = buf[0].sequence -| 1;
     if (overwritten > 0) try writer.print(" overwritten_before={d}", .{overwritten});
     try writer.writeAll(" (always recorded; does not require FX_TRACE)\n");
+    try writeCompactionFailures(writer, alloc);
 
     const start = if (total > trace_compaction_max_events) total - trace_compaction_max_events else 0;
     if (start > 0) try writer.print("... ({d} older events omitted)\n", .{start});
     for (buf[start..total]) |*event| {
-        var line: std.Io.Writer.Allocating = .init(alloc);
-        defer line.deinit();
-        try writeTraceTimestampUtc(&line.writer, event.timestamp_ms);
-        try line.writer.print(" event={s}", .{event.name()});
-        if (event.turn_id != 0) try line.writer.print(" turn_id={d}", .{event.turn_id});
-        if (event.step_id != 0) try line.writer.print(" step_id={d}", .{event.step_id});
-        if (event.subagent_id != 0) try line.writer.print(" subagent_id={d}", .{event.subagent_id});
-        if (event.failed) try line.writer.writeAll(" failed");
-        if (event.detail_len > 0) {
-            try line.writer.writeByte(' ');
-            try line.writer.writeAll(event.detail());
-        }
-        if (event.truncated) try line.writer.writeAll(" ...");
-        // Compaction events carry internal counters and enum names only, never
-        // user payloads, so they render unmasked like network-call telemetry.
-        const raw = line.written();
-        const visible = if (raw.len > trace_transcript_max_line_bytes)
-            raw[0..trace_transcript_max_line_bytes]
-        else
-            raw;
-        try writeTraceTextNeutralized(writer, visible);
-        if (raw.len > trace_transcript_max_line_bytes) {
-            try writer.writeAll(" ...\n");
-        } else {
-            try writer.writeByte('\n');
-        }
+        try writeCompactionEventLine(writer, alloc, event);
     }
+}
+
+/// The kept failed compaction events, newest last. Unlike the window, later
+/// events never push these out.
+fn writeCompactionFailures(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
+    var failed: [diagnostics.failed_compaction_event_capacity]diagnostics.CompactionEvent = undefined;
+    const n = diagnostics.snapshotFailedCompactionEvents(&failed);
+    if (n == 0) {
+        try writer.writeAll("failures: none\n");
+        return;
+    }
+    try writer.print(
+        "failures: kept={d} of {d} this session, newest last; later events do not push these out\n",
+        .{ n, diagnostics.compactionFailureCount() },
+    );
+    for (failed[0..n]) |*event| {
+        try writer.writeAll("  ");
+        try writeCompactionEventLine(writer, alloc, event);
+    }
+}
+
+fn writeCompactionEventLine(writer: *std.Io.Writer, alloc: std.mem.Allocator, event: *const diagnostics.CompactionEvent) !void {
+    var line: std.Io.Writer.Allocating = .init(alloc);
+    defer line.deinit();
+    try writeTraceTimestampUtc(&line.writer, event.timestamp_ms);
+    try line.writer.print(" event={s}", .{event.name()});
+    if (event.turn_id != 0) try line.writer.print(" turn_id={d}", .{event.turn_id});
+    if (event.step_id != 0) try line.writer.print(" step_id={d}", .{event.step_id});
+    if (event.subagent_id != 0) try line.writer.print(" subagent_id={d}", .{event.subagent_id});
+    if (event.failed) try line.writer.writeAll(" failed");
+    if (event.detail_len > 0) {
+        try line.writer.writeByte(' ');
+        try line.writer.writeAll(event.detail());
+    }
+    if (event.truncated) try line.writer.writeAll(" ...");
+    // Compaction events carry internal counters and enum names only, never
+    // user payloads, so they render unmasked like network-call telemetry.
+    const raw = line.written();
+    const visible = text_utils.utf8PrefixByBytes(raw, trace_transcript_max_line_bytes);
+    try writeTraceTextNeutralized(writer, visible);
+    try writer.writeAll(if (visible.len < raw.len) " ...\n" else "\n");
 }
 
 /// Renders the retained session title generation outcome so a shared trace can
@@ -2341,6 +2367,7 @@ fn writeNetworkCallsSummary(writer: *std.Io.Writer) !void {
 
     try writer.print("\n## Network Calls\nlast={d} ok={d} errors={d} avg={d}ms min={d}ms max={d}ms\n", .{ n, ok_count, error_count, avg_ms, min_ms, max_ms });
     try writeNetworkSessionTotals(writer, buf[0..n]);
+    try writeNetworkFailures(writer);
     for (buf[0..n]) |call| {
         try writeNetworkCallCompact(writer, call);
     }
@@ -2388,6 +2415,25 @@ fn writeNetworkSessionTotals(writer: *std.Io.Writer, window: []const diagnostics
     }
 }
 
+/// The kept failed calls, newest last. Unlike the window, later successful
+/// calls never push these out.
+fn writeNetworkFailures(writer: *std.Io.Writer) !void {
+    var failed: [diagnostics.failed_network_call_capacity]diagnostics.NetworkCall = undefined;
+    const n = diagnostics.snapshotFailedNetworkCalls(&failed);
+    if (n == 0) {
+        try writer.writeAll("failures: none\n");
+        return;
+    }
+    try writer.print(
+        "failures: kept={d} of {d} session errors, newest last; later successful calls do not push these out\n",
+        .{ n, diagnostics.networkLifetimeStats().error_calls },
+    );
+    for (failed[0..n]) |call| {
+        try writer.writeAll("  ");
+        try writeNetworkCallCompact(writer, call);
+    }
+}
+
 /// Renders catalog cache state, the selected model's resolved capabilities,
 /// and the always-on catalog event ring so a shared trace explains why an
 /// image submission or capability-dependent feature was rejected.
@@ -2427,17 +2473,41 @@ fn writeModelCatalogSummary(writer: *std.Io.Writer, app: anytype) !void {
         return;
     }
     try writer.print("events={d} (always recorded; does not require FX_TRACE)\n", .{total});
+    try writeModelCatalogFailures(writer);
     for (buf[0..total]) |*event| {
-        try writeTraceTimestampUtc(writer, event.timestamp_ms);
-        try writer.print(" seq={d} {s}", .{ event.sequence, event.name() });
-        if (event.failed) try writer.writeAll(" failed");
-        if (event.detail().len > 0) {
-            try writer.writeByte(' ');
-            try writer.writeAll(event.detail());
-        }
-        if (event.truncated) try writer.writeAll(" [truncated]");
-        try writer.writeByte('\n');
+        try writeModelCatalogEventLine(writer, event);
     }
+}
+
+/// The kept failed catalog events, newest last. Unlike the window, later
+/// events never push these out.
+fn writeModelCatalogFailures(writer: *std.Io.Writer) !void {
+    var failed: [diagnostics.failed_model_catalog_event_capacity]diagnostics.ModelCatalogEvent = undefined;
+    const n = diagnostics.snapshotFailedModelCatalogEvents(&failed);
+    if (n == 0) {
+        try writer.writeAll("failures: none\n");
+        return;
+    }
+    try writer.print(
+        "failures: kept={d} of {d} this session, newest last; later events do not push these out\n",
+        .{ n, diagnostics.modelCatalogFailureCount() },
+    );
+    for (failed[0..n]) |*event| {
+        try writer.writeAll("  ");
+        try writeModelCatalogEventLine(writer, event);
+    }
+}
+
+fn writeModelCatalogEventLine(writer: *std.Io.Writer, event: *const diagnostics.ModelCatalogEvent) !void {
+    try writeTraceTimestampUtc(writer, event.timestamp_ms);
+    try writer.print(" seq={d} {s}", .{ event.sequence, event.name() });
+    if (event.failed) try writer.writeAll(" failed");
+    if (event.detail().len > 0) {
+        try writer.writeByte(' ');
+        try writer.writeAll(event.detail());
+    }
+    if (event.truncated) try writer.writeAll(" [truncated]");
+    try writer.writeByte('\n');
 }
 
 fn writePermissionsSummary(writer: *std.Io.Writer, grants: []const types.PermissionGrant) !void {
@@ -3878,6 +3948,197 @@ test "trace compaction summary renders recorded events without file tracing" {
     defer wrapped.deinit();
     try writeCompactionSummary(&wrapped.writer, alloc);
     try std.testing.expect(std.mem.find(u8, wrapped.written(), "overwritten_before=3") != null);
+}
+
+test "trace compaction section keeps a failure after later events fill the window" {
+    const compactor = @import("../compactor/compactor.zig");
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    compactor.traceFailure(.{ .turn_id = 3 }, .summary_transport_failed, "err={s}", .{"ConnectionResetByPeer"});
+    for (0..diagnostics.compaction_ring_capacity) |index| {
+        compactor.traceEvent(.{ .turn_id = 4 }, .decision, "decision=compact index={d}", .{index});
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeCompactionSummary(&out.writer, alloc);
+    const text = out.written();
+    // The window has moved past the failure; the failures list keeps it.
+    try std.testing.expect(std.mem.find(u8, text, "last=64 failed=0 overwritten_before=1 ") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\nfailures: kept=1 of 1 this session, newest last; later events do not push these out\n  [") != null);
+    try std.testing.expect(std.mem.find(u8, text, " event=summary_transport_failed turn_id=3 failed err=ConnectionResetByPeer\n") != null);
+}
+
+test "trace network section keeps a failed call after later calls fill the window" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var failed: diagnostics.NetworkCall = .{ .started_at_ms = 1_000, .status = 503, .turn_id = 4 };
+    failed.setModel("provider/model-a");
+    failed.setGatewayErrorMessage("upstream unavailable");
+    diagnostics.recordNetworkCall(failed);
+    for (0..diagnostics.network_ring_capacity) |index| {
+        diagnostics.recordNetworkCall(.{ .started_at_ms = 2_000 + @as(i64, @intCast(index)), .status = 200, .turn_id = 5 });
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeNetworkCallsSummary(&out.writer);
+    const text = out.written();
+    // The window has moved past the failure; the failures list keeps it.
+    try std.testing.expect(std.mem.find(u8, text, "\nlast=32 ok=32 errors=0 ") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\nsession: calls=33 ok=32 errors=1 ") != null);
+    const kept = "\nfailures: kept=1 of 1 session errors, newest last; later successful calls do not push these out\n  [";
+    const at = std.mem.find(u8, text, kept) orelse return error.TestExpectedEqual;
+    const line_start = at + kept.len;
+    const line_end = std.mem.findScalarPos(u8, text, line_start, '\n') orelse text.len;
+    try std.testing.expect(std.mem.find(u8, text[line_start..line_end], " model=provider/model-a source=parent status=503 ") != null);
+    try std.testing.expect(std.mem.find(u8, text[line_start..line_end], " error=\"upstream unavailable\"") != null);
+    // Only the failures list names it.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "status=503"));
+}
+
+test "trace model catalog keeps a failed load after later events fill the window" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    diagnostics.recordModelCatalogEvent(true, .load, "outcome=failed category={s} status={d}", .{ "transport", @as(u16, 503) });
+    for (0..diagnostics.model_catalog_ring_capacity) |index| {
+        diagnostics.recordModelCatalogEvent(false, .lookup, "outcome=missing_entry model=provider/model-{d}", .{index});
+    }
+
+    const StubApp = struct {};
+    var stub: StubApp = .{};
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeModelCatalogSummary(&out.writer, &stub);
+    const text = out.written();
+    try std.testing.expect(std.mem.find(u8, text, "events=32 (always recorded; does not require FX_TRACE)\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "\nfailures: kept=1 of 1 this session, newest last; later events do not push these out\n  [") != null);
+    try std.testing.expect(std.mem.find(u8, text, " seq=1 load failed outcome=failed category=transport status=503\n") != null);
+
+    var problems: std.Io.Writer.Allocating = .init(alloc);
+    defer problems.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try writeModelCatalogProblems(&problems.writer));
+    try std.testing.expectEqualStrings("- model catalog load outcome=failed category=transport status=503\n", problems.written());
+}
+
+test "trace problems list the newest kept failures the windows no longer hold" {
+    const compactor = @import("../compactor/compactor.zig");
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    // Five failures of each kind, then enough successes to fill every window.
+    for (0..5) |index| {
+        var call: diagnostics.NetworkCall = .{ .started_at_ms = 1_000, .status = 500, .step_id = index + 1 };
+        call.setModel("provider/model-a");
+        diagnostics.recordNetworkCall(call);
+        compactor.traceFailure(.{ .turn_id = index + 1 }, .summary_incomplete, "attempt={d}", .{index + 1});
+        diagnostics.recordModelCatalogEvent(true, .image_gate, "model=m{d}", .{index + 1});
+    }
+    for (0..diagnostics.compaction_ring_capacity) |index| {
+        diagnostics.recordNetworkCall(.{ .started_at_ms = 2_000, .status = 200 });
+        compactor.traceEvent(.{ .turn_id = 9 }, .decision, "index={d}", .{index});
+        diagnostics.recordModelCatalogEvent(false, .lookup, "outcome=missing_entry model=n{d}", .{index});
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 3), try writeNetworkProblems(&out.writer));
+    try std.testing.expectEqual(@as(usize, 3), try writeCompactionProblems(&out.writer));
+    try std.testing.expectEqual(@as(usize, 3), try writeModelCatalogProblems(&out.writer));
+    const text = out.written();
+    // The newest first, in each kind.
+    try std.testing.expect(std.mem.find(u8, text, " status=500 duration=0ms bytes=0 step=5\n- network ") != null);
+    try std.testing.expect(std.mem.find(u8, text, " step=3\n- context compaction summary_incomplete turn_id=5 detail=attempt=5\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "- context compaction summary_incomplete turn_id=3 detail=attempt=3\n- model catalog image_gate model=m5\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "- model catalog image_gate model=m3\n"));
+    try std.testing.expect(std.mem.find(u8, text, "step=2\n") == null);
+    try std.testing.expect(std.mem.find(u8, text, "status=200") == null);
+}
+
+test "trace failures lines count the session's failures past what is kept" {
+    const compactor = @import("../compactor/compactor.zig");
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    for (0..diagnostics.failed_network_call_capacity + 1) |index| {
+        diagnostics.recordNetworkCall(.{ .started_at_ms = 1_000, .status = 502, .step_id = index });
+        compactor.traceFailure(.{ .turn_id = index }, .summary_incomplete, "attempt={d}", .{index});
+        diagnostics.recordModelCatalogEvent(true, .image_gate, "model=m{d}", .{index});
+    }
+
+    const StubApp = struct {};
+    var stub: StubApp = .{};
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeNetworkCallsSummary(&out.writer);
+    try writeCompactionSummary(&out.writer, alloc);
+    try writeModelCatalogSummary(&out.writer, &stub);
+    const text = out.written();
+    try std.testing.expect(std.mem.find(u8, text, "\nfailures: kept=32 of 33 session errors, ") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "\nfailures: kept=32 of 33 this session, "));
+    // The oldest failure is the one the full lists dropped.
+    try std.testing.expect(std.mem.find(u8, text, "  [1970-01-01T00:00:01.000Z] model= source=parent status=502 duration=0ms bytes=0 step=1\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, " status=502 duration=0ms bytes=0\n") == null);
+}
+
+test "trace sections say when no failure was kept" {
+    const compactor = @import("../compactor/compactor.zig");
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    diagnostics.recordNetworkCall(.{ .started_at_ms = 1_000, .status = 200 });
+    compactor.traceEvent(.{ .turn_id = 1 }, .decision, "decision=no_op", .{});
+    diagnostics.recordModelCatalogEvent(false, .load, "outcome=ready entries={d}", .{3});
+
+    const StubApp = struct {};
+    var stub: StubApp = .{};
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeNetworkCallsSummary(&out.writer);
+    try writeCompactionSummary(&out.writer, alloc);
+    try writeModelCatalogSummary(&out.writer, &stub);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, out.written(), "\nfailures: none\n"));
+
+    var problems: std.Io.Writer.Allocating = .init(alloc);
+    defer problems.deinit();
+    try std.testing.expectEqual(@as(usize, 0), try writeNetworkProblems(&problems.writer));
+    try std.testing.expectEqual(@as(usize, 0), try writeCompactionProblems(&problems.writer));
+    try std.testing.expectEqual(@as(usize, 0), try writeModelCatalogProblems(&problems.writer));
+    try std.testing.expectEqualStrings("", problems.written());
+}
+
+test "trace compaction lines cut long details on a UTF-8 boundary" {
+    const compactor = @import("../compactor/compactor.zig");
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    // Two-byte characters only, so a byte cut lands inside one half the time.
+    const detail = text_utils.repeat("\xc3\xa9", 250);
+    compactor.traceFailure(.{ .turn_id = 2 }, .summary_incomplete, "{s}", .{detail});
+    compactor.traceFailure(.{ .turn_id = 2 }, .summary_incomplete, "x{s}", .{detail});
+
+    var problems: std.Io.Writer.Allocating = .init(alloc);
+    defer problems.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try writeCompactionProblems(&problems.writer));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(problems.written()));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, problems.written(), " ...\n"));
+
+    var section: std.Io.Writer.Allocating = .init(alloc);
+    defer section.deinit();
+    try writeCompactionSummary(&section.writer, alloc);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(section.written()));
+    // Two kept lines and two window lines, each past the line limit.
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, section.written(), " ...\n"));
 }
 
 test "trace model catalog summary and problems render recorded events" {

@@ -561,6 +561,16 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       expect(report).toContain("event=committed");
       const problems = report.split("## Problems")[1]?.split("##")[0] ?? "";
       expect(problems).toContain("- context compaction");
+      // The failures are also kept apart from the event window, so later
+      // events never push them out of the report or its Problems.
+      const compaction = report.split("\n## Context Compaction\n")[1]?.split("\n## ")[0] ?? "";
+      const kept = compaction
+        .split(/\nfailures: kept=\d+ of \d+ this session, newest last; later events do not push these out\n/)[1]
+        ?.split("\n").filter((line) => line.startsWith("  [")) ?? [];
+      expect(kept.some((line) => line.includes(" event=summary_transport_failed "))).toBe(true);
+      expect(kept.some((line) => line.includes(" event=transaction_failed "))).toBe(true);
+      expect(kept.every((line) => line.includes(" failed"))).toBe(true);
+      expect(problems).toContain("- context compaction transaction_failed ");
       await f.close();
       passed = true;
     } finally { await f.cleanup(passed); }
