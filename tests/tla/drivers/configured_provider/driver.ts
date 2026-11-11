@@ -14,6 +14,12 @@
 //              fetch_models on or off and a server that lists its models,
 //              refuses, or never answers. TLC replays the runs through
 //              ConfiguredCatalog's actions (ConfiguredCatalogTrace.tla).
+//   resume     A session saved on one connection, then the connection edited in
+//              settings (its protocol, base_url, or auth, a field outside
+//              those, or the whole connection removed), then resumed. The
+//              driver records what fx sent and to which binding, and what it
+//              said; TLC replays the runs through ConfiguredResume's actions
+//              (ConfiguredResumeTrace.tla).
 //   deadlines  Walks src/gateway/request_deadlines.zig along every edge of
 //              ConfiguredDeadlines.tla's state graph, then seeded random
 //              paths, through lab.zig, which owns the clock. After every step
@@ -31,6 +37,7 @@
 //   bun tests/tla/drivers/configured_provider/driver.ts --self-check
 //   bun tests/tla/drivers/configured_provider/driver.ts request --random 200 --seed 7 --jobs 8
 //   bun tests/tla/drivers/configured_provider/driver.ts request --random 0 --stress 1000
+//   bun tests/tla/drivers/configured_provider/driver.ts resume --self-check
 //
 // Exit codes: 0 everything accepted (and every self-check rejected), 1 a run
 // the model cannot produce, 2 a toolchain, build, or harness failure.
@@ -51,9 +58,9 @@ function option(name: string, fallback: number): number {
   return value;
 }
 
-const parts = ["request", "catalog", "deadlines"].filter((part) => process.argv.includes(part));
+const parts = ["request", "catalog", "resume", "deadlines"].filter((part) => process.argv.includes(part));
 const options = {
-  parts: parts.length > 0 ? parts : ["request", "catalog", "deadlines"],
+  parts: parts.length > 0 ? parts : ["request", "catalog", "resume", "deadlines"],
   selfCheck: process.argv.includes("--self-check"),
   random: option("--random", 60),
   seed: option("--seed", 1),
@@ -491,6 +498,195 @@ async function catalogPart(out: string): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// resume: a saved session resumed after a settings edit, checked against
+// ConfiguredResume.tla.
+
+type Binding = { protocol: string; url: string; auth: string };
+// `binding` null: the connection was removed from settings.
+type ResumeEdit = { name: string; binding: Binding | null; other: boolean };
+type ResumeRun = {
+  id: string;
+  saved: Binding;
+  edit: ResumeEdit;
+  outcome: string;
+  sentTo: Binding | null;
+  evidence: { first: number; exit: number; error: string | null; tail: string };
+};
+
+const RESUME_PROTOCOLS = ["openai-chat-completions", "anthropic-messages"];
+// Two base URLs on the same local server, told apart by their path.
+const RESUME_URLS = ["u1", "u2"];
+const RESUME_AUTHS = ["none", "key"];
+
+function messagesReply(text: string): Response {
+  const events: Array<[string, unknown]> = [
+    ["message_start", { type: "message_start", message: { id: "msg", type: "message", role: "assistant", model: "m", content: [], stop_reason: null, usage: { input_tokens: 5, output_tokens: 0 } } }],
+    ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
+    ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }],
+    ["content_block_stop", { type: "content_block_stop", index: 0 }],
+    ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } }],
+    ["message_stop", { type: "message_stop" }],
+  ];
+  return new Response(events.map(([name, data]) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`).join(""),
+    { headers: { "content-type": "text/event-stream" } });
+}
+
+function chatReply(text: string): Response {
+  return sse([{ id: "chat", model: "m", choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: "stop" }] }]);
+}
+
+function connectionOf(binding: Binding, port: number, other: boolean): Record<string, unknown> {
+  return {
+    protocol: binding.protocol,
+    base_url: `http://127.0.0.1:${port}/${binding.url}/v1`,
+    auth: binding.auth === "key" ? { type: "bearer", env: "FX_TEST_TOKEN_RESUME" } : { type: "none" },
+    model_metadata: { m: { context_window: 32768, max_output_tokens: 1024 } },
+    ...(other ? { timeouts: { stall_ms: 60000 }, headers: { "X-Org": { env: "FX_TEST_ORG" } } } : {}),
+  };
+}
+
+async function runFxJson(args: string[], cwd: string, home: string): Promise<{ exit: number; error: string | null; session: string | null; tail: string }> {
+  const child = Bun.spawn([binary, ...args], {
+    cwd,
+    env: testEnvironment({ HOME: home, FX_TEST_TOKEN_RESUME: "resume-token", FX_TEST_ORG: "org", NO_COLOR: "1" }),
+    stdin: "ignore", stdout: "pipe", stderr: "pipe",
+  });
+  const timer = setTimeout(() => child.kill(9), 60_000);
+  const [stdout, stderr, exit] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+  clearTimeout(timer);
+  let error: string | null = null;
+  let session: string | null = null;
+  try {
+    const parsed = JSON.parse(stdout.trim());
+    error = parsed.error ?? null;
+    session = parsed.session_id || null;
+  } catch {
+    error = "unreadable_output";
+  }
+  return { exit, error, session, tail: `${stdout}\n${stderr}`.slice(-300) };
+}
+
+async function runResume(id: string, saved: Binding, edit: ResumeEdit, scratch: string): Promise<ResumeRun> {
+  const seen: Binding[] = [];
+  const host = Bun.serve({
+    hostname: "127.0.0.1", port: 0, idleTimeout: 0,
+    async fetch(request) {
+      const [, url, , ...rest] = new URL(request.url).pathname.split("/");
+      const leaf = rest.join("/");
+      const protocol = leaf === "chat/completions" ? "openai-chat-completions" : leaf === "messages" ? "anthropic-messages" : null;
+      if (!protocol || !RESUME_URLS.includes(url!)) return new Response("unexpected endpoint", { status: 500 });
+      await request.text();
+      seen.push({ protocol, url: url!, auth: request.headers.get("authorization") === "Bearer resume-token" ? "key" : "none" });
+      return protocol === "anthropic-messages" ? messagesReply(`reply ${seen.length}`) : chatReply(`reply ${seen.length}`);
+    },
+  });
+  const root = mkdtempSync(join(scratch, `${id}-`));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace, { recursive: true });
+  const settingsPath = join(home, ".fx", "settings.json");
+  // A removed connection leaves another one selected, so the resume itself,
+  // not the settings, finds it gone.
+  const write = (binding: Binding | null, other: boolean) => writeFileSync(settingsPath, JSON.stringify({
+    provider: binding ? "local" : "spare", auto_upgrade: false, models: { local: "m", spare: "m" },
+    providers: {
+      ...(binding ? { local: connectionOf(binding, host.port!, other) } : {}),
+      spare: connectionOf({ protocol: "openai-chat-completions", url: "u1", auth: "none" }, host.port!, false),
+    },
+  }));
+  try {
+    write(saved, false);
+    const first = await runFxJson(["ask", "--json", "first turn"], workspace, home);
+    const sent = seen.length;
+    if (first.exit !== 0 || !first.session || sent !== 1) {
+      return { id, saved, edit, outcome: "unreadable", sentTo: null, evidence: { first: first.exit, exit: -1, error: first.error, tail: first.tail } };
+    }
+    write(edit.binding, edit.other);
+    const second = await runFxJson(["ask", "--json", "--resume", first.session, "second turn"], workspace, home);
+    const after = seen.slice(sent);
+    const outcome = second.exit === 0 && after.length > 0 ? "sent"
+      : second.error === "ConfiguredProviderChanged" ? "changed"
+      : second.error === "UnknownConfiguredProvider" || second.error === "ConfiguredProviderRemoved" ? "unknown"
+      : second.error === "CredentialTemporarilyUnavailable" ? "temporary"
+      : "unreadable";
+    return {
+      id, saved, edit, outcome,
+      // Whatever reached the server, refused resume or not: the model checks
+      // that a session's history goes only to the binding it was saved with.
+      sentTo: after[0] ?? null,
+      evidence: { first: first.exit, exit: second.exit, error: second.error, tail: second.tail },
+    };
+  } finally {
+    host.stop(true);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const bindingValue = (b: Binding) => `[protocol |-> ${str(b.protocol)}, url |-> ${str(b.url)}, auth |-> ${str(b.auth)}]`;
+
+function resumeValue(run: ResumeRun): string {
+  return `[saved |-> ${bindingValue(run.saved)}, current |-> ${run.edit.binding ? bindingValue(run.edit.binding) : "[removed |-> TRUE]"}, ` +
+    `other |-> ${run.edit.other ? "TRUE" : "FALSE"}, outcome |-> ${str(run.outcome)}, ` +
+    `sent_to |-> ${run.sentTo ? bindingValue(run.sentTo) : "[nothing |-> TRUE]"}]`;
+}
+
+const resumeConstants = (bug: string) => [
+  `Protocols = ${set(RESUME_PROTOCOLS)}`, `Urls = ${set(RESUME_URLS)}`, `Auths = ${set(RESUME_AUTHS)}`, `Bug = ${str(bug)}`,
+];
+
+function resumeEdits(saved: Binding): ResumeEdit[] {
+  const flip = (values: string[], value: string) => values.find((other) => other !== value)!;
+  const protocol = { ...saved, protocol: flip(RESUME_PROTOCOLS, saved.protocol) };
+  return [
+    { name: "nothing", binding: saved, other: false },
+    { name: "protocol", binding: protocol, other: false },
+    { name: "base_url", binding: { ...saved, url: flip(RESUME_URLS, saved.url) }, other: false },
+    { name: "auth", binding: { ...saved, auth: flip(RESUME_AUTHS, saved.auth) }, other: false },
+    { name: "outside the binding", binding: saved, other: true },
+    { name: "protocol and outside", binding: protocol, other: true },
+    { name: "removed", binding: null, other: false },
+  ];
+}
+
+async function resumePart(out: string): Promise<number> {
+  const scratch = join(out, "resume");
+  mkdirSync(scratch, { recursive: true });
+  const cases: Array<{ saved: Binding; edit: ResumeEdit }> = [];
+  for (const protocol of RESUME_PROTOCOLS) for (const url of RESUME_URLS) for (const auth of RESUME_AUTHS) {
+    const saved = { protocol, url, auth };
+    for (const edit of resumeEdits(saved)) cases.push({ saved, edit });
+  }
+  const started = performance.now();
+  const runs = await pool(cases.length, options.jobs, (index) => runResume(`r${index}`, cases[index]!.saved, cases[index]!.edit, scratch));
+  writeJson(join(out, "resume-runs.json"), runs);
+  const count = (outcome: string) => runs.filter((run) => run.outcome === outcome).length;
+  console.log(`resume: ${runs.length} sessions of ${binary} saved, edited, and resumed in ${((performance.now() - started) / 1000).toFixed(1)}s; ` +
+    `${count("sent")} resumed, ${count("changed")} refused as changed, ${count("unknown")} as unknown, ${count("temporary")} as temporary`);
+  const unread = runs.find((run) => run.outcome === "unreadable");
+  if (unread) {
+    console.log(`REJECTED: run ${unread.id} ended in a way the driver cannot read: ${JSON.stringify(unread)}`);
+    return 1;
+  }
+  const check = async (items: ResumeRun[], bug: string) =>
+    runTrace("ConfiguredResume", items.map(resumeValue).join(",\n  "), resumeConstants(bug), out, `resume-${bug}`);
+  const design = await check(runs, "none");
+  console.log(`resume, the design: ${design.verdict} (TLC work ${design.dir})`);
+  if (design.verdict === "TOOL_ERROR") return 2;
+  if (design.verdict === "REJECTED") {
+    const mismatch = await firstMismatch(runs, async (prefix) => (await check(prefix, "none")).verdict);
+    console.log(`first run the model cannot produce: ${JSON.stringify(mismatch)}`);
+    return 1;
+  }
+  if (options.selfCheck) {
+    const today = await check(runs, "today");
+    console.log(`self-check, resume, the model of fx before the change: ${today.verdict} (must be REJECTED)`);
+    if (today.verdict !== "REJECTED") return today.verdict === "TOOL_ERROR" ? 2 : 1;
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // deadlines: request_deadlines.zig walked along ConfiguredDeadlines.tla.
 
 type Model = Record<string, any>;
@@ -696,7 +892,7 @@ async function main(): Promise<number> {
     return 2;
   }
   const out = outDir("configured_provider");
-  const run: Record<string, (out: string) => Promise<number>> = { request: requestPart, catalog: catalogPart, deadlines: deadlinesPart };
+  const run: Record<string, (out: string) => Promise<number>> = { request: requestPart, catalog: catalogPart, resume: resumePart, deadlines: deadlinesPart };
   let worst = 0;
   for (const part of options.parts) worst = Math.max(worst, await run[part]!(out));
   console.log(`${worst === 0 ? "ACCEPTED" : worst === 1 ? "REJECTED" : "TOOL_ERROR"}; output in ${out}`);

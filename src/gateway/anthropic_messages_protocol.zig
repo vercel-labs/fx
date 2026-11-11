@@ -1265,6 +1265,7 @@ const Recorder = struct {
             .reasoning_delta => |text| try self.reasoning.appendSlice(self.alloc, text),
             .tool_input_delta => |text| try self.tool_input.appendSlice(self.alloc, text),
             .tool_started => |tool| try self.started.print(self.alloc, "{s}:{s};", .{ tool.id, tool.name }),
+            .tool_input_progress => {},
         }
     }
 

@@ -52,11 +52,15 @@ pub const Headers = struct {
         }
         var version_given = false;
         for (definition.headers) |header| {
-            const value = io.getenv(header.env) orelse return error.MissingConfiguredProviderHeader;
-            if (value.len == 0) return error.MissingConfiguredProviderHeader;
-            if (value.len > max_secret_bytes) return error.InvalidConfiguredProviderHeader;
-            for (value) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidConfiguredProviderHeader;
-            list[headers.owned] = .{ .name = header.name, .value = try alloc.dupe(u8, value) };
+            // `config_runtime.configuredProviderMessage` names the header and
+            // its variable for these errors, by the same rule.
+            const value = io.getenv(header.env);
+            switch (definitions.header_value(value)) {
+                .usable => {},
+                .unset, .empty => return error.MissingConfiguredProviderHeader,
+                .too_long, .unsendable => return error.InvalidConfiguredProviderHeader,
+            }
+            list[headers.owned] = .{ .name = header.name, .value = try alloc.dupe(u8, value.?) };
             headers.owned += 1;
             version_given = version_given or std.ascii.eqlIgnoreCase(header.name, "anthropic-version");
         }

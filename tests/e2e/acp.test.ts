@@ -876,6 +876,42 @@ test("ACP load and resume negotiate hooks and clear them when omitted", async ()
   } finally { await client.close(); fixture.close(); }
 }, 30000);
 
+test("configured provider ACP names a refused setting and what to do", async () => {
+  const fixture = createConfiguredProviderFixture();
+  (fixture.settings.providers.local.model_metadata as Record<string, any>)["local-model"].request = { messages: [] };
+  fixture.save();
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+  try {
+    const initialized = await client.request("initialize", { protocolVersion: 1, clientCapabilities: {} }) as any;
+    expect(initialized.error).toEqual({
+      code: -32600,
+      message: "~/.fx/settings.json: providers.local.model_metadata.local-model.request.messages: fx writes this field itself; remove it",
+    });
+    expect(fixture.requests).toHaveLength(0);
+  } finally { await client.close(); fixture.close(); }
+}, 30000);
+
+test("configured provider ACP loads no session whose connection changed, and says what to do", async () => {
+  const fixture = createConfiguredProviderFixture();
+  try {
+    const first = await runFx(["ask", "--json", "first turn"], { cwd: fixture.workspace, env: fixture.env, timeoutMs: 15000 });
+    if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+    const sessionId = JSON.parse(first.stdout).session_id;
+    fixture.settings.providers.local.protocol = "anthropic-messages";
+    fixture.save();
+    const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    try {
+      await client.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+      const loaded = await client.request("session/load", { sessionId, cwd: fixture.workspace, mcpServers: [] }) as any;
+      expect(loaded.error).toEqual({
+        code: -32600,
+        message: "This session's custom connection changed in ~/.fx/settings.json after the session was saved: its protocol, base_url, or auth. Change it back, or start a new session.",
+      });
+      expect(fixture.requests).toHaveLength(1);
+    } finally { await client.close(); }
+  } finally { fixture.close(); }
+}, 40000);
+
 test("configured provider ACP preserves reasoning between prompts", async () => {
   const fixture = createConfiguredProviderFixture(async body => {
     const response = configuredCompletion(body.model, "reasoned answer");

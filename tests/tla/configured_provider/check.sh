@@ -46,6 +46,14 @@
 #   no-stall-bound               a silent response is never given up   NeverPastConfigured
 #   unnamed-failure              a timeout does not say which wait     FailureNamesItsWait
 #
+# ConfiguredResume.tla: resuming a session whose connection the person edited.
+# configured-resume.cfg is the design. configured-resume-today.cfg is fx before
+# the change, which reported a changed binding as a credential that was
+# temporarily unavailable (ChangedBindingSaysSo).
+#
+#   sends   a changed binding sends the history to the new one   HistoryStaysOnItsBinding
+#   strict  an edit outside the binding refuses the resume      UnchangedBindingResumes
+#
 # tests/tla/drivers/configured_provider/driver.ts runs the built fx along
 # these models.
 #
@@ -89,4 +97,9 @@ ConfiguredDeadlines configured-deadlines-mutation-early NeverBeforeConfigured
 ConfiguredDeadlines configured-deadlines-mutation-stall-counts-whole-response NeverBeforeConfigured
 ConfiguredDeadlines configured-deadlines-mutation-no-stall-bound NeverPastConfigured
 ConfiguredDeadlines configured-deadlines-mutation-unnamed-failure FailureNamesItsWait
+
+ConfiguredResume configured-resume -
+ConfiguredResume configured-resume-today ChangedBindingSaysSo
+ConfiguredResume configured-resume-mutation-sends HistoryStaysOnItsBinding
+ConfiguredResume configured-resume-mutation-strict UnchangedBindingResumes
 VERDICTS

@@ -41,6 +41,7 @@ pub const ParseError = Allocator.Error || error{
     ReservedRequestField,
     InvalidEffortLevel,
     InvalidHeader,
+    InvalidHeaderName,
     ReservedHeader,
     InvalidTimeout,
     InvalidConnectionOption,
@@ -215,6 +216,111 @@ pub const Definition = struct {
     }
 };
 
+/// Where in the providers object a refused setting is: its keys joined with
+/// dots, such as `local.model_metadata.m.request.messages`, for the message
+/// that tells the person (`config_runtime.configuredProviderMessage`). A key
+/// that is not a plain word is quoted, and a long one is cut on a character
+/// boundary, so the path stays one short line.
+pub const FailurePath = struct {
+    bytes: [max_bytes]u8 = undefined,
+    len: usize = 0,
+    starts: [max_depth]usize = undefined,
+    depth: usize = 0,
+
+    /// Deeper than any settings path: a connection, a model, a level, a field.
+    const max_depth = 8;
+    const max_key_bytes = 48;
+    const cut_mark = "…";
+    /// Every segment at its longest, so a path never runs out of room.
+    const max_bytes = max_depth * (max_key_bytes + cut_mark.len + 3);
+
+    pub fn text(self: *const FailurePath) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    fn push(self: *FailurePath, key: []const u8) void {
+        if (self.depth < max_depth) self.starts[self.depth] = self.len;
+        self.depth += 1;
+        if (self.depth > max_depth) return;
+        if (self.depth > 1) self.append(".");
+        const plain = key.len > 0 and for (key) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') break false;
+        } else true;
+        if (!plain) self.append("\"");
+        var end = @min(key.len, max_key_bytes);
+        while (end < key.len and end > 0 and key[end] & 0xC0 == 0x80) end -= 1;
+        for (key[0..end]) |byte| self.append(&.{if (byte < 0x20 or byte == 0x7f) '?' else byte});
+        if (end < key.len) self.append(cut_mark);
+        if (!plain) self.append("\"");
+    }
+
+    fn pop(self: *FailurePath) void {
+        self.depth -= 1;
+        if (self.depth < max_depth) self.len = self.starts[self.depth];
+    }
+
+    fn append(self: *FailurePath, part: []const u8) void {
+        const room = @min(part.len, self.bytes.len - self.len);
+        @memcpy(self.bytes[self.len..][0..room], part[0..room]);
+        self.len += room;
+    }
+};
+
+fn enter(at: ?*FailurePath, key: []const u8) void {
+    if (at) |path| path.push(key);
+}
+
+fn leave(at: ?*FailurePath) void {
+    if (at) |path| path.pop();
+}
+
+/// What the person does about a setting fx refused with `err`, or null when
+/// `err` is not one the settings parser returns.
+pub fn failure_advice(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.ReservedRequestField => "fx writes this field itself; remove it",
+        error.ReservedHeader => "fx sets this header itself; remove it",
+        error.InvalidHeader => "a header's value is {\"env\": \"VARIABLE\"}, the environment variable that holds it",
+        error.InvalidHeaderName => "a header's name uses letters, digits, and !#$%&'*+-.^_`|~",
+        error.DuplicateField => "another key here names the same thing, perhaps in other letter case; keep one",
+        error.InvalidTimeout => "a timeout is a whole number of milliseconds from 1 to 86400000",
+        error.InvalidEffortLevel => "an effort level's name uses letters, digits, -, _, and ., and is not auto, adaptive, or default",
+        error.UnknownField => "fx doesn't know this field; check its spelling or remove it",
+        error.MissingField => "this field is required; add it",
+        error.InvalidObject => "this must be a JSON object",
+        error.InvalidProtocol => "the protocol is openai-chat-completions, openai-responses, or anthropic-messages",
+        error.InvalidBaseUrl => "base_url is an http or https URL with no user, query, or fragment",
+        error.InsecureBaseUrl => "base_url uses https, or http only for localhost, 127.0.0.1, or [::1]",
+        error.InvalidAuth => "auth is {\"type\": \"none\"} or {\"type\": \"bearer\", \"env\": \"VARIABLE\"}",
+        error.InvalidEnvironmentName => "a variable's name uses letters, digits, and _, and does not start with a digit",
+        error.InvalidProviderId => "a connection's name starts with a letter and uses letters, digits, _, and -",
+        error.ReservedProviderId => "gateway, codex, and grok are fx's own providers; give the connection another name",
+        error.InvalidToolChoiceMode => "tool_choice_mode is omit or send",
+        error.InvalidConnectionOption => "this is true or false",
+        error.InvalidModelId => "a model id is text with no control characters and no spaces at either end",
+        error.InvalidModelMetadata => "fx can't use this value; fx.sh/docs/configure-fx/custom-model-connections lists each field",
+        error.InvalidRequestFields => "request fields are a JSON object with non-empty keys, nested at most 16 deep",
+        error.LimitExceeded => "this is over fx's limit; make it shorter, or use fewer entries",
+        else => null,
+    };
+}
+
+/// The longest header value fx sends from an environment variable.
+pub const max_header_value_bytes = 16 * 1024;
+
+/// Whether an environment variable's value can travel as a header value.
+pub const HeaderValue = enum { usable, unset, empty, too_long, unsendable };
+
+pub fn header_value(value: ?[]const u8) HeaderValue {
+    const present = value orelse return .unset;
+    if (present.len == 0) return .empty;
+    if (present.len > max_header_value_bytes) return .too_long;
+    for (present) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return .unsendable;
+    }
+    return .usable;
+}
+
 pub const Registry = struct {
     definitions: []const Definition = &.{},
     /// Holds every slice the definitions point at. Null for an empty registry
@@ -228,6 +334,11 @@ pub const Registry = struct {
     /// depths (including providers in the enclosing settings). Value's ObjectMap
     /// cannot retain evidence of duplicates already discarded by another parser.
     pub fn parse(alloc: Allocator, providers: std.json.Value) ParseError!Registry {
+        return parse_located(alloc, providers, null);
+    }
+
+    /// `parse`, leaving in `at` where a refused setting is.
+    pub fn parse_located(alloc: Allocator, providers: std.json.Value, at: ?*FailurePath) ParseError!Registry {
         if (providers != .object) return error.InvalidObject;
         if (providers.object.count() > max_providers) return error.LimitExceeded;
         const arena = try alloc.create(std.heap.ArenaAllocator);
@@ -241,7 +352,9 @@ pub const Registry = struct {
         var iterator = providers.object.iterator();
         var index: usize = 0;
         while (iterator.next()) |entry| : (index += 1) {
-            definitions[index] = try parse_definition(owned, entry.key_ptr.*, entry.value_ptr.*);
+            enter(at, entry.key_ptr.*);
+            definitions[index] = try parse_definition(owned, entry.key_ptr.*, entry.value_ptr.*, at);
+            leave(at);
         }
         return .{ .definitions = definitions, .arena = arena };
     }
@@ -285,26 +398,48 @@ pub const Registry = struct {
 };
 
 /// `owned` is the registry's arena: a failure frees nothing here.
-fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
+fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at: ?*FailurePath) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "vision_model", "headers", "timeouts", "fetch_models", "model_defaults", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "vision_model", "headers", "timeouts", "fetch_models", "model_defaults", "model_metadata" }, at);
+    enter(at, "protocol");
     const protocol_name = try required(value, "protocol");
     if (protocol_name != .string) return error.InvalidProtocol;
     const protocol = std.meta.stringToEnum(Protocol, protocol_name.string) orelse return error.InvalidProtocol;
+    leave(at);
+    enter(at, "base_url");
     const url = try required(value, "base_url");
     if (url != .string) return error.InvalidBaseUrl;
     const normalized = try validate_url(url.string);
-    const auth = try parse_auth(try required(value, "auth"));
+    leave(at);
+    enter(at, "auth");
+    const auth = try parse_auth(try required(value, "auth"), at);
+    leave(at);
     var mode: ToolChoiceMode = .omit;
     if (value.object.get("tool_choice_mode")) |choice| {
+        enter(at, "tool_choice_mode");
         if (choice != .string) return error.InvalidToolChoiceMode;
         mode = if (std.mem.eql(u8, choice.string, "omit")) .omit else if (std.mem.eql(u8, choice.string, "send")) .send else return error.InvalidToolChoiceMode;
+        leave(at);
     }
     var fetch_models = false;
     if (value.object.get("fetch_models")) |fetch| {
+        enter(at, "fetch_models");
         if (fetch != .bool) return error.InvalidConnectionOption;
         fetch_models = fetch.bool;
+        leave(at);
     }
+    const reviewer_model = try optional_model(owned, value, "reviewer_model", at);
+    const title_model = try optional_model(owned, value, "title_model", at);
+    const vision_model = try optional_model(owned, value, "vision_model", at);
+    const headers = if (value.object.get("headers")) |headers| try parse_headers(owned, headers, at) else &.{};
+    const timeouts = if (value.object.get("timeouts")) |timeouts| try parse_timeouts(timeouts, at) else Timeouts{};
+    var model_defaults: ?ModelMetadata = null;
+    if (value.object.get("model_defaults")) |defaults| {
+        enter(at, "model_defaults");
+        model_defaults = try parse_model(owned, protocol, "", defaults, at);
+        leave(at);
+    }
+    const model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(owned, protocol, metadata, at) else &.{};
     return .{
         .id = try owned.dupe(u8, id),
         .protocol = protocol,
@@ -314,26 +449,28 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value) Par
             .bearer => |env| .{ .bearer = try owned.dupe(u8, env) },
         },
         .tool_choice_mode = mode,
-        .reviewer_model = try optional_model(owned, value.object.get("reviewer_model")),
-        .title_model = try optional_model(owned, value.object.get("title_model")),
-        .vision_model = try optional_model(owned, value.object.get("vision_model")),
-        .headers = if (value.object.get("headers")) |headers| try parse_headers(owned, headers) else &.{},
-        .timeouts = if (value.object.get("timeouts")) |timeouts| try parse_timeouts(timeouts) else .{},
+        .reviewer_model = reviewer_model,
+        .title_model = title_model,
+        .vision_model = vision_model,
+        .headers = headers,
+        .timeouts = timeouts,
         .fetch_models = fetch_models,
-        .model_defaults = if (value.object.get("model_defaults")) |defaults| try parse_model(owned, protocol, "", defaults) else null,
-        .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(owned, protocol, metadata) else &.{},
+        .model_defaults = model_defaults,
+        .model_metadata = model_metadata,
     };
 }
 
-fn optional_model(owned: Allocator, value: ?std.json.Value) ParseError!?[]const u8 {
-    const present = value orelse return null;
+fn optional_model(owned: Allocator, parent: std.json.Value, key: []const u8, at: ?*FailurePath) ParseError!?[]const u8 {
+    const present = parent.object.get(key) orelse return null;
+    enter(at, key);
     if (present != .string) return error.InvalidModelId;
     try validate_model_id(present.string);
+    leave(at);
     return try owned.dupe(u8, present.string);
 }
 
-fn parse_auth(value: std.json.Value) ParseError!Auth {
-    try check_fields(value, &.{ "type", "env" });
+fn parse_auth(value: std.json.Value, at: ?*FailurePath) ParseError!Auth {
+    try check_fields(value, &.{ "type", "env" }, at);
     const kind = try required(value, "type");
     if (kind != .string) return error.InvalidAuth;
     if (std.mem.eql(u8, kind.string, "none")) {
@@ -341,7 +478,10 @@ fn parse_auth(value: std.json.Value) ParseError!Auth {
         return .none;
     }
     if (!std.mem.eql(u8, kind.string, "bearer")) return error.InvalidAuth;
-    return .{ .bearer = try environment_name(try required(value, "env")) };
+    enter(at, "env");
+    const env = try environment_name(try required(value, "env"));
+    leave(at);
+    return .{ .bearer = env };
 }
 
 /// The name of an environment variable, borrowed from `value`.
@@ -360,18 +500,20 @@ fn environment_name(value: std.json.Value) ParseError![]const u8 {
 /// how a connection sets Authorization.
 const reserved_headers = [_][]const u8{ "authorization", "content-type", "content-length", "host", "accept", "accept-encoding", "user-agent", "connection", "transfer-encoding" };
 
-fn parse_headers(owned: Allocator, value: std.json.Value) ParseError![]const Header {
-    if (value != .object) return error.InvalidHeader;
+fn parse_headers(owned: Allocator, value: std.json.Value, at: ?*FailurePath) ParseError![]const Header {
+    enter(at, "headers");
+    if (value != .object) return error.InvalidObject;
     if (value.object.count() > max_headers) return error.LimitExceeded;
     const headers = try owned.alloc(Header, value.object.count());
     var iterator = value.object.iterator();
     var index: usize = 0;
     while (iterator.next()) |entry| : (index += 1) {
         const name = entry.key_ptr.*;
+        enter(at, name);
         if (name.len > max_header_name_bytes) return error.LimitExceeded;
-        if (name.len == 0) return error.InvalidHeader;
+        if (name.len == 0) return error.InvalidHeaderName;
         for (name) |byte| {
-            if (!std.ascii.isAlphanumeric(byte) and std.mem.findScalar(u8, "!#$%&'*+-.^_`|~", byte) == null) return error.InvalidHeader;
+            if (!std.ascii.isAlphanumeric(byte) and std.mem.findScalar(u8, "!#$%&'*+-.^_`|~", byte) == null) return error.InvalidHeaderName;
         }
         for (reserved_headers) |reserved| {
             if (std.ascii.eqlIgnoreCase(name, reserved)) return error.ReservedHeader;
@@ -382,82 +524,124 @@ fn parse_headers(owned: Allocator, value: std.json.Value) ParseError![]const Hea
         }
         const slot = entry.value_ptr.*;
         if (slot != .object) return error.InvalidHeader;
-        try check_fields(slot, &.{"env"});
+        try check_fields(slot, &.{"env"}, at);
+        enter(at, "env");
+        const env = try environment_name(try required(slot, "env"));
+        leave(at);
         headers[index] = .{
             .name = try owned.dupe(u8, name),
-            .env = try owned.dupe(u8, try environment_name(try required(slot, "env"))),
+            .env = try owned.dupe(u8, env),
         };
+        leave(at);
     }
+    leave(at);
     return headers;
 }
 
-fn parse_timeouts(value: std.json.Value) ParseError!Timeouts {
-    if (value != .object) return error.InvalidTimeout;
-    try check_fields(value, &.{ "connect_ms", "first_response_ms", "stall_ms" });
-    return .{
-        .connect_ms = try timeout(value.object.get("connect_ms")),
-        .first_response_ms = try timeout(value.object.get("first_response_ms")),
-        .stall_ms = try timeout(value.object.get("stall_ms")),
+fn parse_timeouts(value: std.json.Value, at: ?*FailurePath) ParseError!Timeouts {
+    enter(at, "timeouts");
+    if (value != .object) return error.InvalidObject;
+    try check_fields(value, &.{ "connect_ms", "first_response_ms", "stall_ms" }, at);
+    const timeouts: Timeouts = .{
+        .connect_ms = try timeout(value, "connect_ms", at),
+        .first_response_ms = try timeout(value, "first_response_ms", at),
+        .stall_ms = try timeout(value, "stall_ms", at),
     };
+    leave(at);
+    return timeouts;
 }
 
-fn timeout(value: ?std.json.Value) ParseError!?u32 {
-    const present = value orelse return null;
+fn timeout(parent: std.json.Value, key: []const u8, at: ?*FailurePath) ParseError!?u32 {
+    const present = parent.object.get(key) orelse return null;
+    enter(at, key);
     if (present != .integer or present.integer <= 0 or present.integer > max_timeout_ms) return error.InvalidTimeout;
+    leave(at);
     return @intCast(present.integer);
 }
 
-fn parse_metadata(owned: Allocator, protocol: Protocol, value: std.json.Value) ParseError![]const ModelMetadata {
+fn parse_metadata(owned: Allocator, protocol: Protocol, value: std.json.Value, at: ?*FailurePath) ParseError![]const ModelMetadata {
+    enter(at, "model_metadata");
     if (value != .object) return error.InvalidObject;
     if (value.object.count() > max_models) return error.LimitExceeded;
     const models = try owned.alloc(ModelMetadata, value.object.count());
     var iterator = value.object.iterator();
     var index: usize = 0;
     while (iterator.next()) |entry| : (index += 1) {
+        enter(at, entry.key_ptr.*);
         try validate_model_id(entry.key_ptr.*);
-        models[index] = try parse_model(owned, protocol, entry.key_ptr.*, entry.value_ptr.*);
+        models[index] = try parse_model(owned, protocol, entry.key_ptr.*, entry.value_ptr.*, at);
+        leave(at);
     }
+    leave(at);
     return models;
 }
 
-fn parse_model(owned: Allocator, protocol: Protocol, id: []const u8, metadata: std.json.Value) ParseError!ModelMetadata {
-    try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "output_limit_field", "request", "reasoning_efforts" });
-    const context = try positive_limit(metadata.object.get("context_window"));
-    const output = try positive_limit(metadata.object.get("max_output_tokens"));
-    if (context != null and output != null and output.? >= context.?) return error.InvalidModelMetadata;
+fn parse_model(owned: Allocator, protocol: Protocol, id: []const u8, metadata: std.json.Value, at: ?*FailurePath) ParseError!ModelMetadata {
+    try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "output_limit_field", "request", "reasoning_efforts" }, at);
+    const context = try positive_limit(metadata, "context_window", at);
+    const output = try positive_limit(metadata, "max_output_tokens", at);
+    if (context != null and output != null and output.? >= context.?) {
+        enter(at, "max_output_tokens");
+        return error.InvalidModelMetadata;
+    }
     var limit_field: ?OutputLimitField = null;
     if (metadata.object.get("output_limit_field")) |field| {
+        enter(at, "output_limit_field");
         // The other protocols each have one field for the limit.
         if (protocol != .@"openai-chat-completions" or field != .string) return error.InvalidModelMetadata;
         limit_field = std.meta.stringToEnum(OutputLimitField, field.string) orelse return error.InvalidModelMetadata;
+        leave(at);
     }
     const fx_fields = protocol.owned_request_fields();
+    var request: ?request_fragment.Fragment = null;
+    if (metadata.object.get("request")) |fields| {
+        enter(at, "request");
+        request = try parse_fragment(owned, fields, fx_fields, at);
+        leave(at);
+    }
+    var efforts: ?[]const EffortLevel = null;
+    if (metadata.object.get("reasoning_efforts")) |levels| {
+        enter(at, "reasoning_efforts");
+        efforts = try parse_efforts(owned, levels, fx_fields, at);
+        leave(at);
+    }
     return .{
         .id = try owned.dupe(u8, id),
         .context_window = context,
         .max_output_tokens = output,
-        .supports_tool_use = try optional_bool(metadata.object.get("supports_tool_use")),
-        .supports_vision = try optional_bool(metadata.object.get("supports_vision")),
+        .supports_tool_use = try optional_bool(metadata, "supports_tool_use", at),
+        .supports_vision = try optional_bool(metadata, "supports_vision", at),
         .output_limit_field = limit_field,
-        .request = if (metadata.object.get("request")) |fields| try request_fragment.parse(owned, fields, fx_fields) else null,
-        .reasoning_efforts = if (metadata.object.get("reasoning_efforts")) |levels| try parse_efforts(owned, levels, fx_fields) else null,
+        .request = request,
+        .reasoning_efforts = efforts,
     };
 }
 
-fn parse_efforts(owned: Allocator, value: std.json.Value, fx_fields: []const []const u8) ParseError![]const EffortLevel {
-    if (value != .object) return error.InvalidEffortLevel;
+fn parse_efforts(owned: Allocator, value: std.json.Value, fx_fields: []const []const u8, at: ?*FailurePath) ParseError![]const EffortLevel {
+    if (value != .object) return error.InvalidObject;
     if (value.object.count() > max_effort_levels) return error.LimitExceeded;
     const levels = try owned.alloc(EffortLevel, value.object.count());
     var iterator = value.object.iterator();
     var index: usize = 0;
     while (iterator.next()) |entry| : (index += 1) {
+        enter(at, entry.key_ptr.*);
         try validate_effort_name(entry.key_ptr.*);
         levels[index] = .{
             .name = try owned.dupe(u8, entry.key_ptr.*),
-            .fields = try request_fragment.parse(owned, entry.value_ptr.*, fx_fields),
+            .fields = try parse_fragment(owned, entry.value_ptr.*, fx_fields, at),
         };
+        leave(at);
     }
     return levels;
+}
+
+/// A request fragment; when a key is refused, `at` ends at that key.
+fn parse_fragment(owned: Allocator, value: std.json.Value, fx_fields: []const []const u8, at: ?*FailurePath) ParseError!request_fragment.Fragment {
+    var refused: ?[]const u8 = null;
+    return request_fragment.parseReporting(owned, value, fx_fields, &refused) catch |err| {
+        if (refused) |key| enter(at, key);
+        return err;
+    };
 }
 
 /// A level's name follows the rule for an effort anywhere in fx
@@ -473,25 +657,32 @@ fn validate_effort_name(name: []const u8) error{ LimitExceeded, InvalidEffortLev
     }
 }
 
-fn positive_limit(value: ?std.json.Value) ParseError!?u32 {
-    const present = value orelse return null;
+fn positive_limit(parent: std.json.Value, key: []const u8, at: ?*FailurePath) ParseError!?u32 {
+    const present = parent.object.get(key) orelse return null;
+    enter(at, key);
     if (present != .integer or present.integer <= 0 or present.integer > std.math.maxInt(u32)) return error.InvalidModelMetadata;
+    leave(at);
     return @intCast(present.integer);
 }
 
-fn optional_bool(value: ?std.json.Value) ParseError!?bool {
-    const present = value orelse return null;
+fn optional_bool(parent: std.json.Value, key: []const u8, at: ?*FailurePath) ParseError!?bool {
+    const present = parent.object.get(key) orelse return null;
+    enter(at, key);
     if (present != .bool) return error.InvalidModelMetadata;
+    leave(at);
     return present.bool;
 }
 
-fn check_fields(value: std.json.Value, allowed: []const []const u8) ParseError!void {
+/// Refuses a key `allowed` does not list; `at` then ends at that key.
+fn check_fields(value: std.json.Value, allowed: []const []const u8, at: ?*FailurePath) ParseError!void {
     if (value != .object) return error.InvalidObject;
-    if (value.object.count() > allowed.len) return error.UnknownField;
     for (value.object.keys()) |key| {
         for (allowed) |name| {
             if (std.mem.eql(u8, key, name)) break;
-        } else return error.UnknownField;
+        } else {
+            enter(at, key);
+            return error.UnknownField;
+        }
     }
 }
 
@@ -759,7 +950,7 @@ test "configured provider auth admits only explicit none or a portable environme
     }
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"bearer\",\"env\":\"_key_2\"}", .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("_key_2", (try parse_auth(parsed.value)).bearer);
+    try std.testing.expectEqualStrings("_key_2", (try parse_auth(parsed.value, null)).bearer);
 }
 
 test "configured provider scalar bounds and minimum input budget" {
@@ -945,58 +1136,69 @@ test "configured provider connection options do not change a connection's identi
     try std.testing.expect(!std.mem.eql(u8, &identity, &other.binding_identity()));
 }
 
-test "configured provider refuses fx's own fields and headers, and malformed options" {
-    const cases = [_]struct { json: []const u8, err: ParseError }{
-        .{ .json = "\"model_metadata\":{\"m\":{\"request\":{\"messages\":[]}}}", .err = error.ReservedRequestField },
-        .{ .json = "\"model_metadata\":{\"m\":{\"request\":{\"max_tokens\":1}}}", .err = error.ReservedRequestField },
-        .{ .json = "\"model_metadata\":{\"m\":{\"request\":{\"max_completion_tokens\":1}}}", .err = error.ReservedRequestField },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"high\":{\"model\":\"other\"}}}}", .err = error.ReservedRequestField },
-        .{ .json = "\"model_defaults\":{\"request\":{\"stream\":false}}", .err = error.ReservedRequestField },
-        .{ .json = "\"model_metadata\":{\"m\":{\"request\":[]}}", .err = error.InvalidRequestFields },
-        .{ .json = "\"model_metadata\":{\"m\":{\"request\":null}}", .err = error.InvalidRequestFields },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"high\":\"high\"}}}", .err = error.InvalidRequestFields },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"low\",\"high\"]}}", .err = error.InvalidEffortLevel },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"\":{}}}}", .err = error.InvalidEffortLevel },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"very high\":{}}}}", .err = error.InvalidEffortLevel },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"auto\":{}}}}", .err = error.InvalidEffortLevel },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"Default\":{}}}}", .err = error.InvalidEffortLevel },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"" ++ text_utils.repeat("e", max_effort_name_bytes + 1) ++ "\":{}}}}", .err = error.LimitExceeded },
-        .{ .json = "\"model_metadata\":{\"m\":{\"output_limit_field\":\"max_output_tokens\"}}", .err = error.InvalidModelMetadata },
-        .{ .json = "\"model_metadata\":{\"m\":{\"output_limit_field\":true}}", .err = error.InvalidModelMetadata },
-        .{ .json = "\"model_defaults\":[]", .err = error.InvalidObject },
-        .{ .json = "\"model_defaults\":{\"context_window\":2,\"max_output_tokens\":2}", .err = error.InvalidModelMetadata },
-        .{ .json = "\"model_defaults\":{\"id\":\"m\"}", .err = error.UnknownField },
-        .{ .json = "\"headers\":{\"Authorization\":{\"env\":\"KEY\"}}", .err = error.ReservedHeader },
-        .{ .json = "\"headers\":{\"content-TYPE\":{\"env\":\"KEY\"}}", .err = error.ReservedHeader },
-        .{ .json = "\"headers\":{\"Host\":{\"env\":\"KEY\"}}", .err = error.ReservedHeader },
-        .{ .json = "\"headers\":{\"X-Org\":{\"env\":\"A\"},\"x-org\":{\"env\":\"B\"}}", .err = error.DuplicateField },
-        .{ .json = "\"headers\":{\"X Org\":{\"env\":\"KEY\"}}", .err = error.InvalidHeader },
-        .{ .json = "\"headers\":{\"X-Org:\":{\"env\":\"KEY\"}}", .err = error.InvalidHeader },
-        .{ .json = "\"headers\":{\"\":{\"env\":\"KEY\"}}", .err = error.InvalidHeader },
-        .{ .json = "\"headers\":{\"X-Org\":\"literal-value\"}", .err = error.InvalidHeader },
-        .{ .json = "\"headers\":[]", .err = error.InvalidHeader },
-        .{ .json = "\"headers\":{\"X-Org\":{}}", .err = error.MissingField },
-        .{ .json = "\"headers\":{\"X-Org\":{\"env\":\"KEY\",\"value\":\"literal\"}}", .err = error.UnknownField },
-        .{ .json = "\"headers\":{\"X-Org\":{\"env\":\"1KEY\"}}", .err = error.InvalidEnvironmentName },
-        .{ .json = "\"headers\":{\"" ++ text_utils.repeat("h", max_header_name_bytes + 1) ++ "\":{\"env\":\"KEY\"}}", .err = error.LimitExceeded },
-        .{ .json = "\"timeouts\":{\"connect_ms\":0}", .err = error.InvalidTimeout },
-        .{ .json = "\"timeouts\":{\"first_response_ms\":-1}", .err = error.InvalidTimeout },
-        .{ .json = "\"timeouts\":{\"stall_ms\":86400001}", .err = error.InvalidTimeout },
-        .{ .json = "\"timeouts\":{\"stall_ms\":1.5}", .err = error.InvalidTimeout },
-        .{ .json = "\"timeouts\":{\"stall_ms\":\"30s\"}", .err = error.InvalidTimeout },
-        .{ .json = "\"timeouts\":{\"stall_ms\":null}", .err = error.InvalidTimeout },
-        .{ .json = "\"timeouts\":300", .err = error.InvalidTimeout },
-        .{ .json = "\"timeouts\":{\"total_ms\":1}", .err = error.UnknownField },
-        .{ .json = "\"fetch_models\":\"yes\"", .err = error.InvalidConnectionOption },
-        .{ .json = "\"fetch_models\":null", .err = error.InvalidConnectionOption },
-        .{ .json = "\"title_model\":\"\"", .err = error.InvalidModelId },
-        .{ .json = "\"vision_model\":7", .err = error.InvalidModelId },
+test "configured provider refuses fx's own fields and headers, and malformed options, at their path" {
+    const cases = [_]struct { json: []const u8, err: ParseError, path: []const u8 }{
+        .{ .json = "\"model_metadata\":{\"m\":{\"request\":{\"messages\":[]}}}", .err = error.ReservedRequestField, .path = "local.model_metadata.m.request.messages" },
+        .{ .json = "\"model_metadata\":{\"m\":{\"request\":{\"max_tokens\":1}}}", .err = error.ReservedRequestField, .path = "local.model_metadata.m.request.max_tokens" },
+        .{ .json = "\"model_metadata\":{\"m\":{\"request\":{\"max_completion_tokens\":1}}}", .err = error.ReservedRequestField, .path = "local.model_metadata.m.request.max_completion_tokens" },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"high\":{\"model\":\"other\"}}}}", .err = error.ReservedRequestField, .path = "local.model_metadata.m.reasoning_efforts.high.model" },
+        .{ .json = "\"model_defaults\":{\"request\":{\"stream\":false}}", .err = error.ReservedRequestField, .path = "local.model_defaults.request.stream" },
+        .{ .json = "\"model_metadata\":{\"m\":{\"request\":[]}}", .err = error.InvalidRequestFields, .path = "local.model_metadata.m.request" },
+        .{ .json = "\"model_metadata\":{\"m\":{\"request\":null}}", .err = error.InvalidRequestFields, .path = "local.model_metadata.m.request" },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"high\":\"high\"}}}", .err = error.InvalidRequestFields, .path = "local.model_metadata.m.reasoning_efforts.high" },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"low\",\"high\"]}}", .err = error.InvalidObject, .path = "local.model_metadata.m.reasoning_efforts" },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"\":{}}}}", .err = error.InvalidEffortLevel, .path = "local.model_metadata.m.reasoning_efforts.\"\"" },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"very high\":{}}}}", .err = error.InvalidEffortLevel, .path = "local.model_metadata.m.reasoning_efforts.\"very high\"" },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"auto\":{}}}}", .err = error.InvalidEffortLevel, .path = "local.model_metadata.m.reasoning_efforts.auto" },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"Default\":{}}}}", .err = error.InvalidEffortLevel, .path = "local.model_metadata.m.reasoning_efforts.Default" },
+        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"" ++ text_utils.repeat("e", max_effort_name_bytes + 1) ++ "\":{}}}}", .err = error.LimitExceeded, .path = "local.model_metadata.m.reasoning_efforts." ++ text_utils.repeat("e", FailurePath.max_key_bytes) ++ FailurePath.cut_mark },
+        .{ .json = "\"model_metadata\":{\"m\":{\"output_limit_field\":\"max_output_tokens\"}}", .err = error.InvalidModelMetadata, .path = "local.model_metadata.m.output_limit_field" },
+        .{ .json = "\"model_metadata\":{\"m\":{\"output_limit_field\":true}}", .err = error.InvalidModelMetadata, .path = "local.model_metadata.m.output_limit_field" },
+        .{ .json = "\"model_metadata\":{\"gpt-4.1\":{\"context_window\":\"big\"}}", .err = error.InvalidModelMetadata, .path = "local.model_metadata.\"gpt-4.1\".context_window" },
+        .{ .json = "\"model_defaults\":[]", .err = error.InvalidObject, .path = "local.model_defaults" },
+        .{ .json = "\"model_defaults\":{\"context_window\":2,\"max_output_tokens\":2}", .err = error.InvalidModelMetadata, .path = "local.model_defaults.max_output_tokens" },
+        .{ .json = "\"model_defaults\":{\"id\":\"m\"}", .err = error.UnknownField, .path = "local.model_defaults.id" },
+        .{ .json = "\"headers\":{\"Authorization\":{\"env\":\"KEY\"}}", .err = error.ReservedHeader, .path = "local.headers.Authorization" },
+        .{ .json = "\"headers\":{\"content-TYPE\":{\"env\":\"KEY\"}}", .err = error.ReservedHeader, .path = "local.headers.content-TYPE" },
+        .{ .json = "\"headers\":{\"Host\":{\"env\":\"KEY\"}}", .err = error.ReservedHeader, .path = "local.headers.Host" },
+        .{ .json = "\"headers\":{\"X-Org\":{\"env\":\"A\"},\"x-org\":{\"env\":\"B\"}}", .err = error.DuplicateField, .path = "local.headers.x-org" },
+        .{ .json = "\"headers\":{\"X Org\":{\"env\":\"KEY\"}}", .err = error.InvalidHeaderName, .path = "local.headers.\"X Org\"" },
+        .{ .json = "\"headers\":{\"X-Org:\":{\"env\":\"KEY\"}}", .err = error.InvalidHeaderName, .path = "local.headers.\"X-Org:\"" },
+        .{ .json = "\"headers\":{\"\":{\"env\":\"KEY\"}}", .err = error.InvalidHeaderName, .path = "local.headers.\"\"" },
+        .{ .json = "\"headers\":{\"X-Org\":\"literal-value\"}", .err = error.InvalidHeader, .path = "local.headers.X-Org" },
+        .{ .json = "\"headers\":[]", .err = error.InvalidObject, .path = "local.headers" },
+        .{ .json = "\"headers\":{\"X-Org\":{}}", .err = error.MissingField, .path = "local.headers.X-Org.env" },
+        .{ .json = "\"headers\":{\"X-Org\":{\"env\":\"KEY\",\"value\":\"literal\"}}", .err = error.UnknownField, .path = "local.headers.X-Org.value" },
+        .{ .json = "\"headers\":{\"X-Org\":{\"env\":\"1KEY\"}}", .err = error.InvalidEnvironmentName, .path = "local.headers.X-Org.env" },
+        .{ .json = "\"headers\":{\"" ++ text_utils.repeat("h", max_header_name_bytes + 1) ++ "\":{\"env\":\"KEY\"}}", .err = error.LimitExceeded, .path = "local.headers." ++ text_utils.repeat("h", FailurePath.max_key_bytes) ++ FailurePath.cut_mark },
+        .{ .json = "\"timeouts\":{\"connect_ms\":0}", .err = error.InvalidTimeout, .path = "local.timeouts.connect_ms" },
+        .{ .json = "\"timeouts\":{\"first_response_ms\":-1}", .err = error.InvalidTimeout, .path = "local.timeouts.first_response_ms" },
+        .{ .json = "\"timeouts\":{\"stall_ms\":86400001}", .err = error.InvalidTimeout, .path = "local.timeouts.stall_ms" },
+        .{ .json = "\"timeouts\":{\"stall_ms\":1.5}", .err = error.InvalidTimeout, .path = "local.timeouts.stall_ms" },
+        .{ .json = "\"timeouts\":{\"stall_ms\":\"30s\"}", .err = error.InvalidTimeout, .path = "local.timeouts.stall_ms" },
+        .{ .json = "\"timeouts\":{\"stall_ms\":null}", .err = error.InvalidTimeout, .path = "local.timeouts.stall_ms" },
+        .{ .json = "\"timeouts\":300", .err = error.InvalidObject, .path = "local.timeouts" },
+        .{ .json = "\"timeouts\":{\"total_ms\":1}", .err = error.UnknownField, .path = "local.timeouts.total_ms" },
+        .{ .json = "\"fetch_models\":\"yes\"", .err = error.InvalidConnectionOption, .path = "local.fetch_models" },
+        .{ .json = "\"fetch_models\":null", .err = error.InvalidConnectionOption, .path = "local.fetch_models" },
+        .{ .json = "\"title_model\":\"\"", .err = error.InvalidModelId, .path = "local.title_model" },
+        .{ .json = "\"vision_model\":7", .err = error.InvalidModelId, .path = "local.vision_model" },
+        .{ .json = "\"tool_choice_mode\":\"always\"", .err = error.InvalidToolChoiceMode, .path = "local.tool_choice_mode" },
+        .{ .json = "\"bogus\":1", .err = error.UnknownField, .path = "local.bogus" },
     };
     for (cases) |case| {
         const json = "{\"local\":{" ++ test_required_fields ++ ",";
         const whole = try std.mem.concat(std.testing.allocator, u8, &.{ json, case.json, "}}" });
         defer std.testing.allocator.free(whole);
         std.testing.expectError(case.err, Registry.parse_json(std.testing.allocator, whole)) catch |err| {
+            std.debug.print("case: {s}\n", .{case.json});
+            return err;
+        };
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, whole, .{});
+        defer parsed.deinit();
+        var at: FailurePath = .{};
+        try std.testing.expectError(case.err, Registry.parse_located(std.testing.allocator, parsed.value, &at));
+        std.testing.expectEqualStrings(case.path, at.text()) catch |err| {
             std.debug.print("case: {s}\n", .{case.json});
             return err;
         };
@@ -1096,6 +1298,7 @@ fn fuzzDefinition(_: void, smith: *std.testing.Smith) anyerror!void {
     const alloc = std.testing.allocator;
     var buffer: [4096]u8 = undefined;
     const json = buffer[0..@intCast(smith.slice(&buffer))];
+    try expectPathMatchesVerdict(alloc, json);
     var registry = Registry.parse_json(alloc, json) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return,
@@ -1110,6 +1313,78 @@ fn fuzzDefinition(_: void, smith: *std.testing.Smith) anyerror!void {
         }
         try std.testing.expect(definition.headers.len <= max_headers);
         _ = definition.binding_identity();
+    }
+}
+
+/// The path recorder agrees with `parse_json`: a parse that succeeds leaves
+/// the path empty, and a refusal of settings that name a connection leaves a
+/// path that is one printable line (`config_runtime.configuredProviderMessage`).
+fn expectPathMatchesVerdict(alloc: Allocator, json: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{
+        .duplicate_field_behavior = .@"error",
+        .max_value_len = max_url_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer parsed.deinit();
+    var at: FailurePath = .{};
+    const verdict = Registry.parse_json(alloc, json);
+    if (verdict) |registry| {
+        var plain = registry;
+        plain.deinit(alloc);
+    } else |err| if (err == error.OutOfMemory) return err;
+    if (Registry.parse_located(alloc, parsed.value, &at)) |registry| {
+        var located = registry;
+        located.deinit(alloc);
+        if (verdict) |_| {} else |_| return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 0), at.text().len);
+    } else |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectError(err, verdict);
+        const path = at.text();
+        try std.testing.expect(std.unicode.utf8ValidateSlice(path));
+        for (path) |byte| try std.testing.expect(byte >= 0x20 and byte != 0x7f);
+        const count = if (parsed.value == .object) parsed.value.object.count() else 0;
+        if (count > 0 and count <= max_providers) try std.testing.expect(path.len > 0);
+    }
+}
+
+test "failure path quotes, cuts on a character boundary, and forgets a key it left" {
+    var at: FailurePath = .{};
+    at.push("local");
+    at.push("model_metadata");
+    at.push("vendor/model\x01");
+    try std.testing.expectEqualStrings("local.model_metadata.\"vendor/model?\"", at.text());
+    at.pop();
+    at.push("m");
+    try std.testing.expectEqualStrings("local.model_metadata.m", at.text());
+    at.pop();
+    at.pop();
+    // A key of 47 ASCII bytes and a three-byte character is not a plain word,
+    // and is cut before the character rather than inside it.
+    at.push(text_utils.repeat("a", FailurePath.max_key_bytes - 1) ++ "\u{2026}");
+    try std.testing.expectEqualStrings("local.\"" ++ text_utils.repeat("a", FailurePath.max_key_bytes - 1) ++ FailurePath.cut_mark ++ "\"", at.text());
+    at.pop();
+    at.pop();
+    try std.testing.expectEqual(@as(usize, 0), at.text().len);
+    // Deeper than any settings path: the extra keys are kept out, not overrun.
+    for (0..FailurePath.max_depth + 3) |_| at.push(text_utils.repeat("k", 200));
+    try std.testing.expect(at.text().len <= FailurePath.max_bytes);
+    for (0..FailurePath.max_depth + 3) |_| at.pop();
+    try std.testing.expectEqual(@as(usize, 0), at.text().len);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"local\":{" ++ test_required_fields ++ "}}", .{});
+    defer parsed.deinit();
+    var registry = try Registry.parse_located(std.testing.allocator, parsed.value, &at);
+    defer registry.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), at.text().len);
+}
+
+test "failure advice covers every refusal the settings parser makes" {
+    inline for (@typeInfo(ParseError).error_set.error_names.?) |name| {
+        const err = @field(ParseError, name);
+        if (err != error.OutOfMemory and err != error.InvalidJson) try std.testing.expect(failure_advice(err) != null);
     }
 }
 

@@ -1379,3 +1379,146 @@ describe("automatic permission review on a custom connection", () => {
     } finally { f.close(); }
   }, 35000);
 });
+
+// What a person reads when a custom connection's settings are wrong: the file,
+// the setting's path, and what to do, on every surface that reports it.
+describe("custom connection errors name the setting", () => {
+  const settingsFile = "~/.fx/settings.json";
+  const owned = "fx writes this field itself; remove it";
+  test.each([
+    ["a model's request field fx writes", (f: ReturnType<typeof fixture>) => { metadata(f).request = { messages: [] }; },
+      "providers.local.model_metadata.local-model.request.messages", owned],
+    ["an effort level's field fx writes", (f: ReturnType<typeof fixture>) => { metadata(f).reasoning_efforts = { high: { model: "other" } }; },
+      "providers.local.model_metadata.local-model.reasoning_efforts.high.model", owned],
+    ["a header fx sets", (f: ReturnType<typeof fixture>) => { connection(f).headers = { authorization: { env: "FX_TEST_PROVIDER_ORG" } }; },
+      "providers.local.headers.authorization", "fx sets this header itself; remove it"],
+    ["a header given its value", (f: ReturnType<typeof fixture>) => { connection(f).headers = { "X-Org": "acme" }; },
+      "providers.local.headers.X-Org", "a header's value is {\"env\": \"VARIABLE\"}, the environment variable that holds it"],
+    ["an effort level fx can't name", (f: ReturnType<typeof fixture>) => { metadata(f).reasoning_efforts = { "High Effort!": {} }; },
+      "providers.local.model_metadata.local-model.reasoning_efforts.\"High Effort!\"", "an effort level's name uses letters, digits, -, _, and ., and is not auto, adaptive, or default"],
+    ["a timeout of 0", (f: ReturnType<typeof fixture>) => { connection(f).timeouts = { stall_ms: 0 }; },
+      "providers.local.timeouts.stall_ms", "a timeout is a whole number of milliseconds from 1 to 86400000"],
+    ["a field fx does not know", (f: ReturnType<typeof fixture>) => { metadata(f).bogus = 1; },
+      "providers.local.model_metadata.local-model.bogus", "fx doesn't know this field; check its spelling or remove it"],
+    ["a protocol fx does not speak", (f: ReturnType<typeof fixture>) => { connection(f).protocol = "openai"; },
+      "providers.local.protocol", "the protocol is openai-chat-completions, openai-responses, or anthropic-messages"],
+    ["a model id with a dot", (f: ReturnType<typeof fixture>) => { connection(f).model_metadata["gpt-4.1"] = { request: { model: "x" } }; },
+      "providers.local.model_metadata.\"gpt-4.1\".request.model", owned],
+  ])("settings: fx refuses %s with the setting's path and what to do", async (_what, change, path, fix) => {
+    const f = fixture();
+    try {
+      change(f);
+      f.save();
+      const result = await runFx(["ask", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_TEST_PROVIDER_ORG: "org-fixture-123" }, timeoutMs: 10000 });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe(`fx: ${settingsFile}: ${path}: ${fix}\n`);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 15000);
+
+  test("settings: a key thousands of bytes long is cut in the path, so the message stays one line", async () => {
+    const f = fixture();
+    try {
+      metadata(f).request = { ["k".repeat(5000)]: 1 };
+      f.save();
+      const result = await runFx(["ask", "--no-save", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 10000 });
+      expect(result.code).toBe(1);
+      expect(result.stderr.startsWith(`fx: ${settingsFile}: providers.local.model_metadata.local-model.request.kkkk`)).toBe(true);
+      expect(result.stderr.split("\n")).toHaveLength(2);
+      expect(result.stderr.length).toBeLessThan(400);
+    } finally { f.close(); }
+  }, 15000);
+
+  test("settings: fx provider names the same setting", async () => {
+    const f = fixture();
+    try {
+      const models = f.settings.providers.local.model_metadata as Record<string, any>;
+      models["local-model"].request = { messages: [] };
+      f.save();
+      const result = await runFx(["provider", "local"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe("fx provider: ~/.fx/settings.json: providers.local.model_metadata.local-model.request.messages: fx writes this field itself; remove it\n");
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 30000);
+
+  test("settings: fx doctor names the same setting", async () => {
+    const f = fixture();
+    try {
+      metadata(f).request = { messages: [] };
+      f.save();
+      const doctor = await runFx(["doctor"], { cwd: f.workspace, env: f.env, timeoutMs: 10000 });
+      expect(doctor.stdout).toContain(`[fail] config: failed to load config: ${settingsFile}: providers.local.model_metadata.local-model.request.messages: ${owned}`);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 15000);
+
+  test.each([
+    ["not set", undefined, "which is not set; set it, or remove the header from ~/.fx/settings.json"],
+    ["empty", "", "which is empty; set it, or remove the header from ~/.fx/settings.json"],
+    ["holding a control character", "acme\u0001", "whose value has a character a header can't carry; fix the variable"],
+  ])("headers: a header variable %s is named with its header and connection, before any request", async (_what, value, rest) => {
+    const f = fixture();
+    try {
+      connection(f).headers = { "X-Org": { env: "FX_PROBE_ORG" } };
+      f.save();
+      const result = await runFx(["ask", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_PROBE_ORG: value }, timeoutMs: 10000 });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toBe(`fx: the header X-Org of connection local reads FX_PROBE_ORG, ${rest}\n`);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 15000);
+
+  const changed = "fx ask: This session's custom connection changed in ~/.fx/settings.json after the session was saved: its protocol, base_url, or auth. Change it back, or start a new session.\n";
+  test.each([
+    ["its protocol", (f: ReturnType<typeof fixture>) => { connection(f).protocol = "anthropic-messages"; }],
+    ["its base_url", (f: ReturnType<typeof fixture>) => { connection(f).base_url = connection(f).base_url.replace("127.0.0.1", "localhost"); }],
+    ["its auth", (f: ReturnType<typeof fixture>) => { connection(f).auth = { type: "bearer", env: "FX_TEST_PROVIDER_TOKEN" }; }],
+  ])("resume: a session whose connection changed %s says so and sends nothing", async (_what, change) => {
+    const f = fixture();
+    try {
+      const first = await runFx(["ask", "--json", "first turn"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const session = JSON.parse(first.stdout).session_id;
+      change(f);
+      f.save();
+      const resumed = await runFx(["ask", "--resume", session, "second turn"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      expect(resumed.code).toBe(1);
+      expect(resumed.stderr).toBe(changed);
+      expect(f.requests).toHaveLength(1);
+    } finally { f.close(); }
+  }, 30000);
+
+  test("resume: a session whose connection was removed says so and sends nothing", async () => {
+    const f = fixture();
+    try {
+      const first = await runFx(["ask", "--json", "first turn"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const session = JSON.parse(first.stdout).session_id;
+      delete (f.settings.providers as Record<string, unknown>).local;
+      (f.settings as Record<string, unknown>).provider = "remote";
+      f.save();
+      const resumed = await runFx(["ask", "--resume", session, "second turn"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      expect(resumed.code).toBe(1);
+      expect(resumed.stderr).toBe("fx ask: This session's custom connection is no longer in ~/.fx/settings.json. Add it back, or start a new session.\n");
+      expect(f.requests).toHaveLength(1);
+    } finally { f.close(); }
+  }, 30000);
+
+  test("resume: a change outside the connection's binding still resumes", async () => {
+    const f = fixture();
+    try {
+      const first = await runFx(["ask", "--json", "first turn"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const session = JSON.parse(first.stdout).session_id;
+      connection(f).timeouts = { stall_ms: 60000 };
+      metadata(f).reasoning_efforts = { high: { reasoning_effort: "high" } };
+      connection(f).headers = { "X-Org": { env: "FX_TEST_PROVIDER_ORG" } };
+      f.save();
+      const resumed = await runFx(["ask", "--json", "--resume", session, "second turn"], { cwd: f.workspace, env: { ...f.env, FX_TEST_PROVIDER_ORG: "org-fixture-123" }, timeoutMs: 15000 });
+      if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
+      expect(f.requests).toHaveLength(2);
+      expect(f.requests[1].headers["x-org"]).toBe("org-fixture-123");
+    } finally { f.close(); }
+  }, 30000);
+});

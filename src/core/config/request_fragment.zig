@@ -45,6 +45,12 @@ pub const Fragment = struct {
 /// freeing each key and value and then the field list, or by using an arena.
 /// `reserved` lists the fields fx writes for the connection's protocol.
 pub fn parse(alloc: Allocator, value: std.json.Value, reserved: []const []const u8) Error!Fragment {
+    return parseReporting(alloc, value, reserved, null);
+}
+
+/// `parse`, setting `refused` to the key that made it fail when a key did, so
+/// the person can be told which one. The key borrows `value`.
+pub fn parseReporting(alloc: Allocator, value: std.json.Value, reserved: []const []const u8, refused: ?*?[]const u8) Error!Fragment {
     if (value != .object) return error.InvalidRequestFields;
     if (value.object.count() > max_fields) return error.LimitExceeded;
     const fields = try alloc.alloc(Field, value.object.count());
@@ -60,6 +66,7 @@ pub fn parse(alloc: Allocator, value: std.json.Value, reserved: []const []const 
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
         const key = entry.key_ptr.*;
+        if (refused) |slot| slot.* = key;
         if (key.len == 0) return error.InvalidRequestFields;
         if (key.len > max_key_bytes) return error.LimitExceeded;
         for (reserved) |name| {
@@ -75,6 +82,7 @@ pub fn parse(alloc: Allocator, value: std.json.Value, reserved: []const []const 
         errdefer alloc.free(owned_key);
         fields[initialized] = .{ .key = owned_key, .value_json = try out.toOwnedSlice() };
         initialized += 1;
+        if (refused) |slot| slot.* = null;
     }
     return .{ .fields = fields };
 }

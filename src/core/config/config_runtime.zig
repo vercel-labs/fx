@@ -397,6 +397,87 @@ pub fn loadConfiguredProviders(alloc: Allocator) !configured_provider.Registry {
     return configured_provider.Registry.parse(alloc, definitions);
 }
 
+/// What to do when a saved session's custom connection changed or was
+/// removed after the session was saved (`model_provider.ProviderId.bind`).
+/// Its history may go only to that connection, so nothing is sent
+/// (`tests/tla/configured_provider/ConfiguredResume.tla`).
+pub fn sessionConnectionNotice(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.ConfiguredProviderChanged => profile_paths.displayText("This session's custom connection changed in ~/.fx/settings.json after the session was saved: its protocol, base_url, or auth. Change it back, or start a new session."),
+        error.ConfiguredProviderRemoved => profile_paths.displayText("This session's custom connection is no longer in ~/.fx/settings.json. Add it back, or start a new session."),
+        else => null,
+    };
+}
+
+/// fx's words for an error a custom connection's settings caused: the file,
+/// the setting's path, and what to do, the header whose environment variable
+/// cannot be sent, or a saved session's changed or removed connection. Null
+/// for any other error, and when the settings no longer show it. Reads the
+/// settings again, so call it only on a failure. Caller owns the message.
+pub fn configuredProviderMessage(alloc: Allocator, err: anyerror) Allocator.Error!?[]u8 {
+    if (sessionConnectionNotice(err)) |notice| return try alloc.dupe(u8, notice);
+    if (configured_provider.failure_advice(err)) |advice| {
+        var at: configured_provider.FailurePath = .{};
+        const refusal = (try refusedProviderSetting(alloc, &at)) orelse return null;
+        if (refusal.err != err) return null;
+        return try alloc.print("{s}: providers.{s}: {s}", .{ profile_paths.displayText("~/.fx/settings.json"), at.text(), advice });
+    }
+    if (err == error.MissingConfiguredProviderHeader or err == error.InvalidConfiguredProviderHeader) return headerVariableMessage(alloc);
+    return null;
+}
+
+const ProviderRefusal = struct { err: anyerror };
+
+/// The error the profile's providers fail to parse with, leaving in `at` where
+/// the refused setting is; null when they parse or cannot be read.
+fn refusedProviderSetting(alloc: Allocator, at: *configured_provider.FailurePath) Allocator.Error!?ProviderRefusal {
+    var paths = discoverPaths(alloc, ".") catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
+    defer paths.deinit(alloc);
+    const bytes = (readOptionalUserSettingsFile(alloc, paths) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null) orelse return null;
+    defer alloc.free(bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .duplicate_field_behavior = .@"error" }) catch |err|
+        return if (err == error.OutOfMemory) error.OutOfMemory else null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const providers = parsed.value.object.get("providers") orelse return null;
+    var registry = configured_provider.Registry.parse_located(alloc, providers, at) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .err = err },
+    };
+    registry.deinit(alloc);
+    return null;
+}
+
+/// Names the first header whose environment variable cannot be sent, by the
+/// rule the transport applies (`configured_provider.header_value`).
+fn headerVariableMessage(alloc: Allocator) Allocator.Error!?[]u8 {
+    var registry = loadConfiguredProviders(alloc) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
+    defer registry.deinit(alloc);
+    var first: ?[]u8 = null;
+    errdefer if (first) |message| alloc.free(message);
+    var more: usize = 0;
+    for (registry.definitions) |definition| {
+        for (definition.headers) |header| {
+            const problem: []const u8 = switch (configured_provider.header_value(io_mod.getenv(header.env))) {
+                .usable => continue,
+                .unset => profile_paths.displayText("which is not set; set it, or remove the header from ~/.fx/settings.json"),
+                .empty => profile_paths.displayText("which is empty; set it, or remove the header from ~/.fx/settings.json"),
+                .too_long => std.fmt.comptimePrint("whose value is longer than {d} bytes; shorten it", .{configured_provider.max_header_value_bytes}),
+                .unsendable => "whose value has a character a header can't carry; fix the variable",
+            };
+            if (first != null) {
+                more += 1;
+                continue;
+            }
+            first = try alloc.print("the header {s} of connection {s} reads {s}, {s}", .{ header.name, definition.id, header.env, problem });
+        }
+    }
+    const message = first orelse return null;
+    if (more == 0) return message;
+    defer alloc.free(message);
+    return try alloc.print("{s} ({d} more header{s} too)", .{ message, more, if (more == 1) "" else "s" });
+}
+
 pub fn loadMergedSettings(alloc: Allocator, workspace_root: []const u8) !Settings {
     var paths = try discoverPaths(alloc, workspace_root);
     defer paths.deinit(alloc);

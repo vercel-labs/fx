@@ -18,6 +18,7 @@ const oauth_transport = @import("oauth_transport.zig");
 const stored_login_testing = @import("stored_login_testing.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -356,6 +357,14 @@ pub const CredentialPreparationError = Allocator.Error || error{
     CredentialTemporarilyUnavailable,
     CredentialRefreshPersistenceUncertain,
     CredentialAuthorityChanged,
+    /// A saved session's custom connection no longer has the protocol,
+    /// base_url, or auth it was saved with (`model_provider.ProviderId.bind`).
+    /// Its history may go only to that connection, so nothing is sent
+    /// (`tests/tla/configured_provider/ConfiguredResume.tla` ChangedBindingSaysSo).
+    ConfiguredProviderChanged,
+    /// A saved session's custom connection is no longer in settings
+    /// (`tests/tla/configured_provider/ConfiguredResume.tla` RemovedConnectionIsUnknown).
+    ConfiguredProviderRemoved,
 };
 
 /// Resolves and refreshes one provider credential. The returned value is owned
@@ -378,6 +387,10 @@ pub fn prepareCredential(
         preferred,
     ) catch |err| failure: {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.ConfiguredProviderChanged or err == error.ConfiguredProviderRemoved) {
+            debug_trace.logf("auth", "credential preparation stopped provider={t} err={s}: the session's connection changed or was removed in settings", .{ provider, @errorName(err) });
+            return if (err == error.ConfiguredProviderChanged) error.ConfiguredProviderChanged else error.ConfiguredProviderRemoved;
+        }
         debug_trace.logf(
             "auth",
             "credential preparation failed provider={t} source={s} err={s}",
@@ -483,6 +496,7 @@ pub fn preparationFailureNotice(err: anyerror) ?[]const u8 {
         error.CredentialTemporarilyUnavailable => "Credential refresh is temporarily unavailable. Retry shortly.",
         error.CredentialRefreshPersistenceUncertain => "Credential could not be saved. Check authentication storage before signing in again.",
         error.CredentialAuthorityChanged => "The credential account or team changed. Review authentication before retrying.",
+        error.ConfiguredProviderChanged, error.ConfiguredProviderRemoved => config_runtime.sessionConnectionNotice(err),
         else => null,
     };
 }
@@ -490,6 +504,7 @@ pub fn preparationFailureNotice(err: anyerror) ?[]const u8 {
 /// Returns an owned, secret-free explanation shared by activation surfaces.
 pub fn preparationFailureText(alloc: Allocator, provider: model_provider.ProviderId, err: anyerror) ![]u8 {
     const label = provider_catalog.label(provider);
+    if (err == error.ConfiguredProviderChanged or err == error.ConfiguredProviderRemoved) return alloc.print("{s}: {s}", .{ label, preparationFailureNotice(err).? });
     const failure = classifyCredentialFailure(provider_catalog.find(provider).login_source, err);
     const normalized = preparationError(failure) orelse return alloc.print("{s} requires a new sign-in.", .{label});
     return alloc.print("{s}: {s}", .{ label, preparationFailureNotice(normalized).? });
