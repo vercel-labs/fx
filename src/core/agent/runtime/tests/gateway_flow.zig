@@ -9727,7 +9727,8 @@ test "processQueuedPrompt keeps the selected fx login credential when forced ref
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.credential_refresh_tokens = &.{"selected-login-token"};
+    // The store still holds the rejected token, and the forced refresh gives nothing.
+    hooks.credential_refresh_tokens = &.{ "selected-login-token", "selected-login-token" };
     defer hooks.deinit();
     var fixture = PromptFixture{};
     var job = fixture.job();
@@ -9765,7 +9766,9 @@ test "processQueuedPrompt reports the selected login after refresh failure witho
 
     try std.testing.expectEqual(@as(usize, 1), gateway.request_api_keys.items.len);
     try std.testing.expectEqualStrings("key", gateway.request_api_keys.items[0]);
-    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload, .force }, hooks.credential_refresh_modes.items);
+    // A refused reload, such as for a stored sign-in of another team, is never
+    // followed by a forced refresh, which would rotate that sign-in.
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .reload }, hooks.credential_refresh_modes.items);
     try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
     try std.testing.expectEqual(types.CredentialSource.fx_login, hooks.http_credential_source.?);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);

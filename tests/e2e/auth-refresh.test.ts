@@ -23,6 +23,7 @@ import {
 import {
   bearer,
   rotateFxLogin,
+  signInFxLoginToTeam,
   startFakeIssuer,
   storedFxLoginToken,
   unauthorized,
@@ -652,6 +653,52 @@ test(
       expect(gateway.requests.map((request) => bearer(request.headers))).toEqual(["launch-token", "other-fx-token"]);
       expect(issuer.refreshes).toHaveLength(0);
       expect(storedFxLoginToken(home)).toBe("other-fx-token");
+    } finally {
+      gateway.stop();
+      issuer.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
+test(
+  "fx ask does not refresh the login another fx signed in to another team when its request is rejected",
+  async () => {
+    const home = mkdtempSync(join(tmpdir(), "fx-auth-other-team-"));
+    const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
+    writeSharedFxLogin(home, issuer.issuerUrl, "launch-token");
+    let mainRequests = 0;
+    // Another fx signs the shared login in to another team, and the gateway
+    // rejects the token this one sends.
+    const gateway = startDynamicFakeGateway(() => {
+      mainRequests += 1;
+      if (mainRequests === 1) signInFxLoginToTeam(home, "other-team-token", "team_other");
+      return unauthorized();
+    });
+
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "exercise the shared login"], {
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_TEST_SKIP_ONBOARDING: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_NO_OPEN_BROWSER: "1",
+          FX_TEST_OAUTH_ISSUER_URL: issuer.issuerUrl,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+        },
+        timeoutMs: TIMEOUT,
+      });
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).not.toBe(0);
+      expect(gateway.requests.map((request) => bearer(request.headers))).toEqual(["launch-token"]);
+      expect(issuer.refreshes).toHaveLength(0);
+      expect(storedFxLoginToken(home)).toBe("other-team-token");
     } finally {
       gateway.stop();
       issuer.stop();
