@@ -2698,15 +2698,24 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Tears down hosted agent `child`, which no one else holds once its
-        /// run's slot thread lets go, and drops it from the list.
+        /// run's slot thread lets go, and drops it from the list. The slot
+        /// thread still reads the agent's worker while it detaches from it, so
+        /// the worker is told to stop, the slot lets go, and only then is the
+        /// agent torn down.
         pub fn dropHosted(app: *App, child: *ChildAgent) void {
-            visit(app, child, {}, shutdownInContext) catch |err| {
-                app_session_runtime.Runtime(App).recordShutdownFailure(firstInstance(app) orelse &app.main_agent, err);
-            };
-            // A slot thread that never lets go leaves the agent allocated, so
-            // it reads no freed memory, rather than freezing the screen.
+            child.agent.worker.requestShutdown();
+            child.agent.managed_executions.shutdown();
+            // A slot thread that never lets go leaves the agent allocated and
+            // whole, so it reads no freed memory, rather than freezing the
+            // screen.
             const released = child.bound.waitReleased(release_timeout_ms);
-            if (!released) debug_trace.logf("host", "child_release_timeout child={s} at=drop kept_allocated=true", .{child.id});
+            if (released) {
+                visit(app, child, {}, shutdownInContext) catch |err| {
+                    app_session_runtime.Runtime(App).recordShutdownFailure(firstInstance(app) orelse &app.main_agent, err);
+                };
+            } else {
+                debug_trace.logf("host", "child_release_timeout child={s} at=drop kept_allocated=true", .{child.id});
+            }
             {
                 app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
                 defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
