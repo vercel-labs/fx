@@ -15,6 +15,7 @@ const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_catalog = @import("provider_catalog.zig");
 const provider_picker_catalog = @import("provider_picker_catalog.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const stored_login_testing = @import("stored_login_testing.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const fuzzy_match = @import("../shared/fuzzy_match.zig");
@@ -230,20 +231,6 @@ pub fn refreshCredentialForAccount(
     mode: CredentialRefreshMode,
     expected_account_id: ?[]const u8,
 ) !?credentials.Credential {
-    const credential = (try loadCredentialForAccount(transport, alloc, source, mode, expected_account_id)) orelse return null;
-    noteRequestPathCredentialVerified(source);
-    return credential;
-}
-
-/// `refreshCredentialForAccount` without proving the request path's copy:
-/// the caller owns the result and must call `Credential.deinit`.
-fn loadCredentialForAccount(
-    transport: oauth_transport.Provider,
-    alloc: Allocator,
-    source: credentials.Source,
-    mode: CredentialRefreshMode,
-    expected_account_id: ?[]const u8,
-) !?credentials.Credential {
     if (!credentials.sourceRefreshable(source)) return null;
 
     var credential = (loadCredentialForRefresh(alloc, transport, source, mode) catch |err| {
@@ -265,89 +252,80 @@ fn loadCredentialForAccount(
             return error.ChatGptAccountChanged;
         }
     }
+    noteRequestPathCredentialVerified(source);
     return credential;
 }
 
-/// What a background request, such as a session title or the model list,
-/// needs to renew a sign-in on its own thread. The transport's context must
-/// outlive the request.
-pub const Renewal = struct {
-    transport: oauth_transport.Provider,
+/// The sign-in a background request, such as a session title or the model
+/// list, sends with: a source fx can refresh, with its account and team. Every
+/// fx process shares one stored copy of it.
+pub const SharedSignIn = struct {
     source: credentials.Source,
     account_id: ?[]const u8 = null,
+    team: ?[]const u8 = null,
 
-    /// The renewal for `source`, or null when fx cannot renew it.
-    pub fn forSource(
-        transport: oauth_transport.Provider,
-        source: ?credentials.Source,
-        account_id: ?[]const u8,
-    ) ?Renewal {
+    /// The shared sign-in for `source`, or null when fx stores none for it.
+    pub fn forSource(source: ?credentials.Source, account_id: ?[]const u8, team: ?[]const u8) ?SharedSignIn {
         const active = source orelse return null;
         if (!credentials.sourceRefreshable(active)) return null;
-        return .{ .transport = transport, .source = active, .account_id = account_id };
+        return .{ .source = active, .account_id = account_id, .team = team };
+    }
+
+    /// Whether `stored` signs in as this sign-in: the same source, account,
+    /// and team. Another fx process can sign in to another team, and its token
+    /// must not carry this request.
+    fn accepts(self: SharedSignIn, stored: credentials.Credential) bool {
+        return stored.source == self.source and
+            optionalBytesEqual(stored.accountId(), self.account_id) and
+            optionalBytesEqual(stored.gatewayTeam(), self.team);
     }
 };
+
+fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    const left_bytes = left orelse return right == null;
+    const right_bytes = right orelse return false;
+    return std.mem.eql(u8, left_bytes, right_bytes);
+}
 
 /// Reads the stored credential for a background request before it sends.
 /// Another fx process may have refreshed the shared sign-in after this one
 /// read it, so the copy in memory can be rejected while the store already
 /// holds a newer token (tests/tla/session_title/SessionTitle.tla
-/// TitleFirstSendUsesStore). Refreshes only an expired session. Null when the
-/// store has no usable credential, and the caller keeps the token it has. The
-/// caller owns the result.
-pub fn readStoredCredential(
-    alloc: Allocator,
-    renewal: Renewal,
-    cancel_flag: *std.atomic.Value(bool),
-) Allocator.Error!?credentials.Credential {
-    return loadForBackground(alloc, renewal, .if_needed, cancel_flag);
-}
-
-/// Renews a credential the gateway rejected with 401: the stored credential
-/// when another fx process has already replaced `rejected`, and a forced
-/// refresh only when the store still holds it, because every forced refresh
-/// rotates the sign-in all fx processes share (tests/tla/session_title/
-/// SessionTitle.tla NoNeedlessRefresh). Null when neither gives a token. The
-/// caller owns the result.
-pub fn renewRejectedCredential(
-    alloc: Allocator,
-    renewal: Renewal,
-    rejected: []const u8,
-    cancel_flag: *std.atomic.Value(bool),
-) Allocator.Error!?credentials.Credential {
-    if (try loadForBackground(alloc, renewal, .if_needed, cancel_flag)) |stored| {
-        var current = stored;
-        if (!std.mem.eql(u8, current.token, rejected)) {
-            debug_trace.logf("auth", "background credential renewed step=reread source={t}", .{renewal.source});
-            return current;
-        }
-        current.deinit(alloc);
-    }
-    if (cancel_flag.load(.seq_cst)) return null;
-    const forced = (try loadForBackground(alloc, renewal, .force, cancel_flag)) orelse return null;
-    debug_trace.logf("auth", "background credential renewed step=force source={t}", .{renewal.source});
-    return forced;
-}
-
-/// Loads for a background request. It does not stamp the request path's
-/// verification: the main turn's own copy may still be stale, and only its
-/// own load may let it skip the next one (`requestPathCredentialVerifiedRecently`).
-fn loadForBackground(
-    alloc: Allocator,
-    renewal: Renewal,
-    mode: CredentialRefreshMode,
-    cancel_flag: *std.atomic.Value(bool),
-) Allocator.Error!?credentials.Credential {
-    var transport: oauth_transport.Cancellable = .{ .inner = renewal.transport, .cancel_flag = cancel_flag };
-    return loadCredentialForAccount(transport.provider(), alloc, renewal.source, mode, renewal.account_id) catch |err| {
+/// TitleFirstSendUsesStore). It never calls the issuer and never proves the
+/// request path's copy (`requestPathCredentialVerifiedRecently`): only the
+/// main turn refreshes the sign-in all fx processes share
+/// (tests/tla/session_title/SessionTitle.tla BackgroundNeverRefreshes). Null
+/// when nothing usable is stored, or when the stored sign-in belongs to
+/// another account or team, and the caller keeps the token it has. The caller
+/// owns the result. The read can wait for another fx process that holds the
+/// store's lock.
+pub fn readStoredCredential(alloc: Allocator, sign_in: SharedSignIn) Allocator.Error!?credentials.Credential {
+    var stored = (credentials.loadStoredSource(alloc, sign_in.source) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        debug_trace.logf(
-            "auth",
-            "background credential renewal failed source={t} mode={t} err={s}",
-            .{ renewal.source, mode, @errorName(err) },
-        );
+        debug_trace.logf("auth", "stored credential read failed source={t} err={s}", .{ sign_in.source, @errorName(err) });
         return null;
-    };
+    }) orelse return null;
+    if (!sign_in.accepts(stored)) {
+        debug_trace.logf("auth", "stored credential skipped source={t} reason=other_authority", .{sign_in.source});
+        stored.deinit(alloc);
+        return null;
+    }
+    return stored;
+}
+
+/// The stored credential to send once more after the gateway rejected
+/// `rejected` with 401: only when another fx process has already replaced it
+/// (tests/tla/session_title/SessionTitle.tla TitleGivesUpOnlyWhenUnrecoverable).
+/// Null when the store still holds `rejected`, as `readStoredCredential`
+/// returns null otherwise. The caller owns the result.
+pub fn storedReplacement(alloc: Allocator, sign_in: SharedSignIn, rejected: []const u8) Allocator.Error!?credentials.Credential {
+    var stored = (try readStoredCredential(alloc, sign_in)) orelse return null;
+    if (std.mem.eql(u8, stored.token, rejected)) {
+        stored.deinit(alloc);
+        return null;
+    }
+    debug_trace.logf("auth", "stored credential replaces a rejected one source={t}", .{sign_in.source});
+    return stored;
 }
 
 fn loadCredentialForRefresh(
@@ -2158,10 +2136,10 @@ pub const Runtime = struct {
         return self.oauth_transport;
     }
 
-    /// How a background request renews the selected sign-in, or null when fx
-    /// cannot renew it.
-    pub fn backgroundRenewal(self: *const Self) ?Renewal {
-        return Renewal.forSource(self.oauth_transport, self.credentialSource(), self.accountId());
+    /// The selected sign-in as a background request sends with it, or null
+    /// when fx stores none for it.
+    pub fn backgroundSignIn(self: *const Self) ?SharedSignIn {
+        return SharedSignIn.forSource(self.credentialSource(), self.accountId(), self.gatewayTeam());
     }
 
     pub fn secretStore(self: *const Self) host.SecretStore {
@@ -3685,6 +3663,57 @@ fn expectApiKeyAllocationCleared(
     try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.items.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.capacity);
     try std.testing.expect(std.mem.find(u8, backing, sentinel) == null);
+}
+
+test "a shared sign-in accepts only a stored credential with its source, account, and team" {
+    const sign_in = SharedSignIn.forSource(.fx_login, null, "team-a").?;
+    const same: credentials.Credential = .{ .token = @constCast("t"), .source = .fx_login, .team_id = @constCast("team-a") };
+    const other_team: credentials.Credential = .{ .token = @constCast("t"), .source = .fx_login, .team_id = @constCast("team-b") };
+    const no_team: credentials.Credential = .{ .token = @constCast("t"), .source = .fx_login };
+    const other_source: credentials.Credential = .{ .token = @constCast("t"), .source = .chatgpt_subscription, .team_id = @constCast("team-a") };
+    try std.testing.expect(sign_in.accepts(same));
+    try std.testing.expect(!sign_in.accepts(other_team));
+    try std.testing.expect(!sign_in.accepts(no_team));
+    try std.testing.expect(!sign_in.accepts(other_source));
+
+    const codex = SharedSignIn.forSource(.chatgpt_subscription, "acct-a", null).?;
+    try std.testing.expect(codex.accepts(.{ .token = @constCast("t"), .source = .chatgpt_subscription, .account_id = @constCast("acct-a") }));
+    try std.testing.expect(!codex.accepts(.{ .token = @constCast("t"), .source = .chatgpt_subscription, .account_id = @constCast("acct-b") }));
+
+    for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed }) |source| {
+        try std.testing.expect(SharedSignIn.forSource(source, null, null) == null);
+    }
+    try std.testing.expect(SharedSignIn.forSource(null, null, null) == null);
+}
+
+test "a background request reads the stored sign-in without a refresh or a request-path proof" {
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    // Expired long ago, as a login no fx process has refreshed.
+    try home.store("stored-token", "team-id", 1);
+    resetRequestPathCredentialVerification();
+    defer resetRequestPathCredentialVerification();
+
+    const sign_in: SharedSignIn = .{ .source = .fx_login, .team = "team-id" };
+    // Expired, and no transport exists here: the token comes back as saved.
+    var stored = (try readStoredCredential(alloc, sign_in)).?;
+    defer stored.deinit(alloc);
+    try std.testing.expectEqualStrings("stored-token", stored.token);
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
+
+    // Another team's sign-in is never used.
+    try std.testing.expect((try readStoredCredential(alloc, .{ .source = .fx_login, .team = "team-other" })) == null);
+    // Nothing stored for this source.
+    try std.testing.expect((try readStoredCredential(alloc, .{ .source = .chatgpt_subscription })) == null);
+
+    // After a 401: a replacement only when the store holds another token.
+    try std.testing.expect((try storedReplacement(alloc, sign_in, "stored-token")) == null);
+    var replacement = (try storedReplacement(alloc, sign_in, "launch-token")).?;
+    defer replacement.deinit(alloc);
+    try std.testing.expectEqualStrings("stored-token", replacement.token);
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
 }
 
 test "auth runtime complete credential refresher ignores non-refreshable sources" {

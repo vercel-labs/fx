@@ -7,6 +7,7 @@ import { logLines, rootSessionIds, storeRoot } from "./saved-sessions";
 import {
   bearer,
   rotateFxLogin,
+  signInFxLoginToTeam,
   startFakeIssuer,
   storedFxLoginToken,
   unauthorized,
@@ -431,9 +432,9 @@ test.skipIf(SKIP_TMUX)("tui generates a title in the fresh session an upgrade re
 // Title requests made with a refreshable sign-in. Another fx process can
 // refresh the shared fx login after this one has read it, so the token it holds
 // in memory is rejected while the store already holds a newer one. The title
-// request reads the store before it sends; after a 401 it reads the store
-// again, forces a refresh only when the store still holds the rejected token,
-// and sends at most once more (tests/tla/session_title/SessionTitle.tla).
+// request sends the stored token, and after a 401 sends once more only with a
+// stored token that replaced the rejected one. It never refreshes the login
+// itself (tests/tla/session_title/SessionTitle.tla BackgroundNeverRefreshes).
 
 const FIRST_PROMPT = "refactor the renderer loop to fix the crash";
 
@@ -462,123 +463,86 @@ function lastTitle(root: FixtureRoot): string | undefined {
   return sessionTitles(root).at(-1);
 }
 
-function startLoginGateway(title: ReturnType<typeof titleFor>, count = 4) {
+function startLoginGateway(titles: Array<(body: string, headers: Headers) => Response>) {
   return startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
     models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
-    titleResponses: Array.from({ length: count }, () => title),
+    titleResponses: titles,
   });
 }
 
-test("fx ask renews a login the gateway rejects and sends the title once more", async () => {
-  const root = createFixtureRoot("login-401-once");
-  const issuer = startFakeIssuer({ refresh: () => "renewed-token" });
+async function askWithLogin(label: string, titles: (home: string) => Array<(body: string, headers: Headers) => Response>) {
+  const root = createFixtureRoot(label);
+  const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
   writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
-  const gateway = startLoginGateway(titleFor((token) => token === "renewed-token"));
+  const gateway = startLoginGateway(titles(root.home));
   try {
     const result = await runFx(["ask", FIRST_PROMPT], { cwd: root.workspace, env: loginEnv(root, gateway, issuer), timeoutMs: 30_000 });
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain("MAIN_ANSWER_OK");
-    expect(titleTokens(gateway)).toEqual(["launch-token", "renewed-token"]);
-    expect(issuer.refreshes).toHaveLength(1);
-    expect(storedFxLoginToken(root.home)).toBe("renewed-token");
-    expect(lastTitle(root)).toBe(GENERATED_TITLE);
+    // A title request never refreshes the login all fx processes share.
+    expect(issuer.refreshes).toHaveLength(0);
+    return { tokens: titleTokens(gateway), title: lastTitle(root), stored: storedFxLoginToken(root.home) };
   } finally {
     gateway.stop();
     issuer.stop();
     rmSync(root.root, { recursive: true, force: true });
   }
+}
+
+test("fx ask keeps the derived title without refreshing the login when the gateway rejects the stored one", async () => {
+  const rejected = titleFor(() => false);
+  const run = await askWithLogin("login-401-stored", () => [rejected, rejected]);
+  expect(run.tokens).toEqual(["launch-token"]);
+  expect(run.stored).toBe("launch-token");
+  expect(run.title).toContain("refactor the renderer loop");
 }, 45_000);
 
 test("fx ask sends a rejected title with the login another fx already renewed, without refreshing", async () => {
-  const root = createFixtureRoot("login-401-renewed-elsewhere");
-  const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
-  writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
   const accept = titleFor((token) => token === "other-fx-token");
   // The first title request arrives after another fx renewed the login.
-  const renewedElsewhere = (body: string, headers: Headers) => {
-    rotateFxLogin(root.home, "other-fx-token");
+  const run = await askWithLogin("login-401-renewed-elsewhere", (home) => [(body, headers) => {
+    rotateFxLogin(home, "other-fx-token");
     return accept(body, headers);
-  };
-  const gateway = startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
-    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
-    titleResponses: [renewedElsewhere, accept, accept],
-  });
-  try {
-    const result = await runFx(["ask", FIRST_PROMPT], { cwd: root.workspace, env: loginEnv(root, gateway, issuer), timeoutMs: 30_000 });
-    expect(result.code, result.stderr).toBe(0);
-    expect(titleTokens(gateway)).toEqual(["launch-token", "other-fx-token"]);
-    expect(issuer.refreshes).toHaveLength(0);
-    expect(lastTitle(root)).toBe(GENERATED_TITLE);
-  } finally {
-    gateway.stop();
-    issuer.stop();
-    rmSync(root.root, { recursive: true, force: true });
-  }
+  }, accept, accept]);
+  expect(run.tokens).toEqual(["launch-token", "other-fx-token"]);
+  expect(run.title).toBe(GENERATED_TITLE);
 }, 45_000);
 
-test("fx ask sends the title at most twice when the gateway rejects every login", async () => {
-  const root = createFixtureRoot("login-401-always");
-  const issuer = startFakeIssuer({ refresh: () => "renewed-token" });
-  writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
-  const gateway = startLoginGateway(titleFor(() => false));
-  try {
-    const result = await runFx(["ask", FIRST_PROMPT], { cwd: root.workspace, env: loginEnv(root, gateway, issuer), timeoutMs: 30_000 });
-    expect(result.code, result.stderr).toBe(0);
-    expect(result.stdout).toContain("MAIN_ANSWER_OK");
-    expect(titleTokens(gateway)).toEqual(["launch-token", "renewed-token"]);
-    expect(issuer.refreshes).toHaveLength(1);
-    expect(lastTitle(root)).toContain("refactor the renderer loop");
-  } finally {
-    gateway.stop();
-    issuer.stop();
-    rmSync(root.root, { recursive: true, force: true });
-  }
+test("fx ask sends the title at most twice while another fx keeps renewing the login", async () => {
+  let renewals = 0;
+  const run = await askWithLogin("login-401-always", (home) => Array.from({ length: 3 }, () => () => {
+    renewals += 1;
+    rotateFxLogin(home, `other-fx-token-${renewals}`);
+    return unauthorized();
+  }));
+  expect(run.tokens).toEqual(["launch-token", "other-fx-token-1"]);
+  expect(run.title).toContain("refactor the renderer loop");
 }, 45_000);
 
-test("fx ask keeps the derived title without another request when the login refresh fails", async () => {
-  const root = createFixtureRoot("login-refresh-fails");
-  const issuer = startFakeIssuer({ refresh: () => new Response("issuer unavailable", { status: 500 }) });
-  writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
-  const gateway = startLoginGateway(titleFor(() => false));
-  try {
-    const result = await runFx(["ask", FIRST_PROMPT], { cwd: root.workspace, env: loginEnv(root, gateway, issuer), timeoutMs: 30_000 });
-    expect(result.code, result.stderr).toBe(0);
-    expect(result.stdout).toContain("MAIN_ANSWER_OK");
-    expect(titleTokens(gateway)).toEqual(["launch-token"]);
-    expect(issuer.refreshes.length).toBeGreaterThanOrEqual(1);
-    expect(storedFxLoginToken(root.home)).toBe("launch-token");
-    expect(lastTitle(root)).toContain("refactor the renderer loop");
-  } finally {
-    gateway.stop();
-    issuer.stop();
-    rmSync(root.root, { recursive: true, force: true });
-  }
+test("fx ask never sends the title with the login another fx signed in to another team", async () => {
+  const any = titleFor(() => true);
+  const run = await askWithLogin("login-other-team", (home) => [() => {
+    signInFxLoginToTeam(home, "other-team-token", "team_other");
+    return unauthorized();
+  }, any, any]);
+  expect(run.tokens).toEqual(["launch-token"]);
+  expect(run.stored).toBe("other-team-token");
+  expect(run.title).toContain("refactor the renderer loop");
 }, 45_000);
 
-test("fx ask does not refresh the login when the gateway refuses the title with 403", async () => {
-  const root = createFixtureRoot("login-403");
-  const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
-  writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
+test("fx ask does not send the title again when the gateway refuses it with 403", async () => {
   const forbidden = () => Response.json({ error: { message: "Model not allowed", type: "permission_error" } }, { status: 403 });
-  const gateway = startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
-    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
-    titleResponses: [forbidden, forbidden],
-  });
-  try {
-    const result = await runFx(["ask", FIRST_PROMPT], { cwd: root.workspace, env: loginEnv(root, gateway, issuer), timeoutMs: 30_000 });
-    expect(result.code, result.stderr).toBe(0);
-    expect(titleTokens(gateway)).toEqual(["launch-token"]);
-    expect(issuer.refreshes).toHaveLength(0);
-  } finally {
-    gateway.stop();
-    issuer.stop();
-    rmSync(root.root, { recursive: true, force: true });
-  }
+  const run = await askWithLogin("login-403", (home) => [() => {
+    rotateFxLogin(home, "other-fx-token");
+    return forbidden();
+  }, forbidden]);
+  expect(run.tokens).toEqual(["launch-token"]);
 }, 45_000);
 
 test("fx ask sends a static key's rejected title once", async () => {
   const root = createFixtureRoot("static-key-401");
-  const gateway = startLoginGateway(titleFor(() => false));
+  const rejected = titleFor(() => false);
+  const gateway = startLoginGateway([rejected, rejected]);
   try {
     const result = await runFx(["ask", FIRST_PROMPT], { cwd: root.workspace, env: baseEnv(root, gateway), timeoutMs: 30_000 });
     expect(result.code, result.stderr).toBe(0);
@@ -590,34 +554,13 @@ test("fx ask sends a static key's rejected title once", async () => {
   }
 }, 45_000);
 
-test("fx ask exits soon after its answer while the title waits on a slow login refresh", async () => {
-  const root = createFixtureRoot("login-refresh-slow");
-  const issuer = startFakeIssuer({ refresh: () => Bun.sleep(20_000).then(() => "late-token") });
-  writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
-  const gateway = startLoginGateway(titleFor(() => false));
-  try {
-    const started = Date.now();
-    const result = await runFx(["ask", FIRST_PROMPT], { cwd: root.workspace, env: loginEnv(root, gateway, issuer), timeoutMs: 30_000 });
-    expect(result.code, result.stderr).toBe(0);
-    expect(result.stdout).toContain("MAIN_ANSWER_OK");
-    expect(Date.now() - started).toBeLessThan(8_000);
-    expect(issuer.refreshes).toHaveLength(1);
-    // The login is left as it was, and stays readable.
-    expect(storedFxLoginToken(root.home)).toBe("launch-token");
-    expect(lastTitle(root)).toContain("refactor the renderer loop");
-  } finally {
-    gateway.stop();
-    issuer.stop();
-    rmSync(root.root, { recursive: true, force: true });
-  }
-}, 45_000);
-
 test.skipIf(SKIP_TMUX)("tui sends the title with the login another fx refreshed after launch", async () => {
   const root = createFixtureRoot("tui-stale-login", JSON.stringify({ statusLine: { session: true } }));
   const issuer = startFakeIssuer({ refresh: () => "unexpected-refresh" });
   writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
   let accepted = "launch-token";
-  const gateway = startLoginGateway(titleFor((token) => token === accepted));
+  const title = titleFor((token) => token === accepted);
+  const gateway = startLoginGateway([title, title]);
   let tui: TmuxSession | undefined;
   try {
     tui = await TmuxSession.create({
@@ -648,9 +591,10 @@ test.skipIf(SKIP_TMUX)("tui sends the title with the login another fx refreshed 
 test.skipIf(SKIP_TMUX)("tui gets a title when the login is due for refresh at the first prompt", async () => {
   const root = createFixtureRoot("tui-due-login", JSON.stringify({ statusLine: { session: true } }));
   const issuer = startFakeIssuer({ refresh: () => "renewed-token" });
-  // Not expired, but past its refresh deadline.
+  // Not expired, but past its refresh deadline: the prompt renews it first.
   writeFxLogin(root.home, issuer.issuerUrl, "launch-token", { expiresAtMs: Date.now() + 60_000 });
-  const gateway = startLoginGateway(titleFor((token) => token === "renewed-token"));
+  const title = titleFor((token) => token === "renewed-token");
+  const gateway = startLoginGateway([title, title]);
   let tui: TmuxSession | undefined;
   try {
     tui = await TmuxSession.create({
@@ -664,7 +608,8 @@ test.skipIf(SKIP_TMUX)("tui gets a title when the login is due for refresh at th
     await tui.sendText(FIRST_PROMPT);
     await tui.waitForText("MAIN_ANSWER_OK", 20000);
     await tui.waitForText(GENERATED_TITLE, 15000);
-    expect(titleTokens(gateway).at(-1)).toBe("renewed-token");
+    expect(titleTokens(gateway)).toEqual(["renewed-token"]);
+    expect(issuer.refreshes).toHaveLength(1);
     expect(lastTitle(root)).toBe(GENERATED_TITLE);
   } finally {
     await tui?.kill();
@@ -702,6 +647,10 @@ async function waitUntil(condition: () => boolean, label: string, timeoutMs = 15
   throw new Error(`timed out waiting for ${label}`);
 }
 
+function traceHas(tracePath: string, line: string): boolean {
+  return existsSync(tracePath) && readFileSync(tracePath, "utf8").includes(line);
+}
+
 test.skipIf(SKIP_TMUX)("tui titles a session once, from its first prompt, when the next prompt interrupts the first turn", async () => {
   const root = createFixtureRoot("tui-interrupted-first-turn");
   const tracePath = join(root.root, "trace.log");
@@ -728,14 +677,13 @@ test.skipIf(SKIP_TMUX)("tui titles a session once, from its first prompt, when t
     await tui.waitForStableComposer(15000);
     await tui.sendText(FIRST_PROMPT);
     await waitUntil(() => held.started, "the first turn's reply");
-    await waitUntil(() => existsSync(tracePath) && readFileSync(tracePath, "utf8").includes("event=title_generation result=unavailable"), "the first title request to fail");
-    // Paces the input: the main loop collects the finished title task.
-    await Bun.sleep(300);
+    // The main loop has collected the failed title task, so only the record
+    // can stop the next prompt from starting another.
+    await waitUntil(() => traceHas(tracePath, "event=title_generation_apply result=unavailable"), "the failed title task");
     await tui.sendText("now write the regression test for it");
     await waitUntil(() => held.cancelled, "the interrupted first turn");
+    await waitUntil(() => traceHas(tracePath, "event=title_generation_skipped reason=already_started"), "the gate to refuse a second title");
     await tui.waitForText("SECOND_ANSWER_OK", 20000);
-    // Gives a second title request time to arrive if one were made.
-    await Bun.sleep(1_500);
     expect(gateway.titleRequests).toHaveLength(1);
     expect(gateway.titleRequests[0]!.body).toContain("refactor the renderer loop");
     expect(sessionTitles(root)).not.toContain(GENERATED_TITLE);
@@ -779,55 +727,3 @@ test.skipIf(SKIP_TMUX)("tui titles the next session after /new when the first se
     rmSync(root.root, { recursive: true, force: true });
   }
 }, 60_000);
-
-test.skipIf(SKIP_TMUX)("tui killed while the title waits on a login refresh resumes with a readable login and no second title", async () => {
-  const root = createFixtureRoot("tui-kill-during-refresh");
-  let refreshArrived = false;
-  const issuer = startFakeIssuer({
-    refresh: () => {
-      refreshArrived = true;
-      return Bun.sleep(30_000).then(() => "late-token");
-    },
-  });
-  writeFxLogin(root.home, issuer.issuerUrl, "launch-token");
-  const gateway = startLoginGateway(titleFor(() => false), 6);
-  let tui: TmuxSession | undefined;
-  try {
-    tui = await TmuxSession.create({
-      cmd: JSON.stringify(FX_BIN),
-      cwd: root.workspace,
-      isolated: true,
-      remainOnExit: true,
-      env: loginEnv(root, gateway, issuer),
-    });
-    await tui.waitForStableComposer(15000);
-    await tui.sendText(FIRST_PROMPT);
-    await tui.waitForText("MAIN_ANSWER_OK", 20000);
-    await waitUntil(() => refreshArrived, "the title's login refresh");
-    process.kill(tui.panePid(), "SIGKILL");
-    await waitUntil(() => !tui!.isPaneAlive(), "fx to die");
-    await tui.kill();
-    expect(storedFxLoginToken(root.home)).toBe("launch-token");
-    const sessionId = rootSessionIds(root.home)[0]!;
-    const titleRequestsBefore = gateway.titleRequests.length;
-
-    tui = await TmuxSession.create({
-      cmd: `${JSON.stringify(FX_BIN)} --resume ${sessionId}`,
-      cwd: root.workspace,
-      isolated: true,
-      remainOnExit: true,
-      env: loginEnv(root, gateway, issuer),
-    });
-    await tui.waitForStableComposer(15000);
-    await tui.sendText("now write the regression test for it");
-    await tui.waitForText("MAIN_ANSWER_OK", 20000);
-    await Bun.sleep(1_500);
-    expect(gateway.titleRequests).toHaveLength(titleRequestsBefore);
-    expect(lastTitle(root)).toContain("refactor the renderer loop");
-  } finally {
-    await tui?.kill();
-    gateway.stop();
-    issuer.stop();
-    rmSync(root.root, { recursive: true, force: true });
-  }
-}, 90_000);

@@ -11,22 +11,25 @@
 (*   rotate        [keep]       the driver refreshed the shared login as   *)
 (*                              another fx would; keep says whether the    *)
 (*                              gateway still takes the old token          *)
+(*   team_switch   []           the driver signed the shared login in to   *)
+(*                              another team, as another fx would          *)
 (*   revoke        []           the gateway stopped taking the stored token *)
-(*   issuer_down   []           the fake issuer started failing refreshes  *)
 (*   title_send    [tok, ok, prompt]  a title request reached the gateway  *)
-(*   title_force   [tok, keep]  the issuer answered a refresh; tok 0 means *)
-(*                              it failed                                  *)
 (*   catalog_load  []           the driver opened /model, which reloads     *)
 (*                              the model list                             *)
 (*   catalog_send  [tok, ok]    a model list request reached the gateway   *)
-(*   catalog_force [tok, keep]  as title_force, for the model list         *)
+(*   refresh       [tok]        the issuer answered a refresh: no action   *)
+(*                              of the model matches it, because only the  *)
+(*                              main turn refreshes and the driver's main  *)
+(*                              turn never needs to                        *)
 (*   end           [title, catalog, starts]  how the run ended             *)
 (*                                                                         *)
 (* Tokens are versions: 1 is the token fx launched with, and every token   *)
 (* the driver or the issuer creates after it takes the next number.        *)
-(* Steps fx takes that nothing outside it sees (reading the store, the     *)
-(* turn stopping and being committed, the main turn adopting the stored    *)
-(* token) may happen between any two events.                               *)
+(* Steps fx takes that nothing outside it sees (reading the store, looking *)
+(* for a replacement after a 401, the turn stopping and being committed,   *)
+(* the main turn adopting the stored token) may happen between any two    *)
+(* events.                                                                 *)
 (*                                                                         *)
 (* The run is ACCEPTED when TLC violates NotAllMatched, which it can reach *)
 (* only after every event matched. A completed search means REJECTED.      *)
@@ -57,6 +60,8 @@ Outcome(r) ==
     ELSE IF r.result = "failed" THEN "failed"
     ELSE "pending"
 
+Sent(r, ev) == LastSend(r).tok = ev.tok /\ LastSend(r).ok = ev.ok
+
 Matches ==
     \/ /\ Ev.kind = "prompt" /\ Ev.n = 1
        /\ SubmitFirstPrompt
@@ -65,27 +70,19 @@ Matches ==
     \/ /\ Ev.kind = "rotate"
        /\ OtherFxRefreshes
        /\ KeptOld = Ev.keep
+    \/ /\ Ev.kind = "team_switch"
+       /\ OtherFxSwitchesTeam
     \/ /\ Ev.kind = "revoke"
        /\ GatewayRevokesStored
-    \/ /\ Ev.kind = "issuer_down"
-       /\ IssuerFails
     \/ /\ Ev.kind = "title_send"
        /\ title.prompt = Ev.prompt
        /\ TitleSend
-       /\ LastSend(title') = [tok |-> Ev.tok, ok |-> Ev.ok]
-    \/ /\ Ev.kind = "title_force"
-       /\ TitleForce
-       /\ IF Ev.tok = 0 THEN title'.forceFailed
-          ELSE store' = Ev.tok /\ KeptOld = Ev.keep
+       /\ Sent(title', Ev)
     \/ /\ Ev.kind = "catalog_load"
        /\ CatalogStart
     \/ /\ Ev.kind = "catalog_send"
        /\ CatalogSend
-       /\ LastSend(catalog') = [tok |-> Ev.tok, ok |-> Ev.ok]
-    \/ /\ Ev.kind = "catalog_force"
-       /\ CatalogForce
-       /\ IF Ev.tok = 0 THEN catalog'.forceFailed
-          ELSE store' = Ev.tok /\ KeptOld = Ev.keep
+       /\ Sent(catalog', Ev)
     \/ /\ Ev.kind = "end"
        /\ Outcome(title) = Ev.title
        /\ Outcome(catalog) = Ev.catalog

@@ -328,11 +328,12 @@ for (const provider of ["codex", "grok"] as const) {
 }
 
 // A Codex or Grok subscription's title request rejected with 401 is sent once
-// more with a renewed login, as an fx login's is
+// more with the login another fx process stored, as an fx login's is, and
+// never refreshes the subscription itself
 // (tests/tla/session_title/SessionTitle.tla TitleGivesUpOnlyWhenUnrecoverable).
 for (const provider of ["codex", "grok"] as const) {
   test(
-    `a ${provider} title the subscription rejects is sent once more with a renewed login`,
+    `a ${provider} title the subscription rejects is sent once more with the login another fx stored`,
     async () => {
       const home = mkdtempSync(join(tmpdir(), `fx-auth-refresh-title-${provider}-e2e-`));
       const stale = subscriptionAccessToken(provider, "stale");
@@ -367,6 +368,8 @@ for (const provider of ["codex", "grok"] as const) {
           if (body.includes(TITLE_GENERATION_MARKER)) {
             titleAuthorizations.push(authorization);
             if (authorization.includes(stale)) {
+              // Another fx refreshed the subscription after this one read it.
+              writeExpiredSubscriptionLogin(home, provider, fresh, Date.now() + 60 * 60 * 1000);
               return Response.json({ error: { message: "token expired" } }, { status: 401 });
             }
             return text("Renderer Loop Refactor");
@@ -413,7 +416,7 @@ for (const provider of ["codex", "grok"] as const) {
         expect(titleAuthorizations).toHaveLength(2);
         expect(titleAuthorizations[0]).toContain(stale);
         expect(titleAuthorizations[1]).toContain(fresh);
-        expect(tokenRequests).toBe(1);
+        expect(tokenRequests).toBe(0);
         const titles = savedSessionIds(home).flatMap((id) =>
           (logLines(home, id) as any[]).filter((line) => line.kind === "set" && line.key === "title").map((line) => line.value)
         );

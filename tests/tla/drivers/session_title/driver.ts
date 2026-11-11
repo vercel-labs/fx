@@ -2,12 +2,11 @@
 // has TLC check every run it observes (SessionTitleTrace.tla).
 //
 // Each run is one schedule of the model's environment: another fx process
-// refreshing the shared login (the old token kept or revoked by the gateway),
-// the gateway revoking the stored token, the issuer failing or never
-// answering, the gateway rejecting every token fx's own refreshes issue, and a
-// second prompt interrupting the first turn. The driver plays the environment
-// with a fake gateway, a fake issuer, and edits to ~/.fx/auth.json, then runs
-// one surface of fx:
+// refreshing the shared login (the old token kept or revoked by the gateway)
+// or signing it in to another team, the gateway revoking the stored token,
+// and a second prompt interrupting the first turn. The driver plays the
+// environment with a fake gateway, a fake issuer, and edits to
+// ~/.fx/auth.json, then runs one surface of fx:
 //
 //   ask      fx ask, whose title request runs beside the turn
 //   tui      the interactive terminal in tmux; the environment can act after launch
@@ -19,6 +18,9 @@
 // token the driver or the issuer creates takes the next number) and whether
 // the gateway took it, every refresh the issuer answered, and how the title and
 // the model list ended. TLC replays each run through the model's own actions.
+// The main turn's requests always succeed, so it never refreshes the login,
+// and any refresh in a run comes from a title or model list request, which
+// the design forbids (SessionTitle.tla BackgroundNeverRefreshes).
 //
 // Modes:
 //   (default)       every enumerated schedule; the design model must accept every run
@@ -26,8 +28,8 @@
 //                   (Bug = "today"), which must reject at least one
 //   --base          for a build without the change: the today model must accept
 //                   every run and the design model must reject at least one
-//   --fuzz N        N seeded random schedules with random delays at the gateway and
-//                   the issuer; rejected schedules are saved under the output folder
+//   --fuzz N        N seeded random schedules with random delays at the gateway's
+//                   title channel; rejected schedules are saved under the output folder
 //   --replay FILE   runs the schedules saved in FILE (a JSON array)
 //   --stress N      N fx ask processes in one profile while the login rotates every
 //                   50 ms; checks every rule on the observations and prints wall
@@ -49,7 +51,7 @@ import { binary, targetHelpers, targetModule, testEnvironment } from "../lib/con
 import { TLA_ROOT, outDir, runTlc, tlcToolchain, writeJson } from "../lib/tlc";
 
 type Surface = "ask" | "tui" | "catalog" | "acp";
-type EnvEvent = "rotate_keep" | "rotate_revoke" | "revoke";
+type EnvEvent = "rotate_keep" | "rotate_revoke" | "revoke" | "team_switch";
 type Schedule = {
   id: string;
   surface: Surface;
@@ -57,18 +59,15 @@ type Schedule = {
   /// Environment steps after launch and before the prompt (for ask: before launch,
   /// where only revoke differs from a fresh login).
   before: EnvEvent[];
-  /// Another fx refreshes the login when the first title request arrives.
-  onFirstTitle: "none" | "rotate_keep" | "rotate_revoke";
-  issuer: "up" | "down" | "slow";
-  /// Whether the gateway still takes the old token after fx's own refresh.
-  forceKeepsOld: boolean;
-  /// The gateway rejects every token fx's own refreshes issue.
-  rejectNew: boolean;
+  /// Another fx refreshes the login, or signs it in to another team, when the
+  /// first title request arrives (catalog: the first model list request).
+  onFirstTitle: "none" | "rotate_keep" | "rotate_revoke" | "team_switch";
+  /// Plays onFirstTitle on every title request, not only the first.
+  everyTitle: boolean;
   /// tui: a second prompt interrupts the first turn.
   interrupt: boolean;
-  /// Delays in ms at the gateway's title channel and at the issuer (fuzz).
+  /// Delay in ms at the gateway's title channel (fuzz).
   titleDelayMs: number;
-  issuerDelayMs: number;
 };
 type Event = {
   kind: string;
@@ -138,24 +137,18 @@ function schedule(partial: Partial<Schedule> & { surface: Surface }): Schedule {
     refreshable: true,
     before: [],
     onFirstTitle: "none",
-    issuer: "up",
-    forceKeepsOld: true,
-    rejectNew: false,
+    everyTitle: false,
     interrupt: false,
     titleDelayMs: 0,
-    issuerDelayMs: 0,
     ...partial,
   };
   value.id = [
     value.surface,
     value.refreshable ? "login" : "key",
     value.before.join("+") || "fresh",
-    `first-${value.onFirstTitle}`,
-    `issuer-${value.issuer}`,
-    value.forceKeepsOld ? "keep" : "revoke",
-    value.rejectNew ? "reject-new" : "take-new",
+    `${value.everyTitle ? "every" : "first"}-${value.onFirstTitle}`,
     value.interrupt ? "interrupt" : "single",
-    `d${value.titleDelayMs}-${value.issuerDelayMs}`,
+    `d${value.titleDelayMs}`,
   ].join(".");
   return value;
 }
@@ -163,51 +156,38 @@ function schedule(partial: Partial<Schedule> & { surface: Surface }): Schedule {
 /// Every schedule of the model's environment the driver can play, within small bounds.
 function enumerate(): Schedule[] {
   const out: Schedule[] = [];
-  const issuers = ["up", "down", "slow"] as const;
+  const firsts = ["none", "rotate_keep", "rotate_revoke", "team_switch"] as const;
   if (options.only.includes("ask")) {
     for (const before of [[], ["revoke"]] as EnvEvent[][]) {
-      for (const onFirstTitle of ["none", "rotate_keep", "rotate_revoke"] as const) {
-        for (const issuer of issuers) {
-          for (const forceKeepsOld of [true, false]) {
-            for (const rejectNew of [false, true]) {
-              out.push(schedule({ surface: "ask", before, onFirstTitle, issuer, forceKeepsOld, rejectNew }));
-            }
-          }
-        }
-      }
+      for (const onFirstTitle of firsts) out.push(schedule({ surface: "ask", before, onFirstTitle }));
+      out.push(schedule({ surface: "ask", before, onFirstTitle: "rotate_revoke", everyTitle: true }));
       out.push(schedule({ surface: "ask", refreshable: false, before }));
     }
   }
   if (options.only.includes("tui")) {
-    const befores: EnvEvent[][] = [[], ["rotate_keep"], ["rotate_revoke"], ["rotate_revoke", "rotate_revoke"], ["revoke"], ["rotate_revoke", "revoke"]];
-    for (const before of befores) {
-      for (const issuer of ["up", "down"] as const) {
-        for (const rejectNew of [false, true]) {
-          out.push(schedule({ surface: "tui", before, issuer, rejectNew }));
-        }
-      }
-    }
+    const befores: EnvEvent[][] = [
+      [], ["rotate_keep"], ["rotate_revoke"], ["rotate_revoke", "rotate_revoke"], ["revoke"], ["rotate_revoke", "revoke"],
+      ["team_switch"], ["rotate_revoke", "team_switch"],
+    ];
+    for (const before of befores) out.push(schedule({ surface: "tui", before }));
     out.push(schedule({ surface: "tui", before: ["rotate_revoke"], onFirstTitle: "rotate_revoke" }));
+    out.push(schedule({ surface: "tui", onFirstTitle: "team_switch" }));
     for (const before of [[], ["revoke"]] as EnvEvent[][]) {
       out.push(schedule({ surface: "tui", refreshable: false, before, interrupt: true }));
-      out.push(schedule({ surface: "tui", refreshable: true, before, interrupt: true, rejectNew: true }));
+      out.push(schedule({ surface: "tui", refreshable: true, before, interrupt: true }));
     }
   }
   if (options.only.includes("catalog")) {
-    const befores: EnvEvent[][] = [[], ["rotate_keep"], ["rotate_revoke"], ["revoke"], ["rotate_revoke", "revoke"]];
-    for (const before of befores) {
-      for (const issuer of ["up", "down"] as const) {
-        for (const rejectNew of [false, true]) {
-          out.push(schedule({ surface: "catalog", before, issuer, rejectNew }));
-        }
-      }
+    const befores: EnvEvent[][] = [[], ["rotate_keep"], ["rotate_revoke"], ["revoke"], ["rotate_revoke", "revoke"], ["team_switch"]];
+    for (const before of befores) out.push(schedule({ surface: "catalog", before }));
+    for (const onFirstTitle of ["rotate_keep", "rotate_revoke", "team_switch"] as const) {
+      out.push(schedule({ surface: "catalog", onFirstTitle }));
     }
   }
   if (options.only.includes("acp")) {
-    for (const before of [[], ["rotate_revoke"], ["revoke"], ["rotate_keep", "revoke"]] as EnvEvent[][]) {
+    for (const before of [[], ["rotate_revoke"], ["revoke"], ["rotate_keep", "revoke"], ["team_switch"]] as EnvEvent[][]) {
       out.push(schedule({ surface: "acp", before }));
     }
-    out.push(schedule({ surface: "acp", before: ["revoke"], rejectNew: true }));
   }
   return out;
 }
@@ -221,18 +201,21 @@ function randomSchedules(count: number, seed: number): Schedule[] {
     const refreshable = surface === "catalog" || next() < 0.85;
     const length = Math.floor(next() * 4);
     const before: EnvEvent[] = [];
-    for (let j = 0; j < length; j++) before.push(refreshable ? pick(["rotate_keep", "rotate_revoke", "revoke"] as const) : "revoke");
+    for (let j = 0; j < length; j++) {
+      before.push(refreshable ? pick(["rotate_keep", "rotate_revoke", "revoke", "team_switch"] as const) : "revoke");
+    }
+    // Another fx signs in to another team at most once.
+    const firstSwitch = before.indexOf("team_switch");
+    const once = before.filter((event, index) => event !== "team_switch" || index === firstSwitch);
     out.push(schedule({
       surface,
       refreshable,
-      before: surface === "ask" ? before.filter((event) => event === "revoke").slice(0, 1) : before,
-      onFirstTitle: refreshable && surface !== "catalog" ? pick(["none", "rotate_keep", "rotate_revoke"] as const) : "none",
-      issuer: pick(surface === "ask" ? ["up", "down", "slow"] as const : ["up", "down"] as const),
-      forceKeepsOld: next() < 0.5,
-      rejectNew: next() < 0.3,
+      before: surface === "ask" ? once.filter((event) => event === "revoke").slice(0, 1) : once,
+      onFirstTitle: refreshable && firstSwitch < 0
+        ? pick(["none", "rotate_keep", "rotate_revoke", "team_switch"] as const)
+        : "none",
       interrupt: surface === "tui" && next() < 0.3,
       titleDelayMs: Math.floor(next() * 250),
-      issuerDelayMs: Math.floor(next() * 250),
     }));
   }
   return out;
@@ -245,10 +228,10 @@ class World {
   stored: string;
   events: Event[] = [];
   firstTitleSeen = false;
+  firstCatalogSeen = false;
   armed = false;
   modelRequests = 0;
   catalogFellBack = false;
-  forceFailedSinceSend = false;
 
   constructor(readonly home: string, readonly schedule: Schedule, readonly fakes: any) {
     const launch = schedule.refreshable ? "tok-v1" : "static-key";
@@ -277,38 +260,30 @@ class World {
     const old = this.stored;
     const token = this.create();
     this.accepted.add(token);
-    if (event === "rotate_revoke") this.accepted.delete(old);
     this.stored = token;
+    if (event === "team_switch") {
+      // The gateway takes the other team's token, for that team.
+      this.fakes.signInFxLoginToTeam(this.home, token, "team_other");
+      this.events.push({ kind: "team_switch" });
+      return;
+    }
+    if (event === "rotate_revoke") this.accepted.delete(old);
     this.fakes.rotateFxLogin(this.home, token);
     // Whether the gateway still takes the token stored before this step.
     this.events.push({ kind: "rotate", keep: this.accepted.has(old) });
   }
 
-  /// The issuer answers one of fx's own refreshes.
-  issue(channel: "title" | "catalog"): string {
-    const old = this.stored;
+  /// The issuer answers a refresh. Only a title or model list request can
+  /// have asked for it, which the design forbids.
+  refresh(): string {
     const token = this.create();
     this.accepted.add(token);
-    if (!this.schedule.forceKeepsOld) this.accepted.delete(old);
-    this.stored = token;
-    this.events.push({ kind: `${channel}_force`, tok: this.version(token), keep: this.accepted.has(old) });
-    if (this.schedule.rejectNew) {
-      this.accepted.delete(token);
-      this.events.push({ kind: "revoke" });
-    }
-    this.forceFailedSinceSend = false;
+    this.events.push({ kind: "refresh", tok: this.version(token) });
     return token;
-  }
-
-  failRefresh(channel: "title" | "catalog") {
-    if (this.forceFailedSinceSend) return;
-    this.forceFailedSinceSend = true;
-    this.events.push({ kind: `${channel}_force`, tok: 0, keep: false });
   }
 
   send(channel: "title" | "catalog", token: string, prompt = 0): boolean {
     const ok = this.accepted.has(token);
-    this.forceFailedSinceSend = false;
     const event: Event = { kind: `${channel}_send`, tok: this.version(token), ok };
     if (channel === "title") event.prompt = prompt;
     this.events.push(event);
@@ -370,8 +345,9 @@ function readTrace(path: string): string {
 function titleOutcome(world: World, installed: boolean, trace: string): string {
   const sends = world.events.filter((event) => event.kind === "title_send");
   if (sends.length === 0) return "none";
-  if (installed) return "ok";
-  if (sends.at(-1)!.ok) return "ok";
+  // A title the gateway answered must reach the session; one that did not is
+  // an outcome the model has no name for.
+  if (sends.at(-1)!.ok) return installed ? "ok" : "lost";
   if (trace.includes("event=title_generation_dropped") || trace.includes("reason=cancelled")) return "pending";
   if (trace.includes("event=title_generation result=unavailable")) return "failed";
   return "pending";
@@ -384,8 +360,10 @@ function catalogOutcome(world: World): string {
   return world.catalogFellBack ? "failed" : "pending";
 }
 
-function starts(world: World): number {
-  return new Set(world.events.filter((event) => event.kind === "title_send").map((event) => event.prompt)).size;
+/// Title requests fx started, from its trace: a second request for the same
+/// prompt counts too.
+function starts(trace: string): number {
+  return trace.split("\n").filter((line) => line.includes("event=title_generation_started")).length;
 }
 
 /// One run of fx under `schedule`, with every event it produced.
@@ -398,21 +376,7 @@ async function runSchedule(helpers: any, fakes: any, saved: any, s: Schedule, sc
   writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ statusLine: { session: true } }));
   const tracePath = join(root, "trace.log");
   let world!: World;
-  const issuer = fakes.startFakeIssuer({
-    refresh: async () => {
-      if (s.issuerDelayMs) await Bun.sleep(s.issuerDelayMs);
-      const channel = s.surface === "catalog" ? "catalog" : "title";
-      if (s.issuer === "down") {
-        world.failRefresh(channel);
-        return new Response("issuer unavailable", { status: 500 });
-      }
-      if (s.issuer === "slow") {
-        await Bun.sleep(120_000);
-        return new Response("too late", { status: 500 });
-      }
-      return world.issue(channel);
-    },
-  });
+  const issuer = fakes.startFakeIssuer({ refresh: () => world.refresh() });
   world = new World(home, s, fakes);
   if (s.refreshable) fakes.writeFxLogin(home, issuer.issuerUrl, world.stored);
 
@@ -420,7 +384,7 @@ async function runSchedule(helpers: any, fakes: any, saved: any, s: Schedule, sc
   let mainRequests = 0;
   const title = async (body: string, headers: Headers) => {
     if (s.titleDelayMs) await Bun.sleep(s.titleDelayMs);
-    if (s.onFirstTitle !== "none" && !world.firstTitleSeen) world.apply(s.onFirstTitle);
+    if (s.onFirstTitle !== "none" && (s.everyTitle || !world.firstTitleSeen)) world.apply(s.onFirstTitle);
     world.firstTitleSeen = true;
     return world.send("title", fakes.bearer(headers), promptOf(body)) ? titleText(helpers) : fakes.unauthorized();
   };
@@ -439,6 +403,8 @@ async function runSchedule(helpers: any, fakes: any, saved: any, s: Schedule, sc
         return [publicModel];
       }
       const token = authorization.replace(/^Bearer /, "");
+      if (s.onFirstTitle !== "none" && !world.firstCatalogSeen) world.apply(s.onFirstTitle);
+      world.firstCatalogSeen = true;
       if (!world.send("catalog", token)) return fakes.unauthorized();
       return [publicModel, { id: `private/model-v${world.version(token)}`, type: "language", tags: ["tool-use"] }];
     },
@@ -466,7 +432,7 @@ async function runSchedule(helpers: any, fakes: any, saved: any, s: Schedule, sc
       kind: "end",
       title: titleOutcome(world, installed, readTrace(tracePath)),
       catalog: catalogOutcome(world),
-      starts: starts(world),
+      starts: starts(readTrace(tracePath)),
     });
   };
   let tui: any;
@@ -510,16 +476,15 @@ async function runSchedule(helpers: any, fakes: any, saved: any, s: Schedule, sc
         await tui.sendText(PROMPTS[0]!);
         if (s.interrupt) {
           await waitUntil(() => held.started, 15_000);
-          await waitUntil(() => readTrace(tracePath).includes("event=title_generation result="), 15_000);
-          await Bun.sleep(300);
+          // The main loop has collected the first title task.
+          await waitUntil(() => readTrace(tracePath).includes("event=title_generation_apply result="), 15_000);
           world.events.push({ kind: "prompt", n: 2 });
           await tui.sendText(PROMPTS[1]!);
         }
         await tui.waitForText("MAIN_ANSWER_OK", 20_000);
         await waitUntil(() =>
           sessionTitles(saved, home).includes(GENERATED_TITLE) ||
-          readTrace(tracePath).includes("event=title_generation result=unavailable") ||
-          (s.issuer === "slow" && world.events.some((event) => event.kind === "title_send" && !event.ok)), 15_000);
+          readTrace(tracePath).includes("event=title_generation result=unavailable"), 15_000);
         await Bun.sleep(s.interrupt ? 1_500 : 500);
         end(sessionTitles(saved, home).includes(GENERATED_TITLE));
       }
@@ -587,9 +552,8 @@ function tlaValue(event: Event): string {
     `catalog |-> "${event.catalog ?? ""}", starts |-> ${event.starts ?? 0}]`;
 }
 
-/// The run's events, with the issuer failing from the start when it is down.
-function observedEvents(s: Schedule, events: Event[]): Event[] {
-  return s.refreshable && s.issuer === "down" ? [{ kind: "issuer_down" }, ...events] : events;
+function observedEvents(_s: Schedule, events: Event[]): Event[] {
+  return events;
 }
 
 async function check(dir: string, s: Schedule, events: Event[], bug: "none" | "today"): Promise<Verdict> {
@@ -609,6 +573,7 @@ async function check(dir: string, s: Schedule, events: Event[], bug: "none" | "t
     `    Refreshable = ${s.refreshable ? "TRUE" : "FALSE"}`,
     "    MaxRotations = 12",
     "    MaxRevocations = 12",
+    `    OtherTeam = ${s.refreshable ? "TRUE" : "FALSE"}`,
     `    Bug = "${bug}"`,
     "INVARIANT NotAllMatched",
     "CHECK_DEADLOCK FALSE",
@@ -734,6 +699,7 @@ async function stress(count: number, out: string): Promise<number> {
   gateway.stop();
   issuer.stop();
   const problems: string[] = [];
+  if (refreshes > 0) problems.push(`title requests refreshed the shared login ${refreshes} times`);
   for (const { i, exit } of results) {
     if (exit !== 0) problems.push(`process ${i} exited ${exit}`);
     const mine = sends.get(String(i)) ?? [];

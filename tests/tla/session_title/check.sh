@@ -16,14 +16,15 @@
 # Each session-title-mutation-*.cfg plants one defect, and the rule it names
 # must catch it:
 #
-#   no-reload          the title sends the in-memory token     TitleFirstSendUsesStore
-#   no-replay          the title gives up after one 401         TitleGivesUpOnlyWhenUnrecoverable
-#   double-replay      the title sends a third time             TitleAtMostOneReplay
-#   force-no-recheck   a 401 forces a refresh at once           NoNeedlessRefresh
-#   replay-static-key  a static key is refreshed and resent     StaticKeyNeverReplays
-#   history-gate       the gate reads only the history          AtMostOneTitleRequest
-#   catalog-no-reload  the model list sends the in-memory token CatalogFirstSendUsesStore
-#   catalog-no-replay  the model list falls back after one 401  CatalogFallsBackOnlyWhenUnrecoverable
+#   no-reload            the title sends the in-memory token       TitleFirstSendUsesStore
+#   no-replay            the title gives up after one 401           TitleGivesUpOnlyWhenUnrecoverable
+#   double-replay        the title sends a third time               TitleAtMostOneReplay
+#   background-refresh   a 401 refreshes the shared login           BackgroundNeverRefreshes
+#   authority-unchecked  another team's stored token is sent        NeverSendsOtherTeam
+#   replay-static-key    a static key is sent twice                 StaticKeyNeverReplays
+#   history-gate         the gate reads only the history            AtMostOneTitleRequest
+#   catalog-no-reload    the model list sends the in-memory token   CatalogFirstSendUsesStore
+#   catalog-no-replay    the model list falls back after one 401    CatalogFallsBackOnlyWhenUnrecoverable
 #
 # SessionTitleTrace.tla checks runs of the built fx binary against the model;
 # tests/tla/drivers/session_title/driver.ts runs it.
@@ -38,7 +39,6 @@ set -eu
 
 cd "$(dirname "$0")"
 # shellcheck source=../lib/tlc.sh
-# shellcheck source=../lib/tlc.sh
 . ../lib/tlc.sh
 
 tlc_verdicts "$@" <<'VERDICTS'
@@ -51,7 +51,8 @@ SessionTitle session-title-today-catalog CatalogFallsBackOnlyWhenUnrecoverable
 SessionTitle session-title-mutation-no-reload TitleFirstSendUsesStore
 SessionTitle session-title-mutation-no-replay TitleGivesUpOnlyWhenUnrecoverable
 SessionTitle session-title-mutation-double-replay TitleAtMostOneReplay
-SessionTitle session-title-mutation-force-no-recheck NoNeedlessRefresh
+SessionTitle session-title-mutation-background-refresh BackgroundNeverRefreshes
+SessionTitle session-title-mutation-authority-unchecked NeverSendsOtherTeam
 SessionTitle session-title-mutation-replay-static-key StaticKeyNeverReplays
 SessionTitle session-title-mutation-history-gate AtMostOneTitleRequest
 SessionTitle session-title-mutation-catalog-no-reload CatalogFirstSendUsesStore

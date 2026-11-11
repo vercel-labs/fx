@@ -2367,11 +2367,11 @@ const App = struct {
                 debug_trace.logf("auth", "model_cache_warmup_deferred reason=startup_credential_pending", .{});
                 return;
             }
-            self.model_cache.startWarmupRenewing(
+            self.model_cache.startWarmupWithSharedSignIn(
                 self.providerSet().select(provider_runtime.provider(self)).model_catalog orelse return,
                 self.auth.modelCatalogAccess(),
                 trigger,
-                self.auth.backgroundRenewal(),
+                self.auth.backgroundSignIn(),
             );
         }
     }

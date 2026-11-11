@@ -45,6 +45,17 @@ export function rotateFxLogin(home: string, accessToken: string, refreshToken = 
   writeLoginFile(home, login);
 }
 
+/// Saves a login for another team, as `fx login` in another fx process would.
+export function signInFxLoginToTeam(home: string, accessToken: string, teamId: string): void {
+  const login = JSON.parse(readFileSync(fxLoginPath(home), "utf8"));
+  login.access_token = accessToken;
+  login.refresh_token = `${accessToken}-refresh`;
+  login.expires_at_ms = Date.now() + 60 * 60 * 1000;
+  login.team_id = teamId;
+  login.team_slug = `${teamId}-slug`;
+  writeLoginFile(home, login);
+}
+
 /// The access token the login file holds now.
 export function storedFxLoginToken(home: string): string {
   return JSON.parse(readFileSync(fxLoginPath(home), "utf8")).access_token;

@@ -2591,7 +2591,7 @@ pub fn Runtime(comptime App: type) type {
             const excerpt = session_title_generation.promptExcerpt(prompt) orelse return;
             const title_model = app.sessionTitleModel();
             const session_id = activeSessionId(agent) orelse return;
-            if (!session_title_generation.shouldGenerate(.{
+            const gate: session_title_generation.Gate = .{
                 .setting_enabled = app.session_title_generation,
                 .provider_supports_titles = title_model != null,
                 .session_untitled = agent.session_title.items.len == 0 and
@@ -2599,7 +2599,16 @@ pub fn Runtime(comptime App: type) type {
                 .recovery_replay = false,
                 .task_running = agent.session_persistence.title_generation.task != null,
                 .title_started = agent.session_persistence.title_generation.startedFor(session_id),
-            })) return;
+            };
+            if (!session_title_generation.shouldGenerate(gate)) {
+                var without_record = gate;
+                without_record.title_started = false;
+                if (session_title_generation.shouldGenerate(without_record)) {
+                    debug_trace.logf("session", "event=title_generation_skipped reason=already_started session={s}", .{session_id});
+                }
+                return;
+            }
+
             const credential = app.auth.gatewayCredential() orelse return;
 
             const task = session_title_generation.Task.create(.{
@@ -2610,7 +2619,7 @@ pub fn Runtime(comptime App: type) type {
                 .gateway_team = credential.gateway_team,
                 .account_id = app.auth.accountId(),
                 .credential_source = credential.source,
-                .renewal_transport = app.auth.oauthTransport(),
+                .reads_shared_sign_in = true,
                 .stream_provider = app.agentStreamProvider(),
             }) catch |err| {
                 agent.session_persistence.title_generation.recordSpawnFailure(session_id, title_model.?, err);
@@ -2635,7 +2644,10 @@ pub fn Runtime(comptime App: type) type {
             const task = agent.session_persistence.title_generation.takeCompleted() orelse return false;
             defer task.destroy();
             agent.session_persistence.title_generation.recordFinished(task);
-            const title = task.takeTitle() orelse return false;
+            const title = task.takeTitle() orelse {
+                debug_trace.logf("session", "event=title_generation_apply result=unavailable session={s}", .{task.session_id});
+                return false;
+            };
             defer std.heap.c_allocator.free(title);
             const active_id = activeSessionId(agent) orelse {
                 debug_trace.logf("session", "event=title_generation_apply result=dropped reason=no_active_session", .{});
@@ -10793,10 +10805,6 @@ const TitleGenerationFakeApp = struct {
 
         pub fn accountId(_: *const TitleTestAuth) ?[]const u8 {
             return null;
-        }
-
-        pub fn oauthTransport(_: *const TitleTestAuth) @import("../auth/oauth_transport.zig").Provider {
-            return @import("../auth/oauth_transport.zig").unavailable_provider;
         }
     };
 
